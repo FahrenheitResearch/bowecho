@@ -44,10 +44,19 @@ const HALF_DEGREE_RADIALS_PER_CUT: usize = 720;
 const ONE_DEGREE_RADIALS_PER_CUT: usize = 360;
 const FALLBACK_RADIALS_PER_CUT: usize = 760;
 const MAX_MESSAGE_31_MOMENTS: usize = 10;
-const BZIP_BLOCK_DECODE_CAPACITY_HINT: usize = RECORD_BYTES * 102;
 const GZIP_TRAILER_LEN: usize = 8;
 const MAX_GZIP_PREALLOC_RATIO: usize = 128;
 const ZIP_LOCAL_FILE_HEADER_LEN: usize = 30;
+/// Hard ceiling for one expanded radar payload. Operational Level II,
+/// ODIM, CfRadial, and DORADE files are far smaller; this remains generous
+/// enough for unusually dense research volumes while bounding compression
+/// bombs before they can exhaust the process address space.
+const MAX_DECODED_RADAR_BYTES: usize = 512 * 1024 * 1024;
+/// LDM block-bzip chunks are normally a few hundred KiB decoded. Keep a
+/// separate per-block ceiling so many workers cannot each inflate an
+/// attacker-controlled block all the way to the full-volume budget.
+const MAX_BZIP_BLOCK_DECODED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BZIP_BLOCKS: usize = 4096;
 
 pub type Result<T> = std::result::Result<T, NexradError>;
 
@@ -214,7 +223,15 @@ pub fn decode_supported_volume_bytes(raw: &[u8]) -> std::result::Result<RadarVol
         }
         SupportedVolumeFormat::JmaGrib2Tar => jma::decode_jma_tar_first_station(sniff_bytes),
         SupportedVolumeFormat::NexradLevel2 => {
-            decode_volume_from_bytes(raw).map_err(|err| err.to_string())
+            if decoded_gzip.is_some() {
+                // The router already expanded gzip to inspect its inner
+                // format. Parse those normalized bytes directly instead of
+                // retaining them while inflating the same payload again.
+                decode_normalized_volume_bytes(sniff_bytes, ArchiveCompression::Gzip)
+                    .map_err(|err| err.to_string())
+            } else {
+                decode_volume_from_bytes(raw).map_err(|err| err.to_string())
+            }
         }
     }
 }
@@ -246,6 +263,11 @@ fn decompress_zip_local_member_bytes(raw: &[u8]) -> Result<Vec<u8>> {
     let method = u16::from_le_bytes([raw[8], raw[9]]);
     let compressed_size = u32::from_le_bytes([raw[18], raw[19], raw[20], raw[21]]) as usize;
     let uncompressed_size = u32::from_le_bytes([raw[22], raw[23], raw[24], raw[25]]) as usize;
+    if uncompressed_size > MAX_DECODED_RADAR_BYTES {
+        return Err(NexradError::Compression(format!(
+            "ZIP local-file member declares {uncompressed_size} expanded bytes (limit {MAX_DECODED_RADAR_BYTES})"
+        )));
+    }
     let name_len = u16::from_le_bytes([raw[26], raw[27]]) as usize;
     let extra_len = u16::from_le_bytes([raw[28], raw[29]]) as usize;
     let data_start = ZIP_LOCAL_FILE_HEADER_LEN
@@ -263,12 +285,13 @@ fn decompress_zip_local_member_bytes(raw: &[u8]) -> Result<Vec<u8>> {
     }
     let compressed = &raw[data_start..data_end];
     match method {
-        0 => Ok(compressed.to_vec()),
+        0 => copy_bytes_limited(compressed, MAX_DECODED_RADAR_BYTES, "ZIP stored member"),
         8 => {
-            let mut decoded = Vec::with_capacity(uncompressed_size);
-            DeflateDecoder::new(compressed)
-                .read_to_end(&mut decoded)
-                .map_err(|err| NexradError::Compression(format!("ZIP deflate member: {err}")))?;
+            let decoded = read_to_end_limited(
+                DeflateDecoder::new(compressed),
+                MAX_DECODED_RADAR_BYTES,
+                "ZIP deflate member",
+            )?;
             if uncompressed_size != 0 && decoded.len() != uncompressed_size {
                 return Err(NexradError::Compression(format!(
                     "ZIP deflate member decoded to {} bytes, expected {uncompressed_size}",
@@ -284,7 +307,8 @@ fn decompress_zip_local_member_bytes(raw: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn decode_gzip_volume_from_reader(reader: impl Read) -> Result<RadarVolume> {
-    let mut decoder = GzDecoder::new(reader);
+    let decoder = GzDecoder::new(reader);
+    let mut decoder = ReadLimit::new(decoder, MAX_DECODED_RADAR_BYTES, "gzip radar payload");
     decode_volume_from_stream_until(&mut decoder, ArchiveCompression::Gzip, None).map(|result| {
         debug_assert!(!result.stopped_at_preview);
         result.volume
@@ -306,7 +330,8 @@ where
         return decode_volume_from_bytes(raw);
     }
 
-    let mut decoder = GzDecoder::new(raw);
+    let decoder = GzDecoder::new(raw);
+    let mut decoder = ReadLimit::new(decoder, MAX_DECODED_RADAR_BYTES, "gzip radar payload");
     decode_volume_from_stream(
         &mut decoder,
         ArchiveCompression::Gzip,
@@ -331,7 +356,8 @@ pub fn decode_gzip_preview_from_bytes(
         return Ok(None);
     }
 
-    let mut decoder = GzDecoder::new(raw);
+    let decoder = GzDecoder::new(raw);
+    let mut decoder = ReadLimit::new(decoder, MAX_DECODED_RADAR_BYTES, "gzip radar payload");
     let result = decode_volume_from_stream_until(
         &mut decoder,
         ArchiveCompression::Gzip,
@@ -408,10 +434,11 @@ pub fn normalize_archive_bytes(raw: &[u8]) -> Result<(Vec<u8>, ArchiveCompressio
     }
 
     if raw.starts_with(b"BZh") {
-        let mut decoded = Vec::new();
-        BzDecoder::new(Cursor::new(raw))
-            .read_to_end(&mut decoded)
-            .map_err(|err| NexradError::Compression(err.to_string()))?;
+        let decoded = read_to_end_limited(
+            BzDecoder::new(Cursor::new(raw)),
+            MAX_DECODED_RADAR_BYTES,
+            "whole-file bzip2 radar payload",
+        )?;
         return Ok((decoded, ArchiveCompression::Bzip2WholeFile));
     }
 
@@ -419,14 +446,17 @@ pub fn normalize_archive_bytes(raw: &[u8]) -> Result<(Vec<u8>, ArchiveCompressio
         return Ok((decoded, ArchiveCompression::Bzip2Blocks));
     }
 
-    Ok((raw.to_vec(), ArchiveCompression::Uncompressed))
+    Ok((
+        copy_bytes_limited(raw, MAX_DECODED_RADAR_BYTES, "uncompressed radar payload")?,
+        ArchiveCompression::Uncompressed,
+    ))
 }
 
 fn gzip_decoded_capacity_hint(raw: &[u8]) -> Option<usize> {
     let trailer = raw.get(raw.len().checked_sub(GZIP_TRAILER_LEN)?..)?;
     let isize = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]) as usize;
     let max_reasonable = raw.len().saturating_mul(MAX_GZIP_PREALLOC_RATIO);
-    (isize <= max_reasonable).then_some(isize)
+    (isize <= max_reasonable && isize <= MAX_DECODED_RADAR_BYTES).then_some(isize)
 }
 
 fn decompress_gzip_bytes(raw: &[u8]) -> Result<Vec<u8>> {
@@ -436,11 +466,11 @@ fn decompress_gzip_bytes(raw: &[u8]) -> Result<Vec<u8>> {
         return Ok(decoded);
     }
 
-    let mut decoded = Vec::with_capacity(gzip_decoded_capacity_hint(raw).unwrap_or(0));
-    GzDecoder::new(raw)
-        .read_to_end(&mut decoded)
-        .map_err(|err| NexradError::Compression(err.to_string()))?;
-    Ok(decoded)
+    read_to_end_limited(
+        GzDecoder::new(raw),
+        MAX_DECODED_RADAR_BYTES,
+        "gzip radar payload",
+    )
 }
 
 struct LibdeflateDecompressor {
@@ -468,7 +498,11 @@ impl Drop for LibdeflateDecompressor {
 }
 
 fn decompress_gzip_bytes_libdeflate(raw: &[u8], expected_len: usize) -> Option<Vec<u8>> {
-    let mut decoded = Vec::<MaybeUninit<u8>>::with_capacity(expected_len);
+    if expected_len > MAX_DECODED_RADAR_BYTES {
+        return None;
+    }
+    let mut decoded = Vec::<MaybeUninit<u8>>::new();
+    decoded.try_reserve_exact(expected_len).ok()?;
     let mut actual_len = 0usize;
     let result = LIBDEFLATE_DECOMPRESSOR.with(|decompressor| {
         let decompressor = decompressor.as_ref()?;
@@ -491,6 +525,101 @@ fn decompress_gzip_bytes_libdeflate(raw: &[u8], expected_len: usize) -> Option<V
     let capacity = decoded.capacity();
     std::mem::forget(decoded);
     Some(unsafe { Vec::from_raw_parts(ptr, actual_len, capacity) })
+}
+
+/// Read an expanded stream without ever growing the destination beyond
+/// `limit`. `try_reserve` turns address-space pressure into a normal decode
+/// error instead of invoking the infallible allocation path.
+pub(crate) fn read_to_end_limited(
+    mut reader: impl Read,
+    limit: usize,
+    context: &'static str,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let remaining = limit.saturating_sub(output.len());
+        if remaining == 0 {
+            let mut probe = [0u8; 1];
+            let count = reader
+                .read(&mut probe)
+                .map_err(|err| NexradError::Compression(format!("{context}: {err}")))?;
+            if count != 0 {
+                return Err(NexradError::Compression(format!(
+                    "{context} expands beyond the {limit}-byte limit"
+                )));
+            }
+            break;
+        }
+        let read_len = remaining.min(chunk.len());
+        let count = reader
+            .read(&mut chunk[..read_len])
+            .map_err(|err| NexradError::Compression(format!("{context}: {err}")))?;
+        if count == 0 {
+            break;
+        }
+        output.try_reserve(count).map_err(|err| {
+            NexradError::Compression(format!("{context}: cannot reserve decoded buffer: {err}"))
+        })?;
+        output.extend_from_slice(&chunk[..count]);
+    }
+    Ok(output)
+}
+
+fn copy_bytes_limited(bytes: &[u8], limit: usize, context: &'static str) -> Result<Vec<u8>> {
+    if bytes.len() > limit {
+        return Err(NexradError::Compression(format!(
+            "{context} is {} bytes (limit {limit})",
+            bytes.len()
+        )));
+    }
+    let mut output = Vec::new();
+    output.try_reserve_exact(bytes.len()).map_err(|err| {
+        NexradError::Compression(format!("{context}: cannot reserve decoded buffer: {err}"))
+    })?;
+    output.extend_from_slice(bytes);
+    Ok(output)
+}
+
+/// Streaming expansion guard used by the preview decoders. It permits EOF
+/// exactly at the limit, but probes one byte further before reporting EOF so
+/// an over-limit stream cannot be mistaken for a complete volume.
+struct ReadLimit<R> {
+    inner: R,
+    remaining: usize,
+    context: &'static str,
+}
+
+impl<R> ReadLimit<R> {
+    fn new(inner: R, limit: usize, context: &'static str) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            context,
+        }
+    }
+}
+
+impl<R: Read> Read for ReadLimit<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} expands beyond the {}-byte limit",
+                        self.context, MAX_DECODED_RADAR_BYTES
+                    ),
+                )),
+            };
+        }
+        let allowed = buffer.len().min(self.remaining);
+        let count = self.inner.read(&mut buffer[..allowed])?;
+        self.remaining -= count;
+        Ok(count)
+    }
 }
 
 fn read_record_prefix<R: Read>(reader: &mut R, buffer: &mut [u8], offset: usize) -> Result<bool> {
@@ -946,6 +1075,7 @@ struct BlockSlots<'a> {
     states: Box<[AtomicU8]>,
     errors: Mutex<Vec<Option<String>>>,
     next_claim: AtomicUsize,
+    decoded_bytes: AtomicUsize,
     canceled: AtomicBool,
     wakeup: Mutex<()>,
     published: Condvar,
@@ -965,6 +1095,7 @@ impl<'a> BlockSlots<'a> {
             states: (0..len).map(|_| AtomicU8::new(BLOCK_PENDING)).collect(),
             errors: Mutex::new(vec![None; len]),
             next_claim: AtomicUsize::new(0),
+            decoded_bytes: AtomicUsize::new(0),
             canceled: AtomicBool::new(false),
             wakeup: Mutex::new(()),
             published: Condvar::new(),
@@ -992,6 +1123,20 @@ impl<'a> BlockSlots<'a> {
     fn decompress_index(&self, index: usize) {
         let state = match decompress_bzip_block(self.compressed[index]) {
             Ok(decoded) => {
+                if !reserve_atomic_budget(
+                    &self.decoded_bytes,
+                    decoded.len(),
+                    MAX_DECODED_RADAR_BYTES,
+                ) {
+                    self.errors.lock().unwrap()[index] = Some(format!(
+                        "block-bzip radar payload expands beyond the {MAX_DECODED_RADAR_BYTES}-byte aggregate limit"
+                    ));
+                    self.states[index].store(BLOCK_FAILED, Ordering::Release);
+                    drop(self.wakeup.lock().unwrap());
+                    self.published.notify_all();
+                    self.cancel();
+                    return;
+                }
                 // SAFETY: `index` was claimed exactly once via `next_claim`,
                 // so this thread is the slot's unique writer; readers wait for
                 // the Release store below before touching it.
@@ -1459,8 +1604,20 @@ fn try_decode_bzip_blocks(raw: &[u8]) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     };
 
-    let decoded_len = decoded_blocks.iter().map(Vec::len).sum::<usize>();
-    let mut output = Vec::with_capacity(VOLUME_HEADER_LEN + decoded_len);
+    let decoded_len = decoded_blocks.iter().try_fold(0usize, |total, block| {
+        total.checked_add(block.len()).filter(|sum| *sum <= MAX_DECODED_RADAR_BYTES)
+    }).ok_or_else(|| {
+        NexradError::Compression(format!(
+            "block-bzip radar payload expands beyond the {MAX_DECODED_RADAR_BYTES}-byte aggregate limit"
+        ))
+    })?;
+    let output_len = VOLUME_HEADER_LEN.checked_add(decoded_len).ok_or_else(|| {
+        NexradError::Compression("block-bzip output size overflow".to_owned())
+    })?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(output_len).map_err(|err| {
+        NexradError::Compression(format!("cannot reserve block-bzip output: {err}"))
+    })?;
     output.extend_from_slice(&raw[..VOLUME_HEADER_LEN]);
     for block in decoded_blocks {
         output.extend(block);
@@ -1474,9 +1631,22 @@ fn try_decompress_bzip_blocks(raw: &[u8]) -> Result<Option<Vec<Vec<u8>>>> {
         return Ok(None);
     };
 
+    let decoded_bytes = AtomicUsize::new(0);
     let decoded_blocks = blocks
         .par_iter()
-        .map(|compressed| decompress_bzip_block(compressed))
+        .map(|compressed| {
+            let decoded = decompress_bzip_block(compressed)?;
+            if !reserve_atomic_budget(
+                &decoded_bytes,
+                decoded.len(),
+                MAX_DECODED_RADAR_BYTES,
+            ) {
+                return Err(NexradError::Compression(format!(
+                    "block-bzip radar payload expands beyond the {MAX_DECODED_RADAR_BYTES}-byte aggregate limit"
+                )));
+            }
+            Ok(decoded)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(Some(decoded_blocks))
@@ -1513,6 +1683,11 @@ fn collect_bzip_block_slices(raw: &[u8]) -> Result<Option<Vec<&[u8]>>> {
         }
 
         blocks.push(compressed);
+        if blocks.len() > MAX_BZIP_BLOCKS {
+            return Err(NexradError::Compression(format!(
+                "block-bzip volume contains more than {MAX_BZIP_BLOCKS} blocks"
+            )));
+        }
         cursor += block_size;
         if is_last_block {
             break;
@@ -1527,12 +1702,21 @@ fn collect_bzip_block_slices(raw: &[u8]) -> Result<Option<Vec<&[u8]>>> {
 }
 
 fn decompress_bzip_block(compressed: &[u8]) -> Result<Vec<u8>> {
-    let mut decoded =
-        Vec::with_capacity(BZIP_BLOCK_DECODE_CAPACITY_HINT.max(compressed.len().saturating_mul(2)));
-    BzDecoder::new(Cursor::new(compressed))
-        .read_to_end(&mut decoded)
-        .map_err(|err| NexradError::Compression(err.to_string()))?;
-    Ok(decoded)
+    read_to_end_limited(
+        BzDecoder::new(Cursor::new(compressed)),
+        MAX_BZIP_BLOCK_DECODED_BYTES,
+        "block-bzip chunk",
+    )
+}
+
+fn reserve_atomic_budget(total: &AtomicUsize, additional: usize, limit: usize) -> bool {
+    total
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current
+                .checked_add(additional)
+                .filter(|next| *next <= limit)
+        })
+        .is_ok()
 }
 
 fn parse_volume_header(bytes: &[u8]) -> Result<VolumeHeader> {

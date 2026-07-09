@@ -43,11 +43,19 @@ use crate::dorade::{
     append_dorade_sweep, decode_dorade_sweep_volume, finalize_dorade_volume,
     looks_like_dorade_bytes, looks_like_dorade_name, peek_dorade_sweep,
 };
-use crate::{NexradError, Result, decode_volume_from_bytes};
+use crate::{NexradError, Result, decode_volume_from_bytes, read_to_end_limited};
 
 const ZIP_MAGIC: &[u8; 4] = b"PK\x03\x04";
 /// Empty-archive variant of the zip magic ("PK\x05\x06") is not radar data.
 const VOLUME_HEADER_MAGIC: &[u8; 4] = b"AR2V";
+/// Mobile deployments can contain hundreds of real sweeps, but retaining an
+/// unbounded archive before parallel decode lets a zip bomb or accidental
+/// multi-day tree exhaust memory. These ceilings are deliberately much
+/// larger than one operational volume while keeping peak input retention
+/// finite and diagnosable.
+const MAX_MOBILE_MEMBER_BYTES: usize = 256 * 1024 * 1024;
+const MAX_MOBILE_ARCHIVE_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_MOBILE_MEMBERS: usize = 4096;
 
 /// `true` when the buffer starts with a local-file zip signature.
 pub fn looks_like_zip_bytes(bytes: &[u8]) -> bool {
@@ -98,7 +106,8 @@ pub fn decode_mobile_archive_from_path(path: &Path) -> Result<Vec<MobileVolume>>
 /// open unit (field report). Same sniffing and volume grouping as zips.
 pub fn decode_mobile_dir_from_path(dir: &Path) -> Result<Vec<MobileVolume>> {
     let mut members = Vec::new();
-    collect_dir_members(dir, dir, &mut members, 0)?;
+    let mut budget = MemberBudget::default();
+    collect_dir_members(dir, dir, &mut members, &mut budget, 0)?;
     if members.is_empty() {
         return Err(NexradError::InvalidMessage {
             offset: 0,
@@ -120,6 +129,7 @@ fn collect_dir_members(
     root: &Path,
     dir: &Path,
     members: &mut Vec<RadarMember>,
+    budget: &mut MemberBudget,
     depth: usize,
 ) -> Result<()> {
     if depth > MAX_DIR_DEPTH {
@@ -132,7 +142,7 @@ fn collect_dir_members(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_dir_members(root, &path, members, depth + 1)?;
+            collect_dir_members(root, &path, members, budget, depth + 1)?;
             continue;
         }
         let name = path
@@ -143,10 +153,9 @@ fn collect_dir_members(
         if !plausible_radar_member_name(&name) {
             continue;
         }
-        let bytes = std::fs::read(&path).map_err(|source| NexradError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let declared = file_len_usize(&path)?;
+        budget.reserve(&name, declared)?;
+        let bytes = read_file_limited(&path, MAX_MOBILE_MEMBER_BYTES)?;
         if looks_like_dorade_bytes(&bytes)
             || bytes.starts_with(VOLUME_HEADER_MAGIC)
             || bytes.starts_with(&[0x1f, 0x8b])
@@ -164,6 +173,41 @@ struct RadarMember {
     bytes: Vec<u8>,
 }
 
+#[derive(Default)]
+struct MemberBudget {
+    candidates: usize,
+    expanded_bytes: usize,
+}
+
+impl MemberBudget {
+    fn reserve(&mut self, name: &str, bytes: usize) -> Result<()> {
+        if bytes > MAX_MOBILE_MEMBER_BYTES {
+            return Err(invalid_archive(format!(
+                "archive member {name} declares {bytes} bytes (per-member limit {MAX_MOBILE_MEMBER_BYTES})"
+            )));
+        }
+        let candidates = self.candidates.checked_add(1).ok_or_else(|| {
+            invalid_archive("mobile archive member count overflow".to_owned())
+        })?;
+        if candidates > MAX_MOBILE_MEMBERS {
+            return Err(invalid_archive(format!(
+                "mobile archive contains more than {MAX_MOBILE_MEMBERS} candidate radar members"
+            )));
+        }
+        let expanded_bytes = self.expanded_bytes.checked_add(bytes).ok_or_else(|| {
+            invalid_archive("mobile archive expanded-size overflow".to_owned())
+        })?;
+        if expanded_bytes > MAX_MOBILE_ARCHIVE_BYTES {
+            return Err(invalid_archive(format!(
+                "mobile archive candidate members exceed the {MAX_MOBILE_ARCHIVE_BYTES}-byte aggregate limit"
+            )));
+        }
+        self.candidates = candidates;
+        self.expanded_bytes = expanded_bytes;
+        Ok(())
+    }
+}
+
 fn read_radar_members(path: &Path) -> Result<Vec<RadarMember>> {
     let file = File::open(path).map_err(|source| NexradError::Io {
         path: path.display().to_string(),
@@ -175,6 +219,7 @@ fn read_radar_members(path: &Path) -> Result<Vec<RadarMember>> {
     })?;
 
     let mut members = Vec::new();
+    let mut budget = MemberBudget::default();
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -189,13 +234,22 @@ fn read_radar_members(path: &Path) -> Result<Vec<RadarMember>> {
         if !plausible_radar_member_name(&name) {
             continue;
         }
-        let mut bytes = Vec::with_capacity(entry.size().min(usize::MAX as u64) as usize);
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|err| NexradError::InvalidMessage {
-                offset: 0,
-                reason: format!("zip entry {name}: {err}"),
-            })?;
+        let declared = usize::try_from(entry.size()).map_err(|_| {
+            invalid_archive(format!("zip entry {name} size overflows this platform"))
+        })?;
+        budget.reserve(&name, declared)?;
+        let bytes = read_to_end_limited(
+            &mut entry,
+            MAX_MOBILE_MEMBER_BYTES,
+            "mobile archive member",
+        )
+        .map_err(|err| with_member(&name, err))?;
+        if bytes.len() != declared {
+            return Err(invalid_archive(format!(
+                "zip entry {name} decoded to {} bytes, expected {declared}",
+                bytes.len()
+            )));
+        }
         // Content sniff: extension pre-filter only narrows the candidates.
         if looks_like_dorade_bytes(&bytes)
             || bytes.starts_with(VOLUME_HEADER_MAGIC)
@@ -354,6 +408,43 @@ fn with_member(name: &str, err: NexradError) -> NexradError {
     }
 }
 
+fn invalid_archive(reason: String) -> NexradError {
+    NexradError::InvalidMessage { offset: 0, reason }
+}
+
+fn file_len_usize(path: &Path) -> Result<usize> {
+    let metadata = std::fs::metadata(path).map_err(|source| NexradError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    usize::try_from(metadata.len()).map_err(|_| {
+        invalid_archive(format!("file {} size overflows this platform", path.display()))
+    })
+}
+
+fn read_file_limited(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let declared = file_len_usize(path)?;
+    if declared > limit {
+        return Err(invalid_archive(format!(
+            "file {} is {declared} bytes (limit {limit})",
+            path.display()
+        )));
+    }
+    let mut file = File::open(path).map_err(|source| NexradError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let bytes = read_to_end_limited(&mut file, limit, "mobile radar file")?;
+    if bytes.len() != declared {
+        return Err(invalid_archive(format!(
+            "file {} changed while reading (expected {declared} bytes, read {})",
+            path.display(),
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Descriptor blocks live at the head of a sweepfile; this is enough bytes
 /// to peek COMM/SSWB/VOLD/RADD/PARM*/CELV/CSFD/SWIB without reading rays.
 const PEEK_HEAD_BYTES: usize = 64 * 1024;
@@ -366,10 +457,7 @@ const PEEK_HEAD_BYTES: usize = 64 * 1024;
 /// headers are peeked from the first [`PEEK_HEAD_BYTES`] only, so opening a
 /// file in a large deployment directory stays cheap.
 pub fn decode_dorade_volume_for_path(path: &Path) -> Result<RadarVolume> {
-    let bytes = std::fs::read(path).map_err(|source| NexradError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let bytes = read_file_limited(path, MAX_MOBILE_MEMBER_BYTES)?;
     let header = peek_dorade_sweep(&bytes)?;
 
     let mut sweeps: Vec<GroupableSweep<PathBuf>> = vec![GroupableSweep {
@@ -423,10 +511,7 @@ pub fn decode_dorade_volume_for_path(path: &Path) -> Result<RadarVolume> {
         let data = if sweep.payload == *path {
             bytes.clone()
         } else {
-            std::fs::read(&sweep.payload).map_err(|source| NexradError::Io {
-                path: sweep.payload.display().to_string(),
-                source,
-            })?
+            read_file_limited(&sweep.payload, MAX_MOBILE_MEMBER_BYTES)?
         };
         append_dorade_sweep(&data, &mut volume).map_err(|err| with_member(&sweep.label, err))?;
     }

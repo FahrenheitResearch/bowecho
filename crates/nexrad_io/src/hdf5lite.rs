@@ -35,7 +35,7 @@
 //! messages, fill values beyond zero, named datatypes, ...) is out of scope
 //! and produces an explicit error rather than silent misreads.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
 use flate2::read::ZlibDecoder;
@@ -55,6 +55,16 @@ const MAX_BTREE_NODES: usize = 1 << 16;
 /// Defense against corrupt/self-referencing v2 header continuations: most
 /// header blocks (chunk 0 + OCHK continuations) per object header.
 const MAX_HEADER_BLOCKS: usize = 1 << 10;
+const MAX_OBJECT_MESSAGES: usize = 4096;
+const MAX_OBJECT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GROUP_ENTRIES: usize = 1 << 20;
+const MAX_DATA_CHUNKS: usize = 1 << 18;
+const MAX_DATASPACE_RANK: usize = 32;
+const MAX_DATASPACE_DIM: usize = 100 * 1024 * 1024;
+const MAX_HDF5_DATASET_BYTES: usize = 256 * 1024 * 1024;
+const MAX_HDF5_ATTRIBUTE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HDF5_FILTERS: usize = 32;
+const MAX_HDF5_FILTER_VALUES: usize = 1024;
 
 /// `true` when the buffer starts with the HDF5 superblock signature.
 pub fn looks_like_hdf5_bytes(bytes: &[u8]) -> bool {
@@ -179,7 +189,8 @@ impl<'a> H5File<'a> {
         };
         let header = file.parse_object_header(root_header)?;
         file.objects.insert("/".to_owned(), root_header);
-        file.walk_group("", &header, 0)?;
+        let mut visited_groups = BTreeSet::from([root_header]);
+        file.walk_group("", &header, &mut visited_groups, 0)?;
         Ok(file)
     }
 
@@ -240,8 +251,13 @@ impl<'a> H5File<'a> {
         let dims = dims.ok_or_else(|| invalid(0, format!("dataset '{path}' has no dataspace")))?;
         let dtype = dtype.ok_or_else(|| invalid(0, format!("dataset '{path}' has no datatype")))?;
         let layout = layout.ok_or_else(|| invalid(0, format!("dataset '{path}' has no layout")))?;
-        let element_count: usize = dims.iter().product();
-        let byte_len = element_count * dtype.size;
+        let element_count = checked_product(&dims, "HDF5 dataset element count")?;
+        let byte_len = checked_allocation_bytes(
+            element_count,
+            dtype.size,
+            MAX_HDF5_DATASET_BYTES,
+            "HDF5 dataset",
+        )?;
         let raw = match layout {
             Layout::Compact(data) => data,
             Layout::Contiguous { address, size } => {
@@ -271,7 +287,13 @@ impl<'a> H5File<'a> {
 
     // ----- object graph -------------------------------------------------
 
-    fn walk_group(&mut self, prefix: &str, header: &ObjectHeader, depth: usize) -> Result<()> {
+    fn walk_group(
+        &mut self,
+        prefix: &str,
+        header: &ObjectHeader,
+        visited_groups: &mut BTreeSet<u64>,
+        depth: usize,
+    ) -> Result<()> {
         if depth > MAX_GROUP_DEPTH {
             return Err(invalid(0, "HDF5 group nesting too deep"));
         }
@@ -284,7 +306,8 @@ impl<'a> H5File<'a> {
             let heap = read_offset(&message.body, self.offset_size, self.offset_size)?;
             let heap_data = self.local_heap_data(heap)?;
             let mut entries = Vec::new();
-            self.collect_group_entries(btree, &mut entries, 0)?;
+            let mut visited_nodes = BTreeSet::new();
+            self.collect_group_entries(btree, &mut entries, &mut visited_nodes)?;
             for (name_offset, child_address) in entries {
                 let name = heap_string(self.bytes, heap_data, name_offset)?;
                 let path = format!("{prefix}/{name}");
@@ -293,7 +316,9 @@ impl<'a> H5File<'a> {
                 }
                 let child = self.parse_object_header(child_address)?;
                 self.objects.insert(path.clone(), child_address);
-                self.walk_group(&path, &child, depth + 1)?;
+                if visited_groups.insert(child_address) {
+                    self.walk_group(&path, &child, visited_groups, depth + 1)?;
+                }
             }
         }
         Ok(())
@@ -303,9 +328,15 @@ impl<'a> H5File<'a> {
         &self,
         node_address: u64,
         out: &mut Vec<(u64, u64)>,
-        visited: usize,
+        visited: &mut BTreeSet<u64>,
     ) -> Result<()> {
-        if visited > MAX_BTREE_NODES {
+        if !visited.insert(node_address) {
+            return Err(invalid(
+                address_to_usize(node_address)?,
+                "cycle in HDF5 group B-tree",
+            ));
+        }
+        if visited.len() > MAX_BTREE_NODES {
             return Err(invalid(0, "HDF5 group B-tree too large"));
         }
         let node = self.slice(node_address, 8 + 2 * self.offset_size)?;
@@ -315,7 +346,9 @@ impl<'a> H5File<'a> {
         let level = node[5];
         let entries = u16::from_le_bytes([node[6], node[7]]) as usize;
         // keys/children alternate after the two sibling addresses.
-        let mut cursor = node_address as usize + 8 + 2 * self.offset_size;
+        let mut cursor = address_to_usize(node_address)?
+            .checked_add(8 + 2 * self.offset_size)
+            .ok_or_else(|| invalid(0, "HDF5 group B-tree cursor overflow"))?;
         for _ in 0..entries {
             cursor += self.length_size; // key (heap offset) — unused here
             let child = read_offset(self.bytes, cursor, self.offset_size)?;
@@ -323,7 +356,7 @@ impl<'a> H5File<'a> {
             if level == 0 {
                 self.read_snod(child, out)?;
             } else {
-                self.collect_group_entries(child, out, visited + 1)?;
+                self.collect_group_entries(child, out, visited)?;
             }
         }
         Ok(())
@@ -336,12 +369,22 @@ impl<'a> H5File<'a> {
         }
         let count = u16::from_le_bytes([head[6], head[7]]) as usize;
         let entry_size = 2 * self.offset_size + 8 + 16;
-        let mut cursor = address as usize + 8;
+        let mut cursor = address_to_usize(address)?
+            .checked_add(8)
+            .ok_or_else(|| invalid(0, "HDF5 symbol-table address overflow"))?;
         for _ in 0..count {
             let name_offset = read_offset(self.bytes, cursor, self.length_size)?;
             let header = read_offset(self.bytes, cursor + self.offset_size, self.offset_size)?;
+            if out.len() >= MAX_GROUP_ENTRIES {
+                return Err(invalid(
+                    address_to_usize(address)?,
+                    "HDF5 group has too many entries",
+                ));
+            }
             out.push((name_offset, header));
-            cursor += entry_size;
+            cursor = cursor
+                .checked_add(entry_size)
+                .ok_or_else(|| invalid(cursor, "HDF5 symbol-table cursor overflow"))?;
         }
         Ok(())
     }
@@ -371,30 +414,91 @@ impl<'a> H5File<'a> {
             ));
         }
         let total_messages = u16::from_le_bytes([head[2], head[3]]) as usize;
+        if total_messages > MAX_OBJECT_MESSAGES {
+            return Err(invalid(
+                address_to_usize(address)?,
+                format!(
+                    "HDF5 object header declares {total_messages} messages (limit {MAX_OBJECT_MESSAGES})"
+                ),
+            ));
+        }
         let block_size = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
+        if block_size > MAX_OBJECT_MESSAGE_BYTES {
+            return Err(invalid(
+                address_to_usize(address)?,
+                "HDF5 object-header message block is too large",
+            ));
+        }
         let mut messages = Vec::with_capacity(total_messages);
         // (start, length) message blocks; the first follows 4 pad bytes.
-        let mut blocks = vec![(address as usize + 16, block_size)];
+        let first_block = address_to_usize(address)?
+            .checked_add(16)
+            .ok_or_else(|| invalid(0, "HDF5 object-header address overflow"))?;
+        let mut blocks = vec![(first_block, block_size)];
+        let mut scheduled_blocks = BTreeSet::from([first_block]);
         let mut block_index = 0;
+        let mut message_bytes = 0usize;
         while block_index < blocks.len() && messages.len() < total_messages {
             let (start, len) = blocks[block_index];
             block_index += 1;
             let mut cursor = start;
-            let end = start + len;
-            while cursor + 8 <= end && messages.len() < total_messages {
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| invalid(start, "HDF5 object-header block overflow"))?;
+            self.bytes
+                .get(start..end)
+                .ok_or_else(|| truncated(start, len, self.bytes.len()))?;
+            while cursor
+                .checked_add(8)
+                .is_some_and(|header_end| header_end <= end)
+                && messages.len() < total_messages
+            {
                 let header = self.slice(cursor as u64, 8)?;
                 let kind = u16::from_le_bytes([header[0], header[1]]);
                 let size = u16::from_le_bytes([header[2], header[3]]) as usize;
-                let body = self.slice(cursor as u64 + 8, size)?.to_vec();
+                let body_start = cursor
+                    .checked_add(8)
+                    .ok_or_else(|| invalid(cursor, "HDF5 message address overflow"))?;
+                let body_end = body_start
+                    .checked_add(size)
+                    .ok_or_else(|| invalid(body_start, "HDF5 message size overflow"))?;
+                if body_end > end {
+                    return Err(truncated(cursor, 8 + size, end.saturating_sub(cursor)));
+                }
+                let body = self.slice(body_start as u64, size)?.to_vec();
                 if kind == 0x0010 {
                     // Continuation: offset + length of the next block.
                     let offset = read_offset(&body, 0, self.offset_size)?;
                     let length = read_offset(&body, self.offset_size, self.length_size)?;
-                    blocks.push((offset as usize, length as usize));
+                    let offset = address_to_usize(offset)?;
+                    let length = usize::try_from(length)
+                        .map_err(|_| invalid(cursor, "HDF5 continuation length overflows usize"))?;
+                    if length > MAX_OBJECT_MESSAGE_BYTES {
+                        return Err(invalid(cursor, "HDF5 continuation block is too large"));
+                    }
+                    if blocks.len() >= MAX_HEADER_BLOCKS {
+                        return Err(invalid(
+                            address_to_usize(address)?,
+                            "HDF5 object header has too many continuation blocks",
+                        ));
+                    }
+                    if !scheduled_blocks.insert(offset) {
+                        return Err(invalid(offset, "cycle in HDF5 object-header continuations"));
+                    }
+                    blocks.push((offset, length));
                 } else {
+                    message_bytes = message_bytes.checked_add(size).ok_or_else(|| {
+                        invalid(cursor, "HDF5 object-header message size overflow")
+                    })?;
+                    if message_bytes > MAX_OBJECT_MESSAGE_BYTES {
+                        return Err(invalid(
+                            address_to_usize(address)?,
+                            "HDF5 object header contains too much message data",
+                        ));
+                    }
                     messages.push(Message { kind, body });
                 }
-                cursor += 8 + size;
+                cursor = body_end;
             }
         }
         Ok(ObjectHeader { messages })
@@ -425,33 +529,53 @@ impl<'a> H5File<'a> {
             ));
         }
         let flags = head[5];
-        let mut cursor = address as usize + 6;
+        let address = address_to_usize(address)?;
+        let mut cursor = address
+            .checked_add(6)
+            .ok_or_else(|| invalid(address, "HDF5 v2 header address overflow"))?;
         if flags & 0x20 != 0 {
-            cursor += 16; // access/mod/change/birth timestamps
+            cursor = cursor
+                .checked_add(16)
+                .ok_or_else(|| invalid(cursor, "HDF5 v2 timestamp fields overflow"))?;
         }
         if flags & 0x10 != 0 {
-            cursor += 4; // attribute storage phase-change bounds
+            cursor = cursor
+                .checked_add(4)
+                .ok_or_else(|| invalid(cursor, "HDF5 v2 attribute fields overflow"))?;
         }
         let size_width = 1usize << (flags & 0x03);
-        let chunk0_size = read_uint(self.bytes, cursor, size_width)? as usize;
-        cursor += size_width;
+        let chunk0_size = usize::try_from(read_uint(self.bytes, cursor, size_width)?)
+            .map_err(|_| invalid(cursor, "HDF5 v2 chunk size overflows usize"))?;
+        if chunk0_size > MAX_OBJECT_MESSAGE_BYTES {
+            return Err(invalid(cursor, "HDF5 v2 header message block is too large"));
+        }
+        cursor = cursor
+            .checked_add(size_width)
+            .ok_or_else(|| invalid(cursor, "HDF5 v2 header cursor overflow"))?;
         // Creation-order tracking widens every message header by 2 bytes.
         let message_header = if flags & 0x04 != 0 { 6 } else { 4 };
         let mut messages = Vec::new();
         // (message region start, message region length, chunk start for the
         // checksum). Chunk 0's checksummed span begins at the signature.
-        let mut blocks = vec![(cursor, chunk0_size, address as usize)];
+        let mut blocks = vec![(cursor, chunk0_size, address)];
+        let mut scheduled_blocks = BTreeSet::from([address]);
         let mut block_index = 0;
+        let mut message_bytes = 0usize;
         while block_index < blocks.len() {
             if blocks.len() > MAX_HEADER_BLOCKS {
                 return Err(invalid(
-                    address as usize,
+                    address,
                     "HDF5 v2 header has too many continuation blocks",
                 ));
             }
             let (start, len, chunk_start) = blocks[block_index];
             block_index += 1;
-            let end = start + len;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| invalid(start, "HDF5 v2 message block overflow"))?;
+            if chunk_start > end {
+                return Err(invalid(chunk_start, "invalid HDF5 v2 checksum span"));
+            }
             let stored = self.slice(end as u64, 4)?;
             let stored = u32::from_le_bytes(stored.try_into().expect("4 bytes"));
             let computed = jenkins_lookup3(self.slice(chunk_start as u64, end - chunk_start)?);
@@ -466,30 +590,65 @@ impl<'a> H5File<'a> {
             let mut cursor = start;
             // Stop on the trailing gap: any leftover space smaller than one
             // message header is padding before the checksum.
-            while cursor + message_header <= end {
+            while cursor
+                .checked_add(message_header)
+                .is_some_and(|header_end| header_end <= end)
+            {
                 let header = self.slice(cursor as u64, message_header)?;
                 let kind = u16::from(header[0]);
                 let size = u16::from_le_bytes([header[1], header[2]]) as usize;
                 // header[3] = message flags; header[4..6] = creation order.
-                if cursor + message_header + size > end {
+                let body_start = cursor
+                    .checked_add(message_header)
+                    .ok_or_else(|| invalid(cursor, "HDF5 v2 message address overflow"))?;
+                let body_end = body_start
+                    .checked_add(size)
+                    .ok_or_else(|| invalid(body_start, "HDF5 v2 message size overflow"))?;
+                if body_end > end {
                     return Err(truncated(cursor, message_header + size, end - cursor));
                 }
-                let body = self.slice((cursor + message_header) as u64, size)?.to_vec();
+                let body = self.slice(body_start as u64, size)?.to_vec();
                 if kind == 0x0010 {
-                    let offset = read_offset(&body, 0, self.offset_size)? as usize;
-                    let length = read_uint(&body, self.offset_size, self.length_size)? as usize;
+                    let offset = address_to_usize(read_offset(&body, 0, self.offset_size)?)?;
+                    let length = usize::try_from(read_uint(
+                        &body,
+                        self.offset_size,
+                        self.length_size,
+                    )?)
+                    .map_err(|_| invalid(cursor, "HDF5 v2 continuation length overflow"))?;
                     if length < 8 {
                         return Err(invalid(cursor, "HDF5 v2 continuation block too short"));
+                    }
+                    if length > MAX_OBJECT_MESSAGE_BYTES {
+                        return Err(invalid(cursor, "HDF5 v2 continuation block is too large"));
                     }
                     if self.slice(offset as u64, 4)? != OCHK_SIGNATURE {
                         return Err(invalid(offset, "expected OCHK signature"));
                     }
+                    if !scheduled_blocks.insert(offset) {
+                        return Err(invalid(offset, "cycle in HDF5 v2 header continuations"));
+                    }
+                    let message_start = offset
+                        .checked_add(4)
+                        .ok_or_else(|| invalid(offset, "HDF5 v2 continuation address overflow"))?;
                     // Message region excludes the signature and checksum.
-                    blocks.push((offset + 4, length - 8, offset));
+                    blocks.push((message_start, length - 8, offset));
                 } else {
+                    if messages.len() >= MAX_OBJECT_MESSAGES {
+                        return Err(invalid(address, "HDF5 v2 object header has too many messages"));
+                    }
+                    message_bytes = message_bytes.checked_add(size).ok_or_else(|| {
+                        invalid(cursor, "HDF5 v2 message byte count overflow")
+                    })?;
+                    if message_bytes > MAX_OBJECT_MESSAGE_BYTES {
+                        return Err(invalid(
+                            address,
+                            "HDF5 v2 object header contains too much message data",
+                        ));
+                    }
                     messages.push(Message { kind, body });
                 }
-                cursor += message_header + size;
+                cursor = body_end;
             }
         }
         Ok(ObjectHeader { messages })
@@ -500,6 +659,12 @@ impl<'a> H5File<'a> {
     fn parse_dataspace(&self, body: &[u8]) -> Result<Vec<usize>> {
         let version = *body.first().ok_or_else(|| truncated(0, 1, 0))?;
         let rank = *body.get(1).ok_or_else(|| truncated(1, 1, body.len()))? as usize;
+        if rank > MAX_DATASPACE_RANK {
+            return Err(invalid(
+                1,
+                format!("HDF5 dataspace rank {rank} exceeds {MAX_DATASPACE_RANK}"),
+            ));
+        }
         let dims_start = match version {
             1 => 8, // version, rank, flags, reserved[5]
             2 => 4, // version, rank, flags, type
@@ -509,11 +674,23 @@ impl<'a> H5File<'a> {
         };
         let mut dims = Vec::with_capacity(rank);
         for index in 0..rank {
-            dims.push(read_offset(
+            let at = index
+                .checked_mul(self.length_size)
+                .and_then(|value| dims_start.checked_add(value))
+                .ok_or_else(|| invalid(dims_start, "HDF5 dataspace cursor overflow"))?;
+            let dim = usize::try_from(read_offset(
                 body,
-                dims_start + index * self.length_size,
+                at,
                 self.length_size,
-            )? as usize);
+            )?)
+            .map_err(|_| invalid(at, "HDF5 dimension overflows usize"))?;
+            if dim > MAX_DATASPACE_DIM {
+                return Err(invalid(
+                    at,
+                    format!("HDF5 dimension {dim} exceeds {MAX_DATASPACE_DIM}"),
+                ));
+            }
+            dims.push(dim);
         }
         Ok(dims)
     }
@@ -527,24 +704,24 @@ impl<'a> H5File<'a> {
         let size = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
         let big_endian = bits & 1 != 0;
         match class {
-            0 => Ok(Datatype {
+            0 if (1..=8).contains(&size) => Ok(Datatype {
                 class: DtClass::Int {
                     signed: bits & (1 << 3) != 0,
                 },
                 size,
                 big_endian,
             }),
-            1 => Ok(Datatype {
+            1 if matches!(size, 4 | 8) => Ok(Datatype {
                 class: DtClass::Float,
                 size,
                 big_endian,
             }),
-            3 => Ok(Datatype {
+            3 if size <= MAX_HDF5_ATTRIBUTE_BYTES => Ok(Datatype {
                 class: DtClass::FixedString,
                 size,
                 big_endian: false,
             }),
-            9 if bits & 0x0F == 1 => Ok(Datatype {
+            9 if bits & 0x0F == 1 && size <= MAX_HDF5_ATTRIBUTE_BYTES => Ok(Datatype {
                 class: DtClass::VlenString,
                 size,
                 big_endian: false,
@@ -567,9 +744,15 @@ impl<'a> H5File<'a> {
         let class = *body.get(1).ok_or_else(|| truncated(1, 1, body.len()))?;
         match class {
             0 => {
-                let size = u16::from_le_bytes([body[2], body[3]]) as usize;
+                let size = usize::from(read_le_u16(body, 2)?);
+                if size > MAX_HDF5_DATASET_BYTES {
+                    return Err(invalid(2, "HDF5 compact dataset is too large"));
+                }
+                let end = 4usize
+                    .checked_add(size)
+                    .ok_or_else(|| invalid(4, "HDF5 compact layout size overflow"))?;
                 let data = body
-                    .get(4..4 + size)
+                    .get(4..end)
                     .ok_or_else(|| truncated(4, size, body.len()))?;
                 Ok(Layout::Compact(data.to_vec()))
             }
@@ -580,14 +763,24 @@ impl<'a> H5File<'a> {
             2 => {
                 let dimensionality =
                     *body.get(2).ok_or_else(|| truncated(2, 1, body.len()))? as usize;
+                if dimensionality == 0 || dimensionality > MAX_DATASPACE_RANK + 1 {
+                    return Err(invalid(2, "invalid HDF5 chunk dimensionality"));
+                }
                 let btree_address = read_offset(body, 3, self.offset_size)?;
                 let mut chunk_dims = Vec::with_capacity(dimensionality);
                 for index in 0..dimensionality {
-                    let at = 3 + self.offset_size + index * 4;
+                    let at = index
+                        .checked_mul(4)
+                        .and_then(|value| 3usize.checked_add(self.offset_size)?.checked_add(value))
+                        .ok_or_else(|| invalid(3, "HDF5 chunk-dimension cursor overflow"))?;
                     let dim = body
                         .get(at..at + 4)
                         .ok_or_else(|| truncated(at, 4, body.len()))?;
-                    chunk_dims.push(u32::from_le_bytes(dim.try_into().expect("4 bytes")) as usize);
+                    let dim = u32::from_le_bytes(dim.try_into().expect("4 bytes")) as usize;
+                    if dim == 0 || dim > MAX_DATASPACE_DIM {
+                        return Err(invalid(at, "invalid HDF5 chunk dimension"));
+                    }
+                    chunk_dims.push(dim);
                 }
                 // The trailing entry is the element size; drop it.
                 chunk_dims.pop();
@@ -603,6 +796,12 @@ impl<'a> H5File<'a> {
     fn parse_filter_pipeline(&self, body: &[u8]) -> Result<Vec<Filter>> {
         let version = *body.first().ok_or_else(|| truncated(0, 1, 0))?;
         let count = *body.get(1).ok_or_else(|| truncated(1, 1, body.len()))? as usize;
+        if count > MAX_HDF5_FILTERS {
+            return Err(invalid(
+                1,
+                format!("HDF5 filter count {count} exceeds {MAX_HDF5_FILTERS}"),
+            ));
+        }
         let mut filters = Vec::with_capacity(count);
         let mut cursor = match version {
             1 => 8,
@@ -615,40 +814,65 @@ impl<'a> H5File<'a> {
             }
         };
         for _ in 0..count {
-            let id = u16::from_le_bytes([
-                *body
-                    .get(cursor)
-                    .ok_or_else(|| truncated(cursor, 2, body.len()))?,
-                *body
-                    .get(cursor + 1)
-                    .ok_or_else(|| truncated(cursor, 2, body.len()))?,
-            ]);
+            let id = read_le_u16(body, cursor)?;
             let has_name = version == 1 || id >= 256;
             let name_len = if has_name {
-                u16::from_le_bytes([body[cursor + 2], body[cursor + 3]]) as usize
+                usize::from(read_le_u16(
+                    body,
+                    cursor
+                        .checked_add(2)
+                        .ok_or_else(|| invalid(cursor, "HDF5 filter cursor overflow"))?,
+                )?)
             } else {
                 0
             };
-            let after_id = if has_name { cursor + 4 } else { cursor + 2 };
-            let value_count = u16::from_le_bytes([body[after_id + 2], body[after_id + 3]]) as usize;
-            let mut at = after_id + 4;
+            let after_id = cursor
+                .checked_add(if has_name { 4 } else { 2 })
+                .ok_or_else(|| invalid(cursor, "HDF5 filter cursor overflow"))?;
+            let value_count = usize::from(read_le_u16(
+                body,
+                after_id
+                    .checked_add(2)
+                    .ok_or_else(|| invalid(after_id, "HDF5 filter cursor overflow"))?,
+            )?);
+            if value_count > MAX_HDF5_FILTER_VALUES {
+                return Err(invalid(after_id, "HDF5 filter has too many client values"));
+            }
+            let mut at = after_id
+                .checked_add(4)
+                .ok_or_else(|| invalid(after_id, "HDF5 filter cursor overflow"))?;
             if name_len > 0 {
-                at += if version == 1 {
-                    name_len.div_ceil(8) * 8
+                let padded_name = if version == 1 {
+                    name_len
+                        .checked_add(7)
+                        .map(|value| value / 8 * 8)
+                        .ok_or_else(|| invalid(at, "HDF5 filter name length overflow"))?
                 } else {
                     name_len
                 };
+                checked_range(body, at, padded_name)?;
+                at = at
+                    .checked_add(padded_name)
+                    .ok_or_else(|| invalid(at, "HDF5 filter name cursor overflow"))?;
             }
             let mut client_values = Vec::with_capacity(value_count);
             for index in 0..value_count {
-                let v = body
-                    .get(at + index * 4..at + index * 4 + 4)
-                    .ok_or_else(|| truncated(at, 4, body.len()))?;
+                let value_at = index
+                    .checked_mul(4)
+                    .and_then(|value| at.checked_add(value))
+                    .ok_or_else(|| invalid(at, "HDF5 filter value cursor overflow"))?;
+                let v = checked_range(body, value_at, 4)?;
                 client_values.push(u32::from_le_bytes(v.try_into().expect("4 bytes")));
             }
-            at += value_count * 4;
+            at = value_count
+                .checked_mul(4)
+                .and_then(|value| at.checked_add(value))
+                .ok_or_else(|| invalid(at, "HDF5 filter value length overflow"))?;
             if version == 1 && value_count % 2 == 1 {
-                at += 4;
+                checked_range(body, at, 4)?;
+                at = at
+                    .checked_add(4)
+                    .ok_or_else(|| invalid(at, "HDF5 filter padding overflow"))?;
             }
             filters.push(Filter { id, client_values });
             cursor = at;
@@ -666,6 +890,10 @@ impl<'a> H5File<'a> {
                 format!("attribute version {version} unsupported"),
             ));
         }
+        let header_len = if version == 3 { 9 } else { 8 };
+        if body.len() < header_len {
+            return Err(truncated(0, header_len, body.len()));
+        }
         let flags = body[1];
         if version >= 2 && flags & 0x03 != 0 {
             return Err(invalid(
@@ -673,40 +901,48 @@ impl<'a> H5File<'a> {
                 "shared attribute datatype/dataspace unsupported",
             ));
         }
-        let name_size = u16::from_le_bytes([body[2], body[3]]) as usize;
-        let dt_size = u16::from_le_bytes([body[4], body[5]]) as usize;
-        let ds_size = u16::from_le_bytes([body[6], body[7]]) as usize;
-        let mut cursor = if version == 3 { 9 } else { 8 };
-        let pad = |len: usize| {
+        let name_size = usize::from(read_le_u16(body, 2)?);
+        let dt_size = usize::from(read_le_u16(body, 4)?);
+        let ds_size = usize::from(read_le_u16(body, 6)?);
+        let mut cursor = header_len;
+        let pad = |len: usize| -> Result<usize> {
             if version == 1 {
-                len.div_ceil(8) * 8
+                len.checked_add(7)
+                    .map(|value| value / 8 * 8)
+                    .ok_or_else(|| invalid(0, "HDF5 attribute padding overflow"))
             } else {
-                len
+                Ok(len)
             }
         };
-        let name_bytes = body
-            .get(cursor..cursor + name_size)
-            .ok_or_else(|| truncated(cursor, name_size, body.len()))?;
+        let name_bytes = checked_range(body, cursor, name_size)?;
         let name = name_bytes
             .split(|byte| *byte == 0)
             .next()
             .map(String::from_utf8_lossy)
             .unwrap_or_default();
-        cursor += pad(name_size);
+        cursor = cursor
+            .checked_add(pad(name_size)?)
+            .ok_or_else(|| invalid(cursor, "HDF5 attribute name cursor overflow"))?;
         if name != wanted {
             return Ok(None);
         }
         let dtype = self.parse_datatype(
-            body.get(cursor..cursor + dt_size)
-                .ok_or_else(|| truncated(cursor, dt_size, body.len()))?,
+            checked_range(body, cursor, dt_size)?,
         )?;
-        cursor += pad(dt_size);
-        let dims = self.parse_dataspace(
-            body.get(cursor..cursor + ds_size)
-                .ok_or_else(|| truncated(cursor, ds_size, body.len()))?,
+        cursor = cursor
+            .checked_add(pad(dt_size)?)
+            .ok_or_else(|| invalid(cursor, "HDF5 attribute datatype cursor overflow"))?;
+        let dims = self.parse_dataspace(checked_range(body, cursor, ds_size)?)?;
+        cursor = cursor
+            .checked_add(pad(ds_size)?)
+            .ok_or_else(|| invalid(cursor, "HDF5 attribute dataspace cursor overflow"))?;
+        let count = checked_product(&dims, "HDF5 attribute element count")?.max(1);
+        checked_allocation_bytes(
+            count,
+            dtype.size,
+            MAX_HDF5_ATTRIBUTE_BYTES,
+            "HDF5 attribute",
         )?;
-        cursor += pad(ds_size);
-        let count: usize = dims.iter().product::<usize>().max(1);
         let data = body
             .get(cursor..)
             .ok_or_else(|| truncated(cursor, 0, body.len()))?;
@@ -803,18 +1039,54 @@ impl<'a> H5File<'a> {
         element_size: usize,
         filters: &[Filter],
     ) -> Result<Vec<u8>> {
-        let total: usize = dims.iter().product::<usize>() * element_size;
+        if chunk_dims.len() != dims.len() {
+            return Err(invalid(
+                0,
+                "HDF5 chunk dimensionality does not match dataset rank",
+            ));
+        }
+        let elements = checked_product(dims, "HDF5 chunked dataset element count")?;
+        let total = checked_allocation_bytes(
+            elements,
+            element_size,
+            MAX_HDF5_DATASET_BYTES,
+            "HDF5 chunked dataset",
+        )?;
         let mut out = vec![0u8; total];
         if btree_address == UNDEFINED_ADDR {
             return Ok(out); // dataset never written
         }
         let mut chunks = Vec::new();
-        self.collect_chunks(btree_address, chunk_dims.len() + 1, &mut chunks, 0)?;
-        let chunk_elements: usize = chunk_dims.iter().product();
+        let mut visited_nodes = BTreeSet::new();
+        self.collect_chunks(
+            btree_address,
+            chunk_dims.len() + 1,
+            &mut chunks,
+            &mut visited_nodes,
+        )?;
+        let chunk_elements = checked_product(chunk_dims, "HDF5 chunk element count")?;
+        let chunk_bytes = checked_allocation_bytes(
+            chunk_elements,
+            element_size,
+            MAX_HDF5_DATASET_BYTES,
+            "HDF5 chunk",
+        )?;
         for chunk in chunks {
+            if chunk.stored_size > MAX_HDF5_DATASET_BYTES {
+                return Err(invalid(
+                    address_to_usize(chunk.address)?,
+                    "HDF5 stored chunk is too large",
+                ));
+            }
             let stored = self.slice(chunk.address, chunk.stored_size)?;
-            let raw = apply_inverse_filters(stored, filters, chunk.filter_mask, element_size)?;
-            if raw.len() < chunk_elements * element_size {
+            let raw = apply_inverse_filters(
+                stored,
+                filters,
+                chunk.filter_mask,
+                element_size,
+                chunk_bytes,
+            )?;
+            if raw.len() < chunk_bytes {
                 return Err(invalid(
                     chunk.address as usize,
                     "decoded chunk shorter than chunk dimensions",
@@ -837,9 +1109,15 @@ impl<'a> H5File<'a> {
         node_address: u64,
         key_dims: usize,
         out: &mut Vec<ChunkRef>,
-        visited: usize,
+        visited: &mut BTreeSet<u64>,
     ) -> Result<()> {
-        if visited > MAX_BTREE_NODES {
+        if !visited.insert(node_address) {
+            return Err(invalid(
+                address_to_usize(node_address)?,
+                "cycle in HDF5 chunk B-tree",
+            ));
+        }
+        if visited.len() > MAX_BTREE_NODES {
             return Err(invalid(0, "HDF5 chunk B-tree too large"));
         }
         let node = self.slice(node_address, 8 + 2 * self.offset_size)?;
@@ -852,7 +1130,9 @@ impl<'a> H5File<'a> {
         let level = node[5];
         let entries = u16::from_le_bytes([node[6], node[7]]) as usize;
         let key_size = 8 + 8 * key_dims;
-        let mut cursor = node_address as usize + 8 + 2 * self.offset_size;
+        let mut cursor = address_to_usize(node_address)?
+            .checked_add(8 + 2 * self.offset_size)
+            .ok_or_else(|| invalid(0, "HDF5 chunk B-tree cursor overflow"))?;
         for _ in 0..entries {
             let key = self.slice(cursor as u64, key_size)?;
             let stored_size = u32::from_le_bytes(key[..4].try_into().expect("4 bytes")) as usize;
@@ -860,14 +1140,25 @@ impl<'a> H5File<'a> {
             let mut offsets = Vec::with_capacity(key_dims.saturating_sub(1));
             for dim in 0..key_dims.saturating_sub(1) {
                 let at = 8 + dim * 8;
-                offsets.push(
-                    u64::from_le_bytes(key[at..at + 8].try_into().expect("8 bytes")) as usize,
-                );
+                let offset = u64::from_le_bytes(key[at..at + 8].try_into().expect("8 bytes"));
+                offsets.push(usize::try_from(offset).map_err(|_| {
+                    invalid(
+                        address_to_usize(node_address).unwrap_or(0),
+                        "HDF5 chunk offset overflows usize",
+                    )
+                })?);
             }
-            cursor += key_size;
+            cursor = cursor
+                .checked_add(key_size)
+                .ok_or_else(|| invalid(cursor, "HDF5 chunk B-tree key overflow"))?;
             let child = read_offset(self.bytes, cursor, self.offset_size)?;
-            cursor += self.offset_size;
+            cursor = cursor
+                .checked_add(self.offset_size)
+                .ok_or_else(|| invalid(cursor, "HDF5 chunk B-tree child overflow"))?;
             if level == 0 {
+                if out.len() >= MAX_DATA_CHUNKS {
+                    return Err(invalid(0, "HDF5 dataset has too many chunks"));
+                }
                 out.push(ChunkRef {
                     address: child,
                     stored_size,
@@ -875,17 +1166,19 @@ impl<'a> H5File<'a> {
                     offsets,
                 });
             } else {
-                self.collect_chunks(child, key_dims, out, visited + 1)?;
+                self.collect_chunks(child, key_dims, out, visited)?;
             }
         }
         Ok(())
     }
 
     fn slice(&self, address: u64, len: usize) -> Result<&'a [u8]> {
-        let start =
-            usize::try_from(address).map_err(|_| invalid(0, "HDF5 address overflows usize"))?;
+        let start = address_to_usize(address)?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| invalid(start, "HDF5 byte range overflow"))?;
         self.bytes
-            .get(start..start + len)
+            .get(start..end)
             .ok_or_else(|| truncated(start, len, self.bytes.len()))
     }
 }
@@ -996,7 +1289,11 @@ fn apply_inverse_filters(
     filters: &[Filter],
     filter_mask: u32,
     element_size: usize,
+    max_output: usize,
 ) -> Result<Vec<u8>> {
+    if stored.len() > MAX_HDF5_DATASET_BYTES {
+        return Err(invalid(0, "HDF5 stored filter input is too large"));
+    }
     let mut data = stored.to_vec();
     for (index, filter) in filters.iter().enumerate().rev() {
         if filter_mask & (1 << index) != 0 {
@@ -1006,10 +1303,37 @@ fn apply_inverse_filters(
             1 => {
                 // gzip/deflate (zlib stream per the HDF5 deflate filter).
                 let mut decoder = ZlibDecoder::new(&data[..]);
-                let mut inflated = Vec::with_capacity(data.len() * 4);
-                decoder
-                    .read_to_end(&mut inflated)
-                    .map_err(|err| invalid(0, format!("HDF5 deflate chunk: {err}")))?;
+                let mut inflated = Vec::new();
+                let mut chunk = [0u8; 64 * 1024];
+                loop {
+                    let remaining = max_output.saturating_sub(inflated.len());
+                    if remaining == 0 {
+                        let mut probe = [0u8; 1];
+                        let count = decoder
+                            .read(&mut probe)
+                            .map_err(|err| invalid(0, format!("HDF5 deflate chunk: {err}")))?;
+                        if count != 0 {
+                            return Err(invalid(
+                                0,
+                                format!(
+                                    "HDF5 deflate chunk expands beyond {max_output} bytes"
+                                ),
+                            ));
+                        }
+                        break;
+                    }
+                    let read_len = remaining.min(chunk.len());
+                    let count = decoder
+                        .read(&mut chunk[..read_len])
+                        .map_err(|err| invalid(0, format!("HDF5 deflate chunk: {err}")))?;
+                    if count == 0 {
+                        break;
+                    }
+                    inflated.try_reserve(count).map_err(|err| {
+                        invalid(0, format!("cannot reserve HDF5 deflate output: {err}"))
+                    })?;
+                    inflated.extend_from_slice(&chunk[..count]);
+                }
                 data = inflated;
             }
             2 => {
@@ -1026,6 +1350,18 @@ fn apply_inverse_filters(
                 return Err(invalid(0, format!("HDF5 filter id {other} unsupported")));
             }
         }
+        if data.len() > max_output {
+            return Err(invalid(
+                0,
+                format!("HDF5 filter output exceeds {max_output} bytes"),
+            ));
+        }
+    }
+    if data.len() > max_output {
+        return Err(invalid(
+            0,
+            format!("HDF5 filter output exceeds {max_output} bytes"),
+        ));
     }
     Ok(data)
 }
@@ -1120,12 +1456,54 @@ fn read_u8(bytes: &[u8], at: usize) -> Result<u8> {
         .ok_or_else(|| truncated(at, 1, bytes.len()))
 }
 
+fn checked_range(bytes: &[u8], at: usize, len: usize) -> Result<&[u8]> {
+    let end = at
+        .checked_add(len)
+        .ok_or_else(|| invalid(at, "HDF5 byte range overflow"))?;
+    bytes
+        .get(at..end)
+        .ok_or_else(|| truncated(at, len, bytes.len()))
+}
+
+fn read_le_u16(bytes: &[u8], at: usize) -> Result<u16> {
+    let raw = checked_range(bytes, at, 2)?;
+    Ok(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+fn address_to_usize(address: u64) -> Result<usize> {
+    usize::try_from(address).map_err(|_| invalid(0, "HDF5 address overflows usize"))
+}
+
+fn checked_product(values: &[usize], context: &'static str) -> Result<usize> {
+    values.iter().try_fold(1usize, |product, value| {
+        product
+            .checked_mul(*value)
+            .ok_or_else(|| invalid(0, format!("{context} overflow")))
+    })
+}
+
+fn checked_allocation_bytes(
+    count: usize,
+    element_size: usize,
+    limit: usize,
+    context: &'static str,
+) -> Result<usize> {
+    let bytes = count
+        .checked_mul(element_size)
+        .ok_or_else(|| invalid(0, format!("{context} byte-size overflow")))?;
+    if bytes > limit {
+        return Err(invalid(
+            0,
+            format!("{context} requires {bytes} bytes (limit {limit})"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Little-endian unsigned integer of `size` bytes (HDF5 metadata is always
 /// little-endian).
 fn read_offset(bytes: &[u8], at: usize, size: usize) -> Result<u64> {
-    let raw = bytes
-        .get(at..at + size)
-        .ok_or_else(|| truncated(at, size, bytes.len()))?;
+    let raw = checked_range(bytes, at, size)?;
     let mut value = 0u64;
     for (index, byte) in raw.iter().enumerate() {
         value |= u64::from(*byte) << (8 * index);
@@ -1141,9 +1519,7 @@ fn read_offset(bytes: &[u8], at: usize, size: usize) -> Result<u64> {
 /// address sentinel mapping of [`read_offset`] — for sizes and lengths,
 /// where an all-ones value is a value, not "undefined".
 fn read_uint(bytes: &[u8], at: usize, size: usize) -> Result<u64> {
-    let raw = bytes
-        .get(at..at + size)
-        .ok_or_else(|| truncated(at, size, bytes.len()))?;
+    let raw = checked_range(bytes, at, size)?;
     let mut value = 0u64;
     for (index, byte) in raw.iter().enumerate() {
         value |= u64::from(*byte) << (8 * index);
@@ -1262,6 +1638,15 @@ fn truncated(offset: usize, needed: usize, available: usize) -> NexradError {
 mod tests {
     use super::*;
 
+    fn parser(bytes: &[u8]) -> H5File<'_> {
+        H5File {
+            bytes,
+            offset_size: 8,
+            length_size: 8,
+            objects: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn magic_sniffer_matches_signature_only() {
         assert!(looks_like_hdf5_bytes(b"\x89HDF\r\n\x1a\nrest"));
@@ -1304,6 +1689,64 @@ mod tests {
         assert_eq!(read_uint(&[0xFF], 0, 1).unwrap(), 0xFF);
         assert_eq!(read_uint(&[0xFF, 0xFF], 0, 2).unwrap(), 0xFFFF);
         assert_eq!(read_uint(&[0x83, 0x01], 0, 2).unwrap(), 0x0183);
+    }
+
+    #[test]
+    fn truncated_messages_return_errors_instead_of_indexing() {
+        let file = parser(&[]);
+        assert!(file.parse_attribute(&[1], "name").is_err());
+        let Err(_) = file.parse_layout(&[3, 0]) else {
+            panic!("truncated compact layout must fail");
+        };
+        let Err(_) = file.parse_filter_pipeline(&[1, 1]) else {
+            panic!("truncated filter pipeline must fail");
+        };
+    }
+
+    #[test]
+    fn v1_object_header_rejects_continuation_cycle() {
+        let mut bytes = vec![0u8; 40];
+        bytes[0] = 1;
+        bytes[2..4].copy_from_slice(&1u16.to_le_bytes());
+        bytes[8..12].copy_from_slice(&24u32.to_le_bytes());
+        bytes[16..18].copy_from_slice(&0x0010u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&16u16.to_le_bytes());
+        bytes[24..32].copy_from_slice(&16u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&24u64.to_le_bytes());
+
+        let file = parser(&bytes);
+        let Err(err) = file.parse_object_header(0) else {
+            panic!("continuation cycle must fail");
+        };
+        assert!(err.to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn btree_walks_reject_self_references() {
+        let mut group = vec![0u8; 40];
+        group[..4].copy_from_slice(b"TREE");
+        group[5] = 1;
+        group[6..8].copy_from_slice(&1u16.to_le_bytes());
+        let file = parser(&group);
+        let mut entries = Vec::new();
+        let mut visited = BTreeSet::new();
+        let err = file
+            .collect_group_entries(0, &mut entries, &mut visited)
+            .expect_err("group B-tree cycle must fail");
+        assert!(err.to_string().contains("cycle"));
+
+        let mut chunks = vec![0u8; 48];
+        chunks[..4].copy_from_slice(b"TREE");
+        chunks[4] = 1;
+        chunks[5] = 1;
+        chunks[6..8].copy_from_slice(&1u16.to_le_bytes());
+        let file = parser(&chunks);
+        let mut refs = Vec::new();
+        let mut visited = BTreeSet::new();
+        let err = file
+            .collect_chunks(0, 1, &mut refs, &mut visited)
+            .expect_err("chunk B-tree cycle must fail");
+        assert!(err.to_string().contains("cycle"));
     }
 
     /// Jenkins lookup3 (hashlittle) known-answer vectors. The 30-byte

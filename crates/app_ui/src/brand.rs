@@ -5,9 +5,14 @@
 //! previews, and screenshot/share-card chrome.
 
 use std::collections::BTreeMap;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
+
+const MAX_BRAND_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_BRAND_IMAGE_DIMENSION: u32 = 16 * 1024;
+const MAX_BRAND_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 
 pub(crate) fn window_title(brand: &settings::BrandConfig) -> String {
     brand.resolved_display_name().to_owned()
@@ -72,7 +77,8 @@ pub(crate) fn github_repo_parts(repo_url: &str) -> Option<(&str, &str)> {
 
 pub(crate) fn configured_app_icon(brand: &settings::BrandConfig) -> Option<egui::IconData> {
     let path = settings::BrandAssets::existing_file(&brand.assets.app_icon_png)?;
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_brand_image(path)?;
+    encoded_image_dimensions(&bytes)?;
     eframe::icon_data::from_png_bytes(&bytes).ok()
 }
 
@@ -132,7 +138,8 @@ impl BrandTextureCache {
 }
 
 fn load_color_image(path: &Path) -> Option<egui::ColorImage> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_brand_image(path)?;
+    encoded_image_dimensions(&bytes)?;
     let image = image::load_from_memory(&bytes).ok()?;
     let image = if image.width().max(image.height()) > 2048 {
         image.thumbnail(2048, 2048)
@@ -145,6 +152,32 @@ fn load_color_image(path: &Path) -> Option<egui::ColorImage> {
         size,
         rgba.as_raw(),
     ))
+}
+
+fn read_brand_image(path: &Path) -> Option<Vec<u8>> {
+    if std::fs::metadata(path).ok()?.len() > MAX_BRAND_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    (bytes.len() as u64 <= MAX_BRAND_IMAGE_BYTES).then_some(bytes)
+}
+
+fn encoded_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (width, height) = reader.into_dimensions().ok()?;
+    image_dimensions_allowed(width, height).then_some((width, height))
+}
+
+fn image_dimensions_allowed(width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && width <= MAX_BRAND_IMAGE_DIMENSION
+        && height <= MAX_BRAND_IMAGE_DIMENSION
+        && u64::from(width)
+            .checked_mul(u64::from(height))
+            .is_some_and(|pixels| pixels <= MAX_BRAND_IMAGE_PIXELS)
 }
 
 fn stable_path_label(path: &Path) -> String {
@@ -523,5 +556,13 @@ mod tests {
             effective_repo_url(" https://example.org/releases "),
             "https://example.org/releases"
         );
+    }
+
+    #[test]
+    fn brand_image_dimension_budget_rejects_decode_bombs() {
+        assert!(image_dimensions_allowed(2048, 2048));
+        assert!(!image_dimensions_allowed(0, 2048));
+        assert!(!image_dimensions_allowed(16_384, 16_384));
+        assert!(!image_dimensions_allowed(16_385, 1));
     }
 }

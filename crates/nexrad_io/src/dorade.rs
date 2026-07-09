@@ -70,6 +70,14 @@ const BLOCK_HEADER_LEN: usize = 8;
 const DORADE_BAD_F32: f32 = -9999.0;
 /// DORADE altitude fields are kilometres MSL.
 const KM_TO_M: f64 = 1000.0;
+/// Real mobile-radar sweepfiles in the validation corpus are below 2,000
+/// gates per radial. This allows unusually long/high-resolution research
+/// rays while rejecting attacker-controlled PARM/CSFD counts before RLE
+/// allocates a multi-gigabyte row.
+const MAX_DORADE_GATES_PER_RADIAL: usize = 16 * 1024;
+/// Aggregate decoded cells retained while assembling one sweep. The cap is
+/// independent of input compression and bounds the combined moment rows.
+const MAX_DORADE_CELLS_PER_SWEEP: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Endian {
@@ -322,6 +330,7 @@ struct SweepParse {
     transition_rays: Vec<(PendingRay, Vec<(usize, MomentRow)>)>,
     current_ray: Option<PendingRay>,
     skipped_field_blocks: usize,
+    decoded_cells: usize,
 }
 
 impl SweepParse {
@@ -353,6 +362,7 @@ impl SweepParse {
             transition_rays: Vec::new(),
             current_ray: None,
             skipped_field_blocks: 0,
+            decoded_cells: 0,
         }
     }
 
@@ -493,8 +503,10 @@ impl SweepParse {
         let bad_data = self.endian.i32(block, 100);
         // 1997+ extended PARM (216 bytes) carries per-field gate geometry.
         let (number_cells, first_cell_m, cell_spacing_m) = if block.len() >= 212 {
+            let number_cells = self.endian.i32(block, 200).max(0) as usize;
+            validate_gate_count(number_cells, offset, "PARM")?;
             (
-                Some(self.endian.i32(block, 200).max(0) as usize),
+                Some(number_cells),
                 Some(self.endian.f32(block, 204)),
                 Some(self.endian.f32(block, 208)),
             )
@@ -525,6 +537,7 @@ impl SweepParse {
         if count == 0 {
             return Ok(());
         }
+        validate_gate_count(count, offset, "CELV")?;
         let first = self.endian.f32(block, 12);
         let spacing = if count >= 2 {
             // CELV lists every cell range; radar_core models uniform gates,
@@ -556,6 +569,7 @@ impl SweepParse {
         if total_cells == 0 {
             return Ok(());
         }
+        validate_gate_count(total_cells, offset, "CSFD")?;
         // Multi-segment geometry flattens to the first segment's spacing;
         // see module docs.
         self.range_first_m = Some(first);
@@ -647,7 +661,10 @@ impl SweepParse {
         let endian = self.endian;
         let compressed = self.compression == 1;
         let gate_count = self.gate_count_for_param(param_index);
-        let param = &mut self.params[param_index];
+        if let Some(gates) = gate_count {
+            validate_gate_count(gates, offset, "RDAT")?;
+        }
+        let param = &self.params[param_index];
         let row = match param.binary_format {
             1 => {
                 // i8 → u8 storage; +128 keeps (raw − offset)/scale intact.
@@ -672,7 +689,7 @@ impl SweepParse {
                             format!("no gate count for compressed DORADE field '{name}'"),
                         )
                     })?;
-                    decode_hrd_rle(&words, gates, param.bad_data as i16)
+                    decode_hrd_rle(&words, gates, param.bad_data as i16)?
                 } else {
                     words
                 };
@@ -717,7 +734,19 @@ impl SweepParse {
                 return Ok(());
             }
         };
-        param.pending_row = Some(row);
+        let decoded_cells = self.decoded_cells.checked_add(row.len()).ok_or_else(|| {
+            invalid(offset, "DORADE decoded-cell count overflow")
+        })?;
+        if decoded_cells > MAX_DORADE_CELLS_PER_SWEEP {
+            return Err(invalid(
+                offset,
+                format!(
+                    "DORADE sweep exceeds the {MAX_DORADE_CELLS_PER_SWEEP}-cell decode limit"
+                ),
+            ));
+        }
+        self.decoded_cells = decoded_cells;
+        self.params[param_index].pending_row = Some(row);
         Ok(())
     }
 
@@ -1021,7 +1050,8 @@ fn scan_mode_from_radd(code: i16) -> ScanMode {
 /// Marker word semantics (DORADE document, "compression scheme" appendix):
 /// high bit set → `count` data words follow verbatim; high bit clear →
 /// `count` gates of missing data; a bare `1` terminates the row.
-fn decode_hrd_rle(words: &[i16], gates: usize, bad_data: i16) -> Vec<i16> {
+fn decode_hrd_rle(words: &[i16], gates: usize, bad_data: i16) -> Result<Vec<i16>> {
+    validate_gate_count(gates, 0, "HRD RLE")?;
     let mut out = vec![bad_data; gates];
     let mut input = 0usize;
     let mut output = 0usize;
@@ -1047,7 +1077,7 @@ fn decode_hrd_rle(words: &[i16], gates: usize, bad_data: i16) -> Vec<i16> {
             output += count.min(gates - output);
         }
     }
-    out
+    Ok(out)
 }
 
 fn normalize_azimuth(azimuth_deg: f32) -> f32 {
@@ -1082,6 +1112,18 @@ fn require(block: &[u8], needed: usize, offset: usize, what: &'static str) -> Re
             needed,
             available: block.len(),
         });
+    }
+    Ok(())
+}
+
+fn validate_gate_count(gates: usize, offset: usize, descriptor: &'static str) -> Result<()> {
+    if gates > MAX_DORADE_GATES_PER_RADIAL {
+        return Err(invalid(
+            offset,
+            format!(
+                "{descriptor} declares {gates} gates per radial (limit {MAX_DORADE_GATES_PER_RADIAL})"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1292,8 +1334,23 @@ mod tests {
     fn rle_run_of_missing_gates_pads_with_bad() {
         // 2 missing gates, then 2 literal words, end sentinel.
         let words = [2i16, (0x8000u16 | 2) as i16, 700, 800, 1];
-        let out = decode_hrd_rle(&words, 6, -32768);
+        let out = decode_hrd_rle(&words, 6, -32768).unwrap();
         assert_eq!(out, vec![-32768, -32768, 700, 800, -32768, -32768]);
+    }
+
+    #[test]
+    fn rejects_extended_parm_with_absurd_gate_count() {
+        let mut block = base_block(b"PARM", 216, Endian::Big);
+        block[8..11].copy_from_slice(b"DBZ");
+        put_i16(&mut block, 78, 2, Endian::Big);
+        put_f32(&mut block, 92, 100.0, Endian::Big);
+        put_i32(&mut block, 200, i32::MAX, Endian::Big);
+
+        let mut sweep = SweepParse::new(Endian::Big);
+        let err = sweep
+            .parse_parm(&block, 0)
+            .expect_err("absurd gate count must be rejected");
+        assert!(err.to_string().contains("gates per radial"));
     }
 
     #[test]
