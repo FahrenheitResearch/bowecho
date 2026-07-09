@@ -1071,7 +1071,7 @@ impl ViewerApp {
     ///
     /// Shown when the `inspector_show_loupe` toggle is on OR Shift is held.
     fn draw_cursor_loupe(
-        &self,
+        &mut self,
         painter: &egui::Painter,
         rect: egui::Rect,
         anchor: egui::Pos2,
@@ -1091,9 +1091,6 @@ impl ViewerApp {
         if !rect.contains(anchor) {
             return;
         }
-        let Some(source) = self.loupe_source(painter.ctx(), rect, anchor, radar_has_gate) else {
-            return;
-        };
 
         // Disk geometry. MAGNIFY is the loupe's optical zoom: a rim vertex at
         // screen offset `d` from the loupe center samples the field at
@@ -1114,11 +1111,48 @@ impl ViewerApp {
         center.x = center.x.clamp(rect.left() + margin, rect.right() - margin);
         center.y = center.y.clamp(rect.top() + margin, rect.bottom() - margin);
 
+        // Native-gate path (feat/loupe-native-gates): for a plain base moment
+        // under the cursor, rasterize the REAL polar gates into a small
+        // disk-sized ColorImage and let the mesh sample it 1:1 — true gate
+        // resolution instead of a magnified copy of the Cartesian raster. Any
+        // product the native path does not cover (derived Cartesian fields,
+        // storm-relative and dealiased velocity) falls back to the raster
+        // magnifier below, unchanged.
+        let native = radar_has_gate
+            .then(|| {
+                self.radar_loupe_native_prepare(painter.ctx(), rect, center, focus, RADIUS, MAGNIFY)
+            })
+            .flatten();
+
+        // Resolve the texture + a screen→UV mapper. Native bakes the
+        // magnification into the ColorImage, so its mesh UV is a plain
+        // normalization over the image's bounding square; the raster fall-back
+        // keeps the historical inverse-with-`loupe_sample_screen` mapping.
+        let (texture_id, native_rect, raster_source) = match native {
+            Some((id, img_rect)) => (id, Some(img_rect), None),
+            None => {
+                let Some(source) = self.loupe_source(painter.ctx(), rect, anchor, radar_has_gate)
+                else {
+                    return;
+                };
+                (source.texture_id, None, Some(source))
+            }
+        };
+
         let to_uv = |q: egui::Pos2| -> egui::Pos2 {
-            source.screen_to_uv(loupe_sample_screen(focus, center, q, MAGNIFY))
+            match (native_rect, &raster_source) {
+                (Some(img_rect), _) => egui::pos2(
+                    (q.x - img_rect.left()) / img_rect.width().max(f32::EPSILON),
+                    (q.y - img_rect.top()) / img_rect.height().max(f32::EPSILON),
+                ),
+                (None, Some(source)) => {
+                    source.screen_to_uv(loupe_sample_screen(focus, center, q, MAGNIFY))
+                }
+                (None, None) => egui::Pos2::ZERO,
+            }
         };
         let tint = egui::Color32::WHITE;
-        let mut mesh = egui::epaint::Mesh::with_texture(source.texture_id);
+        let mut mesh = egui::epaint::Mesh::with_texture(texture_id);
         mesh.vertices.push(egui::epaint::Vertex {
             pos: center,
             uv: to_uv(center),
@@ -1171,6 +1205,107 @@ impl ViewerApp {
             ],
             cross_stroke,
         );
+    }
+
+    /// Native-gate loupe: resolve the primary product's polar gates under the
+    /// cursor, rasterize the disk region into a small ColorImage (reused/rebuilt
+    /// only when the sampling inputs change), upload it, and return the texture
+    /// id + the image's screen-space bounding square. Returns `None` for any
+    /// product the native path does not cover — derived Cartesian products,
+    /// storm-relative velocity (needs per-radial motion), and dealiased velocity
+    /// (a separate grid) — so the caller falls back to the raster magnifier.
+    fn radar_loupe_native_prepare(
+        &mut self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        center: egui::Pos2,
+        focus: egui::Pos2,
+        radius: f32,
+        magnify: f32,
+    ) -> Option<(egui::TextureId, egui::Rect)> {
+        let dim = (2.0 * radius).ceil().max(1.0) as usize;
+        let img_rect = egui::Rect::from_center_size(center, egui::vec2(dim as f32, dim as f32));
+
+        // Resolve the sampling plan (product/grid/color table/geometry). Cheap
+        // enough to run every frame; the expensive raster + upload below is
+        // skipped when the plan and disk placement are unchanged.
+        let plan = self.radar_loupe_native_plan(rect)?;
+        let key = LoupeNativeKey::new(&plan, focus, center, magnify, dim);
+        if self.loupe_native_key.as_ref() == Some(&key)
+            && let Some(texture) = &self.loupe_native_texture
+        {
+            return Some((texture.id(), img_rect));
+        }
+
+        let grid = plan.grid()?;
+        let image = build_radar_loupe_image(
+            dim,
+            center,
+            focus,
+            radius,
+            magnify,
+            &plan.geom,
+            &plan.az_lut,
+            grid,
+            &plan.sampler,
+        );
+        match &mut self.loupe_native_texture {
+            Some(texture) => texture.set(image, radar_texture_options()),
+            None => {
+                self.loupe_native_texture =
+                    Some(ctx.load_texture("loupe-native", image, radar_texture_options()));
+            }
+        }
+        self.loupe_native_key = Some(key);
+        Some((self.loupe_native_texture.as_ref()?.id(), img_rect))
+    }
+
+    /// Everything the native loupe needs to color one polar gate under the
+    /// cursor for the CURRENT primary product/cut, mirroring what the radar
+    /// raster (`primary_render_request_for_volume`) and the cursor readout
+    /// (`cursor_readout_for`) resolve: the same displayed volume, the same
+    /// `MomentGrid`, and the same color table (`render_color_tables_for_product`
+    /// → `for_family`). `None` if the product is not a plain base moment.
+    fn radar_loupe_native_plan(&self, rect: egui::Rect) -> Option<LoupeNativePlan> {
+        let product = self.selected_product.clone();
+        // Native gates only exist for the plain base moments; the raster
+        // magnifier still serves everything else.
+        if product.derived().is_some()
+            || product.is_storm_relative_velocity()
+            || self.product_render_uses_dealiased_velocity(&product)
+        {
+            return None;
+        }
+        let volume = self
+            .volume
+            .clone()
+            .map(|volume| self.display_source_volume_for_product(&product, volume))?;
+        let cut = volume.cuts.get(self.selected_cut)?;
+        let grid = cut.moments.get(&product.base_moment())?;
+        if grid.radial_indices.is_empty() {
+            return None;
+        }
+        let (radar_lat, radar_lon) = self.loaded_volume_location()?;
+        let geom = LoupeGateGeom {
+            radar_pos: self.lon_lat_to_screen(rect, radar_lon, radar_lat),
+            angle: self.aeqd_north_angle(rect, radar_lat, radar_lon),
+            km_per_px: 111.32 / self.map_scale,
+            max_range_km: grid_range_km(grid)?,
+        };
+        let color_tables = self.render_color_tables_for_product(&product);
+        let color_signature = color_tables.signature_for_family(product.color_family());
+        let table = color_tables.for_family(product.color_family()).clone();
+        let az_lut = LoupeAzLut::build(cut, grid);
+        Some(LoupeNativePlan {
+            cut: self.selected_cut,
+            moment: product.base_moment(),
+            product_label: product.label().to_owned(),
+            color_signature,
+            geom,
+            az_lut,
+            sampler: table.sampler(),
+            volume,
+        })
     }
 
     /// The field texture the loupe magnifies under the cursor, with the exact
@@ -2136,6 +2271,247 @@ pub(crate) fn loupe_sample_screen(
     magnify: f32,
 ) -> egui::Pos2 {
     focus + (point - center) / magnify.max(f32::EPSILON)
+}
+
+/// Native-gate Field Loupe support. The disk is rasterized on the CPU from the
+/// real polar gates (approach #2): each loupe texel inverse-projects its screen
+/// position to the radar's `(range, azimuth)`, finds the covering gate, and
+/// colors it with the SAME table the 2D layer uses — so magnification exposes
+/// true gate structure instead of magnified Cartesian raster texels.
+///
+/// Screen position → radar polar `(range_km, azimuth_deg)`. This is the exact
+/// inverse the cursor readout uses (`cursor_readout_for`): planar ENU about the
+/// radar screen position, de-rotated by the AEQD convergence `angle`, scaled by
+/// `km_per_px = 111.32 / map_scale`. Returns `None` beyond the grid's range.
+#[derive(Clone, Copy)]
+pub(crate) struct LoupeGateGeom {
+    pub(crate) radar_pos: egui::Pos2,
+    pub(crate) angle: f32,
+    pub(crate) km_per_px: f32,
+    pub(crate) max_range_km: f32,
+}
+
+impl LoupeGateGeom {
+    pub(crate) fn range_az(&self, screen: egui::Pos2) -> Option<(f32, f32)> {
+        let offset = screen - self.radar_pos;
+        let (sin, cos) = (-self.angle).sin_cos();
+        let east_px = offset.x * cos - offset.y * sin;
+        let north_px = -(offset.x * sin + offset.y * cos);
+        let lon_km = east_px * self.km_per_px;
+        let lat_km = north_px * self.km_per_px;
+        let range_km = lat_km.hypot(lon_km);
+        if range_km > self.max_range_km {
+            return None;
+        }
+        let mut azimuth_deg = lon_km.atan2(lat_km).to_degrees();
+        if azimuth_deg < 0.0 {
+            azimuth_deg += 360.0;
+        }
+        Some((range_km, azimuth_deg))
+    }
+}
+
+/// Bin count for the azimuth→row lookup (0.25°/bin — finer than any real radial
+/// spacing, so the discretization is sub-radial and invisible).
+const LOUPE_AZ_BINS: usize = 1440;
+
+/// O(1) azimuth → grid-row lookup for one cut/grid, built once per loupe image.
+/// Approximates [`nearest_grid_row`] (nearest radial within its angular
+/// threshold) with a binned table so the per-texel loop does not rescan every
+/// radial (the disk is tens of thousands of texels).
+pub(crate) struct LoupeAzLut {
+    bins: Box<[i32; LOUPE_AZ_BINS]>,
+}
+
+impl LoupeAzLut {
+    pub(crate) fn build(cut: &ElevationCut, grid: &MomentGrid) -> Self {
+        let mut bins = Box::new([-1i32; LOUPE_AZ_BINS]);
+        let row_count = grid.radial_indices.len();
+        if row_count == 0 {
+            return Self { bins };
+        }
+        let threshold_deg = (360.0 / row_count as f32 * 0.55).clamp(0.35, 0.8);
+        let span_bins = (threshold_deg / 360.0 * LOUPE_AZ_BINS as f32).ceil() as i32;
+        let mut best_delta = [f32::INFINITY; LOUPE_AZ_BINS];
+        for (row, radial_index) in grid.radial_indices.iter().enumerate() {
+            let Some(radial) = cut.radials.get(*radial_index) else {
+                continue;
+            };
+            let azimuth = radial.azimuth_deg.rem_euclid(360.0);
+            let center_bin = (azimuth / 360.0 * LOUPE_AZ_BINS as f32).round() as i32;
+            for delta_bin in -span_bins..=span_bins {
+                let bin = (center_bin + delta_bin).rem_euclid(LOUPE_AZ_BINS as i32) as usize;
+                let bin_azimuth = bin as f32 / LOUPE_AZ_BINS as f32 * 360.0;
+                let delta = angle_delta_deg(bin_azimuth, azimuth);
+                if delta <= threshold_deg && delta < best_delta[bin] {
+                    best_delta[bin] = delta;
+                    bins[bin] = row as i32;
+                }
+            }
+        }
+        Self { bins }
+    }
+
+    pub(crate) fn row(&self, azimuth_deg: f32) -> Option<usize> {
+        let bin = (azimuth_deg.rem_euclid(360.0) / 360.0 * LOUPE_AZ_BINS as f32).floor() as usize;
+        let bin = bin.min(LOUPE_AZ_BINS - 1);
+        let row = self.bins[bin];
+        (row >= 0).then_some(row as usize)
+    }
+}
+
+/// The on-screen color the radar raster paints for one gate, mirroring
+/// render2d's per-gate logic exactly (nodata → transparent; range-folded → the
+/// table's RF color; else scaled value → table color; fully transparent color →
+/// `None`) so the native loupe matches the map pixel-for-pixel. Reads the raw
+/// code for U8/U16 (not [`MomentGrid::scaled_value`], which drops the
+/// range-folded distinction) and the finite float directly for F32.
+pub(crate) fn loupe_gate_color(
+    grid: &MomentGrid,
+    sampler: &color_tables::ColorSampler,
+    row: usize,
+    gate: usize,
+) -> Option<[u8; 4]> {
+    let color = match &grid.storage {
+        MomentStorage::F32(_) => {
+            let value = grid.scaled_value(row, gate)?;
+            if !value.is_finite() {
+                return None;
+            }
+            sampler.color_for_value(value)
+        }
+        MomentStorage::U8(_) | MomentStorage::U16(_) => {
+            let raw = grid_raw_value(grid, row, gate)?;
+            if grid.nodata == Some(raw) {
+                return None;
+            }
+            if grid.range_folded == Some(raw) {
+                sampler.range_folded_color()
+            } else {
+                sampler.color_for_value((raw as f32 - grid.offset) / grid.scale)
+            }
+        }
+    };
+    (color[3] != 0).then_some(color)
+}
+
+/// Rasterize the native-gate loupe disk into a `dim`×`dim` [`egui::ColorImage`]
+/// laid out in DISK SCREEN space over `Rect::from_center_size(center, dim)`.
+/// Each texel bakes the loupe's optical magnification via [`loupe_sample_screen`]
+/// and then samples the real polar gate under that field position; texels
+/// outside the disk stay transparent. The mesh samples this image with NEAREST,
+/// so gate edges stay crisp at any magnification.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_radar_loupe_image(
+    dim: usize,
+    center: egui::Pos2,
+    focus: egui::Pos2,
+    radius: f32,
+    magnify: f32,
+    geom: &LoupeGateGeom,
+    az_lut: &LoupeAzLut,
+    grid: &MomentGrid,
+    sampler: &color_tables::ColorSampler,
+) -> egui::ColorImage {
+    let mut pixels = vec![egui::Color32::TRANSPARENT; dim * dim];
+    let radius_sq = radius * radius;
+    // Match the mesh's `img_rect.min = center - dim/2` exactly so texel centers
+    // line up with the sampled screen positions the mesh UVs address.
+    let half = dim as f32 / 2.0;
+    let origin = egui::pos2(center.x - half, center.y - half);
+    for j in 0..dim {
+        for i in 0..dim {
+            let disk = egui::pos2(origin.x + i as f32 + 0.5, origin.y + j as f32 + 0.5);
+            let delta = disk - center;
+            if delta.x * delta.x + delta.y * delta.y > radius_sq {
+                continue;
+            }
+            let screen = loupe_sample_screen(focus, center, disk, magnify);
+            let Some((range_km, azimuth_deg)) = geom.range_az(screen) else {
+                continue;
+            };
+            let Some(row) = az_lut.row(azimuth_deg) else {
+                continue;
+            };
+            let Some(gate) = gate_for_range(grid, range_km) else {
+                continue;
+            };
+            if let Some(color) = loupe_gate_color(grid, sampler, row, gate) {
+                pixels[j * dim + i] =
+                    egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+            }
+        }
+    }
+    egui::ColorImage {
+        size: [dim, dim],
+        source_size: egui::vec2(dim as f32, dim as f32),
+        pixels,
+    }
+}
+
+/// The resolved plan for one native-gate loupe frame: which displayed volume,
+/// cut, and moment to sample, plus the color sampler and screen→polar geometry.
+/// Holds the volume by `Arc` (cheap) and resolves the grid by reference so a
+/// per-frame rebuild never clones the gate array.
+pub(crate) struct LoupeNativePlan {
+    pub(crate) volume: Arc<RadarVolume>,
+    pub(crate) cut: usize,
+    pub(crate) moment: MomentType,
+    pub(crate) product_label: String,
+    pub(crate) color_signature: u64,
+    pub(crate) geom: LoupeGateGeom,
+    pub(crate) az_lut: LoupeAzLut,
+    pub(crate) sampler: color_tables::ColorSampler,
+}
+
+impl LoupeNativePlan {
+    pub(crate) fn grid(&self) -> Option<&MomentGrid> {
+        self.volume.cuts.get(self.cut)?.moments.get(&self.moment)
+    }
+}
+
+/// Cache key that decides whether the native loupe image must be rebuilt +
+/// re-uploaded: any change to the sampled data, its coloring, or the disk's
+/// screen placement invalidates it. Screen positions are quantized to whole
+/// pixels so sub-pixel jitter does not thrash the GPU upload.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct LoupeNativeKey {
+    volume_ptr: usize,
+    cut: usize,
+    product_label: String,
+    color_signature: u64,
+    dim: usize,
+    focus: [i32; 2],
+    center: [i32; 2],
+    radar_pos: [i32; 2],
+    angle_milli: i32,
+    km_per_px_milli: i32,
+    magnify_milli: i32,
+}
+
+impl LoupeNativeKey {
+    fn new(
+        plan: &LoupeNativePlan,
+        focus: egui::Pos2,
+        center: egui::Pos2,
+        magnify: f32,
+        dim: usize,
+    ) -> Self {
+        let quantize = |p: egui::Pos2| [p.x.round() as i32, p.y.round() as i32];
+        Self {
+            volume_ptr: Arc::as_ptr(&plan.volume) as usize,
+            cut: plan.cut,
+            product_label: plan.product_label.clone(),
+            color_signature: plan.color_signature,
+            dim,
+            focus: quantize(focus),
+            center: quantize(center),
+            radar_pos: quantize(plan.geom.radar_pos),
+            angle_milli: (plan.geom.angle * 1000.0).round() as i32,
+            km_per_px_milli: (plan.geom.km_per_px * 1000.0).round() as i32,
+            magnify_milli: (magnify * 1000.0).round() as i32,
+        }
+    }
 }
 
 pub(crate) fn paint_rotated_image(
@@ -4445,5 +4821,215 @@ impl<V> ShapeCache<V> {
             self.entries.push((key, build()));
         }
         &self.entries.last().expect("just pushed").1
+    }
+}
+
+#[cfg(test)]
+mod loupe_native_gates_tests {
+    use super::*;
+    use color_tables::{ColorTableFamily, ColorTableSet};
+    use radar_core::{ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, Radial};
+
+    fn gate_range(gate_count: usize) -> GateRange {
+        GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 250,
+            gate_count,
+        }
+    }
+
+    fn test_radial(azimuth_deg: f32, range: GateRange) -> Radial {
+        Radial {
+            azimuth_deg,
+            elevation_deg: 0.5,
+            time_offset_ms: 0,
+            gate_range: range,
+            nyquist_velocity_mps: Some(32.0),
+            radial_status: None,
+        }
+    }
+
+    /// A cut whose reflectivity grid has `radial_count` evenly spaced radials
+    /// (0..360) and every gate set to `raw`. scale=2, offset=66, nodata=0,
+    /// range_folded=1 — the classic Level-II REF packing.
+    fn uniform_ref(radial_count: usize, gate_count: usize, raw: u8) -> (ElevationCut, MomentGrid) {
+        let range = gate_range(gate_count);
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        let step = 360.0 / radial_count as f32;
+        for row in 0..radial_count {
+            cut.radials
+                .push(test_radial(row as f32 * step, range.clone()));
+        }
+        let mut grid =
+            MomentGrid::new_u8(MomentType::Reflectivity, range, 2.0, 66.0, Some(0), Some(1));
+        grid.radial_indices = (0..radial_count).collect();
+        grid.storage = MomentStorage::U8(vec![raw; radial_count * gate_count]);
+        (cut, grid)
+    }
+
+    fn ref_grid_only(gate_count: usize, raws: &[u8]) -> MomentGrid {
+        let mut grid = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            gate_range(gate_count),
+            2.0,
+            66.0,
+            Some(0),
+            Some(1),
+        );
+        grid.radial_indices = vec![0];
+        grid.storage = MomentStorage::U8(raws.to_vec());
+        grid
+    }
+
+    #[test]
+    fn gate_color_nodata_is_transparent() {
+        // raw == nodata (0) -> no gate drawn.
+        let grid = ref_grid_only(3, &[0, 120, 1]);
+        let table = ColorTableSet::default()
+            .for_family(ColorTableFamily::Reflectivity)
+            .clone();
+        let sampler = table.sampler();
+        assert_eq!(loupe_gate_color(&grid, &sampler, 0, 0), None);
+    }
+
+    #[test]
+    fn gate_color_range_folded_uses_rf_color() {
+        // raw == range_folded (1) -> the table's dedicated RF color, exactly as
+        // the raster paints it (not transparent, not a scaled sample).
+        let grid = ref_grid_only(3, &[0, 120, 1]);
+        let table = ColorTableSet::default()
+            .for_family(ColorTableFamily::Velocity)
+            .clone();
+        let sampler = table.sampler();
+        let rf = table.range_folded_color();
+        let expected = (rf[3] != 0).then_some(rf);
+        assert_eq!(loupe_gate_color(&grid, &sampler, 0, 2), expected);
+    }
+
+    #[test]
+    fn gate_color_scaled_matches_the_table() {
+        // A normal gate colors via the SAME table.color_for_value the map uses.
+        let grid = ref_grid_only(3, &[0, 120, 1]);
+        let table = ColorTableSet::default()
+            .for_family(ColorTableFamily::Reflectivity)
+            .clone();
+        let sampler = table.sampler();
+        let value = (120.0 - 66.0) / 2.0; // 27 dBZ
+        let expected = table.color_for_value(value);
+        assert_eq!(
+            loupe_gate_color(&grid, &sampler, 0, 1),
+            (expected[3] != 0).then_some(expected)
+        );
+    }
+
+    #[test]
+    fn gate_color_f32_nan_is_transparent() {
+        let mut grid = MomentGrid::new_u16(
+            MomentType::Reflectivity,
+            gate_range(2),
+            1.0,
+            0.0,
+            None,
+            None,
+        );
+        grid.radial_indices = vec![0];
+        grid.storage = MomentStorage::F32(vec![f32::NAN, 25.0]);
+        let table = ColorTableSet::default()
+            .for_family(ColorTableFamily::Reflectivity)
+            .clone();
+        let sampler = table.sampler();
+        assert_eq!(loupe_gate_color(&grid, &sampler, 0, 0), None);
+        assert_eq!(
+            loupe_gate_color(&grid, &sampler, 0, 1),
+            Some(table.color_for_value(25.0))
+        );
+    }
+
+    #[test]
+    fn geom_range_az_inverts_the_readout_mapping() {
+        // radar at screen origin, no AEQD rotation, 1 km/px. Due-east screen
+        // offset -> azimuth 90, due-north (screen y up) -> azimuth 0.
+        let geom = LoupeGateGeom {
+            radar_pos: egui::pos2(0.0, 0.0),
+            angle: 0.0,
+            km_per_px: 1.0,
+            max_range_km: 500.0,
+        };
+        let (range_e, az_e) = geom.range_az(egui::pos2(100.0, 0.0)).expect("in range");
+        assert!((range_e - 100.0).abs() < 1e-3);
+        assert!((az_e - 90.0).abs() < 1e-3);
+        let (range_n, az_n) = geom.range_az(egui::pos2(0.0, -100.0)).expect("in range");
+        assert!((range_n - 100.0).abs() < 1e-3);
+        assert!(az_n.abs() < 1e-3 || (az_n - 360.0).abs() < 1e-3);
+        // Beyond the grid range -> no gate.
+        assert!(geom.range_az(egui::pos2(0.0, 600.0)).is_none());
+    }
+
+    #[test]
+    fn az_lut_resolves_the_nearest_radial_and_gaps() {
+        // 360 radials at 1 deg: threshold 0.55 deg. Exact and near hits resolve;
+        // a 2-deg-spaced cut leaves a gap that returns None mid-way.
+        let (dense_cut, dense_grid) = uniform_ref(360, 4, 120);
+        let lut = LoupeAzLut::build(&dense_cut, &dense_grid);
+        assert_eq!(lut.row(90.0), Some(90));
+        assert_eq!(lut.row(90.2), Some(90));
+        assert_eq!(lut.row(359.9), Some(0));
+
+        let (sparse_cut, sparse_grid) = uniform_ref(180, 4, 120); // 2 deg spacing
+        let sparse = LoupeAzLut::build(&sparse_cut, &sparse_grid);
+        assert_eq!(sparse.row(0.2), Some(0)); // within 0.8 deg threshold
+        assert_eq!(sparse.row(1.0), None); // 1 deg from either radial -> gap
+    }
+
+    #[test]
+    fn build_image_colors_the_focus_gate_and_clears_outside_the_disk() {
+        let (cut, grid) = uniform_ref(360, 600, 120);
+        let table = ColorTableSet::default()
+            .for_family(ColorTableFamily::Reflectivity)
+            .clone();
+        let sampler = table.sampler();
+        let az_lut = LoupeAzLut::build(&cut, &grid);
+        let geom = LoupeGateGeom {
+            radar_pos: egui::pos2(0.0, 0.0),
+            angle: 0.0,
+            km_per_px: 1.0,
+            max_range_km: 150.0,
+        };
+        let radius = 70.0_f32;
+        let magnify = 6.0_f32;
+        let center = egui::pos2(300.0, 300.0);
+        let focus = egui::pos2(100.0, 0.0); // due east of radar, range 100 km
+        let dim = (2.0 * radius).ceil() as usize;
+        let image = build_radar_loupe_image(
+            dim, center, focus, radius, magnify, &geom, &az_lut, &grid, &sampler,
+        );
+        assert_eq!(image.size, [dim, dim]);
+
+        let expected = table.color_for_value((120.0 - 66.0) / 2.0);
+        let expected = egui::Color32::from_rgba_unmultiplied(
+            expected[0],
+            expected[1],
+            expected[2],
+            expected[3],
+        );
+        // Center texel samples the focus gate exactly.
+        let mid = dim / 2;
+        assert_eq!(image.pixels[mid * dim + mid], expected);
+        // A corner is outside the inscribed disk -> transparent.
+        assert_eq!(image.pixels[0], egui::Color32::TRANSPARENT);
+        // The magnification is baked in: a rim texel still lands on a valid,
+        // colored gate (the loupe shows a real neighborhood, not one gate).
+        let rim = loupe_sample_screen(
+            focus,
+            center,
+            center + egui::vec2(radius - 1.0, 0.0),
+            magnify,
+        );
+        assert!(geom.range_az(rim).is_some());
+        let opaque = image.pixels.iter().filter(|p| p.a() != 0).count();
+        assert!(
+            opaque > 100,
+            "expected a filled disk, saw {opaque} opaque texels"
+        );
     }
 }

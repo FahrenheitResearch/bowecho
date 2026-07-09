@@ -269,7 +269,7 @@ use sat_paint::{sat_enhancement_refresh_frames, sat_run_family, satellite_run_ke
 // from max_ref_swath/tor_tracks). The loupe types + the label-rank / loupe-sample
 // helpers are reached only by the `#[cfg(test)]` module (via `use super::*`), so
 // their re-export is test-gated to stay unused-import clean in the release build.
-use map_paint::{GeoBounds, format_cursor_readout, paint_rotated_image};
+use map_paint::{GeoBounds, LoupeNativeKey, format_cursor_readout, paint_rotated_image};
 #[cfg(test)]
 use map_paint::{LoupeKind, LoupeSource, loupe_sample_screen, world_place_label_rank};
 // Sub-move C (markers) adds the marker free-fns it moved that are still
@@ -3126,6 +3126,13 @@ struct ViewerApp {
     /// derived product, reused until product/volume/smoothing inputs change.
     derived_readout_cache: Option<DerivedReadoutCache>,
     dealiased_readout_cache: Option<DealiasedReadoutCache>,
+    /// Native-gate Field Loupe (feat/loupe-native-gates): a small CPU-rasterized
+    /// ColorImage of the REAL polar gates under the cursor, sampled 1:1 by the
+    /// loupe disk mesh (NEAREST) so the magnifier shows true gate structure
+    /// instead of magnified raster texels. Reused across frames; rebuilt +
+    /// re-uploaded only when `loupe_native_key` changes.
+    loupe_native_texture: Option<egui::TextureHandle>,
+    loupe_native_key: Option<LoupeNativeKey>,
     /// One-shot startup release check (background thread, fails silently):
     /// the receiver delivers `Some(tag)` when GitHub has a newer release.
     update_check_rx: WorkerSlot<Option<String>>,
@@ -8026,6 +8033,8 @@ impl ViewerApp {
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
             dealiased_readout_cache: None,
+            loupe_native_texture: None,
+            loupe_native_key: None,
             update_check_rx: WorkerSlot::idle("update-check"),
             update_available: None,
             self_update_rx: StreamSlot::idle("self-update"),
@@ -60917,6 +60926,8 @@ mod tests {
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
             dealiased_readout_cache: None,
+            loupe_native_texture: None,
+            loupe_native_key: None,
             update_check_rx: WorkerSlot::idle("update-check"),
             update_available: None,
             self_update_rx: StreamSlot::idle("self-update"),
