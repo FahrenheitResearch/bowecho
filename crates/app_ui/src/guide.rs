@@ -10,8 +10,7 @@ use eframe::egui;
 
 // Same constants the sidebar reads (ui_theme.rs) — the Guide can't drift
 // from the chrome it documents.
-use crate::ui_theme::ACCENT_COLOR as KEY_COLOR;
-use crate::ui_theme::SUBHEAD_COLOR;
+use crate::ui_theme::{accent_color, subhead_color};
 
 const GUIDE_TOP_BAR_TEXT: &str = "The top bar leads with the LIVE | ARCHIVE control: \
     LIVE follows the current radar's newest data and backfills a loop in one click; \
@@ -160,7 +159,7 @@ fn subhead(ui: &mut egui::Ui, label: &str) {
         egui::RichText::new(label)
             .small()
             .strong()
-            .color(SUBHEAD_COLOR),
+            .color(subhead_color()),
     );
     ui.add_space(2.0);
 }
@@ -193,7 +192,7 @@ fn key_row(ui: &mut egui::Ui, key: &str, what: &str) {
         ui.label(
             egui::RichText::new(format!("{key:<18}"))
                 .monospace()
-                .color(KEY_COLOR),
+                .color(accent_color()),
         );
         ui.label(what);
     });

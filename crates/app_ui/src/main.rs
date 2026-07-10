@@ -1221,8 +1221,8 @@ const TERMINAL_SITE_LABEL_MIN_SCALE: f32 = 95.0;
 // as crate-wide aliases so 100+ call sites keep reading naturally.
 pub(crate) use ui_theme::ROW_H as PANEL_BUTTON_HEIGHT;
 pub(crate) use ui_theme::{
-    ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, ROW_SPACING_X, SIDEBAR_DEFAULT_WIDTH,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
+    LAYER_ROW_SLIDER_WIDTH, ROW_SPACING_X, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH, accent_color, live_color, subhead_color,
 };
 const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] =
     &["tornado", "severe thunderstorm", "flash flood", "flood"];
@@ -19089,7 +19089,7 @@ impl ViewerApp {
                 let live = self.farm.live_sensor().map(|s| (s.id, s.name.clone()));
                 if let Some((id, name)) = live {
                     let chip = egui::RichText::new(format!("{name} LIVE"))
-                        .color(LIVE_COLOR)
+                        .color(live_color())
                         .strong();
                     if ui
                         .add(egui::Label::new(chip).sense(egui::Sense::click()))
@@ -19140,7 +19140,7 @@ impl ViewerApp {
                                     ui.label(
                                         egui::RichText::new(format!("{family} ({})", rows.len()))
                                             .strong()
-                                            .color(SUBHEAD_COLOR),
+                                            .color(subhead_color()),
                                     );
                                     for row in rows {
                                         let text = egui::RichText::new(&row.label)
@@ -19176,7 +19176,7 @@ impl ViewerApp {
                         egui::RichText::new(workflow.label())
                             .small()
                             .strong()
-                            .color(ACCENT_COLOR),
+                            .color(accent_color()),
                     )
                     .on_hover_text(
                         "Last workflow preset applied this session. Use Workflows > Restore previous setup to undo it, or Clear marker to hide this label.",
@@ -22110,7 +22110,7 @@ impl ViewerApp {
         if let Some(slot) = editing_pane {
             if independent_pane == Some(slot) {
                 ui.colored_label(
-                    ACCENT_COLOR,
+                    accent_color(),
                     format!(
                         "Independent pane {} - SITE, products, tilt, and loop controls target this pane",
                         slot + 2
@@ -22118,7 +22118,7 @@ impl ViewerApp {
                 );
             } else {
                 ui.colored_label(
-                    ACCENT_COLOR,
+                    accent_color(),
                     format!(
                         "Editing pane {} — click the main (top-left) pane to edit all",
                         slot + 2
@@ -24787,7 +24787,7 @@ impl ViewerApp {
                         ui.add_sized(
                             [38.0, height],
                             egui::Label::new(
-                                egui::RichText::new("BUSY").small().color(ACCENT_COLOR),
+                                egui::RichText::new("BUSY").small().color(accent_color()),
                             ),
                         );
                         ui.add_sized([172.0, height], egui::Label::new(activity.label).truncate());
@@ -37937,7 +37937,7 @@ fn data_pack_title_cell(ui: &mut egui::Ui, title: &str, width: f32) {
 fn layer_state_color(state: &str) -> egui::Color32 {
     match state {
         "loading" => egui::Color32::from_rgb(238, 218, 62),
-        "live" => LIVE_COLOR,
+        "live" => live_color(),
         "stale" => egui::Color32::from_rgb(225, 164, 56),
         _ => egui::Color32::from_rgb(106, 132, 154),
     }
@@ -42042,43 +42042,118 @@ fn display_cut_for_product(
 }
 
 fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
-    use egui::Color32;
+    use egui::{Color32, CornerRadius, FontFamily, FontId, TextStyle};
     let mut style = (*ctx.global_style()).clone();
     // Snappy = fast: no widget animations (the app's identity is speed).
     style.animation_time = 0.0;
     style.visuals = egui::Visuals::dark();
 
+    // THEME PASS typographic scale (ui-refresh-plan §4): 11 / 12.5 / 14,
+    // monospace for numerics/ids/timestamps. Type and rhythm apply to EVERY
+    // brand — brand kits recolor the chrome, they do not retypeset it.
+    style.text_styles = [
+        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(12.5, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(12.5, FontFamily::Proportional)),
+        (TextStyle::Heading, FontId::new(14.0, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace)),
+    ]
+    .into();
+
     // GR2 "warning-desk" look: near-black, low-chroma neutral panels so the
-    // saturated REF/VEL/CC/ZDR palettes pop. This is the single biggest cheap
-    // lever for reading as a pro radar tool.
+    // saturated REF/VEL/CC/ZDR palettes pop.
     let palette = brand_config.resolved_palette();
-    let panel = brand::color32(palette.surface);
-    let raised = brand::color32(palette.surface_alt);
-    let sunken = Color32::from_rgb(9, 10, 12);
-    style.visuals.panel_fill = panel;
-    style.visuals.window_fill = panel;
-    style.visuals.extreme_bg_color = sunken; // text edits, sliders troughs
-    style.visuals.faint_bg_color = Color32::from_rgb(20, 22, 25); // table striping
-    style.visuals.window_stroke = egui::Stroke::new(1.0, brand::color32(palette.outline));
-    // Desaturated light text, not pure white.
-    style.visuals.override_text_color = Some(brand::color32(palette.text));
+    let stock_default = settings::BrandPalette::default();
+    if palette == stock_default.resolved(&stock_default) {
+        // Stock BowEcho: the ui_theme ramp drives the chrome — candidate A,
+        // or candidate B under BOWECHO_THEME_B=1 (A/B scaffolding, see
+        // ui_theme.rs). Three deliberate neutral levels, ONE accent
+        // (selection + live emphasis), status colors only for meaning.
+        let theme = ui_theme::theme();
+        style.visuals.panel_fill = theme.bg;
+        style.visuals.window_fill = theme.bg;
+        style.visuals.extreme_bg_color = theme.inset; // text edits, slider troughs
+        style.visuals.faint_bg_color = theme.faint; // table striping
+        style.visuals.window_stroke = egui::Stroke::new(1.0, theme.outline);
+        // Desaturated light text, not pure white; explicit weak tier so the
+        // >= 4:1 contrast floor is exactly what the gated tests check.
+        style.visuals.override_text_color = Some(theme.text);
+        style.visuals.weak_text_color = Some(theme.text_weak);
+        style.visuals.hyperlink_color = theme.accent;
+        style.visuals.warn_fg_color = theme.warn;
+        style.visuals.error_fg_color = theme.alert;
+        style.visuals.selection.bg_fill = theme.selection_bg;
+        style.visuals.selection.stroke = egui::Stroke::new(1.0, theme.accent_text);
+        let w = &mut style.visuals.widgets;
+        w.noninteractive.bg_fill = theme.bg;
+        w.noninteractive.weak_bg_fill = theme.bg;
+        // Hairline separators replace heavy rules, everywhere at once:
+        // egui separators draw with this stroke.
+        w.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme.hairline);
+        w.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme.text_weak);
+        w.inactive.bg_fill = theme.raised;
+        w.inactive.weak_bg_fill = theme.raised;
+        w.inactive.fg_stroke = egui::Stroke::new(1.0, theme.text);
+        w.hovered.bg_fill = theme.hover;
+        w.hovered.weak_bg_fill = theme.hover;
+        w.hovered.bg_stroke = egui::Stroke::new(1.0, theme.outline);
+        w.hovered.fg_stroke = egui::Stroke::new(1.5, theme.text_strong);
+        w.active.bg_fill = theme.active;
+        w.active.weak_bg_fill = theme.active;
+        w.active.fg_stroke = egui::Stroke::new(2.0, theme.text_strong);
+        w.open.bg_fill = theme.raised;
+        w.open.weak_bg_fill = theme.raised;
+        w.open.fg_stroke = egui::Stroke::new(1.0, theme.text);
+    } else {
+        // Custom brand kit: the distributor's palette keeps driving the
+        // chrome exactly as before the theme pass.
+        let panel = brand::color32(palette.surface);
+        let raised = brand::color32(palette.surface_alt);
+        let sunken = Color32::from_rgb(9, 10, 12);
+        style.visuals.panel_fill = panel;
+        style.visuals.window_fill = panel;
+        style.visuals.extreme_bg_color = sunken; // text edits, sliders troughs
+        style.visuals.faint_bg_color = Color32::from_rgb(20, 22, 25); // table striping
+        style.visuals.window_stroke = egui::Stroke::new(1.0, brand::color32(palette.outline));
+        // Desaturated light text, not pure white.
+        style.visuals.override_text_color = Some(brand::color32(palette.text));
 
-    // Low-chroma muted-blue selection/active accents.
-    style.visuals.selection.bg_fill = Color32::from_rgb(38, 74, 108);
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, brand::color32(palette.accent));
-    let w = &mut style.visuals.widgets;
-    w.noninteractive.bg_fill = panel;
-    w.inactive.bg_fill = raised;
-    w.inactive.weak_bg_fill = raised;
-    w.hovered.bg_fill = Color32::from_rgb(36, 46, 58);
-    w.hovered.weak_bg_fill = Color32::from_rgb(36, 46, 58);
-    w.active.bg_fill = brand::color32(palette.primary);
-    w.active.weak_bg_fill = brand::color32(palette.primary);
-    w.open.bg_fill = raised;
+        // Low-chroma muted-blue selection/active accents.
+        style.visuals.selection.bg_fill = Color32::from_rgb(38, 74, 108);
+        style.visuals.selection.stroke = egui::Stroke::new(1.0, brand::color32(palette.accent));
+        let w = &mut style.visuals.widgets;
+        w.noninteractive.bg_fill = panel;
+        w.inactive.bg_fill = raised;
+        w.inactive.weak_bg_fill = raised;
+        w.hovered.bg_fill = Color32::from_rgb(36, 46, 58);
+        w.hovered.weak_bg_fill = Color32::from_rgb(36, 46, 58);
+        w.active.bg_fill = brand::color32(palette.primary);
+        w.active.weak_bg_fill = brand::color32(palette.primary);
+        w.open.bg_fill = raised;
+    }
 
-    // Tighten density toward GR2's information-dense layout.
+    // Restrained rounding (spec §4): 2 px widgets, 3 px windows/menus.
+    {
+        let w = &mut style.visuals.widgets;
+        for visuals in [
+            &mut w.noninteractive,
+            &mut w.inactive,
+            &mut w.hovered,
+            &mut w.active,
+            &mut w.open,
+        ] {
+            visuals.corner_radius = CornerRadius::same(2);
+        }
+    }
+    style.visuals.window_corner_radius = CornerRadius::same(3);
+    style.visuals.menu_corner_radius = CornerRadius::same(3);
+
+    // GR2-dense, on a consistent 4 pt spacing rhythm.
     style.spacing.button_padding = egui::vec2(5.0, 2.0);
-    style.spacing.item_spacing = egui::vec2(4.0, 3.0);
+    style.spacing.item_spacing = egui::vec2(4.0, 4.0);
+    style.spacing.window_margin = egui::Margin::same(8);
+    style.spacing.menu_margin = egui::Margin::same(8);
+    style.spacing.indent = 16.0;
     style.spacing.interact_size.y = 18.0;
     ctx.set_global_style(style);
 }

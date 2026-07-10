@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use data_source::sites::SiteRef;
 use eframe::egui;
 
-use crate::LIVE_COLOR;
+use crate::ui_theme::live_color;
 use crate::unified_player::{UnifiedPlayerAction, UnifiedPlayerState};
 use ui_core::loop_engine::Liveness;
 
@@ -264,7 +264,7 @@ pub(crate) fn bar_ui(
         LiveArchiveBarMode::Live | LiveArchiveBarMode::LiveStale
     );
     let live_text = if live_lit {
-        egui::RichText::new("● LIVE").color(LIVE_COLOR).strong()
+        egui::RichText::new("● LIVE").color(live_color()).strong()
     } else {
         egui::RichText::new("● LIVE")
     };
