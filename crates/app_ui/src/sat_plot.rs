@@ -15,8 +15,8 @@ use std::time::Instant;
 use eframe::egui;
 use rustwx_core::{Field2D, GridProjection, GridShape, LatLonGrid, ProductKey};
 use rustwx_render::{
-    Color, ColorScale, DiscreteColorScale, ExtendMode, MapRenderRequest, ProductVisualMode,
-    RgbaGridField,
+    Color, ColorScale, DiscreteColorScale, DomainFrameSource, ExtendMode, MapRenderRequest,
+    ProductVisualMode, RgbaGridField,
 };
 use rw_store::grid::GridFile;
 
@@ -326,6 +326,15 @@ impl SatellitePlotSource {
         let mut request = MapRenderRequest::from_core_field(field, scale);
         rustwx_products::plot_design::StaticPlotDesign::new(bounds, visual_mode)
             .apply_to_request(&mut request);
+        // Model fields use an inscribed ProjectedGrid frame so overlays and
+        // legends remain inside every edge of a curved grid. That is too
+        // destructive for satellite imagery: a wide HRRR native mesh can
+        // have a much smaller fully-inscribed rectangle, clipping most of the
+        // valid raster into a horizontal strip. Follow the projected raster's
+        // complete coverage mask instead.
+        if let Some(frame) = request.domain_frame.as_mut() {
+            frame.source = DomainFrameSource::RasterAlpha;
+        }
         request.apply_projected_map(&projected);
         request.title = Some(self.title.clone());
         request.subtitle_left = Some(self.subtitle_left.clone());
@@ -778,11 +787,11 @@ mod tests {
     }
 
     #[test]
-    fn projected_domain_targets_the_inner_map_frame_not_the_outer_canvas() {
-        // Real HRRR SimSat geometry is a wide CONUS mesh. The first RC used
-        // the outer 864x528 canvas ratio here, while the renderer drew into a
-        // much wider inner map frame after reserving title/colorbar chrome;
-        // the result was a visibly compressed horizontal strip.
+    fn satellite_domain_uses_raster_coverage_and_targets_the_inner_map_frame() {
+        // Real HRRR SimSat geometry is a wide, curved mesh. Its projection
+        // must target the renderer's inner map frame, while the domain frame
+        // follows the whole raster coverage instead of clipping to the much
+        // smaller fully-inscribed rectangle used by model-field overlays.
         let source = SatellitePlotSource::scalar_from_mesh(
             "SimSat IR C13",
             "hrrr_t00z",
@@ -798,6 +807,10 @@ mod tests {
         .unwrap();
         let (width, height) = (864, 528);
         let request = source.build_render_request(width, height).unwrap();
+        assert!(matches!(
+            request.domain_frame.map(|frame| frame.source),
+            Some(DomainFrameSource::RasterAlpha)
+        ));
         let expected = rustwx_render::map_frame_aspect_ratio_for_mode_with_domain_frame(
             ProductVisualMode::FilledMeteorology,
             width,

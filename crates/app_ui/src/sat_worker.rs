@@ -5375,6 +5375,29 @@ mod tests {
                 .any(|pixel| pixel.0 != [255, 255, 255, 255]),
             "real plot must contain more than the white canvas"
         );
+
+        // The first RC exposed a renderer interaction that collapsed this
+        // curved HRRR mesh into a ~178-pixel horizontal strip. Ignore the
+        // title and right-side colorbar, then require substantial raster/map
+        // coverage across the plot height. The canvas background is sampled
+        // from the top-left pixel so this remains independent of theme hues.
+        let background = *rendered.get_pixel(0, 0);
+        let x_start = rendered.width() / 20;
+        let x_end = rendered.width() * 21 / 25;
+        let row_width = x_end - x_start;
+        let substantial_rows = (0..rendered.height())
+            .filter(|&y| {
+                let changed = (x_start..x_end)
+                    .filter(|&x| *rendered.get_pixel(x, y) != background)
+                    .count() as u32;
+                changed >= row_width / 5
+            })
+            .count() as u32;
+        assert!(
+            substantial_rows >= rendered.height() / 4,
+            "real HRRR plot must fill the native surface vertically; only {substantial_rows} of {} rows carry substantial map/raster coverage",
+            rendered.height()
+        );
     }
 
     #[test]
