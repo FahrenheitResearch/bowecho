@@ -90,11 +90,14 @@ mod radar_export;
 mod raster_quality;
 mod rhi;
 mod sat_paint;
+mod sat_plot;
 mod sat_window;
 mod sat_worker;
 mod self_update;
 mod settings_persistence;
 mod settings_ui;
+mod simsat_hrrr;
+mod simsat_ui;
 mod sites_ui;
 mod spc_layers;
 mod table_editor;
@@ -2789,6 +2792,9 @@ struct ViewerApp {
     /// to keep the radar-map satellite layer synchronized.
     sat_run_listings: Vec<rw_ui::SatRunListing>,
     show_satellite: bool,
+    /// Embedded SimSat renderer and its dockable setup/progress surface.
+    simsat: simsat_ui::SimSatPane,
+    show_simsat: bool,
     himawari_band: u8,
     /// Selected IR enhancement for Kelvin BT bands (GOES + Himawari),
     /// persisted via `AppSettings::sat_ir_enhancement` and applied by the
@@ -8106,6 +8112,8 @@ impl ViewerApp {
             sat_player: rw_ui::SatPlayerPanel::new(),
             sat_run_listings: Vec::new(),
             show_satellite: false,
+            simsat: simsat_ui::SimSatPane::default(),
+            show_simsat: false,
             himawari_band: 13,
             sat_ir_enhancement: restored_sat_ir_enhancement,
             goes_composite_style: "natural_color".to_string(),
@@ -18752,8 +18760,11 @@ impl eframe::App for ViewerApp {
             self.frame_ms_avg * 0.95 + dt_ms * 0.05
         };
         self.poll_model_layer(&ctx);
+        self.poll_simsat(&ctx);
         if self.sat.is_some() {
-            self.pump_sat_responses();
+            if let Some(source) = self.pump_sat_responses() {
+                self.open_satellite_native_plot(&ctx, source);
+            }
             self.maybe_sync_satellite_map_to_timeline(&ctx);
         }
         self.poll_sat_layer(&ctx);
@@ -18997,6 +19008,7 @@ impl eframe::App for ViewerApp {
         self.model_data_window(&ctx);
         self.radar_overlays_window(&ctx);
         self.satellite_window(&ctx);
+        self.simsat_window(&ctx);
         self.unified_player_window(&ctx);
         self.sweep_control_window(&ctx);
         self.event_loop_builder_window(&ctx);
@@ -19660,6 +19672,11 @@ impl ViewerApp {
                     "GOES satellite: live follow + frame playback (rw-sat)",
                 ),
                 (
+                    dock::WorkspacePane::Simsat,
+                    "Simulated satellite",
+                    "Render physically based visible, IR, water-vapor, and derived satellite products from WRF or HRRR native-model data",
+                ),
+                (
                     dock::WorkspacePane::Wofs,
                     "WoFS",
                     "NSSL Warn-on-Forecast System: rapid-cycling ensemble guidance (paintballs, probabilities, ensemble means), radar-time-synced",
@@ -19751,7 +19768,68 @@ impl ViewerApp {
             }
         })
         .response
-        .on_hover_text("Data windows: Model · Satellite · WoFS · FARM · 3D · Sounding");
+        .on_hover_text("Data windows: Model · Satellite · SimSat · WoFS · FARM · 3D · Sounding");
+    }
+
+    /// Drain the embedded SimSat worker whether or not its pane is visible.
+    /// Completed store writes and native-plot requests are shell actions so
+    /// the renderer module never owns Satellite/Model window state.
+    fn poll_simsat(&mut self, ctx: &egui::Context) {
+        let actions = self.simsat.poll(ctx);
+        self.handle_simsat_actions(ctx, actions);
+    }
+
+    fn handle_simsat_actions(
+        &mut self,
+        ctx: &egui::Context,
+        actions: Vec<simsat_ui::SimSatAction>,
+    ) {
+        for action in actions {
+            match action {
+                simsat_ui::SimSatAction::SatelliteFrameWritten { key, hhmm } => {
+                    self.ensure_satellite_worker(ctx);
+                    self.sat_map_follow = true;
+                    if let Some(worker) = &self.sat {
+                        worker.send(sat_worker::SatRequest::ScanAndSelect {
+                            key: key.clone(),
+                            hhmm,
+                        });
+                    }
+                    self.open_viewer(dock::WorkspacePane::Satellite);
+                    self.status = format!("SimSat: wrote {key} {hhmm:04}Z");
+                }
+                simsat_ui::SimSatAction::OpenPlot(source) => {
+                    self.open_satellite_native_plot(ctx, source);
+                }
+            }
+        }
+    }
+
+    fn simsat_pane_body(&mut self, ui: &mut egui::Ui) {
+        let actions = self.simsat.ui(ui);
+        let ctx = ui.ctx().clone();
+        self.handle_simsat_actions(&ctx, actions);
+    }
+
+    fn simsat_window(&mut self, ctx: &egui::Context) {
+        if !self.show_simsat || self.workspace.is_docked(dock::WorkspacePane::Simsat) {
+            return;
+        }
+        let mut open = self.show_simsat;
+        let mut actions = Vec::new();
+        egui::Window::new("Simulated satellite")
+            .id(egui::Id::new("bowecho_simsat_window"))
+            .open(&mut open)
+            .default_size([620.0, 720.0])
+            .min_size([500.0, 420.0])
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                self.dock_toggle_row(ui, dock::WorkspacePane::Simsat);
+                actions = self.simsat.ui(ui);
+            });
+        self.set_viewer_open(dock::WorkspacePane::Simsat, open);
+        self.handle_simsat_actions(ctx, actions);
     }
 
     fn event_loop_builder_window(&mut self, ctx: &egui::Context) {
@@ -25400,6 +25478,7 @@ impl ViewerApp {
             dock::WorkspacePane::Wofs => self.wofs.open = open,
             dock::WorkspacePane::Farm => self.farm.open = open,
             dock::WorkspacePane::Satellite => self.show_satellite = open,
+            dock::WorkspacePane::Simsat => self.show_simsat = open,
             dock::WorkspacePane::Model => self.model_dock_open = open,
             dock::WorkspacePane::UnifiedPlayer => self.unified_player.open = open,
             dock::WorkspacePane::Vol3d => self.vol3d.open = open,
@@ -25415,6 +25494,7 @@ impl ViewerApp {
             dock::WorkspacePane::Wofs => self.wofs.open,
             dock::WorkspacePane::Farm => self.farm.open,
             dock::WorkspacePane::Satellite => self.show_satellite,
+            dock::WorkspacePane::Simsat => self.show_simsat,
             dock::WorkspacePane::Model => self.model_dock_open,
             dock::WorkspacePane::UnifiedPlayer => self.unified_player.open,
             dock::WorkspacePane::Vol3d => self.vol3d.open,
@@ -25669,6 +25749,7 @@ impl ViewerApp {
                 let (panel_events, player_events) = self.satellite_pane_body(ui);
                 self.handle_satellite_events(panel_events, player_events);
             }
+            dock::WorkspacePane::Simsat => self.simsat_pane_body(ui),
             dock::WorkspacePane::Model => {
                 let events = self.model_pane_body(ui);
                 self.dispatch_download_events(events);
@@ -61843,6 +61924,8 @@ mod tests {
             sat_player: rw_ui::SatPlayerPanel::new(),
             sat_run_listings: Vec::new(),
             show_satellite: false,
+            simsat: simsat_ui::SimSatPane::default(),
+            show_simsat: false,
             himawari_band: 13,
             sat_ir_enhancement: sat_worker::IrEnhancement::default(),
             goes_composite_style: "natural_color".to_string(),

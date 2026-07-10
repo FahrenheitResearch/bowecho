@@ -19,7 +19,7 @@ const GUIDE_TOP_BAR_TEXT: &str = "The top bar leads with the LIVE | ARCHIVE cont
     opens the full Unified Player. One-shot actions follow \
     (Reset View, Reload, Map Only, Screenshot, Annotate) plus Workflows presets. \
     On the right, the Windows menu opens every data window (Model, Radar \
-    overlays, Satellite, WoFS, FARM, 3D Volume, Sounding) beside this Guide. Status chips appear \
+    overlays, Satellite, SimSat, WoFS, FARM, 3D Volume, Sounding) beside this Guide. Status chips appear \
     beside the menus. Map Only hides chrome for a clean capture; Tab or Esc \
     brings it back.";
 const GUIDE_PANES_LABEL: &str = "Panes 1 / 2 / 3 / 4";
@@ -1013,6 +1013,29 @@ fn satellite(ui: &mut egui::Ui) {
          refresh control re-scans the store for frames written since.",
     );
 
+    subhead(ui, "SIMULATED SATELLITE");
+    para(
+        ui,
+        "Windows \u{25be} \u{25b8} Simulated satellite opens BowEcho's embedded SimSat engine. \
+         It renders physically based visible, GeoColor, sandwich, thermal-IR, water-vapor, \
+         and derived products from local WRF output or HRRR native-level data. Finished \
+         visible/IR frames are written directly into this same satellite store, selected in \
+         the player, and can follow onto the radar map. SimSat needs HRRR wrfnat files; the \
+         normal Model download's smaller pressure + surface pair cannot reconstruct native \
+         cloud volumes. BowEcho therefore downloads wrfnat only when requested by SimSat and \
+         reuses it from the SimSat input cache afterward.",
+    );
+
+    subhead(ui, "NATIVE PLOTS & EXPORT");
+    para(
+        ui,
+        "Native plot sends the current real or simulated satellite frame through the same \
+         projected plotting surface used by the Model window. IR and water-vapor plots retain \
+         raw Kelvin values and a physical colorbar; true-color composites stay RGB and omit a \
+         false scalar legend. Save PNG in that plot window exports the plotted product with its \
+         title, valid time, and map context.",
+    );
+
     subhead(ui, "SHOW ON RADAR MAP");
     action(
         ui,
@@ -1596,7 +1619,10 @@ fn sources(ui: &mut egui::Ui) {
          rusty-weather stack (rw-ingest / rw-ui); the native skew-T is verified against \
          sharprs. RAP (13 km) 0-hour analysis wind profiles are fetched per site from the \
          NOAA open-data mirror to anchor the Analyst 3D dealiaser (CONUS sites). \
-         GOES-16/18/19 ABI imagery from NOAA open-data buckets via rw-sat.",
+         GOES-16/18/19 ABI imagery from NOAA open-data buckets via rw-sat. Simulated satellite \
+         imagery is rendered by FahrenheitResearch/simsat (MIT OR Apache-2.0) from WRF or \
+         HRRR native-level fields; its seasonal ground layer uses NASA Blue Marble Next \
+         Generation imagery.",
     );
 
     para(

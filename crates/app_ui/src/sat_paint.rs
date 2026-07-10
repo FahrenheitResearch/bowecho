@@ -16,7 +16,9 @@ impl ViewerApp {
             return;
         }
         self.ensure_satellite_worker(ctx);
-        self.pump_sat_responses();
+        if let Some(source) = self.pump_sat_responses() {
+            self.open_satellite_native_plot(ctx, source);
+        }
         self.maybe_sync_satellite_map_to_timeline(ctx);
         if self.workspace.is_docked(dock::WorkspacePane::Satellite) {
             return; // body renders as a workspace pane
@@ -401,6 +403,7 @@ impl ViewerApp {
         ui.separator();
         if self.sat_last_frame.is_some() || self.sat_layer.is_some() {
             let mut map_request: Option<(rw_ui::SatRunKey, u16)> = None;
+            let mut plot_request: Option<(rw_ui::SatRunKey, u16)> = None;
             let frame_available = self.sat_last_frame.is_some();
             let button_label = if self.sat_layer.is_some() {
                 "Refresh map frame"
@@ -431,6 +434,17 @@ impl ViewerApp {
                     self.sat_map_follow = true;
                     map_request = self.sat_last_frame.clone();
                 }
+                if ui
+                    .add_enabled(frame_available, egui::Button::new("🗺 Native plot"))
+                    .on_hover_text(
+                        "Render the selected satellite frame through BowEcho's georeferenced \
+                         native plotter. Scalar bands retain raw values/units; RGB composites \
+                         retain their baked colors.",
+                    )
+                    .clicked()
+                {
+                    plot_request = self.sat_last_frame.clone();
+                }
                 if let Some(layer) = &mut self.sat_layer {
                     ui.checkbox(&mut layer.visible, "show");
                     ui.weak(format!("{} {:04}Z", layer.key, layer.hhmm));
@@ -438,6 +452,13 @@ impl ViewerApp {
             });
             if let Some((key, hhmm)) = map_request {
                 self.request_sat_map_frame(key, hhmm);
+            }
+            if let Some((key, hhmm)) = plot_request
+                && let Some(sat) = &self.sat
+            {
+                self.sat_panel
+                    .apply_note(format!("Loading native plot for {key} {hhmm:04}Z"));
+                sat.send(sat_worker::SatRequest::LoadFrameForPlot { key, hhmm });
             }
         }
         let mut selected_enhancement = self.sat_ir_enhancement;
@@ -667,7 +688,8 @@ impl ViewerApp {
         }
     }
 
-    pub(crate) fn pump_sat_responses(&mut self) {
+    pub(crate) fn pump_sat_responses(&mut self) -> Option<sat_plot::SatellitePlotSource> {
+        let mut plot_source = None;
         // Transient borrow per message so handlers can take &mut self.
         while let Some(response) = self.sat.as_ref().and_then(|sat| sat.try_recv()) {
             match response {
@@ -750,6 +772,16 @@ impl ViewerApp {
                         self.flush_pending_sat_map_request();
                     }
                 },
+                sat_worker::SatResponse::PlotFrame { key, hhmm, result } => match *result {
+                    Ok(source) => {
+                        self.sat_panel
+                            .apply_note(format!("Native plot ready for {key} {hhmm:04}Z"));
+                        plot_source = Some(source);
+                    }
+                    Err(message) => {
+                        self.sat_panel.apply_note(format!("native plot: {message}"));
+                    }
+                },
                 sat_worker::SatResponse::Frame {
                     key,
                     hhmm,
@@ -789,6 +821,25 @@ impl ViewerApp {
                 },
             }
         }
+        plot_source
+    }
+
+    /// Route a raw satellite plot payload into the existing Model native-plot
+    /// surface without changing the model run/field selection. The Model
+    /// viewer is initialized lazily on profiles whose model store is empty.
+    pub(crate) fn open_satellite_native_plot(
+        &mut self,
+        ctx: &egui::Context,
+        source: sat_plot::SatellitePlotSource,
+    ) {
+        self.model_enabled = true;
+        if self.model_dock.is_none() {
+            self.model_dock = Some(self.new_model_data_dock(ctx, settings::model_store_dir()));
+        }
+        if let Some(model_dock) = self.model_dock.as_mut() {
+            model_dock.open_satellite_plot(source);
+        }
+        self.open_viewer(dock::WorkspacePane::Model);
     }
 
     /// Install a GOES frame as the sat map layer (LUT built on a

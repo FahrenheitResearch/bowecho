@@ -62,6 +62,7 @@ use rw_ui::{
     SatSatelliteOption, SatSectorOption, StoreView, format_bytes,
 };
 
+use crate::sat_plot::{SatellitePlotPalette, SatellitePlotSource};
 use crate::sat_window::{
     AHI_NOMINAL_HEIGHT_M, AHI_NOMINAL_SEMI_MAJOR_M, AHI_NOMINAL_SEMI_MINOR_M,
     AHI_NOMINAL_SUB_LON_DEG, SatNativeWindow, ScanAngleRect, ahi_fldk_segment_range,
@@ -75,6 +76,10 @@ pub enum SatRequest {
     Validate(SatFollowSpec),
     /// Enumerate the sat store's runs and frames.
     Scan,
+    /// Enumerate the store, then select one just-written frame. Both
+    /// responses are emitted by this worker in order so an external SimSat
+    /// producer cannot race a UI-side scan/select pair.
+    ScanAndSelect { key: SatRunKey, hhmm: u16 },
     /// Start a live follow session (one at a time).
     Follow(SatFollowSpec),
     /// One-shot current-hour ingest for quickly creating a playable loop.
@@ -83,8 +88,12 @@ pub enum SatRequest {
     LoadFrame { key: SatRunKey, hhmm: u16 },
     /// Read a frame PLUS its run grid for the radar-map layer.
     LoadFrameForMap { key: SatRunKey, hhmm: u16 },
+    /// Read one stored frame as raw grid-order science data for the native
+    /// plotter. This never recovers values from the player's colored image.
+    LoadFrameForPlot { key: SatRunKey, hhmm: u16 },
     /// Select the IR enhancement used when coloring stored BT frames
-    /// (applies to subsequent LoadFrame/LoadFrameForMap responses).
+    /// (applies to subsequent LoadFrame/LoadFrameForMap/LoadFrameForPlot
+    /// responses).
     SetIrEnhancement(IrEnhancement),
     /// Download/decode the latest Himawari AHI frame into the shared sat store.
     IngestLatestHimawari(HimawariQuickSpec),
@@ -394,6 +403,12 @@ impl std::fmt::Debug for SatMapFrame {
 pub enum SatResponse {
     /// A map-layer frame (image + geolocation grid).
     MapFrame(Box<Result<SatMapFrame, String>>),
+    /// A raw, georeferenced frame for the shared native plot surface.
+    PlotFrame {
+        key: SatRunKey,
+        hhmm: u16,
+        result: Box<Result<SatellitePlotSource, String>>,
+    },
     SpecStatus(Result<String, String>),
     Runs(Vec<SatRunListing>),
     FollowStarted,
@@ -790,6 +805,9 @@ fn disk_usage(store_root: &Path, model: &str, prefixes: &[String]) -> SatDiskUsa
 /// Title for one sat run: `g19 · conus C13 · 2026-06-10` (with the
 /// `_2` grid-move suffix kept visible).
 fn run_title(model: &str, run: &str) -> String {
+    if model.eq_ignore_ascii_case("simsat") {
+        return simsat_run_title(run);
+    }
     // Composite RGB runs are `<sector>_rgb_<style>_<YYYYMMDD>[_<k>]`.
     if run.contains("_rgb_") {
         let day = run_day(run)
@@ -860,6 +878,108 @@ fn run_title(model: &str, run: &str) -> String {
     }
 }
 
+/// Product/view-qualified SimSat run names are deliberately machine-stable;
+/// turn their tokens into the compact source/product/view labels an operator
+/// needs in the shared Satellite picker. The parser is order-independent so
+/// both `<source>_<product>_<view>_...` and older sector-first names remain
+/// readable.
+fn simsat_run_title(run: &str) -> String {
+    let normalized = run.to_ascii_lowercase();
+    let tokens = normalized.split('_').collect::<Vec<_>>();
+    let source = tokens.iter().find_map(|token| match *token {
+        "hrrr" => Some("HRRR"),
+        "wrf" | "wrfout" => Some("WRF"),
+        "rrfs" => Some("RRFS"),
+        _ => None,
+    });
+    let product = if normalized.contains("geocolor") {
+        Some("GeoColor".to_string())
+    } else if normalized.contains("sandwich") {
+        Some("Sandwich".to_string())
+    } else if normalized.contains("natural_color") || normalized.contains("true_color") {
+        Some("True Color".to_string())
+    } else if normalized.contains("visible") {
+        Some("Visible".to_string())
+    } else if let Some(band) = tokens.iter().find_map(|token| {
+        token
+            .strip_prefix("wv")
+            .and_then(|raw| raw.parse::<u8>().ok())
+    }) {
+        Some(format!("Water Vapor C{band:02}"))
+    } else if normalized.contains("water_vapor")
+        || tokens
+            .iter()
+            .any(|token| matches!(*token, "wv" | "watervapor"))
+    {
+        Some("Water Vapor".to_string())
+    } else if let Some(band) = tokens.iter().find_map(|token| {
+        token
+            .strip_prefix("ir")
+            .and_then(|raw| raw.parse::<u8>().ok())
+    }) {
+        Some(format!("IR C{band:02}"))
+    } else if tokens
+        .iter()
+        .any(|token| matches!(*token, "ir" | "infrared"))
+    {
+        Some("Infrared".to_string())
+    } else if tokens.iter().any(|token| *token == "pw") {
+        Some("Precipitable Water".to_string())
+    } else if tokens.iter().any(|token| *token == "ctt") {
+        Some("Cloud-top Temperature".to_string())
+    } else if tokens.iter().any(|token| *token == "cod") {
+        Some("Cloud Optical Depth".to_string())
+    } else if let Some(band) = tokens.iter().find_map(|token| {
+        token
+            .strip_prefix('c')
+            .filter(|raw| raw.len() <= 2)
+            .and_then(|raw| raw.parse::<u8>().ok())
+    }) {
+        Some(format!("C{band:02}"))
+    } else if normalized.contains("derived") {
+        Some("Derived".to_string())
+    } else if normalized.contains("_rgb_") || normalized.starts_with("rgb_") {
+        Some("RGB".to_string())
+    } else {
+        None
+    };
+    let view = if tokens
+        .iter()
+        .any(|token| matches!(*token, "geo" | "geos" | "geostationary"))
+    {
+        Some("GEO")
+    } else if normalized.contains("top_down")
+        || tokens
+            .iter()
+            .any(|token| matches!(*token, "topdown" | "map"))
+    {
+        Some("TOP-DOWN")
+    } else if tokens.iter().any(|token| *token == "perspective") {
+        Some("PERSPECTIVE")
+    } else {
+        None
+    };
+    let day = run_day(run).map(|day| day.format("%Y-%m-%d").to_string());
+
+    let mut parts = vec!["SimSat".to_string()];
+    if let Some(source) = source {
+        parts.push(source.to_string());
+    }
+    if let Some(product) = product {
+        parts.push(product);
+    }
+    if let Some(view) = view {
+        parts.push(view.to_string());
+    }
+    if let Some(day) = day {
+        parts.push(day);
+    }
+    if parts.len() == 1 {
+        parts.push(run.replace('_', " "));
+    }
+    parts.join(" · ")
+}
+
 /// Enumerate the sat store into player-ready run listings, newest run
 /// first.
 fn scan_runs(store_root: &Path) -> Vec<SatRunListing> {
@@ -903,14 +1023,14 @@ struct WorkerState {
     grids: HashMap<(String, String), GridInfo>,
     /// User-selected IR enhancement, applied at frame-coloring time.
     ir_enhancement: IrEnhancement,
-    /// The most recently served MAP grid, content-addressed by
+    /// The most recently served MAP/native-plot grid, content-addressed by
     /// `GridFile.hash` (sha256 of the grid file bytes). Map playback
     /// requests a frame per step, and a full-disk `grid.rwg` is a ~240 MB
     /// read + hash per open — but every frame of a run, and successive
     /// runs of the same product, reference bit-identical grids, so one
-    /// held `Arc` serves them all (the UI layer shares the same `Arc`, so
-    /// steady-state memory is unchanged). Populated only by the map path;
-    /// player-only sessions never pay for it.
+    /// held `Arc` serves them all (the UI layers share the same `Arc`, so
+    /// steady-state memory is unchanged). Player-only sessions never pay for
+    /// it.
     map_grid: Option<Arc<GridFile>>,
 }
 
@@ -943,15 +1063,14 @@ fn load_frame_for_map(
         .get(&(key.model.clone(), key.run.clone()))
         .ok_or_else(|| format!("{key}: run grid facts missing after frame load"))?;
     let flip_rows = info.flip_rows;
-    let grid = match state.map_grid.as_ref() {
-        Some(cached) if cached.hash == info.hash => Arc::clone(cached),
-        _ => {
-            let opened =
-                Arc::new(GridFile::open(&run_dir.join("grid.rwg")).map_err(|err| err.to_string())?);
-            state.map_grid = Some(Arc::clone(&opened));
-            opened
-        }
-    };
+    let hash = info.hash.clone();
+    let grid = load_frame_grid(
+        state,
+        &run_dir,
+        &hash,
+        colored.frame.image.size[0],
+        colored.frame.image.size[1],
+    )?;
     Ok(SatMapFrame {
         key: key.clone(),
         hhmm,
@@ -959,6 +1078,154 @@ fn load_frame_for_map(
         grid,
         flip_rows,
     })
+}
+
+/// Open/reuse the full geolocation grid for a map or native-plot frame.
+/// The frame hash is authoritative; a stale/mismatched run grid is an error,
+/// never a reason to project values against the wrong coordinates.
+fn load_frame_grid(
+    state: &mut WorkerState,
+    run_dir: &Path,
+    expected_hash: &str,
+    nx: usize,
+    ny: usize,
+) -> Result<Arc<GridFile>, String> {
+    if let Some(cached) = state
+        .map_grid
+        .as_ref()
+        .filter(|grid| grid.hash == expected_hash && grid.nx == nx && grid.ny == ny)
+    {
+        return Ok(Arc::clone(cached));
+    }
+    let opened =
+        Arc::new(GridFile::open(&run_dir.join("grid.rwg")).map_err(|error| error.to_string())?);
+    if opened.hash != expected_hash {
+        return Err(format!(
+            "frame grid hash {expected_hash} does not match run grid {}",
+            opened.hash
+        ));
+    }
+    if opened.nx != nx || opened.ny != ny {
+        return Err(format!(
+            "run grid {}x{} does not match frame {nx}x{ny}",
+            opened.nx, opened.ny
+        ));
+    }
+    state.map_grid = Some(Arc::clone(&opened));
+    Ok(opened)
+}
+
+/// Read one stored frame as native-plot data. Scalar values and composite
+/// colors remain in STORAGE row order; unlike the player path, no north-up
+/// row flip occurs here because the renderer receives the matching grid mesh.
+fn load_frame_for_plot(
+    state: &mut WorkerState,
+    store_root: &Path,
+    key: &SatRunKey,
+    hhmm: u16,
+) -> Result<SatellitePlotSource, String> {
+    let run_dir = store_root.join(&key.model).join(&key.run);
+    let reader = HourReader::open(&run_dir.join(frame_file_name(hhmm)))
+        .map_err(|error| error.to_string())?;
+    let meta = reader.meta();
+    let (nx, ny) = (meta.nx, meta.ny);
+    let grid = load_frame_grid(state, &run_dir, &meta.grid_hash, nx, ny)?;
+    let title = format!("{} · {hhmm:04}Z", run_title(&key.model, &key.run));
+    let subtitle_left = format!("{}/{}", key.model, key.run);
+    let subtitle_right = format!("{} · {hhmm:04}Z", key.model.to_ascii_uppercase());
+
+    if meta
+        .variables
+        .iter()
+        .any(|variable| variable.name == COMPOSITE_R_VAR)
+    {
+        let r = reader
+            .read_full_2d(COMPOSITE_R_VAR)
+            .map_err(|error| error.to_string())?;
+        let g = reader
+            .read_full_2d(COMPOSITE_G_VAR)
+            .map_err(|error| error.to_string())?;
+        let b = reader
+            .read_full_2d(COMPOSITE_B_VAR)
+            .map_err(|error| error.to_string())?;
+        let expected = nx
+            .checked_mul(ny)
+            .ok_or_else(|| format!("satellite frame {nx}x{ny} overflows cell count"))?;
+        if r.len() != expected || g.len() != expected || b.len() != expected {
+            return Err(format!(
+                "{key}/t{hhmm:04}: RGB planes do not match {nx}x{ny} frame"
+            ));
+        }
+        let pixels = r
+            .into_iter()
+            .zip(g)
+            .zip(b)
+            .map(|((r, g), b)| {
+                if r.is_finite() && g.is_finite() && b.is_finite() {
+                    rustwx_render::Color::rgba(
+                        r.round().clamp(0.0, 255.0) as u8,
+                        g.round().clamp(0.0, 255.0) as u8,
+                        b.round().clamp(0.0, 255.0) as u8,
+                        255,
+                    )
+                } else {
+                    rustwx_render::Color::TRANSPARENT
+                }
+            })
+            .collect();
+        return SatellitePlotSource::rgba_from_store(
+            title,
+            subtitle_left,
+            subtitle_right,
+            pixels,
+            grid,
+        );
+    }
+
+    let variable = meta
+        .variables
+        .iter()
+        .find(|variable| variable.kind == "surface2d")
+        .cloned()
+        .ok_or_else(|| format!("{key}/t{hhmm:04} holds no 2D variable"))?;
+    let values = reader
+        .read_full_2d(&variable.name)
+        .map_err(|error| error.to_string())?;
+    let band = selector_band(&variable.selector, &variable.name);
+    let palette = band.and_then(|band| {
+        if variable.name.starts_with("ahi_bt_")
+            && (8..=16).contains(&band)
+            && legacy_pseudo_bt(&values)
+        {
+            finite_percentile_range(&values, 0.02, 0.98).map(|(lo, hi)| {
+                SatellitePlotPalette::from_remapped_satellite_anchors(
+                    lo,
+                    hi,
+                    DYN_COLD_K,
+                    DYN_WARM_K,
+                    ENHANCED_IR,
+                )
+            })
+        } else {
+            let anchors = if (7..=16).contains(&band) {
+                ir_enhancement_anchors(band, state.ir_enhancement)
+            } else {
+                band_anchors(band)
+            };
+            Some(SatellitePlotPalette::from_satellite_anchors(anchors))
+        }
+    });
+    SatellitePlotSource::scalar_from_store(
+        title,
+        subtitle_left,
+        subtitle_right,
+        variable.name,
+        variable.units,
+        variable.selector,
+        values,
+        grid,
+        palette,
+    )
 }
 
 /// Read one stored frame and color it with its band's production palette
@@ -4434,6 +4701,14 @@ fn worker_loop(
                     return;
                 }
             }
+            SatRequest::ScanAndSelect { key, hhmm } => {
+                if !send(SatResponse::Runs(scan_runs(&store_root))) {
+                    return;
+                }
+                if !send(SatResponse::SelectFrame { key, hhmm }) {
+                    return;
+                }
+            }
             SatRequest::LoadFrame { key, hhmm } => {
                 let result = load_frame(&mut state, &store_root, &key, hhmm);
                 let legacy = result
@@ -4452,6 +4727,16 @@ fn worker_loop(
             SatRequest::LoadFrameForMap { key, hhmm } => {
                 let result = load_frame_for_map(&mut state, &store_root, &key, hhmm);
                 if !send(SatResponse::MapFrame(Box::new(result))) {
+                    return;
+                }
+            }
+            SatRequest::LoadFrameForPlot { key, hhmm } => {
+                let result = load_frame_for_plot(&mut state, &store_root, &key, hhmm);
+                if !send(SatResponse::PlotFrame {
+                    key,
+                    hhmm,
+                    result: Box::new(result),
+                }) {
                     return;
                 }
             }
@@ -4926,6 +5211,131 @@ mod tests {
 
         let missing = load_frame(&mut state, &dir, &key, 1900);
         assert!(missing.is_err(), "absent frame surfaces an error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_plot_load_keeps_simsat_scalar_selector_and_storage_rows() {
+        let dir = test_dir("simsat-plot-scalar");
+        let model = "simsat";
+        let run = "hrrr_20260710_t20z_ir13_geo_c13_20260710";
+        let hhmm = 2100;
+        let run_dir = dir.join(model).join(run);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // Row zero is SOUTH: a player image would flip this, while native
+        // plot values must remain byte-for-byte parallel to this mesh.
+        let lat = vec![30.0, 30.0, 31.0, 31.0];
+        let lon = vec![-101.0, -100.0, -101.0, -100.0];
+        let grid = LatLonGrid {
+            shape: GridShape { nx: 2, ny: 2 },
+            lat_deg: lat.clone(),
+            lon_deg: lon.clone(),
+        };
+        let grid_hash = write_grid(&run_dir.join("grid.rwg"), &grid, None).unwrap();
+        let selector = serde_json::json!({
+            "satellite": {
+                "provider": "simsat",
+                "instrument": "synthetic-ir",
+                "product": "surface_bt",
+                "band": 13
+            }
+        });
+        let values = vec![290.0, 291.0, 210.0, f32::NAN];
+        let mut writer = HourWriter::new(model, run, hhmm, 2, 2, &grid_hash, "test");
+        writer
+            .add_surface2d("ahi_bt_c13", "K", selector.clone(), &values)
+            .unwrap();
+        writer.finish(&run_dir.join(frame_file_name(hhmm))).unwrap();
+
+        let key = SatRunKey {
+            model: model.to_string(),
+            run: run.to_string(),
+        };
+        let source = load_frame_for_plot(&mut WorkerState::default(), &dir, &key, hhmm)
+            .expect("SimSat scalar plot frame loads");
+        assert_eq!(source.grid.lat, lat);
+        assert_eq!(source.grid.lon, lon);
+        assert_eq!(source.grid.lat_descending(), Some(false));
+        assert!(source.title.contains("SimSat") && source.title.contains("2100Z"));
+        match &source.raster {
+            crate::sat_plot::SatellitePlotRaster::Scalar {
+                variable,
+                units,
+                selector: loaded_selector,
+                values: loaded_values,
+                palette,
+            } => {
+                assert_eq!(variable, "ahi_bt_c13");
+                assert_eq!(units, "K");
+                assert_eq!(loaded_selector, &selector);
+                assert_eq!(
+                    &loaded_values[..3],
+                    &values[..3],
+                    "raw storage rows were flipped"
+                );
+                assert!(loaded_values[3].is_nan());
+                assert!(palette.is_some(), "C13 selector resolves the IR palette");
+            }
+            other => panic!("expected scalar plot payload, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_plot_composite_keeps_rgb_storage_rows_and_nan_alpha() {
+        let dir = test_dir("simsat-plot-rgb");
+        let model = "simsat";
+        let run = "hrrr_20260710_t20z_geocolor_geo_rgb_goese_20260710";
+        let hhmm = 2100;
+        let run_dir = dir.join(model).join(run);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let grid = LatLonGrid {
+            shape: GridShape { nx: 2, ny: 2 },
+            lat_deg: vec![30.0, 30.0, 31.0, 31.0],
+            lon_deg: vec![-101.0, -100.0, -101.0, -100.0],
+        };
+        let grid_hash = write_grid(&run_dir.join("grid.rwg"), &grid, None).unwrap();
+        let mut writer = HourWriter::new(model, run, hhmm, 2, 2, &grid_hash, "test");
+        writer
+            .add_surface2d(
+                COMPOSITE_R_VAR,
+                "rgb8",
+                serde_json::json!({"satellite": {"provider": "simsat"}}),
+                &[255.0, 0.0, 0.0, f32::NAN],
+            )
+            .unwrap();
+        writer
+            .add_surface2d(
+                COMPOSITE_G_VAR,
+                "rgb8",
+                serde_json::Value::Null,
+                &[0.0, 255.0, 0.0, f32::NAN],
+            )
+            .unwrap();
+        writer
+            .add_surface2d(
+                COMPOSITE_B_VAR,
+                "rgb8",
+                serde_json::Value::Null,
+                &[0.0, 0.0, 255.0, f32::NAN],
+            )
+            .unwrap();
+        writer.finish(&run_dir.join(frame_file_name(hhmm))).unwrap();
+        let key = SatRunKey {
+            model: model.to_string(),
+            run: run.to_string(),
+        };
+        let source = load_frame_for_plot(&mut WorkerState::default(), &dir, &key, hhmm)
+            .expect("SimSat RGB plot frame loads");
+        match &source.raster {
+            crate::sat_plot::SatellitePlotRaster::Rgba { pixels } => {
+                assert_eq!(pixels[0], rustwx_render::Color::rgba(255, 0, 0, 255));
+                assert_eq!(pixels[1], rustwx_render::Color::rgba(0, 255, 0, 255));
+                assert_eq!(pixels[2], rustwx_render::Color::rgba(0, 0, 255, 255));
+                assert_eq!(pixels[3], rustwx_render::Color::TRANSPARENT);
+            }
+            other => panic!("expected RGB plot payload, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5414,6 +5824,29 @@ mod tests {
         // NaturalColor's title is GeoColor (daytime pseudo-true-color).
         let geo = run_title("g18", "fulldisk_rgb_geocolor_20260705");
         assert!(geo.contains("GeoColor"), "geocolor title: {geo}");
+    }
+
+    #[test]
+    fn simsat_run_titles_decode_source_product_and_view_tokens() {
+        let geo = run_title(
+            "simsat",
+            "hrrr_20260710_t20z_geocolor_geo_rgb_goese_20260710",
+        );
+        assert!(
+            geo.contains("SimSat")
+                && geo.contains("HRRR")
+                && geo.contains("GeoColor")
+                && geo.contains("GEO")
+                && geo.contains("2026-07-10"),
+            "{geo}"
+        );
+        let thermal = run_title("simsat", "wrfout_d03_wv08_topdown_c08_20250621");
+        assert!(
+            thermal.contains("WRF")
+                && thermal.contains("Water Vapor C08")
+                && thermal.contains("TOP-DOWN"),
+            "{thermal}"
+        );
     }
 
     #[test]
@@ -6005,6 +6438,46 @@ mod tests {
         {
             SatResponse::Runs(runs) => assert_eq!(runs.len(), 1),
             other => panic!("expected Runs, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_and_select_emits_runs_before_selection() {
+        let dir = test_dir("worker-scan-select");
+        let written = write_band_frame(&dir, &synthetic_field(8, 6, 18, 51, 13), 1).unwrap();
+        let key = SatRunKey {
+            model: written.model,
+            run: written.run,
+        };
+        let worker = SatWorker::spawn(dir.clone(), || {});
+        worker.send(SatRequest::ScanAndSelect {
+            key: key.clone(),
+            hhmm: written.hhmm,
+        });
+        assert!(
+            matches!(
+                worker
+                    .rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("scan responds first"),
+                SatResponse::Runs(_)
+            ),
+            "ScanAndSelect must publish the refreshed listing first"
+        );
+        match worker
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("selection responds second")
+        {
+            SatResponse::SelectFrame {
+                key: selected,
+                hhmm,
+            } => {
+                assert_eq!(selected, key);
+                assert_eq!(hhmm, written.hhmm);
+            }
+            other => panic!("expected SelectFrame second, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

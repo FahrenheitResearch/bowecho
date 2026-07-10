@@ -14,6 +14,15 @@ use rw_ui::{
 };
 use std::path::PathBuf;
 
+use crate::sat_plot::{SatellitePlotPanel, SatellitePlotSource};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NativePlotContent {
+    #[default]
+    Model,
+    Satellite,
+}
+
 /// Background loader for the synthesized per-level isobaric map fields
 /// (the rw-ui worker cannot read `pressure3d` planes). Crate-visible: the
 /// batch plotter (`crate::batch_plots`) reuses `load_level_field` for its
@@ -511,6 +520,10 @@ pub struct ModelDataDock {
     /// the radar map via the 📐 arm button / Ctrl+Shift+drag). Shown as a
     /// floating window when `show_plot_viewer` is set.
     plot_viewer: PlotViewerPanel,
+    /// External real-satellite/SimSat source mounted in the SAME native-plot
+    /// window without changing `browser`, `viewer`, or `latest_field`.
+    satellite_plot: SatellitePlotPanel,
+    native_plot_content: NativePlotContent,
     show_plot_viewer: bool,
     /// v0.30 RC4: the (model, run) whose NATIVE domain extent was last
     /// seeded as the plot viewer's active domain (see
@@ -610,6 +623,8 @@ impl ModelDataDock {
             latest_sounding: None,
             map_request: None,
             plot_viewer: PlotViewerPanel::new(),
+            satellite_plot: SatellitePlotPanel::default(),
+            native_plot_content: NativePlotContent::Model,
             show_plot_viewer: false,
             native_plot_seeded_run: None,
             plot_domain_armed: false,
@@ -848,8 +863,42 @@ impl ModelDataDock {
     /// `DomainSelected` path in [`Self::ui`].
     pub fn apply_map_plot_domain(&mut self, domain: CustomDomain) {
         self.plot_domain_armed = false;
+        self.native_plot_content = NativePlotContent::Model;
         self.show_plot_viewer = true;
         self.plot_viewer.set_active_domain(domain);
+    }
+
+    /// Open a raw real-satellite or SimSat product in the shared native plot
+    /// window. Model browser/field state is intentionally untouched, so the
+    /// user's current model selection is exactly where they left it when they
+    /// return to the model plot.
+    pub(crate) fn open_satellite_plot(&mut self, source: SatellitePlotSource) {
+        self.satellite_plot.set_source(source);
+        self.native_plot_content = NativePlotContent::Satellite;
+        self.show_plot_viewer = true;
+    }
+
+    /// Clear the external source and return the native surface to the current
+    /// model field (when one exists). This does not clear/reselect model data.
+    #[allow(dead_code)] // lifecycle hook for future SimSat result-cache clearing
+    pub(crate) fn clear_satellite_plot(&mut self) {
+        self.satellite_plot.clear_source();
+        if self.native_plot_content == NativePlotContent::Satellite {
+            self.native_plot_content = NativePlotContent::Model;
+            self.show_plot_viewer = self.latest_field.is_some();
+        }
+    }
+
+    /// Non-dialog test hook. The panel's Save PNG button calls the same
+    /// request builder in production.
+    #[cfg(test)]
+    pub(crate) fn save_satellite_plot_png(
+        &self,
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        self.satellite_plot.save_png(path, width, height)
     }
 
     /// v0.30 RC4 fix — seed the run's NATIVE extent as the plot viewer's
@@ -2514,14 +2563,22 @@ impl ModelDataDock {
                     {
                         self.map_request = self.latest_field.clone();
                     }
-                    ui.toggle_value(&mut self.show_plot_viewer, "🗺 Native plot")
+                    let mut model_plot_open = self.show_plot_viewer
+                        && self.native_plot_content == NativePlotContent::Model;
+                    if ui
+                        .toggle_value(&mut model_plot_open, "🗺 Native plot")
                         .on_hover_text(
                             "Render the selected field through rusty-weather's native plot \
                              pipeline. Shift-drag a box on the field viewer to plot a custom \
                              domain; drag a selection corner to rotate. To draw the box on \
                              the radar map instead, arm 📐 Draw plot box (or Ctrl+Shift+drag \
                              the map).",
-                        );
+                        )
+                        .changed()
+                    {
+                        self.native_plot_content = NativePlotContent::Model;
+                        self.show_plot_viewer = model_plot_open;
+                    }
                     // v0.29.3 gesture-collision fix: Shift-drag on the MAP is
                     // contested (loupe, inspector pin, Shift+right-drag 3D
                     // box), so map-side domain drawing gets an explicit arm.
@@ -2563,10 +2620,12 @@ impl ModelDataDock {
                 // viewer to select an arbitrary plot domain, or drag a corner
                 // to rotate it. Open the native plot viewer and retarget it.
                 Some(FieldViewerEvent::DomainSelected(domain)) => {
+                    self.native_plot_content = NativePlotContent::Model;
                     self.show_plot_viewer = true;
                     self.plot_viewer.set_active_domain(domain);
                 }
                 Some(FieldViewerEvent::DomainRotationChanged { rotation_deg }) => {
+                    self.native_plot_content = NativePlotContent::Model;
                     self.show_plot_viewer = true;
                     self.plot_viewer.set_active_domain_rotation(rotation_deg);
                 }
@@ -2580,16 +2639,22 @@ impl ModelDataDock {
         // pipeline styles by store variable, and the viewer's copy may carry
         // a display label).
         if self.show_plot_viewer {
-            // Cloned out as an owned Arc (cheap) so the RC4 domain seed
-            // below can borrow `self` mutably before the window closure.
-            let field: Option<std::sync::Arc<rw_ui::FieldData>> = store_named_current_field(
-                &self.viewer,
-                self.latest_field.as_deref(),
-                &self.hour_store_vars,
-            )
-            .is_some()
-            .then(|| self.latest_field.clone())
-            .flatten();
+            let model_plot = self.native_plot_content == NativePlotContent::Model;
+            // Cloned out as an owned Arc (cheap) so the RC4 domain seed below
+            // can borrow `self` mutably before the window closure. Satellite
+            // content never changes this model twin or its selection.
+            let field: Option<std::sync::Arc<rw_ui::FieldData>> = model_plot
+                .then(|| {
+                    store_named_current_field(
+                        &self.viewer,
+                        self.latest_field.as_deref(),
+                        &self.hour_store_vars,
+                    )
+                    .is_some()
+                    .then(|| self.latest_field.clone())
+                    .flatten()
+                })
+                .flatten();
             if let Some(field) = &field {
                 self.seed_native_plot_domain(field);
             }
@@ -2598,7 +2663,11 @@ impl ModelDataDock {
                 .open(&mut open)
                 .default_size([560.0, 440.0])
                 .show(ui.ctx(), |ui| {
-                    self.plot_viewer.ui(ui, field.as_deref());
+                    if model_plot {
+                        self.plot_viewer.ui(ui, field.as_deref());
+                    } else {
+                        self.satellite_plot.ui(ui);
+                    }
                 });
             if !open {
                 self.show_plot_viewer = false;
@@ -3451,6 +3520,59 @@ mod tests {
             }],
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn satellite_plot_routes_without_changing_current_model_field() {
+        let ctx = egui::Context::default();
+        let mut dock =
+            ModelDataDock::new_for_test(&ctx, tree_with_runs("wrf", &[("20260707_00z", &[0])]));
+        let model_field = std::sync::Arc::new(override_test_field("temperature_2m"));
+        dock.latest_field = Some(std::sync::Arc::clone(&model_field));
+        let source = SatellitePlotSource::scalar_from_mesh(
+            "SimSat precipitable water",
+            "HRRR 20260710 20Z",
+            "f001",
+            "mm",
+            2,
+            2,
+            vec![20.0, 21.0, 30.0, 31.0],
+            vec![30.0, 30.0, 31.0, 31.0],
+            vec![-101.0, -100.0, -101.0, -100.0],
+            None,
+        )
+        .unwrap();
+        dock.open_satellite_plot(source);
+
+        assert_eq!(dock.native_plot_content, NativePlotContent::Satellite);
+        assert!(dock.show_plot_viewer);
+        assert!(dock.satellite_plot.source().is_some());
+        assert!(
+            std::sync::Arc::ptr_eq(dock.latest_field.as_ref().unwrap(), &model_field),
+            "opening an external plot must preserve the selected model field"
+        );
+
+        let out = std::env::temp_dir().join(format!(
+            "bowecho-satellite-native-plot-{}.png",
+            std::process::id()
+        ));
+        dock.save_satellite_plot_png(&out, 320, 240).unwrap();
+        assert!(out.is_file(), "Save PNG writes the requested path");
+        let image = image::open(&out).unwrap();
+        assert_eq!((image.width(), image.height()), (320, 240));
+        let _ = std::fs::remove_file(out);
+
+        dock.clear_satellite_plot();
+        assert_eq!(dock.native_plot_content, NativePlotContent::Model);
+        assert!(
+            dock.show_plot_viewer,
+            "the preserved model field takes over"
+        );
+        assert!(dock.satellite_plot.source().is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            dock.latest_field.as_ref().unwrap(),
+            &model_field
+        ));
     }
 
     #[test]

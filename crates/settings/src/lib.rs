@@ -1426,6 +1426,24 @@ pub fn gdex_cache_dir() -> PathBuf {
     bowecho_dir("gdex")
 }
 
+/// SimSat's renderer-owned cache (SSB bricks and other reusable products).
+///
+/// Keep this separate from the input GRIB directory: renderer caches may be
+/// discarded and rebuilt, while downloaded or user-supplied model inputs are
+/// durable source data.
+pub fn simsat_cache_dir() -> PathBuf {
+    bowecho_dir("simsat-cache")
+}
+
+/// BowEcho-owned source-model inputs offered to the embedded SimSat window.
+///
+/// Automatic HRRR native-grid downloads use a human-readable
+/// `hrrr.YYYYMMDD/conus/` hierarchy below this directory. Users may also copy
+/// compatible WRF or HRRR files here for discovery by the SimSat picker.
+pub fn simsat_input_dir() -> PathBuf {
+    bowecho_dir("simsat-input")
+}
+
 /// Crash log destination (config dir; None when no config dir resolves).
 pub fn panic_log_path() -> Option<PathBuf> {
     bowecho_config_dir().map(|root| {

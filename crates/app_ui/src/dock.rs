@@ -1,6 +1,6 @@
 //! Dockable workspace: the egui_tiles tile tree that hosts the radar map
 //! pane plus any DOCKED viewer panes (Sounding / Radar overlays / WoFS /
-//! FARM / Satellite / Model / Unified Player / 3D). Crate evaluation + integration design:
+//! FARM / Satellite / SimSat / Model / Unified Player / 3D). Crate evaluation + integration design:
 //! docs/docking-spike.md.
 //!
 //! Division of labor:
@@ -59,6 +59,7 @@ pub enum WorkspacePane {
     Wofs,
     Farm,
     Satellite,
+    Simsat,
     Model,
     UnifiedPlayer,
     Vol3d,
@@ -66,12 +67,13 @@ pub enum WorkspacePane {
 
 impl WorkspacePane {
     /// Every dockable viewer (everything but the map anchor).
-    pub const VIEWERS: [Self; 8] = [
+    pub const VIEWERS: [Self; 9] = [
         Self::Sounding,
         Self::RadarOverlays,
         Self::Wofs,
         Self::Farm,
         Self::Satellite,
+        Self::Simsat,
         Self::Model,
         Self::UnifiedPlayer,
         Self::Vol3d,
@@ -86,6 +88,7 @@ impl WorkspacePane {
             Self::Wofs => "WoFS",
             Self::Farm => "FARM",
             Self::Satellite => "Satellite",
+            Self::Simsat => "SimSat",
             Self::Model => "Model",
             Self::UnifiedPlayer => "Player",
             Self::Vol3d => "3D Volume",
@@ -516,7 +519,9 @@ mod tests {
     #[test]
     fn radar_overlays_is_a_first_class_viewer_pane() {
         assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::RadarOverlays));
+        assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::Simsat));
         assert_eq!(WorkspacePane::RadarOverlays.tab_title(), "Radar overlays");
+        assert_eq!(WorkspacePane::Simsat.tab_title(), "SimSat");
     }
 
     #[test]

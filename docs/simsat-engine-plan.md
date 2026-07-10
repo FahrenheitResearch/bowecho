@@ -153,7 +153,7 @@ Dependency-ordered; every gate = fmt/clippy/test on nodes + a real-data proof re
 4. **Blue Marble: full-year 2 km pack (~500 MB) is the default download**; lazy per-month remains as the low-bandwidth option; 500 m regional crop packs greenlit as follow-on. GitHub release-asset hosting accepted.
 5. **Spherical earth accepted** — the standard is physical plausibility, not pixel registration with real ABI imagery.
 6. **QVAPOR gets a full brick channel now** so a 6.2 µm water-vapor IR band is a shader-only addition later.
-7. **Standalone tool (2026-07-07 addendum):** SimSat ships as its own app (`simsat_studio`), not a BowEcho pane; the sat-store output format is the only bridge to BowEcho in v1.
+7. **Standalone + BowEcho (updated 2026-07-10):** SimSat still ships as its own app (`simsat_studio`). The original output-only BowEcho bridge shipped in v0.1.2; the owner subsequently approved direct engine integration as a BowEcho SimSat pane, while retaining the same sat-store contract as the playback/map boundary.
 8. **iGPU hardware floor (2026-07-07 addendum):** must run well on Intel Arrow Lake Xe (Core Ultra 270K-class) and AMD RDNA2 iGPU (Ryzen 9950X-class): prerender-then-play is the primary iGPU mode, stored-frame quality is never reduced, preview adapts. Discrete GPUs are the fast path.
 
 ---
