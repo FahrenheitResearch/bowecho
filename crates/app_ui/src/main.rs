@@ -22139,7 +22139,7 @@ impl ViewerApp {
         // keeps a one-line link-row so the count stays visible from ops.
         let layer_count = self.rail_layer_count();
         if ui
-            .link(format!("Custom: {layer_count} layers →"))
+            .link(format!("Custom: {layer_count} layers >"))
             .on_hover_text(
                 "Open the Custom tab: map layers, added overlays, analysis overlays, and appearance/color tables",
             )
@@ -22526,7 +22526,7 @@ impl ViewerApp {
                 }
                 if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
                     && ui
-                        .small_button("←tracks")
+                        .small_button("<-tracks")
                         .on_hover_text(format!(
                             "Set storm motion from the mean track motion ({direction:03.0}° / {speed_kt:.0} kt)"
                         ))
@@ -22807,7 +22807,7 @@ impl ViewerApp {
             }
             if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
                 && ui
-                    .small_button("SRV←tracks")
+                    .small_button("SRV<-tracks")
                     .on_hover_text(format!(
                         "Set storm motion from the mean track motion ({direction:03.0}° / {speed_kt:.0} kt)"
                     ))
@@ -23700,7 +23700,7 @@ impl ViewerApp {
                     // Live preview drives the FAMILY slot; a per-product
                     // binding outranks it for this product, so say so.
                     self.append_table_editor_status(format!(
-                        "{product_label} keeps its per-product binding while previewing — remove it (✕) to see the draft on this product"
+                        "{product_label} keeps its per-product binding while previewing — remove it (×) to see the draft on this product"
                     ));
                 }
             }
@@ -23717,7 +23717,7 @@ impl ViewerApp {
             ui.horizontal(|ui| {
                 ui.weak(format!("{product_label} ⇒ {override_name}"));
                 if ui
-                    .small_button("✕")
+                    .small_button("×")
                     .on_hover_text("Remove this product's table binding (back to the family table)")
                     .clicked()
                 {
@@ -24079,7 +24079,7 @@ impl ViewerApp {
                         edit_table = Some(table.clone());
                     }
                     if ui
-                        .small_button("✕")
+                        .small_button("×")
                         .on_hover_text(format!(
                             "Delete {}.pal from My tables (no undo)",
                             table.name()
@@ -25455,7 +25455,7 @@ impl ViewerApp {
                     .small_button("Dock ⊞")
                     .on_hover_text(
                         "Snap this viewer into the workspace as a tile next to the map. \
-                         Drag its tab to rearrange or split; the tab's ✕ floats it back out.",
+                         Drag its tab to rearrange or split; the tab's × floats it back out.",
                     )
                     .clicked()
                 {
@@ -25491,7 +25491,7 @@ impl ViewerApp {
                 // a single honest Close instead of the Float/Hide pair.
                 if pane == dock::WorkspacePane::Sounding {
                     if ui
-                        .small_button("Close ✕")
+                        .small_button("Close ×")
                         .on_hover_text(
                             "Close the sounding — Alt-click the map (with model data) to relaunch",
                         )
@@ -29075,7 +29075,7 @@ impl ViewerApp {
                         }
                         if fetching {
                             ui.spinner();
-                            if ui.small_button("✕").on_hover_text("Cancel ingest").clicked()
+                            if ui.small_button("×").on_hover_text("Cancel ingest").clicked()
                                 && let Some(cancel) = &self.model_ingest_cancel
                             {
                                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -29946,7 +29946,7 @@ impl ViewerApp {
                 let span = max_abs.clamp(1.0, 8.0);
                 delta_field.range = Some((-span, span));
                 let summary = format!(
-                    "OA: {} obs ({} rejected), fit {:.2}→{:.2}, {} iters",
+                    "OA: {} obs ({} rejected), fit {:.2}->{:.2}, {} iters",
                     analysis.obs_used,
                     analysis.obs_rejected,
                     analysis.rms_before,
@@ -32386,7 +32386,7 @@ impl ViewerApp {
                                 }
                             });
                     }
-                    ui.menu_button("Overlays ▾", |ui| {
+                    ui.menu_button("Overlays ⏷", |ui| {
                         let overlay_slugs: Vec<String> = catalog
                             .times
                             .keys()
@@ -32446,7 +32446,7 @@ impl ViewerApp {
                         );
                     if self.wofs.sync_to_radar {
                         ui.weak(format!(
-                            "→ {}z + {} min",
+                            "-> {}z + {} min",
                             self.wofs.init, self.wofs.minute
                         ));
                     }
@@ -35571,7 +35571,7 @@ impl ViewerApp {
         painter.text(
             egui::pos2(plot.center().x, rect.bottom() - 2.0),
             egui::Align2::CENTER_BOTTOM,
-            "distance along section (km) — A → B",
+            "distance along section (km) — A to B",
             font,
             label,
         );
@@ -38189,14 +38189,14 @@ fn layer_row(
                 ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
                 if let Some(LayerRowOrder { delta }) = order {
                     if ui
-                        .small_button("↑")
+                        .small_button("⏶")
                         .on_hover_text("Draw later (higher)")
                         .clicked()
                     {
                         *delta = 1;
                     }
                     if ui
-                        .small_button("↓")
+                        .small_button("⏷")
                         .on_hover_text("Draw earlier (lower)")
                         .clicked()
                     {
@@ -38268,7 +38268,7 @@ fn layer_row(
         }
         match remove {
             Some(LayerRowRemove { hover, clicked }) => {
-                if ui.small_button("✕").on_hover_text(hover).clicked() {
+                if ui.small_button("×").on_hover_text(hover).clicked() {
                     *clicked = true;
                 }
             }
@@ -61212,7 +61212,7 @@ mod tests {
         texture.save(out.join("keax_texture.png")).unwrap();
         disk.save(out.join("keax_loupe_disk.png")).unwrap();
         eprintln!(
-            "KEAX {} tilt {:.2}° cursor=({:.0},{:.0}) → {} @ {:.1} km {:03.0}° | REF {}{} | {} | disk texels={} | PNGs in {}",
+            "KEAX {} tilt {:.2}° cursor=({:.0},{:.0}) -> {} @ {:.1} km {:03.0}° | REF {}{} | {} | disk texels={} | PNGs in {}",
             volume.site.id,
             cut.elevation_deg,
             focus.x,
@@ -61375,7 +61375,7 @@ mod tests {
         texture.save(out.join("hrrr_texture.png")).unwrap();
         disk.save(out.join("hrrr_loupe_disk.png")).unwrap();
         eprintln!(
-            "HRRR {}/{} f{:03} var={} [{}] cursor=({:.0},{:.0}) → {} | {} {:.1} {} | {} | disk texels={} | PNGs in {}",
+            "HRRR {}/{} f{:03} var={} [{}] cursor=({:.0},{:.0}) -> {} | {} {:.1} {} | {} | disk texels={} | PNGs in {}",
             model.model,
             run.run,
             hour,

@@ -700,7 +700,7 @@ impl ViewerApp {
                 }
             });
             #[cfg(not(any(windows, target_os = "macos")))]
-            ui.weak("Native file dialogs need Windows/macOS — use RADAR ▸ SITE on Linux.");
+            ui.weak("Native file dialogs need Windows/macOS — use RADAR > SITE on Linux.");
         });
     }
 
@@ -789,7 +789,7 @@ impl ViewerApp {
                     note.as_str(),
                     "A velocity palette's declared Units: header (kt, mph, km/h, m/s) drives the \
                      velocity readout, colorbar ticks, and unit chip — GR2Analyst semantics. Pick or \
-                     edit the table under Map ▸ Color tables to change it.",
+                     edit the table under Map > Color tables to change it.",
                 ],
             );
         }
@@ -945,7 +945,7 @@ impl ViewerApp {
                     )
                     .on_hover_text(
                         "Show the floating storm-cards window listing each active storm's vitals. \
-                         The map overlay stays on either way; the window's [✕] unchecks this.",
+                         The map overlay stays on either way; the window's [×] unchecks this.",
                     )
                     .changed()
                 {
@@ -1154,12 +1154,12 @@ impl ViewerApp {
     /// Hotkey reference (Settings ▸ Hotkeys).
     fn hotkeys_section(&mut self, ui: &mut egui::Ui) {
         ui.weak("PgUp/PgDn frames - Space play");
-        ui.weak("←/→ product · ↑/↓ tilt (focused pane)");
+        ui.weak("Left/Right product · Up/Down tilt (focused pane)");
         let mut bindings: Vec<(&String, &String)> =
             self.app_settings.product_hotkeys.iter().collect();
         bindings.sort_by_key(|(key, _)| product_hotkey_sort_key(key));
         for (key, label) in bindings {
-            ui.monospace(format!("{key}  →  {label}"));
+            ui.monospace(format!("{key}  ->  {label}"));
         }
         if let Some(path) = settings::AppSettings::config_path() {
             ui.weak(format!("customize in {}", path.display()));
@@ -1475,7 +1475,7 @@ impl ViewerApp {
                 .changed();
             let resolved = settings::sanitize_namespace(&edited.storage_namespace)
                 .unwrap_or_else(|| settings::DEFAULT_STORAGE_NAMESPACE.to_owned());
-            ui.weak(format!("→ {resolved}"));
+            ui.weak(format!("-> {resolved}"));
         });
         ui.weak(
             "No existing %APPDATA%/bowecho data is moved or deleted. Import storage copies a selected tree, skips symlinks, and never overwrites destination files.",

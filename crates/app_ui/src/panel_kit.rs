@@ -522,7 +522,7 @@ mod tests {
         // width − name column − dot slot − right cluster − 3 gaps. At the
         // 300 pt panel minimum inside a section indent the post-checkbox
         // width is ≈ 250 pt, and the middle zone must still hold a rail
-        // row's largest inline-extras set (model rows' ↑/↓ ≈ 35 pt,
+        // row's largest inline-extras set (model rows' ⏶/⏷ ≈ 35 pt,
         // placefiles' T + ↻ ≈ 39 pt at 320) — everything wider lives
         // behind ⚙.
         let slider = 56.0;

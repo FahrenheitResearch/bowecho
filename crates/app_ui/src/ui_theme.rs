@@ -6,7 +6,10 @@
 //! - every button/row/slider is `ROW_H` tall — no exceptions;
 //! - layer rows and the tab bar pack at `ROW_SPACING_X`;
 //! - glyph-only buttons are allowed exactly for the universal set already
-//!   in use (↑ ↓ ✕ ⚙ ↻ ◀ ▶ ⏸ ◉) and each MUST carry `on_hover_text`;
+//!   in use (⏶ ⏷ × ⚙ ↻ ◀ ▶ ⏴ ⏵ ⏸ ⏺ ○) and each MUST carry `on_hover_text`.
+//!   Every glyph in the set is COVERED by the default font chain — gated by
+//!   `fonts::tests::glyph_button_vocabulary_is_covered`. The pre-theme set
+//!   used ✕ ◉ ↑ ↓ ▾ ▼ ▸, all of which rendered as replacement boxes;
 //! - `LIVE_COLOR` marks live chips/dots only — never decoration;
 //! - layer-row name width is ONE flexible column shared by every row
 //!   (`panel_kit::rail_name_width`); never invent per-row widths.

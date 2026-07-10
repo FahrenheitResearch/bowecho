@@ -402,7 +402,7 @@ pub(crate) const TOOLS: &[ToolDescriptor] = &[
         id: "range_circle",
         label: "Range Circle",
         hint: "Drag outward from the center; the label reads the radius in your \
-               Settings ▸ Display units.",
+               Settings > Display units.",
         group: ToolGroup::Lines,
         tool: ToolKind::RangeCircle,
     },
@@ -715,8 +715,8 @@ impl ViewerApp {
             for group in ToolGroup::ALL {
                 let current = active.map(descriptor).filter(|d| d.group == group);
                 let title = match current {
-                    Some(d) => format!("{}: {} ▾", group.label(), d.label),
-                    None => format!("{} ▾", group.label()),
+                    Some(d) => format!("{}: {} ⏷", group.label(), d.label),
+                    None => format!("{} ⏷", group.label()),
                 };
                 ui.menu_button(title, |ui| {
                     ui.set_min_width(170.0);
@@ -847,7 +847,7 @@ impl ViewerApp {
                     }
                     if self.annotations.color_overrides.contains_key(id)
                         && ui
-                            .small_button("↺")
+                            .small_button("↻")
                             .on_hover_text("Reset to the tool's default color")
                             .clicked()
                     {
@@ -884,7 +884,7 @@ impl ViewerApp {
                         )
                     });
                     if ui
-                        .add_enabled(has_target, egui::Button::new("→ last"))
+                        .add_enabled(has_target, egui::Button::new("To last"))
                         .on_hover_text(
                             "Rewrite the text of the most recent text / watch / \
                              warning shape (empty restores the preset wording)",
@@ -916,7 +916,7 @@ impl ViewerApp {
                 self.annotations.draft = None;
             }
 
-            ui.menu_button("Save ▾", |ui| {
+            ui.menu_button("Save ⏷", |ui| {
                 ui.set_min_width(220.0);
                 ui.label("Save annotation set (geo-anchored JSON):");
                 ui.text_edit_singleline(&mut self.annotations.save_name);
@@ -941,7 +941,7 @@ impl ViewerApp {
                     ui.weak("Nothing to save yet");
                 }
             });
-            ui.menu_button("Load ▾", |ui| {
+            ui.menu_button("Load ⏷", |ui| {
                 ui.set_min_width(220.0);
                 let dir = settings::annotations_dir();
                 let names = persist::list_saved(&dir);

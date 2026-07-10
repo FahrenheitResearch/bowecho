@@ -357,7 +357,7 @@ pub fn format_time_hint(
         let low = hour_count as f64 * 1.5;
         let high = hour_count as f64 * 4.0;
         format!(
-            "{download} · ⚠ HEAVY: full ECAPE pins EVERY core at ~100% for ≈{low:.0}–{high:.0} min (fast desktop → laptop). Other profiles barely load the machine."
+            "{download} · ⚠ HEAVY: full ECAPE pins EVERY core at ~100% for ≈{low:.0}–{high:.0} min (fast desktop -> laptop). Other profiles barely load the machine."
         )
     } else {
         let est = (hour_count as f64 * 0.5).max(0.5);

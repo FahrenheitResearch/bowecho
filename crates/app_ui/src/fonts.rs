@@ -58,25 +58,38 @@ mod tests {
         let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
     }
 
-    /// TEMPORARY probe (theme pass): print which glyph-vocabulary
-    /// candidates the default proportional chain covers. Removed once the
-    /// covered vocabulary is locked in a guard test.
+    /// The chrome's glyph-button vocabulary (ui_theme.rs module doc) must
+    /// be COVERED by the default font chain — an uncovered char lays out as
+    /// a replacement box. The theme pass found ✕ ◉ ↑ ↓ ▾ ▼ ▸ (the previous
+    /// vocabulary) all uncovered and swapped them for the covered set
+    /// below; this guard keeps the vocabulary honest from here on.
     #[test]
-    fn glyph_coverage_probe() {
+    fn glyph_button_vocabulary_is_covered() {
         let ctx = egui::Context::default();
         install_cjk_fallback(&ctx);
         let font_id = egui::FontId::proportional(14.0);
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.ctx().fonts_mut(|fonts| {
+                // The shipped vocabulary: close ×, gear ⚙, refresh/reset ↻,
+                // transport ◀ ▶ ⏴ ⏵ ⏸, reorder/disclosure ⏶ ⏷, dots ⏺ ○,
+                // separator ·.
                 for ch in [
-                    '✕', '◉', '▾', '↑', '↓', '↻', '◀', '▶', '⏸', '⚙', '●', '×', '✖', '✗',
-                    '⏺', '⏴', '⏵', '▲', '▼', '⏶', '⏷', '▸', '▹', '○', '◦', '∨', '⌄', '·',
+                    '×', '⚙', '↻', '◀', '▶', '⏴', '⏵', '⏸', '⏶', '⏷', '⏺', '○', '·',
                 ] {
-                    println!(
-                        "GLYPH {} U+{:04X} covered={}",
-                        ch,
-                        ch as u32,
-                        fonts.has_glyphs(&font_id, &ch.to_string())
+                    assert!(
+                        fonts.has_glyphs(&font_id, &ch.to_string()),
+                        "vocabulary glyph U+{:04X} {ch:?} lost font coverage",
+                        ch as u32
+                    );
+                }
+                // The pre-theme glyphs stay uncovered — if a font upgrade
+                // ever covers them this assert flags the vocabulary choice
+                // for revisit (and until then, reintroducing them is tofu).
+                for ch in ['✕', '◉', '↑', '↓', '▾', '▼', '▸', '●'] {
+                    assert!(
+                        !fonts.has_glyphs(&font_id, &ch.to_string()),
+                        "U+{:04X} {ch:?} gained coverage — revisit the vocabulary note",
+                        ch as u32
                     );
                 }
             });

@@ -58,7 +58,7 @@ pub(crate) enum ArchiveAccess {
 const REASON_NO_PROVIDER_ARCHIVE: &str = "This provider has no archive adapter yet — recent \
      scans only. Its capability card in Data \u{25b8} Radar coverage names the next unlock.";
 const REASON_UNKNOWN_PROVIDER: &str =
-    "Unknown international provider — pick a site in Data \u{25b8} Radar coverage.";
+    "Unknown international provider — pick a site in Data > Radar coverage.";
 
 /// THE one archive-capability question (spec §1.3): the archive browser,
 /// the Event Loop Builder's Build button, and the Unified Player archive
@@ -1097,7 +1097,7 @@ impl ViewerApp {
         }
         self.start_intl_archive_day_listing(ctx);
         self.status = format!(
-            "Archive: listing {} {site_id} — browse in Data \u{25b8} Archive",
+            "Archive: listing {} {site_id} — browse in Data > Archive",
             intl_provider_label(&provider_id)
         );
     }

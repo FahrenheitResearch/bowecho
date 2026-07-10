@@ -474,9 +474,9 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
             }
         });
         button_response.on_hover_text(if sounding {
-            "Drag to rearrange · right-click or ✕ to close the sounding"
+            "Drag to rearrange · right-click or × to close the sounding"
         } else {
-            "Drag to rearrange · right-click to float/hide · ✕ floats as a window"
+            "Drag to rearrange · right-click to float/hide · × floats as a window"
         })
     }
 

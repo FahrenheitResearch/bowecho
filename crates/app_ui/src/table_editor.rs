@@ -831,7 +831,7 @@ fn stops_ui(ui: &mut egui::Ui, draft: &mut TableDraft) -> bool {
                     .changed();
             }
             if ui
-                .add_enabled(can_delete, egui::Button::new("✕").small())
+                .add_enabled(can_delete, egui::Button::new("×").small())
                 .on_hover_text("Delete this stop")
                 .clicked()
             {

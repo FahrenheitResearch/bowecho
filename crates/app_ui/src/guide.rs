@@ -661,7 +661,7 @@ fn layers(ui: &mut egui::Ui) {
         "— opens the layer's owning surface: the Model/Satellite/WoFS/FARM window for window \
          layers, the Alerts tab for SPC and warnings, or a small popover for layers with \
          only a few options (surface-obs networks, lightning). Broader appearance controls \
-         live in Map ▸ Appearance.",
+         live in Map > Appearance.",
     );
     para(
         ui,
@@ -1256,7 +1256,7 @@ fn tools(ui: &mut egui::Ui) {
         ui,
         "Right-click the map",
         "— the \"Lowest beam here\" menu: the nearby radars with the lowest 0.5° beam over \
-         that point, each with beam height and distance (units per Settings ▸ Display); \
+         that point, each with beam height and distance (units per Settings > Display); \
          click to switch and load. TDWRs, research feeds, custom feeds, and international \
          radars get their own rows, so the menu works over Europe or Japan the same as over \
          CONUS. Right-clicking also jumps to the nearest site directly.",
