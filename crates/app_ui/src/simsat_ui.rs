@@ -285,10 +285,12 @@ struct RenderJob {
     product: SimSatProduct,
     view: OutputView,
     satellite: SatelliteChoice,
+    resolution: ResolutionMode,
     quality: RenderQuality,
     margin_frac: f32,
     granulation: bool,
     bluemarble_download: bool,
+    bluemarble_month: u32,
     exposure: f32,
     clouds: bool,
     multiscatter: bool,
@@ -446,10 +448,12 @@ pub(crate) struct SimSatPane {
     product: SimSatProduct,
     view: OutputView,
     satellite: SatelliteChoice,
+    resolution: ResolutionMode,
     quality: RenderQuality,
     margin_frac: f32,
     granulation: bool,
     bluemarble_download: bool,
+    bluemarble_month: u32,
     exposure: f32,
     clouds: bool,
     multiscatter: bool,
@@ -489,10 +493,12 @@ impl Default for SimSatPane {
             product: SimSatProduct::Visible,
             view: OutputView::Geostationary,
             satellite: SatelliteChoice::GoesEast,
+            resolution: ResolutionMode::Native,
             quality: RenderQuality::Final,
             margin_frac: 0.0,
             granulation: true,
             bluemarble_download: true,
+            bluemarble_month: 0,
             exposure: simsat::render::DEFAULT_EXPOSURE as f32,
             clouds: true,
             multiscatter: true,
@@ -713,6 +719,22 @@ impl SimSatPane {
                             });
                     });
                     ui.end_row();
+
+                    ui.label("Resolution");
+                    ui.add_enabled_ui(self.view == OutputView::Geostationary, |ui| {
+                        egui::ComboBox::from_id_salt("simsat-resolution")
+                            .selected_text(self.resolution.label())
+                            .show_ui(ui, |ui| {
+                                for resolution in ResolutionMode::ALL {
+                                    ui.selectable_value(
+                                        &mut self.resolution,
+                                        resolution,
+                                        resolution.label(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.end_row();
                 });
             if self.view == OutputView::TopDown {
                 ui.small(
@@ -748,6 +770,21 @@ impl SimSatPane {
                     ui.checkbox(
                         &mut self.bluemarble_download,
                         "Download missing 2 km Blue Marble months",
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.bluemarble_month, 0..=12)
+                            .text("Blue Marble month")
+                            .custom_formatter(|value, _| {
+                                if value < 0.5 {
+                                    "Auto".to_owned()
+                                } else {
+                                    format!("{value:.0}")
+                                }
+                            }),
+                    )
+                    .on_hover_text(
+                        "Auto blends seasonal ground imagery for the valid date; 1-12 forces \
+                         a specific month as a what-if surface.",
                     );
                     ui.add_enabled_ui(self.clouds, |ui| {
                         ui.checkbox(
@@ -795,7 +832,7 @@ impl SimSatPane {
                                         .text("Sun azimuth"),
                                 );
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(220, 165, 65),
+                                    ui.visuals().warn_fg_color,
                                     "what-if lighting",
                                 );
                             });
@@ -845,7 +882,7 @@ impl SimSatPane {
             );
         }
         if let Some(error) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
 
         if let Some(label) = &self.last_plot_label {
@@ -1038,10 +1075,12 @@ impl SimSatPane {
             } else {
                 self.satellite
             },
+            resolution: self.resolution,
             quality: self.quality,
             margin_frac: self.margin_frac,
             granulation: self.granulation,
             bluemarble_download: self.bluemarble_download,
+            bluemarble_month: self.bluemarble_month,
             exposure: self.exposure,
             clouds: self.clouds,
             multiscatter: self.multiscatter,
@@ -1282,7 +1321,7 @@ fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
     params.cache = job.cache_root.clone();
     params.satellite = job.satellite.api_satellite();
     params.view = job.view.api_view();
-    params.resolution = ResolutionMode::Native;
+    params.resolution = job.resolution;
     params.margin_frac = job.margin_frac;
     params.exposure = f64::from(job.exposure);
     params.steps = job.quality.steps();
@@ -1297,7 +1336,9 @@ fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
     params.ir_enhancement = None;
     params.bluemarble = if job.product.uses_visible_ground() {
         BlueMarble::Seasonal {
-            month_override: None,
+            month_override: (1..=12)
+                .contains(&job.bluemarble_month)
+                .then_some(job.bluemarble_month),
             download: job.bluemarble_download,
         }
     } else {
@@ -1767,10 +1808,12 @@ mod tests {
             product: SimSatProduct::Visible,
             view: OutputView::Geostationary,
             satellite: SatelliteChoice::GoesWest,
+            resolution: ResolutionMode::Abi1km,
             quality: RenderQuality::Preview,
             margin_frac: 0.25,
             granulation: true,
             bluemarble_download: false,
+            bluemarble_month: 1,
             exposure: 2.25,
             clouds: true,
             multiscatter: false,
@@ -1789,6 +1832,7 @@ mod tests {
         };
         let params = render_params_for(&job, &frame);
         assert_eq!(params.satellite, SatellitePreset::GoesWest);
+        assert_eq!(params.resolution, ResolutionMode::Abi1km);
         assert_eq!(params.timestep, 3);
         assert_eq!(params.margin_frac, 0.25);
         assert_eq!(params.exposure, 2.25);
@@ -1805,8 +1849,8 @@ mod tests {
         assert!(matches!(
             params.bluemarble,
             BlueMarble::Seasonal {
+                month_override: Some(1),
                 download: false,
-                ..
             }
         ));
     }
