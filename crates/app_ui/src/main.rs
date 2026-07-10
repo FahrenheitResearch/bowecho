@@ -505,7 +505,7 @@ const LOOP_SPEED_PERCENT_OPTIONS: &[u16] =
     &[25, 50, 75, 100, 150, 200, 300, 400, 800, 1600, 3200, 6400];
 const BACKGROUND_ACTIVITY_REPAINT_MS: u64 = 250;
 const SATELLITE_MAP_LAYER_HOVER: &str =
-    "Render the current frame as a layer under the radar (opacity in Custom)";
+    "Render the current frame as a layer under the radar (opacity in Map)";
 const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Custom > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar (US or international, whichever is closer). When a loop is loaded, WSR-88D overlays auto-sync to that loop; international overlays refresh live on their provider cadence.";
 const SECURITY_UNSIGNED_BUILD_TEXT: &str = "Official Windows release binaries are Authenticode-signed (Azure Trusted Signing). Windows Defender or SmartScreen may still warn on unsigned local builds or renamed copies. Use official GitHub release assets when possible; do not whitelist random copies.";
 const SECURITY_SIGNATURE_STATUS_TEXT: &str = "In-app updates install only after two checks pass on the downloaded file: it must match the SHA-256 the release published, and Windows (WinVerifyTrust) must report a valid Authenticode signature. Anything else is deleted and reported here.";
@@ -1221,8 +1221,8 @@ const TERMINAL_SITE_LABEL_MIN_SCALE: f32 = 95.0;
 // as crate-wide aliases so 100+ call sites keep reading naturally.
 pub(crate) use ui_theme::ROW_H as PANEL_BUTTON_HEIGHT;
 pub(crate) use ui_theme::{
-    ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, NAME_W_SITE, NAME_W_STD, NAME_W_WIDE,
-    ROW_SPACING_X, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
+    ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, ROW_SPACING_X, SIDEBAR_DEFAULT_WIDTH,
+    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
 };
 const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] =
     &["tornado", "severe thunderstorm", "flash flood", "flood"];
@@ -7657,17 +7657,22 @@ const SIDEBAR_TABS: &[SidebarTab] = &[
 ];
 
 fn sidebar_tab_label(tab: SidebarTab, brand: &settings::BrandConfig) -> &str {
-    fn non_empty<'a>(value: &'a str, fallback: &'a str) -> &'a str {
-        if value.trim().is_empty() {
-            fallback
+    // Empty values AND the pre-rename default labels fall through to the
+    // current defaults: installs that merely persisted the old "Custom"/
+    // "Severe" defaults pick up the Map/Alerts rename, while a deliberate
+    // brand override still wins.
+    fn feature_label<'a>(value: &'a str, legacy_default: &str, current: &'a str) -> &'a str {
+        let value = value.trim();
+        if value.is_empty() || value == legacy_default {
+            current
         } else {
-            value.trim()
+            value
         }
     }
     match tab {
-        SidebarTab::Radar => non_empty(&brand.features.radar, "Radar"),
-        SidebarTab::Layers => non_empty(&brand.features.map, "Custom"),
-        SidebarTab::Severe => non_empty(&brand.features.warnings, "Severe"),
+        SidebarTab::Radar => feature_label(&brand.features.radar, "Radar", "Radar"),
+        SidebarTab::Layers => feature_label(&brand.features.map, "Custom", "Map"),
+        SidebarTab::Severe => feature_label(&brand.features.warnings, "Severe", "Alerts"),
         SidebarTab::Data => "Data",
         SidebarTab::Settings => "⚙",
     }
@@ -17092,6 +17097,14 @@ impl ViewerApp {
             ui.weak("A load is already running.");
         }
 
+        // Pack rows (wave 2): line 1 = chevron + truncating strong title +
+        // right-aligned action cluster; line 2 = weak monospace meta
+        // (site | range | frames) through the kit status block. Fits 320.
+        /// Reserved width for the Load / -3 / +3 action cluster.
+        const PACK_CLUSTER_W: f32 = 124.0;
+        /// Reserved width for a lone Load button.
+        const PACK_LOAD_W: f32 = 52.0;
+
         let mut requested = None;
         for pack in data_packs::BUILT_IN_DATA_PACKS {
             let mut expanded = self.data_pack_expanded.contains(pack.id);
@@ -17106,67 +17119,71 @@ impl ViewerApp {
                     {
                         expanded = !expanded;
                     }
-                    ui.label(egui::RichText::new(pack.title).strong());
-                    ui.weak(format!(
-                        "{} | {} to {}",
-                        pack.site_id, pack.start_utc, pack.end_utc
-                    ));
-                    if loaded.is_some() {
-                        ui.weak(format!("{} frames", self.primary.history.len()));
-                    }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Load"))
-                        .on_hover_text("List the public Level II archive, download the pack frames, and apply the review scene")
-                        .clicked()
-                    {
-                        requested = Some((
-                            *pack,
-                            data_packs::DataPackLoadOptions::default(),
-                            true,
-                        ));
-                    }
-                    let prev_options =
-                        loaded.map(|loaded| data_packs::DataPackLoadOptions {
-                            extra_start_scans: loaded.extra_start_scans + 3,
-                            extra_end_scans: loaded.extra_end_scans,
-                        });
-                    if ui
-                        .add_enabled(!busy && prev_options.is_some(), egui::Button::new("-3"))
-                        .on_hover_text("Load three more scans before this pack's current start")
-                        .clicked()
-                        && let Some(options) = prev_options
-                    {
-                        requested = Some((*pack, options, false));
-                    }
-                    let next_options =
-                        loaded.map(|loaded| data_packs::DataPackLoadOptions {
+                    let title_width = (ui.available_width() - PACK_CLUSTER_W).max(60.0);
+                    data_pack_title_cell(ui, pack.title, title_width);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Right-to-left: +3 at the edge, then -3, then Load.
+                        let next_options = loaded.map(|loaded| data_packs::DataPackLoadOptions {
                             extra_start_scans: loaded.extra_start_scans,
                             extra_end_scans: loaded.extra_end_scans + 3,
                         });
-                    if ui
-                        .add_enabled(!busy && next_options.is_some(), egui::Button::new("+3"))
-                        .on_hover_text("Load three more scans after this pack's current end")
-                        .clicked()
-                        && let Some(options) = next_options
-                    {
-                        requested = Some((*pack, options, false));
-                    }
+                        if ui
+                            .add_enabled(!busy && next_options.is_some(), egui::Button::new("+3"))
+                            .on_hover_text("Load three more scans after this pack's current end")
+                            .clicked()
+                            && let Some(options) = next_options
+                        {
+                            requested = Some((*pack, options, false));
+                        }
+                        let prev_options = loaded.map(|loaded| data_packs::DataPackLoadOptions {
+                            extra_start_scans: loaded.extra_start_scans + 3,
+                            extra_end_scans: loaded.extra_end_scans,
+                        });
+                        if ui
+                            .add_enabled(!busy && prev_options.is_some(), egui::Button::new("-3"))
+                            .on_hover_text("Load three more scans before this pack's current start")
+                            .clicked()
+                            && let Some(options) = prev_options
+                        {
+                            requested = Some((*pack, options, false));
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Load"))
+                            .on_hover_text("List the public Level II archive, download the pack frames, and apply the review scene")
+                            .clicked()
+                        {
+                            requested = Some((
+                                *pack,
+                                data_packs::DataPackLoadOptions::default(),
+                                true,
+                            ));
+                        }
+                    });
                 });
+                let mut meta = format!("{} | {} to {}", pack.site_id, pack.start_utc, pack.end_utc);
+                if loaded.is_some() {
+                    meta.push_str(&format!(" | {} frames", self.primary.history.len()));
+                }
+                panel_kit::status_block(ui, &meta, None);
                 if expanded {
                     ui.indent("data_pack_details", |ui| {
                         ui.weak(pack.summary);
                         let (extra_start, extra_end) = loaded
                             .map(|loaded| (loaded.extra_start_scans, loaded.extra_end_scans))
                             .unwrap_or((0, 0));
-                        ui.weak(format!(
-                            "Anchor {} | focus {:.3}, {:.3} | frames {} (+{} / +{})",
-                            pack.anchor_utc,
-                            pack.focus_lat,
-                            pack.focus_lon,
-                            pack.max_frames,
-                            extra_start,
-                            extra_end
-                        ));
+                        panel_kit::status_block(
+                            ui,
+                            &format!(
+                                "Anchor {} | focus {:.3}, {:.3} | frames {} (+{} / +{})",
+                                pack.anchor_utc,
+                                pack.focus_lat,
+                                pack.focus_lon,
+                                pack.max_frames,
+                                extra_start,
+                                extra_end
+                            ),
+                            None,
+                        );
                     });
                 }
             });
@@ -17181,6 +17198,7 @@ impl ViewerApp {
             let mut expanded = self.data_pack_expanded.contains(pack.id);
             let loaded = self.loaded_data_pack.filter(|loaded| loaded.id == pack.id);
             ui.separator();
+            let mut research_requested = false;
             ui.push_id(pack.id, |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -17190,29 +17208,43 @@ impl ViewerApp {
                     {
                         expanded = !expanded;
                     }
-                    ui.label(egui::RichText::new(pack.title).strong());
-                    ui.weak(format!("{} | latest {} research frames", pack.feed_id, pack.frame_count));
-                    if loaded.is_some() {
-                        ui.weak(format!("{} frames", self.primary.history.len()));
-                    }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Load"))
-                        .on_hover_text("Fetch the feed dir.list, download the newest decodable frames, and apply the review scene")
-                        .clicked()
-                    {
-                        self.start_research_feed_data_pack(*pack, ctx);
-                    }
+                    let title_width = (ui.available_width() - PACK_LOAD_W).max(60.0);
+                    data_pack_title_cell(ui, pack.title, title_width);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Load"))
+                            .on_hover_text("Fetch the feed dir.list, download the newest decodable frames, and apply the review scene")
+                            .clicked()
+                        {
+                            research_requested = true;
+                        }
+                    });
                 });
+                let mut meta = format!(
+                    "{} | latest {} research frames",
+                    pack.feed_id, pack.frame_count
+                );
+                if loaded.is_some() {
+                    meta.push_str(&format!(" | {} frames", self.primary.history.len()));
+                }
+                panel_kit::status_block(ui, &meta, None);
                 if expanded {
                     ui.indent("research_data_pack_details", |ui| {
                         ui.weak(pack.summary);
-                        ui.weak(format!(
-                            "Feed {} | focus {:.3}, {:.3} | frames {}",
-                            pack.poll_url, pack.focus_lat, pack.focus_lon, pack.frame_count
-                        ));
+                        panel_kit::status_block(
+                            ui,
+                            &format!(
+                                "Feed {} | focus {:.3}, {:.3} | frames {}",
+                                pack.poll_url, pack.focus_lat, pack.focus_lon, pack.frame_count
+                            ),
+                            None,
+                        );
                     });
                 }
             });
+            if research_requested {
+                self.start_research_feed_data_pack(*pack, ctx);
+            }
             if expanded {
                 self.data_pack_expanded.insert(pack.id.to_owned());
             } else {
@@ -17233,28 +17265,39 @@ impl ViewerApp {
                     {
                         expanded = !expanded;
                     }
-                    ui.label(egui::RichText::new(pack.title).strong());
-                    ui.weak(format!(
+                    let title_width = (ui.available_width() - PACK_LOAD_W).max(60.0);
+                    data_pack_title_cell(ui, pack.title, title_width);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Load"))
+                            .on_hover_text(
+                                "List the provider archive, download the pack window, and apply the review scene",
+                            )
+                            .clicked()
+                        {
+                            intl_requested = Some(*pack);
+                        }
+                    });
+                });
+                panel_kit::status_block(
+                    ui,
+                    &format!(
                         "{}/{} | {} to {}",
                         pack.provider_id, pack.site_id, pack.start_utc, pack.end_utc
-                    ));
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Load"))
-                        .on_hover_text(
-                            "List the provider archive, download the pack window, and apply the review scene",
-                        )
-                        .clicked()
-                    {
-                        intl_requested = Some(*pack);
-                    }
-                });
+                    ),
+                    None,
+                );
                 if expanded {
                     ui.indent("intl_data_pack_details", |ui| {
                         ui.weak(pack.summary);
-                        ui.weak(format!(
-                            "Focus {:.3}, {:.3} | frames {}",
-                            pack.focus_lat, pack.focus_lon, pack.max_frames
-                        ));
+                        panel_kit::status_block(
+                            ui,
+                            &format!(
+                                "Focus {:.3}, {:.3} | frames {}",
+                                pack.focus_lat, pack.focus_lon, pack.max_frames
+                            ),
+                            None,
+                        );
                     });
                 }
             });
@@ -23562,7 +23605,7 @@ impl ViewerApp {
             ui.label("Color");
             if ui
                 .small_button("Edit…")
-                .on_hover_text("Open the Appearance section in the Custom tab")
+                .on_hover_text("Open the Appearance section in the Map tab")
                 .clicked()
             {
                 self.request_color_table_manager(family);
@@ -23761,7 +23804,6 @@ impl ViewerApp {
                         hover: "Show this overlay radar on the map",
                     },
                     name: &site.level2_id,
-                    name_width: NAME_W_SITE,
                     name_hover: &details_text,
                     state: Some(state),
                     opacity: Some(LayerRowOpacity::U8 {
@@ -37878,11 +37920,18 @@ fn fixed_status_label_with_sense(
     ui.put(rect, egui::Label::new(text).truncate().sense(sense))
 }
 
-fn fixed_state_dot(ui: &mut egui::Ui, color: egui::Color32, hover_text: &str) {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(14.0, PANEL_BUTTON_HEIGHT), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, color);
-    response.on_hover_text(hover_text);
+/// Data-pack row title: strong, truncating at the row's title budget, full
+/// title on hover (wave-2 pack-row grammar).
+fn data_pack_title_cell(ui: &mut egui::Ui, title: &str, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width.max(1.0), PANEL_BUTTON_HEIGHT),
+        egui::Sense::hover(),
+    );
+    ui.put(
+        rect,
+        egui::Label::new(egui::RichText::new(title).strong()).truncate(),
+    )
+    .on_hover_text(title);
 }
 
 fn layer_state_color(state: &str) -> egui::Color32 {
@@ -38000,9 +38049,12 @@ struct LayerRowRemove<'a> {
 struct LayerRowSpec<'a> {
     vis: LayerRowVis<'a>,
     name: &'a str,
-    name_width: f32,
     name_hover: &'a str,
     state: Option<&'a str>,
+    /// Short weak status/count text ("1523 stn · 3m ago", "12:45Z",
+    /// "8 rpt") in the flexible middle column — truncates at the middle
+    /// zone's budget with a full-text hover.
+    count: Option<&'a str>,
     opacity: Option<LayerRowOpacity<'a>>,
     order: Option<LayerRowOrder<'a>>,
     gear: Option<LayerRowGear<'a>>,
@@ -38017,9 +38069,9 @@ impl Default for LayerRowSpec<'_> {
                 hover: "",
             },
             name: "",
-            name_width: NAME_W_STD,
             name_hover: "",
             state: None,
+            count: None,
             opacity: None,
             order: None,
             gear: None,
@@ -38028,17 +38080,20 @@ impl Default for LayerRowSpec<'_> {
     }
 }
 
-/// One unified layer row — the row grammar v2 (docs/ui-overhaul-spec.md §2.1,
-/// direction A "everything is a layer"):
+/// One unified layer row — row grammar v3 (docs/ui-refresh-plan.md wave 2):
 ///
-///   [vis] [name (hover = details)] [state dot] [opacity ───] [↑↓] [extras…] [⚙] [✕]
+///   [vis] [name (flex, hover = details)] [dot slot] [↑↓ extras… count]
+///   [opacity ───] [⚙] [✕]
 ///
-/// Every layer type in the rail (primary radar, overlay radars, GOES, model
-/// fields, drapes, surface obs, lightning, SPC, warnings, placefiles)
-/// renders through this one shape. `trailing` carries the row's earned
-/// inline extras (max two besides ⚙/✕); reorder, gear, and remove are
-/// standardized slots. Returns true when visibility or opacity changed
-/// (callers repaint).
+/// Every layer type in the rail renders through this one shape, and the
+/// rail aligns by construction: the state-dot slot and the right cluster
+/// (opacity slider, ⚙, ✕) are fixed widths and ALWAYS allocated, so every
+/// row's slider starts at the same x and every gear sits at the same x.
+/// The name column flexes with the panel (`panel_kit::rail_name_width`,
+/// truncating with the details hover), and the middle zone carries the
+/// row's earned inline extras (max two besides ⚙/✕) plus the truncating
+/// `count` text, clipped at its budget — anything wider lives behind ⚙.
+/// Returns true when visibility or opacity changed (callers repaint).
 fn layer_row(
     ui: &mut egui::Ui,
     spec: LayerRowSpec<'_>,
@@ -38047,9 +38102,9 @@ fn layer_row(
     let LayerRowSpec {
         vis,
         name,
-        name_width,
         name_hover,
         state,
+        count,
         opacity,
         order,
         gear,
@@ -38081,6 +38136,7 @@ fn layer_row(
                 response.on_hover_text(hover);
             }
         }
+        let name_width = panel_kit::rail_name_width(ui.available_width());
         let name_response = fixed_status_label_with_sense(
             ui,
             name,
@@ -38109,9 +38165,53 @@ fn layer_row(
             *value = !*value;
             changed = true;
         }
+        // State-dot slot — allocated even without a state so the columns
+        // after it share an x across rows.
+        let (dot_rect, dot_response) = ui.allocate_exact_size(
+            egui::vec2(panel_kit::RAIL_DOT_SLOT_W, PANEL_BUTTON_HEIGHT),
+            egui::Sense::hover(),
+        );
         if let Some(state) = state {
-            fixed_state_dot(ui, layer_state_color(state), state);
+            ui.painter()
+                .circle_filled(dot_rect.center(), 4.0, layer_state_color(state));
+            dot_response.on_hover_text(state.to_owned());
         }
+        // Middle zone: reorder + inline extras + truncating count, clipped
+        // at its fixed budget so the right cluster stays put.
+        let spacing = ui.spacing().item_spacing.x;
+        let cluster_width = panel_kit::rail_cluster_width(LAYER_ROW_SLIDER_WIDTH, spacing);
+        let middle_width = (ui.available_width() - cluster_width - spacing).max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(middle_width, PANEL_BUTTON_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_max_width(middle_width);
+                ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                if let Some(LayerRowOrder { delta }) = order {
+                    if ui
+                        .small_button("↑")
+                        .on_hover_text("Draw later (higher)")
+                        .clicked()
+                    {
+                        *delta = 1;
+                    }
+                    if ui
+                        .small_button("↓")
+                        .on_hover_text("Draw earlier (lower)")
+                        .clicked()
+                    {
+                        *delta = -1;
+                    }
+                }
+                trailing(ui);
+                if let Some(count) = count {
+                    ui.add(egui::Label::new(egui::RichText::new(count).weak().small()).truncate())
+                        .on_hover_text(count.to_owned());
+                }
+            },
+        );
+        // Fixed right cluster: opacity slider slot + ⚙ slot + ✕ slot —
+        // allocated even when empty so sliders and gears column-align.
         match opacity {
             Some(LayerRowOpacity::F32 { value, min, hover }) => {
                 if ui
@@ -38138,25 +38238,13 @@ fn layer_row(
                     changed = true;
                 }
             }
-            None => {}
-        }
-        if let Some(LayerRowOrder { delta }) = order {
-            if ui
-                .small_button("↑")
-                .on_hover_text("Draw later (higher)")
-                .clicked()
-            {
-                *delta = 1;
-            }
-            if ui
-                .small_button("↓")
-                .on_hover_text("Draw earlier (lower)")
-                .clicked()
-            {
-                *delta = -1;
+            None => {
+                ui.allocate_exact_size(
+                    egui::vec2(LAYER_ROW_SLIDER_WIDTH, PANEL_BUTTON_HEIGHT),
+                    egui::Sense::hover(),
+                );
             }
         }
-        trailing(ui);
         match gear {
             Some(LayerRowGear::Open { hover, clicked }) => {
                 if ui.small_button("⚙").on_hover_text(hover).clicked() {
@@ -38171,12 +38259,25 @@ fn layer_row(
                 .response
                 .on_hover_text(hover);
             }
-            None => {}
+            None => {
+                ui.allocate_exact_size(
+                    egui::vec2(panel_kit::RAIL_ICON_SLOT_W, PANEL_BUTTON_HEIGHT),
+                    egui::Sense::hover(),
+                );
+            }
         }
-        if let Some(LayerRowRemove { hover, clicked }) = remove
-            && ui.small_button("✕").on_hover_text(hover).clicked()
-        {
-            *clicked = true;
+        match remove {
+            Some(LayerRowRemove { hover, clicked }) => {
+                if ui.small_button("✕").on_hover_text(hover).clicked() {
+                    *clicked = true;
+                }
+            }
+            None => {
+                ui.allocate_exact_size(
+                    egui::vec2(panel_kit::RAIL_ICON_SLOT_W, PANEL_BUTTON_HEIGHT),
+                    egui::Sense::hover(),
+                );
+            }
         }
     });
     changed
@@ -63511,12 +63612,24 @@ mod tests {
     }
 
     #[test]
-    fn custom_tab_advertises_layers_and_appearance() {
+    fn map_tab_advertises_layers_and_appearance() {
         assert!(SIDEBAR_TABS.contains(&SidebarTab::Layers));
         assert_eq!(
             sidebar_tab_label(SidebarTab::Layers, &settings::BrandConfig::default()),
-            "Custom"
+            "Map"
         );
+        assert_eq!(
+            sidebar_tab_label(SidebarTab::Severe, &settings::BrandConfig::default()),
+            "Alerts"
+        );
+        // Persisted pre-rename defaults remap; a real brand override wins.
+        let mut legacy = settings::BrandConfig::default();
+        legacy.features.map = "Custom".to_owned();
+        legacy.features.warnings = "Severe".to_owned();
+        assert_eq!(sidebar_tab_label(SidebarTab::Layers, &legacy), "Map");
+        assert_eq!(sidebar_tab_label(SidebarTab::Severe, &legacy), "Alerts");
+        legacy.features.map = "Layers+".to_owned();
+        assert_eq!(sidebar_tab_label(SidebarTab::Layers, &legacy), "Layers+");
         let tooltip = sidebar_tab_tooltip(SidebarTab::Layers);
         assert!(tooltip.contains("map layers"));
         assert!(tooltip.contains("radar age"));
@@ -63526,7 +63639,8 @@ mod tests {
         assert!(settings_tooltip.contains("alerts"));
         assert!(settings_tooltip.contains("performance"));
         assert!(!settings_tooltip.contains("color tables"));
-        assert!(SATELLITE_MAP_LAYER_HOVER.contains("Custom"));
+        assert!(SATELLITE_MAP_LAYER_HOVER.contains("Map"));
+        assert!(!SATELLITE_MAP_LAYER_HOVER.contains("Custom"));
         assert!(!SATELLITE_MAP_LAYER_HOVER.contains("Layers"));
     }
 

@@ -35,6 +35,21 @@ pub(crate) const CHIP_MIN_W: f32 = 52.0;
 /// wide (kit row math yields a usable label column at this width).
 pub(crate) const POPOVER_MIN_W: f32 = 260.0;
 
+// Layer-rail row columns (wave 2): the rail aligns by construction — the
+// state-dot slot and the right cluster (opacity slider + gear + remove) are
+// fixed widths and ALWAYS allocated, so every row's slider starts at the
+// same x and every gear sits at the same x; the name column flexes with the
+// panel and the middle zone (count text + the row's earned inline extras)
+// absorbs the rest, clipped at its budget.
+/// State-dot slot width (allocated even when the row has no lifecycle).
+pub(crate) const RAIL_DOT_SLOT_W: f32 = 12.0;
+/// Gear and remove slot width each (allocated even when absent).
+pub(crate) const RAIL_ICON_SLOT_W: f32 = 18.0;
+/// Name column share of the post-checkbox row width, and its clamp band.
+const RAIL_NAME_FRACTION: f32 = 0.34;
+pub(crate) const RAIL_NAME_MIN_W: f32 = 96.0;
+pub(crate) const RAIL_NAME_MAX_W: f32 = 150.0;
+
 // ---------------------------------------------------------------------------
 // Pure layout math (unit-tested on the headless nodes).
 // ---------------------------------------------------------------------------
@@ -80,6 +95,18 @@ pub(crate) fn value_slot_text(text: &str, max_chars: usize) -> String {
 /// Section titles render uppercase — callers pass "Loop"/"Products"/…
 pub(crate) fn section_title(title: &str) -> String {
     title.to_uppercase()
+}
+
+/// Layer-rail name column: a fixed share of the post-checkbox row width,
+/// clamped — every row uses the SAME width, so the columns after it align.
+pub(crate) fn rail_name_width(available: f32) -> f32 {
+    (available * RAIL_NAME_FRACTION).clamp(RAIL_NAME_MIN_W, RAIL_NAME_MAX_W)
+}
+
+/// Width of a rail row's fixed right cluster: opacity slider + gear +
+/// remove slots plus their inter-slot spacing.
+pub(crate) fn rail_cluster_width(slider_width: f32, spacing: f32) -> f32 {
+    slider_width + 2.0 * RAIL_ICON_SLOT_W + 2.0 * spacing
 }
 
 /// Persisted sidebar width (whole logical points in settings — `AppSettings`
@@ -365,6 +392,30 @@ pub(crate) fn select_row(
     }
 }
 
+/// Kit 9 — Subgroup header (wave 2): the lighter, NON-collapsible cousin of
+/// [`section`] for groups INSIDE a section (the layer rail's BASE /
+/// ATMOSPHERE / OBS / SEVERE / COMMUNITY). Small uppercase strong title in
+/// the section palette plus an optional right-aligned action slot; no rule,
+/// no persistence — subgroups are a reading aid, not a fold.
+pub(crate) fn subgroup<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    right: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(section_title(title))
+                .size(11.0)
+                .strong()
+                .color(SUBHEAD_COLOR),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right)
+            .inner
+    })
+    .inner
+}
+
 fn label_cell(ui: &mut egui::Ui, width: f32, label: &str) {
     ui.allocate_ui_with_layout(
         egui::vec2(width, ROW_H),
@@ -451,6 +502,54 @@ mod tests {
         assert_eq!(section_title("Loop"), "LOOP");
         assert_eq!(section_title("PRODUCTS"), "PRODUCTS");
         assert_eq!(section_title("Grid / Composites"), "GRID / COMPOSITES");
+    }
+
+    #[test]
+    fn rail_name_column_clamps_and_stays_row_independent() {
+        // One width per panel width — rows align because every row asks the
+        // same question. Clamp band holds across the panel's 300..900 range.
+        assert_eq!(rail_name_width(200.0), RAIL_NAME_MIN_W);
+        assert_eq!(rail_name_width(282.0), RAIL_NAME_MIN_W); // 95.9 → floor
+        assert!((rail_name_width(360.0) - 122.4).abs() < 0.01);
+        assert_eq!(rail_name_width(600.0), RAIL_NAME_MAX_W);
+        assert_eq!(rail_name_width(900.0), RAIL_NAME_MAX_W);
+    }
+
+    #[test]
+    fn rail_middle_zone_holds_the_extras_budget_at_the_panel_minimum() {
+        // Mirror of layer_row's live arithmetic: middle = post-checkbox
+        // width − name column − dot slot − right cluster − 3 gaps. At the
+        // 300 pt panel minimum inside a section indent the post-checkbox
+        // width is ≈ 250 pt, and the middle zone must still hold a rail
+        // row's largest inline-extras set (model rows' ↑/↓ ≈ 35 pt,
+        // placefiles' T + ↻ ≈ 39 pt at 320) — everything wider lives
+        // behind ⚙.
+        let slider = 56.0;
+        let spacing = 3.0;
+        let middle_at = |available: f32| {
+            (available
+                - rail_name_width(available)
+                - RAIL_DOT_SLOT_W
+                - rail_cluster_width(slider, spacing)
+                - 3.0 * spacing)
+                .max(0.0)
+        };
+        for available in [250.0_f32, 260.0, 282.0, 340.0, 620.0] {
+            let middle = middle_at(available);
+            assert!(
+                middle >= 35.0,
+                "middle zone collapsed at {available}pt: {middle}"
+            );
+            // The fixed columns + middle never exceed the row's budget.
+            let total = rail_name_width(available)
+                + RAIL_DOT_SLOT_W
+                + rail_cluster_width(slider, spacing)
+                + 3.0 * spacing
+                + middle;
+            assert!(total <= available + 0.01, "row overflows at {available}pt");
+        }
+        // Degenerate widths clamp to zero instead of going negative.
+        assert_eq!(middle_at(100.0), 0.0);
     }
 
     #[test]

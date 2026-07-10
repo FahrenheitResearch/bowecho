@@ -32,9 +32,9 @@ use ui_core::worker_slot::SlotPoll;
 
 use crate::{
     ACTIVE_LOAD_POLL_MS, ArchiveLoadProgress, AsyncLoadResult, AsyncLoadUpdate, DecodedLoadBatch,
-    FeedSource, MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, PANEL_BUTTON_HEIGHT, SpcReport,
-    ViewerApp, archive_load_progress_row, archive_object_scan_time_utc, cache_dir,
-    decode_archive_history_object, fetch_intl_frame_plan_batch, intl_provider_label,
+    FeedSource, MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, SpcReport, ViewerApp,
+    archive_load_progress_row, archive_object_scan_time_utc, cache_dir,
+    decode_archive_history_object, fetch_intl_frame_plan_batch, intl_provider_label, panel_kit,
     send_archive_progress,
 };
 
@@ -435,17 +435,20 @@ impl ViewerApp {
         // (The loop transport renders above this section in the DATA tab —
         // archive browsing shouldn't need a tab switch to play what it just
         // loaded.)
-        ui.horizontal(|ui| {
-            ui.label("Manual picker frames").on_hover_text(
-                "Archive-browser selections only: load this many scans ending at the chosen scan. Tornado/report clicks use Event day Track/report loop controls.",
-            );
+        panel_kit::row(ui, "Manual picker frames", |ui| {
+            // Right-to-left: the frame count at the row edge, +5 older to
+            // its left when a loaded range can grow.
             if ui
                 .add(
                     egui::DragValue::new(&mut self.archive_frame_count)
                         .range(1..=MAX_ARCHIVE_FRAME_COUNT)
                         .speed(0.2),
                 )
-                .on_hover_text("Manual archive chips end at the clicked scan.")
+                .on_hover_text(
+                    "Archive-browser selections only: load this many scans ending at the \
+                     chosen scan. Tornado/report clicks use Event day Track/report loop \
+                     controls.",
+                )
                 .changed()
             {
                 self.persist_archive_controls();
@@ -465,8 +468,9 @@ impl ViewerApp {
         if self.archive_date_input.is_empty() {
             self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             // Day navigation: step the date and re-list immediately.
+            // Wrapped so Today/List/Load fold under the date at 320 pt.
             let mut step_days: i64 = 0;
             if ui.small_button("◀").on_hover_text("Previous day").clicked() {
                 step_days = -1;
@@ -513,7 +517,10 @@ impl ViewerApp {
             }
         });
         let previous_archive_load_loop = self.archive_load_loop;
-        ui.horizontal(|ui| {
+        // Wrapped, not a kit row: the two mode buttons outgrow the control
+        // column at 320 pt and swapping them for a combo would change the
+        // interaction (the plan forbids behavior changes).
+        ui.horizontal_wrapped(|ui| {
             ui.label("On click:");
             ui.selectable_value(&mut self.archive_load_loop, true, "Loop ending at scan")
                 .on_hover_text("Load Manual loop frames ending at the chosen archive scan");
@@ -536,30 +543,30 @@ impl ViewerApp {
                     .id_salt("archive_volume_list")
                     .max_height(190.0)
                     .show(ui, |ui| {
-                        // Hour headers + wrapped minute chips.
+                        // Hour headers + kit chip grids (even row split,
+                        // truncating, full name on hover).
                         let mut index = 0usize;
                         while index < volumes.len() {
                             let hour = volumes[index].1.get(0..2).unwrap_or("??");
                             ui.weak(format!("{hour} UTC"));
-                            ui.horizontal_wrapped(|ui| {
-                                while index < volumes.len()
-                                    && volumes[index].1.get(0..2).unwrap_or("??") == hour
-                                {
-                                    let minute_label =
-                                        volumes[index].1.get(3..8).unwrap_or(&volumes[index].1);
-                                    if ui
-                                        .add_sized(
-                                            egui::vec2(52.0, PANEL_BUTTON_HEIGHT),
-                                            egui::Button::new(minute_label),
-                                        )
-                                        .on_hover_text(&volumes[index].1)
-                                        .clicked()
-                                    {
-                                        load_object = Some(index);
-                                    }
-                                    index += 1;
-                                }
-                            });
+                            let group_start = index;
+                            while index < volumes.len()
+                                && volumes[index].1.get(0..2).unwrap_or("??") == hour
+                            {
+                                index += 1;
+                            }
+                            let chips = volumes[group_start..index]
+                                .iter()
+                                .map(|volume| panel_kit::Chip {
+                                    label: volume.1.get(3..8).unwrap_or(&volume.1),
+                                    hotkey: None,
+                                    selected: false,
+                                    hover: Some(volume.1.clone()),
+                                })
+                                .collect::<Vec<_>>();
+                            if let Some(clicked) = panel_kit::chip_grid(ui, &chips) {
+                                load_object = Some(group_start + clicked);
+                            }
                         }
                     });
                 if let Some(index) = load_object {
@@ -573,8 +580,7 @@ impl ViewerApp {
     /// `archive_panel`, moved verbatim; date-based (US storm-report
     /// data), so it renders under every browser arm.
     fn spc_reports_browser_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.label("Tornado reports + tracks");
+        panel_kit::row(ui, "Tornado reports + tracks", |ui| {
             let fetching = self.spc_receiver.in_flight();
             if ui
                 .add_enabled(!fetching, egui::Button::new("Fetch"))
@@ -599,6 +605,8 @@ impl ViewerApp {
                     .id_salt("spc_report_list")
                     .max_height(170.0)
                     .show(ui, |ui| {
+                        // Kit select_row: left-aligned truncating monospace
+                        // rows — never centered button text.
                         for report in reports {
                             let scale = if report.f_scale.is_empty() || report.f_scale == "UNK" {
                                 String::new()
@@ -612,15 +620,16 @@ impl ViewerApp {
                                 report.location,
                                 report.state
                             );
-                            if ui
-                                .add_sized(
-                                    egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
-                                    egui::Button::new(label),
-                                )
-                                .on_hover_text(
+                            if panel_kit::select_row(
+                                ui,
+                                false,
+                                true,
+                                &label,
+                                Some(
                                     "Jump: lowest-beam radar + event archive loop before/after this time",
-                                )
-                                .clicked()
+                                ),
+                            )
+                            .clicked()
                             {
                                 jump = Some(report.clone());
                             }
@@ -648,17 +657,17 @@ impl ViewerApp {
             "{} {site_id} archive",
             intl_provider_label(provider_id)
         ));
-        ui.horizontal(|ui| {
-            ui.label("Manual picker frames").on_hover_text(
-                "Archive-browser selections only: load this many scans ending at the chosen scan.",
-            );
+        panel_kit::row(ui, "Manual picker frames", |ui| {
             if ui
                 .add(
                     egui::DragValue::new(&mut self.archive_frame_count)
                         .range(1..=MAX_ARCHIVE_FRAME_COUNT)
                         .speed(0.2),
                 )
-                .on_hover_text("Manual archive chips end at the clicked scan.")
+                .on_hover_text(
+                    "Archive-browser selections only: load this many scans ending at the \
+                     chosen scan.",
+                )
                 .changed()
             {
                 self.persist_archive_controls();
@@ -678,7 +687,8 @@ impl ViewerApp {
         if self.archive_date_input.is_empty() {
             self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            // Wrapped so Today/List/Load fold under the date at 320 pt.
             let mut step_days: i64 = 0;
             if ui.small_button("◀").on_hover_text("Previous day").clicked() {
                 step_days = -1;
@@ -725,7 +735,10 @@ impl ViewerApp {
             }
         });
         let previous_archive_load_loop = self.archive_load_loop;
-        ui.horizontal(|ui| {
+        // Wrapped, not a kit row: the two mode buttons outgrow the control
+        // column at 320 pt and swapping them for a combo would change the
+        // interaction (the plan forbids behavior changes).
+        ui.horizontal_wrapped(|ui| {
             ui.label("On click:");
             ui.selectable_value(&mut self.archive_load_loop, true, "Loop ending at scan")
                 .on_hover_text("Load Manual loop frames ending at the chosen archive scan");
@@ -756,26 +769,33 @@ impl ViewerApp {
                             while index < rows.len() {
                                 let hour = rows[index].time_utc.format("%H").to_string();
                                 ui.weak(format!("{hour} UTC"));
-                                ui.horizontal_wrapped(|ui| {
-                                    while index < rows.len()
-                                        && rows[index].time_utc.format("%H").to_string() == hour
-                                    {
-                                        let label =
-                                            rows[index].time_utc.format("%M:%S").to_string();
-                                        let hover = intl_row_hover_text(&rows[index]);
-                                        if ui
-                                            .add_sized(
-                                                egui::vec2(52.0, PANEL_BUTTON_HEIGHT),
-                                                egui::Button::new(label),
-                                            )
-                                            .on_hover_text(hover)
-                                            .clicked()
-                                        {
-                                            load_row = Some(index);
-                                        }
-                                        index += 1;
-                                    }
-                                });
+                                let group_start = index;
+                                while index < rows.len()
+                                    && rows[index].time_utc.format("%H").to_string() == hour
+                                {
+                                    index += 1;
+                                }
+                                let labels = rows[group_start..index]
+                                    .iter()
+                                    .map(|row| {
+                                        (
+                                            row.time_utc.format("%M:%S").to_string(),
+                                            intl_row_hover_text(row),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                let chips = labels
+                                    .iter()
+                                    .map(|(label, hover)| panel_kit::Chip {
+                                        label,
+                                        hotkey: None,
+                                        selected: false,
+                                        hover: Some(hover.clone()),
+                                    })
+                                    .collect::<Vec<_>>();
+                                if let Some(clicked) = panel_kit::chip_grid(ui, &chips) {
+                                    load_row = Some(group_start + clicked);
+                                }
                             }
                         });
                 }

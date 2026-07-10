@@ -404,7 +404,7 @@ pub struct AppSettings {
     #[serde(default)]
     pub alert_flash_families: Vec<String>,
     /// Play an operator alert sound when a newly issued, current warning is
-    /// latched in the Severe tab. Default off so existing installs stay quiet.
+    /// latched in the Alerts tab. Default off so existing installs stay quiet.
     #[serde(default)]
     pub alert_sound_enabled: bool,
     /// Optional custom `.wav` file for the warning alert. Empty = platform
@@ -425,7 +425,7 @@ pub struct AppSettings {
     #[serde(default)]
     pub radar_update_sound_path: String,
     /// Live warning/hazard auto-refresh cadence, in seconds. Drives how often
-    /// the Severe tab re-fetches NWS active alerts (and any custom warning
+    /// the Alerts tab re-fetches NWS active alerts (and any custom warning
     /// feed). Default 30 s matches the NWS Alerts Web Service polling
     /// guidance; the use site clamps to a small floor so a fast local/relay
     /// feed can poll more aggressively (e.g. during a landfalling cyclone).
@@ -438,12 +438,12 @@ pub struct AppSettings {
     /// format. Empty = disabled.
     #[serde(default)]
     pub warning_provider_url: String,
-    /// Current-alert list sort mode in the Severe tab. Kept as a string so
+    /// Current-alert list sort mode in the Alerts tab. Kept as a string so
     /// older/newer builds can preserve unknown operator preferences.
     #[serde(default = "default_current_alert_sort")]
     pub current_alert_sort: String,
-    /// Current-alert list type filter in the Severe tab. "all" preserves
-    /// the existing family checkbox behavior; specific keys provide fast
+    /// Current-alert list type filter in the Alerts tab. "all" preserves
+    /// the existing family chip behavior; specific keys provide fast
     /// one-control narrowing such as TOR-only newest-first.
     #[serde(default = "default_current_alert_filter")]
     pub current_alert_filter: String,

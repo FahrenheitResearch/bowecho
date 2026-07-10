@@ -32,8 +32,8 @@ const GUIDE_PANES_TEXT: &str = "— synced multi-pane grids (shared pan/zoom/til
 const GUIDE_DEBUG_CASES_TEXT: &str = "— one-click repro launchers for known radar \
     issues. The built-ins include KBMX Tuscaloosa 2011 22:15Z and 22:19Z DVEL \
     scans, and they use the same archive loader as normal case review.";
-const GUIDE_CUSTOM_LAYER_ROW_LABEL: &str = "Layer row in Custom";
-const GUIDE_CUSTOM_OVERLAY_TEXT: &str = "add the nearest radar — US or international, whichever is closer — as an overlay layer. Manage overlays (opacity, refresh, promote, remove) in Custom.";
+const GUIDE_CUSTOM_LAYER_ROW_LABEL: &str = "Layer row in Map";
+const GUIDE_CUSTOM_OVERLAY_TEXT: &str = "add the nearest radar — US or international, whichever is closer — as an overlay layer. Manage overlays (opacity, refresh, promote, remove) in Map.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum GuideSection {
@@ -72,7 +72,7 @@ impl GuideSection {
         match self {
             Self::GettingStarted => "Getting started",
             Self::Products => "Products explained",
-            Self::Layers => "Custom & layers",
+            Self::Layers => "Map & layers",
             Self::ModelData => "Model data & soundings",
             Self::Satellite => "Satellite",
             Self::Archive => "Archive & events",
@@ -222,8 +222,8 @@ fn getting_started(ui: &mut egui::Ui) {
     para(
         ui,
         "BowEcho is the radar map plus the sidebar on the right. The sidebar has five tabs: \
-         Radar (site, products, tilts, loop, algorithms, tools — live operations), Custom \
-         (map layers, added overlays, analysis overlays, appearance), Severe (NWS warning polygons + \
+         Radar (site, products, tilts, loop, algorithms, tools — live operations), Map \
+         (map layers, added overlays, analysis overlays, appearance), Alerts (NWS warning polygons + \
          SPC outlooks and reports), Data (archive days, live poll feeds, the model store, \
          local files), and \u{2699} Settings (display, security and updates, alerts, hotkeys, performance). \
          Collapsible sections remember whether you left them open.",
@@ -341,7 +341,7 @@ fn products(ui: &mut egui::Ui) {
         ui,
         "REF — Reflectivity (dBZ)",
         "precipitation intensity. The default Analyst Reflectivity HD palette keeps magenta \
-         for \u{2265}65 dBZ (hail cores); more palettes in Custom \u{25b8} Appearance.",
+         for \u{2265}65 dBZ (hail cores); more palettes in Map \u{25b8} Appearance.",
         "the workhorse. Watch for bright-banding near the melting layer and ground clutter \
          close to the radar.",
         "",
@@ -634,13 +634,13 @@ fn products(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 2b. Custom — layers and appearance
+// 2b. Map — layers and appearance
 
 fn layers(ui: &mut egui::Ui) {
-    ui.heading("Custom");
+    ui.heading("Map");
     para(
         ui,
-        "The Custom tab groups map layers, added overlays, analysis overlays, and appearance. \
+        "The Map tab groups map layers, added overlays, analysis overlays, and appearance. \
          Map layers include the primary radar, overlay radars, rotation tracks + TDS, GOES, \
          model and mesoanalysis fields, WoFS and FARM drapes, surface obs, lightning, SPC \
          outlooks and reports, warning polygons, and placefiles. Layers draw bottom-to-top \
@@ -660,13 +660,13 @@ fn layers(ui: &mut egui::Ui) {
         ui,
         "\u{2699} gear",
         "— opens the layer's owning surface: the Model/Satellite/WoFS/FARM window for window \
-         layers, the Severe tab for SPC and warnings, or a small popover for layers with \
+         layers, the Alerts tab for SPC and warnings, or a small popover for layers with \
          only a few options (surface-obs networks, lightning). Broader appearance controls \
-         live in Custom ▸ Appearance.",
+         live in Map ▸ Appearance.",
     );
     para(
         ui,
-        "Custom \u{25b8} Appearance also owns deep visual tuning: map backdrop, warning-polygon \
+        "Map \u{25b8} Appearance also owns deep visual tuning: map backdrop, warning-polygon \
          fill/width, per-family polygon colors and dash style, radar-age ring/marker arc/chip \
          colors and thresholds, radar product color tables, and built-in appearance profiles \
          such as GR2-classic, Chase dark, and Accessibility.",
@@ -712,7 +712,7 @@ fn layers(ui: &mut egui::Ui) {
         "Everything that used to hide in the Radar tab's Layers fold lives here now. The \
          Radar tab keeps a one-line \"Custom: N layers \u{2192}\" link; Poll-URL feeds moved to the \
          Data tab (they replace the volume source — acquisition, not a layer); SPC \
-         day/kind config moved to the Severe tab.",
+         day/kind config moved to the Alerts tab.",
     );
 }
 
@@ -1019,7 +1019,7 @@ fn satellite(ui: &mut egui::Ui) {
         ui,
         "Show on radar map",
         "— puts the current frame under the radar as a map layer. Opacity and removal live in \
-         the Custom tab's GOES row.",
+         the Map tab's GOES row.",
     );
 
     subhead(ui, "LIGHTNING");
@@ -1267,7 +1267,7 @@ fn tools(ui: &mut egui::Ui) {
         "Ctrl+right-click",
         "— adds the nearest radar — US or international, whichever is closer — as an extra \
          overlay layer instead of switching, for multi-radar mosaics. Manage overlays \
-         (opacity, refresh, promote, remove) in Custom.",
+         (opacity, refresh, promote, remove) in Map.",
     );
 
     subhead(ui, "VROT TOOL");
@@ -1695,7 +1695,7 @@ mod tests {
     #[test]
     fn guide_copy_mentions_current_navigation_and_repro_surfaces() {
         assert_eq!(GuideSection::ALL.len(), 12);
-        assert_eq!(GuideSection::Layers.label(), "Custom & layers");
+        assert_eq!(GuideSection::Layers.label(), "Map & layers");
         assert_eq!(GuideSection::Player.label(), "Unified Player");
         assert_eq!(GuideSection::Volume3d.label(), "3D Volume");
         assert_eq!(GuideSection::CaptureBrand.label(), "Capture & brand");
@@ -1714,8 +1714,11 @@ mod tests {
         assert_eq!(GUIDE_PANES_LABEL, "Panes 1 / 2 / 3 / 4");
         assert!(GUIDE_PANES_TEXT.contains("three-pane"));
         assert!(GUIDE_DEBUG_CASES_TEXT.contains("Tuscaloosa"));
-        assert_eq!(GUIDE_CUSTOM_LAYER_ROW_LABEL, "Layer row in Custom");
-        assert!(GUIDE_CUSTOM_OVERLAY_TEXT.contains("Custom"));
+        assert_eq!(GUIDE_CUSTOM_LAYER_ROW_LABEL, "Layer row in Map");
+        assert!(GUIDE_CUSTOM_OVERLAY_TEXT.contains("in Map"));
+        assert!(!GUIDE_CUSTOM_OVERLAY_TEXT.contains("in Custom"));
+        // The Radar tab's link literally still says "Custom: N layers" —
+        // that surface belongs to the concurrent Radar-tab visual round.
         assert!(guide_src.contains("Custom: N layers"));
         assert!(guide_src.contains("warning-polygon"));
         assert!(guide_src.contains("radar-age ring/marker arc/chip"));

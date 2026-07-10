@@ -47,7 +47,7 @@ use render2d::{
 use ui_core::worker_slot::{SlotPoll, WorkerSlot};
 
 use crate::{
-    LayerRowOpacity, LayerRowSpec, LayerRowVis, NAME_W_STD, ViewerApp, ViewportKey,
+    LayerRowOpacity, LayerRowSpec, LayerRowVis, ViewerApp, ViewportKey,
     anchored_radar_texture_rect, layer_row, paint_rotated_image, radar_color_image_from_rgba,
     radar_texture_options,
 };
@@ -438,8 +438,8 @@ impl ViewerApp {
                     hover,
                 },
                 name,
-                name_width: NAME_W_STD,
                 name_hover: hover,
+                count: (!trailing_text.is_empty()).then_some(trailing_text.as_str()),
                 opacity: Some(LayerRowOpacity::U8 {
                     value: &mut layer.opacity,
                     min: 40,
@@ -447,11 +447,7 @@ impl ViewerApp {
                 }),
                 ..Default::default()
             },
-            |ui| {
-                if !trailing_text.is_empty() {
-                    ui.weak(trailing_text);
-                }
-            },
+            |_ui| {},
         );
         if changed {
             // Toggling off frees the caches (and cancels any in-flight

@@ -18,6 +18,7 @@
 //! CSVs (per convective day, 2004+) and the SPC WCM tornado database
 //! per-year files (begin/end track coordinates; Schaefer & Edwards 1999).
 
+use crate::panel_kit;
 use crate::spc_layers::{self, EventDayData};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use eframe::egui;
@@ -406,6 +407,7 @@ impl crate::ViewerApp {
                 .to_string();
         }
         let mut load: Option<NaiveDate> = None;
+        // Day row wraps at 320 pt; the loop knobs below are kit rows.
         ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.event_explorer.date_input)
@@ -440,88 +442,93 @@ impl crate::ViewerApp {
                 self.spc_data.fetched_at = None; // outlook follows again
                 ctx.request_repaint();
             }
-            // Every event click uses one explicit archive-loop context model;
-            // these controls do not inherit the Archive browser's manual N.
-            let mut before = crate::normalized_event_pad_frames(
-                self.app_settings.effective_event_before_scans(),
-            );
-            let mut after = crate::normalized_event_pad_frames(
-                self.app_settings.effective_event_after_scans(),
-            );
-            let mut max_frames = crate::normalized_event_max_frames(
-                self.app_settings.event_max_frames,
-            ) as u16;
-            ui.label("Track/report loop").on_hover_text(
-                "Used when you click a tornado track or storm report. Independent of the manual archive picker.",
-            );
+            if self.event_explorer.fetch.is_some() {
+                ui.spinner();
+            }
+        });
+        // Track/report loop context: every event click uses one explicit
+        // archive-loop model; these controls do not inherit the Archive
+        // browser's manual N.
+        let mut before =
+            crate::normalized_event_pad_frames(self.app_settings.effective_event_before_scans());
+        let mut after =
+            crate::normalized_event_pad_frames(self.app_settings.effective_event_after_scans());
+        let mut max_frames =
+            crate::normalized_event_max_frames(self.app_settings.event_max_frames) as u16;
+        panel_kit::row(ui, "Track loop before", |ui| {
             ui.add(
                 egui::DragValue::new(&mut before)
                     .range(0..=crate::MAX_EVENT_PAD_FRAMES)
                     .speed(0.1)
-                    .prefix("Before ")
                     .suffix(" scans"),
             )
-            .on_hover_text("Archive scans before touchdown or the point-report time");
+            .on_hover_text(
+                "Archive scans before touchdown or the point-report time. Used when you click \
+                 a tornado track or storm report — independent of the manual archive picker.",
+            );
+        });
+        panel_kit::row(ui, "Track loop after", |ui| {
             ui.add(
                 egui::DragValue::new(&mut after)
                     .range(0..=crate::MAX_EVENT_PAD_FRAMES)
                     .speed(0.1)
-                    .prefix("After ")
                     .suffix(" scans"),
             )
             .on_hover_text(
                 "Archive scans after lift or the point-report time; one-point events still load these post-event scans",
             );
+        });
+        panel_kit::row(ui, "Track loop cap", |ui| {
             ui.add(
                 egui::DragValue::new(&mut max_frames)
                     .range(1..=crate::MAX_HISTORY_FRAME_LIMIT as u16)
                     .speed(1.0)
-                    .prefix("Cap ")
                     .suffix(" frames"),
             )
             .on_hover_text(
                 "Maximum event-loop frames. When trimming a point event, post-event context is kept before older pre-event scans.",
             );
-            if self.app_settings.event_before_scans != Some(before)
-                || self.app_settings.event_after_scans != Some(after)
-                || self.app_settings.event_max_frames != max_frames
-            {
-                self.app_settings.event_before_scans = Some(before);
-                self.app_settings.event_after_scans = Some(after);
-                self.app_settings.event_max_frames = max_frames;
-                self.mark_app_settings_dirty();
+        });
+        if self.app_settings.event_before_scans != Some(before)
+            || self.app_settings.event_after_scans != Some(after)
+            || self.app_settings.event_max_frames != max_frames
+        {
+            self.app_settings.event_before_scans = Some(before);
+            self.app_settings.event_after_scans = Some(after);
+            self.app_settings.event_max_frames = max_frames;
+            self.mark_app_settings_dirty();
+        }
+        let mut sync_warnings = self.app_settings.event_sync_warnings;
+        if ui
+            .checkbox(&mut sync_warnings, "Sync warnings")
+            .on_hover_text(
+                "Load warning products for the actual archive loop window after the event radar frames land.",
+            )
+            .changed()
+        {
+            self.app_settings.event_sync_warnings = sync_warnings;
+            self.mark_app_settings_dirty();
+        }
+        let mut camera_follow = self.app_settings.event_track_camera_follow;
+        if ui
+            .checkbox(&mut camera_follow, "Follow track")
+            .on_hover_text(
+                "Tornado track clicks only: keep the camera centered on the estimated track position while the loaded loop plays.",
+            )
+            .changed()
+        {
+            self.app_settings.event_track_camera_follow = camera_follow;
+            if !camera_follow {
+                self.clear_camera_follow_targets();
             }
-            let mut sync_warnings = self.app_settings.event_sync_warnings;
-            if ui
-                .checkbox(&mut sync_warnings, "Sync warnings")
-                .on_hover_text(
-                    "Load warning products for the actual archive loop window after the event radar frames land.",
-                )
-                .changed()
-            {
-                self.app_settings.event_sync_warnings = sync_warnings;
-                self.mark_app_settings_dirty();
-            }
-            let mut camera_follow = self.app_settings.event_track_camera_follow;
-            if ui
-                .checkbox(&mut camera_follow, "Follow track")
-                .on_hover_text(
-                    "Tornado track clicks only: keep the camera centered on the estimated track position while the loaded loop plays.",
-                )
-                .changed()
-            {
-                self.app_settings.event_track_camera_follow = camera_follow;
-                if !camera_follow {
-                    self.clear_camera_follow_targets();
-                }
-                self.mark_app_settings_dirty();
-            }
-            let mut auto_model = self.app_settings.event_track_auto_model;
-            let mut model_slug =
-                crate::normalize_event_track_model_slug(&self.app_settings.event_track_model_slug);
-            ui.checkbox(&mut auto_model, "Auto model hour").on_hover_text(
-                "Track/report clicks: download a sounding-grade HRRR/RAP run for the model hour covering the event time.",
-            );
+            self.mark_app_settings_dirty();
+        }
+        let mut auto_model = self.app_settings.event_track_auto_model;
+        let mut model_slug =
+            crate::normalize_event_track_model_slug(&self.app_settings.event_track_model_slug);
+        panel_kit::row(ui, "Auto model hour", |ui| {
+            // Right-to-left: the model combo at the edge, its enable
+            // checkbox to the left.
             ui.add_enabled_ui(auto_model, |ui| {
                 egui::ComboBox::from_id_salt("event_track_auto_model_slug")
                     .selected_text(model_slug.to_ascii_uppercase())
@@ -535,17 +542,17 @@ impl crate::ViewerApp {
             .on_hover_text(
                 "HRRR and RAP are hourly, so BowEcho picks the cycle at or before the track time and downloads the bracketing forecast hours.",
             );
-            if auto_model != self.app_settings.event_track_auto_model
-                || model_slug != self.app_settings.event_track_model_slug
-            {
-                self.app_settings.event_track_auto_model = auto_model;
-                self.app_settings.event_track_model_slug = model_slug;
-                self.mark_app_settings_dirty();
-            }
-            if self.event_explorer.fetch.is_some() {
-                ui.spinner();
-            }
+            ui.checkbox(&mut auto_model, "").on_hover_text(
+                "Track/report clicks: download a sounding-grade HRRR/RAP run for the model hour covering the event time.",
+            );
         });
+        if auto_model != self.app_settings.event_track_auto_model
+            || model_slug != self.app_settings.event_track_model_slug
+        {
+            self.app_settings.event_track_auto_model = auto_model;
+            self.app_settings.event_track_model_slug = model_slug;
+            self.mark_app_settings_dirty();
+        }
         if let Some(date) = load {
             self.event_explorer.pinned_day = Some(date);
             self.event_explorer.failed = None;

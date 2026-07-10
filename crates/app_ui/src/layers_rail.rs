@@ -23,8 +23,8 @@ use crate::{
     compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
     custom_poll_links_from_gis, dock, format_site_label, glm_latest_age_minutes,
     glm_latest_is_live, glm_satellite_label, grid_composites, intl_provider_label, layer_row,
-    mesoanalysis, normalized_poll_url, oa_derived, parse_custom_poll_marker_inputs, poll_url_name,
-    poll_urls_match, spc_layers,
+    mesoanalysis, normalized_poll_url, oa_derived, panel_kit, parse_custom_poll_marker_inputs,
+    poll_url_name, poll_urls_match, spc_layers,
 };
 
 impl ViewerApp {
@@ -66,34 +66,17 @@ impl ViewerApp {
         })
     }
 
-    /// Weak uppercase group mini-header with a right-aligned action slot.
-    /// Groups are deliberately NOT collapsing — the rail stays one
-    /// scannable list; collapsing returns the junk-drawer dynamics
-    /// (spec §2.2).
-    fn rail_group_header(ui: &mut egui::Ui, label: &str, right: impl FnOnce(&mut egui::Ui)) {
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .small()
-                    .strong()
-                    .color(crate::SUBHEAD_COLOR),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
-        });
-    }
-
     /// The rail rows, grouped BASE → ATMOSPHERE → OBS → SEVERE → COMMUNITY
     /// (spec §2.2): primary + overlay radars + rotation tracks/TDS, then
     /// model/OA fields + GOES + drapes, then obs + lightning, then SPC +
     /// warnings, then placefiles.
     pub(crate) fn layers_rail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Groups are weak mini-headers, NOT collapsing — the rail stays one
-        // scannable list (spec §2.2). Map paint order is unchanged (the
+        // Groups are kit subgroup headers, NOT collapsing — the rail stays
+        // one scannable list (spec §2.2). Map paint order is unchanged (the
         // compositor is layer-type-major); the grouping is a reading aid.
         let overlay_count = self.radar_layers.len();
         let mut clear_overlays = false;
-        Self::rail_group_header(ui, "BASE", |ui| {
+        panel_kit::subgroup(ui, "Base", |ui| {
             if overlay_count > 0 {
                 if crate::fixed_action_button(ui, "Clear", 52.0)
                     .on_hover_text("Remove every overlay radar")
@@ -135,7 +118,6 @@ impl ViewerApp {
                     hover: "Primary radar — always drawn; site and products in the sections above",
                 },
                 name: &primary_name,
-                name_width: crate::NAME_W_STD,
                 name_hover: "Primary radar (site/products in SITE and PRODUCTS above)",
                 state: Some(primary_state),
                 opacity: Some(LayerRowOpacity::F32 {
@@ -165,7 +147,7 @@ impl ViewerApp {
         let mut step_hour: i64 = 0;
         // The Hour stepper rides the group header: it steps every
         // dock-following model row at once (spec §2.3).
-        Self::rail_group_header(ui, "ATMOSPHERE", |ui| {
+        panel_kit::subgroup(ui, "Atmosphere", |ui| {
             if has_model_rows {
                 if ui
                     .small_button("▶")
@@ -217,7 +199,6 @@ impl ViewerApp {
                         hover: "Fetching latest gridded radar composite",
                     },
                     name,
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: source.label(),
                     state: Some("loading"),
                     ..Default::default()
@@ -288,6 +269,10 @@ impl ViewerApp {
             let mut remove_this = false;
             let refreshable_source = grid_source;
             let current_color_family = layer.custom_color_family;
+            // The two-extra budget at 320 pt: the frame text rides the
+            // count column; Refresh and the Color picker live behind ⚙
+            // (wave-1 gear-popover precedent) with the window jump as the
+            // menu's first entry.
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -296,12 +281,9 @@ impl ViewerApp {
                         hover: "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)",
                     },
                     name: &name,
-                    // Model field keys run long (temperature_2m, …) — the
-                    // standard tier truncated them to "temperature_…"
-                    // (field report).
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: &name_hover,
                     state: grid_fetching.then_some("fetching"),
+                    count: grid_frame_text.as_deref(),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.1,
@@ -310,65 +292,79 @@ impl ViewerApp {
                     order: (model_row_count > 1).then_some(LayerRowOrder {
                         delta: &mut order_delta,
                     }),
-                    gear: Some(LayerRowGear::Open {
-                        hover: "Open the Model data window (runs · fields · soundings · download)",
-                        clicked: &mut open_window,
+                    gear: Some(LayerRowGear::Menu {
+                        hover: "Model layer options (open window · refresh · colors)",
+                        content: Box::new(|ui| {
+                            if ui
+                                .button("Open Model window")
+                                .on_hover_text("Runs · fields · soundings · download")
+                                .clicked()
+                            {
+                                open_window = true;
+                                ui.close();
+                            }
+                            if refreshable_source.is_some()
+                                && ui
+                                    .button("Refresh composite")
+                                    .on_hover_text("Fetch the latest gridded radar composite")
+                                    .clicked()
+                            {
+                                refresh_grid_composite = refreshable_source;
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.menu_button("Color", |ui| {
+                                if ui
+                                    .selectable_label(current_color_family.is_none(), "Auto")
+                                    .on_hover_text(
+                                        "Automatic model colors: WRF/model fields use Solarpower07's WRF-Runner palettes (reflectivity · temp · dew point · wind · precip · RH · CAPE), otherwise Rusty Weather's production style, then a generic ramp.",
+                                    )
+                                    .clicked()
+                                {
+                                    model_color_action = Some((id, ModelColorAction::Auto));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                for family in ColorTableFamily::ALL {
+                                    if ui
+                                        .selectable_label(
+                                            current_color_family == Some(family),
+                                            family.label(),
+                                        )
+                                        .clicked()
+                                    {
+                                        model_color_action =
+                                            Some((id, ModelColorAction::Use(family)));
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                let edit_family =
+                                    current_color_family.unwrap_or(ColorTableFamily::Generic);
+                                if ui
+                                    .button(format!("Edit {}", edit_family.label()))
+                                    .on_hover_text(
+                                        "Open Map > Appearance > Color tables for this family",
+                                    )
+                                    .clicked()
+                                {
+                                    model_color_action =
+                                        Some((id, ModelColorAction::Edit(edit_family)));
+                                    ui.close();
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Override this layer with an editable BowEcho color table",
+                            );
+                        }),
                     }),
                     remove: Some(LayerRowRemove {
                         hover: "Remove this layer",
                         clicked: &mut remove_this,
                     }),
                 },
-                |ui| {
-                    if let Some(text) = &grid_frame_text {
-                        ui.weak(text.as_str());
-                    }
-                    if let Some(source) = refreshable_source
-                        && ui
-                            .small_button("Refresh")
-                            .on_hover_text("Fetch the latest gridded radar composite")
-                            .clicked()
-                    {
-                        refresh_grid_composite = Some(source);
-                    }
-                    ui.menu_button("Color", |ui| {
-                        if ui
-                            .selectable_label(current_color_family.is_none(), "Auto")
-                            .on_hover_text(
-                                "Automatic model colors: WRF/model fields use Solarpower07's WRF-Runner palettes (reflectivity · temp · dew point · wind · precip · RH · CAPE), otherwise Rusty Weather's production style, then a generic ramp.",
-                            )
-                            .clicked()
-                        {
-                            model_color_action = Some((id, ModelColorAction::Auto));
-                            ui.close();
-                        }
-                        ui.separator();
-                        for family in ColorTableFamily::ALL {
-                            if ui
-                                .selectable_label(
-                                    current_color_family == Some(family),
-                                    family.label(),
-                                )
-                                .clicked()
-                            {
-                                model_color_action = Some((id, ModelColorAction::Use(family)));
-                                ui.close();
-                            }
-                        }
-                        ui.separator();
-                        let edit_family = current_color_family.unwrap_or(ColorTableFamily::Generic);
-                        if ui
-                            .button(format!("Edit {}", edit_family.label()))
-                            .on_hover_text("Open Custom > Appearance > Color tables for this family")
-                            .clicked()
-                        {
-                            model_color_action = Some((id, ModelColorAction::Edit(edit_family)));
-                            ui.close();
-                        }
-                    })
-                    .response
-                    .on_hover_text("Override this layer with an editable BowEcho color table");
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -488,9 +484,9 @@ impl ViewerApp {
                         hover: "Show Italy DPC raw radar/composite raster on the map",
                     },
                     name: &name,
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: &name_hover,
                     state: Some(state),
+                    count: Some(&frame_text),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.05,
@@ -522,9 +518,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    ui.weak(frame_text);
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -576,9 +570,9 @@ impl ViewerApp {
                         hover: "Show Taiwan CWA composite reflectivity on the map",
                     },
                     name: "Taiwan CWA REF",
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: &name_hover,
                     state: Some(state),
+                    count: Some(&frame_text),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.05,
@@ -599,9 +593,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    ui.weak(frame_text);
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -627,7 +619,6 @@ impl ViewerApp {
                         hover: "Show GOES on map",
                     },
                     name: "GOES",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "GOES satellite frame (configure in the Sat window)",
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
@@ -699,6 +690,7 @@ impl ViewerApp {
             );
             let mut open_wofs = false;
             let mut remove_drape = false;
+            let wofs_count = (!init.is_empty()).then(|| format!("{init}z+{minute}m"));
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -707,9 +699,9 @@ impl ViewerApp {
                         hover: "Drape the current WoFS product onto the radar map",
                     },
                     name: "WoFS drape",
-                    name_width: crate::NAME_W_STD,
                     name_hover: &name_hover,
                     state: Some(if self.wofs.open { "live" } else { "paused" }),
+                    count: wofs_count.as_deref(),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut self.wofs.drape_opacity,
                         min: 0.05,
@@ -725,11 +717,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    if !init.is_empty() {
-                        ui.weak(format!("{init}z+{minute}m"));
-                    }
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -755,9 +743,9 @@ impl ViewerApp {
                         hover: "Drape the FARM quicklook PPI onto the radar map (georeferenced)",
                     },
                     name: "FARM drape",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "Georeferenced FARM (DOW/COW) quicklook drape — sensor, placement, and echoes-only live in the FARM window",
                     state: Some(if live.is_some() { "live" } else { "loaded" }),
+                    count: live.as_deref(),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut self.farm.drape.opacity,
                         min: 0.15,
@@ -773,11 +761,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    if let Some(name) = &live {
-                        ui.weak(name.as_str());
-                    }
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -789,7 +773,7 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         }
-        Self::rail_group_header(ui, "OBS", |ui| {
+        panel_kit::subgroup(ui, "Obs", |ui| {
             let _ = ui;
         });
         {
@@ -806,6 +790,13 @@ impl ViewerApp {
             let obs_station_count = self.surface_obs.station_count;
             let obs_fetching =
                 self.obs_rx.is_some() || self.nws_obs_rx.is_some() || self.mesonet_rx.is_some();
+            let obs_count_text = obs_fetched_at.map(|at| {
+                format!(
+                    "{} stn · {}m ago",
+                    obs_station_count,
+                    at.elapsed().as_secs() / 60
+                )
+            });
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -814,8 +805,8 @@ impl ViewerApp {
                         hover: "METAR station plots: temperature/dewpoint (units per Settings ▸ Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
                     },
                     name: "Surface obs",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "METAR station plots: temperature/dewpoint (units per Settings ▸ Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                    count: obs_count_text.as_deref(),
                     gear: Some(LayerRowGear::Menu {
                         hover: "Networks: METAR · Mesonet · obs-adjusted soundings",
                         content: Box::new(|ui| {
@@ -863,13 +854,6 @@ impl ViewerApp {
                     ..Default::default()
                 },
                 |ui| {
-                    if let Some(at) = obs_fetched_at {
-                        ui.weak(format!(
-                            "{} stn · {}m ago",
-                            obs_station_count,
-                            at.elapsed().as_secs() / 60
-                        ));
-                    }
                     if obs_fetching {
                         ui.spinner();
                     }
@@ -1004,9 +988,9 @@ impl ViewerApp {
                         hover: "GOES GLM flashes, free via AWS (no key): trailing Show last window, age-faded, time-synced to the radar loop. Live/stale health uses the newest-flash gate.",
                     },
                     name: "Lightning",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "GOES GLM lightning flashes. The row label toggles the layer too. Europe/Japan require a separate MTG/Himawari lightning path and are not shown by this layer.",
                     state: glm_state,
+                    count: show_glm_line.then_some(glm_line.as_str()),
                     gear: Some(LayerRowGear::Menu {
                         hover: "Lightning data status",
                         content: Box::new(|ui| {
@@ -1047,11 +1031,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                move |ui| {
-                    if show_glm_line {
-                        ui.weak(glm_line);
-                    }
-                },
+                |_ui| {},
             );
             if refresh_glm {
                 self.refresh_glm_data(ctx);
@@ -1081,7 +1061,6 @@ impl ViewerApp {
                         hover: "Radiosonde launch sites as lavender diamond markers — click one for that station's observed sounding at the DISPLAYED radar time (specials included: scrub an archive loop to 21z, get the 21z special). Wyoming + IEM archives, no key.",
                     },
                     name: "RAOB stations",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "Observed-sounding launch sites (click a marker for the sounding at the displayed time, rendered in the native skew-T)",
                     gear: Some(LayerRowGear::Menu {
                         hover: "RAOB layer notes",
@@ -1106,7 +1085,7 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         }
-        Self::rail_group_header(ui, "SEVERE", |ui| {
+        panel_kit::subgroup(ui, "Severe", |ui| {
             let _ = ui;
         });
         // SPC OUTLOOK — one row (spec §2.3): vis = any kind enabled
@@ -1137,10 +1116,9 @@ impl ViewerApp {
                         hover: "Convective outlooks in SPC's own colors, archive-aware: shows the displayed day's outlook",
                     },
                     name: &name,
-                    name_width: crate::NAME_W_STD,
-                    name_hover: "SPC convective outlook polygons. Off remembers your kind set; on restores it. ⚙ opens the SEVERE tab's SPC outlooks section (day + kinds).",
+                    name_hover: "SPC convective outlook polygons. Off remembers your kind set; on restores it. ⚙ opens the ALERTS tab's SPC outlooks section (day + kinds).",
                     gear: Some(LayerRowGear::Open {
-                        hover: "Configure in the SEVERE tab: day · categorical / tornado / wind / hail",
+                        hover: "Configure in the ALERTS tab: day · categorical / tornado / wind / hail",
                         clicked: &mut open_severe,
                     }),
                     ..Default::default()
@@ -1185,10 +1163,9 @@ impl ViewerApp {
                         hover: "Filtered storm reports (tornado / wind / hail) for the DISPLAYED day: live today (refreshed ~5 min), the archived convective day (12Z-12Z) when browsing the past — with clickable tornado tracks (DATA tab: Event day)",
                     },
                     name: "SPC reports",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "SPC storm report dots + tornado track lines for the displayed day; click a track to load its radar loop",
                     gear: Some(LayerRowGear::Open {
-                        hover: "Open the SEVERE tab",
+                        hover: "Open the ALERTS tab",
                         clicked: &mut open_severe,
                     }),
                     ..Default::default()
@@ -1220,15 +1197,11 @@ impl ViewerApp {
                         hover: "mPING crowd reports from the public display feed, refreshed about every 5 min",
                     },
                     name: "mPING",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "Recent mPING public display reports: precipitation, hail, wind damage, flooding, visibility, and winter impacts\nData courtesy of NOAA NSSL / University of Oklahoma",
+                    count: mping_status.as_deref(),
                     ..Default::default()
                 },
-                |ui| {
-                    if let Some(status) = &mping_status {
-                        ui.weak(status);
-                    }
-                },
+                |_ui| {},
             ) {
                 self.mping_fetched_at = None;
                 self.save_overlay_defaults();
@@ -1245,6 +1218,7 @@ impl ViewerApp {
                 .as_ref()
                 .map(|overlay| overlay.records.len())
                 .unwrap_or(0);
+            let warnings_count = (active_count > 0).then(|| format!("{active_count} act"));
             let mut open_severe = false;
             if layer_row(
                 ui,
@@ -1254,24 +1228,20 @@ impl ViewerApp {
                         hover: "NWS warning/watch/MD polygons on the map",
                     },
                     name: "Warnings",
-                    name_width: crate::NAME_W_STD,
-                    name_hover: "Warning polygons (filters + full text in the warnings tab)",
+                    name_hover: "Warning polygons (filters + full text in the Alerts tab)",
+                    count: warnings_count.as_deref(),
                     opacity: Some(LayerRowOpacity::U8 {
                         value: &mut fill_alpha,
                         min: 0,
                         max: 80,
                     }),
                     gear: Some(LayerRowGear::Open {
-                        hover: "Open the warnings tab (filters · fill · full text)",
+                        hover: "Open the Alerts tab (filters · fill · full text)",
                         clicked: &mut open_severe,
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    if active_count > 0 {
-                        ui.weak(format!("{active_count} act"));
-                    }
-                },
+                |_ui| {},
             ) {
                 if fill_alpha != self.style_registry.hazard_global().fill_alpha {
                     self.style_settings.hazard_global.fill_alpha = Some(fill_alpha);
@@ -1284,7 +1254,7 @@ impl ViewerApp {
                 self.sidebar_tab = SidebarTab::Severe;
             }
         }
-        Self::rail_group_header(ui, "COMMUNITY", |ui| {
+        panel_kit::subgroup(ui, "Community", |ui| {
             let _ = ui;
         });
         ui.horizontal(|ui| {
@@ -1340,7 +1310,6 @@ impl ViewerApp {
                         hover: "Show this placefile on the map",
                     },
                     name: &title,
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: &hover,
                     gear: Some(LayerRowGear::Menu {
                         hover: "Placefile options",
@@ -1569,16 +1538,24 @@ impl ViewerApp {
     /// open-data feeds. This is acquisition (it replaces the primary volume
     /// source), not a layer — it lives in the DATA tab (spec §1).
     pub(crate) fn live_feeds_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-                    ui.label("Poll URL").on_hover_text(
-                        "GR2A-style polling: a served directory containing dir.list (the convention DOW/mobile radar crews use). Newest file loads automatically every 15 s, decoded natively (Level II or DORADE), and joins the frame loop.",
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.poll_url)
-                            .hint_text("http://host:port/path")
-                            .desired_width(150.0),
-                    );
-                    ui.menu_button("Feeds ▾", |ui| {
+        panel_kit::row(ui, "Poll URL", |ui| {
+            // Right-to-left: Start/Stop at the edge, the Feeds menu,
+            // then the URL input truncating in whatever remains
+            // (never forcing the panel wider — 320 pt rule).
+            let label = if self.poll_active { "Stop" } else { "Start" };
+            if ui.button(label).clicked() {
+                if self.poll_active {
+                    self.poll_active = false;
+                    self.primary.live.dedupe_key = None;
+                    self.poll_next = None;
+                } else if normalized_poll_url(&self.poll_url).is_empty() {
+                    self.status = "Poll URL: enter a URL or choose a saved link".to_owned();
+                } else {
+                    let url = self.poll_url.clone();
+                    self.start_known_feed_poll(&url);
+                }
+            }
+            ui.menu_button("Feeds ▾", |ui| {
                         ui.weak("research radars serving raw Level II");
                         // Grown from the same community table the map
                         // markers draw from, grouped by state — menu and
@@ -1615,27 +1592,26 @@ impl ViewerApp {
                     .on_hover_text(
                         "Community research-radar poll roots (IEM Level II host, ND State Water Commission, self-hosted university radars) — radars that aren't NEXRAD sites. Community-contributed catalog; the same sites are click-to-poll teal markers on the map.",
                     );
-                    let label = if self.poll_active { "Stop" } else { "Start" };
-                    if ui.button(label).clicked() {
-                        if self.poll_active {
-                            self.poll_active = false;
-                            self.primary.live.dedupe_key = None;
-                            self.poll_next = None;
-                        } else if normalized_poll_url(&self.poll_url).is_empty() {
-                            self.status = "Poll URL: enter a URL or choose a saved link".to_owned();
-                        } else {
-                            let url = self.poll_url.clone();
-                            self.start_known_feed_poll(&url);
-                        }
-                    }
-                    if self.poll_active && matches!(self.primary.feed, FeedSource::CustomUrl(_)) {
-                        ui.weak(
-                            self.primary.live.dedupe_key
-                                .as_deref()
-                                .unwrap_or("waiting for dir.list…"),
-                        );
-                    }
+            ui.add(
+                        egui::TextEdit::singleline(&mut self.poll_url)
+                            .hint_text("http://host:port/path")
+                            .desired_width(ui.available_width()),
+                    )
+                    .on_hover_text(
+                        "GR2A-style polling: a served directory containing dir.list (the convention DOW/mobile radar crews use). Newest file loads automatically every 15 s, decoded natively (Level II or DORADE), and joins the frame loop.",
+                    );
         });
+        if self.poll_active && matches!(self.primary.feed, FeedSource::CustomUrl(_)) {
+            panel_kit::status_block(
+                ui,
+                self.primary
+                    .live
+                    .dedupe_key
+                    .as_deref()
+                    .unwrap_or("waiting for dir.list…"),
+                None,
+            );
+        }
         self.custom_poll_links_section(ui, ctx);
         self.intl_feeds_row(ui, ctx);
     }
@@ -1645,7 +1621,9 @@ impl ViewerApp {
     /// markers so there is exactly one custom-URL start sequence.
     fn custom_poll_links_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        // Wrapped action rows: the three fill buttons fold under the label
+        // at 320 pt.
+        ui.horizontal_wrapped(|ui| {
             ui.label("Custom links").on_hover_text(
                 "Saved GR2A-style poll roots for private/mobile radars. Each saved link can also carry a marker position, drawn as a red dot on the map.",
             );
@@ -1700,7 +1678,7 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.custom_poll_label_input)
                     .hint_text("label")
@@ -1752,6 +1730,9 @@ impl ViewerApp {
                         let active = self.poll_active
                             && matches!(self.primary.feed, FeedSource::CustomUrl(_))
                             && poll_urls_match(&self.poll_url, &entry.poll_url);
+                        // Saved-link row grammar: dot + truncating title +
+                        // right-aligned Poll/Edit/remove cluster (fits 320).
+                        const LINK_CLUSTER_W: f32 = 110.0;
                         ui.horizontal(|ui| {
                             ui.colored_label(
                                 egui::Color32::from_rgb(255, 116, 118),
@@ -1762,21 +1743,31 @@ impl ViewerApp {
                             } else {
                                 format!("{site_id} {label}")
                             };
-                            ui.label(title)
+                            let title_width = (ui.available_width() - LINK_CLUSTER_W).max(60.0);
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(title_width, crate::PANEL_BUTTON_HEIGHT),
+                                egui::Sense::hover(),
+                            );
+                            ui.put(rect, egui::Label::new(title).truncate())
                                 .on_hover_text(format!("{}\n{}", entry.poll_url, coords));
-                            if ui.button("Poll").clicked() {
-                                start_index = Some(index);
-                            }
-                            if ui.button("Edit").clicked() {
-                                edit_index = Some(index);
-                            }
-                            if ui
-                                .button("×")
-                                .on_hover_text("Remove this custom link")
-                                .clicked()
-                            {
-                                remove_index = Some(index);
-                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button("×")
+                                        .on_hover_text("Remove this custom link")
+                                        .clicked()
+                                    {
+                                        remove_index = Some(index);
+                                    }
+                                    if ui.button("Edit").clicked() {
+                                        edit_index = Some(index);
+                                    }
+                                    if ui.button("Poll").clicked() {
+                                        start_index = Some(index);
+                                    }
+                                },
+                            );
                         });
                     }
                 });
@@ -1988,17 +1979,14 @@ impl ViewerApp {
         let selected_capability = capabilities
             .iter()
             .find(|capability| capability.provider_id == self.coverage_provider_id);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Source").on_hover_text(
-                "Choose a provider/site, probe the recent catalog without downloading volumes, then load the same path.",
-            );
+        panel_kit::row(ui, "Provider", |ui| {
             let provider_text = selected_capability
                 .map(|capability| capability.provider_label)
                 .unwrap_or("Provider");
             let mut next_provider = self.coverage_provider_id.clone();
             egui::ComboBox::from_id_salt("coverage_provider_combo")
                 .selected_text(provider_text)
-                .width(168.0)
+                .width(ui.available_width().clamp(120.0, 200.0))
                 .show_ui(ui, |ui| {
                     for capability in &capabilities {
                         ui.selectable_value(
@@ -2007,7 +1995,11 @@ impl ViewerApp {
                             format!("{} ({})", capability.provider_label, capability.country),
                         );
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Choose a provider/site, probe the recent catalog without downloading volumes, then load the same path.",
+                );
             if next_provider != self.coverage_provider_id {
                 self.coverage_provider_id = next_provider;
                 if let Some(first) = data_source::international::intl_static_sites()
@@ -2020,7 +2012,8 @@ impl ViewerApp {
                 }
                 self.coverage_probe_result = None;
             }
-
+        });
+        panel_kit::row(ui, "Site", |ui| {
             let site_text = provider_sites
                 .iter()
                 .find(|site| site.site_id == self.coverage_site_id)
@@ -2029,7 +2022,7 @@ impl ViewerApp {
             let mut next_site = self.coverage_site_id.clone();
             egui::ComboBox::from_id_salt("coverage_site_combo")
                 .selected_text(site_text)
-                .width((ui.available_width() - 180.0).clamp(130.0, 240.0))
+                .width(ui.available_width().clamp(120.0, 240.0))
                 .show_ui(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("coverage_site_combo_scroll")
@@ -2048,8 +2041,8 @@ impl ViewerApp {
                 self.coverage_site_id = next_site;
                 self.coverage_probe_result = None;
             }
-
-            ui.label("Frames");
+        });
+        panel_kit::row(ui, "Frames", |ui| {
             if ui
                 .add(
                     egui::DragValue::new(&mut self.coverage_frame_count)
@@ -2229,10 +2222,53 @@ impl ViewerApp {
     fn intl_feeds_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut list_provider: Option<String> = None;
         let mut start: Option<(String, String)> = None;
-        ui.horizontal(|ui| {
-            ui.label("International").on_hover_text(
-                "National open-data radar networks (ODIM_H5 polar volumes — OPERA Data Information Model), decoded natively. Pick a country's provider, then a site: the newest volume polls every 60 s and joins the frame loop like any polled feed.",
-            );
+        let intl_polling =
+            self.poll_active && matches!(self.primary.feed, FeedSource::Live(SiteRef::Intl { .. }));
+        panel_kit::row(ui, "International", |ui| {
+            // Right-to-left: Start/Stop at the edge, Site, then Country.
+            if intl_polling {
+                if ui.button("Stop").clicked() {
+                    self.poll_active = false;
+                    self.primary.live.dedupe_key = None;
+                    self.poll_next = None;
+                }
+            } else if let Some(FeedSource::Live(SiteRef::Intl {
+                provider_id,
+                site_id,
+            })) = FeedSource::intl_from_settings(&self.app_settings)
+            {
+                // Resume the persisted selection (mirrors poll_url Start).
+                if ui
+                    .button("Start")
+                    .on_hover_text(format!(
+                        "Resume {} {site_id}",
+                        intl_provider_label(&provider_id)
+                    ))
+                    .clicked()
+                {
+                    start = Some((provider_id, site_id));
+                }
+            }
+            if let Some(sites) = &self.intl_sites {
+                ui.menu_button("Site ▾", |ui| {
+                    ui.set_min_width(160.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("intl_site_list")
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for site in sites {
+                                if ui.button(&site.label).clicked() {
+                                    start =
+                                        Some((site.provider_id.to_owned(), site.site_id.clone()));
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+            }
+            if self.intl_sites_rx.in_flight() {
+                ui.spinner();
+            }
             let provider_button = if self.intl_picker_provider.is_empty() {
                 "Country ▾".to_owned()
             } else {
@@ -2265,62 +2301,23 @@ impl ViewerApp {
                 }
             })
             .response
-            .on_hover_text("National feed providers, grouped by country");
-            if self.intl_sites_rx.in_flight() {
-                ui.spinner();
-            }
-            if let Some(sites) = &self.intl_sites {
-                ui.menu_button("Site ▾", |ui| {
-                    ui.set_min_width(160.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("intl_site_list")
-                        .max_height(300.0)
-                        .show(ui, |ui| {
-                            for site in sites {
-                                if ui.button(&site.label).clicked() {
-                                    start = Some((
-                                        site.provider_id.to_owned(),
-                                        site.site_id.clone(),
-                                    ));
-                                    ui.close();
-                                }
-                            }
-                        });
-                });
-            }
-            let intl_polling =
-                self.poll_active && matches!(self.primary.feed, FeedSource::Live(SiteRef::Intl { .. }));
-            if intl_polling {
-                if ui.button("Stop").clicked() {
-                    self.poll_active = false;
-                    self.primary.live.dedupe_key = None;
-                    self.poll_next = None;
-                }
-                // Same status grammar as the URL poll: the dedupe key of
-                // the installed frame (Polled:/Poll: live in self.status).
-                ui.weak(
-                    self.primary.live.dedupe_key
-                        .as_deref()
-                        .unwrap_or("waiting for catalog…"),
-                );
-            } else if let Some(FeedSource::Live(SiteRef::Intl {
-                provider_id,
-                site_id,
-            })) = FeedSource::intl_from_settings(&self.app_settings)
-            {
-                // Resume the persisted selection (mirrors poll_url Start).
-                if ui
-                    .button("Start")
-                    .on_hover_text(format!(
-                        "Resume {} {site_id}",
-                        intl_provider_label(&provider_id)
-                    ))
-                    .clicked()
-                {
-                    start = Some((provider_id, site_id));
-                }
-            }
+            .on_hover_text(
+                "National open-data radar networks (ODIM_H5 polar volumes — OPERA Data Information Model), decoded natively. Pick a country's provider, then a site: the newest volume polls every 60 s and joins the frame loop like any polled feed. Providers grouped by country.",
+            );
         });
+        if intl_polling {
+            // Same status grammar as the URL poll: the dedupe key of the
+            // installed frame (Polled:/Poll: live in self.status).
+            panel_kit::status_block(
+                ui,
+                self.primary
+                    .live
+                    .dedupe_key
+                    .as_deref()
+                    .unwrap_or("waiting for catalog…"),
+                None,
+            );
+        }
         if let Some(provider_id) = list_provider {
             self.start_intl_site_listing(&provider_id, ctx);
         }
