@@ -1123,6 +1123,23 @@ pub(crate) fn try_postprocessed_wrf(
     try_postprocessed_wrf_shared(&nc, path, progress)
 }
 
+/// Vertically destagger a `(nz+1) x cells` w-level field to `nz` mass levels
+/// in place (mass level k = mean of staggered levels k and k+1), then
+/// truncate. In-place forward iteration is safe — the write slot k is only
+/// read again by iteration k itself — and avoids allocating a second
+/// multi-hundred-MB buffer on CONUS-II grids.
+fn destagger_z_to_mass_levels(values: &mut Vec<f64>, nz: usize, cells: usize) {
+    debug_assert!(values.len() >= (nz + 1) * cells);
+    for k in 0..nz {
+        for i in 0..cells {
+            let lo = values[k * cells + i];
+            let hi = values[(k + 1) * cells + i];
+            values[k * cells + i] = 0.5 * (lo + hi);
+        }
+    }
+    values.truncate(nz * cells);
+}
+
 /// Everything one post-processed hour yields: the synthesized surface 2D
 /// fields, the severe/thermo suite (heavy-path store slugs, written through
 /// the derived-field slot), and the isobaric sounding volumes.
@@ -1184,8 +1201,15 @@ fn try_postprocessed_wrf_shared(
     // allocating two more full-3D arrays (hundreds of MB each on CONUS-II).
     let (mut tk, nz) = read3d("TK")?;
     let (p_pa, _) = read3d("P")?;
-    let (mut z_m, _) = read3d("Z")?;
+    let (mut z_m, z_nz) = read3d("Z")?;
     let (qv, _) = read3d("QVAPOR")?;
+    // CONUS-II era quirk: the CTRL/history wrf3d files carry Z on the
+    // STAGGERED vertical grid (w-levels, nz+1 = bottom_top_stag, like W),
+    // while the future-era files carry it destaggered on mass levels (nz).
+    // Destagger vertically when needed so both eras import identically.
+    if z_nz == nz + 1 {
+        destagger_z_to_mass_levels(&mut z_m, nz, cells);
+    }
     let expected = nz.checked_mul(cells).unwrap_or(0);
     if expected == 0
         || [tk.len(), p_pa.len(), z_m.len(), qv.len()]
@@ -1398,6 +1422,20 @@ fn dewpoint_k_from_q_p(q: f64, p_pa: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destagger_z_averages_adjacent_w_levels_and_truncates() {
+        // 3 mass levels, 2 columns; staggered = 4 levels. Level-major layout:
+        // [k0c0, k0c1, k1c0, k1c1, ...].
+        let mut z = vec![
+            0.0, 100.0, // stag level 0
+            10.0, 110.0, // stag level 1
+            30.0, 130.0, // stag level 2
+            70.0, 170.0, // stag level 3
+        ];
+        destagger_z_to_mass_levels(&mut z, 3, 2);
+        assert_eq!(z, vec![5.0, 105.0, 20.0, 120.0, 50.0, 150.0]);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = now_unix();
