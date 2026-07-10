@@ -202,8 +202,10 @@ pub fn live_color() -> Color32 {
     theme().live
 }
 
-/// WCAG 2.x contrast ratio between two opaque colors (1.0..=21.0). Pure —
-/// the headless nodes gate the palette floors with it.
+/// WCAG 2.x contrast ratio between two opaque colors (1.0..=21.0). Pure and
+/// test-only today — the headless nodes gate the palette floors with it;
+/// promote out of `cfg(test)` when a runtime consumer appears.
+#[cfg(test)]
 pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
     fn linear(channel: u8) -> f32 {
         let channel = f32::from(channel) / 255.0;
