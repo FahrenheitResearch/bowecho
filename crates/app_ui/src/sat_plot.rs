@@ -265,12 +265,28 @@ impl SatellitePlotSource {
         };
         let bounds = geographic_bounds(&self.grid.lat, &self.grid.lon)
             .ok_or_else(|| "satellite grid has no finite lat/lon bounds".to_string())?;
+        let visual_mode = ProductVisualMode::FilledMeteorology;
+        let has_colorbar = matches!(&self.raster, SatellitePlotRaster::Scalar { .. });
+        let has_domain_frame =
+            rustwx_products::plot_design::static_domain_frame_for_bounds(bounds).is_some();
+        // The projection target is the INNER map frame, not the outer PNG/canvas.
+        // Titles, legend, colorbar, and the domain frame consume chrome around that
+        // map. Using width/height here made wide satellite grids collapse into a
+        // thin horizontal strip inside an otherwise correctly sized plot.
+        let target_ratio = rustwx_render::map_frame_aspect_ratio_for_mode_with_domain_frame(
+            visual_mode,
+            width,
+            height,
+            has_colorbar,
+            true,
+            has_domain_frame,
+        );
         let projected = rustwx_products::direct::build_projected_map_with_projection(
             &self.grid.lat,
             &self.grid.lon,
             self.grid.projection.as_ref(),
             bounds,
-            width as f64 / height as f64,
+            target_ratio,
         )
         .map_err(|error| error.to_string())?;
 
@@ -308,11 +324,8 @@ impl SatellitePlotSource {
         let field = Field2D::new(ProductKey::named(variable), units, grid.clone(), values)
             .map_err(|error| error.to_string())?;
         let mut request = MapRenderRequest::from_core_field(field, scale);
-        rustwx_products::plot_design::StaticPlotDesign::new(
-            bounds,
-            ProductVisualMode::FilledMeteorology,
-        )
-        .apply_to_request(&mut request);
+        rustwx_products::plot_design::StaticPlotDesign::new(bounds, visual_mode)
+            .apply_to_request(&mut request);
         request.apply_projected_map(&projected);
         request.title = Some(self.title.clone());
         request.subtitle_left = Some(self.subtitle_left.clone());
@@ -762,6 +775,47 @@ mod tests {
         assert_eq!(request.rgba_grid.as_ref().unwrap().pixels, pixels);
         assert!(!request.colorbar);
         assert_eq!(request.title.as_deref(), Some("SimSat GeoColor"));
+    }
+
+    #[test]
+    fn projected_domain_targets_the_inner_map_frame_not_the_outer_canvas() {
+        // Real HRRR SimSat geometry is a wide CONUS mesh. The first RC used
+        // the outer 864x528 canvas ratio here, while the renderer drew into a
+        // much wider inner map frame after reserving title/colorbar chrome;
+        // the result was a visibly compressed horizontal strip.
+        let source = SatellitePlotSource::scalar_from_mesh(
+            "SimSat IR C13",
+            "hrrr_t00z",
+            "2100Z",
+            "K",
+            2,
+            2,
+            vec![290.0, 285.0, 250.0, 240.0],
+            vec![20.0, 20.0, 58.0, 58.0],
+            vec![-153.0, -59.0, -153.0, -59.0],
+            None,
+        )
+        .unwrap();
+        let (width, height) = (864, 528);
+        let request = source.build_render_request(width, height).unwrap();
+        let expected = rustwx_render::map_frame_aspect_ratio_for_mode_with_domain_frame(
+            ProductVisualMode::FilledMeteorology,
+            width,
+            height,
+            request.colorbar,
+            request.title.is_some(),
+            request.domain_frame.is_some(),
+        );
+        let extent = &request
+            .projected_domain
+            .as_ref()
+            .expect("projected satellite domain")
+            .extent;
+        let actual = (extent.x_max - extent.x_min) / (extent.y_max - extent.y_min);
+        assert!(
+            (actual - expected).abs() < 1.0e-9,
+            "projected ratio {actual} must match inner map ratio {expected}"
+        );
     }
 
     #[test]
