@@ -72,10 +72,14 @@ struct ImportedWrfFields {
     projection: Option<GridProjection>,
 }
 
-struct RawField2D {
-    name: String,
-    units: String,
-    values: Vec<f32>,
+/// One raw 2-D plane under the light-import `wrf_*` store naming.
+/// `pub(crate)`: the wrf2d route hands these to BOTH import workers through
+/// [`PostprocessedWrfHour`], and `wrf_process` maps them into its derived-
+/// field refs itself.
+pub(crate) struct RawField2D {
+    pub(crate) name: String,
+    pub(crate) units: String,
+    pub(crate) values: Vec<f32>,
 }
 
 pub fn spawn_import_paths(paths: Vec<PathBuf>, store_root: PathBuf) -> LocalImportTask {
