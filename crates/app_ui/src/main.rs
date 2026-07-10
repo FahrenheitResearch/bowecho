@@ -80,6 +80,7 @@ mod oa_derived;
 mod obs;
 mod obs_soundings;
 mod overlays;
+mod panel_kit;
 mod placefiles;
 mod postproc_severe;
 mod product_select;
@@ -20876,8 +20877,11 @@ impl ViewerApp {
     }
 
     /// A collapsible sidebar section that remembers its open state across
-    /// restarts. The header is forced from the persisted state every frame
-    /// (`.open(Some(..))`) and clicks write back through AppSettings.
+    /// restarts: the persistence wrapper over `panel_kit::section` (the kit
+    /// renders the rule/title/chevron; the keys and this map are unchanged,
+    /// so pre-refresh user collapse state survives). The header is forced
+    /// from the persisted state every frame and clicks write back through
+    /// AppSettings.
     fn remembered_section<R>(
         &mut self,
         ui: &mut egui::Ui,
@@ -20887,16 +20891,11 @@ impl ViewerApp {
         body: impl FnOnce(&mut Self, &mut egui::Ui) -> R,
     ) -> Option<R> {
         let open = self.section_open(key, default_open);
-        Self::section_rule(ui);
-        let header_text = egui::RichText::new(label).strong().color(SUBHEAD_COLOR);
-        let response = egui::CollapsingHeader::new(header_text)
-            .id_salt(key)
-            .open(Some(open))
-            .show(ui, |ui| body(self, ui));
-        if response.header_response.clicked() {
+        let response = panel_kit::section(ui, key, label, open, |ui| body(self, ui));
+        if response.toggled {
             self.set_section_open(key, !open);
         }
-        response.body_returned
+        response.body
     }
 
     fn active_appearance_profile(&self) -> AppearanceProfile {
