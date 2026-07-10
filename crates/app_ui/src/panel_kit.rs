@@ -109,17 +109,6 @@ pub(crate) fn rail_cluster_width(slider_width: f32, spacing: f32) -> f32 {
     slider_width + 2.0 * RAIL_ICON_SLOT_W + 2.0 * spacing
 }
 
-/// The flexible middle zone a rail row leaves between the state dot and the
-/// right cluster (count text + inline extras render here, clipped).
-pub(crate) fn rail_middle_width(available: f32, slider_width: f32, spacing: f32) -> f32 {
-    (available
-        - rail_name_width(available)
-        - RAIL_DOT_SLOT_W
-        - rail_cluster_width(slider_width, spacing)
-        - 3.0 * spacing)
-        .max(0.0)
-}
-
 /// Persisted sidebar width (whole logical points in settings — `AppSettings`
 /// derives `Eq`, so no `f32` there) → the width the panel is built with.
 pub(crate) fn sidebar_width_from_settings(stored: Option<u16>) -> Option<f32> {
@@ -528,14 +517,25 @@ mod tests {
 
     #[test]
     fn rail_middle_zone_holds_the_extras_budget_at_the_panel_minimum() {
-        // Post-checkbox row width at the 300 pt panel minimum inside a
-        // section indent is ≈ 250 pt. The middle zone must still hold a
-        // rail row's largest inline-extras set (model rows' ↑/↓ ≈ 35 pt,
-        // placefiles' T + ↻ ≈ 39 pt) — everything wider lives behind ⚙.
+        // Mirror of layer_row's live arithmetic: middle = post-checkbox
+        // width − name column − dot slot − right cluster − 3 gaps. At the
+        // 300 pt panel minimum inside a section indent the post-checkbox
+        // width is ≈ 250 pt, and the middle zone must still hold a rail
+        // row's largest inline-extras set (model rows' ↑/↓ ≈ 35 pt,
+        // placefiles' T + ↻ ≈ 39 pt at 320) — everything wider lives
+        // behind ⚙.
         let slider = 56.0;
         let spacing = 3.0;
+        let middle_at = |available: f32| {
+            (available
+                - rail_name_width(available)
+                - RAIL_DOT_SLOT_W
+                - rail_cluster_width(slider, spacing)
+                - 3.0 * spacing)
+                .max(0.0)
+        };
         for available in [250.0_f32, 260.0, 282.0, 340.0, 620.0] {
-            let middle = rail_middle_width(available, slider, spacing);
+            let middle = middle_at(available);
             assert!(
                 middle >= 35.0,
                 "middle zone collapsed at {available}pt: {middle}"
@@ -549,7 +549,7 @@ mod tests {
             assert!(total <= available + 0.01, "row overflows at {available}pt");
         }
         // Degenerate widths clamp to zero instead of going negative.
-        assert_eq!(rail_middle_width(100.0, slider, spacing), 0.0);
+        assert_eq!(middle_at(100.0), 0.0);
     }
 
     #[test]
