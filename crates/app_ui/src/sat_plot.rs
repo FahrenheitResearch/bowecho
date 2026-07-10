@@ -322,7 +322,7 @@ impl SatellitePlotSource {
         request.supersample_factor = 1;
         if let Some(pixels) = rgba {
             request.set_rgba_grid(
-                RgbaGridField::new(grid, pixels).map_err(|error| error.to_string())?,
+                RgbaGridField::new(grid.into(), pixels).map_err(|error| error.to_string())?,
             );
             request.colorbar = false;
         }
