@@ -387,8 +387,7 @@ fn process_paths(
                             values: field.values.as_slice(),
                         })
                         .collect::<Vec<_>>();
-                    let volume_inputs =
-                        volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
+                    let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
                     let result = write_hour_from_fields_with_derived(
                         store_root,
                         &model,
@@ -412,8 +411,7 @@ fn process_paths(
             }
         }
 
-        let file = raw_open
-            .map_err(|err| format!("Open WRF {} failed: {err}", path.display()))?;
+        let file = raw_open.map_err(|err| format!("Open WRF {} failed: {err}", path.display()))?;
 
         for timeidx in 0..file.nt {
             if written.len() > u16::MAX as usize {
