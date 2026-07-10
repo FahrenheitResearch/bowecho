@@ -382,11 +382,8 @@ pub(crate) fn run_batch_plot(
             continue;
         }
         let model_id = meta.model.parse::<rustwx_core::ModelId>().ok();
-        let store_var_names: Vec<String> = meta
-            .variables
-            .iter()
-            .map(|var| var.name.clone())
-            .collect();
+        let store_var_names: Vec<String> =
+            meta.variables.iter().map(|var| var.name.clone()).collect();
 
         // Every surface 2-D variable — mirror of the rw-ui worker's
         // `load_field`: read, resolve style, convert units in place.
@@ -576,8 +573,8 @@ fn ensure_style(field: &mut FieldData, store_var_names: &[String]) -> StyleSourc
     if field.style.is_some() {
         return StyleSource::Solar;
     }
-    let title = display_var_name(&field.key.var, store_var_names)
-        .unwrap_or_else(|| field.key.var.clone());
+    let title =
+        display_var_name(&field.key.var, store_var_names).unwrap_or_else(|| field.key.var.clone());
     field.style = generic_ramp_style(&title, &field.units, &field.values);
     StyleSource::Generic
 }
@@ -830,12 +827,8 @@ mod tests {
                 lon.push(-98.0 + 0.1 * x as f32);
             }
         }
-        rustwx_core::LatLonGrid::new(
-            rustwx_core::GridShape::new(NX, NY).expect("dims"),
-            lat,
-            lon,
-        )
-        .expect("grid")
+        rustwx_core::LatLonGrid::new(rustwx_core::GridShape::new(NX, NY).expect("dims"), lat, lon)
+            .expect("grid")
     }
 
     /// Write a `wrf`-slug store: per hour, a canonical `temperature_2m`
@@ -845,10 +838,8 @@ mod tests {
     /// trick grib_import uses), and a `temperature_iso` sounding volume so
     /// the synthesized per-level planes render too.
     fn write_fixture(tag: &str, hours: &[u16]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "bowecho-batch-plots-{tag}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("bowecho-batch-plots-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for &hour in hours {
             let t2m = SelectedField2D::new(

@@ -2770,7 +2770,10 @@ pub(crate) fn user_style_override_active(
 /// the store name itself otherwise). The Solar [`color_tables::ColorTable`]
 /// name ("Solar Temperature", …) is an internal palette id and must never
 /// surface user-facing.
-pub(crate) fn attach_solar_fallback_style(field: &mut rw_ui::FieldData, hour_store_vars: &[String]) {
+pub(crate) fn attach_solar_fallback_style(
+    field: &mut rw_ui::FieldData,
+    hour_store_vars: &[String],
+) {
     if field.style.is_some() {
         return;
     }
