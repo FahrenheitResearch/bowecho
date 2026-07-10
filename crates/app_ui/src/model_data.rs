@@ -2460,9 +2460,30 @@ impl ModelDataDock {
                     }
                     Some(tree) => {
                         let browser = &mut self.browser;
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            picked = browser.ui(ui, tree);
-                        });
+                        // The run list is the LAST region of the Runs column,
+                        // so capping it at exactly the height that remains
+                        // squashes nothing above it. The explicit cap is what
+                        // makes the scrollbar engage: an un-capped ScrollArea
+                        // inside a host that lays this dock out with
+                        // unbounded height just grows with its content and
+                        // never scrolls (owner report: a long processed-
+                        // dataset list runs off the window). The salt keeps
+                        // its scroll state distinct from every other
+                        // ScrollArea in the dock (unsalted ones all share
+                        // egui's "scroll_area" id).
+                        let remaining = ui.available_height();
+                        let list_height = if remaining.is_finite() {
+                            remaining.max(120.0)
+                        } else {
+                            480.0
+                        };
+                        egui::ScrollArea::vertical()
+                            .id_salt("model_runs_list")
+                            .max_height(list_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                picked = browser.ui(ui, tree);
+                            });
                     }
                 }
                 if let Some(key) = picked {
