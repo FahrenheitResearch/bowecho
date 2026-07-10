@@ -5339,6 +5339,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// One-shot release proof for a real SimSat HRRR frame written by BowEcho.
+    /// The fixture is intentionally external: shipping tests stay small, while
+    /// an RC can copy one store run to a node and exercise OUR store reader,
+    /// palette bridge, projection builder, renderer, and PNG encoder together.
+    #[test]
+    #[ignore = "needs BOWECHO_SAT_PLOT_STORE and BOWECHO_SAT_PLOT_OUTPUT"]
+    fn real_simsat_hrrr_store_native_plot_exports_png() {
+        let store = PathBuf::from(
+            std::env::var("BOWECHO_SAT_PLOT_STORE")
+                .expect("set BOWECHO_SAT_PLOT_STORE to the copied sat-store root"),
+        );
+        let output = PathBuf::from(
+            std::env::var("BOWECHO_SAT_PLOT_OUTPUT")
+                .expect("set BOWECHO_SAT_PLOT_OUTPUT to a writable PNG path"),
+        );
+        let run = std::env::var("BOWECHO_SAT_PLOT_RUN")
+            .unwrap_or_else(|_| "hrrr_t00z_ir13_geo_c13_20260710".to_owned());
+        let key = SatRunKey {
+            model: "simsat".to_owned(),
+            run,
+        };
+        let source = load_frame_for_plot(&mut WorkerState::default(), &store, &key, 2100)
+            .expect("real BowEcho SimSat frame loads for native plot");
+        source
+            .save_png(&output, 1600, 1200)
+            .expect("real BowEcho SimSat native plot exports");
+        let rendered = image::open(&output)
+            .expect("exported PNG decodes")
+            .to_rgba8();
+        assert_eq!(rendered.dimensions(), (1600, 1200));
+        assert!(
+            rendered
+                .pixels()
+                .any(|pixel| pixel.0 != [255, 255, 255, 255]),
+            "real plot must contain more than the white canvas"
+        );
+    }
+
     #[test]
     fn map_frames_share_one_grid_read_within_and_across_runs() {
         let dir = test_dir("map-grid-cache");
