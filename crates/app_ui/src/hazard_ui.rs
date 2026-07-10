@@ -7,11 +7,11 @@ use crate::*;
 
 impl ViewerApp {
     pub(crate) fn hazard_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        // Wrapped, not a kit row: four toggles outgrow the control column
+        // at 320 pt and wrapping keeps them one visual family.
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.hazards_visible, "Show")
-                .on_hover_text(
-                    "Draw warning polygons on the map (also the Map-tab Warnings row)",
-                );
+                .on_hover_text("Draw warning polygons on the map (also the Map-tab Warnings row)");
             let mut show_labels = self.app_settings.show_hazard_labels;
             if ui
                 .checkbox(&mut show_labels, "Labels")
@@ -27,29 +27,39 @@ impl ViewerApp {
             ui.checkbox(&mut self.live_hazard_auto_refresh, "Auto-refresh")
                 .on_hover_text("Re-fetch active alerts on the live cadence");
         });
-        ui.horizontal_wrapped(|ui| {
-            for (family, label) in HAZARD_FILTER_FAMILIES {
-                let mut visible = !self.hidden_hazard_families.contains(*family);
-                if ui.checkbox(&mut visible, *label).changed() {
-                    if visible {
-                        self.hidden_hazard_families.remove(*family);
-                    } else {
-                        self.hidden_hazard_families.insert((*family).to_owned());
-                    }
-                    if self
-                        .selected_hazard_record()
-                        .is_some_and(|record| !self.hazard_record_visible(record))
-                    {
-                        self.selected_hazard_index = None;
-                    }
-                    ui.ctx().request_repaint();
-                }
+        // Family filters as a kit chip grid: selected = shown on the map
+        // and in the list; the hidden-family set is the same state the
+        // checkboxes used to edit.
+        let family_chips = HAZARD_FILTER_FAMILIES
+            .iter()
+            .map(|&(family, label)| panel_kit::Chip {
+                label,
+                hotkey: None,
+                selected: !self.hidden_hazard_families.contains(family),
+                hover: Some(format!("Show {family} alerts on the map and in the list")),
+            })
+            .collect::<Vec<_>>();
+        if let Some(clicked) = panel_kit::chip_grid(ui, &family_chips) {
+            let (family, _) = HAZARD_FILTER_FAMILIES[clicked];
+            if !self.hidden_hazard_families.remove(family) {
+                self.hidden_hazard_families.insert(family.to_owned());
             }
-        });
+            if self
+                .selected_hazard_record()
+                .is_some_and(|record| !self.hazard_record_visible(record))
+            {
+                self.selected_hazard_index = None;
+            }
+            ui.ctx().request_repaint();
+        }
         // The fill slider reads/writes the style registry (override on the
         // styles.json document) so it persists across launches.
         let mut fill_alpha = self.style_registry.hazard_global().fill_alpha as f32;
-        let fill_response = ui.add(egui::Slider::new(&mut fill_alpha, 0.0..=80.0).text("Fill"));
+        let fill_response =
+            panel_kit::slider_row(ui, "Fill", &mut fill_alpha, 0.0..=80.0, 0.0, |value| {
+                format!("{value:.0}")
+            })
+            .on_hover_text("Warning-polygon fill opacity (0-80)");
         if fill_response.changed() {
             self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.round() as u8);
             self.rebuild_style_registry();
@@ -94,8 +104,7 @@ impl ViewerApp {
                     ui.weak("No hazard polygons loaded");
                     return;
                 }
-                ui.horizontal(|ui| {
-                    ui.label("Type");
+                panel_kit::row(ui, "Type", |ui| {
                     let mut filter =
                         HazardListFilter::from_key(&app.app_settings.current_alert_filter);
                     egui::ComboBox::from_id_salt("current_alert_filter")
@@ -114,8 +123,8 @@ impl ViewerApp {
                         app.mark_app_settings_dirty();
                         ui.ctx().request_repaint();
                     }
-
-                    ui.label("Sort");
+                });
+                panel_kit::row(ui, "Sort", |ui| {
                     let mut sort = HazardListSort::from_key(&app.app_settings.current_alert_sort);
                     egui::ComboBox::from_id_salt("current_alert_sort")
                         .selected_text(sort.label())
@@ -147,26 +156,59 @@ impl ViewerApp {
                         }
                     });
                 }
+                // Kit select_row list: fixed-order monospace columns
+                // (family code | id | office | until) — the office
+                // truncates, the expiry and the NEW flag never do. The
+                // NEW flag replaces the old yellow row text (select_row
+                // paints one color); the "N new" banner and the map
+                // flashes keep carrying the attention state.
+                let display_rows = rows
+                    .iter()
+                    .map(|row| {
+                        let record = app
+                            .hazard_overlay
+                            .as_ref()
+                            .and_then(|overlay| overlay.records.get(row.index));
+                        let code = hazard_family_menu_label(&row.family);
+                        let raw_label = record
+                            .map(|record| record.label.clone())
+                            .unwrap_or_else(|| row.label.clone());
+                        let office = record
+                            .map(|record| record.office.clone())
+                            .unwrap_or_default();
+                        let until = record
+                            .and_then(|record| record.valid_end.as_deref())
+                            .and_then(hazard_until_hhmmz);
+                        (row, code, raw_label, office, until)
+                    })
+                    .collect::<Vec<_>>();
                 let mut focus_index = None;
                 fixed_height_scroll(
                     ui,
                     "hazard_current_alerts_list",
                     HAZARD_LIST_SCROLL_HEIGHT,
                     |ui| {
-                        for row in &rows {
-                            let text = if row.unacknowledged {
-                                egui::RichText::new(&row.label)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(255, 220, 106))
-                            } else {
-                                egui::RichText::new(&row.label)
-                            };
-                            let response = ui
-                                .add_sized(
-                                    egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
-                                    egui::Button::selectable(row.selected, text),
-                                )
-                                .on_hover_text(&row.hover);
+                        let char_width = ui
+                            .fonts(|fonts| fonts.glyph_width(&egui::FontId::monospace(12.0), '0'))
+                            .max(1.0);
+                        let max_chars =
+                            (((ui.available_width() - 12.0) / char_width).floor() as usize).max(8);
+                        for (row, code, raw_label, office, until) in &display_rows {
+                            let text = hazard_alert_row_text(
+                                code,
+                                raw_label,
+                                office,
+                                until.as_deref(),
+                                row.unacknowledged,
+                                max_chars,
+                            );
+                            let response = panel_kit::select_row(
+                                ui,
+                                row.selected,
+                                true,
+                                &text,
+                                Some(row.hover.as_str()),
+                            );
                             if response.clicked() {
                                 focus_index = Some(row.index);
                             }
@@ -236,10 +278,7 @@ impl ViewerApp {
                     spc_layers::estofex_issue_valid_at(issue, displayed_time),
                 )
             });
-            ui.horizontal(|ui| {
-                ui.label("Day").on_hover_text(
-                    "Outlook day (archive-aware: an archive loop shows THAT day's outlook)",
-                );
+            panel_kit::row(ui, "Day", |ui| {
                 egui::ComboBox::from_id_salt("severe_spc_day")
                     .selected_text(format!("D{}", app.spc_day))
                     .width(64.0)
@@ -252,53 +291,74 @@ impl ViewerApp {
                                 changed = true;
                             }
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(
+                        "Outlook day (archive-aware: an archive loop shows THAT day's outlook)",
+                    );
                 if app.spc_rx.is_some() {
                     ui.spinner();
                 }
             });
-            ui.horizontal_wrapped(|ui| {
-                for (slug, label) in spc_layers::outlook_kind_options(app.spc_day) {
-                    let mut on = if app.spc_day == 3 && *slug == "prob" {
+            // Outlook kinds + the Reports / ESTOFEX toggles as one kit chip
+            // grid — same enable state the checkboxes used to edit.
+            let kinds = spc_layers::outlook_kind_options(app.spc_day);
+            let mut outlook_chips = kinds
+                .iter()
+                .map(|&(slug, label)| {
+                    let on = if app.spc_day == 3 && slug == "prob" {
                         app.spc_outlooks_enabled
                             .iter()
                             .any(|k| matches!(k.as_str(), "prob" | "torn" | "wind" | "hail"))
                     } else {
-                        app.spc_outlooks_enabled.iter().any(|k| k == slug)
+                        app.spc_outlooks_enabled.iter().any(|k| k.as_str() == slug)
                     };
-                    if ui
-                        .checkbox(&mut on, *label)
-                        .on_hover_text("Outlook kind — drawn in SPC's own colors")
-                        .changed()
-                    {
-                        if app.spc_day == 3 && *slug == "prob" {
-                            app.spc_outlooks_enabled
-                                .retain(|k| !matches!(k.as_str(), "prob" | "torn" | "wind" | "hail"));
-                        } else {
-                            app.spc_outlooks_enabled.retain(|k| k != slug);
-                        }
-                        if on {
-                            app.spc_outlooks_enabled.push((*slug).to_owned());
-                        }
-                        changed = true;
+                    panel_kit::Chip {
+                        label,
+                        hotkey: None,
+                        selected: on,
+                        hover: Some("Outlook kind — drawn in SPC's own colors".to_owned()),
                     }
-                }
-                if ui
-                    .checkbox(&mut app.spc_reports_enabled, "Reports")
-                    .on_hover_text(
-                        "Today's filtered storm reports (tornado / wind / hail) — same state as the Map-tab row",
-                    )
-                    .changed()
-                {
+                })
+                .collect::<Vec<_>>();
+            let reports_chip = outlook_chips.len();
+            outlook_chips.push(panel_kit::Chip {
+                label: "Reports",
+                hotkey: None,
+                selected: app.spc_reports_enabled,
+                hover: Some(
+                    "Today's filtered storm reports (tornado / wind / hail) — same state as the Map-tab row"
+                        .to_owned(),
+                ),
+            });
+            let estofex_chip = outlook_chips.len();
+            outlook_chips.push(panel_kit::Chip {
+                label: "ESTOFEX Europe",
+                hotkey: None,
+                selected: estofex_on,
+                hover: Some(
+                    "ESTOFEX European Storm Forecast Experiment outlooks, with issue selection separate from SPC day"
+                        .to_owned(),
+                ),
+            });
+            if let Some(clicked) = panel_kit::chip_grid(ui, &outlook_chips) {
+                if let Some((slug, _)) = kinds.get(clicked) {
+                    let was_on = outlook_chips[clicked].selected;
+                    if app.spc_day == 3 && *slug == "prob" {
+                        app.spc_outlooks_enabled
+                            .retain(|k| !matches!(k.as_str(), "prob" | "torn" | "wind" | "hail"));
+                    } else {
+                        app.spc_outlooks_enabled.retain(|k| k != slug);
+                    }
+                    if !was_on {
+                        app.spc_outlooks_enabled.push((*slug).to_owned());
+                    }
                     changed = true;
-                }
-                if ui
-                    .checkbox(&mut estofex_on, "ESTOFEX Europe")
-                    .on_hover_text(
-                        "ESTOFEX European Storm Forecast Experiment outlooks, with issue selection separate from SPC day",
-                    )
-                    .changed()
-                {
+                } else if clicked == reports_chip {
+                    app.spc_reports_enabled = !app.spc_reports_enabled;
+                    changed = true;
+                } else if clicked == estofex_chip {
+                    estofex_on = !estofex_on;
                     if estofex_on {
                         app.spc_outlooks_enabled
                             .push(spc_layers::ESTOFEX_OUTLOOK_KIND.to_owned());
@@ -309,21 +369,18 @@ impl ViewerApp {
                     }
                     changed = true;
                 }
-                if fixed_action_button(ui, "Center Europe", 108.0)
-                    .on_hover_text("Jump to a Europe overview so ESTOFEX polygons are visible")
-                    .clicked()
-                {
-                    app.center_map_on(50.5, 12.0);
-                    app.map_scale = 22.0;
-                    app.status = "Centered map on Europe for ESTOFEX".to_owned();
-                    ui.ctx().request_repaint();
-                }
-            });
+            }
+            if fixed_action_button(ui, "Center Europe", 108.0)
+                .on_hover_text("Jump to a Europe overview so ESTOFEX polygons are visible")
+                .clicked()
+            {
+                app.center_map_on(50.5, 12.0);
+                app.map_scale = 22.0;
+                app.status = "Centered map on Europe for ESTOFEX".to_owned();
+                ui.ctx().request_repaint();
+            }
             if estofex_on {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("ESTOFEX issue").on_hover_text(
-                        "Auto chooses the newest issue valid at the displayed radar time and never shows an update before it was issued.",
-                    );
+                panel_kit::row(ui, "ESTOFEX issue", |ui| {
                     let selected_text = selected_estofex_issue
                         .as_ref()
                         .map(|(_, label, _, valid)| {
@@ -342,7 +399,7 @@ impl ViewerApp {
                         });
                     egui::ComboBox::from_id_salt("severe_estofex_issue")
                         .selected_text(selected_text)
-                        .width(260.0)
+                        .width(ui.available_width().clamp(120.0, 260.0))
                         .show_ui(ui, |ui| {
                             if ui
                                 .selectable_value(
@@ -366,7 +423,11 @@ impl ViewerApp {
                                     changed = true;
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(
+                            "Auto chooses the newest issue valid at the displayed radar time and never shows an update before it was issued.",
+                        );
                 });
                 let status = if app.spc_rx.is_some() {
                     "ESTOFEX: fetching issue list".to_owned()
@@ -408,12 +469,7 @@ impl ViewerApp {
             "Warning feed",
             false,
             |app, ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Auto-refresh every").on_hover_text(
-                        "How often BowEcho re-fetches live warnings (NWS active alerts plus any \
-                     custom feed). NWS guidance is 30 s; a fast local or relay feed can poll \
-                     down to 5 s.",
-                    );
+                panel_kit::row(ui, "Auto-refresh every", |ui| {
                     let mut secs = app
                         .app_settings
                         .warning_refresh_seconds
@@ -423,6 +479,11 @@ impl ViewerApp {
                             egui::DragValue::new(&mut secs)
                                 .range(MIN_LIVE_HAZARD_REFRESH_SECONDS..=600)
                                 .suffix(" s"),
+                        )
+                        .on_hover_text(
+                            "How often BowEcho re-fetches live warnings (NWS active alerts plus any \
+                             custom feed). NWS guidance is 30 s; a fast local or relay feed can poll \
+                             down to 5 s.",
                         )
                         .changed()
                     {
@@ -438,9 +499,11 @@ impl ViewerApp {
                  shape as api.weather.gov/alerts/active) or the NWS text/VTEC + lat/lon polygon \
                  format.",
             );
+                // The URL input truncates its content instead of forcing the
+                // panel wider (320 pt rule).
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut app.app_settings.warning_provider_url)
-                        .desired_width(260.0)
+                        .desired_width(ui.available_width())
                         .hint_text("https://host/warnings.geojson"),
                 );
                 if response.lost_focus() {
@@ -459,7 +522,7 @@ impl ViewerApp {
         self.remembered_section(ui, "severe_local_file", "Local file", false, |app, ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut app.hazard_path_text)
-                    .desired_width(220.0)
+                    .desired_width(ui.available_width())
                     .hint_text("Path"),
             );
             let loading = app.hazard_receiver.is_some();
@@ -1149,5 +1212,137 @@ impl ViewerApp {
         }
         append_flattened_hazard_fill_shapes(fill_candidates, &mut out.fill_shapes);
         out
+    }
+}
+
+/// `hazard_geom::format_utc_seconds` output ("2026-07-08T22:45:00Z") →
+/// the alert row's compact expiry ("22:45Z"). Anything else → None (the
+/// full string still lives in the row hover's detail lines).
+fn hazard_until_hhmmz(valid_end: &str) -> Option<String> {
+    let time = valid_end.get(11..16)?;
+    if valid_end.as_bytes().get(10) != Some(&b'T')
+        || !valid_end.ends_with('Z')
+        || !time
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == ':')
+    {
+        return None;
+    }
+    Some(format!("{time}Z"))
+}
+
+/// One alert list row as fixed-order monospace columns:
+/// `CODE  ID  OFFICE  until HH:MMZ  NEW` — the office (middle) truncates
+/// to the row's character budget; the id, expiry, and NEW flag never do.
+/// The id column drops a leading family-code duplicate ("FFW 0062 4" with
+/// code "FFW" reads `FFW   0062 4`).
+fn hazard_alert_row_text(
+    code: &str,
+    label: &str,
+    office: &str,
+    until: Option<&str>,
+    unacknowledged: bool,
+    max_chars: usize,
+) -> String {
+    let id = label
+        .strip_prefix(code)
+        .map(str::trim_start)
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(label);
+    let head = format!("{code:<5} {id:<9}");
+    let mut tail = String::new();
+    if let Some(until) = until {
+        tail.push_str("  until ");
+        tail.push_str(until);
+    }
+    if unacknowledged {
+        tail.push_str("  NEW");
+    }
+    let office = office.trim();
+    let budget = max_chars.saturating_sub(head.chars().count() + tail.chars().count());
+    let mut row = head;
+    if !office.is_empty() && budget > 2 {
+        let space = budget - 2;
+        row.push_str("  ");
+        if office.chars().count() <= space {
+            row.push_str(office);
+        } else {
+            row.extend(office.chars().take(space.saturating_sub(1)));
+            row.push('…');
+        }
+    }
+    row.push_str(&tail);
+    row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn until_hhmmz_reads_format_utc_seconds_only() {
+        assert_eq!(
+            hazard_until_hhmmz("2026-07-08T22:45:00Z").as_deref(),
+            Some("22:45Z")
+        );
+        assert_eq!(hazard_until_hhmmz(""), None);
+        assert_eq!(hazard_until_hhmmz("2026-07-08 22:45:00"), None);
+        assert_eq!(hazard_until_hhmmz("not a timestamp at all"), None);
+    }
+
+    #[test]
+    fn alert_row_text_keeps_fixed_columns_and_truncates_only_the_office() {
+        let text = hazard_alert_row_text(
+            "TOR",
+            "TOR 0031",
+            "NWS Des Moines IA",
+            Some("22:45Z"),
+            false,
+            40,
+        );
+        assert!(text.starts_with("TOR   0031"), "{text}");
+        assert!(text.ends_with("until 22:45Z"), "{text}");
+        assert!(text.contains("NWS"), "{text}");
+        assert!(text.chars().count() <= 40, "{text}");
+        // Office truncated with an ellipsis, never the expiry.
+        assert!(text.contains('…'), "{text}");
+
+        // Room to spare: the office renders whole.
+        let wide = hazard_alert_row_text(
+            "TOR",
+            "TOR 0031",
+            "NWS Des Moines IA",
+            Some("22:45Z"),
+            false,
+            80,
+        );
+        assert!(wide.contains("NWS Des Moines IA"), "{wide}");
+
+        // The NEW flag survives truncation at the row's tail.
+        let flagged = hazard_alert_row_text(
+            "SVR",
+            "SVR 0653",
+            "NWS Storm Prediction Center",
+            Some("03:00Z"),
+            true,
+            40,
+        );
+        assert!(flagged.ends_with("NEW"), "{flagged}");
+        assert!(flagged.contains("until 03:00Z"), "{flagged}");
+        assert!(flagged.chars().count() <= 40, "{flagged}");
+    }
+
+    #[test]
+    fn alert_row_text_strips_the_family_code_prefix_and_survives_misses() {
+        // Multi-zone label: the id column keeps the zone suffix.
+        let text = hazard_alert_row_text("FFW", "FFW 0062 4", "KLMK", Some("22:45Z"), false, 60);
+        assert!(text.starts_with("FFW   0062 4"), "{text}");
+        assert!(!text.contains("FFW 0062"), "{text}");
+        // Code that is not a label prefix (watches, MDs): label kept whole.
+        let watch = hazard_alert_row_text("Watch", "TOA 0123", "SPC", None, false, 60);
+        assert!(watch.contains("TOA 0123"), "{watch}");
+        // No office, no expiry: just the head columns.
+        let bare = hazard_alert_row_text("MD", "MD 1234", "", None, false, 60);
+        assert!(bare.trim_end().ends_with("1234"), "{bare}");
     }
 }
