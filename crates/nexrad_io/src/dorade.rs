@@ -1004,13 +1004,9 @@ pub(crate) fn canonical_moment(name: &str) -> Option<MomentType> {
         if let Some(moment) = match_moment_stem(stem) {
             return Some(moment);
         }
-        let next = ["_F", "_HC", "_VC", "HC", "_V", "_H"]
+        stem = ["_F", "_HC", "_VC", "HC", "_V", "_H"]
             .iter()
-            .find_map(|suffix| stem.strip_suffix(suffix).filter(|rest| !rest.is_empty()));
-        match next {
-            Some(shorter) => stem = shorter,
-            None => return None,
-        }
+            .find_map(|suffix| stem.strip_suffix(suffix).filter(|rest| !rest.is_empty()))?;
     }
 }
 
