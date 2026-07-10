@@ -680,9 +680,14 @@ impl ViewerApp {
             }
         }
         ui.separator();
-        ui.strong("Windows Defender / SmartScreen");
-        ui.weak(SECURITY_UNSIGNED_BUILD_TEXT);
-        ui.weak(SECURITY_SIGNATURE_STATUS_TEXT);
+        // Explainer prose folds into a collapsed kit disclosure
+        // (ui-refresh plan: prose never renders inline-expanded).
+        crate::panel_kit::about(
+            ui,
+            "settings_smartscreen_about",
+            "Windows Defender / SmartScreen",
+            &[SECURITY_UNSIGNED_BUILD_TEXT, SECURITY_SIGNATURE_STATUS_TEXT],
+        );
     }
 }
 

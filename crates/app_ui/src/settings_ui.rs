@@ -720,7 +720,10 @@ impl ViewerApp {
 
     /// Display preferences (Settings ▸ Display).
     fn display_settings_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
+        // Wrapped, not a kit row: three radios outgrow the control column
+        // at 320 pt, and swapping them for a combo would change the
+        // interaction (the plan forbids behavior changes).
+        ui.horizontal_wrapped(|ui| {
             ui.label("Smoothing");
             let mut changed = false;
             changed |= ui
@@ -758,8 +761,7 @@ impl ViewerApp {
             }
         });
         self.raster_quality_settings(ui, ctx);
-        ui.horizontal(|ui| {
-            ui.label("Units");
+        panel_kit::row(ui, "Units", |ui| {
             let current = self.units();
             let mut picked = None;
             egui::ComboBox::from_id_salt("display_units")
@@ -774,7 +776,13 @@ impl ViewerApp {
                             picked = Some(option);
                         }
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Readout units: beam heights, distances, temperatures (lowest-beam menu, \
+                     cursor inspector, station plots, range circles). BowEcho is US-born so \
+                     imperial is the default — metric is this one click.",
+                );
             if let Some(option) = picked
                 && option != current
             {
@@ -782,24 +790,24 @@ impl ViewerApp {
                 self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
-        })
-        .response
-        .on_hover_text(
-            "Readout units: beam heights, distances, temperatures (lowest-beam menu, \
-             cursor inspector, station plots, range circles). BowEcho is US-born so \
-             imperial is the default — metric is this one click.",
-        );
+        });
         // "Where is m/s?" lands here first, so say where velocity units
-        // actually live when this setting does not govern them.
+        // actually live when this setting does not govern them — as a
+        // collapsed kit disclosure (prose never inline-expanded).
         if let Some(note) = self.velocity_units_note_for_settings() {
-            ui.weak(note).on_hover_text(
-                "A velocity palette's declared Units: header (kt, mph, km/h, m/s) drives the \
-                 velocity readout, colorbar ticks, and unit chip — GR2Analyst semantics. Pick or \
-                 edit the table under Custom ▸ Color tables to change it.",
+            panel_kit::about(
+                ui,
+                "settings_velocity_units_about",
+                "velocity units",
+                &[
+                    note.as_str(),
+                    "A velocity palette's declared Units: header (kt, mph, km/h, m/s) drives the \
+                     velocity readout, colorbar ticks, and unit chip — GR2Analyst semantics. Pick or \
+                     edit the table under Custom ▸ Color tables to change it.",
+                ],
             );
         }
-        ui.horizontal(|ui| {
-            ui.label("Time zone");
+        panel_kit::row(ui, "Time zone", |ui| {
             let current = self.time_zone();
             let mut picked = None;
             egui::ComboBox::from_id_salt("display_time_zone")
@@ -814,7 +822,12 @@ impl ViewerApp {
                             picked = Some(option);
                         }
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Display-only time zone for map chips and readouts. Archive keys, \
+                     SPC/day logic, and downloads stay UTC so midnight cases do not shift.",
+                );
             if let Some(option) = picked
                 && option != current
             {
@@ -822,14 +835,8 @@ impl ViewerApp {
                 self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
-        })
-        .response
-        .on_hover_text(
-            "Display-only time zone for map chips and readouts. Archive keys, \
-             SPC/day logic, and downloads stay UTC so midnight cases do not shift.",
-        );
-        ui.horizontal(|ui| {
-            ui.label("Basemap");
+        });
+        panel_kit::row(ui, "Basemap", |ui| {
             let mut changed_style = None;
             egui::ComboBox::from_id_salt("basemap_style")
                 .selected_text(self.basemap_style.label())
@@ -854,34 +861,26 @@ impl ViewerApp {
             }
         });
         let mut basemap_lines_changed = false;
-        ui.horizontal(|ui| {
-            ui.label("Line brightness");
-            basemap_lines_changed |= ui
-                .add(
-                    egui::Slider::new(
-                        &mut self.app_settings.basemap_line_brightness_percent,
-                        20..=200,
-                    )
-                    .suffix("%")
-                    .show_value(true),
-                )
-                .on_hover_text("Boundary/admin line intensity on the basemap")
-                .changed();
-        });
-        ui.horizontal(|ui| {
-            ui.label("Line thickness");
-            basemap_lines_changed |= ui
-                .add(
-                    egui::Slider::new(
-                        &mut self.app_settings.basemap_line_thickness_percent,
-                        25..=250,
-                    )
-                    .suffix("%")
-                    .show_value(true),
-                )
-                .on_hover_text("Boundary/admin line width on the basemap")
-                .changed();
-        });
+        basemap_lines_changed |= panel_kit::slider_row(
+            ui,
+            "Line brightness",
+            &mut self.app_settings.basemap_line_brightness_percent,
+            20..=200,
+            0.0,
+            |value| format!("{value}%"),
+        )
+        .on_hover_text("Boundary/admin line intensity on the basemap")
+        .changed();
+        basemap_lines_changed |= panel_kit::slider_row(
+            ui,
+            "Line thickness",
+            &mut self.app_settings.basemap_line_thickness_percent,
+            25..=250,
+            0.0,
+            |value| format!("{value}%"),
+        )
+        .on_hover_text("Boundary/admin line width on the basemap")
+        .changed();
         if basemap_lines_changed {
             self.app_settings.basemap_line_brightness_percent = self
                 .app_settings
@@ -894,22 +893,21 @@ impl ViewerApp {
             self.mark_app_settings_dirty();
             ctx.request_repaint();
         }
-        ui.horizontal(|ui| {
-            ui.label("Scroll zoom speed");
-            if ui
-                .add(
-                    egui::Slider::new(&mut self.app_settings.zoom_speed_percent, 50..=300)
-                        .suffix("%")
-                        .show_value(true),
-                )
-                .on_hover_text(
-                    "How far one scroll-wheel notch zooms the map. 100% is the classic feel; the default 150% zooms half again faster.",
-                )
-                .changed()
-            {
-                self.mark_app_settings_dirty();
-            }
-        });
+        if panel_kit::slider_row(
+            ui,
+            "Scroll zoom speed",
+            &mut self.app_settings.zoom_speed_percent,
+            50..=300,
+            0.0,
+            |value| format!("{value}%"),
+        )
+        .on_hover_text(
+            "How far one scroll-wheel notch zooms the map. 100% is the classic feel; the default 150% zooms half again faster.",
+        )
+        .changed()
+        {
+            self.mark_app_settings_dirty();
+        }
         if ui
             .checkbox(
                 &mut self.app_settings.basemap_lightweight,
@@ -1020,8 +1018,7 @@ impl ViewerApp {
         {
             self.mark_app_settings_dirty();
         }
-        ui.horizontal(|ui| {
-            ui.label("Workspace");
+        panel_kit::row(ui, "Workspace", |ui| {
             if ui
                 .button("Reset layout")
                 .on_hover_text(
@@ -1036,38 +1033,9 @@ impl ViewerApp {
         });
         // Data-folder override (field request: limited LOCALAPPDATA
         // space). Restart-applied so live stores never move mid-session.
-        ui.horizontal(|ui| {
-            ui.label("Data folder").on_hover_text(
-                "Where caches and stores live: Level II cache, model / satellite / \
-                 lightning stores, map tiles. Default is your platform's app-data \
-                 location. Changes apply on restart; existing data is not moved.",
-            );
-            let current = settings::data_dir_override()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "platform default".to_owned());
-            let pending = self.app_settings.data_dir.trim();
-            if !pending.is_empty()
-                && Some(pending)
-                    != settings::data_dir_override()
-                        .map(|p| p.display().to_string())
-                        .as_deref()
-            {
-                ui.weak(format!("{pending} (restart to apply)"));
-            } else {
-                ui.weak(current);
-            }
-            #[cfg(any(windows, target_os = "macos"))]
-            if ui.button("Change…").clicked()
-                && let Some(dir) = rfd::FileDialog::new()
-                    .set_title(format!(
-                        "Choose the {} data folder",
-                        self.app_settings.brand.resolved_display_name()
-                    ))
-                    .pick_folder()
-            {
-                self.set_data_folder_override_in_memory(dir);
-                self.mark_app_settings_dirty();
-            }
+        panel_kit::row(ui, "Data folder", |ui| {
+            // Right-to-left control area: Default at the edge, Change…
+            // beside it.
             let has_data_folder_override = !self.app_settings.data_dir.trim().is_empty();
             if ui
                 .add_enabled(has_data_folder_override, egui::Button::new("Default"))
@@ -1081,7 +1049,43 @@ impl ViewerApp {
                 self.reset_data_folder_override_in_memory();
                 self.mark_app_settings_dirty();
             }
+            #[cfg(any(windows, target_os = "macos"))]
+            if ui
+                .button("Change…")
+                .on_hover_text(
+                    "Where caches and stores live: Level II cache, model / satellite / \
+                     lightning stores, map tiles. Default is your platform's app-data \
+                     location. Changes apply on restart; existing data is not moved.",
+                )
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new()
+                    .set_title(format!(
+                        "Choose the {} data folder",
+                        self.app_settings.brand.resolved_display_name()
+                    ))
+                    .pick_folder()
+            {
+                self.set_data_folder_override_in_memory(dir);
+                self.mark_app_settings_dirty();
+            }
         });
+        // The resolved path gets its own truncating status line — paths are
+        // exactly the kind of text that used to blow the row width.
+        let current = settings::data_dir_override()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "platform default".to_owned());
+        let pending = self.app_settings.data_dir.trim();
+        let path_line = if !pending.is_empty()
+            && Some(pending)
+                != settings::data_dir_override()
+                    .map(|p| p.display().to_string())
+                    .as_deref()
+        {
+            format!("{pending} (restart to apply)")
+        } else {
+            current
+        };
+        panel_kit::status_block(ui, &path_line, None);
     }
 
     /// Radar raster quality (Settings ▸ Display): the supersample resolution
@@ -1089,8 +1093,7 @@ impl ViewerApp {
     /// toggle and its memory estimate. Standard + toggle-off is bit-identical to
     /// pre-feature builds.
     fn raster_quality_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.label("Raster quality");
+        panel_kit::row(ui, "Raster quality", |ui| {
             let current = self.raster_quality();
             let mut picked = None;
             egui::ComboBox::from_id_salt("raster_quality")
@@ -1105,7 +1108,16 @@ impl ViewerApp {
                             picked = Some(option);
                         }
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Pixel resolution the radar polar data is rasterized into for the frame you are \
+                     viewing (the live frame, or the frame you stop the loop on). Higher is sharper when \
+                     you zoom in and in native screenshots — real added gate detail, not upscaling — at a \
+                     memory/CPU cost that grows with the pixel count (~4 MB Standard, ~16 MB High, ~64 MB \
+                     Ultra per frame). While a loop plays it keeps rendering at Standard unless the toggle \
+                     below is on.",
+                );
             if let Some(option) = picked
                 && option != current
             {
@@ -1113,16 +1125,7 @@ impl ViewerApp {
                 self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
-        })
-        .response
-        .on_hover_text(
-            "Pixel resolution the radar polar data is rasterized into for the frame you are \
-             viewing (the live frame, or the frame you stop the loop on). Higher is sharper when \
-             you zoom in and in native screenshots — real added gate detail, not upscaling — at a \
-             memory/CPU cost that grows with the pixel count (~4 MB Standard, ~16 MB High, ~64 MB \
-             Ultra per frame). While a loop plays it keeps rendering at Standard unless the toggle \
-             below is on.",
-        );
+        });
         let mut whole_loop = self.app_settings.raster_high_res_whole_loop;
         if ui
             .checkbox(&mut whole_loop, "Apply high-res to the whole loop")
@@ -1236,9 +1239,25 @@ impl ViewerApp {
         }
 
         ui.add_enabled_ui(self.app_settings.alert_sound_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Sound");
-                ui.weak(self.alert_sound_path_label());
+            panel_kit::row(ui, "Sound", |ui| {
+                // Right-to-left control area: Test at the edge, then
+                // System, then Choose WAV… (the path gets its own
+                // truncating line below).
+                if ui
+                    .button("Test")
+                    .on_hover_text("Play the selected alert sound once")
+                    .clicked()
+                {
+                    self.trigger_alert_sound();
+                }
+                if ui
+                    .button("System")
+                    .on_hover_text("Use the platform system alert sound")
+                    .clicked()
+                {
+                    self.app_settings.alert_sound_path.clear();
+                    self.mark_app_settings_dirty();
+                }
                 #[cfg(any(windows, target_os = "macos"))]
                 if ui
                     .button("Choose WAV…")
@@ -1255,22 +1274,8 @@ impl ViewerApp {
                     self.app_settings.alert_sound_path = path.display().to_string();
                     self.mark_app_settings_dirty();
                 }
-                if ui
-                    .button("System")
-                    .on_hover_text("Use the platform system alert sound")
-                    .clicked()
-                {
-                    self.app_settings.alert_sound_path.clear();
-                    self.mark_app_settings_dirty();
-                }
-                if ui
-                    .button("Test")
-                    .on_hover_text("Play the selected alert sound once")
-                    .clicked()
-                {
-                    self.trigger_alert_sound();
-                }
             });
+            panel_kit::status_block(ui, &self.alert_sound_path_label(), None);
             ui.label("Sound warning types");
             for (family, label) in ALERT_SOUND_FAMILY_OPTIONS {
                 let mut enabled =
@@ -1302,9 +1307,22 @@ impl ViewerApp {
             self.mark_app_settings_dirty();
         }
         ui.add_enabled_ui(self.app_settings.radar_update_sound_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Sound");
-                ui.weak(self.radar_update_sound_path_label());
+            panel_kit::row(ui, "Sound", |ui| {
+                if ui
+                    .button("Test")
+                    .on_hover_text("Play the selected radar-updated sound once")
+                    .clicked()
+                {
+                    let _ = alert_audio::play(&self.app_settings.radar_update_sound_path);
+                }
+                if ui
+                    .button("System")
+                    .on_hover_text("Use the platform system sound")
+                    .clicked()
+                {
+                    self.app_settings.radar_update_sound_path.clear();
+                    self.mark_app_settings_dirty();
+                }
                 #[cfg(any(windows, target_os = "macos"))]
                 if ui
                     .button("Choose WAV…")
@@ -1321,22 +1339,8 @@ impl ViewerApp {
                     self.app_settings.radar_update_sound_path = path.display().to_string();
                     self.mark_app_settings_dirty();
                 }
-                if ui
-                    .button("System")
-                    .on_hover_text("Use the platform system sound")
-                    .clicked()
-                {
-                    self.app_settings.radar_update_sound_path.clear();
-                    self.mark_app_settings_dirty();
-                }
-                if ui
-                    .button("Test")
-                    .on_hover_text("Play the selected radar-updated sound once")
-                    .clicked()
-                {
-                    let _ = alert_audio::play(&self.app_settings.radar_update_sound_path);
-                }
             });
+            panel_kit::status_block(ui, &self.radar_update_sound_path_label(), None);
         });
     }
 
