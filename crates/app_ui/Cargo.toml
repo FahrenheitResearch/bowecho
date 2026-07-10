@@ -138,5 +138,5 @@ default-features = false
 
 [dependencies.wrf-core]
 git = "https://github.com/FahrenheitResearch/wrf-rust.git"
-rev = "f05758d9b8ea0132ea8b9767882396cbc5b2cfac"
+rev = "213068cc40114c1d4997c84a0f956eed2717d91a"
 package = "wrf-core"

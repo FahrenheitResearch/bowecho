@@ -6813,7 +6813,7 @@ dependencies = [
 [[package]]
 name = "wrf-core"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=f05758d9b8ea0132ea8b9767882396cbc5b2cfac#f05758d9b8ea0132ea8b9767882396cbc5b2cfac"
+source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=213068cc40114c1d4997c84a0f956eed2717d91a#213068cc40114c1d4997c84a0f956eed2717d91a"
 dependencies = [
  "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/ecape-rs?rev=414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0)",
  "flate2",
