@@ -2584,6 +2584,10 @@ struct ViewerApp {
     /// One-shot: force the Settings color-tables fold open (set by the
     /// product color row's "Edit…" jump).
     open_color_tables_request: bool,
+    /// One-shot: force the Settings "Security & updates" fold open (set by
+    /// the top bar's "vX.Y.Z available" chip — the in-app updater lives
+    /// there, so the chip routes to it instead of the browser).
+    open_update_section_request: bool,
     color_tables: ColorTableSet,
     /// User .pal tables scanned from `settings::color_tables_dir()` ("My
     /// tables"): (family from the `Product:` header, parsed table).
@@ -7943,6 +7947,7 @@ impl ViewerApp {
             grid_composite_status: Vec::new(),
             grid_composite_announce_status: false,
             open_color_tables_request: false,
+            open_update_section_request: false,
             bold_labels: true,
             color_tables: ColorTableSet::default(),
             user_color_tables: Vec::new(),
@@ -18957,7 +18962,6 @@ impl ViewerApp {
         self.poll_update_check();
         let display_name = self.app_settings.brand.resolved_display_name().to_owned();
         let header_logo = self.app_settings.brand.assets.header_logo.clone();
-        let releases_url = brand::releases_page_url(&self.app_settings.brand);
         ui.horizontal_centered(|ui| {
             if let Some((texture, size)) = self.brand_assets.texture(
                 ui.ctx(),
@@ -19004,8 +19008,7 @@ impl ViewerApp {
                 ui.separator();
                 // STATUS CHIPS — far right after the menus, so a chip
                 // appearing/disappearing never moves a command button.
-                if let Some(tag) = &self.update_available {
-                    let tag = tag.clone();
+                if let Some(tag) = self.update_available.clone() {
                     let text = egui::RichText::new(format!("{tag} available"))
                         .small()
                         .color(egui::Color32::from_rgb(255, 196, 110));
@@ -19013,13 +19016,12 @@ impl ViewerApp {
                         .add(egui::Label::new(text).sense(egui::Sense::click()))
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text(format!(
-                            "A newer {display_name} release is available — open the releases page"
+                            "A newer {display_name} release is available — open the \
+                             update section in ⚙ Settings"
                         ))
                         .clicked()
-                        && let Some(releases_url) = &releases_url
                     {
-                        ui.ctx()
-                            .open_url(egui::OpenUrl::new_tab(releases_url));
+                        self.request_update_settings();
                     }
                 }
                 let live = self.farm.live_sensor().map(|s| (s.id, s.name.clone()));
@@ -23428,6 +23430,15 @@ impl ViewerApp {
         self.sidebar_tab = SidebarTab::Layers;
         self.color_table_target = family;
         self.open_color_tables_request = true;
+    }
+
+    /// The top bar's "vX.Y.Z available" chip lands here: jump to the ⚙
+    /// Settings tab with the "Security & updates" fold forced open on the
+    /// next render — that is where the in-app updater (Install update /
+    /// Open releases / Check now) lives.
+    fn request_update_settings(&mut self) {
+        self.sidebar_tab = SidebarTab::Settings;
+        self.open_update_section_request = true;
     }
 
     fn active_product_color_picker(
@@ -61275,6 +61286,7 @@ mod tests {
             grid_composite_status: Vec::new(),
             grid_composite_announce_status: false,
             open_color_tables_request: false,
+            open_update_section_request: false,
             bold_labels: true,
             color_tables: ColorTableSet::default(),
             user_color_tables: Vec::new(),
@@ -63709,6 +63721,21 @@ mod tests {
         assert_eq!(app.sidebar_tab, SidebarTab::Layers);
         assert_eq!(app.color_table_target, ColorTableFamily::Reflectivity);
         assert!(app.open_color_tables_request);
+    }
+
+    /// The top bar's "vX.Y.Z available" chip routes to the in-app updater
+    /// (Settings tab, "Security & updates" fold) instead of the browser:
+    /// the click handler selects the tab and arms the one-shot expand flag
+    /// that `settings_panel` consumes on its next render.
+    #[test]
+    fn update_chip_routes_to_settings_update_section() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        assert!(!app.open_update_section_request);
+
+        app.request_update_settings();
+
+        assert_eq!(app.sidebar_tab, SidebarTab::Settings);
+        assert!(app.open_update_section_request);
     }
 
     #[test]

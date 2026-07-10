@@ -1767,6 +1767,13 @@ impl ViewerApp {
     /// restarts (spec §1). A future Appearance section (style registry
     /// surfaces, docs/customization-spec.md §5) slots in beside these.
     pub(crate) fn settings_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // One-shot expand path: the top bar's "vX.Y.Z available" chip lands
+        // here with the updater fold forced open (same pattern as the color
+        // picker's `open_color_tables_request`).
+        if self.open_update_section_request {
+            self.open_update_section_request = false;
+            self.set_section_open("settings_security_updates", true);
+        }
         if let Some(persistence) = self.settings_persistence.status_view(Instant::now()) {
             let color = match persistence.level {
                 settings_persistence::PersistenceNoticeLevel::Success => {
