@@ -1167,14 +1167,19 @@ fn load_frame_for_plot(
         let values = reader
             .read_full_2d(&variable.name)
             .map_err(|error| error.to_string())?;
-        return SatellitePlotSource::scalar_from_store(
-            title,
-            subtitle_left,
+        let derived_subtitle_right = if field.units().is_empty() {
+            format!("{} · {hhmm:04}Z", key.model.to_ascii_uppercase())
+        } else {
             format!(
                 "{} · {} · {hhmm:04}Z",
                 key.model.to_ascii_uppercase(),
                 field.units()
-            ),
+            )
+        };
+        return SatellitePlotSource::scalar_from_store(
+            title,
+            subtitle_left,
+            derived_subtitle_right,
             variable.name,
             variable.units,
             variable.selector,
@@ -6089,6 +6094,17 @@ mod tests {
                 && thermal.contains("TOP-DOWN"),
             "{thermal}"
         );
+        let cycle_00 = run_title(
+            "simsat",
+            "hrrr_20260710_t00z_visible_geo_rgb_goese_20260710",
+        );
+        let cycle_19 = run_title(
+            "simsat",
+            "hrrr_20260710_t19z_visible_geo_rgb_goese_20260710",
+        );
+        assert!(cycle_00.contains("HRRR 00Z"), "{cycle_00}");
+        assert!(cycle_19.contains("HRRR 19Z"), "{cycle_19}");
+        assert_ne!(cycle_00, cycle_19, "different cycles need distinct labels");
     }
 
     #[test]

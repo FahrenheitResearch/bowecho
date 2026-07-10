@@ -345,19 +345,26 @@ impl PlotPayload {
                 values,
                 units,
                 palette,
-            } => SatellitePlotSource::scalar_from_mesh_with_palette(
-                self.title.clone(),
-                self.subtitle_left.clone(),
-                self.subtitle_right.clone(),
-                units.clone(),
-                self.nx,
-                self.ny,
-                values.clone(),
-                self.lat.clone(),
-                self.lon.clone(),
-                None,
-                palette.clone(),
-            ),
+            } => {
+                let subtitle_right = if units.is_empty() {
+                    self.subtitle_right.clone()
+                } else {
+                    format!("{} · {units}", self.subtitle_right)
+                };
+                SatellitePlotSource::scalar_from_mesh_with_palette(
+                    self.title.clone(),
+                    self.subtitle_left.clone(),
+                    subtitle_right,
+                    units.clone(),
+                    self.nx,
+                    self.ny,
+                    values.clone(),
+                    self.lat.clone(),
+                    self.lon.clone(),
+                    None,
+                    palette.clone(),
+                )
+            }
             PlotPixels::Rgba(rgba) => {
                 let pixels_len = self
                     .nx
@@ -1751,6 +1758,57 @@ mod tests {
         ));
         assert_eq!(SimSatProduct::Wv10.thermal_band(), Some(10));
         assert_eq!(SimSatProduct::CloudOpticalDepth.thermal_band(), None);
+    }
+
+    #[test]
+    fn render_controls_map_to_the_released_simsat_api() {
+        let job = RenderJob {
+            source: JobSource::Local(PathBuf::from("wrfout")),
+            product: SimSatProduct::Visible,
+            view: OutputView::Geostationary,
+            satellite: SatelliteChoice::GoesWest,
+            quality: RenderQuality::Preview,
+            margin_frac: 0.25,
+            granulation: true,
+            bluemarble_download: false,
+            exposure: 2.25,
+            clouds: true,
+            multiscatter: false,
+            sun_override: true,
+            sun_elevation_deg: 35.0,
+            sun_azimuth_deg: 225.0,
+            cache_root: PathBuf::from("cache"),
+            store_root: PathBuf::from("store"),
+            sector: "test_visible_geo".to_owned(),
+        };
+        let frame = FrameInput {
+            path: PathBuf::from("wrfout"),
+            timestep: 3,
+            sort_key: "time".to_owned(),
+            label: "time".to_owned(),
+        };
+        let params = render_params_for(&job, &frame);
+        assert_eq!(params.satellite, SatellitePreset::GoesWest);
+        assert_eq!(params.timestep, 3);
+        assert_eq!(params.margin_frac, 0.25);
+        assert_eq!(params.exposure, 2.25);
+        assert!(params.clouds);
+        assert!(!params.multiscatter);
+        assert_eq!(params.granulation, Some(true));
+        assert_eq!(
+            params.sun_override,
+            Some(SunOverride {
+                elev_deg: Some(35.0),
+                az_deg: Some(225.0),
+            })
+        );
+        assert!(matches!(
+            params.bluemarble,
+            BlueMarble::Seasonal {
+                download: false,
+                ..
+            }
+        ));
     }
 
     #[test]

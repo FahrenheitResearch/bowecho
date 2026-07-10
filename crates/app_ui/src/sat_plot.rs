@@ -205,6 +205,7 @@ impl SatellitePlotSource {
     /// order. A generic smooth viridis scale is used for derived fields whose
     /// product has no satellite-band selector.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn scalar_from_mesh(
         title: impl Into<String>,
         subtitle_left: impl Into<String>,
