@@ -788,13 +788,10 @@ impl SimSatPane {
             );
             #[cfg(any(windows, target_os = "macos"))]
             {
+                // Keep this unfiltered: normal wrfout files are extensionless.
                 if ui.button("File...").clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .set_title("Open WRF / HRRR input")
-                        .add_filter(
-                            "WRF / GRIB",
-                            &["nc", "grib2", "grb2", "grib", "grb", "json"],
-                        )
                         .pick_file()
                 {
                     self.local_path = path.display().to_string();
@@ -1670,6 +1667,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["one-a", "one-b", "three"]
         );
+    }
+
+    #[test]
+    fn sequence_discovery_accepts_any_extensionless_wrfout_name() {
+        for name in ["wrfout", "wrfout_any_name_without_an_extension"] {
+            assert!(
+                looks_like_sequence_source(Path::new(name)),
+                "extensionless WRF input must remain discoverable: {name}"
+            );
+        }
     }
 
     #[test]
