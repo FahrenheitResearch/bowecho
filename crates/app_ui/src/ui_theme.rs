@@ -364,12 +364,15 @@ mod tests {
     }
 
     /// The two choices map to the two distinct palettes (a copy-paste slip
-    /// here would ship one theme under both names). Deliberately does NOT
-    /// mutate the process-global active theme — tests run concurrently.
+    /// here would ship one theme under both names). Compared by the accent
+    /// field, which the third assert proves is distinguishing — the consts
+    /// are `const`, so `&THEME_A` is a fresh promotion at every use site and
+    /// pointer identity is not guaranteed. Deliberately does NOT mutate the
+    /// process-global active theme — tests run concurrently.
     #[test]
     fn theme_choices_map_to_distinct_palettes() {
-        assert!(std::ptr::eq(ThemeChoice::Slate.palette(), &THEME_A));
-        assert!(std::ptr::eq(ThemeChoice::Graphite.palette(), &THEME_B));
+        assert_eq!(ThemeChoice::Slate.palette().accent, THEME_A.accent);
+        assert_eq!(ThemeChoice::Graphite.palette().accent, THEME_B.accent);
         assert_ne!(THEME_A.accent, THEME_B.accent);
     }
 }
