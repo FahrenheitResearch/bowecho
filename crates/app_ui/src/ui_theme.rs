@@ -251,7 +251,12 @@ mod tests {
             ("weak on raised", theme.text_weak, theme.raised, 4.0),
             ("weak on hover", theme.text_weak, theme.hover, 4.0),
             ("subhead on bg", theme.subhead, theme.bg, 7.0),
-            ("accent_text on selection", theme.accent_text, theme.selection_bg, 4.5),
+            (
+                "accent_text on selection",
+                theme.accent_text,
+                theme.selection_bg,
+                4.5,
+            ),
             ("accent on bg", theme.accent, theme.bg, 4.5),
             ("live on bg", theme.live, theme.bg, 4.5),
             ("warn on bg", theme.warn, theme.bg, 4.5),
