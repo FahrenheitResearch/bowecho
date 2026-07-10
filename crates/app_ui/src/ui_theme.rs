@@ -55,17 +55,16 @@ pub const SIDEBAR_MAX_WIDTH: f32 = 900.0;
 pub const READOUT_FONT_SIZE: f32 = 11.0;
 
 // ---------------------------------------------------------------------------
-// THEME PASS (ui-refresh-plan §4): the chrome ramp + accent + status colors,
-// as TWO candidates for an owner A/B.
+// THEME PASS (ui-refresh-plan §4): the chrome ramp + accent + status colors.
+// Built as TWO candidates for an owner A/B; the owner liked both, so both
+// ship as a user setting (Settings > Display > Theme, persisted as
+// `AppSettings.ui_theme`, applied live via [`set_active_theme`] +
+// re-running `configure_style`):
 //
-//   Candidate A (default): "slate" — near-black blue-grey ramp, the current
-//     cyan-family accent disciplined to selection + live indicators.
-//   Candidate B (`BOWECHO_THEME_B=1`): "graphite + amber" — a pure-neutral
-//     ramp with an amber accent; genuinely different, still restrained.
-//
-// A/B SCAFFOLDING: `theme_b_requested` + `THEME_B` + the env switch are
-// TEMPORARY capture plumbing for the integrator and will be deleted once the
-// owner picks. Deliberately no UI surface for the switch.
+//   "Slate" (default): near-black blue-grey ramp, the current cyan-family
+//     accent disciplined to selection + live indicators.
+//   "Graphite + amber": a pure-neutral ramp with an amber accent;
+//     genuinely different, still restrained.
 //
 // Rules the ramp encodes (spec section 4):
 // - three deliberate neutral levels: `inset` (troughs/text edits) < `bg`
@@ -122,8 +121,8 @@ pub struct Theme {
     pub alert: Color32,
 }
 
-/// Candidate A — "slate". Sources the legacy consts above so code still on
-/// the consts renders as candidate A.
+/// "Slate" ([`ThemeChoice::Slate`], the default). Sources the legacy consts
+/// above so code still on the consts renders as slate.
 pub const THEME_A: Theme = Theme {
     inset: Color32::from_rgb(11, 13, 16),
     bg: Color32::from_rgb(17, 20, 24),
@@ -146,7 +145,7 @@ pub const THEME_A: Theme = Theme {
     alert: Color32::from_rgb(240, 84, 90),
 };
 
-/// Candidate B — "graphite + amber" (A/B scaffolding; see module comment).
+/// "Graphite + amber" ([`ThemeChoice::Graphite`]).
 pub const THEME_B: Theme = Theme {
     inset: Color32::from_rgb(13, 13, 15),
     bg: Color32::from_rgb(20, 20, 23),
@@ -169,24 +168,74 @@ pub const THEME_B: Theme = Theme {
     alert: Color32::from_rgb(240, 84, 90),
 };
 
-/// `BOWECHO_THEME_B` parsing, factored pure for the headless tests: set and
-/// not literally `"0"`/empty selects candidate B.
-fn theme_b_requested(value: Option<&str>) -> bool {
-    value.is_some_and(|value| !value.is_empty() && value != "0")
+/// The user-selectable chrome theme (Settings > Display > Theme). Both v0.30
+/// A/B candidates graduated to shipping options.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ThemeChoice {
+    #[default]
+    Slate,
+    Graphite,
 }
 
-/// The active candidate. Read once at first use — the A/B switch is a
-/// restart-scope capture aid, not a live setting.
-pub fn theme() -> &'static Theme {
-    static CHOICE: std::sync::OnceLock<&'static Theme> = std::sync::OnceLock::new();
-    CHOICE.get_or_init(|| {
-        let requested = std::env::var("BOWECHO_THEME_B").ok();
-        if theme_b_requested(requested.as_deref()) {
-            &THEME_B
-        } else {
-            &THEME_A
+impl ThemeChoice {
+    pub const ALL: [Self; 2] = [Self::Slate, Self::Graphite];
+
+    /// Parse a persisted slug; anything unrecognized (an older config's
+    /// absent key reads as "", a future build may add themes) falls back to
+    /// the default instead of failing the settings load — the
+    /// `RasterQuality::from_slug` convention.
+    pub fn from_slug(slug: &str) -> Self {
+        match slug {
+            "graphite" => Self::Graphite,
+            _ => Self::Slate,
         }
-    })
+    }
+
+    pub fn as_slug(self) -> &'static str {
+        match self {
+            Self::Slate => "slate",
+            Self::Graphite => "graphite",
+        }
+    }
+
+    /// Picker label (Settings > Display > Theme).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Slate => "Slate",
+            Self::Graphite => "Graphite + amber",
+        }
+    }
+
+    pub fn palette(self) -> &'static Theme {
+        match self {
+            Self::Slate => &THEME_A,
+            Self::Graphite => &THEME_B,
+        }
+    }
+}
+
+/// The active choice, as the `ThemeChoice` discriminant. Relaxed atomics are
+/// enough: a UI preference written on the UI thread, read per frame — no
+/// data is published through it.
+static ACTIVE_THEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Activate a theme. Chrome painted through [`theme`]/the accessor fns picks
+/// it up on the next frame; egui's style document does NOT — the caller that
+/// changes themes at runtime must re-run `configure_style` (settings_ui does).
+pub fn set_active_theme(choice: ThemeChoice) {
+    ACTIVE_THEME.store(choice as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn active_theme_choice() -> ThemeChoice {
+    match ACTIVE_THEME.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ThemeChoice::Graphite,
+        _ => ThemeChoice::Slate,
+    }
+}
+
+/// The active theme's palette.
+pub fn theme() -> &'static Theme {
+    active_theme_choice().palette()
 }
 
 /// Section/subgroup title color (theme-aware successor of [`SUBHEAD_COLOR`]).
@@ -301,12 +350,26 @@ mod tests {
         assert_theme_contrast_floors(&THEME_B, "B/graphite+amber");
     }
 
+    /// The persistence contract: every choice round-trips through its slug,
+    /// and unknown/absent slugs (older configs, future themes) read as the
+    /// slate default instead of failing.
     #[test]
-    fn theme_b_env_switch_parsing() {
-        assert!(!theme_b_requested(None));
-        assert!(!theme_b_requested(Some("")));
-        assert!(!theme_b_requested(Some("0")));
-        assert!(theme_b_requested(Some("1")));
-        assert!(theme_b_requested(Some("true")));
+    fn theme_choice_slug_round_trips_and_unknown_falls_back() {
+        for choice in ThemeChoice::ALL {
+            assert_eq!(ThemeChoice::from_slug(choice.as_slug()), choice);
+        }
+        assert_eq!(ThemeChoice::from_slug(""), ThemeChoice::Slate);
+        assert_eq!(ThemeChoice::from_slug("neon"), ThemeChoice::Slate);
+        assert_eq!(ThemeChoice::default(), ThemeChoice::Slate);
+    }
+
+    /// The two choices map to the two distinct palettes (a copy-paste slip
+    /// here would ship one theme under both names). Deliberately does NOT
+    /// mutate the process-global active theme — tests run concurrently.
+    #[test]
+    fn theme_choices_map_to_distinct_palettes() {
+        assert!(std::ptr::eq(ThemeChoice::Slate.palette(), &THEME_A));
+        assert!(std::ptr::eq(ThemeChoice::Graphite.palette(), &THEME_B));
+        assert_ne!(THEME_A.accent, THEME_B.accent);
     }
 }

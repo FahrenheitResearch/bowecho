@@ -666,6 +666,13 @@ pub struct AppSettings {
     /// so `AppSettings` stays UI-crate-free, like `units`/`time_zone`.
     #[serde(default)]
     pub sidebar_tab: String,
+    /// Chrome theme slug: "slate" (the default) or "graphite". Both v0.30
+    /// theme candidates ship as user options (Settings > Display > Theme).
+    /// Parsed via `ThemeChoice::from_slug` at use sites (app_ui/ui_theme.rs)
+    /// so empty (older configs) and unknown slugs fall back to slate. Kept
+    /// as a string so `AppSettings` stays UI-crate-free, like `sidebar_tab`.
+    #[serde(default)]
+    pub ui_theme: String,
     /// Satellite IR enhancement slug applied to Kelvin brightness-temperature
     /// bands (GOES ABI / Himawari AHI 7-16): "cimss" (default rainbow),
     /// "bd" (Dvorak BD curve), "avn", "funktop", "rainbow", "gray".
@@ -990,6 +997,7 @@ impl Default for AppSettings {
             sidebar_section_open: BTreeMap::new(),
             sidebar_width_pt: None,
             sidebar_tab: String::new(),
+            ui_theme: String::new(),
             sat_ir_enhancement: default_sat_ir_enhancement(),
             model_slug: default_model_slug(),
             units: default_units(),
@@ -2032,6 +2040,21 @@ mod tests {
         let back = AppSettings::from_json(&settings.to_json());
 
         assert_eq!(back.sidebar_tab, "severe");
+    }
+
+    #[test]
+    fn ui_theme_defaults_to_empty_and_round_trips() {
+        // Older configs have no ui_theme key: empty reads as the slate
+        // default at use sites (app_ui/ui_theme.rs ThemeChoice::from_slug).
+        assert_eq!(AppSettings::from_json("{}").ui_theme, "");
+
+        let settings = AppSettings {
+            ui_theme: "graphite".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.ui_theme, "graphite");
     }
 
     #[test]

@@ -7828,6 +7828,9 @@ impl ViewerApp {
             status: app_settings_load_status,
         } = loaded_app_settings;
         settings::set_storage_namespace(app_settings.brand.effective_storage_namespace());
+        // Persisted chrome theme BEFORE the style document is built —
+        // configure_style reads ui_theme::theme().
+        ui_theme::set_active_theme(ui_theme::ThemeChoice::from_slug(&app_settings.ui_theme));
         configure_style(&cc.egui_ctx, &app_settings.brand);
         // CJK fallback before the first frame: Japanese site names render
         // as glyphs, not tofu (appended LAST — Latin text is untouched).
@@ -19278,7 +19281,7 @@ impl ViewerApp {
     }
 
     fn workflow_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("Workflows ▾", |ui| {
+        ui.menu_button("Workflows ⏷", |ui| {
             ui.set_min_width(180.0);
             if let Some(workflow) = self.current_workflow {
                 ui.weak(format!("Last applied: {}", workflow.label()));
@@ -19637,7 +19640,7 @@ impl ViewerApp {
     /// tri-state; every window also stays reachable from its layer-row ⚙, so
     /// this menu is a third path, not the only one.
     fn windows_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("Windows ▾", |ui| {
+        ui.menu_button("Windows ⏷", |ui| {
             ui.set_min_width(170.0);
             let mut toggle: Option<dock::WorkspacePane> = None;
             for (pane, label, hover) in [
@@ -42217,9 +42220,9 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
     let palette = brand_config.resolved_palette();
     let stock_default = settings::BrandPalette::default();
     if palette == stock_default.resolved(&stock_default) {
-        // Stock BowEcho: the ui_theme ramp drives the chrome — candidate A,
-        // or candidate B under BOWECHO_THEME_B=1 (A/B scaffolding, see
-        // ui_theme.rs). Three deliberate neutral levels, ONE accent
+        // Stock BowEcho: the ui_theme ramp drives the chrome — the user's
+        // Settings > Display > Theme pick (slate default or graphite+amber,
+        // see ui_theme.rs). Three deliberate neutral levels, ONE accent
         // (selection + live emphasis), status colors only for meaning.
         let theme = ui_theme::theme();
         style.visuals.panel_fill = theme.bg;
@@ -56289,7 +56292,7 @@ mod tests {
             let (label, _, kind) = app
                 .mode_chip_state_with_live_and_stale_floor(true, floor)
                 .expect("fresh live chip");
-            assert_eq!((label.as_str(), kind), ("● LIVE", "LIVE"), "floor {floor}");
+            assert_eq!((label.as_str(), kind), ("⏺ LIVE", "LIVE"), "floor {floor}");
         }
 
         // live, age past the user threshold but inside the intl floor:
@@ -56300,11 +56303,11 @@ mod tests {
             .mode_chip_state_with_live_and_stale_floor(true, 0)
             .expect("stale live chip");
         assert_eq!(kind, "STALE");
-        assert_eq!(label, "● LIVE · STALE 10m");
+        assert_eq!(label, "⏺ LIVE · STALE 10m");
         let (label, _, kind) = app
             .mode_chip_state_with_live_and_stale_floor(true, INTL_STALE_CHIP_FLOOR_SECONDS)
             .expect("floor-rescued live chip");
-        assert_eq!((label.as_str(), kind), ("● LIVE", "LIVE"));
+        assert_eq!((label.as_str(), kind), ("⏺ LIVE", "LIVE"));
 
         // live, age past max(user, floor): STALE at both floors.
         app.volume = volume_aged(2000);
@@ -56312,7 +56315,7 @@ mod tests {
             .mode_chip_state_with_live_and_stale_floor(true, INTL_STALE_CHIP_FLOOR_SECONDS)
             .expect("stale intl chip");
         assert_eq!(kind, "STALE");
-        assert_eq!(label, "● LIVE · STALE 33m");
+        assert_eq!(label, "⏺ LIVE · STALE 33m");
 
         // A user threshold ABOVE the floor still wins — the floor is a
         // floor, not an override.
@@ -56322,7 +56325,7 @@ mod tests {
         let (label, _, kind) = app
             .mode_chip_state_with_live_and_stale_floor(true, INTL_STALE_CHIP_FLOOR_SECONDS)
             .expect("user-threshold live chip");
-        assert_eq!((label.as_str(), kind), ("● LIVE", "LIVE"));
+        assert_eq!((label.as_str(), kind), ("⏺ LIVE", "LIVE"));
         app.style_registry =
             styles::StyleRegistry::from_settings(&styles::StyleSettings::default());
 
@@ -56375,7 +56378,7 @@ mod tests {
         );
         let (label, _, kind) = app.mode_chip_state().expect("stale intl chip");
         assert_eq!(kind, "STALE");
-        assert_eq!(label, "● LIVE · STALE 40m");
+        assert_eq!(label, "⏺ LIVE · STALE 40m");
     }
 
     #[test]

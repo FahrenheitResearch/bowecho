@@ -1541,11 +1541,11 @@ fn chip_from_engine(
 ) -> Option<(String, &'static str)> {
     let newest_time = engine.history.last()?.identity.scan_time_utc;
     let chip = match engine.liveness(Utc::now(), user_stale_chip_seconds)? {
-        Liveness::Live { stale: false, .. } => ("● LIVE".to_owned(), "LIVE"),
+        Liveness::Live { stale: false, .. } => ("⏺ LIVE".to_owned(), "LIVE"),
         Liveness::Live {
             age_seconds,
             stale: true,
-        } => (format!("● LIVE · STALE {}m", age_seconds / 60), "STALE"),
+        } => (format!("⏺ LIVE · STALE {}m", age_seconds / 60), "STALE"),
         Liveness::Archive { age_seconds } => {
             if age_seconds >= 24 * 60 * 60 {
                 (
@@ -1708,7 +1708,7 @@ fn liveness_diff_displayed_vs_newest_age_is_the_spec_normalize() {
         .map(|(label, _color, tag)| (label, tag));
     assert_eq!(
         unified,
-        Some(("● LIVE".to_owned(), "LIVE")),
+        Some(("⏺ LIVE".to_owned(), "LIVE")),
         "the unified chip ages the NEWEST frame, not the browsed display (normalize landed)"
     );
 
@@ -1728,7 +1728,7 @@ fn liveness_diff_displayed_vs_newest_age_is_the_spec_normalize() {
     engine.live.enabled = true;
     assert_eq!(
         chip_from_engine(&engine, 480),
-        Some(("● LIVE".to_owned(), "LIVE")),
+        Some(("⏺ LIVE".to_owned(), "LIVE")),
         "engine ages the NEWEST frame (spec §3)"
     );
 }

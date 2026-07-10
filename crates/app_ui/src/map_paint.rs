@@ -486,9 +486,11 @@ impl ViewerApp {
     }
 
     /// The ONE mode-chip renderer over a [`Liveness`] verdict — every
-    /// string here is greppable-identical to the pre-4e chips (census
-    /// D11). `aged_time` is the frame the verdict's age was derived from
-    /// (dated ARCHIVE chips print it).
+    /// string here matches the pre-4e chips (census D11) except the live
+    /// dot, ● → ⏺ in the theme pass (U+25CF is uncovered in the
+    /// proportional font chain and laid out as tofu; fonts.rs pins the
+    /// vocabulary). `aged_time` is the frame the verdict's age was derived
+    /// from (dated ARCHIVE chips print it).
     fn chip_for_liveness(
         &self,
         liveness: Liveness,
@@ -497,7 +499,7 @@ impl ViewerApp {
         let age_style = self.style_registry.radar_age();
         match liveness {
             Liveness::Live { stale: false, .. } => (
-                "● LIVE".to_owned(),
+                "⏺ LIVE".to_owned(),
                 style_color32(age_style.fresh_color),
                 "LIVE",
             ),
@@ -505,7 +507,7 @@ impl ViewerApp {
                 age_seconds,
                 stale: true,
             } => (
-                format!("● LIVE · STALE {}m", age_seconds / 60),
+                format!("⏺ LIVE · STALE {}m", age_seconds / 60),
                 style_color32(age_style.stale_color),
                 "STALE",
             ),

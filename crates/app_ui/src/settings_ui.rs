@@ -747,6 +747,41 @@ impl ViewerApp {
             }
         });
         self.raster_quality_settings(ui, ctx);
+        panel_kit::row(ui, "Theme", |ui| {
+            let current = ui_theme::ThemeChoice::from_slug(&self.app_settings.ui_theme);
+            let mut picked = None;
+            egui::ComboBox::from_id_salt("display_theme")
+                .selected_text(current.label())
+                .width(118.0)
+                .show_ui(ui, |ui| {
+                    for option in ui_theme::ThemeChoice::ALL {
+                        if ui
+                            .selectable_label(current == option, option.label())
+                            .clicked()
+                        {
+                            picked = Some(option);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Chrome color theme: Slate (blue-grey, cyan accent) or Graphite + amber \
+                     (pure neutral, amber accent). Applies immediately; radar palettes and \
+                     map layers are unaffected. A custom Brand Kit drives the chrome instead \
+                     while one is active.",
+                );
+            if let Some(option) = picked
+                && option != current
+            {
+                self.app_settings.ui_theme = option.as_slug().to_owned();
+                ui_theme::set_active_theme(option);
+                // Rebuild the egui style document — theme() feeds
+                // configure_style, per-frame accessors pick it up anyway.
+                configure_style(ctx, &self.app_settings.brand);
+                self.mark_app_settings_dirty();
+                ctx.request_repaint();
+            }
+        });
         panel_kit::row(ui, "Units", |ui| {
             let current = self.units();
             let mut picked = None;

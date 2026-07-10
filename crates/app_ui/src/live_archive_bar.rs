@@ -264,9 +264,9 @@ pub(crate) fn bar_ui(
         LiveArchiveBarMode::Live | LiveArchiveBarMode::LiveStale
     );
     let live_text = if live_lit {
-        egui::RichText::new("● LIVE").color(live_color()).strong()
+        egui::RichText::new("⏺ LIVE").color(live_color()).strong()
     } else {
-        egui::RichText::new("● LIVE")
+        egui::RichText::new("⏺ LIVE")
     };
     if ui
         .selectable_label(live_lit, live_text)
@@ -281,11 +281,11 @@ pub(crate) fn bar_ui(
 
     let archive_lit = context.mode == LiveArchiveBarMode::Archive;
     let archive_text = if archive_lit {
-        egui::RichText::new("ARCHIVE ▾")
+        egui::RichText::new("ARCHIVE ⏷")
             .color(ARCHIVE_ACTIVE_COLOR)
             .strong()
     } else {
-        egui::RichText::new("ARCHIVE ▾")
+        egui::RichText::new("ARCHIVE ⏷")
     };
     // The popover holds text fields, so it must NOT use the default menu
     // close behavior (CloseOnClick): egui closes such a menu on any
@@ -403,7 +403,7 @@ pub(crate) fn bar_ui(
         player.archive_site_input.clear();
     }
 
-    ui.menu_button("Sweeps ▾", |ui| {
+    ui.menu_button("Sweeps ⏷", |ui| {
         ui.set_min_width(200.0);
         for mode in SweepQuickMode::QUICK {
             if ui

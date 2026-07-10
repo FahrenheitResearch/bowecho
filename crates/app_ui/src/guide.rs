@@ -685,7 +685,7 @@ fn layers(ui: &mut egui::Ui) {
     );
     action(
         ui,
-        "+ Add layer \u{25be}",
+        "+ Add layer ⏷",
         "— the single front door for every map data type: radar overlays, model fields, \
          satellite, WoFS/FARM drapes, mesoanalysis composites, surface obs, placefiles. You \
          never need to know which window a layer is born in.",
@@ -697,7 +697,7 @@ fn layers(ui: &mut egui::Ui) {
         "In Analysis overlays: compute that EMITS layers. Analyze obs runs a Bratseth \
          objective analysis of the model surface field against live obs; Compute composites \
          builds the full SPC mesoanalysis suite (SCP, STP, SHIP, EHI, …) — each field then \
-         adds as an instant \"(OA)\" layer, also reachable from + Add layer \u{25b8} \
+         adds as an instant \"(OA)\" layer, also reachable from + Add layer > \
          Mesoanalysis (OA).",
     );
     cite(
