@@ -62,6 +62,9 @@ fn moment_field_spec(moment: &MomentType) -> Option<(&'static str, &'static str,
 
 /// Default export file name: `{site}_{YYYYMMDD_HHMMSS}_simwrf.nc` (site id
 /// squeezed to filesystem-safe characters).
+// Reached from the rfd-gated (windows/macos) export UI; tests cover all
+// platforms.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn export_file_name(volume: &RadarVolume) -> String {
     let site: String = volume
         .site
@@ -84,6 +87,9 @@ pub(crate) fn export_file_name(volume: &RadarVolume) -> String {
 /// [`export_file_name`] (duplicate names — same site + valid time — get a
 /// `_2`, `_3`, … suffix). Returns how many files were written; the first
 /// failure aborts the run with files 0..k already on disk.
+// Reached from the rfd-gated (windows/macos) export UI; tests cover all
+// platforms.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn export_volumes_cfradial(
     volumes: &[Arc<RadarVolume>],
     dir: &Path,
@@ -112,6 +118,9 @@ pub(crate) fn export_volumes_cfradial(
 /// - ONE gate geometry: every radial and moment grid must agree on
 ///   `first_gate_m`/`gate_spacing_m` (gate COUNTS may differ per sweep —
 ///   shorter rays are padded with the fill sentinel).
+// Reached from the rfd-gated (windows/macos) export UI; tests cover all
+// platforms.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Result<(), String> {
     let sweeps: Vec<&ElevationCut> = volume
         .cuts
