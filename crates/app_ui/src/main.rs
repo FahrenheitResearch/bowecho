@@ -19252,7 +19252,7 @@ impl ViewerApp {
                     let vcp = self
                         .volume
                         .as_deref()
-                        .and_then(|volume| volume.vcp)
+                        .and_then(|volume| volume.vcp.as_ref())
                         .map(|vcp| vcp.pattern);
                     let scan = chrome_readouts::top_bar_scan_readout(
                         &frame.identity.site_id,
