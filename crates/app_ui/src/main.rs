@@ -43,6 +43,7 @@ mod basemap_data;
 mod basemap_towns;
 mod batch_plots;
 mod brand;
+mod chrome_readouts;
 mod data_packs;
 mod dealias_env;
 /// Phase 4e stage (ii): the differential suite gating the primary unify
@@ -1221,8 +1222,8 @@ const TERMINAL_SITE_LABEL_MIN_SCALE: f32 = 95.0;
 // as crate-wide aliases so 100+ call sites keep reading naturally.
 pub(crate) use ui_theme::ROW_H as PANEL_BUTTON_HEIGHT;
 pub(crate) use ui_theme::{
-    ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, ROW_SPACING_X, SIDEBAR_DEFAULT_WIDTH,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
+    ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, READOUT_FONT_SIZE, ROW_SPACING_X,
+    SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
 };
 const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] =
     &["tornado", "severe thunderstorm", "flash flood", "flood"];
@@ -19224,6 +19225,54 @@ impl ViewerApp {
                         "Last workflow preset applied this session. Use Workflows > Restore previous setup to undo it, or Clear marker to hide this label.",
                     );
                 }
+                // AWIPS-style current-scan readouts (ui-refresh spec §5):
+                // monospace facts sourced from the SAME state the status
+                // bar prints (frame history cursor, active-pane product,
+                // installed volume's VCP) — nothing recomputed. Loop state
+                // is a fixed segment; the scan-facts label absorbs the
+                // remaining width and truncates (full frame-status line on
+                // hover), so the strip degrades gracefully from ultrawide
+                // down to the 1120 pt window floor.
+                if let Some(frame) = self.primary.history.get(self.primary.cursor.index) {
+                    let now_utc = Utc::now();
+                    ui.separator();
+                    if let Some(loop_state) = chrome_readouts::top_bar_loop_readout(
+                        self.primary.cursor.index,
+                        self.primary.history.len(),
+                        self.primary.cursor.playing,
+                    ) {
+                        ui.label(
+                            egui::RichText::new(loop_state)
+                                .monospace()
+                                .size(READOUT_FONT_SIZE),
+                        )
+                        .on_hover_text("Loop frame / frame count, playback state");
+                    }
+                    let (product, _cut) = self.active_product_cut();
+                    let vcp = self
+                        .volume
+                        .as_deref()
+                        .and_then(|volume| volume.vcp)
+                        .map(|vcp| vcp.pattern);
+                    let scan = chrome_readouts::top_bar_scan_readout(
+                        &frame.identity.site_id,
+                        product.label(),
+                        vcp,
+                        &self
+                            .time_zone()
+                            .format_date_hms(frame.identity.scan_time_utc),
+                        &frame_age_label(frame.identity.scan_time_utc, now_utc),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(scan)
+                                .monospace()
+                                .size(READOUT_FONT_SIZE),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(frame_status_text(frame, now_utc, self.time_zone()));
+                }
             });
         });
     }
@@ -24794,12 +24843,25 @@ impl ViewerApp {
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
+        // Monospace readout treatment (ui-refresh spec §5). Split rule vs
+        // the top bar: TOP = current-scan facts (site/product/VCP/scan
+        // time + age/loop state), BOTTOM = transient messages (left) +
+        // cursor/map readouts and the frame details the top bar does not
+        // carry (right). Nothing prints in both bars.
+        let mono = |text: String| {
+            egui::RichText::new(text)
+                .monospace()
+                .size(READOUT_FONT_SIZE)
+        };
         ui.horizontal(|ui| {
             // The loader status ("Rendering", "Refreshing", download progress)
             // changes width constantly — give it a FIXED slot so it never
             // shoves the rest of the bar around.
             let height = ui.available_height();
-            ui.add_sized([230.0, height], egui::Label::new(&self.status).truncate());
+            ui.add_sized(
+                [230.0, height],
+                egui::Label::new(mono(self.status.clone())).truncate(),
+            );
             ui.separator();
             if let Some(persistence) = self.settings_persistence.status_view(Instant::now()) {
                 let color = match persistence.level {
@@ -24813,7 +24875,7 @@ impl ViewerApp {
                         egui::Color32::from_rgb(245, 104, 104)
                     }
                 };
-                ui.label(egui::RichText::new(persistence.short).small().color(color))
+                ui.label(mono(persistence.short.to_owned()).color(color))
                     .on_hover_text(persistence.detail);
                 ui.separator();
             }
@@ -24828,40 +24890,69 @@ impl ViewerApp {
                     } else {
                         ui.add_sized(
                             [38.0, height],
-                            egui::Label::new(
-                                egui::RichText::new("BUSY").small().color(ACCENT_COLOR),
-                            ),
+                            egui::Label::new(mono("BUSY".to_owned()).color(ACCENT_COLOR)),
                         );
-                        ui.add_sized([172.0, height], egui::Label::new(activity.label).truncate());
+                        ui.add_sized(
+                            [172.0, height],
+                            egui::Label::new(mono(activity.label)).truncate(),
+                        );
                     }
                     ui.separator();
                 }
             }
             // Stable metrics anchor to the right edge; the variable-width
-            // hover readout absorbs the leftover middle and truncates.
+            // cursor readout absorbs the leftover middle and truncates.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(self.selected_frame_status_text());
+                // Frame detail = status label + live-chunk progress +
+                // source attribution: exactly the parts of the old full
+                // frame-status line the top bar does NOT show. Site /
+                // scan time / age moved up (hover keeps the full line).
+                match self.selected_frame() {
+                    Some(frame) => {
+                        let now_utc = Utc::now();
+                        let chunk = live_chunk_readout(frame, now_utc, self.time_zone());
+                        ui.label(mono(chrome_readouts::status_bar_frame_detail(
+                            frame.status.label(),
+                            chunk.as_deref(),
+                            &frame.source_label,
+                        )))
+                        .on_hover_text(frame_status_text(
+                            frame,
+                            now_utc,
+                            self.time_zone(),
+                        ));
+                    }
+                    None => {
+                        ui.label(mono("No Level II frame loaded".to_owned()));
+                    }
+                }
                 ui.separator();
                 if !self.radar_layers.is_empty() {
-                    ui.label(format!("{} overlays", self.radar_layers.len()));
+                    ui.label(mono(format!("{} overlays", self.radar_layers.len())));
                     ui.separator();
                 }
-                ui.label(format!("{:.0} km range", self.radar_range_km));
+                ui.label(mono(format!("{:.0} km range", self.radar_range_km)));
                 ui.separator();
-                ui.label(format!("map {:.0} px/deg", self.map_scale));
-                ui.separator();
-                let readout = if let Some(readout) = &self.cursor_readout {
+                ui.label(mono(format!("map {:.0} px/deg", self.map_scale)));
+                // Cursor readout only — the old "{product} cut {n}"
+                // fallback duplicated the top bar's product segment and
+                // was dropped with it (tilt lives in the sidebar TILT
+                // section).
+                if let Some(readout) = &self.cursor_readout {
                     let display_unit = table_display_unit(
                         self.active_table_for_product(&readout.product),
                         &readout.product,
                         self.units(),
                     );
-                    format_cursor_readout(readout, self.units(), display_unit, self.time_zone())
-                } else {
-                    let (product, cut) = self.status_bar_product_cut();
-                    format!("{} cut {}", product.label(), cut)
-                };
-                ui.add(egui::Label::new(readout).truncate());
+                    let text = format_cursor_readout(
+                        readout,
+                        self.units(),
+                        display_unit,
+                        self.time_zone(),
+                    );
+                    ui.separator();
+                    ui.add(egui::Label::new(mono(text)).truncate());
+                }
             });
         });
     }
@@ -25183,7 +25274,10 @@ impl ViewerApp {
         None
     }
 
-    fn status_bar_product_cut(&self) -> (DisplayProduct, usize) {
+    /// Product + cut of the pane the user is operating (active grid pane,
+    /// else the primary). Feeds the top bar's product readout (spec §5);
+    /// previously fed the status bar's product/cut fallback.
+    fn active_product_cut(&self) -> (DisplayProduct, usize) {
         if self.grid_layout != PanelLayout::One
             && let Some((product, cut)) = self.pane_product_cut(self.active_pane)
         {

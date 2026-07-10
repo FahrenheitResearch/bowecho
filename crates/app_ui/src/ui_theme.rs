@@ -41,3 +41,7 @@ pub const SIDEBAR_MIN_WIDTH: f32 = 300.0;
 /// Generous cap (field request: free sidebar resizing) — the panel edge
 /// drags; the map pane absorbs whatever is left.
 pub const SIDEBAR_MAX_WIDTH: f32 = 900.0;
+
+/// AWIPS-style monospace readout text size (top-bar information strip +
+/// status-bar readout cluster — ui-refresh spec §5).
+pub const READOUT_FONT_SIZE: f32 = 11.0;
