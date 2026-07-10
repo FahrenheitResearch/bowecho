@@ -1287,9 +1287,9 @@ fn hdf5_recovered_planes(
         {
             continue;
         }
-        let single_plane = match dataset.shape() {
-            &[y, x] => y == ny && x == nx,
-            &[t, y, x] => t == 1 && y == ny && x == nx,
+        let single_plane = match *dataset.shape() {
+            [y, x] => y == ny && x == nx,
+            [t, y, x] => t == 1 && y == ny && x == nx,
             _ => false,
         };
         if !single_plane {
