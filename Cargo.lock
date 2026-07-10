@@ -331,13 +331,14 @@ dependencies = [
  "settings",
  "sha2",
  "sharprs",
+ "simsat",
  "styles",
  "thiserror 2.0.18",
  "tiff",
  "ui_core",
  "windows-sys 0.61.2",
  "winresource",
- "wrf-core",
+ "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=213068cc40114c1d4997c84a0f956eed2717d91a)",
 ]
 
 [[package]]
@@ -5116,6 +5117,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "simsat"
+version = "0.1.2"
+source = "git+https://github.com/FahrenheitResearch/simsat.git?rev=edd19b1bf9fac84d7a8e6cf788ae89f995b35c3d#edd19b1bf9fac84d7a8e6cf788ae89f995b35c3d"
+dependencies = [
+ "chrono",
+ "eframe",
+ "flate2",
+ "grib-core",
+ "image",
+ "netcrust",
+ "rayon",
+ "reqwest",
+ "rustwx-core",
+ "rw-sat",
+ "rw-store",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=f05758d9b8ea0132ea8b9767882396cbc5b2cfac)",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6814,6 +6837,18 @@ dependencies = [
 name = "wrf-core"
 version = "0.1.0"
 source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=213068cc40114c1d4997c84a0f956eed2717d91a#213068cc40114c1d4997c84a0f956eed2717d91a"
+dependencies = [
+ "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/ecape-rs?rev=414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0)",
+ "flate2",
+ "ndarray 0.16.1",
+ "netcdf-reader 0.5.0",
+ "rayon",
+]
+
+[[package]]
+name = "wrf-core"
+version = "0.1.0"
+source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=f05758d9b8ea0132ea8b9767882396cbc5b2cfac#f05758d9b8ea0132ea8b9767882396cbc5b2cfac"
 dependencies = [
  "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/ecape-rs?rev=414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0)",
  "flate2",
