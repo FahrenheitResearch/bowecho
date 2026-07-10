@@ -1990,6 +1990,56 @@ mod tests {
         assert!((west_vel + 10.0).abs() < 1.5, "due-west Vr = {west_vel}");
     }
 
+    /// Round-trip a REAL synthetic volume (the box fixture, both tilts)
+    /// through the CfRadial exporter and OUR OWN CfRadial decoder: format
+    /// sniff, site, gate geometry, per-radial nyquist, and every REF/VEL
+    /// bit (NaN patterns included) must survive the file.
+    #[test]
+    fn synthetic_volume_cfradial_round_trip_bit_exact() {
+        let fields = uniform_box_fields();
+        let config = box_model_config();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let volume = build_synthetic_volume(&fields, time, &config);
+
+        let dir =
+            std::env::temp_dir().join(format!("bowecho-wrf-radar-cfradial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::radar_export::export_file_name(&volume));
+        crate::radar_export::export_volume_cfradial(&volume, &path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            nexrad_io::sniff_supported_volume_format(&bytes),
+            nexrad_io::SupportedVolumeFormat::CfRadial
+        );
+        let decoded = nexrad_io::decode_supported_volume_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.volume_time, volume.volume_time);
+        assert_eq!(decoded.site.id, volume.site.id);
+        assert_eq!(decoded.site.latitude_deg, volume.site.latitude_deg);
+        assert_eq!(decoded.site.longitude_deg, volume.site.longitude_deg);
+        assert_eq!(decoded.site.elevation_m, volume.site.elevation_m);
+
+        assert_eq!(decoded.cuts.len(), volume.cuts.len());
+        for (decoded_cut, source_cut) in decoded.cuts.iter().zip(&volume.cuts) {
+            assert_eq!(decoded_cut.elevation_deg, source_cut.elevation_deg);
+            assert_eq!(decoded_cut.radials.len(), source_cut.radials.len());
+            for (decoded_radial, source_radial) in
+                decoded_cut.radials.iter().zip(&source_cut.radials)
+            {
+                assert_eq!(decoded_radial.azimuth_deg, source_radial.azimuth_deg);
+                assert_eq!(decoded_radial.time_offset_ms, source_radial.time_offset_ms);
+                assert_eq!(decoded_radial.gate_range, source_radial.gate_range);
+                assert_eq!(
+                    decoded_radial.nyquist_velocity_mps,
+                    source_radial.nyquist_velocity_mps
+                );
+            }
+        }
+
+        assert_eq!(moment_bits(&decoded), moment_bits(&volume));
+    }
+
     /// All F32 moment values of a volume as raw bits (NaN patterns
     /// included), for exact equality comparisons.
     fn moment_bits(volume: &RadarVolume) -> Vec<u32> {

@@ -476,6 +476,14 @@ pub struct ModelDataDock {
     /// Finished synthetic-radar volumes waiting for the app to install them in
     /// the loop engine (one-shot, drained by [`Self::take_synthetic_radar`]).
     synthetic_radar_result: Option<crate::wrf_radar::SyntheticRadarOutput>,
+    /// Retained handles to the most recent finished synthetic-radar frames so
+    /// the export control can write them as CfRadial files AFTER the one-shot
+    /// result above is drained into the loop engine. Arc clones of the loop
+    /// frames — no volume data is duplicated. Replaced whole on the next
+    /// finished build.
+    // Read only by the rfd-gated (windows/macos) export UI.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    synthetic_export_frames: Vec<std::sync::Arc<radar_core::RadarVolume>>,
     /// Last import status line shown under the import controls.
     import_message: Option<String>,
     tree: Option<StoreTree>,
@@ -570,6 +578,7 @@ impl ModelDataDock {
             store_root,
             import_job: None,
             synthetic_radar_result: None,
+            synthetic_export_frames: Vec::new(),
             import_message: None,
             tree: None,
             browser: RunBrowserPanel::new(),
@@ -1147,6 +1156,9 @@ impl ModelDataDock {
             PollResult::FinishedSynthetic { message, output } => {
                 self.import_message = Some(message);
                 self.import_job = None;
+                // Retain Arc handles for the CfRadial export control — the
+                // one-shot result below is drained away by the app.
+                self.synthetic_export_frames = output.volumes.clone();
                 // Hand the simulated volumes to the app (drained in
                 // `poll_model_layer`); nothing was written to the store, so no
                 // rescan.
@@ -1427,6 +1439,20 @@ impl ModelDataDock {
                     }
                 }
             }
+            let frame_count = self.synthetic_export_frames.len();
+            if ui
+                .add_enabled(frame_count > 0, egui::Button::new("💾 Export CfRadial…"))
+                .on_hover_text(
+                    "Save the simulated radar frames above as CfRadial-1 NetCDF files — \
+                     the standard research radar exchange format (opens in BowEcho, \
+                     Py-ART, and most radar toolkits). One frame asks for a file name; \
+                     a loop asks for a folder and writes one file per frame. Enabled \
+                     after a simulated-radar build finishes.",
+                )
+                .clicked()
+            {
+                self.export_synthetic_radar_frames();
+            }
         });
         self.synthetic_radar_site_panel(ui);
     }
@@ -1504,6 +1530,53 @@ impl ModelDataDock {
             format!("Simulating radar loop from {count} WRF files…")
         });
         self.import_job = Some(ImportJob::SyntheticRadar(task));
+    }
+
+    /// Export the retained simulated-radar frames as CfRadial-1 NetCDF files:
+    /// one frame → save-file dialog; a loop → folder dialog, one file per
+    /// frame named `{site}_{time}_simwrf.nc`. Writes synchronously on the UI
+    /// thread — a frame is tens of MB and the writer streams through a
+    /// BufWriter, so even a full loop is a brief, user-initiated pause.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn export_synthetic_radar_frames(&mut self) {
+        // Arc clones only — frees `self` for the status-line writes below.
+        let retained = self.synthetic_export_frames.clone();
+        match retained.as_slice() {
+            [] => {}
+            [volume] => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CfRadial NetCDF", &["nc"])
+                    .set_file_name(crate::radar_export::export_file_name(volume))
+                    .set_title("Export simulated radar volume (CfRadial)")
+                    .save_file()
+                {
+                    self.import_message = Some(
+                        match crate::radar_export::export_volume_cfradial(volume, &path) {
+                            Ok(()) => {
+                                format!("Exported simulated radar to {}", path.display())
+                            }
+                            Err(error) => format!("CfRadial export failed: {error}"),
+                        },
+                    );
+                }
+            }
+            frames => {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title(format!(
+                        "Choose a folder for {} CfRadial frame files",
+                        frames.len()
+                    ))
+                    .pick_folder()
+                {
+                    self.import_message = Some(match crate::radar_export::export_volumes_cfradial(
+                        frames, &dir,
+                    ) {
+                        Ok(count) => format!("Wrote {count} CfRadial file(s) to {}", dir.display()),
+                        Err(error) => format!("CfRadial export failed: {error}"),
+                    });
+                }
+            }
+        }
     }
 
     /// Inline size-aware confirmation for a parked heavy import: the warning,

@@ -83,6 +83,7 @@ mod placefiles;
 mod postproc_severe;
 mod product_select;
 mod radar_band;
+mod radar_export;
 mod raster_quality;
 mod rhi;
 mod sat_paint;
