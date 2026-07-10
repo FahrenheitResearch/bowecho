@@ -74,6 +74,32 @@ impl SatellitePlotPalette {
         Self { levels, colors }
     }
 
+    /// Stable SimSat display palette for a raw derived field. Unlike the
+    /// generic per-frame scale, these fixed physical ranges keep colors
+    /// comparable across every frame in a WRF/HRRR loop.
+    pub(crate) fn from_simsat_derived(field: simsat::derived::DerivedField) -> Self {
+        let (lo, hi) = match field {
+            simsat::derived::DerivedField::PrecipitableWater => {
+                (0.0, simsat::derived::PW_DISPLAY_MAX_MM)
+            }
+            simsat::derived::DerivedField::CloudTopTemp => (160.0, 330.0),
+            simsat::derived::DerivedField::CloudOpticalDepth => {
+                (0.0, simsat::derived::COD_DISPLAY_MAX)
+            }
+        };
+        let mut levels = Vec::with_capacity(PALETTE_BINS + 1);
+        let mut colors = Vec::with_capacity(PALETTE_BINS);
+        for step in 0..=PALETTE_BINS {
+            levels.push(f64::from(lo) + f64::from(hi - lo) * step as f64 / PALETTE_BINS as f64);
+        }
+        for step in 0..PALETTE_BINS {
+            let value = lo + (hi - lo) * (step as f32 + 0.5) / PALETTE_BINS as f32;
+            let [r, g, b] = simsat::derived::value_color(value, field);
+            colors.push(Color::rgba(r, g, b, 255));
+        }
+        Self { levels, colors }
+    }
+
     fn scale(&self) -> ColorScale {
         ColorScale::Discrete(DiscreteColorScale {
             levels: self.levels.clone(),
@@ -191,6 +217,35 @@ impl SatellitePlotSource {
         lon: Vec<f32>,
         projection: Option<GridProjection>,
     ) -> Result<Self, String> {
+        Self::scalar_from_mesh_with_palette(
+            title,
+            subtitle_left,
+            subtitle_right,
+            units,
+            nx,
+            ny,
+            values,
+            lat,
+            lon,
+            projection,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scalar_from_mesh_with_palette(
+        title: impl Into<String>,
+        subtitle_left: impl Into<String>,
+        subtitle_right: impl Into<String>,
+        units: impl Into<String>,
+        nx: usize,
+        ny: usize,
+        values: Vec<f32>,
+        lat: Vec<f32>,
+        lon: Vec<f32>,
+        projection: Option<GridProjection>,
+        palette: Option<SatellitePlotPalette>,
+    ) -> Result<Self, String> {
         validate_mesh(nx, ny, values.len(), lat.len(), lon.len())?;
         let title = title.into();
         let variable = product_slug(&title);
@@ -204,7 +259,7 @@ impl SatellitePlotSource {
             serde_json::Value::Null,
             values,
             grid,
-            None,
+            palette,
         )
     }
 
@@ -863,5 +918,22 @@ mod tests {
             (span - 20.0).abs() < 1.0e-6,
             "span={span}, bounds={bounds:?}"
         );
+    }
+
+    #[test]
+    fn simsat_derived_palettes_use_fixed_physical_ranges() {
+        for (field, expected_hi) in [
+            (simsat::derived::DerivedField::PrecipitableWater, 70.0),
+            (simsat::derived::DerivedField::CloudTopTemp, 330.0),
+            (simsat::derived::DerivedField::CloudOpticalDepth, 80.0),
+        ] {
+            let palette = SatellitePlotPalette::from_simsat_derived(field);
+            let ColorScale::Discrete(scale) = palette.scale() else {
+                panic!("SimSat derived palette must be discrete");
+            };
+            assert_eq!(scale.levels.len(), PALETTE_BINS + 1);
+            assert_eq!(scale.colors.len(), PALETTE_BINS);
+            assert!((scale.levels[scale.levels.len() - 1] - expected_hi).abs() < 1.0e-9);
+        }
     }
 }

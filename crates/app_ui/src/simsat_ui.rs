@@ -3,10 +3,10 @@
 //! SimSat's public render API is deliberately synchronous. This module keeps it off
 //! the egui thread, admits only one job at a time, and reports cancellation honestly:
 //! downloads may stop at a chunk boundary, while an in-flight render always finishes
-//! its current frame before the worker checks the cancel flag again. Finished visible
-//! and thermal frames go through SimSat's `rw-store` writer so the existing Satellite
-//! player remains the one playback/display path. Raw scalar fields and rendered RGBA
-//! retain their full per-pixel mesh for the native plot window.
+//! its current frame before the worker checks the cancel flag again. Every finished
+//! product enters the shared satellite store so Satellite remains the one playback and
+//! map-display path. Raw thermal/derived scalars and rendered RGBA retain their full
+//! per-pixel mesh for the native plot window.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -16,15 +16,16 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use chrono::Utc;
 use eframe::egui;
-use simsat::api::{BlueMarble, FrameData, Product, RenderParams, RenderResult};
+use simsat::api::{BlueMarble, FrameData, Product, RenderParams, RenderResult, SunOverride};
 use simsat::camera::{ResolutionMode, SatellitePreset, ViewMode};
 use simsat::clouds::StepQuality;
 use simsat::derived::DerivedField;
 use simsat::store_out::{self, IrFrame, VisibleFrame};
 use simsat::wv::WvBand;
 
-use crate::sat_plot::SatellitePlotSource;
+use crate::sat_plot::{SatellitePlotPalette, SatellitePlotSource};
 use crate::simsat_hrrr::{HrrrNativeSpec, discover_native_files, download_native, latest_specs};
+use crate::simsat_store::{DerivedFrame, write_derived_frame};
 
 const ENGINE_CACHE_SUBDIR: &str = "engine";
 
@@ -157,6 +158,15 @@ impl SimSatProduct {
     fn is_visible_family(self) -> bool {
         self.uses_visible_ground()
     }
+
+    fn derived_field(self) -> Option<DerivedField> {
+        match self {
+            Self::PrecipitableWater => Some(DerivedField::PrecipitableWater),
+            Self::CloudTopTemperature => Some(DerivedField::CloudTopTemp),
+            Self::CloudOpticalDepth => Some(DerivedField::CloudOpticalDepth),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +289,12 @@ struct RenderJob {
     margin_frac: f32,
     granulation: bool,
     bluemarble_download: bool,
+    exposure: f32,
+    clouds: bool,
+    multiscatter: bool,
+    sun_override: bool,
+    sun_elevation_deg: f32,
+    sun_azimuth_deg: f32,
     cache_root: PathBuf,
     store_root: PathBuf,
     sector: String,
@@ -300,7 +316,11 @@ struct StoredFrame {
 
 #[derive(Clone, Debug, PartialEq)]
 enum PlotPixels {
-    Scalar { values: Vec<f32>, units: String },
+    Scalar {
+        values: Vec<f32>,
+        units: String,
+        palette: Option<SatellitePlotPalette>,
+    },
     Rgba(Vec<u8>),
 }
 
@@ -321,7 +341,11 @@ struct PlotPayload {
 impl PlotPayload {
     fn to_plot_source(&self) -> Result<SatellitePlotSource, String> {
         match &self.pixels {
-            PlotPixels::Scalar { values, units } => SatellitePlotSource::scalar_from_mesh(
+            PlotPixels::Scalar {
+                values,
+                units,
+                palette,
+            } => SatellitePlotSource::scalar_from_mesh_with_palette(
                 self.title.clone(),
                 self.subtitle_left.clone(),
                 self.subtitle_right.clone(),
@@ -332,6 +356,7 @@ impl PlotPayload {
                 self.lat.clone(),
                 self.lon.clone(),
                 None,
+                palette.clone(),
             ),
             PlotPixels::Rgba(rgba) => {
                 let pixels_len = self
@@ -418,6 +443,12 @@ pub(crate) struct SimSatPane {
     margin_frac: f32,
     granulation: bool,
     bluemarble_download: bool,
+    exposure: f32,
+    clouds: bool,
+    multiscatter: bool,
+    sun_override: bool,
+    sun_elevation_deg: f32,
+    sun_azimuth_deg: f32,
     task: Option<RenderTask>,
     status: String,
     error: Option<String>,
@@ -455,6 +486,12 @@ impl Default for SimSatPane {
             margin_frac: 0.0,
             granulation: true,
             bluemarble_download: true,
+            exposure: simsat::render::DEFAULT_EXPOSURE as f32,
+            clouds: true,
+            multiscatter: true,
+            sun_override: false,
+            sun_elevation_deg: 45.0,
+            sun_azimuth_deg: 180.0,
             task: None,
             status: "Choose a WRF/GRIB source or an HRRR native-level file.".to_owned(),
             error: None,
@@ -607,8 +644,8 @@ impl SimSatPane {
         ui.heading("SimSat");
         ui.label(
             "Render physically based simulated satellite imagery from WRF or HRRR native levels. \
-             Visible, IR, and water-vapor products land in BowEcho's normal satellite player; \
-             derived scalar fields open in the native plot.",
+             Every product lands in BowEcho's normal satellite player and loops by source run. \
+             Native plot reopens the georeferenced image or raw physical scalar field.",
         );
         ui.add_space(6.0);
 
@@ -705,7 +742,62 @@ impl SimSatPane {
                         &mut self.bluemarble_download,
                         "Download missing 2 km Blue Marble months",
                     );
-                    ui.checkbox(&mut self.granulation, "Sub-grid cloud granulation (experimental)");
+                    ui.add_enabled_ui(self.clouds, |ui| {
+                        ui.checkbox(
+                            &mut self.granulation,
+                            "Sub-grid cloud granulation (experimental)",
+                        );
+                    });
+                    egui::CollapsingHeader::new("Atmosphere, clouds, and lighting")
+                        .id_salt("simsat-atmosphere-controls")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut self.exposure, 0.25..=4.0)
+                                    .text("Exposure"),
+                            )
+                            .on_hover_text(
+                                "Display brightness gain applied before the ABI-style stretch. \
+                                 1.0 retains physical reflectance.",
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut self.clouds, "Volumetric clouds");
+                                ui.add_enabled_ui(self.clouds, |ui| {
+                                    ui.checkbox(&mut self.multiscatter, "Multi-scatter")
+                                        .on_hover_text(
+                                            "Multiple-scattering octaves brighten thick anvils \
+                                             and deep cloud decks.",
+                                        );
+                                });
+                            });
+                            ui.checkbox(&mut self.sun_override, "Override sun (what-if)")
+                                .on_hover_text(
+                                    "Use a chosen sun position instead of the source valid time. \
+                                     This is a non-physical visualization override.",
+                                );
+                            ui.add_enabled_ui(self.sun_override, |ui| {
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.sun_elevation_deg,
+                                        -10.0..=90.0,
+                                    )
+                                    .text("Sun elevation"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut self.sun_azimuth_deg, 0.0..=360.0)
+                                        .text("Sun azimuth"),
+                                );
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 165, 65),
+                                    "what-if lighting",
+                                );
+                            });
+                            ui.small(
+                                "The embedded v0.1.2 API derives atmospheric water from the \
+                                 model and keeps its standard aerosol profile. Studio-only AOD/RH \
+                                 debug tuning is not exposed by the released engine API.",
+                            );
+                        });
                 }
                 ui.small(
                     "Final/stored frames use the CPU path. First use ingests a reusable SimSat brick; \
@@ -943,6 +1035,12 @@ impl SimSatPane {
             margin_frac: self.margin_frac,
             granulation: self.granulation,
             bluemarble_download: self.bluemarble_download,
+            exposure: self.exposure,
+            clouds: self.clouds,
+            multiscatter: self.multiscatter,
+            sun_override: self.sun_override,
+            sun_elevation_deg: self.sun_elevation_deg,
+            sun_azimuth_deg: self.sun_azimuth_deg,
             cache_root,
             store_root,
             sector,
@@ -1179,10 +1277,15 @@ fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
     params.view = job.view.api_view();
     params.resolution = ResolutionMode::Native;
     params.margin_frac = job.margin_frac;
+    params.exposure = f64::from(job.exposure);
     params.steps = job.quality.steps();
-    params.multiscatter = true;
-    params.clouds = true;
-    params.granulation = Some(job.granulation && job.product.uses_visible_ground());
+    params.multiscatter = job.multiscatter;
+    params.clouds = job.clouds;
+    params.granulation = Some(job.clouds && job.granulation && job.product.uses_visible_ground());
+    params.sun_override = job.sun_override.then_some(SunOverride {
+        elev_deg: Some(f64::from(job.sun_elevation_deg)),
+        az_deg: Some(f64::from(job.sun_azimuth_deg)),
+    });
     params.derived_colormap = false;
     params.ir_enhancement = None;
     params.bluemarble = if job.product.uses_visible_ground() {
@@ -1400,6 +1503,41 @@ fn write_result_to_store(
             common.9,
         );
         Some(store_out::write_ir_frame(&job.store_root, &frame)?)
+    } else if let Some(expected_field) = job.product.derived_field() {
+        let FrameData::Scalar { values, field, .. } = &result.data else {
+            return Err("SimSat returned the wrong frame type for a derived product.".to_owned());
+        };
+        if *field != expected_field {
+            return Err(format!(
+                "SimSat returned derived field {} for requested {}",
+                field.slug(),
+                expected_field.slug()
+            ));
+        }
+        let written = write_derived_frame(
+            &job.store_root,
+            &DerivedFrame {
+                nx: common.0,
+                ny: common.1,
+                values: values.clone(),
+                lat: common.2,
+                lon: common.3,
+                sector: common.4,
+                satellite: common.5,
+                field: *field,
+                year: common.6,
+                month: common.7,
+                day: common.8,
+                hhmm: common.9,
+            },
+        )?;
+        return Ok(Some(StoredFrame {
+            key: rw_ui::SatRunKey {
+                model: written.model,
+                run: written.run,
+            },
+            hhmm: written.hhmm,
+        }));
     } else {
         None
     };
@@ -1482,6 +1620,13 @@ fn plot_payload_from_parts(
             PlotPixels::Scalar {
                 values: bt_kelvin,
                 units: "K".to_owned(),
+                palette: Some(SatellitePlotPalette::from_satellite_anchors(
+                    rw_sat::palette::band_anchors(
+                        product
+                            .thermal_band()
+                            .expect("thermal payload guard checked the band"),
+                    ),
+                )),
             }
         }
         FrameData::Scalar { values, field, .. }
@@ -1496,6 +1641,7 @@ fn plot_payload_from_parts(
             PlotPixels::Scalar {
                 values,
                 units: field.units().to_owned(),
+                palette: Some(SatellitePlotPalette::from_simsat_derived(field)),
             }
         }
         _ => {
@@ -1506,7 +1652,7 @@ fn plot_payload_from_parts(
         }
     };
     Ok(PlotPayload {
-        title: product.label().to_owned(),
+        title: format!("SimSat · {}", product.label()),
         subtitle_left,
         subtitle_right,
         nx,
@@ -1698,12 +1844,18 @@ mod tests {
         .unwrap();
         assert_eq!(payload.nx, 2);
         assert_eq!(payload.lat, vec![40.0, 40.0]);
-        let PlotPixels::Scalar { values, units } = payload.pixels else {
+        let PlotPixels::Scalar {
+            values,
+            units,
+            palette,
+        } = payload.pixels
+        else {
             panic!("expected scalar payload");
         };
         assert_eq!(values[0], 12.5);
         assert!(values[1].is_nan());
         assert_eq!(units, "mm");
+        assert!(palette.is_some(), "derived plots need a stable palette");
     }
 
     #[test]

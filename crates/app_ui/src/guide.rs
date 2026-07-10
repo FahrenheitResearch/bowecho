@@ -1019,8 +1019,10 @@ fn satellite(ui: &mut egui::Ui) {
         "Windows > Simulated satellite opens BowEcho's embedded SimSat engine. \
          It renders physically based visible, GeoColor, sandwich, thermal-IR, water-vapor, \
          and derived products from local WRF output or HRRR native-level data. Finished \
-         visible/IR frames are written directly into this same satellite store, selected in \
-         the player, and can follow onto the radar map. SimSat needs HRRR wrfnat files; the \
+         frames are written directly into this same satellite store, grouped into loops by \
+         source run, selected in the player, and can follow onto the radar map. The Render \
+         controls expose exposure, clouds, multiple scattering, granulation, and an explicitly \
+         labeled what-if sun override for visible-family products. SimSat needs HRRR wrfnat files; the \
          normal Model download's smaller pressure + surface pair cannot reconstruct native \
          cloud volumes. BowEcho therefore downloads wrfnat only when requested by SimSat and \
          reuses it from the SimSat input cache afterward.",
@@ -1031,8 +1033,9 @@ fn satellite(ui: &mut egui::Ui) {
         ui,
         "Native plot sends the current real or simulated satellite frame through the same \
          projected plotting surface used by the Model window. IR and water-vapor plots retain \
-         raw Kelvin values and a physical colorbar; true-color composites stay RGB and omit a \
-         false scalar legend. Save PNG in that plot window exports the plotted product with its \
+         raw Kelvin values and a physical colorbar; derived products retain raw mm/K/optical-depth \
+         values with fixed cross-frame palettes; true-color composites stay RGB and omit a false \
+         scalar legend. Save PNG in that plot window exports the plotted product with its \
          title, valid time, and map context.",
     );
 

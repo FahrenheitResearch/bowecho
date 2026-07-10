@@ -68,6 +68,7 @@ use crate::sat_window::{
     AHI_NOMINAL_SUB_LON_DEG, SatNativeWindow, ScanAngleRect, ahi_fldk_segment_range,
     ahi_lat_lon_to_scan_angles, ahi_window_crop, axis_crop_range, window_scan_angle_rect,
 };
+use crate::simsat_store::field_from_variable as simsat_derived_field_from_variable;
 
 /// Requests from the UI thread.
 #[derive(Debug, Clone)]
@@ -886,12 +887,35 @@ fn run_title(model: &str, run: &str) -> String {
 fn simsat_run_title(run: &str) -> String {
     let normalized = run.to_ascii_lowercase();
     let tokens = normalized.split('_').collect::<Vec<_>>();
-    let source = tokens.iter().find_map(|token| match *token {
-        "hrrr" => Some("HRRR"),
-        "wrf" | "wrfout" => Some("WRF"),
-        "rrfs" => Some("RRFS"),
-        _ => None,
-    });
+    let source = if tokens.contains(&"hrrr") {
+        let cycle = tokens.iter().find_map(|token| {
+            token
+                .strip_prefix('t')
+                .and_then(|token| token.strip_suffix('z'))
+                .filter(|token| token.len() == 2 && token.chars().all(|ch| ch.is_ascii_digit()))
+        });
+        Some(match cycle {
+            Some(cycle) => format!("HRRR {cycle}Z"),
+            None => "HRRR".to_owned(),
+        })
+    } else if tokens
+        .iter()
+        .any(|token| matches!(*token, "wrf" | "wrfout"))
+    {
+        let domain = tokens.iter().find(|token| {
+            token.strip_prefix('d').is_some_and(|value| {
+                !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+            })
+        });
+        Some(match domain {
+            Some(domain) => format!("WRF {}", domain.to_ascii_uppercase()),
+            None => "WRF".to_owned(),
+        })
+    } else if tokens.contains(&"rrfs") {
+        Some("RRFS".to_owned())
+    } else {
+        None
+    };
     let product = if normalized.contains("geocolor") {
         Some("GeoColor".to_string())
     } else if normalized.contains("sandwich") {
@@ -963,7 +987,7 @@ fn simsat_run_title(run: &str) -> String {
 
     let mut parts = vec!["SimSat".to_string()];
     if let Some(source) = source {
-        parts.push(source.to_string());
+        parts.push(source);
     }
     if let Some(product) = product {
         parts.push(product);
@@ -1133,6 +1157,32 @@ fn load_frame_for_plot(
     let title = format!("{} · {hhmm:04}Z", run_title(&key.model, &key.run));
     let subtitle_left = format!("{}/{}", key.model, key.run);
     let subtitle_right = format!("{} · {hhmm:04}Z", key.model.to_ascii_uppercase());
+
+    // Derived SimSat frames retain their raw physical field in the store.
+    // Prefer it over any display representation so Native plot keeps exact
+    // values, fixed product colors, units, and a scalar colorbar.
+    if let Some((variable, field)) = meta.variables.iter().find_map(|variable| {
+        simsat_derived_field_from_variable(&variable.name).map(|field| (variable.clone(), field))
+    }) {
+        let values = reader
+            .read_full_2d(&variable.name)
+            .map_err(|error| error.to_string())?;
+        return SatellitePlotSource::scalar_from_store(
+            title,
+            subtitle_left,
+            format!(
+                "{} · {} · {hhmm:04}Z",
+                key.model.to_ascii_uppercase(),
+                field.units()
+            ),
+            variable.name,
+            variable.units,
+            variable.selector,
+            values,
+            grid,
+            Some(SatellitePlotPalette::from_simsat_derived(field)),
+        );
+    }
 
     if meta
         .variables
@@ -1320,20 +1370,27 @@ fn load_colored_frame(
             .iter()
             .find(|var| var.kind == "surface2d")
             .ok_or_else(|| format!("{key}/t{hhmm:04} holds no 2D variable"))?;
-        let band = selector_band(&variable.selector, &variable.name)
-            .ok_or_else(|| format!("{key}/t{hhmm:04} selector carries no band"))?;
         let name = variable.name.clone();
         let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
-        render_sat_pixels(
-            &name,
-            band,
-            &values,
-            nx,
-            ny,
-            flip_rows,
-            map_overlay,
-            state.ir_enhancement,
-        )
+        if let Some(field) = simsat_derived_field_from_variable(&name) {
+            (
+                render_simsat_derived_pixels(&values, field, nx, ny, flip_rows),
+                false,
+            )
+        } else {
+            let band = selector_band(&variable.selector, &variable.name)
+                .ok_or_else(|| format!("{key}/t{hhmm:04} selector carries no band"))?;
+            render_sat_pixels(
+                &name,
+                band,
+                &values,
+                nx,
+                ny,
+                flip_rows,
+                map_overlay,
+                state.ir_enhancement,
+            )
+        }
     };
 
     Ok(ColoredSatFrame {
@@ -1385,6 +1442,35 @@ fn render_composite_pixels(
                 gv.round().clamp(0.0, 255.0) as u8,
                 bv.round().clamp(0.0, 255.0) as u8,
             ));
+        }
+    }
+    pixels
+}
+
+/// Color one raw SimSat derived field with the engine's fixed physical
+/// palette. NaN remains transparent, and the same row-orientation rule as
+/// real satellite bands keeps the player and map mesh aligned.
+fn render_simsat_derived_pixels(
+    values: &[f32],
+    field: simsat::derived::DerivedField,
+    nx: usize,
+    ny: usize,
+    flip_rows: bool,
+) -> Vec<Color32> {
+    let mut pixels = Vec::with_capacity(nx * ny);
+    for image_row in 0..ny {
+        let grid_row = if flip_rows {
+            ny - 1 - image_row
+        } else {
+            image_row
+        };
+        for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
+            if !value.is_finite() {
+                pixels.push(Color32::TRANSPARENT);
+                continue;
+            }
+            let [r, g, b] = simsat::derived::value_color(value, field);
+            pixels.push(Color32::from_rgb(r, g, b));
         }
     }
     pixels
@@ -5339,6 +5425,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn simsat_derived_frame_opens_in_satellite_and_native_plot() {
+        let dir = test_dir("simsat-derived-player-plot");
+        let values = vec![5.0, 35.0, 70.0, f32::NAN];
+        let written = crate::simsat_store::write_derived_frame(
+            &dir,
+            &crate::simsat_store::DerivedFrame {
+                nx: 2,
+                ny: 2,
+                values: values.clone(),
+                lat: vec![30.0, 30.0, 31.0, 31.0],
+                lon: vec![-101.0, -100.0, -101.0, -100.0],
+                sector: "hrrr_20260710_t19z_pw_geo".to_owned(),
+                satellite: simsat::camera::SatellitePreset::GoesEast,
+                field: simsat::derived::DerivedField::PrecipitableWater,
+                year: 2026,
+                month: 7,
+                day: 10,
+                hhmm: 2000,
+            },
+        )
+        .unwrap();
+        let key = SatRunKey {
+            model: written.model,
+            run: written.run,
+        };
+
+        let listings = scan_runs(&dir);
+        let listing = listings.iter().find(|listing| listing.key == key).unwrap();
+        assert_eq!(listing.frames, vec![2000]);
+        assert!(listing.title.contains("HRRR 19Z"), "{}", listing.title);
+        assert!(
+            listing.title.contains("Precipitable Water"),
+            "{}",
+            listing.title
+        );
+
+        let mut state = WorkerState::default();
+        let colored = load_frame(&mut state, &dir, &key, 2000).unwrap();
+        assert_eq!(colored.frame.image.size, [2, 2]);
+        assert!(
+            colored
+                .frame
+                .image
+                .pixels
+                .iter()
+                .any(|pixel| pixel.a() == 0),
+            "derived NaN must remain transparent"
+        );
+        for value in [5.0, 35.0, 70.0] {
+            let [r, g, b] = simsat::derived::value_color(
+                value,
+                simsat::derived::DerivedField::PrecipitableWater,
+            );
+            assert!(
+                colored
+                    .frame
+                    .image
+                    .pixels
+                    .contains(&Color32::from_rgb(r, g, b)),
+                "Satellite must use SimSat's fixed PW palette at {value} mm"
+            );
+        }
+
+        let source = load_frame_for_plot(&mut state, &dir, &key, 2000).unwrap();
+        match &source.raster {
+            crate::sat_plot::SatellitePlotRaster::Scalar {
+                units,
+                values: loaded,
+                palette,
+                ..
+            } => {
+                assert_eq!(units, "mm");
+                assert!(palette.is_some());
+                assert_eq!(loaded.len(), values.len());
+                for (loaded, expected) in loaded.iter().zip(&values) {
+                    if expected.is_nan() {
+                        assert!(loaded.is_nan());
+                    } else {
+                        assert!((loaded - expected).abs() < 1.0e-6);
+                    }
+                }
+            }
+            other => panic!("expected raw derived scalar, got {other:?}"),
+        }
+        let request = source.build_render_request(800, 600).unwrap();
+        assert!(request.colorbar);
+        assert!(matches!(
+            request.domain_frame.map(|frame| frame.source),
+            Some(rustwx_render::DomainFrameSource::RasterAlpha)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// One-shot release proof for a real SimSat HRRR frame written by BowEcho.
     /// The fixture is intentionally external: shipping tests stay small, while
     /// an RC can copy one store run to a node and exercise OUR store reader,
@@ -5895,7 +6076,7 @@ mod tests {
         );
         assert!(
             geo.contains("SimSat")
-                && geo.contains("HRRR")
+                && geo.contains("HRRR 20Z")
                 && geo.contains("GeoColor")
                 && geo.contains("GEO")
                 && geo.contains("2026-07-10"),
@@ -5903,7 +6084,7 @@ mod tests {
         );
         let thermal = run_title("simsat", "wrfout_d03_wv08_topdown_c08_20250621");
         assert!(
-            thermal.contains("WRF")
+            thermal.contains("WRF D03")
                 && thermal.contains("Water Vapor C08")
                 && thermal.contains("TOP-DOWN"),
             "{thermal}"

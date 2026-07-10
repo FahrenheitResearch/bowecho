@@ -97,6 +97,7 @@ mod self_update;
 mod settings_persistence;
 mod settings_ui;
 mod simsat_hrrr;
+mod simsat_store;
 mod simsat_ui;
 mod sites_ui;
 mod spc_layers;
