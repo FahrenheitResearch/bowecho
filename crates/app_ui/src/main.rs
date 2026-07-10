@@ -23078,15 +23078,14 @@ impl ViewerApp {
             self.loop_speed_combo_ui(ui, ctx, ("pane_loop_speed", pane_slot));
             self.loop_settings_gear_ui(ui, ctx, Some(pane_slot));
         });
-        // Full-width scrubber directly under the transport (see the primary
-        // loop bar).
+        // Full-width scrubber directly under the transport, sized through
+        // spacing.slider_width (see the primary loop bar).
         let mut slider_index = selected_frame_index;
         let slider_response = ui
             .add_enabled_ui(frame_count > 1, |ui| {
-                ui.add_sized(
-                    egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
-                    egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false),
-                )
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - PANEL_BUTTON_HEIGHT).max(panel_kit::SLIDER_TRACK_MIN_W);
+                ui.add(egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false))
             })
             .inner
             .on_hover_text("Scrub decoded frame history")
@@ -23212,14 +23211,16 @@ impl ViewerApp {
             self.loop_settings_gear_ui(ui, ctx, None);
         });
         // Full-width scrubber directly under the transport — this IS the
-        // loop position, so it gets the whole panel width.
+        // loop position, so it gets the whole panel width. egui sliders
+        // size from spacing.slider_width, NOT from add_sized: the old
+        // add_sized call left a ~100 pt orphan rail whose boxy handle read
+        // as a stray checkbox (integrator screenshot round).
         let mut slider_index = self.primary.cursor.index.min(frame_count - 1);
         let slider_response = ui
             .add_enabled_ui(frame_count > 1, |ui| {
-                ui.add_sized(
-                    egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
-                    egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false),
-                )
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - PANEL_BUTTON_HEIGHT).max(panel_kit::SLIDER_TRACK_MIN_W);
+                ui.add(egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false))
             })
             .inner
             .on_hover_text("Scrub decoded frame history")
