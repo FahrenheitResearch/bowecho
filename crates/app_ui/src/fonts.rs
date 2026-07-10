@@ -58,6 +58,31 @@ mod tests {
         let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
     }
 
+    /// TEMPORARY probe (theme pass): print which glyph-vocabulary
+    /// candidates the default proportional chain covers. Removed once the
+    /// covered vocabulary is locked in a guard test.
+    #[test]
+    fn glyph_coverage_probe() {
+        let ctx = egui::Context::default();
+        install_cjk_fallback(&ctx);
+        let font_id = egui::FontId::proportional(14.0);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().fonts_mut(|fonts| {
+                for ch in [
+                    '✕', '◉', '▾', '↑', '↓', '↻', '◀', '▶', '⏸', '⚙', '●', '×', '✖', '✗',
+                    '⏺', '⏴', '⏵', '▲', '▼', '⏶', '⏷', '▸', '▹', '○', '◦', '∨', '⌄', '·',
+                ] {
+                    println!(
+                        "GLYPH {} U+{:04X} covered={}",
+                        ch,
+                        ch as u32,
+                        fonts.has_glyphs(&font_id, &ch.to_string())
+                    );
+                }
+            });
+        });
+    }
+
     /// Japanese text lays out through real glyphs — coverage, not the
     /// tofu replacement (which would still have nonzero width, hence the
     /// has_glyphs checks and the no-fallback control).
