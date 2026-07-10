@@ -18767,11 +18767,25 @@ impl eframe::App for ViewerApp {
                     .show_inside(ui, |ui| self.annotate_tool_row_ui(ui));
             }
 
-            egui::Panel::right("product_tilt_panel")
+            // Sidebar width is persisted (ui-refresh plan): the saved width
+            // seeds the panel each session (egui's own memory dies with the
+            // process — eframe is built without persistence), and drags are
+            // written back through the debounced settings lane.
+            let saved_width = panel_kit::sidebar_width_from_settings(
+                self.app_settings.sidebar_width_pt,
+            );
+            let panel_response = egui::Panel::right("product_tilt_panel")
                 .resizable(true)
-                .default_size(SIDEBAR_DEFAULT_WIDTH)
+                .default_size(saved_width.unwrap_or(SIDEBAR_DEFAULT_WIDTH))
                 .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
                 .show_inside(ui, |ui| self.side_panel(ui, &ctx));
+            if let Some(width) =
+                panel_kit::sidebar_width_to_settings(panel_response.response.rect.width())
+                && self.app_settings.sidebar_width_pt != Some(width)
+            {
+                self.app_settings.sidebar_width_pt = Some(width);
+                self.mark_app_settings_dirty();
+            }
 
             egui::Panel::bottom("status_bar")
                 .exact_size(30.0)

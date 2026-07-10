@@ -651,6 +651,14 @@ pub struct AppSettings {
     /// state dies with the process — this map is what survives restarts.
     #[serde(default)]
     pub sidebar_section_open: BTreeMap<String, bool>,
+    /// Sidebar (right control panel) width in whole logical points,
+    /// persisted when the user drags the panel edge. Clamped to the
+    /// panel's min/max range at apply time (app_ui); `None` (older
+    /// configs) keeps the built-in default width. Whole points because
+    /// `AppSettings` derives `Eq` (an `f32` would forfeit it) and
+    /// sub-point panel widths are meaningless.
+    #[serde(default)]
+    pub sidebar_width_pt: Option<u16>,
     /// Satellite IR enhancement slug applied to Kelvin brightness-temperature
     /// bands (GOES ABI / Himawari AHI 7-16): "cimss" (default rainbow),
     /// "bd" (Dvorak BD curve), "avn", "funktop", "rainbow", "gray".
@@ -973,6 +981,7 @@ impl Default for AppSettings {
             wrf_synth_radar: None,
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
+            sidebar_width_pt: None,
             sat_ir_enhancement: default_sat_ir_enhancement(),
             model_slug: default_model_slug(),
             units: default_units(),
@@ -1986,6 +1995,40 @@ mod tests {
         assert!(back.live_low_sweep_auto_advance);
         assert_eq!(back.live_low_sweep_auto_advance_seconds, 10);
         assert!(back.show_center_crosshair);
+    }
+
+    #[test]
+    fn sidebar_width_defaults_to_none_and_round_trips() {
+        // Older configs have no sidebar_width_pt key: no width override.
+        assert_eq!(AppSettings::from_json("{}").sidebar_width_pt, None);
+
+        let settings = AppSettings {
+            sidebar_width_pt: Some(420),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.sidebar_width_pt, Some(420));
+    }
+
+    #[test]
+    fn pre_existing_sidebar_section_keys_survive_a_round_trip() {
+        // The ui-refresh sections reuse this map with unchanged keys; a
+        // user's pre-refresh collapse state must never be lost.
+        let mut settings = AppSettings::default();
+        settings
+            .sidebar_section_open
+            .insert("settings_display".to_owned(), false);
+        settings
+            .sidebar_section_open
+            .insert("data_archive".to_owned(), true);
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(
+            back.sidebar_section_open.get("settings_display"),
+            Some(&false)
+        );
+        assert_eq!(back.sidebar_section_open.get("data_archive"), Some(&true));
     }
 
     #[test]
