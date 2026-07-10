@@ -436,7 +436,10 @@ impl ViewerApp {
     }
 
     /// Record button + output options, drawn next to the playback controls.
-    pub(crate) fn record_controls_ui_for_target(
+    /// The loop-export record button — the one record control that stays on
+    /// the loop bar itself (ui-refresh plan: everything else about recording
+    /// lives in the "Loop settings" gear popover).
+    pub(crate) fn record_loop_button_ui(
         &mut self,
         ui: &mut egui::Ui,
         target: Option<LoopTimelineTarget>,
@@ -461,7 +464,13 @@ impl ViewerApp {
         {
             self.toggle_recording(ui.ctx(), target);
         }
+    }
 
+    /// Free full-window recording start/stop (lives in the loop bar's gear
+    /// popover next to the rest of the record options).
+    pub(crate) fn record_free_button_ui(&mut self, ui: &mut egui::Ui) {
+        let loop_recording = self.media.recorder.is_some();
+        let free_recording = self.media.free_recorder.is_some();
         let free_label = if free_recording { "Stop" } else { "Free" };
         if ui
             .add_enabled_ui(!loop_recording, |ui| {
@@ -476,86 +485,103 @@ impl ViewerApp {
         {
             self.toggle_free_recording(ui.ctx());
         }
-
-        self.record_options_ui(ui);
     }
 
+    /// Record option knobs as kit rows (same widgets, ids, and wiring as the
+    /// old inline row — only the layout is normalized). Shared by the loop
+    /// bar's gear popover and the unified player's "Recording settings" fold.
     pub(crate) fn record_options_ui(&mut self, ui: &mut egui::Ui) {
         let loop_recording = self.media.recorder.is_some();
         let free_recording = self.media.free_recorder.is_some();
         ui.add_enabled_ui(!loop_recording && !free_recording, |ui| {
-            egui::ComboBox::from_id_salt("media_record_size")
-                .selected_text(self.media.record_size.label())
-                .width(56.0)
-                .show_ui(ui, |ui| {
-                    for size in [
-                        RecordSize::Small720,
-                        RecordSize::Full1280,
-                        RecordSize::Hd1920,
-                        RecordSize::Native,
-                    ] {
-                        ui.selectable_value(&mut self.media.record_size, size, size.label());
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "Maximum recording width in pixels (smaller = Discord-friendlier). \
-                     native = the full capture resolution, no downscale — crispest, \
-                     biggest files (MP4 handles it well; GIFs get large)",
-                );
-            egui::ComboBox::from_id_salt("media_record_format")
-                .selected_text(self.media.record_format.label())
-                .width(56.0)
-                .show_ui(ui, |ui| {
-                    for format in [
-                        RecordFormat::Auto,
-                        RecordFormat::Gif,
-                        RecordFormat::Mp4,
-                        RecordFormat::WebP,
-                    ] {
-                        ui.selectable_value(&mut self.media.record_format, format, format.label());
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "Auto = MP4 when ffmpeg is on PATH, otherwise GIF. WebP uses ffmpeg's animated WebP encoder.",
-                );
+            crate::panel_kit::row(ui, "Size", |ui| {
+                egui::ComboBox::from_id_salt("media_record_size")
+                    .selected_text(self.media.record_size.label())
+                    .width(76.0)
+                    .show_ui(ui, |ui| {
+                        for size in [
+                            RecordSize::Small720,
+                            RecordSize::Full1280,
+                            RecordSize::Hd1920,
+                            RecordSize::Native,
+                        ] {
+                            ui.selectable_value(&mut self.media.record_size, size, size.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Maximum recording width in pixels (smaller = Discord-friendlier). \
+                         native = the full capture resolution, no downscale — crispest, \
+                         biggest files (MP4 handles it well; GIFs get large)",
+                    );
+            });
+            crate::panel_kit::row(ui, "Format", |ui| {
+                egui::ComboBox::from_id_salt("media_record_format")
+                    .selected_text(self.media.record_format.label())
+                    .width(76.0)
+                    .show_ui(ui, |ui| {
+                        for format in [
+                            RecordFormat::Auto,
+                            RecordFormat::Gif,
+                            RecordFormat::Mp4,
+                            RecordFormat::WebP,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.media.record_format,
+                                format,
+                                format.label(),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Auto = MP4 when ffmpeg is on PATH, otherwise GIF. WebP uses ffmpeg's animated WebP encoder.",
+                    );
+            });
             let before_loop_speed = self.app_settings.loop_record_speed_percent;
             let mut loop_speed =
                 normalize_loop_record_speed_percent(self.app_settings.loop_record_speed_percent);
-            egui::ComboBox::from_id_salt("media_loop_record_speed")
-                .selected_text(format!("loop {}", loop_record_speed_label(loop_speed)))
-                .width(76.0)
-                .show_ui(ui, |ui| {
-                    for speed in LOOP_RECORD_SPEED_PERCENT_OPTIONS {
-                        ui.selectable_value(
-                            &mut loop_speed,
-                            *speed,
-                            loop_record_speed_label(*speed),
-                        );
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "GIF/MP4/WebP loop export speed. Separate from screen playback so giant low-sweep loops can be compressed intentionally.",
-                );
+            crate::panel_kit::row(ui, "Export speed", |ui| {
+                egui::ComboBox::from_id_salt("media_loop_record_speed")
+                    .selected_text(format!("loop {}", loop_record_speed_label(loop_speed)))
+                    .width(76.0)
+                    .show_ui(ui, |ui| {
+                        for speed in LOOP_RECORD_SPEED_PERCENT_OPTIONS {
+                            ui.selectable_value(
+                                &mut loop_speed,
+                                *speed,
+                                loop_record_speed_label(*speed),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "GIF/MP4/WebP loop export speed. Separate from screen playback so giant low-sweep loops can be compressed intentionally.",
+                    );
+            });
             self.app_settings.loop_record_speed_percent = loop_speed;
             if self.app_settings.loop_record_speed_percent != before_loop_speed {
                 self.mark_app_settings_dirty();
             }
             let before_fps = self.media.record_fps;
-            egui::ComboBox::from_id_salt("media_record_fps")
-                .selected_text(format!("{}fps", self.media.normalized_record_fps()))
-                .width(62.0)
-                .show_ui(ui, |ui| {
-                    for fps in RECORD_FPS_CHOICES {
-                        ui.selectable_value(&mut self.media.record_fps, fps, format!("{fps}fps"));
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "Free recording capture/playback FPS. Loop recording exports at a stable 1x radar cadence so high-speed playback does not make one-second loops.",
-                );
+            crate::panel_kit::row(ui, "Capture FPS", |ui| {
+                egui::ComboBox::from_id_salt("media_record_fps")
+                    .selected_text(format!("{}fps", self.media.normalized_record_fps()))
+                    .width(76.0)
+                    .show_ui(ui, |ui| {
+                        for fps in RECORD_FPS_CHOICES {
+                            ui.selectable_value(
+                                &mut self.media.record_fps,
+                                fps,
+                                format!("{fps}fps"),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Free recording capture/playback FPS. Loop recording exports at a stable 1x radar cadence so high-speed playback does not make one-second loops.",
+                    );
+            });
             self.media.record_fps = normalize_record_fps(self.media.record_fps);
             if self.media.record_fps != before_fps {
                 self.app_settings.record_fps = self.media.record_fps;

@@ -23014,83 +23014,27 @@ impl ViewerApp {
             {
                 timeline_step_delta = Some(1);
             }
-            ui.weak(self.loop_timeline_position_label(LoopTimelineTarget::ExtraPane(
-                pane_slot,
-            )));
-            let mut selected_limit = self.primary.limits.frame_limit;
-            egui::ComboBox::from_id_salt(("pane_history_frame_limit", pane_slot))
-                .selected_text(format!("{}", self.primary.limits.frame_limit))
-                .width(52.0)
-                .show_ui(ui, |ui| {
-                    for limit in HISTORY_SIZE_OPTIONS {
-                        ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
-                    }
-                });
-            if selected_limit != self.primary.limits.frame_limit {
-                self.primary.limits.frame_limit = normalized_history_limit(selected_limit);
-                self.retrim_extra_pane_history_to_shared_limit(pane_slot);
-                ctx.request_repaint();
-            }
-            let mut typed_limit = self.primary.limits.frame_limit;
-            if ui
-                .add(
-                    egui::DragValue::new(&mut typed_limit)
-                        .range(1..=MAX_HISTORY_FRAME_LIMIT)
-                        .speed(1.0)
-                        .prefix("N "),
-                )
-                .on_hover_text("Arbitrary frame request/keep limit for long loops")
-                .changed()
-            {
-                self.primary.limits.frame_limit = normalized_history_limit(typed_limit);
-                self.retrim_extra_pane_history_to_shared_limit(pane_slot);
-                ctx.request_repaint();
-            }
-            let mut speed = self.app_settings.loop_speed_percent;
-            egui::ComboBox::from_id_salt(("pane_loop_speed", pane_slot))
-                .selected_text(loop_speed_label(speed))
-                .width(56.0)
-                .show_ui(ui, |ui| {
-                    for option in LOOP_SPEED_PERCENT_OPTIONS {
-                        ui.selectable_value(&mut speed, *option, loop_speed_label(*option));
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "Loop speed for on-screen playback. Recorded GIF/MP4 loops use the separate export speed in the record controls.",
-                );
-            if speed != self.app_settings.loop_speed_percent {
-                self.app_settings.loop_speed_percent = speed;
-                self.mark_app_settings_dirty();
-                let frame_ms = self.screen_loop_frame_ms();
-                ctx.request_repaint_after(Duration::from_millis(frame_ms));
-            }
-            let mut low_sweeps = self.app_settings.loop_low_sweeps;
-            if ui
-                .checkbox(&mut low_sweeps, "In-scan low sweeps")
-                .on_hover_text(
-                    "During playback, step through complete low-level SAILS sweeps inside each scan",
-                )
-                .changed()
-            {
-                self.app_settings.loop_low_sweeps = low_sweeps;
-                self.mark_app_settings_dirty();
-                self.select_first_extra_pane_low_sweep_if_enabled(pane_slot, ctx);
-                ctx.request_repaint();
-            }
-            if self.app_settings.loop_low_sweeps {
-                self.low_sweep_filter_combo_ui(
-                    ui,
-                    ("pane_loop_low_sweep_filter", pane_slot),
-                    ctx,
-                    Some(pane_slot),
-                );
-            }
+            // Same transport shape as the primary loop bar (the plan's one
+            // component, two data sources): truncating position label,
+            // speed combo, gear with the power knobs.
+            let reserved = 56.0 + 34.0 + ui.spacing().item_spacing.x * 3.0;
+            let label_width = (ui.available_width() - reserved).max(40.0);
+            let position =
+                self.loop_timeline_position_label(LoopTimelineTarget::ExtraPane(pane_slot));
+            ui.add_sized(
+                egui::vec2(label_width, PANEL_BUTTON_HEIGHT),
+                egui::Label::new(egui::RichText::new(&position).weak()).truncate(),
+            )
+            .on_hover_text(position);
+            self.loop_speed_combo_ui(ui, ctx, ("pane_loop_speed", pane_slot));
+            self.loop_settings_gear_ui(ui, ctx, Some(pane_slot));
         });
+        let selected_status_text = self.extra_pane_selected_frame_status_text(pane_slot);
+        panel_kit::status_block(ui, &selected_status_text, None);
         self.extra_pane_low_sweep_cut_controls_ui(ui, ctx, pane_slot);
 
         ui.horizontal(|ui| {
-            self.record_controls_ui_for_target(ui, Some(LoopTimelineTarget::ExtraPane(pane_slot)));
+            self.record_loop_button_ui(ui, Some(LoopTimelineTarget::ExtraPane(pane_slot)));
         });
 
         let mut slider_index = selected_frame_index;
@@ -23107,10 +23051,6 @@ impl ViewerApp {
         if slider_response {
             next_frame_index = Some(slider_index);
         }
-
-        let selected_status_text = self.extra_pane_selected_frame_status_text(pane_slot);
-        ui.add(egui::Label::new(egui::RichText::new(&selected_status_text).weak()).truncate())
-            .on_hover_text(&selected_status_text);
 
         egui::CollapsingHeader::new(format!("Frames ({frame_count})"))
             .id_salt(("pane_loop_frames", pane_slot))
@@ -23194,110 +23134,31 @@ impl ViewerApp {
             {
                 timeline_step_delta = Some(1);
             }
-            ui.weak(self.loop_timeline_position_label(LoopTimelineTarget::Primary));
-            let mut selected_limit = self.primary.limits.frame_limit;
-            egui::ComboBox::from_id_salt("history_frame_limit")
-                .selected_text(format!("{}", self.primary.limits.frame_limit))
-                .width(52.0)
-                .show_ui(ui, |ui| {
-                    for limit in HISTORY_SIZE_OPTIONS {
-                        ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
-                    }
-                });
-            if selected_limit != self.primary.limits.frame_limit {
-                self.set_history_frame_limit(selected_limit, ctx);
-            }
-            // Playback speed (field request) — screen-only. Recorded
-            // GIF/MP4 timing is pinned to real cadence with its own
-            // export-speed control in the record menu.
-            let mut typed_limit = self.primary.limits.frame_limit;
-            if ui
-                .add(
-                    egui::DragValue::new(&mut typed_limit)
-                        .range(1..=MAX_HISTORY_FRAME_LIMIT)
-                        .speed(1.0)
-                        .prefix("N "),
-                )
-                .on_hover_text("Arbitrary frame request/keep limit for long loops")
-                .changed()
-            {
-                self.set_history_frame_limit(typed_limit, ctx);
-            }
-            // Radar-history memory budget (#20): huge super-res loops trim to
-            // fit. Sits next to the frame-limit combo, exactly where "loaded
-            // 200, only see 93" happens — with an honest cap indicator.
-            let mut budget_gib = self.app_settings.radar_history_budget_gib;
-            let used_bytes = self.primary.history_bytes();
-            let budget_bytes = radar_history_budget_bytes(budget_gib);
-            let frames = self.primary.history.len();
-            let ram_capped = frames < self.primary.limits.frame_limit
-                && used_bytes as f64 > budget_bytes as f64 * 0.9;
-            egui::ComboBox::from_id_salt("radar_history_budget")
-                .selected_text(format!("{budget_gib} GiB"))
-                .width(64.0)
-                .show_ui(ui, |ui| {
-                    for gib in RADAR_HISTORY_BUDGET_CHOICES_GIB {
-                        ui.selectable_value(&mut budget_gib, gib, format!("{gib} GiB RAM"));
-                    }
-                })
-                .response
-                .on_hover_text(format!(
-                    "Radar-history memory budget. Large super-res loops (a Cat-5 \
-                     hurricane runs ~60-100 MB per decoded volume) trim oldest-first \
-                     to fit. Using {:.1} / {budget_gib} GiB across {frames} frames.",
-                    used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                ));
-            if budget_gib != self.app_settings.radar_history_budget_gib {
-                self.set_radar_history_budget(budget_gib, ctx);
-            }
-            if ram_capped {
-                ui.weak("⚠ RAM cap").on_hover_text(format!(
-                    "Showing {frames} of the up-to-{} frames you requested — the rest \
-                     were trimmed to fit the {budget_gib} GiB memory budget. Raise the \
-                     budget (dropdown at left) to keep more.",
-                    self.primary.limits.frame_limit
-                ));
-            }
-            let mut speed = self.app_settings.loop_speed_percent;
-            egui::ComboBox::from_id_salt("loop_speed")
-                .selected_text(loop_speed_label(speed))
-                .width(56.0)
-                .show_ui(ui, |ui| {
-                    for option in LOOP_SPEED_PERCENT_OPTIONS {
-                        ui.selectable_value(&mut speed, *option, loop_speed_label(*option));
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "Loop speed for on-screen playback. Recorded GIF/MP4 loops use the separate export speed in the record controls.",
-                );
-            if speed != self.app_settings.loop_speed_percent {
-                self.app_settings.loop_speed_percent = speed;
-                self.mark_app_settings_dirty();
-                let frame_ms = self.screen_loop_frame_ms();
-                ctx.request_repaint_after(Duration::from_millis(frame_ms));
-            }
-            let mut low_sweeps = self.app_settings.loop_low_sweeps;
-            if ui
-                .checkbox(&mut low_sweeps, "In-scan low sweeps")
-                .on_hover_text(
-                    "During playback, step through complete low-level SAILS sweeps inside each scan",
-                )
-                .changed()
-            {
-                self.app_settings.loop_low_sweeps = low_sweeps;
-                self.mark_app_settings_dirty();
-                self.select_first_history_low_sweep_if_enabled(ctx);
-                ctx.request_repaint();
-            }
-            if self.app_settings.loop_low_sweeps {
-                self.low_sweep_filter_combo_ui(ui, "loop_low_sweep_filter", ctx, None);
-            }
+            // The rest of the transport row: "frame i/N" truncating in the
+            // middle, then the on-screen speed combo, then the gear holding
+            // every power knob (ui-refresh plan: the old mega-row was the
+            // No. 1 width offender; this row holds at 320 pt — width budget
+            // = 110 transport + flexible label + 56 speed + 34 gear).
+            let reserved = 56.0 + 34.0 + ui.spacing().item_spacing.x * 3.0;
+            let label_width = (ui.available_width() - reserved).max(40.0);
+            let position = self.loop_timeline_position_label(LoopTimelineTarget::Primary);
+            ui.add_sized(
+                egui::vec2(label_width, PANEL_BUTTON_HEIGHT),
+                egui::Label::new(egui::RichText::new(&position).weak()).truncate(),
+            )
+            .on_hover_text(position);
+            self.loop_speed_combo_ui(ui, ctx, "loop_speed");
+            self.loop_settings_gear_ui(ui, ctx, None);
         });
+        // Row 2 (plan): the status block — what the loop is showing.
+        let selected_status_text = self.selected_frame_status_text();
+        panel_kit::status_block(ui, &selected_status_text, None);
         self.history_low_sweep_cut_controls_ui(ui, ctx);
 
+        // The loop-export button stays one press away; every other record
+        // control lives in the gear popover ("Loop settings").
         ui.horizontal(|ui| {
-            self.record_controls_ui_for_target(ui, Some(LoopTimelineTarget::Primary));
+            self.record_loop_button_ui(ui, Some(LoopTimelineTarget::Primary));
         });
 
         let mut slider_index = self.primary.cursor.index.min(frame_count - 1);
@@ -23314,10 +23175,6 @@ impl ViewerApp {
         if slider_response {
             next_frame_index = Some(slider_index);
         }
-
-        let selected_status_text = self.selected_frame_status_text();
-        ui.add(egui::Label::new(egui::RichText::new(&selected_status_text).weak()).truncate())
-            .on_hover_text(&selected_status_text);
 
         egui::CollapsingHeader::new(format!("Frames ({frame_count})"))
             .id_salt("loop_frames")
@@ -23355,6 +23212,166 @@ impl ViewerApp {
             // longer steal the selection); clicking the newest releases it.
             self.primary.cursor.browsing = index + 1 < self.primary.history.len();
         }
+    }
+
+    /// On-screen playback speed combo — the one power knob that stays on the
+    /// transport row (it is a playback control, not a setting).
+    fn loop_speed_combo_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        id_salt: impl std::hash::Hash,
+    ) {
+        let mut speed = self.app_settings.loop_speed_percent;
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(loop_speed_label(speed))
+            .width(56.0)
+            .show_ui(ui, |ui| {
+                for option in LOOP_SPEED_PERCENT_OPTIONS {
+                    ui.selectable_value(&mut speed, *option, loop_speed_label(*option));
+                }
+            })
+            .response
+            .on_hover_text(
+                "Loop speed for on-screen playback. Recorded GIF/MP4 loops use the separate export speed in the record controls.",
+            );
+        if speed != self.app_settings.loop_speed_percent {
+            self.app_settings.loop_speed_percent = speed;
+            self.mark_app_settings_dirty();
+            let frame_ms = self.screen_loop_frame_ms();
+            ctx.request_repaint_after(Duration::from_millis(frame_ms));
+        }
+    }
+
+    /// The loop bar's gear: every power knob the old mega-row carried, as
+    /// kit rows in one "Loop settings" popover. `pane_slot` None = primary
+    /// loop, Some = a focused independent extra pane (same widgets and
+    /// wiring as before the refresh; the RAM budget remains primary-only
+    /// exactly as it was).
+    fn loop_settings_gear_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pane_slot: Option<usize>,
+    ) {
+        panel_kit::gear_popover(ui, "Loop settings", |ui| {
+            self.loop_settings_popover_body(ui, ctx, pane_slot);
+        });
+    }
+
+    fn loop_settings_popover_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pane_slot: Option<usize>,
+    ) {
+        // Frame keep/request limit — shared state across primary and panes,
+        // applied through the same paths as the old inline widgets.
+        let apply_limit = |app: &mut Self, limit: usize, ctx: &egui::Context| match pane_slot {
+            None => app.set_history_frame_limit(limit, ctx),
+            Some(slot) => {
+                app.primary.limits.frame_limit = normalized_history_limit(limit);
+                app.retrim_extra_pane_history_to_shared_limit(slot);
+                ctx.request_repaint();
+            }
+        };
+        let mut selected_limit = self.primary.limits.frame_limit;
+        panel_kit::row(ui, "Frame limit", |ui| {
+            egui::ComboBox::from_id_salt(("loop_settings_frame_limit", pane_slot))
+                .selected_text(format!("{} frames", self.primary.limits.frame_limit))
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    for limit in HISTORY_SIZE_OPTIONS {
+                        ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
+                    }
+                });
+        });
+        if selected_limit != self.primary.limits.frame_limit {
+            apply_limit(self, selected_limit, ctx);
+        }
+        let mut typed_limit = self.primary.limits.frame_limit;
+        let typed_changed = panel_kit::row(ui, "Custom limit", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut typed_limit)
+                    .range(1..=MAX_HISTORY_FRAME_LIMIT)
+                    .speed(1.0)
+                    .prefix("N "),
+            )
+            .on_hover_text("Arbitrary frame request/keep limit for long loops")
+            .changed()
+        });
+        if typed_changed {
+            apply_limit(self, typed_limit, ctx);
+        }
+        if pane_slot.is_none() {
+            // Radar-history memory budget (#20): huge super-res loops trim
+            // to fit — with an honest cap indicator right below.
+            let mut budget_gib = self.app_settings.radar_history_budget_gib;
+            let used_bytes = self.primary.history_bytes();
+            let budget_bytes = radar_history_budget_bytes(budget_gib);
+            let frames = self.primary.history.len();
+            let ram_capped = frames < self.primary.limits.frame_limit
+                && used_bytes as f64 > budget_bytes as f64 * 0.9;
+            panel_kit::row(ui, "RAM budget", |ui| {
+                egui::ComboBox::from_id_salt("radar_history_budget")
+                    .selected_text(format!("{budget_gib} GiB"))
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        for gib in RADAR_HISTORY_BUDGET_CHOICES_GIB {
+                            ui.selectable_value(&mut budget_gib, gib, format!("{gib} GiB RAM"));
+                        }
+                    })
+                    .response
+                    .on_hover_text(format!(
+                        "Radar-history memory budget. Large super-res loops (a Cat-5 \
+                         hurricane runs ~60-100 MB per decoded volume) trim oldest-first \
+                         to fit. Using {:.1} / {budget_gib} GiB across {frames} frames.",
+                        used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    ));
+            });
+            if budget_gib != self.app_settings.radar_history_budget_gib {
+                self.set_radar_history_budget(budget_gib, ctx);
+            }
+            if ram_capped {
+                ui.weak("⚠ RAM cap").on_hover_text(format!(
+                    "Showing {frames} of the up-to-{} frames you requested — the rest \
+                     were trimmed to fit the {budget_gib} GiB memory budget. Raise the \
+                     RAM budget above to keep more.",
+                    self.primary.limits.frame_limit
+                ));
+            }
+        }
+        let mut low_sweeps = self.app_settings.loop_low_sweeps;
+        let low_sweeps_changed = panel_kit::row(ui, "In-scan low sweeps", |ui| {
+            ui.checkbox(&mut low_sweeps, "")
+                .on_hover_text(
+                    "During playback, step through complete low-level SAILS sweeps inside each scan",
+                )
+                .changed()
+        });
+        if low_sweeps_changed {
+            self.app_settings.loop_low_sweeps = low_sweeps;
+            self.mark_app_settings_dirty();
+            match pane_slot {
+                None => self.select_first_history_low_sweep_if_enabled(ctx),
+                Some(slot) => self.select_first_extra_pane_low_sweep_if_enabled(slot, ctx),
+            }
+            ctx.request_repaint();
+        }
+        if self.app_settings.loop_low_sweeps {
+            panel_kit::row(ui, "Sweep filter", |ui| {
+                self.low_sweep_filter_combo_ui(
+                    ui,
+                    ("loop_settings_low_sweep_filter", pane_slot),
+                    ctx,
+                    pane_slot,
+                );
+            });
+        }
+        panel_kit::row(ui, "Free recording", |ui| {
+            self.record_free_button_ui(ui);
+        });
+        self.record_options_ui(ui);
     }
 
     fn toggle_history_playback(&mut self, ctx: &egui::Context) -> bool {
