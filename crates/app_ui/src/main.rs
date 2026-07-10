@@ -41,6 +41,7 @@ mod annotate;
 mod archive_browser;
 mod basemap_data;
 mod basemap_towns;
+mod batch_plots;
 mod brand;
 mod data_packs;
 mod dealias_env;
@@ -28792,6 +28793,9 @@ impl ViewerApp {
         if let Some(value) = self.app_settings.wrf_synth_radar.as_ref() {
             dock.apply_wrf_synth_radar_json(value);
         }
+        dock.set_plots_base(
+            settings::screenshots_dir_for_brand(&self.app_settings.brand).join("plots"),
+        );
         dock
     }
 
