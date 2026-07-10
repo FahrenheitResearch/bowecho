@@ -127,15 +127,6 @@ rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a"
 git = "https://github.com/FahrenheitResearch/rusty-weather"
 rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a"
 
-# Raw HDF5 dataset enumeration for the wrf2d 2-D import (`local_import.rs`):
-# netcrust's `netcdf-reader` metadata index can drop datasets its own raw
-# HDF5 fallback still reads by name (5 of 192 on the real CONUS-II wrf2d
-# file), so the 2-D route unions the listing with the root-group datasets.
-# Resolves through the workspace-root `[patch.crates-io]` to the SAME pinned
-# rusty-weather rev netcrust vendors — one copy, no new code.
-[dependencies.hdf5-reader]
-version = "0.3"
-
 # GRIB Edition 1 decode (ERA-20C / GDEX "past" reanalysis local import —
 # see `grib_import.rs`). Same pinned rusty-weather rev as everything above;
 # default features off: they only gate GRIB2 codecs (openjp2/png) this
