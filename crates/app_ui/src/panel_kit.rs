@@ -109,7 +109,7 @@ pub(crate) struct SectionResponse<R> {
     pub body: Option<R>,
 }
 
-/// 1. Collapsible section: thin rule + uppercase strong title + chevron.
+/// Kit 1 — Collapsible section: thin rule + uppercase strong title + chevron.
 /// Pure renderer — `open` comes from and `toggled` returns to the caller's
 /// persisted `sidebar_section_open` map (see `ViewerApp::remembered_section`,
 /// the persistence wrapper every tab goes through).
@@ -136,7 +136,7 @@ pub(crate) fn section<R>(
     }
 }
 
-/// 2. Label+control row: label in a clamped left column (truncating, hover
+/// Kit 2 — Label+control row: label in a clamped left column (truncating, hover
 /// carries the full text), control right-aligned in the rest. The control
 /// closure runs in a right-to-left layout — add widgets in visual
 /// right-to-left order; a single control simply renders right-aligned.
@@ -155,7 +155,7 @@ pub(crate) fn row<R>(
     .inner
 }
 
-/// 3. Slider row: label column + track filling the middle + value
+/// Kit 3 — Slider row: label column + track filling the middle + value
 /// right-aligned in a fixed monospace slot. The slider itself renders no
 /// value (`show_value(false)`); the kit draws it so every slider row's
 /// numbers land in the same column. Width budget: label column (clamped) +
@@ -201,7 +201,7 @@ pub(crate) struct Chip<'a> {
     pub hover: Option<String>,
 }
 
-/// 4. Wrapping grid of fixed-width selectable chips: chips start at
+/// Kit 4 — Wrapping grid of fixed-width selectable chips: chips start at
 /// `CHIP_MIN_W` and grow to split each row evenly; text truncates. Returns
 /// the index of the clicked chip, if any.
 pub(crate) fn chip_grid(ui: &mut egui::Ui, chips: &[Chip<'_>]) -> Option<usize> {
@@ -250,7 +250,7 @@ pub(crate) fn chip_grid(ui: &mut egui::Ui, chips: &[Chip<'_>]) -> Option<usize> 
     clicked
 }
 
-/// 5. Up-to-two-line small monospace weak status text; each line truncates
+/// Kit 5 — Up-to-two-line small monospace weak status text; each line truncates
 /// with a full-text hover. For radar/chunk/frame status lines.
 pub(crate) fn status_block(ui: &mut egui::Ui, primary: &str, secondary: Option<&str>) {
     for line in std::iter::once(primary).chain(secondary) {
@@ -264,7 +264,7 @@ pub(crate) fn status_block(ui: &mut egui::Ui, primary: &str, secondary: Option<&
     }
 }
 
-/// 6. Collapsed-by-default disclosure for explainer prose ("About {topic}").
+/// Kit 6 — Collapsed-by-default disclosure for explainer prose ("About {topic}").
 /// Prose never renders inline-expanded by default.
 pub(crate) fn about(ui: &mut egui::Ui, key: &str, topic: &str, paragraphs: &[&str]) {
     let heading = egui::RichText::new(format!("About {topic}")).size(11.5).weak();
@@ -278,7 +278,7 @@ pub(crate) fn about(ui: &mut egui::Ui, key: &str, topic: &str, paragraphs: &[&st
         });
 }
 
-/// 7. Small gear button opening a popover for advanced/rare controls.
+/// Kit 7 — Small gear button opening a popover for advanced/rare controls.
 /// `title` is the popover heading and the gear's hover text (glyph-only
 /// buttons must explain themselves).
 pub(crate) fn gear_popover<R>(
@@ -303,7 +303,7 @@ pub(crate) fn gear_popover<R>(
     result
 }
 
-/// 8. Full-width selectable list row: LEFT-aligned truncating monospace
+/// Kit 8 — Full-width selectable list row: LEFT-aligned truncating monospace
 /// content (tilt rows, and wave 2's tabular alert rows) — never centered.
 /// Mirrors `SelectableLabel`'s paint so hover/selection visuals match the
 /// rest of the app.
