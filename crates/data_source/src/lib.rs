@@ -202,6 +202,11 @@ pub enum DataSourceError {
         expected: u64,
         actual: u64,
     },
+    // User-initiated stop of a streaming download. Callers match on this
+    // variant (never on message text) to tell a cancel from a failure; the
+    // partial `.download` temp is left in place so a retry Range-resumes.
+    #[error("download cancelled: {url}")]
+    DownloadCancelled { url: String },
     #[error("realtime chunk download worker panicked")]
     DownloadWorkerPanic,
 }

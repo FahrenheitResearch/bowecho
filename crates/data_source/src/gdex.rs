@@ -40,9 +40,10 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration as StdDuration;
 
@@ -688,18 +689,86 @@ pub fn download_leaf(leaf: &Leaf, cache_dir: &Path) -> Result<DownloadOutcome> {
     download_to_path(&leaf.download_url, &dest)
 }
 
+/// Chunk size for the cancellable copy loop — large enough that syscall
+/// overhead is negligible on a multi-GB stream, small enough that a cancel
+/// lands within a fraction of a second at typical GDEX throughput.
+const COPY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// How [`copy_with_cancel`] ended. Both ends carry the bytes written (and
+/// flushed) to the writer during this call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyEnd {
+    /// The reader hit EOF — the copy ran to completion.
+    Complete(u64),
+    /// The cancel flag was observed between chunks — the copy stopped early.
+    /// Everything read so far was written and flushed; the writer is left
+    /// intact (the resume contract depends on the partial temp surviving).
+    Cancelled(u64),
+}
+
+/// `io::copy` with a cooperative cancel check between chunks. Flushes the
+/// writer on both exits (completion and cancel) so a partial temp holds every
+/// byte it claims; never truncates or deletes anything.
+fn copy_with_cancel(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    cancel: &AtomicBool,
+) -> io::Result<CopyEnd> {
+    let mut buf = vec![0u8; COPY_CHUNK_BYTES];
+    let mut written: u64 = 0;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            writer.flush()?;
+            return Ok(CopyEnd::Cancelled(written));
+        }
+        let n = match reader.read(&mut buf) {
+            Ok(0) => {
+                writer.flush()?;
+                return Ok(CopyEnd::Complete(written));
+            }
+            Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        writer.write_all(&buf[..n])?;
+        written += n as u64;
+    }
+}
+
 /// Stream `url` to `dest`, resuming an interrupted `.download` temp via HTTP
 /// `Range` when the server supports it. Verifies the final size against the
 /// server's `Content-Length` (when advertised) and atomically renames the temp
 /// into place. Never buffers the body in memory.
 pub fn download_to_path(url: &str, dest: &Path) -> Result<DownloadOutcome> {
+    download_to_path_with_cancel(url, dest, &AtomicBool::new(false))
+}
+
+/// [`download_to_path`] with cooperative cancellation: `cancel` is checked
+/// between copy chunks and at every request(-retry) boundary, so a set flag
+/// stops a multi-GB stream within one chunk instead of running to the end.
+///
+/// On cancel the partial `.download` temp is flushed, closed, and LEFT IN
+/// PLACE — the next call for the same `dest` Range-resumes it exactly like an
+/// interrupted download — and `Err(`[`DataSourceError::DownloadCancelled`]`)`
+/// is returned so callers can tell a user stop from a failure.
+pub fn download_to_path_with_cancel(
+    url: &str,
+    dest: &Path,
+    cancel: &AtomicBool,
+) -> Result<DownloadOutcome> {
+    let cancelled = || DataSourceError::DownloadCancelled {
+        url: url.to_owned(),
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(cancelled());
+    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
 
     // Best-effort total size (fileServer advertises Content-Length; NCSS may
     // not). Used for the cache-hit shortcut and the final size check.
-    let expected_total = head_content_length(url);
+    let expected_total = head_content_length(url, cancel);
     if let Some(total) = expected_total
         && dest
             .metadata()
@@ -721,6 +790,12 @@ pub fn download_to_path(url: &str, dest: &Path) -> Result<DownloadOutcome> {
     // Retry only the request start (send + status); a mid-body break is
     // recovered by the caller re-invoking, which Range-resumes the temp.
     let mut response = with_retry(GDEX_RETRY_BACKOFFS, |_| {
+        // Fatal short-circuits the remaining retries, so a cancel during the
+        // flaky-server backoff schedule stops at the next attempt instead of
+        // sleeping out the rest (up to ~23 s).
+        if cancel.load(Ordering::Relaxed) {
+            return Attempt::Fatal(cancelled());
+        }
         let mut request = crate::download_http_client().get(url);
         if want_resume {
             request = request.header(RANGE, format!("bytes={have}-"));
@@ -749,12 +824,21 @@ pub fn download_to_path(url: &str, dest: &Path) -> Result<DownloadOutcome> {
     } else if status == 206 && want_resume {
         // Partial content: append to the existing temp.
         let mut file = fs::OpenOptions::new().append(true).open(&temp_path)?;
-        io::copy(&mut response, &mut file)?;
+        if let CopyEnd::Cancelled(_) = copy_with_cancel(&mut response, &mut file, cancel)? {
+            // Close the temp and leave it on disk (flushed by the copy):
+            // returning before the size check / rename below is what keeps
+            // the partial resumable.
+            drop(file);
+            return Err(cancelled());
+        }
         true
     } else {
         // 200 (server ignored Range, or a fresh start): rewrite from scratch.
         let mut file = fs::File::create(&temp_path)?;
-        io::copy(&mut response, &mut file)?;
+        if let CopyEnd::Cancelled(_) = copy_with_cancel(&mut response, &mut file, cancel)? {
+            drop(file);
+            return Err(cancelled());
+        }
         false
     };
 
@@ -787,10 +871,17 @@ pub fn download_to_path(url: &str, dest: &Path) -> Result<DownloadOutcome> {
 /// cache-hit shortcut. Any ultimate failure (exhausted retries, a 4xx, or a
 /// missing header) yields `None`; the download then relies on the GET's own
 /// status rather than failing.
-fn head_content_length(url: &str) -> Option<u64> {
-    with_retry(
-        GDEX_RETRY_BACKOFFS,
-        |_| match crate::metadata_http_client().head(url).send() {
+fn head_content_length(url: &str, cancel: &AtomicBool) -> Option<u64> {
+    with_retry(GDEX_RETRY_BACKOFFS, |_| {
+        // A cancel during the HEAD's flaky-server retries falls out as `None`
+        // here; the caller's own cancel checks then stop the download before
+        // any bytes move.
+        if cancel.load(Ordering::Relaxed) {
+            return Attempt::Fatal(DataSourceError::DownloadCancelled {
+                url: url.to_owned(),
+            });
+        }
+        match crate::metadata_http_client().head(url).send() {
             Err(err) => Attempt::Retry(DataSourceError::Http(err)),
             Ok(response) => {
                 let status = response.status().as_u16();
@@ -808,8 +899,8 @@ fn head_content_length(url: &str) -> Option<u64> {
                     )
                 }
             }
-        },
-    )
+        }
+    })
     .ok()
     .flatten()
 }
@@ -1180,6 +1271,164 @@ mod tests {
         assert_eq!(calls.get(), 3, "one initial try plus two backoff retries");
     }
 
+    /// Yields one prebuilt chunk per `read` call; optionally sets a shared
+    /// cancel flag as a side effect of returning the k-th chunk (1-based) —
+    /// the user pressing Cancel while a chunk is in flight.
+    struct ChunkReader {
+        chunks: Vec<Vec<u8>>,
+        next: usize,
+        cancel_after: Option<(usize, std::sync::Arc<AtomicBool>)>,
+    }
+
+    impl ChunkReader {
+        fn new(
+            chunks: Vec<Vec<u8>>,
+            cancel_after: Option<(usize, std::sync::Arc<AtomicBool>)>,
+        ) -> Self {
+            Self {
+                chunks,
+                next: 0,
+                cancel_after,
+            }
+        }
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.get(self.next) else {
+                return Ok(0);
+            };
+            assert!(buf.len() >= chunk.len(), "test chunks fit the copy buffer");
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.next += 1;
+            if let Some((after, flag)) = &self.cancel_after
+                && self.next == *after
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
+            Ok(chunk.len())
+        }
+    }
+
+    /// Records written bytes and counts `flush` calls — the cancel contract
+    /// requires the partial to be flushed before the copy returns.
+    #[derive(Default)]
+    struct FlushTracking {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FlushTracking {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn copy_with_cancel_without_cancel_copies_everything() {
+        let chunks: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 100]).collect();
+        let expected: Vec<u8> = chunks.concat();
+        let mut reader = ChunkReader::new(chunks, None);
+        let mut writer = FlushTracking::default();
+
+        let end = copy_with_cancel(&mut reader, &mut writer, &AtomicBool::new(false))
+            .expect("in-memory copy cannot fail");
+
+        assert_eq!(end, CopyEnd::Complete(expected.len() as u64));
+        assert_eq!(
+            writer.bytes, expected,
+            "a never-cancelled copy is byte-identical"
+        );
+        assert!(writer.flushes >= 1, "completion flushes the writer");
+    }
+
+    #[test]
+    fn copy_with_cancel_stops_between_chunks_and_keeps_flushed_partial() {
+        use std::sync::Arc;
+        let chunks: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 100]).collect();
+        let expected_partial: Vec<u8> = chunks[..2].concat();
+        let flag = Arc::new(AtomicBool::new(false));
+        // The flag is set while chunk 2 is in flight: that chunk still lands,
+        // then the check at the top of the next iteration stops the copy.
+        let mut reader = ChunkReader::new(chunks, Some((2, flag.clone())));
+        let mut writer = FlushTracking::default();
+
+        let end =
+            copy_with_cancel(&mut reader, &mut writer, &flag).expect("in-memory copy cannot fail");
+
+        assert_eq!(end, CopyEnd::Cancelled(expected_partial.len() as u64));
+        assert_eq!(
+            writer.bytes, expected_partial,
+            "every byte read before the cancel is written, none after"
+        );
+        assert!(
+            writer.flushes >= 1,
+            "the partial is flushed before returning"
+        );
+        assert_eq!(
+            reader.next, 2,
+            "no further chunks are pulled after the cancel"
+        );
+    }
+
+    #[test]
+    fn cancelled_copy_keeps_partial_temp_that_resumes_to_identical_bytes() {
+        use std::sync::Arc;
+        let dir = unique_temp_dir("gdex-cancel-partial");
+        fs::create_dir_all(&dir).expect("temp dir");
+        // Mirrors `dest.with_extension("download")` in download_to_path.
+        let temp_path = dir.join("wrf2d_test.nc.download");
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let chunk = 4096;
+
+        // Pass 1 — a fresh download (the 200 path: File::create) cancelled
+        // after 10 chunks. The partial temp must survive, exactly as written.
+        let chunks: Vec<Vec<u8>> = payload.chunks(chunk).map(<[u8]>::to_vec).collect();
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut reader = ChunkReader::new(chunks, Some((10, flag.clone())));
+        let mut file = fs::File::create(&temp_path).expect("create temp");
+        let end = copy_with_cancel(&mut reader, &mut file, &flag).expect("file copy ok");
+        drop(file);
+        let have = (10 * chunk) as u64;
+        assert_eq!(end, CopyEnd::Cancelled(have));
+        assert_eq!(
+            fs::metadata(&temp_path)
+                .expect("temp survives the cancel")
+                .len(),
+            have,
+            "the partial temp is kept on disk with every flushed byte"
+        );
+
+        // Pass 2 — the resume (the 206 path: append the remainder), as the
+        // next download_to_path call does after its Range request.
+        let rest: Vec<Vec<u8>> = payload[have as usize..]
+            .chunks(chunk)
+            .map(<[u8]>::to_vec)
+            .collect();
+        let mut reader = ChunkReader::new(rest, None);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&temp_path)
+            .expect("append temp");
+        let end = copy_with_cancel(&mut reader, &mut file, &AtomicBool::new(false))
+            .expect("file copy ok");
+        drop(file);
+        assert_eq!(end, CopyEnd::Complete(payload.len() as u64 - have));
+        assert_eq!(
+            fs::read(&temp_path).expect("read back"),
+            payload,
+            "cancel + resume reassembles the exact original bytes"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn crawl_cache_round_trips_through_disk() {
         let dir = unique_temp_dir("gdex-cache-roundtrip");
@@ -1316,7 +1565,7 @@ mod tests {
         let url = "https://tds.gdex.ucar.edu/thredds/fileServer/files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_00:00:00.nc";
 
         // HEAD advertises the full size (recon: ~156 MB).
-        let total = head_content_length(url).expect("HEAD Content-Length");
+        let total = head_content_length(url, &AtomicBool::new(false)).expect("HEAD Content-Length");
         eprintln!("live HEAD Content-Length: {total}");
         assert!(total > 100_000_000, "the 00:00 file is ~156 MB");
 

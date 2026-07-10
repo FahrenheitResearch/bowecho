@@ -17,11 +17,17 @@
 //!   fed from `catalog_queue` so a burst of expand clicks is serialized (polite
 //!   to the flaky server; matches the crawl concurrency cap in the core).
 //! - `ncss_slot` — the subset form's grid metadata fetch ([`gdex::fetch_ncss_dataset`]).
-//! - `download_slot` — one download at a time ([`gdex::download_to_path`]).
+//! - `download_slot` — one download at a time
+//!   ([`gdex::download_to_path_with_cancel`]).
 //!
-//! The core's `download_to_path` streams internally with no progress callback,
-//! so the progress row reads the `.download` temp file's size each frame — an
-//! honest bytes/total without touching the proven core.
+//! The core streams internally with no progress callback, so the progress row
+//! reads the `.download` temp file's size each frame — an honest bytes/total
+//! without touching the proven core. The row's Cancel button sets the shared
+//! [`AtomicBool`] carried by [`ActiveDownload`]; the worker stops within one
+//! chunk, KEEPS the partial temp (a retry Range-resumes it), and reports
+//! [`DownloadError::Cancelled`], which `poll()` turns into a status line. Both
+//! the full-file and the NCSS-subset download run through this same slot and
+//! row, so one button covers both.
 //!
 //! ## Download -> import handoff
 //!
@@ -39,9 +45,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
 
+use data_source::DataSourceError;
 use data_source::gdex::{
     self, DownloadOutcome, LatLonBox, Leaf, NcssGridDataset, NcssSubset, ParsedCatalog,
 };
@@ -313,12 +322,38 @@ enum DownloadResolution {
     Import { path: PathBuf, note: String },
     /// Success but nothing to import (shouldn't happen for `.nc`).
     Done(String),
+    /// The user cancelled — the partial temp is kept, so the same download
+    /// resumes where it left off. A status message, not a failure.
+    Cancelled(String),
     /// Failed — a retryable status message.
     Failed(String),
 }
 
+/// How a download ended short of success: a user cancel is structurally
+/// distinct from a failure (matched on the core's error VARIANT, never on
+/// message text), because the two get different status lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DownloadError {
+    /// The user pressed Cancel; the partial `.download` temp is kept.
+    Cancelled,
+    /// Any other failure, as a display message.
+    Failed(String),
+}
+
+impl DownloadError {
+    /// Collapse the core error at the worker boundary (the raw error is not
+    /// `Clone`/`PartialEq`, so the message crosses the channel as a string —
+    /// but the cancel/failure split stays structured).
+    fn from_core(err: DataSourceError) -> Self {
+        match err {
+            DataSourceError::DownloadCancelled { .. } => Self::Cancelled,
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
 /// Resolve a finished download into a UI outcome. Pure — unit-tested.
-fn resolve_download(result: Result<DownloadOutcome, String>) -> DownloadResolution {
+fn resolve_download(result: Result<DownloadOutcome, DownloadError>) -> DownloadResolution {
     match result {
         Ok(outcome) => {
             let how = if outcome.cache_hit {
@@ -346,7 +381,13 @@ fn resolve_download(result: Result<DownloadOutcome, String>) -> DownloadResoluti
                 )),
             }
         }
-        Err(message) => DownloadResolution::Failed(format!("Download failed: {message}")),
+        Err(DownloadError::Cancelled) => DownloadResolution::Cancelled(
+            "Download cancelled — partial file kept; the same download resumes where it left off."
+                .to_owned(),
+        ),
+        Err(DownloadError::Failed(message)) => {
+            DownloadResolution::Failed(format!("Download failed: {message}"))
+        }
     }
 }
 
@@ -368,7 +409,7 @@ struct NcssFetch {
 
 /// One finished download.
 struct DownloadDone {
-    result: Result<DownloadOutcome, String>,
+    result: Result<DownloadOutcome, DownloadError>,
 }
 
 /// A download in flight — enough to render an honest progress row by reading
@@ -379,6 +420,10 @@ struct ActiveDownload {
     dest: PathBuf,
     /// Total bytes when known (full files advertise a size; subsets don't).
     total: Option<u64>,
+    /// Shared with the streaming worker: setting it stops the byte loop
+    /// within one chunk. A fresh flag per download — nothing to reset, so a
+    /// cancel can never leak into the next download.
+    cancel: Arc<AtomicBool>,
 }
 
 /// An intent produced by rendering (applied after, to keep `self` borrows
@@ -388,6 +433,7 @@ enum Action {
     RetryNode(String),
     DownloadFull(Leaf),
     OpenSubset(Leaf),
+    CancelDownload,
 }
 
 /// The subset form's submit/cancel intent.
@@ -535,7 +581,9 @@ impl GdexBrowser {
                         self.status = Some(note);
                         import_path = Some(path);
                     }
-                    DownloadResolution::Done(note) | DownloadResolution::Failed(note) => {
+                    DownloadResolution::Done(note)
+                    | DownloadResolution::Cancelled(note)
+                    | DownloadResolution::Failed(note) => {
                         self.status = Some(note);
                     }
                 }
@@ -591,15 +639,18 @@ impl GdexBrowser {
             return;
         }
         let temp_path = dest.with_extension("download");
+        let cancel = Arc::new(AtomicBool::new(false));
         self.active_download = Some(ActiveDownload {
             label,
             temp_path,
             dest: dest.clone(),
             total,
+            cancel: cancel.clone(),
         });
         self.status = None;
         self.download_slot.spawn(ctx, move |tx| {
-            let result = gdex::download_to_path(&url, &dest).map_err(|err| err.to_string());
+            let result = gdex::download_to_path_with_cancel(&url, &dest, &cancel)
+                .map_err(DownloadError::from_core);
             let _ = tx.send(DownloadDone { result });
         });
     }
@@ -666,6 +717,17 @@ impl GdexBrowser {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(egui::RichText::new(&active.label).small());
+                if active.cancel.load(Ordering::Relaxed) {
+                    // Set but not yet drained: the worker stops at its next
+                    // chunk/retry boundary and reports through poll().
+                    ui.label(egui::RichText::new("cancelling…").small().weak());
+                } else if ui
+                    .small_button("Cancel")
+                    .on_hover_text("Stop this download. The partial file is kept and resumes if you download it again.")
+                    .clicked()
+                {
+                    actions.push(Action::CancelDownload);
+                }
             });
             match active.total {
                 Some(total) if total > 0 => {
@@ -735,6 +797,15 @@ impl GdexBrowser {
                     let result = gdex::fetch_ncss_dataset(&url_path).map_err(|err| err.to_string());
                     let _ = tx.send(NcssFetch { url_path, result });
                 });
+            }
+            Action::CancelDownload => {
+                // Only the flag is set here; the slot is NOT dropped. The
+                // worker sees the flag, keeps the partial temp, and returns
+                // DownloadCancelled, which poll() drains into the cancelled
+                // status — the slot then idles and Download works again.
+                if let Some(active) = &self.active_download {
+                    active.cancel.store(true, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1221,8 +1292,37 @@ mod tests {
         assert!(matches!(wrong, DownloadResolution::Done(_)));
 
         // A failure is a retryable status.
-        let failed = resolve_download(Err("status 503".to_owned()));
+        let failed = resolve_download(Err(DownloadError::Failed("status 503".to_owned())));
         assert!(matches!(failed, DownloadResolution::Failed(msg) if msg.contains("503")));
+    }
+
+    #[test]
+    fn resolve_download_cancel_is_not_a_failure_and_names_the_resume() {
+        // A user cancel resolves to its own variant (nothing is imported) and
+        // the note tells the user the partial is kept and resumes.
+        let cancelled = resolve_download(Err(DownloadError::Cancelled));
+        match cancelled {
+            DownloadResolution::Cancelled(note) => {
+                assert!(note.contains("cancelled"), "note names the cancel: {note}");
+                assert!(note.contains("resumes"), "note promises the resume: {note}");
+            }
+            other => panic!("want Cancelled, got {other:?}"),
+        }
+
+        // The core's cancel error maps on the VARIANT — the split must
+        // survive even if the error message wording changes.
+        let core = DataSourceError::DownloadCancelled {
+            url: "https://example.invalid/file.nc".to_owned(),
+        };
+        assert_eq!(DownloadError::from_core(core), DownloadError::Cancelled);
+        let other = DataSourceError::NoObjects {
+            bucket: "b".to_owned(),
+            prefix: "p".to_owned(),
+        };
+        assert!(matches!(
+            DownloadError::from_core(other),
+            DownloadError::Failed(msg) if msg.contains("b/p")
+        ));
     }
 
     #[test]
