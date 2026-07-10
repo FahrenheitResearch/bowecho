@@ -1281,7 +1281,10 @@ mod tests {
     }
 
     impl ChunkReader {
-        fn new(chunks: Vec<Vec<u8>>, cancel_after: Option<(usize, std::sync::Arc<AtomicBool>)>) -> Self {
+        fn new(
+            chunks: Vec<Vec<u8>>,
+            cancel_after: Option<(usize, std::sync::Arc<AtomicBool>)>,
+        ) -> Self {
             Self {
                 chunks,
                 next: 0,
@@ -1338,7 +1341,10 @@ mod tests {
             .expect("in-memory copy cannot fail");
 
         assert_eq!(end, CopyEnd::Complete(expected.len() as u64));
-        assert_eq!(writer.bytes, expected, "a never-cancelled copy is byte-identical");
+        assert_eq!(
+            writer.bytes, expected,
+            "a never-cancelled copy is byte-identical"
+        );
         assert!(writer.flushes >= 1, "completion flushes the writer");
     }
 
@@ -1361,8 +1367,14 @@ mod tests {
             writer.bytes, expected_partial,
             "every byte read before the cancel is written, none after"
         );
-        assert!(writer.flushes >= 1, "the partial is flushed before returning");
-        assert_eq!(reader.next, 2, "no further chunks are pulled after the cancel");
+        assert!(
+            writer.flushes >= 1,
+            "the partial is flushed before returning"
+        );
+        assert_eq!(
+            reader.next, 2,
+            "no further chunks are pulled after the cancel"
+        );
     }
 
     #[test]
@@ -1386,7 +1398,9 @@ mod tests {
         let have = (10 * chunk) as u64;
         assert_eq!(end, CopyEnd::Cancelled(have));
         assert_eq!(
-            fs::metadata(&temp_path).expect("temp survives the cancel").len(),
+            fs::metadata(&temp_path)
+                .expect("temp survives the cancel")
+                .len(),
             have,
             "the partial temp is kept on disk with every flushed byte"
         );
@@ -1402,8 +1416,8 @@ mod tests {
             .append(true)
             .open(&temp_path)
             .expect("append temp");
-        let end =
-            copy_with_cancel(&mut reader, &mut file, &AtomicBool::new(false)).expect("file copy ok");
+        let end = copy_with_cancel(&mut reader, &mut file, &AtomicBool::new(false))
+            .expect("file copy ok");
         drop(file);
         assert_eq!(end, CopyEnd::Complete(payload.len() as u64 - have));
         assert_eq!(
@@ -1551,8 +1565,7 @@ mod tests {
         let url = "https://tds.gdex.ucar.edu/thredds/fileServer/files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_00:00:00.nc";
 
         // HEAD advertises the full size (recon: ~156 MB).
-        let total =
-            head_content_length(url, &AtomicBool::new(false)).expect("HEAD Content-Length");
+        let total = head_content_length(url, &AtomicBool::new(false)).expect("HEAD Content-Length");
         eprintln!("live HEAD Content-Length: {total}");
         assert!(total > 100_000_000, "the 00:00 file is ~156 MB");
 
