@@ -378,7 +378,7 @@ enum WorkerEvent {
     },
     FrameComplete {
         label: String,
-        plot: PlotPayload,
+        plot: Box<PlotPayload>,
         stored: Option<StoredFrame>,
         store_error: Option<String>,
         warning: Option<String>,
@@ -520,7 +520,7 @@ impl SimSatPane {
                     warning,
                 } => {
                     self.completed += 1;
-                    self.last_plot = Some(plot);
+                    self.last_plot = Some(*plot);
                     self.last_plot_label = Some(label.clone());
                     if let Some(stored) = stored {
                         self.last_stored = Some(stored);
@@ -1140,7 +1140,7 @@ fn run_render_job(
                         completed += 1;
                         let _ = tx.send(WorkerEvent::FrameComplete {
                             label: frame.label,
-                            plot,
+                            plot: Box::new(plot),
                             stored,
                             store_error,
                             warning,
@@ -1565,7 +1565,7 @@ fn source_group_base(path: &Path) -> String {
         .or_else(|| lower.find("-20"))
         .unwrap_or(raw.len());
     let trimmed = raw[..cut]
-        .trim_end_matches(|character| matches!(character, '.' | '_' | '-'))
+        .trim_end_matches(['.', '_', '-'])
         .trim_end_matches("wrfout");
     let token = store_out::sanitize_store_token(trimmed);
     if token == "unknown" {

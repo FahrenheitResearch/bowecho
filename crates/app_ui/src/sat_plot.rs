@@ -356,6 +356,7 @@ impl SatellitePlotSource {
 
 /// Cached interactive surface mounted inside ModelDataDock's existing native
 /// plot window. Model field state remains untouched when this source is set.
+#[derive(Default)]
 pub(crate) struct SatellitePlotPanel {
     source: Option<Arc<SatellitePlotSource>>,
     generation: u64,
@@ -365,21 +366,6 @@ pub(crate) struct SatellitePlotPanel {
     status: Option<String>,
     last_render_ms: Option<f32>,
     last_upload_ms: Option<f32>,
-}
-
-impl Default for SatellitePlotPanel {
-    fn default() -> Self {
-        Self {
-            source: None,
-            generation: 0,
-            texture: None,
-            cache_key: None,
-            error: None,
-            status: None,
-            last_render_ms: None,
-            last_upload_ms: None,
-        }
-    }
 }
 
 impl SatellitePlotPanel {
@@ -700,8 +686,8 @@ fn sanitize_file_component(value: &str) -> String {
 
 fn quantized_plot_size(available: egui::Vec2, aspect: f32) -> (u32, u32) {
     let aspect = aspect.clamp(0.4, 3.0);
-    let max_width = available.x.max(480.0).min(1600.0);
-    let max_height = available.y.max(320.0).min(1200.0);
+    let max_width = available.x.clamp(480.0, 1600.0);
+    let max_height = available.y.clamp(320.0, 1200.0);
     let mut width = max_width;
     let mut height = width / aspect;
     if height > max_height {

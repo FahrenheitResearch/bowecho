@@ -923,11 +923,11 @@ fn simsat_run_title(run: &str) -> String {
         .any(|token| matches!(*token, "ir" | "infrared"))
     {
         Some("Infrared".to_string())
-    } else if tokens.iter().any(|token| *token == "pw") {
+    } else if tokens.contains(&"pw") {
         Some("Precipitable Water".to_string())
-    } else if tokens.iter().any(|token| *token == "ctt") {
+    } else if tokens.contains(&"ctt") {
         Some("Cloud-top Temperature".to_string())
-    } else if tokens.iter().any(|token| *token == "cod") {
+    } else if tokens.contains(&"cod") {
         Some("Cloud Optical Depth".to_string())
     } else if let Some(band) = tokens.iter().find_map(|token| {
         token
@@ -954,7 +954,7 @@ fn simsat_run_title(run: &str) -> String {
             .any(|token| matches!(*token, "topdown" | "map"))
     {
         Some("TOP-DOWN")
-    } else if tokens.iter().any(|token| *token == "perspective") {
+    } else if tokens.contains(&"perspective") {
         Some("PERSPECTIVE")
     } else {
         None

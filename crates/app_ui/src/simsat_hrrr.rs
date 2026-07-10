@@ -62,7 +62,7 @@ impl HrrrNativeSpec {
 
         // HRRR's 00/06/12/18z runs extend through f48; intervening hourly
         // cycles publish through f18.
-        let max_forecast_hour = if self.cycle % 6 == 0 { 48 } else { 18 };
+        let max_forecast_hour = if self.cycle.is_multiple_of(6) { 48 } else { 18 };
         if self.forecast_hour > max_forecast_hour {
             return Err(HrrrNativeSpecError::UnsupportedForecastHour {
                 cycle: self.cycle,
