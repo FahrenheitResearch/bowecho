@@ -158,7 +158,8 @@ pub(crate) fn row<R>(
 /// Kit 3 — Slider row: label column + track filling the middle + value
 /// right-aligned in a fixed monospace slot. The slider itself renders no
 /// value (`show_value(false)`); the kit draws it so every slider row's
-/// numbers land in the same column. Width budget: label column (clamped) +
+/// numbers land in the same column. `step` 0.0 = egui's default stepping
+/// (integer types still snap). Width budget: label column (clamped) +
 /// track (≥ `SLIDER_TRACK_MIN_W`) + `VALUE_SLOT_W`; holds at the 300 pt
 /// panel minimum by construction.
 pub(crate) fn slider_row<Num: egui::emath::Numeric>(
@@ -166,6 +167,7 @@ pub(crate) fn slider_row<Num: egui::emath::Numeric>(
     label: &str,
     value: &mut Num,
     range: std::ops::RangeInclusive<Num>,
+    step: f64,
     display: impl Fn(Num) -> String,
 ) -> egui::Response {
     ui.horizontal(|ui| {
@@ -175,7 +177,11 @@ pub(crate) fn slider_row<Num: egui::emath::Numeric>(
         let spacing = ui.spacing().item_spacing.x;
         let track_width = slider_track_width(ui.available_width(), spacing);
         ui.spacing_mut().slider_width = track_width;
-        let response = ui.add(egui::Slider::new(value, range).show_value(false));
+        let response = ui.add(
+            egui::Slider::new(value, range)
+                .step_by(step)
+                .show_value(false),
+        );
         let full = display(*value);
         let shown = value_slot_text(&full, VALUE_SLOT_MAX_CHARS);
         ui.allocate_ui_with_layout(

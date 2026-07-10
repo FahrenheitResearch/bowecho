@@ -1222,8 +1222,7 @@ const TERMINAL_SITE_LABEL_MIN_SCALE: f32 = 95.0;
 pub(crate) use ui_theme::ROW_H as PANEL_BUTTON_HEIGHT;
 pub(crate) use ui_theme::{
     ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, NAME_W_SITE, NAME_W_STD, NAME_W_WIDE,
-    ROW_SPACING_X, SECTION_SEPARATOR_COLOR, SECTION_SPACING, SIDEBAR_DEFAULT_WIDTH,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
+    ROW_SPACING_X, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
 };
 const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] =
     &["tornado", "severe thunderstorm", "flash flood", "flood"];
@@ -20976,28 +20975,6 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
-    /// Small uppercase section header — visual rhythm for the Radar tab.
-    fn section_header(ui: &mut egui::Ui, label: &str) {
-        ui.add_space(SECTION_SPACING + 2.0);
-        Self::section_rule(ui);
-        ui.label(
-            egui::RichText::new(label)
-                .size(13.5)
-                .strong()
-                .color(egui::Color32::from_rgb(230, 236, 244)),
-        );
-        ui.add_space(1.0);
-    }
-
-    fn section_rule(ui: &mut egui::Ui) {
-        let width = ui.available_width().max(1.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 2.0), egui::Sense::hover());
-        ui.painter().line_segment(
-            [rect.left_center(), rect.right_center()],
-            egui::Stroke::new(1.35, SECTION_SEPARATOR_COLOR),
-        );
-    }
-
     /// The persisted unit-system preference, parsed (imperial unless the
     /// config says "metric") — every units-aware readout reads this.
     fn units(&self) -> units::Units {
@@ -21318,8 +21295,9 @@ impl ViewerApp {
     /// of the volume gate: with no volume it is the only way to pick the
     /// first site; with a volume it sits below PRODUCTS/TILT (owner's
     /// layout — LOOP on top, SITE below products).
-    fn radar_site_section(&mut self, ui: &mut egui::Ui, independent_pane: Option<usize>) {
-        Self::section_header(ui, "SITE");
+    /// SITE section body (the kit section wrapper lives at the two call
+    /// sites in radar_controls_panel — with and without a loaded volume).
+    fn radar_site_section_body(&mut self, ui: &mut egui::Ui, independent_pane: Option<usize>) {
         let site_control_pane = independent_pane;
         let pane_intl_source = site_control_pane
             .and_then(|slot| self.extra_panes.get(slot))
@@ -21774,7 +21752,10 @@ impl ViewerApp {
                 }
             }
         }
-        ui.horizontal(|ui| {
+        // Wrapped action row (the old single row ran ~600 pt — the No. 2
+        // width offender): buttons + live toggles wrap at 320 pt, and the
+        // two label+value knobs below become kit rows.
+        ui.horizontal_wrapped(|ui| {
             if fixed_action_button(ui, "Load Latest", 88.0).clicked() {
                 if let Some(slot) = site_control_pane {
                     self.cancel_extra_pane_load_for_user_command(slot);
@@ -21872,53 +21853,6 @@ impl ViewerApp {
                 .on_hover_text(
                     "Display incomplete live chunk tilts before a full low-level tilt is available",
                 );
-            ui.label("Low gap").on_hover_text(
-                "Minimum seconds between same-scan low-level sweeps before live display advances to the newer complete low tilt",
-            );
-            let mut low_sweep_seconds = if self.app_settings.live_low_sweep_auto_advance {
-                MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS
-            } else {
-                self.app_settings.live_low_sweep_auto_advance_seconds.clamp(
-                    MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
-                    MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
-                )
-            };
-            if ui
-                .add(
-                    egui::DragValue::new(&mut low_sweep_seconds)
-                        .range(
-                            MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS
-                                ..=MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
-                        )
-                        .speed(1)
-                        .suffix(" s"),
-                )
-                .changed()
-            {
-                self.app_settings.live_low_sweep_auto_advance = false;
-                self.app_settings.live_low_sweep_auto_advance_seconds = low_sweep_seconds;
-                self.mark_app_settings_dirty();
-            }
-            let mut live_preload = normalized_live_preload_frame_count(usize::from(
-                self.app_settings.live_preload_frame_count,
-            ));
-            ui.label("Preload").on_hover_text(
-                "After Load Latest displays the newest scan, backfill this many previous scans in the background",
-            );
-            if ui
-                .add(
-                    egui::DragValue::new(&mut live_preload)
-                        .range(0..=MAX_LIVE_PRELOAD_FRAME_COUNT)
-                        .speed(0.1),
-                )
-                .on_hover_text(
-                    "0 disables the quick history backfill. Use Load Loop for a full recent loop.",
-                )
-                .changed()
-            {
-                self.app_settings.live_preload_frame_count = live_preload as u16;
-                self.mark_app_settings_dirty();
-            }
             // Native file dialog (Windows/macOS; Linux needs the GTK dev
             // libs rfd's portal backends pull in — same gating as the
             // color-table browser).
@@ -21961,6 +21895,56 @@ impl ViewerApp {
                     .pick_folder()
             {
                 self.start_local_volume_load(dir, ui.ctx());
+            }
+        });
+        panel_kit::row(ui, "Low gap", |ui| {
+            let mut low_sweep_seconds = if self.app_settings.live_low_sweep_auto_advance {
+                MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS
+            } else {
+                self.app_settings.live_low_sweep_auto_advance_seconds.clamp(
+                    MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
+                    MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
+                )
+            };
+            if ui
+                .add(
+                    egui::DragValue::new(&mut low_sweep_seconds)
+                        .range(
+                            MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS
+                                ..=MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
+                        )
+                        .speed(1)
+                        .suffix(" s"),
+                )
+                .on_hover_text(
+                    "Minimum seconds between same-scan low-level sweeps before live display advances to the newer complete low tilt",
+                )
+                .changed()
+            {
+                self.app_settings.live_low_sweep_auto_advance = false;
+                self.app_settings.live_low_sweep_auto_advance_seconds = low_sweep_seconds;
+                self.mark_app_settings_dirty();
+            }
+        });
+        panel_kit::row(ui, "Preload", |ui| {
+            let mut live_preload = normalized_live_preload_frame_count(usize::from(
+                self.app_settings.live_preload_frame_count,
+            ));
+            if ui
+                .add(
+                    egui::DragValue::new(&mut live_preload)
+                        .range(0..=MAX_LIVE_PRELOAD_FRAME_COUNT)
+                        .speed(0.1),
+                )
+                .on_hover_text(
+                    "After Load Latest displays the newest scan, backfill this many previous \
+                     scans in the background. 0 disables the quick history backfill; use \
+                     Load Loop for a full recent loop.",
+                )
+                .changed()
+            {
+                self.app_settings.live_preload_frame_count = live_preload as u16;
+                self.mark_app_settings_dirty();
             }
         });
         // One-line status — always rendered, hover carries the details.
@@ -22025,8 +22009,9 @@ impl ViewerApp {
             .unwrap_or(self.selected_cut);
 
         // Panes row + editing-pane context, above everything it affects.
+        // Wrapped: layout buttons + Independent must hold at 320 pt.
         let mut independent_toggle: Option<bool> = None;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Panes");
             for (layout, label, hover) in [
                 (PanelLayout::One, "1", "Single pane"),
@@ -22100,8 +22085,9 @@ impl ViewerApp {
         // LOOP — hoisted to the top of the tab (owner layout): loop
         // controls reachable without scrolling. frame_history_panel
         // handles the no-loop empty state itself.
-        Self::section_header(ui, "LOOP");
-        self.frame_history_panel(ui, ctx);
+        self.remembered_section(ui, "radar_loop", "Loop", true, |app, ui| {
+            app.frame_history_panel(ui, ctx);
+        });
 
         // Layer/customization state lives in the Custom tab now; RADAR
         // keeps a one-line link-row so the count stays visible from ops.
@@ -22128,7 +22114,9 @@ impl ViewerApp {
         let Some(volume) = active_volume else {
             // No volume yet: SITE must still render — it is how the
             // first site gets picked. Everything below needs a volume.
-            self.radar_site_section(ui, independent_pane);
+            self.remembered_section(ui, "radar_site", "Site", true, |app, ui| {
+                app.radar_site_section_body(ui, independent_pane);
+            });
             return;
         };
         let volume = volume.as_ref();
@@ -22165,8 +22153,46 @@ impl ViewerApp {
             })
             .collect::<Vec<_>>();
 
-        // PRODUCTS — hotkey-prefixed grid, contextual rows, color, threshold.
-        Self::section_header(ui, "PRODUCTS");
+        // Sections (kit): PRODUCTS, TILT, SITE, ALGORITHMS, TOOLS — each a
+        // persisted collapsible with its body extracted below so this
+        // dispatcher stays a wrapper list (ui-refresh plan; owner layout:
+        // LOOP on top, SITE below products).
+        self.remembered_section(ui, "radar_products", "Products", true, |app, ui| {
+            app.radar_products_section_body(
+                ui,
+                ctx,
+                editing_pane,
+                &editing_product,
+                volume,
+                &product_buttons,
+            );
+        });
+        // TILT — stable position, at most one contextual block above it.
+        self.remembered_section(ui, "radar_tilt", "Tilt", true, |app, ui| {
+            app.radar_tilt_section_body(ui, ctx, editing_pane, &cut_rows);
+        });
+        self.remembered_section(ui, "radar_site", "Site", true, |app, ui| {
+            app.radar_site_section_body(ui, independent_pane);
+        });
+        self.remembered_section(ui, "radar_algorithms", "Algorithms", true, |app, ui| {
+            app.radar_algorithms_section_body(ui, ctx);
+        });
+        self.remembered_section(ui, "radar_tools", "Tools", true, |app, ui| {
+            app.radar_tools_section_body(ui, ctx);
+        });
+    }
+
+    /// PRODUCTS section body — hotkey-prefixed chip grid, contextual family
+    /// rows, color binding, display threshold, gate filter.
+    fn radar_products_section_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        editing_pane: Option<usize>,
+        editing_product: &DisplayProduct,
+        volume: &RadarVolume,
+        product_buttons: &[(DisplayProduct, Option<usize>)],
+    ) {
         if editing_pane.is_none() {
             let mut remember_product_tilts = self.app_settings.remember_product_tilts;
             if ui
@@ -22197,36 +22223,39 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         }
-        // Invert the hotkey map so each product button can show its key.
+        // Invert the hotkey map so each product chip can show its key.
         let hotkey_for_label: std::collections::HashMap<String, String> = self
             .app_settings
             .product_hotkeys
             .iter()
             .map(|(key, label)| (label.clone(), key.clone()))
             .collect();
-        ui.horizontal_wrapped(|ui| {
-            for (product, _target_cut) in &product_buttons {
-                let selected = editing_product == *product;
+        // Product picker as a kit chip grid: weak hotkey prefix + label,
+        // chips wrap and split each row evenly (320 pt rule).
+        let chips: Vec<panel_kit::Chip<'_>> = product_buttons
+            .iter()
+            .map(|(product, _target_cut)| {
                 let label = product.label();
-                let button_text = match hotkey_for_label.get(label) {
-                    Some(key) => format!("{key}·{label}"),
-                    None => label.to_owned(),
-                };
-                let mut response = ui.selectable_label(selected, button_text);
-                if let Some(key) = hotkey_for_label.get(label) {
-                    response = response.on_hover_text(format!("hotkey {key}"));
+                let hotkey = hotkey_for_label.get(label).map(String::as_str);
+                panel_kit::Chip {
+                    label,
+                    hotkey,
+                    selected: editing_product == product,
+                    hover: hotkey.map(|key| format!("hotkey {key}")),
                 }
-                if response.clicked() {
-                    if let Some(slot) = editing_pane {
-                        if self.switch_pane_product(slot, product.clone()) {
-                            ctx.request_repaint();
-                        }
-                    } else if self.switch_primary_product(product.clone()) {
-                        ctx.request_repaint();
-                    }
+            })
+            .collect();
+        if let Some(index) = panel_kit::chip_grid(ui, &chips)
+            && let Some((product, _target_cut)) = product_buttons.get(index)
+        {
+            if let Some(slot) = editing_pane {
+                if self.switch_pane_product(slot, product.clone()) {
+                    ctx.request_repaint();
                 }
+            } else if self.switch_primary_product(product.clone()) {
+                ctx.request_repaint();
             }
-        });
+        }
         // Retrieval product: GBVTD hurricane winds. Not a raster moment, so
         // it lives just below the moment buttons rather than in the picker —
         // clicking it opens the TC Winds panel and arms click-to-place on the
@@ -22308,7 +22337,8 @@ impl ViewerApp {
         // FOCUSED pane's product, so the tilt list below barely shifts.
         if editing_product.is_signed_radial_velocity() || editing_product.uses_dealiased_velocity()
         {
-            ui.horizontal(|ui| {
+            // Wrapped: checkbox + engine combo + Flip must hold at 320 pt.
+            ui.horizontal_wrapped(|ui| {
                 let plain_velocity =
                     matches!(editing_product, DisplayProduct::Moment(MomentType::Velocity));
                 if plain_velocity {
@@ -22424,7 +22454,7 @@ impl ViewerApp {
             }
         }
         if editing_product.is_storm_relative_velocity() {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Motion");
                 let direction_changed = ui
                     .add(
@@ -22469,7 +22499,7 @@ impl ViewerApp {
                 DerivedProduct::Mehs | DerivedProduct::Posh | DerivedProduct::Poh
             )
         ) {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Hail 0°C/−20°C");
                 let f_changed = ui
                     .add(
@@ -22519,8 +22549,7 @@ impl ViewerApp {
         }
 
         let editing_family = editing_product.color_family();
-        let picker_product = editing_product.clone();
-        self.active_product_color_picker(ui, ctx, &picker_product);
+        self.active_product_color_picker(ui, ctx, editing_product);
 
         // Display threshold ("hide below"): declutters weak returns at render
         // time; diverging families (VEL, shear) hide |v| < threshold instead.
@@ -22530,7 +22559,7 @@ impl ViewerApp {
             let mut enabled = self.display_thresholds.contains_key(&family_label);
             let symmetric = family_threshold_is_symmetric(family);
             let active_table_for_threshold =
-                self.active_table_for_product(&editing_product).clone();
+                self.active_table_for_product(editing_product).clone();
             let threshold_range = display_threshold_range(family, &active_table_for_threshold);
             ui.horizontal(|ui| {
                 if ui
@@ -22570,7 +22599,7 @@ impl ViewerApp {
                     }
                     let (units, unit_scale) = table_display_unit(
                         &active_table_for_threshold,
-                        &editing_product,
+                        editing_product,
                         unit_system,
                     );
                     let mut display_threshold = *threshold / unit_scale;
@@ -22623,9 +22652,17 @@ impl ViewerApp {
                 }
             });
         });
+    }
 
-        // TILT — stable position, at most one contextual block above it.
-        Self::section_header(ui, "TILT");
+    /// TILT section body — left-aligned truncating monospace rows
+    /// (#NN angle radials time) that read as a table and fit at 320 pt.
+    fn radar_tilt_section_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        editing_pane: Option<usize>,
+        cut_rows: &[(usize, f32, usize, Option<DateTime<Utc>>, bool, bool)],
+    ) {
         ui.horizontal(|ui| {
             ui.weak("↑/↓");
             if let Some(slot) = editing_pane {
@@ -22656,7 +22693,7 @@ impl ViewerApp {
                     start_time,
                     is_selected,
                     has_selected_product,
-                ) in &cut_rows
+                ) in cut_rows
                 {
                     let label = format!(
                         "#{:02}  {:>4.2} deg  {:>4} radials  {}",
@@ -22667,14 +22704,15 @@ impl ViewerApp {
                             .map(|time| time.format("%H:%M:%S").to_string())
                             .unwrap_or_else(|| "--:--:--".to_owned())
                     );
-                    let response = ui
-                        .add_enabled_ui(*has_selected_product, |ui| {
-                            ui.add_sized(
-                                egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
-                                egui::Button::selectable(*is_selected, label),
-                            )
-                        })
-                        .inner;
+                    // Kit select_row: left-aligned truncating monospace —
+                    // the columns line up and the row fits at 320 pt.
+                    let response = panel_kit::select_row(
+                        ui,
+                        *is_selected,
+                        *has_selected_product,
+                        &label,
+                        None,
+                    );
                     if response.clicked() {
                         if let Some(slot) = editing_pane {
                             // Pin this pane to an independent tilt.
@@ -22686,13 +22724,10 @@ impl ViewerApp {
                     }
                 }
             });
+    }
 
-        // SITE — below PRODUCTS/TILT (owner layout: LOOP on top, SITE
-        // below products).
-        self.radar_site_section(ui, independent_pane);
-
-        // ALGORITHMS.
-        Self::section_header(ui, "ALGORITHMS");
+    /// ALGORITHMS section body — detection/tracking toggles + camera follow.
+    fn radar_algorithms_section_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if ui
             .checkbox(&mut self.show_rotation_markers, "Rotation markers")
             .on_hover_text(
@@ -22708,7 +22743,8 @@ impl ViewerApp {
         }
         // (Rotation tracks + TDS moved to the layer rail — they are map
         // layers with opacity/order needs; spec §2.3 + lane directive.)
-        ui.horizontal(|ui| {
+        // Wrapped: checkbox + track buttons + follow combo hold at 320 pt.
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .checkbox(&mut self.show_storm_tracks, "Storm tracks")
                 .on_hover_text(
@@ -22776,9 +22812,8 @@ impl ViewerApp {
             .id_salt("storm_track_settings")
             .default_open(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Max");
-                    let mut max_tracks = self.storm_track_max_tracks;
+                let mut max_tracks = self.storm_track_max_tracks;
+                panel_kit::row(ui, "Max tracks", |ui| {
                     egui::ComboBox::from_id_salt("storm_track_max_tracks")
                         .selected_text(format!("{max_tracks} tracks"))
                         .width(96.0)
@@ -22791,21 +22826,20 @@ impl ViewerApp {
                                 );
                             }
                         });
-                    let mut min_dbz = self.storm_track_min_dbz;
-                    let min_changed = ui
-                        .add(
-                            egui::Slider::new(
-                                &mut min_dbz,
-                                MIN_STORM_TRACK_MIN_DBZ..=MAX_STORM_TRACK_MIN_DBZ,
-                            )
-                            .step_by(1.0)
-                            .text("Min dBZ"),
-                        )
-                        .changed();
-                    if max_tracks != self.storm_track_max_tracks || min_changed {
-                        self.set_storm_track_filters(max_tracks, min_dbz, ctx);
-                    }
                 });
+                let mut min_dbz = self.storm_track_min_dbz;
+                let min_changed = panel_kit::slider_row(
+                    ui,
+                    "Min dBZ",
+                    &mut min_dbz,
+                    MIN_STORM_TRACK_MIN_DBZ..=MAX_STORM_TRACK_MIN_DBZ,
+                    1.0,
+                    |value| format!("{value:.0} dBZ"),
+                )
+                .changed();
+                if max_tracks != self.storm_track_max_tracks || min_changed {
+                    self.set_storm_track_filters(max_tracks, min_dbz, ctx);
+                }
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     let keyframes = self.manual_camera_path.keyframes.len();
@@ -22857,9 +22891,10 @@ impl ViewerApp {
                     }
                 });
             });
+    }
 
-        // TOOLS.
-        Self::section_header(ui, "TOOLS");
+    /// TOOLS section body — inspector, Vrot, cross-section.
+    fn radar_tools_section_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut show_center_crosshair = self.app_settings.show_center_crosshair;
         if ui
             .checkbox(&mut show_center_crosshair, "Center crosshair")
@@ -22929,8 +22964,7 @@ impl ViewerApp {
                 self.cross_section_status = "Cross-section: arm, then click endpoint A then B".to_owned();
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("XS smoothing");
+        panel_kit::row(ui, "XS smoothing", |ui| {
             let current = self.cross_section_smoothing;
             let mut picked = None;
             egui::ComboBox::from_id_salt("cross_section_smoothing")
@@ -22948,7 +22982,11 @@ impl ViewerApp {
                             picked = Some(option);
                         }
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Smoothed fills short path-sampling gaps and softens barcode stripes. Native shows the raw section samples.",
+                );
             if let Some(option) = picked
                 && option != current
             {
@@ -22960,11 +22998,7 @@ impl ViewerApp {
                 let _ = self.app_settings.save();
                 ctx.request_repaint();
             }
-        })
-        .response
-        .on_hover_text(
-            "Smoothed fills short path-sampling gaps and softens barcode stripes. Native shows the raw section samples.",
-        );
+        });
     }
 
     fn extra_pane_frame_history_panel(
