@@ -22666,7 +22666,9 @@ impl ViewerApp {
         cut_rows: &[TiltCutRow],
     ) {
         ui.horizontal(|ui| {
-            ui.weak("↑/↓");
+            // Plain text, not arrow glyphs — the UI font has no ↑/↓ and
+            // rendered them as tofu boxes (integrator screenshot round).
+            ui.weak("Up/Down keys cycle tilts");
             if let Some(slot) = editing_pane {
                 if self.extra_panes[slot].cut.is_some() {
                     if ui
@@ -23051,12 +23053,23 @@ impl ViewerApp {
                 timeline_step_delta = Some(1);
             }
             // Same transport shape as the primary loop bar (the plan's one
-            // component, two data sources): truncating position label,
+            // component, two data sources): left-clustered position label,
             // speed combo, gear with the power knobs.
-            let reserved = 56.0 + 34.0 + ui.spacing().item_spacing.x * 3.0;
-            let label_width = (ui.available_width() - reserved).max(40.0);
             let position =
                 self.loop_timeline_position_label(LoopTimelineTarget::ExtraPane(pane_slot));
+            let position_width = ui
+                .painter()
+                .layout_no_wrap(
+                    position.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    egui::Color32::PLACEHOLDER,
+                )
+                .size()
+                .x;
+            let reserved = 56.0 + 34.0 + ui.spacing().item_spacing.x * 3.0;
+            let label_width = (ui.available_width() - reserved)
+                .max(40.0)
+                .min(position_width + 4.0);
             ui.add_sized(
                 egui::vec2(label_width, PANEL_BUTTON_HEIGHT),
                 egui::Label::new(egui::RichText::new(&position).weak()).truncate(),
@@ -23065,14 +23078,8 @@ impl ViewerApp {
             self.loop_speed_combo_ui(ui, ctx, ("pane_loop_speed", pane_slot));
             self.loop_settings_gear_ui(ui, ctx, Some(pane_slot));
         });
-        let selected_status_text = self.extra_pane_selected_frame_status_text(pane_slot);
-        panel_kit::status_block(ui, &selected_status_text, None);
-        self.extra_pane_low_sweep_cut_controls_ui(ui, ctx, pane_slot);
-
-        ui.horizontal(|ui| {
-            self.record_loop_button_ui(ui, Some(LoopTimelineTarget::ExtraPane(pane_slot)));
-        });
-
+        // Full-width scrubber directly under the transport (see the primary
+        // loop bar).
         let mut slider_index = selected_frame_index;
         let slider_response = ui
             .add_enabled_ui(frame_count > 1, |ui| {
@@ -23087,6 +23094,13 @@ impl ViewerApp {
         if slider_response {
             next_frame_index = Some(slider_index);
         }
+        let selected_status_text = self.extra_pane_selected_frame_status_text(pane_slot);
+        panel_kit::status_block(ui, &selected_status_text, None);
+        self.extra_pane_low_sweep_cut_controls_ui(ui, ctx, pane_slot);
+
+        panel_kit::row(ui, "Record", |ui| {
+            self.record_loop_button_ui(ui, Some(LoopTimelineTarget::ExtraPane(pane_slot)));
+        });
 
         egui::CollapsingHeader::new(format!("Frames ({frame_count})"))
             .id_salt(("pane_loop_frames", pane_slot))
@@ -23170,14 +23184,25 @@ impl ViewerApp {
             {
                 timeline_step_delta = Some(1);
             }
-            // The rest of the transport row: "frame i/N" truncating in the
-            // middle, then the on-screen speed combo, then the gear holding
-            // every power knob (ui-refresh plan: the old mega-row was the
-            // No. 1 width offender; this row holds at 320 pt — width budget
-            // = 110 transport + flexible label + 56 speed + 34 gear).
-            let reserved = 56.0 + 34.0 + ui.spacing().item_spacing.x * 3.0;
-            let label_width = (ui.available_width() - reserved).max(40.0);
+            // The rest of the transport row, clustered LEFT — wide panels
+            // must not stretch the group apart. The "frame i/N" label is
+            // sized to its text (truncating with hover only when the panel
+            // is narrow); the speed combo and the gear sit right beside it.
+            // Width budget at 320 pt: 110 transport + label + 56 + 34.
             let position = self.loop_timeline_position_label(LoopTimelineTarget::Primary);
+            let position_width = ui
+                .painter()
+                .layout_no_wrap(
+                    position.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    egui::Color32::PLACEHOLDER,
+                )
+                .size()
+                .x;
+            let reserved = 56.0 + 34.0 + ui.spacing().item_spacing.x * 3.0;
+            let label_width = (ui.available_width() - reserved)
+                .max(40.0)
+                .min(position_width + 4.0);
             ui.add_sized(
                 egui::vec2(label_width, PANEL_BUTTON_HEIGHT),
                 egui::Label::new(egui::RichText::new(&position).weak()).truncate(),
@@ -23186,17 +23211,8 @@ impl ViewerApp {
             self.loop_speed_combo_ui(ui, ctx, "loop_speed");
             self.loop_settings_gear_ui(ui, ctx, None);
         });
-        // Row 2 (plan): the status block — what the loop is showing.
-        let selected_status_text = self.selected_frame_status_text();
-        panel_kit::status_block(ui, &selected_status_text, None);
-        self.history_low_sweep_cut_controls_ui(ui, ctx);
-
-        // The loop-export button stays one press away; every other record
-        // control lives in the gear popover ("Loop settings").
-        ui.horizontal(|ui| {
-            self.record_loop_button_ui(ui, Some(LoopTimelineTarget::Primary));
-        });
-
+        // Full-width scrubber directly under the transport — this IS the
+        // loop position, so it gets the whole panel width.
         let mut slider_index = self.primary.cursor.index.min(frame_count - 1);
         let slider_response = ui
             .add_enabled_ui(frame_count > 1, |ui| {
@@ -23211,6 +23227,16 @@ impl ViewerApp {
         if slider_response {
             next_frame_index = Some(slider_index);
         }
+        // Status block: what the loop is showing.
+        let selected_status_text = self.selected_frame_status_text();
+        panel_kit::status_block(ui, &selected_status_text, None);
+        self.history_low_sweep_cut_controls_ui(ui, ctx);
+
+        // Labeled record row — the loop-export button stays one press away;
+        // every other record control lives in the gear popover.
+        panel_kit::row(ui, "Record", |ui| {
+            self.record_loop_button_ui(ui, Some(LoopTimelineTarget::Primary));
+        });
 
         egui::CollapsingHeader::new(format!("Frames ({frame_count})"))
             .id_salt("loop_frames")
