@@ -1011,15 +1011,20 @@ fn scan_runs(store_root: &Path) -> Vec<SatRunListing> {
     let mut listings = Vec::new();
     for model in &tree.models {
         for run in &model.runs {
+            let frames = run.hours.iter().map(|hour| hour.hour).collect::<Vec<_>>();
+            let mut title = run_title(&model.model, &run.run);
+            if model.model == "simsat" && frames.len() > 1 {
+                title.push_str(&format!(" · {} frames", frames.len()));
+            }
             listings.push(SatRunListing {
                 key: SatRunKey {
                     model: model.model.clone(),
                     run: run.run.clone(),
                 },
-                title: run_title(&model.model, &run.run),
+                title,
                 nx: run.nx,
                 ny: run.ny,
-                frames: run.hours.iter().map(|hour| hour.hour).collect(),
+                frames,
             });
         }
     }
@@ -5434,21 +5439,26 @@ mod tests {
     fn simsat_derived_frame_opens_in_satellite_and_native_plot() {
         let dir = test_dir("simsat-derived-player-plot");
         let values = vec![5.0, 35.0, 70.0, f32::NAN];
-        let written = crate::simsat_store::write_derived_frame(
+        let base_frame = crate::simsat_store::DerivedFrame {
+            nx: 2,
+            ny: 2,
+            values: values.clone(),
+            lat: vec![30.0, 30.0, 31.0, 31.0],
+            lon: vec![-101.0, -100.0, -101.0, -100.0],
+            sector: "hrrr_20260710_t19z_pw_geo".to_owned(),
+            satellite: simsat::camera::SatellitePreset::GoesEast,
+            field: simsat::derived::DerivedField::PrecipitableWater,
+            year: 2026,
+            month: 7,
+            day: 10,
+            hhmm: 2000,
+        };
+        let written = crate::simsat_store::write_derived_frame(&dir, &base_frame).unwrap();
+        crate::simsat_store::write_derived_frame(
             &dir,
             &crate::simsat_store::DerivedFrame {
-                nx: 2,
-                ny: 2,
-                values: values.clone(),
-                lat: vec![30.0, 30.0, 31.0, 31.0],
-                lon: vec![-101.0, -100.0, -101.0, -100.0],
-                sector: "hrrr_20260710_t19z_pw_geo".to_owned(),
-                satellite: simsat::camera::SatellitePreset::GoesEast,
-                field: simsat::derived::DerivedField::PrecipitableWater,
-                year: 2026,
-                month: 7,
-                day: 10,
-                hhmm: 2000,
+                hhmm: 2100,
+                ..base_frame.clone()
             },
         )
         .unwrap();
@@ -5459,7 +5469,8 @@ mod tests {
 
         let listings = scan_runs(&dir);
         let listing = listings.iter().find(|listing| listing.key == key).unwrap();
-        assert_eq!(listing.frames, vec![2000]);
+        assert_eq!(listing.frames, vec![2000, 2100]);
+        assert!(listing.title.contains("2 frames"), "{}", listing.title);
         assert!(listing.title.contains("HRRR 19Z"), "{}", listing.title);
         assert!(
             listing.title.contains("Precipitable Water"),
