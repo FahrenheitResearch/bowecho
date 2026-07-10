@@ -199,6 +199,77 @@ pub struct DownloadOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Dataset registry
+// ---------------------------------------------------------------------------
+
+/// One GDEX dataset the in-app browser can open. The registry is the single
+/// source of truth for dataset ids and their user-facing text — the browser's
+/// picker rows, tree-root label, and attribution header all render from here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdexDataset {
+    /// GDEX/RDA dataset id (e.g. `d612005`) — the THREDDS scan root lives at
+    /// `files/g/<id>/` (see [`dataset_catalog_url`]).
+    pub id: &'static str,
+    /// Short display name (picker rows and the browser's tree root).
+    pub label: &'static str,
+    /// One-line description (picker hover text).
+    pub blurb: &'static str,
+    /// What the dataset's leaves are ("NetCDF" / "GRIB1") — a UI hint only;
+    /// the import gate decides per file.
+    pub format: &'static str,
+    /// Attribution line shown in the browser's header.
+    pub attribution: &'static str,
+}
+
+impl GdexDataset {
+    /// The dataset's crawl entry-point catalog URL.
+    pub fn catalog_url(&self) -> String {
+        dataset_catalog_url(self.id)
+    }
+}
+
+/// The datasets offered by the browser's picker. The FIRST entry is the
+/// default (CONUS II — the dataset the pre-picker browser was hardwired to;
+/// its downloads stay flat in the cache root for that reason).
+///
+/// Both ids verified against the live TDS on 2026-07-09:
+/// `https://tds.gdex.ucar.edu/thredds/catalog/files/g/<id>/catalog.xml`.
+/// ERA-20C (`d626000`) answers with `dataFormat: GRIB-1`, Rights "Freely
+/// Available", and nine `e20c.oper.*` subtrees.
+pub const GDEX_DATASETS: &[GdexDataset] = &[
+    GdexDataset {
+        id: "d612005",
+        label: "CONUS II (d612005)",
+        blurb: "NSF NCAR CONUS II regional climate WRF — present + future periods, NetCDF",
+        format: "NetCDF",
+        attribution: "NSF NCAR GDEX · CONUS II regional climate WRF (present + future) · \
+                      CC-BY 4.0 · DOI 10.5065/49SN-8E08",
+    },
+    GdexDataset {
+        id: "d626000",
+        label: "ERA-20C (d626000)",
+        blurb: "ECMWF ERA-20C — 20th-century reanalysis 1900-2010, GRIB1",
+        format: "GRIB1",
+        attribution: "NSF NCAR GDEX · ECMWF ERA-20C 20th-century reanalysis (1900-2010) · \
+                      GRIB1 · rda.ucar.edu/datasets/d626000",
+    },
+];
+
+/// Look a registry dataset up by id.
+pub fn dataset_by_id(id: &str) -> Option<&'static GdexDataset> {
+    GDEX_DATASETS.iter().find(|dataset| dataset.id == id)
+}
+
+/// The dataset id embedded in a THREDDS `urlPath` (`files/g/<id>/...`), when
+/// the path has that shape. Lets download destinations be derived from the
+/// LEAF being downloaded rather than from whatever dataset the picker shows.
+pub fn dataset_id_from_url_path(url_path: &str) -> Option<&str> {
+    let rest = url_path.strip_prefix("files/g/")?;
+    let id = rest.split('/').next()?;
+    if id.is_empty() { None } else { Some(id) }
+}
+
+// ---------------------------------------------------------------------------
 // URL builders
 // ---------------------------------------------------------------------------
 
@@ -1026,10 +1097,115 @@ mod tests {
     const CATALOG_TOP: &str = include_str!("fixtures/gdex_catalog_top.xml");
     const CATALOG_LEAF: &str = include_str!("fixtures/gdex_catalog_leaf.xml");
     const NCSS_DATASET: &str = include_str!("fixtures/gdex_ncss_dataset.xml");
+    const CATALOG_ERA20C_TOP: &str = include_str!("fixtures/gdex_catalog_era20c_top.xml");
+    const CATALOG_ERA20C_DECADE: &str = include_str!("fixtures/gdex_catalog_era20c_decade.xml");
 
     const TOP_URL: &str = "https://tds.gdex.ucar.edu/thredds/catalog/files/g/d612005/catalog.xml";
     const LEAF_URL: &str =
         "https://tds.gdex.ucar.edu/thredds/catalog/files/g/d612005/future2D/208001/catalog.xml";
+    const ERA20C_TOP_URL: &str =
+        "https://tds.gdex.ucar.edu/thredds/catalog/files/g/d626000/catalog.xml";
+    const ERA20C_DECADE_URL: &str = "https://tds.gdex.ucar.edu/thredds/catalog/files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/catalog.xml";
+
+    #[test]
+    fn dataset_registry_ids_are_unique_and_urls_well_formed() {
+        // The default (first) entry is CONUS II — the pre-picker dataset whose
+        // downloads are grandfathered flat in the cache root.
+        assert_eq!(GDEX_DATASETS[0].id, "d612005");
+
+        let mut seen = HashSet::new();
+        for dataset in GDEX_DATASETS {
+            assert!(seen.insert(dataset.id), "duplicate id {}", dataset.id);
+            assert_eq!(
+                dataset.catalog_url(),
+                format!("{CATALOG_BASE}files/g/{}/catalog.xml", dataset.id)
+            );
+            assert_eq!(dataset_by_id(dataset.id), Some(dataset));
+            assert!(!dataset.label.is_empty());
+            assert!(!dataset.attribution.is_empty());
+        }
+        assert_eq!(dataset_by_id("d000000"), None);
+
+        // The two shipped datasets, by exact URL (verified live 2026-07-09).
+        assert_eq!(dataset_catalog_url("d612005"), TOP_URL);
+        assert_eq!(dataset_catalog_url("d626000"), ERA20C_TOP_URL);
+    }
+
+    #[test]
+    fn dataset_id_parses_from_url_path_shapes() {
+        assert_eq!(
+            dataset_id_from_url_path(
+                "files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_00:00:00.nc"
+            ),
+            Some("d612005")
+        );
+        assert_eq!(
+            dataset_id_from_url_path(
+                "files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb"
+            ),
+            Some("d626000")
+        );
+        // The bare scan root and non-TDS shapes yield nothing.
+        assert_eq!(dataset_id_from_url_path("files/g/"), None);
+        assert_eq!(dataset_id_from_url_path("other/d612005/x.nc"), None);
+    }
+
+    #[test]
+    fn era20c_top_catalog_lists_nine_subtrees_and_drops_the_dump_leaf() {
+        let parsed =
+            parse_catalog(CATALOG_ERA20C_TOP, ERA20C_TOP_URL).expect("era20c top parses");
+        // The root's only <dataset urlPath> is the extensionless scan `dump`,
+        // which the extension whitelist drops.
+        assert!(parsed.leaves.is_empty(), "dump must not survive as a leaf");
+        assert_eq!(parsed.child_catalog_urls.len(), 9, "nine e20c subtrees");
+        for expected in [
+            "/e20c.oper.an.sfc.3hr/catalog.xml",
+            "/e20c.oper.an.sfc.6hr/catalog.xml",
+            "/e20c.oper.an.pl.3hr/catalog.xml",
+            "/e20c.oper.invariant/catalog.xml",
+        ] {
+            assert!(
+                parsed
+                    .child_catalog_urls
+                    .iter()
+                    .any(|url| url.ends_with(expected)),
+                "missing subtree {expected}"
+            );
+        }
+        assert!(
+            parsed
+                .child_catalog_urls
+                .iter()
+                .all(|url| url.contains("/files/g/d626000/")),
+            "every child resolves inside the d626000 tree"
+        );
+    }
+
+    #[test]
+    fn era20c_decade_catalog_keeps_grb_leaves_with_size_and_date() {
+        let parsed =
+            parse_catalog(CATALOG_ERA20C_DECADE, ERA20C_DECADE_URL).expect("decade parses");
+        assert!(parsed.child_catalog_urls.is_empty(), "a decade dir is flat");
+        assert_eq!(parsed.leaves.len(), 3);
+
+        let msl = parsed
+            .leaves
+            .iter()
+            .find(|leaf| leaf.name.contains("128_151_msl"))
+            .expect("msl leaf present");
+        assert_eq!(
+            msl.url_path,
+            "files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb"
+        );
+        assert_eq!(
+            msl.download_url,
+            format!("{FILESERVER_BASE}{}", msl.url_path),
+            "fileServer download URL builds for .grb exactly as for .nc"
+        );
+        // <dataSize units="Mbytes">299.3</dataSize> -> decimal bytes.
+        assert_eq!(msl.size_bytes, Some(299_300_000));
+        assert_eq!(msl.date.as_deref(), Some("2014-11-04T18:47:44Z"));
+    }
 
     #[test]
     fn top_catalog_discovers_five_subtrees_and_no_leaves() {
@@ -1520,6 +1696,56 @@ mod tests {
                 .leaves
                 .iter()
                 .any(|leaf| leaf.name == "wrf2d_d01_2080-01-01_00:00:00.nc")
+        );
+    }
+
+    #[test]
+    #[ignore = "live: lists the ERA-20C catalog root + one decade; run once on a node"]
+    fn live_era20c_catalog_root_and_one_decade() {
+        // Root scan -> the nine e20c.oper.* subtrees; the extensionless scan
+        // `dump` must not surface as a leaf (light: ~8 KB XML).
+        let top =
+            fetch_and_parse_catalog(&dataset_catalog_url("d626000")).expect("live era20c top");
+        eprintln!(
+            "live d626000 top: {} child catalogs, {} leaves",
+            top.child_catalog_urls.len(),
+            top.leaves.len()
+        );
+        assert_eq!(top.child_catalog_urls.len(), 9, "nine e20c subtrees");
+        assert!(top.leaves.is_empty(), "dump filtered at the root");
+        assert!(
+            top.child_catalog_urls
+                .iter()
+                .any(|url| url.ends_with("/e20c.oper.an.sfc.3hr/catalog.xml"))
+        );
+
+        // One decade dir of the 3-hourly surface analysis (~390 KB XML):
+        // hundreds of .grb leaves, every one a fileServer download URL with an
+        // advertised size — what the picker's Download button consumes.
+        let decade = fetch_and_parse_catalog(ERA20C_DECADE_URL).expect("live era20c decade");
+        eprintln!("live e20c.oper.an.sfc.3hr/1900_1909: {} leaves", decade.leaves.len());
+        assert!(
+            decade.leaves.len() > 500,
+            "a decade dir carries hundreds of per-variable year files"
+        );
+        assert!(
+            decade
+                .leaves
+                .iter()
+                .all(|leaf| leaf.url_path.to_ascii_lowercase().ends_with(".grb")
+                    && leaf.download_url.starts_with(FILESERVER_BASE))
+        );
+        assert!(
+            decade
+                .leaves
+                .iter()
+                .any(|leaf| leaf.name
+                    == "e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb"),
+            "the fixture's msl leaf exists live"
+        );
+        assert!(
+            decade.leaves.iter().all(|leaf| leaf.size_bytes.is_some()),
+            "decade leaves advertise sizes (drives the progress bar)"
         );
     }
 

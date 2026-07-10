@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.2">
+  <service name="all" serviceType="Compound" base="">
+    <service name="odap" serviceType="OpenDAP" base="/thredds/dodsC/" />
+    <service name="ncssGrid" serviceType="NetcdfSubset" base="/thredds/ncss/grid/" />
+    <service name="cdmremote" serviceType="CdmRemote" base="/thredds/cdmremote/" />
+    <service name="cdmrFeatureGrid" serviceType="CdmrFeature" base="/thredds/cdmrfeature/grid/" />
+    <service name="notebook" serviceType="JupyterNotebook" base="/thredds/notebook/" />
+    <service name="wcs" serviceType="WCS" base="/thredds/wcs/" />
+    <service name="wms" serviceType="WMS" base="/thredds/wms/" />
+    <service name="fileServer" serviceType="HTTPServer" base="/thredds/fileServer/" />
+    <service name="iso" serviceType="ISO" base="/thredds/iso/" />
+    <service name="ncml" serviceType="NCML" base="/thredds/ncml/" />
+    <service name="uddc" serviceType="UDDC" base="/thredds/uddc/" />
+  </service>
+  <dataset name="d626000 Files">
+    <property name="DatasetScan" value="true" />
+    <metadata inherited="true">
+      <serviceName>all</serviceName>
+      <authority>edu.ucar.rda</authority>
+      <dataType>GRID</dataType>
+      <dataFormat>GRIB-1</dataFormat>
+      <documentation type="Rights">Freely Available</documentation>
+      <documentation xlink:href="http://rda.ucar.edu/datasets/d626000/" xlink:title="ERA-20C Project (ECMWF Atmospheric Reanalysis of the 20th Century) (d626000)" />
+      <documentation type="summary">ERA-20C is ECMWF's first atmospheric reanalysis of the 20th century, from 1900-2010. It assimilates observations of surface pressure and surface marine winds only. It is an outcome of the ERA-CLIM project. (Summary trimmed for the fixture; structure matches the live catalog of 2026-07-09.)</documentation>
+      <creator>
+        <name vocabulary="DIF">ECMWF</name>
+        <contact url="http://www.ecmwf.int/" email="http://www.ecmwf.int/en/about/contact-us" />
+      </creator>
+      <keyword>Numerical Weather Prediction</keyword>
+      <keyword>Model data</keyword>
+    </metadata>
+    <dataset name="dump" ID="files/g/d626000/dump" urlPath="files/g/d626000/dump">
+      <dataSize units="Kbytes">204.8</dataSize>
+      <date type="modified">2024-10-19T04:31:58.077Z</date>
+    </dataset>
+    <catalogRef xlink:href="e20c.oper.an.ml.3hr/catalog.xml" xlink:title="e20c.oper.an.ml.3hr" ID="files/g/d626000/e20c.oper.an.ml.3hr" name="e20c.oper.an.ml.3hr">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="e20c.oper.an.pl.3hr/catalog.xml" xlink:title="e20c.oper.an.pl.3hr" ID="files/g/d626000/e20c.oper.an.pl.3hr" name="e20c.oper.an.pl.3hr">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="e20c.oper.an.pt.3hr/catalog.xml" xlink:title="e20c.oper.an.pt.3hr" ID="files/g/d626000/e20c.oper.an.pt.3hr" name="e20c.oper.an.pt.3hr">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="e20c.oper.an.pv.3hr/catalog.xml" xlink:title="e20c.oper.an.pv.3hr" ID="files/g/d626000/e20c.oper.an.pv.3hr" name="e20c.oper.an.pv.3hr">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="e20c.oper.an.sfc.3hr/catalog.xml" xlink:title="e20c.oper.an.sfc.3hr" ID="files/g/d626000/e20c.oper.an.sfc.3hr" name="e20c.oper.an.sfc.3hr">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="e20c.oper.an.sfc.6hr/catalog.xml" xlink:title="e20c.oper.an.sfc.6hr" ID="files/g/d626000/e20c.oper.an.sfc.6hr" name="e20c.oper.an.sfc.6hr">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="e20c.oper.fc.pl.3hr/catalog.xml" xlink:title="e20c.oper.fc.pl.3hr" ID="files/g/d626000/e20c.oper.fc.pl.3hr" name="e20c.oper.fc.pl.3hr">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="e20c.oper.fc.sfc.3hr/catalog.xml" xlink:title="e20c.oper.fc.sfc.3hr" ID="files/g/d626000/e20c.oper.fc.sfc.3hr" name="e20c.oper.fc.sfc.3hr">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="e20c.oper.invariant/catalog.xml" xlink:title="e20c.oper.invariant" ID="files/g/d626000/e20c.oper.invariant" name="e20c.oper.invariant">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+  </dataset>
+</catalog>

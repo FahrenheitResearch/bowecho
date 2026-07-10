@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.2">
+  <service name="all" serviceType="Compound" base="">
+    <service name="ncssGrid" serviceType="NetcdfSubset" base="/thredds/ncss/grid/" />
+    <service name="fileServer" serviceType="HTTPServer" base="/thredds/fileServer/" />
+  </service>
+  <dataset name="e20c.oper.an.sfc.3hr/1900_1909/">
+    <property name="DatasetScan" value="true" />
+    <metadata inherited="true">
+      <serviceName>all</serviceName>
+      <authority>edu.ucar.rda</authority>
+      <dataType>GRID</dataType>
+      <dataFormat>GRIB-1</dataFormat>
+      <documentation type="Rights">Freely Available</documentation>
+    </metadata>
+    <dataset name="e20c.oper.an.sfc.3hr.128_015_aluvp.regn80sc.1900010100_1900123121.grb" ID="files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/e20c.oper.an.sfc.3hr.128_015_aluvp.regn80sc.1900010100_1900123121.grb" urlPath="files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/e20c.oper.an.sfc.3hr.128_015_aluvp.regn80sc.1900010100_1900123121.grb">
+      <dataSize units="Mbytes">299.3</dataSize>
+      <date type="modified">2014-11-04T18:46:09Z</date>
+    </dataset>
+    <dataset name="e20c.oper.an.sfc.3hr.128_015_aluvp.regn80sc.1901010100_1901123121.grb" ID="files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/e20c.oper.an.sfc.3hr.128_015_aluvp.regn80sc.1901010100_1901123121.grb" urlPath="files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/e20c.oper.an.sfc.3hr.128_015_aluvp.regn80sc.1901010100_1901123121.grb">
+      <dataSize units="Mbytes">299.3</dataSize>
+      <date type="modified">2014-11-04T18:46:10Z</date>
+    </dataset>
+    <dataset name="e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb" ID="files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb" urlPath="files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb">
+      <dataSize units="Mbytes">299.3</dataSize>
+      <date type="modified">2014-11-04T18:47:44Z</date>
+    </dataset>
+  </dataset>
+</catalog>
