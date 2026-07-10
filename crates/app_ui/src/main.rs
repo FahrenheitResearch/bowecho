@@ -7179,6 +7179,33 @@ enum SidebarTab {
     Settings,
 }
 
+impl SidebarTab {
+    /// Stable settings slug for this tab — what `app_settings.sidebar_tab`
+    /// stores so the active tab survives restarts (like `sidebar_width_pt`).
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Radar => "radar",
+            Self::Layers => "layers",
+            Self::Severe => "severe",
+            Self::Data => "data",
+            Self::Settings => "settings",
+        }
+    }
+
+    /// Inverse of [`Self::slug`]. Empty (older configs) or unknown slugs
+    /// return `None`; the caller falls back to the Radar tab.
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "radar" => Some(Self::Radar),
+            "layers" => Some(Self::Layers),
+            "severe" => Some(Self::Severe),
+            "data" => Some(Self::Data),
+            "settings" => Some(Self::Settings),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum DisplayTimeZone {
     #[default]
@@ -8282,6 +8309,10 @@ impl ViewerApp {
             annotations: annotate::AnnotationState::default(),
         };
         app.basemap_style = restored_basemap_style;
+        // Restore the last-open sidebar tab (persisted like the width);
+        // empty/unknown slugs (older configs) keep the Radar default.
+        app.sidebar_tab =
+            SidebarTab::from_slug(&app.app_settings.sidebar_tab).unwrap_or(SidebarTab::Radar);
         app.bold_labels = restored_bold_labels;
         app.gate_filter_dbz = restored_gate_filter_dbz;
         app.swath.reflectivity.enabled = app.app_settings.overlay_max_ref_swath;
@@ -18907,6 +18938,17 @@ impl eframe::App for ViewerApp {
                         );
                     });
             }
+        }
+
+        // Persist the active sidebar tab (mirrors the width write-back
+        // above): whatever tab is current after this frame's UI ran — a
+        // user click, a workflow force, an alert jump — is what the next
+        // launch restores. Runs outside the chrome branch so tab changes
+        // made while the chrome is hidden are not lost.
+        let tab_slug = self.sidebar_tab.slug();
+        if self.app_settings.sidebar_tab != tab_slug {
+            self.app_settings.sidebar_tab = tab_slug.to_owned();
+            self.mark_app_settings_dirty();
         }
 
         if self.cross_section_armed || self.cross_section_a_lonlat.is_some() {
@@ -42146,6 +42188,18 @@ fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_tab_slugs_round_trip_and_unknown_falls_back_to_none() {
+        for tab in SIDEBAR_TABS {
+            assert_eq!(SidebarTab::from_slug(tab.slug()), Some(*tab));
+        }
+        // Empty (older configs) and unknown/wrong-case slugs restore Radar
+        // via the `.unwrap_or(SidebarTab::Radar)` at the construction seam.
+        assert_eq!(SidebarTab::from_slug(""), None);
+        assert_eq!(SidebarTab::from_slug("Radar"), None);
+        assert_eq!(SidebarTab::from_slug("alerts"), None);
+    }
 
     #[test]
     fn adaptive_startup_size_near_fills_a_16_9_monitor() {

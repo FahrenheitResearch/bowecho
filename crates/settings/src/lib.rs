@@ -659,6 +659,13 @@ pub struct AppSettings {
     /// sub-point panel widths are meaningless.
     #[serde(default)]
     pub sidebar_width_pt: Option<u16>,
+    /// Active sidebar tab slug ("radar", "layers", "severe", "data",
+    /// "settings"), persisted whenever the tab changes so the app reopens
+    /// on the tab the user last had open. Empty (older configs) or unknown
+    /// slugs restore the Radar tab at use sites (app_ui). Kept as a string
+    /// so `AppSettings` stays UI-crate-free, like `units`/`time_zone`.
+    #[serde(default)]
+    pub sidebar_tab: String,
     /// Satellite IR enhancement slug applied to Kelvin brightness-temperature
     /// bands (GOES ABI / Himawari AHI 7-16): "cimss" (default rainbow),
     /// "bd" (Dvorak BD curve), "avn", "funktop", "rainbow", "gray".
@@ -982,6 +989,7 @@ impl Default for AppSettings {
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
             sidebar_width_pt: None,
+            sidebar_tab: String::new(),
             sat_ir_enhancement: default_sat_ir_enhancement(),
             model_slug: default_model_slug(),
             units: default_units(),
@@ -2009,6 +2017,21 @@ mod tests {
         let back = AppSettings::from_json(&settings.to_json());
 
         assert_eq!(back.sidebar_width_pt, Some(420));
+    }
+
+    #[test]
+    fn sidebar_tab_defaults_to_empty_and_round_trips() {
+        // Older configs have no sidebar_tab key: no tab preference (app_ui
+        // falls back to the Radar tab).
+        assert_eq!(AppSettings::from_json("{}").sidebar_tab, "");
+
+        let settings = AppSettings {
+            sidebar_tab: "severe".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.sidebar_tab, "severe");
     }
 
     #[test]
