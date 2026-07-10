@@ -18770,9 +18770,8 @@ impl eframe::App for ViewerApp {
             // seeds the panel each session (egui's own memory dies with the
             // process — eframe is built without persistence), and drags are
             // written back through the debounced settings lane.
-            let saved_width = panel_kit::sidebar_width_from_settings(
-                self.app_settings.sidebar_width_pt,
-            );
+            let saved_width =
+                panel_kit::sidebar_width_from_settings(self.app_settings.sidebar_width_pt);
             let panel_response = egui::Panel::right("product_tilt_panel")
                 .resizable(true)
                 .default_size(saved_width.unwrap_or(SIDEBAR_DEFAULT_WIDTH))
@@ -22558,8 +22557,7 @@ impl ViewerApp {
             let family_label = family.label().to_owned();
             let mut enabled = self.display_thresholds.contains_key(&family_label);
             let symmetric = family_threshold_is_symmetric(family);
-            let active_table_for_threshold =
-                self.active_table_for_product(editing_product).clone();
+            let active_table_for_threshold = self.active_table_for_product(editing_product).clone();
             let threshold_range = display_threshold_range(family, &active_table_for_threshold);
             ui.horizontal(|ui| {
                 if ui

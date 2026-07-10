@@ -189,8 +189,10 @@ pub(crate) fn slider_row<Num: egui::emath::Numeric>(
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
                 ui.set_min_width(VALUE_SLOT_W);
-                ui.add(egui::Label::new(egui::RichText::new(shown).monospace().size(11.5)))
-                    .on_hover_text(full);
+                ui.add(egui::Label::new(
+                    egui::RichText::new(shown).monospace().size(11.5),
+                ))
+                .on_hover_text(full);
             },
         );
         response
@@ -273,7 +275,9 @@ pub(crate) fn status_block(ui: &mut egui::Ui, primary: &str, secondary: Option<&
 /// Kit 6 — Collapsed-by-default disclosure for explainer prose ("About {topic}").
 /// Prose never renders inline-expanded by default.
 pub(crate) fn about(ui: &mut egui::Ui, key: &str, topic: &str, paragraphs: &[&str]) {
-    let heading = egui::RichText::new(format!("About {topic}")).size(11.5).weak();
+    let heading = egui::RichText::new(format!("About {topic}"))
+        .size(11.5)
+        .weak();
     egui::CollapsingHeader::new(heading)
         .id_salt(key)
         .default_open(false)
@@ -368,7 +372,8 @@ fn label_cell(ui: &mut egui::Ui, width: f32, label: &str) {
         |ui| {
             ui.set_min_width(width);
             ui.set_max_width(width);
-            ui.add(egui::Label::new(label).truncate()).on_hover_text(label);
+            ui.add(egui::Label::new(label).truncate())
+                .on_hover_text(label);
         },
     );
 }
@@ -452,11 +457,23 @@ mod tests {
     fn sidebar_width_settings_roundtrip_clamps_to_panel_range() {
         assert_eq!(sidebar_width_from_settings(None), None);
         assert_eq!(sidebar_width_from_settings(Some(380)), Some(380.0));
-        assert_eq!(sidebar_width_from_settings(Some(100)), Some(SIDEBAR_MIN_WIDTH));
-        assert_eq!(sidebar_width_from_settings(Some(5000)), Some(SIDEBAR_MAX_WIDTH));
+        assert_eq!(
+            sidebar_width_from_settings(Some(100)),
+            Some(SIDEBAR_MIN_WIDTH)
+        );
+        assert_eq!(
+            sidebar_width_from_settings(Some(5000)),
+            Some(SIDEBAR_MAX_WIDTH)
+        );
         assert_eq!(sidebar_width_to_settings(380.4), Some(380));
-        assert_eq!(sidebar_width_to_settings(12.0), Some(SIDEBAR_MIN_WIDTH as u16));
-        assert_eq!(sidebar_width_to_settings(5000.0), Some(SIDEBAR_MAX_WIDTH as u16));
+        assert_eq!(
+            sidebar_width_to_settings(12.0),
+            Some(SIDEBAR_MIN_WIDTH as u16)
+        );
+        assert_eq!(
+            sidebar_width_to_settings(5000.0),
+            Some(SIDEBAR_MAX_WIDTH as u16)
+        );
         assert_eq!(sidebar_width_to_settings(f32::NAN), None);
     }
 }
