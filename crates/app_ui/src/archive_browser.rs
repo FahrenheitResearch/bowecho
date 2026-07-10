@@ -32,8 +32,8 @@ use ui_core::worker_slot::SlotPoll;
 
 use crate::{
     ACTIVE_LOAD_POLL_MS, ArchiveLoadProgress, AsyncLoadResult, AsyncLoadUpdate, DecodedLoadBatch,
-    FeedSource, MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, PANEL_BUTTON_HEIGHT, SpcReport,
-    ViewerApp, archive_load_progress_row, archive_object_scan_time_utc, cache_dir,
+    FeedSource, MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, SpcReport, ViewerApp,
+    archive_load_progress_row, archive_object_scan_time_utc, cache_dir,
     decode_archive_history_object, fetch_intl_frame_plan_batch, intl_provider_label, panel_kit,
     send_archive_progress,
 };
