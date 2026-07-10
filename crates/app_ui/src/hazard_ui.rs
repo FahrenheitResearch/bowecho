@@ -10,7 +10,7 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.hazards_visible, "Show")
                 .on_hover_text(
-                    "Draw warning polygons on the map (also the Custom-tab Warnings row)",
+                    "Draw warning polygons on the map (also the Map-tab Warnings row)",
                 );
             let mut show_labels = self.app_settings.show_hazard_labels;
             if ui
@@ -286,7 +286,7 @@ impl ViewerApp {
                 if ui
                     .checkbox(&mut app.spc_reports_enabled, "Reports")
                     .on_hover_text(
-                        "Today's filtered storm reports (tornado / wind / hail) — same state as the Custom-tab row",
+                        "Today's filtered storm reports (tornado / wind / hail) — same state as the Map-tab row",
                     )
                     .changed()
                 {

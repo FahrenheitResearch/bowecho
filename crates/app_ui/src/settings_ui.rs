@@ -803,7 +803,7 @@ impl ViewerApp {
                     note.as_str(),
                     "A velocity palette's declared Units: header (kt, mph, km/h, m/s) drives the \
                      velocity readout, colorbar ticks, and unit chip — GR2Analyst semantics. Pick or \
-                     edit the table under Custom ▸ Color tables to change it.",
+                     edit the table under Map ▸ Color tables to change it.",
                 ],
             );
         }
@@ -1231,7 +1231,7 @@ impl ViewerApp {
                 "Play sound for new warnings",
             )
             .on_hover_text(
-                "Opt-in audible cue when a newly issued current warning is latched as NEW in the Severe tab",
+                "Opt-in audible cue when a newly issued current warning is latched as NEW in the Alerts tab",
             )
             .changed()
         {

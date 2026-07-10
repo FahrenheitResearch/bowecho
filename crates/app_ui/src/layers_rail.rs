@@ -359,7 +359,7 @@ impl ViewerApp {
                         let edit_family = current_color_family.unwrap_or(ColorTableFamily::Generic);
                         if ui
                             .button(format!("Edit {}", edit_family.label()))
-                            .on_hover_text("Open Custom > Appearance > Color tables for this family")
+                            .on_hover_text("Open Map > Appearance > Color tables for this family")
                             .clicked()
                         {
                             model_color_action = Some((id, ModelColorAction::Edit(edit_family)));
@@ -1138,9 +1138,9 @@ impl ViewerApp {
                     },
                     name: &name,
                     name_width: crate::NAME_W_STD,
-                    name_hover: "SPC convective outlook polygons. Off remembers your kind set; on restores it. ⚙ opens the SEVERE tab's SPC outlooks section (day + kinds).",
+                    name_hover: "SPC convective outlook polygons. Off remembers your kind set; on restores it. ⚙ opens the ALERTS tab's SPC outlooks section (day + kinds).",
                     gear: Some(LayerRowGear::Open {
-                        hover: "Configure in the SEVERE tab: day · categorical / tornado / wind / hail",
+                        hover: "Configure in the ALERTS tab: day · categorical / tornado / wind / hail",
                         clicked: &mut open_severe,
                     }),
                     ..Default::default()
@@ -1188,7 +1188,7 @@ impl ViewerApp {
                     name_width: crate::NAME_W_STD,
                     name_hover: "SPC storm report dots + tornado track lines for the displayed day; click a track to load its radar loop",
                     gear: Some(LayerRowGear::Open {
-                        hover: "Open the SEVERE tab",
+                        hover: "Open the ALERTS tab",
                         clicked: &mut open_severe,
                     }),
                     ..Default::default()
@@ -1255,14 +1255,14 @@ impl ViewerApp {
                     },
                     name: "Warnings",
                     name_width: crate::NAME_W_STD,
-                    name_hover: "Warning polygons (filters + full text in the warnings tab)",
+                    name_hover: "Warning polygons (filters + full text in the Alerts tab)",
                     opacity: Some(LayerRowOpacity::U8 {
                         value: &mut fill_alpha,
                         min: 0,
                         max: 80,
                     }),
                     gear: Some(LayerRowGear::Open {
-                        hover: "Open the warnings tab (filters · fill · full text)",
+                        hover: "Open the Alerts tab (filters · fill · full text)",
                         clicked: &mut open_severe,
                     }),
                     ..Default::default()

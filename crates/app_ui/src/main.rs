@@ -505,7 +505,7 @@ const LOOP_SPEED_PERCENT_OPTIONS: &[u16] =
     &[25, 50, 75, 100, 150, 200, 300, 400, 800, 1600, 3200, 6400];
 const BACKGROUND_ACTIVITY_REPAINT_MS: u64 = 250;
 const SATELLITE_MAP_LAYER_HOVER: &str =
-    "Render the current frame as a layer under the radar (opacity in Custom)";
+    "Render the current frame as a layer under the radar (opacity in Map)";
 const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Custom > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar (US or international, whichever is closer). When a loop is loaded, WSR-88D overlays auto-sync to that loop; international overlays refresh live on their provider cadence.";
 const SECURITY_UNSIGNED_BUILD_TEXT: &str = "Official Windows release binaries are Authenticode-signed (Azure Trusted Signing). Windows Defender or SmartScreen may still warn on unsigned local builds or renamed copies. Use official GitHub release assets when possible; do not whitelist random copies.";
 const SECURITY_SIGNATURE_STATUS_TEXT: &str = "In-app updates install only after two checks pass on the downloaded file: it must match the SHA-256 the release published, and Windows (WinVerifyTrust) must report a valid Authenticode signature. Anything else is deleted and reported here.";
@@ -7657,17 +7657,22 @@ const SIDEBAR_TABS: &[SidebarTab] = &[
 ];
 
 fn sidebar_tab_label(tab: SidebarTab, brand: &settings::BrandConfig) -> &str {
-    fn non_empty<'a>(value: &'a str, fallback: &'a str) -> &'a str {
-        if value.trim().is_empty() {
-            fallback
+    // Empty values AND the pre-rename default labels fall through to the
+    // current defaults: installs that merely persisted the old "Custom"/
+    // "Severe" defaults pick up the Map/Alerts rename, while a deliberate
+    // brand override still wins.
+    fn feature_label<'a>(value: &'a str, legacy_default: &str, current: &'a str) -> &'a str {
+        let value = value.trim();
+        if value.is_empty() || value == legacy_default {
+            current
         } else {
-            value.trim()
+            value
         }
     }
     match tab {
-        SidebarTab::Radar => non_empty(&brand.features.radar, "Radar"),
-        SidebarTab::Layers => non_empty(&brand.features.map, "Custom"),
-        SidebarTab::Severe => non_empty(&brand.features.warnings, "Severe"),
+        SidebarTab::Radar => feature_label(&brand.features.radar, "Radar", "Radar"),
+        SidebarTab::Layers => feature_label(&brand.features.map, "Custom", "Map"),
+        SidebarTab::Severe => feature_label(&brand.features.warnings, "Severe", "Alerts"),
         SidebarTab::Data => "Data",
         SidebarTab::Settings => "⚙",
     }
@@ -23535,7 +23540,7 @@ impl ViewerApp {
             ui.label("Color");
             if ui
                 .small_button("Edit…")
-                .on_hover_text("Open the Appearance section in the Custom tab")
+                .on_hover_text("Open the Appearance section in the Map tab")
                 .clicked()
             {
                 self.request_color_table_manager(family);
@@ -63484,12 +63489,24 @@ mod tests {
     }
 
     #[test]
-    fn custom_tab_advertises_layers_and_appearance() {
+    fn map_tab_advertises_layers_and_appearance() {
         assert!(SIDEBAR_TABS.contains(&SidebarTab::Layers));
         assert_eq!(
             sidebar_tab_label(SidebarTab::Layers, &settings::BrandConfig::default()),
-            "Custom"
+            "Map"
         );
+        assert_eq!(
+            sidebar_tab_label(SidebarTab::Severe, &settings::BrandConfig::default()),
+            "Alerts"
+        );
+        // Persisted pre-rename defaults remap; a real brand override wins.
+        let mut legacy = settings::BrandConfig::default();
+        legacy.features.map = "Custom".to_owned();
+        legacy.features.warnings = "Severe".to_owned();
+        assert_eq!(sidebar_tab_label(SidebarTab::Layers, &legacy), "Map");
+        assert_eq!(sidebar_tab_label(SidebarTab::Severe, &legacy), "Alerts");
+        legacy.features.map = "Layers+".to_owned();
+        assert_eq!(sidebar_tab_label(SidebarTab::Layers, &legacy), "Layers+");
         let tooltip = sidebar_tab_tooltip(SidebarTab::Layers);
         assert!(tooltip.contains("map layers"));
         assert!(tooltip.contains("radar age"));
@@ -63499,7 +63516,8 @@ mod tests {
         assert!(settings_tooltip.contains("alerts"));
         assert!(settings_tooltip.contains("performance"));
         assert!(!settings_tooltip.contains("color tables"));
-        assert!(SATELLITE_MAP_LAYER_HOVER.contains("Custom"));
+        assert!(SATELLITE_MAP_LAYER_HOVER.contains("Map"));
+        assert!(!SATELLITE_MAP_LAYER_HOVER.contains("Custom"));
         assert!(!SATELLITE_MAP_LAYER_HOVER.contains("Layers"));
     }
 

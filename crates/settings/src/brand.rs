@@ -202,8 +202,11 @@ impl Default for BrandFeatureLabels {
     fn default() -> Self {
         Self {
             radar: "Radar".to_owned(),
-            map: "Custom".to_owned(),
-            warnings: "Severe".to_owned(),
+            // Renamed from "Custom"/"Severe" (sidebar UI refresh wave 2).
+            // The sidebar remaps those legacy defaults at display time so
+            // installs that merely persisted them pick up the rename.
+            map: "Map".to_owned(),
+            warnings: "Alerts".to_owned(),
             evacuation: "Evacuation".to_owned(),
             air_quality: "Air Quality".to_owned(),
         }
