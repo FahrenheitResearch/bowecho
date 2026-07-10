@@ -4472,6 +4472,10 @@ struct AsyncRenderResult {
 /// Background cell-identification result: (frame key, cells).
 type StormCellsResult = (FrameWorkKey, Vec<StormCell>);
 type RotationMarkersResult = (DealiasFrameWorkKey, Vec<RotationMarker>);
+/// One TILT list row: (index, elevation_deg, radial_count, start_time,
+/// is_selected, has_selected_product) — built in radar_controls_panel,
+/// rendered by radar_tilt_section_body.
+type TiltCutRow = (usize, f32, usize, Option<DateTime<Utc>>, bool, bool);
 /// (grid hash, inverse LUT) for the decoupled model geolocation.
 type ModelLutEntry = (String, Arc<model_layer::InverseLut>);
 type NativeSoundingResult = (
@@ -22659,7 +22663,7 @@ impl ViewerApp {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         editing_pane: Option<usize>,
-        cut_rows: &[(usize, f32, usize, Option<DateTime<Utc>>, bool, bool)],
+        cut_rows: &[TiltCutRow],
     ) {
         ui.horizontal(|ui| {
             ui.weak("↑/↓");
