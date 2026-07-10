@@ -1016,7 +1016,7 @@ fn satellite(ui: &mut egui::Ui) {
     subhead(ui, "SIMULATED SATELLITE");
     para(
         ui,
-        "Windows \u{25be} \u{25b8} Simulated satellite opens BowEcho's embedded SimSat engine. \
+        "Windows > Simulated satellite opens BowEcho's embedded SimSat engine. \
          It renders physically based visible, GeoColor, sandwich, thermal-IR, water-vapor, \
          and derived products from local WRF output or HRRR native-level data. Finished \
          visible/IR frames are written directly into this same satellite store, selected in \

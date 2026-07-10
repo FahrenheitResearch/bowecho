@@ -435,7 +435,7 @@ impl ViewerApp {
                     map_request = self.sat_last_frame.clone();
                 }
                 if ui
-                    .add_enabled(frame_available, egui::Button::new("🗺 Native plot"))
+                    .add_enabled(frame_available, egui::Button::new("Native plot"))
                     .on_hover_text(
                         "Render the selected satellite frame through BowEcho's georeferenced \
                          native plotter. Scalar bands retain raw values/units; RGB composites \
