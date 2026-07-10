@@ -17097,6 +17097,14 @@ impl ViewerApp {
             ui.weak("A load is already running.");
         }
 
+        // Pack rows (wave 2): line 1 = chevron + truncating strong title +
+        // right-aligned action cluster; line 2 = weak monospace meta
+        // (site | range | frames) through the kit status block. Fits 320.
+        /// Reserved width for the Load / -3 / +3 action cluster.
+        const PACK_CLUSTER_W: f32 = 124.0;
+        /// Reserved width for a lone Load button.
+        const PACK_LOAD_W: f32 = 52.0;
+
         let mut requested = None;
         for pack in data_packs::BUILT_IN_DATA_PACKS {
             let mut expanded = self.data_pack_expanded.contains(pack.id);
@@ -17111,67 +17119,71 @@ impl ViewerApp {
                     {
                         expanded = !expanded;
                     }
-                    ui.label(egui::RichText::new(pack.title).strong());
-                    ui.weak(format!(
-                        "{} | {} to {}",
-                        pack.site_id, pack.start_utc, pack.end_utc
-                    ));
-                    if loaded.is_some() {
-                        ui.weak(format!("{} frames", self.primary.history.len()));
-                    }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Load"))
-                        .on_hover_text("List the public Level II archive, download the pack frames, and apply the review scene")
-                        .clicked()
-                    {
-                        requested = Some((
-                            *pack,
-                            data_packs::DataPackLoadOptions::default(),
-                            true,
-                        ));
-                    }
-                    let prev_options =
-                        loaded.map(|loaded| data_packs::DataPackLoadOptions {
-                            extra_start_scans: loaded.extra_start_scans + 3,
-                            extra_end_scans: loaded.extra_end_scans,
-                        });
-                    if ui
-                        .add_enabled(!busy && prev_options.is_some(), egui::Button::new("-3"))
-                        .on_hover_text("Load three more scans before this pack's current start")
-                        .clicked()
-                        && let Some(options) = prev_options
-                    {
-                        requested = Some((*pack, options, false));
-                    }
-                    let next_options =
-                        loaded.map(|loaded| data_packs::DataPackLoadOptions {
+                    let title_width = (ui.available_width() - PACK_CLUSTER_W).max(60.0);
+                    data_pack_title_cell(ui, pack.title, title_width);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Right-to-left: +3 at the edge, then -3, then Load.
+                        let next_options = loaded.map(|loaded| data_packs::DataPackLoadOptions {
                             extra_start_scans: loaded.extra_start_scans,
                             extra_end_scans: loaded.extra_end_scans + 3,
                         });
-                    if ui
-                        .add_enabled(!busy && next_options.is_some(), egui::Button::new("+3"))
-                        .on_hover_text("Load three more scans after this pack's current end")
-                        .clicked()
-                        && let Some(options) = next_options
-                    {
-                        requested = Some((*pack, options, false));
-                    }
+                        if ui
+                            .add_enabled(!busy && next_options.is_some(), egui::Button::new("+3"))
+                            .on_hover_text("Load three more scans after this pack's current end")
+                            .clicked()
+                            && let Some(options) = next_options
+                        {
+                            requested = Some((*pack, options, false));
+                        }
+                        let prev_options = loaded.map(|loaded| data_packs::DataPackLoadOptions {
+                            extra_start_scans: loaded.extra_start_scans + 3,
+                            extra_end_scans: loaded.extra_end_scans,
+                        });
+                        if ui
+                            .add_enabled(!busy && prev_options.is_some(), egui::Button::new("-3"))
+                            .on_hover_text("Load three more scans before this pack's current start")
+                            .clicked()
+                            && let Some(options) = prev_options
+                        {
+                            requested = Some((*pack, options, false));
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Load"))
+                            .on_hover_text("List the public Level II archive, download the pack frames, and apply the review scene")
+                            .clicked()
+                        {
+                            requested = Some((
+                                *pack,
+                                data_packs::DataPackLoadOptions::default(),
+                                true,
+                            ));
+                        }
+                    });
                 });
+                let mut meta = format!("{} | {} to {}", pack.site_id, pack.start_utc, pack.end_utc);
+                if loaded.is_some() {
+                    meta.push_str(&format!(" | {} frames", self.primary.history.len()));
+                }
+                panel_kit::status_block(ui, &meta, None);
                 if expanded {
                     ui.indent("data_pack_details", |ui| {
                         ui.weak(pack.summary);
                         let (extra_start, extra_end) = loaded
                             .map(|loaded| (loaded.extra_start_scans, loaded.extra_end_scans))
                             .unwrap_or((0, 0));
-                        ui.weak(format!(
-                            "Anchor {} | focus {:.3}, {:.3} | frames {} (+{} / +{})",
-                            pack.anchor_utc,
-                            pack.focus_lat,
-                            pack.focus_lon,
-                            pack.max_frames,
-                            extra_start,
-                            extra_end
-                        ));
+                        panel_kit::status_block(
+                            ui,
+                            &format!(
+                                "Anchor {} | focus {:.3}, {:.3} | frames {} (+{} / +{})",
+                                pack.anchor_utc,
+                                pack.focus_lat,
+                                pack.focus_lon,
+                                pack.max_frames,
+                                extra_start,
+                                extra_end
+                            ),
+                            None,
+                        );
                     });
                 }
             });
@@ -17186,6 +17198,7 @@ impl ViewerApp {
             let mut expanded = self.data_pack_expanded.contains(pack.id);
             let loaded = self.loaded_data_pack.filter(|loaded| loaded.id == pack.id);
             ui.separator();
+            let mut research_requested = false;
             ui.push_id(pack.id, |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -17195,29 +17208,43 @@ impl ViewerApp {
                     {
                         expanded = !expanded;
                     }
-                    ui.label(egui::RichText::new(pack.title).strong());
-                    ui.weak(format!("{} | latest {} research frames", pack.feed_id, pack.frame_count));
-                    if loaded.is_some() {
-                        ui.weak(format!("{} frames", self.primary.history.len()));
-                    }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Load"))
-                        .on_hover_text("Fetch the feed dir.list, download the newest decodable frames, and apply the review scene")
-                        .clicked()
-                    {
-                        self.start_research_feed_data_pack(*pack, ctx);
-                    }
+                    let title_width = (ui.available_width() - PACK_LOAD_W).max(60.0);
+                    data_pack_title_cell(ui, pack.title, title_width);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Load"))
+                            .on_hover_text("Fetch the feed dir.list, download the newest decodable frames, and apply the review scene")
+                            .clicked()
+                        {
+                            research_requested = true;
+                        }
+                    });
                 });
+                let mut meta = format!(
+                    "{} | latest {} research frames",
+                    pack.feed_id, pack.frame_count
+                );
+                if loaded.is_some() {
+                    meta.push_str(&format!(" | {} frames", self.primary.history.len()));
+                }
+                panel_kit::status_block(ui, &meta, None);
                 if expanded {
                     ui.indent("research_data_pack_details", |ui| {
                         ui.weak(pack.summary);
-                        ui.weak(format!(
-                            "Feed {} | focus {:.3}, {:.3} | frames {}",
-                            pack.poll_url, pack.focus_lat, pack.focus_lon, pack.frame_count
-                        ));
+                        panel_kit::status_block(
+                            ui,
+                            &format!(
+                                "Feed {} | focus {:.3}, {:.3} | frames {}",
+                                pack.poll_url, pack.focus_lat, pack.focus_lon, pack.frame_count
+                            ),
+                            None,
+                        );
                     });
                 }
             });
+            if research_requested {
+                self.start_research_feed_data_pack(*pack, ctx);
+            }
             if expanded {
                 self.data_pack_expanded.insert(pack.id.to_owned());
             } else {
@@ -17238,28 +17265,39 @@ impl ViewerApp {
                     {
                         expanded = !expanded;
                     }
-                    ui.label(egui::RichText::new(pack.title).strong());
-                    ui.weak(format!(
+                    let title_width = (ui.available_width() - PACK_LOAD_W).max(60.0);
+                    data_pack_title_cell(ui, pack.title, title_width);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Load"))
+                            .on_hover_text(
+                                "List the provider archive, download the pack window, and apply the review scene",
+                            )
+                            .clicked()
+                        {
+                            intl_requested = Some(*pack);
+                        }
+                    });
+                });
+                panel_kit::status_block(
+                    ui,
+                    &format!(
                         "{}/{} | {} to {}",
                         pack.provider_id, pack.site_id, pack.start_utc, pack.end_utc
-                    ));
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Load"))
-                        .on_hover_text(
-                            "List the provider archive, download the pack window, and apply the review scene",
-                        )
-                        .clicked()
-                    {
-                        intl_requested = Some(*pack);
-                    }
-                });
+                    ),
+                    None,
+                );
                 if expanded {
                     ui.indent("intl_data_pack_details", |ui| {
                         ui.weak(pack.summary);
-                        ui.weak(format!(
-                            "Focus {:.3}, {:.3} | frames {}",
-                            pack.focus_lat, pack.focus_lon, pack.max_frames
-                        ));
+                        panel_kit::status_block(
+                            ui,
+                            &format!(
+                                "Focus {:.3}, {:.3} | frames {}",
+                                pack.focus_lat, pack.focus_lon, pack.max_frames
+                            ),
+                            None,
+                        );
                     });
                 }
             });
@@ -37853,6 +37891,20 @@ fn fixed_status_label_with_sense(
 ) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, PANEL_BUTTON_HEIGHT), sense);
     ui.put(rect, egui::Label::new(text).truncate().sense(sense))
+}
+
+/// Data-pack row title: strong, truncating at the row's title budget, full
+/// title on hover (wave-2 pack-row grammar).
+fn data_pack_title_cell(ui: &mut egui::Ui, title: &str, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width.max(1.0), PANEL_BUTTON_HEIGHT),
+        egui::Sense::hover(),
+    );
+    ui.put(
+        rect,
+        egui::Label::new(egui::RichText::new(title).strong()).truncate(),
+    )
+    .on_hover_text(title);
 }
 
 fn layer_state_color(state: &str) -> egui::Color32 {

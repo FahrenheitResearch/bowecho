@@ -1538,16 +1538,24 @@ impl ViewerApp {
     /// open-data feeds. This is acquisition (it replaces the primary volume
     /// source), not a layer — it lives in the DATA tab (spec §1).
     pub(crate) fn live_feeds_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-                    ui.label("Poll URL").on_hover_text(
-                        "GR2A-style polling: a served directory containing dir.list (the convention DOW/mobile radar crews use). Newest file loads automatically every 15 s, decoded natively (Level II or DORADE), and joins the frame loop.",
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.poll_url)
-                            .hint_text("http://host:port/path")
-                            .desired_width(150.0),
-                    );
-                    ui.menu_button("Feeds ▾", |ui| {
+        panel_kit::row(ui, "Poll URL", |ui| {
+            // Right-to-left: Start/Stop at the edge, the Feeds menu,
+            // then the URL input truncating in whatever remains
+            // (never forcing the panel wider — 320 pt rule).
+            let label = if self.poll_active { "Stop" } else { "Start" };
+            if ui.button(label).clicked() {
+                if self.poll_active {
+                    self.poll_active = false;
+                    self.primary.live.dedupe_key = None;
+                    self.poll_next = None;
+                } else if normalized_poll_url(&self.poll_url).is_empty() {
+                    self.status = "Poll URL: enter a URL or choose a saved link".to_owned();
+                } else {
+                    let url = self.poll_url.clone();
+                    self.start_known_feed_poll(&url);
+                }
+            }
+            ui.menu_button("Feeds ▾", |ui| {
                         ui.weak("research radars serving raw Level II");
                         // Grown from the same community table the map
                         // markers draw from, grouped by state — menu and
@@ -1584,27 +1592,26 @@ impl ViewerApp {
                     .on_hover_text(
                         "Community research-radar poll roots (IEM Level II host, ND State Water Commission, self-hosted university radars) — radars that aren't NEXRAD sites. Community-contributed catalog; the same sites are click-to-poll teal markers on the map.",
                     );
-                    let label = if self.poll_active { "Stop" } else { "Start" };
-                    if ui.button(label).clicked() {
-                        if self.poll_active {
-                            self.poll_active = false;
-                            self.primary.live.dedupe_key = None;
-                            self.poll_next = None;
-                        } else if normalized_poll_url(&self.poll_url).is_empty() {
-                            self.status = "Poll URL: enter a URL or choose a saved link".to_owned();
-                        } else {
-                            let url = self.poll_url.clone();
-                            self.start_known_feed_poll(&url);
-                        }
-                    }
-                    if self.poll_active && matches!(self.primary.feed, FeedSource::CustomUrl(_)) {
-                        ui.weak(
-                            self.primary.live.dedupe_key
-                                .as_deref()
-                                .unwrap_or("waiting for dir.list…"),
-                        );
-                    }
+            ui.add(
+                        egui::TextEdit::singleline(&mut self.poll_url)
+                            .hint_text("http://host:port/path")
+                            .desired_width(ui.available_width()),
+                    )
+                    .on_hover_text(
+                        "GR2A-style polling: a served directory containing dir.list (the convention DOW/mobile radar crews use). Newest file loads automatically every 15 s, decoded natively (Level II or DORADE), and joins the frame loop.",
+                    );
         });
+        if self.poll_active && matches!(self.primary.feed, FeedSource::CustomUrl(_)) {
+            panel_kit::status_block(
+                ui,
+                self.primary
+                    .live
+                    .dedupe_key
+                    .as_deref()
+                    .unwrap_or("waiting for dir.list…"),
+                None,
+            );
+        }
         self.custom_poll_links_section(ui, ctx);
         self.intl_feeds_row(ui, ctx);
     }
@@ -1614,7 +1621,9 @@ impl ViewerApp {
     /// markers so there is exactly one custom-URL start sequence.
     fn custom_poll_links_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        // Wrapped action rows: the three fill buttons fold under the label
+        // at 320 pt.
+        ui.horizontal_wrapped(|ui| {
             ui.label("Custom links").on_hover_text(
                 "Saved GR2A-style poll roots for private/mobile radars. Each saved link can also carry a marker position, drawn as a red dot on the map.",
             );
@@ -1669,7 +1678,7 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.custom_poll_label_input)
                     .hint_text("label")
@@ -1721,6 +1730,9 @@ impl ViewerApp {
                         let active = self.poll_active
                             && matches!(self.primary.feed, FeedSource::CustomUrl(_))
                             && poll_urls_match(&self.poll_url, &entry.poll_url);
+                        // Saved-link row grammar: dot + truncating title +
+                        // right-aligned Poll/Edit/remove cluster (fits 320).
+                        const LINK_CLUSTER_W: f32 = 110.0;
                         ui.horizontal(|ui| {
                             ui.colored_label(
                                 egui::Color32::from_rgb(255, 116, 118),
@@ -1731,21 +1743,31 @@ impl ViewerApp {
                             } else {
                                 format!("{site_id} {label}")
                             };
-                            ui.label(title)
+                            let title_width = (ui.available_width() - LINK_CLUSTER_W).max(60.0);
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(title_width, crate::PANEL_BUTTON_HEIGHT),
+                                egui::Sense::hover(),
+                            );
+                            ui.put(rect, egui::Label::new(title).truncate())
                                 .on_hover_text(format!("{}\n{}", entry.poll_url, coords));
-                            if ui.button("Poll").clicked() {
-                                start_index = Some(index);
-                            }
-                            if ui.button("Edit").clicked() {
-                                edit_index = Some(index);
-                            }
-                            if ui
-                                .button("×")
-                                .on_hover_text("Remove this custom link")
-                                .clicked()
-                            {
-                                remove_index = Some(index);
-                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button("×")
+                                        .on_hover_text("Remove this custom link")
+                                        .clicked()
+                                    {
+                                        remove_index = Some(index);
+                                    }
+                                    if ui.button("Edit").clicked() {
+                                        edit_index = Some(index);
+                                    }
+                                    if ui.button("Poll").clicked() {
+                                        start_index = Some(index);
+                                    }
+                                },
+                            );
                         });
                     }
                 });
@@ -1957,17 +1979,14 @@ impl ViewerApp {
         let selected_capability = capabilities
             .iter()
             .find(|capability| capability.provider_id == self.coverage_provider_id);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Source").on_hover_text(
-                "Choose a provider/site, probe the recent catalog without downloading volumes, then load the same path.",
-            );
+        panel_kit::row(ui, "Provider", |ui| {
             let provider_text = selected_capability
                 .map(|capability| capability.provider_label)
                 .unwrap_or("Provider");
             let mut next_provider = self.coverage_provider_id.clone();
             egui::ComboBox::from_id_salt("coverage_provider_combo")
                 .selected_text(provider_text)
-                .width(168.0)
+                .width(ui.available_width().clamp(120.0, 200.0))
                 .show_ui(ui, |ui| {
                     for capability in &capabilities {
                         ui.selectable_value(
@@ -1976,7 +1995,11 @@ impl ViewerApp {
                             format!("{} ({})", capability.provider_label, capability.country),
                         );
                     }
-                });
+                })
+                .response
+                .on_hover_text(
+                    "Choose a provider/site, probe the recent catalog without downloading volumes, then load the same path.",
+                );
             if next_provider != self.coverage_provider_id {
                 self.coverage_provider_id = next_provider;
                 if let Some(first) = data_source::international::intl_static_sites()
@@ -1989,7 +2012,8 @@ impl ViewerApp {
                 }
                 self.coverage_probe_result = None;
             }
-
+        });
+        panel_kit::row(ui, "Site", |ui| {
             let site_text = provider_sites
                 .iter()
                 .find(|site| site.site_id == self.coverage_site_id)
@@ -1998,7 +2022,7 @@ impl ViewerApp {
             let mut next_site = self.coverage_site_id.clone();
             egui::ComboBox::from_id_salt("coverage_site_combo")
                 .selected_text(site_text)
-                .width((ui.available_width() - 180.0).clamp(130.0, 240.0))
+                .width(ui.available_width().clamp(120.0, 240.0))
                 .show_ui(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("coverage_site_combo_scroll")
@@ -2017,8 +2041,8 @@ impl ViewerApp {
                 self.coverage_site_id = next_site;
                 self.coverage_probe_result = None;
             }
-
-            ui.label("Frames");
+        });
+        panel_kit::row(ui, "Frames", |ui| {
             if ui
                 .add(
                     egui::DragValue::new(&mut self.coverage_frame_count)
@@ -2198,10 +2222,53 @@ impl ViewerApp {
     fn intl_feeds_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut list_provider: Option<String> = None;
         let mut start: Option<(String, String)> = None;
-        ui.horizontal(|ui| {
-            ui.label("International").on_hover_text(
-                "National open-data radar networks (ODIM_H5 polar volumes — OPERA Data Information Model), decoded natively. Pick a country's provider, then a site: the newest volume polls every 60 s and joins the frame loop like any polled feed.",
-            );
+        let intl_polling =
+            self.poll_active && matches!(self.primary.feed, FeedSource::Live(SiteRef::Intl { .. }));
+        panel_kit::row(ui, "International", |ui| {
+            // Right-to-left: Start/Stop at the edge, Site, then Country.
+            if intl_polling {
+                if ui.button("Stop").clicked() {
+                    self.poll_active = false;
+                    self.primary.live.dedupe_key = None;
+                    self.poll_next = None;
+                }
+            } else if let Some(FeedSource::Live(SiteRef::Intl {
+                provider_id,
+                site_id,
+            })) = FeedSource::intl_from_settings(&self.app_settings)
+            {
+                // Resume the persisted selection (mirrors poll_url Start).
+                if ui
+                    .button("Start")
+                    .on_hover_text(format!(
+                        "Resume {} {site_id}",
+                        intl_provider_label(&provider_id)
+                    ))
+                    .clicked()
+                {
+                    start = Some((provider_id, site_id));
+                }
+            }
+            if let Some(sites) = &self.intl_sites {
+                ui.menu_button("Site ▾", |ui| {
+                    ui.set_min_width(160.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("intl_site_list")
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for site in sites {
+                                if ui.button(&site.label).clicked() {
+                                    start =
+                                        Some((site.provider_id.to_owned(), site.site_id.clone()));
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+            }
+            if self.intl_sites_rx.in_flight() {
+                ui.spinner();
+            }
             let provider_button = if self.intl_picker_provider.is_empty() {
                 "Country ▾".to_owned()
             } else {
@@ -2234,62 +2301,23 @@ impl ViewerApp {
                 }
             })
             .response
-            .on_hover_text("National feed providers, grouped by country");
-            if self.intl_sites_rx.in_flight() {
-                ui.spinner();
-            }
-            if let Some(sites) = &self.intl_sites {
-                ui.menu_button("Site ▾", |ui| {
-                    ui.set_min_width(160.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("intl_site_list")
-                        .max_height(300.0)
-                        .show(ui, |ui| {
-                            for site in sites {
-                                if ui.button(&site.label).clicked() {
-                                    start = Some((
-                                        site.provider_id.to_owned(),
-                                        site.site_id.clone(),
-                                    ));
-                                    ui.close();
-                                }
-                            }
-                        });
-                });
-            }
-            let intl_polling =
-                self.poll_active && matches!(self.primary.feed, FeedSource::Live(SiteRef::Intl { .. }));
-            if intl_polling {
-                if ui.button("Stop").clicked() {
-                    self.poll_active = false;
-                    self.primary.live.dedupe_key = None;
-                    self.poll_next = None;
-                }
-                // Same status grammar as the URL poll: the dedupe key of
-                // the installed frame (Polled:/Poll: live in self.status).
-                ui.weak(
-                    self.primary.live.dedupe_key
-                        .as_deref()
-                        .unwrap_or("waiting for catalog…"),
-                );
-            } else if let Some(FeedSource::Live(SiteRef::Intl {
-                provider_id,
-                site_id,
-            })) = FeedSource::intl_from_settings(&self.app_settings)
-            {
-                // Resume the persisted selection (mirrors poll_url Start).
-                if ui
-                    .button("Start")
-                    .on_hover_text(format!(
-                        "Resume {} {site_id}",
-                        intl_provider_label(&provider_id)
-                    ))
-                    .clicked()
-                {
-                    start = Some((provider_id, site_id));
-                }
-            }
+            .on_hover_text(
+                "National open-data radar networks (ODIM_H5 polar volumes — OPERA Data Information Model), decoded natively. Pick a country's provider, then a site: the newest volume polls every 60 s and joins the frame loop like any polled feed. Providers grouped by country.",
+            );
         });
+        if intl_polling {
+            // Same status grammar as the URL poll: the dedupe key of the
+            // installed frame (Polled:/Poll: live in self.status).
+            panel_kit::status_block(
+                ui,
+                self.primary
+                    .live
+                    .dedupe_key
+                    .as_deref()
+                    .unwrap_or("waiting for catalog…"),
+                None,
+            );
+        }
         if let Some(provider_id) = list_provider {
             self.start_intl_site_listing(&provider_id, ctx);
         }
