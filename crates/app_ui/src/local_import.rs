@@ -523,10 +523,9 @@ fn push_canonical_surface_fields(
         )?;
     }
 
-    if let (Some(rainc), Some(rainnc)) = (
-        read_first_2d(src, "RAINC")?,
-        read_first_2d(src, "RAINNC")?,
-    ) {
+    if let (Some(rainc), Some(rainnc)) =
+        (read_first_2d(src, "RAINC")?, read_first_2d(src, "RAINNC")?)
+    {
         let rainsh = read_first_2d(src, "RAINSH")?;
         let values = combine_precip(&rainc, &rainnc, rainsh.as_ref())?;
         push_computed(
@@ -1836,10 +1835,7 @@ mod tests {
             tk.len()
         );
         for value in tk.iter().filter(|value| value.is_finite()) {
-            assert!(
-                (180.0..=340.0).contains(value),
-                "TK {value} K non-physical"
-            );
+            assert!((180.0..=340.0).contains(value), "TK {value} K non-physical");
         }
 
         let _ = std::fs::remove_dir_all(store_root);
