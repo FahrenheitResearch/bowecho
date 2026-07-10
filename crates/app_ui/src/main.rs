@@ -38051,7 +38051,7 @@ enum LayerRowOpacity<'a> {
     },
 }
 
-/// Standardized reorder slot: two small ↑/↓ buttons. Deliberately NOT
+/// Standardized reorder slot: two small ⏶/⏷ buttons. Deliberately NOT
 /// drag-and-drop — the priority persona operates a trackpad in a moving
 /// truck; two 18 px buttons beat a drag gesture under stress (spec §2.1).
 /// A click writes +1 (draw later/higher) or -1 (draw earlier/lower) into
@@ -38124,7 +38124,7 @@ impl Default for LayerRowSpec<'_> {
 
 /// One unified layer row — row grammar v3 (docs/ui-refresh-plan.md wave 2):
 ///
-///   [vis] [name (flex, hover = details)] [dot slot] [↑↓ extras… count]
+///   [vis] [name (flex, hover = details)] [dot slot] [⏶⏷ extras… count]
 ///   [opacity ───] [⚙] [✕]
 ///
 /// Every layer type in the rail renders through this one shape, and the
@@ -38230,15 +38230,19 @@ fn layer_row(
                 ui.set_max_width(middle_width);
                 ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
                 if let Some(LayerRowOrder { delta }) = order {
+                    // ⏶/⏷ (U+23F6/23F7, emoji-icon-font — in BOTH egui
+                    // family fallback chains), NOT ↑/↓ (U+2191/2193): the
+                    // proportional family has no plain arrows and rendered
+                    // them as tofu (fonts.rs coverage test pins this).
                     if ui
-                        .small_button("↑")
+                        .small_button("⏶")
                         .on_hover_text("Draw later (higher)")
                         .clicked()
                     {
                         *delta = 1;
                     }
                     if ui
-                        .small_button("↓")
+                        .small_button("⏷")
                         .on_hover_text("Draw earlier (lower)")
                         .clicked()
                     {

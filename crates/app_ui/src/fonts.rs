@@ -58,6 +58,46 @@ mod tests {
         let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
     }
 
+    /// The arrow-glyph contract behind the v0.30 tofu fixes (integrator
+    /// screenshot round caught ↑/↓ boxes): egui's default PROPORTIONAL
+    /// family (Ubuntu-Light + NotoEmoji + emoji-icon-font) covers none of
+    /// the plain arrows U+2190-2193 or the black triangles U+25B2/25BC —
+    /// those live only in Hack, the monospace primary. The medium
+    /// triangles U+23F4-23F7 come from emoji-icon-font, which sits in
+    /// BOTH family fallback chains, so ⏴⏵⏶⏷ are the sanctioned
+    /// arrow-like glyphs for buttons/labels (the same font already
+    /// renders the shipping ⏸ and ⚙). If this test ever flips, the
+    /// tofu swaps (reorder buttons, gdex expander, hotkey legend,
+    /// wrf_fields labels) can be revisited.
+    #[test]
+    fn arrow_glyph_coverage_matches_the_tofu_swap_choices() {
+        let ctx = egui::Context::default();
+        install_cjk_fallback(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().fonts_mut(|fonts| {
+                let prop = egui::FontId::proportional(14.0);
+                let mono = egui::FontId::monospace(11.0);
+                // The chosen replacements render in BOTH families.
+                for text in ["⏴", "⏵", "⏶", "⏷", "◀", "▶", "⏸"] {
+                    assert!(fonts.has_glyphs(&prop, text), "proportional lacks {text}");
+                    assert!(fonts.has_glyphs(&mono, text), "monospace lacks {text}");
+                }
+                // The originals are tofu in proportional text — why the
+                // swaps exist at all.
+                for text in ["↑", "↓", "←", "→", "▲", "▼"] {
+                    assert!(
+                        !fonts.has_glyphs(&prop, text),
+                        "{text} now covered in proportional — tofu swaps obsolete?"
+                    );
+                }
+                // ...but covered in monospace (Hack): the map inspector
+                // card's "beam ↑" line renders through
+                // FontId::monospace(11.0) and deliberately keeps ↑.
+                assert!(fonts.has_glyphs(&mono, "↑↓"));
+            });
+        });
+    }
+
     /// Japanese text lays out through real glyphs — coverage, not the
     /// tofu replacement (which would still have nonzero width, hence the
     /// has_glyphs checks and the no-fallback control).

@@ -3170,7 +3170,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "Shortwave ↑ TOA — reflected solar",
+                "Shortwave up TOA — reflected solar",
                 "Sensible heat flux (HFX)",
                 "temperature_2m",
                 "wrf_some_experimental_field",

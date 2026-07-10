@@ -970,7 +970,9 @@ fn render_node(
     let load = nodes.get(catalog_url);
     ui.horizontal(|ui| {
         ui.add_space(depth as f32 * 14.0);
-        let arrow = if is_expanded { "▼" } else { "▶" };
+        // ⏷/⏵ from emoji-icon-font — ▼ (U+25BC) is monospace-only in the
+        // egui defaults and rendered as tofu here (proportional label).
+        let arrow = if is_expanded { "⏷" } else { "⏵" };
         if ui
             .selectable_label(false, format!("{arrow} {title}"))
             .clicked()

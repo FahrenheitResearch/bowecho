@@ -1154,7 +1154,11 @@ impl ViewerApp {
     /// Hotkey reference (Settings ▸ Hotkeys).
     fn hotkeys_section(&mut self, ui: &mut egui::Ui) {
         ui.weak("PgUp/PgDn frames - Space play");
-        ui.weak("←/→ product · ↑/↓ tilt (focused pane)");
+        // Plain words, not ←→↑↓ arrow glyphs: the proportional UI font has
+        // none of U+2190-2193 and rendered all four as tofu (same finding
+        // as the TILT-section hint; fonts.rs coverage test pins it). Words
+        // also match the "PgUp/PgDn frames" line above.
+        ui.weak("Left/Right product · Up/Down tilt (focused pane)");
         let mut bindings: Vec<(&String, &String)> =
             self.app_settings.product_hotkeys.iter().collect();
         bindings.sort_by_key(|(key, _)| product_hotkey_sort_key(key));
