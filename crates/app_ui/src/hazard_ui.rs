@@ -188,8 +188,18 @@ impl ViewerApp {
                     "hazard_current_alerts_list",
                     HAZARD_LIST_SCROLL_HEIGHT,
                     |ui| {
+                        // Monospace advance measured the same way select_row
+                        // lays its text out, so the character budget matches
+                        // what actually fits the row.
                         let char_width = ui
-                            .fonts(|fonts| fonts.glyph_width(&egui::FontId::monospace(12.0), '0'))
+                            .painter()
+                            .layout_no_wrap(
+                                "0".to_owned(),
+                                egui::FontId::monospace(12.0),
+                                egui::Color32::WHITE,
+                            )
+                            .size()
+                            .x
                             .max(1.0);
                         let max_chars =
                             (((ui.available_width() - 12.0) / char_width).floor() as usize).max(8);

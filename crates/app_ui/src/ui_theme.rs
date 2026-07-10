@@ -8,7 +8,8 @@
 //! - glyph-only buttons are allowed exactly for the universal set already
 //!   in use (↑ ↓ ✕ ⚙ ↻ ◀ ▶ ⏸ ◉) and each MUST carry `on_hover_text`;
 //! - `LIVE_COLOR` marks live chips/dots only — never decoration;
-//! - row name widths come in exactly three tiers; never invent a fourth.
+//! - layer-row name width is ONE flexible column shared by every row
+//!   (`panel_kit::rail_name_width`); never invent per-row widths.
 
 use eframe::egui::Color32;
 
@@ -31,11 +32,6 @@ pub const LIVE_COLOR: Color32 = Color32::from_rgb(110, 245, 130);
 /// No combo box renders wider than this (the site combo fills, capped by
 /// its row's buttons).
 pub const COMBO_MAX_W: f32 = 220.0;
-
-/// Layer-row name width tiers: site IDs / standard / placefile titles.
-pub const NAME_W_SITE: f32 = 42.0;
-pub const NAME_W_STD: f32 = 96.0;
-pub const NAME_W_WIDE: f32 = 150.0;
 
 /// Shared opacity-slider width for the unified layer rows.
 pub const LAYER_ROW_SLIDER_WIDTH: f32 = 56.0;

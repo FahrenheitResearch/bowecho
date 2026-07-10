@@ -44,9 +44,9 @@ impl ViewerApp {
     fn appearance_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.appearance_profile_row(ui, ctx);
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Style overrides");
-            let reset_enabled = !self.styles_newer_schema && self.style_settings != Default::default();
+        panel_kit::row(ui, "Style overrides", |ui| {
+            let reset_enabled =
+                !self.styles_newer_schema && self.style_settings != Default::default();
             if ui
                 .add_enabled(reset_enabled, egui::Button::new("Reset all"))
                 .on_hover_text(if self.styles_newer_schema {
@@ -60,8 +60,18 @@ impl ViewerApp {
             }
         });
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Map backdrop");
+        panel_kit::row(ui, "Map backdrop", |ui| {
+            // Right-to-left control cluster: Reset sits at the row edge,
+            // the color swatch to its left.
+            if fixed_action_button(ui, "Reset", 52.0)
+                .on_hover_text("Reset to the built-in dark map backdrop")
+                .clicked()
+            {
+                self.style_settings.map.background_color = None;
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
             let mut color = self
                 .style_settings
                 .map
@@ -71,15 +81,6 @@ impl ViewerApp {
             if response.changed() {
                 color[3] = 255;
                 self.style_settings.map.background_color = Some(color);
-                self.rebuild_style_registry();
-                self.save_styles();
-                ctx.request_repaint();
-            }
-            if fixed_action_button(ui, "Reset", 52.0)
-                .on_hover_text("Reset to the built-in dark map backdrop")
-                .clicked()
-            {
-                self.style_settings.map.background_color = None;
                 self.rebuild_style_registry();
                 self.save_styles();
                 ctx.request_repaint();
@@ -106,8 +107,7 @@ impl ViewerApp {
             ctx.request_repaint();
         }
         ui.add_enabled_ui(self.app_settings.show_radar_labels, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Label style");
+            panel_kit::row(ui, "Label style", |ui| {
                 let mut style = RadarLabelStyle::from_key(&self.app_settings.radar_label_style);
                 egui::ComboBox::from_id_salt("radar_label_style")
                     .selected_text(style.label())
@@ -165,6 +165,8 @@ impl ViewerApp {
     fn radar_age_style_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label(egui::RichText::new("Radar age").strong());
         let resolved = self.style_registry.radar_age().clone();
+        // The two self-labeled toggles + the section Reset wrap as one
+        // family; the value/color pairs below are kit rows.
         ui.horizontal_wrapped(|ui| {
             let mut ring_enabled = resolved.ring_enabled;
             if ui
@@ -190,51 +192,6 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
 
-            let mut glyph_arc_radius_px = resolved.glyph_arc_radius_px.clamp(4.0, 24.0);
-            let arc_radius_response = ui
-                .add(
-                    egui::DragValue::new(&mut glyph_arc_radius_px)
-                        .range(4.0..=24.0)
-                        .speed(0.25)
-                        .prefix("Arc ")
-                        .suffix(" px"),
-                )
-                .on_hover_text("Fixed screen radius for loaded-site age arcs");
-            if arc_radius_response.changed() {
-                self.style_settings.radar_age.glyph_arc_radius_px =
-                    Some(glyph_arc_radius_px.clamp(4.0, 24.0));
-                self.rebuild_style_registry();
-                ctx.request_repaint();
-            }
-            if arc_radius_response.drag_stopped()
-                || (arc_radius_response.changed() && !arc_radius_response.dragged())
-            {
-                self.save_styles();
-            }
-
-            let mut stale_minutes =
-                (resolved.stale_chip_seconds.max(0) as f32 / 60.0).clamp(1.0, 60.0);
-            let stale_response = ui
-                .add(
-                    egui::DragValue::new(&mut stale_minutes)
-                        .range(1.0..=60.0)
-                        .speed(0.25)
-                        .prefix("STALE ")
-                        .suffix(" min"),
-                )
-                .on_hover_text("Live radar older than this shows the STALE chip");
-            if stale_response.changed() {
-                self.style_settings.radar_age.stale_chip_seconds =
-                    Some((stale_minutes * 60.0).round() as i64);
-                self.rebuild_style_registry();
-                ctx.request_repaint();
-            }
-            if stale_response.drag_stopped()
-                || (stale_response.changed() && !stale_response.dragged())
-            {
-                self.save_styles();
-            }
-
             if fixed_action_button(ui, "Reset", 52.0)
                 .on_hover_text("Reset radar-age ring, marker arc, thresholds, chip, and colors")
                 .clicked()
@@ -246,208 +203,220 @@ impl ViewerApp {
             }
         });
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Age thresholds")
-                .on_hover_text("Colors move from fresh to aging to stale to expired by scan age");
-            let mut fresh_minutes = (resolved.green_seconds.max(1) as f32 / 60.0).clamp(0.5, 240.0);
-            let mut aging_minutes =
-                (resolved.yellow_seconds.max(1) as f32 / 60.0).clamp(0.5, 240.0);
-            let mut stale_minutes = (resolved.red_seconds.max(1) as f32 / 60.0).clamp(0.5, 240.0);
-
-            let fresh_response = ui
-                .add(
-                    egui::DragValue::new(&mut fresh_minutes)
-                        .range(0.5..=240.0)
-                        .speed(0.25)
-                        .prefix("Fresh <= ")
-                        .suffix(" min"),
-                )
-                .on_hover_text("Age that still renders as the fresh color");
-            let aging_response = ui
-                .add(
-                    egui::DragValue::new(&mut aging_minutes)
-                        .range(0.5..=240.0)
-                        .speed(0.25)
-                        .prefix("Aging <= ")
-                        .suffix(" min"),
-                )
-                .on_hover_text("Age where the gradient reaches the aging color");
-            let stale_response = ui
-                .add(
-                    egui::DragValue::new(&mut stale_minutes)
-                        .range(0.5..=240.0)
-                        .speed(0.25)
-                        .prefix("Stale <= ")
-                        .suffix(" min"),
-                )
-                .on_hover_text(
-                    "Age where the gradient reaches stale and the marker arc becomes full",
-                );
-
-            if fresh_response.changed() || aging_response.changed() || stale_response.changed() {
-                let fresh_seconds = ((fresh_minutes * 60.0).round() as i64).max(1);
-                let aging_seconds = ((aging_minutes * 60.0).round() as i64).max(fresh_seconds);
-                let stale_seconds = ((stale_minutes * 60.0).round() as i64).max(aging_seconds);
-                self.style_settings.radar_age.green_seconds = Some(fresh_seconds);
-                self.style_settings.radar_age.yellow_seconds = Some(aging_seconds);
-                self.style_settings.radar_age.red_seconds = Some(stale_seconds);
-                self.rebuild_style_registry();
-                ctx.request_repaint();
-            }
-            let thresholds_committed = fresh_response.drag_stopped()
-                || aging_response.drag_stopped()
-                || stale_response.drag_stopped()
-                || (fresh_response.changed() && !fresh_response.dragged())
-                || (aging_response.changed() && !aging_response.dragged())
-                || (stale_response.changed() && !stale_response.dragged());
-            if thresholds_committed {
-                self.save_styles();
-            }
+        let mut glyph_arc_radius_px = resolved.glyph_arc_radius_px.clamp(4.0, 24.0);
+        let arc_radius_response = panel_kit::row(ui, "Arc radius", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut glyph_arc_radius_px)
+                    .range(4.0..=24.0)
+                    .speed(0.25)
+                    .suffix(" px"),
+            )
+            .on_hover_text("Fixed screen radius for loaded-site age arcs")
         });
+        if arc_radius_response.changed() {
+            self.style_settings.radar_age.glyph_arc_radius_px =
+                Some(glyph_arc_radius_px.clamp(4.0, 24.0));
+            self.rebuild_style_registry();
+            ctx.request_repaint();
+        }
+        if arc_radius_response.drag_stopped()
+            || (arc_radius_response.changed() && !arc_radius_response.dragged())
+        {
+            self.save_styles();
+        }
 
-        ui.horizontal_wrapped(|ui| {
-            let mut fresh = self
-                .style_settings
-                .radar_age
-                .fresh_color
-                .unwrap_or(resolved.fresh_color);
-            ui.label("Fresh");
-            if ui
-                .color_edit_button_srgba_unmultiplied(&mut fresh)
-                .changed()
-            {
-                self.style_settings.radar_age.fresh_color = Some(fresh);
-                self.rebuild_style_registry();
-                self.save_styles();
-                ctx.request_repaint();
-            }
-
-            let mut aging = self
-                .style_settings
-                .radar_age
-                .aging_color
-                .unwrap_or(resolved.aging_color);
-            ui.label("Aging");
-            if ui
-                .color_edit_button_srgba_unmultiplied(&mut aging)
-                .changed()
-            {
-                self.style_settings.radar_age.aging_color = Some(aging);
-                self.rebuild_style_registry();
-                self.save_styles();
-                ctx.request_repaint();
-            }
-
-            let mut stale = self
-                .style_settings
-                .radar_age
-                .stale_color
-                .unwrap_or(resolved.stale_color);
-            ui.label("Stale");
-            if ui
-                .color_edit_button_srgba_unmultiplied(&mut stale)
-                .changed()
-            {
-                self.style_settings.radar_age.stale_color = Some(stale);
-                self.rebuild_style_registry();
-                self.save_styles();
-                ctx.request_repaint();
-            }
-
-            let mut expired = self
-                .style_settings
-                .radar_age
-                .expired_color
-                .unwrap_or(resolved.expired_color);
-            ui.label("Expired");
-            if ui
-                .color_edit_button_srgba_unmultiplied(&mut expired)
-                .changed()
-            {
-                self.style_settings.radar_age.expired_color = Some(expired);
-                self.rebuild_style_registry();
-                self.save_styles();
-                ctx.request_repaint();
-            }
+        let mut stale_chip_minutes =
+            (resolved.stale_chip_seconds.max(0) as f32 / 60.0).clamp(1.0, 60.0);
+        let stale_chip_response = panel_kit::row(ui, "STALE chip after", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut stale_chip_minutes)
+                    .range(1.0..=60.0)
+                    .speed(0.25)
+                    .suffix(" min"),
+            )
+            .on_hover_text("Live radar older than this shows the STALE chip")
         });
+        if stale_chip_response.changed() {
+            self.style_settings.radar_age.stale_chip_seconds =
+                Some((stale_chip_minutes * 60.0).round() as i64);
+            self.rebuild_style_registry();
+            ctx.request_repaint();
+        }
+        if stale_chip_response.drag_stopped()
+            || (stale_chip_response.changed() && !stale_chip_response.dragged())
+        {
+            self.save_styles();
+        }
+
+        // Age thresholds: colors move fresh → aging → stale → expired.
+        let mut fresh_minutes = (resolved.green_seconds.max(1) as f32 / 60.0).clamp(0.5, 240.0);
+        let mut aging_minutes = (resolved.yellow_seconds.max(1) as f32 / 60.0).clamp(0.5, 240.0);
+        let mut stale_minutes = (resolved.red_seconds.max(1) as f32 / 60.0).clamp(0.5, 240.0);
+        let fresh_response = panel_kit::row(ui, "Fresh up to", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut fresh_minutes)
+                    .range(0.5..=240.0)
+                    .speed(0.25)
+                    .suffix(" min"),
+            )
+            .on_hover_text("Age that still renders as the fresh color")
+        });
+        let aging_response = panel_kit::row(ui, "Aging up to", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut aging_minutes)
+                    .range(0.5..=240.0)
+                    .speed(0.25)
+                    .suffix(" min"),
+            )
+            .on_hover_text("Age where the gradient reaches the aging color")
+        });
+        let stale_response = panel_kit::row(ui, "Stale up to", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut stale_minutes)
+                    .range(0.5..=240.0)
+                    .speed(0.25)
+                    .suffix(" min"),
+            )
+            .on_hover_text("Age where the gradient reaches stale and the marker arc becomes full")
+        });
+        if fresh_response.changed() || aging_response.changed() || stale_response.changed() {
+            let fresh_seconds = ((fresh_minutes * 60.0).round() as i64).max(1);
+            let aging_seconds = ((aging_minutes * 60.0).round() as i64).max(fresh_seconds);
+            let stale_seconds = ((stale_minutes * 60.0).round() as i64).max(aging_seconds);
+            self.style_settings.radar_age.green_seconds = Some(fresh_seconds);
+            self.style_settings.radar_age.yellow_seconds = Some(aging_seconds);
+            self.style_settings.radar_age.red_seconds = Some(stale_seconds);
+            self.rebuild_style_registry();
+            ctx.request_repaint();
+        }
+        let thresholds_committed = fresh_response.drag_stopped()
+            || aging_response.drag_stopped()
+            || stale_response.drag_stopped()
+            || (fresh_response.changed() && !fresh_response.dragged())
+            || (aging_response.changed() && !aging_response.dragged())
+            || (stale_response.changed() && !stale_response.dragged());
+        if thresholds_committed {
+            self.save_styles();
+        }
+
+        // Age colors: one kit row per stop, swatch right-aligned.
+        let mut age_colors_changed = false;
+        for (label, stored, resolved_color) in [
+            (
+                "Fresh color",
+                &mut self.style_settings.radar_age.fresh_color,
+                resolved.fresh_color,
+            ),
+            (
+                "Aging color",
+                &mut self.style_settings.radar_age.aging_color,
+                resolved.aging_color,
+            ),
+            (
+                "Stale color",
+                &mut self.style_settings.radar_age.stale_color,
+                resolved.stale_color,
+            ),
+            (
+                "Expired color",
+                &mut self.style_settings.radar_age.expired_color,
+                resolved.expired_color,
+            ),
+        ] {
+            let mut color = stored.unwrap_or(resolved_color);
+            let changed = panel_kit::row(ui, label, |ui| {
+                ui.color_edit_button_srgba_unmultiplied(&mut color)
+                    .changed()
+            });
+            if changed {
+                *stored = Some(color);
+                age_colors_changed = true;
+            }
+        }
+        if age_colors_changed {
+            self.rebuild_style_registry();
+            self.save_styles();
+            ctx.request_repaint();
+        }
     }
 
     fn hazard_polygon_style_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label(egui::RichText::new("Warning polygons").strong());
-        ui.horizontal_wrapped(|ui| {
-            let global = self.style_registry.hazard_global().clone();
-            let mut fill_alpha = global.fill_alpha as f32;
-            let fill_response = ui.add(egui::Slider::new(&mut fill_alpha, 0.0..=80.0).text("Fill"));
-            if fill_response.changed() {
-                self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.round() as u8);
-                self.rebuild_style_registry();
-                ctx.request_repaint();
-            }
-            if fill_response.drag_stopped() || (fill_response.changed() && !fill_response.dragged())
-            {
-                self.save_styles();
-            }
+        let global = self.style_registry.hazard_global().clone();
 
-            let mut stroke_scale = global.stroke_width_scale;
-            let stroke_response =
-                ui.add(egui::Slider::new(&mut stroke_scale, 0.5..=3.0).text("Width"));
-            if stroke_response.changed() {
-                self.style_settings.hazard_global.stroke_width_scale =
-                    Some((stroke_scale * 100.0).round() / 100.0);
-                self.rebuild_style_registry();
-                ctx.request_repaint();
-            }
-            if stroke_response.drag_stopped()
-                || (stroke_response.changed() && !stroke_response.dragged())
-            {
-                self.save_styles();
-            }
+        let mut fill_alpha = global.fill_alpha as f32;
+        let fill_response =
+            panel_kit::slider_row(ui, "Fill", &mut fill_alpha, 0.0..=80.0, 0.0, |value| {
+                format!("{value:.0}")
+            })
+            .on_hover_text("Warning-polygon fill opacity (0-80)");
+        if fill_response.changed() {
+            self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.round() as u8);
+            self.rebuild_style_registry();
+            ctx.request_repaint();
+        }
+        if fill_response.drag_stopped() || (fill_response.changed() && !fill_response.dragged()) {
+            self.save_styles();
+        }
 
-            let mut selected_boost = global.selected_width_boost;
-            let selected_response =
-                ui.add(egui::Slider::new(&mut selected_boost, 0.0..=4.0).text("Selected +"));
-            if selected_response.changed() {
-                self.style_settings.hazard_global.selected_width_boost =
-                    Some((selected_boost * 100.0).round() / 100.0);
-                self.rebuild_style_registry();
-                ctx.request_repaint();
-            }
-            if selected_response.drag_stopped()
-                || (selected_response.changed() && !selected_response.dragged())
-            {
-                self.save_styles();
-            }
+        let mut stroke_scale = global.stroke_width_scale;
+        let stroke_response =
+            panel_kit::slider_row(ui, "Width", &mut stroke_scale, 0.5..=3.0, 0.0, |value| {
+                format!("{value:.2}x")
+            })
+            .on_hover_text("Warning-polygon outline width scale");
+        if stroke_response.changed() {
+            self.style_settings.hazard_global.stroke_width_scale =
+                Some((stroke_scale * 100.0).round() / 100.0);
+            self.rebuild_style_registry();
+            ctx.request_repaint();
+        }
+        if stroke_response.drag_stopped()
+            || (stroke_response.changed() && !stroke_response.dragged())
+        {
+            self.save_styles();
+        }
 
-            if fixed_action_button(ui, "Reset", 52.0)
-                .on_hover_text("Reset global warning-polygon alpha and width defaults")
-                .clicked()
-            {
-                self.style_settings.hazard_global = styles::HazardGlobalOverride::default();
-                self.rebuild_style_registry();
-                self.save_styles();
-                ctx.request_repaint();
-            }
-        });
+        let mut selected_boost = global.selected_width_boost;
+        let selected_response = panel_kit::slider_row(
+            ui,
+            "Selected +",
+            &mut selected_boost,
+            0.0..=4.0,
+            0.0,
+            |value| format!("{value:.2}"),
+        )
+        .on_hover_text("Extra outline width for the selected polygon");
+        if selected_response.changed() {
+            self.style_settings.hazard_global.selected_width_boost =
+                Some((selected_boost * 100.0).round() / 100.0);
+            self.rebuild_style_registry();
+            ctx.request_repaint();
+        }
+        if selected_response.drag_stopped()
+            || (selected_response.changed() && !selected_response.dragged())
+        {
+            self.save_styles();
+        }
+
+        if fixed_action_button(ui, "Reset", 52.0)
+            .on_hover_text("Reset global warning-polygon alpha and width defaults")
+            .clicked()
+        {
+            self.style_settings.hazard_global = styles::HazardGlobalOverride::default();
+            self.rebuild_style_registry();
+            self.save_styles();
+            ctx.request_repaint();
+        }
 
         let selection_id = ui.make_persistent_id("appearance_hazard_polygon_style_key");
         let mut selected_key = ctx
             .data_mut(|data| data.get_persisted::<String>(selection_id))
             .filter(|key| hazard_style_key_known(key))
             .unwrap_or_else(|| HAZARD_STYLE_DEFAULT_KEY.to_owned());
-        ui.horizontal(|ui| {
-            ui.label("Family");
-            egui::ComboBox::from_id_salt("appearance_hazard_polygon_style_combo")
-                .selected_text(hazard_style_label(&selected_key))
-                .width(ui_theme::COMBO_MAX_W)
-                .show_ui(ui, |ui| {
-                    for key in hazard_style_keys() {
-                        ui.selectable_value(
-                            &mut selected_key,
-                            (*key).to_owned(),
-                            hazard_style_label(key),
-                        );
-                    }
-                });
+        panel_kit::row(ui, "Family", |ui| {
+            // Right-to-left: Reset (when an override exists) at the edge,
+            // the family combo to its left.
             if self.style_settings.hazards.contains_key(&selected_key)
                 && fixed_action_button(ui, "Reset", 52.0)
                     .on_hover_text("Reset this warning polygon family to built-in styling")
@@ -458,6 +427,18 @@ impl ViewerApp {
                 self.save_styles();
                 ctx.request_repaint();
             }
+            egui::ComboBox::from_id_salt("appearance_hazard_polygon_style_combo")
+                .selected_text(hazard_style_label(&selected_key))
+                .width(ui.available_width().clamp(96.0, ui_theme::COMBO_MAX_W))
+                .show_ui(ui, |ui| {
+                    for key in hazard_style_keys() {
+                        ui.selectable_value(
+                            &mut selected_key,
+                            (*key).to_owned(),
+                            hazard_style_label(key),
+                        );
+                    }
+                });
         });
         ctx.data_mut(|data| data.insert_persisted(selection_id, selected_key.clone()));
 
@@ -469,83 +450,88 @@ impl ViewerApp {
             .cloned()
             .unwrap_or_default();
 
-        ui.horizontal_wrapped(|ui| {
-            let mut stroke_color = existing.stroke_color.unwrap_or(resolved.stroke_color);
-            ui.label("Stroke");
-            if ui
-                .color_edit_button_srgba_unmultiplied(&mut stroke_color)
+        let mut stroke_color = existing.stroke_color.unwrap_or(resolved.stroke_color);
+        if panel_kit::row(ui, "Stroke color", |ui| {
+            ui.color_edit_button_srgba_unmultiplied(&mut stroke_color)
                 .changed()
-            {
-                self.style_settings
-                    .hazards
-                    .entry(selected_key.clone())
-                    .or_default()
-                    .stroke_color = Some(stroke_color);
-                self.rebuild_style_registry();
-                self.save_styles();
-                ctx.request_repaint();
-            }
+        }) {
+            self.style_settings
+                .hazards
+                .entry(selected_key.clone())
+                .or_default()
+                .stroke_color = Some(stroke_color);
+            self.rebuild_style_registry();
+            self.save_styles();
+            ctx.request_repaint();
+        }
 
-            let mut fill_color = existing.fill_color.unwrap_or(resolved.fill_color);
-            ui.label("Fill");
-            if ui
-                .color_edit_button_srgba_unmultiplied(&mut fill_color)
+        let mut fill_color = existing.fill_color.unwrap_or(resolved.fill_color);
+        if panel_kit::row(ui, "Fill color", |ui| {
+            ui.color_edit_button_srgba_unmultiplied(&mut fill_color)
                 .changed()
-            {
-                self.style_settings
-                    .hazards
-                    .entry(selected_key.clone())
-                    .or_default()
-                    .fill_color = Some(fill_color);
-                self.rebuild_style_registry();
-                self.save_styles();
-                ctx.request_repaint();
-            }
-        });
+        }) {
+            self.style_settings
+                .hazards
+                .entry(selected_key.clone())
+                .or_default()
+                .fill_color = Some(fill_color);
+            self.rebuild_style_registry();
+            self.save_styles();
+            ctx.request_repaint();
+        }
 
-        ui.horizontal_wrapped(|ui| {
-            let mut stroke_width = existing.stroke_width.unwrap_or(resolved.stroke_width);
-            let width_response =
-                ui.add(egui::Slider::new(&mut stroke_width, 0.5..=8.0).text("Line px"));
-            if width_response.changed() {
-                self.style_settings
-                    .hazards
-                    .entry(selected_key.clone())
-                    .or_default()
-                    .stroke_width = Some((stroke_width * 100.0).round() / 100.0);
-                self.rebuild_style_registry();
-                ctx.request_repaint();
-            }
-            if width_response.drag_stopped()
-                || (width_response.changed() && !width_response.dragged())
-            {
-                self.save_styles();
-            }
+        let mut stroke_width = existing.stroke_width.unwrap_or(resolved.stroke_width);
+        let width_response =
+            panel_kit::slider_row(ui, "Line px", &mut stroke_width, 0.5..=8.0, 0.0, |value| {
+                format!("{value:.2}")
+            })
+            .on_hover_text("Outline width for this family");
+        if width_response.changed() {
+            self.style_settings
+                .hazards
+                .entry(selected_key.clone())
+                .or_default()
+                .stroke_width = Some((stroke_width * 100.0).round() / 100.0);
+            self.rebuild_style_registry();
+            ctx.request_repaint();
+        }
+        if width_response.drag_stopped() || (width_response.changed() && !width_response.dragged())
+        {
+            self.save_styles();
+        }
 
-            let mut family_fill_alpha = existing.fill_alpha.unwrap_or_else(|| {
-                resolved
-                    .fill_alpha
-                    .unwrap_or(self.style_registry.hazard_global().fill_alpha)
-            }) as f32;
-            let fill_alpha_response =
-                ui.add(egui::Slider::new(&mut family_fill_alpha, 0.0..=100.0).text("Fill alpha"));
-            if fill_alpha_response.changed() {
-                self.style_settings
-                    .hazards
-                    .entry(selected_key.clone())
-                    .or_default()
-                    .fill_alpha = Some(family_fill_alpha.round() as u8);
-                self.rebuild_style_registry();
-                ctx.request_repaint();
-            }
-            if fill_alpha_response.drag_stopped()
-                || (fill_alpha_response.changed() && !fill_alpha_response.dragged())
-            {
-                self.save_styles();
-            }
+        let mut family_fill_alpha = existing.fill_alpha.unwrap_or_else(|| {
+            resolved
+                .fill_alpha
+                .unwrap_or(self.style_registry.hazard_global().fill_alpha)
+        }) as f32;
+        let fill_alpha_response = panel_kit::slider_row(
+            ui,
+            "Fill alpha",
+            &mut family_fill_alpha,
+            0.0..=100.0,
+            0.0,
+            |value| format!("{value:.0}"),
+        )
+        .on_hover_text("Fill opacity for this family (overrides the global Fill)");
+        if fill_alpha_response.changed() {
+            self.style_settings
+                .hazards
+                .entry(selected_key.clone())
+                .or_default()
+                .fill_alpha = Some(family_fill_alpha.round() as u8);
+            self.rebuild_style_registry();
+            ctx.request_repaint();
+        }
+        if fill_alpha_response.drag_stopped()
+            || (fill_alpha_response.changed() && !fill_alpha_response.dragged())
+        {
+            self.save_styles();
+        }
 
-            let current_dash = existing.dash.unwrap_or(resolved.dash);
-            let mut dash = current_dash;
+        let current_dash = existing.dash.unwrap_or(resolved.dash);
+        let mut dash = current_dash;
+        panel_kit::row(ui, "Dash", |ui| {
             egui::ComboBox::from_id_salt("appearance_hazard_polygon_dash")
                 .selected_text(hazard_dash_label(dash))
                 .width(104.0)
@@ -561,17 +547,17 @@ impl ViewerApp {
                     );
                     ui.selectable_value(&mut dash, styles::DashPattern::Dotted, "Dotted");
                 });
-            if dash != current_dash {
-                self.style_settings
-                    .hazards
-                    .entry(selected_key.clone())
-                    .or_default()
-                    .dash = Some(dash);
-                self.rebuild_style_registry();
-                self.save_styles();
-                ctx.request_repaint();
-            }
         });
+        if dash != current_dash {
+            self.style_settings
+                .hazards
+                .entry(selected_key.clone())
+                .or_default()
+                .dash = Some(dash);
+            self.rebuild_style_registry();
+            self.save_styles();
+            ctx.request_repaint();
+        }
         ui.weak("These style changes apply to live alerts, watches, SPC discussions, and loaded text polygons.");
     }
 

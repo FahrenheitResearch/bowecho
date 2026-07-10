@@ -512,8 +512,8 @@ impl crate::ViewerApp {
     }
 
     /// Rotation tracks + TDS as unified layer-rail rows (ui-overhaul spec
-    /// §2: every map overlay is a row). Reset stays an inline extra — the
-    /// accumulation window is the layer's one operational control.
+    /// §2: every map overlay is a row). Reset lives behind the row's ⚙
+    /// (wave 2: the inline 50 pt button outgrew the middle zone at 320 pt).
     pub(crate) fn tor_tracks_rail_rows(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         use crate::{LayerRowGear, LayerRowOpacity, LayerRowSpec, LayerRowVis, layer_row};
         let newest = self
@@ -532,7 +532,6 @@ impl crate::ViewerApp {
                     hover: "Per-pixel MAXIMUM low-level (0–2 km, lowest tilts) cyclonic azimuthal shear accumulated across the loaded loop — the swath a translating mesocyclone paints. Single-radar analogue of the MRMS rotation tracks (Mahalik et al. 2019; Miller et al. 2013; Smith et al. 2016). Transparent below 0.003 s⁻¹, magenta at 0.02 s⁻¹. Scrubbing shows the accumulation up to the viewed frame.",
                 },
                 name: "Rotation tracks",
-                name_width: crate::NAME_W_STD,
                 name_hover: "Low-level azimuthal-shear swath across the loop (MRMS rotation-tracks lineage)",
                 opacity: Some(LayerRowOpacity::F32 {
                     value: &mut state.tracks_opacity,
@@ -540,23 +539,26 @@ impl crate::ViewerApp {
                     hover: "Rotation-tracks layer opacity",
                 }),
                 gear: Some(LayerRowGear::Menu {
-                    hover: "Rotation-tracks options",
+                    hover: "Rotation-tracks options (reset window)",
                     content: Box::new(|ui| {
+                        if ui
+                            .add_enabled(can_reset, egui::Button::new("Reset accumulation"))
+                            .on_hover_text(
+                                "Restart the accumulation window at the newest loaded frame",
+                            )
+                            .clicked()
+                        {
+                            reset = true;
+                            ui.close();
+                        }
+                        ui.separator();
                         ui.weak("Appearance controls (ramp, thresholds)");
                         ui.weak("land here next.");
                     }),
                 }),
                 ..Default::default()
             },
-            |ui| {
-                if can_reset
-                    && crate::fixed_action_button(ui, "Reset", 50.0)
-                        .on_hover_text("Restart the accumulation window at the newest loaded frame")
-                        .clicked()
-                {
-                    reset = true;
-                }
-            },
+            |_ui| {},
         ) {
             ctx.request_repaint();
         }
@@ -577,7 +579,6 @@ impl crate::ViewerApp {
                     hover: "Tornado debris signature — a deterministic dual-pol physics flag, NOT a probability: ρhv < 0.82 inside > 30 dBZ echo within 5 km of a rank ≥ 3 circulation, lowest tilt (Ryzhkov et al. 2005; Van Den Broeke & Jauernic 2014; Snyder & Ryzhkov 2015). White/magenta gates at the viewed frame; the magenta trail is the debris track across the loop.",
                 },
                 name: "TDS flag",
-                name_width: crate::NAME_W_STD,
                 name_hover: "Dual-pol tornado debris signature gates + the debris track across the loop",
                 gear: Some(LayerRowGear::Menu {
                     hover: "TDS options",
@@ -614,7 +615,7 @@ impl crate::ViewerApp {
                     )
                 }
             };
-            ui.weak(label);
+            crate::panel_kit::status_block(ui, &label, None);
         }
     }
 }

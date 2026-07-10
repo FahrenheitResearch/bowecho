@@ -1221,8 +1221,8 @@ const TERMINAL_SITE_LABEL_MIN_SCALE: f32 = 95.0;
 // as crate-wide aliases so 100+ call sites keep reading naturally.
 pub(crate) use ui_theme::ROW_H as PANEL_BUTTON_HEIGHT;
 pub(crate) use ui_theme::{
-    ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, NAME_W_SITE, NAME_W_STD, NAME_W_WIDE,
-    ROW_SPACING_X, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
+    ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, ROW_SPACING_X, SIDEBAR_DEFAULT_WIDTH,
+    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
 };
 const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] =
     &["tornado", "severe thunderstorm", "flash flood", "flood"];
@@ -23739,7 +23739,6 @@ impl ViewerApp {
                         hover: "Show this overlay radar on the map",
                     },
                     name: &site.level2_id,
-                    name_width: NAME_W_SITE,
                     name_hover: &details_text,
                     state: Some(state),
                     opacity: Some(LayerRowOpacity::U8 {
@@ -37856,13 +37855,6 @@ fn fixed_status_label_with_sense(
     ui.put(rect, egui::Label::new(text).truncate().sense(sense))
 }
 
-fn fixed_state_dot(ui: &mut egui::Ui, color: egui::Color32, hover_text: &str) {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(14.0, PANEL_BUTTON_HEIGHT), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, color);
-    response.on_hover_text(hover_text);
-}
-
 fn layer_state_color(state: &str) -> egui::Color32 {
     match state {
         "loading" => egui::Color32::from_rgb(238, 218, 62),
@@ -37978,9 +37970,12 @@ struct LayerRowRemove<'a> {
 struct LayerRowSpec<'a> {
     vis: LayerRowVis<'a>,
     name: &'a str,
-    name_width: f32,
     name_hover: &'a str,
     state: Option<&'a str>,
+    /// Short weak status/count text ("1523 stn · 3m ago", "12:45Z",
+    /// "8 rpt") in the flexible middle column — truncates at the middle
+    /// zone's budget with a full-text hover.
+    count: Option<&'a str>,
     opacity: Option<LayerRowOpacity<'a>>,
     order: Option<LayerRowOrder<'a>>,
     gear: Option<LayerRowGear<'a>>,
@@ -37995,9 +37990,9 @@ impl Default for LayerRowSpec<'_> {
                 hover: "",
             },
             name: "",
-            name_width: NAME_W_STD,
             name_hover: "",
             state: None,
+            count: None,
             opacity: None,
             order: None,
             gear: None,
@@ -38006,17 +38001,20 @@ impl Default for LayerRowSpec<'_> {
     }
 }
 
-/// One unified layer row — the row grammar v2 (docs/ui-overhaul-spec.md §2.1,
-/// direction A "everything is a layer"):
+/// One unified layer row — row grammar v3 (docs/ui-refresh-plan.md wave 2):
 ///
-///   [vis] [name (hover = details)] [state dot] [opacity ───] [↑↓] [extras…] [⚙] [✕]
+///   [vis] [name (flex, hover = details)] [dot slot] [↑↓ extras… count]
+///   [opacity ───] [⚙] [✕]
 ///
-/// Every layer type in the rail (primary radar, overlay radars, GOES, model
-/// fields, drapes, surface obs, lightning, SPC, warnings, placefiles)
-/// renders through this one shape. `trailing` carries the row's earned
-/// inline extras (max two besides ⚙/✕); reorder, gear, and remove are
-/// standardized slots. Returns true when visibility or opacity changed
-/// (callers repaint).
+/// Every layer type in the rail renders through this one shape, and the
+/// rail aligns by construction: the state-dot slot and the right cluster
+/// (opacity slider, ⚙, ✕) are fixed widths and ALWAYS allocated, so every
+/// row's slider starts at the same x and every gear sits at the same x.
+/// The name column flexes with the panel (`panel_kit::rail_name_width`,
+/// truncating with the details hover), and the middle zone carries the
+/// row's earned inline extras (max two besides ⚙/✕) plus the truncating
+/// `count` text, clipped at its budget — anything wider lives behind ⚙.
+/// Returns true when visibility or opacity changed (callers repaint).
 fn layer_row(
     ui: &mut egui::Ui,
     spec: LayerRowSpec<'_>,
@@ -38025,9 +38023,9 @@ fn layer_row(
     let LayerRowSpec {
         vis,
         name,
-        name_width,
         name_hover,
         state,
+        count,
         opacity,
         order,
         gear,
@@ -38059,6 +38057,7 @@ fn layer_row(
                 response.on_hover_text(hover);
             }
         }
+        let name_width = panel_kit::rail_name_width(ui.available_width());
         let name_response = fixed_status_label_with_sense(
             ui,
             name,
@@ -38087,9 +38086,53 @@ fn layer_row(
             *value = !*value;
             changed = true;
         }
+        // State-dot slot — allocated even without a state so the columns
+        // after it share an x across rows.
+        let (dot_rect, dot_response) = ui.allocate_exact_size(
+            egui::vec2(panel_kit::RAIL_DOT_SLOT_W, PANEL_BUTTON_HEIGHT),
+            egui::Sense::hover(),
+        );
         if let Some(state) = state {
-            fixed_state_dot(ui, layer_state_color(state), state);
+            ui.painter()
+                .circle_filled(dot_rect.center(), 4.0, layer_state_color(state));
+            dot_response.on_hover_text(state.to_owned());
         }
+        // Middle zone: reorder + inline extras + truncating count, clipped
+        // at its fixed budget so the right cluster stays put.
+        let spacing = ui.spacing().item_spacing.x;
+        let cluster_width = panel_kit::rail_cluster_width(LAYER_ROW_SLIDER_WIDTH, spacing);
+        let middle_width = (ui.available_width() - cluster_width - spacing).max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(middle_width, PANEL_BUTTON_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_max_width(middle_width);
+                ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                if let Some(LayerRowOrder { delta }) = order {
+                    if ui
+                        .small_button("↑")
+                        .on_hover_text("Draw later (higher)")
+                        .clicked()
+                    {
+                        *delta = 1;
+                    }
+                    if ui
+                        .small_button("↓")
+                        .on_hover_text("Draw earlier (lower)")
+                        .clicked()
+                    {
+                        *delta = -1;
+                    }
+                }
+                trailing(ui);
+                if let Some(count) = count {
+                    ui.add(egui::Label::new(egui::RichText::new(count).weak().small()).truncate())
+                        .on_hover_text(count.to_owned());
+                }
+            },
+        );
+        // Fixed right cluster: opacity slider slot + ⚙ slot + ✕ slot —
+        // allocated even when empty so sliders and gears column-align.
         match opacity {
             Some(LayerRowOpacity::F32 { value, min, hover }) => {
                 if ui
@@ -38116,25 +38159,13 @@ fn layer_row(
                     changed = true;
                 }
             }
-            None => {}
-        }
-        if let Some(LayerRowOrder { delta }) = order {
-            if ui
-                .small_button("↑")
-                .on_hover_text("Draw later (higher)")
-                .clicked()
-            {
-                *delta = 1;
-            }
-            if ui
-                .small_button("↓")
-                .on_hover_text("Draw earlier (lower)")
-                .clicked()
-            {
-                *delta = -1;
+            None => {
+                ui.allocate_exact_size(
+                    egui::vec2(LAYER_ROW_SLIDER_WIDTH, PANEL_BUTTON_HEIGHT),
+                    egui::Sense::hover(),
+                );
             }
         }
-        trailing(ui);
         match gear {
             Some(LayerRowGear::Open { hover, clicked }) => {
                 if ui.small_button("⚙").on_hover_text(hover).clicked() {
@@ -38149,12 +38180,25 @@ fn layer_row(
                 .response
                 .on_hover_text(hover);
             }
-            None => {}
+            None => {
+                ui.allocate_exact_size(
+                    egui::vec2(panel_kit::RAIL_ICON_SLOT_W, PANEL_BUTTON_HEIGHT),
+                    egui::Sense::hover(),
+                );
+            }
         }
-        if let Some(LayerRowRemove { hover, clicked }) = remove
-            && ui.small_button("✕").on_hover_text(hover).clicked()
-        {
-            *clicked = true;
+        match remove {
+            Some(LayerRowRemove { hover, clicked }) => {
+                if ui.small_button("✕").on_hover_text(hover).clicked() {
+                    *clicked = true;
+                }
+            }
+            None => {
+                ui.allocate_exact_size(
+                    egui::vec2(panel_kit::RAIL_ICON_SLOT_W, PANEL_BUTTON_HEIGHT),
+                    egui::Sense::hover(),
+                );
+            }
         }
     });
     changed

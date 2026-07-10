@@ -23,8 +23,8 @@ use crate::{
     compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
     custom_poll_links_from_gis, dock, format_site_label, glm_latest_age_minutes,
     glm_latest_is_live, glm_satellite_label, grid_composites, intl_provider_label, layer_row,
-    mesoanalysis, normalized_poll_url, oa_derived, parse_custom_poll_marker_inputs, poll_url_name,
-    poll_urls_match, spc_layers,
+    mesoanalysis, normalized_poll_url, oa_derived, panel_kit, parse_custom_poll_marker_inputs,
+    poll_url_name, poll_urls_match, spc_layers,
 };
 
 impl ViewerApp {
@@ -66,34 +66,17 @@ impl ViewerApp {
         })
     }
 
-    /// Weak uppercase group mini-header with a right-aligned action slot.
-    /// Groups are deliberately NOT collapsing — the rail stays one
-    /// scannable list; collapsing returns the junk-drawer dynamics
-    /// (spec §2.2).
-    fn rail_group_header(ui: &mut egui::Ui, label: &str, right: impl FnOnce(&mut egui::Ui)) {
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .small()
-                    .strong()
-                    .color(crate::SUBHEAD_COLOR),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
-        });
-    }
-
     /// The rail rows, grouped BASE → ATMOSPHERE → OBS → SEVERE → COMMUNITY
     /// (spec §2.2): primary + overlay radars + rotation tracks/TDS, then
     /// model/OA fields + GOES + drapes, then obs + lightning, then SPC +
     /// warnings, then placefiles.
     pub(crate) fn layers_rail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Groups are weak mini-headers, NOT collapsing — the rail stays one
-        // scannable list (spec §2.2). Map paint order is unchanged (the
+        // Groups are kit subgroup headers, NOT collapsing — the rail stays
+        // one scannable list (spec §2.2). Map paint order is unchanged (the
         // compositor is layer-type-major); the grouping is a reading aid.
         let overlay_count = self.radar_layers.len();
         let mut clear_overlays = false;
-        Self::rail_group_header(ui, "BASE", |ui| {
+        panel_kit::subgroup(ui, "Base", |ui| {
             if overlay_count > 0 {
                 if crate::fixed_action_button(ui, "Clear", 52.0)
                     .on_hover_text("Remove every overlay radar")
@@ -135,7 +118,6 @@ impl ViewerApp {
                     hover: "Primary radar — always drawn; site and products in the sections above",
                 },
                 name: &primary_name,
-                name_width: crate::NAME_W_STD,
                 name_hover: "Primary radar (site/products in SITE and PRODUCTS above)",
                 state: Some(primary_state),
                 opacity: Some(LayerRowOpacity::F32 {
@@ -165,7 +147,7 @@ impl ViewerApp {
         let mut step_hour: i64 = 0;
         // The Hour stepper rides the group header: it steps every
         // dock-following model row at once (spec §2.3).
-        Self::rail_group_header(ui, "ATMOSPHERE", |ui| {
+        panel_kit::subgroup(ui, "Atmosphere", |ui| {
             if has_model_rows {
                 if ui
                     .small_button("▶")
@@ -217,7 +199,6 @@ impl ViewerApp {
                         hover: "Fetching latest gridded radar composite",
                     },
                     name,
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: source.label(),
                     state: Some("loading"),
                     ..Default::default()
@@ -288,6 +269,10 @@ impl ViewerApp {
             let mut remove_this = false;
             let refreshable_source = grid_source;
             let current_color_family = layer.custom_color_family;
+            // The two-extra budget at 320 pt: the frame text rides the
+            // count column; Refresh and the Color picker live behind ⚙
+            // (wave-1 gear-popover precedent) with the window jump as the
+            // menu's first entry.
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -296,12 +281,9 @@ impl ViewerApp {
                         hover: "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)",
                     },
                     name: &name,
-                    // Model field keys run long (temperature_2m, …) — the
-                    // standard tier truncated them to "temperature_…"
-                    // (field report).
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: &name_hover,
                     state: grid_fetching.then_some("fetching"),
+                    count: grid_frame_text.as_deref(),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.1,
@@ -310,65 +292,79 @@ impl ViewerApp {
                     order: (model_row_count > 1).then_some(LayerRowOrder {
                         delta: &mut order_delta,
                     }),
-                    gear: Some(LayerRowGear::Open {
-                        hover: "Open the Model data window (runs · fields · soundings · download)",
-                        clicked: &mut open_window,
+                    gear: Some(LayerRowGear::Menu {
+                        hover: "Model layer options (open window · refresh · colors)",
+                        content: Box::new(|ui| {
+                            if ui
+                                .button("Open Model window")
+                                .on_hover_text("Runs · fields · soundings · download")
+                                .clicked()
+                            {
+                                open_window = true;
+                                ui.close();
+                            }
+                            if refreshable_source.is_some()
+                                && ui
+                                    .button("Refresh composite")
+                                    .on_hover_text("Fetch the latest gridded radar composite")
+                                    .clicked()
+                            {
+                                refresh_grid_composite = refreshable_source;
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.menu_button("Color", |ui| {
+                                if ui
+                                    .selectable_label(current_color_family.is_none(), "Auto")
+                                    .on_hover_text(
+                                        "Automatic model colors: WRF/model fields use Solarpower07's WRF-Runner palettes (reflectivity · temp · dew point · wind · precip · RH · CAPE), otherwise Rusty Weather's production style, then a generic ramp.",
+                                    )
+                                    .clicked()
+                                {
+                                    model_color_action = Some((id, ModelColorAction::Auto));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                for family in ColorTableFamily::ALL {
+                                    if ui
+                                        .selectable_label(
+                                            current_color_family == Some(family),
+                                            family.label(),
+                                        )
+                                        .clicked()
+                                    {
+                                        model_color_action =
+                                            Some((id, ModelColorAction::Use(family)));
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                let edit_family =
+                                    current_color_family.unwrap_or(ColorTableFamily::Generic);
+                                if ui
+                                    .button(format!("Edit {}", edit_family.label()))
+                                    .on_hover_text(
+                                        "Open Map > Appearance > Color tables for this family",
+                                    )
+                                    .clicked()
+                                {
+                                    model_color_action =
+                                        Some((id, ModelColorAction::Edit(edit_family)));
+                                    ui.close();
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Override this layer with an editable BowEcho color table",
+                            );
+                        }),
                     }),
                     remove: Some(LayerRowRemove {
                         hover: "Remove this layer",
                         clicked: &mut remove_this,
                     }),
                 },
-                |ui| {
-                    if let Some(text) = &grid_frame_text {
-                        ui.weak(text.as_str());
-                    }
-                    if let Some(source) = refreshable_source
-                        && ui
-                            .small_button("Refresh")
-                            .on_hover_text("Fetch the latest gridded radar composite")
-                            .clicked()
-                    {
-                        refresh_grid_composite = Some(source);
-                    }
-                    ui.menu_button("Color", |ui| {
-                        if ui
-                            .selectable_label(current_color_family.is_none(), "Auto")
-                            .on_hover_text(
-                                "Automatic model colors: WRF/model fields use Solarpower07's WRF-Runner palettes (reflectivity · temp · dew point · wind · precip · RH · CAPE), otherwise Rusty Weather's production style, then a generic ramp.",
-                            )
-                            .clicked()
-                        {
-                            model_color_action = Some((id, ModelColorAction::Auto));
-                            ui.close();
-                        }
-                        ui.separator();
-                        for family in ColorTableFamily::ALL {
-                            if ui
-                                .selectable_label(
-                                    current_color_family == Some(family),
-                                    family.label(),
-                                )
-                                .clicked()
-                            {
-                                model_color_action = Some((id, ModelColorAction::Use(family)));
-                                ui.close();
-                            }
-                        }
-                        ui.separator();
-                        let edit_family = current_color_family.unwrap_or(ColorTableFamily::Generic);
-                        if ui
-                            .button(format!("Edit {}", edit_family.label()))
-                            .on_hover_text("Open Map > Appearance > Color tables for this family")
-                            .clicked()
-                        {
-                            model_color_action = Some((id, ModelColorAction::Edit(edit_family)));
-                            ui.close();
-                        }
-                    })
-                    .response
-                    .on_hover_text("Override this layer with an editable BowEcho color table");
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -488,9 +484,9 @@ impl ViewerApp {
                         hover: "Show Italy DPC raw radar/composite raster on the map",
                     },
                     name: &name,
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: &name_hover,
                     state: Some(state),
+                    count: Some(&frame_text),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.05,
@@ -522,9 +518,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    ui.weak(frame_text);
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -576,9 +570,9 @@ impl ViewerApp {
                         hover: "Show Taiwan CWA composite reflectivity on the map",
                     },
                     name: "Taiwan CWA REF",
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: &name_hover,
                     state: Some(state),
+                    count: Some(&frame_text),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.05,
@@ -599,9 +593,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    ui.weak(frame_text);
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -627,7 +619,6 @@ impl ViewerApp {
                         hover: "Show GOES on map",
                     },
                     name: "GOES",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "GOES satellite frame (configure in the Sat window)",
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
@@ -699,6 +690,7 @@ impl ViewerApp {
             );
             let mut open_wofs = false;
             let mut remove_drape = false;
+            let wofs_count = (!init.is_empty()).then(|| format!("{init}z+{minute}m"));
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -707,9 +699,9 @@ impl ViewerApp {
                         hover: "Drape the current WoFS product onto the radar map",
                     },
                     name: "WoFS drape",
-                    name_width: crate::NAME_W_STD,
                     name_hover: &name_hover,
                     state: Some(if self.wofs.open { "live" } else { "paused" }),
+                    count: wofs_count.as_deref(),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut self.wofs.drape_opacity,
                         min: 0.05,
@@ -725,11 +717,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    if !init.is_empty() {
-                        ui.weak(format!("{init}z+{minute}m"));
-                    }
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -755,9 +743,9 @@ impl ViewerApp {
                         hover: "Drape the FARM quicklook PPI onto the radar map (georeferenced)",
                     },
                     name: "FARM drape",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "Georeferenced FARM (DOW/COW) quicklook drape — sensor, placement, and echoes-only live in the FARM window",
                     state: Some(if live.is_some() { "live" } else { "loaded" }),
+                    count: live.as_deref(),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut self.farm.drape.opacity,
                         min: 0.15,
@@ -773,11 +761,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    if let Some(name) = &live {
-                        ui.weak(name.as_str());
-                    }
-                },
+                |_ui| {},
             ) {
                 ctx.request_repaint();
             }
@@ -789,7 +773,7 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         }
-        Self::rail_group_header(ui, "OBS", |ui| {
+        panel_kit::subgroup(ui, "Obs", |ui| {
             let _ = ui;
         });
         {
@@ -806,6 +790,13 @@ impl ViewerApp {
             let obs_station_count = self.surface_obs.station_count;
             let obs_fetching =
                 self.obs_rx.is_some() || self.nws_obs_rx.is_some() || self.mesonet_rx.is_some();
+            let obs_count_text = obs_fetched_at.map(|at| {
+                format!(
+                    "{} stn · {}m ago",
+                    obs_station_count,
+                    at.elapsed().as_secs() / 60
+                )
+            });
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -814,8 +805,8 @@ impl ViewerApp {
                         hover: "METAR station plots: temperature/dewpoint (units per Settings ▸ Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
                     },
                     name: "Surface obs",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "METAR station plots: temperature/dewpoint (units per Settings ▸ Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                    count: obs_count_text.as_deref(),
                     gear: Some(LayerRowGear::Menu {
                         hover: "Networks: METAR · Mesonet · obs-adjusted soundings",
                         content: Box::new(|ui| {
@@ -863,13 +854,6 @@ impl ViewerApp {
                     ..Default::default()
                 },
                 |ui| {
-                    if let Some(at) = obs_fetched_at {
-                        ui.weak(format!(
-                            "{} stn · {}m ago",
-                            obs_station_count,
-                            at.elapsed().as_secs() / 60
-                        ));
-                    }
                     if obs_fetching {
                         ui.spinner();
                     }
@@ -1004,9 +988,9 @@ impl ViewerApp {
                         hover: "GOES GLM flashes, free via AWS (no key): trailing Show last window, age-faded, time-synced to the radar loop. Live/stale health uses the newest-flash gate.",
                     },
                     name: "Lightning",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "GOES GLM lightning flashes. The row label toggles the layer too. Europe/Japan require a separate MTG/Himawari lightning path and are not shown by this layer.",
                     state: glm_state,
+                    count: show_glm_line.then_some(glm_line.as_str()),
                     gear: Some(LayerRowGear::Menu {
                         hover: "Lightning data status",
                         content: Box::new(|ui| {
@@ -1047,11 +1031,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                move |ui| {
-                    if show_glm_line {
-                        ui.weak(glm_line);
-                    }
-                },
+                |_ui| {},
             );
             if refresh_glm {
                 self.refresh_glm_data(ctx);
@@ -1081,7 +1061,6 @@ impl ViewerApp {
                         hover: "Radiosonde launch sites as lavender diamond markers — click one for that station's observed sounding at the DISPLAYED radar time (specials included: scrub an archive loop to 21z, get the 21z special). Wyoming + IEM archives, no key.",
                     },
                     name: "RAOB stations",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "Observed-sounding launch sites (click a marker for the sounding at the displayed time, rendered in the native skew-T)",
                     gear: Some(LayerRowGear::Menu {
                         hover: "RAOB layer notes",
@@ -1106,7 +1085,7 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         }
-        Self::rail_group_header(ui, "SEVERE", |ui| {
+        panel_kit::subgroup(ui, "Severe", |ui| {
             let _ = ui;
         });
         // SPC OUTLOOK — one row (spec §2.3): vis = any kind enabled
@@ -1137,7 +1116,6 @@ impl ViewerApp {
                         hover: "Convective outlooks in SPC's own colors, archive-aware: shows the displayed day's outlook",
                     },
                     name: &name,
-                    name_width: crate::NAME_W_STD,
                     name_hover: "SPC convective outlook polygons. Off remembers your kind set; on restores it. ⚙ opens the ALERTS tab's SPC outlooks section (day + kinds).",
                     gear: Some(LayerRowGear::Open {
                         hover: "Configure in the ALERTS tab: day · categorical / tornado / wind / hail",
@@ -1185,7 +1163,6 @@ impl ViewerApp {
                         hover: "Filtered storm reports (tornado / wind / hail) for the DISPLAYED day: live today (refreshed ~5 min), the archived convective day (12Z-12Z) when browsing the past — with clickable tornado tracks (DATA tab: Event day)",
                     },
                     name: "SPC reports",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "SPC storm report dots + tornado track lines for the displayed day; click a track to load its radar loop",
                     gear: Some(LayerRowGear::Open {
                         hover: "Open the ALERTS tab",
@@ -1220,15 +1197,11 @@ impl ViewerApp {
                         hover: "mPING crowd reports from the public display feed, refreshed about every 5 min",
                     },
                     name: "mPING",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "Recent mPING public display reports: precipitation, hail, wind damage, flooding, visibility, and winter impacts\nData courtesy of NOAA NSSL / University of Oklahoma",
+                    count: mping_status.as_deref(),
                     ..Default::default()
                 },
-                |ui| {
-                    if let Some(status) = &mping_status {
-                        ui.weak(status);
-                    }
-                },
+                |_ui| {},
             ) {
                 self.mping_fetched_at = None;
                 self.save_overlay_defaults();
@@ -1245,6 +1218,7 @@ impl ViewerApp {
                 .as_ref()
                 .map(|overlay| overlay.records.len())
                 .unwrap_or(0);
+            let warnings_count = (active_count > 0).then(|| format!("{active_count} act"));
             let mut open_severe = false;
             if layer_row(
                 ui,
@@ -1254,8 +1228,8 @@ impl ViewerApp {
                         hover: "NWS warning/watch/MD polygons on the map",
                     },
                     name: "Warnings",
-                    name_width: crate::NAME_W_STD,
                     name_hover: "Warning polygons (filters + full text in the Alerts tab)",
+                    count: warnings_count.as_deref(),
                     opacity: Some(LayerRowOpacity::U8 {
                         value: &mut fill_alpha,
                         min: 0,
@@ -1267,11 +1241,7 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    if active_count > 0 {
-                        ui.weak(format!("{active_count} act"));
-                    }
-                },
+                |_ui| {},
             ) {
                 if fill_alpha != self.style_registry.hazard_global().fill_alpha {
                     self.style_settings.hazard_global.fill_alpha = Some(fill_alpha);
@@ -1284,7 +1254,7 @@ impl ViewerApp {
                 self.sidebar_tab = SidebarTab::Severe;
             }
         }
-        Self::rail_group_header(ui, "COMMUNITY", |ui| {
+        panel_kit::subgroup(ui, "Community", |ui| {
             let _ = ui;
         });
         ui.horizontal(|ui| {
@@ -1340,7 +1310,6 @@ impl ViewerApp {
                         hover: "Show this placefile on the map",
                     },
                     name: &title,
-                    name_width: crate::NAME_W_WIDE,
                     name_hover: &hover,
                     gear: Some(LayerRowGear::Menu {
                         hover: "Placefile options",
