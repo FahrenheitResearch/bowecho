@@ -1611,9 +1611,11 @@ fn sources(ui: &mut egui::Ui) {
     para(
         ui,
         "The model dock's GDEX browser walks the NSF NCAR GDEX online catalog (a THREDDS \
-         server) and imports whole files or NCSS subsets directly. CONUS II is regional \
-         climate WRF downscaling for present and future periods. \
-         Data: NSF NCAR GDEX, CONUS II (CC-BY 4.0), DOI 10.5065/49SN-8E08. Files are \
+         server) and imports whole files or NCSS subsets directly. A dataset picker offers \
+         CONUS II — regional climate WRF downscaling for present and future periods — and \
+         ERA-20C, ECMWF's 20th-century reanalysis (1900-2010, GRIB1). \
+         Data: NSF NCAR GDEX, CONUS II (CC-BY 4.0), DOI 10.5065/49SN-8E08; ECMWF ERA-20C \
+         via NSF NCAR GDEX (d626000). Files are \
          fetched at runtime — nothing is bundled.",
     );
 
@@ -1805,6 +1807,17 @@ mod tests {
         assert!(guide_src.contains("CONUS II"));
         assert!(guide_src.contains("10.5065/49SN-8E08"));
         assert!(guide_src.contains("CC-BY 4.0"));
+    }
+
+    /// ERA-20C attribution rides the SAME GDEX sources paragraph (no invented
+    /// credit surface): ECMWF as producer, GDEX as the distributor, and the
+    /// dataset id the picker exposes.
+    #[test]
+    fn guide_credits_gdex_era20c_source() {
+        let guide_src = include_str!("guide.rs");
+        assert!(guide_src.contains("ERA-20C"));
+        assert!(guide_src.contains("ECMWF"));
+        assert!(guide_src.contains("d626000"));
     }
 
     /// The retired MTG plumbing (v0.29 Phase 5 deletion sweep) must stay

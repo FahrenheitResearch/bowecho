@@ -1152,8 +1152,7 @@ mod tests {
 
     #[test]
     fn era20c_top_catalog_lists_nine_subtrees_and_drops_the_dump_leaf() {
-        let parsed =
-            parse_catalog(CATALOG_ERA20C_TOP, ERA20C_TOP_URL).expect("era20c top parses");
+        let parsed = parse_catalog(CATALOG_ERA20C_TOP, ERA20C_TOP_URL).expect("era20c top parses");
         // The root's only <dataset urlPath> is the extensionless scan `dump`,
         // which the extension whitelist drops.
         assert!(parsed.leaves.is_empty(), "dump must not survive as a leaf");
@@ -1723,7 +1722,10 @@ mod tests {
         // hundreds of .grb leaves, every one a fileServer download URL with an
         // advertised size — what the picker's Download button consumes.
         let decade = fetch_and_parse_catalog(ERA20C_DECADE_URL).expect("live era20c decade");
-        eprintln!("live e20c.oper.an.sfc.3hr/1900_1909: {} leaves", decade.leaves.len());
+        eprintln!(
+            "live e20c.oper.an.sfc.3hr/1900_1909: {} leaves",
+            decade.leaves.len()
+        );
         assert!(
             decade.leaves.len() > 500,
             "a decade dir carries hundreds of per-variable year files"
@@ -1736,11 +1738,8 @@ mod tests {
                     && leaf.download_url.starts_with(FILESERVER_BASE))
         );
         assert!(
-            decade
-                .leaves
-                .iter()
-                .any(|leaf| leaf.name
-                    == "e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb"),
+            decade.leaves.iter().any(|leaf| leaf.name
+                == "e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb"),
             "the fixture's msl leaf exists live"
         );
         assert!(

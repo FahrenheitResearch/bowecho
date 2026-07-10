@@ -1,11 +1,24 @@
-//! GDEX (NSF NCAR CONUS II) in-app catalog browser — Stage 1b UI.
+//! GDEX (NSF NCAR) in-app catalog browser — Stage 1b UI.
 //!
 //! Stage 1a landed the UI-free plumbing in [`data_source::gdex`] (THREDDS
 //! catalog crawl, NCSS subset URL builder, resumable download). This module is
 //! the user-facing browser that makes it usable: a lazy, in-app catalog tree
-//! rooted at CONUS II (`d612005`) that walks the catalog one level at a time,
+//! rooted at a picker-selected dataset from [`gdex::GDEX_DATASETS`] — CONUS II
+//! (`d612005`, NetCDF) by default, ERA-20C (`d626000`, GRIB1) for the
+//! 20th-century reanalysis — that walks the catalog one level at a time,
 //! downloads a file (or an NCSS subset), and hands the local path to the model
 //! dock's existing importer.
+//!
+//! ## Dataset picker
+//!
+//! Tree state is keyed by ABSOLUTE catalog URL, so each dataset's loaded
+//! levels are naturally disjoint: switching datasets swaps the root and
+//! bootstraps it, the other dataset's nodes can never render under the new
+//! root, and switching back finds its tree exactly as it was left. An
+//! in-flight download is never disturbed by a switch. Downloads land in
+//! per-dataset subfolders of the GDEX cache — EXCEPT CONUS II, which predates
+//! the picker and stays flat in the cache root so existing multi-GB downloads
+//! keep cache-hitting and partial `.download` temps keep resuming.
 //!
 //! ## Async architecture (respect the freeze lesson)
 //!
@@ -34,7 +47,11 @@
 //! [`GdexBrowser::poll`] returns the local path of a completed download; the
 //! model dock feeds it to `local_import::spawn_import_paths` — the SAME import
 //! pump, progress, store write, and plot path as the manual model import. A
-//! CONUS II `.nc` (wrf2d surface or wrf3d TK/Z/P) imports unchanged.
+//! CONUS II `.nc` (wrf2d surface or wrf3d TK/Z/P) imports unchanged; an
+//! ERA-20C `.grb` passes the same gate (`is_supported_model_file` accepts
+//! GRIB1 by extension) and routes to `grib_import` inside the import worker.
+//! An NCSS subset of either arrives as classic NetCDF-3 and takes the `.nc`
+//! path.
 //!
 //! ## Testing
 //!
@@ -56,8 +73,34 @@ use data_source::gdex::{
 };
 use ui_core::worker_slot::{SlotPoll, WorkerSlot};
 
-/// The dataset the browser opens on: CONUS II (present + future WRF).
-pub const CONUS_II_DATASET_ID: &str = "d612005";
+/// The dataset the browser opens on (first registry entry: CONUS II).
+fn default_dataset() -> &'static gdex::GdexDataset {
+    &gdex::GDEX_DATASETS[0]
+}
+
+/// Where a dataset's downloads land under the GDEX cache dir. The default
+/// dataset (CONUS II, `d612005`) predates the picker and stays FLAT in the
+/// cache root — the owner's existing multi-GB downloads (and any partial
+/// `.download` temps) keep cache-hitting and resuming. Every other dataset
+/// gets its own `<cache>/<dataset-id>/` subfolder.
+fn dataset_download_dir(cache_dir: &Path, dataset_id: &str) -> PathBuf {
+    if dataset_id == default_dataset().id {
+        cache_dir.to_owned()
+    } else {
+        cache_dir.join(dataset_id)
+    }
+}
+
+/// The download dir for a leaf, derived from the LEAF's own `urlPath` rather
+/// than the picker's current dataset — a download clicked just before a
+/// dataset switch still lands in its own dataset's folder. An unrecognizable
+/// urlPath falls back to the flat cache root (the pre-picker behavior).
+fn leaf_download_dir(cache_dir: &Path, leaf: &Leaf) -> PathBuf {
+    match gdex::dataset_id_from_url_path(&leaf.url_path) {
+        Some(id) => dataset_download_dir(cache_dir, id),
+        None => cache_dir.to_owned(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tree-node state machine (pure, unit-tested)
@@ -259,12 +302,13 @@ impl SubsetForm {
 
     /// Local destination filename for this subset download (sanitized for
     /// NTFS). Distinct from the full-file name so a subset never clobbers a
-    /// full download of the same leaf.
+    /// full download of the same leaf. Always `.nc` — NCSS answers with
+    /// classic NetCDF-3 whatever the source format — so a GRIB1 leaf's data
+    /// extension is stripped along with `.nc`, never embedded mid-name.
     fn subset_dest_name(&self) -> String {
-        let stem = self
-            .leaf
-            .name
-            .strip_suffix(".nc")
+        let stem = [".nc", ".grb", ".grib"]
+            .iter()
+            .find_map(|ext| self.leaf.name.strip_suffix(ext))
             .unwrap_or(&self.leaf.name);
         let tag = self
             .selected
@@ -429,6 +473,7 @@ struct ActiveDownload {
 /// An intent produced by rendering (applied after, to keep `self` borrows
 /// disjoint from egui's closures).
 enum Action {
+    SwitchDataset(&'static str),
     ToggleNode(String),
     RetryNode(String),
     DownloadFull(Leaf),
@@ -458,7 +503,10 @@ pub struct GdexBrowser {
     pub open: bool,
     /// First-open bootstrap flag (auto-expand + load the root).
     initialized: bool,
-    /// The dataset's root catalog URL.
+    /// The picker-selected dataset id (a [`gdex::GDEX_DATASETS`] entry).
+    dataset_id: String,
+    /// The selected dataset's root catalog URL (kept in sync with
+    /// `dataset_id` by [`Self::switch_dataset`]).
     root_url: String,
     /// Per-catalog-level load state, keyed by catalog URL (in-memory cache of
     /// expanded levels for the session).
@@ -490,7 +538,8 @@ impl GdexBrowser {
         Self {
             open: false,
             initialized: false,
-            root_url: gdex::dataset_catalog_url(CONUS_II_DATASET_ID),
+            dataset_id: default_dataset().id.to_owned(),
+            root_url: default_dataset().catalog_url(),
             nodes: BTreeMap::new(),
             expanded: BTreeSet::new(),
             catalog_slot: WorkerSlot::idle("gdex-catalog"),
@@ -512,6 +561,39 @@ impl GdexBrowser {
     }
 
     // -- state-machine helpers (pure-ish; no egui) --------------------------
+
+    /// The registry entry for the picker's current dataset (falls back to the
+    /// default entry if the stored id ever goes stale against the registry).
+    fn current_dataset(&self) -> &'static gdex::GdexDataset {
+        gdex::dataset_by_id(&self.dataset_id).unwrap_or_else(default_dataset)
+    }
+
+    /// Switch the browser to another registry dataset and bootstrap its root
+    /// (expand + fetch, unless that level is already loaded from an earlier
+    /// visit — tree state is keyed by absolute catalog URL, so each dataset's
+    /// nodes are disjoint and survive switches untouched).
+    ///
+    /// Deliberately NOT touched: the download slot and its progress row (a
+    /// switch never disturbs an in-flight download), the node map, and the
+    /// catalog queue (a queued fetch for the other dataset completes into
+    /// that dataset's nodes — ready for when the user switches back). The
+    /// subset form IS closed: it belongs to the other dataset's context.
+    /// Unknown ids and re-selecting the current dataset are no-ops.
+    fn switch_dataset(&mut self, id: &str) {
+        let Some(dataset) = gdex::dataset_by_id(id) else {
+            return;
+        };
+        if dataset.id == self.dataset_id {
+            return;
+        }
+        self.dataset_id = dataset.id.to_owned();
+        self.root_url = dataset.catalog_url();
+        self.subset_form = None;
+        self.ncss_slot.cancel();
+        let root = self.root_url.clone();
+        self.expanded.insert(root.clone());
+        self.ensure_load(&root);
+    }
 
     /// Ensure a node will be fetched: set it Loading and enqueue it (unless it
     /// is already Loaded, Loading, or queued).
@@ -674,7 +756,7 @@ impl GdexBrowser {
 
         let mut actions: Vec<Action> = Vec::new();
         let mut open = self.open;
-        egui::Window::new("🌐 GDEX — NSF NCAR CONUS II")
+        egui::Window::new("🌐 GDEX — NSF NCAR")
             .open(&mut open)
             .default_size([460.0, 520.0])
             .show(&ctx, |ui| {
@@ -694,17 +776,31 @@ impl GdexBrowser {
         self.pump_catalog_queue(&ctx);
     }
 
-    /// The main window body: attribution header, status/progress, then the
-    /// lazy tree.
+    /// The main window body: dataset picker, attribution header,
+    /// status/progress, then the lazy tree.
     fn window_body(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        ui.label(
-            egui::RichText::new(
-                "NSF NCAR GDEX · CONUS II regional climate WRF (present + future) · \
-                 CC-BY 4.0 · DOI 10.5065/49SN-8E08",
-            )
-            .small()
-            .weak(),
-        );
+        let current = self.current_dataset();
+        ui.horizontal(|ui| {
+            ui.label("Dataset:");
+            egui::ComboBox::from_id_salt("gdex_dataset_picker")
+                .selected_text(current.label)
+                .show_ui(ui, |ui| {
+                    for dataset in gdex::GDEX_DATASETS {
+                        let selected = dataset.id == current.id;
+                        if ui
+                            .selectable_label(selected, dataset.label)
+                            .on_hover_text(dataset.blurb)
+                            .clicked()
+                            && !selected
+                        {
+                            actions.push(Action::SwitchDataset(dataset.id));
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(current.blurb);
+        });
+        ui.label(egui::RichText::new(current.attribution).small().weak());
         ui.separator();
 
         // Live download progress row.
@@ -762,7 +858,7 @@ impl GdexBrowser {
                     &self.expanded,
                     ui,
                     &self.root_url,
-                    "CONUS II (d612005)",
+                    current.label,
                     0,
                     actions,
                 );
@@ -771,6 +867,7 @@ impl GdexBrowser {
 
     fn apply_action(&mut self, action: Action, ctx: &egui::Context, cache_dir: &Path) {
         match action {
+            Action::SwitchDataset(id) => self.switch_dataset(id),
             Action::ToggleNode(url) => {
                 if self.expanded.contains(&url) {
                     self.expanded.remove(&url);
@@ -785,7 +882,7 @@ impl GdexBrowser {
                 self.ensure_load(&url);
             }
             Action::DownloadFull(leaf) => {
-                let dest = gdex::local_path_for_leaf(cache_dir, &leaf);
+                let dest = gdex::local_path_for_leaf(&leaf_download_dir(cache_dir, &leaf), &leaf);
                 let label = format!("Downloading {}", leaf.name);
                 self.start_download(ctx, leaf.download_url.clone(), dest, label, leaf.size_bytes);
             }
@@ -837,7 +934,14 @@ impl GdexBrowser {
                 dest_name,
                 label,
             }) => {
-                let dest = cache_dir.join(dest_name);
+                // Same per-dataset dir as a full download of the same leaf
+                // (derived from the leaf, not the picker).
+                let dir = self
+                    .subset_form
+                    .as_ref()
+                    .map(|form| leaf_download_dir(cache_dir, &form.leaf))
+                    .unwrap_or_else(|| cache_dir.to_owned());
+                let dest = dir.join(dest_name);
                 self.subset_form = None;
                 self.start_download(ctx, url, dest, label, None);
             }
@@ -1189,6 +1293,194 @@ mod tests {
         browser.ensure_load(&url);
         assert_eq!(browser.nodes.get(&url), Some(&NodeLoad::Loading));
         assert_eq!(browser.catalog_queue.len(), 1);
+    }
+
+    /// An ERA-20C-shaped leaf (GRIB1, `files/g/d626000/...`).
+    fn era20c_leaf(name: &str) -> Leaf {
+        Leaf {
+            name: name.to_owned(),
+            url_path: format!("files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/{name}"),
+            download_url: format!(
+                "https://tds.gdex.ucar.edu/thredds/fileServer/files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/{name}"
+            ),
+            ncss_url: format!(
+                "https://tds.gdex.ucar.edu/thredds/ncss/grid/files/g/d626000/e20c.oper.an.sfc.3hr/1900_1909/{name}"
+            ),
+            size_bytes: Some(299_300_000),
+            date: Some("2014-11-04T18:47:44Z".to_owned()),
+        }
+    }
+
+    #[test]
+    fn switch_dataset_swaps_root_and_keeps_per_dataset_trees() {
+        let mut browser = GdexBrowser::new();
+        let conus_root = browser.root_url.clone();
+        assert!(conus_root.contains("/d612005/"), "default is CONUS II");
+        assert_eq!(browser.current_dataset().id, "d612005");
+
+        // Load the CONUS II root (as the first-open bootstrap would).
+        browser.expanded.insert(conus_root.clone());
+        browser.apply_catalog(CatalogFetch {
+            catalog_url: conus_root.clone(),
+            result: Ok(ParsedCatalog {
+                catalog_url: conus_root.clone(),
+                child_catalog_urls: vec![
+                    "https://tds.gdex.ucar.edu/thredds/catalog/files/g/d612005/future2D/catalog.xml"
+                        .to_owned(),
+                ],
+                leaves: vec![],
+            }),
+        });
+        // An open subset form belongs to the pre-switch dataset's context.
+        browser.subset_form = Some(SubsetForm::new(leaf("x.nc", None, None)));
+
+        // Switch: root swaps, the new root is expanded + queued Loading, the
+        // subset form closes, and the CONUS II tree survives under its URL.
+        browser.switch_dataset("d626000");
+        assert_eq!(browser.current_dataset().id, "d626000");
+        assert!(browser.root_url.contains("/d626000/"));
+        assert_eq!(
+            browser.nodes.get(&browser.root_url),
+            Some(&NodeLoad::Loading)
+        );
+        assert!(
+            browser
+                .catalog_queue
+                .iter()
+                .any(|url| url.contains("/d626000/"))
+        );
+        assert!(
+            browser.subset_form.is_none(),
+            "subset form closes on switch"
+        );
+        assert!(
+            matches!(
+                browser.nodes.get(&conus_root),
+                Some(NodeLoad::Loaded { .. })
+            ),
+            "the other dataset's tree is kept, keyed by its own URLs"
+        );
+        // No stale children: the fresh root is not Loaded — the other
+        // dataset's tree cannot leak under it.
+        assert!(
+            !matches!(
+                browser.nodes.get(&browser.root_url),
+                Some(NodeLoad::Loaded { .. })
+            ),
+            "fresh root cannot be Loaded yet"
+        );
+
+        // Unknown id and re-selecting the current dataset are no-ops.
+        let queue_len = browser.catalog_queue.len();
+        browser.switch_dataset("d000000");
+        browser.switch_dataset("d626000");
+        assert_eq!(browser.current_dataset().id, "d626000");
+        assert_eq!(browser.catalog_queue.len(), queue_len);
+
+        // Switching back finds the CONUS II tree as it was — Loaded, so
+        // ensure_load is a no-op (no refetch).
+        browser.catalog_queue.clear();
+        browser.switch_dataset("d612005");
+        assert_eq!(browser.root_url, conus_root);
+        assert!(
+            matches!(
+                browser.nodes.get(&conus_root),
+                Some(NodeLoad::Loaded { .. })
+            ),
+            "the earlier tree is found as it was left"
+        );
+        assert!(
+            browser.catalog_queue.is_empty(),
+            "a Loaded root must not be refetched on switch-back"
+        );
+    }
+
+    #[test]
+    fn switch_dataset_leaves_an_active_download_untouched() {
+        let mut browser = GdexBrowser::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        browser.active_download = Some(ActiveDownload {
+            label: "Downloading wrf2d_d01.nc".to_owned(),
+            temp_path: PathBuf::from("/cache/wrf2d_d01.nc.download"),
+            dest: PathBuf::from("/cache/wrf2d_d01.nc"),
+            total: Some(163_700_000),
+            cancel: cancel.clone(),
+        });
+
+        browser.switch_dataset("d626000");
+
+        let active = browser
+            .active_download
+            .as_ref()
+            .expect("the in-flight download survives a dataset switch");
+        assert_eq!(active.dest, PathBuf::from("/cache/wrf2d_d01.nc"));
+        assert!(
+            !cancel.load(Ordering::Relaxed),
+            "switching datasets must never cancel a download"
+        );
+    }
+
+    #[test]
+    fn download_dirs_flat_for_conus_ii_and_scoped_for_other_datasets() {
+        let cache = Path::new("cache");
+        // CONUS II is grandfathered flat — the owner's existing multi-GB
+        // downloads keep cache-hitting and their partials keep resuming.
+        assert_eq!(
+            dataset_download_dir(cache, "d612005"),
+            PathBuf::from("cache")
+        );
+        assert_eq!(
+            dataset_download_dir(cache, "d626000"),
+            Path::new("cache").join("d626000")
+        );
+
+        // Leaf-derived: the dir comes from the leaf's own urlPath.
+        let era =
+            era20c_leaf("e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb");
+        assert_eq!(
+            leaf_download_dir(cache, &era),
+            Path::new("cache").join("d626000")
+        );
+        let conus = leaf("wrf2d_d01_2080-01-01_00:00:00.nc", None, None);
+        assert_eq!(leaf_download_dir(cache, &conus), PathBuf::from("cache"));
+        // Unrecognizable urlPath falls back to the flat root.
+        let odd = Leaf {
+            url_path: "elsewhere/x.nc".to_owned(),
+            ..conus.clone()
+        };
+        assert_eq!(leaf_download_dir(cache, &odd), PathBuf::from("cache"));
+    }
+
+    #[test]
+    fn grb_download_imports_and_its_subset_name_drops_the_grb_suffix() {
+        // The .grb handoff: a downloaded GRIB1 file resolves to Import — the
+        // gate (local_import::is_supported_model_file -> grib_import::
+        // is_grib1_file) accepts by extension, so this pins the whole chain.
+        let name = "e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121.grb";
+        let grb = resolve_download(Ok(DownloadOutcome {
+            path: Path::new("/cache/d626000").join(name),
+            bytes: 299_300_000,
+            resumed: false,
+            cache_hit: false,
+        }));
+        match grb {
+            DownloadResolution::Import { path, note } => {
+                assert_eq!(path, Path::new("/cache/d626000").join(name));
+                assert!(note.contains("importing"), "note announces import: {note}");
+            }
+            other => panic!("a .grb download must import, got {other:?}"),
+        }
+
+        // A subset of a GRIB1 leaf downloads as NetCDF: the .grb suffix is
+        // stripped, never embedded mid-name, and the dest ends in .nc.
+        let mut form = SubsetForm::new(era20c_leaf(name));
+        form.selected.insert("MSL".to_owned());
+        let dest = form.subset_dest_name();
+        assert_eq!(
+            dest,
+            "e20c.oper.an.sfc.3hr.128_151_msl.regn80sc.1900010100_1900123121_subset_MSL.nc"
+        );
+        assert!(!dest.contains(".grb"), "no data extension mid-name: {dest}");
     }
 
     #[test]

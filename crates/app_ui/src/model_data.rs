@@ -1370,7 +1370,7 @@ impl ModelDataDock {
         // native file dialog). Opens the browser window rendered in `ui`.
         ui.horizontal_wrapped(|ui| {
             if ui
-                .button("🌐 GDEX (NSF NCAR CONUS II)…")
+                .button("🌐 GDEX (NSF NCAR)…")
                 .on_hover_text(
                     "Browse the NSF NCAR GDEX online catalog — CONUS II regional climate WRF \
                      (present + future). Download a whole file or an NCSS subset (pick \
