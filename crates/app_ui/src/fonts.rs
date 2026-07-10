@@ -98,6 +98,44 @@ mod tests {
         });
     }
 
+    /// The chrome's glyph-button vocabulary (ui_theme.rs module doc) must
+    /// be COVERED by the default font chain — an uncovered char lays out as
+    /// a replacement box. The theme pass found ✕ ◉ ↑ ↓ ▾ ▼ ▸ (the previous
+    /// vocabulary) all uncovered and swapped them for the covered set
+    /// below; this guard keeps the vocabulary honest from here on.
+    #[test]
+    fn glyph_button_vocabulary_is_covered() {
+        let ctx = egui::Context::default();
+        install_cjk_fallback(&ctx);
+        let font_id = egui::FontId::proportional(14.0);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().fonts_mut(|fonts| {
+                // The shipped vocabulary: close ×, gear ⚙, refresh/reset ↻,
+                // transport ◀ ▶ ⏴ ⏵ ⏸, reorder/disclosure ⏶ ⏷, dots ⏺ ○,
+                // separator ·.
+                for ch in [
+                    '×', '⚙', '↻', '◀', '▶', '⏴', '⏵', '⏸', '⏶', '⏷', '⏺', '○', '·',
+                ] {
+                    assert!(
+                        fonts.has_glyphs(&font_id, &ch.to_string()),
+                        "vocabulary glyph U+{:04X} {ch:?} lost font coverage",
+                        ch as u32
+                    );
+                }
+                // The pre-theme glyphs stay uncovered — if a font upgrade
+                // ever covers them this assert flags the vocabulary choice
+                // for revisit (and until then, reintroducing them is tofu).
+                for ch in ['✕', '◉', '↑', '↓', '▾', '▼', '▸', '●'] {
+                    assert!(
+                        !fonts.has_glyphs(&font_id, &ch.to_string()),
+                        "U+{:04X} {ch:?} gained coverage — revisit the vocabulary note",
+                        ch as u32
+                    );
+                }
+            });
+        });
+    }
+
     /// Japanese text lays out through real glyphs — coverage, not the
     /// tofu replacement (which would still have nonzero width, hence the
     /// has_glyphs checks and the no-fallback control).

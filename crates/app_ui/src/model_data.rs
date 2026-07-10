@@ -1077,7 +1077,7 @@ impl ModelDataDock {
                 match done {
                     Some(Ok(summary)) => PollResult::Finished {
                         message: format!(
-                            "Imported {} hour(s) from {} file(s) → run “{}” ({} variables){}",
+                            "Imported {} hour(s) from {} file(s) -> run “{}” ({} variables){}",
                             summary.hours_written,
                             summary.files_seen,
                             summary.run,
@@ -1122,7 +1122,7 @@ impl ModelDataDock {
                 match done {
                     Some(Ok(summary)) => PollResult::Finished {
                         message: format!(
-                            "Processed {} WRF hour(s) from {} file(s) → run “{}” ({} variables)",
+                            "Processed {} WRF hour(s) from {} file(s) -> run “{}” ({} variables)",
                             summary.hours_written,
                             summary.files_seen,
                             summary.run,
@@ -2053,7 +2053,7 @@ impl ModelDataDock {
                         let gates = (state.clamped_range_km() * 1000.0 / spacing).floor();
                         ui.label(
                             egui::RichText::new(format!(
-                                "{:.0} km range at {spacing:.0} m gates → {gates:.0} gates/radial",
+                                "{:.0} km range at {spacing:.0} m gates -> {gates:.0} gates/radial",
                                 state.clamped_range_km()
                             ))
                             .small()

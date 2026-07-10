@@ -783,11 +783,11 @@ impl ViewerApp {
                 lines.push(match self.units() {
                     // Imperial keeps the m + kft dual (analyst convention).
                     units::Units::Imperial => format!(
-                        "beam ↑ {beam_m:.0} m ({})",
+                        "beam {beam_m:.0} m ({})",
                         units::format_beam_height(beam_m, units::Units::Imperial)
                     ),
                     units::Units::Metric => format!(
-                        "beam ↑ {}",
+                        "beam {}",
                         units::format_beam_height(beam_m, units::Units::Metric)
                     ),
                 });

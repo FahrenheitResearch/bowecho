@@ -12,8 +12,7 @@
 use eframe::egui;
 
 use crate::ui_theme::{
-    ROW_H, SECTION_SEPARATOR_COLOR, SECTION_SPACING, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    SUBHEAD_COLOR,
+    ROW_H, SECTION_SPACING, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, section_rule_color, subhead_color,
 };
 
 /// Label column share of the row (plan: 44%, clamped below).
@@ -152,7 +151,7 @@ pub(crate) fn section<R>(
     let heading = egui::RichText::new(section_title(title))
         .size(12.5)
         .strong()
-        .color(SUBHEAD_COLOR);
+        .color(subhead_color());
     let response = egui::CollapsingHeader::new(heading)
         .id_salt(key)
         .open(Some(open))
@@ -217,7 +216,7 @@ pub(crate) fn slider_row<Num: egui::emath::Numeric>(
             |ui| {
                 ui.set_min_width(VALUE_SLOT_W);
                 ui.add(egui::Label::new(
-                    egui::RichText::new(shown).monospace().size(11.5),
+                    egui::RichText::new(shown).monospace().size(11.0),
                 ))
                 .on_hover_text(full);
             },
@@ -303,7 +302,7 @@ pub(crate) fn status_block(ui: &mut egui::Ui, primary: &str, secondary: Option<&
 /// Prose never renders inline-expanded by default.
 pub(crate) fn about(ui: &mut egui::Ui, key: &str, topic: &str, paragraphs: &[&str]) {
     let heading = egui::RichText::new(format!("About {topic}"))
-        .size(11.5)
+        .size(11.0)
         .weak();
     egui::CollapsingHeader::new(heading)
         .id_salt(key)
@@ -328,9 +327,9 @@ pub(crate) fn gear_popover<R>(
         ui.set_min_width(POPOVER_MIN_W);
         ui.label(
             egui::RichText::new(section_title(title))
-                .size(11.5)
+                .size(11.0)
                 .strong()
-                .color(SUBHEAD_COLOR),
+                .color(subhead_color()),
         );
         ui.separator();
         result = Some(body(ui));
@@ -408,7 +407,7 @@ pub(crate) fn subgroup<R>(
             egui::RichText::new(section_title(title))
                 .size(11.0)
                 .strong()
-                .color(SUBHEAD_COLOR),
+                .color(subhead_color()),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right)
             .inner
@@ -432,9 +431,11 @@ fn label_cell(ui: &mut egui::Ui, width: f32, label: &str) {
 fn section_rule(ui: &mut egui::Ui) {
     let width = ui.available_width().max(1.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 2.0), egui::Sense::hover());
+    // THEME PASS: hairline, not a band — the uppercase title carries the
+    // hierarchy; the rule only marks the boundary.
     ui.painter().line_segment(
         [rect.left_center(), rect.right_center()],
-        egui::Stroke::new(1.35, SECTION_SEPARATOR_COLOR),
+        egui::Stroke::new(1.0, section_rule_color()),
     );
 }
 
@@ -521,7 +522,7 @@ mod tests {
         // width − name column − dot slot − right cluster − 3 gaps. At the
         // 300 pt panel minimum inside a section indent the post-checkbox
         // width is ≈ 250 pt, and the middle zone must still hold a rail
-        // row's largest inline-extras set (model rows' ↑/↓ ≈ 35 pt,
+        // row's largest inline-extras set (model rows' ⏶/⏷ ≈ 35 pt,
         // placefiles' T + ↻ ≈ 39 pt at 320) — everything wider lives
         // behind ⚙.
         let slider = 56.0;

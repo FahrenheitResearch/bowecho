@@ -129,7 +129,7 @@ impl BatchPlotSummary {
     /// One-line completion status for the dock.
     pub(crate) fn status_line(&self) -> String {
         let mut line = format!(
-            "Plotted {} PNG(s) for {}/{} → {}",
+            "Plotted {} PNG(s) for {}/{} -> {}",
             self.written,
             self.model,
             self.run,

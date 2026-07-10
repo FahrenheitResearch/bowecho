@@ -93,7 +93,7 @@ impl ViewerApp {
         // PRIMARY RADAR as a layer row (proposal §3-A): the old bare
         // "Radar" opacity slider, wearing the same row grammar as
         // everything else. No vis toggle / no ✕ — the primary IS the
-        // app (badge ◉ instead); site/products live in the sections
+        // app (badge ⏺ instead); site/products live in the sections
         // above.
         let primary_name = match &self.volume {
             Some(volume) => {
@@ -114,7 +114,7 @@ impl ViewerApp {
             ui,
             LayerRowSpec {
                 vis: LayerRowVis::Badge {
-                    glyph: "◉",
+                    glyph: "⏺",
                     hover: "Primary radar — always drawn; site and products in the sections above",
                 },
                 name: &primary_name,
@@ -802,10 +802,10 @@ impl ViewerApp {
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
                         value: &mut self.obs_enabled,
-                        hover: "METAR station plots: temperature/dewpoint (units per Settings ▸ Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                        hover: "METAR station plots: temperature/dewpoint (units per Settings > Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
                     },
                     name: "Surface obs",
-                    name_hover: "METAR station plots: temperature/dewpoint (units per Settings ▸ Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                    name_hover: "METAR station plots: temperature/dewpoint (units per Settings > Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
                     count: obs_count_text.as_deref(),
                     gear: Some(LayerRowGear::Menu {
                         hover: "Networks: METAR · Mesonet · obs-adjusted soundings",
@@ -1406,11 +1406,11 @@ impl ViewerApp {
                             ui.spinner();
                         }
                         if !self.obs_enabled {
-                            ui.weak("← turn on Surface obs above");
+                            ui.weak("<- turn on Surface obs above");
                         } else if self.surface_obs.is_empty() {
                             ui.weak("waiting for obs fetch…");
                         } else if self.model_lut.is_none() {
-                            ui.weak("← \"Show on radar map\" first (Model window)");
+                            ui.weak("<- \"Show on radar map\" first (Model window)");
                         } else if oa_var.is_none() {
                             ui.weak("show T2m / Td2m / 10m wind to analyze");
                         }
@@ -1455,7 +1455,7 @@ impl ViewerApp {
                                 self.start_oa_composites(ctx);
                             }
                         } else {
-                            ui.menu_button("Composites ▾", |ui| {
+                            ui.menu_button("Composites ⏷", |ui| {
                                 let mut pick: Option<usize> = None;
                                 let _ = &mut pick;
                                 // Grouped like the SPC Mesoscale Analysis
@@ -1509,7 +1509,7 @@ impl ViewerApp {
                             && self.model_lut.is_some()
                             && self.oa_cape_rx.is_none();
                         ui.add_enabled_ui(ready, |ui| {
-                            ui.menu_button("Derive (OA) ▾", |ui| {
+                            ui.menu_button("Derive (OA) ⏷", |ui| {
                                 for product in oa_derived::OaProduct::ALL {
                                     if ui.button(product.label()).clicked() {
                                         self.start_oa_derive(product, ctx);
@@ -1555,7 +1555,7 @@ impl ViewerApp {
                     self.start_known_feed_poll(&url);
                 }
             }
-            ui.menu_button("Feeds ▾", |ui| {
+            ui.menu_button("Feeds ⏷", |ui| {
                         ui.weak("research radars serving raw Level II");
                         // Grown from the same community table the map
                         // markers draw from, grouped by state — menu and
@@ -1736,7 +1736,7 @@ impl ViewerApp {
                         ui.horizontal(|ui| {
                             ui.colored_label(
                                 egui::Color32::from_rgb(255, 116, 118),
-                                if active { "●" } else { "○" },
+                                if active { "⏺" } else { "○" },
                             );
                             let title = if site_id.is_empty() {
                                 label.clone()
@@ -2250,7 +2250,7 @@ impl ViewerApp {
                 }
             }
             if let Some(sites) = &self.intl_sites {
-                ui.menu_button("Site ▾", |ui| {
+                ui.menu_button("Site ⏷", |ui| {
                     ui.set_min_width(160.0);
                     egui::ScrollArea::vertical()
                         .id_salt("intl_site_list")
@@ -2270,9 +2270,9 @@ impl ViewerApp {
                 ui.spinner();
             }
             let provider_button = if self.intl_picker_provider.is_empty() {
-                "Country ▾".to_owned()
+                "Country ⏷".to_owned()
             } else {
-                format!("{} ▾", intl_provider_label(&self.intl_picker_provider))
+                format!("{} ⏷", intl_provider_label(&self.intl_picker_provider))
             };
             ui.menu_button(provider_button, |ui| {
                 ui.set_min_width(190.0);
@@ -2337,7 +2337,7 @@ impl ViewerApp {
         let mut add_italy_dpc: Option<ItalyDpcMapProduct> = None;
         let mut add_taiwan_cwa = false;
         let mut add_grid_composite: Option<grid_composites::GridCompositeSource> = None;
-        ui.menu_button("+ Add layer ▾", |ui| {
+        ui.menu_button("+ Add layer ⏷", |ui| {
                     ui.menu_button("Radar overlay", |ui| {
                         ui.set_min_width(220.0);
                         egui::ScrollArea::vertical()
@@ -2402,7 +2402,7 @@ impl ViewerApp {
                     })
                     .response
                     .on_hover_text(
-                        "Another radar drawn over the map (tip: right-click the map → \"lowest beam here\" does this too)",
+                        "Another radar drawn over the map (tip: right-click the map > \"lowest beam here\" does this too)",
                     );
                     if ui
                         .button("Model field…")
