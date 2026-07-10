@@ -42052,11 +42052,23 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
     // monospace for numerics/ids/timestamps. Type and rhythm apply to EVERY
     // brand — brand kits recolor the chrome, they do not retypeset it.
     style.text_styles = [
-        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+        (
+            TextStyle::Small,
+            FontId::new(11.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(12.5, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(12.5, FontFamily::Proportional)),
-        (TextStyle::Heading, FontId::new(14.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace)),
+        (
+            TextStyle::Button,
+            FontId::new(12.5, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Heading,
+            FontId::new(14.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(12.0, FontFamily::Monospace),
+        ),
     ]
     .into();
 

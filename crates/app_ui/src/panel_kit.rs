@@ -12,8 +12,7 @@
 use eframe::egui;
 
 use crate::ui_theme::{
-    ROW_H, SECTION_SPACING, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, section_rule_color,
-    subhead_color,
+    ROW_H, SECTION_SPACING, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, section_rule_color, subhead_color,
 };
 
 /// Label column share of the row (plan: 44%, clamped below).
