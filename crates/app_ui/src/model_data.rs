@@ -15,8 +15,10 @@ use rw_ui::{
 use std::path::PathBuf;
 
 /// Background loader for the synthesized per-level isobaric map fields
-/// (the rw-ui worker cannot read `pressure3d` planes).
-mod iso_fields;
+/// (the rw-ui worker cannot read `pressure3d` planes). Crate-visible: the
+/// batch plotter (`crate::batch_plots`) reuses `load_level_field` for its
+/// per-level iso plane plots.
+pub(crate) mod iso_fields;
 
 /// A running local WRF/NetCDF ingest, spawned from the dock's import controls.
 /// Both variants write into the same model store the dock browses, so a
@@ -65,6 +67,12 @@ struct WrfProcessUiState {
     only_text: String,
     #[serde(default)]
     skip_text: String,
+    /// Batch-plot every field of a run to PNG when an import completes
+    /// (wrench heavy, light 📄, and GDEX all land through the same
+    /// completion arms). Persisted with the rest of this popover state; ON
+    /// by default — the whole point of a bulk import is bulk output.
+    #[serde(default = "wrf_default_true")]
+    auto_plot: bool,
 }
 
 fn wrf_default_true() -> bool {
@@ -81,6 +89,7 @@ impl Default for WrfProcessUiState {
             raw_extras: true,
             only_text: String::new(),
             skip_text: String::new(),
+            auto_plot: true,
         }
     }
 }
@@ -555,6 +564,19 @@ pub struct ModelDataDock {
     /// lands while a manual import is still running waits here instead of
     /// being dropped.
     gdex_import_queue: std::collections::VecDeque<PathBuf>,
+    /// Running batch "plot everything" job (single slot like `import_job`;
+    /// drained in [`Self::poll_plot_job`]).
+    plot_job: Option<crate::batch_plots::BatchPlotTask>,
+    /// Latest progress/status line from the plot job (shown under the plot
+    /// controls, same idiom as `import_message`).
+    plot_message: Option<String>,
+    /// Last completed plot-job summary, kept so the "Open plots folder"
+    /// button knows where the output landed.
+    plot_done: Option<crate::batch_plots::BatchPlotSummary>,
+    /// Base directory for batch plot output. Defaults to the unbranded
+    /// screenshots folder; main.rs overrides with the brand-aware dir at
+    /// dock construction ([`Self::set_plots_base`]).
+    plots_base: PathBuf,
 }
 
 impl ModelDataDock {
@@ -593,7 +615,18 @@ impl ModelDataDock {
             iso_load_pending: None,
             gdex: crate::gdex_ui::GdexBrowser::new(),
             gdex_import_queue: std::collections::VecDeque::new(),
+            plot_job: None,
+            plot_message: None,
+            plot_done: None,
+            plots_base: settings::screenshots_dir().join("plots"),
         }
+    }
+
+    /// Point batch plot output at the brand-aware screenshots folder
+    /// (`<screenshots>/plots`). Called once from main.rs right after
+    /// construction — the dock itself has no brand config.
+    pub fn set_plots_base(&mut self, dir: PathBuf) {
+        self.plots_base = dir;
     }
 
     /// Push edited color-table style overrides to the store worker and reload
@@ -701,6 +734,7 @@ impl ModelDataDock {
     /// reference host).
     fn handle_responses(&mut self) {
         self.poll_import();
+        self.poll_plot_job();
         self.poll_iso_load();
         self.poll_gdex();
         while let Some(response) = self.worker.try_recv() {
@@ -995,6 +1029,10 @@ impl ModelDataDock {
             Progress(String),
             Finished {
                 message: String,
+                /// `(store_root, model, run)` of a run that just landed in
+                /// the store — the auto-plot trigger. `None` for failures
+                /// and for jobs with no store output.
+                plot: Option<(PathBuf, String, String)>,
             },
             /// A synthetic-radar job finished: its volumes go to the app to
             /// loop, not to the store, so this carries the output out.
@@ -1041,9 +1079,11 @@ impl ModelDataDock {
                                 format!(" — note: {}", summary.notes.join("; "))
                             }
                         ),
+                        plot: Some((summary.store_root, summary.model, summary.run)),
                     },
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("Import failed: {error}"),
+                        plot: None,
                     },
                     None => match latest {
                         Some(message) => PollResult::Progress(message),
@@ -1079,9 +1119,11 @@ impl ModelDataDock {
                             summary.run,
                             summary.variables.len()
                         ),
+                        plot: Some((summary.store_root, summary.model, summary.run)),
                     },
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("WRF processing failed: {error}"),
+                        plot: None,
                     },
                     None => match latest {
                         Some(message) => PollResult::Progress(message),
@@ -1120,6 +1162,7 @@ impl ModelDataDock {
                     },
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("Synthetic radar failed: {error}"),
+                        plot: None,
                     },
                     None => match latest {
                         Some(message) => PollResult::Progress(message),
@@ -1139,10 +1182,18 @@ impl ModelDataDock {
                 // ticking so progress and completion show promptly.
                 self.repaint.request_repaint();
             }
-            PollResult::Finished { message } => {
+            PollResult::Finished { message, plot } => {
                 self.import_message = Some(message);
                 self.import_job = None;
                 self.rescan();
+                // Auto-plot: bulk imports produce bulk output when the
+                // toggle is on. All store-writing completions (wrench
+                // heavy, light 📄, GDEX via the local pump) land here.
+                if self.wrf_options.auto_plot
+                    && let Some((store_root, model, run)) = plot
+                {
+                    self.start_plot_job(store_root, model, run);
+                }
             }
             PollResult::FinishedSynthetic { message, output } => {
                 self.import_message = Some(message);
@@ -1189,6 +1240,76 @@ impl ModelDataDock {
         let task = crate::local_import::spawn_import_paths(vec![path], self.store_root.clone());
         self.import_message = Some(format!("Importing {name} (from GDEX)…"));
         self.import_job = Some(ImportJob::Local(task));
+    }
+
+    /// Launch the batch "plot everything" job for a run in the store —
+    /// from the auto-plot trigger or the manual "Plot all fields…" button.
+    /// Single slot: a second request while one runs is refused with a status
+    /// line (matching the single-slot import job).
+    fn start_plot_job(&mut self, store_root: PathBuf, model: String, run: String) {
+        if self.plot_job.is_some() {
+            self.plot_message =
+                Some("A batch plot job is already running — cancel it first.".to_owned());
+            return;
+        }
+        self.plot_done = None;
+        self.plot_message = Some(format!("Plotting all fields of {model}/{run}…"));
+        let task = crate::batch_plots::spawn_batch_plot(
+            crate::batch_plots::BatchPlotRequest {
+                store_root,
+                model,
+                run,
+                plots_base: self.plots_base.clone(),
+                overrides: self.color_tables.settings().clone().normalized(),
+                options: crate::batch_plots::BatchPlotOptions::default(),
+            },
+            self.repaint.clone(),
+        );
+        self.plot_job = Some(task);
+    }
+
+    /// Drain the running batch plot job (same pattern as `poll_import`):
+    /// newest progress line wins, a terminal `Done` clears the slot and
+    /// keeps the summary for the "Open plots folder" button.
+    fn poll_plot_job(&mut self) {
+        let Some(task) = self.plot_job.as_ref() else {
+            return;
+        };
+        let mut latest = None;
+        let mut done = None;
+        loop {
+            match task.rx.try_recv() {
+                Ok(crate::batch_plots::BatchPlotMessage::Progress(message)) => {
+                    latest = Some(message);
+                }
+                Ok(crate::batch_plots::BatchPlotMessage::Done(outcome)) => {
+                    done = Some(outcome);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = Some(Err("Plot worker stopped unexpectedly".to_owned()));
+                    break;
+                }
+            }
+        }
+        match done {
+            Some(Ok(summary)) => {
+                self.plot_message = Some(summary.status_line());
+                self.plot_done = Some(summary);
+                self.plot_job = None;
+            }
+            Some(Err(error)) => {
+                self.plot_message = Some(format!("Batch plotting failed: {error}"));
+                self.plot_job = None;
+            }
+            None => {
+                if let Some(message) = latest {
+                    self.plot_message = Some(message);
+                    self.repaint.request_repaint();
+                }
+            }
+        }
     }
 
     /// One-shot: take finished synthetic-radar volumes for the app to install
@@ -1255,6 +1376,66 @@ impl ModelDataDock {
         });
         if let Some(message) = &self.import_message {
             ui.label(egui::RichText::new(message).small().weak());
+        }
+        self.plot_controls(ui);
+    }
+
+    /// Batch "plot everything" controls: the auto-plot toggle, a manual
+    /// launch for the selected run (any model, not just WRF), progress and
+    /// Cancel while the job runs, and the completion line with an "Open
+    /// plots folder" button. Unconditional (no file dialog involved), so it
+    /// works on every platform.
+    fn plot_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut self.wrf_options.auto_plot,
+                "Auto-plot all fields after import",
+            )
+            .on_hover_text(
+                "When an import finishes (file, folder, or GDEX), render every field of the \
+                 new run — all forecast hours — to PNG under the screenshots folder: \
+                 plots/<model>/<run>/<field>/f###.png, with an index.json per run.",
+            );
+            let selected = self.browser.selected().cloned();
+            let can_plot = selected.is_some() && self.plot_job.is_none();
+            let hover = match &selected {
+                Some(hour) => format!(
+                    "Render every field of {}/{} (all hours) to PNG now.",
+                    hour.model, hour.run
+                ),
+                None => "Select a model run in the browser first.".to_owned(),
+            };
+            if ui
+                .add_enabled(can_plot, egui::Button::new("Plot all fields…"))
+                .on_hover_text(hover)
+                .clicked()
+                && let Some(hour) = selected
+            {
+                self.start_plot_job(self.store_root.clone(), hour.model, hour.run);
+            }
+        });
+        if let Some(task) = &self.plot_job {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                if ui
+                    .button("Cancel")
+                    .on_hover_text("Stop after the current plot; finished PNGs are kept.")
+                    .clicked()
+                {
+                    task.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        if let Some(message) = &self.plot_message {
+            ui.label(egui::RichText::new(message).small().weak());
+        }
+        if self.plot_done.is_some()
+            && ui.button("Open plots folder").clicked()
+            && let Some(summary) = &self.plot_done
+            && let Err(error) = crate::table_editor::show_in_file_browser(&summary.out_dir)
+        {
+            self.plot_message = Some(error);
         }
     }
 
@@ -2494,7 +2675,7 @@ fn iso_route(store_var: &str, hour_store_vars: &[String]) -> Option<color_tables
 /// labels, then synthesized iso-level labels. A name that is a REAL
 /// variable of the hour never takes the iso label (mirror of
 /// [`iso_route`]'s guard), so such a variable round-trips as itself.
-fn display_var_name(store_var: &str, hour_store_vars: &[String]) -> Option<String> {
+pub(crate) fn display_var_name(store_var: &str, hour_store_vars: &[String]) -> Option<String> {
     if let Some(label) = color_tables::wrf_display_label(store_var) {
         return Some(label.to_owned());
     }
@@ -2589,7 +2770,7 @@ pub(crate) fn user_style_override_active(
 /// the store name itself otherwise). The Solar [`color_tables::ColorTable`]
 /// name ("Solar Temperature", …) is an internal palette id and must never
 /// surface user-facing.
-fn attach_solar_fallback_style(field: &mut rw_ui::FieldData, hour_store_vars: &[String]) {
+pub(crate) fn attach_solar_fallback_style(field: &mut rw_ui::FieldData, hour_store_vars: &[String]) {
     if field.style.is_some() {
         return;
     }
@@ -2735,6 +2916,33 @@ pub(crate) fn patch_sounding_scene_zoom(view_state: &mut serde_json::Value, zoom
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// The auto-plot toggle defaults ON, and a settings blob persisted
+    /// BEFORE the toggle existed restores to ON too (serde default) — an
+    /// old config must not silently disable the new behavior.
+    #[test]
+    fn auto_plot_toggle_defaults_on_and_survives_old_settings() {
+        assert!(WrfProcessUiState::default().auto_plot);
+        let restored: WrfProcessUiState = serde_json::from_value(serde_json::json!({
+            "core_fields": true,
+            "diagnostics": true,
+            "heavy_ecape": false,
+            "raw_extras": true,
+            "only_text": "",
+            "skip_text": ""
+        }))
+        .expect("pre-toggle settings blob parses");
+        assert!(restored.auto_plot);
+        let roundtrip: WrfProcessUiState = serde_json::from_value(
+            serde_json::to_value(WrfProcessUiState {
+                auto_plot: false,
+                ..WrfProcessUiState::default()
+            })
+            .expect("serializes"),
+        )
+        .expect("roundtrips");
+        assert!(!roundtrip.auto_plot, "an explicit OFF persists");
+    }
 
     #[test]
     fn model_run_time_parses_operational_run_slug() {
