@@ -304,6 +304,7 @@ dependencies = [
  "egui_tiles",
  "flate2",
  "grib-core",
+ "hdf5-reader",
  "image",
  "naga",
  "netcrust",

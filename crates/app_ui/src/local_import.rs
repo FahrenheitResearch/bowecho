@@ -727,17 +727,17 @@ fn read_first_2d_any(src: &PlaneSource, names: &[&str]) -> Result<Plane2D, Impor
 }
 
 fn read_first_2d(src: &PlaneSource, name: &str) -> Result<Option<Plane2D>, ImportError> {
-    let Some(var) = src.nc.variable(name) else {
-        return Ok(None);
-    };
     // Fast path: for the `[Time, …, ny, nx]` record layout — exactly the case
     // netcrust's first-record read would hyperslab — decode the timestep-0
     // slice through wrf-core instead. Identical value positions: both paths
     // yield the record's `…, ny, nx` values, and `plane_from_last_record`
     // applies the same tail-plane + f32 narrowing to either. Anything else
     // (no Time dim, rank < 3, unexpected length, wrf-core read error) keeps
-    // the legacy netcrust read byte-for-byte.
-    if let Some(wrf) = src.wrf {
+    // the legacy netcrust read byte-for-byte. Names the netcrust metadata
+    // listing misses (netcdf-reader index gaps — CONUS-II wrf2d) skip the
+    // fast path and fall through to the netcrust read, whose raw-HDF5
+    // by-name fallback can still resolve them.
+    if let (Some(wrf), Some(var)) = (src.wrf, src.nc.variable(name)) {
         let dims = var.dimensions();
         let shape = var.shape();
         if dims.len() >= 3 && shape.len() == dims.len() && dims[0].name() == "Time" {
@@ -772,11 +772,22 @@ fn read_first_2d(src: &PlaneSource, name: &str) -> Result<Option<Plane2D>, Impor
 /// Legacy netcrust plane read — the pre-fast-path implementation, kept intact
 /// as the fallback for non-wrfout files (and the reference side of the
 /// value-identity fixture test).
+///
+/// Listing-missed names: netcrust's `netcdf-reader` metadata index can drop
+/// datasets the raw-HDF5 layer still reads by name (measured on the real
+/// CONUS-II wrf2d file: 5 of 192 — U10/MUCAPE/SRH03/SWUPT/ACEDIR), so a name
+/// absent from the LISTING is still attempted through
+/// `read_array_f64_first_record_or_all`, whose built-in hdf5 fallback does
+/// the by-name resolution. A name absent from both stays `None` (the read
+/// error is treated as absence only for unlisted names — listed variables
+/// propagate their read errors exactly as before).
 fn read_first_2d_netcrust(nc: &NcFile, name: &str) -> Result<Option<Plane2D>, ImportError> {
-    if nc.variable(name).is_none() {
-        return Ok(None);
-    }
-    let array = nc.read_array_f64_first_record_or_all(name)?;
+    let listed = nc.variable(name).is_some();
+    let array = match nc.read_array_f64_first_record_or_all(name) {
+        Ok(array) => array,
+        Err(_) if !listed => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
     plane_from_last_record(name, array.shape(), array.values())
 }
 
@@ -1239,6 +1250,66 @@ fn is_coordinate_axis_name(name: &str) -> bool {
     )
 }
 
+/// Recover single-plane dataset names netcrust's metadata listing missed, by
+/// walking the raw HDF5 root group directly — the same `hdf5-reader` (same
+/// pinned rev, via the workspace `[patch.crates-io]`) that netcrust's own
+/// by-name read fallback uses. Measured on the real CONUS-II wrf2d file:
+/// the `netcdf-reader` index drops 5 of 192 datasets (U10, MUCAPE, SRH03,
+/// SWUPT, ACEDIR) that read fine by name. Returns `(name, units attribute)`
+/// for every mass-grid plane not already in `listed`; without dimension
+/// metadata only `[ny, nx]` / `[1, ny, nx]` shapes qualify (a multi-record
+/// unlisted variable is skipped — conservative). Non-HDF5 files, in-memory
+/// handles, or any walk error return empty: the listing-based enumeration
+/// stands alone.
+fn hdf5_recovered_planes(
+    nc: &NcFile,
+    listed: &HashSet<String>,
+    ny: usize,
+    nx: usize,
+) -> Vec<(String, Option<String>)> {
+    let Some(path) = nc.path() else {
+        return Vec::new();
+    };
+    let Ok(file) = hdf5_reader::Hdf5File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = file.root_group() else {
+        return Vec::new();
+    };
+    let Ok(datasets) = root.datasets() else {
+        return Vec::new();
+    };
+    let (ny, nx) = (ny as u64, nx as u64);
+    let mut recovered = Vec::new();
+    for dataset in datasets {
+        let name = dataset.name();
+        if listed.contains(name) || !raw_wrf_variable_allowed(name) || is_coordinate_axis_name(name)
+        {
+            continue;
+        }
+        let single_plane = match dataset.shape() {
+            &[y, x] => y == ny && x == nx,
+            &[t, y, x] => t == 1 && y == ny && x == nx,
+            _ => false,
+        };
+        if !single_plane {
+            continue;
+        }
+        // The netcrust units lookup can't see these variables either; take
+        // the units straight off the HDF5 attribute so MUCAPE still lands
+        // as J kg-1 (unit-aware styling depends on it).
+        let units = dataset
+            .attribute("units")
+            .ok()
+            .and_then(|attr| attr.read_string().ok())
+            .map(|value| value.trim_matches('\0').trim().to_string())
+            .filter(|value| !value.is_empty());
+        recovered.push((name.to_string(), units));
+    }
+    recovered.sort();
+    recovered
+}
+
 /// Build the store hour for a PURE 2-D post-processed surface archive
 /// (CONUS-II GDEX `wrf2d`: `Time(1)` + ~190 single-plane data variables, no
 /// model-level stacks — owner-reported "bad shape for variable TK" when the
@@ -1295,21 +1366,41 @@ fn postprocessed_wrf2d_hour(
 
     // Every mass-grid data plane, read-narrow-drop, one at a time. A count
     // line every few planes keeps the dock's progress live without spamming
-    // the channel (~190 variables on a real wrf2d file).
+    // the channel (~190 variables on a real wrf2d file). The plan is the
+    // netcrust metadata listing UNIONed with the raw-HDF5 root-group walk —
+    // the listing alone drops index-missed datasets (U10/MUCAPE/… on the
+    // real file; see `hdf5_recovered_planes`).
     let variables = nc.variables()?;
-    let planned = variables
+    let mut planned = variables
         .iter()
         .filter(|var| {
             let names: Vec<&str> = var.dimensions().iter().map(|dim| dim.name()).collect();
             is_postproc_2d_data_plane(var.name(), &names, &var.shape(), ny, nx)
         })
-        .map(|var| var.name().to_string())
+        .map(|var| (var.name().to_string(), None::<String>))
         .collect::<Vec<_>>();
+    let listed = variables
+        .iter()
+        .map(|var| var.name().to_string())
+        .collect::<HashSet<_>>();
+    let recovered = hdf5_recovered_planes(nc, &listed, ny, nx);
+    if !recovered.is_empty() {
+        progress(format!(
+            "recovered {} planes the NetCDF metadata listing missed ({})",
+            recovered.len(),
+            recovered
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        planned.extend(recovered);
+    }
     let total = planned.len();
     progress(format!("reading {total} 2-D surface planes"));
     let mut seen = HashSet::<String>::new();
     let mut raw_2d = Vec::new();
-    for (index, wrf_name) in planned.iter().enumerate() {
+    for (index, (wrf_name, units_override)) in planned.iter().enumerate() {
         if index % 10 == 0 {
             progress(format!(
                 "reading 2-D surface plane {}/{total} ({wrf_name})",
@@ -1328,7 +1419,10 @@ fn postprocessed_wrf2d_hour(
         }
         raw_2d.push(RawField2D {
             name,
-            units: variable_units(nc, wrf_name).unwrap_or_else(|| "1".to_string()),
+            units: units_override
+                .clone()
+                .or_else(|| variable_units(nc, wrf_name))
+                .unwrap_or_else(|| "1".to_string()),
             values: plane.values,
         });
     }
@@ -1809,8 +1903,22 @@ mod tests {
             );
         }
         // Raw planes: the misrouting trio plus a severe plane and an
-        // accumulated-flux plane, under the light-import wrf_* naming.
-        for var in ["wrf_tk", "wrf_z", "wrf_p", "wrf_sbcape", "wrf_aclwdnb"] {
+        // accumulated-flux plane, under the light-import wrf_* naming — AND
+        // the five planes the netcdf-reader metadata index drops on this
+        // file, which only the raw-HDF5 union recovery can land
+        // (hdf5_recovered_planes).
+        for var in [
+            "wrf_tk",
+            "wrf_z",
+            "wrf_p",
+            "wrf_sbcape",
+            "wrf_aclwdnb",
+            "wrf_u10",
+            "wrf_mucape",
+            "wrf_srh03",
+            "wrf_swupt",
+            "wrf_acedir",
+        ] {
             assert!(
                 summary.variables.iter().any(|name| name == var),
                 "{var} missing: {:?}",
