@@ -365,7 +365,7 @@ fn process_paths(
             match crate::local_import::try_postprocessed_wrf(path, &mut |message: String| {
                 let _ = tx.send(WrfProcessMessage::Progress(message));
             }) {
-                Ok(Some((canonical, severe, volumes))) => {
+                Ok(Some((canonical, severe, volumes, raw_2d))) => {
                     let hour = u16::try_from(written.len()).expect("bounded above");
                     let _ = tx.send(WrfProcessMessage::Progress(format!(
                         "Reading post-processed WRF {} -> f{hour:03}",
@@ -379,7 +379,7 @@ fn process_paths(
                     // path's getvar loop writes for raw wrfouts — the wrench
                     // flow now yields severe fields for post-processed files
                     // too.
-                    let severe_refs = severe
+                    let mut derived_refs = severe
                         .iter()
                         .map(|field| DerivedFieldInput {
                             name: field.name,
@@ -387,6 +387,14 @@ fn process_paths(
                             values: field.values.as_slice(),
                         })
                         .collect::<Vec<_>>();
+                    // Raw `wrf_*` planes from the 2-D wrf2d route (empty on
+                    // the 3-D route) — the wrench flow imports pure surface
+                    // archives the same way the light import does.
+                    derived_refs.extend(raw_2d.iter().map(|field| DerivedFieldInput {
+                        name: field.name.as_str(),
+                        units: field.units.as_str(),
+                        values: field.values.as_slice(),
+                    }));
                     let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
                     let result = write_hour_from_fields_with_derived(
                         store_root,
@@ -394,7 +402,7 @@ fn process_paths(
                         &run,
                         hour,
                         &refs,
-                        &severe_refs,
+                        &derived_refs,
                         &volume_inputs,
                         writer_build(),
                         now_unix(),

@@ -208,7 +208,7 @@ fn import_paths(
         let postprocessed = try_postprocessed_wrf_shared(&nc, path, &mut |message| {
             progress(format!("{tag}: {message}"))
         })?;
-        if let Some((canonical, severe, volumes)) = postprocessed {
+        if let Some((canonical, severe, volumes, raw_2d)) = postprocessed {
             let refs = canonical
                 .iter()
                 .map(|(name, field)| (name.as_str(), field))
@@ -216,7 +216,7 @@ fn import_paths(
             // Severe/thermo fields ride the derived-field slot under the same
             // store slugs the heavy getvar path writes, so labels and Solar
             // styles apply identically.
-            let severe_refs = severe
+            let mut derived_refs = severe
                 .iter()
                 .map(|field| DerivedFieldInput {
                     name: field.name,
@@ -224,6 +224,14 @@ fn import_paths(
                     values: field.values.as_slice(),
                 })
                 .collect::<Vec<_>>();
+            // Raw `wrf_*` planes from the 2-D wrf2d route share that slot —
+            // the same convention the raw-wrfout light import uses (empty on
+            // the 3-D route, so its hours are written exactly as before).
+            derived_refs.extend(raw_2d.iter().map(|field| DerivedFieldInput {
+                name: field.name.as_str(),
+                units: field.units.as_str(),
+                values: field.values.as_slice(),
+            }));
             let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
             progress(format!("{tag}: writing forecast hour f{hour:03} to store"));
             let result = write_hour_from_fields_with_derived(
@@ -232,7 +240,7 @@ fn import_paths(
                 &run,
                 hour,
                 &refs,
-                &severe_refs,
+                &derived_refs,
                 &volume_inputs,
                 writer_build(),
                 now_unix(),
@@ -349,144 +357,7 @@ fn read_wrf_2d_fields(
     let grid = LatLonGrid::new(shape, lat.values, lon.values)?;
     let projection = wrf_projection(nc);
     let mut canonical = Vec::new();
-
-    push_direct(
-        &mut canonical,
-        &src,
-        &grid,
-        projection.clone(),
-        "T2",
-        "temperature_2m",
-        FieldSelector::height_agl(CanonicalField::Temperature, 2),
-        Some("K"),
-    )?;
-    push_direct(
-        &mut canonical,
-        &src,
-        &grid,
-        projection.clone(),
-        "U10",
-        "u_10m",
-        FieldSelector::height_agl(CanonicalField::UWind, 10),
-        Some("m/s"),
-    )?;
-    push_direct(
-        &mut canonical,
-        &src,
-        &grid,
-        projection.clone(),
-        "V10",
-        "v_10m",
-        FieldSelector::height_agl(CanonicalField::VWind, 10),
-        Some("m/s"),
-    )?;
-    push_direct(
-        &mut canonical,
-        &src,
-        &grid,
-        projection.clone(),
-        "PSFC",
-        "surface_pressure",
-        FieldSelector::surface(CanonicalField::Pressure),
-        Some("Pa"),
-    )?;
-    push_direct(
-        &mut canonical,
-        &src,
-        &grid,
-        projection.clone(),
-        "HGT",
-        "orography",
-        FieldSelector::surface(CanonicalField::GeopotentialHeight),
-        Some("m"),
-    )?;
-    push_direct(
-        &mut canonical,
-        &src,
-        &grid,
-        projection.clone(),
-        "SLP",
-        "mslp",
-        FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
-        Some("Pa"),
-    )?;
-    push_direct(
-        &mut canonical,
-        &src,
-        &grid,
-        projection.clone(),
-        "REFD_MAX",
-        "composite_reflectivity",
-        FieldSelector::entire_atmosphere(CanonicalField::CompositeReflectivity),
-        Some("dBZ"),
-    )?;
-    push_direct(
-        &mut canonical,
-        &src,
-        &grid,
-        projection.clone(),
-        "WSPD10MAX",
-        "wind_speed_10m_max",
-        FieldSelector::height_agl(CanonicalField::WindGust, 10),
-        Some("m/s"),
-    )?;
-
-    if let (Some(u10), Some(v10)) = (read_first_2d(&src, "U10")?, read_first_2d(&src, "V10")?) {
-        let values = combine_same_grid(&u10, &v10, |u, v| (u.mul_add(u, v * v)).sqrt())?;
-        push_computed(
-            &mut canonical,
-            &grid,
-            projection.clone(),
-            "wind_speed_10m",
-            FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
-            "m/s",
-            values,
-        )?;
-    }
-
-    if let (Some(t2), Some(q2), Some(psfc)) = (
-        read_first_2d(&src, "T2")?,
-        read_first_2d(&src, "Q2")?,
-        read_first_2d(&src, "PSFC")?,
-    ) {
-        let dewpoint = derive_dewpoint_k(&t2, &q2, &psfc)?;
-        push_computed(
-            &mut canonical,
-            &grid,
-            projection.clone(),
-            "dewpoint_2m",
-            FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
-            "K",
-            dewpoint,
-        )?;
-        let rh = derive_relative_humidity_percent(&t2, &q2, &psfc)?;
-        push_computed(
-            &mut canonical,
-            &grid,
-            projection.clone(),
-            "relative_humidity_2m",
-            FieldSelector::height_agl(CanonicalField::RelativeHumidity, 2),
-            "%",
-            rh,
-        )?;
-    }
-
-    if let (Some(rainc), Some(rainnc)) = (
-        read_first_2d(&src, "RAINC")?,
-        read_first_2d(&src, "RAINNC")?,
-    ) {
-        let rainsh = read_first_2d(&src, "RAINSH")?;
-        let values = combine_precip(&rainc, &rainnc, rainsh.as_ref())?;
-        push_computed(
-            &mut canonical,
-            &grid,
-            projection.clone(),
-            "apcp",
-            FieldSelector::surface(CanonicalField::TotalPrecipitation),
-            "kg/m^2",
-            values,
-        )?;
-    }
+    push_canonical_surface_fields(&mut canonical, &src, &grid, &projection)?;
 
     let raw_2d = read_raw_wrf_mass_grid_fields(&src, lat.nx, lat.ny, progress)?;
 
@@ -516,6 +387,160 @@ fn read_wrf_2d_fields(
         grid,
         projection,
     })
+}
+
+/// The canonical surface-field suite shared by the raw-wrfout 2-D read and
+/// the post-processed 2-D (`wrf2d`) route: direct T2/U10/V10/PSFC/HGT/SLP/
+/// REFD_MAX/WSPD10MAX planes plus the derived 10 m wind speed, 2 m dewpoint /
+/// relative humidity, and total-precipitation fields — each pushed only when
+/// its source planes exist in the file. Body moved unchanged from
+/// `read_wrf_2d_fields` (only the borrow spellings changed for the
+/// by-reference parameters).
+fn push_canonical_surface_fields(
+    canonical: &mut Vec<(String, SelectedField2D)>,
+    src: &PlaneSource,
+    grid: &LatLonGrid,
+    projection: &Option<GridProjection>,
+) -> Result<(), ImportError> {
+    push_direct(
+        canonical,
+        src,
+        grid,
+        projection.clone(),
+        "T2",
+        "temperature_2m",
+        FieldSelector::height_agl(CanonicalField::Temperature, 2),
+        Some("K"),
+    )?;
+    push_direct(
+        canonical,
+        src,
+        grid,
+        projection.clone(),
+        "U10",
+        "u_10m",
+        FieldSelector::height_agl(CanonicalField::UWind, 10),
+        Some("m/s"),
+    )?;
+    push_direct(
+        canonical,
+        src,
+        grid,
+        projection.clone(),
+        "V10",
+        "v_10m",
+        FieldSelector::height_agl(CanonicalField::VWind, 10),
+        Some("m/s"),
+    )?;
+    push_direct(
+        canonical,
+        src,
+        grid,
+        projection.clone(),
+        "PSFC",
+        "surface_pressure",
+        FieldSelector::surface(CanonicalField::Pressure),
+        Some("Pa"),
+    )?;
+    push_direct(
+        canonical,
+        src,
+        grid,
+        projection.clone(),
+        "HGT",
+        "orography",
+        FieldSelector::surface(CanonicalField::GeopotentialHeight),
+        Some("m"),
+    )?;
+    push_direct(
+        canonical,
+        src,
+        grid,
+        projection.clone(),
+        "SLP",
+        "mslp",
+        FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
+        Some("Pa"),
+    )?;
+    push_direct(
+        canonical,
+        src,
+        grid,
+        projection.clone(),
+        "REFD_MAX",
+        "composite_reflectivity",
+        FieldSelector::entire_atmosphere(CanonicalField::CompositeReflectivity),
+        Some("dBZ"),
+    )?;
+    push_direct(
+        canonical,
+        src,
+        grid,
+        projection.clone(),
+        "WSPD10MAX",
+        "wind_speed_10m_max",
+        FieldSelector::height_agl(CanonicalField::WindGust, 10),
+        Some("m/s"),
+    )?;
+
+    if let (Some(u10), Some(v10)) = (read_first_2d(src, "U10")?, read_first_2d(src, "V10")?) {
+        let values = combine_same_grid(&u10, &v10, |u, v| (u.mul_add(u, v * v)).sqrt())?;
+        push_computed(
+            canonical,
+            grid,
+            projection.clone(),
+            "wind_speed_10m",
+            FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
+            "m/s",
+            values,
+        )?;
+    }
+
+    if let (Some(t2), Some(q2), Some(psfc)) = (
+        read_first_2d(src, "T2")?,
+        read_first_2d(src, "Q2")?,
+        read_first_2d(src, "PSFC")?,
+    ) {
+        let dewpoint = derive_dewpoint_k(&t2, &q2, &psfc)?;
+        push_computed(
+            canonical,
+            grid,
+            projection.clone(),
+            "dewpoint_2m",
+            FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
+            "K",
+            dewpoint,
+        )?;
+        let rh = derive_relative_humidity_percent(&t2, &q2, &psfc)?;
+        push_computed(
+            canonical,
+            grid,
+            projection.clone(),
+            "relative_humidity_2m",
+            FieldSelector::height_agl(CanonicalField::RelativeHumidity, 2),
+            "%",
+            rh,
+        )?;
+    }
+
+    if let (Some(rainc), Some(rainnc)) = (
+        read_first_2d(src, "RAINC")?,
+        read_first_2d(src, "RAINNC")?,
+    ) {
+        let rainsh = read_first_2d(src, "RAINSH")?;
+        let values = combine_precip(&rainc, &rainnc, rainsh.as_ref())?;
+        push_computed(
+            canonical,
+            grid,
+            projection.clone(),
+            "apcp",
+            FieldSelector::surface(CanonicalField::TotalPrecipitation),
+            "kg/m^2",
+            values,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn push_direct(
@@ -1108,9 +1133,10 @@ fn fill_missing_surface(fields: &mut ImportedWrfFields, surface: SurfaceFallback
 /// pressure, Pa) and staggered `U`/`V` instead of the raw `T`/`PB`/`PH`/`PHB`
 /// the wrf-core reader needs, and carry no surface fields. Returns the
 /// synthesized surface 2D fields + the severe/thermo suite + the isobaric
-/// volumes, or `None` if this isn't a post-processed WRF file (so the caller
-/// falls back to the raw path). `progress` streams the stage messages both
-/// import paths show in the dock.
+/// volumes (+ raw `wrf_*` planes when the file is a pure 2-D `wrf2d` surface
+/// archive), or `None` if this isn't a post-processed WRF file (so the
+/// caller falls back to the raw path). `progress` streams the stage messages
+/// both import paths show in the dock.
 pub(crate) fn try_postprocessed_wrf(
     path: &Path,
     progress: &mut dyn FnMut(String),
@@ -1142,12 +1168,175 @@ fn destagger_z_to_mass_levels(values: &mut Vec<f64>, nz: usize, cells: usize) {
 
 /// Everything one post-processed hour yields: the synthesized surface 2D
 /// fields, the severe/thermo suite (heavy-path store slugs, written through
-/// the derived-field slot), and the isobaric sounding volumes.
+/// the derived-field slot), the isobaric sounding volumes, and — for the
+/// 2-D-only `wrf2d` route — every mass-grid data plane as a raw `wrf_*`
+/// field (same derived-slot convention as the raw-wrfout light import; the
+/// 3-D route always returns this empty).
 pub(crate) type PostprocessedWrfHour = (
     Vec<(String, SelectedField2D)>,
     Vec<crate::postproc_severe::SevereField>,
     Vec<IsoVolume>,
+    Vec<RawField2D>,
 );
+
+/// Post-processed climate-WRF routing rule: TRUE when the `TK` variable is a
+/// single 2-D surface plane — i.e. after dropping one leading record
+/// ("Time") dimension, exactly `[ny, nx]` remains. That is the CONUS-II
+/// `wrf2d` surface-archive dialect (every data variable at the lowest model
+/// level / surface, `(Time=1, ny, nx)`). `wrf3d`-style archives carry TK on
+/// model levels (`[Time, nz, ny, nx]` or `[nz, ny, nx]`) and return FALSE so
+/// the existing 3-D reader (including its staggered-Z destagger) is
+/// untouched. The Time-squeeze mirrors what
+/// `read_array_f64_first_record_or_all` does on the read side.
+fn postproc_tk_is_2d(dim_names: &[&str], shape: &[usize]) -> bool {
+    if dim_names.len() != shape.len() {
+        return false;
+    }
+    let squeezed_rank = if dim_names.first().copied() == Some("Time") {
+        shape.len() - 1
+    } else {
+        shape.len()
+    };
+    squeezed_rank == 2
+}
+
+/// A `wrf2d`-style data variable for the post-processed 2-D route: a single
+/// plane on the `ny x nx` mass grid — shaped `[Time, ny, nx]`, `[1, ny, nx]`,
+/// or `[ny, nx]` — that is not a coordinate/bookkeeping variable (the raw
+/// wrfout blocklist plus the lat/lon/time axis names the grid reader
+/// consumes). Staggered planes and model-level stacks never match the shape
+/// rule.
+fn is_postproc_2d_data_plane(
+    name: &str,
+    dim_names: &[&str],
+    shape: &[usize],
+    ny: usize,
+    nx: usize,
+) -> bool {
+    if !raw_wrf_variable_allowed(name) || is_coordinate_axis_name(name) {
+        return false;
+    }
+    if dim_names.len() != shape.len() {
+        return false;
+    }
+    match shape {
+        [y, x] => *y == ny && *x == nx,
+        [t, y, x] => (*t == 1 || dim_names[0] == "Time") && *y == ny && *x == nx,
+        _ => false,
+    }
+}
+
+/// Coordinate-axis variable names the 2-D enumeration must skip (the grid
+/// reader consumes these; they are not data planes). The uppercase WRF forms
+/// (XLAT/XLONG/…) are already on `raw_wrf_variable_allowed`'s blocklist.
+fn is_coordinate_axis_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "lat" | "lon" | "latitude" | "longitude" | "time" | "times" | "xtime"
+    )
+}
+
+/// Build the store hour for a PURE 2-D post-processed surface archive
+/// (CONUS-II GDEX `wrf2d`: `Time(1)` + ~190 single-plane data variables, no
+/// model-level stacks — owner-reported "bad shape for variable TK" when the
+/// 3-D reader claimed one). Yields the canonical surface suite (these files
+/// ship T2/Q2/PSFC/U10/V10/WSPD10MAX) plus EVERY mass-grid data plane as a
+/// raw `wrf_*` field through the same derived-slot store-write convention
+/// the raw-wrfout light import uses, so picker labels and Solar fallback
+/// styles resolve identically. No isobaric volumes and no computed severe
+/// suite — nothing 3-D exists to build them from; the files carry their own
+/// pre-computed severe planes (SBCAPE/MUCAPE/SRH01/…), which land as raw
+/// fields. Memory stays flat: one netcrust f64 record (~16 MB on the
+/// 1419 x 1429 CONUS-II grid) is narrowed to f32 and dropped per plane.
+fn postprocessed_wrf2d_hour(
+    nc: &NcFile,
+    path: &Path,
+    progress: &mut dyn FnMut(String),
+) -> Result<PostprocessedWrfHour, ImportError> {
+    // Same netcrust-only source as the 3-D post-processed route: wrf-core
+    // cannot open these files (no raw T/PB).
+    let src = PlaneSource::netcrust_only(nc);
+    let lat = read_first_2d_any(&src, &["XLAT", "XLAT_M", "lat", "latitude"])?;
+    let lon = read_first_2d_any(&src, &["XLONG", "XLONG_M", "lon", "longitude"])?;
+    if lat.nx != lon.nx || lat.ny != lon.ny || lat.values.len() != lon.values.len() {
+        return Err(ImportError::GridMismatch(path.to_path_buf()));
+    }
+    let (nx, ny) = (lat.nx, lat.ny);
+    let shape = GridShape::new(nx, ny)?;
+    let grid = LatLonGrid::new(shape, lat.values, lon.values)?;
+    let projection = wrf_projection(nc);
+
+    let mut canonical = Vec::new();
+    push_canonical_surface_fields(&mut canonical, &src, &grid, &projection)?;
+    // The store writer needs at least one extracted 2-D field to carry the
+    // hour grid. Real wrf2d archives ship PSFC/T2/U10/…, so this fallback is
+    // for pathological surface archives only: lowest-model-level P (always
+    // present — it is part of the post-processed gate) as the
+    // surface-pressure proxy, the same approximation the 3-D route documents
+    // for its parcel state.
+    if canonical.is_empty() {
+        push_direct(
+            &mut canonical,
+            &src,
+            &grid,
+            projection.clone(),
+            "P",
+            "surface_pressure",
+            FieldSelector::surface(CanonicalField::Pressure),
+            Some("Pa"),
+        )?;
+    }
+    if canonical.is_empty() {
+        return Err(ImportError::NoFields(path.to_path_buf()));
+    }
+
+    // Every mass-grid data plane, read-narrow-drop, one at a time. A count
+    // line every few planes keeps the dock's progress live without spamming
+    // the channel (~190 variables on a real wrf2d file).
+    let variables = nc.variables()?;
+    let planned = variables
+        .iter()
+        .filter(|var| {
+            let names: Vec<&str> = var.dimensions().iter().map(|dim| dim.name()).collect();
+            is_postproc_2d_data_plane(var.name(), &names, &var.shape(), ny, nx)
+        })
+        .map(|var| var.name().to_string())
+        .collect::<Vec<_>>();
+    let total = planned.len();
+    progress(format!("reading {total} 2-D surface planes"));
+    let mut seen = HashSet::<String>::new();
+    let mut raw_2d = Vec::new();
+    for (index, wrf_name) in planned.iter().enumerate() {
+        if index % 10 == 0 {
+            progress(format!(
+                "reading 2-D surface plane {}/{total} ({wrf_name})",
+                index + 1
+            ));
+        }
+        let Some(plane) = read_first_2d(&src, wrf_name)? else {
+            continue;
+        };
+        if plane.nx != nx || plane.ny != ny {
+            continue;
+        }
+        let name = format!("wrf_{}", sanitize_store_var_name(wrf_name));
+        if name == "wrf_" || !seen.insert(name.clone()) {
+            continue;
+        }
+        raw_2d.push(RawField2D {
+            name,
+            units: variable_units(nc, wrf_name).unwrap_or_else(|| "1".to_string()),
+            values: plane.values,
+        });
+    }
+    progress(format!(
+        "read {} 2-D surface planes ({} canonical fields)",
+        raw_2d.len(),
+        canonical.len()
+    ));
+
+    Ok((canonical, Vec::new(), Vec::new(), raw_2d))
+}
 
 /// [`try_postprocessed_wrf`] against an already-open netcrust handle, so the
 /// light import's per-file loop pays `netcrust::open`'s eager NetCDF-4
@@ -1164,6 +1353,20 @@ fn try_postprocessed_wrf_shared(
         && nc.variable("PB").is_none();
     if !is_postprocessed {
         return Ok(None);
+    }
+    // CONUS-II `wrf2d` surface archives pass the TK/Z/P gate too, but carry
+    // every variable as a SINGLE lowest-model-level / surface plane — the 3-D
+    // reader below would fail on them ("bad shape for variable TK",
+    // owner-reported). Route them to the 2-D-only import instead.
+    let tk_is_2d = nc
+        .variable("TK")
+        .map(|var| {
+            let names: Vec<&str> = var.dimensions().iter().map(|dim| dim.name()).collect();
+            postproc_tk_is_2d(&names, &var.shape())
+        })
+        .unwrap_or(false);
+    if tk_is_2d {
+        return postprocessed_wrf2d_hour(nc, path, progress).map(Some);
     }
 
     // Post-processed climate files stay entirely on netcrust: wrf-core can't
@@ -1344,7 +1547,7 @@ fn try_postprocessed_wrf_shared(
         }
     };
 
-    Ok(Some((canonical, severe, volumes)))
+    Ok(Some((canonical, severe, volumes, Vec::new())))
 }
 
 /// Destagger a `[nz, ny, nx+1]` (west_east_stag) field to `[nz, ny, nx]` mass
@@ -1440,6 +1643,206 @@ mod tests {
     fn temp_dir(name: &str) -> PathBuf {
         let unique = now_unix();
         std::env::temp_dir().join(format!("rw-local-import-{name}-{unique}"))
+    }
+
+    /// The post-processed routing rule (owner-reported CONUS-II wrf2d
+    /// misroute, "bad shape for variable TK: [1419, 1429]"): single-plane TK
+    /// (surface archive) routes 2-D, model-level TK (wrf3d, either Z era)
+    /// stays on the 3-D path. Dim names/shapes taken from the real GDEX
+    /// files.
+    #[test]
+    fn postproc_routing_separates_wrf2d_from_wrf3d() {
+        // Real wrf2d TK: (Time, south_north, west_east) = (1, 1419, 1429).
+        assert!(postproc_tk_is_2d(
+            &["Time", "south_north", "west_east"],
+            &[1, 1419, 1429]
+        ));
+        // Real wrf3d TK: (Time, bottom_top, south_north, west_east).
+        assert!(!postproc_tk_is_2d(
+            &["Time", "bottom_top", "south_north", "west_east"],
+            &[1, 50, 1419, 1429]
+        ));
+        // No record dim: bare planes route 2-D, bare stacks route 3-D.
+        assert!(postproc_tk_is_2d(
+            &["south_north", "west_east"],
+            &[1419, 1429]
+        ));
+        assert!(!postproc_tk_is_2d(
+            &["bottom_top", "south_north", "west_east"],
+            &[50, 1419, 1429]
+        ));
+        // Degenerate ranks and dims/shape disagreement never claim 2-D.
+        assert!(!postproc_tk_is_2d(&["Time"], &[1]));
+        assert!(!postproc_tk_is_2d(
+            &["Time", "south_north"],
+            &[1, 1419, 1429]
+        ));
+    }
+
+    /// The wrf2d plane scanner: accepts single mass-grid planes in all three
+    /// stored shapes, rejects coordinates, bookkeeping axes, staggered
+    /// single-level winds, and model-level stacks. Names/shapes from the
+    /// real wrf2d probe (192 variables, 185 mass-grid data planes).
+    #[test]
+    fn wrf2d_plane_scanner_selects_mass_grid_data_vars() {
+        let (ny, nx) = (1419usize, 1429usize);
+        let t = &["Time", "south_north", "west_east"][..];
+        // Data planes: float and int-bucket vars alike.
+        assert!(is_postproc_2d_data_plane("TK", t, &[1, ny, nx], ny, nx));
+        assert!(is_postproc_2d_data_plane("SBCAPE", t, &[1, ny, nx], ny, nx));
+        assert!(is_postproc_2d_data_plane(
+            "I_ACLWDNB",
+            t,
+            &[1, ny, nx],
+            ny,
+            nx
+        ));
+        // Bare (ny, nx) planes count too, as does a non-Time leading dim of
+        // length 1, and a multi-record Time dim (record 0 is read).
+        assert!(is_postproc_2d_data_plane(
+            "TSK",
+            &["south_north", "west_east"],
+            &[ny, nx],
+            ny,
+            nx
+        ));
+        assert!(is_postproc_2d_data_plane(
+            "TSK",
+            &["level", "south_north", "west_east"],
+            &[1, ny, nx],
+            ny,
+            nx
+        ));
+        assert!(is_postproc_2d_data_plane("T2", t, &[4, ny, nx], ny, nx));
+        // Coordinates and bookkeeping are never data.
+        assert!(!is_postproc_2d_data_plane(
+            "XLAT",
+            &["south_north", "west_east"],
+            &[ny, nx],
+            ny,
+            nx
+        ));
+        assert!(!is_postproc_2d_data_plane(
+            "lat",
+            &["south_north", "west_east"],
+            &[ny, nx],
+            ny,
+            nx
+        ));
+        assert!(!is_postproc_2d_data_plane("XTIME", &["Time"], &[1], ny, nx));
+        assert!(!is_postproc_2d_data_plane(
+            "Times",
+            &["Time", "DateStrLen"],
+            &[1, 19],
+            ny,
+            nx
+        ));
+        // Staggered single-level winds do not sit on the mass grid.
+        assert!(!is_postproc_2d_data_plane(
+            "U",
+            &["Time", "south_north", "west_east_stag"],
+            &[1, ny, nx + 1],
+            ny,
+            nx
+        ));
+        assert!(!is_postproc_2d_data_plane(
+            "V",
+            &["Time", "south_north_stag", "west_east"],
+            &[1, ny + 1, nx],
+            ny,
+            nx
+        ));
+        // Model-level stacks belong to the 3-D route.
+        assert!(!is_postproc_2d_data_plane(
+            "TK",
+            &["Time", "bottom_top", "south_north", "west_east"],
+            &[1, 50, ny, nx],
+            ny,
+            nx
+        ));
+    }
+
+    /// Real-data proof for the CONUS-II `wrf2d` 2-D route (the owner's
+    /// failing file): runs the full light import on the surface archive
+    /// named by `RW_WRF2D_FIXTURE` and asserts the canonical suite + raw
+    /// `wrf_*` planes land with physical values and NO iso volumes. Skips
+    /// (passing) when the env var is unset.
+    #[test]
+    fn optional_wrf2d_fixture_imports_surface_planes() {
+        let Ok(fixture) = std::env::var("RW_WRF2D_FIXTURE") else {
+            eprintln!("skipping; set RW_WRF2D_FIXTURE to a CONUS-II wrf2d file");
+            return;
+        };
+        let store_root = temp_dir("wrf2d");
+        let start = std::time::Instant::now();
+        let summary = import_paths(&[PathBuf::from(&fixture)], &store_root, &mut |message| {
+            eprintln!("[{:9.2?}] {message}", start.elapsed());
+        })
+        .unwrap();
+        eprintln!(
+            "[{:9.2?}] DONE: {} hour(s), {} variables; peak RSS {}",
+            start.elapsed(),
+            summary.hours_written,
+            summary.variables.len(),
+            peak_rss_label()
+        );
+        assert_eq!(summary.model, "wrf");
+        assert_eq!(summary.hours_written, 1);
+        // Canonical suite from the file's own T2/Q2/PSFC/U10/V10 planes.
+        for var in [
+            "temperature_2m",
+            "dewpoint_2m",
+            "relative_humidity_2m",
+            "surface_pressure",
+            "u_10m",
+            "v_10m",
+            "wind_speed_10m",
+            "wind_speed_10m_max",
+        ] {
+            assert!(
+                summary.variables.iter().any(|name| name == var),
+                "{var} missing: {:?}",
+                summary.variables
+            );
+        }
+        // Raw planes: the misrouting trio plus a severe plane and an
+        // accumulated-flux plane, under the light-import wrf_* naming.
+        for var in ["wrf_tk", "wrf_z", "wrf_p", "wrf_sbcape", "wrf_aclwdnb"] {
+            assert!(
+                summary.variables.iter().any(|name| name == var),
+                "{var} missing: {:?}",
+                summary.variables
+            );
+        }
+        // A pure 2-D archive must not synthesize sounding volumes.
+        assert!(
+            !summary.variables.iter().any(|name| name.ends_with("_iso")),
+            "unexpected iso volumes: {:?}",
+            summary.variables
+        );
+
+        // Value roundtrip through the store: lowest-model-level TK must be
+        // physical air temperature over the CONUS grid.
+        let hour = store_root
+            .join(&summary.model)
+            .join(&summary.run)
+            .join("f000.rws");
+        let reader = rw_store::reader::HourReader::open(&hour).expect("open hour");
+        let tk = reader.read_full_2d("wrf_tk").expect("read wrf_tk");
+        let finite = tk.iter().filter(|value| value.is_finite()).count();
+        assert!(
+            finite > tk.len() / 2,
+            "wrf_tk mostly NaN: {finite}/{}",
+            tk.len()
+        );
+        for value in tk.iter().filter(|value| value.is_finite()) {
+            assert!(
+                (180.0..=340.0).contains(value),
+                "TK {value} K non-physical"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(store_root);
     }
 
     #[test]
