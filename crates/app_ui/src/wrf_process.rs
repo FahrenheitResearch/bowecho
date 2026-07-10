@@ -344,61 +344,75 @@ fn process_paths(
         if written.len() > u16::MAX as usize {
             return Err(format!("Too many WRF times to store: {}", written.len()));
         }
-        // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
-        // raw T/PB) — wrf-core can't open these, so route them through the
-        // netcrust-based reader before falling through to the raw path.
-        match crate::local_import::try_postprocessed_wrf(path, &mut |message: String| {
-            let _ = tx.send(WrfProcessMessage::Progress(message));
-        }) {
-            Ok(Some((canonical, severe, volumes))) => {
-                let hour = u16::try_from(written.len()).expect("bounded above");
-                let _ = tx.send(WrfProcessMessage::Progress(format!(
-                    "Reading post-processed WRF {} -> f{hour:03}",
-                    display_name(path)
-                )));
-                let refs = canonical
-                    .iter()
-                    .map(|(name, field)| (name.as_str(), field))
-                    .collect::<Vec<_>>();
-                // Severe/thermo suite under the same store slugs this path's
-                // getvar loop writes for raw wrfouts — the wrench flow now
-                // yields severe fields for post-processed files too.
-                let severe_refs = severe
-                    .iter()
-                    .map(|field| DerivedFieldInput {
-                        name: field.name,
-                        units: field.units,
-                        values: field.values.as_slice(),
-                    })
-                    .collect::<Vec<_>>();
-                let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
-                let result = write_hour_from_fields_with_derived(
-                    store_root,
-                    &model,
-                    &run,
-                    hour,
-                    &refs,
-                    &severe_refs,
-                    &volume_inputs,
-                    writer_build(),
-                    now_unix(),
-                )
-                .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
-                all_vars.extend(result.vars.iter().cloned());
-                written.push(result);
-                continue;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Err(format!("Process WRF {} failed: {err}", path.display()));
-            }
-        }
-
         let _ = tx.send(WrfProcessMessage::Progress(format!(
             "Opening WRF {}",
             display_name(path)
         )));
-        let file = WrfFile::open(path)
+        // Probe the raw wrf-core reader FIRST: raw wrfouts are the common
+        // wrench-flow case and the probe fails fast on post-processed files
+        // (they carry no raw T). The previous order ran netcrust::open's
+        // eager NetCDF-4 metadata indexing (~57 s on a 2 GB compressed
+        // wrfout, docs/wrf-import-large-grids.md) on EVERY raw file just to
+        // conclude "not post-processed". The two detectors cannot overlap:
+        // raw files have T (wrf-core opens), post-processed have TK/Z/P and
+        // no PB (netcrust path claims them).
+        let raw_open = WrfFile::open(path);
+        if raw_open.is_err() {
+            // Post-processed climate wrfout (CONUS-I/II, GDEX: derived
+            // TK/Z/P, no raw T/PB) — wrf-core can't open these, so route
+            // them through the netcrust-based reader before reporting the
+            // raw open error below.
+            match crate::local_import::try_postprocessed_wrf(path, &mut |message: String| {
+                let _ = tx.send(WrfProcessMessage::Progress(message));
+            }) {
+                Ok(Some((canonical, severe, volumes))) => {
+                    let hour = u16::try_from(written.len()).expect("bounded above");
+                    let _ = tx.send(WrfProcessMessage::Progress(format!(
+                        "Reading post-processed WRF {} -> f{hour:03}",
+                        display_name(path)
+                    )));
+                    let refs = canonical
+                        .iter()
+                        .map(|(name, field)| (name.as_str(), field))
+                        .collect::<Vec<_>>();
+                    // Severe/thermo suite under the same store slugs this
+                    // path's getvar loop writes for raw wrfouts — the wrench
+                    // flow now yields severe fields for post-processed files
+                    // too.
+                    let severe_refs = severe
+                        .iter()
+                        .map(|field| DerivedFieldInput {
+                            name: field.name,
+                            units: field.units,
+                            values: field.values.as_slice(),
+                        })
+                        .collect::<Vec<_>>();
+                    let volume_inputs =
+                        volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
+                    let result = write_hour_from_fields_with_derived(
+                        store_root,
+                        &model,
+                        &run,
+                        hour,
+                        &refs,
+                        &severe_refs,
+                        &volume_inputs,
+                        writer_build(),
+                        now_unix(),
+                    )
+                    .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
+                    all_vars.extend(result.vars.iter().cloned());
+                    written.push(result);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(format!("Process WRF {} failed: {err}", path.display()));
+                }
+            }
+        }
+
+        let file = raw_open
             .map_err(|err| format!("Open WRF {} failed: {err}", path.display()))?;
 
         for timeidx in 0..file.nt {
@@ -1185,10 +1199,15 @@ fn filter_token_matches(key: &str, token: &str) -> bool {
 
 fn is_heavy_wrf_diagnostic(name: &str) -> bool {
     let key = slug(name);
+    // "ncape" is a full ecape-rs solve (normalized CAPE) but does not
+    // literally contain "ecape", so without the explicit match it leaks
+    // into the default pass at ~10 s/file on an 800x800x79 grid; in the
+    // Heavy group it rides the ecape stack cache for milliseconds.
     key.contains("ecape")
         || matches!(
             key.as_str(),
-            "sbecape"
+            "ncape"
+                | "sbecape"
                 | "mlecape"
                 | "muecape"
                 | "sbncape"
@@ -1490,6 +1509,17 @@ mod tests {
         assert!(filtered.should_process("srh1", Some("srh_0_1km"), WrfProductGroup::Diagnostic));
         assert!(!filtered.should_process("srh3", Some("srh_0_3km"), WrfProductGroup::Diagnostic));
         assert!(!filtered.should_process("t2", Some("temperature_2m"), WrfProductGroup::Core));
+    }
+
+    #[test]
+    fn ncape_is_classified_with_the_heavy_ecape_group() {
+        // ncape is a full ecape-rs solve; misclassified as Diagnostic it cost
+        // ~10 s per 800x800x79 file in the default pass (perf audit
+        // 2026-07-09). In the Heavy group it rides the ecape stack cache.
+        assert!(is_heavy_wrf_diagnostic("ncape"));
+        assert!(is_heavy_wrf_diagnostic("sbncape"));
+        assert!(!is_heavy_wrf_diagnostic("sbcape"));
+        assert!(!is_heavy_wrf_diagnostic("stp"));
     }
 
     /// Real-data proof for the UI field selector: the SAME wrfout processed
