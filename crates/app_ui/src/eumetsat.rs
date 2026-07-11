@@ -208,6 +208,8 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
     let mut stack: Vec<LayerDraft> = Vec::new();
     let mut target: Option<TextTarget> = None;
     let mut out = Vec::new();
+    let mut seen_layers = 0usize;
+    let mut seen_names = Vec::new();
 
     loop {
         match reader.read_event() {
@@ -276,9 +278,14 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
             Ok(Event::End(event)) => {
                 if event.local_name().as_ref() == b"Layer" {
                     if let Some(draft) = stack.pop()
-                        && let Some(product) = MtgProduct::parse(&draft.name)
                     {
-                        out.push(finish_layer(product, draft)?);
+                        seen_layers += 1;
+                        if !draft.name.is_empty() && seen_names.len() < 8 {
+                            seen_names.push(draft.name.clone());
+                        }
+                        if let Some(product) = MtgProduct::parse(&draft.name) {
+                            out.push(finish_layer(product, draft)?);
+                        }
                     }
                 }
                 target = None;
@@ -291,7 +298,10 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
         }
     }
     if out.is_empty() {
-        return Err("EUMETView capabilities contained none of BowEcho's MTG layers".to_owned());
+        return Err(format!(
+            "EUMETView capabilities contained none of BowEcho's MTG layers (inspected {seen_layers} layers; first names: {})",
+            seen_names.join(", ")
+        ));
     }
     out.sort_by_key(|layer| {
         MtgProduct::ALL
