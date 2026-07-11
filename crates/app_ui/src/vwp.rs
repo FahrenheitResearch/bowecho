@@ -74,9 +74,10 @@ pub(crate) enum Product48DisplayOutcome {
         elevation_deg: Option<f32>,
         quality: Product48DisplayQuality,
     },
-    Rejected {
-        reason: String,
-    },
+    // Product 48 imports currently expose only decoded winds, but the display
+    // model retains rejected rows for parser variants and deterministic tests.
+    #[allow(dead_code)]
+    Rejected { reason: String },
 }
 
 /// Adaptable-parameter metadata carried by Product 48's tabular block.
