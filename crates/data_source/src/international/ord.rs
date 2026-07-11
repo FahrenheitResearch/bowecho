@@ -2723,7 +2723,14 @@ mod tests {
         .expect("full day plans");
 
         assert_eq!(calls.len(), ORD_ARCHIVE_DAY_MAX_CATALOG_REQUESTS);
-        assert_eq!(calls.iter().copied().collect::<BTreeSet<_>>().len(), 50);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(kind, hour)| (kind.dir(), *hour))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            50
+        );
         assert_eq!(snapshots.len(), ORD_ARCHIVE_DAY_PHASES + 1);
         assert_eq!(
             snapshots
