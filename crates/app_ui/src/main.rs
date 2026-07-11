@@ -3086,6 +3086,9 @@ struct ViewerApp {
     native_sounding_panel: rw_ui::SoundingPanel,
     sounding_viewer_source: SoundingViewerSource,
     native_skewt_open: bool,
+    /// Experimental vertical wind profile derived from the loaded volume's
+    /// dealiased radial velocity (or a locally imported Product 48 profile).
+    vwp_open: bool,
     /// One-shot: the docked model sounding has taken its default canvas zoom
     /// this session, so later clicks never re-stomp a zoom the user adjusted.
     sounding_dock_zoom_defaulted: bool,
@@ -4876,6 +4879,24 @@ fn default_model_layer_color_family(field: &rw_ui::FieldData) -> Option<ColorTab
     let model = field.key.hour.model.to_ascii_lowercase();
     let var = field.key.var.to_ascii_lowercase();
     let units = field.units.trim().to_ascii_lowercase();
+    // IMGW POLRAD Cartesian CMAX fields are dual-pol radar products, so bind
+    // them to the same live-editable BowEcho families as polar radar moments.
+    // Match the canonical ODIM token at the end of the source slug; this also
+    // keeps every site/product layer independently addressable.
+    if model == "imgw-polrad" {
+        if var.ends_with("_kdp") {
+            return Some(ColorTableFamily::SpecificDifferentialPhase);
+        }
+        if var.ends_with("_rhohv") {
+            return Some(ColorTableFamily::CorrelationCoefficient);
+        }
+        if var.ends_with("_zdr") {
+            return Some(ColorTableFamily::DifferentialReflectivity);
+        }
+        if var.ends_with("_phidp") {
+            return Some(ColorTableFamily::DifferentialPhase);
+        }
+    }
     // Locally-ingested WRF reflectivity is colored by Solar's "PW Style" via
     // the model-table path (`solar_model_field_table`), so don't claim it for
     // the radar reflectivity family here. Real radar composites (MRMS/OPERA
@@ -8263,6 +8284,7 @@ impl ViewerApp {
             native_sounding_panel: rw_ui::SoundingPanel::new(),
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
+            vwp_open: false,
             sounding_dock_zoom_defaulted: false,
             archive_frame_count: restored_archive_frame_count,
             archive_loaded_range: None,
@@ -25481,6 +25503,7 @@ impl ViewerApp {
             dock::WorkspacePane::Satellite => self.show_satellite = open,
             dock::WorkspacePane::Simsat => self.show_simsat = open,
             dock::WorkspacePane::Model => self.model_dock_open = open,
+            dock::WorkspacePane::Vwp => self.vwp_open = open,
             dock::WorkspacePane::UnifiedPlayer => self.unified_player.open = open,
             dock::WorkspacePane::Vol3d => self.vol3d.open = open,
         }
@@ -25497,6 +25520,7 @@ impl ViewerApp {
             dock::WorkspacePane::Satellite => self.show_satellite,
             dock::WorkspacePane::Simsat => self.show_simsat,
             dock::WorkspacePane::Model => self.model_dock_open,
+            dock::WorkspacePane::Vwp => self.vwp_open,
             dock::WorkspacePane::UnifiedPlayer => self.unified_player.open,
             dock::WorkspacePane::Vol3d => self.vol3d.open,
         }
@@ -25754,6 +25778,9 @@ impl ViewerApp {
             dock::WorkspacePane::Model => {
                 let events = self.model_pane_body(ui);
                 self.dispatch_download_events(events);
+            }
+            dock::WorkspacePane::Vwp => {
+                ui.weak("Computing vertical wind profileâ€¦");
             }
             dock::WorkspacePane::UnifiedPlayer => {
                 let ctx = ui.ctx().clone();
@@ -53112,6 +53139,22 @@ mod tests {
     }
 
     #[test]
+    fn imgw_cmax_layers_use_native_dual_pol_color_families() {
+        for (suffix, expected) in [
+            ("kdp", ColorTableFamily::SpecificDifferentialPhase),
+            ("rhohv", ColorTableFamily::CorrelationCoefficient),
+            ("zdr", ColorTableFamily::DifferentialReflectivity),
+            ("phidp", ColorTableFamily::DifferentialPhase),
+        ] {
+            let mut field = test_model_field("imgw-polrad", "latest", 0)
+                .as_ref()
+                .clone();
+            field.key.var = format!("imgw_polrad_ram_{suffix}");
+            assert_eq!(default_model_layer_color_family(&field), Some(expected));
+        }
+    }
+
+    #[test]
     fn wrf_fields_take_solar_palettes_not_the_generic_default() {
         // Locally-ingested WRF reflectivity is NOT claimed by the radar family
         // (it flows to Solar's PW Style), while its Solar table resolves.
@@ -62075,6 +62118,7 @@ mod tests {
             native_sounding_panel: rw_ui::SoundingPanel::new(),
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
+            vwp_open: false,
             sounding_dock_zoom_defaulted: false,
             archive_frame_count: 10,
             archive_loaded_range: None,
