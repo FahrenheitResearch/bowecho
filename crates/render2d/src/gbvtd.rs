@@ -844,14 +844,10 @@ mod tests {
 
         // Byte-budget test: newest-first, how many fit in the 8 GiB primary
         // budget (the trim drops oldest first, keeps newest).
-        sizes.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+        sizes.sort_by_key(|entry| std::cmp::Reverse(entry.0)); // newest first
         const GIB8: usize = 8 * 1024 * 1024 * 1024;
         let total_bytes: usize = sizes.iter().map(|(_, b)| *b).sum();
-        let avg_mb = if total > 0 {
-            (total_bytes / total) as f64 / (1024.0 * 1024.0)
-        } else {
-            0.0
-        };
+        let avg_mb = total_bytes.checked_div(total).unwrap_or(0) as f64 / (1024.0 * 1024.0);
         let mut acc = 0usize;
         let mut fit = 0usize;
         for (_, b) in &sizes {
