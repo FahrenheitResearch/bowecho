@@ -12,6 +12,7 @@ pub mod mobile_archive;
 pub mod netcdf3;
 pub mod odim;
 pub mod odim_cartesian;
+pub mod vwp;
 
 use std::cell::UnsafeCell;
 use std::collections::btree_map::Entry;
