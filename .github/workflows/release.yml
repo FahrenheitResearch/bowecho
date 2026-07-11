@@ -57,8 +57,9 @@ jobs:
         include:
           # update_asset bakes the exact release-asset name into the binary
           # (BOWECHO_UPDATE_ASSET) so the in-app updater can only download
-          # the variant it is already running. Windows-only; builds without
-          # it (dev builds, other platforms) never offer in-app install.
+          # the variant it is already running. Windows and macOS matrix
+          # builds receive it; Linux and local builds without it keep the
+          # browser-based update flow.
           - os: windows-latest
             artifact_name: bowecho-windows-x64
             package: windows
@@ -84,9 +85,11 @@ jobs:
           - os: macos-15-intel
             artifact_name: bowecho-macos-intel
             package: macos
+            update_asset: bowecho-macos-intel.zip
           - os: macos-15
             artifact_name: bowecho-macos-apple-silicon
             package: macos
+            update_asset: bowecho-macos-apple-silicon.zip
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
@@ -124,8 +127,8 @@ jobs:
       - name: Build release binary
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-          # In-app updater self-identification (empty for non-Windows
-          # matrix entries, which the code treats as "cannot self-update").
+          # In-app updater self-identification (empty for Linux matrix
+          # entries, which the code treats as "cannot self-update").
           BOWECHO_UPDATE_ASSET: ${{ matrix.update_asset }}
         run: cargo build --release -p app_ui --bin bowecho
 
@@ -266,13 +269,15 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
+            if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+              echo "::error::Tagged macOS releases require every Developer ID and notarization secret (see docs/SIGNING.md)."
+              exit 1
+            fi
           fi
 
-      # Signs + notarizes BowEcho.app when the Apple secrets exist
-      # (docs/SIGNING.md) — silently skipped until then, so adding the
-      # secrets is the ONLY step needed to ship Gatekeeper-clean builds.
       # Signs + notarizes BowEcho.app with the repo's Developer ID
-      # certificate and App Store Connect API key (docs/SIGNING.md).
+      # certificate and App Store Connect API key (docs/SIGNING.md). Tagged
+      # release jobs cannot reach this point without every required secret.
       - name: Sign and notarize macOS app
         if: runner.os == 'macOS' && steps.macos_signing.outputs.enabled == 'true'
         shell: bash
@@ -312,8 +317,17 @@ jobs:
             --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$ASC_KEY_ID" \
             --issuer "$ASC_ISSUER_ID" --wait
           xcrun stapler staple "$app"
-          spctl --assess --type execute --verbose "$app" || true
           security delete-keychain "$keychain"
+
+      - name: Validate signed macOS app
+        if: runner.os == 'macOS' && steps.macos_signing.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="BowEcho.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=4 "$app"
 
       - name: Zip macOS app
         if: runner.os == 'macOS'
