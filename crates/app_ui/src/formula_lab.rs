@@ -414,31 +414,28 @@ impl FormulaLabPanel {
                     .color(egui::Color32::LIGHT_RED),
                 );
             }
-            if let Some(source) = sources.raw_wrf {
-                if self.raw_source_error.is_none() {
-                    if let Some(revision) = &self.raw_revision {
-                        if revision.len >= LARGE_RAW_WRF_BYTES {
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new("Large raw-WRF formula evaluation")
-                                        .strong(),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} is {:.1} GB. A 3-D formula can retain several large f64 fields in addition to wrf-core's diagnostic cache.",
-                                        source.path.display(),
-                                        revision.len as f64 / 1.0e9
-                                    ))
-                                    .small(),
-                                );
-                                ui.checkbox(
-                                    &mut self.large_raw_confirmed,
-                                    "I understand the memory cost; allow evaluation",
-                                );
-                            });
-                        }
-                    }
-                }
+            if let Some(source) = sources.raw_wrf
+                && self.raw_source_error.is_none()
+                && let Some(revision) = &self.raw_revision
+                && revision.len >= LARGE_RAW_WRF_BYTES
+            {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Large raw-WRF formula evaluation").strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} is {:.1} GB. A 3-D formula can retain several large f64 fields in addition to wrf-core's diagnostic cache.",
+                            source.path.display(),
+                            revision.len as f64 / 1.0e9
+                        ))
+                        .small(),
+                    );
+                    ui.checkbox(
+                        &mut self.large_raw_confirmed,
+                        "I understand the memory cost; allow evaluation",
+                    );
+                });
             }
         }
 
@@ -535,12 +532,11 @@ impl FormulaLabPanel {
             let clicked = ui
                 .add_enabled(can_run, egui::Button::new("Evaluate and display"))
                 .clicked();
-            if clicked {
-                if let (Some(source), Ok(output_name)) =
+            if clicked
+                && let (Some(source), Ok(output_name)) =
                     (self.effective_source(sources), output_name)
-                {
-                    self.start_evaluation(ui.ctx(), source, output_name);
-                }
+            {
+                self.start_evaluation(ui.ctx(), source, output_name);
             }
             if self.task.is_some() {
                 ui.spinner();
@@ -1660,12 +1656,13 @@ fn normalized_output_name(value: &str) -> Result<String, String> {
 }
 
 fn desktop_standard_limits() -> ResourceLimits {
-    let mut limits = ResourceLimits::default();
-    limits.max_output_elements = 64 * 1024 * 1024;
-    limits.max_working_bytes = 512 * 1024 * 1024;
-    limits.max_total_allocated_bytes = 2 * 1024 * 1024 * 1024;
-    limits.max_operations = 1_000_000_000;
-    limits
+    ResourceLimits {
+        max_output_elements: 64 * 1024 * 1024,
+        max_working_bytes: 512 * 1024 * 1024,
+        max_total_allocated_bytes: 2 * 1024 * 1024 * 1024,
+        max_operations: 1_000_000_000,
+        ..ResourceLimits::default()
+    }
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
