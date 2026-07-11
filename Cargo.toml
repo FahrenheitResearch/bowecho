@@ -16,7 +16,7 @@ eframe = { version = "0.34.3", features = ["glow"] }
 earcutr = "0.5"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
-rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6", "gtk3"] }
 libdeflate-sys = "1.25.2"
 quick-xml = { version = "0.39", features = ["serialize"] }
 rayon = "1.11"

@@ -59,7 +59,8 @@ and choose **Open** once (or run
 `xattr -d com.apple.quarantine BowEcho.app` in Terminal).
 
 **Linux:** the download is the binary itself - `chmod +x bowecho-linux-x64 &&
-./bowecho-linux-x64` (needs X11/Wayland + OpenGL, standard on desktops).
+./bowecho-linux-x64` (needs X11/Wayland, OpenGL, and GTK 3.24; these are
+standard on most desktop distributions).
 
 ## Trust and verification
 
@@ -187,8 +188,8 @@ cd bowecho
 cargo run --release -p app_ui --bin bowecho
 ```
 
-Rust stable (edition 2024). Linux needs `pkg-config libgl1-mesa-dev libx11-dev
-libxi-dev libxkbcommon-dev`.
+Rust stable (edition 2024). Debian/Ubuntu Linux builds need `pkg-config
+libgtk-3-dev libgl1-mesa-dev libx11-dev libxi-dev libxkbcommon-dev`.
 
 ## Disclaimer
 
