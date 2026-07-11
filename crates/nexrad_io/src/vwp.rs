@@ -409,9 +409,10 @@ fn find_block(reader: Reader<'_>, block_id: u16) -> Option<usize> {
             continue;
         }
         let length = usize::try_from(reader.u32(offset + 4)?).ok()?;
-        if (1..MAX_BLOCK_BYTES).contains(&length)
-            && offset.checked_add(8)?.checked_add(length)? <= reader.len()
-        {
+        // The ICD length field is not consistent across old archive
+        // generations about whether the eight-byte block header is included.
+        // Sub-parsers clamp to the actual buffer, so accept either convention.
+        if (1..MAX_BLOCK_BYTES).contains(&length) {
             return Some(offset);
         }
     }
@@ -680,20 +681,21 @@ fn parse_tabular(reader: Reader<'_>, offset: usize) -> TabularResult {
             }
         }
 
-        for line in &page {
-            let upper = line.to_ascii_uppercase();
-            if let Some(value) = number_after(&upper, "RMS THRESHOLD") {
-                result.metadata.rms_threshold_kts = Some(value);
-            }
-            if let Some(value) = number_after(&upper, "SYMMETRY THRESHOLD") {
-                result.metadata.symmetry_threshold_kts = Some(value);
-            }
-            if let Some(value) = integer_after(&upper, "DATA POINTS THRESHOLD") {
-                result.metadata.data_points_threshold = Some(value);
-            }
-            if let Some(value) = number_after(&upper, "OPTIMUM SLANT RANGE") {
-                result.metadata.optimum_slant_range_nm = Some(value);
-            }
+        // Some archive products split a label and its value across adjacent
+        // tabular records. Joining matches the logical page represented by the
+        // original parser while keeping the bounded record decoder above.
+        let upper = page.join("\n").to_ascii_uppercase();
+        if let Some(value) = number_after(&upper, "RMS THRESHOLD") {
+            result.metadata.rms_threshold_kts = Some(value);
+        }
+        if let Some(value) = number_after(&upper, "SYMMETRY THRESHOLD") {
+            result.metadata.symmetry_threshold_kts = Some(value);
+        }
+        if let Some(value) = integer_after(&upper, "DATA POINTS THRESHOLD") {
+            result.metadata.data_points_threshold = Some(value);
+        }
+        if let Some(value) = number_after(&upper, "OPTIMUM SLANT RANGE") {
+            result.metadata.optimum_slant_range_nm = Some(value);
         }
     }
     result
