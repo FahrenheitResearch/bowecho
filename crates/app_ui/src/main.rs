@@ -20046,11 +20046,6 @@ impl ViewerApp {
                     "GOES satellite: live follow + frame playback (rw-sat)",
                 ),
                 (
-                    dock::WorkspacePane::Simsat,
-                    "Simulated satellite",
-                    "Render physically based visible, IR, water-vapor, and derived satellite products from WRF or HRRR native-model data",
-                ),
-                (
                     dock::WorkspacePane::Wofs,
                     "WoFS",
                     "NSSL Warn-on-Forecast System: rapid-cycling ensemble guidance (paintballs, probabilities, ensemble means), radar-time-synced",
@@ -20142,7 +20137,7 @@ impl ViewerApp {
             }
         })
         .response
-        .on_hover_text("Data windows: Model · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding");
+        .on_hover_text("Data windows: Model · VWP · Satellite · WoFS · FARM · 3D · Sounding");
     }
 
     /// Drain the embedded SimSat worker whether or not its pane is visible.
