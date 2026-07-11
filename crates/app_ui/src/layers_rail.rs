@@ -28,6 +28,22 @@ use crate::{
     poll_url_name, poll_urls_match, spc_layers,
 };
 
+fn model_map_layer_visibility_hover(grid_composite: bool) -> &'static str {
+    if grid_composite {
+        "Show this gridded radar/composite layer on the map"
+    } else {
+        "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)"
+    }
+}
+
+fn model_map_layer_opacity_hover(grid_composite: bool) -> &'static str {
+    if grid_composite {
+        "Gridded radar/composite layer opacity"
+    } else {
+        "Model layer opacity"
+    }
+}
+
 impl ViewerApp {
     /// Honest layer count for the rail header (ui-refresh proposal §1.3.3):
     /// everything the rail shows as an enabled row.
@@ -289,7 +305,7 @@ impl ViewerApp {
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
                         value: &mut layer.visible,
-                        hover: "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)",
+                        hover: model_map_layer_visibility_hover(grid_source.is_some()),
                     },
                     name: &name,
                     name_hover: &name_hover,
@@ -298,7 +314,7 @@ impl ViewerApp {
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.1,
-                        hover: "Model layer opacity",
+                        hover: model_map_layer_opacity_hover(grid_source.is_some()),
                     }),
                     order: (model_row_count > 1).then_some(LayerRowOrder {
                         delta: &mut order_delta,
@@ -2682,5 +2698,21 @@ impl ViewerApp {
         if let Some(pick) = self.take_composite_pick() {
             self.push_composite_layer(pick, ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_composite_hover_does_not_claim_model_sounding_behavior() {
+        let visibility = model_map_layer_visibility_hover(true);
+        assert!(visibility.contains("gridded radar/composite"));
+        assert!(!visibility.contains("soundings"));
+        assert_eq!(
+            model_map_layer_opacity_hover(true),
+            "Gridded radar/composite layer opacity"
+        );
     }
 }

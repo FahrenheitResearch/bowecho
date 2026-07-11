@@ -2486,9 +2486,9 @@ struct PlotDomainMapDrag {
 }
 
 /// Exact inputs that determine a computed vertical-wind profile. The Arc
-/// address separates same-time replacement volumes; the scan stamp and cut
-/// count defend against address reuse after a history trim. Analyst 3D's
-/// temporal/model anchors ride in the shared dealias context key.
+/// address separates same-time replacement volumes; completed workers also
+/// carry a strong Arc witness, so this cheap key is never trusted by itself.
+/// Analyst 3D's temporal/model anchors ride in the shared dealias context key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VwpWorkKey {
     volume_ptr: usize,
@@ -2499,8 +2499,29 @@ struct VwpWorkKey {
 
 struct VwpComputeResult {
     key: VwpWorkKey,
+    /// Strong identity witness for `key.volume_ptr`. Keeping this Arc in the
+    /// message prevents allocator reuse and lets the UI require `ptr_eq`
+    /// before applying a result.
+    source_volume: Arc<RadarVolume>,
     result: std::result::Result<render2d::VwpProfile, String>,
     dealias_label: &'static str,
+}
+
+/// A local Product 48 import stays selected until the primary volume itself
+/// changes or the user explicitly requests a computed profile. Dealias-engine
+/// and RAP-anchor changes are intentionally irrelevant to this hold.
+struct VwpProduct48Hold {
+    primary_volume: Option<Arc<RadarVolume>>,
+}
+
+impl VwpProduct48Hold {
+    fn matches(&self, current: Option<&Arc<RadarVolume>>) -> bool {
+        match (&self.primary_volume, current) {
+            (Some(imported_for), Some(current)) => Arc::ptr_eq(imported_for, current),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -2546,6 +2567,9 @@ fn product48_display_profile(
                     direction_deg: level.direction_deg as f32,
                     speed_mps: level.speed_kts as f32 / 1.943_844_4,
                     rms_mps: level.rms_kts.map(|rms| rms as f32 / 1.943_844_4),
+                    divergence: level.divergence.map(|value| value as f32),
+                    slant_range_nm: level.slant_range_nm.map(|value| value as f32),
+                    elevation_deg: level.elevation_angle_deg.map(|value| value as f32),
                     quality,
                 },
             }
@@ -2556,6 +2580,18 @@ fn product48_display_profile(
         valid_time: profile.valid_time,
         radar_elevation_m: Some(f32::from(product.radar.height_ft) * 0.3048),
         source_label,
+        metadata: vwp::Product48DisplayMetadata {
+            rms_threshold_kts: product.metadata.rms_threshold_kts.map(|value| value as f32),
+            symmetry_threshold_kts: product
+                .metadata
+                .symmetry_threshold_kts
+                .map(|value| value as f32),
+            data_points_threshold: product.metadata.data_points_threshold,
+            optimum_slant_range_nm: product
+                .metadata
+                .optimum_slant_range_nm
+                .map(|value| value as f32),
+        },
         levels,
     })
 }
@@ -3169,6 +3205,7 @@ struct ViewerApp {
     vwp_panel: vwp::VwpPanelState,
     vwp_compute_rx: Option<mpsc::Receiver<VwpComputeResult>>,
     vwp_requested_key: Option<VwpWorkKey>,
+    vwp_product48_hold: Option<VwpProduct48Hold>,
     /// One-shot: the docked model sounding has taken its default canvas zoom
     /// this session, so later clicks never re-stomp a zoom the user adjusted.
     sounding_dock_zoom_defaulted: bool,
@@ -8371,6 +8408,7 @@ impl ViewerApp {
             vwp_panel: vwp::VwpPanelState::default(),
             vwp_compute_rx: None,
             vwp_requested_key: None,
+            vwp_product48_hold: None,
             sounding_dock_zoom_defaulted: false,
             archive_frame_count: restored_archive_frame_count,
             archive_loaded_range: None,
@@ -16662,48 +16700,91 @@ impl ViewerApp {
         (previous_volume, dealias_env, context)
     }
 
-    /// Drain the latest VWP worker and, while the viewer is open, start a
-    /// replacement whenever the displayed volume or exact dealias inputs
-    /// change. Replacing the receiver is cancellation: an older worker sees
-    /// its send fail and can never overwrite the newer profile.
+    /// Drain the single VWP worker and, while the viewer is open, start work
+    /// for the latest selected volume. A changed frame never drops an active
+    /// receiver: the old worker finishes, its Arc witness rejects it as stale,
+    /// and the then-current frame starts next. This bounds expensive
+    /// full-volume dealias/VAD work to one background thread.
     fn poll_vwp(&mut self, ctx: &egui::Context) {
         let message = self.vwp_compute_rx.as_ref().map(mpsc::Receiver::try_recv);
-        match message {
+        let mut disconnected = false;
+        let completed = match message {
             Some(Ok(message)) => {
                 self.vwp_compute_rx = None;
-                if self.vwp_requested_key == Some(message.key) {
-                    match message.result {
-                        Ok(profile) => self.vwp_panel.set_computed(profile, message.dealias_label),
-                        Err(error) => self.vwp_panel.set_error(error),
-                    }
-                }
-                ctx.request_repaint();
+                Some(message)
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.vwp_compute_rx = None;
-                self.vwp_panel.set_error("VWP worker disconnected");
+                disconnected = true;
+                None
             }
-            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+            Some(Err(mpsc::TryRecvError::Empty)) | None => None,
+        };
+
+        let current = self.volume.clone().map(|volume| {
+            let (previous_volume, dealias_env, context) =
+                self.primary_dealias_inputs_for_volume(&volume);
+            let key = VwpWorkKey {
+                volume_ptr: Arc::as_ptr(&volume) as usize,
+                scan_time_millis: volume.volume_time.timestamp_millis(),
+                cut_count: volume.cuts.len(),
+                dealias: context,
+            };
+            (volume, previous_volume, dealias_env, key)
+        });
+
+        if let Some(hold) = &self.vwp_product48_hold {
+            let held_volume_is_current = hold.matches(current.as_ref().map(|value| &value.0));
+            if held_volume_is_current {
+                // A local import owns the pane. Any unexpectedly overlapping
+                // worker is drained above and deliberately ignored.
+                if completed.is_some() || disconnected {
+                    self.vwp_requested_key = None;
+                }
+                return;
+            }
+            self.vwp_product48_hold = None;
+            self.vwp_requested_key = None;
+            self.vwp_panel.clear();
+        }
+
+        if disconnected {
+            // Retain the requested key so a repeatedly panicking worker does
+            // not respawn in a tight loop. Recompute or a new input retries.
+            self.vwp_panel.set_error("VWP worker disconnected");
+            ctx.request_repaint();
+        }
+
+        if let Some(message) = completed {
+            let exact_current_input = current.as_ref().is_some_and(|current| {
+                current.3 == message.key && Arc::ptr_eq(&current.0, &message.source_volume)
+            });
+            if self.vwp_requested_key == Some(message.key) && exact_current_input {
+                match message.result {
+                    Ok(profile) => self.vwp_panel.set_computed(profile, message.dealias_label),
+                    Err(error) => self.vwp_panel.set_error(error),
+                }
+            } else {
+                // The selected frame or one of its dealias anchors changed
+                // while this single worker ran. Allow the latest input below.
+                self.vwp_requested_key = None;
+            }
+            ctx.request_repaint();
         }
 
         if !self.vwp_open {
             return;
         }
-        let Some(volume) = self.volume.clone() else {
-            if self.vwp_requested_key.take().is_some() {
-                self.vwp_compute_rx = None;
-                self.vwp_panel.clear();
+        let Some((volume, previous_volume, dealias_env, key)) = current else {
+            self.vwp_panel.clear();
+            if self.vwp_compute_rx.is_none() {
+                self.vwp_requested_key = None;
             }
             return;
         };
-        let (previous_volume, dealias_env, context) =
-            self.primary_dealias_inputs_for_volume(&volume);
-        let key = VwpWorkKey {
-            volume_ptr: Arc::as_ptr(&volume) as usize,
-            scan_time_millis: volume.volume_time.timestamp_millis(),
-            cut_count: volume.cuts.len(),
-            dealias: context,
-        };
+        if self.vwp_compute_rx.is_some() {
+            return;
+        }
         if self.vwp_requested_key == Some(key) {
             return;
         }
@@ -16715,7 +16796,6 @@ impl ViewerApp {
             DealiasEngine::Analyst3d => "Analyst 3D dealias",
         };
         self.vwp_requested_key = Some(key);
-        self.vwp_compute_rx = None;
         self.vwp_panel.begin_compute(format!(
             "{} {} - resolving velocity tilts",
             volume.site.id, dealias_label
@@ -16736,6 +16816,7 @@ impl ViewerApp {
                     .map_err(|error| error.to_string());
             let _ = sender.send(VwpComputeResult {
                 key,
+                source_volume: volume,
                 result,
                 dealias_label,
             });
@@ -16747,7 +16828,7 @@ impl ViewerApp {
     fn vwp_pane_body(&mut self, ui: &mut egui::Ui) {
         let action = self.vwp_panel.ui(ui);
         if action.recompute_requested {
-            self.vwp_compute_rx = None;
+            self.vwp_product48_hold = None;
             self.vwp_requested_key = None;
             ui.ctx().request_repaint();
         }
@@ -16778,21 +16859,14 @@ impl ViewerApp {
         match result {
             Ok(profile) => {
                 self.vwp_panel.set_product_48(profile);
-                // Hold this import until the selected volume changes or the
-                // user explicitly asks to recompute.
-                self.vwp_requested_key = self.volume.as_ref().map(|volume| {
-                    let (_, _, dealias) = self.primary_dealias_inputs_for_volume(volume);
-                    VwpWorkKey {
-                        volume_ptr: Arc::as_ptr(volume) as usize,
-                        scan_time_millis: volume.volume_time.timestamp_millis(),
-                        cut_count: volume.cuts.len(),
-                        dealias,
-                    }
+                self.vwp_product48_hold = Some(VwpProduct48Hold {
+                    primary_volume: self.volume.clone(),
                 });
-                self.vwp_compute_rx = None;
+                self.vwp_requested_key = None;
                 self.status = format!("VWP: opened {}", path.display());
             }
             Err(error) => {
+                self.vwp_product48_hold = None;
                 self.vwp_panel.set_error(error.clone());
                 self.status = format!("VWP import failed: {error}");
             }
@@ -32443,13 +32517,21 @@ impl ViewerApp {
         source: grid_composites::GridCompositeSource,
         ctx: &egui::Context,
     ) {
+        self.prepare_grid_composite_add(source);
+        self.start_grid_composite_refresh(source, ctx, true);
+        self.status = format!("{}: fetching latest grid", source.short_label());
+        ctx.request_repaint();
+    }
+
+    /// Grid composites share the model-map LUT/build machinery, even though
+    /// they are observed radar products. Wake that pipeline before starting
+    /// the fetch so a disabled Model setting cannot strand the build result.
+    fn prepare_grid_composite_add(&mut self, source: grid_composites::GridCompositeSource) {
+        self.model_enabled = true;
         let (lat, lon, scale) = source.map_center();
         self.map_center_lat = lat;
         self.map_center_lon = lon;
         self.map_scale = scale;
-        self.start_grid_composite_refresh(source, ctx, true);
-        self.status = format!("{}: fetching latest grid", source.short_label());
-        ctx.request_repaint();
     }
 
     fn start_grid_composite_refresh(
@@ -53444,6 +53526,133 @@ mod tests {
     }
 
     #[test]
+    fn grid_composite_add_wakes_a_disabled_model_layer_pipeline() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.model_enabled = false;
+        let source = grid_composites::GridCompositeSource::imgw_polrad(
+            data_source::grid_products::imgw::ImgwPolradSite::Ramza,
+            data_source::grid_products::imgw::ImgwPolradQuantity::PhiDp,
+        );
+
+        // Exercise the synchronous half of add_grid_composite_layer; the
+        // fetch half intentionally remains outside a deterministic unit test.
+        app.prepare_grid_composite_add(source);
+
+        assert!(app.model_enabled);
+        let (expected_lat, expected_lon, expected_scale) = source.map_center();
+        assert_eq!(app.map_center_lat, expected_lat);
+        assert_eq!(app.map_center_lon, expected_lon);
+        assert_eq!(app.map_scale, expected_scale);
+    }
+
+    fn test_vwp_key(volume: &Arc<RadarVolume>) -> VwpWorkKey {
+        VwpWorkKey {
+            volume_ptr: Arc::as_ptr(volume) as usize,
+            scan_time_millis: volume.volume_time.timestamp_millis(),
+            cut_count: volume.cuts.len(),
+            dealias: DealiasContextKey::new(DealiasEngine::Region, None, None),
+        }
+    }
+
+    #[test]
+    fn vwp_changed_volume_keeps_the_existing_worker_single_flight() {
+        let time = Utc.with_ymd_and_hms(2026, 7, 10, 20, 0, 0).unwrap();
+        let old_volume = Arc::new(test_volume_with_site_time("KTLX", time));
+        let new_volume = Arc::new(test_volume_with_site_time(
+            "KTLX",
+            time + chrono::Duration::minutes(5),
+        ));
+        let old_key = test_vwp_key(&old_volume);
+        let (sender, receiver) = mpsc::channel();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(new_volume);
+        app.vwp_open = true;
+        app.dealias_engine = DealiasEngine::Region;
+        app.vwp_requested_key = Some(old_key);
+        app.vwp_compute_rx = Some(receiver);
+
+        app.poll_vwp(&egui::Context::default());
+
+        // If poll_vwp replaced the receiver and spawned another worker, this
+        // send would fail. Keeping it proves only the original worker lives.
+        assert!(
+            sender
+                .send(VwpComputeResult {
+                    key: old_key,
+                    source_volume: old_volume,
+                    result: Err("sentinel".to_owned()),
+                    dealias_label: "Region dealias",
+                })
+                .is_ok()
+        );
+        assert!(app.vwp_compute_rx.is_some());
+    }
+
+    #[test]
+    fn vwp_result_requires_arc_witness_even_when_the_cheap_key_matches() {
+        let time = Utc.with_ymd_and_hms(2026, 7, 10, 20, 0, 0).unwrap();
+        let stale_volume = Arc::new(test_volume_with_site_time("KTLX", time));
+        let current_volume = Arc::new(test_volume_with_site_time("KTLX", time));
+        let current_key = test_vwp_key(&current_volume);
+        let profile = render2d::VwpProfile {
+            site_id: "KTLX".to_owned(),
+            valid_time: time,
+            radar_elevation_m: Some(370.0),
+            velocity_cut_count: 0,
+            levels: Vec::new(),
+        };
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(VwpComputeResult {
+                // Deliberately model an address-key collision: only the Arc
+                // witness distinguishes this stale source from current.
+                key: current_key,
+                source_volume: stale_volume,
+                result: Ok(profile),
+                dealias_label: "Region dealias",
+            })
+            .unwrap();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(current_volume);
+        app.vwp_open = false;
+        app.dealias_engine = DealiasEngine::Region;
+        app.vwp_requested_key = Some(current_key);
+        app.vwp_compute_rx = Some(receiver);
+
+        app.poll_vwp(&egui::Context::default());
+
+        assert!(app.vwp_panel.export_csv().is_none());
+        assert!(app.vwp_requested_key.is_none());
+    }
+
+    #[test]
+    fn product_48_hold_ignores_dealias_changes_for_the_same_primary_arc() {
+        let time = Utc.with_ymd_and_hms(2026, 7, 10, 20, 0, 0).unwrap();
+        let volume = Arc::new(test_volume_with_site_time("KTLX", time));
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::clone(&volume));
+        app.vwp_open = true;
+        app.vwp_panel.set_product_48(vwp::Product48DisplayProfile {
+            site_id: "KTLX".to_owned(),
+            valid_time: time,
+            radar_elevation_m: Some(370.0),
+            source_label: "Product 48 test".to_owned(),
+            metadata: vwp::Product48DisplayMetadata::default(),
+            levels: Vec::new(),
+        });
+        app.vwp_product48_hold = Some(VwpProduct48Hold {
+            primary_volume: Some(volume),
+        });
+        app.dealias_engine = DealiasEngine::RegionGlobal;
+
+        app.poll_vwp(&egui::Context::default());
+
+        assert!(app.vwp_compute_rx.is_none());
+        assert!(app.vwp_panel.export_csv().is_some());
+        assert!(app.vwp_product48_hold.is_some());
+    }
+
+    #[test]
     fn wrf_fields_take_solar_palettes_not_the_generic_default() {
         // Locally-ingested WRF reflectivity is NOT claimed by the radar family
         // (it flows to Solar's PW Style), while its Solar table resolves.
@@ -62499,6 +62708,7 @@ mod tests {
             vwp_panel: vwp::VwpPanelState::default(),
             vwp_compute_rx: None,
             vwp_requested_key: None,
+            vwp_product48_hold: None,
             sounding_dock_zoom_defaulted: false,
             archive_frame_count: 10,
             archive_loaded_range: None,

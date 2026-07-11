@@ -24,6 +24,11 @@ const MIN_CHART_HEIGHT: f32 = 300.0;
 const MAX_CHART_HEIGHT: f32 = 620.0;
 const NARROW_CHART_HEIGHT: f32 = 340.0;
 const MPS_TO_KT: f32 = 1.943_844_4;
+const NM_TO_M: f32 = 1_852.0;
+
+const fn native_file_dialogs_available() -> bool {
+    cfg!(any(windows, target_os = "macos"))
+}
 
 const GOOD_COLOR: egui::Color32 = egui::Color32::from_rgb(58, 194, 126);
 const HODO_LOW_COLOR: egui::Color32 = egui::Color32::from_rgb(31, 186, 218);
@@ -61,11 +66,25 @@ pub(crate) enum Product48DisplayOutcome {
         direction_deg: f32,
         speed_mps: f32,
         rms_mps: Option<f32>,
+        /// Product 48's tabular divergence value in its native product
+        /// units. Symbology-only profiles do not carry it.
+        divergence: Option<f32>,
+        slant_range_nm: Option<f32>,
+        elevation_deg: Option<f32>,
         quality: Product48DisplayQuality,
     },
     Rejected {
         reason: String,
     },
+}
+
+/// Adaptable-parameter metadata carried by Product 48's tabular block.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Product48DisplayMetadata {
+    pub(crate) rms_threshold_kts: Option<f32>,
+    pub(crate) symmetry_threshold_kts: Option<f32>,
+    pub(crate) data_points_threshold: Option<u32>,
+    pub(crate) optimum_slant_range_nm: Option<f32>,
 }
 
 /// Minimal adapter accepted by the panel for a decoded Product 48 profile.
@@ -78,6 +97,7 @@ pub(crate) struct Product48DisplayProfile {
     pub(crate) valid_time: DateTime<Utc>,
     pub(crate) radar_elevation_m: Option<f32>,
     pub(crate) source_label: String,
+    pub(crate) metadata: Product48DisplayMetadata,
     pub(crate) levels: Vec<Product48DisplayLevel>,
 }
 
@@ -169,15 +189,29 @@ impl VwpPanelState {
                 action.recompute_requested = true;
             }
             if ui
-                .add_enabled(!busy, egui::Button::new("Open Product 48..."))
-                .on_hover_text("Open a NEXRAD Level III Product 48 VWP file")
+                .add_enabled(
+                    native_file_dialogs_available() && !busy,
+                    egui::Button::new("Open Product 48..."),
+                )
+                .on_hover_text(if native_file_dialogs_available() {
+                    "Open a NEXRAD Level III Product 48 VWP file"
+                } else {
+                    "Product 48 file dialogs are available on Windows and macOS"
+                })
                 .clicked()
             {
                 action.open_product48_requested = true;
             }
             if ui
-                .add_enabled(plot.is_some(), egui::Button::new("Save CSV"))
-                .on_hover_text("Save the displayed profile and its QC diagnostics")
+                .add_enabled(
+                    native_file_dialogs_available() && plot.is_some(),
+                    egui::Button::new("Save CSV"),
+                )
+                .on_hover_text(if native_file_dialogs_available() {
+                    "Save the displayed profile and its QC diagnostics"
+                } else {
+                    "VWP CSV file dialogs are available on Windows and macOS"
+                })
                 .clicked()
             {
                 action.save_csv_requested = true;
@@ -263,6 +297,28 @@ fn profile_body(ui: &mut egui::Ui, profile: &PlotProfile) {
             );
         }
     });
+    if let Some(metadata) = &profile.product48_metadata {
+        let mut values = Vec::new();
+        if let Some(threshold) = metadata.rms_threshold_kts {
+            values.push(format!("RMS threshold {threshold:.1} kt"));
+        }
+        if let Some(threshold) = metadata.symmetry_threshold_kts {
+            values.push(format!("symmetry threshold {threshold:.1} kt"));
+        }
+        if let Some(points) = metadata.data_points_threshold {
+            values.push(format!("data-points threshold {points}"));
+        }
+        if let Some(range) = metadata.optimum_slant_range_nm {
+            values.push(format!("optimum range {range:.1} nmi"));
+        }
+        if !values.is_empty() {
+            ui.label(
+                egui::RichText::new(values.join(" - "))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+    }
     ui.add_space(5.0);
     quality_summary(ui, profile);
     ui.add_space(6.0);
@@ -539,6 +595,9 @@ fn level_hover_ui(ui: &mut egui::Ui, level: &PlotLevel) {
                     rms * MPS_TO_KT
                 ));
             }
+            if let Some(divergence) = wind.product48_divergence {
+                ui.label(format!("Product 48 divergence {divergence:.4}"));
+            }
             if let (Some(samples), Some(sectors)) = (wind.samples_used, wind.azimuth_sectors) {
                 ui.label(format!(
                     "{samples} samples across {sectors}/12 azimuth sectors"
@@ -725,6 +784,7 @@ struct PlotProfile {
     radar_elevation_m: Option<f32>,
     source_label: String,
     detail_label: Option<String>,
+    product48_metadata: Option<Product48DisplayMetadata>,
     levels: Vec<PlotLevel>,
 }
 
@@ -743,6 +803,7 @@ impl PlotProfile {
                     "{dealias_label} - {} velocity cuts",
                     profile.velocity_cut_count
                 )),
+                product48_metadata: None,
                 levels: profile
                     .levels
                     .iter()
@@ -756,6 +817,7 @@ impl PlotProfile {
                                 direction_deg: wind.direction_deg,
                                 speed_mps: wind.speed_mps,
                                 rms_mps: wind.diagnostics.rms_mps,
+                                product48_divergence: None,
                                 quality: match wind.quality {
                                     VwpQuality::Good => PlotQuality::Good,
                                     VwpQuality::Marginal => PlotQuality::Marginal,
@@ -787,6 +849,7 @@ impl PlotProfile {
                 radar_elevation_m: profile.radar_elevation_m,
                 source_label: profile.source_label.clone(),
                 detail_label: Some("NEXRAD Level III Product 48".to_owned()),
+                product48_metadata: Some(profile.metadata.clone()),
                 levels: profile
                     .levels
                     .iter()
@@ -797,6 +860,9 @@ impl PlotProfile {
                                 direction_deg,
                                 speed_mps,
                                 rms_mps,
+                                divergence,
+                                slant_range_nm,
+                                elevation_deg,
                                 quality,
                             } => {
                                 let direction_rad = direction_deg.to_radians();
@@ -807,6 +873,7 @@ impl PlotProfile {
                                     direction_deg: *direction_deg,
                                     speed_mps: *speed_mps,
                                     rms_mps: *rms_mps,
+                                    product48_divergence: *divergence,
                                     quality: match quality {
                                         Product48DisplayQuality::Good => PlotQuality::Good,
                                         Product48DisplayQuality::Marginal => PlotQuality::Marginal,
@@ -814,8 +881,8 @@ impl PlotProfile {
                                     samples_used: None,
                                     azimuth_sectors: None,
                                     max_azimuth_gap_deg: None,
-                                    slant_range_m: None,
-                                    elevation_deg: None,
+                                    slant_range_m: slant_range_nm.map(|range| range * NM_TO_M),
+                                    elevation_deg: *elevation_deg,
                                 })
                             }
                             Product48DisplayOutcome::Rejected { reason } => PlotOutcome::Rejected {
@@ -831,36 +898,53 @@ impl PlotProfile {
 
     fn csv(&self) -> String {
         let mut output = String::from(
-            "site_id,valid_time,source,target_height_m_agl,height_m_msl,direction_deg,speed_mps,speed_kt,u_mps,v_mps,rms_mps,quality,rejection_reason,samples_used,azimuth_sectors,max_azimuth_gap_deg,slant_range_m,elevation_deg\n",
+            "site_id,valid_time,source,target_height_m_agl,height_m_msl,direction_deg,speed_mps,speed_kt,u_mps,v_mps,rms_mps,product48_divergence,quality,rejection_reason,samples_used,azimuth_sectors,max_azimuth_gap_deg,slant_range_m,elevation_deg,product48_rms_threshold_kt,product48_symmetry_threshold_kt,product48_data_points_threshold,product48_optimum_slant_range_nm\n",
         );
         let site_id = csv_escape(&self.site_id);
         let valid_time = self.valid_time.to_rfc3339_opts(SecondsFormat::Secs, true);
         let source = csv_escape(&self.source_label);
+        let metadata = self.product48_metadata.as_ref();
+        let rms_threshold = optional_f32(metadata.and_then(|value| value.rms_threshold_kts), 2);
+        let symmetry_threshold =
+            optional_f32(metadata.and_then(|value| value.symmetry_threshold_kts), 2);
+        let data_points_threshold = metadata
+            .and_then(|value| value.data_points_threshold)
+            .map_or_else(String::new, |value| value.to_string());
+        let optimum_range =
+            optional_f32(metadata.and_then(|value| value.optimum_slant_range_nm), 2);
 
         for level in &self.levels {
-            match &level.outcome {
+            let fields = match &level.outcome {
                 PlotOutcome::Retrieved(wind) => {
                     let quality = match wind.quality {
                         PlotQuality::Good => "good",
                         PlotQuality::Marginal => "marginal",
                     };
-                    let _ = writeln!(
-                        output,
-                        "{site_id},{valid_time},{source},{:.1},{},{:.1},{:.3},{:.3},{:.3},{:.3},{},{quality},,{},{},{},{},{}",
-                        level.target_height_m_agl,
+                    [
+                        site_id.clone(),
+                        valid_time.clone(),
+                        source.clone(),
+                        format!("{:.1}", level.target_height_m_agl),
                         optional_f32(wind.height_m_msl, 1),
-                        wind.direction_deg,
-                        wind.speed_mps,
-                        wind.speed_mps * MPS_TO_KT,
-                        wind.u_mps,
-                        wind.v_mps,
+                        format!("{:.1}", wind.direction_deg),
+                        format!("{:.3}", wind.speed_mps),
+                        format!("{:.3}", wind.speed_mps * MPS_TO_KT),
+                        format!("{:.3}", wind.u_mps),
+                        format!("{:.3}", wind.v_mps),
                         optional_f32(wind.rms_mps, 3),
+                        optional_f32(wind.product48_divergence, 4),
+                        quality.to_owned(),
+                        String::new(),
                         optional_usize(wind.samples_used),
                         optional_usize(wind.azimuth_sectors),
                         optional_f32(wind.max_azimuth_gap_deg, 1),
                         optional_f32(wind.slant_range_m, 1),
                         optional_f32(wind.elevation_deg, 2),
-                    );
+                        rms_threshold.clone(),
+                        symmetry_threshold.clone(),
+                        data_points_threshold.clone(),
+                        optimum_range.clone(),
+                    ]
                 }
                 PlotOutcome::Rejected {
                     reason,
@@ -877,14 +961,34 @@ impl PlotProfile {
                             )
                         },
                     );
-                    let reason = csv_escape(reason);
-                    let _ = writeln!(
-                        output,
-                        "{site_id},{valid_time},{source},{:.1},,,,,,,{rms},rejected,{reason},{samples},{sectors},{gap},,",
-                        level.target_height_m_agl,
-                    );
+                    [
+                        site_id.clone(),
+                        valid_time.clone(),
+                        source.clone(),
+                        format!("{:.1}", level.target_height_m_agl),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        rms,
+                        String::new(),
+                        "rejected".to_owned(),
+                        csv_escape(reason),
+                        samples,
+                        sectors,
+                        gap,
+                        String::new(),
+                        String::new(),
+                        rms_threshold.clone(),
+                        symmetry_threshold.clone(),
+                        data_points_threshold.clone(),
+                        optimum_range.clone(),
+                    ]
                 }
-            }
+            };
+            let _ = writeln!(output, "{}", fields.join(","));
         }
         output
     }
@@ -913,6 +1017,7 @@ struct PlotWind {
     direction_deg: f32,
     speed_mps: f32,
     rms_mps: Option<f32>,
+    product48_divergence: Option<f32>,
     quality: PlotQuality,
     samples_used: Option<usize>,
     azimuth_sectors: Option<usize>,
@@ -978,6 +1083,7 @@ mod tests {
                 .unwrap(),
             radar_elevation_m: Some(231.3),
             source_label: "Product 48 symbology".to_owned(),
+            metadata: Product48DisplayMetadata::default(),
             levels: vec![Product48DisplayLevel {
                 height_m_agl: 73.0,
                 height_m_msl: Some(304.8),
@@ -985,6 +1091,9 @@ mod tests {
                     direction_deg: 180.0,
                     speed_mps: 10.0,
                     rms_mps: Some(3.0),
+                    divergence: None,
+                    slant_range_nm: None,
+                    elevation_deg: None,
                     quality: Product48DisplayQuality::Good,
                 },
             }],
@@ -1008,6 +1117,7 @@ mod tests {
                 .unwrap(),
             radar_elevation_m: Some(231.3),
             source_label: "Product 48, symbology".to_owned(),
+            metadata: Product48DisplayMetadata::default(),
             levels: vec![Product48DisplayLevel {
                 height_m_agl: 500.0,
                 height_m_msl: None,
@@ -1022,6 +1132,54 @@ mod tests {
         let csv = state.export_csv().unwrap();
         assert!(csv.contains("\"Product 48, symbology\""));
         assert!(csv.contains("rejected,\"RMS, too large\""));
+    }
+
+    #[test]
+    fn product_48_csv_preserves_tabular_diagnostics_and_thresholds() {
+        let profile = Product48DisplayProfile {
+            site_id: "KTLX".to_owned(),
+            valid_time: Utc
+                .with_ymd_and_hms(2026, 7, 10, 20, 0, 0)
+                .single()
+                .unwrap(),
+            radar_elevation_m: Some(370.0),
+            source_label: "Product 48 tabular VAD output".to_owned(),
+            metadata: Product48DisplayMetadata {
+                rms_threshold_kts: Some(9.7),
+                symmetry_threshold_kts: Some(13.6),
+                data_points_threshold: Some(25),
+                optimum_slant_range_nm: Some(16.2),
+            },
+            levels: vec![Product48DisplayLevel {
+                height_m_agl: 1_000.0,
+                height_m_msl: Some(1_370.0),
+                outcome: Product48DisplayOutcome::Retrieved {
+                    direction_deg: 225.0,
+                    speed_mps: 15.0,
+                    rms_mps: Some(2.0),
+                    divergence: Some(0.0012),
+                    slant_range_nm: Some(16.2),
+                    elevation_deg: Some(2.5),
+                    quality: Product48DisplayQuality::Good,
+                },
+            }],
+        };
+        let mut state = VwpPanelState::default();
+        state.set_product_48(profile);
+
+        let csv = state.export_csv().unwrap();
+        assert!(csv.contains("product48_divergence"));
+        assert!(csv.contains("product48_rms_threshold_kt"));
+        assert!(csv.contains(",0.0012,good,"));
+        assert!(csv.contains(",30002.4,2.50,9.70,13.60,25,16.20"));
+    }
+
+    #[test]
+    fn native_dialog_actions_follow_the_desktop_target_gate() {
+        #[cfg(any(windows, target_os = "macos"))]
+        assert!(native_file_dialogs_available());
+        #[cfg(not(any(windows, target_os = "macos")))]
+        assert!(!native_file_dialogs_available());
     }
 
     #[test]
