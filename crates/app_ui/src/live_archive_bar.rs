@@ -1,8 +1,9 @@
-//! The LIVE | ARCHIVE bar — the v0.29 Phase-5 two-button front
+//! The LIVE + Timeline toolbar — the v0.29 Phase-5 source controls
 //! (`docs/v029-engine-spec.md` §7 Phase 5; §12b owner decision 5).
 //!
-//! The bar is the primary flow; the Unified Player survives VERBATIM as
-//! its "Advanced" disclosure. Nothing in the widget loads data or owns a
+//! The toolbar is the primary flow; archive loading, sweep policy, and the
+//! Unified Player share one Timeline menu instead of competing as adjacent
+//! top-level controls. Nothing in the widget loads data or owns a
 //! worker: every click returns a [`LiveArchiveBarAction`] and the
 //! `ViewerApp` dispatch (`handle_live_archive_bar_action`, below) maps
 //! it onto the EXISTING paths — the latest-loop loaders for LIVE, the
@@ -28,14 +29,9 @@ use chrono::{DateTime, Utc};
 use data_source::sites::SiteRef;
 use eframe::egui;
 
-use crate::ui_theme::live_color;
+use crate::ui_theme::{live_color, subhead_color};
 use crate::unified_player::{UnifiedPlayerAction, UnifiedPlayerState};
 use ui_core::loop_engine::Liveness;
-
-/// The archive segment's active tint — the amber family the ARCHIVE chip
-/// uses (a fixed UI accent, not radar data; the chip's exact color stays
-/// style-registry-driven).
-const ARCHIVE_ACTIVE_COLOR: egui::Color32 = egui::Color32::from_rgb(226, 178, 92);
 
 /// Which segment is lit. Derived ONLY from the engine's liveness verdict
 /// (plus "no data yet"), never from load bookkeeping.
@@ -152,7 +148,7 @@ pub(crate) fn sweep_quick_mode_player_actions(mode: SweepQuickMode) -> Vec<Unifi
     }
 }
 
-/// The ARCHIVE popover's typed site override, resolved against the US
+/// The archive-loader window's typed site override, resolved against the US
 /// Level-II catalog by [`typed_site_status`]. Scope is deliberately
 /// US-only: international archive loads need a provider and stay on the
 /// loaded-radar path (click the site first).
@@ -170,7 +166,7 @@ pub(crate) enum TypedSiteStatus {
     Unknown { input: String },
 }
 
-/// Resolve the popover's typed site field against the ONE union catalog
+/// Resolve the archive window's typed site field against the ONE union catalog
 /// (`data_source::sites::resolve` — the Phase-3 rule; never iterate the
 /// raw site list). `us_owner_id` is the display owner's Level-II ID
 /// when a US site owns the display, `None` when an international site
@@ -230,7 +226,7 @@ pub(crate) enum LiveArchiveBarAction {
     /// One click: re-arm the display owner's live feed + loop backfill
     /// through the existing latest-loop path.
     GoLive,
-    /// Load N frames ending at the popover's UTC time through the
+    /// Load N frames ending at the archive window's UTC time through the
     /// Unified Player "Loop Ending At" arms (US, ORD, provider archive,
     /// honest-grey reason — one dispatch).
     LoadArchiveEndingAt,
@@ -242,15 +238,15 @@ pub(crate) enum LiveArchiveBarAction {
     ApplySweepMode(SweepQuickMode),
     /// Open the full sweep-policy editor (per-product ranges).
     OpenSweepControls,
-    /// Open the Unified Player — the bar's "Advanced" disclosure.
+    /// Open the full Unified Player workspace.
     OpenAdvanced,
     /// Jump to the Data tab's full archive browser.
     BrowseArchiveDays,
 }
 
-/// Render the bar. The ARCHIVE popover edits the SAME end-time fields
-/// the Advanced player shows (`UnifiedPlayerState.end_*_input`) — one
-/// set of values, no copying, one parser.
+/// Render the source/timeline toolbar. The archive window edits the SAME
+/// end-time fields the Unified Player shows (`UnifiedPlayerState.end_*_input`)
+/// — one set of values, no copying, one parser.
 pub(crate) fn bar_ui(
     ui: &mut egui::Ui,
     context: &LiveArchiveBarContext,
@@ -258,6 +254,9 @@ pub(crate) fn bar_ui(
 ) -> Option<LiveArchiveBarAction> {
     let mut action = None;
     player.ensure_end_time_inputs(context.default_end_utc);
+    let ctx = ui.ctx().clone();
+    let archive_open_id = egui::Id::new("top_bar_archive_loader_open");
+    let mut archive_open = ctx.data(|data| data.get_temp::<bool>(archive_open_id).unwrap_or(false));
 
     let live_lit = matches!(
         context.mode,
@@ -269,7 +268,7 @@ pub(crate) fn bar_ui(
         egui::RichText::new("⏺ LIVE")
     };
     if ui
-        .selectable_label(live_lit, live_text)
+        .add(egui::Button::selectable(live_lit, live_text).frame(false))
         .on_hover_text(
             "Go live: follow this radar's newest data and backfill a recent loop. \
              Synced warnings arm automatically.",
@@ -279,132 +278,41 @@ pub(crate) fn bar_ui(
         action = Some(LiveArchiveBarAction::GoLive);
     }
 
-    let archive_lit = context.mode == LiveArchiveBarMode::Archive;
-    let archive_text = if archive_lit {
-        egui::RichText::new("ARCHIVE ⏷")
-            .color(ARCHIVE_ACTIVE_COLOR)
-            .strong()
-    } else {
-        egui::RichText::new("ARCHIVE ⏷")
-    };
-    // The popover holds text fields, so it must NOT use the default menu
-    // close behavior (CloseOnClick): egui closes such a menu on any
-    // click INSIDE it too, and a click into a TextEdit counts — the
-    // popup vanished the moment you clicked a field (only drag-selecting
-    // text survived, because a drag is not a click). CloseOnClickOutside
-    // keeps it open while editing; Load/Browse still close it
-    // explicitly via `ui.close()`.
-    let (archive_button, archive_menu) = egui::containers::menu::MenuButton::new(archive_text)
-        .config(
-            egui::containers::menu::MenuConfig::new()
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-        )
-        .ui(ui, |ui| {
-            ui.set_min_width(240.0);
-            ui.label(egui::RichText::new("Loop ending at (UTC)").strong());
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut player.end_date_input)
-                        .desired_width(88.0)
-                        .hint_text("YYYY-MM-DD"),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut player.end_hour_input)
-                        .desired_width(26.0)
-                        .hint_text("HH"),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut player.end_minute_input)
-                        .desired_width(26.0)
-                        .hint_text("MM"),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Site");
-                ui.add(
-                    egui::TextEdit::singleline(&mut player.archive_site_input)
-                        .desired_width(56.0)
-                        .hint_text(context.owner_site_hint.as_str()),
-                )
-                .on_hover_text(
-                    "Which radar to load. Empty = the loaded radar; type a \
-                     US site ID (KEAX, TOKC, …) to load a different one.",
-                );
-                ui.label("Frames");
-                let mut frames = context.frames;
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut frames)
-                            .range(1..=context.frames_max)
-                            .speed(1.0),
-                    )
-                    .on_hover_text("Loop length: scans ending at the time above")
-                    .changed()
-                {
-                    action = Some(LiveArchiveBarAction::SetFrames(frames));
-                }
-            });
-            // Three honest Load states: an unknown typed site refuses
-            // with the input echoed; the owner's derived no-archive
-            // reason (spec §1.3) gates ONLY loads that follow the owner
-            // — a valid typed US site always has the Level-II archive.
-            let typed_unknown_reason = match &context.typed_site {
-                TypedSiteStatus::Unknown { input } => {
-                    Some(format!("{input} is not in the US site catalog"))
-                }
-                TypedSiteStatus::FollowsOwner | TypedSiteStatus::ValidUs { .. } => None,
-            };
-            let owner_reason = match &context.typed_site {
-                TypedSiteStatus::FollowsOwner => context.archive_reason,
-                TypedSiteStatus::ValidUs { .. } | TypedSiteStatus::Unknown { .. } => None,
-            };
-            if let Some(reason) = typed_unknown_reason {
-                ui.add_enabled(false, egui::Button::new("Load archive loop"))
-                    .on_disabled_hover_text(&reason);
-                ui.weak(&reason);
-            } else if let Some(reason) = owner_reason {
-                // Honest grey (spec §1.3): the derived capability reason
-                // IS the disabled explanation.
-                ui.add_enabled(false, egui::Button::new("Load archive loop"))
-                    .on_disabled_hover_text(reason);
-                ui.weak(reason);
-            } else {
-                let load = ui
-                    .add_enabled(!context.load_busy, egui::Button::new("Load archive loop"))
-                    .on_hover_text(
-                        "Load the loop ending at this UTC time. \
-                         Synced warnings arm automatically.",
-                    )
-                    .on_disabled_hover_text("A radar load is already running");
-                if load.clicked() {
-                    action = Some(LiveArchiveBarAction::LoadArchiveEndingAt);
-                    ui.close();
-                }
-            }
-            ui.separator();
-            if ui
-                .button("Browse archive days…")
-                .on_hover_text(
-                    "The full archive browser (Data tab): day listings, hour chips, \
-                     tornado-report jumps",
-                )
-                .clicked()
-            {
-                action = Some(LiveArchiveBarAction::BrowseArchiveDays);
-                ui.close();
-            }
-            ui.weak(&context.owner_label);
-        });
-    archive_button.on_hover_text("Load a fixed past loop for the current radar");
-    if archive_menu.is_none() {
-        // Popover closed: the site override is popover-scoped — an
-        // empty field follows whatever radar is loaded (the 90% case),
-        // so leftover text must not silently redirect a later load.
-        player.archive_site_input.clear();
-    }
-
-    ui.menu_button("Sweeps ⏷", |ui| {
-        ui.set_min_width(200.0);
+    let timeline_text = egui::RichText::new("Timeline ⏷");
+    let (timeline_button, _) = egui::containers::menu::MenuButton::from_button(
+        egui::Button::new(timeline_text).frame(false),
+    )
+    .ui(ui, |ui| {
+        ui.set_min_width(240.0);
+        timeline_menu_heading(ui, "RADAR TIMELINE");
+        ui.weak(&context.owner_label);
+        ui.separator();
+        if ui
+            .selectable_label(live_lit, "Go live + backfill recent scans")
+            .on_hover_text("Resume the newest data and preload a recent loop")
+            .clicked()
+        {
+            action = Some(LiveArchiveBarAction::GoLive);
+            ui.close();
+        }
+        if ui
+            .button("Load archive loop…")
+            .on_hover_text("Choose a radar, UTC end time, and frame count")
+            .clicked()
+        {
+            archive_open = true;
+            ui.close();
+        }
+        if ui
+            .button("Browse archive days…")
+            .on_hover_text("The full archive browser: day listings, hour chips, and report jumps")
+            .clicked()
+        {
+            action = Some(LiveArchiveBarAction::BrowseArchiveDays);
+            ui.close();
+        }
+        ui.separator();
+        timeline_menu_heading(ui, "SWEEP PLAYBACK");
         for mode in SweepQuickMode::QUICK {
             if ui
                 .selectable_label(context.sweep_mode == mode, mode.label())
@@ -414,11 +322,10 @@ pub(crate) fn bar_ui(
                 ui.close();
             }
         }
-        ui.separator();
         if ui
             .selectable_label(
                 context.sweep_mode == SweepQuickMode::Custom,
-                SweepQuickMode::Custom.label(),
+                "Custom sweep ranges…",
             )
             .on_hover_text(
                 "The full sweep-policy editor: per-product-family modes and fixed \
@@ -429,24 +336,161 @@ pub(crate) fn bar_ui(
             action = Some(LiveArchiveBarAction::OpenSweepControls);
             ui.close();
         }
-    })
-    .response
-    .on_hover_text(
-        "Low-level sweep loops — how each scan expands into sweeps \
-         (all-lowest is fluid, a fixed range is steadier)",
-    );
+        ui.weak(format!("{} frame history", context.frames));
+        ui.separator();
+        timeline_menu_heading(ui, "WORKSPACE");
+        if ui
+            .button("Open timeline, sync, and export…")
+            .on_hover_text(
+                "Unified playback, archive windows, camera follow, export, and \
+                 warning/report/satellite/model sync",
+            )
+            .clicked()
+        {
+            action = Some(LiveArchiveBarAction::OpenAdvanced);
+            ui.close();
+        }
+    });
+    let archive_window_pos = timeline_button.rect.left_bottom() + egui::vec2(0.0, 4.0);
+    timeline_button
+        .on_hover_text("Archive loading, loop length, sweep playback, synchronization, and export");
 
-    if ui
-        .button("Advanced")
-        .on_hover_text(
-            "The full Unified Player: loads, archive windows, export, camera follow, \
-             mosaics, warning/report/satellite/model sync",
-        )
-        .clicked()
+    if archive_open
+        && let Some(window_action) =
+            archive_loader_window(&ctx, archive_window_pos, context, player, &mut archive_open)
     {
-        action = Some(LiveArchiveBarAction::OpenAdvanced);
+        action = Some(window_action);
+    }
+    ctx.data_mut(|data| data.insert_temp(archive_open_id, archive_open));
+    if !archive_open {
+        // The override belongs to this one archive request. Clearing it when
+        // the window closes prevents a later load from silently switching
+        // radars.
+        player.archive_site_input.clear();
     }
 
+    action
+}
+
+fn timeline_menu_heading(ui: &mut egui::Ui, label: &str) {
+    ui.label(
+        egui::RichText::new(label)
+            .size(10.0)
+            .strong()
+            .color(subhead_color()),
+    );
+}
+
+fn archive_loader_window(
+    ctx: &egui::Context,
+    default_pos: egui::Pos2,
+    context: &LiveArchiveBarContext,
+    player: &mut UnifiedPlayerState,
+    open: &mut bool,
+) -> Option<LiveArchiveBarAction> {
+    let mut visible = *open;
+    let mut close_requested = false;
+    let mut action = None;
+    egui::Window::new("Load archive loop")
+        .id(egui::Id::new("top_bar_archive_loader"))
+        .open(&mut visible)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(330.0)
+        .default_pos(default_pos)
+        .show(ctx, |ui| {
+            ui.set_min_width(310.0);
+            ui.weak(format!("Loaded radar: {}", context.owner_label));
+            ui.add_space(4.0);
+            egui::Grid::new("top_bar_archive_loader_fields")
+                .num_columns(2)
+                .spacing(egui::vec2(12.0, 8.0))
+                .show(ui, |ui| {
+                    ui.label("Ending (UTC)");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut player.end_date_input)
+                                .id(egui::Id::new("top_bar_archive_end_date"))
+                                .desired_width(88.0)
+                                .hint_text("YYYY-MM-DD"),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut player.end_hour_input)
+                                .desired_width(26.0)
+                                .hint_text("HH"),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut player.end_minute_input)
+                                .desired_width(26.0)
+                                .hint_text("MM"),
+                        );
+                    });
+                    ui.end_row();
+
+                    ui.label("Radar site");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut player.archive_site_input)
+                            .id(egui::Id::new("top_bar_archive_site"))
+                            .desired_width(88.0)
+                            .hint_text(context.owner_site_hint.as_str()),
+                    )
+                    .on_hover_text(
+                        "Empty uses the loaded radar. Enter a US site ID such as \
+                         KEAX or KTLX to switch for this load.",
+                    );
+                    ui.end_row();
+
+                    ui.label("Frame limit");
+                    let mut frames = context.frames;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut frames)
+                                .range(1..=context.frames_max)
+                                .speed(1.0)
+                                .suffix(" frames"),
+                        )
+                        .on_hover_text("Scans ending at the UTC time above")
+                        .changed()
+                    {
+                        action = Some(LiveArchiveBarAction::SetFrames(frames));
+                    }
+                    ui.end_row();
+                });
+
+            let disabled_reason = match &context.typed_site {
+                TypedSiteStatus::Unknown { input } => {
+                    Some(format!("{input} is not in the US site catalog"))
+                }
+                TypedSiteStatus::FollowsOwner => context.archive_reason.map(str::to_owned),
+                TypedSiteStatus::ValidUs { .. } => None,
+            };
+
+            ui.add_space(6.0);
+            if let Some(reason) = disabled_reason {
+                ui.add_enabled(false, egui::Button::new("Load loop"))
+                    .on_disabled_hover_text(&reason);
+                ui.weak(reason);
+            } else {
+                let load = ui
+                    .add_enabled(!context.load_busy, egui::Button::new("Load loop"))
+                    .on_hover_text("Load the loop ending at this UTC time and arm synced warnings")
+                    .on_disabled_hover_text("A radar load is already running");
+                if load.clicked() {
+                    action = Some(LiveArchiveBarAction::LoadArchiveEndingAt);
+                    close_requested = true;
+                }
+            }
+            if ui
+                .button("Open full archive browser")
+                .on_hover_text("Day listings, hour chips, and tornado-report jumps")
+                .clicked()
+            {
+                action = Some(LiveArchiveBarAction::BrowseArchiveDays);
+                close_requested = true;
+            }
+        });
+
+    *open = visible && !close_requested;
     action
 }
 
@@ -463,7 +507,7 @@ use crate::{
 
 impl ViewerApp {
     // -----------------------------------------------------------------
-    // The LIVE | ARCHIVE bar (v0.29 Phase 5, live_archive_bar.rs).
+    // The LIVE + Timeline toolbar (live_archive_bar.rs).
     // The bar renders from a read-only context and returns an action;
     // everything it can do maps onto EXISTING paths below.
     // -----------------------------------------------------------------
@@ -510,7 +554,7 @@ impl ViewerApp {
         }
     }
 
-    /// The popover's typed site override, resolved against the catalog —
+    /// The archive window's typed site override, resolved against the catalog —
     /// used by the context (button state) AND the dispatch (load
     /// behavior), so the two cannot disagree.
     fn live_archive_bar_typed_site(&self) -> TypedSiteStatus {
@@ -672,6 +716,70 @@ mod tests {
     use data_source::RadarSite;
     use radar_core::RadarVolume;
     use std::sync::Arc;
+
+    #[test]
+    fn archive_loader_window_stays_open_while_editing_a_field() {
+        fn input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn render(
+            ctx: &egui::Context,
+            input: egui::RawInput,
+            player: &mut UnifiedPlayerState,
+            open: &mut bool,
+        ) {
+            let context = LiveArchiveBarContext {
+                mode: LiveArchiveBarMode::Archive,
+                owner_label: "KTLX · Level II archive".to_owned(),
+                load_busy: false,
+                archive_reason: None,
+                sweep_mode: SweepQuickMode::Off,
+                frames: 24,
+                frames_max: 2_000,
+                default_end_utc: Utc::now(),
+                owner_site_hint: "KTLX".to_owned(),
+                typed_site: TypedSiteStatus::FollowsOwner,
+            };
+            let _ = ctx.run_ui(input, |_ui| {
+                let _ = archive_loader_window(ctx, egui::pos2(80.0, 50.0), &context, player, open);
+            });
+        }
+
+        let ctx = egui::Context::default();
+        let mut player = UnifiedPlayerState::default();
+        let mut open = true;
+        render(&ctx, input(Vec::new()), &mut player, &mut open);
+        // Give the floating Window one settled pass before addressing a child
+        // field by its persistent ID.
+        render(&ctx, input(Vec::new()), &mut player, &mut open);
+        let date_id = egui::Id::new("top_bar_archive_end_date");
+        assert!(
+            ctx.read_response(date_id).is_some(),
+            "archive date field must be laid out"
+        );
+        ctx.memory_mut(|memory| memory.request_focus(date_id));
+        render(
+            &ctx,
+            input(vec![egui::Event::Text("2026-07-11".to_owned())]),
+            &mut player,
+            &mut open,
+        );
+
+        assert!(open, "editing an archive field must not close its window");
+        assert_eq!(player.end_date_input, "2026-07-11");
+        assert!(
+            ctx.read_response(date_id).is_some(),
+            "archive window must still render after text entry"
+        );
+    }
 
     /// The lit segment derives from the engine's liveness verdict — the
     /// same value the mode chip renders — so bar and chip cannot
@@ -892,7 +1000,7 @@ mod tests {
         );
     }
 
-    /// Typing an adjacent radar into the ARCHIVE popover switches the
+    /// Typing an adjacent radar into the archive-loader window switches the
     /// selection FIRST — through the same path as a site-search pick —
     /// then runs the normal archive load for it; the override is
     /// one-shot (the field clears). Empty end-time inputs keep the load
@@ -931,7 +1039,7 @@ mod tests {
     }
 
     /// The 1 s live auto-refresh fetch must not count as load-busy (it
-    /// greyed the popover's Load button for a slice of every second —
+    /// greyed the archive window's Load button for a slice of every second —
     /// visible flashing); a user-commanded load still does.
     #[test]
     fn auto_refresh_fetch_is_not_load_busy() {

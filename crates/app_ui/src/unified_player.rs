@@ -11,8 +11,8 @@ pub(crate) struct UnifiedPlayerState {
     pub(crate) end_date_input: String,
     pub(crate) end_hour_input: String,
     pub(crate) end_minute_input: String,
-    /// The ARCHIVE popover's site override (live_archive_bar.rs). Scoped
-    /// to one popover session: empty = load the currently loaded radar.
+    /// The archive-loader window's site override (live_archive_bar.rs).
+    /// Scoped to one window session: empty = load the currently loaded radar.
     pub(crate) archive_site_input: String,
     pub(crate) coordinated_sites_input: String,
     pub(crate) coordinated_site_radius_km: f32,
@@ -179,8 +179,8 @@ impl UnifiedPlayerState {
         self.end_minute_input = time.format("%M").to_string();
     }
 
-    /// LIVE|ARCHIVE bar popover prefill (live_archive_bar.rs): the
-    /// compact ARCHIVE popover edits the SAME end-time fields this
+    /// Timeline archive-window prefill (live_archive_bar.rs): the compact
+    /// loader edits the SAME end-time fields this
     /// player shows, so an empty set seeds from the given anchor
     /// (displayed frame time, else now) exactly like
     /// [`Self::ensure_time_inputs`]'s end half.

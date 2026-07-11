@@ -436,7 +436,7 @@ impl ViewerApp {
 
     pub(crate) fn media_top_bar_ui(&mut self, ui: &mut egui::Ui) {
         let output_folder = self.app_settings.brand.output_folder_name();
-        if crate::fixed_action_button(ui, "Screenshot", 86.0)
+        if crate::toolbar_action_button(ui, "Screenshot", 76.0)
             .on_hover_text(format!(
                 "Copy a full-window screenshot to the clipboard and save a PNG in Pictures/{output_folder} (F12; Shift+F12 captures the map only)"
             ))

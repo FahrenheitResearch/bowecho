@@ -9,19 +9,30 @@
 //! attribution). Everything here formats state the app already computed —
 //! nothing is re-derived.
 
-/// Top-bar current-scan readout: `{site}  {product}  VCP {n}  {clock}  age
-/// {age}` with two-space separators (AWIPS strip convention, monospace at
-/// the call site). The VCP segment drops out when the volume carries none
+/// Top-bar current-scan readout split into a strong identity and quieter
+/// timing detail. The VCP segment drops out when the volume carries none
 /// (international, mobile, and synthetic-WRF feeds have no VCP).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TopBarScanReadout {
+    pub(crate) identity: String,
+    pub(crate) detail: String,
+}
+
 pub(crate) fn top_bar_scan_readout(
     site: &str,
     product: &str,
     vcp: Option<u16>,
     clock: &str,
     age: &str,
-) -> String {
-    let vcp = vcp.map(|p| format!("VCP {p}  ")).unwrap_or_default();
-    format!("{site}  {product}  {vcp}{clock}  age {age}")
+) -> TopBarScanReadout {
+    let detail = match vcp {
+        Some(pattern) => format!("VCP {pattern} · {clock} · age {age}"),
+        None => format!("{clock} · age {age}"),
+    };
+    TopBarScanReadout {
+        identity: format!("{site} · {product}"),
+        detail,
+    }
 }
 
 /// Top-bar loop-state readout: `{i}/{N} PLAYING|PAUSED` (1-based frame
@@ -66,13 +77,19 @@ mod tests {
     fn scan_readout_formats_awips_segments_and_drops_missing_vcp() {
         assert_eq!(
             top_bar_scan_readout("KEAX", "REF", Some(212), "2026-07-10 18:32:05Z", "2m14s"),
-            "KEAX  REF  VCP 212  2026-07-10 18:32:05Z  age 2m14s"
+            TopBarScanReadout {
+                identity: "KEAX · REF".to_owned(),
+                detail: "VCP 212 · 2026-07-10 18:32:05Z · age 2m14s".to_owned(),
+            }
         );
         // No VCP (international/mobile/synthetic volumes): segment gone,
         // spacing intact.
         assert_eq!(
             top_bar_scan_readout("ES-MAD", "REF", None, "2026-07-10 18:32:05Z", "4m"),
-            "ES-MAD  REF  2026-07-10 18:32:05Z  age 4m"
+            TopBarScanReadout {
+                identity: "ES-MAD · REF".to_owned(),
+                detail: "2026-07-10 18:32:05Z · age 4m".to_owned(),
+            }
         );
     }
 

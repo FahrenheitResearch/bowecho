@@ -1601,32 +1601,107 @@ impl ModelDataDock {
         self.import_job = Some(ImportJob::SyntheticRadar(task));
     }
 
-    /// Import controls (WRF/NetCDF folder pickers + status), rendered in the
-    /// dock's left "Runs" column. Spawns the ingest onto a worker thread;
-    /// `poll_import` finishes it and re-scans the store.
+    /// Acquisition, formula, and output controls rendered below the run
+    /// library. The dock's normal job is browsing fields, so these workflows
+    /// stay behind two explicit disclosures instead of permanently consuming
+    /// the whole left rail.
     fn import_controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.strong("Import");
-            if self.import_job.is_some() {
-                ui.spinner();
-            }
-        });
-        self.import_pickers(ui);
-        ui.horizontal_wrapped(|ui| {
-            ui.toggle_value(&mut self.formula_lab.open, "Formula Lab")
-                .on_hover_text(
-                    "Compile safe custom diagnostics against the selected run from any model. \
-                     Raw WRF sources additionally support WRF grid metrics, physical height, \
-                     vector, vertical, and horizontal-calculus operations.",
+        egui::CollapsingHeader::new(model_section_heading("Add data"))
+            .id_salt("model_add_data")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.import_pickers(ui);
+                ui.add_space(6.0);
+                model_subheading(ui, "Online catalog");
+                ui.label(
+                    egui::RichText::new(
+                        "Browse and import regional climate WRF data without leaving BowEcho.",
+                    )
+                    .small()
+                    .weak(),
                 );
+                ui.horizontal(|ui| {
+                    let gdex_busy = self.gdex.busy();
+                    let reserved = if gdex_busy {
+                        ui.spacing().item_spacing.x + 18.0
+                    } else {
+                        0.0
+                    };
+                    let response = ui
+                        .add_sized(
+                            [(ui.available_width() - reserved).max(120.0), 26.0],
+                            egui::Button::new("Browse GDEX catalog…"),
+                        )
+                        .on_hover_text(
+                            "Browse the NSF NCAR GDEX online catalog — CONUS II regional \
+                             climate WRF (present + future). Download a whole file or an NCSS \
+                             subset; it imports into the model store like any other run.",
+                        );
+                    if response.clicked() {
+                        self.gdex.open = true;
+                    }
+                    if gdex_busy {
+                        ui.spinner();
+                    }
+                });
+            });
+
+        egui::CollapsingHeader::new(model_section_heading("Tools & output"))
+            .id_salt("model_tools_output")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.formula_controls(ui);
+                ui.add_space(8.0);
+                model_subheading(ui, "Batch plots");
+                self.plot_controls(ui);
+            });
+
+        if let Some(message) = &self.import_message {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if self.import_job.is_some() {
+                    ui.spinner();
+                }
+                crate::panel_kit::status_block(ui, message, None);
+            });
+        }
+    }
+
+    /// Formula Lab launcher and optional unrestricted raw-WRF source picker.
+    /// Kept together as one tool instead of two unrelated buttons in the
+    /// acquisition button wall.
+    fn formula_controls(&mut self, ui: &mut egui::Ui) {
+        model_subheading(ui, "Formula Lab");
+        ui.label(
+            egui::RichText::new(
+                "Build custom diagnostics from the selected run, or attach a raw WRF source \
+                 for grid-aware formulas.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            let spacing = ui.spacing().item_spacing.x;
+            let width = ((ui.available_width() - spacing) * 0.5).max(90.0);
+            if ui
+                .add_sized(
+                    [width, 26.0],
+                    egui::Button::selectable(self.formula_lab.open, "Formula Lab"),
+                )
+                .on_hover_text(
+                    "Compile safe custom diagnostics against the selected run from any model.",
+                )
+                .clicked()
+            {
+                self.formula_lab.open = !self.formula_lab.open;
+            }
 
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             if ui
-                .button("Choose raw WRF...")
+                .add_sized([width, 26.0], egui::Button::new("Choose WRF source…"))
                 .on_hover_text(
                     "Choose any raw WRF file, including extensionless wrfout_* files from \
-                     any domain (d01, d02, d03, and beyond). The picker intentionally has \
-                     no extension or filename filter.",
+                     any domain. No extension or filename filter is applied.",
                 )
                 .clicked()
                 && let Some(path) = rfd::FileDialog::new()
@@ -1639,8 +1714,9 @@ impl ModelDataDock {
             }
 
             #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-            ui.add_enabled(false, egui::Button::new("Choose raw WRF..."))
-                .on_hover_text("Raw WRF file picking is unavailable on this platform.");
+            ui.add_enabled_ui(false, |ui| {
+                ui.add_sized([width, 26.0], egui::Button::new("Choose WRF source…"));
+            });
         });
         if let Some(path) = self.formula_raw_path.clone() {
             let label = path
@@ -1649,9 +1725,13 @@ impl ModelDataDock {
                 .unwrap_or("raw WRF file");
             let mut clear = false;
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(label).small().weak())
-                    .on_hover_text(path.display().to_string());
-                clear = ui.small_button("Clear raw source").clicked();
+                ui.label(
+                    egui::RichText::new(format!("Source: {label}"))
+                        .small()
+                        .weak(),
+                )
+                .on_hover_text(path.display().to_string());
+                clear = ui.small_button("Clear").clicked();
             });
             if clear {
                 self.formula_raw_path = None;
@@ -1660,30 +1740,6 @@ impl ModelDataDock {
                 }
             }
         }
-        // GDEX online catalog (works on every platform — an in-app tree, no
-        // native file dialog). Opens the browser window rendered in `ui`.
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("🌐 GDEX (NSF NCAR)…")
-                .on_hover_text(
-                    "Browse the NSF NCAR GDEX online catalog — CONUS II regional climate WRF \
-                     (present + future). Download a whole file or an NCSS subset (pick \
-                     variables / bbox / time); it imports into the model store and plots like \
-                     any other run. Downloads run in the background; the server is flaky, so \
-                     errors are retryable.",
-                )
-                .clicked()
-            {
-                self.gdex.open = true;
-            }
-            if self.gdex.busy() {
-                ui.spinner();
-            }
-        });
-        if let Some(message) = &self.import_message {
-            ui.label(egui::RichText::new(message).small().weak());
-        }
-        self.plot_controls(ui);
     }
 
     /// Batch "plot everything" controls: the auto-plot toggle, a manual
@@ -1692,38 +1748,42 @@ impl ModelDataDock {
     /// plots folder" button. Unconditional (no file dialog involved), so it
     /// works on every platform.
     fn plot_controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(
-                &mut self.wrf_options.auto_plot,
-                "Auto-plot all fields after import",
-            )
-            .on_hover_text(
-                "When an import finishes (file, folder, or GDEX), render every field of the \
-                 new run — all forecast hours — to PNG under the screenshots folder: \
-                 plots/<model>/<run>/<field>/f###.png, with an index.json per run.",
-            );
-            let selected = self.browser.selected().cloned();
-            let can_plot =
-                selected.is_some() && self.plot_job.is_none() && !self.formula_lab.busy();
-            let hover = match &selected {
-                Some(hour) => format!(
-                    "Render every field of {}/{} (all hours) to PNG now.",
-                    hour.model, hour.run
-                ),
-                None => "Select a model run in the browser first.".to_owned(),
-            };
-            if ui
-                .add_enabled(can_plot, egui::Button::new("Plot all fields…"))
-                .on_hover_text(hover)
-                .clicked()
-                && let Some(hour) = selected
-            {
-                self.start_plot_job(self.store_root.clone(), hour.model, hour.run);
-            }
-        });
+        ui.checkbox(
+            &mut self.wrf_options.auto_plot,
+            "Automatically plot new imports",
+        )
+        .on_hover_text(
+            "When an import finishes (file, folder, or GDEX), render every field of the \
+             new run — all forecast hours — to PNG under the screenshots folder.",
+        );
+
+        let selected = self.browser.selected().cloned();
+        let can_plot = selected.is_some() && self.plot_job.is_none() && !self.formula_lab.busy();
+        let hover = match &selected {
+            Some(hour) => format!(
+                "Render every field of {}/{} (all hours) to PNG now.",
+                hour.model, hour.run
+            ),
+            None => "Select a model run in the library first.".to_owned(),
+        };
+        if ui
+            .add_enabled_ui(can_plot, |ui| {
+                ui.add_sized(
+                    [ui.available_width().max(120.0), 26.0],
+                    egui::Button::new("Plot selected run…"),
+                )
+            })
+            .inner
+            .on_hover_text(hover)
+            .clicked()
+            && let Some(hour) = selected
+        {
+            self.start_plot_job(self.store_root.clone(), hour.model, hour.run);
+        }
         if let Some(task) = &self.plot_job {
             ui.horizontal(|ui| {
                 ui.spinner();
+                ui.label(egui::RichText::new("Rendering plots").small().weak());
                 if ui
                     .button("Cancel")
                     .on_hover_text("Stop after the current plot; finished PNGs are kept.")
@@ -1735,10 +1795,15 @@ impl ModelDataDock {
             });
         }
         if let Some(message) = &self.plot_message {
-            ui.label(egui::RichText::new(message).small().weak());
+            crate::panel_kit::status_block(ui, message, None);
         }
         if self.plot_done.is_some()
-            && ui.button("Open plots folder").clicked()
+            && ui
+                .add_sized(
+                    [ui.available_width().max(120.0), 24.0],
+                    egui::Button::new("Open plots folder"),
+                )
+                .clicked()
             && let Some(summary) = &self.plot_done
             && let Err(error) = crate::table_editor::show_in_file_browser(&summary.out_dir)
         {
@@ -1750,186 +1815,208 @@ impl ModelDataDock {
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn import_pickers(&mut self, ui: &mut egui::Ui) {
         let busy = self.import_job.is_some() || self.formula_lab.busy();
-        ui.horizontal_wrapped(|ui| {
-            // Single-file import — the common case; no need to point at a whole
-            // folder / batch. `spawn_import_paths` already takes a path list, so
-            // a one-element vec imports exactly the chosen file.
-            if ui
-                .add_enabled(!busy, egui::Button::new("📄 WRF/NetCDF file…"))
-                .on_hover_text(
-                    "QUICK import of a SINGLE WRF/NetCDF file (one forecast hour): 2D \
-                     surface fields + skew-T sounding volumes only — NO CAPE/STP/severe. \
-                     For the severe/thermo suite use the 🛠 wrf-rust buttons below. Handles \
-                     raw wrfout, post-processed climate wrfout, and plain NetCDF. Click a \
-                     point in the field viewer afterwards to sound it.",
-                )
-                .clicked()
-                && let Some(file) = rfd::FileDialog::new()
-                    .set_title("Choose a WRF/NetCDF file to import")
-                    .pick_file()
-            {
-                self.gate_or_launch_light_import(vec![file]);
-            }
+        model_workflow_card(
+            ui,
+            "Quick import",
+            "Surface fields and sounding volumes from WRF/NetCDF. Best for opening and browsing a run.",
+            |ui| {
+                ui.horizontal(|ui| {
+                    let spacing = ui.spacing().item_spacing.x;
+                    let width = ((ui.available_width() - spacing) * 0.5).max(82.0);
+                    if ui
+                        .add_enabled_ui(!busy, |ui| {
+                            ui.add_sized([width, 26.0], egui::Button::new("Choose file…"))
+                        })
+                        .inner
+                        .on_hover_text(
+                            "Import one WRF/NetCDF forecast hour: 2D surface fields and \
+                             sounding volumes. Raw extensionless wrfout files are supported.",
+                        )
+                        .clicked()
+                        && let Some(file) = rfd::FileDialog::new()
+                            .set_title("Choose a WRF/NetCDF file to import")
+                            .pick_file()
+                    {
+                        self.gate_or_launch_light_import(vec![file]);
+                    }
+                    if ui
+                        .add_enabled_ui(!busy, |ui| {
+                            ui.add_sized([width, 26.0], egui::Button::new("Choose folder…"))
+                        })
+                        .inner
+                        .on_hover_text(
+                            "Import every supported WRF/NetCDF file in a folder; each file \
+                             becomes a forecast hour.",
+                        )
+                        .clicked()
+                        && let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Choose a WRF/NetCDF folder to import")
+                            .pick_folder()
+                    {
+                        let files = crate::local_import::supported_files_in_folder(&dir);
+                        if files.is_empty() {
+                            self.import_message =
+                                Some(format!("No WRF/NetCDF files under {}", dir.display()));
+                        } else {
+                            self.gate_or_launch_light_import(files);
+                        }
+                    }
+                });
+            },
+        );
 
-            if ui
-                .add_enabled(!busy, egui::Button::new("📥 WRF/NetCDF folder…"))
-                .on_hover_text(
-                    "QUICK import of a folder of WRF/NetCDF files: 2D surface fields + \
-                     skew-T sounding volumes only — NO CAPE/STP/severe. Each file becomes \
-                     one forecast hour. For the severe/thermo suite use the 🛠 wrf-rust \
-                     buttons below. Handles raw wrfout, post-processed climate wrfout, and \
-                     plain NetCDF. Click a point in the field viewer afterwards to sound it.",
-                )
-                .clicked()
-                && let Some(dir) = rfd::FileDialog::new()
-                    .set_title("Choose a WRF/NetCDF folder to import")
-                    .pick_folder()
-            {
-                let files = crate::local_import::supported_files_in_folder(&dir);
-                if files.is_empty() {
-                    self.import_message =
-                        Some(format!("No WRF/NetCDF files under {}", dir.display()));
-                } else {
-                    self.gate_or_launch_light_import(files);
-                }
-            }
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(egui::RichText::new("Full diagnostics").strong())
+            .id_salt("model_full_diagnostics")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Compute the wrf-rust severe and thermodynamic suite: CAPE/CIN, \
+                         shear, SRH, STP/SCP/EHI, LCL/LFC/EL, precipitation, and more.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    let spacing = ui.spacing().item_spacing.x;
+                    let width = ((ui.available_width() - spacing) * 0.5).max(82.0);
+                    if ui
+                        .add_enabled_ui(!busy, |ui| {
+                            ui.add_sized([width, 26.0], egui::Button::new("Choose files…"))
+                        })
+                        .inner
+                        .on_hover_text(
+                            "Multi-select one or hundreds of raw wrfout files. Each becomes \
+                             a forecast hour and receives the selected diagnostic suite.",
+                        )
+                        .clicked()
+                        && let Some(picked) = rfd::FileDialog::new()
+                            .set_title(
+                                "Choose raw wrfout file(s) — multi-select processes 1 to hundreds",
+                            )
+                            .pick_files()
+                    {
+                        let files: Vec<PathBuf> = picked
+                            .into_iter()
+                            .filter(|path| crate::wrf_process::is_supported_wrf_file(path))
+                            .collect();
+                        self.gate_or_launch_heavy_import(files);
+                    }
+                    if ui
+                        .add_enabled_ui(!busy, |ui| {
+                            ui.add_sized([width, 26.0], egui::Button::new("Choose folder…"))
+                        })
+                        .inner
+                        .on_hover_text(
+                            "Run the selected diagnostics over every raw wrfout file in a folder.",
+                        )
+                        .clicked()
+                        && let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Choose a WRF folder for the wrf-rust severe/thermo import")
+                            .pick_folder()
+                    {
+                        let files = crate::wrf_process::wrf_files_in_folder(&dir);
+                        if files.is_empty() {
+                            self.import_message =
+                                Some(format!("No WRF files under {}", dir.display()));
+                        } else {
+                            self.gate_or_launch_heavy_import(files);
+                        }
+                    }
+                });
+                self.wrf_options_panel(ui);
+            });
 
-            // The wrf-rust (getvar) severe/thermo path — the SAME CAPE/STP/EHI
-            // products HRRR gets. Multi-select one or hundreds of raw wrfout
-            // FILES; each becomes a forecast hour, processed as fast as wrf-rust
-            // allows (only the selected products are computed). This is the
-            // STP/CAPE path — the quick 📄/📥 buttons above write soundings only.
-            if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new("🛠 WRF CAPE / severe (wrf-rust) — file(s)…"),
-                )
-                .on_hover_text(
-                    "wrf-rust (getvar) severe/thermo processing for raw wrfout files: \
-                     CAPE/CIN, SRH, bulk shear, STP/SCP/EHI, LCL/LFC/EL, precip, soil — the \
-                     full diagnostic suite, the same products HRRR gets. MULTI-SELECT one or \
-                     hundreds of files in the dialog; each becomes a forecast hour, computed \
-                     as fast as wrf-rust allows. Narrow the products with “🛠 WRF \
-                     full-diagnostics fields” below (default = everything but heavy eCAPE). \
-                     The quick 📄/📥 buttons above only write soundings — this is the \
-                     STP/CAPE path.",
-                )
-                .clicked()
-                && let Some(picked) = rfd::FileDialog::new()
-                    .set_title("Choose raw wrfout file(s) — multi-select processes 1 to hundreds")
-                    .pick_files()
-            {
-                let files: Vec<PathBuf> = picked
-                    .into_iter()
-                    .filter(|path| crate::wrf_process::is_supported_wrf_file(path))
-                    .collect();
-                self.gate_or_launch_heavy_import(files);
-            }
-
-            if ui
-                .add_enabled(!busy, egui::Button::new("🛠 …whole folder"))
-                .on_hover_text(
-                    "Same wrf-rust severe/thermo processing, over EVERY raw wrfout in a \
-                     folder — one forecast hour per file.",
-                )
-                .clicked()
-                && let Some(dir) = rfd::FileDialog::new()
-                    .set_title("Choose a WRF folder for the wrf-rust severe/thermo import")
-                    .pick_folder()
-            {
-                let files = crate::wrf_process::wrf_files_in_folder(&dir);
-                if files.is_empty() {
-                    self.import_message = Some(format!("No WRF files under {}", dir.display()));
-                } else {
-                    self.gate_or_launch_heavy_import(files);
-                }
-            }
-        });
-        // Product selector for the heavy "Full model import" above. The light
-        // single-file/folder path (`local_import`) writes a FIXED 2D-surface +
-        // isobaric-sounding set with no options struct, so it is not wired
-        // here; if per-field selection is ever wanted there too, this same
-        // popover could drive a `local_import` options argument.
-        self.wrf_options_panel(ui);
         self.heavy_import_warning_ui(ui);
         self.light_import_warning_ui(ui);
 
-        ui.separator();
-        // The FAST simulated-radar path: loops in the radar view, writes
-        // NOTHING to the model store. Kept visually apart from the store
-        // imports above — the owner has repeatedly launched the heavy import
-        // expecting this one.
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new("🌩 Simulated radar from WRF (fast)…"),
-                )
-                .on_hover_text(
-                    "FAST path (~seconds per file): forward-model the raw wrfout \
-                     hydrometeors + winds into a SIMULATED NEXRAD-style scan (REF + radial \
-                     velocity) that renders and LOOPS in the radar view — colormaps, \
-                     cross-sections, GBVTD and all. Pick one or MORE wrfout files: each \
-                     file / forecast time becomes a loop frame, sorted by model time. \
-                     Writes nothing to the model store. NOT the heavy full-diagnostics \
-                     import (that one is 🛠 above).",
-                )
-                .clicked()
-            {
-                match self.synth_radar.to_config() {
-                    Err(message) => self.import_message = Some(message),
-                    Ok(config) => {
-                        if let Some(files) = rfd::FileDialog::new()
-                            .set_title("Choose raw wrfout file(s) — multi-select builds a loop")
-                            .pick_files()
-                        {
-                            self.launch_synthetic_radar(files, config);
-                        }
-                    }
-                }
-            }
-            if ui
-                .add_enabled(!busy, egui::Button::new("🌩 …whole folder"))
-                .on_hover_text(
-                    "Same FAST simulated-radar path, over EVERY wrfout in a folder — one \
-                     loop frame per file / forecast time, sorted by model time.",
-                )
-                .clicked()
-            {
-                match self.synth_radar.to_config() {
-                    Err(message) => self.import_message = Some(message),
-                    Ok(config) => {
-                        if let Some(dir) = rfd::FileDialog::new()
-                            .set_title("Choose a folder of raw wrfout files to simulate")
-                            .pick_folder()
-                        {
-                            let files = crate::wrf_process::wrf_files_in_folder(&dir);
-                            if files.is_empty() {
-                                self.import_message =
-                                    Some(format!("No WRF files under {}", dir.display()));
-                            } else {
-                                self.launch_synthetic_radar(files, config);
+        egui::CollapsingHeader::new(egui::RichText::new("Simulated radar").strong())
+            .id_salt("model_simulated_radar")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Forward-model WRF hydrometeors and winds into a fast, loopable \
+                         NEXRAD-style reflectivity and radial-velocity scan.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    let spacing = ui.spacing().item_spacing.x;
+                    let width = ((ui.available_width() - spacing) * 0.5).max(82.0);
+                    if ui
+                        .add_enabled_ui(!busy, |ui| {
+                            ui.add_sized([width, 26.0], egui::Button::new("Build from files…"))
+                        })
+                        .inner
+                        .on_hover_text(
+                            "Pick one or more wrfout files; each forecast time becomes a \
+                             radar-loop frame. Nothing is written to the model store.",
+                        )
+                        .clicked()
+                    {
+                        match self.synth_radar.to_config() {
+                            Err(message) => self.import_message = Some(message),
+                            Ok(config) => {
+                                if let Some(files) = rfd::FileDialog::new()
+                                    .set_title(
+                                        "Choose raw wrfout file(s) — multi-select builds a loop",
+                                    )
+                                    .pick_files()
+                                {
+                                    self.launch_synthetic_radar(files, config);
+                                }
                             }
                         }
                     }
+                    if ui
+                        .add_enabled_ui(!busy, |ui| {
+                            ui.add_sized([width, 26.0], egui::Button::new("Build from folder…"))
+                        })
+                        .inner
+                        .on_hover_text("Build one radar-loop frame per wrfout file in a folder.")
+                        .clicked()
+                    {
+                        match self.synth_radar.to_config() {
+                            Err(message) => self.import_message = Some(message),
+                            Ok(config) => {
+                                if let Some(dir) = rfd::FileDialog::new()
+                                    .set_title("Choose a folder of raw wrfout files to simulate")
+                                    .pick_folder()
+                                {
+                                    let files = crate::wrf_process::wrf_files_in_folder(&dir);
+                                    if files.is_empty() {
+                                        self.import_message =
+                                            Some(format!("No WRF files under {}", dir.display()));
+                                    } else {
+                                        self.launch_synthetic_radar(files, config);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                let frame_count = self.synthetic_export_frames.len();
+                if ui
+                    .add_enabled_ui(frame_count > 0, |ui| {
+                        ui.add_sized(
+                            [ui.available_width().max(120.0), 24.0],
+                            egui::Button::new("Export latest as CfRadial…"),
+                        )
+                    })
+                    .inner
+                    .on_hover_text(
+                        "Save the latest simulated-radar frame or loop as CfRadial-1 NetCDF \
+                         for BowEcho, Py-ART, and other radar toolkits.",
+                    )
+                    .clicked()
+                {
+                    self.export_synthetic_radar_frames();
                 }
-            }
-            let frame_count = self.synthetic_export_frames.len();
-            if ui
-                .add_enabled(frame_count > 0, egui::Button::new("💾 Export CfRadial…"))
-                .on_hover_text(
-                    "Save the simulated radar frames above as CfRadial-1 NetCDF files — \
-                     the standard research radar exchange format (opens in BowEcho, \
-                     Py-ART, and most radar toolkits). One frame asks for a file name; \
-                     a loop asks for a folder and writes one file per frame. Enabled \
-                     after a simulated-radar build finishes.",
-                )
-                .clicked()
-            {
-                self.export_synthetic_radar_frames();
-            }
-        });
-        self.synthetic_radar_site_panel(ui);
+                self.synthetic_radar_site_panel(ui);
+            });
     }
 
     /// Size-gate a wrf-rust severe/thermo import (park LARGE grids behind an
@@ -2088,16 +2175,15 @@ impl ModelDataDock {
         let warning = pending.warning.clone();
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(
-                egui::RichText::new("⚠ Large WRF import")
+                egui::RichText::new("Large WRF import")
                     .strong()
-                    .color(egui::Color32::from_rgb(0xd0, 0x8a, 0x30)),
+                    .color(crate::ui_theme::theme().warn),
             );
             ui.label(egui::RichText::new(warning).small());
             ui.label(
                 egui::RichText::new(
-                    "Tip: narrow the field selection with “🛠 WRF full-diagnostics fields” \
-                     above, start core-only, or — if you just want to SEE the storm — use \
-                     “🌩 Simulated radar from WRF (fast)” below instead.",
+                    "Narrow Fields to compute, start core-only, or use Simulated radar when \
+                     you only need a fast radar-style view of the storm.",
                 )
                 .small()
                 .weak(),
@@ -2152,17 +2238,16 @@ impl ModelDataDock {
         let warning = pending.warning.clone();
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(
-                egui::RichText::new("⚠ Large WRF import")
+                egui::RichText::new("Large WRF import")
                     .strong()
-                    .color(egui::Color32::from_rgb(0xd0, 0x8a, 0x30)),
+                    .color(crate::ui_theme::theme().warn),
             );
             ui.label(egui::RichText::new(warning).small());
             ui.label(
                 egui::RichText::new(
-                    "Tip: if you just want radar-style browsing of this run, “🌩 \
-                     Simulated radar from WRF (fast)” below is the fast path — seconds \
-                     per file, loops in the radar view. Import here only for store \
-                     fields + skew-T soundings; progress shows below while it runs.",
+                    "For radar-style browsing, use Simulated radar instead: it takes seconds \
+                     per file and loops in the radar view. Quick import is for model-store \
+                     fields and skew-T soundings.",
                 )
                 .small()
                 .weak(),
@@ -2197,14 +2282,14 @@ impl ModelDataDock {
     fn synthetic_radar_site_panel(&mut self, ui: &mut egui::Ui) {
         let busy = self.import_job.is_some() || self.formula_lab.busy();
         let state = &mut self.synth_radar;
-        egui::CollapsingHeader::new("📡 Virtual radar site & range")
+        egui::CollapsingHeader::new("Radar site & scan settings")
             .id_salt("wrf_synth_radar_site")
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(
                         "Where the simulated antenna stands and how far it scans. Applies \
-                         to the next “🌩 Simulated radar from WRF” run. The antenna sits \
+                         to the next Simulated radar run. The antenna sits \
                          on the model terrain at the chosen spot (+10 m tower).",
                     )
                     .small()
@@ -2279,7 +2364,7 @@ impl ModelDataDock {
                                                 .unwrap_or_default();
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "✔ {}{coords}",
+                                                    "Valid site: {}{coords}",
                                                     record.label
                                                 ))
                                                 .small()
@@ -2289,10 +2374,10 @@ impl ModelDataDock {
                                         None => {
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "✘ “{id}” not in the site catalog"
+                                                    "Site “{id}” was not found"
                                                 ))
                                                 .small()
-                                                .color(egui::Color32::from_rgb(0xd0, 0x8a, 0x30)),
+                                                .color(crate::ui_theme::theme().warn),
                                             );
                                         }
                                     }
@@ -2500,7 +2585,7 @@ impl ModelDataDock {
     fn wrf_options_panel(&mut self, ui: &mut egui::Ui) {
         let busy = self.import_job.is_some() || self.formula_lab.busy();
         let opts = &mut self.wrf_options;
-        egui::CollapsingHeader::new("🛠 WRF full-diagnostics fields")
+        egui::CollapsingHeader::new("Fields to compute")
             .id_salt("wrf_full_diag_fields")
             .default_open(false)
             .show(ui, |ui| {
@@ -2582,7 +2667,7 @@ impl ModelDataDock {
                             "Nothing selected — enable a group or widen the Only filter.",
                         )
                         .small()
-                        .color(egui::Color32::from_rgb(0xd0, 0x8a, 0x30)),
+                        .color(crate::ui_theme::theme().warn),
                     );
                 } else {
                     egui::ScrollArea::vertical()
@@ -2733,6 +2818,69 @@ impl ModelDataDock {
         Some((key, valid, run_age, changed))
     }
 
+    /// Contextual actions for the currently displayed field. The primary map
+    /// action and three view/edit modes read as one toolbar instead of four
+    /// unrelated buttons floating above the image.
+    fn viewer_toolbar(&mut self, ui: &mut egui::Ui) {
+        if self.latest_field.is_none() {
+            return;
+        }
+        let theme = crate::ui_theme::theme();
+        egui::Frame::new()
+            .fill(theme.faint)
+            .stroke(egui::Stroke::new(1.0_f32, theme.hairline))
+            .corner_radius(4)
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("FIELD TOOLS")
+                            .size(11.0)
+                            .strong()
+                            .color(crate::ui_theme::subhead_color()),
+                    );
+                    if ui
+                        .button("Add to radar map")
+                        .on_hover_text(
+                            "Render this field as a layer under the radar; opacity remains in Layers.",
+                        )
+                        .clicked()
+                    {
+                        self.map_request = self.latest_field.clone();
+                    }
+
+                    let mut model_plot_open = self.show_plot_viewer
+                        && self.native_plot_content == NativePlotContent::Model;
+                    if ui
+                        .toggle_value(&mut model_plot_open, "Native plot")
+                        .on_hover_text(
+                            "Render the selected field through rusty-weather's native plot \
+                             pipeline. Shift-drag the field viewer to select a custom domain.",
+                        )
+                        .changed()
+                    {
+                        self.native_plot_content = NativePlotContent::Model;
+                        self.show_plot_viewer = model_plot_open;
+                    }
+
+                    // Map-side domain drawing remains explicitly armed so it
+                    // cannot collide with pan, loupe, sounding, or 3-D input.
+                    ui.toggle_value(&mut self.plot_domain_armed, "Draw map domain")
+                        .on_hover_text(
+                            "Arm the radar map: the next click-drag draws the native-plot \
+                             domain. Esc, right-click, or clicking this again cancels. \
+                             Shortcut: Ctrl+Shift+drag the map.",
+                        );
+                    ui.toggle_value(&mut self.show_color_tables, "Color tables")
+                        .on_hover_text(
+                            "Edit model plot palettes and product bindings. Overrides apply \
+                             in this viewer and on the radar-map layer.",
+                        );
+                });
+            });
+        ui.add_space(4.0);
+    }
+
     /// The dock body — call inside an egui Window/panel. Returns false when
     /// the user asked to close.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -2740,65 +2888,69 @@ impl ModelDataDock {
 
         egui::Panel::left("model_runs")
             .resizable(true)
-            .default_size(230.0)
+            .default_size(300.0)
+            .min_size(260.0)
+            .max_size(440.0)
             .show_inside(ui, |ui| {
-                ui.add_space(2.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.strong("Runs");
-                    if ui.button("⟳").on_hover_text("Re-scan the store").clicked() {
-                        self.worker.send(StoreRequest::Enumerate);
-                    }
+                    ui.label(model_section_heading("Model library"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("↻")
+                            .on_hover_text("Re-scan the model store")
+                            .clicked()
+                        {
+                            self.worker.send(StoreRequest::Enumerate);
+                        }
+                    });
                 });
-                ui.label(
-                    egui::RichText::new(self.store_root.display().to_string())
-                        .small()
-                        .weak(),
-                );
-                ui.separator();
-                self.import_controls(ui);
-                ui.separator();
+                let store_label = self.store_root.display().to_string();
+                crate::panel_kit::status_block(ui, &store_label, None);
+                ui.add_space(6.0);
+                model_subheading(ui, "Runs");
+
                 let mut picked = None;
+                let available = ui.available_height();
+                let list_height = if available.is_finite() {
+                    (available * 0.52).clamp(170.0, 460.0)
+                } else {
+                    360.0
+                };
                 match &self.tree {
                     None => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("scanning store…");
-                        });
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), list_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Scanning model store…");
+                                });
+                            },
+                        );
                     }
                     Some(tree) if tree.models.is_empty() => {
-                        ui.label(format!(
-                            "No model runs under\n{}",
-                            self.store_root.display()
-                        ));
-                        ui.label(
-                            egui::RichText::new(
-                                "Run rusty-weather ingest, or point the store path at an rw-store directory.",
-                            )
-                            .small()
-                            .weak(),
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), list_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.label("No model runs yet.");
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Use Add data below to import WRF/NetCDF or browse GDEX.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            },
                         );
                     }
                     Some(tree) => {
                         let browser = &mut self.browser;
-                        // The run list is the LAST region of the Runs column,
-                        // so capping it at exactly the height that remains
-                        // squashes nothing above it. The explicit cap is what
-                        // makes the scrollbar engage: an un-capped ScrollArea
-                        // inside a host that lays this dock out with
-                        // unbounded height just grows with its content and
-                        // never scrolls (owner report: a long processed-
-                        // dataset list runs off the window). The salt keeps
-                        // its scroll state distinct from every other
-                        // ScrollArea in the dock (unsalted ones all share
-                        // egui's "scroll_area" id).
-                        let remaining = ui.available_height();
-                        let list_height = if remaining.is_finite() {
-                            remaining.max(120.0)
-                        } else {
-                            480.0
-                        };
                         egui::ScrollArea::vertical()
                             .id_salt("model_runs_list")
+                            .min_scrolled_height(list_height)
                             .max_height(list_height)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
@@ -2809,6 +2961,13 @@ impl ModelDataDock {
                 if let Some(key) = picked {
                     self.select_hour(key);
                 }
+                ui.add_space(6.0);
+                let actions_height = ui.available_height().max(120.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("model_library_actions")
+                    .max_height(actions_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| self.import_controls(ui));
             });
 
         // The sounding is NOT rendered here. A model-sounding load feeds BOTH
@@ -2823,53 +2982,7 @@ impl ModelDataDock {
         // `dock_model_sounding_beside_plot`.
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            if self.latest_field.is_some() {
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Show on radar map")
-                        .on_hover_text(
-                            "Render this field as a layer under the radar (opacity in Layers)",
-                        )
-                        .clicked()
-                    {
-                        self.map_request = self.latest_field.clone();
-                    }
-                    let mut model_plot_open = self.show_plot_viewer
-                        && self.native_plot_content == NativePlotContent::Model;
-                    if ui
-                        .toggle_value(&mut model_plot_open, "🗺 Native plot")
-                        .on_hover_text(
-                            "Render the selected field through rusty-weather's native plot \
-                             pipeline. Shift-drag a box on the field viewer to plot a custom \
-                             domain; drag a selection corner to rotate. To draw the box on \
-                             the radar map instead, arm 📐 Draw plot box (or Ctrl+Shift+drag \
-                             the map).",
-                        )
-                        .changed()
-                    {
-                        self.native_plot_content = NativePlotContent::Model;
-                        self.show_plot_viewer = model_plot_open;
-                    }
-                    // v0.29.3 gesture-collision fix: Shift-drag on the MAP is
-                    // contested (loupe, inspector pin, Shift+right-drag 3D
-                    // box), so map-side domain drawing gets an explicit arm.
-                    ui.toggle_value(&mut self.plot_domain_armed, "📐 Draw plot box")
-                        .on_hover_text(
-                            "Arm the radar map: the next click-drag on the map draws the \
-                             custom plot domain — no modifier keys, and nothing else fires \
-                             (no pan, loupe, sounding, or 3D box). Esc, right-click, or \
-                             clicking this again cancels; a completed box disarms. \
-                             Shortcut: Ctrl+Shift+drag the map.",
-                        );
-                    ui.toggle_value(&mut self.show_color_tables, "🎨 Color tables")
-                        .on_hover_text(
-                            "Edit model field-plot color tables: bind a product to a palette, \
-                             edit its levels and colors; the field reloads with your palette — \
-                             in the dock viewer AND on the radar-map layer, where your binding \
-                             outranks the built-in Solar WRF palettes.",
-                        );
-                });
-            }
+            self.viewer_toolbar(ui);
             match self.viewer.ui(ui) {
                 Some(FieldViewerEvent::VarSelected(var)) => {
                     if self.viewer.restore_generated_field(&var) {
@@ -2938,7 +3051,7 @@ impl ModelDataDock {
                 self.seed_native_plot_domain(field);
             }
             let mut open = true;
-            egui::Window::new("🗺 Native plot")
+            egui::Window::new("Native plot")
                 .open(&mut open)
                 .default_size([560.0, 440.0])
                 .show(ui.ctx(), |ui| {
@@ -2967,7 +3080,7 @@ impl ModelDataDock {
                     self.latest_field.as_deref(),
                     &self.hour_store_vars,
                 );
-                egui::Window::new("🎨 Color tables")
+                egui::Window::new("Color tables")
                     .open(&mut open)
                     .default_size([520.0, 520.0])
                     .show(ui.ctx(), |ui| {
@@ -2992,6 +3105,43 @@ impl ModelDataDock {
             self.gdex.ui(ui, &cache_dir);
         }
     }
+}
+
+fn model_section_heading(title: &str) -> egui::RichText {
+    egui::RichText::new(title.to_uppercase())
+        .size(12.5)
+        .strong()
+        .color(crate::ui_theme::subhead_color())
+}
+
+fn model_subheading(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        egui::RichText::new(title.to_uppercase())
+            .size(11.0)
+            .strong()
+            .color(crate::ui_theme::subhead_color()),
+    );
+}
+
+fn model_workflow_card<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: &str,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let theme = crate::ui_theme::theme();
+    egui::Frame::new()
+        .fill(theme.faint)
+        .stroke(egui::Stroke::new(1.0_f32, theme.hairline))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            model_subheading(ui, title);
+            ui.label(egui::RichText::new(description).small().weak());
+            ui.add_space(3.0);
+            body(ui)
+        })
+        .inner
 }
 
 /// An integer is losslessly representable by binary64 when, after removing

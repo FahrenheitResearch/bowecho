@@ -12,14 +12,14 @@ use eframe::egui;
 // from the chrome it documents.
 use crate::ui_theme::{accent_color, subhead_color};
 
-const GUIDE_TOP_BAR_TEXT: &str = "The top bar leads with the LIVE | ARCHIVE control: \
-    LIVE follows the current radar's newest data and backfills a loop in one click; \
-    ARCHIVE loads a loop ending at any UTC date/time. Both arm synced warnings by \
-    default. Sweeps picks the low-level sweep loop mode one click deep, and Advanced \
-    opens the full Unified Player. One-shot actions follow \
-    (Reset View, Reload, Map Only, Screenshot, Annotate) plus Workflows presets. \
+const GUIDE_TOP_BAR_TEXT: &str = "The top bar leads with LIVE plus one Timeline menu: \
+    LIVE follows the current radar's newest data and backfills a loop in one click. \
+    Timeline brings archive-loop loading, archive-day browsing, sweep playback, and \
+    the full Unified Player into one place; live and archive entry both arm synced \
+    warnings by default. Reload, Screenshot, Annotate, and Workflows remain one click \
+    away. View contains Reset map view and Map only. \
     On the right, the Windows menu opens every data window (Model, Radar \
-    overlays, Satellite, SimSat, WoFS, FARM, 3D Volume, Sounding) beside this Guide. Status chips appear \
+    overlays, Satellite, WoFS, FARM, 3D Volume, Sounding) beside this Guide. Status chips appear \
     beside the menus. Map Only hides chrome for a clean capture; Tab or Esc \
     brings it back.";
 const GUIDE_PANES_LABEL: &str = "Panes 1 / 2 / 3 / 4";
@@ -319,8 +319,8 @@ fn getting_started(ui: &mut egui::Ui) {
     action(ui, GUIDE_PANES_LABEL, GUIDE_PANES_TEXT);
     para(
         ui,
-        "Drag pans, the scroll wheel zooms about the cursor, Reset View (top bar) recenters on \
-         the site. The colorbar for the active product draws on-canvas.",
+        "Drag pans, the scroll wheel zooms about the cursor, and View > Reset map view \
+         recenters on the site. The colorbar for the active product draws on-canvas.",
     );
 }
 
@@ -1076,8 +1076,8 @@ fn satellite(ui: &mut egui::Ui) {
     subhead(ui, "SIMULATED SATELLITE");
     para(
         ui,
-        "Windows > Simulated satellite opens BowEcho's embedded SimSat engine. \
-         It renders physically based visible, GeoColor, sandwich, thermal-IR, water-vapor, \
+        "The embedded SimSat engine is still being tuned, so its launcher is intentionally \
+         hidden in this build. It renders physically based visible, GeoColor, sandwich, thermal-IR, water-vapor, \
          and derived products from local WRF output or HRRR native-level data. Finished \
          frames are written directly into this same satellite store, grouped into loops by \
          source run, selected in the player, and can follow onto the radar map. The Render \
@@ -1246,9 +1246,9 @@ fn unified_player(ui: &mut egui::Ui) {
     ui.heading("Unified Player");
     para(
         ui,
-        "The Unified Player is the Advanced disclosure of the top bar's LIVE | ARCHIVE \
-         control — the bar covers go-live and loop-ending-at in one click; open Advanced \
-         (or Windows > Unified Player) for everything else. It owns long radar loops, archive \
+        "The Unified Player is the full workspace behind the top bar's Timeline menu — \
+         LIVE and Timeline cover go-live, archive loops, and sweep playback; choose Open \
+         timeline, sync, and export (or Windows > Unified Player) for everything else. It owns long radar loops, archive \
          windows, low-sweep timelines, synced warnings/reports/lightning/models, multi-radar \
          mosaics, camera follow, and loop export. Every control that existed before the bar \
          still lives here.",
@@ -1794,13 +1794,12 @@ mod tests {
         assert!(GUIDE_TOP_BAR_TEXT.contains("Map Only"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Workflows"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Radar overlays"));
-        // The v0.29 two-button front: the bar leads the top-bar copy, the
-        // sweep menu is documented one click deep, synced warnings are the
-        // named default, and the Unified Player is its Advanced disclosure.
-        assert!(GUIDE_TOP_BAR_TEXT.contains("LIVE | ARCHIVE"));
+        // The consolidated source/timeline front stays documented with its
+        // sync default and full-player path.
+        assert!(GUIDE_TOP_BAR_TEXT.contains("LIVE plus one Timeline"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("synced warnings"));
-        assert!(GUIDE_TOP_BAR_TEXT.contains("Sweeps"));
-        assert!(GUIDE_TOP_BAR_TEXT.contains("Advanced"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("sweep playback"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("Unified Player"));
         let guide_src = include_str!("guide.rs");
         assert!(guide_src.contains("security and updates"));
         assert_eq!(GUIDE_PANES_LABEL, "Panes 1 / 2 / 3 / 4");

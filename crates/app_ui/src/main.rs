@@ -19266,7 +19266,7 @@ impl eframe::App for ViewerApp {
         }
         if !self.chrome_hidden {
             egui::Panel::top("top_bar")
-                .exact_size(42.0)
+                .exact_size(44.0)
                 .show_inside(ui, |ui| self.top_bar(ui));
 
             // Annotate's compact tool row (fronts/lines/boxes/icons) lives
@@ -19491,7 +19491,7 @@ impl eframe::App for ViewerApp {
 }
 
 impl ViewerApp {
-    /// Top bar (ui-overhaul spec §3): brand · one-shot actions on the left,
+    /// Top bar (ui-overhaul spec §3): brand · source/timeline + commands,
     /// then — right-aligned — Guide and the `Windows ▾` menu in FIXED edge
     /// positions with the status chips extending leftward from them. Chips
     /// are *status*, buttons are *commands*; they no longer share widgets
@@ -19511,25 +19511,21 @@ impl ViewerApp {
                 let scale = (26.0 / source.y.max(1.0)).min(92.0 / source.x.max(1.0));
                 ui.add(egui::Image::new((texture.id(), source * scale)));
             }
-            ui.heading(&display_name);
+            ui.label(egui::RichText::new(&display_name).size(15.0).strong());
             ui.separator();
-            // The two-button front (v0.29 Phase 5): LIVE | ARCHIVE, with
-            // the sweep menu one click deep and the Unified Player as the
-            // Advanced disclosure.
+            // One-click LIVE plus one Timeline menu. Archive loading, sweep
+            // policy, and the full player used to be three adjacent controls
+            // despite sharing one engine; the Timeline menu gives that
+            // workflow one coherent home.
             self.live_archive_bar_ui(ui);
             ui.separator();
-            if fixed_action_button(ui, "Reset View", 90.0).clicked() {
-                self.reset_view();
-            }
-            if fixed_action_button(ui, "Reload", 62.0).clicked() {
-                self.load_volume(ui.ctx());
-            }
-            if fixed_action_button(ui, "Map Only", 74.0)
-                .on_hover_text("Hide chrome and leave the map/data workspace visible (Tab or Esc restores)")
+            if toolbar_action_button(ui, "↻ Reload", 72.0)
+                .on_hover_text("Reload the current radar source")
                 .clicked()
             {
-                self.chrome_hidden = true;
+                self.load_volume(ui.ctx());
             }
+            self.view_menu(ui);
             self.workflow_menu(ui);
             self.media_top_bar_ui(ui);
             self.annotate_top_bar_ui(ui);
@@ -19537,7 +19533,7 @@ impl ViewerApp {
                 // Guide stays top-level forever: with the no-tours rule it is
                 // the discoverability anchor and must never be buried.
                 if ui
-                    .selectable_label(self.show_guide, "Guide")
+                    .add(egui::Button::selectable(self.show_guide, "Guide").frame(false))
                     .on_hover_text("How to read every product + where every feature lives")
                     .clicked()
                 {
@@ -19659,29 +19655,13 @@ impl ViewerApp {
                         "Last workflow preset applied this session. Use Workflows > Restore previous setup to undo it, or Clear marker to hide this label.",
                     );
                 }
-                // AWIPS-style current-scan readouts (ui-refresh spec §5):
-                // monospace facts sourced from the SAME state the status
-                // bar prints (frame history cursor, active-pane product,
-                // installed volume's VCP) — nothing recomputed. Loop state
-                // is a fixed segment; the scan-facts label absorbs the
-                // remaining width and truncates (full frame-status line on
-                // hover), so the strip degrades gracefully from ultrawide
-                // down to the 1120 pt window floor.
+                // Current-scan telemetry keeps the v0.31 AWIPS facts but
+                // separates identity, timing, and playback state into visual
+                // tiers. Detail drops before identity at narrow widths; the
+                // complete frame status remains on hover.
                 if let Some(frame) = self.primary.history.get(self.primary.cursor.index) {
                     let now_utc = Utc::now();
-                    ui.separator();
-                    if let Some(loop_state) = chrome_readouts::top_bar_loop_readout(
-                        self.primary.cursor.index,
-                        self.primary.history.len(),
-                        self.primary.cursor.playing,
-                    ) {
-                        ui.label(
-                            egui::RichText::new(loop_state)
-                                .monospace()
-                                .size(READOUT_FONT_SIZE),
-                        )
-                        .on_hover_text("Loop frame / frame count, playback state");
-                    }
+                    let readout_budget = ui.available_width();
                     let (product, _cut) = self.active_product_cut();
                     let vcp = self
                         .volume
@@ -19697,22 +19677,113 @@ impl ViewerApp {
                             .format_date_hms(frame.identity.scan_time_utc),
                         &frame_age_label(frame.identity.scan_time_utc, now_utc),
                     );
+                    let loop_state = chrome_readouts::top_bar_loop_readout(
+                        self.primary.cursor.index,
+                        self.primary.history.len(),
+                        self.primary.cursor.playing,
+                    );
+                    let font_id = egui::FontId::monospace(READOUT_FONT_SIZE);
+                    let measure = |text: &str| {
+                        ui.painter()
+                            .layout_no_wrap(
+                                text.to_owned(),
+                                font_id.clone(),
+                                ui.visuals().text_color(),
+                            )
+                            .size()
+                            .x
+                    };
+                    let identity_width = measure(&scan.identity);
+                    let loop_width = loop_state.as_deref().map(&measure).unwrap_or(0.0);
+                    let detail_width = measure(&scan.detail);
+                    let spacing = ui.spacing().item_spacing.x;
+                    let show_loop = readout_budget >= identity_width + loop_width + spacing * 3.0;
+                    let show_detail = show_loop
+                        && readout_budget
+                            >= identity_width + loop_width + detail_width + spacing * 5.0;
+
+                    ui.separator();
+                    if show_loop
+                        && let Some(loop_state) = loop_state
+                    {
+                        let loop_text = egui::RichText::new(loop_state)
+                            .monospace()
+                            .size(READOUT_FONT_SIZE);
+                        let loop_text = if self.primary.cursor.playing {
+                            loop_text.strong().color(accent_color())
+                        } else {
+                            loop_text.weak()
+                        };
+                        ui.label(loop_text)
+                            .on_hover_text("Loop frame / frame count, playback state");
+                    }
+                    let hover = frame_status_text(frame, now_utc, self.time_zone());
+                    if show_detail {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&scan.detail)
+                                    .monospace()
+                                    .size(READOUT_FONT_SIZE)
+                                    .weak(),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&hover);
+                    }
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(scan)
+                            egui::RichText::new(&scan.identity)
                                 .monospace()
-                                .size(READOUT_FONT_SIZE),
+                                .size(READOUT_FONT_SIZE)
+                                .strong(),
                         )
                         .truncate(),
                     )
-                    .on_hover_text(frame_status_text(frame, now_utc, self.time_zone()));
+                    .on_hover_text(hover);
                 }
             });
         });
     }
 
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        let (button, _) = egui::containers::menu::MenuButton::from_button(
+            egui::Button::new("View ⏷").frame(false),
+        )
+        .ui(ui, |ui| {
+            ui.set_min_width(180.0);
+            ui.label(
+                egui::RichText::new("MAP & CHROME")
+                    .size(10.0)
+                    .strong()
+                    .color(subhead_color()),
+            );
+            if ui
+                .button("Reset map view")
+                .on_hover_text("Recenter and restore the default zoom for the loaded radar")
+                .clicked()
+            {
+                self.reset_view();
+                ui.close();
+            }
+            if ui
+                .button("Map only")
+                .on_hover_text("Hide app chrome while leaving maps and data windows visible")
+                .clicked()
+            {
+                self.chrome_hidden = true;
+                ui.close();
+            }
+            ui.separator();
+            ui.weak("Tab toggles chrome · Esc restores it");
+        });
+        button.on_hover_text("Map reset and clean-screen controls");
+    }
+
     fn workflow_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("Workflows ⏷", |ui| {
+        let (button, _) = egui::containers::menu::MenuButton::from_button(
+            egui::Button::new("Workflows ⏷").frame(false),
+        )
+        .ui(ui, |ui| {
             ui.set_min_width(180.0);
             if let Some(workflow) = self.current_workflow {
                 ui.weak(format!("Last applied: {}", workflow.label()));
@@ -19744,6 +19815,7 @@ impl ViewerApp {
                 }
             }
         });
+        button.on_hover_text("Apply a complete operational workspace preset");
     }
 
     fn apply_workflow_preset(&mut self, preset: WorkflowPreset, ctx: &egui::Context) {
@@ -20071,7 +20143,10 @@ impl ViewerApp {
     /// tri-state; every window also stays reachable from its layer-row ⚙, so
     /// this menu is a third path, not the only one.
     fn windows_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("Windows ⏷", |ui| {
+        let (button, _) = egui::containers::menu::MenuButton::from_button(
+            egui::Button::new("Windows ⏷").frame(false),
+        )
+        .ui(ui, |ui| {
             ui.set_min_width(170.0);
             let mut toggle: Option<dock::WorkspacePane> = None;
             for (pane, label, hover) in [
@@ -20185,9 +20260,8 @@ impl ViewerApp {
                     self.farm.select_sensor(id);
                 }
             }
-        })
-        .response
-        .on_hover_text("Data windows: Model · VWP · Satellite · WoFS · FARM · 3D · Sounding");
+        });
+        button.on_hover_text("Data windows: Model · VWP · Satellite · WoFS · FARM · 3D · Sounding");
     }
 
     /// Drain the embedded SimSat worker whether or not its pane is visible.
@@ -29748,199 +29822,36 @@ impl ViewerApp {
                     store_empty,
                 )
                 .show_header(ui, |ui| {
-                    ui.strong("Download");
-                    ui.weak("any init · specific hours · any profile — with size estimate");
+                    ui.strong("Acquire model data");
+                    ui.weak(if store_empty {
+                        "Get a ready-to-use first run"
+                    } else {
+                        "Latest run · quick presets · archive-time match · custom setup"
+                    });
                 })
                 .body(|ui| {
                     self.ensure_ingest_worker(&ctx);
-                    // Store freshness + the one-click ingest that used to
-                    // live in the sidebar's Layers fold (proposal step 4).
-                    ui.horizontal(|ui| {
-                        let newest = self
-                            .model_dock
-                            .as_ref()
-                            .and_then(|dock| dock.newest_run());
-                        match newest {
-                            Some((model, run, hours)) => {
-                                ui.weak(format!("Newest in store: {model} {run} · {hours} hrs"));
-                            }
-                            None => {
-                                ui.weak("Store empty");
-                            }
-                        }
-                        let fetching = self.model_ingest_rx.is_some();
-                        let (auto_model, auto_switched) = self.auto_model_for_radar();
-                        let auto_label = auto_model.as_str().to_uppercase();
-                        let coverage_note = if auto_switched {
-                            " — radar is outside HRRR coverage, GFS selected automatically"
-                        } else {
-                            ""
-                        };
-                        if ui
-                            .add_enabled(!fetching, egui::Button::new("Fetch latest"))
-                            .on_hover_text(format!(
-                                "Ingest the freshest {auto_label} init (four hours bracketing now, sounding-grade) and prune to the two newest runs{coverage_note}",
-                            ))
-                            .clicked()
-                        {
-                            self.start_model_ingest(&ctx);
-                        }
-                        if fetching {
-                            ui.spinner();
-                            if ui.small_button("×").on_hover_text("Cancel ingest").clicked()
-                                && let Some(cancel) = &self.model_ingest_cancel
-                            {
-                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                    });
-                    // Hours presets, model-aware: HRRR's short-range
-                    // loadouts next to GFS's longer sounding-grade spans.
-                    // The panel owns its spec, so a preset rebuilds it
-                    // with the new hours/profile; the SpecChanged event
-                    // refreshes pickers and the size estimate.
-                    ui.horizontal(|ui| {
-                        ui.weak("Presets:");
-                        let gfs_selected = self.download_panel.spec().model == "gfs";
-                        let presets: &[(&str, &str, &str, &str)] = if gfs_selected {
-                            &[
-                                (
-                                    "Sounding 0-12h",
-                                    "sounding",
-                                    "0-12",
-                                    "Hourly sounding-grade GFS — global skew-T soundings for the next half day",
-                                ),
-                                (
-                                    "Full 0-48h",
-                                    "full",
-                                    "0-48",
-                                    "Full GFS pack (2D maps + derived fields) through two days",
-                                ),
-                            ]
-                        } else {
-                            &[
-                                (
-                                    "Sounding 0-3h",
-                                    "sounding",
-                                    "0-3",
-                                    "The one-click loadout: next three hours, sounding-grade",
-                                ),
-                                (
-                                    "Full 0-18h",
-                                    "full",
-                                    "0-18",
-                                    "Full pack (2D maps + derived fields) through the short range",
-                                ),
-                            ]
-                        };
-                        let running = self.download_panel.is_running();
-                        for &(label, profile, hours, hover) in presets {
-                            if ui
-                                .add_enabled(!running, egui::Button::new(label).small())
-                                .on_hover_text(hover)
-                                .clicked()
-                            {
-                                let mut spec = self.download_panel.spec().clone();
-                                spec.profile = profile.to_owned();
-                                spec.hours = hours.to_owned();
-                                // Snap the compute flags to the profile's
-                                // defaults (mirrors the panel's own combo).
-                                spec.derived = profile != "sounding";
-                                spec.heavy = false;
-                                self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
-                                self.download_panel
-                                    .set_model_options(ingest_worker_model_options());
-                                events.push(rw_ui::DownloadEvent::SpecChanged(spec));
-                            }
-                        }
-                        // Archive sync (field request): one click seeds
-                        // the init covering the DISPLAYED frame so a
-                        // model overlay on an archive event needs no date
-                        // math. AWS mirrors hold the deep archives; the
-                        // probe button reports per-hour reality.
-                        if let Some(displayed) = self.displayed_timeline_time_utc()
-                            && ui
-                                .add_enabled(
-                                    !running,
-                                    egui::Button::new("@ displayed frame").small(),
-                                )
-                                .on_hover_text(
-                                    "Set run date/cycle to the model init covering the \
-                                     displayed radar frame, hours bracketing it — overlay \
-                                     the model that verified an archive event",
-                                )
-                                .clicked()
-                            && let Some((date, cycle, hours)) =
-                                ingest_worker::spec_fields_for_displayed_time(
-                                    &self.download_panel.spec().model,
-                                    displayed,
-                                )
-                        {
-                            let mut spec = self.download_panel.spec().clone();
-                            spec.date = date;
-                            spec.cycle = cycle;
-                            spec.hours = hours;
-                            self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
-                            self.download_panel
-                                .set_model_options(ingest_worker_model_options());
-                            events.push(rw_ui::DownloadEvent::SpecChanged(spec));
-                        }
-                    });
-                    let selected_hour = self
-                        .model_dock
-                        .as_ref()
-                        .and_then(|dock| dock.selected_hour())
-                        .cloned();
-                    let mut requested_upper_air: Option<u16> = None;
-                    let mut clear_upper_air = false;
-                    ui.horizontal(|ui| {
-                        ui.weak("SPC UA:");
-                        let busy = self.upper_air_rx.in_flight();
-                        for level in upper_air::QUICKLOOK_LEVELS_HPA {
-                            if ui
-                                .add_enabled(
-                                    selected_hour.is_some() && !busy,
-                                    egui::Button::new(format!("{level} mb")).small(),
-                                )
-                                .on_hover_text(
-                                    "Draw 20 m height contours, 2 C temperature contours, and model wind barbs for the selected run/hour",
-                                )
-                                .clicked()
-                            {
-                                requested_upper_air = Some(level);
-                            }
-                        }
-                        if busy {
-                            ui.spinner();
-                        }
-                        if let Some(layer) = &mut self.upper_air_layer {
-                            ui.checkbox(&mut layer.visible, "show");
-                            ui.add(
-                                egui::Slider::new(&mut layer.opacity, 0.25..=1.0)
-                                    .show_value(false),
-                            );
-                            ui.weak(layer.short_label());
-                            if ui.small_button("Clear").clicked() {
-                                clear_upper_air = true;
-                            }
-                        } else if selected_hour.is_none() {
-                            ui.weak("select a model hour");
-                        }
-                    });
-                    if clear_upper_air {
-                        self.upper_air_layer = None;
-                    }
-                    if let Some(level) = requested_upper_air
-                        && let Some(hour) = selected_hour
-                    {
-                        self.start_upper_air_quicklook(hour, level, &ctx);
-                    }
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .id_salt("model_window_download_scroll")
-                        .max_height(380.0)
+                    events.extend(self.model_quick_acquisition_ui(ui, &ctx));
+                    self.model_upper_air_toolbar_ui(ui, &ctx);
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new("Custom download setup")
+                        .id_salt("model_window_custom_download")
+                        .default_open(false)
                         .show(ui, |ui| {
-                            events.extend(self.download_panel.ui(ui));
+                            ui.label(
+                                egui::RichText::new(
+                                    "Choose a model, run, forecast hours, profile, source, and cache behavior.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .id_salt("model_window_download_scroll")
+                                .max_height(380.0)
+                                .show(ui, |ui| {
+                                    events.extend(self.download_panel.ui(ui));
+                                });
                         });
                 });
             ui.separator();
@@ -29957,6 +29868,254 @@ impl ViewerApp {
             self.persist_wrf_synth_radar();
         }
         events
+    }
+
+    fn model_quick_acquisition_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+    ) -> Vec<rw_ui::DownloadEvent> {
+        enum QuickChoice {
+            Preset {
+                profile: &'static str,
+                hours: &'static str,
+            },
+            DisplayedTime {
+                date: String,
+                cycle: u8,
+                hours: String,
+            },
+        }
+
+        let mut events = Vec::new();
+        let newest = self
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.newest_run())
+            .map(|(model, run, hours)| format!("Newest: {model} {run} · {hours} hours"))
+            .unwrap_or_else(|| "Model store is empty".to_owned());
+        let fetching = self.model_ingest_rx.is_some();
+        let running = self.download_panel.is_running();
+        let (auto_model, auto_switched) = self.auto_model_for_radar();
+        let auto_label = auto_model.as_str().to_uppercase();
+        let gfs_selected = self.download_panel.spec().model == "gfs";
+        let displayed_choice = self.displayed_timeline_time_utc().and_then(|displayed| {
+            ingest_worker::spec_fields_for_displayed_time(
+                &self.download_panel.spec().model,
+                displayed,
+            )
+        });
+        let mut fetch_latest = false;
+        let mut quick_choice = None;
+
+        let theme = ui_theme::theme();
+        egui::Frame::new()
+            .fill(theme.faint)
+            .stroke(egui::Stroke::new(1.0_f32, theme.hairline))
+            .corner_radius(4)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("QUICK ACQUIRE")
+                            .size(11.0)
+                            .strong()
+                            .color(subhead_color()),
+                    );
+                    ui.weak(&newest);
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Fetch a ready-to-use recent run, or choose a focused preset.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    fetch_latest = ui
+                        .add_enabled(
+                            !fetching,
+                            egui::Button::new(
+                                egui::RichText::new(format!("Fetch latest {auto_label}"))
+                                    .strong(),
+                            ),
+                        )
+                        .on_hover_text(format!(
+                            "Fetch the freshest {auto_label} init with four hours bracketing now and prune to the two newest runs",
+                        ))
+                        .clicked();
+
+                    ui.add_enabled_ui(!running, |ui| {
+                        ui.menu_button("Quick presets ⏷", |ui| {
+                            ui.set_min_width(240.0);
+                            ui.label(
+                                egui::RichText::new("FORECAST PACKS")
+                                    .size(10.0)
+                                    .strong()
+                                    .color(subhead_color()),
+                            );
+                            let presets: &[(&str, &str, &str, &str)] = if gfs_selected {
+                                &[
+                                    (
+                                        "Soundings · 0–12 hours",
+                                        "sounding",
+                                        "0-12",
+                                        "Hourly sounding-grade GFS for the next half day",
+                                    ),
+                                    (
+                                        "Full fields · 0–48 hours",
+                                        "full",
+                                        "0-48",
+                                        "GFS 2D maps and derived fields through two days",
+                                    ),
+                                ]
+                            } else {
+                                &[
+                                    (
+                                        "Soundings · 0–3 hours",
+                                        "sounding",
+                                        "0-3",
+                                        "Sounding-grade fields for the next three hours",
+                                    ),
+                                    (
+                                        "Full fields · 0–18 hours",
+                                        "full",
+                                        "0-18",
+                                        "2D maps and derived fields through the short range",
+                                    ),
+                                ]
+                            };
+                            for &(label, profile, hours, hover) in presets {
+                                if ui.button(label).on_hover_text(hover).clicked() {
+                                    quick_choice = Some(QuickChoice::Preset { profile, hours });
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            let displayed = ui
+                                .add_enabled(
+                                    displayed_choice.is_some(),
+                                    egui::Button::new("Match displayed radar time"),
+                                )
+                                .on_hover_text(
+                                    "Use the model init and forecast hours covering the radar frame currently on screen",
+                                )
+                                .on_disabled_hover_text("No radar timeline frame is displayed");
+                            if displayed.clicked()
+                                && let Some((date, cycle, hours)) = displayed_choice.clone()
+                            {
+                                quick_choice = Some(QuickChoice::DisplayedTime {
+                                    date,
+                                    cycle,
+                                    hours,
+                                });
+                                ui.close();
+                            }
+                        });
+                    });
+
+                    if fetching {
+                        ui.spinner();
+                        if ui.small_button("×").on_hover_text("Cancel fetch").clicked()
+                            && let Some(cancel) = &self.model_ingest_cancel
+                        {
+                            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+                if auto_switched {
+                    ui.weak("Outside HRRR coverage · GFS selected automatically");
+                }
+            });
+
+        if fetch_latest {
+            self.start_model_ingest(ctx);
+        }
+        if let Some(choice) = quick_choice {
+            let mut spec = self.download_panel.spec().clone();
+            match choice {
+                QuickChoice::Preset { profile, hours } => {
+                    spec.profile = profile.to_owned();
+                    spec.hours = hours.to_owned();
+                    spec.derived = profile != "sounding";
+                    spec.heavy = false;
+                }
+                QuickChoice::DisplayedTime { date, cycle, hours } => {
+                    spec.date = date;
+                    spec.cycle = cycle;
+                    spec.hours = hours;
+                }
+            }
+            self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
+            self.download_panel
+                .set_model_options(ingest_worker_model_options());
+            events.push(rw_ui::DownloadEvent::SpecChanged(spec));
+        }
+        events
+    }
+
+    fn model_upper_air_toolbar_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let selected_hour = self
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.selected_hour())
+            .cloned();
+        let busy = self.upper_air_rx.in_flight();
+        let mut requested_upper_air = None;
+        let mut clear_upper_air = false;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("UPPER-AIR MAP")
+                    .size(11.0)
+                    .strong()
+                    .color(subhead_color()),
+            );
+            ui.add_enabled_ui(selected_hour.is_some() && !busy, |ui| {
+                egui::ComboBox::from_id_salt("model_upper_air_quicklook")
+                    .selected_text(
+                        self.upper_air_layer
+                            .as_ref()
+                            .map(|layer| layer.short_label())
+                            .unwrap_or_else(|| "Add pressure level…".to_owned()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for level in upper_air::QUICKLOOK_LEVELS_HPA {
+                            if ui.button(format!("{level} mb")).clicked() {
+                                requested_upper_air = Some(level);
+                                ui.close();
+                            }
+                        }
+                    });
+            });
+            if busy {
+                ui.spinner();
+                ui.weak("Building overlay");
+            }
+            if let Some(layer) = &mut self.upper_air_layer {
+                ui.checkbox(&mut layer.visible, "Visible");
+                ui.add(
+                    egui::Slider::new(&mut layer.opacity, 0.25..=1.0)
+                        .show_value(false)
+                        .text("Opacity"),
+                );
+                if ui.small_button("Clear").clicked() {
+                    clear_upper_air = true;
+                }
+            } else if selected_hour.is_none() {
+                ui.weak("Select a run and forecast hour first");
+            }
+        });
+
+        if clear_upper_air {
+            self.upper_air_layer = None;
+        }
+        if let Some(level) = requested_upper_air
+            && let Some(hour) = selected_hour
+        {
+            self.start_upper_air_quicklook(hour, level, ctx);
+        }
     }
 
     /// Spawn the flexible-download worker on first use (the Download
@@ -38621,6 +38780,13 @@ fn fixed_action_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Resp
     ui.add_sized(
         egui::vec2(width, PANEL_BUTTON_HEIGHT),
         egui::Button::new(label),
+    )
+}
+
+pub(crate) fn toolbar_action_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+    ui.add_sized(
+        egui::vec2(width, PANEL_BUTTON_HEIGHT),
+        egui::Button::new(label).frame(false),
     )
 }
 

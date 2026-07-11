@@ -685,7 +685,7 @@ impl ViewerApp {
         if ui
             .add_sized(
                 egui::vec2(72.0, crate::PANEL_BUTTON_HEIGHT),
-                egui::Button::selectable(active, "Annotate"),
+                egui::Button::selectable(active, "Annotate").frame(false),
             )
             .on_hover_text(
                 "Draw geo-anchored weather graphics on the map: fronts, \
