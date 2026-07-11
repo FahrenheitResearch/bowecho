@@ -3195,8 +3195,7 @@ struct ViewerApp {
     /// listed day's rows for the intl display owner, the loaded chip
     /// range for "+N older", and the list-then-load-newest flag.
     intl_archive_rows: Option<archive_browser::IntlArchiveDayListing>,
-    intl_archive_list_rx:
-        WorkerSlot<std::result::Result<archive_browser::IntlArchiveDayListing, String>>,
+    intl_archive_list_rx: StreamSlot<archive_browser::IntlArchiveListMessage>,
     intl_archive_loaded_range: Option<(usize, usize)>,
     intl_archive_load_after_listing: bool,
     /// ORD-only full-day command queued while its phased catalog listing is
@@ -8277,7 +8276,7 @@ impl ViewerApp {
             ord_archive_hour_input: String::new(),
             ord_archive_minute_input: String::new(),
             intl_archive_rows: None,
-            intl_archive_list_rx: WorkerSlot::idle("intl-archive-list"),
+            intl_archive_list_rx: StreamSlot::idle("intl-archive-list"),
             intl_archive_loaded_range: None,
             intl_archive_load_after_listing: false,
             intl_archive_full_day_after_listing: false,
@@ -55205,6 +55204,7 @@ mod tests {
         archive_browser::IntlArchiveDayListing {
             provider_id: provider_id.to_owned(),
             site_id: site_id.to_owned(),
+            date_utc: NaiveDate::from_ymd_opt(2026, 5, 30).unwrap(),
             rows: (0..scans)
                 .map(|minute| archive_browser::ArchiveScanRow {
                     time_utc: Utc
@@ -55237,6 +55237,7 @@ mod tests {
         });
         app.archive_frame_count = 10;
         app.archive_load_loop = true;
+        app.archive_date_input = "2026-05-30".to_owned();
         app.intl_archive_rows = Some(test_intl_archive_listing("ord", "plbrz", 12));
 
         app.start_intl_archive_chip_load(11, &egui::Context::default());
@@ -55266,6 +55267,7 @@ mod tests {
         });
         app.archive_frame_count = 10;
         app.archive_load_loop = false;
+        app.archive_date_input = "2026-05-30".to_owned();
         app.intl_archive_rows = Some(test_intl_archive_listing("smhi", "angelholm", 12));
 
         app.start_intl_archive_chip_load(11, &egui::Context::default());
@@ -55285,12 +55287,100 @@ mod tests {
             provider_id: "smhi".to_owned(),
             site_id: "angelholm".to_owned(),
         });
+        app.archive_date_input = "2026-05-30".to_owned();
         app.intl_archive_rows = Some(test_intl_archive_listing("ord", "plbrz", 3));
 
         app.start_intl_archive_chip_load(2, &egui::Context::default());
 
         assert!(app.load_receiver.is_none(), "no load may start");
         assert_eq!(app.status, "Archive: list a date before loading");
+    }
+
+    #[test]
+    fn explicit_intl_relisting_clears_queued_full_day_intent() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
+            provider_id: "ord".to_owned(),
+            site_id: "plbrz".to_owned(),
+        });
+        app.intl_archive_full_day_after_listing = true;
+        // Invalid input stops before spawning network work, while still
+        // exercising the explicit-replacement intent reset.
+        app.archive_date_input = "not-a-date".to_owned();
+
+        app.start_intl_archive_day_listing(&egui::Context::default());
+
+        assert!(!app.intl_archive_full_day_after_listing);
+        assert!(!app.intl_archive_list_rx.in_flight());
+        assert_eq!(app.status, "Archive date must be YYYY-MM-DD");
+    }
+
+    #[test]
+    fn ord_full_day_terminal_selection_upserts_without_duplicate_history() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
+            provider_id: "ord".to_owned(),
+            site_id: "plbrz".to_owned(),
+        });
+        app.primary.limits.frame_limit = 3;
+        let plans = (0..3)
+            .map(|minute| data_source::international::FramePlan {
+                identity: format!("plbrz-{minute}"),
+                parts: vec![data_source::international::PlanPart {
+                    url: format!("https://example.invalid/{minute}.h5"),
+                }],
+                merge: false,
+            })
+            .collect::<Vec<_>>();
+        let (sender, receiver) = mpsc::channel();
+        archive_browser::stream_intl_full_day_with(
+            plans,
+            "ORD full day test",
+            &sender,
+            |plan| {
+                let minute = plan
+                    .identity
+                    .rsplit('-')
+                    .next()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap();
+                let scan_time = Utc
+                    .with_ymd_and_hms(2026, 5, 30, 0, minute, 0)
+                    .unwrap();
+                Ok(test_decoded_from_volume(
+                    PathBuf::from(format!("ord-archive:{}", plan.identity)),
+                    test_volume_with_site_time("plbrz", scan_time),
+                    FrameStatus::Complete,
+                ))
+            },
+        );
+        drop(sender);
+
+        let ctx = egui::Context::default();
+        let mut final_selected = false;
+        for message in receiver {
+            match message.update {
+                AsyncLoadUpdate::History(batch, select_frame) => {
+                    app.install_decoded_load_batch(batch, false, select_frame, &ctx);
+                }
+                AsyncLoadUpdate::Final(Ok(batch)) => {
+                    final_selected = app.install_decoded_load_batch(batch, true, true, &ctx);
+                }
+                AsyncLoadUpdate::Final(Err(error)) => panic!("unexpected error: {error}"),
+                _ => {}
+            }
+        }
+
+        assert!(final_selected);
+        assert_eq!(
+            app.primary.history.len(),
+            3,
+            "terminal newest-frame selection must upsert, not append a duplicate"
+        );
+        assert_eq!(
+            app.volume.as_ref().map(|volume| volume.volume_time),
+            Some(Utc.with_ymd_and_hms(2026, 5, 30, 0, 2, 0).unwrap())
+        );
     }
 
     /// The Phase-2 display-owner shim: the archive browser, Event Loop
@@ -62332,7 +62422,7 @@ mod tests {
             ord_archive_hour_input: String::new(),
             ord_archive_minute_input: String::new(),
             intl_archive_rows: None,
-            intl_archive_list_rx: WorkerSlot::idle("intl-archive-list"),
+            intl_archive_list_rx: StreamSlot::idle("intl-archive-list"),
             intl_archive_loaded_range: None,
             intl_archive_load_after_listing: false,
             intl_archive_full_day_after_listing: false,

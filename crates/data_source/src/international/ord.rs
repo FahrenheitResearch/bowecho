@@ -517,10 +517,15 @@ where
     }
 
     debug_assert!(requests_completed <= ORD_ARCHIVE_DAY_MAX_CATALOG_REQUESTS);
+    if let Some(error) = first_error {
+        return Err(format!(
+            "ORD archive: incomplete full-day listing for {site_id} on {date_utc}: {error}"
+        ));
+    }
     if plans.is_empty() {
-        return Err(first_error.unwrap_or_else(|| {
-            format!("ORD archive: no complete scans for {site_id} on {date_utc}")
-        }));
+        return Err(format!(
+            "ORD archive: no complete scans for {site_id} on {date_utc}"
+        ));
     }
     Ok(plans)
 }
@@ -2748,13 +2753,13 @@ mod tests {
     }
 
     #[test]
-    fn full_day_lister_keeps_partial_results_when_one_kind_errors() {
+    fn full_day_lister_refuses_partial_results_when_one_kind_errors() {
         let date = NaiveDate::from_ymd_opt(2026, 6, 9).unwrap();
         let day_start = utc_time(2026, 6, 9, 0, 0);
         let cancel = AtomicBool::new(false);
         let mut snapshots = Vec::new();
 
-        let plans = archive_plans_for_day_with_lister(
+        let error = archive_plans_for_day_with_lister(
             "plbrz",
             date,
             [ObjectKind::Pvol, ObjectKind::Scan],
@@ -2768,10 +2773,10 @@ mod tests {
                 ObjectKind::Scan => Err("synthetic SCAN listing outage".to_owned()),
             },
         )
-        .expect("PVOL lane remains usable");
+        .expect_err("a full-day result must not hide the failed SCAN lane");
 
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].stamp_utc, utc_time(2026, 6, 9, 0, 6));
+        assert!(error.contains("incomplete full-day listing"));
+        assert!(error.contains("synthetic SCAN listing outage"));
         assert_eq!(snapshots.last().unwrap().completed_phases, 24);
         assert_eq!(snapshots.last().unwrap().catalog_requests_completed, 50);
     }

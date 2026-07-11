@@ -155,8 +155,9 @@ pub trait RecentFrames {
 /// A phase is deliberately provider-defined: ORD reports one phase per UTC
 /// hour, while providers whose archive is one daily manifest use one phase.
 /// `catalog_requests_completed` counts completed catalog request attempts,
-/// including attempts that returned an error and were skipped in favor of a
-/// partial listing. It never counts volume downloads.
+/// including attempts that returned an error. It never counts volume
+/// downloads. The terminal result owns completeness semantics; ORD's full-day
+/// implementation errors rather than returning a silently partial day.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ArchiveListProgress {
     /// Finished listing phases.

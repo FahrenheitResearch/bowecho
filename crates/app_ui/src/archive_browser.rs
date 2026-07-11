@@ -20,21 +20,24 @@
 //! [`FramePlan`]: data_source::international::FramePlan
 //! [`IntlProvider::archive_source`]: data_source::international::IntlProvider::archive_source
 
-use std::sync::mpsc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use data_source::international::FramePlan;
+use data_source::international::{ArchiveListProgress, FramePlan};
 use data_source::sites::SiteRef;
 use eframe::egui;
-use ui_core::worker_slot::SlotPoll;
+use ui_core::worker_slot::{SlotMessage, StreamState};
 
 use crate::{
-    ACTIVE_LOAD_POLL_MS, ArchiveLoadProgress, AsyncLoadResult, AsyncLoadUpdate, DecodedLoadBatch,
-    FeedSource, MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, SpcReport, ViewerApp,
-    archive_load_progress_row, archive_object_scan_time_utc, cache_dir,
-    decode_archive_history_object, fetch_intl_frame_plan_batch, intl_provider_label, panel_kit,
+    ACTIVE_LOAD_POLL_MS, ArchiveLoadProgress, AsyncLoadResult, AsyncLoadUpdate, DecodedLoad,
+    DecodedLoadBatch, FeedSource, FrameStatus, LoadTimings, MAX_ARCHIVE_FRAME_COUNT,
+    MAX_HISTORY_FRAME_LIMIT, SpcReport, ViewerApp, archive_load_progress_row,
+    archive_object_scan_time_utc, cache_dir, compact_intl_identity, decode_archive_history_object,
+    fetch_assemble_intl_plan, fetch_intl_frame_plan_batch, intl_provider_label, panel_kit,
     send_archive_progress,
 };
 
@@ -366,7 +369,37 @@ pub(crate) fn us_volumes_from_rows(
 pub(crate) struct IntlArchiveDayListing {
     pub(crate) provider_id: String,
     pub(crate) site_id: String,
+    pub(crate) date_utc: NaiveDate,
     pub(crate) rows: Vec<ArchiveScanRow>,
+}
+
+/// Streaming catalog answer for the international archive browser. ORD emits
+/// one [`Progress`](Self::Progress) per UTC hour; the terminal result carries
+/// the date-tagged listing so a manually edited picker date can never reuse a
+/// stale day.
+pub(crate) enum IntlArchiveListMessage {
+    Progress {
+        provider_id: String,
+        site_id: String,
+        date_utc: NaiveDate,
+        progress: ArchiveListProgress,
+    },
+    Finished(Result<IntlArchiveDayListing, String>),
+}
+
+impl SlotMessage for IntlArchiveListMessage {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Finished(_))
+    }
+}
+
+fn intl_archive_listing_matches(
+    listing: &IntlArchiveDayListing,
+    provider_id: &str,
+    site_id: &str,
+    date_utc: NaiveDate,
+) -> bool {
+    listing.provider_id == provider_id && listing.site_id == site_id && listing.date_utc == date_utc
 }
 
 impl ViewerApp {
@@ -758,14 +791,32 @@ impl ViewerApp {
         if self.archive_load_loop != previous_archive_load_loop {
             self.persist_archive_controls();
         }
+        let mut cancel_archive_work = false;
         if let Some(progress) = &self.archive_load_progress {
-            archive_load_progress_row(ui, progress);
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Cancel this archive listing or download")
+                    .clicked()
+                {
+                    cancel_archive_work = true;
+                }
+                archive_load_progress_row(ui, progress);
+            });
+        }
+        if cancel_archive_work {
+            self.cancel_intl_archive_work();
         }
         let mut load_row: Option<usize> = None;
         if let Some(listing) = &self.intl_archive_rows {
             // A listing for a previous display owner never renders under
-            // (or loads into) the new one.
-            if listing.provider_id == provider_id && listing.site_id == site_id {
+            // (or loads into) the new one. Date ownership is equally strict:
+            // editing the picker does not relabel yesterday's cached rows.
+            let selected_date =
+                chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d").ok();
+            if selected_date.is_some_and(|date| {
+                intl_archive_listing_matches(listing, provider_id, site_id, date)
+            }) {
                 if listing.rows.is_empty() {
                     ui.weak("No archive scans for that date");
                 } else {
@@ -819,6 +870,17 @@ impl ViewerApp {
     /// Kick a background listing of the display owner's archive date
     /// (the intl mirror of `start_archive_listing`).
     pub(crate) fn start_intl_archive_day_listing(&mut self, ctx: &egui::Context) {
+        self.start_intl_archive_day_listing_inner(ctx, false);
+    }
+
+    fn start_intl_archive_day_listing_inner(
+        &mut self,
+        ctx: &egui::Context,
+        preserve_full_day_intent: bool,
+    ) {
+        if !preserve_full_day_intent {
+            self.intl_archive_full_day_after_listing = false;
+        }
         let SiteRef::Intl {
             provider_id,
             site_id,
@@ -844,59 +906,137 @@ impl ViewerApp {
         );
         self.intl_archive_rows = None;
         self.intl_archive_loaded_range = None;
+        self.archive_load_progress = Some(ArchiveLoadProgress::indeterminate(
+            "Archive listing",
+            format!("Listing {site_id} {date}"),
+        ));
         self.intl_archive_list_rx.cancel();
         self.intl_archive_list_rx.spawn(ctx, move |tx| {
-            let lister = ArchiveLister::Intl {
-                provider_id: provider_id.clone(),
-                site_id: site_id.clone(),
-            };
-            let result = lister.list_day(date).map(|rows| IntlArchiveDayListing {
+            let cancel = AtomicBool::new(false);
+            let result = intl_archive_source(&provider_id, |archive| {
+                archive.day_plans_with_progress(&site_id, date, &cancel, &mut |progress| {
+                    if tx
+                        .send(IntlArchiveListMessage::Progress {
+                            provider_id: provider_id.clone(),
+                            site_id: site_id.clone(),
+                            date_utc: date,
+                            progress,
+                        })
+                        .is_err()
+                    {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                })
+            });
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let result = result.map(|plans| IntlArchiveDayListing {
                 provider_id,
                 site_id,
-                rows,
+                date_utc: date,
+                rows: intl_rows_from_plans(plans, date),
             });
-            let _ = tx.send(result);
+            let _ = tx.send(IntlArchiveListMessage::Finished(result));
         });
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
+    fn cancel_intl_archive_work(&mut self) {
+        let cancelled_listing = self.intl_archive_list_rx.in_flight();
+        if cancelled_listing {
+            self.intl_archive_list_rx.cancel();
+        }
+        let cancelled_load = self.cancel_primary_radar_load_for_user_command();
+        if cancelled_listing || cancelled_load {
+            self.archive_load_progress = None;
+            self.intl_archive_load_after_listing = false;
+            self.intl_archive_full_day_after_listing = false;
+            self.pending_site_id = None;
+            self.status = if cancelled_load && !self.primary.history.is_empty() {
+                format!(
+                    "Archive load cancelled; kept {} decoded scans",
+                    self.primary.history.len()
+                )
+            } else {
+                "Archive operation cancelled".to_owned()
+            };
+        }
+    }
+
     pub(crate) fn poll_intl_archive_listing(&mut self, ctx: &egui::Context) {
-        match self.intl_archive_list_rx.poll() {
-            SlotPoll::Ready(Ok(listing)) => {
-                self.status = format!("Archive: {} scans listed", listing.rows.len());
-                self.intl_archive_rows = Some(listing);
-                if self.intl_archive_full_day_after_listing {
-                    self.intl_archive_full_day_after_listing = false;
-                    self.start_ord_full_day_load(ctx);
-                    return;
+        let (messages, state) = self.intl_archive_list_rx.drain(Duration::from_millis(2));
+        let mut start_full_day = false;
+        for message in messages {
+            match message {
+                IntlArchiveListMessage::Progress {
+                    provider_id,
+                    site_id,
+                    date_utc,
+                    progress,
+                } => {
+                    let provider = provider_id.to_ascii_uppercase();
+                    self.status = format!(
+                        "Archive: listing {provider} {site_id} {date_utc} — hour {}/{}; {} scans",
+                        progress.completed_phases, progress.total_phases, progress.plans_found
+                    );
+                    self.archive_load_progress = Some(ArchiveLoadProgress {
+                        label: format!("{provider} archive listing"),
+                        detail: format!(
+                            "{site_id} {date_utc} · {} scans · {} catalog requests",
+                            progress.plans_found, progress.catalog_requests_completed
+                        ),
+                        done: progress.completed_phases,
+                        total: progress.total_phases,
+                    });
                 }
-                if self.intl_archive_load_after_listing {
-                    self.intl_archive_load_after_listing = false;
-                    let newest = self
-                        .intl_archive_rows
-                        .as_ref()
-                        .map(|listing| listing.rows.len())
-                        .unwrap_or(0);
-                    if newest == 0 {
-                        self.status = "Archive: no scans to load for that date".to_owned();
-                    } else {
-                        self.start_intl_archive_chip_load(newest - 1, ctx);
+                IntlArchiveListMessage::Finished(Ok(listing)) => {
+                    self.archive_load_progress = None;
+                    self.status = format!(
+                        "Archive: {} scans listed for {}",
+                        listing.rows.len(),
+                        listing.date_utc
+                    );
+                    self.intl_archive_rows = Some(listing);
+                    if self.intl_archive_full_day_after_listing {
+                        self.intl_archive_full_day_after_listing = false;
+                        start_full_day = true;
+                    } else if self.intl_archive_load_after_listing {
+                        self.intl_archive_load_after_listing = false;
+                        let newest = self
+                            .intl_archive_rows
+                            .as_ref()
+                            .map(|listing| listing.rows.len())
+                            .unwrap_or(0);
+                        if newest == 0 {
+                            self.status = "Archive: no scans to load for that date".to_owned();
+                        } else {
+                            self.start_intl_archive_chip_load(newest - 1, ctx);
+                        }
                     }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
+                IntlArchiveListMessage::Finished(Err(err)) => {
+                    self.archive_load_progress = None;
+                    self.intl_archive_rows = None;
+                    self.intl_archive_load_after_listing = false;
+                    self.intl_archive_full_day_after_listing = false;
+                    self.status = format!("Archive listing failed: {err}");
+                    ctx.request_repaint();
+                }
             }
-            SlotPoll::Ready(Err(err)) => {
-                self.intl_archive_rows = None;
-                self.intl_archive_load_after_listing = false;
-                self.intl_archive_full_day_after_listing = false;
-                self.status = format!("Archive listing failed: {err}");
-                ctx.request_repaint();
-            }
-            SlotPoll::Idle => {}
-            SlotPoll::Pending => {
+        }
+        if start_full_day {
+            self.start_ord_full_day_load(ctx);
+            return;
+        }
+        match state {
+            StreamState::Idle | StreamState::Finished => {}
+            StreamState::Pending => {
                 ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
             }
-            SlotPoll::Disconnected => {
+            StreamState::Disconnected => {
+                self.archive_load_progress = None;
                 self.intl_archive_load_after_listing = false;
                 self.intl_archive_full_day_after_listing = false;
                 self.status = "Archive listing worker disconnected".to_owned();
@@ -937,22 +1077,29 @@ impl ViewerApp {
             self.status = "Full-day phased loading is currently an ORD archive feature".to_owned();
             return;
         }
+        let Ok(date_utc) =
+            chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
+        else {
+            self.status = "Archive date must be YYYY-MM-DD".to_owned();
+            return;
+        };
         if self.load_receiver.is_some() {
             self.status = "Wait for the current load to finish".to_owned();
             return;
         }
         if self.intl_archive_list_rx.in_flight() {
             self.intl_archive_full_day_after_listing = true;
-            self.status = "ORD archive: full day will load when listing finishes".to_owned();
+            // The edit box may have changed while an older date was in
+            // flight. Restart against the exact requested day; the streamed
+            // lister's dropped receiver cooperatively cancels its next hour.
+            self.start_intl_archive_day_listing_inner(ctx, true);
             return;
         }
-        let Some(listing) = self
-            .intl_archive_rows
-            .as_ref()
-            .filter(|listing| listing.provider_id == provider_id && listing.site_id == site_id)
-        else {
+        let Some(listing) = self.intl_archive_rows.as_ref().filter(|listing| {
+            intl_archive_listing_matches(listing, &provider_id, &site_id, date_utc)
+        }) else {
             self.intl_archive_full_day_after_listing = true;
-            self.start_intl_archive_day_listing(ctx);
+            self.start_intl_archive_day_listing_inner(ctx, true);
             return;
         };
         if listing.rows.is_empty() {
@@ -996,9 +1143,16 @@ impl ViewerApp {
         else {
             return 0;
         };
+        let Ok(date_utc) =
+            chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
+        else {
+            return 0;
+        };
         self.intl_archive_rows
             .as_ref()
-            .filter(|listing| listing.provider_id == provider_id && listing.site_id == site_id)
+            .filter(|listing| {
+                intl_archive_listing_matches(listing, &provider_id, &site_id, date_utc)
+            })
             .map(|listing| listing.rows.len())
             .unwrap_or(0)
     }
@@ -1015,11 +1169,15 @@ impl ViewerApp {
         else {
             return;
         };
-        let Some(listing) = self
-            .intl_archive_rows
-            .as_ref()
-            .filter(|listing| listing.provider_id == provider_id && listing.site_id == site_id)
+        let Ok(date_utc) =
+            chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
         else {
+            self.status = "Archive date must be YYYY-MM-DD".to_owned();
+            return;
+        };
+        let Some(listing) = self.intl_archive_rows.as_ref().filter(|listing| {
+            intl_archive_listing_matches(listing, &provider_id, &site_id, date_utc)
+        }) else {
             self.status = "Archive: list a date before loading".to_owned();
             return;
         };
@@ -1060,11 +1218,15 @@ impl ViewerApp {
         else {
             return;
         };
-        let Some(listing) = self
-            .intl_archive_rows
-            .as_ref()
-            .filter(|listing| listing.provider_id == provider_id && listing.site_id == site_id)
+        let Ok(date_utc) =
+            chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
         else {
+            self.status = "Archive date must be YYYY-MM-DD".to_owned();
+            return;
+        };
+        let Some(listing) = self.intl_archive_rows.as_ref().filter(|listing| {
+            intl_archive_listing_matches(listing, &provider_id, &site_id, date_utc)
+        }) else {
             return;
         };
         let Some((start, end)) = self.intl_archive_loaded_range else {
@@ -1671,11 +1833,217 @@ impl ViewerApp {
 
 const ORD_FULL_DAY_DECODE_PHASE: usize = 20;
 
-/// Reuse the proven international batch decoder in bounded phases. One
-/// successful phase is held back so the final message can select the newest
-/// frame; earlier phases stream through `History` and are installed while the
-/// next phase downloads. Dropping the outer receiver makes the next send fail
-/// and cooperatively stops the remaining day.
+struct FailedFullDayPlan {
+    index: usize,
+    plan: FramePlan,
+    error: String,
+}
+
+fn full_day_phase_label(label: &str, index: usize, total: usize) -> String {
+    let phases = total.div_ceil(ORD_FULL_DAY_DECODE_PHASE).max(1);
+    let phase = (index / ORD_FULL_DAY_DECODE_PHASE + 1).min(phases);
+    format!("{label} phase {phase}/{phases}")
+}
+
+fn send_full_day_progress(
+    sender: &mpsc::Sender<AsyncLoadResult>,
+    label: &str,
+    detail: String,
+    done: usize,
+    total: usize,
+    index: usize,
+) -> bool {
+    sender
+        .send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::ArchiveProgress(ArchiveLoadProgress {
+                label: full_day_phase_label(label, index, total),
+                detail,
+                done: done.min(total),
+                total,
+            }),
+        })
+        .is_ok()
+}
+
+fn send_full_day_history(
+    sender: &mpsc::Sender<AsyncLoadResult>,
+    label: &str,
+    decoded: DecodedLoad,
+    select_frame: bool,
+) -> bool {
+    sender
+        .send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::History(
+                DecodedLoadBatch {
+                    frames: vec![decoded],
+                    selected_index: 0,
+                },
+                select_frame,
+            ),
+        })
+        .is_ok()
+}
+
+/// Stream one decoded scan at a time, grouped into 20-scan progress phases.
+/// Every failed scan gets one retry. Dropping the outer receiver is observed
+/// before the next scan starts, so cancellation is bounded by one in-flight
+/// volume rather than a whole phase.
+pub(crate) fn stream_intl_full_day_with<F>(
+    plans: Vec<FramePlan>,
+    label: &str,
+    sender: &mpsc::Sender<AsyncLoadResult>,
+    mut decode: F,
+) where
+    F: FnMut(&FramePlan) -> Result<DecodedLoad, String>,
+{
+    let total = plans.len();
+    let mut failures = Vec::new();
+    let mut newest: Option<(usize, DecodedLoad)> = None;
+    let mut decoded_count = 0usize;
+    let mut selected_first = false;
+
+    for (index, plan) in plans.into_iter().enumerate() {
+        if !send_full_day_progress(
+            sender,
+            label,
+            format!("Downloading {}", compact_intl_identity(&plan.identity)),
+            index,
+            total,
+            index,
+        ) {
+            return;
+        }
+        match decode(&plan) {
+            Ok(decoded) => {
+                decoded_count += 1;
+                let select_frame = !selected_first;
+                if !send_full_day_history(sender, label, decoded.clone(), select_frame) {
+                    return;
+                }
+                selected_first = true;
+                if newest
+                    .as_ref()
+                    .is_none_or(|(newest_index, _)| index > *newest_index)
+                {
+                    newest = Some((index, decoded));
+                }
+                if !send_full_day_progress(
+                    sender,
+                    label,
+                    format!("Decoded {}", compact_intl_identity(&plan.identity)),
+                    index + 1,
+                    total,
+                    index,
+                ) {
+                    return;
+                }
+            }
+            Err(error) => {
+                if !send_full_day_progress(
+                    sender,
+                    label,
+                    format!(
+                        "Failed {}; retry queued",
+                        compact_intl_identity(&plan.identity)
+                    ),
+                    index + 1,
+                    total,
+                    index,
+                ) {
+                    return;
+                }
+                failures.push(FailedFullDayPlan { index, plan, error });
+            }
+        }
+    }
+
+    let retry_total = failures.len();
+    let mut remaining = Vec::new();
+    for (retry_index, failure) in failures.into_iter().enumerate() {
+        if !send_full_day_progress(
+            sender,
+            label,
+            format!(
+                "Retrying {} ({}/{retry_total})",
+                compact_intl_identity(&failure.plan.identity),
+                retry_index + 1
+            ),
+            total,
+            total,
+            failure.index,
+        ) {
+            return;
+        }
+        match decode(&failure.plan) {
+            Ok(decoded) => {
+                decoded_count += 1;
+                let select_frame = !selected_first;
+                if !send_full_day_history(sender, label, decoded.clone(), select_frame) {
+                    return;
+                }
+                selected_first = true;
+                if newest
+                    .as_ref()
+                    .is_none_or(|(newest_index, _)| failure.index > *newest_index)
+                {
+                    newest = Some((failure.index, decoded));
+                }
+            }
+            Err(error) => remaining.push(FailedFullDayPlan {
+                error: format!("{}; retry: {error}", failure.error),
+                ..failure
+            }),
+        }
+    }
+
+    if !remaining.is_empty() {
+        if let Some((_, decoded)) = newest {
+            // Select the newest successfully decoded scan even though the
+            // terminal status honestly reports the incomplete day.
+            if !send_full_day_history(sender, label, decoded, true) {
+                return;
+            }
+        }
+        let mut details = remaining
+            .iter()
+            .take(3)
+            .map(|failure| format!("{}: {}", failure.plan.identity, failure.error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if remaining.len() > 3 {
+            details.push_str(&format!("; and {} more", remaining.len() - 3));
+        }
+        let _ = sender.send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::Final(Err(format!(
+                "ORD full day incomplete: decoded {decoded_count}/{total} scans; {} failed after retry ({details})",
+                remaining.len()
+            ))),
+        });
+        return;
+    }
+
+    let update = newest.map_or_else(
+        || {
+            AsyncLoadUpdate::Final(Err(
+                "ORD full-day archive contained no decodable scans".to_owned()
+            ))
+        },
+        |(_, decoded)| {
+            AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+                frames: vec![decoded],
+                selected_index: 0,
+            }))
+        },
+    );
+    let _ = sender.send(AsyncLoadResult {
+        label: label.to_owned(),
+        update,
+    });
+}
+
 fn fetch_intl_frame_plan_batch_phased(
     site_id: &str,
     plans: Vec<FramePlan>,
@@ -1684,85 +2052,16 @@ fn fetch_intl_frame_plan_batch_phased(
     source_prefix: &str,
     sender: &mpsc::Sender<AsyncLoadResult>,
 ) {
-    let total = plans.len();
-    let phase_total = total.div_ceil(ORD_FULL_DAY_DECODE_PHASE);
-    let mut pending_batch: Option<DecodedLoadBatch> = None;
-    let mut errors = Vec::new();
-
-    for (phase_index, chunk) in plans.chunks(ORD_FULL_DAY_DECODE_PHASE).enumerate() {
-        let phase_start = phase_index * ORD_FULL_DAY_DECODE_PHASE;
-        let phase_plans = chunk.to_vec();
-        let selected_index = phase_plans.len().saturating_sub(1);
-        let (phase_sender, phase_receiver) = mpsc::channel();
-        fetch_intl_frame_plan_batch(
-            site_id,
-            phase_plans,
-            selected_index,
-            label,
-            path_prefix,
-            source_prefix,
-            &phase_sender,
-        );
-        drop(phase_sender);
-
-        while let Ok(message) = phase_receiver.recv() {
-            match message.update {
-                AsyncLoadUpdate::ArchiveProgress(mut progress) => {
-                    progress.label = format!("{label} phase {}/{}", phase_index + 1, phase_total);
-                    progress.done = (phase_start + progress.done).min(total);
-                    progress.total = total;
-                    if sender
-                        .send(AsyncLoadResult {
-                            label: label.to_owned(),
-                            update: AsyncLoadUpdate::ArchiveProgress(progress),
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                AsyncLoadUpdate::Final(Ok(batch)) => {
-                    if let Some(previous) = pending_batch.replace(batch)
-                        && sender
-                            .send(AsyncLoadResult {
-                                label: label.to_owned(),
-                                update: AsyncLoadUpdate::History(previous, false),
-                            })
-                            .is_err()
-                    {
-                        return;
-                    }
-                }
-                AsyncLoadUpdate::Final(Err(error)) => errors.push(error),
-                // The reused worker currently emits only progress + final;
-                // forward any future incremental update rather than dropping
-                // it if that contract expands.
-                update => {
-                    if sender
-                        .send(AsyncLoadResult {
-                            label: label.to_owned(),
-                            update,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    let update = pending_batch.map_or_else(
-        || {
-            AsyncLoadUpdate::Final(Err(errors.pop().unwrap_or_else(|| {
-                "ORD full-day archive contained no decodable scans".to_owned()
-            })))
-        },
-        |batch| AsyncLoadUpdate::Final(Ok(batch)),
-    );
-    let _ = sender.send(AsyncLoadResult {
-        label: label.to_owned(),
-        update,
+    stream_intl_full_day_with(plans, label, sender, |plan| {
+        let frame_start = Instant::now();
+        let (identity, volume) = fetch_assemble_intl_plan(plan, site_id)?;
+        Ok(DecodedLoad {
+            path: PathBuf::from(format!("{path_prefix}:{identity}")),
+            volume: Arc::new(volume),
+            timings: LoadTimings::default().finish(frame_start),
+            status: FrameStatus::Complete,
+            source_label: format!("{source_prefix} {site_id} {identity}"),
+        })
     });
 }
 
@@ -1892,6 +2191,9 @@ fn intl_row_hover_text(row: &ArchiveScanRow) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn s3(key: &str) -> data_source::S3Object {
@@ -1910,6 +2212,151 @@ mod tests {
             }],
             merge: false,
         }
+    }
+
+    fn decoded(identity: &str, minute: u32) -> DecodedLoad {
+        DecodedLoad {
+            path: PathBuf::from(identity),
+            volume: Arc::new(radar_core::RadarVolume::new(
+                radar_core::RadarSite::new("TEST"),
+                Utc.with_ymd_and_hms(2026, 5, 30, 0, minute, 0).unwrap(),
+            )),
+            timings: LoadTimings::default(),
+            status: FrameStatus::Complete,
+            source_label: identity.to_owned(),
+        }
+    }
+
+    #[test]
+    fn intl_archive_listing_identity_includes_the_selected_utc_date() {
+        let date = NaiveDate::from_ymd_opt(2026, 5, 30).unwrap();
+        let listing = IntlArchiveDayListing {
+            provider_id: "ord".to_owned(),
+            site_id: "plbrz".to_owned(),
+            date_utc: date,
+            rows: Vec::new(),
+        };
+
+        assert!(intl_archive_listing_matches(&listing, "ord", "plbrz", date));
+        assert!(!intl_archive_listing_matches(
+            &listing,
+            "ord",
+            "plbrz",
+            date.succ_opt().unwrap()
+        ));
+        assert!(!intl_archive_listing_matches(
+            &listing, "ord", "plram", date
+        ));
+    }
+
+    #[test]
+    fn intl_archive_list_stream_marks_only_the_finished_message_terminal() {
+        let date = NaiveDate::from_ymd_opt(2026, 5, 30).unwrap();
+        let progress = IntlArchiveListMessage::Progress {
+            provider_id: "ord".to_owned(),
+            site_id: "plbrz".to_owned(),
+            date_utc: date,
+            progress: ArchiveListProgress::default(),
+        };
+        let finished = IntlArchiveListMessage::Finished(Err("done".to_owned()));
+
+        assert!(!progress.is_terminal());
+        assert!(finished.is_terminal());
+    }
+
+    #[test]
+    fn full_day_stream_emits_first_frame_immediately_and_selects_newest_at_finish() {
+        let plans = vec![plan("a"), plan("b"), plan("c")];
+        let (sender, receiver) = mpsc::channel();
+        stream_intl_full_day_with(plans, "full day", &sender, |plan| {
+            let minute = match plan.identity.as_str() {
+                "a" => 0,
+                "b" => 1,
+                _ => 2,
+            };
+            Ok(decoded(&plan.identity, minute))
+        });
+        drop(sender);
+
+        let mut history = Vec::new();
+        let mut final_identity = None;
+        for message in receiver {
+            match message.update {
+                AsyncLoadUpdate::History(batch, selected) => history.push((
+                    batch.frames[0].path.to_string_lossy().into_owned(),
+                    selected,
+                )),
+                AsyncLoadUpdate::Final(Ok(batch)) => {
+                    final_identity = Some(batch.frames[0].path.to_string_lossy().into_owned());
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            history,
+            [
+                ("a".to_owned(), true),
+                ("b".to_owned(), false),
+                ("c".to_owned(), false)
+            ]
+        );
+        assert_eq!(final_identity.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn full_day_stream_stops_before_decode_when_receiver_is_cancelled() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let calls = Cell::new(0usize);
+
+        stream_intl_full_day_with(vec![plan("a"), plan("b")], "full day", &sender, |plan| {
+            calls.set(calls.get() + 1);
+            Ok(decoded(&plan.identity, calls.get() as u32))
+        });
+
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn full_day_stream_retries_then_reports_an_incomplete_day_honestly() {
+        let (sender, receiver) = mpsc::channel();
+        let mut calls = BTreeMap::<String, usize>::new();
+        stream_intl_full_day_with(
+            vec![plan("a"), plan("b"), plan("c")],
+            "full day",
+            &sender,
+            |plan| {
+                *calls.entry(plan.identity.clone()).or_default() += 1;
+                if plan.identity == "b" {
+                    Err("synthetic download failure".to_owned())
+                } else {
+                    let minute = if plan.identity == "a" { 0 } else { 2 };
+                    Ok(decoded(&plan.identity, minute))
+                }
+            },
+        );
+        drop(sender);
+
+        let mut selected_history = Vec::new();
+        let mut terminal_error = None;
+        for message in receiver {
+            match message.update {
+                AsyncLoadUpdate::History(batch, true) => {
+                    selected_history.push(batch.frames[0].path.to_string_lossy().into_owned())
+                }
+                AsyncLoadUpdate::Final(Err(error)) => terminal_error = Some(error),
+                _ => {}
+            }
+        }
+
+        assert_eq!(calls.get("a"), Some(&1));
+        assert_eq!(calls.get("b"), Some(&2), "failed scan gets one retry");
+        assert_eq!(calls.get("c"), Some(&1));
+        assert_eq!(selected_history, ["a", "c"]);
+        let error = terminal_error.expect("partial day must end in an error");
+        assert!(error.contains("decoded 2/3"), "unexpected error: {error}");
+        assert!(error.contains("b"), "unexpected error: {error}");
     }
 
     /// Census D15 (owner decision 2026-07-02): over-cap intl archive
