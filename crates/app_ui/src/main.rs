@@ -2502,6 +2502,7 @@ struct VwpComputeResult {
     dealias_label: &'static str,
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn product48_display_profile(
     path: &Path,
     product: &nexrad_io::vwp::VwpProduct,

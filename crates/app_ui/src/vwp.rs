@@ -7,6 +7,12 @@
 //! background work out of the view makes the same body usable in a dock tile
 //! and a floating window.
 
+// Native file save/open dialogs are intentionally Windows/macOS-only in
+// app_ui. The Product 48 adapter and CSV-only fields therefore look unused in
+// a normal Linux binary build even though their tests and supported desktop
+// builds exercise them.
+#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+
 use std::fmt::Write as _;
 
 use chrono::{DateTime, SecondsFormat, Utc};
