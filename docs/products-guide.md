@@ -97,8 +97,8 @@ range folding, non-meteorological echoes, and an uneven precipitation field can
 bias the fit. Compare the result with the velocity display, a nearby sounding,
 and other observations before using it operationally.
 
-On Windows and macOS, the VWP panel can also import a local NEXRAD Level III
-Product 48 file. Imported Product 48 profiles use that product's tabular data
+On Windows, macOS, and Linux, the VWP panel can also import a local NEXRAD
+Level III Product 48 file. Imported Product 48 profiles use that product's tabular data
 when present and fall back to its symbology wind barbs; they remain distinct
 from a profile computed from the current Level II volume. An imported profile
 stays selected across dealias-engine or environmental-anchor updates; changing
