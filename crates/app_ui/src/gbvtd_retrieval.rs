@@ -235,7 +235,7 @@ impl crate::ViewerApp {
                 .collect();
             painter.add(egui::Shape::closed_line(
                 ring,
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 210, 40)),
+                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 210, 40)),
             ));
 
             // Mark the strongest-eyewall azimuth: the wavenumber-1 tangential
@@ -257,7 +257,7 @@ impl crate::ViewerApp {
                 let tip = to_screen(circ.center_km.0 + rmw * cb, circ.center_km.1 + rmw * sb);
                 let hub = to_screen(circ.center_km.0, circ.center_km.1);
                 let cyan = egui::Color32::from_rgb(0, 220, 220);
-                painter.line_segment([hub, tip], egui::Stroke::new(1.5, cyan));
+                painter.line_segment([hub, tip], egui::Stroke::new(1.5_f32, cyan));
                 painter.circle_filled(tip, 4.0, cyan);
                 painter.text(
                     tip + egui::vec2(6.0, -6.0),
@@ -271,7 +271,7 @@ impl crate::ViewerApp {
 
         let center = to_screen(circ.center_km.0, circ.center_km.1);
         let arm = 9.0;
-        let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 60));
+        let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 60, 60));
         painter.line_segment(
             [center - egui::vec2(arm, 0.0), center + egui::vec2(arm, 0.0)],
             stroke,

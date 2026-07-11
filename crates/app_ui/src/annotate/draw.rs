@@ -137,7 +137,7 @@ pub(crate) fn draft_nodes(painter: &egui::Painter, points: &[Pos2]) {
         painter.circle_stroke(
             *p,
             4.5,
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 115)),
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 115)),
         );
     }
 }
@@ -746,7 +746,7 @@ fn pressure_icon(
         center,
         r,
         fade(fill, alpha),
-        Stroke::new(2.5, fade(ring, alpha)),
+        Stroke::new(2.5_f32, fade(ring, alpha)),
     );
     painter.text(
         center,
@@ -775,7 +775,7 @@ fn meso_icon(painter: &egui::Painter, center: Pos2, alpha: f32) {
     for dash in dash_segments(&ring, &MESO_DASH) {
         painter.add(egui::Shape::line(
             dash,
-            Stroke::new(2.5, fade(orange, alpha)),
+            Stroke::new(2.5_f32, fade(orange, alpha)),
         ));
     }
     painter.text(
@@ -807,7 +807,7 @@ fn tornado_icon(painter: &egui::Painter, center: Pos2, alpha: f32) {
     );
     painter.add(egui::Shape::closed_line(
         funnel,
-        Stroke::new(2.0, fade(Color32::from_rgb(0xbb, 0x00, 0xee), alpha)),
+        Stroke::new(2.0_f32, fade(Color32::from_rgb(0xbb, 0x00, 0xee), alpha)),
     ));
     // Swirl lines: width shrinks toward the funnel tip.
     let swirl = fade(Color32::from_rgb(0xcc, 0x44, 0xff), alpha);
@@ -815,7 +815,7 @@ fn tornado_icon(painter: &egui::Painter, center: Pos2, alpha: f32) {
         let half_width = (dy - 10.0).abs() * 0.4 + 2.0;
         painter.line_segment(
             [p(-half_width, dy), p(half_width, dy)],
-            Stroke::new(1.5, swirl),
+            Stroke::new(1.5_f32, swirl),
         );
     }
 }
@@ -829,7 +829,7 @@ fn hail_icon(painter: &egui::Painter, center: Pos2, alpha: f32) {
         center,
         r,
         fade(Color32::from_rgba_unmultiplied(0, 180, 180, 64), alpha),
-        Stroke::new(2.5, fade(teal, alpha)),
+        Stroke::new(2.5_f32, fade(teal, alpha)),
     );
     painter.text(
         center,

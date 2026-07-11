@@ -645,8 +645,8 @@ impl crate::ViewerApp {
                     if !cull.contains(a) && !cull.contains(b) {
                         continue;
                     }
-                    painter.line_segment([a, b], egui::Stroke::new(4.0, halo));
-                    painter.line_segment([a, b], egui::Stroke::new(2.2, track_color));
+                    painter.line_segment([a, b], egui::Stroke::new(4.0_f32, halo));
+                    painter.line_segment([a, b], egui::Stroke::new(2.2_f32, track_color));
                     // Direction cue: a small arrowhead at the END point
                     // (only once the track is long enough to read).
                     let delta = b - a;

@@ -181,8 +181,8 @@ impl ViewerApp {
         let center = rect.center();
         let gap = 5.0;
         let arm = 18.0;
-        let shadow = egui::Stroke::new(3.0, egui::Color32::from_black_alpha(180));
-        let red = egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 30, 30));
+        let shadow = egui::Stroke::new(3.0_f32, egui::Color32::from_black_alpha(180));
+        let red = egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(255, 30, 30));
         let segments = [
             [
                 center + egui::vec2(-arm, 0.0),
@@ -221,12 +221,12 @@ impl ViewerApp {
                 egui::Color32::from_rgb(240, 90, 80)
             };
             painter.circle_filled(*position, 4.0, color);
-            painter.circle_stroke(*position, 4.0, egui::Stroke::new(1.2, egui::Color32::BLACK));
+            painter.circle_stroke(*position, 4.0, egui::Stroke::new(1.2_f32, egui::Color32::BLACK));
         }
         if self.vrot_points.len() == 2 {
             painter.line_segment(
                 [positions[0], positions[1]],
-                egui::Stroke::new(1.6, egui::Color32::from_rgb(245, 230, 120)),
+                egui::Stroke::new(1.6_f32, egui::Color32::from_rgb(245, 230, 120)),
             );
             let (lon_a, lat_a, v_a, h_a) = self.vrot_points[0];
             let (lon_b, lat_b, v_b, h_b) = self.vrot_points[1];
@@ -622,7 +622,7 @@ impl ViewerApp {
         }
 
         // border (four segments — avoids StrokeKind API churn)
-        let border = egui::Stroke::new(1.0, egui::Color32::from_gray(120));
+        let border = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(120));
         let (tl, tr) = (egui::pos2(x0, top), egui::pos2(x0 + bar_w, top));
         let (bl, br) = (egui::pos2(x0, bottom), egui::pos2(x0 + bar_w, bottom));
         for seg in [[tl, tr], [tr, br], [br, bl], [bl, tl]] {
@@ -705,13 +705,13 @@ impl ViewerApp {
                     egui::Color32::from_rgb(c[0], c[1], c[2])
                 };
                 let vector = direction * 26.0;
-                painter.arrow(anchor, vector, egui::Stroke::new(4.0, egui::Color32::BLACK));
-                painter.arrow(anchor, vector, egui::Stroke::new(2.0, color));
+                painter.arrow(anchor, vector, egui::Stroke::new(4.0_f32, egui::Color32::BLACK));
+                painter.arrow(anchor, vector, egui::Stroke::new(2.0_f32, color));
             }
         }
         if pinned {
             painter.circle_filled(anchor, 3.0, egui::Color32::from_rgb(255, 226, 120));
-            painter.circle_stroke(anchor, 5.0, egui::Stroke::new(1.2, egui::Color32::BLACK));
+            painter.circle_stroke(anchor, 5.0, egui::Stroke::new(1.2_f32, egui::Color32::BLACK));
         }
         let history_frame_time = self.surface_obs_frame_time_utc();
         let obs_history = self
@@ -1014,7 +1014,7 @@ impl ViewerApp {
             egui::Color32::from_rgba_unmultiplied(12, 15, 20, 232),
         );
         let border = egui::Stroke::new(
-            1.0,
+            1.0_f32,
             if pinned {
                 egui::Color32::from_rgb(255, 226, 120)
             } else {
@@ -1040,7 +1040,7 @@ impl ViewerApp {
                 painter.rect_stroke(
                     chip_rect,
                     2.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(20)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(20)),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -1227,16 +1227,16 @@ impl ViewerApp {
         painter.circle_stroke(
             center,
             radius,
-            egui::Stroke::new(3.0, egui::Color32::from_rgb(12, 15, 20)),
+            egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(12, 15, 20)),
         );
         painter.circle_stroke(
             center,
             radius,
-            egui::Stroke::new(1.4, egui::Color32::from_rgb(232, 238, 246)),
+            egui::Stroke::new(1.4_f32, egui::Color32::from_rgb(232, 238, 246)),
         );
         let cross = 8.0;
         let cross_stroke = egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 190),
         );
         painter.line_segment(
@@ -1848,7 +1848,7 @@ impl ViewerApp {
         let lat_min = bounds.south;
         let lat_max = bounds.north;
         let step = graticule_step(rect.width() / self.lon_pixels_per_degree());
-        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(28, 38, 50));
+        let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(28, 38, 50));
         let label_color = egui::Color32::from_rgb(92, 108, 124);
 
         // Meridians and parallels are ARCS under AEQD — sample as polylines
@@ -2940,7 +2940,7 @@ impl ViewerApp {
                 painter.circle_stroke(
                     *position,
                     10.0,
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(236, 246, 255)),
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(236, 246, 255)),
                 );
             }
             // Red ring on any radar the NWS reports DOWN (only sites whose
@@ -2949,7 +2949,7 @@ impl ViewerApp {
             if self.app_settings.show_radar_status
                 && let Some(badge) = self.site_operational_down_badge(site)
             {
-                painter.circle_stroke(*position, radius + 3.5, egui::Stroke::new(2.0, badge));
+                painter.circle_stroke(*position, radius + 3.5, egui::Stroke::new(2.0_f32, badge));
             }
         }
 
@@ -3178,7 +3178,7 @@ impl ViewerApp {
                 painter.rect_stroke(
                     rect,
                     radius,
-                    egui::Stroke::new(if selected { 1.7 } else { 1.2 }, outline),
+                    egui::Stroke::new(if selected { 1.7_f32 } else { 1.2_f32 }, outline),
                     egui::StrokeKind::Outside,
                 );
                 painter.galley(rect.min + egui::vec2(5.0, 2.5), galley, text_color);
@@ -3196,7 +3196,7 @@ impl ViewerApp {
                     painter.rect_stroke(
                         rect,
                         3.0,
-                        egui::Stroke::new(1.5, self.selected_radar_label_stroke()),
+                        egui::Stroke::new(1.5_f32, self.selected_radar_label_stroke()),
                         egui::StrokeKind::Outside,
                     );
                 }
@@ -3360,7 +3360,7 @@ impl ViewerApp {
                     rect,
                     radius,
                     egui::Stroke::new(
-                        if selected { 1.7 } else { 1.2 },
+                        if selected { 1.7_f32 } else { 1.2_f32 },
                         if selected {
                             self.selected_radar_label_stroke()
                         } else {
@@ -3388,7 +3388,7 @@ impl ViewerApp {
                     painter.rect_stroke(
                         rect,
                         3.0,
-                        egui::Stroke::new(1.5, self.selected_radar_label_stroke()),
+                        egui::Stroke::new(1.5_f32, self.selected_radar_label_stroke()),
                         egui::StrokeKind::Outside,
                     );
                 }
@@ -3499,14 +3499,14 @@ impl ViewerApp {
                 painter.circle_stroke(
                     *position,
                     10.0,
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 240, 214)),
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 240, 214)),
                 );
             } else {
                 // Hollow ring: selectable, but not the live poll target.
                 painter.circle_stroke(
                     *position,
                     if is_hovered { 4.5 } else { 3.0 },
-                    egui::Stroke::new(1.5, if is_hovered { INTL_LIT } else { INTL_IDLE }),
+                    egui::Stroke::new(1.5_f32, if is_hovered { INTL_LIT } else { INTL_IDLE }),
                 );
             }
             if is_hovered && !is_active {
@@ -3638,7 +3638,7 @@ impl ViewerApp {
                 painter.circle_stroke(
                     *position,
                     10.0,
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 210, 210)),
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 210, 210)),
                 );
                 painter.text(
                     *position + egui::vec2(12.0, -10.0),
@@ -3651,7 +3651,7 @@ impl ViewerApp {
                 painter.circle_stroke(
                     *position,
                     if is_hovered { 4.8 } else { 3.4 },
-                    egui::Stroke::new(1.7, if is_hovered { CUSTOM_LIT } else { CUSTOM_IDLE }),
+                    egui::Stroke::new(1.7_f32, if is_hovered { CUSTOM_LIT } else { CUSTOM_IDLE }),
                 );
                 painter.circle_filled(
                     *position,
@@ -3725,7 +3725,7 @@ impl ViewerApp {
                 painter.circle_stroke(
                     *position,
                     10.0,
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(214, 252, 250)),
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(214, 252, 250)),
                 );
                 painter.text(
                     *position + egui::vec2(12.0, -10.0),
@@ -3740,7 +3740,7 @@ impl ViewerApp {
                     *position,
                     if is_hovered { 4.5 } else { 3.0 },
                     egui::Stroke::new(
-                        1.5,
+                        1.5_f32,
                         if is_hovered {
                             COMMUNITY_LIT
                         } else {
@@ -3818,7 +3818,7 @@ impl ViewerApp {
                     *position + egui::vec2(0.0, radius),
                     *position + egui::vec2(-radius, 0.0),
                 ],
-                egui::Stroke::new(1.5, color),
+                egui::Stroke::new(1.5_f32, color),
             ));
             if is_hovered {
                 let text = format!(
@@ -3863,7 +3863,7 @@ impl ViewerApp {
         painter.circle_stroke(
             position,
             11.0,
-            egui::Stroke::new(1.8, egui::Color32::from_rgb(244, 252, 255)),
+            egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(244, 252, 255)),
         );
         self.draw_radar_age_glyph_arc(
             painter,
@@ -3894,11 +3894,11 @@ impl ViewerApp {
         let fill = egui::Color32::from_rgb(255, 215, 72);
         let outline = egui::Color32::from_rgb(15, 18, 24);
         painter.circle_filled(position, 5.5, fill);
-        painter.circle_stroke(position, 8.5, egui::Stroke::new(2.0, outline));
+        painter.circle_stroke(position, 8.5, egui::Stroke::new(2.0_f32, outline));
         painter.circle_stroke(
             position,
             11.0,
-            egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 245, 170)),
+            egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(255, 245, 170)),
         );
         painter.text(
             position + egui::vec2(12.0, -10.0),
@@ -3934,7 +3934,7 @@ impl ViewerApp {
                 position,
                 8.5,
                 egui::Stroke::new(
-                    1.3,
+                    1.3_f32,
                     egui::Color32::from_rgba_unmultiplied(214, 242, 255, layer.opacity),
                 ),
             );
@@ -3975,7 +3975,7 @@ impl ViewerApp {
         painter.add(egui::Shape::line(
             points,
             egui::Stroke::new(
-                2.5,
+                2.5_f32,
                 freshness_ring_color(volume_time_utc, now_utc, alpha, age_style),
             ),
         ));
@@ -4952,28 +4952,28 @@ pub(crate) fn basemap_underlay_strokes(
     let strokes = if style == tiles::TileStyle::Satellite {
         BasemapLineStrokes {
             world: egui::Stroke::new(
-                0.9,
+                0.9_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 176),
             ),
             county: egui::Stroke::new(
-                0.65,
+                0.65_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 102),
             ),
             state: egui::Stroke::new(
-                1.05,
+                1.05_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 166),
             ),
             regional: egui::Stroke::new(
-                0.85,
+                0.85_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 146),
             ),
         }
     } else {
         BasemapLineStrokes {
-            world: egui::Stroke::new(0.75, egui::Color32::from_rgb(31, 45, 57)),
-            county: egui::Stroke::new(0.65, egui::Color32::from_rgb(24, 35, 46)),
-            state: egui::Stroke::new(1.05, egui::Color32::from_rgb(41, 58, 73)),
-            regional: egui::Stroke::new(0.85, egui::Color32::from_rgb(36, 52, 65)),
+            world: egui::Stroke::new(0.75_f32, egui::Color32::from_rgb(31, 45, 57)),
+            county: egui::Stroke::new(0.65_f32, egui::Color32::from_rgb(24, 35, 46)),
+            state: egui::Stroke::new(1.05_f32, egui::Color32::from_rgb(41, 58, 73)),
+            regional: egui::Stroke::new(0.85_f32, egui::Color32::from_rgb(36, 52, 65)),
         }
     };
     tune_basemap_strokes(strokes, brightness, thickness)
@@ -4987,38 +4987,38 @@ pub(crate) fn basemap_overlay_strokes(
     let strokes = if style == tiles::TileStyle::Satellite {
         BasemapLineStrokes {
             world: egui::Stroke::new(
-                0.85,
+                0.85_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 118),
             ),
             county: egui::Stroke::new(
-                0.55,
+                0.55_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 108),
             ),
             state: egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 148),
             ),
             regional: egui::Stroke::new(
-                0.75,
+                0.75_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128),
             ),
         }
     } else {
         BasemapLineStrokes {
             world: egui::Stroke::new(
-                0.85,
+                0.85_f32,
                 egui::Color32::from_rgba_unmultiplied(102, 126, 145, 84),
             ),
             county: egui::Stroke::new(
-                0.55,
+                0.55_f32,
                 egui::Color32::from_rgba_unmultiplied(92, 112, 128, 92),
             ),
             state: egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgba_unmultiplied(126, 150, 170, 116),
             ),
             regional: egui::Stroke::new(
-                0.75,
+                0.75_f32,
                 egui::Color32::from_rgba_unmultiplied(112, 136, 154, 96),
             ),
         }

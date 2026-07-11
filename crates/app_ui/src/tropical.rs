@@ -320,7 +320,7 @@ impl TropicalState {
     fn storm_card(&mut self, ui: &mut egui::Ui, storm: &TropicalCyclone) {
         let color = category_color(storm.category);
         egui::Frame::group(ui.style())
-            .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.8)))
+            .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -833,7 +833,7 @@ impl crate::ViewerApp {
                     rect,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
                     egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150),
                     ),
                 ));
@@ -852,7 +852,7 @@ impl crate::ViewerApp {
                 crate::push_solid_open_line(
                     &mut shapes,
                     &line,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(250, 250, 250)),
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(250, 250, 250)),
                     rect,
                     jump_px,
                 );
@@ -880,7 +880,7 @@ impl crate::ViewerApp {
                 &mut forecast_lines,
                 &path,
                 egui::Stroke::new(
-                    1.5,
+                    1.5_f32,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
                 ),
                 rect,
@@ -920,7 +920,7 @@ impl crate::ViewerApp {
                     .or(storm.category);
                 let color = category_color(category);
                 painter.circle_filled(pos, 5.0, color);
-                painter.circle_stroke(pos, 5.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+                painter.circle_stroke(pos, 5.0, egui::Stroke::new(1.5_f32, egui::Color32::BLACK));
                 if let Some(hp) = hover {
                     let dist = hp.distance(pos);
                     if dist <= 9.0 && nearest.as_ref().is_none_or(|(best, ..)| dist < *best) {
@@ -943,7 +943,7 @@ impl crate::ViewerApp {
             }
             let color = category_color(storm.category);
             painter.circle_filled(pos, 6.0, color);
-            painter.circle_stroke(pos, 6.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+            painter.circle_stroke(pos, 6.0, egui::Stroke::new(1.5_f32, egui::Color32::BLACK));
             crate::draw_halo_text(
                 painter,
                 pos + egui::vec2(10.0, 0.0),
@@ -996,7 +996,7 @@ impl crate::ViewerApp {
             self.map_scale,
             rect,
             egui::Color32::from_rgba_unmultiplied(30, 200, 190, 28),
-            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(235, 70, 70, 190)),
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(235, 70, 70, 190)),
         ));
     }
 
@@ -1031,7 +1031,7 @@ impl crate::ViewerApp {
                 crate::push_solid_closed_line(
                     shapes,
                     &ring,
-                    egui::Stroke::new(1.2, wind_radii_color(radii.kt)),
+                    egui::Stroke::new(1.2_f32, wind_radii_color(radii.kt)),
                     rect,
                     jump,
                 );
@@ -1221,7 +1221,7 @@ fn draw_forecast_tooltip(
     painter.rect_stroke(
         panel,
         4.0,
-        egui::Stroke::new(1.0, accent),
+        egui::Stroke::new(1.0_f32, accent),
         egui::StrokeKind::Outside,
     );
     let mut y = origin.y + pad;

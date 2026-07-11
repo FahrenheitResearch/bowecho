@@ -485,7 +485,7 @@ impl crate::ViewerApp {
                         painter.circle_stroke(
                             position,
                             radius + 1.0,
-                            egui::Stroke::new(1.4, egui::Color32::from_rgb(235, 30, 235)),
+                            egui::Stroke::new(1.4_f32, egui::Color32::from_rgb(235, 30, 235)),
                         );
                         current_centroid += position.to_vec2();
                         current_count += 1;

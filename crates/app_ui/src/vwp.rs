@@ -271,7 +271,7 @@ fn experimental_banner(ui: &mut egui::Ui) {
     let warning = ui.visuals().warn_fg_color;
     egui::Frame::new()
         .fill(warning.gamma_multiply(0.08))
-        .stroke(egui::Stroke::new(1.0, warning.gamma_multiply(0.75)))
+        .stroke(egui::Stroke::new(1.0_f32, warning.gamma_multiply(0.75)))
         .corner_radius(4)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
@@ -456,7 +456,7 @@ fn draw_profile_chart(
                 egui::pos2(plot_rect.left(), y),
                 egui::pos2(plot_rect.right(), y),
             ],
-            egui::Stroke::new(1.0, grid_color),
+            egui::Stroke::new(1.0_f32, grid_color),
         );
         painter.text(
             egui::pos2(plot_rect.left() - 7.0, y),
@@ -474,7 +474,7 @@ fn draw_profile_chart(
             egui::pos2(staff_origin_x, plot_rect.top()),
             egui::pos2(staff_origin_x, plot_rect.bottom()),
         ],
-        egui::Stroke::new(1.0, grid_color.gamma_multiply(0.7)),
+        egui::Stroke::new(1.0_f32, grid_color.gamma_multiply(0.7)),
     );
 
     for level in &profile.levels {
@@ -500,14 +500,14 @@ fn draw_profile_chart(
                 let color = visuals.error_fg_color.gamma_multiply(0.75);
                 painter.line_segment(
                     [origin - egui::vec2(3.0, 3.0), origin + egui::vec2(3.0, 3.0)],
-                    egui::Stroke::new(1.2, color),
+                    egui::Stroke::new(1.2_f32, color),
                 );
                 painter.line_segment(
                     [
                         origin + egui::vec2(-3.0, 3.0),
                         origin + egui::vec2(3.0, -3.0),
                     ],
-                    egui::Stroke::new(1.2, color),
+                    egui::Stroke::new(1.2_f32, color),
                 );
             }
         }
@@ -538,7 +538,7 @@ fn draw_wind_barb(
 ) {
     let knots = (speed_mps.max(0.0) * MPS_TO_KT).round();
     if knots < 2.5 {
-        painter.circle_stroke(origin, 3.0, egui::Stroke::new(1.2, color));
+        painter.circle_stroke(origin, 3.0, egui::Stroke::new(1.2_f32, color));
         return;
     }
 
@@ -546,7 +546,7 @@ fn draw_wind_barb(
     let toward_source = egui::vec2(radians.sin(), -radians.cos());
     let feather_side = egui::vec2(-toward_source.y, toward_source.x);
     let tip = origin + toward_source * 23.0;
-    painter.line_segment([origin, tip], egui::Stroke::new(1.35, color));
+    painter.line_segment([origin, tip], egui::Stroke::new(1.35_f32, color));
 
     let inward = -toward_source;
     let mut cursor = tip;
@@ -565,7 +565,7 @@ fn draw_wind_barb(
     while five_knot_units >= 2 {
         painter.line_segment(
             [cursor, cursor + feather_side * 8.0 + inward * 3.0],
-            egui::Stroke::new(1.35, color),
+            egui::Stroke::new(1.35_f32, color),
         );
         cursor += inward * 4.0;
         five_knot_units -= 2;
@@ -573,7 +573,7 @@ fn draw_wind_barb(
     if five_knot_units == 1 {
         painter.line_segment(
             [cursor, cursor + feather_side * 4.5 + inward * 1.5],
-            egui::Stroke::new(1.35, color),
+            egui::Stroke::new(1.35_f32, color),
         );
     }
 }
@@ -674,7 +674,7 @@ fn draw_hodograph(ui: &mut egui::Ui, rect: egui::Rect, profile: &PlotProfile) {
     let mut ring_kt = ring_step_kt;
     while ring_kt <= scale_kt + 0.5 {
         let ring_radius = radius * ring_kt / scale_kt;
-        painter.circle_stroke(center, ring_radius, egui::Stroke::new(1.0, grid_color));
+        painter.circle_stroke(center, ring_radius, egui::Stroke::new(1.0_f32, grid_color));
         painter.text(
             center + egui::vec2(3.0, -ring_radius + 2.0),
             egui::Align2::LEFT_TOP,
@@ -689,14 +689,14 @@ fn draw_hodograph(ui: &mut egui::Ui, rect: egui::Rect, profile: &PlotProfile) {
             center - egui::vec2(radius, 0.0),
             center + egui::vec2(radius, 0.0),
         ],
-        egui::Stroke::new(1.0, grid_color),
+        egui::Stroke::new(1.0_f32, grid_color),
     );
     painter.line_segment(
         [
             center - egui::vec2(0.0, radius),
             center + egui::vec2(0.0, radius),
         ],
-        egui::Stroke::new(1.0, grid_color),
+        egui::Stroke::new(1.0_f32, grid_color),
     );
     painter.text(
         center - egui::vec2(0.0, radius + 8.0),
@@ -746,7 +746,7 @@ fn draw_hodograph(ui: &mut egui::Ui, rect: egui::Rect, profile: &PlotProfile) {
         let color = height_color(((lower_height + upper_height) * 0.5) / maximum_height_m);
         painter.line_segment(
             [wind_position(lower_wind), wind_position(upper_wind)],
-            egui::Stroke::new(2.4, color),
+            egui::Stroke::new(2.4_f32, color),
         );
     }
     for (height, wind) in winds {

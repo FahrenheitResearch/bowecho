@@ -7950,7 +7950,7 @@ fn brand_color_field(ui: &mut egui::Ui, label: &str, value: &mut String, fallbac
     ui.painter().rect_stroke(
         swatch,
         3.0,
-        egui::Stroke::new(1.0, outline),
+        egui::Stroke::new(1.0_f32, outline),
         egui::StrokeKind::Inside,
     );
     if settings::parse_hex_color(value).is_none() {
@@ -25186,7 +25186,7 @@ impl ViewerApp {
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgba_unmultiplied(8, 12, 18, 222))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 70, 86)))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 70, 86)))
                     .corner_radius(4)
                     .inner_margin(egui::Margin::symmetric(8, 6))
                     .show(ui, |ui| {
@@ -26295,7 +26295,7 @@ impl ViewerApp {
         painter.rect_stroke(
             selection,
             0.0,
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(112, 198, 255)),
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(112, 198, 255)),
             egui::StrokeKind::Outside,
         );
         let km_per_px = 111.32 / self.map_scale.max(f32::EPSILON);
@@ -26562,7 +26562,7 @@ impl ViewerApp {
         painter.rect_stroke(
             selection,
             0.0,
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 196, 90)),
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 196, 90)),
             egui::StrokeKind::Outside,
         );
         painter.text(
@@ -27582,9 +27582,9 @@ impl ViewerApp {
             // Cell separator border (four segments — avoids StrokeKind churn);
             // the focused pane gets an accent border.
             let border = if cell_index == self.active_pane {
-                egui::Stroke::new(1.6, egui::Color32::from_rgb(96, 150, 210))
+                egui::Stroke::new(1.6_f32, egui::Color32::from_rgb(96, 150, 210))
             } else {
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 52, 60))
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(46, 52, 60))
             };
             cell_painter.line_segment([cell.left_top(), cell.right_top()], border);
             cell_painter.line_segment([cell.left_bottom(), cell.right_bottom()], border);
@@ -28051,7 +28051,7 @@ impl ViewerApp {
                         out.shapes.push(egui::Shape::circle_stroke(
                             position,
                             4.5 * scale,
-                            egui::Stroke::new(1.0, egui::Color32::BLACK),
+                            egui::Stroke::new(1.0_f32, egui::Color32::BLACK),
                         ));
                         let angle = heading_deg.to_radians();
                         let direction = egui::vec2(angle.sin(), -angle.cos());
@@ -28060,7 +28060,7 @@ impl ViewerApp {
                                 position + direction * 5.0 * scale,
                                 position + direction * 11.0 * scale,
                             ],
-                            egui::Stroke::new(2.0, fill),
+                            egui::Stroke::new(2.0_f32, fill),
                         ));
                     }
                     if let Some(label) = label {
@@ -28139,7 +28139,7 @@ impl ViewerApp {
                             out.shapes.push(egui::Shape::convex_polygon(
                                 screen.clone(),
                                 fill,
-                                egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
+                                egui::Stroke::new(0.0_f32, egui::Color32::TRANSPARENT),
                             ));
                         } else if let Some(mesh) = filled_polygon_mesh(&screen, fill) {
                             out.shapes.push(egui::Shape::mesh(mesh));
@@ -32876,8 +32876,8 @@ impl ViewerApp {
                 let (Some(a), Some(b)) = (to_screen(segment.a), to_screen(segment.b)) else {
                     continue;
                 };
-                let width = if segment.major { 1.65 } else { 0.95 };
-                painter.line_segment([a, b], egui::Stroke::new(width + 1.8, halo_color));
+                let width = if segment.major { 1.65_f32 } else { 0.95_f32 };
+                painter.line_segment([a, b], egui::Stroke::new(width + 1.8_f32, halo_color));
                 painter.line_segment([a, b], egui::Stroke::new(width, color));
             }
             let label_stride = (segments.len() / 48).clamp(60, 240);
@@ -34644,7 +34644,7 @@ impl ViewerApp {
             (3, 7),
         ];
         let box_stroke = egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(145, 157, 175, 125),
         );
         if self.vol3d.show_box {
@@ -34655,11 +34655,11 @@ impl ViewerApp {
 
         if self.vol3d.show_grid {
             let faint = egui::Stroke::new(
-                0.75,
+                0.75_f32,
                 egui::Color32::from_rgba_unmultiplied(125, 138, 158, 65),
             );
             let axis = egui::Stroke::new(
-                0.9,
+                0.9_f32,
                 egui::Color32::from_rgba_unmultiplied(155, 169, 190, 90),
             );
             let grid_km = if self.vol3d.box_half_km <= 60.0 {
@@ -34683,7 +34683,7 @@ impl ViewerApp {
         // Draw the active clip boundaries as horizontal outlines so a cutaway
         // never looks like missing data with no explanation.
         let clip_stroke = egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(110, 190, 235, 115),
         );
         for fraction in [clip_low, clip_high] {
@@ -34743,7 +34743,7 @@ impl ViewerApp {
                 ui.painter().circle_stroke(
                     position,
                     6.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 175, 235)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 175, 235)),
                 );
                 if let Some(volume) = &self.volume {
                     ui.painter().text(
@@ -35101,7 +35101,7 @@ impl ViewerApp {
             painter.circle_stroke(
                 *pos,
                 4.3,
-                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210)),
             );
             if label_glyphs {
                 let glyph = mping::report_glyph(report);
@@ -35188,7 +35188,7 @@ impl ViewerApp {
             let energy_femto = (f64::from(flash.energy) * 1e15).max(1.0);
             let size =
                 (1.6 + 0.55 * energy_femto.log10() as f32).clamp(1.6, 5.0) * glm_style.size_scale;
-            let stroke = egui::Stroke::new(1.2, color);
+            let stroke = egui::Stroke::new(1.2_f32, color);
             painter.line_segment(
                 [pos - egui::vec2(size, 0.0), pos + egui::vec2(size, 0.0)],
                 stroke,
@@ -35410,7 +35410,7 @@ impl ViewerApp {
             5.0,
             egui::Color32::from_rgba_unmultiplied(8, 11, 16, 208),
         );
-        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(64, 78, 96));
+        let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(64, 78, 96));
         painter.line_segment([card.left_top(), card.right_top()], stroke);
         painter.line_segment([card.right_top(), card.right_bottom()], stroke);
         painter.line_segment([card.right_bottom(), card.left_bottom()], stroke);
@@ -35523,11 +35523,11 @@ impl ViewerApp {
             if points.len() >= 2 {
                 painter.add(egui::Shape::line(
                     points.clone(),
-                    egui::Stroke::new(1.6, line_color),
+                    egui::Stroke::new(1.6_f32, line_color),
                 ));
             }
             painter.circle_filled(current, 3.5, line_color);
-            painter.circle_stroke(current, 3.5, egui::Stroke::new(1.0, egui::Color32::BLACK));
+            painter.circle_stroke(current, 3.5, egui::Stroke::new(1.0_f32, egui::Color32::BLACK));
             if let Some((u, v)) = track.fitted_motion {
                 let (_, east, north) = track.last_fix().expect("non-empty");
                 let mut previous = current;
@@ -35547,11 +35547,11 @@ impl ViewerApp {
                     painter.line_segment(
                         [previous, position],
                         egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             egui::Color32::from_rgba_unmultiplied(235, 240, 245, 110),
                         ),
                     );
-                    painter.circle_stroke(position, 2.5, egui::Stroke::new(1.2, line_color));
+                    painter.circle_stroke(position, 2.5, egui::Stroke::new(1.2_f32, line_color));
                     previous = position;
                 }
             }
@@ -35798,30 +35798,30 @@ impl ViewerApp {
                     painter.add(egui::Shape::convex_polygon(
                         points,
                         egui::Color32::from_rgb(225, 32, 38),
-                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                        egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
                     ));
                 }
                 render2d::RotationStrength::Mesocyclone => {
                     let color = egui::Color32::from_rgb(250, 200, 60);
-                    painter.circle_stroke(position, 9.0, egui::Stroke::new(2.6, color));
+                    painter.circle_stroke(position, 9.0, egui::Stroke::new(2.6_f32, color));
                     // The inner ring marks time-associated (persistent)
                     // mesocyclones; a first-seen couplet shows one ring + CPLT.
                     if marker.persistence >= 2 {
-                        painter.circle_stroke(position, 5.0, egui::Stroke::new(1.6, color));
+                        painter.circle_stroke(position, 5.0, egui::Stroke::new(1.6_f32, color));
                     }
                 }
                 render2d::RotationStrength::ModerateCirculation => {
                     painter.circle_stroke(
                         position,
                         8.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 170, 50)),
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(240, 170, 50)),
                     );
                 }
                 render2d::RotationStrength::WeakCirculation => {
                     painter.circle_stroke(
                         position,
                         7.0,
-                        egui::Stroke::new(1.4, egui::Color32::from_rgb(200, 180, 120)),
+                        egui::Stroke::new(1.4_f32, egui::Color32::from_rgb(200, 180, 120)),
                     );
                 }
             }
@@ -35863,7 +35863,7 @@ impl ViewerApp {
         let to_screen = |(lon, lat): (f32, f32)| self.lon_lat_to_screen(rect, lon, lat);
         let handle = |painter: &egui::Painter, p: egui::Pos2, label: &str| {
             painter.circle_filled(p, 4.5, accent);
-            painter.circle_stroke(p, 4.5, egui::Stroke::new(1.0, egui::Color32::BLACK));
+            painter.circle_stroke(p, 4.5, egui::Stroke::new(1.0_f32, egui::Color32::BLACK));
             painter.text(
                 p + egui::vec2(0.0, -8.0),
                 egui::Align2::CENTER_BOTTOM,
@@ -35875,7 +35875,7 @@ impl ViewerApp {
         match (self.cross_section_a_lonlat, self.cross_section_b_lonlat) {
             (Some(a), Some(b)) => {
                 let (pa, pb) = (to_screen(a), to_screen(b));
-                painter.line_segment([pa, pb], egui::Stroke::new(2.0, accent));
+                painter.line_segment([pa, pb], egui::Stroke::new(2.0_f32, accent));
                 handle(painter, pa, "A");
                 handle(painter, pb, "B");
             }
@@ -35884,7 +35884,7 @@ impl ViewerApp {
                 if let Some(h) = hover {
                     painter.line_segment(
                         [pa, h],
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 160, 90)),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 160, 90)),
                     );
                 }
                 handle(painter, pa, "A");
@@ -36259,14 +36259,14 @@ impl ViewerApp {
                     egui::pos2(pointer.x, plot.top()),
                     egui::pos2(pointer.x, plot.bottom()),
                 ],
-                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(75)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(75)),
             );
             painter.line_segment(
                 [
                     egui::pos2(plot.left(), pointer.y),
                     egui::pos2(plot.right(), pointer.y),
                 ],
-                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(75)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(75)),
             );
             if value.is_finite() {
                 let (unit_label, unit_scale) = table_display_unit(
@@ -36303,7 +36303,7 @@ impl ViewerApp {
                 painter.rect_stroke(
                     card,
                     2.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(95)),
                     egui::StrokeKind::Outside,
                 );
                 painter.text(
@@ -40119,7 +40119,7 @@ fn draw_obs_history_timeline(
         3.0,
         egui::Color32::from_rgba_unmultiplied(4, 7, 11, 190),
     );
-    let border = egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 78));
+    let border = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(48, 62, 78));
     painter.line_segment([rect.left_top(), rect.right_top()], border);
     painter.line_segment([rect.right_top(), rect.right_bottom()], border);
     painter.line_segment([rect.right_bottom(), rect.left_bottom()], border);
@@ -40149,7 +40149,7 @@ fn draw_obs_history_timeline(
     {
         use chrono::Timelike;
         let grid_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 84, 104, 55));
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(70, 84, 104, 55));
         let mut tick = start
             .with_minute(0)
             .and_then(|t| t.with_second(0))
@@ -40215,7 +40215,7 @@ fn draw_obs_history_timeline(
                 egui::pos2(plot_left, band_bottom),
                 egui::pos2(plot_right, band_bottom),
             ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 84, 104, 90)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(70, 84, 104, 90)),
         );
         painter.text(
             egui::pos2(rect.left() + 4.0, band_mid),
@@ -40260,7 +40260,7 @@ fn draw_obs_history_timeline(
                     .iter()
                     .map(|(time, value)| egui::pos2(x_of(*time), y_of(*value)))
                     .collect();
-                painter.add(egui::Shape::line(poly, egui::Stroke::new(1.4, *color)));
+                painter.add(egui::Shape::line(poly, egui::Stroke::new(1.4_f32, *color)));
             }
             for (time, value) in pts.iter() {
                 painter.circle_filled(egui::pos2(x_of(*time), y_of(*value)), 1.2, *color);
@@ -40268,7 +40268,7 @@ fn draw_obs_history_timeline(
             if let Some((time, value)) = nearest(pts) {
                 let point = egui::pos2(x_of(time), y_of(value));
                 painter.circle_filled(point, 2.6, *color);
-                painter.circle_stroke(point, 2.6, egui::Stroke::new(0.8, egui::Color32::BLACK));
+                painter.circle_stroke(point, 2.6, egui::Stroke::new(0.8_f32, egui::Color32::BLACK));
                 let dy = if series_n <= 1 {
                     0.0
                 } else {
@@ -40327,7 +40327,7 @@ fn draw_obs_history_timeline(
             egui::pos2(marker_x, rows_top),
             egui::pos2(marker_x, rows_bottom + 1.0),
         ],
-        egui::Stroke::new(1.4, marker_color),
+        egui::Stroke::new(1.4_f32, marker_color),
     );
     painter.add(egui::Shape::convex_polygon(
         vec![
@@ -40346,7 +40346,7 @@ fn draw_obs_history_timeline(
             egui::pos2(plot_left, axis_y),
             egui::pos2(plot_right, axis_y),
         ],
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120)),
     );
     let axis_font = egui::FontId::monospace(9.0);
     let weak = egui::Color32::from_rgb(150, 160, 172);
@@ -40389,7 +40389,7 @@ fn draw_obs_history_table(
         3.0,
         egui::Color32::from_rgba_unmultiplied(4, 7, 11, 190),
     );
-    let border = egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 78));
+    let border = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(48, 62, 78));
     painter.line_segment([rect.left_top(), rect.right_top()], border);
     painter.line_segment([rect.right_top(), rect.right_bottom()], border);
     painter.line_segment([rect.right_bottom(), rect.left_bottom()], border);
@@ -40446,7 +40446,7 @@ fn draw_obs_history_table(
     y += 13.0;
     painter.line_segment(
         [egui::pos2(left, y), egui::pos2(rect.right() - 8.0, y)],
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120)),
     );
     y += 3.0;
     for row in history.rows.iter().take(max_rows) {
@@ -40945,7 +40945,7 @@ fn parse_radar_operational_status(
             })
         })
         .collect::<Vec<_>>();
-    alarm_rows.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    alarm_rows.sort_by_key(|right| std::cmp::Reverse(right.timestamp));
 
     Ok(RadarOperationalStatus {
         site_id: station_id,
@@ -42780,7 +42780,7 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
         style.visuals.window_fill = theme.bg;
         style.visuals.extreme_bg_color = theme.inset; // text edits, slider troughs
         style.visuals.faint_bg_color = theme.faint; // table striping
-        style.visuals.window_stroke = egui::Stroke::new(1.0, theme.outline);
+        style.visuals.window_stroke = egui::Stroke::new(1.0_f32, theme.outline);
         // Desaturated light text, not pure white; explicit weak tier so the
         // >= 4:1 contrast floor is exactly what the gated tests check.
         style.visuals.override_text_color = Some(theme.text);
@@ -42789,27 +42789,27 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
         style.visuals.warn_fg_color = theme.warn;
         style.visuals.error_fg_color = theme.alert;
         style.visuals.selection.bg_fill = theme.selection_bg;
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, theme.accent_text);
+        style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, theme.accent_text);
         let w = &mut style.visuals.widgets;
         w.noninteractive.bg_fill = theme.bg;
         w.noninteractive.weak_bg_fill = theme.bg;
         // Hairline separators replace heavy rules, everywhere at once:
         // egui separators draw with this stroke.
-        w.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme.hairline);
-        w.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme.text_weak);
+        w.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, theme.hairline);
+        w.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, theme.text_weak);
         w.inactive.bg_fill = theme.raised;
         w.inactive.weak_bg_fill = theme.raised;
-        w.inactive.fg_stroke = egui::Stroke::new(1.0, theme.text);
+        w.inactive.fg_stroke = egui::Stroke::new(1.0_f32, theme.text);
         w.hovered.bg_fill = theme.hover;
         w.hovered.weak_bg_fill = theme.hover;
-        w.hovered.bg_stroke = egui::Stroke::new(1.0, theme.outline);
-        w.hovered.fg_stroke = egui::Stroke::new(1.5, theme.text_strong);
+        w.hovered.bg_stroke = egui::Stroke::new(1.0_f32, theme.outline);
+        w.hovered.fg_stroke = egui::Stroke::new(1.5_f32, theme.text_strong);
         w.active.bg_fill = theme.active;
         w.active.weak_bg_fill = theme.active;
-        w.active.fg_stroke = egui::Stroke::new(2.0, theme.text_strong);
+        w.active.fg_stroke = egui::Stroke::new(2.0_f32, theme.text_strong);
         w.open.bg_fill = theme.raised;
         w.open.weak_bg_fill = theme.raised;
-        w.open.fg_stroke = egui::Stroke::new(1.0, theme.text);
+        w.open.fg_stroke = egui::Stroke::new(1.0_f32, theme.text);
     } else {
         // Custom brand kit: the distributor's palette keeps driving the
         // chrome exactly as before the theme pass.
@@ -42820,13 +42820,13 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
         style.visuals.window_fill = panel;
         style.visuals.extreme_bg_color = sunken; // text edits, sliders troughs
         style.visuals.faint_bg_color = Color32::from_rgb(20, 22, 25); // table striping
-        style.visuals.window_stroke = egui::Stroke::new(1.0, brand::color32(palette.outline));
+        style.visuals.window_stroke = egui::Stroke::new(1.0_f32, brand::color32(palette.outline));
         // Desaturated light text, not pure white.
         style.visuals.override_text_color = Some(brand::color32(palette.text));
 
         // Low-chroma muted-blue selection/active accents.
         style.visuals.selection.bg_fill = Color32::from_rgb(38, 74, 108);
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, brand::color32(palette.accent));
+        style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, brand::color32(palette.accent));
         let w = &mut style.visuals.widgets;
         w.noninteractive.bg_fill = panel;
         w.inactive.bg_fill = raised;
@@ -43054,7 +43054,7 @@ mod tests {
             rect,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
             egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150),
             ),
         );
@@ -43113,7 +43113,7 @@ mod tests {
             rect,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
             egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150),
             ),
         );

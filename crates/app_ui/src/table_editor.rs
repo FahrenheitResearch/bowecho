@@ -103,7 +103,7 @@ fn paint_badge_chip(painter: &egui::Painter, left_center: egui::Pos2, badge: Bad
     painter.rect_stroke(
         text_rect.expand2(egui::vec2(4.0, 2.0)),
         4.0,
-        egui::Stroke::new(1.0, color.gamma_multiply(0.55)),
+        egui::Stroke::new(1.0_f32, color.gamma_multiply(0.55)),
         egui::StrokeKind::Outside,
     );
     text_rect.right() + 6.0
@@ -704,7 +704,7 @@ fn gradient_bar_ui(
             painter.vline(
                 x.clamp(rect.left() + 0.5, rect.right() - 0.5),
                 egui::Rangef::new(rect.bottom() - 5.0, rect.bottom()),
-                egui::Stroke::new(1.0, egui::Color32::from_gray(210)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(210)),
             );
             let align = match index {
                 0 => egui::Align2::LEFT_TOP,

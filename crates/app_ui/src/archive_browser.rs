@@ -217,7 +217,7 @@ fn limit_intl_rows_for_window(
         return rows;
     }
     rows.retain(|row| row.time_utc >= start_utc && row.time_utc <= end_utc);
-    rows.sort_by(|left, right| left.time_utc.cmp(&right.time_utc));
+    rows.sort_by_key(|left| left.time_utc);
     if rows.len() <= max {
         return rows;
     }

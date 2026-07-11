@@ -256,7 +256,7 @@ pub(crate) fn paint_capture_overlay(
         painter.rect_stroke(
             card,
             6.0,
-            egui::Stroke::new(1.0, color32(palette.outline)),
+            egui::Stroke::new(1.0_f32, color32(palette.outline)),
             egui::StrokeKind::Inside,
         );
 
@@ -341,7 +341,7 @@ pub(crate) fn paint_capture_overlay(
             painter.rect_stroke(
                 rect,
                 5.0,
-                egui::Stroke::new(1.0, color32(palette.primary)),
+                egui::Stroke::new(1.0_f32, color32(palette.primary)),
                 egui::StrokeKind::Inside,
             );
             painter.galley(
@@ -399,7 +399,7 @@ pub(crate) fn preview_ui(
         painter.rect_stroke(
             rect,
             6.0,
-            egui::Stroke::new(1.0, color32(palette.outline)),
+            egui::Stroke::new(1.0_f32, color32(palette.outline)),
             egui::StrokeKind::Inside,
         );
         if let Some((texture, _)) = textures.texture(

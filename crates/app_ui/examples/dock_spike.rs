@@ -69,7 +69,7 @@ impl egui_tiles::Behavior<SpikePane> for SpikeBehavior<'_> {
                     *self.map_pan += response.drag_delta();
                 }
                 let cross = rect.center() + *self.map_pan;
-                let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 120));
+                let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 200, 120));
                 painter.line_segment(
                     [
                         egui::pos2(cross.x - 14.0, cross.y),
@@ -106,7 +106,7 @@ impl egui_tiles::Behavior<SpikePane> for SpikeBehavior<'_> {
                         egui::pos2(rect.left() + 10.0, rect.bottom() - 10.0),
                         egui::pos2(rect.right() + 400.0, rect.top() - 40.0),
                     ],
-                    egui::Stroke::new(3.0, egui::Color32::YELLOW),
+                    egui::Stroke::new(3.0_f32, egui::Color32::YELLOW),
                 );
                 painter.text(
                     rect.left_top() + egui::vec2(8.0, 8.0),

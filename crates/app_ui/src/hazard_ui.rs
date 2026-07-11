@@ -1009,7 +1009,7 @@ impl ViewerApp {
         } else {
             egui::Color32::from_rgba_unmultiplied(255, 118, 72, 220)
         };
-        let stroke = egui::Stroke::new(if blink_on { 4.5 } else { 2.75 }, color);
+        let stroke = egui::Stroke::new(if blink_on { 4.5_f32 } else { 2.75_f32 }, color);
         let bounds = self.visible_geo_bounds(rect).expand(0.05);
         for record in &overlay.records {
             if !self

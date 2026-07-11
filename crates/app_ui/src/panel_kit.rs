@@ -435,7 +435,7 @@ fn section_rule(ui: &mut egui::Ui) {
     // hierarchy; the rule only marks the boundary.
     ui.painter().line_segment(
         [rect.left_center(), rect.right_center()],
-        egui::Stroke::new(1.0, section_rule_color()),
+        egui::Stroke::new(1.0_f32, section_rule_color()),
     );
 }
 

@@ -938,14 +938,14 @@ impl WofsState {
                     *pos,
                     4.5,
                     egui::Color32::from_rgb(214, 48, 36),
-                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
                 );
             } else if hovered {
                 painter.circle(
                     *pos,
                     4.0,
                     egui::Color32::from_rgb(36, 92, 214),
-                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
                 );
             } else {
                 painter.circle_filled(
