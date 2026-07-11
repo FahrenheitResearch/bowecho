@@ -55,6 +55,7 @@ mod event_explorer;
 mod event_loop_builder;
 mod farm_live;
 mod fonts;
+mod formula_lab;
 mod gbvtd_retrieval;
 mod gdex_ui;
 mod geo_helpers;

@@ -39,6 +39,10 @@ pub struct StoreFormulaSource {
     /// Must be empty unless the host verified every stored timestep's valid
     /// time. Exact-time runs supply the complete map, never a partial axis.
     pub exact_times: BTreeMap<u16, ExactStoreTime>,
+    /// Host validation of the complete selected exact-time axis. Pointwise
+    /// formulas remain available when false, but plans requiring adjacent
+    /// times are blocked before the bridge can rehydrate timing from disk.
+    pub temporal_axis_verified: bool,
 }
 
 /// Staged raw WRF source offered by the host. Full map/height calculus is
@@ -539,6 +543,7 @@ impl FormulaLabPanel {
             && evaluation_source.is_some()
             && self.task.is_none()
             && output_name.is_ok()
+            && self.temporal_source_allowed(sources)
             && !self.large_raw_needs_confirmation(sources)
             && sources.evaluation_blocked.is_none();
         ui.horizontal(|ui| {
@@ -569,6 +574,15 @@ impl FormulaLabPanel {
                 egui::RichText::new(format!("Evaluation is paused: {reason}"))
                     .small()
                     .color(egui::Color32::YELLOW),
+            );
+        }
+        if !self.temporal_source_allowed(sources) {
+            ui.label(
+                egui::RichText::new(
+                    "Temporal evaluation is disabled: this store source does not have a complete, host-verified exact-time axis",
+                )
+                .small()
+                .color(egui::Color32::YELLOW),
             );
         }
         if let Some(status) = &self.status {
@@ -984,6 +998,22 @@ impl FormulaLabPanel {
         }
     }
 
+    fn temporal_source_allowed(&self, sources: FormulaLabSources<'_>) -> bool {
+        let needs_adjacent_times = self.compiled.as_ref().is_some_and(|compiled| {
+            compiled
+                .plan()
+                .requirements
+                .iter()
+                .any(|requirement| matches!(requirement, Requirement::AdjacentTimes))
+        });
+        if !needs_adjacent_times || self.source_kind != FormulaSourceKind::Store {
+            return true;
+        }
+        sources
+            .store
+            .is_some_and(|source| source.temporal_axis_verified)
+    }
+
     fn raw_evaluation_source(
         &self,
         source: Option<&RawWrfFormulaSource>,
@@ -1064,6 +1094,18 @@ impl FormulaLabPanel {
             self.status = Some("Formula must compile before evaluation".to_string());
             return;
         };
+        if matches!(&source, EvaluationSource::Store(source) if !source.temporal_axis_verified)
+            && compiled
+                .plan()
+                .requirements
+                .iter()
+                .any(|requirement| matches!(requirement, Requirement::AdjacentTimes))
+        {
+            self.status = Some(
+                "Temporal formula requires a complete, host-verified exact-time axis".to_string(),
+            );
+            return;
+        }
         let parameters = self.parameter_values.clone();
         let mut options = self.evaluation_options.clone();
         match parse_unit_overrides(&self.unit_overrides_text) {
@@ -1820,6 +1862,7 @@ mod tests {
                 exact_time: None,
             },
             exact_times: BTreeMap::new(),
+            temporal_axis_verified: false,
         };
         assert!(
             panel
@@ -1830,6 +1873,43 @@ mod tests {
                 })
                 .is_none()
         );
+    }
+
+    #[test]
+    fn unverified_store_time_axis_blocks_only_temporal_formulas() {
+        let store = StoreFormulaSource {
+            store_root: PathBuf::from("store"),
+            hour: HourKey {
+                model: "wrf".to_string(),
+                run: "run".to_string(),
+                hour: 0,
+                exact_time: None,
+            },
+            exact_times: BTreeMap::new(),
+            temporal_axis_verified: false,
+        };
+        let sources = FormulaLabSources {
+            store: Some(&store),
+            raw_wrf: None,
+            evaluation_blocked: None,
+        };
+        let mut panel = FormulaLabPanel::new();
+        panel.set_source_kind(FormulaSourceKind::Store);
+        panel.set_source("temperature_2m");
+        assert!(panel.compiled().is_some());
+        assert!(panel.temporal_source_allowed(sources));
+
+        panel.set_source("dt(temperature_2m)");
+        assert!(panel.compiled().is_some());
+        assert!(!panel.temporal_source_allowed(sources));
+
+        let mut verified = store;
+        verified.temporal_axis_verified = true;
+        assert!(panel.temporal_source_allowed(FormulaLabSources {
+            store: Some(&verified),
+            raw_wrf: None,
+            evaluation_blocked: None,
+        }));
     }
 
     #[test]

@@ -14,6 +14,10 @@ use rw_ui::{
 };
 use std::path::PathBuf;
 
+use crate::formula_lab::{
+    FormulaLabPanel, FormulaLabSources, FormulaResultSource, FormulaSourceKind,
+    RawWrfFormulaSource, StoreFormulaSource,
+};
 use crate::sat_plot::{SatellitePlotPanel, SatellitePlotSource};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -543,6 +547,13 @@ pub struct ModelDataDock {
     /// and the current field reloaded so the new palette shows.
     color_tables: ColorTableEditorPanel,
     show_color_tables: bool,
+    /// Safe formula compiler/evaluator from Rusty Weather. The window remains
+    /// independently pollable while the Model window is closed.
+    formula_lab: FormulaLabPanel,
+    /// Explicit raw-WRF file staged for formulas that need WRF grid metrics,
+    /// physical height, vectors, or horizontal calculus. The unrestricted
+    /// picker accepts extensionless `wrfout_*` files from every domain.
+    formula_raw_path: Option<PathBuf>,
     /// User's WRF full-diagnostics processing selection (product groups +
     /// only/skip field filters). Edited in the import area's options popover,
     /// applied when the heavy "Full model import" launches, and persisted
@@ -630,6 +641,8 @@ impl ModelDataDock {
             plot_domain_armed: false,
             color_tables: ColorTableEditorPanel::new(),
             show_color_tables: false,
+            formula_lab: FormulaLabPanel::new(),
+            formula_raw_path: None,
             wrf_options: WrfProcessUiState::default(),
             synth_radar: SyntheticRadarUiState::default(),
             pending_heavy_import: None,
@@ -659,12 +672,173 @@ impl ModelDataDock {
     /// is what repaints.
     fn apply_color_table_changes(&mut self) {
         let settings = self.color_tables.settings().clone().normalized();
-        self.worker.send(StoreRequest::SetStyleOverrides(settings));
+        self.worker
+            .send(StoreRequest::SetStyleOverrides(settings.clone()));
         self.plot_viewer.clear();
         if let Some(field) = self.viewer.wanted_field() {
-            self.viewer.set_loading(&field.var);
-            self.request_field_load(field);
+            if self.viewer.restyle_generated_field(&settings) {
+                self.latest_field = self
+                    .viewer
+                    .current_field()
+                    .cloned()
+                    .map(std::sync::Arc::new);
+            } else {
+                self.viewer.set_loading(&field.var);
+                self.request_field_load(field);
+            }
         }
+    }
+
+    /// Build the selected rw-store source with its complete, validated exact
+    /// time axis. Legacy v1 runs intentionally provide an empty map so `dt`
+    /// remains disabled instead of treating storage slots or file times as
+    /// meteorological time.
+    fn formula_store_source(&self) -> Option<StoreFormulaSource> {
+        let hour = self.browser.selected()?.clone();
+        let run = self
+            .tree
+            .as_ref()?
+            .models
+            .iter()
+            .find(|model| model.model == hour.model)?
+            .runs
+            .iter()
+            .find(|run| run.run == hour.run)?;
+        let (exact_times, temporal_axis_verified) = run
+            .exact_times()
+            .filter(|axis| axis.get(&hour.hour) == hour.exact_time.as_ref())
+            .filter(|axis| {
+                axis.values()
+                    .all(|exact| lead_seconds_exact_in_f64(exact.lead_seconds))
+            })
+            .map(|axis| {
+                let exact_times = axis
+                    .into_iter()
+                    .map(|(slot, exact)| {
+                        (
+                            slot,
+                            rw_formula::ExactStoreTime::new(
+                                exact.lead_seconds as f64,
+                                Some(format!(
+                                    "{} · {}",
+                                    rw_ui::format_lead_seconds(exact.lead_seconds),
+                                    rw_ui::format_valid_unix(exact.valid_unix)
+                                )),
+                            ),
+                        )
+                    })
+                    .collect();
+                (exact_times, true)
+            })
+            .unwrap_or_else(|| (std::collections::BTreeMap::new(), false));
+        Some(StoreFormulaSource {
+            store_root: self.store_root.clone(),
+            hour,
+            exact_times,
+            temporal_axis_verified,
+        })
+    }
+
+    fn formula_raw_source(&self) -> Option<RawWrfFormulaSource> {
+        let path = self.formula_raw_path.clone()?;
+        let run = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("raw_wrf")
+            .to_owned();
+        Some(RawWrfFormulaSource {
+            path,
+            initial_time_index: 0,
+            display_hour: HourKey {
+                model: "raw-wrf".to_owned(),
+                run,
+                hour: 0,
+                exact_time: None,
+            },
+        })
+    }
+
+    fn stage_formula_raw_from_files(&mut self, files: &[PathBuf]) {
+        if let Some(first) = files.first() {
+            self.formula_raw_path = Some(first.clone());
+        }
+    }
+
+    fn formula_evaluation_blocked(&self) -> bool {
+        self.import_job.is_some()
+            || self.plot_job.is_some()
+            || self.pending_heavy_import.is_some()
+            || self.pending_light_import.is_some()
+    }
+
+    /// Poll the Formula Lab worker and keep its independent window responsive.
+    /// `pump()` calls this every frame even when the Model window itself is
+    /// closed, so a long WRF diagnostic cannot lose its completion message.
+    fn pump_formula_lab(&mut self) {
+        let store = self.formula_store_source();
+        let raw_wrf = self.formula_raw_source();
+        let blocked = self.formula_evaluation_blocked().then_some(
+            "a model import, size confirmation, synthetic-radar build, or batch plot is active",
+        );
+        let ctx = self.repaint.clone();
+        let Some(result) = self.formula_lab.show(
+            &ctx,
+            FormulaLabSources {
+                store: store.as_ref(),
+                raw_wrf: raw_wrf.as_ref(),
+                evaluation_blocked: blocked,
+            },
+        ) else {
+            if self.formula_lab.busy() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+            return;
+        };
+
+        let raw_result = matches!(&result.source, FormulaResultSource::RawWrf { .. });
+        let still_current = match &result.source {
+            FormulaResultSource::Store { store_root, hour } => {
+                self.formula_lab.source_kind() == FormulaSourceKind::Store
+                    && store_root == &self.store_root
+                    && self.browser.selected() == Some(hour)
+            }
+            FormulaResultSource::RawWrf {
+                path, time_index, ..
+            } => {
+                self.formula_lab.source_kind() == FormulaSourceKind::RawWrf
+                    && self.formula_raw_path.as_ref() == Some(path)
+                    && self.formula_lab.raw_time_index() == *time_index
+            }
+        } && result.source.revision_is_current();
+
+        if !still_current {
+            self.formula_lab
+                .note_result_discarded("the selected data source changed while it ran");
+            return;
+        }
+
+        self.install_formula_field(result.field, raw_result);
+    }
+
+    fn install_formula_field(&mut self, field: rw_ui::FieldData, raw_result: bool) {
+        self.plot_viewer.clear();
+        self.native_plot_content = NativePlotContent::Model;
+        self.native_plot_seeded_run = None;
+        if raw_result {
+            self.sounding.clear();
+            self.latest_sounding = None;
+        }
+        let settings = self.color_tables.settings().clone().normalized();
+        self.viewer.install_generated_field(field, &settings);
+        // Keep the styled/display-unit field as the external map/native-plot
+        // source. `install_generated_field` retains the raw scientific values
+        // internally, so later palette edits always reconvert exactly once.
+        self.latest_field = self
+            .viewer
+            .current_field()
+            .cloned()
+            .map(std::sync::Arc::new);
     }
 
     /// Route a picker load: synthesized iso-level names go to the
@@ -764,23 +938,12 @@ impl ModelDataDock {
         while let Some(response) = self.worker.try_recv() {
             match response {
                 StoreResponse::Tree(tree) => {
-                    if self.browser.selected().is_none() {
-                        let first = tree.models.first().and_then(|model| {
-                            model.runs.first().and_then(|run| {
-                                run.hours.first().map(|hour| HourKey {
-                                    model: model.model.clone(),
-                                    run: run.run.clone(),
-                                    hour: hour.hour,
-                                    exact_time: hour.exact_time,
-                                })
-                            })
-                        });
-                        if let Some(key) = first {
-                            self.browser.select(key.clone());
-                            self.select_hour(key);
-                        }
-                    }
+                    let selection_changed = self.browser.reconcile(&tree);
+                    let selected = self.browser.selected().cloned();
                     self.tree = Some(tree);
+                    if selection_changed && let Some(key) = selected {
+                        self.select_hour(key);
+                    }
                 }
                 StoreResponse::HourVars(key, Ok(vars)) => {
                     if self.browser.selected() == Some(&key) {
@@ -792,8 +955,16 @@ impl ModelDataDock {
                         self.hour_store_vars = vars.iter().map(|var| var.name.clone()).collect();
                         self.viewer.set_hour(key, viewer_display_vars(vars));
                         if let Some(field) = self.viewer.wanted_field() {
-                            self.viewer.set_loading(&field.var);
-                            self.request_field_load(field);
+                            if self.viewer.restore_generated_field(&field.var) {
+                                self.latest_field = self
+                                    .viewer
+                                    .current_field()
+                                    .cloned()
+                                    .map(std::sync::Arc::new);
+                            } else {
+                                self.viewer.set_loading(&field.var);
+                                self.request_field_load(field);
+                            }
                         }
                     }
                 }
@@ -839,6 +1010,7 @@ impl ModelDataDock {
     /// store browser, LUT, and sounding flows alive for map interactions.
     pub fn pump(&mut self) {
         self.handle_responses();
+        self.pump_formula_lab();
     }
 
     /// One-shot map request (the app installs it as a radar-map layer).
@@ -1281,6 +1453,7 @@ impl ModelDataDock {
             self.gdex_import_queue.push_back(path);
         }
         if self.import_job.is_none()
+            && !self.formula_lab.busy()
             && let Some(path) = self.gdex_import_queue.pop_front()
         {
             self.launch_gdex_import(path);
@@ -1295,6 +1468,12 @@ impl ModelDataDock {
     /// `import_job` also engages the live-refresh crash guard
     /// (`import_in_flight`) automatically.
     fn launch_gdex_import(&mut self, path: PathBuf) {
+        if self.formula_lab.busy() {
+            self.gdex_import_queue.push_front(path);
+            self.import_message =
+                Some("GDEX import is waiting for the Formula Lab evaluation to finish".to_owned());
+            return;
+        }
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -1309,6 +1488,11 @@ impl ModelDataDock {
     /// Single slot: a second request while one runs is refused with a status
     /// line (matching the single-slot import job).
     fn start_plot_job(&mut self, store_root: PathBuf, model: String, run: String) {
+        if self.formula_lab.busy() {
+            self.plot_message =
+                Some("Batch plotting cannot start while Formula Lab is evaluating".to_owned());
+            return;
+        }
         if self.plot_job.is_some() {
             self.plot_message =
                 Some("A batch plot job is already running — cancel it first.".to_owned());
@@ -1416,6 +1600,54 @@ impl ModelDataDock {
             }
         });
         self.import_pickers(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut self.formula_lab.open, "Formula Lab")
+                .on_hover_text(
+                    "Compile safe custom diagnostics against the selected run from any model. \
+                     Raw WRF sources additionally support WRF grid metrics, physical height, \
+                     vector, vertical, and horizontal-calculus operations.",
+                );
+
+            #[cfg(any(windows, target_os = "macos"))]
+            if ui
+                .button("Choose raw WRF...")
+                .on_hover_text(
+                    "Choose any raw WRF file, including extensionless wrfout_* files from \
+                     any domain (d01, d02, d03, and beyond). The picker intentionally has \
+                     no extension or filename filter.",
+                )
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("Choose any raw WRF file for Formula Lab")
+                    .pick_file()
+            {
+                self.formula_raw_path = Some(path);
+                self.formula_lab.set_source_kind(FormulaSourceKind::RawWrf);
+                self.formula_lab.open = true;
+            }
+
+            #[cfg(not(any(windows, target_os = "macos")))]
+            ui.add_enabled(false, egui::Button::new("Choose raw WRF..."))
+                .on_hover_text("Raw WRF file picking is available on Windows and macOS.");
+        });
+        if let Some(path) = self.formula_raw_path.clone() {
+            let label = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("raw WRF file");
+            let mut clear = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(label).small().weak())
+                    .on_hover_text(path.display().to_string());
+                clear = ui.small_button("Clear raw source").clicked();
+            });
+            if clear {
+                self.formula_raw_path = None;
+                if self.formula_lab.source_kind() == FormulaSourceKind::RawWrf {
+                    self.formula_lab.set_source_kind(FormulaSourceKind::Store);
+                }
+            }
+        }
         // GDEX online catalog (works on every platform — an in-app tree, no
         // native file dialog). Opens the browser window rendered in `ui`.
         ui.horizontal_wrapped(|ui| {
@@ -1459,7 +1691,8 @@ impl ModelDataDock {
                  plots/<model>/<run>/<field>/f###.png, with an index.json per run.",
             );
             let selected = self.browser.selected().cloned();
-            let can_plot = selected.is_some() && self.plot_job.is_none();
+            let can_plot =
+                selected.is_some() && self.plot_job.is_none() && !self.formula_lab.busy();
             let hover = match &selected {
                 Some(hour) => format!(
                     "Render every field of {}/{} (all hours) to PNG now.",
@@ -1505,7 +1738,7 @@ impl ModelDataDock {
     /// matching the rest of the app's local-file UI).
     #[cfg(any(windows, target_os = "macos"))]
     fn import_pickers(&mut self, ui: &mut egui::Ui) {
-        let busy = self.import_job.is_some();
+        let busy = self.import_job.is_some() || self.formula_lab.busy();
         ui.horizontal_wrapped(|ui| {
             // Single-file import — the common case; no need to point at a whole
             // folder / batch. `spawn_import_paths` already takes a path list, so
@@ -1694,7 +1927,11 @@ impl ModelDataDock {
     /// 1-to-hundreds of wrfouts take the identical safe path.
     #[cfg(any(windows, target_os = "macos"))]
     fn gate_or_launch_heavy_import(&mut self, files: Vec<PathBuf>) {
-        if files.is_empty() {
+        self.stage_formula_raw_from_files(&files);
+        if self.formula_lab.busy() {
+            self.import_message =
+                Some("WRF processing cannot start while Formula Lab is evaluating".to_owned());
+        } else if files.is_empty() {
             self.import_message = Some("No supported wrfout files selected".to_string());
         } else if let Some(warning) = heavy_import_size_warning(&files) {
             self.import_message = None;
@@ -1711,6 +1948,11 @@ impl ModelDataDock {
         files: Vec<PathBuf>,
         options: crate::wrf_process::WrfProcessOptions,
     ) {
+        if self.formula_lab.busy() {
+            self.import_message =
+                Some("WRF processing cannot start while Formula Lab is evaluating".to_owned());
+            return;
+        }
         let count = files.len();
         let task = crate::wrf_process::spawn_process_paths(files, self.store_root.clone(), options);
         self.import_message = Some(format!("Processing {count} WRF file(s)…"));
@@ -1721,7 +1963,11 @@ impl ModelDataDock {
     /// behind [`Self::light_import_warning_ui`], launch small ones directly.
     #[cfg(any(windows, target_os = "macos"))]
     fn gate_or_launch_light_import(&mut self, files: Vec<PathBuf>) {
-        if let Some(warning) = light_import_size_warning(&files) {
+        self.stage_formula_raw_from_files(&files);
+        if self.formula_lab.busy() {
+            self.import_message =
+                Some("Model import cannot start while Formula Lab is evaluating".to_owned());
+        } else if let Some(warning) = light_import_size_warning(&files) {
             self.import_message = None;
             self.pending_light_import = Some(PendingLightImport { files, warning });
         } else {
@@ -1732,6 +1978,11 @@ impl ModelDataDock {
     /// Spawn the light import job (after any size gate).
     #[cfg(any(windows, target_os = "macos"))]
     fn launch_light_import(&mut self, files: Vec<PathBuf>) {
+        if self.formula_lab.busy() {
+            self.import_message =
+                Some("Model import cannot start while Formula Lab is evaluating".to_owned());
+            return;
+        }
         let message = if let [file] = files.as_slice() {
             let name = file
                 .file_name()
@@ -1753,6 +2004,12 @@ impl ModelDataDock {
         files: Vec<PathBuf>,
         config: crate::wrf_radar::SyntheticRadarConfig,
     ) {
+        self.stage_formula_raw_from_files(&files);
+        if self.formula_lab.busy() {
+            self.import_message =
+                Some("Synthetic radar cannot start while Formula Lab is evaluating".to_owned());
+            return;
+        }
         let count = files.len();
         let task = crate::wrf_radar::spawn_synthetic_radar(files, config);
         self.import_message = Some(if count == 1 {
@@ -1927,7 +2184,7 @@ impl ModelDataDock {
     /// saves.
     #[cfg(any(windows, target_os = "macos"))]
     fn synthetic_radar_site_panel(&mut self, ui: &mut egui::Ui) {
-        let busy = self.import_job.is_some();
+        let busy = self.import_job.is_some() || self.formula_lab.busy();
         let state = &mut self.synth_radar;
         egui::CollapsingHeader::new("📡 Virtual radar site & range")
             .id_salt("wrf_synth_radar_site")
@@ -2230,7 +2487,7 @@ impl ModelDataDock {
     /// `persist_wrf_process_options` (app side) saves.
     #[cfg(any(windows, target_os = "macos"))]
     fn wrf_options_panel(&mut self, ui: &mut egui::Ui) {
-        let busy = self.import_job.is_some();
+        let busy = self.import_job.is_some() || self.formula_lab.busy();
         let opts = &mut self.wrf_options;
         egui::CollapsingHeader::new("🛠 WRF full-diagnostics fields")
             .id_salt("wrf_full_diag_fields")
@@ -2605,12 +2862,20 @@ impl ModelDataDock {
             }
             match self.viewer.ui(ui) {
                 Some(FieldViewerEvent::VarSelected(var)) => {
-                    self.viewer.set_loading(&var);
-                    if let Some(field) = self.viewer.wanted_field() {
-                        // The viewer selects by display label; real store
-                        // vars load through the worker, synthesized iso
-                        // levels through the plane loader.
-                        self.request_field_load(field);
+                    if self.viewer.restore_generated_field(&var) {
+                        self.latest_field = self
+                            .viewer
+                            .current_field()
+                            .cloned()
+                            .map(std::sync::Arc::new);
+                    } else {
+                        self.viewer.set_loading(&var);
+                        if let Some(field) = self.viewer.wanted_field() {
+                            // The viewer selects by display label; real store
+                            // vars load through the worker, synthesized iso
+                            // levels through the plane loader.
+                            self.request_field_load(field);
+                        }
                     }
                 }
                 Some(FieldViewerEvent::PointClicked { fx, fy }) => {
@@ -2717,6 +2982,16 @@ impl ModelDataDock {
             self.gdex.ui(ui, &cache_dir);
         }
     }
+}
+
+/// An integer is losslessly representable by binary64 when, after removing
+/// trailing zero bits, its significant part fits the 53-bit significand.
+fn lead_seconds_exact_in_f64(seconds: u64) -> bool {
+    if seconds == 0 {
+        return true;
+    }
+    let significant_bits = u64::BITS - seconds.leading_zeros() - seconds.trailing_zeros();
+    significant_bits <= f64::MANTISSA_DIGITS
 }
 
 /// Max forecast horizon (hours past init) a stored run can plausibly
@@ -3528,6 +3803,135 @@ mod tests {
             }],
             warnings: Vec::new(),
         }
+    }
+
+    fn exact_formula_tree(times: &[(u16, rw_store::RwsExactTime)]) -> StoreTree {
+        StoreTree {
+            models: vec![rw_ui::ModelEntry {
+                model: "wrf".to_owned(),
+                runs: vec![rw_ui::RunEntry {
+                    run: "research".to_owned(),
+                    build: "test".to_owned(),
+                    writer_version: "test".to_owned(),
+                    nx: 2,
+                    ny: 2,
+                    exact_time_axis: true,
+                    hours: times
+                        .iter()
+                        .map(|&(slot, exact_time)| rw_ui::HourEntry {
+                            hour: slot,
+                            file: format!("f{slot:03}.rws"),
+                            variable_count: 1,
+                            written_unix: 0,
+                            exact_time: Some(exact_time),
+                        })
+                        .collect(),
+                }],
+            }],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn formula_source_verifies_complete_exact_axis_and_fails_dt_closed() {
+        let first = rw_store::RwsExactTime::new(31_680, 134_243_280);
+        let second = rw_store::RwsExactTime::new(33_480, 134_245_080);
+        let ctx = egui::Context::default();
+        let mut dock =
+            ModelDataDock::new_for_test(&ctx, exact_formula_tree(&[(0, first), (1, second)]));
+        dock.browser.select(HourKey {
+            model: "wrf".to_owned(),
+            run: "research".to_owned(),
+            hour: 0,
+            exact_time: Some(first),
+        });
+        let source = dock.formula_store_source().expect("selected store source");
+        assert!(source.temporal_axis_verified);
+        assert_eq!(source.exact_times.len(), 2);
+        assert_eq!(source.exact_times[&0].seconds, 31_680.0);
+        assert!(
+            source.exact_times[&0]
+                .label
+                .as_deref()
+                .is_some_and(|label| label.contains("+08:48:00"))
+        );
+
+        // A stale selected time keeps pointwise store formulas available but
+        // supplies no host approval for AdjacentTimes/dt.
+        dock.browser.select(HourKey {
+            model: "wrf".to_owned(),
+            run: "research".to_owned(),
+            hour: 0,
+            exact_time: Some(second),
+        });
+        let stale = dock
+            .formula_store_source()
+            .expect("pointwise source remains");
+        assert!(!stale.temporal_axis_verified);
+        assert!(stale.exact_times.is_empty());
+
+        let huge = rw_store::RwsExactTime::new(u64::MAX, 0);
+        dock.tree = Some(exact_formula_tree(&[(0, huge)]));
+        dock.browser.select(HourKey {
+            model: "wrf".to_owned(),
+            run: "research".to_owned(),
+            hour: 0,
+            exact_time: Some(huge),
+        });
+        let unrepresentable = dock
+            .formula_store_source()
+            .expect("pointwise source remains");
+        assert!(!unrepresentable.temporal_axis_verified);
+        assert!(unrepresentable.exact_times.is_empty());
+        assert!(lead_seconds_exact_in_f64(1_u64 << 63));
+        assert!(!lead_seconds_exact_in_f64(u64::MAX));
+    }
+
+    #[test]
+    fn formula_raw_source_accepts_extensionless_non_d01_wrfout() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+        let path = PathBuf::from("wrfout_d37_2026-07-10_20:00:00");
+        dock.formula_raw_path = Some(path.clone());
+        let source = dock.formula_raw_source().expect("staged raw WRF source");
+        assert_eq!(source.path, path);
+        assert_eq!(source.display_hour.run, "wrfout_d37_2026-07-10_20:00:00");
+    }
+
+    #[test]
+    fn formula_result_installs_auto_style_and_becomes_native_plot_source() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+        let hour = HourKey {
+            model: "wrf".to_owned(),
+            run: "research".to_owned(),
+            hour: 0,
+            exact_time: None,
+        };
+        dock.install_formula_field(
+            rw_ui::FieldData {
+                key: rw_ui::FieldKey {
+                    hour,
+                    var: "custom_diagnostic".to_owned(),
+                },
+                units: "m/s".to_owned(),
+                nx: 3,
+                ny: 1,
+                values: vec![-4.0, 2.0, 1_000.0],
+                range: Some((-4.0, 1_000.0)),
+                grid: None,
+                lat_descending: false,
+                style: None,
+            },
+            false,
+        );
+        assert_eq!(dock.native_plot_content, NativePlotContent::Model);
+        let installed = dock.latest_field().expect("external Formula field");
+        let style = installed.style.as_ref().expect("automatic Formula style");
+        assert!(style.title.contains("auto, full finite range"));
+        let scale = style.scale.resolved_discrete();
+        assert_eq!(scale.levels.first(), Some(&-4.0));
+        assert_eq!(scale.levels.last(), Some(&1_000.0));
     }
 
     #[test]
