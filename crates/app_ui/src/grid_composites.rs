@@ -665,6 +665,30 @@ mod tests {
         );
     }
 
+    /// End-to-end live proof through BowEcho's production path: current IMGW
+    /// listing, HDF5 download, native ODIM Cartesian decode, geometry
+    /// validation, lat/lon conversion, and final model-layer FieldData.
+    #[test]
+    #[ignore = "network: downloads and decodes the latest IMGW RAM KDP CMAX grid"]
+    fn live_imgw_ram_kdp_builds_a_plot_ready_field() {
+        let source =
+            GridCompositeSource::imgw_polrad(ImgwPolradSite::Ramza, ImgwPolradQuantity::Kdp);
+        let fetch = load_latest_field(source).expect("live IMGW RAM KDP field");
+
+        assert_eq!(fetch.field.key.var, "imgw_polrad_cmax_ram_kdp");
+        assert!(fetch.valid_time.is_some(), "ODIM start time is preserved");
+        assert!(fetch.field.nx > 0 && fetch.field.ny > 0);
+        assert_eq!(fetch.field.values.len(), fetch.field.nx * fetch.field.ny);
+        assert!(
+            fetch.field.grid.is_some(),
+            "projected grid has lat/lon mesh"
+        );
+        assert!(
+            fetch.field.range.is_some(),
+            "live KDP grid has finite values"
+        );
+    }
+
     #[test]
     fn spherical_aeqd_inverse_preserves_center_and_cardinal_directions() {
         let radius = PROJ_SPHERE_RADIUS_M;
