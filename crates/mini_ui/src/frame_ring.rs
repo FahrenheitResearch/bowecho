@@ -115,7 +115,7 @@ impl FrameRing {
             None => {
                 self.frames.push(frame);
                 // Stable sort: equal times keep install order.
-                self.frames.sort_by(|a, b| a.time.cmp(&b.time));
+                self.frames.sort_by_key(|frame| frame.time);
             }
         }
 

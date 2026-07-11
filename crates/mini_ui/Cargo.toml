@@ -36,7 +36,7 @@ ui_core = { path = "../ui_core" }
 eframe = { workspace = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-eframe = { version = "0.34.3", default-features = false, features = ["wgpu", "wayland"] }
+eframe = { version = "0.34.3", default-features = false, features = ["wgpu"] }
 
 [dev-dependencies]
 # B3: the shared slots' `inject_for_test` is visible to this crate's tests.
