@@ -22,7 +22,7 @@ use crate::{
     GLM_LIVE_MAX_AGE_MINUTES, ItalyDpcMapProduct, LayerRowGear, LayerRowOpacity, LayerRowOrder,
     LayerRowRemove, LayerRowSpec, LayerRowVis, PlacefileSlot, RadarSite, SidebarTab, ViewerApp,
     compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
-    custom_poll_links_from_gis, dock, format_site_label, glm_latest_age_minutes,
+    custom_poll_links_from_gis, dock, eumetsat, format_site_label, glm_latest_age_minutes,
     glm_latest_is_live, glm_satellite_label, grid_composites, intl_provider_label, layer_row,
     mesoanalysis, normalized_poll_url, oa_derived, panel_kit, parse_custom_poll_marker_inputs,
     poll_url_name, poll_urls_match, spc_layers,
@@ -658,16 +658,24 @@ impl ViewerApp {
         }
         let mut remove_sat_layer = false;
         let mut open_sat_window = false;
+        let sat_layer_source = self.sat_layer.as_ref().map(|layer| match layer.key.model.as_str() {
+            "mtg_i1" => ("Meteosat", "Meteosat-12 / EUMETSAT satellite frame"),
+            "h8" | "h9" => ("Himawari", "Himawari AHI satellite frame"),
+            "simsat" => ("SimSat", "Simulated satellite frame"),
+            _ => ("GOES", "GOES ABI satellite frame"),
+        });
         if let Some(layer) = &mut self.sat_layer
             && layer_row(
                 ui,
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
                         value: &mut layer.visible,
-                        hover: "Show GOES on map",
+                        hover: "Show satellite imagery on map",
                     },
-                    name: "GOES",
-                    name_hover: "GOES satellite frame (configure in the Sat window)",
+                    name: sat_layer_source.map(|source| source.0).unwrap_or("Satellite"),
+                    name_hover: sat_layer_source
+                        .map(|source| source.1)
+                        .unwrap_or("Satellite frame"),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.1,
@@ -1026,6 +1034,7 @@ impl ViewerApp {
             };
             let show_glm_line = self.glm_enabled;
             let mut refresh_glm = false;
+            let mut open_mtg_lightning = false;
             let mut next_window_min = glm_window_min;
             let mut glm_style_changed = false;
             let row_changed = layer_row(
@@ -1036,7 +1045,7 @@ impl ViewerApp {
                         hover: "GOES GLM flashes, free via AWS (no key): trailing Show last window, age-faded, time-synced to the radar loop. Live/stale health uses the newest-flash gate.",
                     },
                     name: "Lightning",
-                    name_hover: "GOES GLM lightning flashes. The row label toggles the layer too. Europe/Japan require a separate MTG/Himawari lightning path and are not shown by this layer.",
+                    name_hover: "GOES GLM point flashes. The gear also opens a Meteosat Lightning Imager accumulated-flash-area loop for Europe/Africa. Himawari has no onboard lightning mapper.",
                     state: glm_state,
                     count: show_glm_line.then_some(glm_line.as_str()),
                     gear: Some(LayerRowGear::Menu {
@@ -1052,7 +1061,13 @@ impl ViewerApp {
                             ui.weak(
                                 "Loaded loops read the loop time span from the rolling GLM store.",
                             );
-                            ui.weak("MTG Lightning Imager is not enabled here yet.");
+                            ui.weak(
+                                "Meteosat LI is a five-minute accumulated-flash-area raster, not individual point flashes.",
+                            );
+                            if ui.button("Meteosat LI · 1-hour loop").clicked() {
+                                open_mtg_lightning = true;
+                                ui.close();
+                            }
                             ui.separator();
                             ui.horizontal(|ui| {
                                 ui.label("Show last");
@@ -1083,6 +1098,11 @@ impl ViewerApp {
             );
             if refresh_glm {
                 self.refresh_glm_data(ctx);
+                ctx.request_repaint();
+            }
+            if open_mtg_lightning {
+                self.show_satellite = true;
+                self.queue_meteosat_product(ctx, eumetsat::MtgProduct::LightningAfa, 12);
                 ctx.request_repaint();
             }
             if glm_style_changed {
@@ -2594,9 +2614,9 @@ impl ViewerApp {
                         ui.close();
                     }
                     if ui
-                        .button("Satellite (GOES)…")
+                        .button("Satellite…")
                         .on_hover_text(
-                            "Open the Satellite window: configure the follow, then \"Show on radar map\"",
+                            "Open the GOES, Himawari, Meteosat, and saved-loop Satellite window",
                         )
                         .clicked()
                     {

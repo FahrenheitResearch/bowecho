@@ -659,9 +659,9 @@ fn sub_lon_arc_deg(sub_lon_deg: f64, lat_deg: f64, lon_deg: f64) -> f64 {
 /// raw longitude distance where the disks overlap), then every satellite
 /// by increasing arc, taking the first whose disk can actually see the
 /// window ([`sat_window::window_visible_from_sub_lon`], the same gate the
-/// persisted native window uses). `None` when nothing in-app covers the
-/// storm — Meteosat's longitudes, hidden until EUMETSAT access is
-/// reliable.
+/// persisted native window uses). `None` when no one-press storm-card adapter
+/// covers the storm. Public Meteosat imagery remains available in the
+/// Satellite window; this picker does not dispatch that provider yet.
 fn covering_geo_satellite(basin: Basin, window: &SatNativeWindow) -> Option<TcGeoSat> {
     let clamped = window.clamped();
     let preferred = match basin {
@@ -731,8 +731,8 @@ fn plan_tc_sat_view(
     .clamped();
     let Some(sat) = covering_geo_satellite(basin, &window) else {
         return Err(
-            "no in-app geostationary satellite covers this storm (Meteosat/MTG is \
-             temporarily unavailable)"
+            "no one-press storm-card satellite route covers this storm (Meteosat-12 remains \
+             available in the Satellite window)"
                 .to_string(),
         );
     };
@@ -1440,8 +1440,8 @@ mod tests {
 
     /// One-press satellite selection: basin rules first (WPac → Himawari,
     /// EPac/CPac → GOES-West, Atlantic → GOES-East), nearest-visible disk
-    /// for basins without a rule, and an honest `None` where no in-app
-    /// satellite can see the storm (Meteosat's slot is not in the app).
+    /// for basins without a rule, and an honest `None` where the one-press
+    /// card has no adapter (Meteosat is available separately in Satellite).
     #[test]
     fn tc_sat_selection_covers_basins_and_dateline() {
         // Bavi-class WPac storm.
@@ -1483,7 +1483,7 @@ mod tests {
             covering_geo_satellite(Basin::NorthIndian, &tc_window(15.0, 90.0)),
             Some(TcGeoSat::Himawari)
         );
-        // Arabian Sea / Meteosat territory: nothing in-app covers it.
+        // Arabian Sea / Meteosat territory: no storm-card adapter covers it.
         assert_eq!(
             covering_geo_satellite(Basin::NorthIndian, &tc_window(15.0, 55.0)),
             None
@@ -1577,7 +1577,7 @@ mod tests {
         // Uncovered storm: an explicit, honest error (never a silent no-op).
         let err = plan_tc_sat_view(TcSatProduct::Ir, Basin::NorthIndian, 15.0, 55.0, 11)
             .expect_err("Arabian Sea west is out of every in-app disk");
-        assert!(err.contains("Meteosat"), "{err}");
+        assert!(err.contains("Meteosat-12 remains available"), "{err}");
     }
 
     /// Tickets are monotonic and start above the initial inflight-free

@@ -41,6 +41,7 @@ use rw_sat::himawari::{
     HimawariValueMode, assemble_hsd_segments, inspect_hsd_file, is_complete_segment_set,
     list_latest_segments, parse_segment_name, stage_download_manifest,
 };
+use rw_sat::mtg::{EumetsatCredentials, request_access_token};
 use rw_sat::palette::{anchor_color, band_anchors};
 use rw_sat::s3::{
     S3Object, Sector, abi_filename_product_matches_request, band_hour_prefix, bucket_for_satellite,
@@ -111,6 +112,66 @@ pub enum SatRequest {
     /// Native-window GOES IR ingest (tropical-card "🛰 IR"): window-cropped
     /// CMI BT baked through the current IR enhancement into a `_rgb_` frame.
     IngestLatestGoesIrWindow(GoesIrWindowSpec),
+    /// Verify an EUMETSAT Data Store consumer key/secret by minting a
+    /// short-lived token. The request's Debug implementation redacts both
+    /// credential fields, and the token is discarded inside the worker.
+    CheckEumetsatAccount(EumetsatAuthSpec),
+    /// Read/save/delete the credential pair through the native OS vault.
+    /// These run on the satellite worker so Secret Service/Keychain access
+    /// never stalls egui's paint thread.
+    LoadEumetsatCredentials,
+    SaveEumetsatCredentials(EumetsatAuthSpec),
+    ForgetEumetsatCredentials,
+    /// Fetch one or more explicit-time public MTG frames from EUMETView WMS,
+    /// store them as a loop, and select the newest successful frame.
+    IngestMeteosatWms(MeteosatWmsSpec),
+}
+
+/// Secret-bearing input for an EUMETSAT account check. Keep this out of
+/// `AppSettings` and make accidental request logging harmless.
+#[derive(Clone)]
+pub struct EumetsatAuthSpec {
+    pub consumer_key: String,
+    pub consumer_secret: String,
+}
+
+impl std::fmt::Debug for EumetsatAuthSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EumetsatAuthSpec")
+            .field("consumer_key", &"[redacted]")
+            .field("consumer_secret", &"[redacted]")
+            .finish()
+    }
+}
+
+impl EumetsatAuthSpec {
+    fn credentials(&self) -> Result<EumetsatCredentials, String> {
+        let key = self.consumer_key.trim();
+        let secret = self.consumer_secret.trim();
+        if key.is_empty() || secret.is_empty() {
+            return Err("Enter both the EUMETSAT consumer key and consumer secret".to_owned());
+        }
+        Ok(EumetsatCredentials::new(key, secret))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MeteosatWmsSpec {
+    pub product: String,
+    pub frame_count: usize,
+    pub window: Option<SatNativeWindow>,
+    pub max_image_edge: u32,
+}
+
+impl Default for MeteosatWmsSpec {
+    fn default() -> Self {
+        Self {
+            product: crate::eumetsat::MtgProduct::GeoColour.slug().to_owned(),
+            frame_count: 1,
+            window: None,
+            max_image_edge: 1_600,
+        }
+    }
 }
 
 /// Himawari AHI visible RGB-composite recipe. Unlike GOES ABI (which lacks a
@@ -411,6 +472,13 @@ pub enum SatResponse {
         result: Box<Result<SatellitePlotSource, String>>,
     },
     SpecStatus(Result<String, String>),
+    /// Result of the explicit credential check. No token or credential data
+    /// crosses back to the UI thread.
+    EumetsatAccount(Result<String, String>),
+    /// Vault load returns the redacting request wrapper so `SatResponse` can
+    /// remain Debug without exposing the recovered values.
+    EumetsatCredentialsLoaded(Result<Option<EumetsatAuthSpec>, String>),
+    EumetsatCredentialsSaved(Result<String, String>),
     Runs(Vec<SatRunListing>),
     FollowStarted,
     /// The session ended: `Ok` = clean stop, `Err` = failure.
@@ -814,6 +882,12 @@ fn run_title(model: &str, run: &str) -> String {
         let day = run_day(run)
             .map(|day| day.format("%Y-%m-%d").to_string())
             .unwrap_or_default();
+        for product in crate::eumetsat::MtgProduct::ALL {
+            let marker = format!("_rgb_wms_{}_", product.slug());
+            if run.contains(&marker) {
+                return format!("Meteosat-12 · {} · {day}", product.label());
+            }
+        }
         for style in GoesAbiRgbCompositeStyle::ALL {
             let marker = format!("_rgb_{}_", style.slug());
             if let Some(pos) = run.find(&marker) {
@@ -1013,7 +1087,7 @@ fn scan_runs(store_root: &Path) -> Vec<SatRunListing> {
         for run in &model.runs {
             let frames = run.hours.iter().map(|hour| hour.hour).collect::<Vec<_>>();
             let mut title = run_title(&model.model, &run.run);
-            if model.model == "simsat" && frames.len() > 1 {
+            if matches!(model.model.as_str(), "simsat" | "mtg_i1") && frames.len() > 1 {
                 title.push_str(&format!(" · {} frames", frames.len()));
             }
             listings.push(SatRunListing {
@@ -1161,7 +1235,11 @@ fn load_frame_for_plot(
     let grid = load_frame_grid(state, &run_dir, &meta.grid_hash, nx, ny)?;
     let title = format!("{} · {hhmm:04}Z", run_title(&key.model, &key.run));
     let subtitle_left = format!("{}/{}", key.model, key.run);
-    let subtitle_right = format!("{} · {hhmm:04}Z", key.model.to_ascii_uppercase());
+    let subtitle_right = if key.model == "mtg_i1" {
+        format!("EUMETSAT · {hhmm:04}Z")
+    } else {
+        format!("{} · {hhmm:04}Z", key.model.to_ascii_uppercase())
+    };
 
     // Derived SimSat frames retain their raw physical field in the store.
     // Prefer it over any display representation so Native plot keeps exact
@@ -4765,6 +4843,179 @@ fn write_goes_rgb_frame(
     })
 }
 
+fn meteosat_window_bounds(
+    window: SatNativeWindow,
+    coverage: crate::eumetsat::WmsBounds,
+) -> Result<crate::eumetsat::WmsBounds, String> {
+    let window = window.clamped();
+    let half_lat_deg = (window.size_km / (2.0 * 111.32)).max(0.05);
+    let cos_lat = window.center_lat_deg.to_radians().cos().abs().max(0.15);
+    let half_lon_deg = (window.size_km / (2.0 * 111.32 * cos_lat)).max(0.05);
+    let bounds = crate::eumetsat::WmsBounds {
+        west_deg: (window.center_lon_deg - half_lon_deg).max(coverage.west_deg),
+        south_deg: (window.center_lat_deg - half_lat_deg).max(coverage.south_deg),
+        east_deg: (window.center_lon_deg + half_lon_deg).min(coverage.east_deg),
+        north_deg: (window.center_lat_deg + half_lat_deg).min(coverage.north_deg),
+    };
+    bounds.validate().map_err(|_| {
+        format!(
+            "Meteosat focused window {} lies outside the advertised MTG view",
+            window.run_slug()
+        )
+    })
+}
+
+fn ingest_meteosat_wms(
+    store_root: &Path,
+    spec: &MeteosatWmsSpec,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let product = crate::eumetsat::MtgProduct::parse(&spec.product)
+        .ok_or_else(|| format!("unknown Meteosat product '{}'", spec.product))?;
+    let client = crate::eumetsat::EumetViewClient::new()?;
+    let capabilities = client.capabilities()?;
+    let layer = capabilities
+        .into_iter()
+        .find(|layer| layer.product == product)
+        .ok_or_else(|| {
+            format!(
+                "EUMETView does not currently advertise {} ({})",
+                product.label(),
+                product.layer()
+            )
+        })?;
+    let bounds = match spec.window {
+        Some(window) => meteosat_window_bounds(window, layer.bounds)?,
+        None => layer.bounds,
+    };
+    let (width, height) =
+        crate::eumetsat::image_size_for_bounds(bounds, spec.max_image_edge.clamp(512, 2_048));
+    let times = layer.recent_times(spec.frame_count.clamp(1, 36));
+    if times.is_empty() {
+        return Err(format!("EUMETView returned no times for {}", product.label()));
+    }
+
+    let sector = spec
+        .window
+        .map(|window| window.clamped().run_slug())
+        .unwrap_or_else(|| "fulldisk".to_owned());
+    let store_bounds = crate::sat_rgb_store::LonLatBounds {
+        west_deg: bounds.west_deg,
+        south_deg: bounds.south_deg,
+        east_deg: bounds.east_deg,
+        north_deg: bounds.north_deg,
+    };
+    let mut newest = None;
+    let mut failures = 0usize;
+    let total = times.len();
+    for (index, time) in times.into_iter().enumerate() {
+        send(SatResponse::Note(format!(
+            "Meteosat {}: fetching frame {}/{} · {}",
+            product.label(),
+            index + 1,
+            total,
+            time.format("%H:%MZ")
+        )));
+        let request = crate::eumetsat::GetMapRequest {
+            product,
+            time,
+            bounds,
+            width,
+            height,
+        };
+        let image = match client.fetch_map(&request) {
+            Ok(image) => image,
+            Err(error) => {
+                failures += 1;
+                send(SatResponse::Note(format!(
+                    "Meteosat {} {} skipped: {error}",
+                    product.label(),
+                    time.format("%H:%MZ")
+                )));
+                continue;
+            }
+        };
+        let scan_end = time + chrono::Duration::minutes(layer.cadence_minutes.max(1));
+        let metadata = crate::sat_rgb_store::RgbSatelliteMetadata {
+            source_id: "mtg_fd".to_owned(),
+            provider: "eumetsat".to_owned(),
+            instrument: if product == crate::eumetsat::MtgProduct::LightningAfa {
+                "li".to_owned()
+            } else {
+                "fci".to_owned()
+            },
+            satellite: "Meteosat-12 / MTG-I1".to_owned(),
+            model: "mtg-i1".to_owned(),
+            product_id: product.slug().to_owned(),
+            product_title: product.label().to_owned(),
+            sector: sector.clone(),
+            scan_start_utc: time,
+            scan_end_utc: scan_end,
+            extra_metadata: serde_json::json!({
+                "service": "EUMETView",
+                "wms_layer": product.layer(),
+                "cadence_minutes": layer.cadence_minutes,
+                "attribution": format!("Contains modified EUMETSAT Meteosat data {}.", time.format("%Y")),
+                "lightning_semantics": if product == crate::eumetsat::MtgProduct::LightningAfa {
+                    "five-minute accumulated flash area raster; not individual flash points"
+                } else {
+                    ""
+                },
+            }),
+        };
+        let frame = crate::sat_rgb_store::write_regular_lonlat_rgb_frame(
+            store_root,
+            crate::sat_rgb_store::RegularLonLatRgb {
+                width: image.width,
+                height: image.height,
+                bounds: store_bounds,
+                rgb: &image.rgb,
+                alpha: Some(&image.alpha),
+            },
+            &metadata,
+            Utc::now().timestamp().max(0) as u64,
+        )?;
+        send(SatResponse::FrameWritten {
+            id: format!("{}@{}", product.layer(), time.to_rfc3339()),
+            run: frame.run.clone(),
+            hhmm: frame.hhmm,
+            bytes: frame.bytes,
+            encode_ms: frame.encode_ms,
+        });
+        newest = Some(frame);
+    }
+
+    let frame = newest.ok_or_else(|| {
+        format!(
+            "Meteosat {}: all {total} requested EUMETView frame(s) failed",
+            product.label()
+        )
+    })?;
+    send(SatResponse::Runs(scan_runs(store_root)));
+    send(SatResponse::SelectFrame {
+        key: SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        },
+        hhmm: frame.hhmm,
+    });
+    Ok(format!(
+        "Meteosat-12 {}: loaded {} of {total} frame(s) at {}x{} into {}/{}, newest {:04}Z{}",
+        product.label(),
+        total - failures,
+        width,
+        height,
+        frame.model,
+        frame.run,
+        frame.hhmm,
+        if failures > 0 {
+            format!(" · {failures} skipped")
+        } else {
+            String::new()
+        }
+    ))
+}
+
 fn worker_loop(
     store_root: PathBuf,
     requests: &Receiver<SatRequest>,
@@ -4844,6 +5095,82 @@ fn worker_loop(
             }
             SatRequest::SetIrEnhancement(enhancement) => {
                 state.ir_enhancement = enhancement;
+            }
+            SatRequest::CheckEumetsatAccount(spec) => {
+                let result = spec.credentials().and_then(|credentials| {
+                    let agent = build_agent();
+                    request_access_token(&agent, &credentials, 3600)
+                        .map(|token| {
+                            format!(
+                                "EUMETSAT account connected; access token valid for {} minutes",
+                                (token.expires_in / 60).max(1)
+                            )
+                        })
+                        .map_err(|err| format!("EUMETSAT account check failed: {err}"))
+                });
+                if !send(SatResponse::EumetsatAccount(result)) {
+                    return;
+                }
+            }
+            SatRequest::LoadEumetsatCredentials => {
+                let result = crate::eumetsat_credentials::load_credentials()
+                    .map(|credentials| {
+                        credentials.map(|credentials| EumetsatAuthSpec {
+                            consumer_key: credentials.consumer_key().to_owned(),
+                            consumer_secret: credentials.consumer_secret().to_owned(),
+                        })
+                    })
+                    .map_err(|err| err.to_string());
+                if !send(SatResponse::EumetsatCredentialsLoaded(result)) {
+                    return;
+                }
+            }
+            SatRequest::SaveEumetsatCredentials(spec) => {
+                let result = crate::eumetsat_credentials::EumetsatCredentials::new(
+                    &spec.consumer_key,
+                    &spec.consumer_secret,
+                )
+                .and_then(|credentials| {
+                    crate::eumetsat_credentials::save_credentials(&credentials)
+                })
+                .map(|()| "EUMETSAT account saved securely on this device".to_owned())
+                .map_err(|err| err.to_string());
+                if !send(SatResponse::EumetsatCredentialsSaved(result)) {
+                    return;
+                }
+            }
+            SatRequest::ForgetEumetsatCredentials => {
+                let result = crate::eumetsat_credentials::delete_credentials()
+                    .map(|deleted| {
+                        if deleted {
+                            "Saved EUMETSAT account removed from this device".to_owned()
+                        } else {
+                            "No saved EUMETSAT account was present".to_owned()
+                        }
+                    })
+                    .map_err(|err| err.to_string());
+                if !send(SatResponse::EumetsatCredentialsSaved(result)) {
+                    return;
+                }
+            }
+            SatRequest::IngestMeteosatWms(spec) => {
+                let scope = spec
+                    .window
+                    .map(|window| format!(" · focused window {}", window.run_slug()))
+                    .unwrap_or_default();
+                send(SatResponse::Note(format!(
+                    "Meteosat: discovering {}{}",
+                    spec.product, scope
+                )));
+                match ingest_meteosat_wms(&store_root, &spec, &send) {
+                    Ok(summary) => {
+                        send(SatResponse::Note(summary));
+                        send(SatResponse::Runs(scan_runs(&store_root)));
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!("Meteosat failed: {message}")));
+                    }
+                }
             }
             SatRequest::IngestLatestHimawari(spec) => {
                 send(SatResponse::Note(format!(
@@ -5137,6 +5464,65 @@ mod tests {
 
     fn spec() -> SatFollowSpec {
         SatFollowSpec::default()
+    }
+
+    #[test]
+    fn eumetsat_auth_request_debug_is_redacted() {
+        let spec = EumetsatAuthSpec {
+            consumer_key: "consumer-key-must-not-leak".to_owned(),
+            consumer_secret: "consumer-secret-must-not-leak".to_owned(),
+        };
+        let rendered = format!("{spec:?}");
+        assert!(!rendered.contains("consumer-key-must-not-leak"));
+        assert!(!rendered.contains("consumer-secret-must-not-leak"));
+        assert_eq!(rendered.matches("[redacted]").count(), 2);
+    }
+
+    /// Real service -> BowEcho fetch -> PNG decode -> geolocated RGB store ->
+    /// player-color path proof. Explicitly invoked on a build node only.
+    #[test]
+    #[ignore = "live EUMETView end-to-end smoke"]
+    fn live_meteosat_wms_ingest_round_trips_through_bowecho_store() {
+        let store = std::env::temp_dir().join(format!(
+            "bowecho-live-mtg-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        let messages = std::sync::Mutex::new(Vec::new());
+        let send = |response| {
+            messages.lock().expect("messages").push(response);
+            true
+        };
+        let summary = ingest_meteosat_wms(
+            &store,
+            &MeteosatWmsSpec {
+                product: crate::eumetsat::MtgProduct::GeoColour.slug().to_owned(),
+                frame_count: 1,
+                window: None,
+                max_image_edge: 512,
+            },
+            &send,
+        )
+        .expect("live ingest");
+        assert!(summary.contains("Meteosat-12 Geo Colour"));
+        let runs = scan_runs(&store);
+        let run = runs
+            .iter()
+            .find(|run| run.key.model == "mtg_i1")
+            .expect("stored MTG run");
+        assert_eq!(run.frames.len(), 1);
+        let mut state = WorkerState::default();
+        let colored = load_frame(&mut state, &store, &run.key, run.frames[0])
+            .expect("BowEcho player frame");
+        assert_eq!(colored.frame.image.size, [run.nx, run.ny]);
+        assert!(colored
+            .frame
+            .image
+            .pixels
+            .iter()
+            .any(|pixel| pixel.a() > 0));
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     #[test]

@@ -300,6 +300,20 @@ pub struct AppSettings {
     /// sites (app_ui/main.rs).
     #[serde(default = "default_himawari_true_color_scope")]
     pub himawari_true_color_scope: String,
+    /// Control surface selected in the unified Satellite window. This only
+    /// selects provider controls; stored runs remain available in the shared
+    /// player. Known values are `goes`, `himawari`, and `meteosat`.
+    #[serde(default = "default_satellite_source")]
+    pub satellite_source: String,
+    /// EUMETView MTG layer slug selected in the Satellite window. This is a
+    /// non-secret display preference; EUMETSAT credentials live exclusively
+    /// in the platform credential vault.
+    #[serde(default = "default_eumetsat_product")]
+    pub eumetsat_product: String,
+    /// Number of MTG frames requested by the one-shot loop action (ten-minute
+    /// FCI products or five-minute Lightning Imager AFA).
+    #[serde(default = "default_eumetsat_loop_frames")]
+    pub eumetsat_loop_frames: u8,
     /// RAOB launch-site markers (the observed-soundings obs layer) —
     /// default off; clicking a marker fetches that station's sounding at
     /// the displayed radar time.
@@ -808,6 +822,18 @@ fn default_himawari_true_color_scope() -> String {
     "region".to_owned()
 }
 
+fn default_satellite_source() -> String {
+    "goes".to_owned()
+}
+
+fn default_eumetsat_product() -> String {
+    "geo_colour".to_owned()
+}
+
+fn default_eumetsat_loop_frames() -> u8 {
+    12
+}
+
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
 /// integers (microdegrees etc.) so `AppSettings` stays `Eq`-derivable.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -908,6 +934,9 @@ impl Default for AppSettings {
             sat_native_window_lon_e6: default_sat_native_window_lon_e6(),
             sat_native_window_size_km: default_sat_native_window_size_km(),
             himawari_true_color_scope: default_himawari_true_color_scope(),
+            satellite_source: default_satellite_source(),
+            eumetsat_product: default_eumetsat_product(),
+            eumetsat_loop_frames: default_eumetsat_loop_frames(),
             overlay_raob: false,
             show_tropical: true,
             show_tropical_panel: true,
@@ -1846,6 +1875,23 @@ mod tests {
         let back = AppSettings::from_json(&s.to_json());
         assert_eq!(back.himawari_true_color_scope, "fulldisk");
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn satellite_provider_preferences_default_and_round_trip() {
+        let old = AppSettings::from_json("{}");
+        assert_eq!(old.satellite_source, "goes");
+        assert_eq!(old.eumetsat_product, "geo_colour");
+        assert_eq!(old.eumetsat_loop_frames, 12);
+
+        let settings = AppSettings {
+            satellite_source: "meteosat".to_owned(),
+            eumetsat_product: "ir_105_hrfi".to_owned(),
+            eumetsat_loop_frames: 18,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+        assert_eq!(back, settings);
     }
 
     #[test]

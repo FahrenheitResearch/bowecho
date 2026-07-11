@@ -964,10 +964,40 @@ fn satellite(ui: &mut egui::Ui) {
          context. The True color button composes AHI true color (real 0.51 µm green, not a \
          synthesized one) at the scope you pick: the west-Pacific tropics region, or the WHOLE \
          disk at ~4 km or ~2 km effective. GOES adds its own RGB composites (GeoColor, \
-         NaturalColor, …) over the current sector. MTG/European satellite imagery is not \
-         available in this build — it needs EUMETSAT entitlement the app cannot assume. \
-         Switching source, sector, or layer clears stale frames so late downloads from the old \
-         selection cannot flash onto the map.",
+         NaturalColor, …) over the current sector. Switching source, sector, or layer clears \
+         stale frames so late downloads from the old selection cannot flash onto the map.",
+    );
+
+    subhead(ui, "METEOSAT-12 / EUMETVIEW");
+    para(
+        ui,
+        "Choose Meteosat-12 for public, live MTG-I1 imagery rendered by EUMETSAT EUMETView — \
+         no account or API key is required. Load latest fetches the newest image; Load loop \
+         discovers recent service timestamps and fetches the selected number of frames. Normal \
+         imagery is available every 10 minutes and the LI Accumulated Flash Area product every \
+         5 minutes. The product picker includes Geo Colour and True Colour RGB, HRFI IR10.5 and \
+         VIS0.6, Cloud Phase, Cloud Type, Dust, Fire Temperature, Fog / Low Clouds, Snow, and \
+         LI Accumulated Flash Area.",
+    );
+    para(
+        ui,
+        "Each returned Meteosat frame enters the same local satellite store and frame player as \
+         GOES and Himawari. Equal product, geographic grid, and UTC day values join one loop. \
+         Map follows player and Show on radar map work normally, and Native plot opens the \
+         provider-rendered RGB frame on BowEcho's plotting surface for Save PNG. These are \
+         rendered EUMETView images rather than raw FCI radiances, so the local IR enhancement \
+         picker does not recolor them.",
+    );
+
+    subhead(ui, "OPTIONAL EUMETSAT DATA STORE ACCOUNT");
+    para(
+        ui,
+        "The public EUMETView imagery above never needs an account. The separate Data Store \
+         account controls let you check a consumer key and consumer secret, save them in the \
+         operating-system credential vault on this device, or forget them. Account checks mint \
+         a short-lived access token on the satellite worker and do not retain that token. The \
+         key and secret never enter BowEcho's settings file. This optional account connection is \
+         not a raw FCI download path.",
     );
 
     subhead(ui, "IR ENHANCEMENTS");
@@ -991,7 +1021,9 @@ fn satellite(ui: &mut egui::Ui) {
          pixels covering it are fetched and decoded, so a typhoon eye stays crisp and the \
          frames stay small enough to loop. Repeated loads of the same window stack into one \
          loopable run. It works for Himawari (segment-level fetch) and GOES (windowed decode), \
-         and overrides the full-sector/full-disk scope while it is on.",
+         and overrides the full-sector/full-disk scope while it is on. Meteosat EUMETView \
+         products are provider-rendered geographic images and do not use this sensor-native \
+         crop control.",
     );
 
     subhead(ui, "STORM SATELLITE (ONE PRESS)");
@@ -1034,9 +1066,9 @@ fn satellite(ui: &mut egui::Ui) {
         "Native plot sends the current real or simulated satellite frame through the same \
          projected plotting surface used by the Model window. IR and water-vapor plots retain \
          raw Kelvin values and a physical colorbar; derived products retain raw mm/K/optical-depth \
-         values with fixed cross-frame palettes; true-color composites stay RGB and omit a false \
-         scalar legend. Save PNG in that plot window exports the plotted product with its \
-         title, valid time, and map context.",
+         values with fixed cross-frame palettes; true-color composites and provider-rendered \
+         EUMETView products stay RGB and omit a false scalar legend. Save PNG in that plot \
+         window exports the plotted product with its title, valid time, and map context.",
     );
 
     subhead(ui, "SHOW ON RADAR MAP");
@@ -1053,7 +1085,9 @@ fn satellite(ui: &mut egui::Ui) {
         "The Lightning layer is GOES GLM: BowEcho chooses East or West from the map longitude, \
          fetches the newest granules first, age-fades flashes, and reads the rolling store for \
          loaded radar loops. Live means the newest flash is inside the live-age gate; stale \
-         status means the layer is waiting for newer GLM files, not that radar data is broken.",
+         status means the layer is waiting for newer GLM files, not that radar data is broken. \
+         EUMETView's LI Accumulated Flash Area is available as a rendered raster in the \
+         Satellite window; the dedicated point-flash Lightning overlay remains GOES GLM.",
     );
 
     subhead(ui, "BAND PICKS");
@@ -1631,8 +1665,9 @@ fn sources(ui: &mut egui::Ui) {
     para(
         ui,
         "GOES GLM lightning and Himawari-9 IR/WV full-disk frames are also wired from NOAA \
-         open-data buckets. MTG/European satellite imagery is not available in this build \
-         (EUMETSAT entitlement).",
+         open-data buckets. Meteosat-12 / MTG-I1 rendered imagery is provided publicly by \
+         EUMETSAT through EUMETView; public imagery needs no account. An optional EUMETSAT \
+         Data Store consumer account is kept only in the operating-system credential vault.",
     );
 
     subhead(ui, "GDEX CLIMATE MODEL DATA");
@@ -1851,17 +1886,27 @@ mod tests {
         assert!(guide_src.contains("d626000"));
     }
 
-    /// The retired MTG plumbing (v0.29 Phase 5 deletion sweep) must stay
-    /// gone from the copy: the guide may say European imagery is NOT
-    /// available, never that FCI discovery/decode "are wired" (stale
-    /// claims assembled at runtime so this file cannot match itself).
+    /// Restored MTG imagery is the public rendered EUMETView path, not the
+    /// retired whole-product FCI downloader. Keep the no-account imagery,
+    /// secure optional account, common player/map/plot path, and LI raster vs.
+    /// point-overlay distinction explicit together.
     #[test]
-    fn guide_copy_is_honest_about_retired_mtg_plumbing() {
+    fn guide_documents_restored_public_meteosat_integration() {
         let guide_src = include_str!("guide.rs");
-        let stale_wired_claim = ["FCI", "discovery/local decode"].join(" ");
-        assert!(!guide_src.contains(&stale_wired_claim));
-        let stale_decode_claim = ["decode are", "wired"].join(" ");
-        assert!(!guide_src.contains(&stale_decode_claim));
-        assert!(guide_src.contains("not available in this build"));
+        assert!(guide_src.contains("Meteosat-12 / EUMETVIEW"));
+        assert!(guide_src.contains("EUMETSAT EUMETView"));
+        assert!(guide_src.contains("no account or API key is required"));
+        assert!(guide_src.contains("Load latest"));
+        assert!(guide_src.contains("Load loop"));
+        assert!(guide_src.contains("Map follows player"));
+        assert!(guide_src.contains("operating-system credential vault"));
+        assert!(guide_src.contains("not a raw FCI download path"));
+        assert!(guide_src.contains("dedicated point-flash Lightning overlay remains GOES GLM"));
+        let retired_unavailable_claim = [
+            "MTG/European satellite imagery",
+            "is not available in this build",
+        ]
+        .join(" ");
+        assert!(!guide_src.contains(&retired_unavailable_claim));
     }
 }

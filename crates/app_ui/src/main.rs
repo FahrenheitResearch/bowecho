@@ -53,6 +53,8 @@ mod differential_4e;
 mod dock;
 mod event_explorer;
 mod event_loop_builder;
+mod eumetsat;
+mod eumetsat_credentials;
 mod farm_live;
 mod fonts;
 mod formula_lab;
@@ -92,6 +94,7 @@ mod raster_quality;
 mod rhi;
 mod sat_paint;
 mod sat_plot;
+mod sat_rgb_store;
 mod sat_window;
 mod sat_worker;
 mod self_update;
@@ -2922,6 +2925,10 @@ struct ViewerApp {
     /// Embedded SimSat renderer and its dockable setup/progress surface.
     simsat: simsat_ui::SimSatPane,
     show_simsat: bool,
+    /// Provider-specific controls shown above the shared satellite player.
+    /// The selection is persisted, while every provider continues to write
+    /// into the same store/player/map/plot pipeline.
+    satellite_source: sat_paint::SatelliteSource,
     himawari_band: u8,
     /// Selected IR enhancement for Kelvin BT bands (GOES + Himawari),
     /// persisted via `AppSettings::sat_ir_enhancement` and applied by the
@@ -2935,6 +2942,15 @@ struct ViewerApp {
     /// tropics, the historical default), "fulldisk" (~4 km effective) or
     /// "fulldisk2km" (~2 km). The native window, when enabled, wins.
     himawari_true_color_scope: String,
+    /// Selected public EUMETView MTG product and one-shot loop depth.
+    eumetsat_product: String,
+    eumetsat_loop_frames: u8,
+    /// EUMETSAT Data Store account input. These strings are loaded from and
+    /// saved to the platform credential vault only; AppSettings never sees
+    /// them. The access token is minted in the worker and never retained.
+    eumetsat_consumer_key: String,
+    eumetsat_consumer_secret: String,
+    eumetsat_account_status: Option<Result<String, String>>,
     /// Satellite native-resolution window (persisted as
     /// `sat_native_window_*`): when enabled, the true-color composite
     /// ingests fetch/decode only the data covering this center+size box and
@@ -8047,6 +8063,10 @@ impl ViewerApp {
             app_settings.sat_native_window_size_km,
         );
         let restored_himawari_true_color_scope = app_settings.himawari_true_color_scope.clone();
+        let restored_satellite_source =
+            sat_paint::SatelliteSource::parse(&app_settings.satellite_source);
+        let restored_eumetsat_product = app_settings.eumetsat_product.clone();
+        let restored_eumetsat_loop_frames = app_settings.eumetsat_loop_frames.clamp(2, 36);
         let restored_overlays = (
             app_settings.overlay_obs,
             app_settings.overlay_obs_metar,
@@ -8268,10 +8288,16 @@ impl ViewerApp {
             show_satellite: false,
             simsat: simsat_ui::SimSatPane::new(),
             show_simsat: false,
+            satellite_source: restored_satellite_source,
             himawari_band: 13,
             sat_ir_enhancement: restored_sat_ir_enhancement,
             goes_composite_style: "natural_color".to_string(),
             himawari_true_color_scope: restored_himawari_true_color_scope,
+            eumetsat_product: restored_eumetsat_product,
+            eumetsat_loop_frames: restored_eumetsat_loop_frames,
+            eumetsat_consumer_key: String::new(),
+            eumetsat_consumer_secret: String::new(),
+            eumetsat_account_status: None,
             sat_window_enabled: restored_sat_window.0,
             sat_window_lat_deg: restored_sat_window.1,
             sat_window_lon_deg: restored_sat_window.2,
@@ -62659,10 +62685,16 @@ mod tests {
             show_satellite: false,
             simsat: simsat_ui::SimSatPane::new(),
             show_simsat: false,
+            satellite_source: sat_paint::SatelliteSource::Goes,
             himawari_band: 13,
             sat_ir_enhancement: sat_worker::IrEnhancement::default(),
             goes_composite_style: "natural_color".to_string(),
             himawari_true_color_scope: "region".to_string(),
+            eumetsat_product: "geo_colour".to_string(),
+            eumetsat_loop_frames: 12,
+            eumetsat_consumer_key: String::new(),
+            eumetsat_consumer_secret: String::new(),
+            eumetsat_account_status: None,
             sat_window_enabled: false,
             sat_window_lat_deg: 13.5,
             sat_window_lon_deg: 144.8,

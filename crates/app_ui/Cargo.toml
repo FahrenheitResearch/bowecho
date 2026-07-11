@@ -36,6 +36,7 @@ simsat = { git = "https://github.com/FahrenheitResearch/simsat.git", rev = "edd1
 # progress, hashing the streamed bytes for the SHA-256 gate that runs before
 # the Authenticode gate (docs/SIGNING.md).
 reqwest.workspace = true
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 sha2 = "0.10"
 tiff.workspace = true
 

@@ -8,6 +8,45 @@
 
 use crate::*;
 
+/// Provider control surface selected in the unified Satellite window. The
+/// player below remains shared: every provider writes the same geolocated
+/// store contract, so switching controls never discards stored loops.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SatelliteSource {
+    #[default]
+    Goes,
+    Himawari,
+    Meteosat,
+}
+
+impl SatelliteSource {
+    pub(crate) const ALL: [Self; 3] = [Self::Goes, Self::Himawari, Self::Meteosat];
+
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Goes => "goes",
+            Self::Himawari => "himawari",
+            Self::Meteosat => "meteosat",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Goes => "GOES",
+            Self::Himawari => "Himawari-9",
+            Self::Meteosat => "Meteosat-12",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "himawari" | "h9" => Self::Himawari,
+            "meteosat" | "mtg" | "mtg-i1" => Self::Meteosat,
+            _ => Self::Goes,
+        }
+    }
+}
+
 impl ViewerApp {
     /// Satellite window: GOES live-follow plus non-GOES ingest/discovery
     /// actions, all writing into BowEcho's own rolling satellite store.
@@ -67,6 +106,7 @@ impl ViewerApp {
         worker.send(sat_worker::SatRequest::SetIrEnhancement(
             self.sat_ir_enhancement,
         ));
+        worker.send(sat_worker::SatRequest::LoadEumetsatCredentials);
         worker.send(sat_worker::SatRequest::Scan);
         self.sat = Some(worker);
     }
@@ -118,253 +158,393 @@ impl ViewerApp {
         self.mark_app_settings_dirty();
     }
 
-    /// Satellite body (follow config + frame player), window and pane
-    /// alike. Returned events feed `handle_satellite_events`.
-    pub(crate) fn satellite_pane_body(
+    /// Queue public EUMETView imagery through the same player/store/map path
+    /// as GOES and Himawari. Exposed to the Layers > Lightning shortcut too.
+    pub(crate) fn queue_meteosat_product(
         &mut self,
-        ui: &mut egui::Ui,
-    ) -> (Vec<rw_ui::SatelliteEvent>, Vec<rw_ui::SatPlayerEvent>) {
-        let mut panel_events = Vec::new();
-        let mut load_goes_loop = false;
-        egui::CollapsingHeader::new("GOES live follow")
-            .default_open(true)
-            .show(ui, |ui| {
-                panel_events = self.sat_panel.ui(ui);
-                if fixed_action_button(ui, "Load live loop", 110.0)
-                    .on_hover_text(
-                        "One-shot current-hour GOES ingest for the selected satellite/sector/layer, then play it in the frame player.",
-                    )
-                    .clicked()
-                {
-                    load_goes_loop = true;
-                }
-            });
-        if load_goes_loop && let Some(sat) = &self.sat {
-            self.sat_map_follow = true;
-            self.status = "Satellite: loading GOES loop".to_owned();
-            self.sat_panel
-                .apply_note("GOES loop: queued current-hour ingest".to_string());
-            sat.send(sat_worker::SatRequest::LoadLoop(
-                self.sat_panel.spec().clone(),
+        ctx: &egui::Context,
+        product: eumetsat::MtgProduct,
+        frame_count: usize,
+    ) {
+        self.ensure_satellite_worker(ctx);
+        self.satellite_source = SatelliteSource::Meteosat;
+        self.eumetsat_product = product.slug().to_owned();
+        self.app_settings.satellite_source = self.satellite_source.slug().to_owned();
+        self.app_settings.eumetsat_product = self.eumetsat_product.clone();
+        self.mark_app_settings_dirty();
+        let window = self.sat_native_window_if_visible(0.0, "Meteosat-12");
+        let scope = window
+            .map(|window| format!(" · focused {}", window.run_slug()))
+            .unwrap_or_default();
+        self.sat_map_follow = true;
+        self.status = format!(
+            "Satellite: loading Meteosat-12 {} · {} frame{}{}",
+            product.label(),
+            frame_count,
+            if frame_count == 1 { "" } else { "s" },
+            scope
+        );
+        self.sat_panel.apply_note(format!(
+            "Meteosat: queued {} {} frame{}{}",
+            product.label(),
+            frame_count,
+            if frame_count == 1 { "" } else { "s" },
+            scope
+        ));
+        if let Some(sat) = &self.sat {
+            sat.send(sat_worker::SatRequest::IngestMeteosatWms(
+                sat_worker::MeteosatWmsSpec {
+                    product: product.slug().to_owned(),
+                    frame_count: frame_count.clamp(1, 36),
+                    window,
+                    max_image_edge: if window.is_some() { 2_048 } else { 1_600 },
+                },
             ));
         }
-        ui.separator();
+    }
+
+    /// Provider-first control surface. All provider actions feed the shared
+    /// region controls and the player/output section below it.
+    fn satellite_provider_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Vec<rw_ui::SatelliteEvent> {
+        panel_kit::subgroup(ui, "Source & product", |_ui| {});
+        let chips = SatelliteSource::ALL
+            .iter()
+            .map(|source| panel_kit::Chip {
+                label: source.label(),
+                hotkey: None,
+                selected: self.satellite_source == *source,
+                hover: Some(format!("Show {} controls", source.label())),
+            })
+            .collect::<Vec<_>>();
+        if let Some(index) = panel_kit::chip_grid(ui, &chips) {
+            self.satellite_source = SatelliteSource::ALL[index];
+            self.app_settings.satellite_source = self.satellite_source.slug().to_owned();
+            self.mark_app_settings_dirty();
+        }
+
+        let mut panel_events = Vec::new();
+        let mut load_goes_loop = false;
+        let mut load_goes_composite = false;
         let mut load_himawari = false;
         let mut load_himawari_composite = false;
-        const HIMAWARI_IR_BANDS: &[(u8, &str)] = &[
-            (7, "B07 Shortwave IR 3.9"),
-            (8, "B08 Upper WV 6.2"),
-            (9, "B09 Mid WV 6.9"),
-            (10, "B10 Low WV 7.3"),
-            (11, "B11 Cloud-top IR 8.6"),
-            (12, "B12 Ozone 9.6"),
-            (13, "B13 Clean IR 10.4"),
-            (14, "B14 Longwave IR 11.2"),
-            (15, "B15 Dirty IR 12.3"),
-            (16, "B16 CO2 IR 13.3"),
-        ];
-        let selected_himawari_label = HIMAWARI_IR_BANDS
-            .iter()
-            .find(|(band, _)| *band == self.himawari_band)
-            .map(|(_, label)| *label)
-            .unwrap_or("B13 Clean IR 10.4");
-        let mut load_composite = false;
-        let mut sat_window_changed = false;
-        let mut himawari_scope_changed = false;
-        const HIMAWARI_SCOPE_OPTIONS: &[(&str, &str)] = &[
-            ("region", "Region · WPac"),
-            ("fulldisk", "Full disk · 4 km"),
-            ("fulldisk2km", "Full disk · 2 km"),
-        ];
-        let selected_himawari_scope_label = HIMAWARI_SCOPE_OPTIONS
-            .iter()
-            .find(|(slug, _)| *slug == self.himawari_true_color_scope)
-            .map(|(_, label)| *label)
-            .unwrap_or("Region · WPac");
-        let composite_options = sat_worker::goes_composite_style_options();
-        let selected_composite_label = composite_options
-            .iter()
-            .find(|(slug, _)| slug == &self.goes_composite_style)
-            .map(|(_, label)| label.clone())
-            .unwrap_or_else(|| "GeoColor · C01+C02+C03".to_string());
-        egui::CollapsingHeader::new("Other satellite sources")
-            .default_open(true)
-            .show(ui, |ui| {
+        let mut load_meteosat_latest = false;
+        let mut load_meteosat_loop = false;
+        let mut load_meteosat_lightning = false;
+        let mut save_eumetsat = false;
+        let mut test_eumetsat = false;
+        let mut forget_eumetsat = false;
+
+        match self.satellite_source {
+            SatelliteSource::Goes => {
+                panel_kit::subgroup(ui, "GOES live follow", |_ui| {});
+                panel_events = self.sat_panel.ui(ui);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("H9");
-                    egui::ComboBox::from_id_salt("himawari_ir_band")
-                        .selected_text(selected_himawari_label)
-                        .width(150.0)
-                        .show_ui(ui, |ui| {
-                            for &(band, label) in HIMAWARI_IR_BANDS {
-                                ui.selectable_value(&mut self.himawari_band, band, label);
-                            }
-                        });
-                    if fixed_action_button(ui, "Load live", 84.0)
+                    if fixed_action_button(ui, "Load live loop", 110.0)
                         .on_hover_text(
-                            "Download/decode the latest Himawari-9 full-disk frame for the selected IR/WV band, then select it in the player.",
+                            "One-shot current-hour ingest for the selected GOES satellite, sector, and layer.",
                         )
                         .clicked()
                     {
+                        load_goes_loop = true;
+                    }
+                    let options = sat_worker::goes_composite_style_options();
+                    let selected = options
+                        .iter()
+                        .find(|(slug, _)| slug == &self.goes_composite_style)
+                        .map(|(_, label)| label.as_str())
+                        .unwrap_or("GeoColor · C01+C02+C03");
+                    egui::ComboBox::from_id_salt("goes_composite_style")
+                        .selected_text(selected)
+                        .width(210.0)
+                        .show_ui(ui, |ui| {
+                            for (slug, label) in options {
+                                ui.selectable_value(&mut self.goes_composite_style, slug, label);
+                            }
+                        });
+                    if fixed_action_button(ui, "Load RGB", 86.0)
+                        .on_hover_text(
+                            "Fetch, co-register, and compose the selected GOES RGB product. Natural color products render dark at night.",
+                        )
+                        .clicked()
+                    {
+                        load_goes_composite = true;
+                    }
+                });
+            }
+            SatelliteSource::Himawari => {
+                const IR_BANDS: &[(u8, &str)] = &[
+                    (7, "B07 Shortwave IR 3.9"),
+                    (8, "B08 Upper WV 6.2"),
+                    (9, "B09 Mid WV 6.9"),
+                    (10, "B10 Low WV 7.3"),
+                    (11, "B11 Cloud-top IR 8.6"),
+                    (12, "B12 Ozone 9.6"),
+                    (13, "B13 Clean IR 10.4"),
+                    (14, "B14 Longwave IR 11.2"),
+                    (15, "B15 Dirty IR 12.3"),
+                    (16, "B16 CO2 IR 13.3"),
+                ];
+                const SCOPES: &[(&str, &str)] = &[
+                    ("region", "Region · WPac"),
+                    ("fulldisk", "Full disk · 4 km"),
+                    ("fulldisk2km", "Full disk · 2 km"),
+                ];
+                let selected_band = IR_BANDS
+                    .iter()
+                    .find(|(band, _)| *band == self.himawari_band)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("B13 Clean IR 10.4");
+                let selected_scope = SCOPES
+                    .iter()
+                    .find(|(slug, _)| *slug == self.himawari_true_color_scope)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("Region · WPac");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("IR / WV");
+                    egui::ComboBox::from_id_salt("himawari_ir_band")
+                        .selected_text(selected_band)
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for &(band, label) in IR_BANDS {
+                                ui.selectable_value(&mut self.himawari_band, band, label);
+                            }
+                        });
+                    if fixed_action_button(ui, "Load latest", 92.0).clicked() {
                         load_himawari = true;
                     }
-                    if fixed_action_button(ui, "True color", 90.0)
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("True color");
+                    let before = self.himawari_true_color_scope.clone();
+                    egui::ComboBox::from_id_salt("himawari_true_color_scope")
+                        .selected_text(selected_scope)
+                        .width(150.0)
+                        .show_ui(ui, |ui| {
+                            for &(slug, label) in SCOPES {
+                                ui.selectable_value(
+                                    &mut self.himawari_true_color_scope,
+                                    slug.to_owned(),
+                                    label,
+                                );
+                            }
+                        });
+                    if self.himawari_true_color_scope != before {
+                        self.app_settings.himawari_true_color_scope =
+                            self.himawari_true_color_scope.clone();
+                        self.mark_app_settings_dirty();
+                    }
+                    if fixed_action_button(ui, "Load RGB", 86.0)
                         .on_hover_text(
-                            "Fetch the co-registered Himawari-9 visible bands (B01/B02/B03), compose AHI true color (real 0.51 µm green — no synthesized green), and select it in the player + map. Region composes the west-Pacific tropics at ~4 km effective; Full disk composes the WHOLE disk at ~4 km or ~2 km. Native window, when on, overrides both with a 0.5 km crop. Daytime side only; heavier than an IR band.",
+                            "Compose AHI true color from real blue, green, and red bands. A focused window overrides the region/full-disk scope.",
                         )
                         .clicked()
                     {
                         load_himawari_composite = true;
                     }
-                    egui::ComboBox::from_id_salt("himawari_true_color_scope")
-                        .selected_text(selected_himawari_scope_label)
-                        .width(126.0)
-                        .show_ui(ui, |ui| {
-                            for &(slug, label) in HIMAWARI_SCOPE_OPTIONS {
-                                himawari_scope_changed |= ui
-                                    .selectable_value(
-                                        &mut self.himawari_true_color_scope,
-                                        slug.to_string(),
-                                        label,
-                                    )
-                                    .changed();
-                            }
-                        })
-                        .response
-                        .on_hover_text(
-                            "Scope for the True color button: the west-Pacific tropics region (the historical default) or the whole disk at ~4 km / ~2 km effective resolution. Full disk downloads all ten segments of each visible band (a few hundred MB per scan) and loops in its own run family. Ignored while Native window is on.",
-                        );
                 });
+                ui.weak(
+                    "Himawari-8/9 has no satellite lightning mapper; JMA LIDEN is a separate ground network.",
+                );
+            }
+            SatelliteSource::Meteosat => {
+                let selected = eumetsat::MtgProduct::parse(&self.eumetsat_product)
+                    .unwrap_or_default();
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("GOES RGB");
-                    egui::ComboBox::from_id_salt("goes_composite_style")
-                        .selected_text(selected_composite_label)
-                        .width(210.0)
+                    ui.label("MTG-I1");
+                    egui::ComboBox::from_id_salt("eumetsat_mtg_product")
+                        .selected_text(selected.label())
+                        .width(205.0)
                         .show_ui(ui, |ui| {
-                            for (slug, label) in &composite_options {
-                                ui.selectable_value(
-                                    &mut self.goes_composite_style,
-                                    slug.clone(),
-                                    label,
-                                );
+                            for product in eumetsat::MtgProduct::ALL {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.eumetsat_product,
+                                        product.slug().to_owned(),
+                                        product.label(),
+                                    )
+                                    .changed()
+                                {
+                                    self.app_settings.eumetsat_product =
+                                        self.eumetsat_product.clone();
+                                    self.mark_app_settings_dirty();
+                                }
                             }
                         });
-                    if fixed_action_button(ui, "Load true-color", 120.0)
-                        .on_hover_text(
-                            "Fetch the ABI bands the selected RGB composite needs for the current GOES satellite/sector, co-register + compose true/natural color, and select it in the player + map. NaturalColor/GeoColor render dark at night.",
-                        )
-                        .clicked()
-                    {
-                        load_composite = true;
+                    if fixed_action_button(ui, "Latest", 72.0).clicked() {
+                        load_meteosat_latest = true;
+                    }
+                    if fixed_action_button(ui, "Load loop", 84.0).clicked() {
+                        load_meteosat_loop = true;
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
-                    sat_window_changed |= ui
-                        .checkbox(&mut self.sat_window_enabled, "Native window")
-                        .on_hover_text(
-                            "Compose the true-color loads above at NATIVE resolution (0.5 km) over just this box: only the segments/pixels covering it are fetched and decoded, so a typhoon eye stays crisp and the frames stay small enough to loop. Repeated loads of the same window stack into one loopable run.",
-                        )
-                        .changed();
-                    ui.label("lat");
-                    let lat_response = ui.add(
-                        egui::DragValue::new(&mut self.sat_window_lat_deg)
-                            .speed(0.1)
-                            .range(-75.0..=75.0)
-                            .suffix("°"),
-                    );
-                    ui.label("lon");
-                    let lon_response = ui.add(
-                        egui::DragValue::new(&mut self.sat_window_lon_deg)
-                            .speed(0.1)
-                            .range(-180.0..=180.0)
-                            .suffix("°"),
-                    );
-                    ui.label("size");
-                    let size_response = ui.add(
-                        egui::DragValue::new(&mut self.sat_window_size_km)
-                            .speed(10.0)
-                            .range(50.0..=2000.0)
-                            .suffix(" km"),
-                    );
-                    // Commit-on-release: dragging previews the values live
-                    // but only a finished drag or a typed edit persists —
-                    // per-frame saves during a drag hammer the settings file.
-                    for response in [&lat_response, &lon_response, &size_response] {
-                        sat_window_changed |= response.drag_stopped()
-                            || (response.changed() && !response.dragged());
-                    }
+                    ui.label("Loop frames");
                     if ui
-                        .button("Use map center")
-                        .on_hover_text("Center the window on the current radar-map view center.")
+                        .add(
+                            egui::DragValue::new(&mut self.eumetsat_loop_frames)
+                                .range(2..=36)
+                                .speed(1.0),
+                        )
+                        .changed()
+                    {
+                        self.app_settings.eumetsat_loop_frames = self.eumetsat_loop_frames;
+                        self.mark_app_settings_dirty();
+                    }
+                    if fixed_action_button(ui, "Lightning · 1 hour", 132.0)
+                        .on_hover_text(
+                            "Load twelve 5-minute MTG Lightning Imager accumulated-flash-area rasters. This is gridded flash extent, not individual point flashes.",
+                        )
                         .clicked()
                     {
-                        self.sat_window_lat_deg = f64::from(self.map_center_lat);
-                        self.sat_window_lon_deg = f64::from(self.map_center_lon);
-                        sat_window_changed = true;
+                        load_meteosat_lightning = true;
                     }
+                    ui.weak("Public EUMETView · no account required");
                 });
-                ui.weak(
-                    "MTG/European satellite imagery is temporarily hidden until EUMETSAT access is reliable.",
-                );
-                ui.weak(
-                    "GOES follows live continuously. Himawari writes gridded full-disk frames into the same player/store.",
-                );
-            });
-        if sat_window_changed {
+
+                egui::CollapsingHeader::new("Data Store account · optional")
+                    .id_salt("eumetsat_account")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.weak(
+                            "The live products above are public. Connect a consumer key and secret for EUMETSAT Data Store access; BowEcho stores them only in this device's credential vault and mints tokens automatically.",
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.eumetsat_consumer_key)
+                                    .hint_text("consumer key")
+                                    .password(true)
+                                    .desired_width(180.0),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.eumetsat_consumer_secret)
+                                    .hint_text("consumer secret")
+                                    .password(true)
+                                    .desired_width(190.0),
+                            );
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let complete = !self.eumetsat_consumer_key.trim().is_empty()
+                                && !self.eumetsat_consumer_secret.trim().is_empty();
+                            if ui.add_enabled(complete, egui::Button::new("Save securely")).clicked()
+                            {
+                                save_eumetsat = true;
+                            }
+                            if ui.add_enabled(complete, egui::Button::new("Test account")).clicked()
+                            {
+                                test_eumetsat = true;
+                            }
+                            if ui.button("Forget").clicked() {
+                                forget_eumetsat = true;
+                            }
+                        });
+                        if let Some(status) = &self.eumetsat_account_status {
+                            panel_kit::status_block(
+                                ui,
+                                match status {
+                                    Ok(message) | Err(message) => message,
+                                },
+                                None,
+                            );
+                        }
+                    });
+            }
+        }
+
+        panel_kit::subgroup(ui, "Region & resolution", |_ui| {});
+        let mut window_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            window_changed |= ui
+                .checkbox(&mut self.sat_window_enabled, "Focused window")
+                .on_hover_text(
+                    "Use the same saved center and size for provider RGB/MTG requests. Instrument-native GOES/Himawari composites stay at native resolution; EUMETView requests a high-resolution geolocated crop.",
+                )
+                .changed();
+            ui.label("lat");
+            let lat = ui.add(
+                egui::DragValue::new(&mut self.sat_window_lat_deg)
+                    .speed(0.1)
+                    .range(-75.0..=75.0)
+                    .suffix("°"),
+            );
+            ui.label("lon");
+            let lon = ui.add(
+                egui::DragValue::new(&mut self.sat_window_lon_deg)
+                    .speed(0.1)
+                    .range(-180.0..=180.0)
+                    .suffix("°"),
+            );
+            ui.label("size");
+            let size = ui.add(
+                egui::DragValue::new(&mut self.sat_window_size_km)
+                    .speed(10.0)
+                    .range(50..=2000)
+                    .suffix(" km"),
+            );
+            for response in [&lat, &lon, &size] {
+                window_changed |=
+                    response.drag_stopped() || (response.changed() && !response.dragged());
+            }
+            if ui.button("Use map center").clicked() {
+                self.sat_window_lat_deg = f64::from(self.map_center_lat);
+                self.sat_window_lon_deg = f64::from(self.map_center_lon);
+                window_changed = true;
+            }
+        });
+        if window_changed {
             self.persist_sat_native_window();
         }
-        if himawari_scope_changed {
-            self.app_settings.himawari_true_color_scope = self.himawari_true_color_scope.clone();
-            self.mark_app_settings_dirty();
+
+        if load_goes_loop && let Some(sat) = &self.sat {
+            self.sat_map_follow = true;
+            self.status = "Satellite: loading GOES loop".to_owned();
+            self.sat_panel.apply_note("GOES loop: queued current-hour ingest".to_owned());
+            sat.send(sat_worker::SatRequest::LoadLoop(self.sat_panel.spec().clone()));
         }
-        if let Some(sat) = &self.sat
-            && load_himawari
-        {
+        if load_goes_composite && self.sat.is_some() {
+            let base = self.sat_panel.spec().clone();
+            let style = self.goes_composite_style.clone();
+            let window = self.sat_native_window_if_visible(
+                sat_window::goes_nominal_sub_lon_deg(&base.satellite),
+                &base.satellite,
+            );
+            self.sat_map_follow = true;
+            self.status = format!("Satellite: composing GOES {} {style}", base.sector);
+            if let Some(sat) = &self.sat {
+                sat.send(sat_worker::SatRequest::IngestLatestGoesComposite(
+                    sat_worker::GoesCompositeSpec {
+                        satellite: base.satellite,
+                        sector: base.sector,
+                        style,
+                        window,
+                        ..sat_worker::GoesCompositeSpec::default()
+                    },
+                ));
+            }
+        }
+        if load_himawari && let Some(sat) = &self.sat {
             let band = self.himawari_band.clamp(7, 16);
             self.sat_map_follow = true;
             self.status = format!("Satellite: loading latest Himawari-9 B{band:02}");
-            self.sat_panel.apply_note(format!(
-                "Himawari: queued latest H9 B{band:02} full-disk ingest"
+            sat.send(sat_worker::SatRequest::IngestLatestHimawari(
+                sat_worker::HimawariQuickSpec {
+                    band,
+                    ..sat_worker::HimawariQuickSpec::default()
+                },
             ));
-            let spec = sat_worker::HimawariQuickSpec {
-                band,
-                ..sat_worker::HimawariQuickSpec::default()
-            };
-            sat.send(sat_worker::SatRequest::IngestLatestHimawari(spec));
         }
         if load_himawari_composite && self.sat.is_some() {
-            let window = self
-                .sat_native_window_if_visible(sat_window::AHI_NOMINAL_SUB_LON_DEG, "Himawari-9");
-            // Scope only shapes the no-window path: the native window keeps
-            // its stride-1 crop regardless. "region" builds the exact spec
-            // this button always sent.
+            let window =
+                self.sat_native_window_if_visible(sat_window::AHI_NOMINAL_SUB_LON_DEG, "Himawari-9");
             let (full_disk, downsample) = match self.himawari_true_color_scope.as_str() {
                 "fulldisk" => (true, 4),
                 "fulldisk2km" => (true, 2),
-                _ => (
-                    false,
-                    sat_worker::HimawariCompositeSpec::default().downsample,
-                ),
+                _ => (false, sat_worker::HimawariCompositeSpec::default().downsample),
             };
             self.sat_map_follow = true;
-            self.status = match window {
-                Some(window) => format!(
-                    "Satellite: composing Himawari-9 AHI true color · native window {}",
-                    window.run_slug()
-                ),
-                None if full_disk => {
-                    "Satellite: composing Himawari-9 AHI true color · full disk".to_owned()
-                }
-                None => "Satellite: composing Himawari-9 AHI true color".to_owned(),
-            };
-            self.sat_panel.apply_note(format!(
-                "Himawari composite: queued latest H9 AHI true-color (B01/B02/B03){}",
-                if window.is_none() && full_disk {
-                    " · full disk"
-                } else {
-                    ""
-                }
-            ));
+            self.status = "Satellite: composing Himawari-9 AHI true color".to_owned();
             if let Some(sat) = &self.sat {
                 sat.send(sat_worker::SatRequest::IngestLatestHimawariComposite(
                     sat_worker::HimawariCompositeSpec {
@@ -376,31 +556,59 @@ impl ViewerApp {
                 ));
             }
         }
-        if load_composite && self.sat.is_some() {
-            let base = self.sat_panel.spec().clone();
-            let style = self.goes_composite_style.clone();
-            let window = self.sat_native_window_if_visible(
-                sat_window::goes_nominal_sub_lon_deg(&base.satellite),
-                &base.satellite,
-            );
-            self.sat_map_follow = true;
-            self.status = format!("Satellite: composing GOES {} {style}", base.sector);
-            self.sat_panel.apply_note(format!(
-                "GOES composite: queued {} {} {style}",
-                base.satellite, base.sector
-            ));
-            let composite = sat_worker::GoesCompositeSpec {
-                satellite: base.satellite,
-                sector: base.sector,
-                style,
-                window,
-                ..sat_worker::GoesCompositeSpec::default()
+        if load_meteosat_latest || load_meteosat_loop || load_meteosat_lightning {
+            let product = if load_meteosat_lightning {
+                eumetsat::MtgProduct::LightningAfa
+            } else {
+                eumetsat::MtgProduct::parse(&self.eumetsat_product).unwrap_or_default()
+            };
+            let frames = if load_meteosat_latest {
+                1
+            } else if load_meteosat_lightning {
+                12
+            } else {
+                usize::from(self.eumetsat_loop_frames.clamp(2, 36))
+            };
+            self.queue_meteosat_product(ui.ctx(), product, frames);
+        }
+        if save_eumetsat || test_eumetsat {
+            let credentials = sat_worker::EumetsatAuthSpec {
+                consumer_key: self.eumetsat_consumer_key.trim().to_owned(),
+                consumer_secret: self.eumetsat_consumer_secret.trim().to_owned(),
             };
             if let Some(sat) = &self.sat {
-                sat.send(sat_worker::SatRequest::IngestLatestGoesComposite(composite));
+                if save_eumetsat {
+                    sat.send(sat_worker::SatRequest::SaveEumetsatCredentials(
+                        credentials.clone(),
+                    ));
+                }
+                if test_eumetsat {
+                    self.eumetsat_account_status = Some(Ok(
+                        "Checking EUMETSAT account…".to_owned(),
+                    ));
+                    sat.send(sat_worker::SatRequest::CheckEumetsatAccount(credentials));
+                }
             }
         }
-        ui.separator();
+        if forget_eumetsat {
+            self.eumetsat_consumer_key.clear();
+            self.eumetsat_consumer_secret.clear();
+            self.eumetsat_account_status = None;
+            if let Some(sat) = &self.sat {
+                sat.send(sat_worker::SatRequest::ForgetEumetsatCredentials);
+            }
+        }
+        panel_events
+    }
+
+    /// Satellite body (follow config + frame player), window and pane
+    /// alike. Returned events feed `handle_satellite_events`.
+    pub(crate) fn satellite_pane_body(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> (Vec<rw_ui::SatelliteEvent>, Vec<rw_ui::SatPlayerEvent>) {
+        let panel_events = self.satellite_provider_controls(ui);
+        panel_kit::subgroup(ui, "Display & output", |_ui| {});
         if self.sat_last_frame.is_some() || self.sat_layer.is_some() {
             let mut map_request: Option<(rw_ui::SatRunKey, u16)> = None;
             let mut plot_request: Option<(rw_ui::SatRunKey, u16)> = None;
@@ -522,6 +730,7 @@ impl ViewerApp {
                 self.request_sat_map_frame(key, hhmm);
             }
         }
+        panel_kit::subgroup(ui, "Saved loop", |_ui| {});
         let player_events = self.sat_player.ui(ui);
         (panel_events, player_events)
     }
@@ -695,6 +904,35 @@ impl ViewerApp {
             match response {
                 sat_worker::SatResponse::SpecStatus(status) => {
                     self.sat_panel.set_spec_status(status)
+                }
+                sat_worker::SatResponse::EumetsatAccount(result) => {
+                    let note = match &result {
+                        Ok(message) => message.clone(),
+                        Err(message) => message.clone(),
+                    };
+                    self.eumetsat_account_status = Some(result);
+                    self.sat_panel.apply_note(note);
+                }
+                sat_worker::SatResponse::EumetsatCredentialsLoaded(result) => match result {
+                    Ok(Some(credentials)) => {
+                        self.eumetsat_consumer_key = credentials.consumer_key;
+                        self.eumetsat_consumer_secret = credentials.consumer_secret;
+                        self.eumetsat_account_status = Some(Ok(
+                            "Saved EUMETSAT account loaded from this device".to_owned(),
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(message) => {
+                        self.eumetsat_account_status = Some(Err(message));
+                    }
+                },
+                sat_worker::SatResponse::EumetsatCredentialsSaved(result) => {
+                    let note = match &result {
+                        Ok(message) => message.clone(),
+                        Err(message) => message.clone(),
+                    };
+                    self.eumetsat_account_status = Some(result);
+                    self.sat_panel.apply_note(note);
                 }
                 sat_worker::SatResponse::Runs(runs) => {
                     let runs = self.satellite_runs_for_current_spec(runs);
@@ -1143,6 +1381,40 @@ impl ViewerApp {
             } else {
                 painter.image(texture.id(), rect, uv, tint);
             }
+        }
+        if layer.key.model == "mtg_i1" {
+            let year = layer
+                .key
+                .run
+                .split('_')
+                .find(|token| token.len() == 8 && token.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|token| token.get(..4))
+                .unwrap_or("2026");
+            let text = format!("Contains modified EUMETSAT Meteosat data {year}.");
+            let style = painter.ctx().global_style();
+            let visuals = &style.visuals;
+            let galley = painter.layout_no_wrap(
+                text,
+                egui::FontId::proportional(10.0),
+                visuals.text_color(),
+            );
+            let size = galley.size() + egui::vec2(12.0, 8.0);
+            let card = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - size.x - 8.0, rect.top() + 62.0),
+                size,
+            );
+            painter.rect_filled(card, 4.0, visuals.window_fill());
+            painter.rect_stroke(
+                card,
+                4.0,
+                visuals.window_stroke(),
+                egui::StrokeKind::Inside,
+            );
+            painter.galley(
+                card.min + egui::vec2(6.0, 4.0),
+                galley,
+                visuals.text_color(),
+            );
         }
     }
 }
