@@ -26176,7 +26176,7 @@ impl ViewerApp {
         let visuals = &style.visuals;
         let text_color = visuals.text_color();
         let font = egui::FontId::proportional(10.0);
-        let available_width = (rect.width() - 24.0).max(1.0).min(1_000.0);
+        let available_width = (rect.width() - 24.0).clamp(1.0, 1_000.0);
         let galley = painter.layout(
             format!("{source_notice}\n{processed_notice}"),
             font,
