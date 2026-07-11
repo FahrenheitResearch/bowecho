@@ -514,7 +514,9 @@ const BACKGROUND_ACTIVITY_REPAINT_MS: u64 = 250;
 const SATELLITE_MAP_LAYER_HOVER: &str =
     "Render the current frame as a layer under the radar (opacity in Map)";
 const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Custom > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar (US or international, whichever is closer). When a loop is loaded, WSR-88D overlays auto-sync to that loop; international overlays refresh live on their provider cadence.";
+#[cfg(any(windows, test))]
 const SECURITY_UNSIGNED_BUILD_TEXT: &str = "Official Windows release binaries are Authenticode-signed (Azure Trusted Signing). Windows Defender or SmartScreen may still warn on unsigned local builds or renamed copies. Use official GitHub release assets when possible; do not whitelist random copies.";
+#[cfg(any(windows, test))]
 const SECURITY_SIGNATURE_STATUS_TEXT: &str = "In-app updates install only after two checks pass on the downloaded file: it must match the SHA-256 the release published, and Windows (WinVerifyTrust) must report a valid Authenticode signature. Anything else is deleted and reported here.";
 const WGPU_TO_GLOW_FALLBACK_NOTICE: &str =
     "WGPU startup failed; running with OpenGL fallback. Update graphics drivers if this repeats.";

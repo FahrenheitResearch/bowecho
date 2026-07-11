@@ -91,6 +91,7 @@ fn parse_semver_triple(version: &str) -> Option<(u64, u64, u64)> {
 // click; every failed check removes the private download and reports why.
 
 /// One event from the update worker to the UI.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) enum SelfUpdateEvent {
     Progress { received: u64, total: Option<u64> },
     Verifying,
@@ -1217,7 +1218,7 @@ fn finalize_verified_update(
 /// is legal on Windows), then rename the verified download into its place.
 /// Both paths share a directory, so neither rename crosses volumes. If the
 /// second rename fails the original is renamed back.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn swap_running_executable(downloaded: &Path, exe: &Path) -> Result<(), String> {
     let backup = update_backup_path(exe);
     if backup.exists() {
@@ -1762,9 +1763,11 @@ mod tests {
     #[test]
     fn macos_bundle_derivation_accepts_only_the_exact_app_layout() {
         let executable = Path::new("C:/Applications/BowEcho.app/Contents/MacOS/bowecho");
+        let app = Path::new("C:/Applications/BowEcho.app");
+        assert_eq!(macos_app_bundle_from_executable(executable).unwrap(), app);
         assert_eq!(
-            macos_app_bundle_from_executable(executable).unwrap(),
-            Path::new("C:/Applications/BowEcho.app")
+            macos_backup_path(app).unwrap(),
+            Path::new("C:/Applications/.BowEcho.app.update-backup")
         );
         assert!(
             macos_app_bundle_from_executable(Path::new(
