@@ -26159,14 +26159,11 @@ impl ViewerApp {
     }
 
     fn draw_imgw_attribution(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let Some((source_notice, processed_notice)) =
-            grid_composites::visible_imgw_attribution(self.model_layers.iter().map(|slot| {
-                (
-                    slot.layer.visible,
-                    slot.layer.field.key.var.as_str(),
-                )
-            }))
-        else {
+        let Some((source_notice, processed_notice)) = grid_composites::visible_imgw_attribution(
+            self.model_layers
+                .iter()
+                .map(|slot| (slot.layer.visible, slot.layer.field.key.var.as_str())),
+        ) else {
             return;
         };
 
@@ -26198,12 +26195,7 @@ impl ViewerApp {
             card_size,
         );
         painter.rect_filled(card, 4.0, visuals.window_fill());
-        painter.rect_stroke(
-            card,
-            4.0,
-            visuals.window_stroke(),
-            egui::StrokeKind::Inside,
-        );
+        painter.rect_stroke(card, 4.0, visuals.window_stroke(), egui::StrokeKind::Inside);
         painter.galley(card.min + egui::vec2(8.0, 5.0), galley, text_color);
     }
 
