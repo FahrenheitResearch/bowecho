@@ -504,19 +504,19 @@ fn parse_symbology(reader: Reader<'_>, offset: usize, radar_height_ft: i16) -> V
         .filter(|altitude| (1..=70).contains(altitude))
         .collect();
     let mut altitude_map = HashMap::<i16, i32>::new();
-    if let Some(ticks) = vector_packets.get(1) {
-        if ticks.len() == altitude_labels.len() {
-            for (tick, altitude) in ticks.iter().rev().zip(&altitude_labels) {
-                altitude_map.insert(*tick, *altitude);
-            }
+    if let Some(ticks) = vector_packets.get(1)
+        && ticks.len() == altitude_labels.len()
+    {
+        for (tick, altitude) in ticks.iter().rev().zip(&altitude_labels) {
+            altitude_map.insert(*tick, *altitude);
         }
     }
     if altitude_map.is_empty() {
         for label in labels.iter().filter(|label| label.i == 31) {
-            if let Ok(altitude) = label.text.parse::<i32>() {
-                if (1..=70).contains(&altitude) {
-                    altitude_map.insert(label.j, altitude);
-                }
+            if let Ok(altitude) = label.text.parse::<i32>()
+                && (1..=70).contains(&altitude)
+            {
+                altitude_map.insert(label.j, altitude);
             }
         }
     }
