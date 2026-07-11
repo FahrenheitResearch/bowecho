@@ -1277,6 +1277,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_archive_progress_is_object_safe_and_honors_precancel() {
+        let provider = FakeArchiveProvider;
+        let source: &dyn ArchiveFrames = provider.archive_source().expect("archive source");
+        let date = NaiveDate::from_ymd_opt(2026, 6, 9).expect("date");
+        let cancel = AtomicBool::new(false);
+        let mut snapshots = Vec::new();
+        let plans = source
+            .day_plans_with_progress("nwsit", date, &cancel, &mut |snapshot| {
+                snapshots.push(snapshot)
+            })
+            .expect("progress day plans");
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(
+            snapshots,
+            [
+                ArchiveListProgress {
+                    completed_phases: 0,
+                    total_phases: 1,
+                    plans_found: 0,
+                    catalog_requests_completed: 0,
+                },
+                ArchiveListProgress {
+                    completed_phases: 1,
+                    total_phases: 1,
+                    plans_found: 2,
+                    catalog_requests_completed: 1,
+                },
+            ]
+        );
+
+        let cancel = AtomicBool::new(true);
+        let mut cancelled_snapshots = Vec::new();
+        let err = source
+            .day_plans_with_progress("nwsit", date, &cancel, &mut |snapshot| {
+                cancelled_snapshots.push(snapshot)
+            })
+            .unwrap_err();
+        assert!(err.contains("cancelled"), "unexpected error: {err}");
+        assert_eq!(cancelled_snapshots.len(), 1);
+        assert_eq!(cancelled_snapshots[0].completed_phases, 0);
+    }
+
     /// The provided `window_plans` folds `day_plans` over every UTC date
     /// the window touches, stays oldest-first, and caps to the NEWEST
     /// `max` frames (the loop-ending-at-scan tail).
