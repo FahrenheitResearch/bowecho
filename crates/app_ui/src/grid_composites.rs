@@ -2,7 +2,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use rustwx_core::{CanonicalField, FieldSelector, GridProjection, ModelId, SelectedField2D};
+use data_source::grid_products::imgw::{
+    IMGW_PROCESSED_NOTICE_PL, IMGW_SOURCE_NOTICE_PL, ImgwPolradQuantity, ImgwPolradSite,
+};
+use nexrad_io::odim_cartesian::{OdimCartesianGrid, OdimCartesianProjection, PROJ_SPHERE_RADIUS_M};
+use rustwx_core::{
+    CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, ModelId, SelectedField2D,
+};
 use rustwx_products::viewer::operational_style_for_store_variable;
 use rw_store::grid::GridFile;
 
@@ -11,28 +17,46 @@ pub(crate) enum GridCompositeSource {
     MrmsLowestAltitudeReflectivity,
     MrmsCompositeReflectivity,
     EumetnetOperaDbzh,
+    ImgwPolradCmax {
+        site: ImgwPolradSite,
+        quantity: ImgwPolradQuantity,
+    },
 }
 
 impl GridCompositeSource {
+    /// The fixed, non-site grid sources. IMGW sources are reconstructed from
+    /// their typed site/quantity slug by [`Self::from_variable_slug`].
     pub(crate) const ALL: [Self; 3] = [
         Self::MrmsLowestAltitudeReflectivity,
         Self::MrmsCompositeReflectivity,
         Self::EumetnetOperaDbzh,
     ];
 
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) const fn imgw_polrad(site: ImgwPolradSite, quantity: ImgwPolradQuantity) -> Self {
+        Self::ImgwPolradCmax { site, quantity }
+    }
+
+    pub(crate) fn label(self) -> String {
         match self {
-            Self::MrmsLowestAltitudeReflectivity => "MRMS lowest-altitude reflectivity",
-            Self::MrmsCompositeReflectivity => "MRMS composite reflectivity",
-            Self::EumetnetOperaDbzh => "EUMETNET OPERA DBZH composite",
+            Self::MrmsLowestAltitudeReflectivity => "MRMS lowest-altitude reflectivity".to_owned(),
+            Self::MrmsCompositeReflectivity => "MRMS composite reflectivity".to_owned(),
+            Self::EumetnetOperaDbzh => "EUMETNET OPERA DBZH composite".to_owned(),
+            Self::ImgwPolradCmax { site, quantity } => format!(
+                "IMGW POLRAD {} {} CMAX",
+                site.label(),
+                quantity.filename_token()
+            ),
         }
     }
 
-    pub(crate) fn short_label(self) -> &'static str {
+    pub(crate) fn short_label(self) -> String {
         match self {
-            Self::MrmsLowestAltitudeReflectivity => "MRMS low REF",
-            Self::MrmsCompositeReflectivity => "MRMS CREF",
-            Self::EumetnetOperaDbzh => "OPERA DBZH",
+            Self::MrmsLowestAltitudeReflectivity => "MRMS low REF".to_owned(),
+            Self::MrmsCompositeReflectivity => "MRMS CREF".to_owned(),
+            Self::EumetnetOperaDbzh => "OPERA DBZH".to_owned(),
+            Self::ImgwPolradCmax { site, quantity } => {
+                format!("IMGW {} {}", site.system_code(), quantity.filename_token())
+            }
         }
     }
 
@@ -40,21 +64,35 @@ impl GridCompositeSource {
         match self {
             Self::MrmsLowestAltitudeReflectivity | Self::MrmsCompositeReflectivity => "mrms",
             Self::EumetnetOperaDbzh => "eumetnet-opera",
+            Self::ImgwPolradCmax { .. } => "imgw-polrad",
         }
     }
 
-    pub(crate) fn variable_slug(self) -> &'static str {
+    pub(crate) fn variable_slug(self) -> String {
         match self {
-            Self::MrmsLowestAltitudeReflectivity => "mrms_reflectivity_lowest_altitude",
-            Self::MrmsCompositeReflectivity => "mrms_composite_reflectivity",
-            Self::EumetnetOperaDbzh => "eumetnet_opera_dbzh_composite",
+            Self::MrmsLowestAltitudeReflectivity => "mrms_reflectivity_lowest_altitude".to_owned(),
+            Self::MrmsCompositeReflectivity => "mrms_composite_reflectivity".to_owned(),
+            Self::EumetnetOperaDbzh => "eumetnet_opera_dbzh_composite".to_owned(),
+            Self::ImgwPolradCmax { site, quantity } => format!(
+                "imgw_polrad_cmax_{}_{}",
+                site.code(),
+                imgw_quantity_slug(quantity)
+            ),
         }
     }
 
     pub(crate) fn from_variable_slug(value: &str) -> Option<Self> {
-        Self::ALL
+        if let Some(source) = Self::ALL
             .into_iter()
             .find(|source| source.variable_slug() == value)
+        {
+            return Some(source);
+        }
+        let (site, quantity) = value.strip_prefix("imgw_polrad_cmax_")?.split_once('_')?;
+        Some(Self::imgw_polrad(
+            ImgwPolradSite::from_code(site)?,
+            imgw_quantity_from_slug(quantity)?,
+        ))
     }
 
     pub(crate) fn map_center(self) -> (f32, f32, f32) {
@@ -63,7 +101,67 @@ impl GridCompositeSource {
                 (39.0, -97.0, 26.0)
             }
             Self::EumetnetOperaDbzh => (50.5, 10.0, 22.0),
+            Self::ImgwPolradCmax { site, .. } => {
+                let (latitude, longitude, _) = site.location();
+                (latitude as f32, longitude as f32, 115.0)
+            }
         }
+    }
+
+    pub(crate) const fn is_imgw_polrad(self) -> bool {
+        matches!(self, Self::ImgwPolradCmax { .. })
+    }
+
+    /// Terms-required notices shown on IMGW layer surfaces. BowEcho applies
+    /// the ODIM gain/offset and renders a colored map, so it is safest to
+    /// carry both the source and processed-data statements.
+    pub(crate) fn imgw_attribution(self) -> Option<String> {
+        self.is_imgw_polrad()
+            .then(|| format!("{IMGW_SOURCE_NOTICE_PL}\n{IMGW_PROCESSED_NOTICE_PL}"))
+    }
+}
+
+const IMGW_STANDARD_QUANTITIES: &[ImgwPolradQuantity] = &[
+    ImgwPolradQuantity::Kdp,
+    ImgwPolradQuantity::RhoHv,
+    ImgwPolradQuantity::Zdr,
+];
+const IMGW_RAMZA_QUANTITIES: &[ImgwPolradQuantity] = &[
+    ImgwPolradQuantity::Kdp,
+    ImgwPolradQuantity::RhoHv,
+    ImgwPolradQuantity::Zdr,
+    ImgwPolradQuantity::PhiDp,
+];
+
+/// Current live quantity availability. All ten sites publish KDP, RHOHV and
+/// ZDR; RAM additionally publishes PHIDP. Fetching remains defensive because
+/// an individual newest cycle can be incomplete while it is being written.
+pub(crate) const fn imgw_quantities_for_site(
+    site: ImgwPolradSite,
+) -> &'static [ImgwPolradQuantity] {
+    if matches!(site, ImgwPolradSite::Ramza) {
+        IMGW_RAMZA_QUANTITIES
+    } else {
+        IMGW_STANDARD_QUANTITIES
+    }
+}
+
+const fn imgw_quantity_slug(quantity: ImgwPolradQuantity) -> &'static str {
+    match quantity {
+        ImgwPolradQuantity::Kdp => "kdp",
+        ImgwPolradQuantity::RhoHv => "rhohv",
+        ImgwPolradQuantity::Zdr => "zdr",
+        ImgwPolradQuantity::PhiDp => "phidp",
+    }
+}
+
+fn imgw_quantity_from_slug(value: &str) -> Option<ImgwPolradQuantity> {
+    match value {
+        "kdp" => Some(ImgwPolradQuantity::Kdp),
+        "rhohv" => Some(ImgwPolradQuantity::RhoHv),
+        "zdr" => Some(ImgwPolradQuantity::Zdr),
+        "phidp" => Some(ImgwPolradQuantity::PhiDp),
+        _ => None,
     }
 }
 
@@ -95,6 +193,9 @@ pub(crate) fn load_latest_field(source: GridCompositeSource) -> GridCompositeRes
             "MRMS composite reflectivity",
         )?,
         GridCompositeSource::EumetnetOperaDbzh => fetch_opera_latest()?,
+        GridCompositeSource::ImgwPolradCmax { site, quantity } => {
+            fetch_imgw_polrad_latest(site, quantity)?
+        }
     };
     let field = selected_field_to_field_data(source, selected)?;
     Ok(GridCompositeFetch {
@@ -138,6 +239,151 @@ fn fetch_opera_latest() -> Result<(SelectedField2D, Option<DateTime<Utc>>), Stri
     let selected = rustwx_io::extract_eumetnet_opera_dbzh_from_odim_h5(&bytes)
         .map_err(|err| format!("EUMETNET OPERA DBZH failed: {err}"))?;
     Ok((selected, valid_time))
+}
+
+/// Fetch the newest cycle that actually contains the requested quantity.
+/// IMGW writes a cycle's files independently, so looking back a few cycles
+/// prevents a momentarily incomplete newest listing from blanking a layer.
+fn fetch_imgw_polrad_latest(
+    site: ImgwPolradSite,
+    quantity: ImgwPolradQuantity,
+) -> Result<(SelectedField2D, Option<DateTime<Utc>>), String> {
+    let label = format!(
+        "IMGW POLRAD {} {} CMAX",
+        site.system_code(),
+        quantity.filename_token()
+    );
+    let cycles = data_source::grid_products::imgw::imgw_polrad_recent_cycles(site, 4)
+        .map_err(|err| format!("{label} failed: {err}"))?;
+    let file = cycles
+        .iter()
+        .rev()
+        .find_map(|cycle| cycle.file(quantity))
+        .ok_or_else(|| format!("{label} failed: no recent cycle carries this quantity"))?;
+    let bytes = data_source::fetch_volume_bytes(&file.download_url)
+        .map_err(|err| format!("{label} download failed: {err}"))?;
+    let decoded = nexrad_io::odim_cartesian::decode_odim_h5_cartesian_max(&bytes)
+        .map_err(|err| format!("{label} decode failed: {err}"))?;
+    validate_imgw_grid(site, quantity, &decoded)
+        .map_err(|err| format!("{label} validation failed: {err}"))?;
+    let valid_time = Some(decoded.start_time);
+    let selected = imgw_grid_to_selected(decoded)
+        .map_err(|err| format!("{label} grid conversion failed: {err}"))?;
+    Ok((selected, valid_time))
+}
+
+fn validate_imgw_grid(
+    site: ImgwPolradSite,
+    quantity: ImgwPolradQuantity,
+    grid: &OdimCartesianGrid,
+) -> Result<(), String> {
+    if !grid.site.id.eq_ignore_ascii_case(site.system_code()) {
+        return Err(format!(
+            "requested site {} but ODIM /how/system identifies {}",
+            site.system_code(),
+            grid.site.id
+        ));
+    }
+    if !grid
+        .quantity_code
+        .eq_ignore_ascii_case(quantity.odim_quantity())
+    {
+        return Err(format!(
+            "requested quantity {} but ODIM dataset identifies {}",
+            quantity.odim_quantity(),
+            grid.quantity_code
+        ));
+    }
+    Ok(())
+}
+
+fn imgw_grid_to_selected(grid: OdimCartesianGrid) -> Result<SelectedField2D, String> {
+    let (lat_deg, lon_deg) = imgw_grid_lat_lon(&grid)?;
+    let shape = GridShape {
+        nx: grid.geometry.width,
+        ny: grid.geometry.height,
+    };
+    let lat_lon = LatLonGrid::new(shape, lat_deg, lon_deg)
+        .map_err(|err| format!("invalid latitude/longitude grid: {err}"))?;
+    let units = grid.units.unwrap_or_else(|| "unknown".to_owned());
+    // rustwx-core has no dual-pol canonical selectors yet. The selector is
+    // only a storage-shape carrier here; the typed variable slug and BowEcho
+    // color-family hook retain the actual KDP/RHOHV/ZDR/PHIDP identity.
+    SelectedField2D::new(
+        FieldSelector::entire_atmosphere(CanonicalField::CompositeReflectivity),
+        units,
+        lat_lon,
+        grid.values,
+    )
+    .map(|selected| selected.with_projection(GridProjection::Geographic))
+    .map_err(|err| format!("invalid selected field: {err}"))
+}
+
+fn imgw_grid_lat_lon(grid: &OdimCartesianGrid) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let OdimCartesianProjection::AzimuthalEquidistantSphere {
+        center_latitude_deg,
+        center_longitude_deg,
+        radius_m,
+        ..
+    } = &grid.projection;
+    if (*radius_m - PROJ_SPHERE_RADIUS_M).abs() > 0.5 {
+        return Err(format!("unsupported IMGW AEQD sphere radius {radius_m} m"));
+    }
+    let len = grid
+        .geometry
+        .width
+        .checked_mul(grid.geometry.height)
+        .ok_or_else(|| "grid dimensions overflow".to_owned())?;
+    let mut latitudes = Vec::with_capacity(len);
+    let mut longitudes = Vec::with_capacity(len);
+    for y in 0..grid.geometry.height {
+        for x in 0..grid.geometry.width {
+            let (east_m, north_m) = grid
+                .geometry
+                .cell_center_offset_m(x, y)
+                .ok_or_else(|| "cell index unexpectedly outside grid".to_owned())?;
+            let (latitude, longitude) = inverse_spherical_aeqd(
+                *center_latitude_deg,
+                *center_longitude_deg,
+                *radius_m,
+                east_m,
+                north_m,
+            );
+            latitudes.push(latitude as f32);
+            longitudes.push(longitude as f32);
+        }
+    }
+    Ok((latitudes, longitudes))
+}
+
+/// Inverse of PROJ's spherical azimuthal-equidistant definition. Inputs are
+/// offsets from the projection center, with x east and y north.
+fn inverse_spherical_aeqd(
+    center_latitude_deg: f64,
+    center_longitude_deg: f64,
+    radius_m: f64,
+    east_m: f64,
+    north_m: f64,
+) -> (f64, f64) {
+    let rho = east_m.hypot(north_m);
+    if rho <= f64::EPSILON {
+        return (center_latitude_deg, center_longitude_deg);
+    }
+    let center_latitude = center_latitude_deg.to_radians();
+    let central_angle = rho / radius_m;
+    let (sin_c, cos_c) = central_angle.sin_cos();
+    let (sin_lat0, cos_lat0) = center_latitude.sin_cos();
+    let latitude = (cos_c * sin_lat0 + north_m * sin_c * cos_lat0 / rho).asin();
+    let longitude = center_longitude_deg.to_radians()
+        + (east_m * sin_c).atan2(rho * cos_lat0 * cos_c - north_m * sin_lat0 * sin_c);
+    (
+        latitude.to_degrees(),
+        normalize_longitude(longitude.to_degrees()),
+    )
+}
+
+fn normalize_longitude(longitude_deg: f64) -> f64 {
+    (longitude_deg + 180.0).rem_euclid(360.0) - 180.0
 }
 
 /// Reference time from the first GRIB2 message's identification section
@@ -294,12 +540,21 @@ fn selected_field_to_field_data(
     let selector_json = serde_json::to_value(selected.selector)
         .map_err(|err| format!("grid composite selector encode failed: {err}"))?;
     let mut values = selected.values;
-    let style = operational_style_for_store_variable(
-        source.variable_slug(),
-        &selector_json,
-        &selected.units,
-        ModelId::Hrrr,
-    );
+    let variable_slug = source.variable_slug();
+    // The rusty-weather canonical-field vocabulary does not yet contain the
+    // four dual-pol quantities. Do not let the shape-carrier reflectivity
+    // selector assign a reflectivity production scale; main.rs binds each
+    // typed IMGW slug to BowEcho's matching editable radar color family.
+    let style = if source.is_imgw_polrad() {
+        None
+    } else {
+        operational_style_for_store_variable(
+            &variable_slug,
+            &selector_json,
+            &selected.units,
+            ModelId::Hrrr,
+        )
+    };
     let units = match &style {
         Some(style) => {
             if !style.convert.is_none() {
@@ -320,7 +575,7 @@ fn selected_field_to_field_data(
                 run: "latest".to_owned(),
                 hour: 0,
             },
-            var: source.variable_slug().to_owned(),
+            var: variable_slug,
         },
         units,
         nx,
@@ -370,6 +625,59 @@ fn format_opera_time(time: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use rustwx_core::{CanonicalField, FieldSelector, GridShape, LatLonGrid, SelectedField2D};
+
+    #[test]
+    fn imgw_source_slug_round_trips_site_and_quantity() {
+        let source =
+            GridCompositeSource::imgw_polrad(ImgwPolradSite::Ramza, ImgwPolradQuantity::PhiDp);
+        assert_eq!(source.model_slug(), "imgw-polrad");
+        assert_eq!(source.variable_slug(), "imgw_polrad_cmax_ram_phidp");
+        assert_eq!(
+            GridCompositeSource::from_variable_slug(&source.variable_slug()),
+            Some(source)
+        );
+        assert_eq!(source.short_label(), "IMGW RAM PhiDP");
+        assert!(source.label().contains("Ramża"));
+        assert!(source.imgw_attribution().is_some());
+        assert_eq!(
+            GridCompositeSource::from_variable_slug("imgw_polrad_cmax_ram_unknown"),
+            None
+        );
+    }
+
+    #[test]
+    fn imgw_menu_exposes_phidp_only_where_current_feed_publishes_it() {
+        assert_eq!(
+            imgw_quantities_for_site(ImgwPolradSite::Brzuchania),
+            IMGW_STANDARD_QUANTITIES
+        );
+        assert_eq!(
+            imgw_quantities_for_site(ImgwPolradSite::Ramza),
+            IMGW_RAMZA_QUANTITIES
+        );
+        assert!(
+            imgw_quantities_for_site(ImgwPolradSite::Ramza).contains(&ImgwPolradQuantity::PhiDp)
+        );
+        assert!(
+            !imgw_quantities_for_site(ImgwPolradSite::Brzuchania)
+                .contains(&ImgwPolradQuantity::PhiDp)
+        );
+    }
+
+    #[test]
+    fn spherical_aeqd_inverse_preserves_center_and_cardinal_directions() {
+        let radius = PROJ_SPHERE_RADIUS_M;
+        assert_eq!(
+            inverse_spherical_aeqd(50.0, 20.0, radius, 0.0, 0.0),
+            (50.0, 20.0)
+        );
+        let (east_lat, east_lon) = inverse_spherical_aeqd(50.0, 20.0, radius, 100_000.0, 0.0);
+        let (north_lat, north_lon) = inverse_spherical_aeqd(50.0, 20.0, radius, 0.0, 100_000.0);
+        assert!((east_lat - 49.9916).abs() < 0.01, "{east_lat}");
+        assert!(east_lon > 21.3 && east_lon < 21.5, "{east_lon}");
+        assert!(north_lat > 50.89 && north_lat < 50.91, "{north_lat}");
+        assert!((north_lon - 20.0).abs() < 1.0e-9, "{north_lon}");
+    }
 
     #[test]
     fn mrms_field_conversion_builds_stable_layer_key() {

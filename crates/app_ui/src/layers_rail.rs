@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
 use color_tables::ColorTableFamily;
+use data_source::grid_products::imgw::IMGW_POLRAD_SITES;
 use data_source::sites::SiteRef;
 use eframe::egui;
 use ui_core::loop_engine::FeedSource;
@@ -189,8 +190,13 @@ impl ViewerApp {
             .unwrap_or_else(|| "no runs in store".to_owned());
         let model_row_count = self.model_layers.len();
         let mut refresh_grid_composite: Option<grid_composites::GridCompositeSource> = None;
+        let mut center_grid_composite: Option<grid_composites::GridCompositeSource> = None;
         if let Some(source) = self.grid_composite_placeholder_source() {
             let name = source.short_label();
+            let name_hover = source.imgw_attribution().map_or_else(
+                || source.label(),
+                |attribution| format!("{}\n\n{attribution}", source.label()),
+            );
             let _ = layer_row(
                 ui,
                 LayerRowSpec {
@@ -198,8 +204,8 @@ impl ViewerApp {
                         glyph: "○",
                         hover: "Fetching latest gridded radar composite",
                     },
-                    name,
-                    name_hover: source.label(),
+                    name: &name,
+                    name_hover: &name_hover,
                     state: Some("loading"),
                     ..Default::default()
                 },
@@ -224,7 +230,7 @@ impl ViewerApp {
                 None => color_tables::parse_iso_slug(&layer.field.key.var).map(|spec| spec.label()),
             };
             let name = grid_source
-                .map(|source| source.short_label().to_owned())
+                .map(grid_composites::GridCompositeSource::short_label)
                 .unwrap_or_else(|| {
                     let label = wrf_info
                         .map(|info| info.label)
@@ -256,12 +262,17 @@ impl ViewerApp {
                     ),
                 },
                 |source| {
-                    format!(
+                    let mut hover = format!(
                         "{} ({})\nFrame: {}\nLatest public grid composite — auto-refreshes ~60 s while visible; layers draw bottom-to-top in list order",
                         source.label(),
                         layer.field.units,
                         grid_frame_text.as_deref().unwrap_or("pending first fetch"),
-                    )
+                    );
+                    if let Some(attribution) = source.imgw_attribution() {
+                        hover.push_str("\n\n");
+                        hover.push_str(&attribution);
+                    }
+                    hover
                 },
             );
             let mut order_delta: i8 = 0;
@@ -293,9 +304,22 @@ impl ViewerApp {
                         delta: &mut order_delta,
                     }),
                     gear: Some(LayerRowGear::Menu {
-                        hover: "Model layer options (open window · refresh · colors)",
+                        hover: if grid_source.is_some() {
+                            "Grid layer options (center · refresh · colors)"
+                        } else {
+                            "Model layer options (open window · colors)"
+                        },
                         content: Box::new(|ui| {
-                            if ui
+                            if let Some(source) = refreshable_source {
+                                if ui
+                                    .button("Center on grid")
+                                    .on_hover_text("Center the map on this grid's source region")
+                                    .clicked()
+                                {
+                                    center_grid_composite = Some(source);
+                                    ui.close();
+                                }
+                            } else if ui
                                 .button("Open Model window")
                                 .on_hover_text("Runs · fields · soundings · download")
                                 .clicked()
@@ -380,6 +404,14 @@ impl ViewerApp {
         }
         if open_model_window {
             self.open_viewer(dock::WorkspacePane::Model);
+        }
+        if let Some(source) = center_grid_composite {
+            let (latitude, longitude, scale) = source.map_center();
+            self.map_center_lat = latitude;
+            self.map_center_lon = longitude;
+            self.map_scale = scale;
+            self.clamp_map_center();
+            ctx.request_repaint();
         }
         if let Some((id, action)) = model_color_action {
             let edit_family = match action {
@@ -2443,6 +2475,34 @@ impl ViewerApp {
                             add_taiwan_cwa = true;
                             ui.close();
                         }
+                        ui.menu_button("Poland IMGW dual-pol CMAX", |ui| {
+                            ui.set_min_width(245.0);
+                            for &site in IMGW_POLRAD_SITES {
+                                ui.menu_button(
+                                    format!("{} ({})", site.label(), site.system_code()),
+                                    |ui| {
+                                        for &quantity in
+                                            grid_composites::imgw_quantities_for_site(site)
+                                        {
+                                            if ui.button(quantity.label()).clicked() {
+                                                add_grid_composite = Some(
+                                                    grid_composites::GridCompositeSource::imgw_polrad(
+                                                        site, quantity,
+                                                    ),
+                                                );
+                                                ui.close();
+                                            }
+                                        }
+                                    },
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(format!(
+                            "Official IMGW-PIB POLRAD 2-D site-centered ODIM HDF5 maximum products (not polar volumes; quantity availability varies by radar).\n\n{}\n{}",
+                            data_source::grid_products::imgw::IMGW_SOURCE_NOTICE_PL,
+                            data_source::grid_products::imgw::IMGW_PROCESSED_NOTICE_PL,
+                        ));
                         ui.menu_button("MRMS", |ui| {
                             if ui.button("Lowest-altitude reflectivity").clicked() {
                                 add_grid_composite = Some(
