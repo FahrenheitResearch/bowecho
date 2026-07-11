@@ -40669,6 +40669,7 @@ fn raob_column_to_rw_sounding_data(
             model: format!("{} RAOB", site.id),
             run: format!("{}{}", valid.format("%Y-%m-%d %Hz"), context),
             hour: 0,
+            exact_time: None,
         },
         fx: 0.0,
         fy: 0.0,
@@ -43475,6 +43476,7 @@ mod tests {
                 model: "gfs".to_owned(),
                 run: "20260612_00z".to_owned(),
                 hour: 7,
+                exact_time: None,
             },
             fx: 0.0,
             fy: 0.0,
@@ -43534,6 +43536,7 @@ mod tests {
                 model: "hrrr".to_owned(),
                 run: "2026-06-24 22z".to_owned(),
                 hour: 1,
+                exact_time: None,
             },
             fx: 0.0,
             fy: 0.0,
@@ -50136,6 +50139,7 @@ mod tests {
                 model: "hrrr".to_owned(),
                 run: "20260615_17z".to_owned(),
                 hour: 1,
+                exact_time: None,
             })
         );
         assert!(
@@ -53166,11 +53170,13 @@ mod tests {
                         writer_version: "test".to_owned(),
                         nx: 2,
                         ny: 2,
+                        exact_time_axis: false,
                         hours: vec![rw_ui::HourEntry {
                             hour: 0,
                             file: "f000.rws".to_owned(),
                             variable_count: 1,
                             written_unix: 0,
+                            exact_time: None,
                         }],
                     }],
                 }],
@@ -53296,6 +53302,7 @@ mod tests {
                     writer_version: "test".to_owned(),
                     nx: 2,
                     ny: 2,
+                    exact_time_axis: false,
                     hours: hours
                         .iter()
                         .copied()
@@ -53304,6 +53311,7 @@ mod tests {
                             file: format!("f{hour:03}.rws"),
                             variable_count: 1,
                             written_unix: 0,
+                            exact_time: None,
                         })
                         .collect(),
                 }],
@@ -53361,6 +53369,7 @@ mod tests {
                     model: model.to_owned(),
                     run: run.to_owned(),
                     hour,
+                    exact_time: None,
                 },
                 var: "temperature_2m".to_owned(),
             },
@@ -53710,6 +53719,7 @@ mod tests {
                         model: "wrf".to_owned(),
                         run: "verify".to_owned(),
                         hour: 0,
+                        exact_time: None,
                     },
                     var: store_name.to_owned(),
                 },
@@ -53785,6 +53795,7 @@ mod tests {
                         model: "wrf".to_owned(),
                         run: "verify".to_owned(),
                         hour: 0,
+                        exact_time: None,
                     },
                     var: "temperature_2m".to_owned(),
                 },
@@ -53876,6 +53887,7 @@ mod tests {
                     model: "wrf".to_owned(),
                     run: "proof".to_owned(),
                     hour: 0,
+                    exact_time: None,
                 },
                 var: "temperature_2m".to_owned(),
             },

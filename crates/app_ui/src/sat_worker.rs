@@ -2251,6 +2251,8 @@ fn write_himawari_grid_frame(
         hhmm,
         RwsHourEntry {
             file: file_name,
+            lead_seconds: None,
+            valid_unix: None,
             written_unix,
             encode_ms,
             variables: vec![variable.clone()],
@@ -3770,6 +3772,8 @@ fn write_himawari_composite_frame(
         hhmm,
         RwsHourEntry {
             file: file_name,
+            lead_seconds: None,
+            valid_unix: None,
             written_unix,
             encode_ms,
             variables: vec![
@@ -4732,6 +4736,8 @@ fn write_goes_rgb_frame(
         hhmm,
         RwsHourEntry {
             file: file_name,
+            lead_seconds: None,
+            valid_unix: None,
             written_unix,
             encode_ms,
             variables: vec![

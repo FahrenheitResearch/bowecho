@@ -284,6 +284,7 @@ mod tests {
                 model: "wrf".to_owned(),
                 run: "local_wrf_19740403_090000".to_owned(),
                 hour: 0,
+                exact_time: None,
             },
             var: var.to_owned(),
         }

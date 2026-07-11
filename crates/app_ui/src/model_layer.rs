@@ -754,6 +754,7 @@ mod tests {
                     model: "gfs".to_owned(),
                     run: "20260626_00z".to_owned(),
                     hour: 0,
+                    exact_time: None,
                 },
                 var: "temperature_2m".to_owned(),
             },

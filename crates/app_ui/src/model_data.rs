@@ -771,6 +771,7 @@ impl ModelDataDock {
                                     model: model.model.clone(),
                                     run: run.run.clone(),
                                     hour: hour.hour,
+                                    exact_time: hour.exact_time,
                                 })
                             })
                         });
@@ -2346,24 +2347,26 @@ impl ModelDataDock {
         let Some(tree) = &self.tree else {
             return;
         };
-        let hours: Vec<u16> = tree
+        let hours: Vec<(u16, Option<rw_store::RwsExactTime>)> = tree
             .models
             .iter()
             .find(|m| m.model == current.model)
             .and_then(|m| m.runs.iter().find(|r| r.run == current.run))
-            .map(|r| r.hours.iter().map(|h| h.hour).collect())
+            .map(|r| r.hours.iter().map(|h| (h.hour, h.exact_time)).collect())
             .unwrap_or_default();
-        let Some(position) = hours.iter().position(|&h| h == current.hour) else {
+        let Some(position) = hours.iter().position(|&(slot, _)| slot == current.hour) else {
             return;
         };
         let next = position as i64 + delta;
         if next < 0 || next as usize >= hours.len() {
             return;
         }
+        let (hour, exact_time) = hours[next as usize];
         let key = HourKey {
             model: current.model,
             run: current.run,
-            hour: hours[next as usize],
+            hour,
+            exact_time,
         };
         self.browser.select(key.clone());
         self.select_hour(key);
@@ -2438,6 +2441,7 @@ impl ModelDataDock {
                 model: model.model.clone(),
                 run: run.run.clone(),
                 hour: best.hour,
+                exact_time: best.exact_time,
             },
             valid,
             target - run_time,
@@ -3158,6 +3162,7 @@ mod tests {
                     model: "wrf".to_owned(),
                     run: "20260519_00z".to_owned(),
                     hour: 0,
+                    exact_time: None,
                 },
                 var: var.to_owned(),
             },
@@ -3221,6 +3226,7 @@ mod tests {
             model: "wrf".to_owned(),
             run: "local_wrf_19740403_090000".to_owned(),
             hour: 0,
+            exact_time: None,
         }
     }
 
@@ -3506,6 +3512,7 @@ mod tests {
                         writer_version: "test".to_owned(),
                         nx: 2,
                         ny: 2,
+                        exact_time_axis: false,
                         hours: hours
                             .iter()
                             .map(|&hour| rw_ui::HourEntry {
@@ -3513,6 +3520,7 @@ mod tests {
                                 file: format!("f{hour:03}.rws"),
                                 variable_count: 1,
                                 written_unix: 0,
+                                exact_time: None,
                             })
                             .collect(),
                     })
@@ -4409,6 +4417,7 @@ mod tests {
             model: "wrf".to_owned(),
             run: STYLE_RUN.to_owned(),
             hour: 0,
+            exact_time: None,
         }
     }
 

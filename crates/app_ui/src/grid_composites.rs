@@ -574,6 +574,7 @@ fn selected_field_to_field_data(
                 model: source.model_slug().to_owned(),
                 run: "latest".to_owned(),
                 hour: 0,
+                exact_time: None,
             },
             var: variable_slug,
         },

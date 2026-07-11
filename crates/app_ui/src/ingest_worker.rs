@@ -1322,6 +1322,7 @@ mod tests {
             model: "gfs".to_owned(),
             run: format!("{date}_{cycle_hour:02}z"),
             hour: hours[0],
+            exact_time: None,
         };
         worker.send(rw_ui::StoreRequest::LoadHour(key.clone()));
         let vars = loop {

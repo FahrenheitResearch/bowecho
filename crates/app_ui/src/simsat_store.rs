@@ -160,6 +160,8 @@ pub(crate) fn write_derived_frame(
         frame.hhmm,
         RwsHourEntry {
             file: file_name,
+            lead_seconds: None,
+            valid_unix: None,
             written_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs())

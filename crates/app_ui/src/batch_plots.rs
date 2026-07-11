@@ -424,6 +424,7 @@ pub(crate) fn run_batch_plot(
                         model: request.model.clone(),
                         run: request.run.clone(),
                         hour,
+                        exact_time: meta.exact_time(),
                     },
                     var: var.name.clone(),
                 },
@@ -458,6 +459,7 @@ pub(crate) fn run_batch_plot(
                         model: request.model.clone(),
                         run: request.run.clone(),
                         hour,
+                        exact_time: meta.exact_time(),
                     },
                     var: spec.slug(),
                 };
@@ -937,6 +939,7 @@ mod tests {
                     model: model.to_owned(),
                     run: "r".to_owned(),
                     hour: 0,
+                    exact_time: None,
                 },
                 var: var.to_owned(),
             },

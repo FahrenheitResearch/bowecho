@@ -467,6 +467,7 @@ mod tests {
                     model: "hrrr".into(),
                     run: "20990101_00z".into(),
                     hour: 0,
+                    exact_time: None,
                 },
                 var: "temperature_2m".into(),
             },
