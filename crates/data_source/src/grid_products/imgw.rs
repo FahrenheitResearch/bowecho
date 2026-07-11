@@ -543,4 +543,26 @@ mod tests {
             IMGW_PROCESSED_NOTICE_PL
         );
     }
+
+    /// Listing-only live proof. The request downloads the portal's HTML
+    /// fragment and constructs plans; it deliberately fetches no HDF5 body.
+    #[test]
+    #[ignore = "network: lists current IMGW RAM CMAX files without downloading them"]
+    fn imgw_polrad_live_listing_builds_current_download_plans() {
+        let cycles =
+            imgw_polrad_recent_cycles(ImgwPolradSite::Ramza, 2).expect("live IMGW RAM listing");
+        assert!(!cycles.is_empty() && cycles.len() <= 2);
+        assert!(
+            cycles
+                .windows(2)
+                .all(|pair| pair[0].observed_at < pair[1].observed_at)
+        );
+        let newest = cycles.last().expect("newest IMGW cycle");
+        assert_eq!(newest.site, ImgwPolradSite::Ramza);
+        assert!(newest.file(ImgwPolradQuantity::Kdp).is_some());
+        assert!(newest.files.iter().all(|file| {
+            file.download_url.starts_with(IMGW_DATASTORE_DOWNLOAD_BASE)
+                && file.identity.starts_with("imgw-polrad/ram/")
+        }));
+    }
 }

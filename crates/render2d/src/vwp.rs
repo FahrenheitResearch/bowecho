@@ -38,6 +38,7 @@ const TRIM_SIGMA_MULTIPLIER: f32 = 3.0;
 const TRIM_MIN_MPS: f32 = 3.0;
 const TRIM_MAX_MPS: f32 = 12.0;
 const NORMAL_PIVOT_EPSILON: f64 = 1.0e-10;
+const MAX_PROFILE_LEVELS: usize = 256;
 
 /// Geometry controls for [`compute_vwp`].  Science/QC thresholds are fixed so
 /// two users cannot silently assign different trust labels to the same data.
@@ -252,7 +253,10 @@ pub fn compute_vwp(
             }
         }
 
-        let outcome = if let Some(best) = accepted.into_iter().min_by(compare_wind_candidates) {
+        let outcome = if let Some(best) = accepted
+            .into_iter()
+            .min_by(|left, right| compare_wind_candidates(left, right, target_height))
+        {
             VwpLevelOutcome::Retrieved(best)
         } else if let Some(best) = rejected.into_iter().max_by(compare_rejected_candidates) {
             VwpLevelOutcome::Rejected(VwpRejectedLevel {
@@ -302,6 +306,11 @@ fn validate_config(config: VwpConfig) -> Result<(), VwpError> {
     }
     if config.height_step_m <= 0.0 {
         return Err(VwpError::InvalidConfig("height step must be positive"));
+    }
+    let requested_levels =
+        ((config.max_height_m_agl - config.min_height_m_agl) / config.height_step_m).floor() + 1.0;
+    if !requested_levels.is_finite() || requested_levels > MAX_PROFILE_LEVELS as f32 {
+        return Err(VwpError::InvalidConfig("too many requested height levels"));
     }
     if config.min_slant_range_m < 0.0 || config.max_slant_range_m <= config.min_slant_range_m {
         return Err(VwpError::InvalidConfig("slant-range limits are invalid"));
@@ -379,7 +388,9 @@ fn candidate_for_height(
     let spacing_m = grid.gate_range.gate_spacing_m as f32;
     let gate_radius = (config.annulus_half_width_m / spacing_m).round() as usize;
     let gate_start = center_gate.saturating_sub(gate_radius);
-    let gate_end = (center_gate + gate_radius).min(grid.gate_range.gate_count - 1);
+    let gate_end = center_gate
+        .saturating_add(gate_radius)
+        .min(grid.gate_range.gate_count - 1);
     let samples = annulus_samples(cut, grid, gate_start, gate_end);
     let raw_coverage = coverage(&samples);
     let base_diagnostics = VwpCandidateDiagnostics {
@@ -799,7 +810,11 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
     }
 }
 
-fn compare_wind_candidates(left: &VwpWindLevel, right: &VwpWindLevel) -> std::cmp::Ordering {
+fn compare_wind_candidates(
+    left: &VwpWindLevel,
+    right: &VwpWindLevel,
+    target_height_m_agl: f32,
+) -> std::cmp::Ordering {
     quality_rank(left.quality)
         .cmp(&quality_rank(right.quality))
         .then_with(|| {
@@ -817,6 +832,11 @@ fn compare_wind_candidates(left: &VwpWindLevel, right: &VwpWindLevel) -> std::cm
                 .diagnostics
                 .azimuth_sectors
                 .cmp(&left.diagnostics.azimuth_sectors)
+        })
+        .then_with(|| {
+            (left.height_m_agl - target_height_m_agl)
+                .abs()
+                .total_cmp(&(right.height_m_agl - target_height_m_agl).abs())
         })
         .then_with(|| {
             left.diagnostics
@@ -1067,6 +1087,18 @@ mod tests {
         assert_eq!(
             compute_vwp(&volume, &grids(&volume), one_level_config(1_000.0)),
             Err(VwpError::UnsupportedScanMode(ScanMode::Rhi))
+        );
+
+        volume.metadata.scan_mode = Some(ScanMode::Ppi);
+        let too_many_levels = VwpConfig {
+            min_height_m_agl: 0.0,
+            max_height_m_agl: 20_000.0,
+            height_step_m: 1.0,
+            ..VwpConfig::default()
+        };
+        assert_eq!(
+            compute_vwp(&volume, &grids(&volume), too_many_levels),
+            Err(VwpError::InvalidConfig("too many requested height levels"))
         );
     }
 }
