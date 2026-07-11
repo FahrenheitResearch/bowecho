@@ -123,14 +123,9 @@ pub(crate) struct WmsBounds {
 
 impl WmsBounds {
     pub(crate) fn validate(self) -> Result<Self, String> {
-        let finite = [
-            self.west_deg,
-            self.south_deg,
-            self.east_deg,
-            self.north_deg,
-        ]
-        .into_iter()
-        .all(f64::is_finite);
+        let finite = [self.west_deg, self.south_deg, self.east_deg, self.north_deg]
+            .into_iter()
+            .all(f64::is_finite);
         if !finite
             || self.west_deg < -180.0
             || self.east_deg > 180.0
@@ -206,7 +201,8 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut stack: Vec<LayerDraft> = Vec::new();
-    let mut target: Option<TextTarget> = None;
+    let mut element_path: Vec<Vec<u8>> = Vec::new();
+    let mut target: Option<(TextTarget, usize)> = None;
     let mut out = Vec::new();
     let mut seen_layers = 0usize;
     let mut seen_names = Vec::new();
@@ -214,20 +210,37 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
     loop {
         match reader.read_event() {
             Ok(Event::Start(event)) => {
-                let local = event.local_name();
-                let name = local.as_ref();
+                let name = event.local_name().as_ref().to_vec();
+                element_path.push(name.clone());
                 if name == b"Layer" {
                     stack.push(LayerDraft::default());
                     target = None;
                 } else if let Some(draft) = stack.last_mut() {
-                    target = match name {
-                        b"Name" => Some(TextTarget::Name),
-                        b"Title" => Some(TextTarget::Title),
-                        b"westBoundLongitude" => Some(TextTarget::West),
-                        b"southBoundLatitude" => Some(TextTarget::South),
-                        b"eastBoundLongitude" => Some(TextTarget::East),
-                        b"northBoundLatitude" => Some(TextTarget::North),
-                        b"Dimension" => {
+                    let direct_layer_child = path_ends_with(&element_path, &[b"Layer", &name]);
+                    let geographic_bound = path_ends_with(
+                        &element_path,
+                        &[b"Layer", b"EX_GeographicBoundingBox", &name],
+                    );
+                    target = match name.as_slice() {
+                        b"Name" if direct_layer_child => {
+                            Some((TextTarget::Name, element_path.len()))
+                        }
+                        b"Title" if direct_layer_child => {
+                            Some((TextTarget::Title, element_path.len()))
+                        }
+                        b"westBoundLongitude" if geographic_bound => {
+                            Some((TextTarget::West, element_path.len()))
+                        }
+                        b"southBoundLatitude" if geographic_bound => {
+                            Some((TextTarget::South, element_path.len()))
+                        }
+                        b"eastBoundLongitude" if geographic_bound => {
+                            Some((TextTarget::East, element_path.len()))
+                        }
+                        b"northBoundLatitude" if geographic_bound => {
+                            Some((TextTarget::North, element_path.len()))
+                        }
+                        b"Dimension" if direct_layer_child => {
                             let is_time = event.attributes().flatten().any(|attribute| {
                                 attribute.key.local_name().as_ref() == b"name"
                                     && attribute
@@ -242,26 +255,33 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
                                         attribute.key.local_name().as_ref() == b"default"
                                     })
                                     .and_then(|attribute| {
-                                        attribute
-                                            .decode_and_unescape_value(event.decoder())
-                                            .ok()
+                                        attribute.decode_and_unescape_value(event.decoder()).ok()
                                     })
                                     .map(|value| value.into_owned())
                                     .unwrap_or_default();
-                                Some(TextTarget::Time)
+                                Some((TextTarget::Time, element_path.len()))
                             } else {
                                 None
                             }
                         }
-                        _ => None,
+                        // A live GeoServer layer contains nested Style/Name
+                        // and Style/Title elements. Those are not layer
+                        // identity fields and must never replace the direct
+                        // Layer/Name and Layer/Title values.
+                        _ if direct_layer_child || geographic_bound => None,
+                        _ => target,
                     };
                 }
             }
             Ok(Event::Text(text)) => {
-                if let (Some(draft), Some(target)) = (stack.last_mut(), target) {
+                if let (Some(draft), Some((target, target_depth))) = (stack.last_mut(), target)
+                    && target_depth == element_path.len()
+                {
                     let value = text
                         .decode()
-                        .map_err(|error| format!("EUMETView capabilities text decode failed: {error}"))?
+                        .map_err(|error| {
+                            format!("EUMETView capabilities text decode failed: {error}")
+                        })?
                         .trim()
                         .to_owned();
                     match target {
@@ -277,8 +297,7 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
             }
             Ok(Event::End(event)) => {
                 if event.local_name().as_ref() == b"Layer" {
-                    if let Some(draft) = stack.pop()
-                    {
+                    if let Some(draft) = stack.pop() {
                         seen_layers += 1;
                         if !draft.name.is_empty() && seen_names.len() < 8 {
                             seen_names.push(draft.name.clone());
@@ -288,7 +307,10 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
                         }
                     }
                 }
-                target = None;
+                if target.is_some_and(|(_, target_depth)| target_depth == element_path.len()) {
+                    target = None;
+                }
+                element_path.pop();
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
@@ -310,6 +332,15 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
             .unwrap_or(usize::MAX)
     });
     Ok(out)
+}
+
+fn path_ends_with(path: &[Vec<u8>], suffix: &[&[u8]]) -> bool {
+    path.len() >= suffix.len()
+        && path[path.len() - suffix.len()..]
+            .iter()
+            .map(Vec::as_slice)
+            .zip(suffix.iter().copied())
+            .all(|(actual, expected)| actual == expected)
 }
 
 fn finish_layer(product: MtgProduct, draft: LayerDraft) -> Result<LayerCapability, String> {
@@ -368,7 +399,9 @@ fn parse_time_extent(
     let latest = parse_wms_time(parts[1])?;
     let cadence = parse_iso_minutes(parts[2]).unwrap_or(fallback_cadence_minutes.max(1));
     if latest < first {
-        return Err(format!("EUMETView time extent ends before it starts: {value}"));
+        return Err(format!(
+            "EUMETView time extent ends before it starts: {value}"
+        ));
     }
     Ok((first, latest, cadence))
 }
@@ -523,7 +556,10 @@ impl EumetViewClient {
                 "EUMETView returned '{content_type}' instead of an image"
             ));
         }
-        if response.content_length().is_some_and(|bytes| bytes > MAX_IMAGE_BYTES) {
+        if response
+            .content_length()
+            .is_some_and(|bytes| bytes > MAX_IMAGE_BYTES)
+        {
             return Err(format!(
                 "EUMETView image exceeds BowEcho's {} MiB response limit",
                 MAX_IMAGE_BYTES / (1024 * 1024)
@@ -590,6 +626,15 @@ mod tests {
             <northBoundLatitude>77.3</northBoundLatitude>
           </EX_GeographicBoundingBox>
           <Dimension name="time" default="2026-07-11T18:20:00Z" nearestValue="1">2024-09-23T00:00:00.000Z/2026-07-11T18:20:00.000Z/PT10M</Dimension>
+          <Style>
+            <Name>raster</Name>
+            <Title>A simple default style</Title>
+            <Abstract>A sample style for rasters</Abstract>
+            <LegendURL width="20" height="20">
+              <Format>image/png</Format>
+              <OnlineResource href="https://view.eumetsat.int/geoserver/ows?layer=mtg_fd%3Argb_geocolour"/>
+            </LegendURL>
+          </Style>
         </Layer><Layer>
           <Name>mtg_fd:li_afa</Name><Title>LI Accumulated Flash Area</Title>
           <EX_GeographicBoundingBox><westBoundLongitude>-70</westBoundLongitude><eastBoundLongitude>70</eastBoundLongitude><southBoundLatitude>-70</southBoundLatitude><northBoundLatitude>70</northBoundLatitude></EX_GeographicBoundingBox>
@@ -600,7 +645,10 @@ mod tests {
     #[test]
     fn product_catalog_covers_imagery_and_lightning() {
         assert_eq!(MtgProduct::ALL.len(), 11);
-        assert_eq!(MtgProduct::parse("mtg_fd:ir105_hrfi"), Some(MtgProduct::Ir105Hrfi));
+        assert_eq!(
+            MtgProduct::parse("mtg_fd:ir105_hrfi"),
+            Some(MtgProduct::Ir105Hrfi)
+        );
         assert_eq!(MtgProduct::parse("li_afa"), Some(MtgProduct::LightningAfa));
         assert_eq!(MtgProduct::LightningAfa.cadence_minutes(), 5);
     }
@@ -611,8 +659,12 @@ mod tests {
         assert_eq!(layers.len(), 2);
         let geo = &layers[0];
         assert_eq!(geo.product, MtgProduct::GeoColour);
+        assert_eq!(geo.title, "Geo Colour RGB - MTG-I - 0 degree");
         assert_eq!(geo.bounds.west_deg, -81.25);
-        assert_eq!(geo.latest_time, Utc.with_ymd_and_hms(2026, 7, 11, 18, 20, 0).unwrap());
+        assert_eq!(
+            geo.latest_time,
+            Utc.with_ymd_and_hms(2026, 7, 11, 18, 20, 0).unwrap()
+        );
         assert_eq!(geo.cadence_minutes, 10);
         let lightning = &layers[1];
         assert_eq!(lightning.product, MtgProduct::LightningAfa);
@@ -628,27 +680,51 @@ mod tests {
         let request = GetMapRequest {
             product: MtgProduct::GeoColour,
             time: Utc.with_ymd_and_hms(2026, 7, 11, 18, 20, 0).unwrap(),
-            bounds: WmsBounds { west_deg: -20.0, south_deg: 20.0, east_deg: 30.0, north_deg: 60.0 },
+            bounds: WmsBounds {
+                west_deg: -20.0,
+                south_deg: 20.0,
+                east_deg: 30.0,
+                north_deg: 60.0,
+            },
             width: 1024,
             height: 800,
         };
         let url = request.url().expect("URL");
-        let pairs = url.query_pairs().into_owned().collect::<std::collections::HashMap<_, _>>();
+        let pairs = url
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(pairs.get("crs").map(String::as_str), Some("CRS:84"));
         assert_eq!(pairs.get("bbox").map(String::as_str), Some("-20,20,30,60"));
-        assert_eq!(pairs.get("time").map(String::as_str), Some("2026-07-11T18:20:00Z"));
-        assert_eq!(pairs.get("layers").map(String::as_str), Some("mtg_fd:rgb_geocolour"));
+        assert_eq!(
+            pairs.get("time").map(String::as_str),
+            Some("2026-07-11T18:20:00Z")
+        );
+        assert_eq!(
+            pairs.get("layers").map(String::as_str),
+            Some("mtg_fd:rgb_geocolour")
+        );
     }
 
     #[test]
     fn image_size_preserves_bbox_aspect_and_caps_edges() {
         let (width, height) = image_size_for_bounds(
-            WmsBounds { west_deg: -70.0, south_deg: -35.0, east_deg: 70.0, north_deg: 35.0 },
+            WmsBounds {
+                west_deg: -70.0,
+                south_deg: -35.0,
+                east_deg: 70.0,
+                north_deg: 35.0,
+            },
             1_600,
         );
         assert_eq!((width, height), (1_600, 800));
         let (width, height) = image_size_for_bounds(
-            WmsBounds { west_deg: -10.0, south_deg: -70.0, east_deg: 10.0, north_deg: 70.0 },
+            WmsBounds {
+                west_deg: -10.0,
+                south_deg: -70.0,
+                east_deg: 10.0,
+                north_deg: 70.0,
+            },
             4_096,
         );
         assert_eq!(height, MAX_IMAGE_EDGE);
