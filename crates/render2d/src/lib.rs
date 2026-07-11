@@ -23,6 +23,7 @@ mod swath;
 mod tracking;
 pub mod tracks;
 mod volumetric;
+mod vwp;
 pub mod wind;
 pub use cells::{StormCell, identify_storm_cells};
 pub use dealias_pyart::dealias_velocity_grid_pyart_region;
@@ -68,6 +69,10 @@ pub use volumetric::{
     reflectivity_cross_section, reflectivity_cross_section_with_smoothing, velocity_cross_section,
     velocity_cross_section_cached, velocity_cross_section_cached_with_smoothing, vil_density_grid,
     vil_grid, volume_box_resample, volume_box_resample_moment,
+};
+pub use vwp::{
+    VwpCandidateDiagnostics, VwpConfig, VwpError, VwpLevel, VwpLevelOutcome, VwpProfile,
+    VwpQuality, VwpRejectedLevel, VwpRejectionReason, VwpWindLevel, compute_vwp,
 };
 pub use wind::{
     gust_proxy_grid, gust_proxy_grid_from_dealiased, marc_grid, marc_grid_from_dealiased,
