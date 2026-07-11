@@ -11,6 +11,8 @@ use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, REFERER};
 use serde::{Deserialize, Serialize};
 
+pub mod imgw;
+
 const ITALY_DPC_API_BASE: &str = "https://radar-api.protezionecivile.it";
 const ITALY_DPC_ORIGIN: &str = "https://radar.protezionecivile.it";
 const ITALY_DPC_WMTS_BASE: &str = "https://radar-geowebcache.protezionecivile.it/service/wmts";
@@ -38,6 +40,7 @@ pub enum GridProductKind {
     ThreeDimensionalComposite,
     VerticallyIntegratedLiquid,
     VerticalMaximumIntensity,
+    DualPolarizationMaximum,
     HeavyRainDetection,
     Lightning,
     RadarStatus,
@@ -800,6 +803,7 @@ const ORD_API_CODECS: &[GridCodec] = &[
 const HDF5_GRID: &[GridCodec] = &[GridCodec::Hdf5Grid];
 const KNMI_GRID: &[GridCodec] = &[GridCodec::Hdf5Grid, GridCodec::NetcdfGrid];
 const SWISS_GRID: &[GridCodec] = &[GridCodec::Hdf5Grid, GridCodec::NetcdfGrid];
+const IMGW_CMAX_CODECS: &[GridCodec] = &[GridCodec::OdimH5Grid];
 const RADOLAN_CODECS: &[GridCodec] = &[GridCodec::ApiJson, GridCodec::Hdf5Grid];
 const ITALY_CODECS: &[GridCodec] = &[
     GridCodec::GeoTiff,
@@ -825,6 +829,7 @@ const ITALY_DPC_ACCESS: &[GridAccess] = &[
 ];
 const ITALY_DPC_WMTS: &[GridAccess] = &[GridAccess::WmsWmts];
 const OPEN_HTTP: &[GridAccess] = &[GridAccess::OpenHttp];
+const PORTAL_DOWNLOAD: &[GridAccess] = &[GridAccess::PortalDownload];
 
 const OPERA_PRODUCTS: &[GridProduct] = &[
     GridProduct {
@@ -1115,6 +1120,57 @@ const DWD_GRID_PRODUCTS: &[GridProduct] = &[
         access: OPEN_HTTP,
         status: GridImplementationStatus::DecoderNeeded,
         source_hint: "DWD radar precipitation nowcast product family",
+    },
+];
+
+const IMGW_POLRAD_PRODUCTS: &[GridProduct] = &[
+    GridProduct {
+        slug: "imgw-polrad-cmax-kdp",
+        label: "Poland IMGW POLRAD CMAX KDP",
+        kind: GridProductKind::DualPolarizationMaximum,
+        cadence_minutes: Some(5),
+        resolution_km: Some(1.0),
+        forecast_hours: None,
+        codecs: IMGW_CMAX_CODECS,
+        access: PORTAL_DOWNLOAD,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "IMGW national datastore ODIM_H5 MAX grid; site-centered maximum projection, not a polar volume",
+    },
+    GridProduct {
+        slug: "imgw-polrad-cmax-rhohv",
+        label: "Poland IMGW POLRAD CMAX RHOHV",
+        kind: GridProductKind::DualPolarizationMaximum,
+        cadence_minutes: Some(5),
+        resolution_km: Some(1.0),
+        forecast_hours: None,
+        codecs: IMGW_CMAX_CODECS,
+        access: PORTAL_DOWNLOAD,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "IMGW national datastore ODIM_H5 MAX grid; quantity availability varies by site",
+    },
+    GridProduct {
+        slug: "imgw-polrad-cmax-zdr",
+        label: "Poland IMGW POLRAD CMAX ZDR",
+        kind: GridProductKind::DualPolarizationMaximum,
+        cadence_minutes: Some(5),
+        resolution_km: Some(1.0),
+        forecast_hours: None,
+        codecs: IMGW_CMAX_CODECS,
+        access: PORTAL_DOWNLOAD,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "IMGW national datastore ODIM_H5 MAX grid; values require each file's gain/offset",
+    },
+    GridProduct {
+        slug: "imgw-polrad-cmax-phidp",
+        label: "Poland IMGW POLRAD CMAX PHIDP",
+        kind: GridProductKind::DualPolarizationMaximum,
+        cadence_minutes: Some(5),
+        resolution_km: Some(1.0),
+        forecast_hours: None,
+        codecs: IMGW_CMAX_CODECS,
+        access: PORTAL_DOWNLOAD,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "IMGW national datastore ODIM_H5 MAX grid; published quantity set is discovered per site",
     },
 ];
 
@@ -1517,6 +1573,13 @@ const GRID_PROVIDERS: &[StaticGridProductProvider] = &[
         products: DWD_GRID_PRODUCTS,
     },
     StaticGridProductProvider {
+        id: "imgw-polrad",
+        label: "IMGW-PIB POLRAD",
+        region: "Poland",
+        docs_url: imgw::IMGW_DATASTORE_URL,
+        products: IMGW_POLRAD_PRODUCTS,
+    },
+    StaticGridProductProvider {
         id: "italy-dpc",
         label: "Italy DPC / ItaliaMeteo",
         region: "Italy",
@@ -1606,6 +1669,10 @@ mod tests {
             "meteoswiss-precip",
             "meteoswiss-combiprecip",
             "dwd-radolan-qpe",
+            "imgw-polrad-cmax-kdp",
+            "imgw-polrad-cmax-rhohv",
+            "imgw-polrad-cmax-zdr",
+            "imgw-polrad-cmax-phidp",
             "italy-dpc-vmi",
             "italy-dpc-sri",
             "italy-dpc-srt",
@@ -1621,6 +1688,28 @@ mod tests {
         ] {
             assert!(slugs.contains(required), "{required}");
         }
+    }
+
+    #[test]
+    fn imgw_polrad_catalog_is_fetchable_dual_pol_cmax_not_polar_volume() {
+        let imgw = grid_product_providers()
+            .iter()
+            .find(|provider| provider.id == "imgw-polrad")
+            .expect("IMGW POLRAD provider");
+        assert_eq!(imgw.region, "Poland");
+        assert_eq!(imgw.products.len(), 4);
+        for product in imgw.products {
+            assert_eq!(product.kind, GridProductKind::DualPolarizationMaximum);
+            assert_eq!(product.status, GridImplementationStatus::Fetchable);
+            assert!(product.codecs.contains(&GridCodec::OdimH5Grid));
+            assert!(product.access.contains(&GridAccess::PortalDownload));
+            assert_eq!(product.cadence_minutes, Some(5));
+        }
+        assert!(
+            imgw.products
+                .iter()
+                .any(|product| product.source_hint.contains("not a polar volume"))
+        );
     }
 
     #[test]
