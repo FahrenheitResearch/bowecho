@@ -97,11 +97,15 @@ range folding, non-meteorological echoes, and an uneven precipitation field can
 bias the fit. Compare the result with the velocity display, a nearby sounding,
 and other observations before using it operationally.
 
-The VWP panel can also import a local NEXRAD Level III Product 48 file. Imported
-Product 48 profiles use that product's tabular data when present and fall back
-to its symbology wind barbs; they remain distinct from a profile computed from
-the current Level II volume. BowEcho does not automatically download Product 48
-files.
+On Windows and macOS, the VWP panel can also import a local NEXRAD Level III
+Product 48 file. Imported Product 48 profiles use that product's tabular data
+when present and fall back to its symbology wind barbs; they remain distinct
+from a profile computed from the current Level II volume. An imported profile
+stays selected across dealias-engine or environmental-anchor updates; changing
+the primary radar volume or choosing **Recompute** returns to the computed VWP.
+CSV export retains available tabular divergence, slant range, elevation angle,
+and adaptable threshold metadata. BowEcho does not automatically download
+Product 48 files.
 
 Computed VWP requires a loaded radar volume with radial velocity. A
 two-dimensional composite or CMAX layer — including the IMGW POLRAD layers
@@ -112,8 +116,9 @@ below — has no radials or elevation scans and therefore cannot produce a VWP.
 BowEcho can display the ODIM HDF5 dual-polarization CMAX grids published through
 the IMGW-PIB national datastore. Supported quantities are **KDP** (deg/km),
 **RHOHV** (unitless), **ZDR** (dB), and **PHIDP** (degrees). Product availability
-varies by radar and cycle, so BowEcho discovers and offers only the files the
-datastore currently publishes.
+varies by radar and cycle. BowEcho's menu reflects the verified catalog
+snapshot documented below; loading still checks the live datastore and reports
+an unavailable product honestly if IMGW changes a site's publication set.
 
 Supported POLRAD sites are Brzuchania, Nowy Gdańsk, Góra Św. Anny, Legionowo,
 Pastewnik, Poznań, Ramża, Rzeszów, Świdwin, and Użranki.
@@ -131,6 +136,53 @@ the source notice “Źródłem pochodzenia danych jest Instytut Meteorologii i
 Gospodarki Wodnej – Państwowy Instytut Badawczy” and, for processed
 IMGW-derived output, “Dane Instytutu Meteorologii i Gospodarki Wodnej –
 Państwowego Instytutu Badawczego zostały przetworzone”.
+
+## Formula Lab model diagnostics
+
+Formula Lab is available from the Model window. It compiles custom diagnostic
+expressions through Rusty Weather's bounded formula engine; expressions are
+data formulas, not arbitrary Rust, Python, or shell code. Evaluation runs in a
+background worker and keeps progressing if the Model window is closed.
+
+The **Store** source uses the model/run/hour selected in BowEcho's model
+browser. It is model-neutral: WRF, HRRR, and other stored models work whenever
+the requested variables and dimensions exist. The **Raw WRF** source exposes
+WRF grid metrics, height, vector, vertical, and horizontal-calculus operations.
+Its file picker is intentionally unrestricted because ordinary `wrfout_*`
+files are often extensionless; it does not assume `d01` or any other domain.
+
+Temporal operators such as `dt(...)` are enabled only when BowEcho verifies a
+complete exact-time axis for the selected run and every lead time is exactly
+representable by the formula bridge. A stale, legacy, partial, or ambiguous
+axis disables temporal evaluation while leaving pointwise formulas available.
+This prevents ordinal storage slots from being mistaken for meteorological
+time.
+
+A completed formula becomes an in-memory field in the existing model field
+viewer. BowEcho generates a color scale over the result's full finite range,
+unless an exact saved output-name binding supplies a user color table. The
+styled field can be sent to the radar map and native plot/PNG workflow just
+like a stored model field. Changing source data while evaluation is running
+causes the stale result to be discarded instead of displayed.
+
+## EUMETNET ORD full-day archive loads
+
+For an ORD radar, open **Data > Archive**, enter a UTC date, and choose
+**Load full day**. BowEcho lists the day in 24 bounded one-hour catalog phases,
+merges the ORD PVOL/SCAN lanes, sorts and identity-deduplicates the scans, then
+downloads them with progress grouped into 20-scan phases. Decoded frames stream
+into the loop immediately; the newest successful scan is selected at the end.
+
+The MeteoGate API's commonly observed count of 20 refers to elevation
+`Coverage` objects, not to a limit of 20 radar scans. A daily listing can
+therefore contain hundreds of scans. BowEcho tags cached listings with their
+exact UTC date so editing the date cannot accidentally load a previously
+listed day.
+
+Both listing and download expose cancellation. A failed volume gets one retry;
+if any catalog phase or scan remains unavailable, BowEcho reports the day as
+incomplete and keeps the successfully decoded frames instead of claiming a
+complete load.
 
 ## Cross-sections and panes
 

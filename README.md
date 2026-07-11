@@ -116,6 +116,13 @@ tables, and a colorblind-safe velocity option).
 Shear (LLSD rotation), Radial Divergence — computed volume-locally in tens of
 milliseconds and selectable like any product.
 
+**Model analysis:** Formula Lab evaluates safe custom diagnostics against any
+compatible model run in the BowEcho store, or directly against a raw WRF file.
+Normal extensionless `wrfout_*` names from every domain are accepted. Results
+open in the existing field viewer, map layer, and native plot workflow with an
+automatic color scale spanning the finite output range; an exact saved color
+binding takes precedence when one exists.
+
 **Storm analysis:** NSSL-style mesocyclone/TVS detection (Stumpf et al.
 1998; Mitchell et al. 1998) with time-association (CPLT → MESO), SCIT storm
 cell tracks with motion extrapolation (Johnson et al. 1998), maximum expected
@@ -154,6 +161,9 @@ latitude.
 
 - NEXRAD Level II from the public `unidata-nexrad-level2` S3 archive and the
   real-time chunk feed. No keys, no accounts, no middleman servers.
+- EUMETNET ORD archive days can be listed and loaded in bounded UTC-hour and
+  20-scan phases with visible progress and cancellation. The 20 objects exposed
+  by MeteoGate are elevation coverages, not a 20-scan archive limit.
 - Live Polish POLRAD dual-polarization CMAX grids from the **IMGW-PIB public
   datastore**: KDP, RHOHV, ZDR, and PHIDP where each site publishes them.
   These are two-dimensional maximum-projection layers, not polar volumes;
