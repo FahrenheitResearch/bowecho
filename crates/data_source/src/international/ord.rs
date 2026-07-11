@@ -418,17 +418,10 @@ pub fn archive_plans_for_day_with_progress(
     let (_, dir, _) = country_for_archive_code(site_id)
         .ok_or_else(|| format!("ORD: site '{site_id}' is not in an enabled country"))?;
     let kinds = preferred_object_kinds(site_id);
-    archive_plans_for_day_with_lister(
-        site_id,
-        date_utc,
-        kinds,
-        cancel,
-        progress,
-        |kind, hour| {
-            list_hour_keys_from_base(ARCHIVE_BUCKET_BASE, dir, site_id, kind, hour)
-                .map_err(|err| format!("ORD archive '{site_id}': {err}"))
-        },
-    )
+    archive_plans_for_day_with_lister(site_id, date_utc, kinds, cancel, progress, |kind, hour| {
+        list_hour_keys_from_base(ARCHIVE_BUCKET_BASE, dir, site_id, kind, hour)
+            .map_err(|err| format!("ORD archive '{site_id}': {err}"))
+    })
 }
 
 fn archive_plans_for_day_with_lister<F>(
@@ -838,12 +831,12 @@ impl ArchiveFrames for OrdProvider {
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(ArchiveListProgress),
     ) -> Result<Vec<FramePlan>, String> {
-        Ok(archive_plans_for_day_with_progress(
-            site_id, date_utc, cancel, progress,
-        )?
-        .into_iter()
-        .map(|plan| plan.frame)
-        .collect())
+        Ok(
+            archive_plans_for_day_with_progress(site_id, date_utc, cancel, progress)?
+                .into_iter()
+                .map(|plan| plan.frame)
+                .collect(),
+        )
     }
 
     /// Hour-granular override of the day-folding default: ORD's archive
@@ -2719,8 +2712,7 @@ mod tests {
                 calls.push((kind, hour));
                 if kind == ObjectKind::Pvol && hour == day_start {
                     Ok(complete_pvol_keys("plbrz", "20260609T0006"))
-                } else if kind == ObjectKind::Pvol
-                    && hour == day_start + chrono::Duration::hours(1)
+                } else if kind == ObjectKind::Pvol && hour == day_start + chrono::Duration::hours(1)
                 {
                     Ok(complete_pvol_keys("plbrz", "20260609T0106"))
                 } else {
@@ -2743,10 +2735,7 @@ mod tests {
         assert_eq!(snapshots.last().unwrap().catalog_requests_completed, 50);
         assert_eq!(snapshots.last().unwrap().plans_found, 2);
         assert_eq!(
-            plans
-                .iter()
-                .map(|plan| plan.stamp_utc)
-                .collect::<Vec<_>>(),
+            plans.iter().map(|plan| plan.stamp_utc).collect::<Vec<_>>(),
             [utc_time(2026, 6, 9, 0, 6), utc_time(2026, 6, 9, 1, 6)]
         );
     }
@@ -2820,12 +2809,9 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 5, 30).unwrap();
         let cancel = AtomicBool::new(false);
         let mut snapshots = Vec::new();
-        let plans = archive_plans_for_day_with_progress(
-            "plbrz",
-            date,
-            &cancel,
-            &mut |snapshot| snapshots.push(snapshot),
-        )
+        let plans = archive_plans_for_day_with_progress("plbrz", date, &cancel, &mut |snapshot| {
+            snapshots.push(snapshot)
+        })
         .expect("live full-day ORD archive plans");
 
         println!(
@@ -2834,7 +2820,11 @@ mod tests {
             snapshots.last().unwrap().catalog_requests_completed
         );
         assert!(plans.len() > 20, "full-day listing was unexpectedly capped");
-        assert!(plans.windows(2).all(|pair| pair[0].stamp_utc <= pair[1].stamp_utc));
+        assert!(
+            plans
+                .windows(2)
+                .all(|pair| pair[0].stamp_utc <= pair[1].stamp_utc)
+        );
         assert!(plans.iter().all(|plan| plan.stamp_utc.date_naive() == date));
         assert_eq!(
             plans
