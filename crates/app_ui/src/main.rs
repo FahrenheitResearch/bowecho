@@ -55333,27 +55333,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let (sender, receiver) = mpsc::channel();
-        archive_browser::stream_intl_full_day_with(
-            plans,
-            "ORD full day test",
-            &sender,
-            |plan| {
-                let minute = plan
-                    .identity
-                    .rsplit('-')
-                    .next()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .unwrap();
-                let scan_time = Utc
-                    .with_ymd_and_hms(2026, 5, 30, 0, minute, 0)
-                    .unwrap();
-                Ok(test_decoded_from_volume(
-                    PathBuf::from(format!("ord-archive:{}", plan.identity)),
-                    test_volume_with_site_time("plbrz", scan_time),
-                    FrameStatus::Complete,
-                ))
-            },
-        );
+        archive_browser::stream_intl_full_day_with(plans, "ORD full day test", &sender, |plan| {
+            let minute = plan
+                .identity
+                .rsplit('-')
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap();
+            let scan_time = Utc.with_ymd_and_hms(2026, 5, 30, 0, minute, 0).unwrap();
+            Ok(test_decoded_from_volume(
+                PathBuf::from(format!("ord-archive:{}", plan.identity)),
+                test_volume_with_site_time("plbrz", scan_time),
+                FrameStatus::Complete,
+            ))
+        });
         drop(sender);
 
         let ctx = egui::Context::default();
