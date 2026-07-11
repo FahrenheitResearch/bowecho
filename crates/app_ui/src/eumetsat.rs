@@ -296,15 +296,15 @@ pub(crate) fn parse_capabilities(xml: &str) -> Result<Vec<LayerCapability>, Stri
                 }
             }
             Ok(Event::End(event)) => {
-                if event.local_name().as_ref() == b"Layer" {
-                    if let Some(draft) = stack.pop() {
-                        seen_layers += 1;
-                        if !draft.name.is_empty() && seen_names.len() < 8 {
-                            seen_names.push(draft.name.clone());
-                        }
-                        if let Some(product) = MtgProduct::parse(&draft.name) {
-                            out.push(finish_layer(product, draft)?);
-                        }
+                if event.local_name().as_ref() == b"Layer"
+                    && let Some(draft) = stack.pop()
+                {
+                    seen_layers += 1;
+                    if !draft.name.is_empty() && seen_names.len() < 8 {
+                        seen_names.push(draft.name.clone());
+                    }
+                    if let Some(product) = MtgProduct::parse(&draft.name) {
+                        out.push(finish_layer(product, draft)?);
                     }
                 }
                 if target.is_some_and(|(_, target_depth)| target_depth == element_path.len()) {
