@@ -1277,6 +1277,10 @@ fn bowecho_tile_layer_config() -> tiles::TileLayerConfig {
 }
 
 fn main() -> eframe::Result {
+    if self_update::run_macos_update_helper_if_requested() {
+        return Ok(());
+    }
+
     // Crash forensics: panics land in a log next to the settings so field
     // reports from other machines carry a backtrace ("crashes a lot when
     // switching pane views" needs a line number, not a guess).
@@ -1304,9 +1308,9 @@ fn main() -> eframe::Result {
         eprintln!("{report}");
         default_hook(info);
     }));
-    // Sweep leftovers from a previous in-app update (the parked
-    // `bowecho.exe.old` may still be locked while the pre-update process
-    // finishes exiting; failures stay silent and retry next launch).
+    // Sweep leftovers from a previous in-app update. The parked previous
+    // executable or app bundle may still be in use while the pre-update
+    // process finishes exiting; failures stay silent and retry next launch.
     cleanup_stale_update_artifacts();
     let input_path = std::env::args_os().nth(1).map(PathBuf::from);
     let startup_settings = load_startup_settings_report();
@@ -1333,9 +1337,10 @@ fn main() -> eframe::Result {
         Err(err) => Err(err),
     };
     if result.is_ok() {
-        // In-app update: the verified swap already happened on disk; the new
-        // binary launches only after eframe fully shut down, so `on_exit`
-        // persistence finished before the new process reads any state.
+        // In-app update: the verified update is ready and eframe fully shut
+        // down, so `on_exit` persistence finished before this either launches
+        // the replaced Windows executable or hands the staged macOS app bundle
+        // to the post-exit helper for its swap and relaunch.
         relaunch_after_self_update();
     }
     result
