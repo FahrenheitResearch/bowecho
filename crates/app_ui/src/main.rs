@@ -110,6 +110,7 @@ mod unified_player;
 mod units;
 mod upper_air;
 mod vol3d;
+mod vwp;
 mod wofs;
 mod wofs_georef;
 mod wrf_process;
@@ -2483,6 +2484,80 @@ struct PlotDomainMapDrag {
     current: egui::Pos2,
 }
 
+/// Exact inputs that determine a computed vertical-wind profile. The Arc
+/// address separates same-time replacement volumes; the scan stamp and cut
+/// count defend against address reuse after a history trim. Analyst 3D's
+/// temporal/model anchors ride in the shared dealias context key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VwpWorkKey {
+    volume_ptr: usize,
+    scan_time_millis: i64,
+    cut_count: usize,
+    dealias: DealiasContextKey,
+}
+
+struct VwpComputeResult {
+    key: VwpWorkKey,
+    result: std::result::Result<render2d::VwpProfile, String>,
+    dealias_label: &'static str,
+}
+
+fn product48_display_profile(
+    path: &Path,
+    product: &nexrad_io::vwp::VwpProduct,
+) -> std::result::Result<vwp::Product48DisplayProfile, String> {
+    let profile = product
+        .profiles
+        .first()
+        .ok_or_else(|| "Product 48 contains no profiles".to_owned())?;
+    let site_id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.split(|character: char| !character.is_ascii_alphanumeric())
+                .find(|part| part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_alphabetic()))
+                .map(str::to_ascii_uppercase)
+                .unwrap_or_else(|| "VWP".to_owned())
+        })
+        .unwrap_or_else(|| "VWP".to_owned());
+    let source_label = match product.source {
+        nexrad_io::vwp::VwpSource::Tabular => "Product 48 tabular VAD output",
+        nexrad_io::vwp::VwpSource::Symbology => "Product 48 symbology wind barbs",
+    }
+    .to_owned();
+    let rms_threshold = product.metadata.rms_threshold_kts.unwrap_or(10.0);
+    let levels = profile
+        .levels
+        .iter()
+        .map(|level| {
+            let quality = if level.rms_kts.is_some_and(|rms| rms <= rms_threshold) {
+                vwp::Product48DisplayQuality::Good
+            } else {
+                vwp::Product48DisplayQuality::Marginal
+            };
+            vwp::Product48DisplayLevel {
+                height_m_agl: (level.altitude_km_agl * 1_000.0) as f32,
+                height_m_msl: level
+                    .altitude_ft_msl
+                    .map(|height_ft| height_ft as f32 * 0.3048),
+                outcome: vwp::Product48DisplayOutcome::Retrieved {
+                    direction_deg: level.direction_deg as f32,
+                    speed_mps: level.speed_kts as f32 / 1.943_844_4,
+                    rms_mps: level.rms_kts.map(|rms| rms as f32 / 1.943_844_4),
+                    quality,
+                },
+            }
+        })
+        .collect();
+    Ok(vwp::Product48DisplayProfile {
+        site_id,
+        valid_time: profile.valid_time,
+        radar_elevation_m: Some(f32::from(product.radar.height_ft) * 0.3048),
+        source_label,
+        levels,
+    })
+}
+
 struct ViewerApp {
     source_path: Option<PathBuf>,
     renderer_backend: &'static str,
@@ -3089,6 +3164,9 @@ struct ViewerApp {
     /// Experimental vertical wind profile derived from the loaded volume's
     /// dealiased radial velocity (or a locally imported Product 48 profile).
     vwp_open: bool,
+    vwp_panel: vwp::VwpPanelState,
+    vwp_compute_rx: Option<mpsc::Receiver<VwpComputeResult>>,
+    vwp_requested_key: Option<VwpWorkKey>,
     /// One-shot: the docked model sounding has taken its default canvas zoom
     /// this session, so later clicks never re-stomp a zoom the user adjusted.
     sounding_dock_zoom_defaulted: bool,
@@ -8285,6 +8363,9 @@ impl ViewerApp {
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
             vwp_open: false,
+            vwp_panel: vwp::VwpPanelState::default(),
+            vwp_compute_rx: None,
+            vwp_requested_key: None,
             sounding_dock_zoom_defaulted: false,
             archive_frame_count: restored_archive_frame_count,
             archive_loaded_range: None,
@@ -16425,6 +16506,11 @@ impl ViewerApp {
         {
             wanted.push(Arc::clone(volume));
         }
+        if self.vwp_open
+            && let Some(volume) = &self.volume
+        {
+            wanted.push(Arc::clone(volume));
+        }
         if self.tor_tracks.show_tracks || self.tor_tracks.show_tds {
             wanted.extend(
                 self.primary
@@ -16569,6 +16655,173 @@ impl ViewerApp {
             dealias_env.as_ref(),
         );
         (previous_volume, dealias_env, context)
+    }
+
+    /// Drain the latest VWP worker and, while the viewer is open, start a
+    /// replacement whenever the displayed volume or exact dealias inputs
+    /// change. Replacing the receiver is cancellation: an older worker sees
+    /// its send fail and can never overwrite the newer profile.
+    fn poll_vwp(&mut self, ctx: &egui::Context) {
+        let message = self.vwp_compute_rx.as_ref().map(mpsc::Receiver::try_recv);
+        match message {
+            Some(Ok(message)) => {
+                self.vwp_compute_rx = None;
+                if self.vwp_requested_key == Some(message.key) {
+                    match message.result {
+                        Ok(profile) => self.vwp_panel.set_computed(profile, message.dealias_label),
+                        Err(error) => self.vwp_panel.set_error(error),
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.vwp_compute_rx = None;
+                self.vwp_panel.set_error("VWP worker disconnected");
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+
+        if !self.vwp_open {
+            return;
+        }
+        let Some(volume) = self.volume.clone() else {
+            if self.vwp_requested_key.take().is_some() {
+                self.vwp_compute_rx = None;
+                self.vwp_panel.clear();
+            }
+            return;
+        };
+        let (previous_volume, dealias_env, context) =
+            self.primary_dealias_inputs_for_volume(&volume);
+        let key = VwpWorkKey {
+            volume_ptr: Arc::as_ptr(&volume) as usize,
+            scan_time_millis: volume.volume_time.timestamp_millis(),
+            cut_count: volume.cuts.len(),
+            dealias: context,
+        };
+        if self.vwp_requested_key == Some(key) {
+            return;
+        }
+
+        let engine = self.dealias_engine;
+        let dealias_label = match engine {
+            DealiasEngine::Region => "Region dealias",
+            DealiasEngine::RegionGlobal => "Region Global dealias",
+            DealiasEngine::Analyst3d => "Analyst 3D dealias",
+        };
+        self.vwp_requested_key = Some(key);
+        self.vwp_compute_rx = None;
+        self.vwp_panel.begin_compute(format!(
+            "{} {} - resolving velocity tilts",
+            volume.site.id, dealias_label
+        ));
+        let (sender, receiver) = mpsc::channel();
+        self.vwp_compute_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let grids = resolve_dealiased_volume_grids(
+                &volume,
+                previous_volume.as_ref(),
+                dealias_env.as_ref(),
+                engine,
+            );
+            let borrowed = grids.iter().map(Option::as_deref).collect::<Vec<_>>();
+            let result =
+                render2d::compute_vwp(volume.as_ref(), &borrowed, render2d::VwpConfig::default())
+                    .map_err(|error| error.to_string());
+            let _ = sender.send(VwpComputeResult {
+                key,
+                result,
+                dealias_label,
+            });
+            ctx_clone.request_repaint();
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
+    fn vwp_pane_body(&mut self, ui: &mut egui::Ui) {
+        let action = self.vwp_panel.ui(ui);
+        if action.recompute_requested {
+            self.vwp_compute_rx = None;
+            self.vwp_requested_key = None;
+            ui.ctx().request_repaint();
+        }
+        if action.open_product48_requested {
+            self.open_vwp_product48_file();
+        }
+        if action.save_csv_requested {
+            self.save_vwp_csv();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn open_vwp_product48_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            // Product 48/NVW files are commonly extensionless.
+            .add_filter("All Product 48 files", &["*"])
+            .set_title("Open NEXRAD Product 48 VWP")
+            .pick_file()
+        else {
+            return;
+        };
+        let result = std::fs::read(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))
+            .and_then(|bytes| {
+                nexrad_io::vwp::decode_level3_vwp(&bytes).map_err(|error| error.to_string())
+            })
+            .and_then(|product| product48_display_profile(&path, &product));
+        match result {
+            Ok(profile) => {
+                self.vwp_panel.set_product_48(profile);
+                // Hold this import until the selected volume changes or the
+                // user explicitly asks to recompute.
+                self.vwp_requested_key = self.volume.as_ref().map(|volume| {
+                    let (_, _, dealias) = self.primary_dealias_inputs_for_volume(volume);
+                    VwpWorkKey {
+                        volume_ptr: Arc::as_ptr(volume) as usize,
+                        scan_time_millis: volume.volume_time.timestamp_millis(),
+                        cut_count: volume.cuts.len(),
+                        dealias,
+                    }
+                });
+                self.vwp_compute_rx = None;
+                self.status = format!("VWP: opened {}", path.display());
+            }
+            Err(error) => {
+                self.vwp_panel.set_error(error.clone());
+                self.status = format!("VWP import failed: {error}");
+            }
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn open_vwp_product48_file(&mut self) {
+        self.status = "Product 48 file dialogs are available on Windows and macOS".to_owned();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn save_vwp_csv(&mut self) {
+        let Some(csv) = self.vwp_panel.export_csv() else {
+            self.status = "VWP: no profile to save".to_owned();
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .set_file_name("bowecho-vwp.csv")
+            .set_title("Save vertical wind profile")
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, csv) {
+            Ok(()) => self.status = format!("VWP: saved {}", path.display()),
+            Err(error) => self.status = format!("VWP save failed: {error}"),
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn save_vwp_csv(&mut self) {
+        self.status = "VWP CSV dialogs are available on Windows and macOS".to_owned();
     }
 
     fn storm_motion_key(&self) -> (i16, i16) {
@@ -18845,6 +19098,7 @@ impl eframe::App for ViewerApp {
         self.poll_raob_sites(&ctx);
         self.poll_native_sounding(&ctx);
         self.poll_dealias_env(&ctx);
+        self.poll_vwp(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
             ctx.request_repaint();
         }
@@ -19029,6 +19283,7 @@ impl eframe::App for ViewerApp {
         }
 
         self.model_data_window(&ctx);
+        self.vwp_window(&ctx);
         self.radar_overlays_window(&ctx);
         self.satellite_window(&ctx);
         self.simsat_window(&ctx);
@@ -19685,6 +19940,11 @@ impl ViewerApp {
                     "NWP model fields + skew-T soundings (rusty-weather store) — turns the model master switch on if needed",
                 ),
                 (
+                    dock::WorkspacePane::Vwp,
+                    "Vertical wind profile",
+                    "Experimental VAD wind profile from the loaded radar volume's dealiased radial velocity, with Product 48 import",
+                ),
+                (
                     dock::WorkspacePane::RadarOverlays,
                     "Radar overlays",
                     "Separate window/pane for extra radars: visibility, opacity, refresh, center, promote, and remove",
@@ -19791,7 +20051,7 @@ impl ViewerApp {
             }
         })
         .response
-        .on_hover_text("Data windows: Model · Satellite · SimSat · WoFS · FARM · 3D · Sounding");
+        .on_hover_text("Data windows: Model · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding");
     }
 
     /// Drain the embedded SimSat worker whether or not its pane is visible.
@@ -25779,9 +26039,7 @@ impl ViewerApp {
                 let events = self.model_pane_body(ui);
                 self.dispatch_download_events(events);
             }
-            dock::WorkspacePane::Vwp => {
-                ui.weak("Computing vertical wind profileâ€¦");
-            }
+            dock::WorkspacePane::Vwp => self.vwp_pane_body(ui),
             dock::WorkspacePane::UnifiedPlayer => {
                 let ctx = ui.ctx().clone();
                 self.unified_player_pane_body(ui, &ctx);
@@ -29180,6 +29438,23 @@ impl ViewerApp {
             settings::screenshots_dir_for_brand(&self.app_settings.brand).join("plots"),
         );
         dock
+    }
+
+    fn vwp_window(&mut self, ctx: &egui::Context) {
+        if !self.vwp_open || self.workspace.is_docked(dock::WorkspacePane::Vwp) {
+            return;
+        }
+        let mut open = self.vwp_open;
+        egui::Window::new("Vertical wind profile (VWP)")
+            .open(&mut open)
+            .default_size([980.0, 680.0])
+            .min_size([460.0, 360.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                self.dock_toggle_row(ui, dock::WorkspacePane::Vwp);
+                self.vwp_pane_body(ui);
+            });
+        self.set_viewer_open(dock::WorkspacePane::Vwp, open);
     }
 
     fn radar_overlays_window(&mut self, ctx: &egui::Context) {
@@ -62119,6 +62394,9 @@ mod tests {
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
             vwp_open: false,
+            vwp_panel: vwp::VwpPanelState::default(),
+            vwp_compute_rx: None,
+            vwp_requested_key: None,
             sounding_dock_zoom_defaulted: false,
             archive_frame_count: 10,
             archive_loaded_range: None,
