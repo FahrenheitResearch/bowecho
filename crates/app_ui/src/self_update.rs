@@ -1,5 +1,8 @@
-//! Self-update: the passive release check plus the Windows in-app updater
-//! (download → SHA-256 → Authenticode → swap → relaunch).
+//! Self-update: the passive release check plus native Windows and macOS
+//! installers. Both pin the canonical HTTPS release asset and its SHA-256;
+//! Windows then verifies Authenticode and swaps the executable, while macOS
+//! verifies the signed app bundle and hands a whole-bundle swap to a private
+//! helper after the eframe event loop exits.
 //!
 //! v0.29.4 phase-1 extraction #1 (docs/main-decomposition-plan.md): every
 //! body moved VERBATIM from main.rs — the only edits are `use` lines and
@@ -7,14 +10,18 @@
 //! `brand.rs` keeps sole ownership of repo-URL parsing
 //! (`update_check_api_url`, `CANONICAL_REPO_URL`, …); this module calls it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(windows, target_os = "macos", test))]
+use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
 use eframe::egui;
 use ui_core::worker_slot::{SlotMessage, StreamState};
 
-use crate::{SECURITY_SIGNATURE_STATUS_TEXT, SECURITY_UNSIGNED_BUILD_TEXT, ViewerApp, brand};
+#[cfg(windows)]
+use crate::{SECURITY_SIGNATURE_STATUS_TEXT, SECURITY_UNSIGNED_BUILD_TEXT};
+use crate::{ViewerApp, brand};
 
 /// Fetch the latest configured GitHub release tag and return it iff it is
 /// newer than the running build. Invalid/non-GitHub repository URLs disable
@@ -74,21 +81,20 @@ fn parse_semver_triple(version: &str) -> Option<(u64, u64, u64)> {
 }
 
 // ---------------------------------------------------------------------------
-// In-app updater (Windows release builds only — docs/SIGNING.md)
+// Native in-app updater (Windows and macOS release builds)
 //
 // User clicks Install update → background thread downloads the SAME release
-// asset variant this binary was built as, plus its `.sha256` → the download
-// must match that checksum AND carry a valid Authenticode signature
-// (WinVerifyTrust) → the running exe is parked as `.old`, the verified file
-// renamed into its place, and the app restarts itself after a clean
-// shutdown. Any failed check deletes the download and reports the reason.
-// Nothing ever installs without the click.
+// asset variant this binary was built as, plus its `.sha256`. Windows requires
+// Authenticode and swaps its executable. macOS requires Developer ID,
+// Gatekeeper, stable bundle/team identity, then performs a whole-app swap from
+// a private sibling stage after clean shutdown. Nothing installs without the
+// click; every failed check removes the private download and reports why.
 
 /// One event from the update worker to the UI.
 pub(crate) enum SelfUpdateEvent {
     Progress { received: u64, total: Option<u64> },
     Verifying,
-    SwapComplete,
+    ReadyToRelaunch,
     Failed(String),
 }
 
@@ -99,7 +105,7 @@ impl SlotMessage for SelfUpdateEvent {
     fn is_terminal(&self) -> bool {
         matches!(
             self,
-            SelfUpdateEvent::SwapComplete | SelfUpdateEvent::Failed(_)
+            SelfUpdateEvent::ReadyToRelaunch | SelfUpdateEvent::Failed(_)
         )
     }
 }
@@ -114,24 +120,72 @@ pub(crate) enum SelfUpdatePhase {
     Failed(String),
 }
 
-/// Set once by the update worker after a successful swap: the path to spawn
-/// (the same path this process started from — the file now holds the new
-/// release). Read by `main` after the event loop exits.
-static SELF_UPDATE_RELAUNCH: OnceLock<PathBuf> = OnceLock::new();
+/// Work that may only begin after eframe has exited. Windows has already
+/// swapped its executable by this point. macOS deliberately has not touched
+/// the running signed bundle: a helper performs the whole-bundle rename once
+/// its stdin reaches EOF at process teardown.
+enum SelfUpdateRelaunchPlan {
+    #[cfg(windows)]
+    Windows { executable: PathBuf },
+    #[cfg(target_os = "macos")]
+    MacOs(MacOsRelaunchPlan),
+}
+
+#[cfg(target_os = "macos")]
+struct MacOsRelaunchPlan {
+    current_app: PathBuf,
+    staged_app: PathBuf,
+    stage_root: PathBuf,
+}
+
+static SELF_UPDATE_RELAUNCH: OnceLock<SelfUpdateRelaunchPlan> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelfUpdatePlatform {
+    Windows,
+    MacIntel,
+    MacAppleSilicon,
+    BrowserOnly,
+}
 
 /// Build-time variant self-identification. The release workflow bakes the
 /// exact asset name this binary ships as (`BOWECHO_UPDATE_ASSET`, e.g.
-/// "bowecho-windows-x64-v3.exe") into the Windows builds, so the updater can
+/// "bowecho-windows-x64-v3.exe") into native-install builds, so the updater can
 /// only ever download the variant it is already running. Local/dev builds
-/// bake nothing and CI passes an empty value to non-Windows targets — both
+/// bake nothing and CI passes an empty value to browser-only targets — both
 /// yield `None`, which keeps the in-app installer hidden (deliberate safety
-/// property: an unbaked binary cannot guess its own variant). macOS/Linux
-/// stay browser-only for now, hence the explicit platform gate.
-fn self_update_asset(baked: Option<&'static str>, is_windows: bool) -> Option<&'static str> {
-    if !is_windows {
-        return None;
+/// property: an unbaked binary cannot guess its own variant). The two macOS
+/// architectures accept only their matching release zip; Linux stays
+/// browser-only.
+fn self_update_asset(
+    baked: Option<&'static str>,
+    platform: SelfUpdatePlatform,
+) -> Option<&'static str> {
+    let name = baked.map(str::trim).filter(|name| !name.is_empty())?;
+    match platform {
+        // Preserve the existing baked Windows variants exactly. Their asset
+        // names are selected by the release matrix (baseline, v3, ARM64).
+        SelfUpdatePlatform::Windows => Some(name),
+        SelfUpdatePlatform::MacIntel if name == "bowecho-macos-intel.zip" => Some(name),
+        SelfUpdatePlatform::MacAppleSilicon if name == "bowecho-macos-apple-silicon.zip" => {
+            Some(name)
+        }
+        SelfUpdatePlatform::MacIntel
+        | SelfUpdatePlatform::MacAppleSilicon
+        | SelfUpdatePlatform::BrowserOnly => None,
     }
-    baked.map(str::trim).filter(|name| !name.is_empty())
+}
+
+fn current_self_update_platform() -> SelfUpdatePlatform {
+    if cfg!(windows) {
+        SelfUpdatePlatform::Windows
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        SelfUpdatePlatform::MacIntel
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        SelfUpdatePlatform::MacAppleSilicon
+    } else {
+        SelfUpdatePlatform::BrowserOnly
+    }
 }
 
 /// In-app installs are pinned to the canonical BowEcho repository: the
@@ -167,6 +221,7 @@ fn github_release_asset_url(api_url: &str, tag: &str, asset: &str) -> Option<Str
 /// emits binary mode (`<hex> *<name>`), Linux text mode (`<hex>  <name>`).
 /// Accepts both plus a bare digest; anything that is not a 64-char hex first
 /// token is `None` (the updater then refuses to install).
+#[cfg(any(windows, target_os = "macos", test))]
 fn parse_sha256_asset(contents: &str) -> Option<String> {
     let token = contents.split_whitespace().next()?;
     (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -184,7 +239,7 @@ fn apply_self_update_event(phase: &SelfUpdatePhase, event: &SelfUpdateEvent) -> 
             total: *total,
         },
         (_, SelfUpdateEvent::Verifying) => SelfUpdatePhase::Verifying,
-        (_, SelfUpdateEvent::SwapComplete) => SelfUpdatePhase::Restarting,
+        (_, SelfUpdateEvent::ReadyToRelaunch) => SelfUpdatePhase::Restarting,
         (_, SelfUpdateEvent::Failed(reason)) => SelfUpdatePhase::Failed(reason.clone()),
     }
 }
@@ -203,7 +258,14 @@ fn self_update_phase_label(phase: &SelfUpdatePhase) -> Option<String> {
             ),
         }),
         SelfUpdatePhase::Verifying => {
-            Some("Verifying download (SHA-256 checksum + Authenticode signature)".to_owned())
+            let signature = if cfg!(target_os = "macos") {
+                "Developer ID signature + Gatekeeper"
+            } else {
+                "Authenticode signature"
+            };
+            Some(format!(
+                "Verifying download (SHA-256 checksum + {signature})"
+            ))
         }
         SelfUpdatePhase::Restarting => Some("Update installed — restarting".to_owned()),
         SelfUpdatePhase::Failed(reason) => Some(format!("Update failed: {reason}")),
@@ -213,16 +275,19 @@ fn self_update_phase_label(phase: &SelfUpdatePhase) -> Option<String> {
 /// `bowecho.exe` → `bowecho.exe.old`: where the running executable is parked
 /// during the swap (renaming a running exe is legal on Windows; deleting it
 /// is not).
+#[cfg(any(windows, test))]
 fn update_backup_path(exe: &Path) -> PathBuf {
     sibling_with_suffix(exe, ".old")
 }
 
 /// `bowecho.exe` → `bowecho.exe.update`: the download target, deliberately
 /// next to the executable so the final rename never crosses volumes.
+#[cfg(any(windows, test))]
 fn update_download_path(exe: &Path) -> PathBuf {
     sibling_with_suffix(exe, ".update")
 }
 
+#[cfg(any(windows, test))]
 fn sibling_with_suffix(exe: &Path, suffix: &str) -> PathBuf {
     let mut name = exe
         .file_name()
@@ -234,45 +299,626 @@ fn sibling_with_suffix(exe: &Path, suffix: &str) -> PathBuf {
 
 /// Everything an interrupted or completed update may leave next to the
 /// executable: the parked previous binary and a dead partial download.
+#[cfg(any(windows, test))]
 fn stale_update_artifacts(exe: &Path) -> [PathBuf; 2] {
     [update_backup_path(exe), update_download_path(exe)]
 }
 
-/// Best-effort startup sweep of update leftovers. The `.old` file is
-/// usually still locked on the first post-update launch (the pre-update
-/// process is exiting) — removal failures stay silent and retry on the
-/// next launch.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_APP_NAME: &str = "BowEcho.app";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_EXECUTABLE_NAME: &str = "bowecho";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_BUNDLE_IDENTIFIER: &str = "research.fahrenheit.bowecho";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_STAGE_PREFIX: &str = ".bowecho-update-stage-";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_STAGE_SENTINEL: &str = ".bowecho-private-update-stage-v1";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_STAGE_SENTINEL_CONTENTS: &str = "BowEcho private update stage v1\n";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_BACKUP_NAME: &str = ".BowEcho.app.update-backup";
+#[cfg(target_os = "macos")]
+const MACOS_HELPER_ARGUMENT: &str = "--bowecho-private-macos-update-helper-v1";
+
+/// Derive the signed app root from the only accepted executable layout:
+/// `BowEcho.app/Contents/MacOS/bowecho`. No ancestor search or arbitrary
+/// `.app` guess is allowed.
+#[cfg(any(target_os = "macos", test))]
+fn macos_app_bundle_from_executable(executable: &Path) -> Result<PathBuf, String> {
+    if executable.file_name() != Some(std::ffi::OsStr::new(MACOS_EXECUTABLE_NAME)) {
+        return Err("the running executable is not BowEcho.app/Contents/MacOS/bowecho".to_owned());
+    }
+    let macos = executable
+        .parent()
+        .filter(|path| path.file_name() == Some(std::ffi::OsStr::new("MacOS")))
+        .ok_or_else(|| "the running executable is not inside Contents/MacOS".to_owned())?;
+    let contents = macos
+        .parent()
+        .filter(|path| path.file_name() == Some(std::ffi::OsStr::new("Contents")))
+        .ok_or_else(|| "the running executable is not inside BowEcho.app/Contents".to_owned())?;
+    let app = contents
+        .parent()
+        .filter(|path| path.file_name() == Some(std::ffi::OsStr::new(MACOS_APP_NAME)))
+        .ok_or_else(|| {
+            "the running executable is not inside an exact BowEcho.app bundle".to_owned()
+        })?;
+    Ok(app.to_path_buf())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_app_executable(app: &Path) -> PathBuf {
+    app.join("Contents")
+        .join("MacOS")
+        .join(MACOS_EXECUTABLE_NAME)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_backup_path(app: &Path) -> Result<PathBuf, String> {
+    let parent = app
+        .parent()
+        .ok_or_else(|| "BowEcho.app has no parent directory".to_owned())?;
+    Ok(parent.join(MACOS_BACKUP_NAME))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn path_has_app_translocation_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == std::ffi::OsStr::new("AppTranslocation"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn has_exact_macos_bundle_layout(app: &Path) -> bool {
+    let real_directory = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    };
+    let real_file = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    };
+    let contents = app.join("Contents");
+    let macos = contents.join("MacOS");
+    real_directory(app)
+        && real_directory(&contents)
+        && real_directory(&macos)
+        && real_file(&contents.join("Info.plist"))
+        && real_file(&macos.join(MACOS_EXECUTABLE_NAME))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_private_macos_stage(stage: &Path) -> bool {
+    if !stage
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(MACOS_STAGE_PREFIX))
+    {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(stage) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let sentinel = stage.join(MACOS_STAGE_SENTINEL);
+    let Ok(sentinel_metadata) = std::fs::symlink_metadata(&sentinel) else {
+        return false;
+    };
+    sentinel_metadata.is_file()
+        && !sentinel_metadata.file_type().is_symlink()
+        && std::fs::read_to_string(sentinel)
+            .is_ok_and(|contents| contents == MACOS_STAGE_SENTINEL_CONTENTS)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn remove_private_macos_stage(stage: &Path) -> Result<(), String> {
+    if !is_private_macos_stage(stage) {
+        return Err("refusing to recursively remove an unmarked update stage".to_owned());
+    }
+    std::fs::remove_dir_all(stage)
+        .map_err(|err| format!("could not remove the private update stage: {err}"))
+}
+
+/// Exact extraction contract for release zips: the extraction root contains
+/// one directory named `BowEcho.app`, with the expected plist and executable.
+/// Rejecting extra top-level entries also rejects nested/double-wrapped zips.
+#[cfg(any(target_os = "macos", test))]
+fn exact_extracted_macos_app(extraction_root: &Path) -> Result<PathBuf, String> {
+    let mut entries = std::fs::read_dir(extraction_root)
+        .map_err(|err| format!("could not inspect the extracted update: {err}"))?;
+    let entry = entries
+        .next()
+        .transpose()
+        .map_err(|err| format!("could not inspect the extracted update: {err}"))?
+        .ok_or_else(|| "the update zip extracted no BowEcho.app".to_owned())?;
+    if entries.next().is_some() || entry.file_name() != std::ffi::OsStr::new(MACOS_APP_NAME) {
+        return Err("the update zip must contain exactly one top-level BowEcho.app".to_owned());
+    }
+    let file_type = entry
+        .file_type()
+        .map_err(|err| format!("could not inspect extracted BowEcho.app: {err}"))?;
+    if !file_type.is_dir() || file_type.is_symlink() {
+        return Err("the extracted BowEcho.app is not a real directory".to_owned());
+    }
+    let app = entry.path();
+    if !has_exact_macos_bundle_layout(&app) {
+        return Err(
+            "the extracted app is missing Contents/Info.plist or Contents/MacOS/bowecho".to_owned(),
+        );
+    }
+    Ok(app)
+}
+
+/// Rename a complete staged app into place, rolling the old app back if the
+/// second rename fails. The helper, not the GUI worker, calls this on macOS.
+#[cfg(any(target_os = "macos", test))]
+fn swap_macos_app_bundle(
+    staged_app: &Path,
+    current_app: &Path,
+    backup_app: &Path,
+) -> Result<(), String> {
+    if backup_app.exists() {
+        if !has_exact_macos_bundle_layout(backup_app) {
+            return Err(
+                "refusing to remove the previous update backup because it is not an exact \
+                 BowEcho app layout"
+                    .to_owned(),
+            );
+        }
+        std::fs::remove_dir_all(backup_app)
+            .map_err(|err| format!("could not clear the previous update backup: {err}"))?;
+    }
+    std::fs::rename(current_app, backup_app)
+        .map_err(|err| format!("could not move the current BowEcho.app aside: {err}"))?;
+    if let Err(err) = std::fs::rename(staged_app, current_app) {
+        return Err(match std::fs::rename(backup_app, current_app) {
+            Ok(()) => format!(
+                "could not install the new BowEcho.app ({err}); the previous app was restored"
+            ),
+            Err(rollback) => format!(
+                "could not install the new BowEcho.app ({err}) and restoring the previous app \
+                 failed ({rollback}); reinstall BowEcho from the releases page"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Best-effort startup sweep of update leftovers. Windows retries deletion
+/// of the parked executable. A freshly launched macOS app removes the parked
+/// old bundle and abandoned private sibling stages.
 pub(crate) fn cleanup_stale_update_artifacts() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = &exe;
+
+    #[cfg(windows)]
     for path in stale_update_artifacts(&exe) {
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
     }
+
+    #[cfg(target_os = "macos")]
+    if let Ok(app) = macos_app_bundle_from_executable(&exe)
+        && let Some(parent) = app.parent()
+    {
+        if let Ok(backup) = macos_backup_path(&app)
+            && has_exact_macos_bundle_layout(&backup)
+        {
+            let _ = std::fs::remove_dir_all(backup);
+        }
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(MACOS_STAGE_PREFIX) {
+                    let _ = remove_private_macos_stage(&entry.path());
+                }
+            }
+        }
+    }
 }
 
-/// Spawn the freshly installed executable with the original CLI args. Runs
-/// only after `eframe::run_native` returned, so `on_exit` persistence
-/// (workspace layout, sounding state) completed before the new process
-/// starts reading state.
+/// Spawn the platform relaunch after `eframe::run_native` returned. Windows
+/// starts the already-swapped executable. macOS starts the current signed
+/// BowEcho binary in private helper mode and deliberately leaks the stdin
+/// writer: EOF therefore arrives only when this process actually terminates,
+/// at which point the helper can safely rename the whole app bundle.
 pub(crate) fn relaunch_after_self_update() {
-    let Some(exe) = SELF_UPDATE_RELAUNCH.get() else {
+    let Some(plan) = SELF_UPDATE_RELAUNCH.get() else {
         return;
     };
-    if let Err(err) = std::process::Command::new(exe)
+
+    #[cfg(windows)]
+    let SelfUpdateRelaunchPlan::Windows { executable } = plan;
+    #[cfg(windows)]
+    if let Err(err) = std::process::Command::new(executable)
         .args(std::env::args_os().skip(1))
         .spawn()
     {
-        eprintln!("Failed to relaunch {} after update: {err}", exe.display());
+        eprintln!(
+            "Failed to relaunch {} after update: {err}",
+            executable.display()
+        );
     }
+
+    #[cfg(target_os = "macos")]
+    let SelfUpdateRelaunchPlan::MacOs(plan) = plan;
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Stdio;
+
+        let helper = macos_app_executable(&plan.current_app);
+        let mut command = std::process::Command::new(&helper);
+        command
+            .arg(MACOS_HELPER_ARGUMENT)
+            .arg(&plan.stage_root)
+            .arg(&plan.staged_app)
+            .arg("--")
+            .args(std::env::args_os().skip(1))
+            .stdin(Stdio::piped());
+        match command.spawn() {
+            Ok(mut child) => {
+                // Keep the pipe open until the OS tears this process down.
+                // Dropping it here would let the helper race process exit.
+                if let Some(stdin) = child.stdin.take() {
+                    std::mem::forget(stdin);
+                }
+            }
+            Err(err) => eprintln!(
+                "Failed to start the BowEcho macOS update helper {}: {err}",
+                helper.display()
+            ),
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = plan;
+}
+
+#[cfg(target_os = "macos")]
+struct MacOsHelperRequest {
+    stage_root: PathBuf,
+    staged_app: PathBuf,
+    original_args: Vec<std::ffi::OsString>,
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_helper_request() -> Result<Option<MacOsHelperRequest>, String> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(MACOS_HELPER_ARGUMENT)) {
+        return Ok(None);
+    }
+    let stage_root = args
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| "macOS update helper is missing its private stage path".to_owned())?;
+    let staged_app = args
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| "macOS update helper is missing its staged app path".to_owned())?;
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+        return Err("macOS update helper request is malformed".to_owned());
+    }
+    Ok(Some(MacOsHelperRequest {
+        stage_root,
+        staged_app,
+        original_args: args.collect(),
+    }))
+}
+
+/// Intercept the private macOS whole-bundle swap mode before logging, settings,
+/// or GUI startup. The helper waits for stdin EOF, which the parent arranges
+/// to occur only when its process terminates. Off macOS this is always false.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn run_macos_update_helper_if_requested() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_macos_update_helper_if_requested() -> bool {
+    let request = match parse_macos_helper_request() {
+        Ok(None) => return false,
+        Ok(Some(request)) => request,
+        Err(reason) => {
+            eprintln!("BowEcho macOS update helper rejected its request: {reason}");
+            return true;
+        }
+    };
+    if let Err(reason) = run_macos_update_helper(request) {
+        eprintln!("BowEcho macOS update helper failed: {reason}");
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_update_helper(request: MacOsHelperRequest) -> Result<(), String> {
+    use std::io::Read as _;
+
+    let executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|err| format!("could not locate the update helper executable: {err}"))?;
+    let current_app = macos_app_bundle_from_executable(&executable)?;
+    if path_has_app_translocation_component(&current_app) {
+        return Err("updates cannot run from macOS App Translocation".to_owned());
+    }
+    let current_parent = current_app
+        .parent()
+        .ok_or_else(|| "BowEcho.app has no parent directory".to_owned())?
+        .canonicalize()
+        .map_err(|err| format!("could not resolve the app directory: {err}"))?;
+    let stage_root = request
+        .stage_root
+        .canonicalize()
+        .map_err(|err| format!("could not resolve the private update stage: {err}"))?;
+    if stage_root.parent() != Some(current_parent.as_path())
+        || !stage_root
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(MACOS_STAGE_PREFIX))
+    {
+        return Err("the private update stage is not a sibling of BowEcho.app".to_owned());
+    }
+    if !is_private_macos_stage(&stage_root) {
+        return Err("the private update stage is missing its trusted sentinel".to_owned());
+    }
+    let staged_app = request
+        .staged_app
+        .canonicalize()
+        .map_err(|err| format!("could not resolve staged BowEcho.app: {err}"))?;
+    let expected_staged_app = stage_root
+        .join("extracted")
+        .join(MACOS_APP_NAME)
+        .canonicalize()
+        .map_err(|err| format!("could not resolve the expected staged app: {err}"))?;
+    if staged_app != expected_staged_app {
+        return Err("the staged app is outside the private extraction directory".to_owned());
+    }
+    let exact_staged_app = exact_extracted_macos_app(&stage_root.join("extracted"))?
+        .canonicalize()
+        .map_err(|err| format!("could not resolve extracted BowEcho.app: {err}"))?;
+    if exact_staged_app != staged_app {
+        return Err("the extracted update does not have the exact BowEcho.app layout".to_owned());
+    }
+
+    // The parent deliberately keeps the write end alive until process exit.
+    // Read and discard without an allocation until the OS closes that pipe.
+    let mut stdin = std::io::stdin().lock();
+    let mut byte = [0_u8; 1];
+    while stdin
+        .read(&mut byte)
+        .map_err(|err| format!("could not synchronize with the exiting app: {err}"))?
+        != 0
+    {}
+
+    // Re-run the trust and architecture gates in the helper immediately
+    // before the rename, closing the worker/helper time-of-check gap.
+    if let Err(reason) = verify_macos_bundle_pair(&current_app, &staged_app)
+        .and_then(|()| verify_macos_bundle_architecture(&staged_app))
+    {
+        let reopen = open_macos_app(&current_app, &request.original_args);
+        return Err(format!(
+            "the final update verification failed ({reason}); reopening the unchanged app \
+             returned {reopen:?}"
+        ));
+    }
+    let backup_app = macos_backup_path(&current_app)?;
+    if let Err(reason) = swap_macos_app_bundle(&staged_app, &current_app, &backup_app) {
+        let reopen = open_macos_app(&current_app, &request.original_args);
+        return Err(format!(
+            "the app-bundle swap failed ({reason}); reopening the current app returned \
+             {reopen:?}"
+        ));
+    }
+    if let Err(relaunch) = open_macos_app(&current_app, &request.original_args) {
+        rollback_macos_app_after_relaunch_failure(
+            &current_app,
+            &staged_app,
+            &backup_app,
+            &request.original_args,
+            &relaunch,
+        )?;
+        return Err(format!(
+            "the updated app could not relaunch ({relaunch}); the previous app was restored"
+        ));
+    }
+    let _ = remove_private_macos_stage(&stage_root);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_app(app: &Path, original_args: &[std::ffi::OsString]) -> Result<(), String> {
+    let mut open = std::process::Command::new("/usr/bin/open");
+    open.arg("-n").arg(app);
+    if !original_args.is_empty() {
+        open.arg("--args").args(original_args);
+    }
+    let status = open
+        .status()
+        .map_err(|err| format!("could not run /usr/bin/open: {err}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("/usr/bin/open exited with {status}"))
+}
+
+#[cfg(target_os = "macos")]
+fn rollback_macos_app_after_relaunch_failure(
+    current_app: &Path,
+    staged_app: &Path,
+    backup_app: &Path,
+    original_args: &[std::ffi::OsString],
+    relaunch_reason: &str,
+) -> Result<(), String> {
+    if !has_exact_macos_bundle_layout(current_app) || !has_exact_macos_bundle_layout(backup_app) {
+        return Err(format!(
+            "updated app could not relaunch ({relaunch_reason}); rollback was refused because \
+             the installed app or backup no longer has the exact BowEcho layout. The previous \
+             app remains at {}",
+            backup_app.display()
+        ));
+    }
+    std::fs::rename(current_app, staged_app).map_err(|err| {
+        format!(
+            "updated app could not relaunch ({relaunch_reason}) and could not be moved back to \
+             its private stage ({err}); the previous app remains at {}",
+            backup_app.display()
+        )
+    })?;
+    if let Err(restore) = std::fs::rename(backup_app, current_app) {
+        let reinstall = std::fs::rename(staged_app, current_app);
+        return Err(format!(
+            "updated app could not relaunch ({relaunch_reason}) and restoring the previous app \
+             failed ({restore}); restoring the update in place returned {reinstall:?}. The \
+             previous app remains at {}",
+            backup_app.display()
+        ));
+    }
+    if let Err(old_relaunch) = open_macos_app(current_app, original_args) {
+        return Err(format!(
+            "updated app could not relaunch ({relaunch_reason}); the previous app was restored \
+             but /usr/bin/open also failed for it ({old_relaunch})"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MacOsCodeIdentity {
+    identifier: String,
+    team_identifier: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_codesign_identity(output: &str) -> Result<MacOsCodeIdentity, String> {
+    let field = |prefix: &str| {
+        output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(prefix))
+            .map(str::trim)
+            .find(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let identifier = field("Identifier=")
+        .ok_or_else(|| "codesign did not report a signed Identifier".to_owned())?;
+    let team_identifier = field("TeamIdentifier=")
+        .filter(|team| team != "not set")
+        .ok_or_else(|| "codesign did not report a Developer ID TeamIdentifier".to_owned())?;
+    Ok(MacOsCodeIdentity {
+        identifier,
+        team_identifier,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn command_failure(tool: &str, output: &std::process::Output) -> String {
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if detail.is_empty() {
+        format!("{tool} exited with {}", output.status)
+    } else {
+        format!("{tool} exited with {}: {detail}", output.status)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_app_signature(app: &Path) -> Result<MacOsCodeIdentity, String> {
+    let verification = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(app)
+        .output()
+        .map_err(|err| format!("could not run codesign verification: {err}"))?;
+    if !verification.status.success() {
+        return Err(command_failure(
+            "codesign --verify --deep --strict",
+            &verification,
+        ));
+    }
+    let assessment = std::process::Command::new("/usr/sbin/spctl")
+        .args(["--assess", "--type", "execute"])
+        .arg(app)
+        .output()
+        .map_err(|err| format!("could not run Gatekeeper assessment: {err}"))?;
+    if !assessment.status.success() {
+        return Err(command_failure(
+            "spctl --assess --type execute",
+            &assessment,
+        ));
+    }
+    let display = std::process::Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4"])
+        .arg(app)
+        .output()
+        .map_err(|err| format!("could not inspect the app signature: {err}"))?;
+    if !display.status.success() {
+        return Err(command_failure("codesign --display --verbose=4", &display));
+    }
+    let mut identity_output = String::from_utf8_lossy(&display.stdout).into_owned();
+    identity_output.push_str(&String::from_utf8_lossy(&display.stderr));
+    parse_macos_codesign_identity(&identity_output)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_bundle_pair(current_app: &Path, staged_app: &Path) -> Result<(), String> {
+    let current = verify_macos_app_signature(current_app)
+        .map_err(|reason| format!("current BowEcho.app failed verification: {reason}"))?;
+    let staged = verify_macos_app_signature(staged_app)
+        .map_err(|reason| format!("downloaded BowEcho.app failed verification: {reason}"))?;
+    if current.identifier != MACOS_BUNDLE_IDENTIFIER || staged.identifier != MACOS_BUNDLE_IDENTIFIER
+    {
+        return Err(format!(
+            "bundle identifier mismatch: expected {MACOS_BUNDLE_IDENTIFIER}, current is {}, \
+             downloaded is {}",
+            current.identifier, staged.identifier
+        ));
+    }
+    if current.team_identifier != staged.team_identifier {
+        return Err(format!(
+            "Developer ID team mismatch: current app is signed by {}, downloaded app by {}",
+            current.team_identifier, staged.team_identifier
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_bundle_architecture(app: &Path) -> Result<(), String> {
+    let lipo = Path::new("/usr/bin/lipo");
+    if !lipo.exists() {
+        return Ok(());
+    }
+    let output = std::process::Command::new(lipo)
+        .arg("-archs")
+        .arg(macos_app_executable(app))
+        .output()
+        .map_err(|err| format!("could not inspect the downloaded architecture: {err}"))?;
+    if !output.status.success() {
+        return Err(command_failure("lipo -archs", &output));
+    }
+    let expected = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        other => return Err(format!("unsupported macOS architecture {other}")),
+    };
+    let architectures = String::from_utf8_lossy(&output.stdout);
+    if !architectures
+        .split_whitespace()
+        .any(|arch| arch == expected)
+    {
+        return Err(format!(
+            "downloaded BowEcho.app does not contain the running {expected} architecture"
+        ));
+    }
+    Ok(())
 }
 
 /// Client for the one-shot updater download: generous total timeout for a
 /// ~50 MB asset on a slow link (the 8 s/45 s data_source budgets are sized
 /// for radar polling, not installers); rustls like every other outbound
 /// call.
+#[cfg(any(windows, target_os = "macos"))]
 fn self_update_http_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .user_agent(concat!(
@@ -286,15 +932,101 @@ fn self_update_http_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|err| format!("could not build HTTP client: {err}"))
 }
 
-/// Download → hash → checksum gate → signature gate → swap. Every failure
-/// is a reason string for the UI, and no failure path leaves a partial
-/// download behind.
+#[cfg(target_os = "macos")]
+fn create_private_macos_stage(current_app: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if current_app.file_name() != Some(std::ffi::OsStr::new(MACOS_APP_NAME)) {
+        return Err("the running app is not an exact BowEcho.app bundle".to_owned());
+    }
+    if path_has_app_translocation_component(current_app) {
+        return Err(
+            "updates cannot run from macOS App Translocation; move BowEcho.app to Applications \
+             and reopen it"
+                .to_owned(),
+        );
+    }
+    let parent = current_app
+        .parent()
+        .ok_or_else(|| "BowEcho.app has no parent directory".to_owned())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0_u8..32 {
+        let stage = parent.join(format!(
+            "{MACOS_STAGE_PREFIX}{}-{nonce:x}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&stage) {
+            Ok(()) => {
+                std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |err| {
+                        let _ = std::fs::remove_dir(&stage);
+                        format!("could not make the private update stage private: {err}")
+                    },
+                )?;
+                let sentinel = stage.join(MACOS_STAGE_SENTINEL);
+                let sentinel_result = (|| -> Result<(), std::io::Error> {
+                    use std::io::Write as _;
+
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&sentinel)?;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                    file.write_all(MACOS_STAGE_SENTINEL_CONTENTS.as_bytes())?;
+                    file.sync_all()
+                })();
+                if let Err(err) = sentinel_result {
+                    let _ = std::fs::remove_file(&sentinel);
+                    let _ = std::fs::remove_dir(&stage);
+                    return Err(format!(
+                        "could not mark the private update stage safely: {err}"
+                    ));
+                }
+                return Ok(stage);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "BowEcho.app's parent directory is not writable; move the app to a location \
+                     you can update ({err})"
+                ));
+            }
+        }
+    }
+    Err("could not reserve a unique private update stage".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn extract_macos_release_zip(zip: &Path, extraction_root: &Path) -> Result<(), String> {
+    std::fs::create_dir(extraction_root)
+        .map_err(|err| format!("could not create the update extraction directory: {err}"))?;
+    let output = std::process::Command::new("/usr/bin/ditto")
+        .args(["-x", "-k"])
+        .arg(zip)
+        .arg(extraction_root)
+        .output()
+        .map_err(|err| format!("could not extract the macOS update with ditto: {err}"))?;
+    if !output.status.success() {
+        return Err(command_failure("ditto -x -k", &output));
+    }
+    Ok(())
+}
+
+/// Download → hash → checksum gate → platform signature gate. Windows
+/// preserves the established executable swap before returning its relaunch
+/// plan. macOS returns an untouched, verified sibling stage; its helper swaps
+/// only after the GUI process has exited.
+#[cfg(windows)]
 fn run_self_update_worker(
     asset_url: &str,
     exe: &Path,
     events: &mpsc::Sender<SelfUpdateEvent>,
     ctx: &egui::Context,
-) -> Result<(), String> {
+) -> Result<SelfUpdateRelaunchPlan, String> {
     let client = self_update_http_client()?;
     let expected_sha256 = client
         .get(format!("{asset_url}.sha256"))
@@ -331,12 +1063,88 @@ fn run_self_update_worker(
         &actual_sha256,
         verify_authenticode_signature,
         swap_running_executable,
-    )
+    )?;
+    Ok(SelfUpdateRelaunchPlan::Windows {
+        executable: exe.to_path_buf(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn run_self_update_worker(
+    asset_url: &str,
+    exe: &Path,
+    events: &mpsc::Sender<SelfUpdateEvent>,
+    ctx: &egui::Context,
+) -> Result<SelfUpdateRelaunchPlan, String> {
+    let executable = exe
+        .canonicalize()
+        .map_err(|err| format!("could not resolve the running executable: {err}"))?;
+    let current_app = macos_app_bundle_from_executable(&executable)?;
+    let stage_root = create_private_macos_stage(&current_app)?;
+    let result = (|| {
+        let client = self_update_http_client()?;
+        let expected_sha256 = client
+            .get(format!("{asset_url}.sha256"))
+            .send()
+            .and_then(|response| response.error_for_status())
+            .and_then(|response| response.text())
+            .map_err(|err| format!("could not fetch the release checksum: {err}"))?;
+        let expected_sha256 = parse_sha256_asset(&expected_sha256)
+            .ok_or_else(|| "the release's .sha256 file is missing or malformed".to_owned())?;
+        let downloaded_zip = stage_root.join("update.zip");
+        let mut last_step_sent = u64::MAX;
+        let actual_sha256 =
+            download_update_asset(&client, asset_url, &downloaded_zip, |received, total| {
+                let step = match total {
+                    Some(total) if total > 0 => received * 100 / total,
+                    _ => received / (1024 * 1024),
+                };
+                if step != last_step_sent {
+                    last_step_sent = step;
+                    let _ = events.send(SelfUpdateEvent::Progress { received, total });
+                    ctx.request_repaint();
+                }
+            })?;
+        let _ = events.send(SelfUpdateEvent::Verifying);
+        ctx.request_repaint();
+        if !expected_sha256.eq_ignore_ascii_case(&actual_sha256) {
+            return Err(format!(
+                "SHA-256 mismatch: release lists {expected_sha256}, download hashed to \
+                 {actual_sha256}"
+            ));
+        }
+        let extraction_root = stage_root.join("extracted");
+        extract_macos_release_zip(&downloaded_zip, &extraction_root)?;
+        let staged_app = exact_extracted_macos_app(&extraction_root)?;
+        verify_macos_bundle_pair(&current_app, &staged_app)?;
+        verify_macos_bundle_architecture(&staged_app)?;
+        let _ = std::fs::remove_file(&downloaded_zip);
+        Ok(SelfUpdateRelaunchPlan::MacOs(MacOsRelaunchPlan {
+            current_app,
+            staged_app,
+            stage_root: stage_root.clone(),
+        }))
+    })();
+    if result.is_err() {
+        let _ = remove_private_macos_stage(&stage_root);
+    }
+    result
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn run_self_update_worker(
+    _asset_url: &str,
+    _exe: &Path,
+    _events: &mpsc::Sender<SelfUpdateEvent>,
+    _ctx: &egui::Context,
+) -> Result<SelfUpdateRelaunchPlan, String> {
+    Err("in-app updates are available on Windows and macOS".to_owned())
 }
 
 /// Stream a release asset to `destination`, hashing the exact bytes written.
 /// Returns the lowercase SHA-256 hex. `progress` fires with
 /// `(received, total)`; total comes from Content-Length when present.
+#[cfg(any(windows, target_os = "macos"))]
 fn download_update_asset(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -378,6 +1186,7 @@ fn download_update_asset(
 /// injected so tests can drive every branch without WinVerifyTrust or a
 /// live executable swap. The downloaded file is deleted on ANY failure —
 /// an unverified binary must never linger next to the real one.
+#[cfg(any(windows, test))]
 fn finalize_verified_update(
     downloaded: &Path,
     exe: &Path,
@@ -408,6 +1217,7 @@ fn finalize_verified_update(
 /// is legal on Windows), then rename the verified download into its place.
 /// Both paths share a directory, so neither rename crosses volumes. If the
 /// second rename fails the original is renamed back.
+#[cfg(any(windows, test))]
 fn swap_running_executable(downloaded: &Path, exe: &Path) -> Result<(), String> {
     let backup = update_backup_path(exe);
     if backup.exists() {
@@ -504,15 +1314,6 @@ fn verify_authenticode_signature(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Explicit platform gate: in-app updates are Windows-only for now
-/// (macOS/Linux keep the browser flow), so off-Windows verification
-/// refuses everything. Unreachable in practice — [`self_update_asset`]
-/// already returns `None` off-Windows, so the installer UI never appears.
-#[cfg(not(windows))]
-fn verify_authenticode_signature(_path: &Path) -> Result<(), String> {
-    Err("in-app updates are Windows-only".to_owned())
-}
-
 impl ViewerApp {
     /// One release-version check per launch, on a background thread: never
     /// blocks the UI, and every failure (offline, rate-limited, bad JSON) is
@@ -531,8 +1332,8 @@ impl ViewerApp {
     }
 
     /// User clicked Install update: download the same-variant asset for the
-    /// new tag, verify it (SHA-256 against the release's `.sha256`, then
-    /// Authenticode via WinVerifyTrust), swap it into place, and restart.
+    /// new tag, verify it against the release's `.sha256` and the platform
+    /// trust service, prepare its native swap, and restart.
     /// Everything runs off the UI thread; [`Self::poll_self_update`] applies
     /// the worker's progress events. Never called without an explicit click.
     fn start_self_update(&mut self, ctx: &egui::Context, tag: &str, asset: &str) {
@@ -567,15 +1368,14 @@ impl ViewerApp {
             total: None,
         };
         self.self_update_rx.spawn(ctx, move |tx| {
-            // The worker body is §9-protected ("logic untouched"): it keeps
-            // its own sender/ctx signature and progress-throttled repaints.
             match run_self_update_worker(&asset_url, &exe, tx.sender(), tx.ctx()) {
-                Ok(()) => {
+                Ok(plan) => {
                     // Relaunch happens in `main` after the event loop exits
-                    // (see `relaunch_after_self_update`); the UI only needs
-                    // to close the viewport when it sees this event.
-                    let _ = SELF_UPDATE_RELAUNCH.set(exe);
-                    let _ = tx.send(SelfUpdateEvent::SwapComplete);
+                    // (see `relaunch_after_self_update`). On macOS the plan
+                    // intentionally retains the verified sibling stage until
+                    // the post-exit helper can swap the entire app bundle.
+                    let _ = SELF_UPDATE_RELAUNCH.set(plan);
+                    let _ = tx.send(SelfUpdateEvent::ReadyToRelaunch);
                 }
                 Err(reason) => {
                     let _ = tx.send(SelfUpdateEvent::Failed(reason));
@@ -589,10 +1389,9 @@ impl ViewerApp {
         // first terminal event, exactly like the pre-slot drain loop.
         let (events, state) = self.self_update_rx.drain(Duration::MAX);
         for event in events {
-            if matches!(event, SelfUpdateEvent::SwapComplete) {
-                // The verified binary is already in place on disk;
-                // shut down cleanly so `on_exit` persistence runs,
-                // then `main` spawns the new executable.
+            if matches!(event, SelfUpdateEvent::ReadyToRelaunch) {
+                // Shut down cleanly so `on_exit` persistence runs, then main
+                // executes the platform relaunch plan.
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             self.self_update_phase = apply_self_update_event(&self.self_update_phase, &event);
@@ -628,21 +1427,31 @@ impl ViewerApp {
             // In-app install: only when a newer release exists AND this
             // binary knows which release asset it is (baked by the release
             // workflow — local/dev builds never self-update) AND we are on
-            // Windows AND updates come from the canonical repo (Brand-Kit
+            // Windows/macOS AND updates come from the canonical repo (Brand-Kit
             // repo overrides keep the browser flow — see
             // self_update_repo_allowed). Everyone else gets the button below.
-            let update_asset =
-                self_update_asset(option_env!("BOWECHO_UPDATE_ASSET"), cfg!(windows))
-                    .filter(|_| self_update_repo_allowed(&self.app_settings.brand.repo_url));
+            let update_asset = self_update_asset(
+                option_env!("BOWECHO_UPDATE_ASSET"),
+                current_self_update_platform(),
+            )
+            .filter(|_| self_update_repo_allowed(&self.app_settings.brand.repo_url));
             if let (Some(tag), Some(asset)) = (self.update_available.clone(), update_asset) {
                 let installing = self.self_update_rx.in_flight()
                     || matches!(self.self_update_phase, SelfUpdatePhase::Restarting);
                 if ui
                     .add_enabled(!installing, egui::Button::new("Install update"))
-                    .on_hover_text(format!(
-                        "Download {asset} from the {tag} release, verify its SHA-256 checksum \
-                         and Authenticode signature, then restart {display_name}"
-                    ))
+                    .on_hover_text(if cfg!(target_os = "macos") {
+                        format!(
+                            "Download {asset} from the {tag} release, verify its SHA-256, \
+                             Developer ID signature, and Gatekeeper assessment, then restart \
+                             {display_name}"
+                        )
+                    } else {
+                        format!(
+                            "Download {asset} from the {tag} release, verify its SHA-256 checksum \
+                             and Authenticode signature, then restart {display_name}"
+                        )
+                    })
                     .clicked()
                 {
                     self.start_self_update(ctx, &tag, asset);
@@ -682,11 +1491,32 @@ impl ViewerApp {
         ui.separator();
         // Explainer prose folds into a collapsed kit disclosure
         // (ui-refresh plan: prose never renders inline-expanded).
+        #[cfg(windows)]
         crate::panel_kit::about(
             ui,
             "settings_smartscreen_about",
             "Windows Defender / SmartScreen",
             &[SECURITY_UNSIGNED_BUILD_TEXT, SECURITY_SIGNATURE_STATUS_TEXT],
+        );
+        #[cfg(target_os = "macos")]
+        crate::panel_kit::about(
+            ui,
+            "settings_macos_update_security_about",
+            "macOS update security",
+            &[
+                "Official macOS releases are Developer ID-signed, notarized, and assessed by \
+                 Gatekeeper before an in-app update can install.",
+                "The updater pins the canonical GitHub asset and its SHA-256, requires the \
+                 stable BowEcho bundle identifier and the same signing team as the running app, \
+                 then swaps the whole app bundle only after BowEcho exits.",
+            ],
+        );
+        #[cfg(not(any(windows, target_os = "macos")))]
+        crate::panel_kit::about(
+            ui,
+            "settings_release_security_about",
+            "Release security",
+            &["Linux opens the canonical releases page; in-app installation is not enabled."],
         );
     }
 }
@@ -727,18 +1557,51 @@ mod tests {
     }
 
     #[test]
-    fn self_update_asset_requires_baked_name_and_windows() {
+    fn self_update_asset_requires_a_baked_platform_variant() {
         assert_eq!(
-            self_update_asset(Some("bowecho-windows-x64-v3.exe"), true),
+            self_update_asset(
+                Some("bowecho-windows-x64-v3.exe"),
+                SelfUpdatePlatform::Windows
+            ),
             Some("bowecho-windows-x64-v3.exe")
         );
         // Local/dev builds bake nothing → the in-app installer never appears.
-        assert_eq!(self_update_asset(None, true), None);
+        assert_eq!(self_update_asset(None, SelfUpdatePlatform::Windows), None);
         // CI passes an empty env value to targets without an update asset.
-        assert_eq!(self_update_asset(Some(""), true), None);
-        assert_eq!(self_update_asset(Some("  "), true), None);
-        // macOS/Linux stay browser-only even if a name were baked.
-        assert_eq!(self_update_asset(Some("bowecho-linux-x64"), false), None);
+        assert_eq!(
+            self_update_asset(Some(""), SelfUpdatePlatform::Windows),
+            None
+        );
+        assert_eq!(
+            self_update_asset(Some("  "), SelfUpdatePlatform::Windows),
+            None
+        );
+        assert_eq!(
+            self_update_asset(
+                Some("bowecho-macos-intel.zip"),
+                SelfUpdatePlatform::MacIntel
+            ),
+            Some("bowecho-macos-intel.zip")
+        );
+        assert_eq!(
+            self_update_asset(
+                Some("bowecho-macos-apple-silicon.zip"),
+                SelfUpdatePlatform::MacAppleSilicon
+            ),
+            Some("bowecho-macos-apple-silicon.zip")
+        );
+        assert_eq!(
+            self_update_asset(
+                Some("bowecho-macos-apple-silicon.zip"),
+                SelfUpdatePlatform::MacIntel
+            ),
+            None
+        );
+        // Linux stays browser-only even if an asset name were accidentally baked.
+        assert_eq!(
+            self_update_asset(Some("bowecho-linux-x64"), SelfUpdatePlatform::BrowserOnly),
+            None
+        );
     }
 
     #[test]
@@ -848,7 +1711,7 @@ mod tests {
         let verifying = apply_self_update_event(&sizeless, &SelfUpdateEvent::Verifying);
         assert_eq!(verifying, SelfUpdatePhase::Verifying);
 
-        let restarting = apply_self_update_event(&verifying, &SelfUpdateEvent::SwapComplete);
+        let restarting = apply_self_update_event(&verifying, &SelfUpdateEvent::ReadyToRelaunch);
         assert_eq!(restarting, SelfUpdatePhase::Restarting);
         // Terminal: no late event may resurrect the progress UI.
         assert_eq!(
@@ -894,6 +1757,158 @@ mod tests {
                 PathBuf::from("C:/apps/BowEcho/bowecho.exe.update"),
             ]
         );
+    }
+
+    #[test]
+    fn macos_bundle_derivation_accepts_only_the_exact_app_layout() {
+        let executable = Path::new("C:/Applications/BowEcho.app/Contents/MacOS/bowecho");
+        assert_eq!(
+            macos_app_bundle_from_executable(executable).unwrap(),
+            Path::new("C:/Applications/BowEcho.app")
+        );
+        assert!(
+            macos_app_bundle_from_executable(Path::new(
+                "C:/Applications/Renamed.app/Contents/MacOS/bowecho"
+            ))
+            .is_err()
+        );
+        assert!(
+            macos_app_bundle_from_executable(Path::new(
+                "C:/Applications/BowEcho.app/Contents/Helpers/bowecho"
+            ))
+            .is_err()
+        );
+        assert!(
+            macos_app_bundle_from_executable(Path::new(
+                "C:/Applications/BowEcho.app/Contents/MacOS/not-bowecho"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn app_translocation_is_rejected_by_component_not_substring() {
+        assert!(path_has_app_translocation_component(Path::new(
+            "C:/private/var/AppTranslocation/xyz/d/BowEcho.app"
+        )));
+        assert!(!path_has_app_translocation_component(Path::new(
+            "C:/Applications/AppTranslocation Notes/BowEcho.app"
+        )));
+    }
+
+    #[test]
+    fn macos_codesign_identity_requires_identifier_and_real_team() {
+        let identity = parse_macos_codesign_identity(
+            "Executable=/Applications/BowEcho.app/Contents/MacOS/bowecho\n\
+             Identifier=research.fahrenheit.bowecho\n\
+             TeamIdentifier=ABCDE12345\n",
+        )
+        .unwrap();
+        assert_eq!(identity.identifier, MACOS_BUNDLE_IDENTIFIER);
+        assert_eq!(identity.team_identifier, "ABCDE12345");
+        assert!(parse_macos_codesign_identity("Identifier=research.fahrenheit.bowecho").is_err());
+        assert!(
+            parse_macos_codesign_identity(
+                "Identifier=research.fahrenheit.bowecho\nTeamIdentifier=not set\n"
+            )
+            .is_err()
+        );
+    }
+
+    fn scratch_directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bowecho-selfupdate-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create scratch directory");
+        path
+    }
+
+    fn write_fake_macos_app(app: &Path, marker: &str) {
+        let macos = app.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&macos).expect("create fake app layout");
+        std::fs::write(app.join("Contents").join("Info.plist"), b"plist")
+            .expect("write fake plist");
+        std::fs::write(macos.join(MACOS_EXECUTABLE_NAME), marker.as_bytes())
+            .expect("write fake executable");
+    }
+
+    #[test]
+    fn extracted_macos_release_requires_one_exact_bowecho_app() {
+        let root = scratch_directory("mac-extraction");
+        let app = root.join(MACOS_APP_NAME);
+        write_fake_macos_app(&app, "new");
+        assert_eq!(exact_extracted_macos_app(&root).unwrap(), app);
+        std::fs::write(root.join("unexpected.txt"), b"extra").unwrap();
+        assert!(exact_extracted_macos_app(&root).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_stage_removal_requires_exact_sentinel() {
+        let parent = scratch_directory("stage-sentinel");
+        let stage = parent.join(format!("{MACOS_STAGE_PREFIX}test"));
+        std::fs::create_dir(&stage).unwrap();
+        assert!(!is_private_macos_stage(&stage));
+        assert!(remove_private_macos_stage(&stage).is_err());
+        assert!(stage.exists(), "unmarked directory must not be removed");
+        std::fs::write(
+            stage.join(MACOS_STAGE_SENTINEL),
+            MACOS_STAGE_SENTINEL_CONTENTS,
+        )
+        .unwrap();
+        assert!(is_private_macos_stage(&stage));
+        remove_private_macos_stage(&stage).unwrap();
+        assert!(!stage.exists());
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn macos_bundle_swap_is_whole_bundle_and_rolls_back() {
+        let root = scratch_directory("mac-swap");
+        let current = root.join(MACOS_APP_NAME);
+        let staged = root.join("staged").join(MACOS_APP_NAME);
+        let backup = root.join(MACOS_BACKUP_NAME);
+        write_fake_macos_app(&current, "old");
+        write_fake_macos_app(&staged, "new");
+        swap_macos_app_bundle(&staged, &current, &backup).unwrap();
+        assert_eq!(
+            std::fs::read(macos_app_executable(&current)).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            std::fs::read(macos_app_executable(&backup)).unwrap(),
+            b"old"
+        );
+
+        // A missing staged app makes the second rename fail; the old bundle
+        // must return to its original path.
+        std::fs::remove_dir_all(&current).unwrap();
+        std::fs::rename(&backup, &current).unwrap();
+        let missing = root.join("missing").join(MACOS_APP_NAME);
+        let outcome = swap_macos_app_bundle(&missing, &current, &backup);
+        assert!(outcome.unwrap_err().contains("previous app was restored"));
+        assert!(has_exact_macos_bundle_layout(&current));
+        assert!(!backup.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn macos_bundle_swap_refuses_to_delete_an_untrusted_backup_directory() {
+        let root = scratch_directory("mac-unsafe-backup");
+        let current = root.join(MACOS_APP_NAME);
+        let staged = root.join("staged").join(MACOS_APP_NAME);
+        let backup = root.join(MACOS_BACKUP_NAME);
+        write_fake_macos_app(&current, "old");
+        write_fake_macos_app(&staged, "new");
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("do-not-delete"), b"user data").unwrap();
+        let outcome = swap_macos_app_bundle(&staged, &current, &backup);
+        assert!(outcome.unwrap_err().contains("refusing to remove"));
+        assert!(backup.join("do-not-delete").exists());
+        assert!(current.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Scratch file for the finalize tests: a real on-disk download stand-in
