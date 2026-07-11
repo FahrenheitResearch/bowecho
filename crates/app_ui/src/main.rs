@@ -3198,6 +3198,9 @@ struct ViewerApp {
         WorkerSlot<std::result::Result<archive_browser::IntlArchiveDayListing, String>>,
     intl_archive_loaded_range: Option<(usize, usize)>,
     intl_archive_load_after_listing: bool,
+    /// ORD-only full-day command queued while its phased catalog listing is
+    /// still running.
+    intl_archive_full_day_after_listing: bool,
     /// GR2-style two-click Vrot tool: armed -> click max inbound, then max
     /// outbound; the card shows Vrot, couplet diameter, and beam height.
     vrot_tool_armed: bool,
@@ -8276,6 +8279,7 @@ impl ViewerApp {
             intl_archive_list_rx: WorkerSlot::idle("intl-archive-list"),
             intl_archive_loaded_range: None,
             intl_archive_load_after_listing: false,
+            intl_archive_full_day_after_listing: false,
             community_menu: None,
             poll_url: restored_poll_url,
             custom_poll_label_input: String::new(),
@@ -62318,6 +62322,7 @@ mod tests {
             intl_archive_list_rx: WorkerSlot::idle("intl-archive-list"),
             intl_archive_loaded_range: None,
             intl_archive_load_after_listing: false,
+            intl_archive_full_day_after_listing: false,
             community_menu: None,
             spc_data: spc_layers::SpcData::default(),
             spc_outlooks_enabled: Vec::new(),

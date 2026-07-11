@@ -730,6 +730,16 @@ impl ViewerApp {
             {
                 self.start_intl_archive_default_load(ctx);
             }
+            if provider_id == "ord"
+                && ui
+                    .add_enabled(!listing, egui::Button::new("Load full day"))
+                    .on_hover_text(
+                        "List every ORD scan on this UTC date, then download and decode the day in bounded 20-scan phases. The 20 objects shown by MeteoGate are elevation coverages, not a scan limit.",
+                    )
+                    .clicked()
+            {
+                self.start_ord_full_day_load(ctx);
+            }
             if listing {
                 ui.spinner();
             }
@@ -855,6 +865,11 @@ impl ViewerApp {
             SlotPoll::Ready(Ok(listing)) => {
                 self.status = format!("Archive: {} scans listed", listing.rows.len());
                 self.intl_archive_rows = Some(listing);
+                if self.intl_archive_full_day_after_listing {
+                    self.intl_archive_full_day_after_listing = false;
+                    self.start_ord_full_day_load(ctx);
+                    return;
+                }
                 if self.intl_archive_load_after_listing {
                     self.intl_archive_load_after_listing = false;
                     let newest = self
@@ -873,6 +888,7 @@ impl ViewerApp {
             SlotPoll::Ready(Err(err)) => {
                 self.intl_archive_rows = None;
                 self.intl_archive_load_after_listing = false;
+                self.intl_archive_full_day_after_listing = false;
                 self.status = format!("Archive listing failed: {err}");
                 ctx.request_repaint();
             }
@@ -882,6 +898,7 @@ impl ViewerApp {
             }
             SlotPoll::Disconnected => {
                 self.intl_archive_load_after_listing = false;
+                self.intl_archive_full_day_after_listing = false;
                 self.status = "Archive listing worker disconnected".to_owned();
             }
         }
@@ -903,6 +920,70 @@ impl ViewerApp {
         }
         self.intl_archive_load_after_listing = true;
         self.start_intl_archive_day_listing(ctx);
+    }
+
+    /// Load every scan listed for the current ORD UTC date. Download/decode
+    /// is phased so a full day never exists twice as one giant worker-side
+    /// batch before it reaches the history engine.
+    fn start_ord_full_day_load(&mut self, ctx: &egui::Context) {
+        let SiteRef::Intl {
+            provider_id,
+            site_id,
+        } = self.display_owner_site()
+        else {
+            return;
+        };
+        if provider_id != "ord" {
+            self.status = "Full-day phased loading is currently an ORD archive feature".to_owned();
+            return;
+        }
+        if self.load_receiver.is_some() {
+            self.status = "Wait for the current load to finish".to_owned();
+            return;
+        }
+        if self.intl_archive_list_rx.in_flight() {
+            self.intl_archive_full_day_after_listing = true;
+            self.status = "ORD archive: full day will load when listing finishes".to_owned();
+            return;
+        }
+        let Some(listing) = self
+            .intl_archive_rows
+            .as_ref()
+            .filter(|listing| listing.provider_id == provider_id && listing.site_id == site_id)
+        else {
+            self.intl_archive_full_day_after_listing = true;
+            self.start_intl_archive_day_listing(ctx);
+            return;
+        };
+        if listing.rows.is_empty() {
+            self.status = "ORD archive: no scans to load for that date".to_owned();
+            return;
+        }
+        if listing.rows.len() > MAX_HISTORY_FRAME_LIMIT {
+            self.status = format!(
+                "ORD archive: {} scans exceed the {}-frame history safety limit",
+                listing.rows.len(),
+                MAX_HISTORY_FRAME_LIMIT
+            );
+            return;
+        }
+        let rows = listing.rows.clone();
+        let end = rows.len() - 1;
+        let label = format!(
+            "ORD full day {site_id} {} ({} scans)",
+            rows[0].time_utc.format("%Y-%m-%d"),
+            rows.len()
+        );
+        self.start_intl_archive_row_batch(
+            provider_id,
+            site_id,
+            rows,
+            end,
+            Some((0, end)),
+            label,
+            true,
+            ctx,
+        );
     }
 
     /// Row count of the listing IF it belongs to the current display
@@ -964,6 +1045,7 @@ impl ViewerApp {
             chosen - start,
             Some((start, chosen)),
             label,
+            false,
             ctx,
         );
     }
@@ -1009,6 +1091,7 @@ impl ViewerApp {
             end - new_start,
             Some((new_start, end)),
             label,
+            false,
             ctx,
         );
     }
@@ -1026,6 +1109,7 @@ impl ViewerApp {
         selected_index: usize,
         loaded_range: Option<(usize, usize)>,
         label: String,
+        phased: bool,
         ctx: &egui::Context,
     ) {
         let plans = intl_plans_from_rows(rows);
@@ -1067,15 +1151,26 @@ impl ViewerApp {
         let worker_label = label.clone();
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
-            fetch_intl_frame_plan_batch(
-                &site_id,
-                plans,
-                selected_index,
-                &worker_label,
-                &path_prefix,
-                &source_prefix,
-                &sender,
-            );
+            if phased {
+                fetch_intl_frame_plan_batch_phased(
+                    &site_id,
+                    plans,
+                    &worker_label,
+                    &path_prefix,
+                    &source_prefix,
+                    &sender,
+                );
+            } else {
+                fetch_intl_frame_plan_batch(
+                    &site_id,
+                    plans,
+                    selected_index,
+                    &worker_label,
+                    &path_prefix,
+                    &source_prefix,
+                    &sender,
+                );
+            }
             ctx_clone.request_repaint();
         });
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
@@ -1572,6 +1667,103 @@ impl ViewerApp {
         };
         self.start_archive_range_load(chosen.saturating_sub(limit - 1), chosen, ctx)
     }
+}
+
+const ORD_FULL_DAY_DECODE_PHASE: usize = 20;
+
+/// Reuse the proven international batch decoder in bounded phases. One
+/// successful phase is held back so the final message can select the newest
+/// frame; earlier phases stream through `History` and are installed while the
+/// next phase downloads. Dropping the outer receiver makes the next send fail
+/// and cooperatively stops the remaining day.
+fn fetch_intl_frame_plan_batch_phased(
+    site_id: &str,
+    plans: Vec<FramePlan>,
+    label: &str,
+    path_prefix: &str,
+    source_prefix: &str,
+    sender: &mpsc::Sender<AsyncLoadResult>,
+) {
+    let total = plans.len();
+    let phase_total = total.div_ceil(ORD_FULL_DAY_DECODE_PHASE);
+    let mut pending_batch: Option<DecodedLoadBatch> = None;
+    let mut errors = Vec::new();
+
+    for (phase_index, chunk) in plans.chunks(ORD_FULL_DAY_DECODE_PHASE).enumerate() {
+        let phase_start = phase_index * ORD_FULL_DAY_DECODE_PHASE;
+        let phase_plans = chunk.to_vec();
+        let selected_index = phase_plans.len().saturating_sub(1);
+        let (phase_sender, phase_receiver) = mpsc::channel();
+        fetch_intl_frame_plan_batch(
+            site_id,
+            phase_plans,
+            selected_index,
+            label,
+            path_prefix,
+            source_prefix,
+            &phase_sender,
+        );
+        drop(phase_sender);
+
+        while let Ok(message) = phase_receiver.recv() {
+            match message.update {
+                AsyncLoadUpdate::ArchiveProgress(mut progress) => {
+                    progress.label = format!("{label} phase {}/{}", phase_index + 1, phase_total);
+                    progress.done = (phase_start + progress.done).min(total);
+                    progress.total = total;
+                    if sender
+                        .send(AsyncLoadResult {
+                            label: label.to_owned(),
+                            update: AsyncLoadUpdate::ArchiveProgress(progress),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                AsyncLoadUpdate::Final(Ok(batch)) => {
+                    if let Some(previous) = pending_batch.replace(batch)
+                        && sender
+                            .send(AsyncLoadResult {
+                                label: label.to_owned(),
+                                update: AsyncLoadUpdate::History(previous, false),
+                            })
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                AsyncLoadUpdate::Final(Err(error)) => errors.push(error),
+                // The reused worker currently emits only progress + final;
+                // forward any future incremental update rather than dropping
+                // it if that contract expands.
+                update => {
+                    if sender
+                        .send(AsyncLoadResult {
+                            label: label.to_owned(),
+                            update,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    let update = pending_batch.map_or_else(
+        || {
+            AsyncLoadUpdate::Final(Err(errors.pop().unwrap_or_else(|| {
+                "ORD full-day archive contained no decodable scans".to_owned()
+            })))
+        },
+        |batch| AsyncLoadUpdate::Final(Ok(batch)),
+    );
+    let _ = sender.send(AsyncLoadResult {
+        label: label.to_owned(),
+        update,
+    });
 }
 
 /// Worker body for intl archive-window loads: list through
