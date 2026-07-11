@@ -120,7 +120,9 @@ milliseconds and selectable like any product.
 1998; Mitchell et al. 1998) with time-association (CPLT → MESO), SCIT storm
 cell tracks with motion extrapolation (Johnson et al. 1998), maximum expected
 hail size (Witt et al. 1998), live draggable cross-sections, and GRLevelX
-placefiles (icon sheets, Object blocks, auto-refresh).
+placefiles (icon sheets, Object blocks, auto-refresh). An experimental
+**Vertical Wind Profile (VWP)** retrieves winds from dealiased radial velocity
+in the loaded PPI volume and exposes its sampling and fit-quality diagnostics.
 
 **Velocity dealiasing** offers two engines: region-based unfolding
 (Jing & Wiener 1993; Feldmann et al. 2020) — validated on real derecho data
@@ -152,6 +154,10 @@ latitude.
 
 - NEXRAD Level II from the public `unidata-nexrad-level2` S3 archive and the
   real-time chunk feed. No keys, no accounts, no middleman servers.
+- Live Polish POLRAD dual-polarization CMAX grids from the **IMGW-PIB public
+  datastore**: KDP, RHOHV, ZDR, and PHIDP where each site publishes them.
+  These are two-dimensional maximum-projection layers, not polar volumes;
+  they do not contain recoverable tilts or vertical storm structure.
 - Live NWS warnings/advisories and SPC mesoscale discussions overlay as
   clickable polygons with product-aware fills.
 - Multi-radar overlays: load neighboring sites on the same map with
@@ -192,6 +198,13 @@ During severe weather, follow your local NWS office and emergency management.
   ORD in June 2026). ORD radar data is licensed **CC BY 4.0**; BowEcho
   displays it with attribution to OPERA and the originating national
   services.
+- **IMGW-PIB POLRAD** — Polish dual-polarization CMAX grids from the
+  [IMGW-PIB public datastore](https://danepubliczne.imgw.pl/pl/datastore),
+  under the [published reuse terms](https://danepubliczne.imgw.pl/pl/introduction).
+  Required source notice: “Źródłem pochodzenia danych jest Instytut
+  Meteorologii i Gospodarki Wodnej – Państwowy Instytut Badawczy”. For
+  processed IMGW-derived output: “Dane Instytutu Meteorologii i Gospodarki
+  Wodnej – Państwowego Instytutu Badawczego zostały przetworzone”.
 - National open-data radar feeds: **SMHI** (Sweden), **FMI** (Finland),
   **DWD** (Germany), **DMI** (Denmark), **CHMI** (Czechia), **SHMÚ**
   (Slovakia), **GeoSphere Austria**, the **Estonian Environment Agency**,

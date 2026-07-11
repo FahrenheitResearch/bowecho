@@ -82,6 +82,56 @@ inspector warns when a sampled gate is near Nyquist and may still be folded.
 Use dealiased velocity as analysis aid rather than as proof that every gate is
 meteorologically correct.
 
+## Vertical wind profile (experimental)
+
+The Vertical Wind Profile (VWP) estimates the horizontal wind by fitting the
+azimuthal pattern of **dealiased radial velocity** in the currently loaded PPI
+volume. It is a derived analysis, not a directly measured wind at a point.
+The panel shows the wind profile and hodograph together with RMS fit error,
+sample count, azimuth coverage, selected range/elevation, and an explicit
+quality result for each height. Missing or rejected levels are expected when
+the scan lacks sufficient velocity, height coverage, or viewing angles.
+
+Treat VWP as experimental guidance. Dealiasing errors, sparse azimuth coverage,
+range folding, non-meteorological echoes, and an uneven precipitation field can
+bias the fit. Compare the result with the velocity display, a nearby sounding,
+and other observations before using it operationally.
+
+The VWP panel can also import a local NEXRAD Level III Product 48 file. Imported
+Product 48 profiles use that product's tabular data when present and fall back
+to its symbology wind barbs; they remain distinct from a profile computed from
+the current Level II volume. BowEcho does not automatically download Product 48
+files.
+
+Computed VWP requires a loaded radar volume with radial velocity. A
+two-dimensional composite or CMAX layer — including the IMGW POLRAD layers
+below — has no radials or elevation scans and therefore cannot produce a VWP.
+
+## Poland IMGW-PIB POLRAD CMAX layers
+
+BowEcho can display the ODIM HDF5 dual-polarization CMAX grids published through
+the IMGW-PIB national datastore. Supported quantities are **KDP** (deg/km),
+**RHOHV** (unitless), **ZDR** (dB), and **PHIDP** (degrees). Product availability
+varies by radar and cycle, so BowEcho discovers and offers only the files the
+datastore currently publishes.
+
+Supported POLRAD sites are Brzuchania, Nowy Gdańsk, Góra Św. Anny, Legionowo,
+Pastewnik, Poznań, Ramża, Rzeszów, Świdwin, and Użranki.
+
+These products are site-centered, top-down **two-dimensional maximum
+projections**. They are useful as regional dual-pol layers, but they are not
+polar sweeps or full volumes: individual tilts, radial geometry, beam heights,
+and three-dimensional storm structure cannot be recovered from them. Do not
+interpret a CMAX pixel as a value from a specific elevation, and do not compare
+it one-for-one with a selected base tilt.
+
+Source: [IMGW-PIB public datastore](https://danepubliczne.imgw.pl/pl/datastore).
+[IMGW-PIB reuse terms](https://danepubliczne.imgw.pl/pl/introduction) require
+the source notice “Źródłem pochodzenia danych jest Instytut Meteorologii i
+Gospodarki Wodnej – Państwowy Instytut Badawczy” and, for processed
+IMGW-derived output, “Dane Instytutu Meteorologii i Gospodarki Wodnej –
+Państwowego Instytutu Badawczego zostały przetworzone”.
+
 ## Cross-sections and panes
 
 Vertical cross-sections are interactive in the app. Draw a section across a
