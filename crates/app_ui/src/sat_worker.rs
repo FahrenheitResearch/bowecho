@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Timelike, Utc};
 use eframe::egui::{Color32, ColorImage};
-use rustwx_core::{GridShape, LatLonGrid};
+use rustwx_core::{GridShape, LatLonGrid, MAX_GRID_CELLS};
 use rw_sat::abi::{
     AbiFixedGrid, AbiSector, GoesAbiField, GoesAbiScene, read_goes_abi_field,
     read_goes_abi_field_window, read_goes_abi_scene,
@@ -2924,11 +2924,21 @@ fn fetch_himawari_band_counts(
         send,
     )?;
     if let Some(window) = window {
+        send(SatResponse::Note(format!(
+            "Himawari B{band:02}: assembling native focused window {}",
+            window.run_slug()
+        )));
         return assemble_ahi_window_counts(&paths, window);
     }
     if full_disk {
+        send(SatResponse::Note(format!(
+            "Himawari B{band:02}: assembling full-disk source grid"
+        )));
         return assemble_ahi_fulldisk_counts(&paths, downsample);
     }
+    send(SatResponse::Note(format!(
+        "Himawari B{band:02}: assembling selected segments"
+    )));
     // rw-sat's assemble gives us the correct grid/scene (geolocation), but its
     // Count values are right-shifted (see ahi_true_counts_on_grid); replace them
     // with the true raw counts read on the same downsampled grid.
@@ -3688,6 +3698,180 @@ fn compose_ahi_true_color(
     Ok((r, g, b))
 }
 
+/// Largest aspect-preserving raster that fits the shared desktop grid
+/// ceiling. AHI's stride-2 full disk is 5500x5500 (30.25 M cells), while the
+/// store intentionally caps a horizontal grid at 25 M cells. The source
+/// decode stays at stride 2 and this final presentation fit retains far more
+/// detail than dropping the source to integer stride 3 (3667x3667).
+fn grid_dims_within_cell_limit(
+    nx: usize,
+    ny: usize,
+    max_cells: usize,
+) -> Result<(usize, usize), String> {
+    let cells = nx
+        .checked_mul(ny)
+        .ok_or_else(|| format!("grid dimensions {nx}x{ny} overflow"))?;
+    if nx == 0 || ny == 0 || max_cells == 0 {
+        return Err(format!(
+            "grid dimensions and cell limit must be non-zero ({nx}x{ny}, limit {max_cells})"
+        ));
+    }
+    if cells <= max_cells {
+        return Ok((nx, ny));
+    }
+
+    let scale = (max_cells as f64 / cells as f64).sqrt();
+    let mut out_nx = ((nx as f64 * scale).floor() as usize).max(1);
+    let mut out_ny = ((ny as f64 * scale).floor() as usize).max(1);
+    while out_nx.saturating_mul(out_ny) > max_cells {
+        if out_nx as f64 / nx as f64 >= out_ny as f64 / ny as f64 && out_nx > 1 {
+            out_nx -= 1;
+        } else if out_ny > 1 {
+            out_ny -= 1;
+        } else {
+            return Err(format!(
+                "cell limit {max_cells} cannot hold grid aspect {nx}x{ny}"
+            ));
+        }
+    }
+    Ok((out_nx, out_ny))
+}
+
+fn scan_axis_edges(axis: &[f64]) -> Result<(f64, f64), String> {
+    if axis.len() < 2 || axis.iter().any(|value| !value.is_finite()) {
+        return Err("satellite scan axis must contain at least two finite coordinates".to_owned());
+    }
+    let first_edge = axis[0] - (axis[1] - axis[0]) * 0.5;
+    let last = axis.len() - 1;
+    let last_edge = axis[last] + (axis[last] - axis[last - 1]) * 0.5;
+    Ok((first_edge, last_edge))
+}
+
+/// Re-center a fixed-grid scan axis at a new sample count without changing
+/// either outer pixel edge. This keeps the entire AHI disk in view instead of
+/// cropping limb pixels to satisfy the store ceiling.
+fn resize_scan_axis(axis: &[f64], out_len: usize) -> Result<Vec<f64>, String> {
+    if out_len == 0 {
+        return Err("satellite scan axis output length must be non-zero".to_owned());
+    }
+    if axis.len() == out_len {
+        return Ok(axis.to_vec());
+    }
+    let (first_edge, last_edge) = scan_axis_edges(axis)?;
+    let step = (last_edge - first_edge) / out_len as f64;
+    Ok((0..out_len)
+        .map(|index| first_edge + (index as f64 + 0.5) * step)
+        .collect())
+}
+
+/// Bilinear presentation resample with a finite-coverage threshold. NaN is
+/// the off-earth alpha mask; requiring at least half the interpolation weight
+/// to be finite prevents a tiny valid corner from painting a false limb halo.
+fn resize_finite_plane(
+    source: &[f32],
+    src_nx: usize,
+    src_ny: usize,
+    out_nx: usize,
+    out_ny: usize,
+) -> Result<Vec<f32>, String> {
+    if source.len() != src_nx.saturating_mul(src_ny) {
+        return Err(format!(
+            "satellite plane length {} does not match {src_nx}x{src_ny}",
+            source.len()
+        ));
+    }
+    if (src_nx, src_ny) == (out_nx, out_ny) {
+        return Ok(source.to_vec());
+    }
+    if src_nx == 0 || src_ny == 0 || out_nx == 0 || out_ny == 0 {
+        return Err("satellite resample dimensions must be non-zero".to_owned());
+    }
+
+    let mut output = Vec::with_capacity(out_nx.saturating_mul(out_ny));
+    for out_y in 0..out_ny {
+        let src_y = (((out_y as f64 + 0.5) * src_ny as f64 / out_ny as f64) - 0.5)
+            .clamp(0.0, (src_ny - 1) as f64);
+        let y0 = src_y.floor() as usize;
+        let y1 = (y0 + 1).min(src_ny - 1);
+        let wy = (src_y - y0 as f64) as f32;
+        for out_x in 0..out_nx {
+            let src_x = (((out_x as f64 + 0.5) * src_nx as f64 / out_nx as f64) - 0.5)
+                .clamp(0.0, (src_nx - 1) as f64);
+            let x0 = src_x.floor() as usize;
+            let x1 = (x0 + 1).min(src_nx - 1);
+            let wx = (src_x - x0 as f64) as f32;
+            let samples = [
+                (source[y0 * src_nx + x0], (1.0 - wx) * (1.0 - wy)),
+                (source[y0 * src_nx + x1], wx * (1.0 - wy)),
+                (source[y1 * src_nx + x0], (1.0 - wx) * wy),
+                (source[y1 * src_nx + x1], wx * wy),
+            ];
+            let mut value_sum = 0.0_f32;
+            let mut finite_weight = 0.0_f32;
+            for (value, weight) in samples {
+                if value.is_finite() {
+                    value_sum += value * weight;
+                    finite_weight += weight;
+                }
+            }
+            output.push(if finite_weight >= 0.5 {
+                value_sum / finite_weight
+            } else {
+                f32::NAN
+            });
+        }
+    }
+    Ok(output)
+}
+
+/// Fit an oversized AHI RGB composite to the store limit while preserving
+/// full-disk coverage, RGB/alpha semantics, and enough metadata to audit the
+/// presentation resample later. Normal 4 km and focused-window composites are
+/// returned byte-for-byte.
+fn fit_himawari_composite_to_cell_limit(
+    mut scene: SatelliteGridScene,
+    (r, g, b): CompositePlanes,
+    max_cells: usize,
+) -> Result<(SatelliteGridScene, CompositePlanes), String> {
+    let (src_nx, src_ny) = (scene.fixed_grid.nx, scene.fixed_grid.ny);
+    let (out_nx, out_ny) = grid_dims_within_cell_limit(src_nx, src_ny, max_cells)?;
+    if (out_nx, out_ny) == (src_nx, src_ny) {
+        return Ok((scene, (r, g, b)));
+    }
+
+    let out_r = resize_finite_plane(&r, src_nx, src_ny, out_nx, out_ny)?;
+    drop(r);
+    let out_g = resize_finite_plane(&g, src_nx, src_ny, out_nx, out_ny)?;
+    drop(g);
+    let out_b = resize_finite_plane(&b, src_nx, src_ny, out_nx, out_ny)?;
+    drop(b);
+    scene.fixed_grid = AbiFixedGrid {
+        nx: out_nx,
+        ny: out_ny,
+        x_scan_rad: resize_scan_axis(&scene.fixed_grid.x_scan_rad, out_nx)?,
+        y_scan_rad: resize_scan_axis(&scene.fixed_grid.y_scan_rad, out_ny)?,
+    };
+    let record = serde_json::json!({
+        "reason": "shared grid cell safety limit",
+        "source_nx": src_nx,
+        "source_ny": src_ny,
+        "stored_nx": out_nx,
+        "stored_ny": out_ny,
+        "max_cells": max_cells,
+        "method": "finite-aware bilinear; scan-angle edges preserved",
+    });
+    if let Some(metadata) = scene.metadata.as_object_mut() {
+        metadata.insert("bowecho_store_resample".to_owned(), record);
+    } else {
+        let source_metadata = std::mem::take(&mut scene.metadata);
+        scene.metadata = serde_json::json!({
+            "source_metadata": source_metadata,
+            "bowecho_store_resample": record,
+        });
+    }
+    Ok((scene, (out_r, out_g, out_b)))
+}
+
 /// The generic satellite selector for a baked AHI RGB-composite frame: the
 /// base band on the AHI sweep=y projection, plus a `composite` block naming
 /// the style and its source bands (mirrors [`composite_selector`] and
@@ -3726,6 +3910,7 @@ fn himawari_composite_selector(
             "scan_start_utc": scene.start_time_utc.to_rfc3339(),
             "scan_end_utc": scene.end_time_utc.to_rfc3339(),
             "projection": projection,
+            "metadata": scene.metadata,
         }
     })
 }
@@ -4002,7 +4187,12 @@ fn ingest_latest_himawari_composite(
     let len = nx.saturating_mul(ny);
 
     let mut planes: HashMap<u8, Vec<f32>> = HashMap::with_capacity(bands.len());
-    for &band in bands {
+    for (index, &band) in bands.iter().enumerate() {
+        send(SatResponse::Note(format!(
+            "Himawari composite: calibrating B{band:02} ({}/{})",
+            index + 1,
+            bands.len()
+        )));
         // Take the band's counts out of the map so each count plane frees
         // as soon as its reflectance lands on the base grid — at the 2 km
         // full disk that is ~121 MB per band that would otherwise stack.
@@ -4013,7 +4203,27 @@ fn ingest_latest_himawari_composite(
         let on_base = resample_ahi_to_base(&field.scene.fixed_grid, &reflectance, &base_grid);
         planes.insert(band, on_base);
     }
+    send(SatResponse::Note(
+        "Himawari composite: combining calibrated true-color planes".to_owned(),
+    ));
     let (r, g, b) = compose_ahi_true_color(style, &planes, len)?;
+    drop(planes);
+    let source_dims = (nx, ny);
+    let target_dims = grid_dims_within_cell_limit(nx, ny, MAX_GRID_CELLS)?;
+    if target_dims != source_dims {
+        send(SatResponse::Note(format!(
+            "Himawari composite: fitting {}x{} source to {}x{} store-safe high-resolution grid",
+            source_dims.0, source_dims.1, target_dims.0, target_dims.1
+        )));
+    }
+    let (base_scene, (r, g, b)) =
+        fit_himawari_composite_to_cell_limit(base_scene, (r, g, b), MAX_GRID_CELLS)?;
+    let (nx, ny) = (base_scene.fixed_grid.nx, base_scene.fixed_grid.ny);
+    let len = nx.saturating_mul(ny);
+    debug_assert_eq!((nx, ny), target_dims);
+    send(SatResponse::Note(format!(
+        "Himawari composite: writing {nx}x{ny} frame to the satellite store"
+    )));
 
     let frame = write_himawari_composite_frame(
         store_root,
@@ -7507,6 +7717,66 @@ mod tests {
         assert_eq!((0..22_000).step_by(8).count(), 2750);
         assert_eq!((0..11_000).step_by(2).count(), 5500);
         assert_eq!((0..22_000).step_by(4).count(), 5500);
+    }
+
+    #[test]
+    fn high_resolution_fulldisk_fits_shared_grid_limit_without_cropping() {
+        assert_eq!(
+            grid_dims_within_cell_limit(5500, 5500, MAX_GRID_CELLS),
+            Ok((5000, 5000))
+        );
+        assert!(GridShape::new(5000, 5000).is_ok());
+
+        let mut scene = synthetic_ahi_field(2, 0, vec![-0.15, -0.05, 0.05, 0.15]).scene;
+        scene.fixed_grid.ny = 4;
+        scene.fixed_grid.y_scan_rad = vec![0.15, 0.05, -0.05, -0.15];
+        let source_x_edges = scan_axis_edges(&scene.fixed_grid.x_scan_rad).unwrap();
+        let source_y_edges = scan_axis_edges(&scene.fixed_grid.y_scan_rad).unwrap();
+        let mut plane = (0..16).map(|value| value as f32 / 15.0).collect::<Vec<_>>();
+        plane[0] = f32::NAN;
+
+        let (fitted, (r, g, b)) =
+            fit_himawari_composite_to_cell_limit(scene, (plane.clone(), plane.clone(), plane), 9)
+                .expect("4x4 composite fits a 9-cell test ceiling");
+
+        assert_eq!((fitted.fixed_grid.nx, fitted.fixed_grid.ny), (3, 3));
+        assert_eq!((r.len(), g.len(), b.len()), (9, 9, 9));
+        assert!(r[0].is_nan() && g[0].is_nan() && b[0].is_nan());
+        let fitted_x_edges = scan_axis_edges(&fitted.fixed_grid.x_scan_rad).unwrap();
+        let fitted_y_edges = scan_axis_edges(&fitted.fixed_grid.y_scan_rad).unwrap();
+        assert!((fitted_x_edges.0 - source_x_edges.0).abs() < 1.0e-12);
+        assert!((fitted_x_edges.1 - source_x_edges.1).abs() < 1.0e-12);
+        assert!((fitted_y_edges.0 - source_y_edges.0).abs() < 1.0e-12);
+        assert!((fitted_y_edges.1 - source_y_edges.1).abs() < 1.0e-12);
+        assert_eq!(fitted.metadata["bowecho_store_resample"]["source_nx"], 4);
+        assert_eq!(fitted.metadata["bowecho_store_resample"]["stored_nx"], 3);
+        let selector = himawari_composite_selector(&fitted, HimawariCompositeStyle::TrueColor);
+        assert_eq!(
+            selector["satellite"]["metadata"]["bowecho_store_resample"]["stored_nx"],
+            3
+        );
+
+        // The overwhelmingly common 4 km/window path stays byte-for-byte:
+        // no coordinate, pixel, or metadata rewrite when already under cap.
+        let untouched = synthetic_ahi_field(3, 0, vec![0.0, 0.04]).scene;
+        let original_scene = untouched.clone();
+        let original = vec![0.0_f32, 0.25, 0.5, f32::NAN];
+        let (same_scene, (same_r, same_g, same_b)) = fit_himawari_composite_to_cell_limit(
+            untouched,
+            (original.clone(), original.clone(), original.clone()),
+            MAX_GRID_CELLS,
+        )
+        .expect("in-limit composite is unchanged");
+        assert_eq!(same_scene, original_scene);
+        for same in [&same_r, &same_g, &same_b] {
+            assert_eq!(
+                same.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                original
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Sector tokens mirror rw-sat's assembler naming, so the whole-disk

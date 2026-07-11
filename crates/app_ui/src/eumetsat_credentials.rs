@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 pub(crate) const EUMETSAT_VAULT_SERVICE: &str = "research.fahrenheit.bowecho";
 pub(crate) const EUMETSAT_VAULT_ACCOUNT: &str = "eumetsat-api-consumer-v1";
 
+/// The current satellite workflow uses public EUMETView imagery only. Keep
+/// the tested Data Store credential path ready for future raw-product support,
+/// but do not expose or load account credentials until that support exists.
+pub(crate) const DATA_STORE_ACCOUNT_UI_ENABLED: bool = false;
+
 const CREDENTIAL_SCHEMA_VERSION: u8 = 1;
 const REDACTED: &str = "[REDACTED]";
 

@@ -106,7 +106,9 @@ impl ViewerApp {
         worker.send(sat_worker::SatRequest::SetIrEnhancement(
             self.sat_ir_enhancement,
         ));
-        worker.send(sat_worker::SatRequest::LoadEumetsatCredentials);
+        if eumetsat_credentials::DATA_STORE_ACCOUNT_UI_ENABLED {
+            worker.send(sat_worker::SatRequest::LoadEumetsatCredentials);
+        }
         worker.send(sat_worker::SatRequest::Scan);
         self.sat = Some(worker);
     }
@@ -207,17 +209,25 @@ impl ViewerApp {
     /// region controls and the player/output section below it.
     fn satellite_provider_controls(&mut self, ui: &mut egui::Ui) -> Vec<rw_ui::SatelliteEvent> {
         panel_kit::subgroup(ui, "Source & product", |_ui| {});
-        let chips = SatelliteSource::ALL
-            .iter()
-            .map(|source| panel_kit::Chip {
-                label: source.label(),
-                hotkey: None,
-                selected: self.satellite_source == *source,
-                hover: Some(format!("Show {} controls", source.label())),
-            })
-            .collect::<Vec<_>>();
-        if let Some(index) = panel_kit::chip_grid(ui, &chips) {
-            self.satellite_source = SatelliteSource::ALL[index];
+        let spacing = ui.spacing().item_spacing.x;
+        let tab_width = satellite_source_tab_width(ui.available_width(), spacing);
+        let mut selected_source = None;
+        ui.horizontal(|ui| {
+            for source in SatelliteSource::ALL {
+                if ui
+                    .add_sized(
+                        egui::vec2(tab_width, PANEL_BUTTON_HEIGHT),
+                        egui::Button::selectable(self.satellite_source == source, source.label()),
+                    )
+                    .on_hover_text(format!("Show {} controls", source.label()))
+                    .clicked()
+                {
+                    selected_source = Some(source);
+                }
+            }
+        });
+        if let Some(source) = selected_source {
+            self.satellite_source = source;
             self.app_settings.satellite_source = self.satellite_source.slug().to_owned();
             self.mark_app_settings_dirty();
         }
@@ -404,52 +414,58 @@ impl ViewerApp {
                     ui.hyperlink_to("Open MTG LI color legend", eumetsat::MTG_LI_LEGEND_URL);
                 }
 
-                egui::CollapsingHeader::new("Data Store account · optional")
-                    .id_salt("eumetsat_account")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.weak(
-                            "The live products above are public. Connect a consumer key and secret for EUMETSAT Data Store access; BowEcho stores them only in this device's credential vault and mints tokens automatically.",
-                        );
-                        ui.horizontal_wrapped(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.eumetsat_consumer_key)
-                                    .hint_text("consumer key")
-                                    .password(true)
-                                    .desired_width(180.0),
+                if eumetsat_credentials::DATA_STORE_ACCOUNT_UI_ENABLED {
+                    egui::CollapsingHeader::new("Data Store account · optional")
+                        .id_salt("eumetsat_account")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.weak(
+                                "The live products above are public. Connect a consumer key and secret for EUMETSAT Data Store access; BowEcho stores them only in this device's credential vault and mints tokens automatically.",
                             );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.eumetsat_consumer_secret)
-                                    .hint_text("consumer secret")
-                                    .password(true)
-                                    .desired_width(190.0),
-                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.eumetsat_consumer_key)
+                                        .hint_text("consumer key")
+                                        .password(true)
+                                        .desired_width(180.0),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.eumetsat_consumer_secret)
+                                        .hint_text("consumer secret")
+                                        .password(true)
+                                        .desired_width(190.0),
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                let complete = !self.eumetsat_consumer_key.trim().is_empty()
+                                    && !self.eumetsat_consumer_secret.trim().is_empty();
+                                if ui
+                                    .add_enabled(complete, egui::Button::new("Save securely"))
+                                    .clicked()
+                                {
+                                    save_eumetsat = true;
+                                }
+                                if ui
+                                    .add_enabled(complete, egui::Button::new("Test account"))
+                                    .clicked()
+                                {
+                                    test_eumetsat = true;
+                                }
+                                if ui.button("Forget").clicked() {
+                                    forget_eumetsat = true;
+                                }
+                            });
+                            if let Some(status) = &self.eumetsat_account_status {
+                                panel_kit::status_block(
+                                    ui,
+                                    match status {
+                                        Ok(message) | Err(message) => message,
+                                    },
+                                    None,
+                                );
+                            }
                         });
-                        ui.horizontal_wrapped(|ui| {
-                            let complete = !self.eumetsat_consumer_key.trim().is_empty()
-                                && !self.eumetsat_consumer_secret.trim().is_empty();
-                            if ui.add_enabled(complete, egui::Button::new("Save securely")).clicked()
-                            {
-                                save_eumetsat = true;
-                            }
-                            if ui.add_enabled(complete, egui::Button::new("Test account")).clicked()
-                            {
-                                test_eumetsat = true;
-                            }
-                            if ui.button("Forget").clicked() {
-                                forget_eumetsat = true;
-                            }
-                        });
-                        if let Some(status) = &self.eumetsat_account_status {
-                            panel_kit::status_block(
-                                ui,
-                                match status {
-                                    Ok(message) | Err(message) => message,
-                                },
-                                None,
-                            );
-                        }
-                    });
+                }
             }
         }
 
@@ -613,6 +629,12 @@ impl ViewerApp {
         ui: &mut egui::Ui,
     ) -> (Vec<rw_ui::SatelliteEvent>, Vec<rw_ui::SatPlayerEvent>) {
         let panel_events = self.satellite_provider_controls(ui);
+        if self.satellite_source != SatelliteSource::Goes
+            && let Some(activity) = satellite_activity_status(&self.status)
+        {
+            panel_kit::subgroup(ui, "Live progress", |_ui| {});
+            panel_kit::status_block(ui, activity, None);
+        }
         panel_kit::subgroup(ui, "Display & output", |_ui| {});
         if self.sat_last_frame.is_some() || self.sat_layer.is_some() {
             let mut map_request: Option<(rw_ui::SatRunKey, u16)> = None;
@@ -956,9 +978,17 @@ impl ViewerApp {
                     self.sat_panel.apply_poll_done(band, new_keys, ms);
                 }
                 sat_worker::SatResponse::DownloadStarted { id, label, bytes } => {
+                    self.status = format!(
+                        "Satellite: {label} · downloading {}",
+                        rw_ui::format_bytes(bytes)
+                    );
                     self.sat_panel.apply_download_started(id, label, bytes);
                 }
                 sat_worker::SatResponse::DownloadDone { id, ms, cache_hit } => {
+                    self.status = format!(
+                        "Satellite: download complete in {ms} ms{} · decoding / storing",
+                        if cache_hit { " · cache hit" } else { "" }
+                    );
                     self.sat_panel.apply_download_done(&id, ms, cache_hit);
                 }
                 sat_worker::SatResponse::FrameWritten {
@@ -968,6 +998,10 @@ impl ViewerApp {
                     bytes,
                     encode_ms,
                 } => {
+                    self.status = format!(
+                        "Satellite: stored {run}/t{hhmm:04} · {} in {encode_ms} ms",
+                        rw_ui::format_bytes(bytes)
+                    );
                     self.sat_panel
                         .apply_frame_written(&id, run, hhmm, bytes, encode_ms);
                     if let Some(sat) = &self.sat {
@@ -1419,6 +1453,17 @@ impl ViewerApp {
     }
 }
 
+fn satellite_activity_status(status: &str) -> Option<&str> {
+    status
+        .strip_prefix("Satellite: ")
+        .map(str::trim)
+        .filter(|activity| !activity.is_empty())
+}
+
+fn satellite_source_tab_width(available: f32, spacing: f32) -> f32 {
+    panel_kit::chip_width(available, spacing, SatelliteSource::ALL.len())
+}
+
 pub(crate) fn nearest_sat_frame_for_time(
     runs: &[rw_ui::SatRunListing],
     preferred_key: Option<&rw_ui::SatRunKey>,
@@ -1747,6 +1792,22 @@ fn resize_color_image_linear(image: &egui::ColorImage, new_size: [usize; 2]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_goes_activity_only_accepts_satellite_status() {
+        assert_eq!(
+            satellite_activity_status("Satellite: Himawari B03 S04/10 · downloading 2.1 MB"),
+            Some("Himawari B03 S04/10 · downloading 2.1 MB")
+        );
+        assert_eq!(satellite_activity_status("Radar: loading KTLX"), None);
+        assert_eq!(satellite_activity_status("Satellite:   "), None);
+    }
+
+    #[test]
+    fn satellite_source_tabs_split_the_row_three_ways() {
+        assert_eq!(satellite_source_tab_width(520.0, 4.0), 170.0);
+        assert_eq!(satellite_source_tab_width(320.0, 4.0), 104.0);
+    }
 
     #[test]
     fn satellite_player_preview_is_capped_below_wgpu_texture_limit() {

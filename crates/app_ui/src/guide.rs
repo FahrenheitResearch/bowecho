@@ -1001,33 +1001,35 @@ fn satellite(ui: &mut egui::Ui) {
          UTC date. Product metadata also records the EUMETView layer and EUMETSAT provider.",
     );
 
-    subhead(ui, "OPTIONAL EUMETSAT DATA STORE ACCOUNT");
-    para(
-        ui,
-        "The public EUMETView imagery above never needs an account. The separate Data Store \
-         account controls let you check a consumer key and consumer secret, save them in the \
-         operating-system credential vault on this device, or forget them. Account checks mint \
-         a short-lived access token on the satellite worker and do not retain that token. The \
-         key and secret never enter BowEcho's settings file. This optional account connection is \
-         not a raw FCI download path.",
-    );
-    action(
-        ui,
-        "Which values to enter",
-        "— open EUMETSAT API Key Management, then copy Consumer Key into BowEcho's consumer-key \
-         field and Consumer Secret into the consumer-secret field. Do not paste the temporary \
-         Access Token: BowEcho requests and refreshes short-lived tokens from the saved pair.",
-    );
-    ui.hyperlink_to(
-        "Open EUMETSAT API Key Management",
-        "https://api.eumetsat.int/api-key/",
-    );
-    para(
-        ui,
-        "If the page has no key pair yet, sign in with an EUMETSAT User Portal account and \
-         create one there. Save securely writes the pair to Windows Credential Manager, macOS \
-         Keychain, or Linux Secret Service; Test account verifies it by requesting a token.",
-    );
+    if crate::eumetsat_credentials::DATA_STORE_ACCOUNT_UI_ENABLED {
+        subhead(ui, "OPTIONAL EUMETSAT DATA STORE ACCOUNT");
+        para(
+            ui,
+            "The public EUMETView imagery above never needs an account. The separate Data Store \
+             account controls let you check a consumer key and consumer secret, save them in the \
+             operating-system credential vault on this device, or forget them. Account checks mint \
+             a short-lived access token on the satellite worker and do not retain that token. The \
+             key and secret never enter BowEcho's settings file. This optional account connection is \
+             not a raw FCI download path.",
+        );
+        action(
+            ui,
+            "Which values to enter",
+            "— open EUMETSAT API Key Management, then copy Consumer Key into BowEcho's consumer-key \
+             field and Consumer Secret into the consumer-secret field. Do not paste the temporary \
+             Access Token: BowEcho requests and refreshes short-lived tokens from the saved pair.",
+        );
+        ui.hyperlink_to(
+            "Open EUMETSAT API Key Management",
+            "https://api.eumetsat.int/api-key/",
+        );
+        para(
+            ui,
+            "If the page has no key pair yet, sign in with an EUMETSAT User Portal account and \
+             create one there. Save securely writes the pair to Windows Credential Manager, macOS \
+             Keychain, or Linux Secret Service; Test account verifies it by requesting a token.",
+        );
+    }
 
     subhead(ui, "IR ENHANCEMENTS");
     para(
@@ -1692,9 +1694,9 @@ fn sources(ui: &mut egui::Ui) {
         ui,
         "GOES GLM lightning and Himawari-9 IR/WV full-disk frames are also wired from NOAA \
          open-data buckets. Meteosat-12 / MTG-I1 rendered imagery is provided publicly by \
-         EUMETSAT through EUMETView; public imagery needs no account. An optional EUMETSAT \
-         Data Store consumer account is kept only in the operating-system credential vault. \
-         Modified map and plot output carries ‘Contains modified EUMETSAT Meteosat data YEAR.’",
+         EUMETSAT through EUMETView; public imagery needs no account and the current Satellite \
+         interface does not request Data Store credentials. Modified map and plot output carries \
+         ‘Contains modified EUMETSAT Meteosat data YEAR.’",
     );
 
     subhead(ui, "GDEX CLIMATE MODEL DATA");
@@ -1915,8 +1917,9 @@ mod tests {
 
     /// Restored MTG imagery is the public rendered EUMETView path, not the
     /// retired whole-product FCI downloader. Keep the no-account imagery,
-    /// secure optional account, common player/map/plot path, and LI raster vs.
-    /// point-overlay distinction explicit together.
+    /// common player/map/plot path and LI raster vs. point-overlay distinction
+    /// explicit together. Data Store controls stay hidden until they back a
+    /// real raw-product workflow.
     #[test]
     fn guide_documents_restored_public_meteosat_integration() {
         let guide_src = include_str!("guide.rs");
@@ -1926,11 +1929,10 @@ mod tests {
         assert!(guide_src.contains("Load latest"));
         assert!(guide_src.contains("Load loop"));
         assert!(guide_src.contains("Map follows player"));
-        assert!(guide_src.contains("operating-system credential vault"));
-        assert!(guide_src.contains("https://api.eumetsat.int/api-key/"));
-        assert!(guide_src.contains("Consumer Key"));
-        assert!(guide_src.contains("Consumer Secret"));
-        assert!(guide_src.contains("Do not paste the temporary"));
+        assert!(
+            guide_src.contains("if crate::eumetsat_credentials::DATA_STORE_ACCOUNT_UI_ENABLED")
+        );
+        assert!(guide_src.contains("does not request Data Store credentials"));
         assert!(guide_src.contains("Contains modified EUMETSAT Meteosat data YEAR."));
         assert!(guide_src.contains("not a raw FCI download path"));
         assert!(guide_src.contains("dedicated point-flash Lightning overlay remains GOES GLM"));
