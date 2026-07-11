@@ -37,9 +37,11 @@ pub(crate) mod iso_fields;
 /// Both variants write into the same model store the dock browses, so a
 /// finished import is picked up by [`ModelDataDock::rescan`] and its runs then
 /// sound through the existing skew-T path.
-// Constructed only from the rfd file-dialog UI (cfg windows/macos); the
-// Linux verify node would otherwise flag every variant dead.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Constructed only from the native rfd file-dialog UI on supported desktops.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 enum ImportJob {
     /// Light path (`local_import`): 2D surface fields + isobaric sounding
     /// volumes. Handles raw `wrfout`, post-processed climate wrfout, and plain
@@ -503,8 +505,11 @@ pub struct ModelDataDock {
     /// result above is drained into the loop engine. Arc clones of the loop
     /// frames — no volume data is duplicated. Replaced whole on the next
     /// finished build.
-    // Read only by the rfd-gated (windows/macos) export UI.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    // Read only by the native rfd export UI on supported desktops.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     synthetic_export_frames: Vec<std::sync::Arc<radar_core::RadarVolume>>,
     /// Last import status line shown under the import controls.
     import_message: Option<String>,
@@ -565,13 +570,19 @@ pub struct ModelDataDock {
     synth_radar: SyntheticRadarUiState,
     /// A heavy full-diagnostics import awaiting explicit confirmation because
     /// the chosen folder looks LARGE (see [`heavy_import_size_warning`]).
-    // Read only by the rfd-gated (windows/macos) import UI.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    // Read only by the native rfd import UI on supported desktops.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     pending_heavy_import: Option<PendingHeavyImport>,
     /// A light import awaiting the same explicit confirmation (see
     /// [`light_import_size_warning`]).
-    // Read only by the rfd-gated (windows/macos) import UI.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    // Read only by the native rfd import UI on supported desktops.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     pending_light_import: Option<PendingLightImport>,
     /// Store-variable names of the hour currently in the viewer, captured
     /// from its `HourVars` response. Load routing + display translation
@@ -759,7 +770,7 @@ impl ModelDataDock {
         })
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn stage_formula_raw_from_files(&mut self, files: &[PathBuf]) {
         if let Some(first) = files.first() {
             self.formula_raw_path = Some(first.clone());
@@ -1609,7 +1620,7 @@ impl ModelDataDock {
                      vector, vertical, and horizontal-calculus operations.",
                 );
 
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             if ui
                 .button("Choose raw WRF...")
                 .on_hover_text(
@@ -1627,9 +1638,9 @@ impl ModelDataDock {
                 self.formula_lab.open = true;
             }
 
-            #[cfg(not(any(windows, target_os = "macos")))]
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
             ui.add_enabled(false, egui::Button::new("Choose raw WRF..."))
-                .on_hover_text("Raw WRF file picking is available on Windows and macOS.");
+                .on_hover_text("Raw WRF file picking is unavailable on this platform.");
         });
         if let Some(path) = self.formula_raw_path.clone() {
             let label = path
@@ -1735,9 +1746,8 @@ impl ModelDataDock {
         }
     }
 
-    /// Native folder pickers that spawn the ingest (rfd is Windows/macOS-only,
-    /// matching the rest of the app's local-file UI).
-    #[cfg(any(windows, target_os = "macos"))]
+    /// Native file and folder pickers that spawn the ingest.
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn import_pickers(&mut self, ui: &mut egui::Ui) {
         let busy = self.import_job.is_some() || self.formula_lab.busy();
         ui.horizontal_wrapped(|ui| {
@@ -1926,7 +1936,7 @@ impl ModelDataDock {
     /// explicit confirmation — the owner has melted this machine on a 250 m
     /// grid) or launch it directly. Shared by the file(s) and folder pickers so
     /// 1-to-hundreds of wrfouts take the identical safe path.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn gate_or_launch_heavy_import(&mut self, files: Vec<PathBuf>) {
         self.stage_formula_raw_from_files(&files);
         if self.formula_lab.busy() {
@@ -1943,7 +1953,7 @@ impl ModelDataDock {
     }
 
     /// Spawn the heavy full-diagnostics processing job (after any size gate).
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn launch_heavy_import(
         &mut self,
         files: Vec<PathBuf>,
@@ -1962,7 +1972,7 @@ impl ModelDataDock {
 
     /// Light-path counterpart of the heavy size gate: park a LARGE selection
     /// behind [`Self::light_import_warning_ui`], launch small ones directly.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn gate_or_launch_light_import(&mut self, files: Vec<PathBuf>) {
         self.stage_formula_raw_from_files(&files);
         if self.formula_lab.busy() {
@@ -1977,7 +1987,7 @@ impl ModelDataDock {
     }
 
     /// Spawn the light import job (after any size gate).
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn launch_light_import(&mut self, files: Vec<PathBuf>) {
         if self.formula_lab.busy() {
             self.import_message =
@@ -1999,7 +2009,7 @@ impl ModelDataDock {
     }
 
     /// Spawn the fast simulated-radar job over the picked file set.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn launch_synthetic_radar(
         &mut self,
         files: Vec<PathBuf>,
@@ -2026,7 +2036,7 @@ impl ModelDataDock {
     /// frame named `{site}_{time}_simwrf.nc`. Writes synchronously on the UI
     /// thread — a frame is tens of MB and the writer streams through a
     /// BufWriter, so even a full loop is a brief, user-initiated pause.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn export_synthetic_radar_frames(&mut self) {
         // Arc clones only — frees `self` for the status-line writes below.
         let retained = self.synthetic_export_frames.clone();
@@ -2070,7 +2080,7 @@ impl ModelDataDock {
 
     /// Inline size-aware confirmation for a parked heavy import: the warning,
     /// a fast core-only alternative, an explicit "start anyway", and cancel.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn heavy_import_warning_ui(&mut self, ui: &mut egui::Ui) {
         let Some(pending) = &self.pending_heavy_import else {
             return;
@@ -2134,7 +2144,7 @@ impl ModelDataDock {
     /// grid even the light path is minutes of wrf-core compute per file, so
     /// the user is told BEFORE it starts — with the pointer to the fast
     /// simulated-radar path for radar-style browsing.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn light_import_warning_ui(&mut self, ui: &mut egui::Ui) {
         let Some(pending) = &self.pending_light_import else {
             return;
@@ -2183,7 +2193,7 @@ impl ModelDataDock {
     /// max-range + gate-spacing overrides. Edits mutate `self.synth_radar`,
     /// which the 🌩 buttons read and `persist_wrf_synth_radar` (app side)
     /// saves.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn synthetic_radar_site_panel(&mut self, ui: &mut egui::Ui) {
         let busy = self.import_job.is_some() || self.formula_lab.busy();
         let state = &mut self.synth_radar;
@@ -2486,7 +2496,7 @@ impl ModelDataDock {
     /// exactly which store fields the selection will write. Edits mutate
     /// `self.wrf_options`, which the "WRF full diagnostics…" button reads and
     /// `persist_wrf_process_options` (app side) saves.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn wrf_options_panel(&mut self, ui: &mut egui::Ui) {
         let busy = self.import_job.is_some() || self.formula_lab.busy();
         let opts = &mut self.wrf_options;
@@ -2585,12 +2595,11 @@ impl ModelDataDock {
             });
     }
 
-    /// Non-desktop fallback: native folder dialogs (rfd) are unavailable, so
-    /// there is nothing to pick here.
-    #[cfg(not(any(windows, target_os = "macos")))]
+    /// Fallback for unsupported targets without a native dialog backend.
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     fn import_pickers(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            egui::RichText::new("Folder import needs Windows or macOS.")
+            egui::RichText::new("Native file and folder import is unavailable on this platform.")
                 .small()
                 .weak(),
         );
