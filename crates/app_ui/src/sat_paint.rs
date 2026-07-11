@@ -205,10 +205,7 @@ impl ViewerApp {
 
     /// Provider-first control surface. All provider actions feed the shared
     /// region controls and the player/output section below it.
-    fn satellite_provider_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-    ) -> Vec<rw_ui::SatelliteEvent> {
+    fn satellite_provider_controls(&mut self, ui: &mut egui::Ui) -> Vec<rw_ui::SatelliteEvent> {
         panel_kit::subgroup(ui, "Source & product", |_ui| {});
         let chips = SatelliteSource::ALL
             .iter()
@@ -350,8 +347,8 @@ impl ViewerApp {
                 );
             }
             SatelliteSource::Meteosat => {
-                let selected = eumetsat::MtgProduct::parse(&self.eumetsat_product)
-                    .unwrap_or_default();
+                let selected =
+                    eumetsat::MtgProduct::parse(&self.eumetsat_product).unwrap_or_default();
                 ui.horizontal_wrapped(|ui| {
                     ui.label("MTG-I1");
                     egui::ComboBox::from_id_salt("eumetsat_mtg_product")
@@ -500,8 +497,11 @@ impl ViewerApp {
         if load_goes_loop && let Some(sat) = &self.sat {
             self.sat_map_follow = true;
             self.status = "Satellite: loading GOES loop".to_owned();
-            self.sat_panel.apply_note("GOES loop: queued current-hour ingest".to_owned());
-            sat.send(sat_worker::SatRequest::LoadLoop(self.sat_panel.spec().clone()));
+            self.sat_panel
+                .apply_note("GOES loop: queued current-hour ingest".to_owned());
+            sat.send(sat_worker::SatRequest::LoadLoop(
+                self.sat_panel.spec().clone(),
+            ));
         }
         if load_goes_composite && self.sat.is_some() {
             let base = self.sat_panel.spec().clone();
@@ -536,12 +536,15 @@ impl ViewerApp {
             ));
         }
         if load_himawari_composite && self.sat.is_some() {
-            let window =
-                self.sat_native_window_if_visible(sat_window::AHI_NOMINAL_SUB_LON_DEG, "Himawari-9");
+            let window = self
+                .sat_native_window_if_visible(sat_window::AHI_NOMINAL_SUB_LON_DEG, "Himawari-9");
             let (full_disk, downsample) = match self.himawari_true_color_scope.as_str() {
                 "fulldisk" => (true, 4),
                 "fulldisk2km" => (true, 2),
-                _ => (false, sat_worker::HimawariCompositeSpec::default().downsample),
+                _ => (
+                    false,
+                    sat_worker::HimawariCompositeSpec::default().downsample,
+                ),
             };
             self.sat_map_follow = true;
             self.status = "Satellite: composing Himawari-9 AHI true color".to_owned();
@@ -583,9 +586,8 @@ impl ViewerApp {
                     ));
                 }
                 if test_eumetsat {
-                    self.eumetsat_account_status = Some(Ok(
-                        "Checking EUMETSAT account…".to_owned(),
-                    ));
+                    self.eumetsat_account_status =
+                        Some(Ok("Checking EUMETSAT account…".to_owned()));
                     sat.send(sat_worker::SatRequest::CheckEumetsatAccount(credentials));
                 }
             }
@@ -1404,12 +1406,7 @@ impl ViewerApp {
                 size,
             );
             painter.rect_filled(card, 4.0, visuals.window_fill());
-            painter.rect_stroke(
-                card,
-                4.0,
-                visuals.window_stroke(),
-                egui::StrokeKind::Inside,
-            );
+            painter.rect_stroke(card, 4.0, visuals.window_stroke(), egui::StrokeKind::Inside);
             painter.galley(
                 card.min + egui::vec2(6.0, 4.0),
                 galley,

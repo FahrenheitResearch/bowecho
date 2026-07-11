@@ -658,12 +658,15 @@ impl ViewerApp {
         }
         let mut remove_sat_layer = false;
         let mut open_sat_window = false;
-        let sat_layer_source = self.sat_layer.as_ref().map(|layer| match layer.key.model.as_str() {
-            "mtg_i1" => ("Meteosat", "Meteosat-12 / EUMETSAT satellite frame"),
-            "h8" | "h9" => ("Himawari", "Himawari AHI satellite frame"),
-            "simsat" => ("SimSat", "Simulated satellite frame"),
-            _ => ("GOES", "GOES ABI satellite frame"),
-        });
+        let sat_layer_source =
+            self.sat_layer
+                .as_ref()
+                .map(|layer| match layer.key.model.as_str() {
+                    "mtg_i1" => ("Meteosat", "Meteosat-12 / EUMETSAT satellite frame"),
+                    "h8" | "h9" => ("Himawari", "Himawari AHI satellite frame"),
+                    "simsat" => ("SimSat", "Simulated satellite frame"),
+                    _ => ("GOES", "GOES ABI satellite frame"),
+                });
         if let Some(layer) = &mut self.sat_layer
             && layer_row(
                 ui,
@@ -672,7 +675,9 @@ impl ViewerApp {
                         value: &mut layer.visible,
                         hover: "Show satellite imagery on map",
                     },
-                    name: sat_layer_source.map(|source| source.0).unwrap_or("Satellite"),
+                    name: sat_layer_source
+                        .map(|source| source.0)
+                        .unwrap_or("Satellite"),
                     name_hover: sat_layer_source
                         .map(|source| source.1)
                         .unwrap_or("Satellite frame"),

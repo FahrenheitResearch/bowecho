@@ -81,18 +81,30 @@ pub enum SatRequest {
     /// Enumerate the store, then select one just-written frame. Both
     /// responses are emitted by this worker in order so an external SimSat
     /// producer cannot race a UI-side scan/select pair.
-    ScanAndSelect { key: SatRunKey, hhmm: u16 },
+    ScanAndSelect {
+        key: SatRunKey,
+        hhmm: u16,
+    },
     /// Start a live follow session (one at a time).
     Follow(SatFollowSpec),
     /// One-shot current-hour ingest for quickly creating a playable loop.
     LoadLoop(SatFollowSpec),
     /// Read one stored frame and color it with its band palette.
-    LoadFrame { key: SatRunKey, hhmm: u16 },
+    LoadFrame {
+        key: SatRunKey,
+        hhmm: u16,
+    },
     /// Read a frame PLUS its run grid for the radar-map layer.
-    LoadFrameForMap { key: SatRunKey, hhmm: u16 },
+    LoadFrameForMap {
+        key: SatRunKey,
+        hhmm: u16,
+    },
     /// Read one stored frame as raw grid-order science data for the native
     /// plotter. This never recovers values from the player's colored image.
-    LoadFrameForPlot { key: SatRunKey, hhmm: u16 },
+    LoadFrameForPlot {
+        key: SatRunKey,
+        hhmm: u16,
+    },
     /// Select the IR enhancement used when coloring stored BT frames
     /// (applies to subsequent LoadFrame/LoadFrameForMap/LoadFrameForPlot
     /// responses).
@@ -4898,7 +4910,10 @@ fn ingest_meteosat_wms(
         crate::eumetsat::image_size_for_bounds(bounds, spec.max_image_edge.clamp(512, 2_048));
     let times = layer.recent_times(spec.frame_count.clamp(1, 36));
     if times.is_empty() {
-        return Err(format!("EUMETView returned no times for {}", product.label()));
+        return Err(format!(
+            "EUMETView returned no times for {}",
+            product.label()
+        ));
     }
 
     let sector = spec
@@ -5136,9 +5151,7 @@ fn worker_loop(
                     &spec.consumer_key,
                     &spec.consumer_secret,
                 )
-                .and_then(|credentials| {
-                    crate::eumetsat_credentials::save_credentials(&credentials)
-                })
+                .and_then(|credentials| crate::eumetsat_credentials::save_credentials(&credentials))
                 .map(|()| "EUMETSAT account saved securely on this device".to_owned())
                 .map_err(|err| err.to_string());
                 if !send(SatResponse::EumetsatCredentialsSaved(result)) {
@@ -5519,15 +5532,10 @@ mod tests {
             .expect("stored MTG run");
         assert_eq!(run.frames.len(), 1);
         let mut state = WorkerState::default();
-        let colored = load_frame(&mut state, &store, &run.key, run.frames[0])
-            .expect("BowEcho player frame");
+        let colored =
+            load_frame(&mut state, &store, &run.key, run.frames[0]).expect("BowEcho player frame");
         assert_eq!(colored.frame.image.size, [run.nx, run.ny]);
-        assert!(colored
-            .frame
-            .image
-            .pixels
-            .iter()
-            .any(|pixel| pixel.a() > 0));
+        assert!(colored.frame.image.pixels.iter().any(|pixel| pixel.a() > 0));
         let _ = std::fs::remove_dir_all(&store);
     }
 

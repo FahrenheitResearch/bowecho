@@ -51,10 +51,10 @@ mod dealias_env;
 #[cfg(test)]
 mod differential_4e;
 mod dock;
-mod event_explorer;
-mod event_loop_builder;
 mod eumetsat;
 mod eumetsat_credentials;
+mod event_explorer;
+mod event_loop_builder;
 mod farm_live;
 mod fonts;
 mod formula_lab;
