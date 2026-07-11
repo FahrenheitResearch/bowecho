@@ -323,20 +323,31 @@ pub(crate) fn gear_popover<R>(
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
     let mut result = None;
-    ui.menu_button("⚙", |ui| {
-        ui.set_min_width(POPOVER_MIN_W);
-        ui.label(
-            egui::RichText::new(section_title(title))
-                .size(11.0)
-                .strong()
-                .color(subhead_color()),
-        );
-        ui.separator();
-        result = Some(body(ui));
-    })
-    .response
-    .on_hover_text(title.to_owned());
+    let (button, _) = egui::containers::menu::MenuButton::new("⚙")
+        .config(
+            egui::containers::menu::MenuConfig::new().close_behavior(gear_popover_close_behavior()),
+        )
+        .ui(ui, |ui| {
+            ui.set_min_width(POPOVER_MIN_W);
+            ui.label(
+                egui::RichText::new(section_title(title))
+                    .size(11.0)
+                    .strong()
+                    .color(subhead_color()),
+            );
+            ui.separator();
+            result = Some(body(ui));
+        });
+    button.on_hover_text(title.to_owned());
     result
+}
+
+/// Gear popovers contain ComboBoxes, drag values, checkboxes, and other
+/// interactive controls. Egui's default menu behavior closes on any click,
+/// including clicks inside those widgets, so only an outside click should
+/// dismiss this kind of popover.
+fn gear_popover_close_behavior() -> egui::PopupCloseBehavior {
+    egui::PopupCloseBehavior::CloseOnClickOutside
 }
 
 /// Kit 8 — Full-width selectable list row: LEFT-aligned truncating monospace
@@ -442,6 +453,14 @@ fn section_rule(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gear_popovers_stay_open_for_inside_control_clicks() {
+        assert!(matches!(
+            gear_popover_close_behavior(),
+            egui::PopupCloseBehavior::CloseOnClickOutside
+        ));
+    }
 
     #[test]
     fn label_column_clamps_at_narrow_and_wide_panels() {
