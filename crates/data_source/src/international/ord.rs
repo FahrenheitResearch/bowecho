@@ -57,17 +57,24 @@
 //! not polar volumes) and is also excluded.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 
 use super::listing::fnv1a64;
 use super::{
-    ArchiveFrames, FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache,
-    fetch_s3_style_listing, s3_style_listing_url,
+    ArchiveFrames, ArchiveListProgress, FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames,
+    SiteCache, fetch_s3_style_listing, s3_style_listing_url,
 };
 
 const BUCKET_BASE: &str = "https://s3.waw3-1.cloudferro.com/openradar-24h";
 const ARCHIVE_BUCKET_BASE: &str = "https://s3.waw3-1.cloudferro.com/openradar-archive";
+
+/// A full UTC day is listed as independently reportable one-hour phases.
+pub const ORD_ARCHIVE_DAY_PHASES: usize = 24;
+/// Hard upper bound for a full-day ORD catalog walk: one pre-day boundary
+/// hour plus the 24 requested hours, for both `PVOL` and `SCAN`.
+pub const ORD_ARCHIVE_DAY_MAX_CATALOG_REQUESTS: usize = 2 * (ORD_ARCHIVE_DAY_PHASES + 1);
 
 /// One scan cycle: a file belongs to the frame anchored at the newest
 /// stamp when its own stamp is inside this trailing window (same role as
@@ -271,6 +278,18 @@ impl ObjectKind {
     }
 }
 
+fn preferred_object_kinds(site_id: &str) -> [ObjectKind; 2] {
+    let pvol_hint = ORD_SITES
+        .iter()
+        .find(|(code, ..)| *code == site_id)
+        .is_none_or(|&(.., pvol)| pvol);
+    if pvol_hint {
+        [ObjectKind::Pvol, ObjectKind::Scan]
+    } else {
+        [ObjectKind::Scan, ObjectKind::Pvol]
+    }
+}
+
 /// EUMETNET ORD: 15 additional European countries from the OPERA 24-hour
 /// cache bucket, one provider.
 pub struct OrdProvider {
@@ -339,18 +358,8 @@ pub fn archive_plans_for_hour(
     let (_, dir, _) = country_for_archive_code(site_id)
         .ok_or_else(|| format!("ORD: site '{site_id}' is not in an enabled country"))?;
     let hour_utc = truncate_to_utc_hour(hour_utc);
-    let pvol_hint = ORD_SITES
-        .iter()
-        .find(|(code, ..)| *code == site_id)
-        .is_none_or(|&(.., pvol)| pvol);
-    let kinds = if pvol_hint {
-        [ObjectKind::Pvol, ObjectKind::Scan]
-    } else {
-        [ObjectKind::Scan, ObjectKind::Pvol]
-    };
+    let kinds = preferred_object_kinds(site_id);
 
-    let mut empty_kinds = Vec::new();
-    let mut collections = Vec::new();
     let mut keys_by_kind = Vec::new();
     for kind in kinds {
         let mut keys = list_hour_keys_from_base(ARCHIVE_BUCKET_BASE, dir, site_id, kind, hour_utc)
@@ -366,29 +375,183 @@ pub fn archive_plans_for_hour(
         keys.extend(previous);
         keys.sort();
         keys.dedup();
-        keys_by_kind.push((kind, keys.clone()));
-        let plans = archive_plans_from_keys(site_id, kind, &keys, hour_utc)?;
-        if !plans.is_empty() {
-            collections.push(plan_collection(site_id, kind, plans));
-        } else {
-            empty_kinds.push(kind.dir());
-        }
+        keys_by_kind.push((kind, keys));
     }
-    if let Some(collection) =
-        mixed_plan_collection_from_kind_keys(ARCHIVE_BUCKET_BASE, site_id, &keys_by_kind, hour_utc)?
-    {
-        collections.push(collection);
-    }
-
-    if let Some(best) = best_plan_collection(collections) {
-        return Ok(best.plans);
+    let plans = archive_plans_for_hour_from_kind_keys(site_id, hour_utc, &keys_by_kind)?;
+    if !plans.is_empty() {
+        return Ok(plans);
     }
 
     Err(format!(
         "ORD archive: no complete {} scan for {site_id} during {}Z",
-        empty_kinds.join("/"),
+        kinds.map(ObjectKind::dir).join("/"),
         hour_utc.format("%Y-%m-%d %H")
     ))
+}
+
+/// Build every complete scan for one UTC date, oldest first.
+///
+/// Unlike repeatedly calling [`archive_plans_for_hour`], this walk carries
+/// each hour's key pages into the next phase. Boundary scan assembly stays
+/// identical while the catalog request bound drops from 96 to
+/// [`ORD_ARCHIVE_DAY_MAX_CATALOG_REQUESTS`].
+pub fn archive_plans_for_day(
+    site_id: &str,
+    date_utc: NaiveDate,
+) -> Result<Vec<OrdArchivePlan>, String> {
+    let cancel = AtomicBool::new(false);
+    archive_plans_for_day_with_progress(site_id, date_utc, &cancel, &mut |_| {})
+}
+
+/// Cancellable, phased form of [`archive_plans_for_day`].
+///
+/// One progress snapshot is emitted before work and after each completed UTC
+/// hour. Cancellation is cooperative between S3 catalog requests; no volume
+/// bytes are downloaded by this function.
+pub fn archive_plans_for_day_with_progress(
+    site_id: &str,
+    date_utc: NaiveDate,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(ArchiveListProgress),
+) -> Result<Vec<OrdArchivePlan>, String> {
+    validate_site_code(site_id)?;
+    let (_, dir, _) = country_for_archive_code(site_id)
+        .ok_or_else(|| format!("ORD: site '{site_id}' is not in an enabled country"))?;
+    let kinds = preferred_object_kinds(site_id);
+    archive_plans_for_day_with_lister(
+        site_id,
+        date_utc,
+        kinds,
+        cancel,
+        progress,
+        |kind, hour| {
+            list_hour_keys_from_base(ARCHIVE_BUCKET_BASE, dir, site_id, kind, hour)
+                .map_err(|err| format!("ORD archive '{site_id}': {err}"))
+        },
+    )
+}
+
+fn archive_plans_for_day_with_lister<F>(
+    site_id: &str,
+    date_utc: NaiveDate,
+    kinds: [ObjectKind; 2],
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(ArchiveListProgress),
+    mut list_hour: F,
+) -> Result<Vec<OrdArchivePlan>, String>
+where
+    F: FnMut(ObjectKind, DateTime<Utc>) -> Result<Vec<String>, String>,
+{
+    let cancelled = || format!("ORD archive: listing cancelled for {site_id} on {date_utc}");
+    let day_start =
+        DateTime::<Utc>::from_naive_utc_and_offset(date_utc.and_time(NaiveTime::MIN), Utc);
+    let mut requests_completed = 0usize;
+    let mut first_error = None;
+    let mut plans = Vec::new();
+
+    progress(ArchiveListProgress {
+        completed_phases: 0,
+        total_phases: ORD_ARCHIVE_DAY_PHASES,
+        plans_found: 0,
+        catalog_requests_completed: 0,
+    });
+    if cancel.load(Ordering::Relaxed) {
+        return Err(cancelled());
+    }
+
+    // Seed each kind with the one adjacent hour needed to assemble cycles
+    // whose trailing product/sweep window crosses midnight.
+    let boundary_hour = day_start - chrono::Duration::hours(1);
+    let mut previous_by_kind = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
+        let previous = match list_hour(kind, boundary_hour) {
+            Ok(keys) => keys,
+            Err(err) => {
+                first_error.get_or_insert(err);
+                Vec::new()
+            }
+        };
+        requests_completed += 1;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
+        previous_by_kind.push((kind, previous));
+    }
+
+    for phase in 0..ORD_ARCHIVE_DAY_PHASES {
+        let hour_utc = day_start + chrono::Duration::hours(phase as i64);
+        let mut keys_by_kind = Vec::with_capacity(kinds.len());
+        for (kind, previous) in &mut previous_by_kind {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(cancelled());
+            }
+            let current = match list_hour(*kind, hour_utc) {
+                Ok(keys) => keys,
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                    Vec::new()
+                }
+            };
+            requests_completed += 1;
+            if cancel.load(Ordering::Relaxed) {
+                return Err(cancelled());
+            }
+
+            let mut boundary_keys = previous.clone();
+            boundary_keys.extend(current.iter().cloned());
+            boundary_keys.sort();
+            boundary_keys.dedup();
+            keys_by_kind.push((*kind, boundary_keys));
+            *previous = current;
+        }
+
+        match archive_plans_for_hour_from_kind_keys(site_id, hour_utc, &keys_by_kind) {
+            Ok(mut hour_plans) => plans.append(&mut hour_plans),
+            Err(err) => {
+                first_error.get_or_insert(err);
+            }
+        }
+        sort_dedupe_archive_plans(&mut plans);
+        progress(ArchiveListProgress {
+            completed_phases: phase + 1,
+            total_phases: ORD_ARCHIVE_DAY_PHASES,
+            plans_found: plans.len(),
+            catalog_requests_completed: requests_completed,
+        });
+    }
+
+    debug_assert!(requests_completed <= ORD_ARCHIVE_DAY_MAX_CATALOG_REQUESTS);
+    if plans.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            format!("ORD archive: no complete scans for {site_id} on {date_utc}")
+        }));
+    }
+    Ok(plans)
+}
+
+fn archive_plans_for_hour_from_kind_keys(
+    site_id: &str,
+    hour_utc: DateTime<Utc>,
+    keys_by_kind: &[(ObjectKind, Vec<String>)],
+) -> Result<Vec<OrdArchivePlan>, String> {
+    let mut collections = Vec::new();
+    for (kind, keys) in keys_by_kind {
+        let plans = archive_plans_from_keys(site_id, *kind, keys, hour_utc)?;
+        if !plans.is_empty() {
+            collections.push(plan_collection(site_id, *kind, plans));
+        }
+    }
+    if let Some(collection) =
+        mixed_plan_collection_from_kind_keys(ARCHIVE_BUCKET_BASE, site_id, keys_by_kind, hour_utc)?
+    {
+        collections.push(collection);
+    }
+    Ok(best_plan_collection(collections)
+        .map(|collection| collection.plans)
+        .unwrap_or_default())
 }
 
 /// Build the archive plan nearest a requested UTC time.
@@ -660,30 +823,27 @@ impl RecentFrames for OrdProvider {
 }
 
 impl ArchiveFrames for OrdProvider {
-    /// Fold [`archive_plans_for_hour`] over the 24 UTC hours of
-    /// `date_utc` — the immutable-archive-bucket wrapper. Hours that
-    /// error (silent hour, transient listing failure) are skipped and
-    /// the first error is reported only when the whole day yields
-    /// nothing, mirroring [`RecentFrames::recent_frames`] above.
+    /// Phased full-day walk over the immutable archive bucket.
     fn day_plans(&self, site_id: &str, date_utc: NaiveDate) -> Result<Vec<FramePlan>, String> {
-        let day_start =
-            DateTime::<Utc>::from_naive_utc_and_offset(date_utc.and_time(NaiveTime::MIN), Utc);
-        let mut plans = Vec::new();
-        let mut first_error: Option<String> = None;
-        for hour in 0..24 {
-            match archive_plans_for_hour(site_id, day_start + chrono::Duration::hours(hour)) {
-                Ok(mut hour_plans) => plans.append(&mut hour_plans),
-                Err(err) => {
-                    first_error.get_or_insert(err);
-                }
-            }
-        }
-        if plans.is_empty() {
-            return Err(first_error.unwrap_or_else(|| {
-                format!("ORD archive: no complete scans for {site_id} on {date_utc}")
-            }));
-        }
-        Ok(archive_frames_oldest_first(plans, usize::MAX))
+        Ok(archive_plans_for_day(site_id, date_utc)?
+            .into_iter()
+            .map(|plan| plan.frame)
+            .collect())
+    }
+
+    fn day_plans_with_progress(
+        &self,
+        site_id: &str,
+        date_utc: NaiveDate,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(ArchiveListProgress),
+    ) -> Result<Vec<FramePlan>, String> {
+        Ok(archive_plans_for_day_with_progress(
+            site_id, date_utc, cancel, progress,
+        )?
+        .into_iter()
+        .map(|plan| plan.frame)
+        .collect())
     }
 
     /// Hour-granular override of the day-folding default: ORD's archive
@@ -732,14 +892,23 @@ impl ArchiveFrames for OrdProvider {
 /// to the NEWEST `max` while staying oldest-first (the same
 /// tail-of-the-window shape as [`RecentFrames::recent_frames`]).
 fn archive_frames_oldest_first(mut plans: Vec<OrdArchivePlan>, max: usize) -> Vec<FramePlan> {
-    plans.sort_by_key(|plan| plan.stamp_utc);
-    plans.dedup_by(|left, right| left.frame.identity == right.frame.identity);
+    sort_dedupe_archive_plans(&mut plans);
     let skip = plans.len().saturating_sub(max);
     plans
         .into_iter()
         .skip(skip)
         .map(|plan| plan.frame)
         .collect()
+}
+
+fn sort_dedupe_archive_plans(plans: &mut Vec<OrdArchivePlan>) {
+    plans.sort_by(|left, right| {
+        left.stamp_utc
+            .cmp(&right.stamp_utc)
+            .then_with(|| left.frame.identity.cmp(&right.frame.identity))
+    });
+    let mut seen = BTreeSet::new();
+    plans.retain(|plan| seen.insert(plan.frame.identity.clone()));
 }
 
 /// Today and (for the midnight/outage window) the previous UTC day.
@@ -2514,6 +2683,170 @@ mod tests {
         );
         assert!(archive_frames_oldest_first(Vec::new(), 3).is_empty());
         assert!(archive_frames_oldest_first(vec![plan(0, "deess_0500")], 0).is_empty());
+    }
+
+    fn complete_pvol_keys(site_id: &str, stamp: &str) -> Vec<String> {
+        let date = &stamp[..8];
+        let year = &date[..4];
+        let month = &date[4..6];
+        let day = &date[6..8];
+        let elevs = "0.5_1.5_2.5";
+        ["DBZH", "VRADH"]
+            .into_iter()
+            .map(|moment| {
+                format!(
+                    "{year}/{month}/{day}/PL/{site_id}/PVOL/{site_id}@{stamp}@{elevs}@{moment}.h5"
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_day_lister_reuses_hour_pages_and_reports_bounded_progress() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 9).unwrap();
+        let day_start = utc_time(2026, 6, 9, 0, 0);
+        let cancel = AtomicBool::new(false);
+        let mut calls = Vec::new();
+        let mut snapshots = Vec::new();
+
+        let plans = archive_plans_for_day_with_lister(
+            "plbrz",
+            date,
+            [ObjectKind::Pvol, ObjectKind::Scan],
+            &cancel,
+            &mut |snapshot| snapshots.push(snapshot),
+            |kind, hour| {
+                calls.push((kind, hour));
+                if kind == ObjectKind::Pvol && hour == day_start {
+                    Ok(complete_pvol_keys("plbrz", "20260609T0006"))
+                } else if kind == ObjectKind::Pvol
+                    && hour == day_start + chrono::Duration::hours(1)
+                {
+                    Ok(complete_pvol_keys("plbrz", "20260609T0106"))
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+        )
+        .expect("full day plans");
+
+        assert_eq!(calls.len(), ORD_ARCHIVE_DAY_MAX_CATALOG_REQUESTS);
+        assert_eq!(calls.iter().copied().collect::<BTreeSet<_>>().len(), 50);
+        assert_eq!(snapshots.len(), ORD_ARCHIVE_DAY_PHASES + 1);
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.completed_phases)
+                .collect::<Vec<_>>(),
+            (0..=ORD_ARCHIVE_DAY_PHASES).collect::<Vec<_>>()
+        );
+        assert_eq!(snapshots.last().unwrap().catalog_requests_completed, 50);
+        assert_eq!(snapshots.last().unwrap().plans_found, 2);
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.stamp_utc)
+                .collect::<Vec<_>>(),
+            [utc_time(2026, 6, 9, 0, 6), utc_time(2026, 6, 9, 1, 6)]
+        );
+    }
+
+    #[test]
+    fn full_day_lister_keeps_partial_results_when_one_kind_errors() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 9).unwrap();
+        let day_start = utc_time(2026, 6, 9, 0, 0);
+        let cancel = AtomicBool::new(false);
+        let mut snapshots = Vec::new();
+
+        let plans = archive_plans_for_day_with_lister(
+            "plbrz",
+            date,
+            [ObjectKind::Pvol, ObjectKind::Scan],
+            &cancel,
+            &mut |snapshot| snapshots.push(snapshot),
+            |kind, hour| match kind {
+                ObjectKind::Pvol if hour == day_start => {
+                    Ok(complete_pvol_keys("plbrz", "20260609T0006"))
+                }
+                ObjectKind::Pvol => Ok(Vec::new()),
+                ObjectKind::Scan => Err("synthetic SCAN listing outage".to_owned()),
+            },
+        )
+        .expect("PVOL lane remains usable");
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].stamp_utc, utc_time(2026, 6, 9, 0, 6));
+        assert_eq!(snapshots.last().unwrap().completed_phases, 24);
+        assert_eq!(snapshots.last().unwrap().catalog_requests_completed, 50);
+    }
+
+    #[test]
+    fn full_day_lister_cancels_between_bounded_catalog_requests() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 9).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut calls = 0usize;
+        let mut snapshots = Vec::new();
+
+        let err = archive_plans_for_day_with_lister(
+            "plbrz",
+            date,
+            [ObjectKind::Pvol, ObjectKind::Scan],
+            &cancel,
+            &mut |snapshot| snapshots.push(snapshot),
+            |_, _| {
+                calls += 1;
+                if calls == 5 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(Vec::new())
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("listing cancelled"), "unexpected error: {err}");
+        assert_eq!(calls, 5, "cancellation is checked after every request");
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.completed_phases)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    #[ignore = "live ORD full-day archive catalog probe — run manually with --ignored"]
+    fn ord_live_full_day_catalog_is_not_capped_at_twenty_scans() {
+        let date = NaiveDate::from_ymd_opt(2026, 5, 30).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut snapshots = Vec::new();
+        let plans = archive_plans_for_day_with_progress(
+            "plbrz",
+            date,
+            &cancel,
+            &mut |snapshot| snapshots.push(snapshot),
+        )
+        .expect("live full-day ORD archive plans");
+
+        println!(
+            "listed {} plbrz scans for {date} in {} catalog requests",
+            plans.len(),
+            snapshots.last().unwrap().catalog_requests_completed
+        );
+        assert!(plans.len() > 20, "full-day listing was unexpectedly capped");
+        assert!(plans.windows(2).all(|pair| pair[0].stamp_utc <= pair[1].stamp_utc));
+        assert!(plans.iter().all(|plan| plan.stamp_utc.date_naive() == date));
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.frame.identity.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            plans.len(),
+            "full-day plans must be identity-deduplicated"
+        );
+        assert_eq!(snapshots.last().unwrap().completed_phases, 24);
+        assert_eq!(snapshots.last().unwrap().catalog_requests_completed, 50);
     }
 
     /// Live bucket roundtrip across multiple newly-enabled countries:

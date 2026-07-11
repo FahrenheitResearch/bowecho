@@ -38,6 +38,7 @@
 //! `nexrad_io::jma::decode_jma_tar_volumes` when the plan came from
 //! [`JmaProvider`] (see its docs).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
@@ -67,7 +68,11 @@ pub use geosphere::GeoSphereProvider;
 pub use kaia::KaiaEstoniaProvider;
 pub use lombardia::LombardiaProvider;
 pub use meteoromania::MeteoRomaniaProvider;
-pub use ord::{OrdArchivePlan, OrdProvider, archive_plan_nearest, archive_plans_for_hour};
+pub use ord::{
+    ORD_ARCHIVE_DAY_MAX_CATALOG_REQUESTS, ORD_ARCHIVE_DAY_PHASES, OrdArchivePlan, OrdProvider,
+    archive_plan_nearest, archive_plans_for_day, archive_plans_for_day_with_progress,
+    archive_plans_for_hour,
+};
 pub use piemonte::PiemonteProvider;
 pub use shmu::ShmuProvider;
 pub use smhi::{SmhiProvider, smhi_archive_plans_for_day};
@@ -145,6 +150,25 @@ pub trait RecentFrames {
     fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String>;
 }
 
+/// Progress snapshot for a provider archive catalog listing.
+///
+/// A phase is deliberately provider-defined: ORD reports one phase per UTC
+/// hour, while providers whose archive is one daily manifest use one phase.
+/// `catalog_requests_completed` counts completed catalog request attempts,
+/// including attempts that returned an error and were skipped in favor of a
+/// partial listing. It never counts volume downloads.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArchiveListProgress {
+    /// Finished listing phases.
+    pub completed_phases: usize,
+    /// Total phases planned for this listing.
+    pub total_phases: usize,
+    /// Stable, identity-deduplicated plans found so far.
+    pub plans_found: usize,
+    /// Catalog request attempts that have returned.
+    pub catalog_requests_completed: usize,
+}
+
 /// Historical archive lookup, for providers whose upstream exposes dated
 /// holdings beyond the rolling live window. Implemented on the provider
 /// type and handed back through [`IntlProvider::archive_source`], which is
@@ -157,6 +181,46 @@ pub trait ArchiveFrames {
     /// [`IntlProvider::recent`]: catalog probes only — never volume
     /// downloads.
     fn day_plans(&self, site_id: &str, date_utc: NaiveDate) -> Result<Vec<FramePlan>, String>;
+
+    /// Cancellable/progress-reporting form of [`Self::day_plans`].
+    ///
+    /// Cancellation is cooperative between catalog requests. Implementations
+    /// with a multi-request catalog should override this method and emit a
+    /// snapshot after each bounded phase. The default treats the provider's
+    /// existing daily lookup as one phase, preserving compatibility for
+    /// one-manifest archives.
+    fn day_plans_with_progress(
+        &self,
+        site_id: &str,
+        date_utc: NaiveDate,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(ArchiveListProgress),
+    ) -> Result<Vec<FramePlan>, String> {
+        progress(ArchiveListProgress {
+            completed_phases: 0,
+            total_phases: 1,
+            plans_found: 0,
+            catalog_requests_completed: 0,
+        });
+        if cancel.load(Ordering::Relaxed) {
+            return Err(format!(
+                "archive listing cancelled for '{site_id}' on {date_utc}"
+            ));
+        }
+        let plans = self.day_plans(site_id, date_utc)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(format!(
+                "archive listing cancelled for '{site_id}' on {date_utc}"
+            ));
+        }
+        progress(ArchiveListProgress {
+            completed_phases: 1,
+            total_phases: 1,
+            plans_found: plans.len(),
+            catalog_requests_completed: 1,
+        });
+        Ok(plans)
+    }
 
     /// Frames inside `[start, end]`, OLDEST FIRST, capped to the NEWEST
     /// `max` (the frames nearest the window's end anchor — the
