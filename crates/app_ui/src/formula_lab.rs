@@ -1668,7 +1668,7 @@ fn desktop_standard_limits() -> ResourceLimits {
     limits
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn clamp_desktop_limits(requested: ResourceLimits) -> ResourceLimits {
     clamp_limits_to(requested, &ResourceLimits::default())
 }
