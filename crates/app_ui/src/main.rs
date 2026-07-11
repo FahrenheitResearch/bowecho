@@ -1122,8 +1122,11 @@ fn sweep_policy_rows_ui(
     changed
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 #[derive(Clone, Debug, PartialEq)]
 struct CustomGisSite {
     site_id: String,
@@ -2212,8 +2215,11 @@ fn sniff_local_radar_kind(path: &Path) -> LocalRadarKind {
     LocalRadarKind::NexradLevel2
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn local_file_set_label(paths: &[PathBuf]) -> String {
     let count = paths.len();
     let first = paths
@@ -2524,7 +2530,7 @@ impl VwpProduct48Hold {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn product48_display_profile(
     path: &Path,
     product: &nexrad_io::vwp::VwpProduct,
@@ -7907,7 +7913,7 @@ impl BrandAssetField {
         }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn extensions(self) -> &'static [&'static str] {
         match self {
             Self::AppIconIco => &["ico"],
@@ -16840,7 +16846,7 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn open_vwp_product48_file(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             // Product 48/NVW files are commonly extensionless.
@@ -16873,12 +16879,12 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     fn open_vwp_product48_file(&mut self) {
-        self.status = "Product 48 file dialogs are available on Windows and macOS".to_owned();
+        self.status = "Product 48 file dialogs are unavailable on this platform".to_owned();
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn save_vwp_csv(&mut self) {
         let Some(csv) = self.vwp_panel.export_csv() else {
             self.status = "VWP: no profile to save".to_owned();
@@ -16898,9 +16904,9 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     fn save_vwp_csv(&mut self) {
-        self.status = "VWP CSV dialogs are available on Windows and macOS".to_owned();
+        self.status = "VWP CSV dialogs are unavailable on this platform".to_owned();
     }
 
     fn storm_motion_key(&self) -> (i16, i16) {
@@ -16910,8 +16916,11 @@ impl ViewerApp {
         )
     }
 
-    // rfd-gated (windows/macos) import path; dead on the Linux verify node.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    // Native-dialog import path; retained for unsupported non-desktop targets.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     fn start_local_volume_file_selection(&mut self, mut paths: Vec<PathBuf>, ctx: &egui::Context) {
         if paths.is_empty() {
             return;
@@ -16951,8 +16960,11 @@ impl ViewerApp {
         }
     }
 
-    // rfd-gated (windows/macos) import path; dead on the Linux verify node.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    // Native-dialog import path; retained for unsupported non-desktop targets.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     fn start_local_volume_set_load(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
         let label = local_file_set_label(&paths);
         self.prepare_local_volume_load(&label);
@@ -21566,8 +21578,11 @@ impl ViewerApp {
         DisplayTimeZone::from_settings(&self.app_settings)
     }
 
-    // rfd-gated (windows/macos) import path; dead on the Linux verify node.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    // Native-dialog import path; retained for unsupported non-desktop targets.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     fn set_data_folder_override_in_memory(&mut self, dir: PathBuf) {
         self.app_settings.data_dir = dir.display().to_string();
         self.status = format!(
@@ -21584,7 +21599,7 @@ impl ViewerApp {
         );
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn import_app_settings_from_path(&mut self, path: &Path) {
         let text = match settings::read_text_capped(path, settings::MAX_JSON_DOCUMENT_BYTES) {
             Ok(text) => text,
@@ -21615,7 +21630,7 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn export_styles_to_path(&mut self, path: &Path) {
         let result = if self.styles_newer_schema {
             styles::styles_path()
@@ -21634,7 +21649,7 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn import_styles_from_path(&mut self, path: &Path, ctx: &egui::Context) {
         let loaded = styles::load_from_path(path);
         if matches!(
@@ -22433,10 +22448,8 @@ impl ViewerApp {
                 .on_hover_text(
                     "Display incomplete live chunk tilts before a full low-level tilt is available",
                 );
-            // Native file dialog (Windows/macOS; Linux needs the GTK dev
-            // libs rfd's portal backends pull in — same gating as the
-            // color-table browser).
-            #[cfg(any(windows, target_os = "macos"))]
+            // Native file dialog on every supported desktop platform.
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             if fixed_action_button(ui, "Open…", 52.0)
                 .on_hover_text(
                     "Open local radar file(s): NEXRAD Level II (.ar2v/.gz/.msg31), a DORADE \
@@ -22462,7 +22475,7 @@ impl ViewerApp {
             {
                 self.start_local_volume_file_selection(paths, ui.ctx());
             }
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             if fixed_action_button(ui, "Open Folder…", 96.0)
                 .on_hover_text(
                     "Open a whole deployment folder: per-sweep DORADE files \
@@ -24640,9 +24653,8 @@ impl ViewerApp {
                 .hint_text("Color table path"),
         );
         ui.horizontal(|ui| {
-            // Native file dialog (Windows/macOS; Linux needs GTK dev libs
-            // rfd's portal backends pull in, so Linux keeps the path box).
-            #[cfg(any(windows, target_os = "macos"))]
+            // Native file dialog on every supported desktop platform.
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             if fixed_action_button(ui, "Browse…", 70.0).clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("Color tables", &["pal", "txt"])
@@ -42202,16 +42214,22 @@ fn poll_url_name(url: &str) -> String {
         .to_owned()
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn parse_custom_radar_gis(text: &str) -> Vec<CustomGisSite> {
     text.lines()
         .filter_map(parse_custom_radar_gis_line)
         .collect()
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn parse_custom_radar_gis_line(raw_line: &str) -> Option<CustomGisSite> {
     let line = raw_line.trim().trim_start_matches('\u{feff}');
     if line.is_empty() || line.starts_with(';') || line.starts_with('#') || line.starts_with("//") {
@@ -42225,8 +42243,11 @@ fn parse_custom_radar_gis_line(raw_line: &str) -> Option<CustomGisSite> {
     }
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn custom_radar_gis_payload(line: &str) -> &str {
     if let Some((prefix, rest)) = line.split_once(':') {
         let prefix = prefix.trim();
@@ -42242,8 +42263,11 @@ fn custom_radar_gis_payload(line: &str) -> &str {
     line
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn parse_custom_radar_gis_csv_line(line: &str) -> Option<CustomGisSite> {
     let fields: Vec<&str> = line.split(',').map(str::trim).collect();
     if fields.len() < 4 {
@@ -42264,8 +42288,11 @@ fn parse_custom_radar_gis_csv_line(line: &str) -> Option<CustomGisSite> {
     custom_gis_site_from_parts(site_id, state, &name, lat, lon)
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn parse_custom_radar_gis_whitespace_line(line: &str) -> Option<CustomGisSite> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 4 {
@@ -42279,8 +42306,11 @@ fn parse_custom_radar_gis_whitespace_line(line: &str) -> Option<CustomGisSite> {
     custom_gis_site_from_parts(site_id, state, &name, lat, lon)
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn custom_gis_site_from_parts(
     site_id: &str,
     state: &str,
@@ -42312,8 +42342,11 @@ fn custom_gis_site_from_parts(
     })
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn custom_poll_links_from_gis(
     text: &str,
     base_poll_url: &str,
@@ -42339,8 +42372,11 @@ fn custom_poll_links_from_gis(
         .collect())
 }
 
-// rfd-gated (windows/macos) import path; dead on the Linux verify node.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// Native-dialog import path; retained for unsupported non-desktop targets.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn custom_poll_url_for_gis_site(base_url: &str, site_id: &str, total_sites: usize) -> String {
     let base_url = normalized_poll_url(base_url);
     let site_id = site_id.trim();

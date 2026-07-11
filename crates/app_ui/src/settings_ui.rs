@@ -660,7 +660,7 @@ impl ViewerApp {
         });
         self.remembered_section(ui, "data_local", "Local files", true, |app, ui| {
             let _ = (&app, &ui);
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             ui.horizontal(|ui| {
                 if ui
                     .button("Open radar file…")
@@ -699,8 +699,8 @@ impl ViewerApp {
                     app.start_local_volume_load(dir, ui.ctx());
                 }
             });
-            #[cfg(not(any(windows, target_os = "macos")))]
-            ui.weak("Native file dialogs need Windows/macOS — use RADAR > SITE on Linux.");
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+            ui.weak("Native file dialogs are unavailable on this platform.");
         });
     }
 
@@ -1070,7 +1070,7 @@ impl ViewerApp {
                 self.reset_data_folder_override_in_memory();
                 self.mark_app_settings_dirty();
             }
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             if ui
                 .button("Change…")
                 .on_hover_text(
@@ -1283,7 +1283,7 @@ impl ViewerApp {
                     self.app_settings.alert_sound_path.clear();
                     self.mark_app_settings_dirty();
                 }
-                #[cfg(any(windows, target_os = "macos"))]
+                #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
                 if ui
                     .button("Choose WAV…")
                     .on_hover_text("Pick a custom .wav file; empty uses the platform system alert")
@@ -1348,7 +1348,7 @@ impl ViewerApp {
                     self.app_settings.radar_update_sound_path.clear();
                     self.mark_app_settings_dirty();
                 }
-                #[cfg(any(windows, target_os = "macos"))]
+                #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
                 if ui
                     .button("Choose WAV…")
                     .on_hover_text("Pick a custom .wav file; empty uses the platform system sound")
@@ -1520,7 +1520,7 @@ impl ViewerApp {
             "No existing %APPDATA%/bowecho data is moved or deleted. Import storage copies a selected tree, skips symlinks, and never overwrites destination files.",
         );
         ui.horizontal_wrapped(|ui| {
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             {
                 let import_enabled = edited.use_custom_storage_namespace
                     && edited.effective_storage_namespace().is_some();
@@ -1551,9 +1551,9 @@ impl ViewerApp {
                     }
                 }
             }
-            #[cfg(not(any(windows, target_os = "macos")))]
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
             {
-                ui.weak("Storage import folder picker is available on Windows/macOS.");
+                ui.weak("Storage import folder picker is unavailable on this platform.");
             }
         });
 
@@ -1648,7 +1648,7 @@ impl ViewerApp {
                     *value = (!text.trim().is_empty()).then(|| text.trim().to_owned());
                     changed = true;
                 }
-                #[cfg(any(windows, target_os = "macos"))]
+                #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
                 if ui.small_button("Choose...").clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .add_filter(field.label(), field.extensions())
@@ -1710,7 +1710,7 @@ impl ViewerApp {
 
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             {
                 let prefix = edited.filename_prefix();
                 if ui.button("Export Brand Kit...").clicked()
@@ -1759,9 +1759,9 @@ impl ViewerApp {
                     }
                 }
             }
-            #[cfg(not(any(windows, target_os = "macos")))]
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
             {
-                ui.weak("Brand Kit file dialogs are available on Windows/macOS.");
+                ui.weak("Brand Kit file dialogs are unavailable on this platform.");
             }
         });
 
@@ -1882,14 +1882,14 @@ impl ViewerApp {
     /// Layers fold (ui-refresh proposal section 4 step 4): the app-wide
     /// master switch, the disk-retention policy, and a store-path readout.
     fn settings_backup_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         let _ = ctx;
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         let display_name = self.app_settings.brand.resolved_display_name().to_owned();
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         let filename_prefix = self.app_settings.brand.filename_prefix();
         ui.horizontal_wrapped(|ui| {
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             {
                 if fixed_action_button(ui, "Export config...", 112.0)
                     .on_hover_text("Save the current config.json preferences to a backup file")
@@ -1947,9 +1947,9 @@ impl ViewerApp {
                     self.import_styles_from_path(&path, ctx);
                 }
             }
-            #[cfg(not(any(windows, target_os = "macos")))]
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
             {
-                ui.weak("Native settings backup dialogs need Windows/macOS.");
+                ui.weak("Native settings backup dialogs are unavailable on this platform.");
             }
         });
         if let Some(path) = settings::AppSettings::config_path() {

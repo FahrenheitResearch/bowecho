@@ -7,11 +7,12 @@
 //! background work out of the view makes the same body usable in a dock tile
 //! and a floating window.
 
-// Native file save/open dialogs are intentionally Windows/macOS-only in
-// app_ui. The Product 48 adapter and CSV-only fields therefore look unused in
-// a normal Linux binary build even though their tests and supported desktop
-// builds exercise them.
-#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+// The Product 48 adapter and CSV-only fields are exercised by every supported
+// desktop build. Keep dead-code tolerance only for non-desktop targets.
+#![cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 
 use std::fmt::Write as _;
 
@@ -27,7 +28,7 @@ const MPS_TO_KT: f32 = 1.943_844_4;
 const NM_TO_M: f32 = 1_852.0;
 
 const fn native_file_dialogs_available() -> bool {
-    cfg!(any(windows, target_os = "macos"))
+    cfg!(any(windows, target_os = "macos", target_os = "linux"))
 }
 
 const GOOD_COLOR: egui::Color32 = egui::Color32::from_rgb(58, 194, 126);
@@ -196,7 +197,7 @@ impl VwpPanelState {
                 .on_hover_text(if native_file_dialogs_available() {
                     "Open a NEXRAD Level III Product 48 VWP file"
                 } else {
-                    "Product 48 file dialogs are available on Windows and macOS"
+                    "Product 48 file dialogs are unavailable on this platform"
                 })
                 .clicked()
             {
@@ -210,7 +211,7 @@ impl VwpPanelState {
                 .on_hover_text(if native_file_dialogs_available() {
                     "Save the displayed profile and its QC diagnostics"
                 } else {
-                    "VWP CSV file dialogs are available on Windows and macOS"
+                    "VWP CSV file dialogs are unavailable on this platform"
                 })
                 .clicked()
             {
@@ -1176,9 +1177,9 @@ mod tests {
 
     #[test]
     fn native_dialog_actions_follow_the_desktop_target_gate() {
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         assert!(native_file_dialogs_available());
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         assert!(!native_file_dialogs_available());
     }
 

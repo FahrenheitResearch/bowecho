@@ -21,9 +21,9 @@ use rustwx_render::{
 use rw_store::grid::GridFile;
 
 const PREVIEW_QUALITY_SCALE: f32 = 1.5;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 const EXPORT_WIDTH: u32 = 1600;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 const EXPORT_HEIGHT: u32 = 1200;
 const PALETTE_BINS: usize = 256;
 
@@ -284,7 +284,7 @@ impl SatellitePlotSource {
         Self::rgba_from_store(title, subtitle_left, subtitle_right, pixels, grid)
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn suggested_file_name(&self) -> String {
         format!("{}.png", sanitize_file_component(&self.title))
     }
@@ -412,7 +412,10 @@ impl SatellitePlotSource {
         rustwx_render::render_image(&request).map_err(|error| error.to_string())
     }
 
-    #[cfg_attr(not(any(windows, target_os = "macos", test)), allow(dead_code))]
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux", test)),
+        allow(dead_code)
+    )]
     pub(crate) fn save_png(&self, path: &Path, width: u32, height: u32) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -485,7 +488,7 @@ impl SatellitePlotPanel {
             ui.separator();
             let save = ui
                 .add_enabled(
-                    cfg!(any(windows, target_os = "macos")),
+                    cfg!(any(windows, target_os = "macos", target_os = "linux")),
                     egui::Button::new("Save PNG"),
                 )
                 .on_hover_text("Export this georeferenced native plot as a 1600x1200 PNG");
@@ -567,7 +570,7 @@ impl SatellitePlotPanel {
         self.last_upload_ms = Some(upload.elapsed().as_secs_f32() * 1000.0);
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn save_dialog(&mut self, source: &SatellitePlotSource) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("PNG image", &["png"])
@@ -583,7 +586,7 @@ impl SatellitePlotPanel {
         });
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     fn save_dialog(&mut self, _source: &SatellitePlotSource) {}
 }
 
@@ -742,7 +745,7 @@ fn product_slug(title: &str) -> String {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn sanitize_file_component(value: &str) -> String {
     let component = value
         .chars()

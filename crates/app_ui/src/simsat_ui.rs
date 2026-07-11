@@ -922,7 +922,7 @@ impl SimSatPane {
                     .desired_width(360.0)
                     .hint_text("wrfout / GRIB2 file, SimSat run.json, or folder"),
             );
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             {
                 // Keep this unfiltered: normal wrfout files are extensionless.
                 if ui.button("File...").clicked()

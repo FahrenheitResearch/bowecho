@@ -437,8 +437,11 @@ enum EditorAction {
     None,
     LivePreviewToggled,
     Save,
-    // Emitted only by the rfd-gated (windows/macos) export button.
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    // Emitted only by the native-dialog export button.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     Export,
     Revert,
     Close,
@@ -623,7 +626,7 @@ impl TableEditor {
             {
                 action = EditorAction::Save;
             }
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             if ui
                 .button("Export…")
                 .on_hover_text("Write the same GR2Analyst-compatible .pal anywhere")
@@ -1088,9 +1091,7 @@ impl ViewerApp {
         }
     }
 
-    /// Export…: the same bytes Save writes, anywhere (rfd save dialog;
-    /// Windows/macOS only, matching the Browse… pattern — Linux saves to
-    /// My tables and copies from the folder).
+    /// Export…: the same bytes Save writes, anywhere through a native save dialog.
     fn export_table_editor_draft(&mut self) {
         let table = match self.table_editor.build_cached() {
             Ok(table) => table,
@@ -1099,7 +1100,7 @@ impl ViewerApp {
                 return;
             }
         };
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         {
             let stem = sanitize_file_stem(&self.table_editor.draft.name);
             let file_name = if stem.is_empty() {
@@ -1123,11 +1124,10 @@ impl ViewerApp {
                 }
             }
         }
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
             let _ = table;
-            self.table_editor.status =
-                "Export needs a file dialog — use Save to My tables and copy the .pal".to_owned();
+            self.table_editor.status = "Export dialogs are unavailable on this platform".to_owned();
         }
     }
 

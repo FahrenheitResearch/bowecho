@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,14 +21,14 @@ use rw_formula::{
     ParameterValues, Recipe, RecipeReference, RecipeRequirements, Requirement, ResourceLimits,
     Span, StoreRunResolver, evaluate_resolver_2d, evaluate_wrf_path_2d_with_limits,
 };
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use rw_store::atomic::atomic_write_bytes;
 use rw_store::grid::GridFile;
 use rw_store::run::RwsRunManifest;
 use rw_ui::{FieldData, FieldKey, HourKey};
 
 const LARGE_RAW_WRF_BYTES: u64 = 1 << 30;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 const MAX_RECIPE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Current rw-store source offered by the host.
@@ -1282,7 +1282,7 @@ impl FormulaLabPanel {
             }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn load_recipe_dialog(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("WRF Formula Recipe", &["json"])
@@ -1313,12 +1313,12 @@ impl FormulaLabPanel {
         }
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     fn load_recipe_dialog(&mut self) {
-        self.status = Some("Recipe file dialogs need Windows or macOS".to_string());
+        self.status = Some("Recipe file dialogs are unavailable on this platform".to_string());
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn save_recipe_dialog(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_file_name(format!("{}.wrf-formula.json", self.recipe_name))
@@ -1347,12 +1347,12 @@ impl FormulaLabPanel {
         }
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     fn save_recipe_dialog(&mut self) {
-        self.status = Some("Recipe file dialogs need Windows or macOS".to_string());
+        self.status = Some("Recipe file dialogs are unavailable on this platform".to_string());
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn apply_recipe(&mut self, recipe: Recipe) {
         self.source = recipe.source;
         self.recipe_name = recipe.name;
@@ -1456,7 +1456,7 @@ fn evaluate_source(
     })
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn load_recipe_bounded(path: &Path) -> Result<Recipe, FormulaError> {
     let file = fs::File::open(path)
         .map_err(|error| FormulaError::new(ErrorKind::Parse, error.to_string()))?;
@@ -1612,7 +1612,7 @@ fn parse_unit_overrides(text: &str) -> Result<BTreeMap<String, String>, FormulaE
     Ok(output)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn format_unit_overrides(overrides: &BTreeMap<String, String>) -> String {
     overrides
         .iter()
@@ -1665,7 +1665,7 @@ fn desktop_standard_limits() -> ResourceLimits {
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn clamp_desktop_limits(requested: ResourceLimits) -> ResourceLimits {
     clamp_limits_to(requested, &ResourceLimits::default())
 }
