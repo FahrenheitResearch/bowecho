@@ -400,6 +400,9 @@ impl ViewerApp {
                     }
                     ui.weak("Public EUMETView · no account required");
                 });
+                if selected == eumetsat::MtgProduct::LightningAfa {
+                    ui.hyperlink_to("Open MTG LI color legend", eumetsat::MTG_LI_LEGEND_URL);
+                }
 
                 egui::CollapsingHeader::new("Data Store account · optional")
                     .id_salt("eumetsat_account")

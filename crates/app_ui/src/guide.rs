@@ -981,6 +981,12 @@ fn satellite(ui: &mut egui::Ui) {
     );
     para(
         ui,
+        "Lightning AFA is a five-minute gridded flash-footprint accumulation comparable to \
+         GLM flash-extent density, not a count of individually plotted flashes. Select it to \
+         expose the official MTG LI color-legend link.",
+    );
+    para(
+        ui,
         "Each returned Meteosat frame enters the same local satellite store and frame player as \
          GOES and Himawari. Equal product, geographic grid, and UTC day values join one loop. \
          Map follows player and Show on radar map work normally, and Native plot opens the \

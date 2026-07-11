@@ -1040,6 +1040,7 @@ impl ViewerApp {
             let show_glm_line = self.glm_enabled;
             let mut refresh_glm = false;
             let mut open_mtg_lightning = false;
+            let mut quick_mtg_lightning = false;
             let mut next_window_min = glm_window_min;
             let mut glm_style_changed = false;
             let row_changed = layer_row(
@@ -1099,13 +1100,23 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |_ui| {},
+                |ui| {
+                    if ui
+                        .small_button("MTG LI")
+                        .on_hover_text(
+                            "Load a one-hour Meteosat Lightning Imager accumulated-flash-area loop",
+                        )
+                        .clicked()
+                    {
+                        quick_mtg_lightning = true;
+                    }
+                },
             );
             if refresh_glm {
                 self.refresh_glm_data(ctx);
                 ctx.request_repaint();
             }
-            if open_mtg_lightning {
+            if open_mtg_lightning || quick_mtg_lightning {
                 self.show_satellite = true;
                 self.queue_meteosat_product(ctx, eumetsat::MtgProduct::LightningAfa, 12);
                 ctx.request_repaint();

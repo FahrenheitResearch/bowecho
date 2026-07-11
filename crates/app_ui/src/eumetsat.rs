@@ -10,6 +10,7 @@ use image::ImageFormat;
 use quick_xml::events::Event;
 
 pub(crate) const EUMETVIEW_WMS_URL: &str = "https://view.eumetsat.int/geoserver/wms";
+pub(crate) const MTG_LI_LEGEND_URL: &str = "https://view.eumetsat.int/geoserver/ows?service=WMS&version=1.3.0&request=GetLegendGraphic&format=image%2Fpng&width=640&height=80&layer=mtg_fd%3Ali_afa";
 const MAX_IMAGE_EDGE: u32 = 2_048;
 const MAX_IMAGE_PIXELS: u64 = 4_194_304;
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
