@@ -30,7 +30,7 @@ pub(crate) const VALUE_SLOT_MAX_CHARS: usize = 7;
 pub(crate) const SLIDER_TRACK_MIN_W: f32 = 70.0;
 /// Minimum selectable-chip width; chips grow from here to fill the row.
 pub(crate) const CHIP_MIN_W: f32 = 52.0;
-/// Popovers opened by `gear_popover` lay their kit rows out at least this
+/// Windows opened by `gear_window` lay their kit rows out at least this
 /// wide (kit row math yields a usable label column at this width).
 pub(crate) const POPOVER_MIN_W: f32 = 260.0;
 
@@ -314,40 +314,59 @@ pub(crate) fn about(ui: &mut egui::Ui, key: &str, topic: &str, paragraphs: &[&st
         });
 }
 
-/// Kit 7 — Small gear button opening a popover for advanced/rare controls.
-/// `title` is the popover heading and the gear's hover text (glyph-only
-/// buttons must explain themselves).
-pub(crate) fn gear_popover<R>(
+/// Kit 7 — Small gear button opening a persistent settings window.
+///
+/// This must be a real [`egui::Window`], not an egui menu/popover: egui keeps
+/// only one popup open per viewport, so opening a ComboBox inside a popup
+/// forcibly closes its parent. The window stays available while its nested
+/// dropdowns are used and closes only from the gear toggle or title-bar X.
+/// `title` is also the gear's hover text (glyph-only buttons must explain
+/// themselves).
+pub(crate) fn gear_window<R>(
     ui: &mut egui::Ui,
     title: &str,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    let mut result = None;
-    let (button, _) = egui::containers::menu::MenuButton::new("⚙")
-        .config(
-            egui::containers::menu::MenuConfig::new().close_behavior(gear_popover_close_behavior()),
-        )
-        .ui(ui, |ui| {
-            ui.set_min_width(POPOVER_MIN_W);
-            ui.label(
-                egui::RichText::new(section_title(title))
-                    .size(11.0)
-                    .strong()
-                    .color(subhead_color()),
-            );
-            ui.separator();
-            result = Some(body(ui));
-        });
-    button.on_hover_text(title.to_owned());
-    result
+    gear_window_impl(ui, title, body).1
 }
 
-/// Gear popovers contain ComboBoxes, drag values, checkboxes, and other
-/// interactive controls. Egui's default menu behavior closes on any click,
-/// including clicks inside those widgets, so only an outside click should
-/// dismiss this kind of popover.
-fn gear_popover_close_behavior() -> egui::PopupCloseBehavior {
-    egui::PopupCloseBehavior::CloseOnClickOutside
+fn gear_window_impl<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> (egui::Response, Option<R>) {
+    let button = ui.button("⚙").on_hover_text(title.to_owned());
+    let ctx = ui.ctx().clone();
+    let open_id = button.id.with("gear_window_open");
+    let window_id = button.id.with("gear_window");
+    let mut open = ctx.data(|data| data.get_temp::<bool>(open_id).unwrap_or(false));
+    if button.clicked() {
+        open = !open;
+    }
+
+    let mut result = None;
+    if open {
+        let mut window_open = true;
+        let default_pos = egui::pos2(
+            button.rect.right() - POPOVER_MIN_W,
+            button.rect.bottom() + 4.0,
+        );
+        egui::Window::new(title)
+            .id(window_id)
+            .open(&mut window_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(POPOVER_MIN_W)
+            .default_pos(default_pos)
+            .show(&ctx, |ui| {
+                ui.set_min_width(POPOVER_MIN_W);
+                result = Some(body(ui));
+            });
+        open = window_open;
+    }
+    ctx.data_mut(|data| data.insert_temp(open_id, open));
+
+    (button, result)
 }
 
 /// Kit 8 — Full-width selectable list row: LEFT-aligned truncating monospace
@@ -455,11 +474,117 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gear_popovers_stay_open_for_inside_control_clicks() {
-        assert!(matches!(
-            gear_popover_close_behavior(),
-            egui::PopupCloseBehavior::CloseOnClickOutside
-        ));
+    fn gear_window_stays_open_while_using_a_combo_box() {
+        #[derive(Default)]
+        struct FrameState {
+            gear_rect: Option<egui::Rect>,
+            combo_rect: Option<egui::Rect>,
+            second_option_rect: Option<egui::Rect>,
+            body_rendered: bool,
+        }
+
+        fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn pointer_input(position: egui::Pos2, pressed: bool) -> egui::RawInput {
+            raw_input(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ])
+        }
+
+        fn frame(ctx: &egui::Context, input: egui::RawInput, selection: &mut usize) -> FrameState {
+            let mut state = FrameState::default();
+            let _ = ctx.run_ui(input, |ui| {
+                let (gear, body) = gear_window_impl(ui, "Loop settings", |ui| {
+                    let combo = egui::ComboBox::from_id_salt("gear_window_test_combo")
+                        .selected_text(format!("{} frames", *selection))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(selection, 24, "24 frames");
+                            let second = ui.selectable_value(selection, 48, "48 frames");
+                            state.second_option_rect = Some(second.rect);
+                        });
+                    state.combo_rect = Some(combo.response.rect);
+                });
+                state.gear_rect = Some(gear.rect);
+                state.body_rendered = body.is_some();
+            });
+            state
+        }
+
+        fn click(ctx: &egui::Context, position: egui::Pos2, selection: &mut usize) -> FrameState {
+            let _ = frame(ctx, pointer_input(position, true), selection);
+            frame(ctx, pointer_input(position, false), selection)
+        }
+
+        let ctx = egui::Context::default();
+        let mut selection = 24;
+
+        let initial = frame(&ctx, raw_input(Vec::new()), &mut selection);
+        assert!(!initial.body_rendered);
+        let gear_center = initial
+            .gear_rect
+            .expect("gear button must be laid out")
+            .center();
+
+        let clicked_open = click(&ctx, gear_center, &mut selection);
+        assert!(
+            clicked_open.body_rendered,
+            "gear click must open the settings window"
+        );
+        let opened = frame(&ctx, raw_input(Vec::new()), &mut selection);
+        assert!(
+            opened.body_rendered,
+            "settings window must remain open after its first layout pass"
+        );
+        let combo_center = opened
+            .combo_rect
+            .expect("ComboBox must be laid out in the open window")
+            .center();
+
+        let clicked_combo = click(&ctx, combo_center, &mut selection);
+        assert!(
+            clicked_combo.body_rendered,
+            "opening a nested ComboBox must not close its settings window"
+        );
+        let combo_opened = frame(&ctx, raw_input(Vec::new()), &mut selection);
+        assert!(
+            combo_opened.body_rendered,
+            "settings window must remain open while its ComboBox is open"
+        );
+        let second_option_center = combo_opened
+            .second_option_rect
+            .expect("open ComboBox must lay out its options")
+            .center();
+
+        let selected = click(&ctx, second_option_center, &mut selection);
+        assert_eq!(
+            selection, 48,
+            "the nested ComboBox option must be clickable"
+        );
+        assert!(
+            selected.body_rendered,
+            "selecting a nested option must not close its settings window"
+        );
+
+        let settled = frame(&ctx, raw_input(Vec::new()), &mut selection);
+        assert!(
+            settled.body_rendered,
+            "the settings window must remain open after the option click"
+        );
     }
 
     #[test]

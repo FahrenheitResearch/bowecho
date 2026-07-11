@@ -23953,7 +23953,7 @@ impl ViewerApp {
         ctx: &egui::Context,
         pane_slot: Option<usize>,
     ) {
-        panel_kit::gear_popover(ui, "Loop settings", |ui| {
+        panel_kit::gear_window(ui, "Loop settings", |ui| {
             self.loop_settings_popover_body(ui, ctx, pane_slot);
         });
     }
