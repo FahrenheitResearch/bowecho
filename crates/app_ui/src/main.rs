@@ -8037,6 +8037,8 @@ impl ViewerApp {
         // field doc.
         let mut primary = LoopEngine::new(EngineId(0), EngineRole::Primary, restored_primary_feed);
         primary.live.enabled = true;
+        primary.limits.frame_limit =
+            normalized_history_limit(usize::from(app_settings.history_frame_limit));
         // Honor the user's configurable radar-history memory budget (#20: big
         // super-res loops were silently trimmed by the fixed 8 GiB default).
         primary.limits.byte_budget = Some(radar_history_budget_bytes(
@@ -8134,6 +8136,8 @@ impl ViewerApp {
         let restored_archive_load_loop = app_settings.archive_load_loop;
         let restored_cross_section_smoothing = cross_section_smoothing_from_settings(&app_settings);
         let restored_record_fps = media::normalize_record_fps(app_settings.record_fps);
+        let restored_record_size = app_settings.record_size.clone();
+        let restored_record_format = app_settings.record_format.clone();
         let restored_storm_track_max_tracks =
             normalized_storm_track_max_tracks(usize::from(app_settings.storm_track_max_tracks));
         let restored_storm_track_min_dbz =
@@ -8502,7 +8506,11 @@ impl ViewerApp {
             update_available: None,
             self_update_rx: StreamSlot::idle("self-update"),
             self_update_phase: SelfUpdatePhase::Idle,
-            media: media::MediaShare::with_record_fps(restored_record_fps),
+            media: media::MediaShare::with_record_settings(
+                restored_record_fps,
+                &restored_record_size,
+                &restored_record_format,
+            ),
             brand_assets: brand::BrandTextureCache::default(),
             annotations: annotate::AnnotationState::default(),
         };
@@ -12220,6 +12228,7 @@ impl ViewerApp {
             .as_ref()
             .map(|volume| frame_identity_for_volume(volume.as_ref()));
         self.primary.limits.frame_limit = normalized_history_limit(limit);
+        self.persist_user_history_frame_limit();
         self.trim_frame_history();
         if let Some(identity) = active_identity
             && let Some(index) = self
@@ -12233,6 +12242,14 @@ impl ViewerApp {
             self.primary.cursor.index = self.primary.history.len().saturating_sub(1);
         }
         ctx.request_repaint();
+    }
+
+    fn persist_user_history_frame_limit(&mut self) {
+        let limit = normalized_history_limit(self.primary.limits.frame_limit) as u16;
+        if self.app_settings.history_frame_limit != limit {
+            self.app_settings.history_frame_limit = limit;
+            self.mark_app_settings_dirty();
+        }
     }
 
     /// Apply a new radar-history memory budget (#20): persist it, push it into
@@ -20908,6 +20925,7 @@ impl ViewerApp {
             }
             Some(unified_player::UnifiedPlayerAction::UseFullResolutionExportPreset) => {
                 self.media.use_full_resolution_mp4_preset();
+                self.persist_media_record_output_settings();
                 self.unified_player
                     .mark_status("Native MP4 export preset selected");
                 ctx.request_repaint();
@@ -23952,6 +23970,7 @@ impl ViewerApp {
             None => app.set_history_frame_limit(limit, ctx),
             Some(slot) => {
                 app.primary.limits.frame_limit = normalized_history_limit(limit);
+                app.persist_user_history_frame_limit();
                 app.retrim_extra_pane_history_to_shared_limit(slot);
                 ctx.request_repaint();
             }
@@ -58159,6 +58178,17 @@ mod tests {
         assert_eq!(context.history_frame_limit_max, 2000);
         assert!(context.history_frame_limit_options.contains(&2000));
         assert_eq!(MAX_HISTORY_FRAME_LIMIT, 2000);
+    }
+
+    #[test]
+    fn user_frame_limit_updates_persisted_preference() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        app.set_history_frame_limit(96, &ctx);
+
+        assert_eq!(app.primary.limits.frame_limit, 96);
+        assert_eq!(app.app_settings.history_frame_limit, 96);
     }
 
     /// Dashed hazard outlines emit multiple segment shapes where the solid

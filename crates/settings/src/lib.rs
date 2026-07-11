@@ -500,6 +500,11 @@ pub struct AppSettings {
     /// media exports have their own speed control.
     #[serde(default = "default_loop_speed_percent")]
     pub loop_speed_percent: u16,
+    /// User-selected radar history frame limit. Loaders may temporarily grow
+    /// the active limit to fit an explicitly requested archive, but the next
+    /// startup restores this preference. BowEcho clamps it to 3..=2000.
+    #[serde(default = "default_history_frame_limit")]
+    pub history_frame_limit: u16,
     /// Scroll-wheel zoom speed in percent. 100 keeps the classic
     /// pre-v0.28.1 step; the 150 default zooms half again faster (field
     /// feedback). Applied as an exponent on the per-notch zoom factor so
@@ -551,6 +556,14 @@ pub struct AppSettings {
     /// their own export-speed cadence; this controls the live viewport recorder.
     #[serde(default = "default_record_fps")]
     pub record_fps: u16,
+    /// Recording output-size slug: `720`, `1280`, `1920`, or `native`.
+    /// Native is the first-run/missing-field default so captures keep the
+    /// full physical-pixel resolution unless the user chooses a smaller file.
+    #[serde(default = "default_record_size")]
+    pub record_size: String,
+    /// Recording container preference: `auto`, `gif`, `mp4`, or `webp`.
+    #[serde(default = "default_record_format")]
+    pub record_format: String,
     /// Loop export speed in percent of the 700 ms/frame baseline. Kept
     /// separate from screen playback speed so operators can scrub at 64x
     /// without accidentally creating one-second share loops, but can still
@@ -749,12 +762,24 @@ fn default_loop_speed_percent() -> u16 {
     100
 }
 
+fn default_history_frame_limit() -> u16 {
+    7
+}
+
 fn default_loop_low_sweep_filter() -> String {
     "all".to_owned()
 }
 
 fn default_record_fps() -> u16 {
     30
+}
+
+fn default_record_size() -> String {
+    "native".to_owned()
+}
+
+fn default_record_format() -> String {
+    "auto".to_owned()
 }
 
 fn default_loop_record_speed_percent() -> u16 {
@@ -989,6 +1014,7 @@ impl Default for AppSettings {
             smooth_display_mode: String::new(),
             cross_section_smoothing: default_cross_section_smoothing(),
             loop_speed_percent: default_loop_speed_percent(),
+            history_frame_limit: default_history_frame_limit(),
             zoom_speed_percent: default_zoom_speed_percent(),
             radar_history_budget_gib: default_radar_history_budget_gib(),
             loop_low_sweeps: false,
@@ -1000,6 +1026,8 @@ impl Default for AppSettings {
             live_low_sweep_auto_advance_seconds: default_live_low_sweep_auto_advance_seconds(),
             show_center_crosshair: false,
             record_fps: default_record_fps(),
+            record_size: default_record_size(),
+            record_format: default_record_format(),
             loop_record_speed_percent: default_loop_record_speed_percent(),
             event_pad_frames: default_event_pad_frames(),
             event_before_scans: None,
@@ -2213,16 +2241,25 @@ mod tests {
     fn record_fps_defaults_to_30_and_round_trips() {
         let old = AppSettings::from_json("{}");
         assert_eq!(old.record_fps, 30);
+        assert_eq!(old.record_size, "native");
+        assert_eq!(old.record_format, "auto");
+        assert_eq!(old.history_frame_limit, 7);
         assert_eq!(old.loop_record_speed_percent, 100);
 
         let settings = AppSettings {
             record_fps: 60,
+            record_size: "1920".to_owned(),
+            record_format: "webp".to_owned(),
+            history_frame_limit: 96,
             loop_record_speed_percent: 1600,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
 
         assert_eq!(back.record_fps, 60);
+        assert_eq!(back.record_size, "1920");
+        assert_eq!(back.record_format, "webp");
+        assert_eq!(back.history_frame_limit, 96);
         assert_eq!(back.loop_record_speed_percent, 1600);
     }
 

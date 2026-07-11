@@ -71,6 +71,25 @@ pub(crate) enum RecordSize {
 }
 
 impl RecordSize {
+    fn from_slug(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "720" => Self::Small720,
+            "1280" => Self::Full1280,
+            "1920" => Self::Hd1920,
+            "native" => Self::Native,
+            _ => Self::Native,
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Small720 => "720",
+            Self::Full1280 => "1280",
+            Self::Hd1920 => "1920",
+            Self::Native => "native",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Small720 => "720",
@@ -101,6 +120,25 @@ pub(crate) enum RecordFormat {
 }
 
 impl RecordFormat {
+    fn from_slug(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "gif" => Self::Gif,
+            "mp4" => Self::Mp4,
+            "webp" => Self::WebP,
+            "auto" => Self::Auto,
+            _ => Self::Auto,
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gif => "gif",
+            Self::Mp4 => "mp4",
+            Self::WebP => "webp",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
@@ -219,7 +257,7 @@ impl Default for MediaShare {
             result_rx,
             last_map_rect: None,
             capture_overlay_visible: false,
-            record_size: RecordSize::Small720,
+            record_size: RecordSize::Native,
             record_format: RecordFormat::Auto,
             record_fps: DEFAULT_RECORD_FPS,
             ffmpeg_available: None,
@@ -231,9 +269,15 @@ impl Default for MediaShare {
 }
 
 impl MediaShare {
-    pub(crate) fn with_record_fps(record_fps: u16) -> Self {
+    pub(crate) fn with_record_settings(
+        record_fps: u16,
+        record_size: &str,
+        record_format: &str,
+    ) -> Self {
         Self {
             record_fps: normalize_record_fps(record_fps),
+            record_size: RecordSize::from_slug(record_size),
+            record_format: RecordFormat::from_slug(record_format),
             ..Self::default()
         }
     }
@@ -494,6 +538,7 @@ impl ViewerApp {
         let loop_recording = self.media.recorder.is_some();
         let free_recording = self.media.free_recorder.is_some();
         ui.add_enabled_ui(!loop_recording && !free_recording, |ui| {
+            let before_size = self.media.record_size;
             crate::panel_kit::row(ui, "Size", |ui| {
                 egui::ComboBox::from_id_salt("media_record_size")
                     .selected_text(self.media.record_size.label())
@@ -515,6 +560,7 @@ impl ViewerApp {
                          biggest files (MP4 handles it well; GIFs get large)",
                     );
             });
+            let before_format = self.media.record_format;
             crate::panel_kit::row(ui, "Format", |ui| {
                 egui::ComboBox::from_id_salt("media_record_format")
                     .selected_text(self.media.record_format.label())
@@ -538,6 +584,11 @@ impl ViewerApp {
                         "Auto = MP4 when ffmpeg is on PATH, otherwise GIF. WebP uses ffmpeg's animated WebP encoder.",
                     );
             });
+            if self.media.record_size != before_size
+                || self.media.record_format != before_format
+            {
+                self.persist_media_record_output_settings();
+            }
             let before_loop_speed = self.app_settings.loop_record_speed_percent;
             let mut loop_speed =
                 normalize_loop_record_speed_percent(self.app_settings.loop_record_speed_percent);
@@ -588,6 +639,19 @@ impl ViewerApp {
                 self.mark_app_settings_dirty();
             }
         });
+    }
+
+    /// Keep the two session-owned enum choices mirrored into the string-based
+    /// settings document. Centralized so the loop popover and the unified
+    /// player's native-MP4 preset cannot drift.
+    pub(crate) fn persist_media_record_output_settings(&mut self) {
+        let size = self.media.record_size.slug();
+        let format = self.media.record_format.slug();
+        if self.app_settings.record_size != size || self.app_settings.record_format != format {
+            self.app_settings.record_size = size.to_owned();
+            self.app_settings.record_format = format.to_owned();
+            self.mark_app_settings_dirty();
+        }
     }
 
     pub(crate) fn loop_record_renders_settled(&self) -> bool {
@@ -2216,6 +2280,22 @@ mod tests {
             media.record_settings_label(1600),
             "native MP4 · loop 16x · free 60fps"
         );
+    }
+
+    #[test]
+    fn recording_output_defaults_native_and_restores_saved_slugs() {
+        let defaults = MediaShare::default();
+        assert_eq!(defaults.record_size, RecordSize::Native);
+        assert_eq!(defaults.record_format, RecordFormat::Auto);
+
+        let restored = MediaShare::with_record_settings(60, "1920", "webp");
+        assert_eq!(restored.record_size, RecordSize::Hd1920);
+        assert_eq!(restored.record_format, RecordFormat::WebP);
+        assert_eq!(restored.record_fps, 60);
+
+        let unknown = MediaShare::with_record_settings(30, "future-size", "future-format");
+        assert_eq!(unknown.record_size, RecordSize::Native);
+        assert_eq!(unknown.record_format, RecordFormat::Auto);
     }
 
     #[test]
