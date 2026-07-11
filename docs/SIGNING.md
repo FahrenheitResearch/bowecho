@@ -126,9 +126,11 @@ chain:
 5. **Exit, swap, rollback, and relaunch.** BowEcho defers installation until
    the eframe window has exited. Before exit it starts the old, signed BowEcho
    binary in a private helper mode; the helper waits for parent-stdin EOF, then
-   renames the installed bundle to a sibling backup and the staged bundle to
-   the original path. If the second rename fails, it restores the original
-   bundle. On success it relaunches the app through `/usr/bin/open`.
+   moves the installed bundle into the uniquely named, sentinel-owned private
+   stage and moves the staged bundle to the original path. If the second rename
+   fails, it restores the original bundle. On success it relaunches the app
+   through `/usr/bin/open`. The private stage retains that last working app
+   through the first launch; only a later explicit update attempt prunes it.
 
 The updater cannot replace an App-Translocated or otherwise unwritable app.
 Those cases, any trust/checksum failure, and a failed swap leave or restore the
