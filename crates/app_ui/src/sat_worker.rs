@@ -5497,13 +5497,10 @@ mod tests {
         assert_eq!(rendered.matches("[redacted]").count(), 2);
     }
 
-    /// Real service -> BowEcho fetch -> PNG decode -> geolocated RGB store ->
-    /// player-color path proof. Explicitly invoked on a build node only.
-    #[test]
-    #[ignore = "live EUMETView end-to-end smoke"]
-    fn live_meteosat_wms_ingest_round_trips_through_bowecho_store() {
+    fn live_meteosat_product_round_trip(product: crate::eumetsat::MtgProduct) {
         let store = std::env::temp_dir().join(format!(
-            "bowecho-live-mtg-{}-{}",
+            "bowecho-live-mtg-{}-{}-{}",
+            product.slug(),
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
@@ -5516,7 +5513,7 @@ mod tests {
         let summary = ingest_meteosat_wms(
             &store,
             &MeteosatWmsSpec {
-                product: crate::eumetsat::MtgProduct::GeoColour.slug().to_owned(),
+                product: product.slug().to_owned(),
                 frame_count: 1,
                 window: None,
                 max_image_edge: 512,
@@ -5524,7 +5521,7 @@ mod tests {
             &send,
         )
         .expect("live ingest");
-        assert!(summary.contains("Meteosat-12 Geo Colour"));
+        assert!(summary.contains(product.label()));
         let runs = scan_runs(&store);
         let run = runs
             .iter()
@@ -5537,6 +5534,22 @@ mod tests {
         assert_eq!(colored.frame.image.size, [run.nx, run.ny]);
         assert!(colored.frame.image.pixels.iter().any(|pixel| pixel.a() > 0));
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// Real service -> BowEcho fetch -> PNG decode -> geolocated RGB store ->
+    /// player-color path proof. Explicitly invoked on a build node only.
+    #[test]
+    #[ignore = "live EUMETView end-to-end smoke"]
+    fn live_meteosat_wms_ingest_round_trips_through_bowecho_store() {
+        live_meteosat_product_round_trip(crate::eumetsat::MtgProduct::GeoColour);
+    }
+
+    /// The MTG Lightning Imager uses the same production path, but a distinct
+    /// five-minute accumulated-flash-area layer and palette.
+    #[test]
+    #[ignore = "live EUMETView Lightning Imager end-to-end smoke"]
+    fn live_meteosat_lightning_ingest_round_trips_through_bowecho_store() {
+        live_meteosat_product_round_trip(crate::eumetsat::MtgProduct::LightningAfa);
     }
 
     #[test]
