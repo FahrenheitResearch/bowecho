@@ -221,7 +221,11 @@ impl ViewerApp {
                 egui::Color32::from_rgb(240, 90, 80)
             };
             painter.circle_filled(*position, 4.0, color);
-            painter.circle_stroke(*position, 4.0, egui::Stroke::new(1.2_f32, egui::Color32::BLACK));
+            painter.circle_stroke(
+                *position,
+                4.0,
+                egui::Stroke::new(1.2_f32, egui::Color32::BLACK),
+            );
         }
         if self.vrot_points.len() == 2 {
             painter.line_segment(
@@ -705,13 +709,21 @@ impl ViewerApp {
                     egui::Color32::from_rgb(c[0], c[1], c[2])
                 };
                 let vector = direction * 26.0;
-                painter.arrow(anchor, vector, egui::Stroke::new(4.0_f32, egui::Color32::BLACK));
+                painter.arrow(
+                    anchor,
+                    vector,
+                    egui::Stroke::new(4.0_f32, egui::Color32::BLACK),
+                );
                 painter.arrow(anchor, vector, egui::Stroke::new(2.0_f32, color));
             }
         }
         if pinned {
             painter.circle_filled(anchor, 3.0, egui::Color32::from_rgb(255, 226, 120));
-            painter.circle_stroke(anchor, 5.0, egui::Stroke::new(1.2_f32, egui::Color32::BLACK));
+            painter.circle_stroke(
+                anchor,
+                5.0,
+                egui::Stroke::new(1.2_f32, egui::Color32::BLACK),
+            );
         }
         let history_frame_time = self.surface_obs_frame_time_utc();
         let obs_history = self

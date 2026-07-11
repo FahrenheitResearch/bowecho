@@ -996,7 +996,10 @@ impl crate::ViewerApp {
             self.map_scale,
             rect,
             egui::Color32::from_rgba_unmultiplied(30, 200, 190, 28),
-            egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(235, 70, 70, 190)),
+            egui::Stroke::new(
+                1.5_f32,
+                egui::Color32::from_rgba_unmultiplied(235, 70, 70, 190),
+            ),
         ));
     }
 

@@ -25186,7 +25186,10 @@ impl ViewerApp {
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgba_unmultiplied(8, 12, 18, 222))
-                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 70, 86)))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        egui::Color32::from_rgb(58, 70, 86),
+                    ))
                     .corner_radius(4)
                     .inner_margin(egui::Margin::symmetric(8, 6))
                     .show(ui, |ui| {
@@ -35527,7 +35530,11 @@ impl ViewerApp {
                 ));
             }
             painter.circle_filled(current, 3.5, line_color);
-            painter.circle_stroke(current, 3.5, egui::Stroke::new(1.0_f32, egui::Color32::BLACK));
+            painter.circle_stroke(
+                current,
+                3.5,
+                egui::Stroke::new(1.0_f32, egui::Color32::BLACK),
+            );
             if let Some((u, v)) = track.fitted_motion {
                 let (_, east, north) = track.last_fix().expect("non-empty");
                 let mut previous = current;
@@ -40148,8 +40155,10 @@ fn draw_obs_history_timeline(
     // Faint hour gridlines spanning the bands — a light "time bar".
     {
         use chrono::Timelike;
-        let grid_stroke =
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(70, 84, 104, 55));
+        let grid_stroke = egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgba_unmultiplied(70, 84, 104, 55),
+        );
         let mut tick = start
             .with_minute(0)
             .and_then(|t| t.with_second(0))
@@ -40215,7 +40224,10 @@ fn draw_obs_history_timeline(
                 egui::pos2(plot_left, band_bottom),
                 egui::pos2(plot_right, band_bottom),
             ],
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(70, 84, 104, 90)),
+            egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgba_unmultiplied(70, 84, 104, 90),
+            ),
         );
         painter.text(
             egui::pos2(rect.left() + 4.0, band_mid),
@@ -40346,7 +40358,10 @@ fn draw_obs_history_timeline(
             egui::pos2(plot_left, axis_y),
             egui::pos2(plot_right, axis_y),
         ],
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120)),
+        egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120),
+        ),
     );
     let axis_font = egui::FontId::monospace(9.0);
     let weak = egui::Color32::from_rgb(150, 160, 172);
@@ -40446,7 +40461,10 @@ fn draw_obs_history_table(
     y += 13.0;
     painter.line_segment(
         [egui::pos2(left, y), egui::pos2(rect.right() - 8.0, y)],
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120)),
+        egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120),
+        ),
     );
     y += 3.0;
     for row in history.rows.iter().take(max_rows) {
