@@ -55,7 +55,11 @@ impl GridCompositeSource {
             Self::MrmsCompositeReflectivity => "MRMS CREF".to_owned(),
             Self::EumetnetOperaDbzh => "OPERA DBZH".to_owned(),
             Self::ImgwPolradCmax { site, quantity } => {
-                format!("IMGW {} {}", site.system_code(), quantity.filename_token())
+                format!(
+                    "IMGW {} {} CMAX",
+                    site.system_code(),
+                    quantity.filename_token()
+                )
             }
         }
     }
@@ -119,6 +123,23 @@ impl GridCompositeSource {
         self.is_imgw_polrad()
             .then(|| format!("{IMGW_SOURCE_NOTICE_PL}\n{IMGW_PROCESSED_NOTICE_PL}"))
     }
+}
+
+/// The exact IMGW-PIB notices required on an output containing a visible,
+/// processed POLRAD grid. Returning one pair instead of one value per layer
+/// makes the attribution naturally deduplicate when several CMAX layers are
+/// stacked on the same map.
+pub(crate) fn visible_imgw_attribution<'a>(
+    layers: impl IntoIterator<Item = (bool, &'a str)>,
+) -> Option<(&'static str, &'static str)> {
+    layers
+        .into_iter()
+        .any(|(visible, variable_slug)| {
+            visible
+                && GridCompositeSource::from_variable_slug(variable_slug)
+                    .is_some_and(GridCompositeSource::is_imgw_polrad)
+        })
+        .then_some((IMGW_SOURCE_NOTICE_PL, IMGW_PROCESSED_NOTICE_PL))
 }
 
 const IMGW_STANDARD_QUANTITIES: &[ImgwPolradQuantity] = &[
@@ -637,12 +658,49 @@ mod tests {
             GridCompositeSource::from_variable_slug(&source.variable_slug()),
             Some(source)
         );
-        assert_eq!(source.short_label(), "IMGW RAM PhiDP");
+        assert_eq!(source.short_label(), "IMGW RAM PhiDP CMAX");
         assert!(source.label().contains("Ramża"));
         assert!(source.imgw_attribution().is_some());
         assert_eq!(
             GridCompositeSource::from_variable_slug("imgw_polrad_cmax_ram_unknown"),
             None
+        );
+    }
+
+    #[test]
+    fn imgw_attribution_is_absent_for_removed_hidden_or_untyped_layers() {
+        assert_eq!(
+            visible_imgw_attribution(std::iter::empty::<(bool, &str)>()),
+            None
+        );
+        assert_eq!(
+            visible_imgw_attribution([(false, "imgw_polrad_cmax_ram_kdp")]),
+            None
+        );
+        assert_eq!(
+            visible_imgw_attribution([(true, "imgw_polrad_cmax_ram_unknown")]),
+            None
+        );
+    }
+
+    #[test]
+    fn one_visible_imgw_layer_returns_the_exact_required_notice_pair() {
+        assert_eq!(
+            visible_imgw_attribution([(true, "imgw_polrad_cmax_ram_kdp")]),
+            Some((IMGW_SOURCE_NOTICE_PL, IMGW_PROCESSED_NOTICE_PL))
+        );
+    }
+
+    #[test]
+    fn multiple_visible_imgw_layers_still_return_one_notice_pair() {
+        let attribution = visible_imgw_attribution([
+            (true, "imgw_polrad_cmax_ram_kdp"),
+            (true, "imgw_polrad_cmax_gdy_zdr"),
+            (true, "mrms_composite_reflectivity"),
+        ]);
+        assert_eq!(
+            attribution,
+            Some((IMGW_SOURCE_NOTICE_PL, IMGW_PROCESSED_NOTICE_PL))
         );
     }
 

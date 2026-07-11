@@ -116,8 +116,14 @@ below — has no radials or elevation scans and therefore cannot produce a VWP.
 BowEcho can display the ODIM HDF5 dual-polarization CMAX grids published through
 the IMGW-PIB national datastore. Supported quantities are **KDP** (deg/km),
 **RHOHV** (unitless), **ZDR** (dB), and **PHIDP** (degrees). Product availability
-varies by radar and cycle. BowEcho's menu reflects the verified catalog
-snapshot documented below; loading still checks the live datastore and reports
+varies by radar and cycle. The menu uses this static fallback catalog snapshot,
+verified **2026-07-10**; it does not probe every site while the menu is open:
+
+| POLRAD sites | KDP | RHOHV | ZDR | PHIDP |
+| --- | --- | --- | --- | --- |
+| All ten sites below | published | published | published | Ramża only |
+
+Every selection still checks the live datastore before downloading and reports
 an unavailable product honestly if IMGW changes a site's publication set.
 
 Supported POLRAD sites are Brzuchania, Nowy Gdańsk, Góra Św. Anny, Legionowo,

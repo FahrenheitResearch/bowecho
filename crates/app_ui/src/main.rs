@@ -26149,6 +26149,62 @@ impl ViewerApp {
         } else {
             self.grid_canvas(ui, rect);
         }
+        // IMGW's reuse terms require the exact source and processed-data
+        // notices on every product made with its data. Keep this inside the
+        // normal map composition: map-only screenshots crop to this rect and
+        // GIF/MP4 recording captures the same composited pixels. It is not a
+        // Brand Kit option and therefore cannot be disabled with watermark or
+        // share-card settings.
+        self.draw_imgw_attribution(&painter, rect);
+    }
+
+    fn draw_imgw_attribution(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some((source_notice, processed_notice)) =
+            grid_composites::visible_imgw_attribution(self.model_layers.iter().map(|slot| {
+                (
+                    slot.layer.visible,
+                    slot.layer.field.key.var.as_str(),
+                )
+            }))
+        else {
+            return;
+        };
+
+        // Top-center deliberately stays clear of the Brand capture card and
+        // watermark, which both occupy the bottom of the map. The 62-point
+        // offset also clears the normal mode/raw-velocity chips. All chrome
+        // colors come from the active egui theme so this remains readable in
+        // both BowEcho themes without introducing a hard-coded third palette.
+        let style = painter.ctx().style();
+        let visuals = &style.visuals;
+        let text_color = visuals.text_color();
+        let font = egui::FontId::proportional(10.0);
+        let available_width = (rect.width() - 24.0).max(1.0).min(1_000.0);
+        let galley = painter.layout(
+            format!("{source_notice}\n{processed_notice}"),
+            font,
+            text_color,
+            (available_width - 16.0).max(1.0),
+        );
+        let card_size = egui::vec2(
+            (galley.size().x + 16.0).min(available_width),
+            galley.size().y + 10.0,
+        );
+        let preferred_top = rect.top() + 62.0;
+        let latest_top = rect.bottom() - card_size.y - 8.0;
+        let top = preferred_top.min(latest_top).max(rect.top() + 8.0);
+        let card = egui::Rect::from_min_size(
+            egui::pos2(rect.center().x - card_size.x * 0.5, top),
+            card_size,
+        );
+        painter.rect_filled(card, 4.0, visuals.window_fill());
+        painter.rect_stroke(
+            card,
+            4.0,
+            visuals.window_stroke(),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(card.min + egui::vec2(8.0, 5.0), galley, text_color);
     }
 
     fn map_backdrop_color(&self) -> egui::Color32 {

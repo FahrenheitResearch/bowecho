@@ -1170,7 +1170,7 @@ const IMGW_POLRAD_PRODUCTS: &[GridProduct] = &[
         codecs: IMGW_CMAX_CODECS,
         access: PORTAL_DOWNLOAD,
         status: GridImplementationStatus::Fetchable,
-        source_hint: "IMGW national datastore ODIM_H5 MAX grid; published quantity set is discovered per site",
+        source_hint: "IMGW national datastore ODIM_H5 MAX grid; availability varies by site and is validated against the live listing when fetched",
     },
 ];
 
