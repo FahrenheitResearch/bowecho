@@ -154,7 +154,7 @@ impl VwpPanelState {
                 ui.separator();
             }
 
-            let busy = matches!(self.status, PanelStatus::Computing(_));
+            let busy = matches!(&self.status, PanelStatus::Computing(_));
             if ui
                 .add_enabled(!busy, egui::Button::new("Recompute"))
                 .on_hover_text("Recompute from the currently selected radar volume")
