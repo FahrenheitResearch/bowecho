@@ -318,7 +318,7 @@ const MACOS_STAGE_SENTINEL: &str = ".bowecho-private-update-stage-v1";
 #[cfg(any(target_os = "macos", test))]
 const MACOS_STAGE_SENTINEL_CONTENTS: &str = "BowEcho private update stage v1\n";
 #[cfg(any(target_os = "macos", test))]
-const MACOS_BACKUP_NAME: &str = ".BowEcho.app.update-backup";
+const MACOS_PREVIOUS_DIRECTORY: &str = "previous";
 #[cfg(target_os = "macos")]
 const MACOS_HELPER_ARGUMENT: &str = "--bowecho-private-macos-update-helper-v1";
 
@@ -355,11 +355,8 @@ fn macos_app_executable(app: &Path) -> PathBuf {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn macos_backup_path(app: &Path) -> Result<PathBuf, String> {
-    let parent = app
-        .parent()
-        .ok_or_else(|| "BowEcho.app has no parent directory".to_owned())?;
-    Ok(parent.join(MACOS_BACKUP_NAME))
+fn macos_backup_path(stage: &Path) -> PathBuf {
+    stage.join(MACOS_PREVIOUS_DIRECTORY).join(MACOS_APP_NAME)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -412,6 +409,19 @@ fn is_private_macos_stage(stage: &Path) -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn private_macos_stage_has_valid_previous_app(stage: &Path) -> bool {
+    is_private_macos_stage(stage) && has_exact_macos_bundle_layout(&macos_backup_path(stage))
+}
+
+/// Startup may discard an interrupted download, but a completed update's
+/// last working app remains available until the user explicitly begins the
+/// next update.
+#[cfg(any(target_os = "macos", test))]
+fn private_macos_stage_is_abandoned(stage: &Path) -> bool {
+    is_private_macos_stage(stage) && !private_macos_stage_has_valid_previous_app(stage)
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn remove_private_macos_stage(stage: &Path) -> Result<(), String> {
     if !is_private_macos_stage(stage) {
         return Err("refusing to recursively remove an unmarked update stage".to_owned());
@@ -456,23 +466,27 @@ fn exact_extracted_macos_app(extraction_root: &Path) -> Result<PathBuf, String> 
 fn swap_macos_app_bundle(
     staged_app: &Path,
     current_app: &Path,
-    backup_app: &Path,
-) -> Result<(), String> {
-    if backup_app.exists() {
-        if !has_exact_macos_bundle_layout(backup_app) {
-            return Err(
-                "refusing to remove the previous update backup because it is not an exact \
-                 BowEcho app layout"
-                    .to_owned(),
-            );
-        }
-        std::fs::remove_dir_all(backup_app)
-            .map_err(|err| format!("could not clear the previous update backup: {err}"))?;
+    stage_root: &Path,
+) -> Result<PathBuf, String> {
+    if !is_private_macos_stage(stage_root) {
+        return Err("refusing to place a backup in an unmarked update stage".to_owned());
     }
-    std::fs::rename(current_app, backup_app)
+    if !has_exact_macos_bundle_layout(staged_app) || !has_exact_macos_bundle_layout(current_app) {
+        return Err("the current or staged app does not have the exact BowEcho layout".to_owned());
+    }
+    let backup_app = macos_backup_path(stage_root);
+    let previous_directory = backup_app
+        .parent()
+        .expect("the stage-local backup always has a previous directory");
+    if previous_directory.exists() {
+        return Err("the private update stage already contains a previous-app area".to_owned());
+    }
+    std::fs::create_dir(previous_directory)
+        .map_err(|err| format!("could not create the private previous-app area: {err}"))?;
+    std::fs::rename(current_app, &backup_app)
         .map_err(|err| format!("could not move the current BowEcho.app aside: {err}"))?;
     if let Err(err) = std::fs::rename(staged_app, current_app) {
-        return Err(match std::fs::rename(backup_app, current_app) {
+        return Err(match std::fs::rename(&backup_app, current_app) {
             Ok(()) => format!(
                 "could not install the new BowEcho.app ({err}); the previous app was restored"
             ),
@@ -482,12 +496,13 @@ fn swap_macos_app_bundle(
             ),
         });
     }
-    Ok(())
+    Ok(backup_app)
 }
 
 /// Best-effort startup sweep of update leftovers. Windows retries deletion
-/// of the parked executable. A freshly launched macOS app removes the parked
-/// old bundle and abandoned private sibling stages.
+/// of the parked executable. macOS removes only sentinel-marked interrupted
+/// stages; a stage containing the last working app is deliberately preserved
+/// until a later explicit update attempt.
 pub(crate) fn cleanup_stale_update_artifacts() {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -507,15 +522,12 @@ pub(crate) fn cleanup_stale_update_artifacts() {
     if let Ok(app) = macos_app_bundle_from_executable(&exe)
         && let Some(parent) = app.parent()
     {
-        if let Ok(backup) = macos_backup_path(&app)
-            && has_exact_macos_bundle_layout(&backup)
-        {
-            let _ = std::fs::remove_dir_all(backup);
-        }
         if let Ok(entries) = std::fs::read_dir(parent) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                if name.to_string_lossy().starts_with(MACOS_STAGE_PREFIX) {
+                if name.to_string_lossy().starts_with(MACOS_STAGE_PREFIX)
+                    && private_macos_stage_is_abandoned(&entry.path())
+                {
                     let _ = remove_private_macos_stage(&entry.path());
                 }
             }
@@ -705,14 +717,16 @@ fn run_macos_update_helper(request: MacOsHelperRequest) -> Result<(), String> {
              returned {reopen:?}"
         ));
     }
-    let backup_app = macos_backup_path(&current_app)?;
-    if let Err(reason) = swap_macos_app_bundle(&staged_app, &current_app, &backup_app) {
-        let reopen = open_macos_app(&current_app, &request.original_args);
-        return Err(format!(
-            "the app-bundle swap failed ({reason}); reopening the current app returned \
-             {reopen:?}"
-        ));
-    }
+    let backup_app = match swap_macos_app_bundle(&staged_app, &current_app, &stage_root) {
+        Ok(backup_app) => backup_app,
+        Err(reason) => {
+            let reopen = open_macos_app(&current_app, &request.original_args);
+            return Err(format!(
+                "the app-bundle swap failed ({reason}); reopening the current app returned \
+                 {reopen:?}"
+            ));
+        }
+    };
     if let Err(relaunch) = open_macos_app(&current_app, &request.original_args) {
         rollback_macos_app_after_relaunch_failure(
             &current_app,
@@ -725,7 +739,9 @@ fn run_macos_update_helper(request: MacOsHelperRequest) -> Result<(), String> {
             "the updated app could not relaunch ({relaunch}); the previous app was restored"
         ));
     }
-    let _ = remove_private_macos_stage(&stage_root);
+    // Keep the sentinel-marked stage: it now owns the last known-working app.
+    // A later explicit update attempt prunes it immediately before creating a
+    // fresh stage, so at most one previous app persists.
     Ok(())
 }
 
@@ -933,6 +949,28 @@ fn self_update_http_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|err| format!("could not build HTTP client: {err}"))
 }
 
+/// An explicit update click retires every prior updater-owned stage before a
+/// new one is allocated. Startup never calls this: it preserves the most
+/// recent working bundle for rollback, while this boundary keeps retention
+/// to at most one old app across successful updates.
+#[cfg(any(target_os = "macos", test))]
+fn prune_prior_private_macos_stages(parent: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir(parent)
+        .map_err(|err| format!("could not inspect prior macOS update stages: {err}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("could not inspect an update stage: {err}"))?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(MACOS_STAGE_PREFIX)
+            && is_private_macos_stage(&entry.path())
+        {
+            remove_private_macos_stage(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn create_private_macos_stage(current_app: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -951,6 +989,7 @@ fn create_private_macos_stage(current_app: &Path) -> Result<PathBuf, String> {
     let parent = current_app
         .parent()
         .ok_or_else(|| "BowEcho.app has no parent directory".to_owned())?;
+    prune_prior_private_macos_stages(parent)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1765,9 +1804,10 @@ mod tests {
         let executable = Path::new("C:/Applications/BowEcho.app/Contents/MacOS/bowecho");
         let app = Path::new("C:/Applications/BowEcho.app");
         assert_eq!(macos_app_bundle_from_executable(executable).unwrap(), app);
+        let stage = Path::new("C:/Applications/.bowecho-update-stage-test");
         assert_eq!(
-            macos_backup_path(app).unwrap(),
-            Path::new("C:/Applications/.BowEcho.app.update-backup")
+            macos_backup_path(stage),
+            stage.join("previous").join(MACOS_APP_NAME)
         );
         assert!(
             macos_app_bundle_from_executable(Path::new(
@@ -1837,6 +1877,15 @@ mod tests {
             .expect("write fake executable");
     }
 
+    fn write_fake_private_stage(stage: &Path) {
+        std::fs::create_dir_all(stage).expect("create fake private stage");
+        std::fs::write(
+            stage.join(MACOS_STAGE_SENTINEL),
+            MACOS_STAGE_SENTINEL_CONTENTS,
+        )
+        .expect("write private stage sentinel");
+    }
+
     #[test]
     fn extracted_macos_release_requires_one_exact_bowecho_app() {
         let root = scratch_directory("mac-extraction");
@@ -1868,14 +1917,48 @@ mod tests {
     }
 
     #[test]
+    fn startup_cleanup_predicate_preserves_a_valid_previous_app() {
+        let parent = scratch_directory("stage-preserve-backup");
+        let stage = parent.join(format!("{MACOS_STAGE_PREFIX}preserve"));
+        write_fake_private_stage(&stage);
+        assert!(private_macos_stage_is_abandoned(&stage));
+        write_fake_macos_app(&macos_backup_path(&stage), "previous");
+        assert!(private_macos_stage_has_valid_previous_app(&stage));
+        assert!(
+            !private_macos_stage_is_abandoned(&stage),
+            "startup cleanup must preserve the last working app"
+        );
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn explicit_update_prunes_only_exact_sentinel_stages() {
+        let parent = scratch_directory("stage-explicit-prune");
+        let owned = parent.join(format!("{MACOS_STAGE_PREFIX}owned"));
+        write_fake_private_stage(&owned);
+        write_fake_macos_app(&macos_backup_path(&owned), "previous");
+        let unmarked = parent.join(format!("{MACOS_STAGE_PREFIX}unmarked"));
+        std::fs::create_dir(&unmarked).unwrap();
+        std::fs::write(unmarked.join("keep"), b"not updater-owned").unwrap();
+        prune_prior_private_macos_stages(&parent).unwrap();
+        assert!(!owned.exists(), "explicit update retires its prior backup");
+        assert!(
+            unmarked.join("keep").exists(),
+            "a prefix without the exact sentinel is never removable"
+        );
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
     fn macos_bundle_swap_is_whole_bundle_and_rolls_back() {
         let root = scratch_directory("mac-swap");
         let current = root.join(MACOS_APP_NAME);
-        let staged = root.join("staged").join(MACOS_APP_NAME);
-        let backup = root.join(MACOS_BACKUP_NAME);
+        let stage = root.join(format!("{MACOS_STAGE_PREFIX}first"));
+        write_fake_private_stage(&stage);
+        let staged = stage.join("extracted").join(MACOS_APP_NAME);
         write_fake_macos_app(&current, "old");
         write_fake_macos_app(&staged, "new");
-        swap_macos_app_bundle(&staged, &current, &backup).unwrap();
+        let backup = swap_macos_app_bundle(&staged, &current, &stage).unwrap();
         assert_eq!(
             std::fs::read(macos_app_executable(&current)).unwrap(),
             b"new"
@@ -1885,31 +1968,41 @@ mod tests {
             b"old"
         );
 
-        // A missing staged app makes the second rename fail; the old bundle
-        // must return to its original path.
+        // Force the second rename to fail; the old bundle must return to its
+        // original path.
         std::fs::remove_dir_all(&current).unwrap();
         std::fs::rename(&backup, &current).unwrap();
-        let missing = root.join("missing").join(MACOS_APP_NAME);
-        let outcome = swap_macos_app_bundle(&missing, &current, &backup);
+        let stage_two = root.join(format!("{MACOS_STAGE_PREFIX}second"));
+        write_fake_private_stage(&stage_two);
+        // Put the staged stand-in inside the current bundle. Moving current
+        // aside moves that nested path too, forcing the install rename to
+        // fail after the backup rename and exercising the real rollback.
+        let nested_staged = current.join("nested").join(MACOS_APP_NAME);
+        write_fake_macos_app(&nested_staged, "nested-new");
+        let outcome = swap_macos_app_bundle(&nested_staged, &current, &stage_two);
         assert!(outcome.unwrap_err().contains("previous app was restored"));
         assert!(has_exact_macos_bundle_layout(&current));
-        assert!(!backup.exists());
+        assert!(!macos_backup_path(&stage_two).exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn macos_bundle_swap_refuses_to_delete_an_untrusted_backup_directory() {
-        let root = scratch_directory("mac-unsafe-backup");
+    fn macos_bundle_swap_never_deletes_an_existing_stage_backup() {
+        let root = scratch_directory("mac-existing-backup");
         let current = root.join(MACOS_APP_NAME);
-        let staged = root.join("staged").join(MACOS_APP_NAME);
-        let backup = root.join(MACOS_BACKUP_NAME);
+        let stage = root.join(format!("{MACOS_STAGE_PREFIX}occupied"));
+        write_fake_private_stage(&stage);
+        let staged = stage.join("extracted").join(MACOS_APP_NAME);
+        let backup = macos_backup_path(&stage);
         write_fake_macos_app(&current, "old");
         write_fake_macos_app(&staged, "new");
-        std::fs::create_dir(&backup).unwrap();
-        std::fs::write(backup.join("do-not-delete"), b"user data").unwrap();
-        let outcome = swap_macos_app_bundle(&staged, &current, &backup);
-        assert!(outcome.unwrap_err().contains("refusing to remove"));
-        assert!(backup.join("do-not-delete").exists());
+        write_fake_macos_app(&backup, "do-not-delete");
+        let outcome = swap_macos_app_bundle(&staged, &current, &stage);
+        assert!(outcome.unwrap_err().contains("already contains"));
+        assert_eq!(
+            std::fs::read(macos_app_executable(&backup)).unwrap(),
+            b"do-not-delete"
+        );
         assert!(current.exists());
         let _ = std::fs::remove_dir_all(root);
     }
