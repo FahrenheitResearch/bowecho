@@ -1236,7 +1236,13 @@ fn load_frame_for_plot(
     let title = format!("{} · {hhmm:04}Z", run_title(&key.model, &key.run));
     let subtitle_left = format!("{}/{}", key.model, key.run);
     let subtitle_right = if key.model == "mtg_i1" {
-        format!("EUMETSAT · {hhmm:04}Z")
+        let year = key
+            .run
+            .split('_')
+            .find(|token| token.len() == 8 && token.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|token| token.get(..4))
+            .unwrap_or("2026");
+        format!("Contains modified EUMETSAT Meteosat data {year}. · {hhmm:04}Z")
     } else {
         format!("{} · {hhmm:04}Z", key.model.to_ascii_uppercase())
     };

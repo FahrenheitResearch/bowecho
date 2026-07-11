@@ -964,8 +964,8 @@ fn satellite(ui: &mut egui::Ui) {
          context. The True color button composes AHI true color (real 0.51 µm green, not a \
          synthesized one) at the scope you pick: the west-Pacific tropics region, or the WHOLE \
          disk at ~4 km or ~2 km effective. GOES adds its own RGB composites (GeoColor, \
-         NaturalColor, …) over the current sector. Switching source, sector, or layer clears \
-         stale frames so late downloads from the old selection cannot flash onto the map.",
+         NaturalColor, …) over the current sector. The source chips change the controls above \
+         the one shared player; stored loops from every provider remain available below.",
     );
 
     subhead(ui, "METEOSAT-12 / EUMETVIEW");
@@ -988,6 +988,12 @@ fn satellite(ui: &mut egui::Ui) {
          rendered EUMETView images rather than raw FCI radiances, so the local IR enhancement \
          picker does not recolor them.",
     );
+    para(
+        ui,
+        "BowEcho keeps the required source notice visible on Meteosat map layers and plot/PNG \
+         output: ‘Contains modified EUMETSAT Meteosat data YEAR.’ The year follows the frame's \
+         UTC date. Product metadata also records the EUMETView layer and EUMETSAT provider.",
+    );
 
     subhead(ui, "OPTIONAL EUMETSAT DATA STORE ACCOUNT");
     para(
@@ -998,6 +1004,23 @@ fn satellite(ui: &mut egui::Ui) {
          a short-lived access token on the satellite worker and do not retain that token. The \
          key and secret never enter BowEcho's settings file. This optional account connection is \
          not a raw FCI download path.",
+    );
+    action(
+        ui,
+        "Which values to enter",
+        "— open EUMETSAT API Key Management, then copy Consumer Key into BowEcho's consumer-key \
+         field and Consumer Secret into the consumer-secret field. Do not paste the temporary \
+         Access Token: BowEcho requests and refreshes short-lived tokens from the saved pair.",
+    );
+    ui.hyperlink_to(
+        "Open EUMETSAT API Key Management",
+        "https://api.eumetsat.int/api-key/",
+    );
+    para(
+        ui,
+        "If the page has no key pair yet, sign in with an EUMETSAT User Portal account and \
+         create one there. Save securely writes the pair to Windows Credential Manager, macOS \
+         Keychain, or Linux Secret Service; Test account verifies it by requesting a token.",
     );
 
     subhead(ui, "IR ENHANCEMENTS");
@@ -1013,17 +1036,14 @@ fn satellite(ui: &mut egui::Ui) {
          to use the new enhancements.",
     );
 
-    subhead(ui, "NATIVE-RESOLUTION WINDOWS");
+    subhead(ui, "FOCUSED WINDOWS");
     para(
         ui,
-        "Tick Native window and set a center lat/lon and size to compose the true-color loads \
-         at the sensor's full 0.5 km resolution over just that box — only the segments and \
-         pixels covering it are fetched and decoded, so a typhoon eye stays crisp and the \
-         frames stay small enough to loop. Repeated loads of the same window stack into one \
-         loopable run. It works for Himawari (segment-level fetch) and GOES (windowed decode), \
-         and overrides the full-sector/full-disk scope while it is on. Meteosat EUMETView \
-         products are provider-rendered geographic images and do not use this sensor-native \
-         crop control.",
+        "Tick Focused window and set a center lat/lon and size to keep high-resolution loads \
+         around one storm or region. Himawari and GOES true-color loads fetch/decode the \
+         instrument-native pixels covering that box; Meteosat asks EUMETView for a bounded \
+         2048-pixel geographic crop. Repeated loads of the same window and product stack into \
+         one loopable run. Use map center copies the current radar-map center into the box.",
     );
 
     subhead(ui, "STORM SATELLITE (ONE PRESS)");
@@ -1667,7 +1687,8 @@ fn sources(ui: &mut egui::Ui) {
         "GOES GLM lightning and Himawari-9 IR/WV full-disk frames are also wired from NOAA \
          open-data buckets. Meteosat-12 / MTG-I1 rendered imagery is provided publicly by \
          EUMETSAT through EUMETView; public imagery needs no account. An optional EUMETSAT \
-         Data Store consumer account is kept only in the operating-system credential vault.",
+         Data Store consumer account is kept only in the operating-system credential vault. \
+         Modified map and plot output carries ‘Contains modified EUMETSAT Meteosat data YEAR.’",
     );
 
     subhead(ui, "GDEX CLIMATE MODEL DATA");
@@ -1900,6 +1921,11 @@ mod tests {
         assert!(guide_src.contains("Load loop"));
         assert!(guide_src.contains("Map follows player"));
         assert!(guide_src.contains("operating-system credential vault"));
+        assert!(guide_src.contains("https://api.eumetsat.int/api-key/"));
+        assert!(guide_src.contains("Consumer Key"));
+        assert!(guide_src.contains("Consumer Secret"));
+        assert!(guide_src.contains("Do not paste the temporary"));
+        assert!(guide_src.contains("Contains modified EUMETSAT Meteosat data YEAR."));
         assert!(guide_src.contains("not a raw FCI download path"));
         assert!(guide_src.contains("dedicated point-flash Lightning overlay remains GOES GLM"));
         let retired_unavailable_claim = [

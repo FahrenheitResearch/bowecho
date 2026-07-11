@@ -566,7 +566,7 @@ fn decode_image(bytes: &[u8], content_type: &str) -> Result<WmsImage, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike};
 
     const SAMPLE: &str = r#"<?xml version="1.0"?>
       <WMS_Capabilities xmlns="http://www.opengis.net/wms">
