@@ -759,6 +759,7 @@ impl ModelDataDock {
         })
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn stage_formula_raw_from_files(&mut self, files: &[PathBuf]) {
         if let Some(first) = files.first() {
             self.formula_raw_path = Some(first.clone());

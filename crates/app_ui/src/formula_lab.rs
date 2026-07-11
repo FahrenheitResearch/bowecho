@@ -280,14 +280,6 @@ impl FormulaLabPanel {
         self.task.is_some()
     }
 
-    pub fn compiled(&self) -> Option<&CompiledFormula> {
-        self.compiled.as_ref()
-    }
-
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-
     pub fn set_source(&mut self, source: impl Into<String>) {
         let source = source.into();
         if self.source != source {
@@ -298,13 +290,6 @@ impl FormulaLabPanel {
 
     pub fn raw_time_index(&self) -> usize {
         self.raw_time_index
-    }
-
-    pub fn set_raw_time_index(&mut self, time_index: usize) {
-        if self.raw_time_index != time_index {
-            self.raw_time_index = time_index;
-            self.mark_editor_changed();
-        }
     }
 
     pub fn source_kind(&self) -> FormulaSourceKind {
@@ -1238,8 +1223,12 @@ impl FormulaLabPanel {
                     return None;
                 }
                 self.status = Some(format!(
-                    "Generated {} ({}×{}, {})",
-                    result.field.key.var, result.field.nx, result.field.ny, result.field.units
+                    "Generated {} ({}×{}, {}) · {}",
+                    result.field.key.var,
+                    result.field.nx,
+                    result.field.ny,
+                    result.field.units,
+                    result.description
                 ));
                 self.last_provenance = Some(result.provenance.clone());
                 self.last_warnings = result.warnings.clone();
@@ -1367,6 +1356,7 @@ impl FormulaLabPanel {
         self.status = Some("Recipe file dialogs need Windows or macOS".to_string());
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn apply_recipe(&mut self, recipe: Recipe) {
         self.source = recipe.source;
         self.recipe_name = recipe.name;
@@ -1626,6 +1616,7 @@ fn parse_unit_overrides(text: &str) -> Result<BTreeMap<String, String>, FormulaE
     Ok(output)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn format_unit_overrides(overrides: &BTreeMap<String, String>) -> String {
     overrides
         .iter()
@@ -1677,6 +1668,7 @@ fn desktop_standard_limits() -> ResourceLimits {
     limits
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn clamp_desktop_limits(requested: ResourceLimits) -> ResourceLimits {
     clamp_limits_to(requested, &ResourceLimits::default())
 }
@@ -1896,11 +1888,11 @@ mod tests {
         let mut panel = FormulaLabPanel::new();
         panel.set_source_kind(FormulaSourceKind::Store);
         panel.set_source("temperature_2m");
-        assert!(panel.compiled().is_some());
+        assert!(panel.compiled.is_some());
         assert!(panel.temporal_source_allowed(sources));
 
         panel.set_source("dt(temperature_2m)");
-        assert!(panel.compiled().is_some());
+        assert!(panel.compiled.is_some());
         assert!(!panel.temporal_source_allowed(sources));
 
         let mut verified = store;
