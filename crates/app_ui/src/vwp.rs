@@ -690,7 +690,7 @@ fn draw_hodograph(ui: &mut egui::Ui, rect: egui::Rect, profile: &PlotProfile) {
         painter.circle_filled(wind_position(wind), 2.8, color);
     }
 
-    if maximum_wind_kt == 0.0 {
+    if maximum_wind_kt <= f32::EPSILON {
         painter.text(
             center,
             egui::Align2::CENTER_CENTER,
