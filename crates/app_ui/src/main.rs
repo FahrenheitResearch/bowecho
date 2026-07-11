@@ -26175,7 +26175,7 @@ impl ViewerApp {
         // offset also clears the normal mode/raw-velocity chips. All chrome
         // colors come from the active egui theme so this remains readable in
         // both BowEcho themes without introducing a hard-coded third palette.
-        let style = painter.ctx().style();
+        let style = painter.ctx().global_style();
         let visuals = &style.visuals;
         let text_color = visuals.text_color();
         let font = egui::FontId::proportional(10.0);
