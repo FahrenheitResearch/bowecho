@@ -2483,10 +2483,10 @@ fn verify_execution(
                 &grouping.partial_group_policy,
                 "reject_entire_lut",
             )?;
-            if grouping.maximum_points_per_process != 1024 {
+            if grouping.maximum_points_per_process != 2048 {
                 return invalid(
                     "execution.grouping.maximum_points_per_process",
-                    "must be exactly 1024",
+                    "must be exactly 2048",
                 );
             }
             if grouping.group_timeout_seconds != 3600 {
@@ -3375,7 +3375,7 @@ mod tests {
                 ],
                 geometry_axis_kind: AxisKind::RadarElevation,
                 partial_group_policy: "reject_entire_lut".to_owned(),
-                maximum_points_per_process: 1024,
+                maximum_points_per_process: 2048,
                 group_timeout_seconds: 3600,
             }),
         }
@@ -3388,7 +3388,7 @@ mod tests {
         assert!(matches!(
             bound,
             TMatrixExecutionDescriptor::FreshProcessPerMaterialStateGroup {
-                maximum_points_per_process: 1024,
+                maximum_points_per_process: 2048,
                 group_timeout_seconds: 3600,
                 ..
             }
@@ -3400,6 +3400,13 @@ mod tests {
             .unwrap()
             .material_state_axis_kinds
             .swap(0, 1);
+        assert!(verify_execution(changed, &wet_material_for_execution()).is_err());
+        let mut changed = grouped_wet_execution();
+        changed
+            .grouping
+            .as_mut()
+            .unwrap()
+            .maximum_points_per_process = 1024;
         assert!(verify_execution(changed, &wet_material_for_execution()).is_err());
     }
 

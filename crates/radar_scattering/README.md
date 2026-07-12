@@ -150,7 +150,7 @@ after all gates pass.
 
 Property-table descriptors also bind the declared density applicability and
 the crash-isolated material-state grouping plan (material axes, T-matrix
-state axes, elevation geometry axis, 1,024-point process cap, and 3,600-second
+state axes, elevation geometry axis, 2,048-point process cap, and 3,600-second
 group timeout). Grouping is reproducibility metadata, not permission to accept
 partial output: any failed group still rejects the complete LUT.
 
