@@ -309,6 +309,17 @@ struct SyntheticRadarUiState {
     zdr_bias_db: f32,
     #[serde(default)]
     scan_timing: crate::wrf_radar::ScanTiming,
+    /// Whether rays sample one frozen WRF scene or interpolate compatible
+    /// adjacent scenes in raw model-state space. Older settings remain frozen.
+    #[serde(default)]
+    atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode,
+    /// What to do when interpolation cannot obtain a complete later scene.
+    /// Holding the anchor preserves the historical final frame.
+    #[serde(default)]
+    missing_neighbor_policy: app_ui::wrf_temporal::MissingNeighborPolicy,
+    /// User-controlled preflight budget for the two-scene temporal cache.
+    #[serde(default = "default_synth_temporal_memory_budget_mib")]
+    temporal_memory_budget_mib: usize,
     #[serde(default = "default_synth_rotation_rate_deg_s")]
     rotation_rate_deg_s: f32,
     #[serde(default = "default_synth_transition_delay_s")]
@@ -384,6 +395,10 @@ fn default_synth_prf_hz() -> f32 {
     crate::wrf_radar::SyntheticRadarConfig::default().prf_hz
 }
 
+fn default_synth_temporal_memory_budget_mib() -> usize {
+    8192
+}
+
 fn default_synth_sensitivity_dbz_at_1km() -> f32 {
     crate::wrf_radar::SyntheticRadarConfig::default().sensitivity_dbz_at_1km
 }
@@ -418,6 +433,9 @@ impl Default for SyntheticRadarUiState {
             system_phidp_deg: 0.0,
             zdr_bias_db: 0.0,
             scan_timing: crate::wrf_radar::ScanTiming::default(),
+            atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode::default(),
+            missing_neighbor_policy: app_ui::wrf_temporal::MissingNeighborPolicy::default(),
+            temporal_memory_budget_mib: default_synth_temporal_memory_budget_mib(),
             rotation_rate_deg_s: default_synth_rotation_rate_deg_s(),
             transition_delay_s: default_synth_transition_delay_s(),
             prf_hz: default_synth_prf_hz(),
@@ -458,6 +476,9 @@ impl SyntheticRadarUiState {
             dual_pol: self.dual_pol,
             propagation: self.propagation,
             scan_timing: self.scan_timing,
+            atmosphere_time_mode: self.atmosphere_time_mode,
+            missing_neighbor_policy: self.missing_neighbor_policy,
+            temporal_memory_budget_mib: self.temporal_memory_budget_mib,
             instrument_noise: self.instrument_noise,
             ref_gate_texture: self.ref_gate_texture,
             vel_gate_texture: self.vel_gate_texture,
@@ -475,6 +496,9 @@ impl SyntheticRadarUiState {
         self.dual_pol = preset.dual_pol;
         self.propagation = preset.propagation;
         self.scan_timing = preset.scan_timing;
+        self.atmosphere_time_mode = preset.atmosphere_time_mode;
+        self.missing_neighbor_policy = preset.missing_neighbor_policy;
+        self.temporal_memory_budget_mib = preset.temporal_memory_budget_mib;
         self.instrument_noise = preset.instrument_noise;
         self.ref_gate_texture = preset.ref_gate_texture;
         self.vel_gate_texture = preset.vel_gate_texture;
@@ -501,6 +525,9 @@ impl SyntheticRadarUiState {
         self.rotation_rate_deg_s = defaults.rotation_rate_deg_s;
         self.transition_delay_s = defaults.transition_delay_s;
         self.prf_hz = defaults.prf_hz;
+        self.atmosphere_time_mode = app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
+        self.missing_neighbor_policy = app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
+        self.temporal_memory_budget_mib = default_synth_temporal_memory_budget_mib();
         self.sensitivity_dbz_at_1km = defaults.sensitivity_dbz_at_1km;
         self.include_low_tilt = false;
         self.vel_gate_texture = false;
@@ -518,15 +545,25 @@ impl SyntheticRadarUiState {
                 self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
                 self.terrain_blockage = false;
                 self.scan_timing = crate::wrf_radar::ScanTiming::InstantaneousTruth;
+                self.atmosphere_time_mode =
+                    app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
                 self.instrument_noise = false;
                 self.fold_velocity = false;
             }
             SyntheticRadarRecipe::RealRadar => {
                 self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
+                self.atmosphere_time_mode =
+                    app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
+                self.missing_neighbor_policy =
+                    app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
             }
             SyntheticRadarRecipe::MaximumFidelity => {
                 self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
                 self.beam_integration = crate::wrf_radar::BeamIntegration::Reference;
+                self.atmosphere_time_mode =
+                    app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
+                self.missing_neighbor_policy =
+                    app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
             }
         }
     }
@@ -604,7 +641,20 @@ impl SyntheticRadarUiState {
             propagation: self.propagation,
             system_phidp_deg: self.system_phidp_deg,
             zdr_bias_db: self.zdr_bias_db,
-            scan_timing: self.scan_timing,
+            // Raw-state interpolation is meaningful only for a timed scan.
+            // Normalize stale/manually-edited settings instead of emitting an
+            // internally contradictory renderer configuration.
+            scan_timing: if matches!(
+                self.atmosphere_time_mode,
+                app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
+            ) {
+                crate::wrf_radar::ScanTiming::TimedVolume
+            } else {
+                self.scan_timing
+            },
+            atmosphere_time_mode: self.atmosphere_time_mode,
+            missing_neighbor_policy: self.missing_neighbor_policy,
+            temporal_memory_budget_mib: self.temporal_memory_budget_mib.clamp(1024, 65_536),
             rotation_rate_deg_s: self.rotation_rate_deg_s,
             transition_delay_s: self.transition_delay_s,
             prf_hz: self.prf_hz,
@@ -3594,11 +3644,20 @@ impl ModelDataDock {
                             );
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("Scan timing:");
-                                ui.selectable_value(
-                                    &mut state.scan_timing,
-                                    crate::wrf_radar::ScanTiming::InstantaneousTruth,
-                                    "Instantaneous",
-                                );
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            state.scan_timing,
+                                            crate::wrf_radar::ScanTiming::InstantaneousTruth
+                                        ),
+                                        "Instantaneous",
+                                    )
+                                    .clicked()
+                                {
+                                    state.scan_timing =
+                                        crate::wrf_radar::ScanTiming::InstantaneousTruth;
+                                    state.atmosphere_time_mode = app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
+                                }
                                 ui.selectable_value(
                                     &mut state.scan_timing,
                                     crate::wrf_radar::ScanTiming::TimedVolume,
@@ -3626,6 +3685,87 @@ impl ModelDataDock {
                                     .suffix(" s transition"),
                                 );
                             });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Atmosphere time:");
+                                ui.selectable_value(
+                                    &mut state.atmosphere_time_mode,
+                                    app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart,
+                                    "Frozen",
+                                )
+                                .on_hover_text(
+                                    "Every ray samples the WRF scene at volume start. This is the backward-compatible mode and is valid for instantaneous or timed scans.",
+                                );
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            state.atmosphere_time_mode,
+                                            app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
+                                        ),
+                                        "Interpolate adjacent WRF scenes",
+                                    )
+                                    .on_hover_text(
+                                        "Use each timed ray's acquisition time to linearly interpolate raw atmospheric and microphysical model state between compatible adjacent WRF scenes, before nonlinear radar scattering. Selecting this also enables Timed volume.",
+                                    )
+                                    .clicked()
+                                {
+                                    state.atmosphere_time_mode =
+                                        app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
+                                    state.scan_timing = crate::wrf_radar::ScanTiming::TimedVolume;
+                                }
+                            });
+                            if matches!(
+                                state.atmosphere_time_mode,
+                                app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
+                            ) {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Timed rays interpolate linear raw model state before scattering; radar products are never blended, and the renderer never extrapolates beyond the next compatible WRF scene.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Final-frame policy:");
+                                    ui.selectable_value(
+                                        &mut state.missing_neighbor_policy,
+                                        app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor,
+                                        "Hold last",
+                                    )
+                                    .on_hover_text(
+                                        "Render the final frame from its anchor scene and record that temporal sampling was held.",
+                                    );
+                                    ui.selectable_value(
+                                        &mut state.missing_neighbor_policy,
+                                        app_ui::wrf_temporal::MissingNeighborPolicy::DropFrame,
+                                        "Drop",
+                                    )
+                                    .on_hover_text(
+                                        "Omit a frame that has no complete compatible later scene.",
+                                    );
+                                    ui.selectable_value(
+                                        &mut state.missing_neighbor_policy,
+                                        app_ui::wrf_temporal::MissingNeighborPolicy::Error,
+                                        "Error",
+                                    )
+                                    .on_hover_text(
+                                        "Stop the run instead of falling back when a complete temporal bracket is unavailable.",
+                                    );
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Temporal memory budget:");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut state.temporal_memory_budget_mib,
+                                        )
+                                        .range(1024..=65_536)
+                                        .speed(256)
+                                        .suffix(" MiB"),
+                                    )
+                                    .on_hover_text(
+                                        "Preflight limit for the bounded two-scene raw-state cache. The run stops before allocation if the compatible scene pair would exceed this budget.",
+                                    );
+                                });
+                            }
                             if state.scan_strategy.is_named_vcp() {
                                 ui.label(
                                     egui::RichText::new(
@@ -5724,6 +5864,20 @@ mod tests {
             crate::wrf_radar::ScanTiming::InstantaneousTruth
         );
         assert_eq!(
+            empty.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart,
+            "older settings keep one frozen WRF scene"
+        );
+        assert_eq!(
+            empty.missing_neighbor_policy,
+            app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor,
+            "the backward-compatible final-frame policy holds the anchor"
+        );
+        assert_eq!(
+            empty.temporal_memory_budget_mib, 8192,
+            "older settings receive the bounded two-scene cache budget"
+        );
+        assert_eq!(
             empty.rotation_rate_deg_s,
             default_synth_rotation_rate_deg_s()
         );
@@ -5776,6 +5930,9 @@ mod tests {
             system_phidp_deg: 12.5,
             zdr_bias_db: -0.35,
             scan_timing: crate::wrf_radar::ScanTiming::TimedVolume,
+            atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent,
+            missing_neighbor_policy: app_ui::wrf_temporal::MissingNeighborPolicy::DropFrame,
+            temporal_memory_budget_mib: 16_384,
             rotation_rate_deg_s: 24.0,
             transition_delay_s: 4.25,
             prf_hz: 1_200.0,
@@ -5845,6 +6002,15 @@ mod tests {
         assert_eq!(config.system_phidp_deg, historical.system_phidp_deg);
         assert_eq!(config.zdr_bias_db, historical.zdr_bias_db);
         assert_eq!(config.scan_timing, historical.scan_timing);
+        assert_eq!(config.atmosphere_time_mode, historical.atmosphere_time_mode);
+        assert_eq!(
+            config.missing_neighbor_policy,
+            historical.missing_neighbor_policy
+        );
+        assert_eq!(
+            config.temporal_memory_budget_mib,
+            historical.temporal_memory_budget_mib
+        );
         assert_eq!(config.rotation_rate_deg_s, historical.rotation_rate_deg_s);
         assert_eq!(config.transition_delay_s, historical.transition_delay_s);
         assert_eq!(config.prf_hz, historical.prf_hz);
@@ -5893,6 +6059,9 @@ mod tests {
             system_phidp_deg: 18.5,
             zdr_bias_db: -0.4,
             scan_timing: ScanTiming::TimedVolume,
+            atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent,
+            missing_neighbor_policy: app_ui::wrf_temporal::MissingNeighborPolicy::Error,
+            temporal_memory_budget_mib: 12_288,
             rotation_rate_deg_s: 22.0,
             transition_delay_s: 4.5,
             prf_hz: 1_350.0,
@@ -5920,11 +6089,61 @@ mod tests {
         assert_eq!(config.system_phidp_deg, 18.5);
         assert_eq!(config.zdr_bias_db, -0.4);
         assert_eq!(config.scan_timing, ScanTiming::TimedVolume);
+        assert_eq!(
+            config.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
+        );
+        assert_eq!(
+            config.missing_neighbor_policy,
+            app_ui::wrf_temporal::MissingNeighborPolicy::Error
+        );
+        assert_eq!(config.temporal_memory_budget_mib, 12_288);
         assert_eq!(config.rotation_rate_deg_s, 22.0);
         assert_eq!(config.transition_delay_s, 4.5);
         assert_eq!(config.prf_hz, 1_350.0);
         assert!(config.instrument_noise);
         assert_eq!(config.sensitivity_dbz_at_1km, -36.0);
+    }
+
+    #[test]
+    fn synth_radar_temporal_interpolation_requires_timed_scan_and_clamps_budget() {
+        use crate::wrf_radar::ScanTiming;
+        use app_ui::wrf_temporal::{AtmosphereTimeMode, MissingNeighborPolicy};
+
+        // A stale or hand-edited settings entry cannot launch the contradictory
+        // combination of adjacent-scene interpolation and instantaneous rays.
+        let low_budget = SyntheticRadarUiState {
+            scan_timing: ScanTiming::InstantaneousTruth,
+            atmosphere_time_mode: AtmosphereTimeMode::LinearAdjacent,
+            missing_neighbor_policy: MissingNeighborPolicy::DropFrame,
+            temporal_memory_budget_mib: 64,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(low_budget.scan_timing, ScanTiming::TimedVolume);
+        assert_eq!(
+            low_budget.atmosphere_time_mode,
+            AtmosphereTimeMode::LinearAdjacent
+        );
+        assert_eq!(
+            low_budget.missing_neighbor_policy,
+            MissingNeighborPolicy::DropFrame
+        );
+        assert_eq!(low_budget.temporal_memory_budget_mib, 1024);
+
+        let high_budget = SyntheticRadarUiState {
+            temporal_memory_budget_mib: usize::MAX,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(high_budget.scan_timing, ScanTiming::InstantaneousTruth);
+        assert_eq!(
+            high_budget.atmosphere_time_mode,
+            AtmosphereTimeMode::FrozenAtVolumeStart
+        );
+        assert_eq!(high_budget.temporal_memory_budget_mib, 65_536);
     }
 
     #[test]
@@ -5947,6 +6166,10 @@ mod tests {
         assert!(instrument.dual_pol);
         assert!(instrument.propagation);
         assert_eq!(instrument.scan_timing, ScanTiming::TimedVolume);
+        assert_eq!(
+            instrument.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
+        );
         assert!(instrument.instrument_noise);
         assert!(instrument.fold_velocity);
         assert!(!instrument.ref_gate_texture);
@@ -5987,6 +6210,14 @@ mod tests {
         assert!(real.dual_pol && real.propagation && real.spectrum_width);
         assert!(real.terrain_blockage && real.instrument_noise && real.fold_velocity);
         assert_eq!(real.scan_timing, ScanTiming::TimedVolume);
+        assert_eq!(
+            real.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
+        );
+        assert_eq!(
+            real.missing_neighbor_policy,
+            app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor
+        );
         assert_eq!(real.beam_width_deg, defaults.beam_width_deg);
         assert_eq!(real.prf_hz, defaults.prf_hz);
         assert_eq!(real.system_phidp_deg, 0.0);
@@ -6004,11 +6235,25 @@ mod tests {
         assert!(!clean.instrument_noise);
         assert!(!clean.fold_velocity);
         assert_eq!(clean.scan_timing, ScanTiming::InstantaneousTruth);
+        assert_eq!(
+            clean.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart
+        );
+
+        state.apply_recipe(SyntheticRadarRecipe::CleanTruth);
+        let truth = state.to_config().unwrap();
+        assert_eq!(truth.scan_timing, ScanTiming::InstantaneousTruth);
+        assert_eq!(
+            truth.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart
+        );
 
         state.apply_recipe(SyntheticRadarRecipe::MaximumFidelity);
+        let maximum = state.to_config().unwrap();
+        assert_eq!(maximum.beam_integration, BeamIntegration::Reference);
         assert_eq!(
-            state.to_config().unwrap().beam_integration,
-            BeamIntegration::Reference
+            maximum.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
         );
     }
 
