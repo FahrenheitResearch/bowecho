@@ -62,6 +62,40 @@ every field and hour from light, full-diagnostic, and GDEX imports to the
 screenshots folder. It is separate from simulated radar, which enters the radar
 viewer instead of the model store.
 
+## Operational HRRR/RRFS forecast radar
+
+The **Operational forecast radar** card uses the same polar renderer, radar
+location/range controls, loop engine, refresh action, product picker, and
+CfRadial export as raw WRF. Its input is native hybrid-level model GRIB, not a
+pre-rendered reflectivity image.
+
+- **Latest HRRR - build** resolves one current published cycle through the
+  existing SimSat HRRR source logic and can build f00, f01, or the two-frame
+  f00/f01 loop. Downloads use SimSat's resumable native-file downloader and
+  input directory; BowEcho does not create a second HRRR cache.
+- **Build cached HRRR** discovers complete native files in the shared SimSat
+  input and model-cache directories.
+- **Choose local HRRR/RRFS files...** is an unrestricted multi-file picker for
+  native GRIB. Compatible valid times become ordinary radar-loop frames.
+- **Refresh** re-resolves a latest-HRRR request, but deliberately reuses the
+  exact snapshot for local/cached selections.
+
+The reader crops the native model around the virtual radar, retains hybrid
+height and earth-relative winds, converts pressure vertical velocity (omega)
+to geometric `w`, rotates grid-relative winds when the GRIB declares them, and
+streams cloud liquid, cloud ice, rain, snow, and graupel through additive
+scattering without keeping duplicate full species volumes. SPFH is converted
+using its declared moisture basis; optional TKE enters spectrum width.
+
+HRRR uses an explicitly versioned Thompson-family category mapping. RRFS uses
+the categories actually present in the file and does not infer an unencoded
+microphysics scheme. Missing number fields use documented bulk-PSD defaults.
+These are **bulk S-band dual-pol-like forecast assumptions**, not property
+T-matrix science, observed calibration, or proof that the operational model
+ran a particular hidden scheme configuration. Incomplete or inconsistent
+base/species inventories fail closed and every assumption is retained in
+volume/CfRadial provenance.
+
 ## Operating modes
 
 - **Truth** keeps one model instant, center sampling, unfolded air motion, and
