@@ -663,7 +663,7 @@ impl PolarAccumulator {
         self.zv += weight * f64::from(contribution.zv.max(0.0));
         self.cov_re += weight * finite_or_zero(contribution.cov_re);
         self.cov_im += weight * finite_or_zero(contribution.cov_im);
-        self.kdp += weight * f64::from(contribution.kdp_deg_km.max(0.0));
+        self.kdp += weight * finite_or_zero(contribution.kdp_deg_km);
         self.ah += weight * f64::from(contribution.ah_db_km.max(0.0));
         self.av += weight * f64::from(contribution.av_db_km.max(0.0));
 
@@ -706,7 +706,7 @@ impl PolarAccumulator {
             cov_re: finite_signed(self.cov_re, MAX_LINEAR_Z),
             cov_im: finite_signed(self.cov_im, MAX_LINEAR_Z),
             covariance_magnitude: finite_nonnegative(covariance, MAX_LINEAR_Z),
-            kdp_deg_km: finite_nonnegative(self.kdp, 1_000.0),
+            kdp_deg_km: finite_signed(self.kdp, 1_000.0),
             ah_db_km: finite_nonnegative(self.ah, 100.0),
             av_db_km: finite_nonnegative(self.av, 100.0),
             fall_speed_mps: finite_nonnegative(fall_speed, 50.0),
@@ -879,6 +879,29 @@ mod tests {
         let sample = accumulator.finalize();
         assert!(sample.zdr_db.abs() < 0.1, "ZDR={}", sample.zdr_db);
         assert!(sample.rho_hv > 0.99, "rhoHV={}", sample.rho_hv);
+    }
+
+    #[test]
+    fn polar_accumulator_preserves_signed_kdp() {
+        let contribution = BulkContribution {
+            zh: 10.0,
+            zv: 10.0,
+            kdp_deg_km: -2.5,
+            ..BulkContribution::default()
+        };
+        let mut accumulator = PolarAccumulator::default();
+        accumulator.add(2.0, contribution);
+        assert_eq!(accumulator.finalize().kdp_deg_km, -5.0);
+
+        let mut legacy_positive = PolarAccumulator::default();
+        legacy_positive.add(
+            2.0,
+            BulkContribution {
+                kdp_deg_km: 2.5,
+                ..contribution
+            },
+        );
+        assert_eq!(legacy_positive.finalize().kdp_deg_km, 5.0);
     }
 
     #[test]

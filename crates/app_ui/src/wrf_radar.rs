@@ -913,7 +913,8 @@ pub struct WrfRadarFields {
     pub v: Vec<f32>,
     pub w: Vec<f32>,
     pub terrain_m: Vec<f32>,
-    /// Compact scheme-aware polarimetric state. Eight one-byte planes retain
+    /// Compact scheme-aware polarimetric state. Seven one-byte planes and one
+    /// signed two-byte KDP plane retain
     /// the ratios/propagation/fall moments while `dbz` remains the full-precision
     /// ZH plane, avoiding several additional 193 MiB f32 volumes on the
     /// documented 800x800x79 nest.
@@ -946,7 +947,7 @@ struct CompactPolarFields {
     zdr: Vec<i8>,
     rho: Vec<u8>,
     covariance_phase: Vec<i8>,
-    kdp: Vec<u8>,
+    kdp: Vec<i16>,
     ah: Vec<u8>,
     adp: Vec<i8>,
     fall_speed: Vec<u8>,
@@ -1003,7 +1004,7 @@ impl CompactPolarFields {
         self.rho[index] = (sample.rho_hv.clamp(0.0, 1.0) * u8::MAX as f32).round() as u8;
         let phase_deg = sample.cov_im.atan2(sample.cov_re).to_degrees();
         self.covariance_phase[index] = quantize_i8(phase_deg, COMPACT_PHASE_STEP_DEG);
-        self.kdp[index] = quantize_u8(sample.kdp_deg_km, COMPACT_KDP_STEP_DEG_KM);
+        self.kdp[index] = quantize_i16(sample.kdp_deg_km, COMPACT_KDP_STEP_DEG_KM);
         self.ah[index] = quantize_u8(sample.ah_db_km, COMPACT_ATTEN_STEP_DB_KM);
         self.adp[index] = quantize_i8(sample.ah_db_km - sample.av_db_km, COMPACT_ATTEN_STEP_DB_KM);
         self.fall_speed[index] = quantize_u8(sample.fall_speed_mps, COMPACT_FALL_STEP_MPS);
@@ -1025,6 +1026,16 @@ fn quantize_u8(value: f32, step: f32) -> u8 {
 fn quantize_i8(value: f32, step: f32) -> i8 {
     if value.is_finite() && step > 0.0 {
         (value / step).round().clamp(i8::MIN as f32, i8::MAX as f32) as i8
+    } else {
+        0
+    }
+}
+
+fn quantize_i16(value: f32, step: f32) -> i16 {
+    if value.is_finite() && step > 0.0 {
+        (value / step)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16
     } else {
         0
     }
@@ -3760,7 +3771,7 @@ fn temporal_memory_estimate(
         compact_bytes_per_scene = compact_bytes_per_scene
             .checked_add(
                 cells_per_scene
-                    .checked_mul(8)
+                    .checked_mul(9)
                     .ok_or_else(|| "WRF polar memory estimate overflowed".to_string())?,
             )
             .ok_or_else(|| "WRF polar memory estimate overflowed".to_string())?;
@@ -4080,6 +4091,26 @@ mod tests {
         let single_peak = temporal_required_peak_bytes(one, false).unwrap();
         let two_scene_peak = temporal_required_peak_bytes(one, true).unwrap();
         assert_eq!(two_scene_peak - single_peak, one.scene_bytes().unwrap());
+    }
+
+    #[test]
+    fn temporal_preflight_counts_nine_compact_polar_bytes_per_cell() {
+        let group = fingerprint_group(fingerprint_scene(
+            "C:/private/a/wrfout_d03",
+            "sha256:source-a",
+            0,
+        ));
+        let scalar_config = SyntheticRadarConfig::default();
+        let polar_config = SyntheticRadarConfig {
+            dual_pol: true,
+            ..scalar_config.clone()
+        };
+        let scalar = temporal_memory_estimate(&group, &scalar_config, 1).unwrap();
+        let polar = temporal_memory_estimate(&group, &polar_config, 1).unwrap();
+        assert_eq!(
+            polar.compact_bytes_per_scene - scalar.compact_bytes_per_scene,
+            polar.cells_per_scene * 9
+        );
     }
 
     #[test]
@@ -4406,6 +4437,37 @@ mod tests {
             compact.store(index, sample);
         }
         fields.polarimetric = Some(compact);
+    }
+
+    #[test]
+    fn compact_polar_fields_preserve_signed_kdp() {
+        let profile = crate::wrf_radar_physics::detect_scheme(Some(10), ["QRAIN", "QNRAIN"]);
+        let mut compact = CompactPolarFields::new(2, profile, vec!["QRAIN".to_string()]);
+        let base = crate::wrf_radar_physics::IntrinsicPolarSample {
+            zh: 10.0,
+            zv: 10.0,
+            covariance_magnitude: 10.0,
+            rho_hv: 1.0,
+            ..crate::wrf_radar_physics::IntrinsicPolarSample::default()
+        };
+        compact.store(
+            0,
+            crate::wrf_radar_physics::IntrinsicPolarSample {
+                kdp_deg_km: -12.3,
+                ..base
+            },
+        );
+        compact.store(
+            1,
+            crate::wrf_radar_physics::IntrinsicPolarSample {
+                kdp_deg_km: 12.3,
+                ..base
+            },
+        );
+
+        assert_eq!(compact.kdp, [-123, 123]);
+        assert!((compact.contribution_at(0, 10.0).kdp_deg_km + 12.3).abs() < 1.0e-6);
+        assert!((compact.contribution_at(1, 10.0).kdp_deg_km - 12.3).abs() < 1.0e-6);
     }
 
     #[test]

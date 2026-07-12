@@ -55,8 +55,8 @@ impl ComplexCovariance {
 /// Specific differential phase in degrees per kilometre.
 ///
 /// This type permits a finite negative value because vertically preferred
-/// orientation can reverse the sign. Conversion to the current application
-/// accumulator rejects negative KDP instead of relying on its clamp-to-zero.
+/// orientation can reverse the sign. The application accumulator preserves
+/// signed KDP within its symmetric representable range.
 #[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
 pub struct SpecificDifferentialPhase(f64);
 
@@ -275,16 +275,12 @@ impl AdditiveScattering {
     /// application `PolarAccumulator::add` seam.
     ///
     /// The conversion is deliberately fallible: the existing accumulator
-    /// accepts only positive-down fall speed and nonnegative KDP, and stores
-    /// f32. No clamping or saturation occurs here.
+    /// accepts only positive-down fall speed and stores f32. Signed KDP is
+    /// accepted over the accumulator's symmetric range. No clamping or
+    /// saturation occurs here.
     pub fn to_polar_accumulator_quantities(
         self,
     ) -> Result<PolarAccumulatorQuantities, OutputError> {
-        if self.kdp.get() < 0.0 {
-            return Err(OutputError::NegativeKdpNotRepresentable {
-                value: self.kdp.get(),
-            });
-        }
         let (fall_speed_mps, fall_speed_variance_m2s2) = self.fall_speed.mean_variance(self.zh)?;
         accumulator_range("ZH", self.zh.get(), 0.0, ACCUMULATOR_MAX_LINEAR_Z)?;
         accumulator_range("ZV", self.zv.get(), 0.0, ACCUMULATOR_MAX_LINEAR_Z)?;
@@ -294,7 +290,12 @@ impl AdditiveScattering {
             0.0,
             ACCUMULATOR_MAX_LINEAR_Z,
         )?;
-        accumulator_range("KDP", self.kdp.get(), 0.0, ACCUMULATOR_MAX_KDP_DEG_KM)?;
+        accumulator_range(
+            "KDP",
+            self.kdp.get(),
+            -ACCUMULATOR_MAX_KDP_DEG_KM,
+            ACCUMULATOR_MAX_KDP_DEG_KM,
+        )?;
         accumulator_range("AH", self.ah.get(), 0.0, ACCUMULATOR_MAX_ATTENUATION_DB_KM)?;
         accumulator_range("AV", self.av.get(), 0.0, ACCUMULATOR_MAX_ATTENUATION_DB_KM)?;
         accumulator_range(
@@ -418,7 +419,8 @@ pub enum OutputError {
     FallMomentsWithoutReflectivity,
     #[error("fall-speed moments imply negative variance (first={first}, second={second}, ZH={zh})")]
     NegativeFallSpeedVariance { first: f64, second: f64, zh: f64 },
-    #[error("negative KDP {value} cannot be passed to the current PolarAccumulator seam")]
+    #[deprecated(note = "signed KDP is representable by the application accumulator")]
+    #[error("negative KDP {value} cannot be passed to the legacy PolarAccumulator seam")]
     NegativeKdpNotRepresentable { value: f64 },
     #[error("{field} value {value} is outside finite f32 range")]
     F32Range { field: &'static str, value: f64 },
@@ -460,6 +462,7 @@ mod tests {
         assert_eq!(quantities.zv, 80.0);
         assert_eq!(quantities.cov_re, 50.0);
         assert_eq!(quantities.cov_im, -10.0);
+        assert_eq!(quantities.kdp_deg_km, 0.7);
         assert!((quantities.fall_speed_mps - 4.0).abs() < 1.0e-6);
         assert!((quantities.fall_speed_variance_m2s2 - 2.25).abs() < 1.0e-6);
     }
@@ -496,14 +499,49 @@ mod tests {
     }
 
     #[test]
-    fn negative_kdp_is_representable_but_not_silently_clamped_at_app_seam() {
+    fn signed_kdp_survives_the_app_seam_without_clamping() {
         let mut components = sample(10.0, 1.0, 0.0).components();
         components[4] = -0.25;
         let output = AdditiveScattering::from_components(components).unwrap();
         assert_eq!(
-            output.to_polar_accumulator_quantities(),
-            Err(OutputError::NegativeKdpNotRepresentable { value: -0.25 })
+            output.to_polar_accumulator_quantities().unwrap().kdp_deg_km,
+            -0.25
         );
+    }
+
+    #[test]
+    fn signed_kdp_app_seam_uses_a_strict_symmetric_range() {
+        for value in [-ACCUMULATOR_MAX_KDP_DEG_KM, ACCUMULATOR_MAX_KDP_DEG_KM] {
+            let mut components = sample(10.0, 1.0, 0.0).components();
+            components[4] = value;
+            assert_eq!(
+                AdditiveScattering::from_components(components)
+                    .unwrap()
+                    .to_polar_accumulator_quantities()
+                    .unwrap()
+                    .kdp_deg_km,
+                value as f32
+            );
+        }
+
+        for value in [
+            -ACCUMULATOR_MAX_KDP_DEG_KM - 0.1,
+            ACCUMULATOR_MAX_KDP_DEG_KM + 0.1,
+        ] {
+            let mut components = sample(10.0, 1.0, 0.0).components();
+            components[4] = value;
+            assert!(matches!(
+                AdditiveScattering::from_components(components)
+                    .unwrap()
+                    .to_polar_accumulator_quantities(),
+                Err(OutputError::PolarAccumulatorRange {
+                    field: "KDP",
+                    minimum: -1_000.0,
+                    maximum: 1_000.0,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
