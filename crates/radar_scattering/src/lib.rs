@@ -1,9 +1,10 @@
 //! Non-UI radar-scattering primitives and a fail-closed offline LUT format.
 //!
 //! The crate deliberately stops at the science/serialization boundary. It
-//! does not decode WRF, select a microphysics scheme, integrate a particle
-//! size distribution, or write application products. In particular, no LUT
-//! shipped by this crate is represented as production T-matrix science.
+//! does not decode WRF, select a microphysics scheme, or write application
+//! products. Its scheme-native PSD support begins only after a caller supplies
+//! a typed raw microphysics tuple. In particular, no LUT shipped by this crate
+//! is represented as production T-matrix science.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +14,7 @@ mod lut;
 mod orientation;
 mod output;
 mod particle;
+mod scheme_psd;
 mod science;
 mod tmatrix_runtime;
 
@@ -47,6 +49,15 @@ pub use particle::{
     P3ParticleState, P3Provenance, ParticleEnvironment, ParticleError, ParticleProvenance,
     ParticleRecord, ParticleShape, ParticleState, ProvenanceError, SourceVariable,
 };
+pub use scheme_psd::{
+    DEFAULT_ADDITIVE_ABSOLUTE_TOLERANCES, ISHMAEL_DELTA_RANGE, ISHMAEL_DENSITY_RANGE_KG_M3,
+    ISHMAEL_GAMMA_SHAPE, ISHMAEL_MONOMER_SEMI_AXIS_M, ISHMAEL_PSD_REVISION, IshmaelPsd,
+    IshmaelPsdInput, IshmaelReconstructionAudit, PsdError, PsdFallSpeedAuthority,
+    PsdFallSpeedProvenance, PsdIntegrationAudit, PsdIntegrationConfig, PsdIntegrationError,
+    PsdIntegrationResult, PsdParticleDomain, PsdParticleNode, PsdParticleSupport,
+    PsdQuadratureLevel, PsdQuadratureRule, PsdSourceCategory, PsdSpheroidHabit,
+    SCHEME_PSD_REVISION, SchemePsdRevision, analytic_gamma_moment, integrate_ishmael_psd,
+};
 pub use science::{
     EffectiveMediumRule, KernelModel, MeltingModel, OrientationModel, ScienceError,
     ScienceMetadata, TMatrixImplementation, TableValidation, TemporalSampling,
@@ -56,6 +67,6 @@ pub use tmatrix_runtime::{
     HomogeneousMaterial, NumberScalingPolicy, RadarConventionDescriptor, RadarHvConvention,
     RadarViewApplicability, RadarViewGeometry, ResearchTMatrixLut, ScaledScatteringContribution,
     SpheroidConvention, TMatrixEvaluationRequest, TMatrixExecutionDescriptor, TMatrixLoadError,
-    TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory, TMatrixPopulationRole,
-    TMatrixTableDescriptor, TerminalSpeedPolicy,
+    TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory, TMatrixParticleNodeQuery,
+    TMatrixPopulationRole, TMatrixTableDescriptor, TerminalSpeedPolicy,
 };

@@ -14,7 +14,8 @@ use crate::{
     AdditiveScattering, AxisCoordinate, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
     DiagnosticWetCategory, EffectiveMediumRule, InterpolationError, KernelModel, LutError,
     MeltingModel, MicrophysicsFamily, MixtureTopology, OfflineLut, OrientationModel, OutputError,
-    ParticleState, Sha256Digest, TMatrixImplementation, TableValidation, TemporalSampling, Unit,
+    ParticleState, PsdError, PsdFallSpeedProvenance, PsdParticleDomain, PsdParticleNode,
+    PsdSpheroidHabit, Sha256Digest, TMatrixImplementation, TableValidation, TemporalSampling, Unit,
 };
 
 const PYTMATRIX_KERNEL: &str = "pytmatrix-0.3.3";
@@ -373,6 +374,185 @@ pub struct TMatrixEvaluationRequest {
     view: RadarViewGeometry,
 }
 
+/// One dry scheme-PSD particle query against a table normalized to exactly
+/// one particle per cubic metre.
+///
+/// Population weighting is deliberately absent. Callers integrate the
+/// returned [`AdditiveScattering`] with their PSD node's number-density
+/// weight. Orientation, spheroid family, exact frequency, and every table
+/// coordinate remain fail-closed through the existing runtime binding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TMatrixParticleNodeQuery {
+    temperature_k: f64,
+    equivolume_diameter_m: f64,
+    bulk_density_kg_m3: f64,
+    minor_to_major_axis_ratio: f64,
+    habit: PsdSpheroidHabit,
+    rime_mass_fraction: Option<f64>,
+    rime_density_kg_m3: Option<f64>,
+    positive_down_fall_speed_m_s: f64,
+    fall_speed: PsdFallSpeedProvenance,
+    orientation: OrientationModel,
+    request: TMatrixEvaluationRequest,
+}
+
+impl TMatrixParticleNodeQuery {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        temperature_k: f64,
+        equivolume_diameter_m: f64,
+        bulk_density_kg_m3: f64,
+        minor_to_major_axis_ratio: f64,
+        habit: PsdSpheroidHabit,
+        rime_mass_fraction: Option<f64>,
+        rime_density_kg_m3: Option<f64>,
+        positive_down_fall_speed_m_s: f64,
+        fall_speed: PsdFallSpeedProvenance,
+        orientation: OrientationModel,
+        request: TMatrixEvaluationRequest,
+    ) -> Result<Self, EvaluationError> {
+        for (field, value) in [
+            ("particle-node temperature", temperature_k),
+            (
+                "particle-node equivalent-volume diameter",
+                equivolume_diameter_m,
+            ),
+            ("particle-node bulk density", bulk_density_kg_m3),
+            (
+                "particle-node positive-down fall speed",
+                positive_down_fall_speed_m_s,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(EvaluationError::InvalidQuery { field, value });
+            }
+        }
+        if !(minor_to_major_axis_ratio.is_finite()
+            && 0.0 < minor_to_major_axis_ratio
+            && minor_to_major_axis_ratio <= 1.0)
+        {
+            return Err(EvaluationError::InvalidQuery {
+                field: "particle-node minor-to-major axis ratio",
+                value: minor_to_major_axis_ratio,
+            });
+        }
+        let effectively_spherical = (minor_to_major_axis_ratio - 1.0).abs() <= 1.0e-10;
+        if effectively_spherical != (habit == PsdSpheroidHabit::Spherical) {
+            return Err(EvaluationError::ParticleNodeHabitGeometryMismatch {
+                habit,
+                minor_to_major_axis_ratio,
+            });
+        }
+        if let Some(value) = rime_mass_fraction
+            && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(EvaluationError::InvalidQuery {
+                field: "particle-node rime mass fraction",
+                value,
+            });
+        }
+        if let Some(value) = rime_density_kg_m3
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(EvaluationError::InvalidQuery {
+                field: "particle-node rime density",
+                value,
+            });
+        }
+        Ok(Self {
+            temperature_k,
+            equivolume_diameter_m,
+            bulk_density_kg_m3,
+            minor_to_major_axis_ratio,
+            habit,
+            rime_mass_fraction,
+            rime_density_kg_m3,
+            positive_down_fall_speed_m_s,
+            fall_speed,
+            orientation,
+            request,
+        })
+    }
+
+    pub fn from_psd_node(
+        node: &PsdParticleNode,
+        temperature_k: f64,
+        positive_down_fall_speed_m_s: f64,
+        fall_speed: PsdFallSpeedProvenance,
+        orientation: OrientationModel,
+        request: TMatrixEvaluationRequest,
+    ) -> Result<Self, EvaluationError> {
+        Self::new(
+            temperature_k,
+            node.equivolume_diameter_m(),
+            node.bulk_density_kg_m3(),
+            node.minor_to_major_axis_ratio(),
+            node.habit(),
+            node.rime_mass_fraction(),
+            node.rime_density_kg_m3(),
+            positive_down_fall_speed_m_s,
+            fall_speed,
+            orientation,
+            request,
+        )
+    }
+
+    #[must_use]
+    pub const fn temperature_k(&self) -> f64 {
+        self.temperature_k
+    }
+
+    #[must_use]
+    pub const fn equivolume_diameter_m(&self) -> f64 {
+        self.equivolume_diameter_m
+    }
+
+    #[must_use]
+    pub const fn bulk_density_kg_m3(&self) -> f64 {
+        self.bulk_density_kg_m3
+    }
+
+    #[must_use]
+    pub const fn minor_to_major_axis_ratio(&self) -> f64 {
+        self.minor_to_major_axis_ratio
+    }
+
+    #[must_use]
+    pub const fn habit(&self) -> PsdSpheroidHabit {
+        self.habit
+    }
+
+    #[must_use]
+    pub const fn rime_mass_fraction(&self) -> Option<f64> {
+        self.rime_mass_fraction
+    }
+
+    #[must_use]
+    pub const fn rime_density_kg_m3(&self) -> Option<f64> {
+        self.rime_density_kg_m3
+    }
+
+    #[must_use]
+    pub const fn positive_down_fall_speed_m_s(&self) -> f64 {
+        self.positive_down_fall_speed_m_s
+    }
+
+    #[must_use]
+    pub const fn fall_speed(&self) -> PsdFallSpeedProvenance {
+        self.fall_speed
+    }
+
+    #[must_use]
+    pub const fn orientation(&self) -> &OrientationModel {
+        &self.orientation
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> TMatrixEvaluationRequest {
+        self.request
+    }
+}
+
 /// Auditable conversion from a closure's per-dry-air number to the number
 /// density used to scale a per-1-m3 monodisperse table node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -518,6 +698,44 @@ impl ResearchTMatrixLut {
     #[must_use]
     pub const fn offline_lut(&self) -> &OfflineLut {
         &self.lut
+    }
+
+    /// Exact diameter/density/aspect envelope of a dry property-particle
+    /// table, suitable for PSD omission accounting before node evaluation.
+    pub fn dry_particle_node_domain(&self) -> Result<PsdParticleDomain, EvaluationError> {
+        if self.descriptor.category
+            != TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle
+            || self.descriptor.population_role
+                != TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle
+        {
+            return Err(EvaluationError::DryParticleNodeTableRequired {
+                actual_category: self.descriptor.category,
+                actual_role: self.descriptor.population_role,
+            });
+        }
+        let bounds = |kind| -> Result<[f64; 2], EvaluationError> {
+            let axis = self
+                .lut
+                .header()
+                .axes()
+                .iter()
+                .find(|axis| axis.kind() == kind)
+                .ok_or(EvaluationError::MissingParticleNodeTableAxis(kind))?;
+            let coordinates = axis.coordinates();
+            let minimum = *coordinates
+                .first()
+                .ok_or(EvaluationError::MissingParticleNodeTableAxis(kind))?;
+            let maximum = *coordinates
+                .last()
+                .ok_or(EvaluationError::MissingParticleNodeTableAxis(kind))?;
+            Ok([minimum, maximum])
+        };
+        PsdParticleDomain::new(
+            bounds(AxisKind::EquivolumeDiameter)?,
+            bounds(AxisKind::BulkDensity)?,
+            bounds(AxisKind::MinorToMajorAxisRatio)?,
+        )
+        .map_err(EvaluationError::ParticleNodeDomain)
     }
 
     /// Interpolate a per-particle table node and scale every additive output
@@ -684,6 +902,145 @@ impl ResearchTMatrixLut {
         per_m3
             .checked_scale(number_m3)
             .map_err(EvaluationError::Output)
+    }
+
+    /// Interpolate one dry property-aware particle without applying any PSD
+    /// population scale.
+    ///
+    /// The table loader already requires exactly one particle per cubic metre
+    /// and forbids extrapolation. This method adds a typed scheme-PSD seam
+    /// while preserving every existing table identity, material, ODF,
+    /// frequency, view, shape, and axis check.
+    pub fn evaluate_dry_particle_node_per_m3(
+        &self,
+        query: &TMatrixParticleNodeQuery,
+    ) -> Result<AdditiveScattering, EvaluationError> {
+        if self.descriptor.category
+            != TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle
+            || self.descriptor.population_role
+                != TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle
+        {
+            return Err(EvaluationError::DryParticleNodeTableRequired {
+                actual_category: self.descriptor.category,
+                actual_role: self.descriptor.population_role,
+            });
+        }
+        if self.descriptor.normalization_number_concentration_m3 != 1.0 {
+            return Err(EvaluationError::ParticleNodeNormalizationMismatch {
+                actual_m3: self.descriptor.normalization_number_concentration_m3,
+            });
+        }
+        let request = query.request;
+        if request.spheroid != self.descriptor.spheroid {
+            return Err(EvaluationError::SpheroidConventionMismatch {
+                expected: self.descriptor.spheroid,
+                actual: request.spheroid,
+            });
+        }
+        let habit_matches = match query.habit {
+            PsdSpheroidHabit::Oblate => request.spheroid == SpheroidConvention::OblateMinorVertical,
+            PsdSpheroidHabit::Prolate => {
+                request.spheroid == SpheroidConvention::ProlateMajorVertical
+            }
+            PsdSpheroidHabit::Spherical => true,
+        };
+        if !habit_matches {
+            return Err(EvaluationError::ParticleNodeSpheroidMismatch {
+                habit: query.habit,
+                actual: request.spheroid,
+            });
+        }
+        let expected_orientation = self.descriptor.odf.orientation_model();
+        if query.orientation != expected_orientation {
+            return Err(EvaluationError::OrientationMismatch {
+                expected: expected_orientation,
+                actual: query.orientation.clone(),
+            });
+        }
+        if let Some(expected_k) = self.descriptor.material.fixed_temperature_k()
+            && query.temperature_k != expected_k
+        {
+            return Err(EvaluationError::FixedDielectricTemperatureMismatch {
+                expected_k,
+                actual_k: query.temperature_k,
+            });
+        }
+        match self.descriptor.material {
+            TMatrixMaterial::Homogeneous {
+                material: HomogeneousMaterial::Ice,
+                mass_density_kg_m3,
+                ..
+            } => {
+                if query.bulk_density_kg_m3 != mass_density_kg_m3 {
+                    return Err(EvaluationError::MaterialDensityMismatch {
+                        expected_kg_m3: mass_density_kg_m3,
+                        actual_kg_m3: query.bulk_density_kg_m3,
+                    });
+                }
+            }
+            TMatrixMaterial::SymmetricBruggemanSphericalAirIceMatzler2006V1 { .. } => {}
+            TMatrixMaterial::Homogeneous {
+                material: HomogeneousMaterial::LiquidWater,
+                ..
+            }
+            | TMatrixMaterial::MaxwellGarnettIceHostWaterInclusion { .. }
+            | TMatrixMaterial::SymmetricBruggemanSphericalAirIceWaterV1 { .. }
+            | TMatrixMaterial::TemperatureDependentLiquidWaterLiebe1991 { .. } => {
+                return Err(EvaluationError::DryParticleNodeMaterialRequired);
+            }
+        }
+
+        let frequency_axis = self
+            .lut
+            .header()
+            .axes()
+            .iter()
+            .find(|axis| axis.kind() == AxisKind::Frequency)
+            .ok_or(EvaluationError::MissingParticleNodeTableAxis(
+                AxisKind::Frequency,
+            ))?;
+        if frequency_axis.coordinates().len() != 1 {
+            return Err(EvaluationError::ParticleNodeFrequencyMustBeSingleton {
+                actual_coordinates: frequency_axis.coordinates().len(),
+            });
+        }
+        let exact_frequency_hz = frequency_axis.coordinates()[0];
+        if request.frequency_hz != exact_frequency_hz {
+            return Err(EvaluationError::ParticleNodeFrequencyMismatch {
+                expected_hz: exact_frequency_hz,
+                actual_hz: request.frequency_hz,
+            });
+        }
+
+        let mut coordinates = Vec::with_capacity(self.lut.header().axes().len());
+        for axis in self.lut.header().axes() {
+            let value = match axis.kind() {
+                AxisKind::EquivolumeDiameter => query.equivolume_diameter_m,
+                AxisKind::Temperature => query.temperature_k,
+                AxisKind::BulkDensity => query.bulk_density_kg_m3,
+                AxisKind::CondensedVolumeFraction => {
+                    condensed_volume_fraction(query.bulk_density_kg_m3, 0.0)?
+                }
+                AxisKind::LiquidMassFraction => 0.0,
+                AxisKind::MinorToMajorAxisRatio => query.minor_to_major_axis_ratio,
+                AxisKind::Frequency => request.frequency_hz,
+                AxisKind::RadarElevation => request.view.beam_elevation_deg(),
+                AxisKind::RimeMassFraction => query.rime_mass_fraction.ok_or(
+                    EvaluationError::MissingParticleNodeAxisProperty(axis.kind()),
+                )?,
+                AxisKind::RimeDensity => query.rime_density_kg_m3.ok_or(
+                    EvaluationError::MissingParticleNodeAxisProperty(axis.kind()),
+                )?,
+                AxisKind::CantingAngle | AxisKind::TimeOffset => {
+                    return Err(EvaluationError::UnsupportedAxis(axis.kind()));
+                }
+            };
+            coordinates.push(AxisCoordinate::new(axis.kind(), value)?);
+        }
+        replace_fall_moments(
+            self.lut.interpolate(&coordinates)?,
+            query.positive_down_fall_speed_m_s,
+        )
     }
 
     /// Add a category contribution without exposing any nonlinear derived
@@ -951,6 +1308,29 @@ pub enum EvaluationError {
         expected: TMatrixParticleCategory,
         actual: TMatrixParticleCategory,
     },
+    #[error(
+        "dry per-particle PSD evaluation requires a dry property-aware table, got {actual_category:?}/{actual_role:?}"
+    )]
+    DryParticleNodeTableRequired {
+        actual_category: TMatrixParticleCategory,
+        actual_role: TMatrixPopulationRole,
+    },
+    #[error("per-particle PSD table normalization must be exactly 1 m^-3, got {actual_m3}")]
+    ParticleNodeNormalizationMismatch { actual_m3: f64 },
+    #[error("PSD node habit {habit:?} cannot use requested spheroid convention {actual:?}")]
+    ParticleNodeSpheroidMismatch {
+        habit: PsdSpheroidHabit,
+        actual: SpheroidConvention,
+    },
+    #[error(
+        "PSD node habit {habit:?} is inconsistent with minor-to-major ratio {minor_to_major_axis_ratio}"
+    )]
+    ParticleNodeHabitGeometryMismatch {
+        habit: PsdSpheroidHabit,
+        minor_to_major_axis_ratio: f64,
+    },
+    #[error("dry per-particle PSD evaluation requires a dry ice material table")]
+    DryParticleNodeMaterialRequired,
     #[error("particle category has no number concentration; PSD integration is unsupported")]
     MissingNumberConcentration,
     #[error("wet-coexistence/mixed-material evaluation is not implemented")]
@@ -1016,6 +1396,20 @@ pub enum EvaluationError {
     UnsupportedAxis(AxisKind),
     #[error("closed particle does not provide property required by axis {0:?}")]
     MissingAxisProperty(AxisKind),
+    #[error("PSD particle node does not provide property required by axis {0:?}")]
+    MissingParticleNodeAxisProperty(AxisKind),
+    #[error("dry particle-node table does not provide required axis {0:?}")]
+    MissingParticleNodeTableAxis(AxisKind),
+    #[error("dry particle-node table domain is invalid: {0}")]
+    ParticleNodeDomain(#[source] PsdError),
+    #[error(
+        "dry particle-node table must bind exactly one frequency coordinate, got {actual_coordinates}"
+    )]
+    ParticleNodeFrequencyMustBeSingleton { actual_coordinates: usize },
+    #[error(
+        "dry particle-node table requires exact frequency {expected_hz} Hz, got {actual_hz} Hz"
+    )]
+    ParticleNodeFrequencyMismatch { expected_hz: f64, actual_hz: f64 },
     #[error("number concentration per cubic metre is invalid: {value}")]
     InvalidNumberDensity { value: f64 },
     #[error(transparent)]
@@ -2712,8 +3106,9 @@ mod tests {
     use super::*;
     use crate::{
         Axis, ClosureContext, ConventionalCategoryInput, DiagnosticCoexistenceInput,
-        GeneratorMetadata, OrientationDefinition, P3CategoryInput, ScienceMetadata,
-        close_conventional_category, close_p3_category,
+        GeneratorMetadata, IshmaelIceCategory, IshmaelPsd, IshmaelPsdInput, OrientationDefinition,
+        P3CategoryInput, PsdFallSpeedAuthority, PsdIntegrationConfig, PsdParticleSupport,
+        ScienceMetadata, close_conventional_category, close_p3_category, integrate_ishmael_psd,
     };
 
     const FREQUENCY_HZ: f64 = 2_700_832_954.954_955;
@@ -2939,6 +3334,73 @@ mod tests {
         .unwrap()
     }
 
+    fn synthetic_speed_provenance() -> PsdFallSpeedProvenance {
+        PsdFallSpeedProvenance::new(
+            PsdFallSpeedAuthority::SyntheticTestOnly,
+            Sha256Digest::compute(b"tmatrix-particle-node-test-speed-v1"),
+        )
+    }
+
+    fn dry_property_runtime(spheroid: SpheroidConvention) -> ResearchTMatrixLut {
+        let axes = vec![
+            Axis::new(
+                AxisKind::EquivolumeDiameter,
+                Unit::Meter,
+                vec![1.0e-6, 0.01],
+            )
+            .unwrap(),
+            Axis::new(AxisKind::Temperature, Unit::Kelvin, vec![200.0, 300.0]).unwrap(),
+            Axis::new(
+                AxisKind::BulkDensity,
+                Unit::KilogramPerCubicMeter,
+                vec![50.0, 917.0],
+            )
+            .unwrap(),
+            Axis::new(
+                AxisKind::MinorToMajorAxisRatio,
+                Unit::UnitlessFraction,
+                vec![0.1, 1.0],
+            )
+            .unwrap(),
+            Axis::new(AxisKind::Frequency, Unit::Hertz, vec![FREQUENCY_HZ]).unwrap(),
+            Axis::new(AxisKind::RadarElevation, Unit::Degree, vec![-0.5, 20.0]).unwrap(),
+        ];
+        let science = ScienceMetadata::new(
+            KernelModel::TMatrix {
+                implementation: TMatrixImplementation::PyTMatrix033,
+            },
+            gaussian20_odf().orientation_model(),
+            MeltingModel::Dry,
+            TemporalSampling::Instantaneous,
+            TableValidation::ResearchOnlyUnvalidated,
+        )
+        .unwrap();
+        let descriptor = TMatrixTableDescriptor {
+            table_id: "software-test-dry-property-node".to_owned(),
+            category: TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle,
+            population_role: TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle,
+            density_applicability: DensityApplicability::DryBulkDensity15To917KgM3Above1225Air,
+            spheroid,
+            material: TMatrixMaterial::SymmetricBruggemanSphericalAirIceMatzler2006V1 {
+                air_relative_permittivity: ComplexRefractiveIndex {
+                    real: 1.0,
+                    imaginary: 0.0,
+                },
+                ice_material_density_kg_m3: 917.0,
+                homotopy_steps: 64,
+                newton_max_iterations: 100,
+                newton_relative_tolerance: 1.0e-12,
+                temperature_range_k: [200.0, 300.0],
+            },
+            odf: gaussian20_odf(),
+            radar: test_radar_descriptor(),
+            terminal_speed: test_drag_policy(),
+            execution: TMatrixExecutionDescriptor::FreshProcessPerGridPoint,
+            normalization_number_concentration_m3: 1.0,
+        };
+        constant_runtime(axes, science, descriptor)
+    }
+
     #[test]
     fn loader_binds_complete_digest_config_and_descriptor() {
         let (table, _, _) = fixture();
@@ -3029,6 +3491,141 @@ mod tests {
         {
             assert!((actual - expected).abs() <= 1.0e-14);
         }
+    }
+
+    #[test]
+    fn dry_particle_node_query_returns_exactly_one_particle_per_m3() {
+        let table = dry_property_runtime(SpheroidConvention::OblateMinorVertical);
+        let domain = table.dry_particle_node_domain().unwrap();
+        assert_eq!(domain.equivolume_diameter_range_m(), [1.0e-6, 0.01]);
+        assert_eq!(domain.bulk_density_range_kg_m3(), [50.0, 917.0]);
+        assert_eq!(domain.minor_to_major_axis_ratio_range(), [0.1, 1.0]);
+        let query = TMatrixParticleNodeQuery::new(
+            260.0,
+            1.0e-3,
+            400.0,
+            0.8,
+            PsdSpheroidHabit::Oblate,
+            None,
+            None,
+            3.0,
+            synthetic_speed_provenance(),
+            gaussian20_odf().orientation_model(),
+            request(FREQUENCY_HZ, 1.0),
+        )
+        .unwrap();
+        let output = table.evaluate_dry_particle_node_per_m3(&query).unwrap();
+        assert_eq!(
+            output.components(),
+            [2.0, 1.0, 0.5, 0.0, 0.1, 0.01, 0.01, 6.0, 18.0]
+        );
+    }
+
+    #[test]
+    fn ishmael_psd_integrates_through_typed_particle_node_query() {
+        let table = dry_property_runtime(SpheroidConvention::OblateMinorVertical);
+        let domain = table.dry_particle_node_domain().unwrap();
+        let support = PsdParticleSupport::new(Some(domain), None, Some(domain));
+        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
+            IshmaelIceCategory::Planar,
+            1.020_730_388_452_175_2e-3,
+            100_000.0,
+            6.250_000_000_000_000_5e-9,
+            3.125_000_000_000_000_3e-9,
+            1.2,
+        ))
+        .unwrap();
+        let speed_provenance = synthetic_speed_provenance();
+        let result = integrate_ishmael_psd(
+            &distribution,
+            PsdIntegrationConfig::default(),
+            support,
+            speed_provenance,
+            |node| {
+                let positive_down_speed = 0.25 + 1_000.0 * node.equivolume_diameter_m();
+                let query = TMatrixParticleNodeQuery::from_psd_node(
+                    node,
+                    260.0,
+                    positive_down_speed,
+                    speed_provenance,
+                    gaussian20_odf().orientation_model(),
+                    request(FREQUENCY_HZ, 1.0),
+                )?;
+                table
+                    .evaluate_dry_particle_node_per_m3(&query)?
+                    .checked_scale(1.0e-4)
+                    .map_err(EvaluationError::Output)
+            },
+        )
+        .unwrap();
+        assert!(result.additive().zh().get() > 0.0);
+        assert!(result.accumulator().fall_speed_variance_m2s2 > 0.0);
+        assert_eq!(result.audit().fall_speed, speed_provenance);
+        assert!(result.audit().domain_omitted_number_fraction <= 1.0e-6);
+    }
+
+    #[test]
+    fn particle_node_query_rejects_habit_frequency_and_wrong_table_role() {
+        let table = dry_property_runtime(SpheroidConvention::OblateMinorVertical);
+        assert!(matches!(
+            TMatrixParticleNodeQuery::new(
+                260.0,
+                1.0e-3,
+                400.0,
+                1.0,
+                PsdSpheroidHabit::Oblate,
+                None,
+                None,
+                3.0,
+                synthetic_speed_provenance(),
+                gaussian20_odf().orientation_model(),
+                request(FREQUENCY_HZ, 1.0),
+            ),
+            Err(EvaluationError::ParticleNodeHabitGeometryMismatch { .. })
+        ));
+        let prolate = TMatrixParticleNodeQuery::new(
+            260.0,
+            1.0e-3,
+            400.0,
+            0.8,
+            PsdSpheroidHabit::Prolate,
+            None,
+            None,
+            3.0,
+            synthetic_speed_provenance(),
+            gaussian20_odf().orientation_model(),
+            request(FREQUENCY_HZ, 1.0),
+        )
+        .unwrap();
+        assert!(matches!(
+            table.evaluate_dry_particle_node_per_m3(&prolate),
+            Err(EvaluationError::ParticleNodeSpheroidMismatch { .. })
+        ));
+
+        let wrong_frequency = TMatrixParticleNodeQuery::new(
+            260.0,
+            1.0e-3,
+            400.0,
+            0.8,
+            PsdSpheroidHabit::Oblate,
+            None,
+            None,
+            3.0,
+            synthetic_speed_provenance(),
+            gaussian20_odf().orientation_model(),
+            request(FREQUENCY_HZ + 1.0, 1.0),
+        )
+        .unwrap();
+        assert!(matches!(
+            table.evaluate_dry_particle_node_per_m3(&wrong_frequency),
+            Err(EvaluationError::ParticleNodeFrequencyMismatch { .. })
+        ));
+
+        let (conventional, _, _) = fixture();
+        assert!(matches!(
+            conventional.evaluate_dry_particle_node_per_m3(&prolate),
+            Err(EvaluationError::DryParticleNodeTableRequired { .. })
+        ));
     }
 
     #[test]
