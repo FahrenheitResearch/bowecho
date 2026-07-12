@@ -1026,7 +1026,9 @@ fn wrf(ui: &mut egui::Ui) {
         "\u{2014} choose one raw wrfout file and run it through the scan geometry currently \
          displayed in BowEcho. Replay preserves the observed site's cuts, split cuts, rays, \
          acquisition times, gate layout, missing sectors, moment availability, radial status, \
-         Nyquist and PRT instead of approximating them with a named VCP.",
+         and per-ray Nyquist instead of approximating them with a named VCP. When the decoded \
+         source supplies aligned ray-local instrument metadata, replay also copies PRT, \
+         unambiguous range, pulse count and independent-sample count to the simulated rays.",
     );
     para(
         ui,
@@ -1037,12 +1039,20 @@ fn wrf(ui: &mut egui::Ui) {
          reported unavailable, never fabricated. The observed radial timing owns ambiguity, so \
          replay disables custom coupled-PRF timing, manual folding and stage diagnostics.",
     );
+    para(
+        ui,
+        "Missing ray-local instrument values stay missing: replay never derives PRT or \
+         unambiguous range from a numbered VCP code or flattens differing rays to one scalar. \
+         Custom coupled single-PRF scans instead stamp their resolved PRT, unambiguous range, \
+         transmitted pulse count and effective independent-sample count on every generated ray.",
+    );
     action(
         ui,
         "Export latest as CfRadial\u{2026}",
         "— one generated frame opens a .nc save dialog; a loop opens a folder picker and writes \
-         one CfRadial-1 file per frame. Each file includes moments, ray timing, instrument \
-         settings, calibration, model/microphysics identity, and forward-operator provenance.",
+         one CfRadial-1 file per frame. Each file preserves available per-ray PRT, unambiguous \
+         range, pulse count and independent-sample arrays alongside moments, acquisition timing, \
+         calibration, model/microphysics identity and forward-operator provenance.",
     );
 
     subhead(ui, "OPERATIONAL HRRR/RRFS FORECAST RADAR");
@@ -1107,6 +1117,14 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
+        "Raw-state pre-closure currently requires Legacy embedded S at exactly 2.8 GHz with \
+         Full property rain/melting sensitivity. A validated local S/C/X pack or Frozen-only \
+         sensitivity must use Frozen or Linear adjacent (derived/additive); the UI and backend \
+         disable new incompatible Raw-state selection, and backend validation rejects any \
+         retained incompatible combination.",
+    );
+    para(
+        ui,
         "Interpolation changes sampling inside each output radar volume: later rays and cuts \
          blend slightly farther toward the next WRF scene. It does not create extra loop frames, \
          add low-level-update frames, run WRF forward, or update live. With N compatible scenes, \
@@ -1148,8 +1166,9 @@ fn wrf(ui: &mut egui::Ui) {
     action(
         ui,
         "P3/ISHMAEL T-matrix (research)",
-        "— opt-in 2.8 GHz property-aware dual-pol with bounded offline T-matrix tables. \
-         Exact supported inputs are required; it never substitutes Rayleigh.",
+        "— opt-in property-aware dual-pol using the shipped legacy embedded 2.8 GHz S tables, \
+         Full property sensitivity and Raw-state pre-closure. Exact supported inputs are \
+         required; it never substitutes another table source, band or Rayleigh.",
     );
     para(
         ui,
@@ -1159,9 +1178,10 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "Storm view, Clean model truth and Clean dual-pol start Frozen. Real radar, Maximum \
-         fidelity and P3/ISHMAEL T-matrix start with Timed volume plus adjacent-scene \
-         interpolation and Hold last. You can change those temporal controls after choosing a \
+        "Storm view, Clean model truth and Clean dual-pol start Frozen. Real radar and Maximum \
+         fidelity start with Timed volume plus additive adjacent-scene interpolation and Hold \
+         last. P3/ISHMAEL T-matrix starts with Timed volume plus the narrower Raw-state \
+         pre-closure reference. You can change compatible temporal controls after choosing a \
          recipe.",
     );
 
@@ -1216,11 +1236,12 @@ fn wrf(ui: &mut egui::Ui) {
     subhead(ui, "QUALITY FIELDS & ALGORITHM TRUTH LAB");
     para(
         ui,
-        "The current WRF UI retains three compact pulse-volume support fractions in synthetic builds. \
+        "Gate support fields (MCOV / TUNB / MSIG) is enabled by default and persisted. \
          MCOV is the configured quadrature weight covered by the model domain; TUNB is the \
          nested fraction that also remains terrain-unblocked; MSIG is the still-smaller fraction \
-         that contains meteorological signal. These fields explain off-domain, blocked and \
-         clear-air gates; they do not alter the physical moments.",
+         that contains meteorological signal. Minimum model coverage separately masks physical \
+         moments below its persisted 0–1 MCOV threshold; the emitted quality fields stay \
+         unmasked so the rejection remains auditable. The default threshold is zero.",
     );
     para(
         ui,
@@ -1286,10 +1307,36 @@ fn wrf(ui: &mut egui::Ui) {
          Lin/WSM/WDM, Thompson, Morrison, Milbrandt-Yau and NSSL bulk schemes are recognized; \
          the result records whether closure was full two-moment, partial, or assumption-heavy.",
     );
+
+    subhead(ui, "T-MATRIX TABLE SOURCE & SENSITIVITY");
+    para(
+        ui,
+        "Legacy embedded S is the shipped research-v1 five-table source and works only at \
+         exactly 2.8 GHz. Validated local pack requests one exact manifest-qualified pack at \
+         2.8 GHz S, 5.6 GHz C or 9.4 GHz X; it never chooses a nearest band or falls back. No \
+         validated C- or X-band pack ships with BowEcho, so those choices remain unavailable \
+         until an evidence-backed local pack exists.",
+    );
+    para(
+        ui,
+        "Local packs live below the displayed deterministic model-cache path \
+         bowecho-simradar/tmatrix-packs. The reproducible \
+         crates/radar_scattering/tools/pytmatrix-0.3.3/generate_band_pack.py tool emits exact \
+         S/C/X five-role packs, but always marks them unvalidated_research; runtime requires a \
+         separately reviewed validated_research manifest with matching sizes, SHA-256 hashes, \
+         roles, science revision and exact frequency.",
+    );
+    para(
+        ui,
+        "Full property includes standalone/residual rain and qualified wet frozen/rain \
+         coexistence. Frozen-only deliberately omits all rain and wet coexistence so only dry \
+         frozen categories contribute. This is a sensitivity control, not a prognostic melting \
+         model, and the selected mode is fingerprinted and exported.",
+    );
     para(
         ui,
         "The opt-in property-aware T-matrix research contract accepts \
-         P3 50–53 and ISHMAEL 55 raw tuples. Its versioned PyTMatrix tables use exactly 2.8 GHz, \
+         P3 50–53 and ISHMAEL 55 raw tuples. The shipped legacy PyTMatrix tables use exactly 2.8 GHz, \
          symmetric Bruggeman air/ice/water mixing, separate oblate/prolate shapes, and a fixed \
          mean-zero Gaussian canting distribution with 20\u{00b0} standard deviation and \
          deterministic 50-node (5 by 10) orientation integration. Solver-complete diameter \
@@ -1379,6 +1426,12 @@ fn wrf(ui: &mut egui::Ui) {
          categories use scheme-native PSD integration; P3's equivalent-oblate shape and \
          Gaussian-20 canting remain external assumptions. Wet ISHMAEL PSD allocation and a \
          complete prognostic melting-layer model remain unavailable.",
+    );
+    para(
+        ui,
+        "The legacy embedded 2.8 GHz S bundle is the only shipped property table source. \
+         BowEcho ships no validated C/X packs; exact 5.6/9.4 GHz selection fails closed until a \
+         separately installed evidence-backed pack satisfies the validated local contract.",
     );
     para(
         ui,
@@ -2362,6 +2415,15 @@ fn tools(ui: &mut egui::Ui) {
          unavailable; it never infers a species mixture or synthetic spectrum from REF, VEL or \
          dual-pol moments.",
     );
+    para(
+        ui,
+        "The deep worker verifies the frame/config witness, reopens the exact retained WRF \
+         source/time, and recomputes that radial from its first gate through the selected gate. \
+         The prefix is required for cumulative PhiDP, attenuation and refracted blockage. Bulk \
+         Rayleigh can then show individual hydrometeors and a selected-gate Doppler spectrum; \
+         property T-matrix currently exposes only aggregate polar/instrument stages and marks \
+         category decomposition and spectrum unavailable.",
+    );
 
     subhead(ui, "BEST RADAR");
     action(
@@ -2908,12 +2970,16 @@ mod tests {
         assert!(guide_src.contains("SAILS, MRLE, AVSET, Add-MPDA"));
         assert!(guide_src.contains("Linear adjacent is the fast path"));
         assert!(guide_src.contains("Raw-state pre-closure is the slower"));
+        assert!(guide_src.contains("Raw-state pre-closure currently requires Legacy embedded S"));
+        assert!(guide_src.contains("retained incompatible combination"));
         assert!(guide_src.contains("Both adjacent modes never extrapolate"));
         assert!(guide_src.contains("hold, drop or error"));
         assert!(guide_src.contains("does not create extra loop frames"));
         assert!(guide_src.contains("the first N\\u{2212}1 frames"));
         assert!(guide_src.contains("Mixed d01/d02"));
         assert!(guide_src.contains("one CfRadial-1 file per frame"));
+        assert!(guide_src.contains("per-ray PRT, unambiguous"));
+        assert!(guide_src.contains("independent-sample arrays"));
         assert!(guide_src.contains("MP_PHYSICS alone is not sufficient"));
         assert!(guide_src.contains("Real radar, Maximum"));
         assert!(guide_src.contains("OPERATIONAL HRRR/RRFS FORECAST RADAR"));
@@ -2932,18 +2998,29 @@ mod tests {
                 "missing validation product {product}"
             );
         }
+        assert!(guide_src.contains("Minimum model coverage"));
+        assert!(guide_src.contains("quality fields stay unmasked"));
         assert!(guide_src.contains("Physically coupled single-PRF moment estimator"));
         assert!(guide_src.contains("Emit Ideal + Measured diagnostic moments"));
         assert!(guide_src.contains("Algorithm Truth Lab"));
         assert!(guide_src.contains("wrong Nyquist branches"));
         assert!(guide_src.contains("Why this synthetic gate?"));
         assert!(guide_src.contains("generation-matched real retained-source GateExplanation"));
+        assert!(guide_src.contains("recomputes that radial from its first gate"));
+        assert!(guide_src.contains("property T-matrix currently exposes only aggregate"));
         assert!(guide_src.contains("never infers a species mixture"));
 
         assert!(guide_src.contains("property-aware T-matrix research contract"));
         assert!(guide_src.contains("P3 50–53 and ISHMAEL 55"));
         assert!(guide_src.contains("symmetric Bruggeman air/ice/water"));
         assert!(guide_src.contains("exactly 2.8 GHz"));
+        assert!(guide_src.contains("2.8 GHz S, 5.6 GHz C or 9.4 GHz X"));
+        assert!(guide_src.contains("No validated C- or X-band pack ships"));
+        assert!(guide_src.contains("bowecho-simradar/tmatrix-packs"));
+        assert!(guide_src.contains("generate_band_pack.py"));
+        assert!(guide_src.contains("always marks them unvalidated_research"));
+        assert!(guide_src.contains("Full property includes standalone/residual rain"));
+        assert!(guide_src.contains("Frozen-only deliberately omits all rain"));
         assert!(guide_src.contains("deterministic 50-node (5 by 10) orientation integration"));
         assert!(guide_src.contains("signed KDP remains signed"));
         assert!(guide_src.contains("never silent Rayleigh fallback"));
@@ -2952,8 +3029,11 @@ mod tests {
         assert!(guide_src.contains("old single-characteristic-particle"));
         assert!(guide_src.contains("official WRF v5.4 two-moment table"));
         assert!(guide_src.contains("projected-area-equivalent oblate"));
+        assert!(guide_src.contains("WRF refractivity (research)"));
         assert!(guide_src.contains("not independently validated"));
         assert!(guide_src.contains("make no operational claim"));
+        assert!(!guide_src.contains("P3 is characteristic-particle"));
+        assert!(!guide_src.contains("not PSD-integrated"));
         assert!(!guide_src.contains("BowEcho v0."));
         assert!(!guide_src.contains("SimSat v0."));
 

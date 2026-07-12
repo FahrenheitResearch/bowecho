@@ -34,9 +34,11 @@ If an observed radar volume is already displayed, **Replay displayed observed
 scan...** is the validation workflow. Choose one raw WRF file and BowEcho will
 reuse the observation's actual cuts, individual ray azimuths/elevations,
 acquisition times, gate geometry, split cuts, missing sectors, moment
-availability, Nyquist, and PRT. The result opens as linked **Observed / Simulated
-/ Difference** panes. This is exact acquisition replay, not a reconstructed base
-VCP.
+availability, and per-ray Nyquist. When the decoded source carries ray-local
+instrument metadata, replay also copies PRT, unambiguous range, pulse count,
+and independent-sample count to the matching simulated rays. The result opens
+as linked **Observed / Simulated / Difference** panes. This is exact
+acquisition replay, not a reconstructed base VCP.
 
 Extensionless **wrfout_*** names from every domain are valid. A folder build
 captures the files found at selection time. Refresh deliberately reuses that
@@ -127,9 +129,11 @@ range, and gate geometry:
 - **Real radar (balanced)** is the recommended practical S-band simulation.
 - **Maximum fidelity (slow)** uses the 27-point pulse-volume rule for one file
   or a short loop.
-- **P3/ISHMAEL T-matrix (research)** selects the exact 2.8 GHz,
-  property-aware, fail-closed research operator without changing the chosen
-  antenna or scan geometry.
+- **P3/ISHMAEL T-matrix (research)** selects the shipped legacy embedded
+  2.8 GHz S-band, Full-property, property-aware research operator without
+  changing the chosen antenna or scan geometry. Expert controls can instead
+  request a validated local exact-frequency pack, but never silently change
+  the source or band.
 
 Changing an advanced control after applying a recipe labels the setup as
 `Custom tuning`. Selecting a recipe again resets all interacting physics,
@@ -140,8 +144,9 @@ The recipes also choose coherent temporal defaults. **Storm view**, **Clean
 model truth**, and **Clean dual-pol** start Frozen. **Real radar** and
 **Maximum fidelity** start with Timed volume, fast derived/additive adjacent
 sampling, and Hold last. **P3/ISHMAEL T-matrix** starts with the slower
-Raw-state pre-closure reference and Hold last. These remain editable after
-applying the recipe.
+Raw-state pre-closure reference, legacy embedded 2.8 GHz S tables,
+Full-property sensitivity, and Hold last. These remain editable after applying
+the recipe, subject to the exact table/time compatibility rules below.
 
 ### Recipe comparison
 
@@ -195,6 +200,13 @@ simulated output retains the three gate-quality products described below, and
 the difference builder compares only moments available on the exact same
 cut/radial/gate geometry. Missing observed moments are listed explicitly
 instead of becoming silent all-NaN products.
+
+Ray-local instrument metadata is part of that exact replay contract when the
+source actually provides it. BowEcho preserves aligned per-ray PRT,
+unambiguous range, pulse count, and independent-sample count beside the copied
+Nyquist value and writes those arrays through CfRadial. A source that lacks a
+field stays missing; replay does not infer it from a named VCP code or a
+volume-wide average.
 
 The comparison workspace starts with REF / REF / DIF_REF and supports the
 other exact-overlap difference products through the ordinary product picker.
@@ -314,6 +326,14 @@ to agree in rapidly growing, melting, or riming regions. Comparing them is the
 purpose of the reference mode; neither creates extra forecast frames or claims
 to integrate WRF forward in time.
 
+The current Raw-state implementation is deliberately narrower than the
+ordinary compact-scene path: it requires the legacy embedded S source at
+exactly 2.8 GHz with **Full property** rain/melting sensitivity. A validated
+local S/C/X pack or **Frozen-only** sensitivity must use Frozen or **Linear
+adjacent (derived/additive)** timing. The UI disables new incompatible
+Raw-state selection, and backend validation rejects any retained incompatible
+combination.
+
 If there is no complete later scene, or the scan would cross beyond it, the
 explicit policy can **hold the anchor**, **drop the frame**, or **stop with an
 error**. A held frame records why it was held; it is not labeled interpolated.
@@ -372,6 +392,21 @@ Corrected fields are not generic post-processing guesses. They are the
 intrinsic values retained by the same radial propagation calculation that
 produces the observed moments.
 
+### Gate support emission and coverage mask
+
+**Gate support fields (MCOV / TUNB / MSIG)** is enabled by default. The three
+compact fractions are emitted for every generated gate and remain audit
+products rather than display guesses. Disabling emission removes those moment
+grids from new volumes; it does not change the underlying pulse-volume
+sampling used to build the physical moments.
+
+**Minimum model coverage** is a separate persisted threshold from 0 to 1.
+Physical moments are masked when MCOV is below that threshold, while emitted
+MCOV/TUNB/MSIG remain unmasked so the rejection can be diagnosed. The default
+is zero for historical behavior. TUNB and MSIG do not independently mask a
+gate: they report terrain-unblocked and meteorological-signal support inside
+the same quadrature contract.
+
 The bulk operator recognizes common Lin/WSM/WDM, Thompson, Morrison,
 Milbrandt-Yau, and NSSL bulk schemes and records whether the available fields
 provide full two-moment, partial two-moment, or assumption-heavy mass-only
@@ -386,6 +421,41 @@ BowEcho defines a separate, opt-in research-mode contract for P3
 operator. A build may evaluate this mode only when its versioned property-aware
 tables and runtime descriptor match the request exactly; an absent or
 inapplicable asset is an error, never a silent fallback to Rayleigh.
+
+### Exact table source and band
+
+The T-matrix controls separate **Table source** from **Exact band**:
+
+- **Legacy embedded S** is the shipped research-v1 five-table bundle and is
+  valid only at exactly **2.8 GHz**. Selecting it makes C and X unavailable.
+- **Validated local pack** requests one manifest-qualified five-role pack at
+  exactly **2.8 GHz S**, **5.6 GHz C**, or **9.4 GHz X**. Selection never uses
+  a nearest frequency, substitutes another band, or falls back to the embedded
+  source. A missing, ambiguous, corrupt, or `unvalidated_research` pack stops
+  the build before the large WRF read.
+
+No validated C- or X-band packs ship with BowEcho. Therefore the C and X UI
+choices are capability gates, not bundled science: they remain unavailable
+until an evidence-backed local pack is installed. BowEcho also ships no
+validated-local replacement S pack; the usable bundled S source remains the
+explicitly research-only legacy embedded bundle.
+
+Each local pack is a directory below the deterministic, override-aware model
+cache path `bowecho-simradar/tmatrix-packs`. The UI shows the fully resolved
+path on the running system. A pack contains `pack.json` plus exactly five
+role/config/LUT records: dry oblate, dry prolate, wet oblate, wet prolate, and
+standalone/residual rain. Runtime discovery validates the declared exact band,
+science revision, byte lengths, SHA-256 digests, role identities, and the
+`validated_research` status before typed LUT decoding.
+
+The reproducible generator is
+`crates/radar_scattering/tools/pytmatrix-0.3.3/generate_band_pack.py`; its full
+format and locked-container workflow are documented in the adjacent
+`PACK_FORMAT.md`. It can generate deterministic S/C/X packs, but deliberately
+marks every output `unvalidated_research`. Generation proves reproducibility
+and internal integrity, not scientific validation, so its output is rejected
+by the runtime until a separate evidence-bound promotion produces a new
+reviewed manifest.
 
 ### Practical file check
 
@@ -433,11 +503,27 @@ shape-authoritative policy exists and evaluates only genuinely spherical P3
 regions under omission budgets; neither policy silently revives the removed
 single-characteristic-particle production path.
 
-The research tables use PyTMatrix at exactly **2.8 GHz**, with distinct oblate
-and prolate spheroids and a symmetric Bruggeman effective-medium mixture of
-air, ice, and liquid water. Their radar-view axis covers pulse-volume offsets
-around all 19 custom/named cut centers from 0.1 degrees through 19.5 degrees,
-including center plus/minus the correctly converted 0.95-degree-FWHM Gaussian
+### Full-property and Frozen-only sensitivity
+
+**Full property** requires the complete rain state, evaluates standalone and
+residual rain, and permits qualified homogeneous wet-frozen/rain coexistence
+inside the selected five-table envelope. **Frozen-only** deliberately omits
+all rain and wet-coexistence scattering and retains only dry frozen P3 or
+ISHMAEL categories. It is a sensitivity experiment for isolating the frozen
+contribution, not a claim that the source atmosphere contains no rain.
+
+This switch does not create a prognostic melting model. Full-property wet
+coexistence is a declared mass-conserving diagnostic partition and symmetric
+effective-medium topology; Frozen-only is an explicit omission. Both choices
+are recorded in the configuration fingerprint, progress/provenance, and
+scattering-model label.
+
+The shipped legacy embedded research tables use PyTMatrix at exactly
+**2.8 GHz**, with distinct oblate and prolate spheroids and a symmetric
+Bruggeman effective-medium mixture of air, ice, and liquid water. Their
+radar-view axis covers pulse-volume offsets around all 19 custom/named cut
+centers from 0.1 degrees through 19.5 degrees, including center plus/minus the
+correctly converted 0.95-degree-FWHM Gaussian
 beam sigma. The declared view axis is -0.5 through 20 degrees. A custom beam or
 quadrature sample outside that axis fails closed. Frozen-particle orientation
 is a mean-zero Gaussian canting distribution with a fixed 20-degree standard
@@ -510,6 +596,13 @@ another. Named VCP PRF *codes* remain unresolved rather than being treated as
 hertz; the coupled path therefore applies only where a literal research PRF is
 known.
 
+For a custom coupled scan, BowEcho stamps the resolved PRT, unambiguous range,
+transmitted pulse count, and effective independent-sample count on every ray.
+Those ray-aligned values survive loop installation, merge only into missing
+slots, and export as per-ray CfRadial arrays. The legacy volume-level PRT and
+unambiguous-range fields remain a compatibility fallback for sources without
+ray-local values; they are not used to flatten differing ray metadata.
+
 Enable **Emit Ideal + Measured diagnostic moments** to retain all three stages:
 
 1. **Ideal**: perfect pulse-volume-integrated scattering.
@@ -526,6 +619,33 @@ folds, branch errors, false unfolds, and velocity error. The current lab does
 not fabricate VWP, GBVTD, tracking, or vortex truth metrics; those remain
 unavailable until their production algorithms have dedicated model-truth
 adapters.
+
+### Why This Gate and on-demand spectrum
+
+Right-click a synthetic gate and choose **Why this synthetic gate?** for the
+retained geometry, acquisition/temporal bracket, MCOV/TUNB/MSIG support,
+beam/refractivity geometry, propagation, and Ideal/Measured/Presented stages.
+The immediate cards use data already present in the volume. The deeper
+explanation requires the session-private retained WRF source descriptor; it
+first verifies the frame configuration fingerprint and geometry witness, then
+reopens the exact source file/time index rather than trusting a changed path.
+
+The worker recomputes the selected radial from its first gate through the
+selected gate. That radial-prefix behavior is required because PhiDP,
+horizontal/differential attenuation, refracted terrain blockage, and Presented
+values depend on all preceding gates; recomputing only the selected cell would
+give a different physical answer. Source paths remain session-private and are
+not written into the exported provenance.
+
+For the bulk-Rayleigh WRF kernel, the same recomputation can expose individual
+bulk hydrometeor contributions and synthesize a selected-gate true, aliased,
+noise, measured, and noise-subtracted Doppler spectrum. The property T-matrix
+path currently exposes the aggregate physical/polar and instrument-stage
+answer only. Its P3/ISHMAEL per-category contribution seam is not yet qualified,
+so the inspector explicitly withholds the category decomposition and Doppler
+spectrum instead of reverse-engineering them from aggregate REF/VEL/dual-pol
+moments. Operational HRRR/RRFS frames and volumes whose retained source no
+longer matches are likewise reported unavailable.
 
 ## Geometry, instrument, and presentation controls
 
@@ -546,11 +666,12 @@ Stoelinga/community diagnostic. The scientific sampling default is linear Z;
 legacy direct-dBZ interpolation exists only to reproduce older BowEcho
 renders.
 
-Instrument controls include S-band frequency, beam width, pulse width, PRF,
-range-dependent sensitivity, calibration phase/ZDR bias, Nyquist folding,
-rotation rate, and inter-sweep transition. Named Build 24 patterns own their
-physical rows, source rates, periods, waveforms, and PRF-code provenance, so
-the custom timing/PRF-Hz controls do not overwrite the source definition.
+Instrument controls include bulk-path S-band frequency or an exact property
+table band, beam width, pulse width, PRF, range-dependent sensitivity,
+calibration phase/ZDR bias, Nyquist folding, rotation rate, and inter-sweep
+transition. Named Build 24 patterns own their physical rows, source rates,
+periods, waveforms, and PRF-code provenance, so the custom timing/PRF-Hz
+controls do not overwrite the source definition.
 Reflectivity texture, velocity wobble, and ground clutter are deterministic
 virtual-instrument/presentation effects. They do not add model-resolved
 meteorological structure.
@@ -564,8 +685,9 @@ reads a sparse native scene, includes that raw state in its pre-build peak,
 precomputes only active-cell additive scattering at the five elevation nodes,
 and then drops the raw property arrays. Adjacent-scene mode uses a bounded
 two-input-scene cache and checks the exact retained sparse-scene size after
-each read in addition to input, embedded tables, read/build/cut scratch, and
-retained output volumes. Raw-state mode deliberately retains the two normalized
+each read in addition to input, the selected table source, read/build/cut
+scratch, and retained output volumes. Raw-state mode deliberately retains the
+two normalized
 raw property scenes and dense dynamics/thermodynamics needed for on-demand
 pre-closure evaluation; its stricter preflight includes that extra ownership.
 It does not silently substitute a smaller kernel when the configured ceiling
@@ -574,7 +696,8 @@ is exceeded.
 For one generated frame, CfRadial export opens a `.nc` save dialog. For a loop,
 it opens a folder picker and writes one CfRadial-1 file per frame. Every file
 includes all native and attenuation moments, real ray times, frequency, beam
-width, pulse width, PRT, unambiguous range, scan name, model and microphysics
+width, pulse width, ray-local PRT, unambiguous range, transmitted pulse count,
+independent-sample count when present, scan name, model and microphysics
 provenance, calibration settings, and the forward-operator configuration. The
 pinned NetCDF writer cannot yet emit the required character variables for
 strict `sweep_mode` and `prt_mode`; BowEcho does not fake them as numeric
@@ -597,6 +720,10 @@ variables.
   independently validated. ISHMAEL and P3 have scheme-native PSD paths; P3's
   equivalent-oblate shape and Gaussian-20 canting remain external assumptions.
   Neither is operational calibration.
+- The legacy embedded 2.8 GHz S bundle is the only shipped property-table
+  source. No validated C- or X-band pack ships; selecting those exact bands
+  requires a separately installed, evidence-backed `validated_research` pack
+  and otherwise fails closed.
 - Symmetric Bruggeman air/ice/water mixing represents a declared effective
   medium; it is not a complete prognostic melting-layer microphysics model.
 - Deterministic clutter and texture are optional synthetic instrument effects,
