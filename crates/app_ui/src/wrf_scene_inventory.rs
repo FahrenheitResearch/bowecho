@@ -120,13 +120,13 @@ impl WrfSceneTime {
     /// Resolve one scene time without inventing offsets for missing records.
     /// A valid internal `Times[timeidx]` always wins over the filename.
     pub fn from_sources(internal_times: Option<&str>, path: &Path) -> Self {
-        if let Some(raw) = internal_times {
-            if let Some(valid_time) = parse_wrf_internal_time(raw) {
-                return Self::InternalTimes {
-                    valid_time,
-                    raw: raw.to_string(),
-                };
-            }
+        if let Some(raw) = internal_times
+            && let Some(valid_time) = parse_wrf_internal_time(raw)
+        {
+            return Self::InternalTimes {
+                valid_time,
+                raw: raw.to_string(),
+            };
         }
 
         let invalid_internal_times = internal_times.map(str::to_string);
