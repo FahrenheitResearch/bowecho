@@ -3521,9 +3521,11 @@ mod tests {
 
     #[test]
     fn persisted_state_round_trips_controls_but_not_source_or_runtime() {
-        let mut pane = SimSatPane::default();
-        pane.product = SimSatProduct::Ir13;
-        pane.satellite = SatelliteChoice::GoesEast;
+        let mut pane = SimSatPane {
+            product: SimSatProduct::Ir13,
+            satellite: SatelliteChoice::GoesEast,
+            ..SimSatPane::default()
+        };
         pane.apply_quick_mode(SimSatQuickMode::SensorQa).unwrap();
         pane.local_path = "C:/private/wrfout".to_owned();
         let saved = pane.take_persisted_state_if_dirty().unwrap();
