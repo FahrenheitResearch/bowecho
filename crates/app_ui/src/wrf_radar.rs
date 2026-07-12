@@ -52,6 +52,8 @@ use app_ui::vcp_catalog::{
     BUILD_24_SOURCE, Build24Vcp, DopplerPrfValue, MomentCoverage, PhysicalScanRow, PulseLength,
     VcpDefinition, Waveform, build_24_definition,
 };
+use app_ui::wrf_scene_adapter::inventory_selected_wrf_paths;
+use app_ui::wrf_scene_inventory::{WrfScene, WrfSceneGroup, WrfSceneTime};
 
 /// Operational adaptations intentionally outside the checked base-pattern
 /// catalog and this synthetic renderer.
@@ -3062,10 +3064,11 @@ pub struct SyntheticRadarOutput {
     pub label: String,
     pub volumes: Vec<Arc<RadarVolume>>,
     pub notes: Vec<String>,
-    /// [`SyntheticRadarConfig::data_fingerprint`] of the config that built these
-    /// volumes. The install path folds it into each frame's history path key so
-    /// a re-import with CHANGED settings deduplicates as a distinct build
-    /// (replaces the stale volume) while an unchanged re-import reuses.
+    /// Effective build fingerprint: [`SyntheticRadarConfig::data_fingerprint`]
+    /// plus the run/domain/grid and basename-free scene identities/time indices
+    /// that built these volumes. The install path folds it into each frame's
+    /// history key so either changed settings OR changed WRF input replaces a
+    /// stale result without exposing private absolute paths.
     pub config_fingerprint: u64,
 }
 
@@ -3117,102 +3120,112 @@ fn build_synthetic_from_paths(
     if paths.is_empty() {
         return Err("No WRF files selected".to_string());
     }
-    let mut files: Vec<PathBuf> = paths
+    let files: Vec<PathBuf> = paths
         .iter()
         .filter(|path| crate::wrf_process::is_supported_wrf_file(path))
         .cloned()
         .collect();
-    // Multi-select / folder picks arrive in arbitrary order: sort by the WRF
-    // valid time parsed from the filename so the loop plays in model time.
-    files.sort_by_cached_key(|path| wrf_time_sort_key(path));
     if files.is_empty() {
         return Err("No supported WRF files selected".to_string());
     }
 
+    let _ = tx.send(SyntheticRadarMessage::Progress(
+        "Inventorying WRF run, domain, grid, and internal times…".to_owned(),
+    ));
+    let selected = inventory_selected_wrf_paths(&files)?;
+    let scenes = selected.group.scenes.clone();
+    let config_fingerprint = scene_build_fingerprint(config, &selected.group);
+
     let mut volumes = Vec::new();
-    let mut notes = Vec::new();
-    let mut fallback_index = 0u32;
-    let file_total = files.len();
-    for (file_index, path) in files.iter().enumerate() {
-        let _ = tx.send(SyntheticRadarMessage::Progress(format!(
-            "Opening WRF {}",
-            display_name(path)
-        )));
-        let file = match WrfFile::open(path) {
-            Ok(file) => file,
-            Err(err) => {
-                notes.push(format!("Open {} failed: {err}", display_name(path)));
-                continue;
-            }
-        };
-        let times = file.times().unwrap_or_default();
-        let name = display_name(path);
-        let nt = file.nt;
-        for timeidx in 0..nt {
-            // Stream fine-grained stage labels for this frame so the UI shows
-            // steady progress instead of a multi-second (or, in a debug build,
-            // multi-minute) freeze with no feedback. Multi-file loops lead
-            // with "file 2/5: …" so the owner sees the loop building.
-            let frame_prefix = match (file_total > 1, nt > 1) {
-                (true, true) => format!(
-                    "file {}/{file_total} ({name}, time {}/{nt}): ",
-                    file_index + 1,
-                    timeidx + 1
-                ),
-                (true, false) => format!("file {}/{file_total} ({name}): ", file_index + 1),
-                (false, true) => format!("Simulating {name} (time {}/{nt}): ", timeidx + 1),
-                (false, false) => format!("Simulating {name}: "),
-            };
-            let progress = |stage: &str| {
-                let _ = tx.send(SyntheticRadarMessage::Progress(format!(
-                    "{frame_prefix}{stage}"
-                )));
-            };
-            progress("reading…");
-            let fields =
-                match read_wrf_radar_fields_for_config_reporting(&file, timeidx, config, &progress)
-                {
-                    Ok(fields) => fields,
-                    Err(err) => {
-                        notes.push(format!("{name} time {timeidx}: {err}"));
-                        continue;
-                    }
-                };
-            let valid_time = times
-                .get(timeidx)
-                .and_then(|raw| parse_wrf_time(raw))
-                .unwrap_or_else(|| {
-                    // No parsable Times entry — keep frames distinct so the
-                    // loop engine does not collapse them into one identity.
-                    let base = DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is valid")
-                        + chrono::Duration::hours(i64::from(fallback_index));
-                    fallback_index += 1;
-                    base
-                });
-            let volume = build_synthetic_volume_reporting(&fields, valid_time, config, &progress);
-            // Self-document the gate spacing when grid-matching is on: record the
-            // effective size and whether it came from the grid DX or fell back.
-            let gate_note = if config.match_gate_to_grid {
-                let eff = effective_gate_spacing(config, fields.dx_m);
-                if matched_grid_dx(config, fields.dx_m) {
-                    format!(", gate {eff:.0} m (grid DX)")
-                } else {
-                    format!(", gate {eff:.0} m (grid DX unavailable)")
-                }
-            } else {
-                String::new()
-            };
-            let polar_note = fields
-                .dual_pol_status
-                .as_deref()
-                .map(|status| format!(", {status}"))
-                .unwrap_or_default();
-            notes.push(format!(
-                "{name} time {timeidx}: {} radials from {}{gate_note}{polar_note}",
-                volume.metadata.decoded_radial_count, fields.ref_source,
-            ));
-            volumes.push(Arc::new(volume));
+    let mut notes = selected
+        .notes
+        .into_iter()
+        .map(|note| format!("{}: {}", note.source_name, note.message))
+        .collect::<Vec<_>>();
+    let one_scene_per_file = {
+        let mut identities = std::collections::BTreeSet::new();
+        scenes
+            .iter()
+            .all(|scene| identities.insert(scene.source_identity.clone()))
+    };
+    let frame_total = scenes.len();
+    let mut opened_path: Option<PathBuf> = None;
+    let mut opened_file: Option<WrfFile> = None;
+    for (frame_index, scene) in scenes.iter().enumerate() {
+        if opened_path.as_ref() != Some(&scene.path) {
+            opened_file = Some(WrfFile::open(&scene.path).map_err(|error| {
+                format!(
+                    "Open inventoried WRF {}: {error}",
+                    display_name(&scene.path)
+                )
+            })?);
+            opened_path = Some(scene.path.clone());
         }
+        let file = opened_file
+            .as_ref()
+            .expect("inventoried WRF file opened above");
+        let name = display_name(&scene.path);
+        let timeidx = scene.time_index;
+        let frame_prefix = if one_scene_per_file && frame_total > 1 {
+            // Preserve the established multi-file progress vocabulary.
+            format!("file {}/{frame_total} ({name}): ", frame_index + 1)
+        } else if frame_total > 1 {
+            format!(
+                "frame {}/{frame_total} ({name}, time {}/{}): ",
+                frame_index + 1,
+                timeidx + 1,
+                file.nt
+            )
+        } else if file.nt > 1 {
+            format!("Simulating {name} (time {}/{}): ", timeidx + 1, file.nt)
+        } else {
+            format!("Simulating {name}: ")
+        };
+        let progress = |stage: &str| {
+            let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+                "{frame_prefix}{stage}"
+            )));
+        };
+        progress("reading…");
+        let fields =
+            match read_wrf_radar_fields_for_config_reporting(file, timeidx, config, &progress) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    notes.push(format!("{name} time {timeidx}: {error}"));
+                    continue;
+                }
+            };
+        let valid_time = scene
+            .time
+            .valid_time()
+            .cloned()
+            .expect("scene adapter rejects untimed scenes");
+        let mut volume = build_synthetic_volume_reporting(&fields, valid_time, config, &progress);
+        append_scene_provenance(&mut volume, scene);
+        // Self-document the gate spacing when grid-matching is on: record the
+        // effective size and whether it came from the grid DX or fell back.
+        let gate_note = if config.match_gate_to_grid {
+            let eff = effective_gate_spacing(config, fields.dx_m);
+            if matched_grid_dx(config, fields.dx_m) {
+                format!(", gate {eff:.0} m (grid DX)")
+            } else {
+                format!(", gate {eff:.0} m (grid DX unavailable)")
+            }
+        } else {
+            String::new()
+        };
+        let polar_note = fields
+            .dual_pol_status
+            .as_deref()
+            .map(|status| format!(", {status}"))
+            .unwrap_or_default();
+        notes.push(format!(
+            "{name} time {timeidx} ({}): {} radials from {}{gate_note}{polar_note}",
+            scene_time_authority(&scene.time),
+            volume.metadata.decoded_radial_count,
+            fields.ref_source,
+        ));
+        volumes.push(Arc::new(volume));
     }
 
     if volumes.is_empty() {
@@ -3225,16 +3238,62 @@ fn build_synthetic_from_paths(
             )
         });
     }
-    // The loop keys on the volume's own scan time: sort on it so frames play
-    // in valid-time order even when a filename stamp and the file's internal
-    // `Times` disagree (stable — equal times keep the filename order).
-    volumes.sort_by_key(|volume| volume.volume_time);
+    // `WrfSceneInventory` already supplies strict chronological order from
+    // internal Times; retain it exactly so timeidx/provenance stay aligned.
     Ok(SyntheticRadarOutput {
         label: label.to_string(),
         volumes,
         notes,
-        config_fingerprint: config.data_fingerprint(),
+        config_fingerprint,
     })
+}
+
+fn scene_time_authority(time: &WrfSceneTime) -> &'static str {
+    match time {
+        WrfSceneTime::InternalTimes { .. } => "internal Times",
+        WrfSceneTime::FilenameFallback { .. } => "filename fallback",
+        WrfSceneTime::Unavailable { .. } => "unavailable",
+    }
+}
+
+fn append_scene_provenance(volume: &mut RadarVolume, scene: &WrfScene) {
+    let valid_time = scene
+        .time
+        .valid_time()
+        .expect("scene adapter rejects untimed scenes");
+    let provenance = format!(
+        "scene_source={}; scene_time_index={}; scene_time_authority={}; scene_valid_time={}",
+        scene.source_identity.0,
+        scene.time_index,
+        scene_time_authority(&scene.time),
+        valid_time.to_rfc3339(),
+    );
+    match volume.metadata.forward_operator_config.as_mut() {
+        Some(config) => {
+            config.push_str("; ");
+            config.push_str(&provenance);
+        }
+        None => volume.metadata.forward_operator_config = Some(provenance),
+    }
+}
+
+fn scene_build_fingerprint(config: &SyntheticRadarConfig, group: &WrfSceneGroup) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.data_fingerprint().hash(&mut hasher);
+    group.key.hash(&mut hasher);
+    for scene in &group.scenes {
+        scene.source_identity.hash(&mut hasher);
+        scene.time_index.hash(&mut hasher);
+        scene
+            .time
+            .valid_time()
+            .map(DateTime::<Utc>::timestamp_millis)
+            .hash(&mut hasher);
+        scene_time_authority(&scene.time).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn display_name(path: &Path) -> String {
@@ -3244,59 +3303,9 @@ fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Multi-file loop ordering key: the WRF valid time parsed from the filename
-/// (`wrfout_d03_2025-06-21_01_30_00` → `"20250621013000"`), then the bare
-/// filename as the tiebreak/fallback — so a shuffled multi-select or a folder
-/// pick always builds (and reports "file k/n" progress) in model-time order.
-/// Files without a parsable stamp sort together by name, ahead of nothing.
-fn wrf_time_sort_key(path: &Path) -> (String, String) {
-    let name = display_name(path);
-    (
-        crate::wrf_process::parse_wrf_timestamp(&name).unwrap_or_default(),
-        name,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn multi_file_sort_key_orders_by_parsed_wrf_time() {
-        // Shuffled pick order (what rfd multi-select hands back) must sort by
-        // the model time embedded in the name, not the pick order. Paths are
-        // built with join so the directory strips on every OS (a literal
-        // `C:\run\...` is ONE component on Linux and broke the CI gate).
-        let mut paths = [
-            PathBuf::from("run").join("wrfout_d03_2025-06-21_02_15_00"),
-            PathBuf::from("run").join("wrfout_d03_2025-06-21_01_30_00"),
-            PathBuf::from("run").join("wrfout_d03_2025-06-21_02_30_00"),
-            PathBuf::from("run").join("wrfout_d03_2025-06-21_02_00_00"),
-            PathBuf::from("run").join("wrfout_d03_2025-06-21_01_45_00"),
-        ];
-        paths.sort_by_cached_key(|path| wrf_time_sort_key(path));
-        let names: Vec<String> = paths.iter().map(|path| display_name(path)).collect();
-        assert_eq!(
-            names,
-            vec![
-                "wrfout_d03_2025-06-21_01_30_00",
-                "wrfout_d03_2025-06-21_01_45_00",
-                "wrfout_d03_2025-06-21_02_00_00",
-                "wrfout_d03_2025-06-21_02_15_00",
-                "wrfout_d03_2025-06-21_02_30_00",
-            ]
-        );
-
-        // Colon-form stamps sort identically; unstamped names fall back to
-        // filename order without panicking.
-        let colon = wrf_time_sort_key(Path::new("wrfout_d02_2025-06-21_01:45:00"));
-        let underscore = wrf_time_sort_key(Path::new("wrfout_d03_2025-06-21_01_45_00"));
-        assert_eq!(colon.0, underscore.0);
-        assert_eq!(colon.0, "20250621014500");
-        let plain = wrf_time_sort_key(Path::new("some_model_output.nc"));
-        assert!(plain.0.is_empty());
-        assert_eq!(plain.1, "some_model_output.nc");
-    }
 
     /// REAL-data proof for the multi-frame loop path (project rule: prove on
     /// real data). Gated on `BOWECHO_WRF_RADAR_MULTI_FIXTURE` = a `;`-joined
