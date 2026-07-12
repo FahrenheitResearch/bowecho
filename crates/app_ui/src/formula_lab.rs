@@ -17,7 +17,7 @@ use std::time::SystemTime;
 use eframe::egui;
 use rw_formula::{
     BoundaryPolicy, BridgeError, CompiledFormula, ErrorKind, EvaluationOptions, ExactStoreTime,
-    FormulaError, FormulaProvenance, MissingPolicy, NonFinitePolicy, ParameterSpec,
+    FormulaError, FormulaProvenance, HeightDatum, MissingPolicy, NonFinitePolicy, ParameterSpec,
     ParameterValues, Recipe, RecipeReference, RecipeRequirements, Requirement, ResourceLimits,
     Span, StoreRunResolver, evaluate_resolver_2d, evaluate_wrf_path_2d_with_limits,
 };
@@ -25,11 +25,22 @@ use rw_formula::{
 use rw_store::atomic::atomic_write_bytes;
 use rw_store::grid::GridFile;
 use rw_store::run::RwsRunManifest;
-use rw_ui::{FieldData, FieldKey, HourKey};
+use rw_ui::{FieldData, FieldKey, HourKey, VarInfo, VarKind};
 
 const LARGE_RAW_WRF_BYTES: u64 = 1 << 30;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 const MAX_RECIPE_BYTES: u64 = 4 * 1024 * 1024;
+const PACKED_WRF_FORMULA_FIELDS: &[&str] = &[
+    "cape2d",
+    "uvmet",
+    "uvmet10",
+    "bunkers_rm",
+    "bunkers_lm",
+    "mean_wind_0_6km",
+    "mean_wind",
+    "effective_inflow",
+    "cloudfrac",
+];
 
 /// Current rw-store source offered by the host.
 #[derive(Debug, Clone)]
@@ -39,10 +50,15 @@ pub struct StoreFormulaSource {
     /// Must be empty unless the host verified every stored timestep's valid
     /// time. Exact-time runs supply the complete map, never a partial axis.
     pub exact_times: BTreeMap<u16, ExactStoreTime>,
-    /// Host validation of the complete selected exact-time axis. Pointwise
-    /// formulas remain available when false, but plans requiring adjacent
-    /// times are blocked before the bridge can rehydrate timing from disk.
+    /// Host validation that the complete selected time axis has at least two
+    /// distinct, strictly increasing times. Pointwise formulas remain
+    /// available when false; only plans requiring adjacent times are blocked.
     pub temporal_axis_verified: bool,
+    /// Complete variable inventory for the selected timestep, supplied by the
+    /// same rw-ui `HourVars` response that populates the Models viewer. Keeping
+    /// names, units, kinds, and pressure levels lets Formula Lab preflight the
+    /// selected dataset before a background evaluation is launched.
+    pub variables: Vec<VarInfo>,
 }
 
 /// Staged raw WRF source offered by the host. Full map/height calculus is
@@ -72,6 +88,52 @@ pub enum FormulaSourceKind {
     RawWrf,
 }
 
+#[derive(Debug, Default)]
+struct SourceReadiness {
+    ready: bool,
+    blockers: Vec<String>,
+    notes: Vec<String>,
+    override_suggestions: Vec<UnitOverrideSuggestion>,
+}
+
+#[derive(Debug, Clone)]
+struct UnitOverrideSuggestion {
+    field: String,
+    stored_units: String,
+    formula_units: &'static str,
+}
+
+#[derive(Debug)]
+struct FormulaStarter {
+    title: &'static str,
+    description: String,
+    source: Option<String>,
+    output_name: &'static str,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct FormulaLabPersistedState {
+    schema: u8,
+    source: String,
+    output_name: String,
+    recipe_name: String,
+    recipe_version: String,
+    recipe_description: String,
+    expected_output_units: String,
+    authors: Vec<String>,
+    references: Vec<RecipeReference>,
+    tags: Vec<String>,
+    requirements: RecipeRequirements,
+    resource_limits: Option<ResourceLimits>,
+    parameter_specs: Vec<ParameterSpec>,
+    parameter_values: ParameterValues,
+    evaluation_options: EvaluationOptions,
+    unit_overrides_text: String,
+    source_kind: String,
+    large_research_profile: bool,
+    field_filter: String,
+}
+
 #[derive(Debug, Clone)]
 enum EvaluationSource {
     Store(StoreFormulaSource),
@@ -87,10 +149,12 @@ impl EvaluationSource {
     fn label(&self) -> String {
         match self {
             Self::Store(source) => {
-                let time_note = if source.exact_times.is_empty() {
+                let time_note = if source.temporal_axis_verified {
+                    "dt ready: verified adjacent time axis"
+                } else if source.exact_times.is_empty() {
                     "dt disabled: valid times not verified"
                 } else {
-                    "verified exact time axis"
+                    "dt disabled: fewer than two increasing times"
                 };
                 format!("Store {} ({time_note})", source.hour)
             }
@@ -196,9 +260,10 @@ struct StoreRunRevision {
     hours: Vec<(u16, RawFileRevision)>,
 }
 
-/// Reusable Formula Lab window state.
+/// Reusable Formula Lab editor state. Window and docking ownership stay with
+/// the BowEcho host so this body can render identically in a dock tile or a
+/// floating workspace window.
 pub struct FormulaLabPanel {
-    pub open: bool,
     source: String,
     output_name: String,
     recipe_name: String,
@@ -227,6 +292,10 @@ pub struct FormulaLabPanel {
     source_kind: FormulaSourceKind,
     large_raw_confirmed: bool,
     large_research_profile: bool,
+    field_filter: String,
+    editor_cursor: usize,
+    editor_selection: Option<(usize, usize)>,
+    pending_editor_cursor: Option<usize>,
     /// Every input that can affect an evaluation advances this counter. A
     /// worker captures it at launch and can never publish an obsolete result.
     editor_generation: u64,
@@ -235,7 +304,6 @@ pub struct FormulaLabPanel {
 impl Default for FormulaLabPanel {
     fn default() -> Self {
         let mut panel = Self {
-            open: false,
             source: "sqrt(u_10m^2 + v_10m^2)".to_string(),
             output_name: "formula_result".to_string(),
             recipe_name: "formula_result".to_string(),
@@ -264,6 +332,13 @@ impl Default for FormulaLabPanel {
             source_kind: FormulaSourceKind::Store,
             large_raw_confirmed: false,
             large_research_profile: false,
+            field_filter: String::new(),
+            editor_cursor: "sqrt(u_10m^2 + v_10m^2)".chars().count(),
+            editor_selection: Some((
+                "sqrt(u_10m^2 + v_10m^2)".chars().count(),
+                "sqrt(u_10m^2 + v_10m^2)".chars().count(),
+            )),
+            pending_editor_cursor: None,
             editor_generation: 0,
         };
         panel.refresh_compile();
@@ -284,6 +359,9 @@ impl FormulaLabPanel {
         let source = source.into();
         if self.source != source {
             self.source = source;
+            self.editor_cursor = self.source.chars().count();
+            self.editor_selection = Some((self.editor_cursor, self.editor_cursor));
+            self.pending_editor_cursor = Some(self.editor_cursor);
             self.refresh_compile();
         }
     }
@@ -311,46 +389,96 @@ impl FormulaLabPanel {
         self.last_warnings.clear();
     }
 
-    /// Poll any worker and draw the Formula Lab window. Polling continues when
-    /// the window is closed, so a completed background result is never lost.
-    pub fn show(
-        &mut self,
-        ctx: &egui::Context,
-        sources: FormulaLabSources<'_>,
-    ) -> Option<FormulaLabResult> {
-        self.sync_raw_source(sources.raw_wrf);
-        if self.source_kind == FormulaSourceKind::Store
-            && sources.store.is_none()
-            && sources.raw_wrf.is_some()
-        {
-            self.set_source_kind(FormulaSourceKind::RawWrf);
-        } else if self.source_kind == FormulaSourceKind::RawWrf
-            && sources.raw_wrf.is_none()
-            && sources.store.is_some()
-        {
-            self.set_source_kind(FormulaSourceKind::Store);
-        }
-        // Source synchronization must happen before polling so a result from a
-        // replaced raw file cannot briefly update provenance or reach the host.
-        let completed = self.poll_task(sources);
-        if !self.open {
-            return completed;
-        }
+    /// Versioned editor state only. Runtime workers, results, raw-file
+    /// revisions, status text, and large-file consent are deliberately absent.
+    pub fn state_json(&self) -> serde_json::Value {
+        serde_json::to_value(FormulaLabPersistedState {
+            schema: 1,
+            source: self.source.clone(),
+            output_name: self.output_name.clone(),
+            recipe_name: self.recipe_name.clone(),
+            recipe_version: self.recipe_version.clone(),
+            recipe_description: self.recipe_description.clone(),
+            expected_output_units: self.expected_output_units.clone(),
+            authors: self.authors.clone(),
+            references: self.references.clone(),
+            tags: self.tags.clone(),
+            requirements: self.requirements.clone(),
+            resource_limits: self.resource_limits.clone(),
+            parameter_specs: self.parameter_specs.clone(),
+            parameter_values: self.parameter_values.clone(),
+            evaluation_options: self.evaluation_options.clone(),
+            unit_overrides_text: self.unit_overrides_text.clone(),
+            source_kind: match self.source_kind {
+                FormulaSourceKind::Store => "store",
+                FormulaSourceKind::RawWrf => "raw_wrf",
+            }
+            .to_owned(),
+            large_research_profile: self.large_research_profile,
+            field_filter: self.field_filter.clone(),
+        })
+        .unwrap_or(serde_json::Value::Null)
+    }
 
-        let mut open = self.open;
-        egui::Window::new("Formula Lab")
-            .open(&mut open)
-            .default_size([720.0, 720.0])
-            .resizable(true)
-            .show(ctx, |ui| {
-                self.window_ui(ui, sources);
-            });
-        self.open = open;
-        completed
+    pub fn apply_state_json(&mut self, value: &serde_json::Value) -> bool {
+        let Ok(state) = serde_json::from_value::<FormulaLabPersistedState>(value.clone()) else {
+            return false;
+        };
+        if state.schema != 1 {
+            return false;
+        }
+        let source_kind = match state.source_kind.as_str() {
+            "store" => FormulaSourceKind::Store,
+            "raw_wrf" => FormulaSourceKind::RawWrf,
+            _ => return false,
+        };
+        self.source = state.source;
+        self.output_name = state.output_name;
+        self.recipe_name = state.recipe_name;
+        self.recipe_version = state.recipe_version;
+        self.recipe_description = state.recipe_description;
+        self.expected_output_units = state.expected_output_units;
+        self.authors = state.authors;
+        self.references = state.references;
+        self.tags = state.tags;
+        self.requirements = state.requirements;
+        self.resource_limits = state.resource_limits.map(clamp_desktop_limits);
+        self.parameter_specs = state.parameter_specs;
+        self.parameter_values = state.parameter_values;
+        self.evaluation_options = state.evaluation_options;
+        self.unit_overrides_text = state.unit_overrides_text;
+        self.source_kind = source_kind;
+        self.large_research_profile = state.large_research_profile;
+        self.field_filter = state.field_filter;
+        self.editor_cursor = self.source.chars().count();
+        self.editor_selection = Some((self.editor_cursor, self.editor_cursor));
+        self.pending_editor_cursor = Some(self.editor_cursor);
+        self.sync_parameter_values();
+        self.refresh_compile();
+        true
+    }
+
+    /// Synchronize source identity and poll an in-flight worker. The host calls
+    /// this from its app-wide pump even when Formula Lab is not visible.
+    pub fn poll(&mut self, sources: FormulaLabSources<'_>) -> Option<FormulaLabResult> {
+        self.sync_sources(sources);
+        self.poll_task(sources)
+    }
+
+    fn sync_sources(&mut self, sources: FormulaLabSources<'_>) {
+        self.sync_raw_source(sources.raw_wrf);
+    }
+
+    /// Draw the reusable editor body in a host-owned dock tile or window.
+    pub fn ui(&mut self, ui: &mut egui::Ui, sources: FormulaLabSources<'_>) {
+        self.sync_sources(sources);
+        egui::ScrollArea::vertical()
+            .id_salt("formula_lab_body_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.window_ui(ui, sources));
     }
 
     fn window_ui(&mut self, ui: &mut egui::Ui, sources: FormulaLabSources<'_>) {
-        let source_kind_before = self.source_kind;
         ui.horizontal_wrapped(|ui| {
             if ui.button("Open recipe…").clicked() {
                 self.load_recipe_dialog();
@@ -359,14 +487,13 @@ impl FormulaLabPanel {
                 self.save_recipe_dialog();
             }
             ui.separator();
-            ui.label("Source:");
-            ui.add_enabled_ui(sources.store.is_some(), |ui| {
-                ui.selectable_value(&mut self.source_kind, FormulaSourceKind::Store, "Store");
-            });
-            ui.add_enabled_ui(sources.raw_wrf.is_some(), |ui| {
-                ui.selectable_value(&mut self.source_kind, FormulaSourceKind::RawWrf, "Raw WRF");
-            });
-            ui.separator();
+            ui.label(
+                egui::RichText::new(match self.source_kind {
+                    FormulaSourceKind::Store => "Stored model",
+                    FormulaSourceKind::RawWrf => "Raw WRF",
+                })
+                .strong(),
+            );
             match self.effective_source(sources) {
                 Some(source) => {
                     ui.label(egui::RichText::new(source.label()).small());
@@ -380,9 +507,8 @@ impl FormulaLabPanel {
                 }
             }
         });
-        if self.source_kind != source_kind_before {
-            self.mark_editor_changed();
-        }
+
+        self.capabilities_ui(ui, sources);
 
         if self.source_kind == FormulaSourceKind::RawWrf && sources.raw_wrf.is_some() {
             ui.horizontal(|ui| {
@@ -439,29 +565,7 @@ impl FormulaLabPanel {
             }
         }
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Starters:").small().weak());
-            if ui
-                .add_enabled(
-                    sources.store.is_some(),
-                    egui::Button::new("Store 10 m wind"),
-                )
-                .clicked()
-            {
-                self.set_source_kind(FormulaSourceKind::Store);
-                self.set_source("sqrt(u_10m^2 + v_10m^2)");
-            }
-            if ui
-                .add_enabled(
-                    sources.raw_wrf.is_some(),
-                    egui::Button::new("Raw WRF 10 m wind"),
-                )
-                .clicked()
-            {
-                self.set_source_kind(FormulaSourceKind::RawWrf);
-                self.set_source("sqrt(U10^2 + V10^2)");
-            }
-        });
+        self.starters_ui(ui, sources);
 
         ui.separator();
         ui.horizontal_wrapped(|ui| {
@@ -493,19 +597,49 @@ impl FormulaLabPanel {
             }
         });
 
-        ui.label("Equation");
-        let source_response = ui.add(
-            egui::TextEdit::multiline(&mut self.source)
-                .code_editor()
-                .desired_rows(9)
-                .desired_width(f32::INFINITY)
-                .hint_text("wind = grid_vector(ua, va)\nmagnitude(wind)"),
-        );
-        if source_response.changed() {
-            self.refresh_compile();
-        }
-
-        self.compile_status_ui(ui);
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width().clamp(190.0, 270.0));
+                self.field_browser_ui(ui, sources);
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Equation").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Clear").clicked() {
+                            self.set_source(String::new());
+                            self.editor_cursor = 0;
+                        }
+                    });
+                });
+                let mut output = egui::TextEdit::multiline(&mut self.source)
+                    .id_salt("formula_lab_equation")
+                    .code_editor()
+                    .desired_rows(11)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("wind = grid_vector(u_10m, v_10m)\nmagnitude(wind)")
+                    .show(ui);
+                let response_changed = output.response.changed();
+                if let Some(cursor) = self.pending_editor_cursor.take() {
+                    let cursor = cursor.min(self.source.chars().count());
+                    let range = egui::text::CCursorRange::one(egui::text::CCursor::new(cursor));
+                    output.state.cursor.set_char_range(Some(range));
+                    output.state.store(ui.ctx(), output.response.id);
+                    output.response.request_focus();
+                    self.editor_cursor = cursor;
+                    self.editor_selection = Some((cursor, cursor));
+                } else if let Some(range) = output.cursor_range {
+                    let selected = range.as_sorted_char_range();
+                    self.editor_cursor = range.primary.index;
+                    self.editor_selection = Some((selected.start, selected.end));
+                }
+                if response_changed {
+                    self.refresh_compile();
+                }
+                self.compile_status_ui(ui, sources);
+            });
+        });
         ui.separator();
 
         egui::CollapsingHeader::new("Parameters")
@@ -525,7 +659,7 @@ impl FormulaLabPanel {
             && evaluation_source.is_some()
             && self.task.is_none()
             && output_name.is_ok()
-            && self.temporal_source_allowed(sources)
+            && self.source_readiness(sources).ready
             && !self.large_raw_needs_confirmation(sources)
             && sources.evaluation_blocked.is_none();
         ui.horizontal(|ui| {
@@ -584,7 +718,563 @@ impl FormulaLabPanel {
         }
     }
 
-    fn compile_status_ui(&self, ui: &mut egui::Ui) {
+    fn capabilities_ui(&self, ui: &mut egui::Ui, sources: FormulaLabSources<'_>) {
+        let text = match self.source_kind {
+            FormulaSourceKind::Store => {
+                let temporal = if sources
+                    .store
+                    .is_some_and(|source| source.temporal_axis_verified)
+                {
+                    "time derivatives ready"
+                } else {
+                    "time derivatives need at least two verified times"
+                };
+                format!(
+                    "Stored model data: field algebra + pressure volumes + explicit-height vertical operators; {temporal}. Horizontal derivatives need Raw WRF grid metrics."
+                )
+            }
+            FormulaSourceKind::RawWrf => "Raw WRF: full grid metrics, map factors, physical height, projected vectors, horizontal/vertical calculus, and multi-time dt when present.".to_owned(),
+        };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Source capabilities").strong());
+                ui.label(egui::RichText::new(text).small().weak());
+            });
+        });
+    }
+
+    fn starters_ui(&mut self, ui: &mut egui::Ui, sources: FormulaLabSources<'_>) {
+        let starters = self.starters(sources);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Quick starts").small().strong());
+            for starter in starters {
+                let enabled = starter.source.is_some();
+                let response = ui
+                    .add_enabled(enabled, egui::Button::new(starter.title))
+                    .on_hover_text(&starter.description);
+                if response.clicked()
+                    && let Some(source) = starter.source
+                {
+                    self.source = source;
+                    self.output_name = starter.output_name.to_owned();
+                    self.recipe_name = starter.output_name.to_owned();
+                    self.recipe_description = starter.description;
+                    self.editor_cursor = self.source.chars().count();
+                    self.editor_selection = Some((self.editor_cursor, self.editor_cursor));
+                    self.pending_editor_cursor = Some(self.editor_cursor);
+                    self.refresh_compile();
+                }
+            }
+        });
+    }
+
+    fn starters(&self, sources: FormulaLabSources<'_>) -> Vec<FormulaStarter> {
+        if self.source_kind == FormulaSourceKind::RawWrf {
+            let available = sources.raw_wrf.is_some() && self.raw_source_error.is_none();
+            let formula = |text: &str| available.then(|| text.to_owned());
+            return vec![
+                FormulaStarter {
+                    title: "10 m wind",
+                    description: "WRF U10/V10 wind-speed magnitude.".to_owned(),
+                    source: formula("sqrt(U10^2 + V10^2)"),
+                    output_name: "wind_speed_10m",
+                },
+                FormulaStarter {
+                    title: "2 m temperature",
+                    description: "Direct WRF T2 field, useful as a safe recipe starting point."
+                        .to_owned(),
+                    source: formula("T2"),
+                    output_name: "temperature_2m",
+                },
+                FormulaStarter {
+                    title: "10 m divergence",
+                    description: "Grid-aware divergence; Raw WRF supplies map factors and spacing."
+                        .to_owned(),
+                    source: formula("div(grid_vector(U10, V10))"),
+                    output_name: "divergence_10m",
+                },
+                FormulaStarter {
+                    title: "10 m vorticity",
+                    description: "Grid-aware vertical vorticity from the WRF 10 m wind.".to_owned(),
+                    source: formula("curl(grid_vector(U10, V10))"),
+                    output_name: "vorticity_10m",
+                },
+                FormulaStarter {
+                    title: "T2 tendency",
+                    description:
+                        "Temporal derivative; requires adjacent Times in this raw WRF file."
+                            .to_owned(),
+                    source: formula("dt(T2)"),
+                    output_name: "temperature_2m_tendency",
+                },
+            ];
+        }
+
+        let variables = sources
+            .store
+            .map(|source| source.variables.as_slice())
+            .unwrap_or(&[]);
+        let find = |aliases: &[&str]| find_inventory_name(variables, aliases);
+        let u = find(&["u_10m", "u10"]);
+        let v = find(&["v_10m", "v10"]);
+        let temperature = find(&["temperature_2m", "t_2m", "t2"]);
+        // Relative humidity is scientifically distinct and must never be used
+        // as an implicit dewpoint substitute.
+        let dewpoint = find(&["dewpoint_2m", "td_2m", "td2"]);
+        let precip = find(&["apcp_run_total", "apcp", "precipitation_accumulation"]);
+        let reflectivity = find(&["composite_reflectivity", "refc"]);
+        let temporal = sources
+            .store
+            .is_some_and(|source| source.temporal_axis_verified);
+        vec![
+            FormulaStarter {
+                title: "10 m wind",
+                description: missing_pair_description(
+                    "Portable speed magnitude using the exact U/V tokens in this run.",
+                    u.as_deref(),
+                    v.as_deref(),
+                    "u_10m/U10",
+                    "v_10m/V10",
+                ),
+                source: u
+                    .as_ref()
+                    .zip(v.as_ref())
+                    .map(|(u, v)| format!("sqrt({u}^2 + {v}^2)")),
+                output_name: "wind_speed_10m",
+            },
+            FormulaStarter {
+                title: "Dewpoint spread",
+                description: missing_pair_description(
+                    "2 m temperature minus actual 2 m dewpoint.",
+                    temperature.as_deref(),
+                    dewpoint.as_deref(),
+                    "temperature_2m",
+                    "dewpoint_2m (RH is not substituted)",
+                ),
+                source: temperature
+                    .as_ref()
+                    .zip(dewpoint.as_ref())
+                    .map(|(temperature, dewpoint)| format!("{temperature} - {dewpoint}")),
+                output_name: "dewpoint_depression_2m",
+            },
+            FormulaStarter {
+                title: "2 m temperature",
+                description: starter_field_description(
+                    "Direct 2 m temperature field.",
+                    temperature.as_deref(),
+                    "temperature_2m/T2",
+                ),
+                source: temperature.clone(),
+                output_name: "temperature_2m",
+            },
+            FormulaStarter {
+                title: "Run precip field",
+                description: starter_field_description(
+                    "Direct run accumulation field. Confirm the selected token's accumulation window in the model metadata; APCP and apcp_run_total are not treated as scientifically interchangeable.",
+                    precip.as_deref(),
+                    "apcp_run_total/APCP",
+                ),
+                source: precip,
+                output_name: "accumulated_precipitation",
+            },
+            FormulaStarter {
+                title: "Composite reflectivity",
+                description: starter_field_description(
+                    "Direct composite reflectivity field.",
+                    reflectivity.as_deref(),
+                    "composite_reflectivity/REFC",
+                ),
+                source: reflectivity,
+                output_name: "composite_reflectivity",
+            },
+            FormulaStarter {
+                title: "Temperature tendency",
+                description: if !temporal {
+                    "Needs 2 m temperature and at least two distinct verified run times.".to_owned()
+                } else {
+                    starter_field_description(
+                        "Temporal derivative across the selected run's verified time axis.",
+                        temperature.as_deref(),
+                        "temperature_2m/T2",
+                    )
+                },
+                source: temporal
+                    .then_some(temperature)
+                    .flatten()
+                    .map(|temperature| format!("dt({temperature})")),
+                output_name: "temperature_2m_tendency",
+            },
+        ]
+    }
+
+    fn field_browser_ui(&mut self, ui: &mut egui::Ui, sources: FormulaLabSources<'_>) {
+        ui.label(egui::RichText::new("Fields").strong());
+        ui.label(
+            egui::RichText::new("Click a field to insert its exact token at the editor cursor.")
+                .small()
+                .weak(),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut self.field_filter)
+                .hint_text("Search name or units")
+                .desired_width(f32::INFINITY),
+        );
+        let query = self.field_filter.trim().to_ascii_lowercase();
+        let fields: Vec<VarInfo> = match self.source_kind {
+            FormulaSourceKind::Store => sources
+                .store
+                .map(|source| source.variables.clone())
+                .unwrap_or_default(),
+            FormulaSourceKind::RawWrf => raw_wrf_common_fields(),
+        };
+        let filtered = fields.into_iter().filter(|field| {
+            query.is_empty()
+                || field.name.to_ascii_lowercase().contains(&query)
+                || field.units.to_ascii_lowercase().contains(&query)
+        });
+        let mut clicked = None;
+        egui::ScrollArea::vertical()
+            .id_salt("formula_lab_fields")
+            .max_height(280.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for field in filtered.take(300) {
+                    let kind = match field.kind {
+                        VarKind::Surface2D => "2-D",
+                        VarKind::Pressure3D if self.source_kind == FormulaSourceKind::RawWrf => {
+                            "3-D WRF/native"
+                        }
+                        VarKind::Pressure3D => "3-D pressure",
+                    };
+                    let label = if field.units.trim().is_empty() {
+                        field.name.clone()
+                    } else {
+                        format!("{}  [{}]", field.name, field.units)
+                    };
+                    let raw_details = (self.source_kind == FormulaSourceKind::RawWrf)
+                        .then(|| wrf_core::variables::get_var_def(&field.name))
+                        .flatten()
+                        .map(|definition| {
+                            let aliases = if definition.aliases.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · aliases: {}", definition.aliases.join(", "))
+                            };
+                            format!(" · {}{aliases}", definition.description)
+                        })
+                        .unwrap_or_default();
+                    if ui
+                        .button(label)
+                        .on_hover_text(format!(
+                            "{kind}{}{raw_details}",
+                            if field.levels_hpa.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {} levels", field.levels_hpa.len())
+                            }
+                        ))
+                        .clicked()
+                    {
+                        clicked = Some(field.name);
+                    }
+                }
+            });
+        if let Some(field) = clicked {
+            self.insert_field_token(&field);
+        }
+        if self.source_kind == FormulaSourceKind::Store
+            && sources
+                .store
+                .is_some_and(|source| source.variables.is_empty())
+        {
+            ui.label(
+                egui::RichText::new("Loading the selected timestep's field inventory…")
+                    .small()
+                    .weak(),
+            );
+        }
+        if self.source_kind == FormulaSourceKind::RawWrf {
+            ui.label(
+                egui::RichText::new(
+                    "Common WRF tokens are listed; the file resolver validates availability when you evaluate.",
+                )
+                .small()
+                .weak(),
+            );
+        }
+    }
+
+    fn insert_field_token(&mut self, field: &str) {
+        let char_count = self.source.chars().count();
+        let (selection_start, selection_end) = self
+            .editor_selection
+            .unwrap_or((self.editor_cursor, self.editor_cursor));
+        let start = selection_start.min(selection_end).min(char_count);
+        let end = selection_start.max(selection_end).min(char_count);
+        let start_byte = char_to_byte_index(&self.source, start);
+        let end_byte = char_to_byte_index(&self.source, end);
+        self.source.replace_range(start_byte..end_byte, field);
+        self.editor_cursor = start + field.chars().count();
+        self.editor_selection = Some((self.editor_cursor, self.editor_cursor));
+        self.pending_editor_cursor = Some(self.editor_cursor);
+        self.refresh_compile();
+    }
+
+    fn source_readiness(&self, sources: FormulaLabSources<'_>) -> SourceReadiness {
+        let mut readiness = SourceReadiness::default();
+        let Some(compiled) = &self.compiled else {
+            readiness
+                .blockers
+                .push("Fix the equation syntax first.".to_owned());
+            return readiness;
+        };
+        if compiled.plan().dependencies.is_empty() {
+            readiness.blockers.push(
+                "The result is scalar; include at least one grid field so Formula Lab can produce a displayable [Y, X] field."
+                    .to_owned(),
+            );
+        }
+        let has_vertical_output_reducer = compiled.plan().functions.iter().any(|function| {
+            matches!(
+                function.as_str(),
+                "mean_z" | "integrate_z" | "interpolate_z"
+            )
+        });
+        match self.source_kind {
+            FormulaSourceKind::RawWrf => {
+                if sources.raw_wrf.is_none() {
+                    readiness
+                        .blockers
+                        .push("Choose a raw WRF file for this source.".to_owned());
+                } else if let Some(error) = &self.raw_source_error {
+                    readiness
+                        .blockers
+                        .push(format!("Raw WRF source is unreadable: {error}"));
+                } else {
+                    readiness.notes.push(
+                        "Raw WRF field names and time count are validated by the file resolver at evaluation."
+                            .to_owned(),
+                    );
+                }
+                let mut known_three_dimensional = Vec::new();
+                let raw_inventory = raw_wrf_common_fields();
+                for dependency in &compiled.plan().dependencies {
+                    if let Some(definition) = wrf_core::variables::get_var_def(dependency) {
+                        if PACKED_WRF_FORMULA_FIELDS.contains(&definition.name) {
+                            readiness.blockers.push(format!(
+                                "Raw WRF field '{}' is a packed component product and cannot be used directly; choose component-specific fields.",
+                                dependency
+                            ));
+                        } else if definition.dim == wrf_core::variables::VarDim::ThreeD {
+                            known_three_dimensional.push(dependency.clone());
+                        }
+                    } else if raw_inventory.iter().any(|field| {
+                        field.name.eq_ignore_ascii_case(dependency)
+                            && field.kind == VarKind::Pressure3D
+                    }) {
+                        known_three_dimensional.push(dependency.clone());
+                    }
+                }
+                if !known_three_dimensional.is_empty() && !has_vertical_output_reducer {
+                    readiness.blockers.push(format!(
+                        "Known 3-D raw WRF input(s) {} need mean_z, integrate_z, or interpolate_z before the result can display as 2-D.",
+                        known_three_dimensional.join(", ")
+                    ));
+                }
+                if let Some(requirements) = &compiled.plan().recipe_requirements
+                    && (requirements.maximum_cadence_seconds.is_some()
+                        || requirements.maximum_horizontal_spacing_m.is_some()
+                        || requirements.minimum_vertical_levels.is_some())
+                {
+                    readiness.notes.push(
+                        "Recipe cadence, grid-spacing, and vertical-level requirements are validated from the raw WRF file at evaluation."
+                            .to_owned(),
+                    );
+                }
+            }
+            FormulaSourceKind::Store => {
+                let Some(source) = sources.store else {
+                    readiness
+                        .blockers
+                        .push("Select a model, run, and time from the store.".to_owned());
+                    return readiness;
+                };
+                if source.variables.is_empty() {
+                    readiness
+                        .blockers
+                        .push("Waiting for this timestep's field inventory.".to_owned());
+                }
+                let overrides = parse_unit_overrides(&self.unit_overrides_text).unwrap_or_default();
+                let mut dependencies = compiled.plan().dependencies.clone();
+                if let Some(requirements) = &compiled.plan().recipe_requirements {
+                    dependencies.extend(requirements.fields.iter().cloned());
+                }
+                dependencies.sort_by_key(|name| name.to_ascii_lowercase());
+                dependencies.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+                let mut dependency_fields = Vec::new();
+                for dependency in dependencies {
+                    let Some(field) = source
+                        .variables
+                        .iter()
+                        .find(|field| field.name.eq_ignore_ascii_case(&dependency))
+                    else {
+                        readiness.blockers.push(format!(
+                            "Missing field '{dependency}' in {}/{} {}.",
+                            source.hour.model,
+                            source.hour.run,
+                            source.hour.time_label()
+                        ));
+                        continue;
+                    };
+                    dependency_fields.push(field);
+                    let overridden = overrides
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case(&field.name));
+                    if overridden
+                        && !field.units.trim().is_empty()
+                        && wrf_formula::parse_unit(&field.units).is_ok()
+                    {
+                        readiness.blockers.push(format!(
+                            "Field '{}' now has recognized stored units '{}'; remove its stale unit override before evaluating.",
+                            field.name, field.units
+                        ));
+                    } else if !overridden && field.units.trim().is_empty() {
+                        readiness.blockers.push(format!(
+                            "Field '{}' has no stored unit metadata. Add an explicit, scientifically verified unit override.",
+                            field.name
+                        ));
+                    } else if !overridden && wrf_formula::parse_unit(&field.units).is_err() {
+                        if let Some(formula_units) = safe_unit_override(&field.units) {
+                            readiness.blockers.push(format!(
+                                "Field '{}' uses unsupported stored units '{}'. Review and apply the conservative override offered below.",
+                                field.name, field.units
+                            ));
+                            readiness.override_suggestions.push(UnitOverrideSuggestion {
+                                field: field.name.clone(),
+                                stored_units: field.units.clone(),
+                                formula_units,
+                            });
+                        } else {
+                            readiness.blockers.push(format!(
+                                "Field '{}' uses unsupported stored units '{}'. This needs a scale-aware scientific conversion; no automatic relabeling override is offered.",
+                                field.name, field.units
+                            ));
+                        }
+                    }
+                }
+                let pressure_fields = dependency_fields
+                    .iter()
+                    .copied()
+                    .filter(|field| field.kind == VarKind::Pressure3D)
+                    .collect::<Vec<_>>();
+                if pressure_fields.len() > 1 {
+                    let reference = &pressure_fields[0].levels_hpa;
+                    if pressure_fields
+                        .iter()
+                        .skip(1)
+                        .any(|field| &field.levels_hpa != reference)
+                    {
+                        readiness.blockers.push(format!(
+                            "Pressure-volume inputs use different level axes ({}); store formulas require identical levels.",
+                            pressure_fields
+                                .iter()
+                                .map(|field| format!("{}:{}", field.name, field.levels_hpa.len()))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                }
+                if !pressure_fields.is_empty() && !has_vertical_output_reducer {
+                    readiness.blockers.push(format!(
+                        "3-D pressure input(s) {} need mean_z, integrate_z, or interpolate_z before the result can display as 2-D.",
+                        pressure_fields
+                            .iter()
+                            .map(|field| field.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                for requirement in &compiled.plan().requirements {
+                    match requirement {
+                        Requirement::MassMapFactor => readiness.blockers.push(
+                            "Horizontal derivatives need grid spacing/map factors that rw-store does not persist; choose Raw WRF."
+                                .to_owned(),
+                        ),
+                        Requirement::PhysicalHeight {
+                            datum: HeightDatum::ResolverDefault,
+                        } => readiness.blockers.push(
+                            "ddz(field) needs the resolver's default physical-height coordinate; use ddz(field, height_field) or choose Raw WRF."
+                                .to_owned(),
+                        ),
+                        Requirement::AdjacentTimes if !source.temporal_axis_verified => readiness
+                            .blockers
+                            .push("dt() needs at least two distinct, increasing verified run times."
+                                .to_owned()),
+                        _ => {}
+                    }
+                }
+                if let Some(requirements) = &compiled.plan().recipe_requirements {
+                    if let Some(maximum_cadence) = requirements.maximum_cadence_seconds {
+                        match selected_axis_neighbor_interval_seconds(
+                            &source.exact_times,
+                            source.hour.hour,
+                        ) {
+                            Some(interval) if source.temporal_axis_verified => {
+                                if interval > maximum_cadence {
+                                    readiness.blockers.push(format!(
+                                        "Recipe requires cadence ≤ {maximum_cadence:.0} s, but the selected output's largest neighbor interval is {interval:.0} s."
+                                    ));
+                                }
+                            }
+                            _ => readiness.blockers.push(format!(
+                                "Recipe requires cadence ≤ {maximum_cadence:.0} s, but this store source lacks two verified increasing times."
+                            )),
+                        }
+                    }
+                    if let Some(maximum_spacing) = requirements.maximum_horizontal_spacing_m {
+                        readiness.blockers.push(format!(
+                            "Recipe requires horizontal spacing ≤ {maximum_spacing:.0} m, but rw-store does not persist resolver dx/dy; choose Raw WRF."
+                        ));
+                    }
+                    if let Some(minimum_levels) = requirements.minimum_vertical_levels {
+                        readiness.blockers.push(format!(
+                            "Recipe requires at least {minimum_levels} vertical levels, but the store resolver cannot expose a run-wide nz; choose Raw WRF."
+                        ));
+                    }
+                }
+                readiness.notes.push(format!(
+                    "{} fields inventoried for {} / {} / {}.",
+                    source.variables.len(),
+                    source.hour.model,
+                    source.hour.run,
+                    source.hour.time_label()
+                ));
+            }
+        }
+        readiness.ready = readiness.blockers.is_empty();
+        readiness
+    }
+
+    fn append_unit_override(&mut self, suggestion: &UnitOverrideSuggestion) {
+        if self
+            .unit_overrides_text
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.trim()))
+            .any(|name| name.eq_ignore_ascii_case(&suggestion.field))
+        {
+            return;
+        }
+        if !self.unit_overrides_text.trim().is_empty() {
+            self.unit_overrides_text.push('\n');
+        }
+        self.unit_overrides_text.push_str(&format!(
+            "{} = {}",
+            suggestion.field, suggestion.formula_units
+        ));
+        self.refresh_compile();
+    }
+
+    fn compile_status_ui(&mut self, ui: &mut egui::Ui, sources: FormulaLabSources<'_>) {
         if let Some(error) = &self.compile_error {
             ui.label(
                 egui::RichText::new(format!("{:?}: {}", error.kind, error.message))
@@ -616,7 +1306,34 @@ impl FormulaLabPanel {
             ui.label(egui::RichText::new("Formula has not compiled").weak());
             return;
         };
-        ui.label(egui::RichText::new("✓ Formula compiled").color(egui::Color32::LIGHT_GREEN));
+        let readiness = self.source_readiness(sources);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("✓ Syntax valid").color(egui::Color32::LIGHT_GREEN));
+            ui.separator();
+            if readiness.ready {
+                ui.label(
+                    egui::RichText::new("✓ Ready for selected source")
+                        .strong()
+                        .color(egui::Color32::LIGHT_GREEN),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("Source not ready")
+                        .strong()
+                        .color(egui::Color32::YELLOW),
+                );
+            }
+        });
+        for blocker in &readiness.blockers {
+            ui.label(
+                egui::RichText::new(format!("• {blocker}"))
+                    .small()
+                    .color(egui::Color32::YELLOW),
+            );
+        }
+        for note in &readiness.notes {
+            ui.label(egui::RichText::new(note).small().weak());
+        }
         let plan = compiled.plan();
         ui.label(
             egui::RichText::new(format!(
@@ -671,6 +1388,24 @@ impl FormulaLabPanel {
             .small()
             .weak(),
         );
+        let mut apply_override = None;
+        for suggestion in &readiness.override_suggestions {
+            if ui
+                .small_button(format!(
+                    "Use {} = {} (stored {})",
+                    suggestion.field, suggestion.formula_units, suggestion.stored_units
+                ))
+                .on_hover_text(
+                    "Add this explicit, conservative unit interpretation to Evaluation options.",
+                )
+                .clicked()
+            {
+                apply_override = Some(suggestion.clone());
+            }
+        }
+        if let Some(suggestion) = apply_override {
+            self.append_unit_override(&suggestion);
+        }
     }
 
     fn parameters_ui(&mut self, ui: &mut egui::Ui) {
@@ -1369,6 +2104,9 @@ impl FormulaLabPanel {
         self.evaluation_options = recipe.evaluation_options;
         self.resource_limits = recipe.resource_limits.map(clamp_desktop_limits);
         self.parameter_values.clear();
+        self.editor_cursor = self.source.chars().count();
+        self.editor_selection = Some((self.editor_cursor, self.editor_cursor));
+        self.pending_editor_cursor = Some(self.editor_cursor);
         self.sync_parameter_values();
         self.refresh_compile();
     }
@@ -1526,7 +2264,29 @@ fn inspect_store_run_revision(source: &StoreFormulaSource) -> Result<StoreRunRev
             }
         }
     } else if !source.exact_times.is_empty() {
-        return Err("Formula Lab received exact times for a legacy forecast-hour run".to_string());
+        if source.exact_times.len() != manifest.hours.len() {
+            return Err(
+                "Formula Lab legacy forecast-hour axis is incomplete for the selected run"
+                    .to_string(),
+            );
+        }
+        for &forecast_hour in manifest.hours.keys() {
+            let supplied = source.exact_times.get(&forecast_hour).ok_or_else(|| {
+                format!("Formula Lab legacy forecast-hour axis is missing f{forecast_hour:03}")
+            })?;
+            let expected_seconds = f64::from(forecast_hour) * 3_600.0;
+            if supplied.seconds != expected_seconds {
+                return Err(format!(
+                    "Formula Lab legacy f{forecast_hour:03} time must be {expected_seconds} seconds"
+                ));
+            }
+        }
+    }
+    if source.temporal_axis_verified && !time_axis_supports_adjacent(&source.exact_times) {
+        return Err(
+            "Formula Lab source marked temporal-ready without two distinct, increasing times"
+                .to_string(),
+        );
     }
 
     let grid = inspect_raw_file_revision(&run_dir.join("grid.rwg"))?;
@@ -1778,6 +2538,149 @@ fn nonfinite_text(policy: NonFinitePolicy) -> &'static str {
     }
 }
 
+fn find_inventory_name(variables: &[VarInfo], aliases: &[&str]) -> Option<String> {
+    aliases.iter().find_map(|alias| {
+        variables
+            .iter()
+            .find(|field| field.name.eq_ignore_ascii_case(alias))
+            .map(|field| field.name.clone())
+    })
+}
+
+fn char_to_byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(byte_index, _)| byte_index)
+        .unwrap_or(text.len())
+}
+
+fn starter_field_description(base: &str, field: Option<&str>, wanted: &str) -> String {
+    match field {
+        Some(field) => format!("{base} Uses exact token '{field}'."),
+        None => format!("Unavailable: this timestep has no {wanted} field."),
+    }
+}
+
+fn missing_pair_description(
+    base: &str,
+    first: Option<&str>,
+    second: Option<&str>,
+    first_wanted: &str,
+    second_wanted: &str,
+) -> String {
+    if first.is_some() && second.is_some() {
+        base.to_owned()
+    } else {
+        let mut missing = Vec::new();
+        if first.is_none() {
+            missing.push(first_wanted);
+        }
+        if second.is_none() {
+            missing.push(second_wanted);
+        }
+        format!("Unavailable: missing {}.", missing.join(" and "))
+    }
+}
+
+fn raw_wrf_common_fields() -> Vec<VarInfo> {
+    let mut fields = [
+        ("U10", "m s-1", VarKind::Surface2D),
+        ("V10", "m s-1", VarKind::Surface2D),
+        ("T2", "K", VarKind::Surface2D),
+        ("Q2", "kg kg-1", VarKind::Surface2D),
+        ("PSFC", "Pa", VarKind::Surface2D),
+        ("RAINC", "mm", VarKind::Surface2D),
+        ("RAINNC", "mm", VarKind::Surface2D),
+        ("REFL_10CM", "dBZ", VarKind::Pressure3D),
+        ("ua", "m s-1", VarKind::Pressure3D),
+        ("va", "m s-1", VarKind::Pressure3D),
+        ("wa", "m s-1", VarKind::Pressure3D),
+        ("tk", "K", VarKind::Pressure3D),
+        ("pressure", "hPa", VarKind::Pressure3D),
+        ("pres", "Pa", VarKind::Pressure3D),
+        ("z", "m", VarKind::Pressure3D),
+    ]
+    .into_iter()
+    .map(|(name, units, kind)| VarInfo {
+        name: name.to_owned(),
+        units: units.to_owned(),
+        kind,
+        levels_hpa: Vec::new(),
+    })
+    .collect::<Vec<_>>();
+    fields.extend(
+        wrf_core::variables::VARS
+            .iter()
+            .filter(|definition| !PACKED_WRF_FORMULA_FIELDS.contains(&definition.name))
+            .map(|definition| VarInfo {
+                name: definition.name.to_owned(),
+                units: definition.default_units.to_owned(),
+                kind: match definition.dim {
+                    wrf_core::variables::VarDim::TwoD => VarKind::Surface2D,
+                    wrf_core::variables::VarDim::ThreeD => VarKind::Pressure3D,
+                },
+                levels_hpa: Vec::new(),
+            }),
+    );
+    fields.sort_by_key(|field| field.name.to_ascii_lowercase());
+    fields.dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
+    fields
+}
+
+fn safe_unit_override(stored_units: &str) -> Option<&'static str> {
+    match stored_units.trim().to_ascii_lowercase().as_str() {
+        "gpm" => Some("m"),
+        "-" | "0/1" | "fraction" | "index" | "count" => Some("1"),
+        "w m{-2}" => Some("W/m2"),
+        "j m-2" => Some("kg s-2"),
+        _ => None,
+    }
+}
+
+fn time_axis_supports_adjacent(axis: &BTreeMap<u16, ExactStoreTime>) -> bool {
+    if axis.len() < 2 {
+        return false;
+    }
+    axis.values()
+        .map(|time| time.seconds)
+        .try_fold(None, |previous, seconds| {
+            if !seconds.is_finite() || previous.is_some_and(|prior| seconds <= prior) {
+                Err(())
+            } else {
+                Ok(Some(seconds))
+            }
+        })
+        .is_ok()
+}
+
+fn selected_axis_neighbor_interval_seconds(
+    axis: &BTreeMap<u16, ExactStoreTime>,
+    selected_slot: u16,
+) -> Option<f64> {
+    use std::ops::Bound::{Excluded, Unbounded};
+
+    let current = axis.get(&selected_slot)?.seconds;
+    if !current.is_finite() {
+        return None;
+    }
+    let mut intervals = Vec::with_capacity(2);
+    if let Some((_, previous)) = axis.range(..selected_slot).next_back() {
+        let interval = current - previous.seconds;
+        if !interval.is_finite() || interval <= 0.0 {
+            return None;
+        }
+        intervals.push(interval);
+    }
+    if let Some((_, next)) = axis.range((Excluded(selected_slot), Unbounded)).next() {
+        let interval = next.seconds - current;
+        if !interval.is_finite() || interval <= 0.0 {
+            return None;
+        }
+        intervals.push(interval);
+    }
+    intervals.into_iter().reduce(f64::max)
+}
+
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     let detail = payload
         .downcast_ref::<&str>()
@@ -1801,9 +2704,57 @@ mod tests {
     }
 
     #[test]
+    fn field_insertion_advances_and_replaces_the_saved_selection() {
+        let mut panel = FormulaLabPanel::new();
+        panel.source.clear();
+        panel.editor_cursor = 0;
+        panel.editor_selection = Some((0, 0));
+        panel.insert_field_token("temperature_2m");
+        panel.insert_field_token(" + dewpoint_2m");
+        assert_eq!(panel.source, "temperature_2m + dewpoint_2m");
+        assert_eq!(panel.editor_cursor, panel.source.chars().count());
+
+        panel.editor_selection = Some((0, "temperature_2m".chars().count()));
+        panel.insert_field_token("T2");
+        assert_eq!(panel.source, "T2 + dewpoint_2m");
+        assert_eq!(panel.pending_editor_cursor, Some(2));
+    }
+
+    #[test]
     fn unit_overrides_reject_case_collisions() {
         let error = parse_unit_overrides("T2 = K\nt2 = degC").unwrap_err();
         assert_eq!(error.kind, ErrorKind::Compile);
+    }
+
+    #[test]
+    fn every_offered_unit_override_is_accepted_by_the_pinned_evaluator() {
+        for stored in [
+            "gpm", "-", "0/1", "fraction", "index", "count", "W m{-2}", "J m-2",
+        ] {
+            let suggested = safe_unit_override(stored).expect("known safe suggestion");
+            assert!(
+                wrf_formula::parse_unit(suggested).is_ok(),
+                "{stored} suggestion {suggested} must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn cadence_preflight_uses_only_neighbors_of_selected_output() {
+        let axis = BTreeMap::from([
+            (0, ExactStoreTime::new(0.0, None)),
+            (1, ExactStoreTime::new(3_600.0, None)),
+            (2, ExactStoreTime::new(7_200.0, None)),
+            (3, ExactStoreTime::new(18_000.0, None)),
+        ]);
+        assert_eq!(
+            selected_axis_neighbor_interval_seconds(&axis, 0),
+            Some(3_600.0)
+        );
+        assert_eq!(
+            selected_axis_neighbor_interval_seconds(&axis, 2),
+            Some(10_800.0)
+        );
     }
 
     #[test]
@@ -1852,6 +2803,7 @@ mod tests {
             },
             exact_times: BTreeMap::new(),
             temporal_axis_verified: false,
+            variables: Vec::new(),
         };
         assert!(
             panel
@@ -1862,6 +2814,12 @@ mod tests {
                 })
                 .is_none()
         );
+        panel.sync_sources(FormulaLabSources {
+            store: Some(&store),
+            raw_wrf: None,
+            evaluation_blocked: None,
+        });
+        assert_eq!(panel.source_kind(), FormulaSourceKind::RawWrf);
     }
 
     #[test]
@@ -1876,6 +2834,7 @@ mod tests {
             },
             exact_times: BTreeMap::new(),
             temporal_axis_verified: false,
+            variables: Vec::new(),
         };
         let sources = FormulaLabSources {
             store: Some(&store),
@@ -1899,6 +2858,332 @@ mod tests {
             raw_wrf: None,
             evaluation_blocked: None,
         }));
+    }
+
+    fn store_var(name: &str, units: &str, kind: VarKind, levels: &[u16]) -> VarInfo {
+        VarInfo {
+            name: name.to_owned(),
+            units: units.to_owned(),
+            kind,
+            levels_hpa: levels.to_vec(),
+        }
+    }
+
+    fn test_store_source(variables: Vec<VarInfo>) -> StoreFormulaSource {
+        StoreFormulaSource {
+            store_root: PathBuf::from("store"),
+            hour: HourKey {
+                model: "hrrr".to_owned(),
+                run: "20260711_00z".to_owned(),
+                hour: 0,
+                exact_time: None,
+            },
+            exact_times: BTreeMap::from([
+                (0, ExactStoreTime::new(0.0, Some("f000".to_owned()))),
+                (1, ExactStoreTime::new(3_600.0, Some("f001".to_owned()))),
+            ]),
+            temporal_axis_verified: true,
+            variables,
+        }
+    }
+
+    #[test]
+    fn store_readiness_preflights_fields_units_and_capabilities() {
+        let source = test_store_source(vec![
+            store_var("U10", "m/s", VarKind::Surface2D, &[]),
+            store_var("V10", "m/s", VarKind::Surface2D, &[]),
+            store_var("terrain_height", "gpm", VarKind::Surface2D, &[]),
+            store_var("pressure_bad", "kPa", VarKind::Surface2D, &[]),
+            store_var("unitless_unknown", "", VarKind::Surface2D, &[]),
+            store_var(
+                "temperature_iso",
+                "K",
+                VarKind::Pressure3D,
+                &[1000, 850, 700],
+            ),
+            store_var("temperature_2m", "K", VarKind::Surface2D, &[]),
+        ]);
+        let sources = FormulaLabSources {
+            store: Some(&source),
+            raw_wrf: None,
+            evaluation_blocked: None,
+        };
+        let mut panel = FormulaLabPanel::new();
+        panel.set_source("sqrt(U10^2 + V10^2)");
+        assert!(panel.source_readiness(sources).ready);
+
+        panel.set_source("U10 + missing_wind");
+        let missing = panel.source_readiness(sources);
+        assert!(!missing.ready);
+        assert!(
+            missing
+                .blockers
+                .iter()
+                .any(|message| message.contains("missing_wind"))
+        );
+
+        panel.set_source("ddx(U10)");
+        let calculus = panel.source_readiness(sources);
+        assert!(
+            calculus
+                .blockers
+                .iter()
+                .any(|message| message.contains("Raw WRF"))
+        );
+
+        panel.set_source("terrain_height");
+        let units = panel.source_readiness(sources);
+        assert_eq!(units.override_suggestions.len(), 1);
+        panel.append_unit_override(&units.override_suggestions[0]);
+        assert!(panel.source_readiness(sources).ready);
+
+        panel.set_source("pressure_bad");
+        let scaled_units = panel.source_readiness(sources);
+        assert!(!scaled_units.ready);
+        assert!(scaled_units.override_suggestions.is_empty());
+        assert!(
+            scaled_units
+                .blockers
+                .iter()
+                .any(|message| message.contains("scale-aware"))
+        );
+
+        panel.set_source("unitless_unknown");
+        assert!(
+            panel
+                .source_readiness(sources)
+                .blockers
+                .iter()
+                .any(|message| message.contains("no stored unit metadata"))
+        );
+
+        panel.set_source("2 + 2");
+        assert!(
+            panel
+                .source_readiness(sources)
+                .blockers
+                .iter()
+                .any(|message| message.contains("result is scalar"))
+        );
+
+        panel.unit_overrides_text = "U10 = m/s".to_owned();
+        panel.set_source("U10");
+        assert!(
+            panel
+                .source_readiness(sources)
+                .blockers
+                .iter()
+                .any(|message| message.contains("remove its stale unit override"))
+        );
+        panel.unit_overrides_text.clear();
+        panel.set_source("temperature_iso - temperature_2m");
+        assert!(
+            panel
+                .source_readiness(sources)
+                .blockers
+                .iter()
+                .any(|message| message.contains("need mean_z"))
+        );
+
+        panel.requirements.maximum_cadence_seconds = Some(1_800.0);
+        panel.requirements.maximum_horizontal_spacing_m = Some(3_000.0);
+        panel.requirements.minimum_vertical_levels = Some(20);
+        panel.set_source("temperature_2m");
+        let recipe = panel.source_readiness(sources);
+        assert!(
+            recipe
+                .blockers
+                .iter()
+                .any(|message| message.contains("largest neighbor interval is 3600"))
+        );
+        assert!(
+            recipe
+                .blockers
+                .iter()
+                .any(|message| message.contains("does not persist resolver dx/dy"))
+        );
+        assert!(
+            recipe
+                .blockers
+                .iter()
+                .any(|message| message.contains("run-wide nz"))
+        );
+    }
+
+    #[test]
+    fn store_starters_use_exact_tokens_and_never_substitute_humidity_for_dewpoint() {
+        let source = test_store_source(vec![
+            store_var("U10", "m/s", VarKind::Surface2D, &[]),
+            store_var("V10", "m/s", VarKind::Surface2D, &[]),
+            store_var("temperature_2m", "K", VarKind::Surface2D, &[]),
+            store_var("rh_2m", "%", VarKind::Surface2D, &[]),
+        ]);
+        let panel = FormulaLabPanel::new();
+        let starters = panel.starters(FormulaLabSources {
+            store: Some(&source),
+            raw_wrf: None,
+            evaluation_blocked: None,
+        });
+        assert_eq!(
+            starters
+                .iter()
+                .find(|starter| starter.title == "10 m wind")
+                .and_then(|starter| starter.source.as_deref()),
+            Some("sqrt(U10^2 + V10^2)")
+        );
+        assert!(
+            starters
+                .iter()
+                .find(|starter| starter.title == "Dewpoint spread")
+                .is_some_and(|starter| starter.source.is_none())
+        );
+    }
+
+    #[test]
+    fn raw_wrf_browser_uses_registry_but_excludes_packed_outputs() {
+        let fields = raw_wrf_common_fields();
+        assert!(
+            fields.len() > 40,
+            "wrf-core registry should provide breadth"
+        );
+        assert!(fields.iter().any(|field| field.name == "temp"));
+        for packed in ["cape2d", "uvmet", "uvmet10", "mean_wind", "cloudfrac"] {
+            assert!(
+                fields.iter().all(|field| field.name != packed),
+                "packed component output {packed} must not be advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_wrf_readiness_blocks_known_packed_and_unreduced_3d_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "bowecho-formula-raw-readiness-{}",
+            std::process::id()
+        ));
+        fs::write(&path, b"stable raw source identity").expect("raw fixture");
+        let raw = RawWrfFormulaSource {
+            path: path.clone(),
+            initial_time_index: 0,
+            display_hour: HourKey {
+                model: "raw-wrf".to_owned(),
+                run: "fixture".to_owned(),
+                hour: 0,
+                exact_time: None,
+            },
+        };
+        let sources = FormulaLabSources {
+            store: None,
+            raw_wrf: Some(&raw),
+            evaluation_blocked: None,
+        };
+        let mut panel = FormulaLabPanel::new();
+        panel.set_source_kind(FormulaSourceKind::RawWrf);
+        panel.sync_sources(sources);
+
+        panel.set_source("pressure");
+        assert!(
+            panel
+                .source_readiness(sources)
+                .blockers
+                .iter()
+                .any(|message| message.contains("Known 3-D raw WRF"))
+        );
+        panel.set_source("cape2d");
+        assert!(
+            panel
+                .source_readiness(sources)
+                .blockers
+                .iter()
+                .any(|message| message.contains("packed component"))
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn formula_editor_state_round_trips_without_runtime_state() {
+        let mut panel = FormulaLabPanel::new();
+        panel.set_source("dt(temperature_2m)");
+        panel.output_name = "temperature_tendency".to_owned();
+        panel.source_kind = FormulaSourceKind::RawWrf;
+        panel.status = Some("runtime-only".to_owned());
+        panel.large_raw_confirmed = true;
+        let state = panel.state_json();
+        assert!(state.get("status").is_none());
+        assert!(state.get("large_raw_confirmed").is_none());
+
+        let mut restored = FormulaLabPanel::new();
+        assert!(restored.apply_state_json(&state));
+        assert_eq!(restored.source, "dt(temperature_2m)");
+        assert_eq!(restored.output_name, "temperature_tendency");
+        assert_eq!(restored.source_kind, FormulaSourceKind::RawWrf);
+        assert!(!restored.large_raw_confirmed);
+        assert!(restored.status.is_none());
+    }
+
+    #[test]
+    fn legacy_store_revision_accepts_only_complete_forecast_hour_times() {
+        let root = std::env::temp_dir().join(format!(
+            "bowecho-formula-v1-revision-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let run_dir = root.join("hrrr").join("20260711_00z");
+        fs::create_dir_all(&run_dir).expect("create v1 fixture");
+        fs::write(run_dir.join("grid.rwg"), b"grid").expect("grid identity file");
+        fs::write(run_dir.join("f000.rws"), b"hour zero").expect("hour zero");
+        fs::write(run_dir.join("f003.rws"), b"hour three").expect("hour three");
+        let manifest = serde_json::json!({
+            "schema": "rw-store.run.v1",
+            "model": "hrrr",
+            "run": "20260711_00z",
+            "grid_hash": "fixture-grid",
+            "nx": 2,
+            "ny": 2,
+            "hours": {
+                "0": {"file":"f000.rws","written_unix":1,"encode_ms":1,"variables":["temperature_2m"]},
+                "3": {"file":"f003.rws","written_unix":2,"encode_ms":1,"variables":["temperature_2m"]}
+            },
+            "writer": {"name":"test","version":"1","build":"fixture"}
+        });
+        fs::write(
+            run_dir.join("run.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+        let mut source = StoreFormulaSource {
+            store_root: root.clone(),
+            hour: HourKey {
+                model: "hrrr".to_owned(),
+                run: "20260711_00z".to_owned(),
+                hour: 0,
+                exact_time: None,
+            },
+            exact_times: BTreeMap::from([
+                (0, ExactStoreTime::new(0.0, Some("f000".to_owned()))),
+                (3, ExactStoreTime::new(10_800.0, Some("f003".to_owned()))),
+            ]),
+            temporal_axis_verified: true,
+            variables: Vec::new(),
+        };
+        assert!(inspect_store_run_revision(&source).is_ok());
+
+        source.exact_times.remove(&3);
+        assert!(
+            inspect_store_run_revision(&source)
+                .unwrap_err()
+                .contains("incomplete")
+        );
+        source.exact_times.insert(3, ExactStoreTime::new(3.0, None));
+        assert!(
+            inspect_store_run_revision(&source)
+                .unwrap_err()
+                .contains("must be 10800")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

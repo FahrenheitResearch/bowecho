@@ -117,12 +117,16 @@ tables, and a colorblind-safe velocity option).
 Shear (LLSD rotation), Radial Divergence — computed volume-locally in tens of
 milliseconds and selectable like any product.
 
-**Model analysis:** Formula Lab evaluates safe custom diagnostics against any
-compatible model run in the BowEcho store, or directly against a raw WRF file.
-Normal extensionless `wrfout_*` names from every domain are accepted. Results
-open in the existing field viewer, map layer, and native plot workflow with an
-automatic color scale spanning the finite output range; an exact saved color
-binding takes precedence when one exists.
+**Model analysis:** **Windows > Formula Lab** opens a first-class dockable
+workspace for safe custom diagnostics. Its stored-model source follows the
+same model/run/time selection as Models; compatible quick starts and the field
+browser use the variables actually present in that timestep, so the workflow
+is not tied to WRF or one download profile. A raw WRF source additionally
+unlocks grid-aware horizontal and vertical calculus. Normal extensionless
+`wrfout_*` names from every domain are accepted. Results enter the shared
+Models viewer, radar-map layer, and native plot workflow with an automatic
+color scale spanning the finite output range; an exact saved color binding
+takes precedence when one exists.
 
 **Storm analysis:** NSSL-style mesocyclone/TVS detection (Stumpf et al.
 1998; Mitchell et al. 1998) with time-association (CPLT → MESO), SCIT storm

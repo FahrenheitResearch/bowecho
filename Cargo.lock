@@ -341,6 +341,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "winresource",
  "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=2550d4e2f85c61a190cf639d59e713f553facd07)",
+ "wrf-formula",
 ]
 
 [[package]]

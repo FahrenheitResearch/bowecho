@@ -829,6 +829,17 @@ pub struct ModelDataDock {
     /// Safe formula compiler/evaluator from Rusty Weather. The window remains
     /// independently pollable while the Model window is closed.
     formula_lab: FormulaLabPanel,
+    /// One-shot host requests. Formula Lab is a first-class workspace surface;
+    /// this shared backend never owns its egui Window or dock tile directly.
+    formula_lab_open_requested: bool,
+    formula_lab_open_models_requested: bool,
+    /// Last installed Formula Lab field, retained for result-card actions even
+    /// if the Models viewer later browses a different stored field.
+    formula_result_field: Option<std::sync::Arc<rw_ui::FieldData>>,
+    /// Unstyled scientific Formula Lab output retained across hour changes.
+    /// rw-ui intentionally drops its generated cache when another hour is
+    /// selected; this copy lets Formula Lab reinstall exactly from raw values.
+    formula_result_raw_field: Option<rw_ui::FieldData>,
     /// Explicit raw-WRF file staged for formulas that need WRF grid metrics,
     /// physical height, vectors, or horizontal calculus. The unrestricted
     /// picker accepts extensionless `wrfout_*` files from every domain.
@@ -865,6 +876,8 @@ pub struct ModelDataDock {
     /// like a synthesized iso-level slug; only synthesized names go to the
     /// iso plane loader.
     hour_store_vars: Vec<String>,
+    /// Full selected-hour metadata for Formula Lab discovery and preflight.
+    hour_store_var_info: Vec<rw_ui::VarInfo>,
     /// In-flight background load of a synthesized per-level isobaric field
     /// (one at a time; drained in [`Self::poll_iso_load`]).
     iso_load: Option<iso_fields::IsoFieldLoadTask>,
@@ -927,12 +940,17 @@ impl ModelDataDock {
             color_tables: ColorTableEditorPanel::new(),
             show_color_tables: false,
             formula_lab: FormulaLabPanel::new(),
+            formula_lab_open_requested: false,
+            formula_lab_open_models_requested: false,
+            formula_result_field: None,
+            formula_result_raw_field: None,
             formula_raw_path: None,
             wrf_options: WrfProcessUiState::default(),
             synth_radar: SyntheticRadarUiState::default(),
             pending_heavy_import: None,
             pending_light_import: None,
             hour_store_vars: Vec::new(),
+            hour_store_var_info: Vec::new(),
             iso_load: None,
             iso_load_pending: None,
             gdex: crate::gdex_ui::GdexBrowser::new(),
@@ -967,6 +985,14 @@ impl ModelDataDock {
                     .current_field()
                     .cloned()
                     .map(std::sync::Arc::new);
+                if let Some(latest) = self.latest_field.clone()
+                    && self
+                        .formula_result_field
+                        .as_ref()
+                        .is_some_and(|formula| formula.key == latest.key)
+                {
+                    self.formula_result_field = Some(latest);
+                }
             } else {
                 self.viewer.set_loading(&field.var);
                 self.request_field_load(field);
@@ -974,10 +1000,11 @@ impl ModelDataDock {
         }
     }
 
-    /// Build the selected rw-store source with its complete, validated exact
-    /// time axis. Legacy v1 runs intentionally provide an empty map so `dt`
-    /// remains disabled instead of treating storage slots or file times as
-    /// meteorological time.
+    /// Build the selected rw-store source with its complete time axis. Exact
+    /// v2 runs use manifest valid times. Legacy v1 derives `hour * 3600` only
+    /// for recognized operational model slugs with canonical cycle names;
+    /// custom/local writers sometimes used sequential slots, so they remain
+    /// pointwise-only until migrated to exact-time v2.
     fn formula_store_source(&self) -> Option<StoreFormulaSource> {
         let hour = self.browser.selected()?.clone();
         let run = self
@@ -989,38 +1016,60 @@ impl ModelDataDock {
             .runs
             .iter()
             .find(|run| run.run == hour.run)?;
-        let (exact_times, temporal_axis_verified) = run
+        let exact_times = if let Some(axis) = run
             .exact_times()
             .filter(|axis| axis.get(&hour.hour) == hour.exact_time.as_ref())
             .filter(|axis| {
                 axis.values()
                     .all(|exact| lead_seconds_exact_in_f64(exact.lead_seconds))
-            })
-            .map(|axis| {
-                let exact_times = axis
-                    .into_iter()
-                    .map(|(slot, exact)| {
-                        (
-                            slot,
-                            rw_formula::ExactStoreTime::new(
-                                exact.lead_seconds as f64,
-                                Some(format!(
-                                    "{} · {}",
-                                    rw_ui::format_lead_seconds(exact.lead_seconds),
-                                    rw_ui::format_valid_unix(exact.valid_unix)
-                                )),
-                            ),
-                        )
-                    })
-                    .collect();
-                (exact_times, true)
-            })
-            .unwrap_or_else(|| (std::collections::BTreeMap::new(), false));
+            }) {
+            axis.into_iter()
+                .map(|(slot, exact)| {
+                    (
+                        slot,
+                        rw_formula::ExactStoreTime::new(
+                            exact.lead_seconds as f64,
+                            Some(format!(
+                                "{} · {}",
+                                rw_ui::format_lead_seconds(exact.lead_seconds),
+                                rw_ui::format_valid_unix(exact.valid_unix)
+                            )),
+                        ),
+                    )
+                })
+                .collect()
+        } else if !run.exact_time_axis
+            && hour.exact_time.is_none()
+            && model_run_time_utc(&run.run).is_some()
+            && hour.model.parse::<rustwx_core::ModelId>().is_ok()
+        {
+            run.hours
+                .iter()
+                .map(|entry| {
+                    let seconds = u64::from(entry.hour) * 3_600;
+                    (
+                        entry.hour,
+                        rw_formula::ExactStoreTime::new(
+                            seconds as f64,
+                            Some(format!(
+                                "f{:03} · {}",
+                                entry.hour,
+                                rw_ui::format_lead_seconds(seconds)
+                            )),
+                        ),
+                    )
+                })
+                .collect()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        let temporal_axis_verified = formula_axis_supports_adjacent_times(&exact_times);
         Some(StoreFormulaSource {
             store_root: self.store_root.clone(),
             hour,
             exact_times,
             temporal_axis_verified,
+            variables: self.hour_store_var_info.clone(),
         })
     }
 
@@ -1068,14 +1117,11 @@ impl ModelDataDock {
             "a model import, size confirmation, synthetic-radar build, or batch plot is active",
         );
         let ctx = self.repaint.clone();
-        let Some(result) = self.formula_lab.show(
-            &ctx,
-            FormulaLabSources {
-                store: store.as_ref(),
-                raw_wrf: raw_wrf.as_ref(),
-                evaluation_blocked: blocked,
-            },
-        ) else {
+        let Some(result) = self.formula_lab.poll(FormulaLabSources {
+            store: store.as_ref(),
+            raw_wrf: raw_wrf.as_ref(),
+            evaluation_blocked: blocked,
+        }) else {
             if self.formula_lab.busy() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
@@ -1116,6 +1162,7 @@ impl ModelDataDock {
             self.latest_sounding = None;
         }
         let settings = self.color_tables.settings().clone().normalized();
+        self.formula_result_raw_field = Some(field.clone());
         self.viewer.install_generated_field(field, &settings);
         // Keep the styled/display-unit field as the external map/native-plot
         // source. `install_generated_field` retains the raw scientific values
@@ -1125,6 +1172,7 @@ impl ModelDataDock {
             .current_field()
             .cloned()
             .map(std::sync::Arc::new);
+        self.formula_result_field = self.latest_field.clone();
     }
 
     /// Route a picker load: synthesized iso-level names go to the
@@ -1211,6 +1259,8 @@ impl ModelDataDock {
     }
 
     fn select_hour(&mut self, key: HourKey) {
+        self.hour_store_vars.clear();
+        self.hour_store_var_info.clear();
         self.worker.send(StoreRequest::LoadHour(key));
     }
 
@@ -1239,6 +1289,7 @@ impl ModelDataDock {
                         // the load below translates back to store names /
                         // iso planes (`request_field_load`).
                         self.hour_store_vars = vars.iter().map(|var| var.name.clone()).collect();
+                        self.hour_store_var_info = vars.clone();
                         self.viewer.set_hour(key, viewer_display_vars(vars));
                         if let Some(field) = self.viewer.wanted_field() {
                             if self.viewer.restore_generated_field(&field.var) {
@@ -1254,8 +1305,12 @@ impl ModelDataDock {
                         }
                     }
                 }
-                StoreResponse::HourVars(_, Err(message)) => {
-                    self.viewer.set_error(message);
+                StoreResponse::HourVars(key, Err(message)) => {
+                    if self.browser.selected() == Some(&key) {
+                        self.hour_store_vars.clear();
+                        self.hour_store_var_info.clear();
+                        self.viewer.set_error(message);
+                    }
                 }
                 StoreResponse::Field(key, boxed) => match *boxed {
                     Ok(mut field) => {
@@ -1299,12 +1354,289 @@ impl ModelDataDock {
         self.pump_formula_lab();
     }
 
+    /// Render the first-class Formula Lab workspace. This shares the Models
+    /// run browser and worker but owns all source selection it needs, including
+    /// unrestricted extensionless wrfout picking.
+    pub fn formula_lab_ui(&mut self, ui: &mut egui::Ui) {
+        self.handle_responses();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(model_section_heading("Formula Lab"));
+            ui.label(
+                egui::RichText::new(
+                    "Build portable diagnostics across stored models, or use raw WRF for full grid-aware calculus.",
+                )
+                .small()
+                .weak(),
+            );
+        });
+        ui.add_space(4.0);
+
+        let mut source_kind = self.formula_lab.source_kind();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Data source").strong());
+                ui.selectable_value(&mut source_kind, FormulaSourceKind::Store, "Stored model");
+                ui.selectable_value(&mut source_kind, FormulaSourceKind::RawWrf, "Raw WRF");
+                ui.separator();
+                if ui.small_button("Re-scan store").clicked() {
+                    self.rescan();
+                }
+            });
+            self.formula_lab.set_source_kind(source_kind);
+
+            match source_kind {
+                FormulaSourceKind::Store => {
+                    if let Some(selected) = self.browser.selected() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Selected: {} / {} / {}",
+                                selected.model,
+                                selected.run,
+                                selected.time_label()
+                            ))
+                            .small(),
+                        );
+                    }
+                    let mut picked = None;
+                    ui.push_id("formula_lab_store_browser", |ui| match &self.tree {
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Scanning model store…");
+                            });
+                        }
+                        Some(tree) if tree.models.is_empty() => {
+                            ui.label("No stored model runs yet.");
+                        }
+                        Some(tree) => {
+                            egui::CollapsingHeader::new("Choose model / run / time")
+                                .default_open(self.browser.selected().is_none())
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("run_list")
+                                        .max_height(210.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            picked = self.browser.ui(ui, tree);
+                                        });
+                                });
+                        }
+                    });
+                    if let Some(key) = picked {
+                        self.select_hour(key);
+                    }
+                }
+                FormulaSourceKind::RawWrf => {
+                    ui.horizontal_wrapped(|ui| {
+                        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+                        if ui.button("Choose raw WRF file…").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .set_title("Choose any raw WRF file for Formula Lab")
+                                .pick_file()
+                        {
+                            self.formula_raw_path = Some(path);
+                        }
+                        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+                        ui.add_enabled(false, egui::Button::new("Choose raw WRF file…"));
+                        if self.formula_raw_path.is_some() && ui.small_button("Clear").clicked() {
+                            self.formula_raw_path = None;
+                        }
+                        if let Some(path) = &self.formula_raw_path {
+                            ui.label(egui::RichText::new(path.display().to_string()).small().weak());
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "No extension or filename filter: wrfout from any domain is accepted.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    });
+                }
+            }
+        });
+
+        let store = self.formula_store_source();
+        let raw_wrf = self.formula_raw_source();
+        let blocked = self.formula_evaluation_blocked().then_some(
+            "a model import, size confirmation, synthetic-radar build, or batch plot is active",
+        );
+        self.formula_result_actions_ui(ui);
+        self.formula_lab.ui(
+            ui,
+            FormulaLabSources {
+                store: store.as_ref(),
+                raw_wrf: raw_wrf.as_ref(),
+                evaluation_blocked: blocked,
+            },
+        );
+    }
+
+    fn formula_result_actions_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(field) = self.formula_result_field.clone() else {
+            return;
+        };
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(egui::RichText::new("Last Formula Lab result").strong());
+            ui.label(format!(
+                "{} · {}×{} · {} · {} / {} / {}",
+                field.key.var,
+                field.nx,
+                field.ny,
+                field.units,
+                field.key.hour.model,
+                field.key.hour.run,
+                field.key.hour.time_label()
+            ));
+            ui.label(
+                egui::RichText::new(match field.range {
+                    Some((minimum, maximum)) => {
+                        format!("Finite range: {minimum:.4} to {maximum:.4} {}", field.units)
+                    }
+                    None => "Finite range: no finite display values".to_owned(),
+                })
+                .small()
+                .weak(),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Open Models").clicked() {
+                    self.activate_formula_result(&field);
+                    self.formula_lab_open_models_requested = true;
+                }
+                if ui.button("Add to radar map").clicked() {
+                    self.map_request = Some(field.clone());
+                }
+                if ui.button("Native plot").clicked() {
+                    self.activate_formula_result(&field);
+                    self.native_plot_content = NativePlotContent::Model;
+                    self.show_plot_viewer = true;
+                }
+                if ui.button("Color tables").clicked() {
+                    self.activate_formula_result(&field);
+                    self.show_color_tables = true;
+                }
+            });
+        });
+    }
+
+    fn activate_formula_result(&mut self, fallback: &std::sync::Arc<rw_ui::FieldData>) {
+        if self.viewer.restore_generated_field(&fallback.key.var) {
+            self.latest_field = self
+                .viewer
+                .current_field()
+                .cloned()
+                .map(std::sync::Arc::new);
+            self.formula_result_field = self.latest_field.clone();
+        } else if let Some(raw) = self.formula_result_raw_field.clone() {
+            let settings = self.color_tables.settings().clone().normalized();
+            self.viewer.install_generated_field(raw, &settings);
+            self.latest_field = self
+                .viewer
+                .current_field()
+                .cloned()
+                .map(std::sync::Arc::new);
+            self.formula_result_field = self.latest_field.clone();
+        } else {
+            // Defensive fallback: Formula Lab retains the styled display field
+            // independently even if the viewer's generated cache was reset.
+            self.latest_field = Some(fallback.clone());
+        }
+    }
+
+    pub fn formula_lab_busy(&self) -> bool {
+        self.formula_lab.busy()
+    }
+
+    pub fn request_formula_lab_open(&mut self) {
+        self.formula_lab_open_requested = true;
+    }
+
+    pub fn take_formula_lab_open_requested(&mut self) -> bool {
+        std::mem::take(&mut self.formula_lab_open_requested)
+    }
+
+    pub fn take_formula_lab_open_models_requested(&mut self) -> bool {
+        std::mem::take(&mut self.formula_lab_open_models_requested)
+    }
+
+    pub fn formula_lab_state_json(&self) -> serde_json::Value {
+        self.formula_lab.state_json()
+    }
+
+    pub fn apply_formula_lab_state_json(&mut self, value: &serde_json::Value) -> bool {
+        self.formula_lab.apply_state_json(value)
+    }
+
     /// Draw auxiliary windows that belong to the shared Models/WRF backend
     /// exactly once per app frame, independent of which owner surface is open.
     pub fn auxiliary_windows(&mut self, ctx: &egui::Context) {
         if self.gdex.open {
             let cache_dir = settings::gdex_cache_dir();
             self.gdex.ui(ctx, &cache_dir);
+        }
+
+        // Native plot and color-table tools are app-wide auxiliaries. Keeping
+        // them here makes Formula Lab actions work even when Models is closed
+        // or docked behind another active tab, and guarantees one render per
+        // app frame through the shared ModelDataDock owner.
+        if self.show_plot_viewer {
+            let model_plot = self.native_plot_content == NativePlotContent::Model;
+            let field: Option<std::sync::Arc<rw_ui::FieldData>> = model_plot
+                .then(|| {
+                    store_named_current_field(
+                        &self.viewer,
+                        self.latest_field.as_deref(),
+                        &self.hour_store_vars,
+                    )
+                    .is_some()
+                    .then(|| self.latest_field.clone())
+                    .flatten()
+                })
+                .flatten();
+            if let Some(field) = &field {
+                self.seed_native_plot_domain(field);
+            }
+            let mut open = true;
+            egui::Window::new("Native plot")
+                .open(&mut open)
+                .default_size([560.0, 440.0])
+                .show(ctx, |ui| {
+                    if model_plot {
+                        self.plot_viewer.ui(ui, field.as_deref());
+                    } else {
+                        self.satellite_plot.ui(ui);
+                    }
+                });
+            if !open {
+                self.show_plot_viewer = false;
+            }
+        }
+
+        if self.show_color_tables {
+            let mut open = true;
+            let mut changed = false;
+            {
+                let field = store_named_current_field(
+                    &self.viewer,
+                    self.latest_field.as_deref(),
+                    &self.hour_store_vars,
+                );
+                egui::Window::new("Color tables")
+                    .open(&mut open)
+                    .default_size([520.0, 520.0])
+                    .show(ctx, |ui| {
+                        self.color_tables.ui(ui, field);
+                        changed = self.color_tables.take_changed();
+                    });
+            }
+            if changed {
+                self.apply_color_table_changes();
+            }
+            if !open {
+                self.show_color_tables = false;
+            }
         }
     }
 
@@ -1541,6 +1873,15 @@ impl ModelDataDock {
     /// Re-scan the store (after an ingest finishes).
     pub fn rescan(&mut self) {
         self.worker.send(StoreRequest::Enumerate);
+        // A re-enumerated run may keep the same model/run/hour identity while
+        // its manifest and variables changed. Clear compatibility metadata
+        // immediately and refresh that hour after the queued enumeration so
+        // Formula Lab can never report Ready from the previous revision.
+        self.hour_store_vars.clear();
+        self.hour_store_var_info.clear();
+        if let Some(selected) = self.browser.selected().cloned() {
+            self.worker.send(StoreRequest::LoadHour(selected));
+        }
     }
 
     /// Drain a running local WRF/NetCDF import. On completion the store is
@@ -1995,16 +2336,13 @@ impl ModelDataDock {
             let spacing = ui.spacing().item_spacing.x;
             let width = ((ui.available_width() - spacing) * 0.5).max(90.0);
             if ui
-                .add_sized(
-                    [width, 26.0],
-                    egui::Button::selectable(self.formula_lab.open, "Formula Lab"),
-                )
+                .add_sized([width, 26.0], egui::Button::new("Open Formula Lab"))
                 .on_hover_text(
                     "Compile safe custom diagnostics against the selected run from any model.",
                 )
                 .clicked()
             {
-                self.formula_lab.open = !self.formula_lab.open;
+                self.request_formula_lab_open();
             }
 
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -2021,7 +2359,7 @@ impl ModelDataDock {
             {
                 self.formula_raw_path = Some(path);
                 self.formula_lab.set_source_kind(FormulaSourceKind::RawWrf);
-                self.formula_lab.open = true;
+                self.request_formula_lab_open();
             }
 
             #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -3525,7 +3863,7 @@ impl ModelDataDock {
                             .on_hover_text("Re-scan the model store")
                             .clicked()
                         {
-                            self.worker.send(StoreRequest::Enumerate);
+                            self.rescan();
                         }
                     });
                 });
@@ -3648,77 +3986,6 @@ impl ModelDataDock {
                 None => {}
             }
         });
-
-        // v0.2.3 custom-domain native plot, as a floating window. Rendered
-        // after the field viewer so a domain selected this frame shows at once.
-        // The STORE-NAMED twin of the viewer's field goes in (the native plot
-        // pipeline styles by store variable, and the viewer's copy may carry
-        // a display label).
-        if self.show_plot_viewer {
-            let model_plot = self.native_plot_content == NativePlotContent::Model;
-            // Cloned out as an owned Arc (cheap) so the RC4 domain seed below
-            // can borrow `self` mutably before the window closure. Satellite
-            // content never changes this model twin or its selection.
-            let field: Option<std::sync::Arc<rw_ui::FieldData>> = model_plot
-                .then(|| {
-                    store_named_current_field(
-                        &self.viewer,
-                        self.latest_field.as_deref(),
-                        &self.hour_store_vars,
-                    )
-                    .is_some()
-                    .then(|| self.latest_field.clone())
-                    .flatten()
-                })
-                .flatten();
-            if let Some(field) = &field {
-                self.seed_native_plot_domain(field);
-            }
-            let mut open = true;
-            egui::Window::new("Native plot")
-                .open(&mut open)
-                .default_size([560.0, 440.0])
-                .show(ui.ctx(), |ui| {
-                    if model_plot {
-                        self.plot_viewer.ui(ui, field.as_deref());
-                    } else {
-                        self.satellite_plot.ui(ui);
-                    }
-                });
-            if !open {
-                self.show_plot_viewer = false;
-            }
-        }
-
-        // v0.2.3 editable color tables. The STORE-NAMED twin goes in so the
-        // editor's product bindings stay keyed by real store variables (the
-        // worker resolves overrides against those). The borrow is scoped and
-        // dropped BEFORE apply — which reloads the field and thus needs
-        // `self.viewer` mutably.
-        if self.show_color_tables {
-            let mut open = true;
-            let mut changed = false;
-            {
-                let field = store_named_current_field(
-                    &self.viewer,
-                    self.latest_field.as_deref(),
-                    &self.hour_store_vars,
-                );
-                egui::Window::new("Color tables")
-                    .open(&mut open)
-                    .default_size([520.0, 520.0])
-                    .show(ui.ctx(), |ui| {
-                        self.color_tables.ui(ui, field);
-                        changed = self.color_tables.take_changed();
-                    });
-            }
-            if changed {
-                self.apply_color_table_changes();
-            }
-            if !open {
-                self.show_color_tables = false;
-            }
-        }
     }
 }
 
@@ -3767,6 +4034,24 @@ fn lead_seconds_exact_in_f64(seconds: u64) -> bool {
     }
     let significant_bits = u64::BITS - seconds.leading_zeros() - seconds.trailing_zeros();
     significant_bits <= f64::MANTISSA_DIGITS
+}
+
+fn formula_axis_supports_adjacent_times(
+    axis: &std::collections::BTreeMap<u16, rw_formula::ExactStoreTime>,
+) -> bool {
+    if axis.len() < 2 {
+        return false;
+    }
+    axis.values()
+        .map(|time| time.seconds)
+        .try_fold(None, |previous, seconds| {
+            if !seconds.is_finite() || previous.is_some_and(|prior| seconds <= prior) {
+                Err(())
+            } else {
+                Ok(Some(seconds))
+            }
+        })
+        .is_ok()
 }
 
 /// Max forecast horizon (hours past init) a stored run can plausibly
@@ -3925,10 +4210,10 @@ fn store_named_current_field<'a>(
     let current = viewer.current_field()?;
     latest.filter(|latest| {
         latest.key.hour == current.key.hour
-            && display_var_name(&latest.key.var, hour_store_vars)
-                .as_deref()
-                .unwrap_or(&latest.key.var)
-                == current.key.var
+            && (latest.key.var == current.key.var
+                || display_var_name(&latest.key.var, hour_store_vars)
+                    .as_deref()
+                    .is_some_and(|display| display == current.key.var))
     })
 }
 
@@ -4663,6 +4948,110 @@ mod tests {
     }
 
     #[test]
+    fn formula_source_derives_verified_v1_forecast_hour_axis() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(
+            &ctx,
+            tree_with_runs("hrrr", &[("20260711_00z", &[0, 1, 3])]),
+        );
+        dock.browser.select(HourKey {
+            model: "hrrr".to_owned(),
+            run: "20260711_00z".to_owned(),
+            hour: 1,
+            exact_time: None,
+        });
+        let source = dock.formula_store_source().expect("v1 store source");
+        assert!(source.temporal_axis_verified);
+        assert_eq!(source.exact_times.len(), 3);
+        assert_eq!(source.exact_times[&0].seconds, 0.0);
+        assert_eq!(source.exact_times[&1].seconds, 3_600.0);
+        assert_eq!(source.exact_times[&3].seconds, 10_800.0);
+        assert_eq!(
+            source.exact_times[&3].label.as_deref(),
+            Some("f003 · +03:00:00")
+        );
+
+        dock.tree = Some(tree_with_runs("hrrr", &[("20260711_00z", &[0])]));
+        dock.browser.select(HourKey {
+            model: "hrrr".to_owned(),
+            run: "20260711_00z".to_owned(),
+            hour: 0,
+            exact_time: None,
+        });
+        let singleton = dock.formula_store_source().expect("single-frame source");
+        assert_eq!(singleton.exact_times.len(), 1);
+        assert!(
+            !singleton.temporal_axis_verified,
+            "one timestamp is honest metadata but cannot satisfy AdjacentTimes"
+        );
+
+        dock.tree = Some(tree_with_runs("wrf", &[("local-research-run", &[0, 1, 2])]));
+        dock.browser.select(HourKey {
+            model: "wrf".to_owned(),
+            run: "local-research-run".to_owned(),
+            hour: 1,
+            exact_time: None,
+        });
+        let local = dock.formula_store_source().expect("local v1 source");
+        assert!(local.exact_times.is_empty());
+        assert!(
+            !local.temporal_axis_verified,
+            "sequential local-WRF v1 slots are not proven forecast hours"
+        );
+
+        dock.tree = Some(tree_with_runs(
+            "custom_model",
+            &[("20260711_00z", &[0, 1, 2])],
+        ));
+        dock.browser.select(HourKey {
+            model: "custom_model".to_owned(),
+            run: "20260711_00z".to_owned(),
+            hour: 1,
+            exact_time: None,
+        });
+        let custom = dock.formula_store_source().expect("custom v1 source");
+        assert!(custom.exact_times.is_empty());
+        assert!(!custom.temporal_axis_verified);
+    }
+
+    #[test]
+    fn formula_temporal_axis_requires_strictly_increasing_distinct_times() {
+        let increasing = std::collections::BTreeMap::from([
+            (0, rw_formula::ExactStoreTime::new(0.0, None)),
+            (1, rw_formula::ExactStoreTime::new(1_800.0, None)),
+        ]);
+        assert!(formula_axis_supports_adjacent_times(&increasing));
+        let duplicate = std::collections::BTreeMap::from([
+            (0, rw_formula::ExactStoreTime::new(0.0, None)),
+            (1, rw_formula::ExactStoreTime::new(0.0, None)),
+        ]);
+        assert!(!formula_axis_supports_adjacent_times(&duplicate));
+    }
+
+    #[test]
+    fn rescan_clears_formula_inventory_before_same_key_refresh() {
+        let ctx = egui::Context::default();
+        let mut dock =
+            ModelDataDock::new_for_test(&ctx, tree_with_runs("hrrr", &[("20260711_00z", &[0])]));
+        dock.browser.select(HourKey {
+            model: "hrrr".to_owned(),
+            run: "20260711_00z".to_owned(),
+            hour: 0,
+            exact_time: None,
+        });
+        dock.hour_store_vars = vec!["stale_field".to_owned()];
+        dock.hour_store_var_info = vec![rw_ui::VarInfo {
+            name: "stale_field".to_owned(),
+            units: "1".to_owned(),
+            kind: rw_ui::VarKind::Surface2D,
+            levels_hpa: Vec::new(),
+        }];
+        dock.rescan();
+        assert!(dock.hour_store_vars.is_empty());
+        assert!(dock.hour_store_var_info.is_empty());
+    }
+
+    #[test]
     fn formula_raw_source_accepts_extensionless_non_d01_wrfout() {
         let ctx = egui::Context::default();
         let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
@@ -4707,6 +5096,80 @@ mod tests {
         let scale = style.scale.resolved_discrete();
         assert_eq!(scale.levels.first(), Some(&-4.0));
         assert_eq!(scale.levels.last(), Some(&1_000.0));
+    }
+
+    #[test]
+    fn formula_result_survives_hour_change_and_iso_like_output_name() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+        let formula_hour = HourKey {
+            model: "wrf".to_owned(),
+            run: "research".to_owned(),
+            hour: 0,
+            exact_time: None,
+        };
+        dock.install_formula_field(
+            rw_ui::FieldData {
+                key: rw_ui::FieldKey {
+                    hour: formula_hour.clone(),
+                    var: "temperature_850".to_owned(),
+                },
+                units: "K".to_owned(),
+                nx: 2,
+                ny: 1,
+                values: vec![280.0, 281.0],
+                range: Some((280.0, 281.0)),
+                grid: None,
+                lat_descending: false,
+                style: None,
+            },
+            false,
+        );
+        assert!(
+            store_named_current_field(
+                &dock.viewer,
+                dock.latest_field.as_deref(),
+                &dock.hour_store_vars
+            )
+            .is_some()
+        );
+        let card_field = dock
+            .formula_result_field
+            .clone()
+            .expect("result card field");
+
+        dock.viewer.set_hour(
+            HourKey {
+                model: "hrrr".to_owned(),
+                run: "20260711_00z".to_owned(),
+                hour: 1,
+                exact_time: None,
+            },
+            vec![test_var("temperature_2m", "K")],
+        );
+        assert!(
+            !dock.viewer.restore_generated_field("temperature_850"),
+            "rw-ui drops generated cache when another hour is selected"
+        );
+
+        dock.activate_formula_result(&card_field);
+        let current = dock.viewer.current_field().expect("formula restored");
+        assert_eq!(current.key.hour, formula_hour);
+        assert_eq!(current.key.var, "temperature_850");
+        assert!(
+            store_named_current_field(
+                &dock.viewer,
+                dock.latest_field.as_deref(),
+                &dock.hour_store_vars
+            )
+            .is_some()
+        );
+        let raw = dock
+            .formula_result_raw_field
+            .as_ref()
+            .expect("raw scientific result retained");
+        assert_eq!(raw.values, [280.0, 281.0]);
+        assert_eq!(raw.units, "K");
     }
 
     #[test]

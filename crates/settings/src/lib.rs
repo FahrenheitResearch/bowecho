@@ -668,6 +668,13 @@ pub struct AppSettings {
     /// configs) restores today's default: domain centre, 230 km / 250 m.
     #[serde(default)]
     pub wrf_synth_radar: Option<serde_json::Value>,
+    /// Last Formula Lab draft (equation, output/recipe metadata, parameters,
+    /// evaluation options, and source preference). The app-ui crate owns the
+    /// versioned schema; settings keeps it opaque so the scientific UI can
+    /// evolve without coupling this crate to wrf-formula types. Running-task
+    /// state and one-session raw-file consent are deliberately never saved.
+    #[serde(default)]
+    pub formula_lab_state: Option<serde_json::Value>,
     /// Data-folder override: where caches and stores live (Level II
     /// cache, model/sat/GLM stores, tiles, georefs). Empty = platform
     /// default. Read once at startup; Settings says "restart to apply".
@@ -1050,6 +1057,7 @@ impl Default for AppSettings {
             model_style_overrides: None,
             wrf_process_options: None,
             wrf_synth_radar: None,
+            formula_lab_state: None,
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
             sidebar_width_pt: None,
@@ -2459,6 +2467,23 @@ mod tests {
         // Absent → None: older configs restore today's default placement
         // (domain centre, 230 km / 250 m).
         assert_eq!(AppSettings::from_json("{}").wrf_synth_radar, None);
+    }
+
+    #[test]
+    fn formula_lab_state_round_trips_as_opaque_json() {
+        let s = AppSettings {
+            formula_lab_state: Some(serde_json::json!({
+                "version": 1,
+                "source": "sqrt(u_10m^2 + v_10m^2)",
+                "output_name": "wind_speed_10m",
+                "source_kind": "store"
+            })),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back, s);
+        // Older configs simply restore the Formula Lab starter draft.
+        assert_eq!(AppSettings::from_json("{}").formula_lab_state, None);
     }
 
     #[test]

@@ -145,31 +145,64 @@ Państwowego Instytutu Badawczego zostały przetworzone”.
 
 ## Formula Lab model diagnostics
 
-Formula Lab is available from the Model window. It compiles custom diagnostic
-expressions through Rusty Weather's bounded formula engine; expressions are
-data formulas, not arbitrary Rust, Python, or shell code. Evaluation runs in a
-background worker and keeps progressing if the Model window is closed.
+Open **Windows > Formula Lab**. Formula Lab is a first-class workspace: it can
+float or dock, and it shares one model backend with Models and WRF. Its editor
+draft and options persist, while evaluation runs in a background worker even
+when the workspace is hidden. It compiles data expressions through Rusty
+Weather's bounded formula engine; a formula is not arbitrary Rust, Python, or
+shell code.
 
-The **Store** source uses the model/run/hour selected in BowEcho's model
-browser. It is model-neutral: WRF, HRRR, and other stored models work whenever
-the requested variables and dimensions exist. The **Raw WRF** source exposes
-WRF grid metrics, height, vector, vertical, and horizontal-calculus operations.
-Its file picker is intentionally unrestricted because ordinary `wrfout_*`
-files are often extensionless; it does not assume `d01` or any other domain.
+The normal workflow is:
 
-Temporal operators such as `dt(...)` are enabled only when BowEcho verifies a
-complete exact-time axis for the selected run and every lead time is exactly
-representable by the formula bridge. A stale, legacy, partial, or ambiguous
-axis disables temporal evaluation while leaving pointwise formulas available.
-This prevents ordinal storage slots from being mistaken for meteorological
-time.
+1. Choose **Model store** or **Raw WRF**. For stored data, select a
+   model/run/time in the shared browser. For raw WRF, choose any readable WRF
+   file; ordinary extensionless `wrfout_*` files and every domain are accepted.
+2. Pick an enabled quick start, or click fields in the searchable browser to
+   insert their exact names into the equation. Stored-model quick starts adapt
+   to the fields in that timestep instead of assuming one model's naming.
+3. Edit the equation and output name. **Syntax valid** only means the bounded
+   formula language compiled; it does not prove the selected data can satisfy
+   the formula.
+4. Check the source status. **Ready for selected source** means the available
+   inventory, units, required capabilities, and any required time axis passed
+   the checks BowEcho can perform before evaluation. **Source not ready** lists
+   the missing field, unsupported units, unavailable grid metric, or time-axis
+   requirement that blocks the run. A scientifically appropriate unit
+   override can be added when stored metadata uses an equivalent but
+   unsupported label.
+5. Choose **Evaluate and display**. The result enters the shared Models field
+   viewer; use its result actions to open Models, add the field to the radar
+   map, or use the native plot/PNG workflow.
 
-A completed formula becomes an in-memory field in the existing model field
-viewer. BowEcho generates a color scale over the result's full finite range,
-unless an exact saved output-name binding supplies a user color table. The
-styled field can be sent to the radar map and native plot/PNG workflow just
-like a stored model field. Changing source data while evaluation is running
-causes the stale result to be discarded instead of displayed.
+Stored formulas are model-neutral: pointwise 2-D algebra works across practical
+BowEcho store models whenever the requested fields, dimensions, and units are
+present. There is no model-slug allowlist: GFS, HRRR/HRRR-AK, RAP, NAM, NBM,
+RRFS and compatible imported WRF stores use the same path. Pressure-volume and
+explicit-height vertical operators work only when the selected run provides
+compatible pressure levels and height data. Stored runs do not currently
+persist the grid spacing/map factors required by horizontal derivatives, so
+`ddx`, `ddy`, `grad`, `div`, `curl`, and `laplacian` require **Raw WRF**. A
+formula cannot use a display-only synthesized level name that is absent from
+the field browser, and a bare 3-D result cannot be displayed until the equation
+reduces it to a 2-D field.
+
+Raw WRF exposes native grid metrics, map factors, physical height, projected
+vectors, and horizontal/vertical calculus. Its field browser lists common WRF
+tokens, not a complete inventory of the chosen file; the raw-file resolver
+therefore performs the final field, dimension, time-index, and output-shape
+validation when evaluation begins. Large files require an explicit memory-cost
+confirmation.
+
+Temporal operators such as `dt(...)` are enabled only with at least two
+distinct, increasing, host-verified times. An incomplete, stale, or ambiguous
+axis leaves pointwise formulas available but blocks temporal evaluation; raw
+WRF needs adjacent times in the file. This prevents ordinal storage slots from
+being mistaken for meteorological time.
+
+BowEcho generates a color scale over a result's full finite range unless an
+exact saved output-name binding supplies a user color table. Changing source
+data while evaluation is running causes the stale result to be discarded
+instead of displayed.
 
 ## EUMETNET ORD full-day archive loads
 

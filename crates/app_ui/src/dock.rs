@@ -1,6 +1,7 @@
 //! Dockable workspace: the egui_tiles tile tree that hosts the radar map
 //! pane plus any DOCKED viewer panes (Sounding / Radar overlays / WoFS /
-//! FARM / Satellite / SimSat / Model / WRF / VWP / Unified Player / 3D). Crate evaluation + integration design:
+//! FARM / Satellite / SimSat / Model / WRF / Formula Lab / VWP /
+//! Unified Player / 3D). Crate evaluation + integration design:
 //! docs/docking-spike.md.
 //!
 //! Division of labor:
@@ -62,6 +63,7 @@ pub enum WorkspacePane {
     Simsat,
     Model,
     Wrf,
+    FormulaLab,
     Vwp,
     UnifiedPlayer,
     Vol3d,
@@ -69,7 +71,7 @@ pub enum WorkspacePane {
 
 impl WorkspacePane {
     /// Every dockable viewer (everything but the map anchor).
-    pub const VIEWERS: [Self; 11] = [
+    pub const VIEWERS: [Self; 12] = [
         Self::Sounding,
         Self::RadarOverlays,
         Self::Wofs,
@@ -78,6 +80,7 @@ impl WorkspacePane {
         Self::Simsat,
         Self::Model,
         Self::Wrf,
+        Self::FormulaLab,
         Self::Vwp,
         Self::UnifiedPlayer,
         Self::Vol3d,
@@ -95,6 +98,7 @@ impl WorkspacePane {
             Self::Simsat => "SimSat",
             Self::Model => "Model",
             Self::Wrf => "WRF",
+            Self::FormulaLab => "Formula Lab",
             Self::Vwp => "VWP",
             Self::UnifiedPlayer => "Player",
             Self::Vol3d => "3D Volume",
@@ -263,6 +267,32 @@ impl Workspace {
             None => self.tree.root = Some(tabs_id),
         }
         self.mark_dirty();
+    }
+
+    /// Bring an already-docked pane to the front of every tab container that
+    /// wraps it. Explicit launch actions (for example Formula Lab -> Models)
+    /// should be visible even when the target already exists as an inactive
+    /// tab; merely calling [`Self::dock`] is otherwise a no-op.
+    pub fn activate_pane(&mut self, pane: WorkspacePane) -> bool {
+        let Some(mut child) = self.tree.tiles.find_pane(&pane) else {
+            return false;
+        };
+        let mut changed = false;
+        while let Some(parent) = self.tree.tiles.parent_of(child) {
+            if let Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+                self.tree.tiles.get_mut(parent)
+                && tabs.children.contains(&child)
+                && tabs.active != Some(child)
+            {
+                tabs.set_active(child);
+                changed = true;
+            }
+            child = parent;
+        }
+        if changed {
+            self.mark_dirty();
+        }
+        changed
     }
 
     /// Dock `pane` as a horizontal split sibling immediately to the RIGHT
@@ -527,10 +557,12 @@ mod tests {
         assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::RadarOverlays));
         assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::Simsat));
         assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::Wrf));
+        assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::FormulaLab));
         assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::Vwp));
         assert_eq!(WorkspacePane::RadarOverlays.tab_title(), "Radar overlays");
         assert_eq!(WorkspacePane::Simsat.tab_title(), "SimSat");
         assert_eq!(WorkspacePane::Wrf.tab_title(), "WRF");
+        assert_eq!(WorkspacePane::FormulaLab.tab_title(), "Formula Lab");
         assert_eq!(WorkspacePane::Vwp.tab_title(), "VWP");
     }
 
@@ -565,6 +597,33 @@ mod tests {
         // Simplification (run by tree.ui each frame) prunes the leftover
         // containers; the map pane itself must still be present.
         assert!(workspace.is_docked(WorkspacePane::Map));
+    }
+
+    #[test]
+    fn activating_an_existing_docked_pane_selects_its_tab() {
+        let mut workspace = Workspace::default();
+        workspace.dock(WorkspacePane::Model);
+        workspace.dock(WorkspacePane::FormulaLab);
+        let model = workspace
+            .tree
+            .tiles
+            .find_pane(&WorkspacePane::Model)
+            .expect("model pane");
+        let formula = workspace
+            .tree
+            .tiles
+            .find_pane(&WorkspacePane::FormulaLab)
+            .expect("formula pane");
+        let parent = workspace.tree.tiles.parent_of(model).expect("shared tabs");
+        assert_eq!(workspace.tree.tiles.parent_of(formula), Some(parent));
+        let active = |workspace: &Workspace| match workspace.tree.tiles.get(parent) {
+            Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) => tabs.active,
+            other => panic!("expected tabs, got {other:?}"),
+        };
+        assert_eq!(active(&workspace), Some(formula));
+        assert!(workspace.activate_pane(WorkspacePane::Model));
+        assert_eq!(active(&workspace), Some(model));
+        assert!(!workspace.activate_pane(WorkspacePane::Model));
     }
 
     /// The tab strip (Tabs container) that directly wraps a docked pane.
@@ -741,9 +800,11 @@ mod tests {
     fn persisted_layout_round_trips_tree_modes_and_preferences() {
         let mut workspace = Workspace::default();
         workspace.dock(WorkspacePane::Wofs);
+        workspace.dock(WorkspacePane::FormulaLab);
         workspace.prefer_docked.insert(WorkspacePane::Vol3d); // hidden, was docked
         let viewers: BTreeMap<WorkspacePane, ViewerMode> = [
             (WorkspacePane::Wofs, ViewerMode::Docked),
+            (WorkspacePane::FormulaLab, ViewerMode::Docked),
             (WorkspacePane::Satellite, ViewerMode::Floating),
             (WorkspacePane::Vol3d, ViewerMode::Hidden),
         ]
@@ -756,6 +817,7 @@ mod tests {
         assert_eq!(back, viewers);
         assert!(restored.is_docked(WorkspacePane::Map));
         assert!(restored.is_docked(WorkspacePane::Wofs));
+        assert!(restored.is_docked(WorkspacePane::FormulaLab));
         assert!(restored.prefer_docked.contains(&WorkspacePane::Wofs));
         assert!(restored.prefer_docked.contains(&WorkspacePane::Vol3d));
         assert!(restored.tree == workspace.tree);

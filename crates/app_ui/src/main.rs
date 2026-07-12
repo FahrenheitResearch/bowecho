@@ -2985,6 +2985,10 @@ struct ViewerApp {
     /// Dedicated raw-WRF workflows window/pane. Shares `model_dock` with the
     /// Models viewer so processing jobs and stored results have one owner.
     wrf_window_open: bool,
+    /// First-class Formula Lab window/pane. It shares the same `model_dock`
+    /// as Models and WRF so source selection, evaluation workers, generated
+    /// fields, native plots, and map output all have one owner.
+    formula_lab_window_open: bool,
     /// Deferred because the request can originate inside the dock tile-tree
     /// pass, where mutating the live workspace tree is forbidden.
     wrf_open_models_requested: bool,
@@ -7834,6 +7838,7 @@ struct WorkflowSnapshot {
     model_download_open: bool,
     model_viewer_mode: dock::ViewerMode,
     wrf_viewer_mode: dock::ViewerMode,
+    formula_lab_viewer_mode: dock::ViewerMode,
     satellite_viewer_mode: dock::ViewerMode,
     sounding_viewer_mode: dock::ViewerMode,
     sat_map_follow: bool,
@@ -8323,6 +8328,7 @@ impl ViewerApp {
             model_dock: None,
             model_dock_open: false,
             wrf_window_open: false,
+            formula_lab_window_open: false,
             wrf_open_models_requested: false,
             initial_viewport_sized: false,
             model_timeline_follow: false,
@@ -19436,6 +19442,11 @@ impl eframe::App for ViewerApp {
         self.model_data_window(&ctx);
         self.wrf_window(&ctx);
         self.apply_wrf_window_requests();
+        self.apply_formula_lab_window_requests();
+        self.formula_lab_window(&ctx);
+        // A floating Formula Lab can request Models while it renders above;
+        // drain once more so that action is not delayed by a frame.
+        self.apply_formula_lab_window_requests();
         if let Some(dock) = self.model_dock.as_mut() {
             dock.auxiliary_windows(&ctx);
         }
@@ -19498,6 +19509,7 @@ impl eframe::App for ViewerApp {
         self.persist_model_style_overrides();
         self.persist_wrf_process_options();
         self.persist_wrf_synth_radar();
+        self.persist_formula_lab_state();
         if self.workspace.dirty {
             self.persist_workspace_layout();
         }
@@ -19980,6 +19992,7 @@ impl ViewerApp {
             model_download_open: self.model_download_open,
             model_viewer_mode: self.viewer_mode(dock::WorkspacePane::Model),
             wrf_viewer_mode: self.viewer_mode(dock::WorkspacePane::Wrf),
+            formula_lab_viewer_mode: self.viewer_mode(dock::WorkspacePane::FormulaLab),
             satellite_viewer_mode: self.viewer_mode(dock::WorkspacePane::Satellite),
             sounding_viewer_mode: self.viewer_mode(dock::WorkspacePane::Sounding),
             sat_map_follow: self.sat_map_follow,
@@ -20056,6 +20069,10 @@ impl ViewerApp {
         self.model_download_open = snapshot.model_download_open;
         self.restore_viewer_mode(dock::WorkspacePane::Model, snapshot.model_viewer_mode);
         self.restore_viewer_mode(dock::WorkspacePane::Wrf, snapshot.wrf_viewer_mode);
+        self.restore_viewer_mode(
+            dock::WorkspacePane::FormulaLab,
+            snapshot.formula_lab_viewer_mode,
+        );
         self.restore_viewer_mode(
             dock::WorkspacePane::Satellite,
             snapshot.satellite_viewer_mode,
@@ -20169,9 +20186,14 @@ impl ViewerApp {
             let mut toggle: Option<dock::WorkspacePane> = None;
             for (pane, label, hover) in [
                 (
+                    dock::WorkspacePane::FormulaLab,
+                    "Formula Lab",
+                    "Build, validate, and evaluate custom diagnostics from the selected model run or an attached raw WRF source",
+                ),
+                (
                     dock::WorkspacePane::Wrf,
                     "WRF",
-                    "Raw wrfout import, wrf-rust diagnostics, Formula Lab, and simulated radar",
+                    "Raw wrfout import, wrf-rust diagnostics, and simulated radar",
                 ),
                 (
                     dock::WorkspacePane::Model,
@@ -20273,7 +20295,12 @@ impl ViewerApp {
                 // §1.3.7): with the master switch off, poll_model_layer would
                 // tear the dock down next frame and the window flashed for
                 // one frame and died. Flip the switch on.
-                if matches!(pane, dock::WorkspacePane::Model | dock::WorkspacePane::Wrf)
+                if matches!(
+                    pane,
+                    dock::WorkspacePane::Model
+                        | dock::WorkspacePane::Wrf
+                        | dock::WorkspacePane::FormulaLab
+                )
                     && self.viewer_open(pane)
                     && !self.model_enabled
                 {
@@ -20290,7 +20317,7 @@ impl ViewerApp {
             }
         });
         button.on_hover_text(
-            "Data windows: WRF · Models · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding",
+            "Data windows: Formula Lab · WRF · Models · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding",
         );
     }
 
@@ -26009,6 +26036,7 @@ impl ViewerApp {
             dock::WorkspacePane::Simsat => self.show_simsat = open,
             dock::WorkspacePane::Wrf => self.wrf_window_open = open,
             dock::WorkspacePane::Model => self.model_dock_open = open,
+            dock::WorkspacePane::FormulaLab => self.formula_lab_window_open = open,
             dock::WorkspacePane::Vwp => self.vwp_open = open,
             dock::WorkspacePane::UnifiedPlayer => self.unified_player.open = open,
             dock::WorkspacePane::Vol3d => self.vol3d.open = open,
@@ -26027,6 +26055,7 @@ impl ViewerApp {
             dock::WorkspacePane::Simsat => self.show_simsat,
             dock::WorkspacePane::Wrf => self.wrf_window_open,
             dock::WorkspacePane::Model => self.model_dock_open,
+            dock::WorkspacePane::FormulaLab => self.formula_lab_window_open,
             dock::WorkspacePane::Vwp => self.vwp_open,
             dock::WorkspacePane::UnifiedPlayer => self.unified_player.open,
             dock::WorkspacePane::Vol3d => self.vol3d.open,
@@ -26050,7 +26079,9 @@ impl ViewerApp {
     /// Open a viewer, honoring its docked-vs-floating preference.
     fn open_viewer(&mut self, pane: dock::WorkspacePane) {
         self.set_viewer_open(pane, true);
-        if self.workspace.prefer_docked.contains(&pane) {
+        if self.workspace.is_docked(pane) {
+            self.workspace.activate_pane(pane);
+        } else if self.workspace.prefer_docked.contains(&pane) {
             self.workspace.dock(pane);
         }
     }
@@ -26120,6 +26151,20 @@ impl ViewerApp {
         }
     }
 
+    /// Persist the Formula Lab recipe/editor/source preferences as one opaque
+    /// value owned by the Formula Lab implementation. Window visibility and
+    /// docking remain part of the workspace layout above.
+    fn persist_formula_lab_state(&mut self) {
+        let Some(dock) = self.model_dock.as_ref() else {
+            return;
+        };
+        let value = dock.formula_lab_state_json();
+        if self.app_settings.formula_lab_state.as_ref() != Some(&value) {
+            self.app_settings.formula_lab_state = Some(value);
+            self.mark_app_settings_dirty();
+        }
+    }
+
     fn persist_workspace_layout(&mut self) {
         self.workspace.dirty = false;
         let viewers: BTreeMap<dock::WorkspacePane, dock::ViewerMode> = dock::WorkspacePane::VIEWERS
@@ -26178,9 +26223,12 @@ impl ViewerApp {
                 }
             }
         }
-        // A restored Models or WRF viewer implies the shared backend switch —
-        // otherwise poll_model_layer would tear its worker down immediately.
-        if (self.model_dock_open || self.wrf_window_open) && !self.model_enabled {
+        // A restored Models, WRF, or Formula Lab viewer implies the shared
+        // backend switch; otherwise poll_model_layer would tear its worker
+        // down immediately.
+        if (self.model_dock_open || self.wrf_window_open || self.formula_lab_window_open)
+            && !self.model_enabled
+        {
             self.model_enabled = true;
         }
         // Restoring is not an edit; nothing to write back.
@@ -26282,6 +26330,7 @@ impl ViewerApp {
             }
             dock::WorkspacePane::Simsat => self.simsat_pane_body(ui),
             dock::WorkspacePane::Wrf => self.wrf_pane_body(ui),
+            dock::WorkspacePane::FormulaLab => self.formula_lab_pane_body(ui),
             dock::WorkspacePane::Model => {
                 let events = self.model_pane_body(ui);
                 self.dispatch_download_events(events);
@@ -29716,6 +29765,9 @@ impl ViewerApp {
         if let Some(value) = self.app_settings.wrf_synth_radar.as_ref() {
             dock.apply_wrf_synth_radar_json(value);
         }
+        if let Some(value) = self.app_settings.formula_lab_state.as_ref() {
+            dock.apply_formula_lab_state_json(value);
+        }
         dock.set_plots_base(
             settings::screenshots_dir_for_brand(&self.app_settings.brand).join("plots"),
         );
@@ -29839,6 +29891,41 @@ impl ViewerApp {
         self.set_viewer_open(dock::WorkspacePane::Wrf, open);
     }
 
+    /// First-class Formula Lab window. The editor is only a surface: Models,
+    /// WRF, and Formula Lab deliberately share one `ModelDataDock`, one store
+    /// selection, and one evaluation/result pipeline.
+    fn formula_lab_window(&mut self, ctx: &egui::Context) {
+        if !self.formula_lab_window_open {
+            return;
+        }
+        self.model_enabled = true;
+        self.ensure_model_data_dock(ctx);
+        if self.workspace.is_docked(dock::WorkspacePane::FormulaLab) {
+            return;
+        }
+        let mut open = self.formula_lab_window_open;
+        egui::Window::new("Formula Lab")
+            .open(&mut open)
+            .default_size([1100.0, 840.0])
+            .min_size([760.0, 520.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                self.dock_toggle_row(ui, dock::WorkspacePane::FormulaLab);
+                self.formula_lab_pane_body(ui);
+            });
+        self.set_viewer_open(dock::WorkspacePane::FormulaLab, open);
+    }
+
+    fn formula_lab_pane_body(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.model_enabled = true;
+        self.ensure_model_data_dock(&ctx);
+        if let Some(dock) = self.model_dock.as_mut() {
+            dock.formula_lab_ui(ui);
+        }
+        self.persist_formula_lab_state();
+    }
+
     fn wrf_pane_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.ensure_model_data_dock(&ctx);
@@ -29864,6 +29951,27 @@ impl ViewerApp {
         }
         self.model_enabled = true;
         self.open_viewer(dock::WorkspacePane::Model);
+    }
+
+    /// The WRF workspace can launch Formula Lab from inside the tile-tree.
+    /// Drain that intent only after the tree pass, then use the normal viewer
+    /// open path so a saved dock preference is honored.
+    fn apply_formula_lab_window_requests(&mut self) {
+        let (open_formula_lab, open_models) =
+            self.model_dock.as_mut().map_or((false, false), |dock| {
+                (
+                    dock.take_formula_lab_open_requested(),
+                    dock.take_formula_lab_open_models_requested(),
+                )
+            });
+        if open_formula_lab {
+            self.model_enabled = true;
+            self.open_viewer(dock::WorkspacePane::FormulaLab);
+        }
+        if open_models {
+            self.model_enabled = true;
+            self.open_viewer(dock::WorkspacePane::Model);
+        }
     }
 
     /// Model data body (Download fold + store dock), window and pane
@@ -32367,21 +32475,41 @@ impl ViewerApp {
     }
 
     fn poll_model_layer(&mut self, ctx: &egui::Context) {
-        if self.wrf_window_open && !self.model_enabled {
+        if (self.wrf_window_open || self.formula_lab_window_open) && !self.model_enabled {
             self.model_enabled = true;
         }
         if !self.model_enabled {
+            // Closing the owning windows while a formula evaluates must not
+            // drop its receiver. Honor the disabled model switch as soon as
+            // the worker publishes or stops; until then, pump only.
+            if self
+                .model_dock
+                .as_ref()
+                .is_some_and(model_data::ModelDataDock::formula_lab_busy)
+            {
+                if let Some(dock) = self.model_dock.as_mut() {
+                    dock.pump();
+                }
+                ctx.request_repaint_after(Duration::from_millis(250));
+                return;
+            }
             if self.model_dock.is_some() {
+                // Capture the editor draft before dropping its single owner;
+                // on_exit cannot persist state from a dock that no longer
+                // exists.
+                self.persist_formula_lab_state();
                 // Tear down: drop the dock/layer/LUT so nothing model-side
-                // runs until re-enabled. A docked Model pane leaves the
-                // workspace too (prefer_docked keeps the comeback).
+                // runs until re-enabled. Docked Model/WRF/Formula Lab panes
+                // leave the workspace too (prefer_docked keeps the comeback).
                 self.model_dock = None;
                 self.model_layers.clear();
                 self.model_lut = None;
                 self.model_dock_open = false;
                 self.wrf_window_open = false;
+                self.formula_lab_window_open = false;
                 self.workspace.undock(dock::WorkspacePane::Model);
                 self.workspace.undock(dock::WorkspacePane::Wrf);
+                self.workspace.undock(dock::WorkspacePane::FormulaLab);
             }
             return;
         }
@@ -63006,6 +63134,7 @@ mod tests {
             model_dock: None,
             model_dock_open: false,
             wrf_window_open: false,
+            formula_lab_window_open: false,
             wrf_open_models_requested: false,
             initial_viewport_sized: false,
             model_timeline_follow: false,
@@ -64927,6 +65056,87 @@ mod tests {
     }
 
     #[test]
+    fn formula_lab_is_a_first_class_viewer_that_keeps_the_shared_backend_enabled() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        assert_eq!(
+            app.viewer_mode(dock::WorkspacePane::FormulaLab),
+            dock::ViewerMode::Hidden
+        );
+
+        app.open_viewer(dock::WorkspacePane::FormulaLab);
+        assert!(app.formula_lab_window_open);
+        assert_eq!(
+            app.viewer_mode(dock::WorkspacePane::FormulaLab),
+            dock::ViewerMode::Floating
+        );
+
+        // The window itself is explicit intent to keep Models' single shared
+        // worker owner alive, even if the model master switch was previously
+        // off. No second ModelDataDock is created by viewer state.
+        app.model_enabled = false;
+        app.poll_model_layer(&ctx);
+        assert!(app.model_enabled);
+        assert!(app.model_dock.is_none());
+
+        app.workspace
+            .prefer_docked
+            .insert(dock::WorkspacePane::FormulaLab);
+        app.toggle_viewer(dock::WorkspacePane::FormulaLab);
+        assert!(!app.viewer_open(dock::WorkspacePane::FormulaLab));
+        app.toggle_viewer(dock::WorkspacePane::FormulaLab);
+        assert!(app.workspace.is_docked(dock::WorkspacePane::FormulaLab));
+    }
+
+    #[test]
+    fn wrf_formula_lab_request_restores_the_saved_dock_preference() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let mut model_dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("hrrr", "20260711_00z", &[0]),
+        );
+        model_dock.request_formula_lab_open();
+        app.model_dock = Some(model_dock);
+        app.workspace
+            .prefer_docked
+            .insert(dock::WorkspacePane::FormulaLab);
+
+        app.apply_formula_lab_window_requests();
+
+        assert!(app.model_enabled);
+        assert!(app.viewer_open(dock::WorkspacePane::FormulaLab));
+        assert!(app.workspace.is_docked(dock::WorkspacePane::FormulaLab));
+        assert!(
+            app.model_dock.is_some(),
+            "the request reuses the shared dock"
+        );
+    }
+
+    #[test]
+    fn model_backend_teardown_persists_formula_draft_and_closes_its_surface() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.model_dock = Some(model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("gfs", "20260711_00z", &[0]),
+        ));
+        app.formula_lab_window_open = true;
+        app.workspace.dock(dock::WorkspacePane::FormulaLab);
+        // Closing the Formula Lab is distinct from disabling the shared model
+        // backend; mirror the latter only after the surface is closed.
+        app.set_viewer_open(dock::WorkspacePane::FormulaLab, false);
+        app.model_enabled = false;
+
+        app.poll_model_layer(&ctx);
+
+        assert!(app.app_settings.formula_lab_state.is_some());
+        assert!(app.model_dock.is_none());
+        assert!(!app.formula_lab_window_open);
+        assert!(!app.workspace.is_docked(dock::WorkspacePane::FormulaLab));
+    }
+
+    #[test]
     fn loading_a_site_remembers_startup_but_never_auto_favorites() {
         // Field feedback: "some actions make it automatically save radar;
         // only save radar by clicking the star". Loading/selecting a site
@@ -65617,6 +65827,8 @@ mod tests {
         app.glm_enabled = false;
         app.vrot_tool_armed = false;
         app.show_inspector_card = false;
+        app.set_viewer_open(dock::WorkspacePane::FormulaLab, true);
+        app.workspace.dock(dock::WorkspacePane::FormulaLab);
 
         app.apply_workflow_preset(WorkflowPreset::ModelWrf, &ctx);
 
@@ -65627,12 +65839,18 @@ mod tests {
         assert!(app.model_download_open);
         assert!(app.viewer_open(dock::WorkspacePane::Model));
         assert!(app.viewer_open(dock::WorkspacePane::Wrf));
+        assert!(app.workspace.is_docked(dock::WorkspacePane::FormulaLab));
         assert!(app.viewer_open(dock::WorkspacePane::Sounding));
         assert!(app.obs_enabled);
         assert!(app.obs_adjust_soundings);
         assert!(app.glm_enabled);
         assert!(app.show_inspector_card);
         assert!(app.vrot_tool_armed);
+
+        // Prove workflow restoration owns Formula Lab's tri-state too, not
+        // just the older Models/WRF pair.
+        app.toggle_viewer(dock::WorkspacePane::FormulaLab);
+        assert!(!app.viewer_open(dock::WorkspacePane::FormulaLab));
 
         app.restore_previous_workflow(&ctx);
 
@@ -65645,6 +65863,8 @@ mod tests {
         assert!(!app.workspace.is_docked(dock::WorkspacePane::Model));
         assert!(!app.viewer_open(dock::WorkspacePane::Wrf));
         assert!(!app.workspace.is_docked(dock::WorkspacePane::Wrf));
+        assert!(app.viewer_open(dock::WorkspacePane::FormulaLab));
+        assert!(app.workspace.is_docked(dock::WorkspacePane::FormulaLab));
         assert!(!app.viewer_open(dock::WorkspacePane::Sounding));
         assert!(!app.obs_enabled);
         assert!(!app.obs_adjust_soundings);

@@ -157,3 +157,10 @@ default-features = false
 git = "https://github.com/FahrenheitResearch/wrf-rust.git"
 rev = "2550d4e2f85c61a190cf639d59e713f553facd07"
 package = "wrf-core"
+
+# Formula Lab source-readiness must use the exact same unit parser as the
+# pinned evaluator; a hand-maintained unit list can incorrectly claim Ready.
+[dependencies.wrf-formula]
+git = "https://github.com/FahrenheitResearch/wrf-rust.git"
+rev = "2550d4e2f85c61a190cf639d59e713f553facd07"
+package = "wrf-formula"

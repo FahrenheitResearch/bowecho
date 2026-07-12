@@ -727,7 +727,8 @@ fn model_data(ui: &mut egui::Ui) {
          onto the radar map. Enable the \
          master switch first: \u{2699} Settings \u{25b8} Model \u{25b8} Model data (off = \
          pure radar app). Windows \u{25be} \u{25b8} Models opens stored runs and plotting; \
-         Windows \u{25be} \u{25b8} WRF opens raw-WRF processing and simulated radar.",
+         Windows \u{25be} \u{25b8} WRF opens raw-WRF processing and simulated radar; \
+         Windows \u{25be} \u{25b8} Formula Lab opens custom diagnostics.",
     );
 
     subhead(ui, "GETTING DATA");
@@ -757,7 +758,7 @@ fn model_data(ui: &mut egui::Ui) {
     para(
         ui,
         "WRF is a separate first-class window and dockable workspace, not a section buried in \
-         Models. Open data, wrf-rust full diagnostics, Formula Lab, GDEX, and simulated radar \
+         Models. Open data, wrf-rust full diagnostics, GDEX, and simulated radar \
          live there. They share one backend with Models, so processed fields immediately appear \
          in the Models run library for plotting, maps, and soundings.",
     );
@@ -782,6 +783,38 @@ fn model_data(ui: &mut egui::Ui) {
         "— the full-diagnostics ingest (~117 fields: CAPE, severe, precip, soil, …) via \
          wrf-core, minutes per file on large grids. A field selector narrows it to a \
          core-only set when you don't need everything. This is NOT the simulated-radar button.",
+    );
+
+    subhead(ui, "FORMULA LAB");
+    para(
+        ui,
+        "Formula Lab is its own dockable workspace and shares the selected model/run/time with \
+         Models. Choose a compatible quick start or insert exact variable names from its \
+         searchable field browser. Syntax valid means the bounded equation compiled; Ready for \
+         selected source additionally checks the current inventory, units, source capabilities, \
+         and time axis before evaluation.",
+    );
+    action(
+        ui,
+        "Stored model",
+        "— model-neutral pointwise formulas work across practical stored models whenever the \
+         selected timestep actually contains the requested fields. Stored runs can use pressure \
+         volumes and explicit-height vertical operators, but do not retain the grid metrics \
+         needed for horizontal derivatives.",
+    );
+    action(
+        ui,
+        "Raw WRF",
+        "— choose any readable raw WRF file, including extensionless wrfout files from every \
+         domain. Raw WRF supplies native map factors, height, projected vectors, and grid-aware \
+         horizontal/vertical calculus. The resolver performs the final file-specific checks.",
+    );
+    para(
+        ui,
+        "A completed result enters the shared Models viewer. Formula Lab's result card can open \
+         Models, add the field to the radar map, open the native plot/PNG workflow, or adjust its \
+         color table. The editor draft and options persist across restarts; running worker state \
+         and large-file consent do not.",
     );
 
     subhead(ui, "UPPER-AIR (ISOBARIC) FIELDS");
