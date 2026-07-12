@@ -713,6 +713,12 @@ impl ResearchTMatrixLut {
                 wet.mixture().topology(),
             ));
         }
+        if wet.wet_fraction() <= 0.0 {
+            return Err(EvaluationError::PhaseRegimeMismatch {
+                expected: "strictly wet liquid_mass_fraction>0",
+                actual_liquid_mass_fraction: wet.wet_fraction(),
+            });
+        }
         self.verify_request_shape(request)?;
 
         let source_state = wet.source_category().record().state();
@@ -3132,7 +3138,7 @@ mod tests {
                 .with_fall_speed_m_s(2.0),
         )
         .unwrap();
-        let diagnosis = DiagnosticCoexistenceInput::new(272.15, rain, vec![frozen])
+        let diagnosis = DiagnosticCoexistenceInput::new(272.15, rain.clone(), vec![frozen.clone()])
             .unwrap()
             .diagnose()
             .unwrap();
@@ -3158,6 +3164,24 @@ mod tests {
             wet.wet_total_mass_kgkg()
         );
         assert!((contribution.additive().zh().get() - 3.0e6).abs() <= 1.0e-8);
+
+        // A zero-LMF node is valid as a wet-table interpolation boundary, but
+        // a genuinely dry category must dispatch to the dry table.
+        let dry_boundary = DiagnosticCoexistenceInput::new(269.15, rain, vec![frozen])
+            .unwrap()
+            .diagnose()
+            .unwrap();
+        assert_eq!(dry_boundary.wet_categories()[0].wet_fraction(), 0.0);
+        assert_eq!(
+            table.evaluate_wet_category(
+                &dry_boundary.wet_categories()[0],
+                request(FREQUENCY_HZ, 1.0),
+            ),
+            Err(EvaluationError::PhaseRegimeMismatch {
+                expected: "strictly wet liquid_mass_fraction>0",
+                actual_liquid_mass_fraction: 0.0,
+            })
+        );
     }
 
     #[test]
