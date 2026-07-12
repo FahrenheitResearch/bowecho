@@ -1258,7 +1258,7 @@ fn checked_property_tmatrix_build_remainder(
         .and_then(|value| value.checked_add(embedded_lut_bytes))
         .and_then(|value| value.checked_add(reserved_memory_bytes))
         .ok_or_else(|| "Property T-matrix build-memory reservation overflowed".to_string())?;
-    let remaining = budget_bytes.checked_sub(current_base_bytes).unwrap_or(0);
+    let remaining = budget_bytes.saturating_sub(current_base_bytes);
     if remaining >= minimum_owned_peak_bytes {
         Ok(remaining)
     } else {
@@ -3016,6 +3016,9 @@ struct ColumnSample {
     tke_m2s2: f32,
 }
 
+// These inputs are kept explicit because they cross the spatial, beam and
+// atmosphere-time sampling boundary; bundling them would hide unit contracts.
+#[allow(clippy::too_many_arguments)]
 fn sample_column_temporal(
     fields: &WrfRadarFields,
     neighbor_fields: Option<&WrfRadarFields>,
@@ -4313,6 +4316,9 @@ fn build_temporal_synthetic_from_scenes(
     })
 }
 
+// This short-lived control value favors clear ownership at the scan boundary;
+// it is never stored in a collection or retained per ray/gate.
+#[allow(clippy::large_enum_variant)]
 enum TemporalNeighborResolution {
     Fields(Arc<WrfRadarFields>),
     Held(RadarVolume, String),
@@ -4722,8 +4728,10 @@ mod tests {
 
     #[test]
     fn property_scene_failures_propagate_while_bulk_failures_remain_skippable() {
-        let mut research = SyntheticRadarConfig::default();
-        research.polarimetric_kernel = PolarimetricKernel::PropertyTMatrixResearchV1;
+        let research = SyntheticRadarConfig {
+            polarimetric_kernel: PolarimetricKernel::PropertyTMatrixResearchV1,
+            ..SyntheticRadarConfig::default()
+        };
         let mut notes = Vec::new();
         assert_eq!(
             record_or_propagate_scene_failure(
