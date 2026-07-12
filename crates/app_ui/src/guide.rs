@@ -1303,14 +1303,24 @@ fn wrf(ui: &mut egui::Ui) {
     para(
         ui,
         "The frozen-particle path is deliberately scheme-specific. ISHMAEL dry frozen \
-         categories reconstruct their native gamma PSD from each QICE/QNICE/QVOLI/QAOLI tuple \
-         and integrate per-particle scattering through the dry property tables. Table support \
-         and omitted number, mass and sixth-moment fractions are audited; unsupported tails or \
-         particle nodes fail instead of clamping. Wet ISHMAEL PSD allocation is unavailable \
-         rather than replaced by a characteristic particle. P3 50–53 remains the explicit \
-         versioned characteristic-particle closure because an exact native P3 PSD reconstruction \
-         is not implemented. The two schemes therefore must not be described as equivalent PSD \
-         science.",
+         categories reconstruct their native gamma PSD from each QICE/QNICE/QVOLI/QAOLI tuple. \
+         P3 50–52 reconstruct lambda/mu from the exact official WRF v5.4 two-moment table; P3 53 \
+         uses the exact triple-moment table and WRF M3/M6 iteration. BowEcho lazily downloads only \
+         the required 1.6 or 17.9 MB file and accepts it only after pinned size, SHA-256, header, \
+         layout, source-revision and scheme checks. Both paths integrate per-particle scattering \
+         through the dry T-matrix tables and audit omitted number, mass and sixth-moment tails. \
+         Wet ISHMAEL PSD allocation remains unavailable rather than replaced by a characteristic \
+         particle.",
+    );
+    para(
+        ui,
+        "P3 itself predicts Dmax, mass and projected area but not a unique spheroidal habit or \
+         canting distribution. BowEcho's usable P3 policy preserves the exact PSD and native \
+         mass/area law, then applies an explicitly versioned projected-area-equivalent oblate \
+         shape plus the table's Gaussian-20 canting as external research assumptions. Provenance \
+         says so directly. A strict shape-authoritative mode evaluates only P3's genuinely \
+         spherical regions under omission budgets. The old single-characteristic-particle \
+         production dispatch is removed.",
     );
     para(
         ui,
@@ -1320,8 +1330,8 @@ fn wrf(ui: &mut egui::Ui) {
          declared axes, Waterman T-matrix nodes retain nonspherical, non-Rayleigh/resonant \
          behavior. Missing or mismatched tables, properties, frequency, orientation, shape or \
          view coordinates are errors, never silent Rayleigh fallback. Both the scheme-native \
-         ISHMAEL dry PSD branch and the P3 characteristic-particle branch are research-only, are \
-         not independently validated, and make no operational claim.",
+         ISHMAEL and P3 PSD branches are research-only, are not independently validated, and make \
+         no operational claim; P3 shape/canting remains the named external assumption above.",
     );
     para(
         ui,
@@ -1365,10 +1375,10 @@ fn wrf(ui: &mut egui::Ui) {
         "Bulk Rayleigh remains the default. In that mode P3, ISHMAEL, incomplete hydrometeor \
          inputs, or unsupported closures fall back explicitly to scalar REF/VEL with a note. \
          The opt-in T-matrix contract is table-bounded research: it can represent nonspherical \
-         and non-Rayleigh/resonant scattering within its declared axes. ISHMAEL dry frozen \
-         categories use scheme-native PSD integration; P3 still uses characteristic particles; \
-         wet ISHMAEL PSD allocation and a complete prognostic melting-layer model remain \
-         unavailable.",
+         and non-Rayleigh/resonant scattering within its declared axes. ISHMAEL and P3 frozen \
+         categories use scheme-native PSD integration; P3's equivalent-oblate shape and \
+         Gaussian-20 canting remain external assumptions. Wet ISHMAEL PSD allocation and a \
+         complete prognostic melting-layer model remain unavailable.",
     );
     para(
         ui,
@@ -2939,7 +2949,9 @@ mod tests {
         assert!(guide_src.contains("never silent Rayleigh fallback"));
         assert!(guide_src.contains("reconstruct their native gamma PSD"));
         assert!(guide_src.contains("Wet ISHMAEL PSD allocation is unavailable"));
-        assert!(guide_src.contains("P3 still uses characteristic particles"));
+        assert!(guide_src.contains("old single-characteristic-particle"));
+        assert!(guide_src.contains("official WRF v5.4 two-moment table"));
+        assert!(guide_src.contains("projected-area-equivalent oblate"));
         assert!(guide_src.contains("not independently validated"));
         assert!(guide_src.contains("make no operational claim"));
         assert!(!guide_src.contains("BowEcho v0."));

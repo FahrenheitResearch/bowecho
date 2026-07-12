@@ -413,10 +413,25 @@ table's terminal-speed law and value, and audits convergence plus the omitted
 number, mass, and sixth-moment tails. A node is never clipped to a table edge;
 the cell fails when its declared support/omission envelope is exceeded.
 
-P3 50-53 remains explicitly labeled **characteristic-particle** science in the
-current production path. Its scheme-native distribution requires the matching
-source-qualified P3 lookup/mass-property contract and is not inferred from
-Q/N/rime bulk values with a generic gamma approximation.
+P3 50-53 uses the matching official WRF P3 v5.4 lookup table to reconstruct
+the scheme-native distribution: 50-52 use the exact two-moment table and 53
+uses the exact triple-moment table, including WRF's five-iteration M3/M6 shape
+solve. BowEcho downloads that 1.6 or 17.9 MB asset only when required, caches
+it outside the executable, and accepts it only after the pinned byte length,
+SHA-256, header, record layout, source commit, and scheme/table-kind checks all
+pass. PSD quadrature then integrates additive scattering through the dry
+T-matrix node tables; convergence and omitted number, mass, and sixth-moment
+fractions remain fail-closed.
+
+P3 predicts maximum dimension, mass, and projected area, but not one unique
+spheroidal habit or canting distribution. The usable research policy therefore
+keeps lambda, mu, PSD weights, mass, and area scheme-native while mapping each
+node to an explicitly named projected-area-equivalent oblate spheroid with the
+table's Gaussian-20 canting assumption. Provenance states that this shape and
+orientation are external research assumptions, not P3 predictions. A stricter
+shape-authoritative policy exists and evaluates only genuinely spherical P3
+regions under omission budgets; neither policy silently revives the removed
+single-characteristic-particle production path.
 
 The research tables use PyTMatrix at exactly **2.8 GHz**, with distinct oblate
 and prolate spheroids and a symmetric Bruggeman effective-medium mixture of
@@ -477,12 +492,12 @@ non-embedded conventional dry-ice fixture. Exact table/config hashes and the
 scope boundary are recorded in
 `validation/tmatrix/refined_grid_v10_property_bundle_acceptance.json`.
 
-This remains **research-only and not independently validated**. ISHMAEL now
-integrates its reconstructable native PSD, while P3 still scales one
-closure-derived characteristic particle by number concentration. The
-reproducible generator checks table integrity and held-out interpolation, not
-agreement with an operational radar. No PSD implementation, table,
-orientation model, VCP choice, or visually plausible output creates an
+This remains **research-only and not independently validated**. ISHMAEL and P3
+now integrate their reconstructable native PSDs, but P3 spheroid shape/canting
+remains the explicit projected-area-equivalent research mapping described
+above. The reproducible generator checks table integrity and held-out
+interpolation, not agreement with an operational radar. No PSD implementation,
+table, orientation model, VCP choice, or visually plausible output creates an
 operational-calibration claim.
 
 ## Coupled instrument stages and Algorithm Truth Lab
@@ -579,9 +594,9 @@ variables.
   ISHMAEL, missing hydrometeors, and unsupported closures fall back explicitly
   to scalar REF/VEL with a diagnostic note.
 - The opt-in T-matrix contract is research-only, table-bounded, and not
-  independently validated. ISHMAEL has a scheme-native dry-frozen PSD path;
-  P3 remains a characteristic-particle approximation. Neither is operational
-  calibration.
+  independently validated. ISHMAEL and P3 have scheme-native PSD paths; P3's
+  equivalent-oblate shape and Gaussian-20 canting remain external assumptions.
+  Neither is operational calibration.
 - Symmetric Bruggeman air/ice/water mixing represents a declared effective
   medium; it is not a complete prognostic melting-layer microphysics model.
 - Deterministic clutter and texture are optional synthetic instrument effects,
@@ -596,8 +611,9 @@ observations is still required before any production-science claim. The
 repository includes an exact-geometry multi-case validation harness with
 independent-operator provenance, JSON/Markdown scorecards, pooled bias/MAE/
 RMSE/percentile/correlation metrics, and fail-closed geometry matching; useful
-results still require real independent reference cases. P3 scheme-native PSD,
-category- or flow-dependent frozen-particle orientation table families,
-prognostic melting-state evolution, scattering beyond each strict
-role-specific PyTMatrix convergence envelope, and adaptive operational VCP
-behaviors remain outside the current production contract.
+results still require real independent reference cases. Category- or
+flow-dependent frozen-particle orientation table families, prognostic
+melting-state evolution, scattering beyond each strict role-specific PyTMatrix
+convergence envelope, independently validated C/X-band table packs, and
+adaptive operational VCP behaviors remain outside the current production
+contract.
