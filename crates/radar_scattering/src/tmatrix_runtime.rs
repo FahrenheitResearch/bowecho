@@ -1278,7 +1278,7 @@ fn bind_descriptor(
     verify_axis_contract(lut, &material)?;
     verify_category_material(category, population_role, &material)?;
     let odf = bind_orientation(config.orientation)?;
-    let radar = bind_radar(config.radar, lut)?;
+    let radar = bind_radar(config.radar, lut, population_role)?;
     let terminal_speed = bind_terminal_speed(config.terminal_velocity, lut)?;
     verify_category_terminal(category, &terminal_speed)?;
     exact_text(
@@ -2193,6 +2193,7 @@ fn bind_orientation(raw: RawOrientation) -> Result<TMatrixOdfConvention, TMatrix
 fn bind_radar(
     raw: RawRadar,
     lut: &OfflineLut,
+    population_role: TMatrixPopulationRole,
 ) -> Result<RadarConventionDescriptor, TMatrixLoadError> {
     if raw.speed_of_light_m_s != SPEED_OF_LIGHT_M_S {
         return invalid(
@@ -2266,9 +2267,7 @@ fn bind_radar(
     };
     exact_text("radar.solver.shape", &raw.solver.shape, "spheroid")?;
     positive("radar.solver.ddelt", raw.solver.ddelt)?;
-    if raw.solver.ndgs == 0 {
-        return invalid("radar.solver.ndgs", "must be nonzero");
-    }
+    verify_solver_ndgs(population_role, raw.solver.ndgs)?;
     Ok(RadarConventionDescriptor {
         convention: RadarHvConvention::PytMatrixHorizontalHhConjugateVv,
         view_applicability,
@@ -2276,6 +2275,26 @@ fn bind_radar(
         solver_ddelt: raw.solver.ddelt,
         solver_ndgs: raw.solver.ndgs,
     })
+}
+
+fn verify_solver_ndgs(
+    population_role: TMatrixPopulationRole,
+    ndgs: u32,
+) -> Result<(), TMatrixLoadError> {
+    let expected = match population_role {
+        TMatrixPopulationRole::OrdinaryConventional => 2,
+        TMatrixPopulationRole::ConventionalRainStandaloneAndResidual
+        | TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle
+        | TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle => 10,
+    };
+    if ndgs == expected {
+        Ok(())
+    } else {
+        invalid(
+            "radar.solver.ndgs",
+            format!("population role {population_role:?} requires exactly {expected}, got {ndgs}"),
+        )
+    }
 }
 
 fn bind_terminal_speed(
@@ -2833,7 +2852,7 @@ mod tests {
                 RadarViewApplicability::PpiElevationAxisMinus05To20AxisymmetricGaussian,
             reference_water_dielectric_factor_squared: 0.93,
             solver_ddelt: 0.001,
-            solver_ndgs: 2,
+            solver_ndgs: 10,
         }
     }
 
@@ -3347,6 +3366,29 @@ mod tests {
             .material_state_axis_kinds
             .swap(0, 1);
         assert!(verify_execution(changed, &wet_material_for_execution()).is_err());
+    }
+
+    #[test]
+    fn solver_order_is_exact_for_each_population_role() {
+        for (role, expected_ndgs) in [
+            (TMatrixPopulationRole::OrdinaryConventional, 2),
+            (
+                TMatrixPopulationRole::ConventionalRainStandaloneAndResidual,
+                10,
+            ),
+            (
+                TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle,
+                10,
+            ),
+            (
+                TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle,
+                10,
+            ),
+        ] {
+            verify_solver_ndgs(role, expected_ndgs).unwrap();
+            assert!(verify_solver_ndgs(role, expected_ndgs - 1).is_err());
+            assert!(verify_solver_ndgs(role, expected_ndgs + 1).is_err());
+        }
     }
 
     #[test]

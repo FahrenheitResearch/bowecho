@@ -154,6 +154,12 @@ state axes, elevation geometry axis, 1,024-point process cap, and 3,600-second
 group timeout). Grouping is reproducibility metadata, not permission to accept
 partial output: any failed group still rejects the complete LUT.
 
+The PyTMatrix convergence order is population-bound as well: ordinary legacy
+conventional tables require `ndgs=2`, while property dry/wet tables and the
+view-aware standalone/residual rain table require `ndgs=10`. Diameter nodes
+remain exact config/header data; the runtime does not substitute or hard-code
+a candidate diameter grid.
+
 ## Evidence status
 
 There is no generic "production" label. `TableValidation` distinguishes
