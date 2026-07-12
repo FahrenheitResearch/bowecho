@@ -258,7 +258,20 @@ pub struct RadarConventionDescriptor {
     pub solver_ndgs: u32,
 }
 
-/// Terminal-speed law already folded into the table's additive fall moments.
+/// Policy for the small discontinuity where the piecewise Schiller-Naumann
+/// drag approximation switches to its constant high-Reynolds drag value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DragTransitionBoundaryPolicy {
+    /// Select the exact transition-Reynolds speed when the one-sided drag
+    /// residuals straddle zero and the piecewise approximation has no exact
+    /// force-balance root.
+    SelectExactTransitionReynoldsBoundaryWhenPiecewiseDragResidualJumpStraddlesZero,
+}
+
+/// Terminal-speed law folded into each stored table node's additive fall
+/// moments by the generator. Runtime category evaluation replaces those two
+/// stored moments with the closed or diagnosed category's positive-downward
+/// fall speed before number-density scaling.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TerminalSpeedPolicy {
     AtlasRain1973Exponential {
@@ -273,6 +286,7 @@ pub enum TerminalSpeedPolicy {
         air_dynamic_viscosity_pa_s: f64,
         drag_transition_reynolds: f64,
         high_reynolds_drag_coefficient: f64,
+        drag_transition_boundary_policy: DragTransitionBoundaryPolicy,
         maximum_iterations: u32,
         relative_tolerance: f64,
     },
@@ -1217,6 +1231,7 @@ enum RawTerminalSpeed {
         air_dynamic_viscosity_pa_s: f64,
         drag_transition_reynolds: f64,
         high_reynolds_drag_coefficient: f64,
+        drag_transition_boundary_policy: String,
         maximum_iterations: u32,
         relative_tolerance: f64,
     },
@@ -2365,6 +2380,7 @@ fn bind_terminal_speed(
             air_dynamic_viscosity_pa_s,
             drag_transition_reynolds,
             high_reynolds_drag_coefficient,
+            drag_transition_boundary_policy,
             maximum_iterations,
             relative_tolerance,
         } => {
@@ -2390,12 +2406,18 @@ fn bind_terminal_speed(
             if maximum_iterations == 0 {
                 return invalid("terminal_velocity.maximum_iterations", "must be nonzero");
             }
+            exact_text(
+                "terminal_velocity.drag_transition_boundary_policy",
+                &drag_transition_boundary_policy,
+                "select_exact_transition_reynolds_boundary_when_piecewise_drag_residual_jump_straddles_zero",
+            )?;
             Ok(TerminalSpeedPolicy::SchillerNaumannGravityDrag {
                 gravity_m_s2,
                 air_density_kg_m3,
                 air_dynamic_viscosity_pa_s,
                 drag_transition_reynolds,
                 high_reynolds_drag_coefficient,
+                drag_transition_boundary_policy: DragTransitionBoundaryPolicy::SelectExactTransitionReynoldsBoundaryWhenPiecewiseDragResidualJumpStraddlesZero,
                 maximum_iterations,
                 relative_tolerance,
             })
@@ -2751,6 +2773,7 @@ mod tests {
                 "air_dynamic_viscosity_pa_s":0.000017894,
                 "drag_transition_reynolds":1000.0,
                 "high_reynolds_drag_coefficient":0.44,
+                "drag_transition_boundary_policy":"select_exact_transition_reynolds_boundary_when_piecewise_drag_residual_jump_straddles_zero",
                 "maximum_iterations":200,
                 "relative_tolerance":1e-12
             },
@@ -2880,6 +2903,7 @@ mod tests {
             air_dynamic_viscosity_pa_s: 1.7894e-5,
             drag_transition_reynolds: 1_000.0,
             high_reynolds_drag_coefficient: 0.44,
+            drag_transition_boundary_policy: DragTransitionBoundaryPolicy::SelectExactTransitionReynoldsBoundaryWhenPiecewiseDragResidualJumpStraddlesZero,
             maximum_iterations: 200,
             relative_tolerance: 1.0e-12,
         }
@@ -2935,6 +2959,34 @@ mod tests {
             table.descriptor().radar().view_applicability,
             RadarViewApplicability::HorizontalSingletonZeroDegreeAxis
         );
+        assert_eq!(table.descriptor().terminal_speed(), &test_drag_policy());
+    }
+
+    #[test]
+    fn loader_requires_exact_drag_transition_boundary_policy() {
+        let mut missing: serde_json::Value = serde_json::from_str(&fixture_config(20.0)).unwrap();
+        missing["terminal_velocity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("drag_transition_boundary_policy");
+        let (bytes, config) = fixture_with_config(serde_json::to_string(&missing).unwrap());
+        assert!(matches!(
+            ResearchTMatrixLut::load(&bytes, Sha256Digest::compute(&bytes), config.as_bytes()),
+            Err(TMatrixLoadError::GeneratorConfigJson(_))
+        ));
+
+        let mut unsupported: serde_json::Value =
+            serde_json::from_str(&fixture_config(20.0)).unwrap();
+        unsupported["terminal_velocity"]["drag_transition_boundary_policy"] =
+            json!("interpolate_across_drag_jump");
+        let (bytes, config) = fixture_with_config(serde_json::to_string(&unsupported).unwrap());
+        assert!(matches!(
+            ResearchTMatrixLut::load(&bytes, Sha256Digest::compute(&bytes), config.as_bytes()),
+            Err(TMatrixLoadError::InvalidConfig {
+                field: "terminal_velocity.drag_transition_boundary_policy",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3163,7 +3215,11 @@ mod tests {
             contribution.represented_mixing_ratio_kgkg(),
             wet.wet_total_mass_kgkg()
         );
-        assert!((contribution.additive().zh().get() - 3.0e6).abs() <= 1.0e-8);
+        let components = contribution.additive().components();
+        let closure_speed = wet.fall_speed_m_s().value();
+        assert!((components[0] - 3.0e6).abs() <= 1.0e-8);
+        assert!((components[7] - components[0] * closure_speed).abs() <= 1.0e-8);
+        assert!((components[8] - components[0] * closure_speed * closure_speed).abs() <= 1.0e-8);
 
         // A zero-LMF node is valid as a wet-table interpolation boundary, but
         // a genuinely dry category must dispatch to the dry table.
