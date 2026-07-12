@@ -435,10 +435,10 @@ impl ConventionalProvenance {
         assumptions: Vec<ClosureAssumption>,
         wrf_mp_physics: Option<i32>,
     ) -> Result<Self, ProvenanceError> {
-        if let Some(value) = wrf_mp_physics {
-            if value <= 0 {
-                return Err(ProvenanceError::InvalidSchemeId { value });
-            }
+        if let Some(value) = wrf_mp_physics
+            && value <= 0
+        {
+            return Err(ProvenanceError::InvalidSchemeId { value });
         }
         Ok(Self {
             core: ProvenanceCore::new(

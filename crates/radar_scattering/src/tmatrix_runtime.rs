@@ -607,13 +607,13 @@ impl ResearchTMatrixLut {
                 actual: particle.orientation().model().clone(),
             });
         }
-        if let Some(expected_k) = self.descriptor.material.fixed_temperature_k() {
-            if environment.temperature_k() != expected_k {
-                return Err(EvaluationError::FixedDielectricTemperatureMismatch {
-                    expected_k,
-                    actual_k: environment.temperature_k(),
-                });
-            }
+        if let Some(expected_k) = self.descriptor.material.fixed_temperature_k()
+            && environment.temperature_k() != expected_k
+        {
+            return Err(EvaluationError::FixedDielectricTemperatureMismatch {
+                expected_k,
+                actual_k: environment.temperature_k(),
+            });
         }
         match self.descriptor.material {
             TMatrixMaterial::Homogeneous {
@@ -1685,13 +1685,13 @@ fn verify_axis_contract(
             } => Some(*temperature_range_k),
             _ => None,
         };
-        if let Some(expected_bounds) = expected_bounds {
-            if bounds != expected_bounds {
-                return invalid(
-                    "axes.temperature",
-                    format!("must exactly span {expected_bounds:?} K, got {bounds:?}"),
-                );
-            }
+        if let Some(expected_bounds) = expected_bounds
+            && bounds != expected_bounds
+        {
+            return invalid(
+                "axes.temperature",
+                format!("must exactly span {expected_bounds:?} K, got {bounds:?}"),
+            );
         }
     }
     for axis in lut.header().axes() {
