@@ -30,6 +30,14 @@ NetCDF**, **WRF full diagnostics**, or **Formula Lab** instead.
 7. Use **Export latest as CfRadial...** when a portable radar volume with
    model/operator provenance is needed.
 
+If an observed radar volume is already displayed, **Replay displayed observed
+scan...** is the validation workflow. Choose one raw WRF file and BowEcho will
+reuse the observation's actual cuts, individual ray azimuths/elevations,
+acquisition times, gate geometry, split cuts, missing sectors, moment
+availability, Nyquist, and PRT. The result opens as linked **Observed / Simulated
+/ Difference** panes. This is exact acquisition replay, not a reconstructed base
+VCP.
+
 Extensionless **wrfout_*** names from every domain are valid. A folder build
 captures the files found at selection time. Refresh deliberately reuses that
 ordered session snapshot; it does not rescan the folder or silently add files
@@ -131,6 +139,32 @@ remain unchanged.
 The complete data-changing configuration participates in frame identity and
 export provenance. Presentation-only viewer settings do not silently alter the
 forward operator.
+
+An exact replay retains both the chosen WRF file and observed-volume snapshot
+for the session, so **Refresh current frame(s)** reruns the same validation
+pair after tuning. A normal simulated-radar build clears replay mode. The
+comparison workspace is transient and does not overwrite the user's saved pane
+layout or independent-panel settings.
+
+## Exact observed-scan replay and differences
+
+Replay fails closed unless the displayed source has valid site coordinates,
+cuts, rays, and gate geometry. It also rejects BowEcho synthetic/difference
+volumes as observation templates. Geometry is copied from the decoded source;
+BowEcho does not fill missing sectors, merge duplicate-elevation split cuts, or
+invent moment coverage.
+
+Observed radial acquisition time drives the atmosphere-time weight for every
+replayed ray. Terrain-horizon sampling uses that ray's real azimuth. The
+simulated output retains the three gate-quality products described below, and
+the difference builder compares only moments available on the exact same
+cut/radial/gate geometry. Missing observed moments are listed explicitly
+instead of becoming silent all-NaN products.
+
+The comparison workspace starts with REF / REF / DIF_REF and supports the
+other exact-overlap difference products through the ordinary product picker.
+Difference phase uses circular angular subtraction. Polling and live refresh
+are disabled while the local three-volume comparison owns the panes.
 
 ## Forward operator
 
@@ -266,6 +300,12 @@ Propagation proceeds from near to far along each radial:
 | PHI / PhiDP | Accumulated two-way differential phase plus configured system phase |
 | AH / ADP | Specific horizontal / differential attenuation |
 | PIA / PIDA | Integrated two-way horizontal / differential attenuation |
+| MCOV | Model support fraction of the pulse-volume quadrature at the gate |
+| TUNB | Terrain-unblocked fraction; blocked weight is retained as lost signal |
+| MSIG | Meteorological-signal fraction after model support and terrain blockage |
+| IREF / IVEL / ISW / IZDR / IRHO / IKDP | Ideal pulse-volume-integrated moments before virtual receiver/estimator effects |
+| MREF / MVEL / MSW / MZDR / MRHO / MKDP | Measured moments after the coupled instrument/estimator and before presentation effects |
+| DIF_* | Exact-gate simulated-minus-observed validation products |
 
 Corrected fields are not generic post-processing guesses. They are the
 intrinsic values retained by the same radial propagation calculation that
@@ -278,9 +318,9 @@ closure. P3 and ISHMAEL use property-based ice categories that cannot honestly
 be relabeled as snow/graupel/hail. When the **bulk Rayleigh** kernel is selected,
 those schemes therefore fall back to scalar REF/VEL with an explicit note.
 
-## Opt-in v0.33.1 property-aware T-matrix research contract
+## Opt-in property-aware T-matrix research contract
 
-BowEcho v0.33.1 defines a separate, opt-in research-mode contract for P3
+BowEcho defines a separate, opt-in research-mode contract for P3
 `mp_physics` 50-53 and ISHMAEL `mp_physics` 55. It is not the default bulk
 operator. A build may evaluate this mode only when its versioned property-aware
 tables and runtime descriptor match the request exactly; an absent or
@@ -303,6 +343,19 @@ as available. Each active source cell is closed once before its bounded LUT
 evaluation; the resulting ZH/ZV/covariance/KDP/attenuation/fall moments remain
 additive through spatial, beam, and time sampling. Nonlinear products are
 derived only after those sums.
+
+ISHMAEL `mp_physics=55` uses a scheme-native dry-frozen PSD integration. Each
+planar, columnar, or aggregate tuple reconstructs its native gamma distribution
+from QICE/QNICE/QVOLI/QAOLI and exact dry-air density. Diameter quadrature
+selects oblate or prolate support from the node's diagnosed habit, enforces the
+table's terminal-speed law and value, and audits convergence plus the omitted
+number, mass, and sixth-moment tails. A node is never clipped to a table edge;
+the cell fails when its declared support/omission envelope is exceeded.
+
+P3 50-53 remains explicitly labeled **characteristic-particle** science in the
+current production path. Its scheme-native distribution requires the matching
+source-qualified P3 lookup/mass-property contract and is not inferred from
+Q/N/rime bulk values with a generic gamma approximation.
 
 The research tables use PyTMatrix at exactly **2.8 GHz**, with distinct oblate
 and prolate spheroids and a symmetric Bruggeman effective-medium mixture of
@@ -363,13 +416,40 @@ non-embedded conventional dry-ice fixture. Exact table/config hashes and the
 scope boundary are recorded in
 `validation/tmatrix/refined_grid_v10_property_bundle_acceptance.json`.
 
-This remains **research-only and not independently validated**. It scales a
-single closure-derived characteristic particle by number concentration; it is
-not an integration over a scheme-native particle-size distribution. The
+This remains **research-only and not independently validated**. ISHMAEL now
+integrates its reconstructable native PSD, while P3 still scales one
+closure-derived characteristic particle by number concentration. The
 reproducible generator checks table integrity and held-out interpolation, not
-agreement with an operational radar. No P3/ISHMAEL table, orientation model,
-VCP choice, or visually plausible output creates an operational-calibration
-claim.
+agreement with an operational radar. No PSD implementation, table,
+orientation model, VCP choice, or visually plausible output creates an
+operational-calibration claim.
+
+## Coupled instrument stages and Algorithm Truth Lab
+
+The optional coupled single-PRF estimator makes frequency, pulse width, PRF,
+dwell, pulse count, independent-sample fraction, and sensitivity one physical
+contract. It derives wavelength, Nyquist velocity, unambiguous range, and the
+matched-filter range response instead of letting those values contradict one
+another. Named VCP PRF *codes* remain unresolved rather than being treated as
+hertz; the coupled path therefore applies only where a literal research PRF is
+known.
+
+Enable **Emit Ideal + Measured diagnostic moments** to retain all three stages:
+
+1. **Ideal**: perfect pulse-volume-integrated scattering.
+2. **Measured**: matched pulse weighting, PRF ambiguity, sample-count/SNR
+   uncertainty, receiver sensitivity, blockage, and attenuation.
+3. **Presented**: the ordinary products after optional deterministic texture,
+   clutter, display thresholds, and other presentation choices.
+
+Open **Windows > Algorithm Truth Lab** on a synthetic pane to compare the exact
+co-gridded I/M/Presented stages. It reports signed bias, MAE, RMSE, percentile
+and maximum errors for the retained moment triples, plus analytic folding
+exposure. When an exact-geometry DVEL grid is present it also reports recovered
+folds, branch errors, false unfolds, and velocity error. The current lab does
+not fabricate VWP, GBVTD, tracking, or vortex truth metrics; those remain
+unavailable until their production algorithms have dedicated model-truth
+adapters.
 
 ## Geometry, instrument, and presentation controls
 
@@ -434,8 +514,9 @@ variables.
   ISHMAEL, missing hydrometeors, and unsupported closures fall back explicitly
   to scalar REF/VEL with a diagnostic note.
 - The opt-in T-matrix contract is research-only, table-bounded, and not
-  independently validated. Its P3/ISHMAEL path is a characteristic-particle
-  approximation, not a scheme-native PSD integral or operational calibration.
+  independently validated. ISHMAEL has a scheme-native dry-frozen PSD path;
+  P3 remains a characteristic-particle approximation. Neither is operational
+  calibration.
 - Symmetric Bruggeman air/ice/water mixing represents a declared effective
   medium; it is not a complete prognostic melting-layer microphysics model.
 - Deterministic clutter and texture are optional synthetic instrument effects,
@@ -446,9 +527,12 @@ variables.
 ## Remaining scientific boundary
 
 Independent comparison against trusted polarimetric forward operators and
-observations is still required before any production-science claim. A true
-scheme-native PSD integral, category- or flow-dependent frozen-particle
-orientation distributions, prognostic melting-state evolution, scattering
-beyond each strict role-specific PyTMatrix convergence envelope, and adaptive
-operational VCP behaviors remain outside the characteristic-particle research
-contract.
+observations is still required before any production-science claim. The
+repository includes an exact-geometry multi-case validation harness with
+independent-operator provenance, JSON/Markdown scorecards, pooled bias/MAE/
+RMSE/percentile/correlation metrics, and fail-closed geometry matching; useful
+results still require real independent reference cases. P3 scheme-native PSD,
+category- or flow-dependent frozen-particle orientation table families,
+prognostic melting-state evolution, scattering beyond each strict
+role-specific PyTMatrix convergence envelope, and adaptive operational VCP
+behaviors remain outside the current production contract.
