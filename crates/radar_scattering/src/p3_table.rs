@@ -35,6 +35,9 @@ const COLLISION_FIELDS: usize = 2;
 const WRF_QSMALL: f32 = 1.0e-14;
 const WRF_NSMALL: f32 = 1.0e-16;
 const WRF_ZSMALL: f32 = 1.0e-35;
+// Preserve the decimal `REAL` literal from the pinned WRF Fortran source.
+// Replacing it with Rust's PI spelling would obscure source-parity intent.
+#[allow(clippy::approx_constant, clippy::excessive_precision)]
 const WRF_PI: f32 = 3.14159265;
 const WRF_TRIPLE_MOMENT_ITERATIONS: usize = 5;
 
@@ -1178,7 +1181,7 @@ mod tests {
             clamped: false,
         };
         let value = interpolate_four_axes(&lambda, layout, shape, mass, rime, density);
-        assert!((value - 726_109.375).abs() <= 0.01);
+        assert!((f64::from(value) - 726_109.375_f64).abs() <= 0.01);
         assert!(
             (interpolate_four_axes(&mu, layout, shape, mass, rime, density) - 6.5).abs() <= 1e-6
         );

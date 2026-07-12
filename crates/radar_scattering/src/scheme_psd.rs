@@ -408,6 +408,7 @@ impl IshmaelPsd {
         self.reconstruction
     }
 
+    #[cfg(test)]
     fn equivolume_diameter_at_scaled_a(self, scaled_a: f64) -> Result<f64, PsdError> {
         positive("scaled ISHMAEL a coordinate", scaled_a)?;
         let diameter_at_scale =
@@ -1282,6 +1283,9 @@ struct RuleAccumulation {
     all: MomentFractions,
 }
 
+// Each argument is an independent part of the quadrature rule or its audit
+// context; bundling them would only obscure the coarse/refined call sites.
+#[allow(clippy::too_many_arguments)]
 fn integrate_rule<F, E>(
     distribution: IshmaelPsd,
     panels: usize,
