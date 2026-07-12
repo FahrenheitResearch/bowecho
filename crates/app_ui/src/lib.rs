@@ -1,6 +1,7 @@
 //! Native app-shell state shared by future winit/wgpu UI code.
 
 pub mod vcp_catalog;
+pub mod wrf_scene_adapter;
 pub mod wrf_scene_inventory;
 pub mod wrf_temporal;
 
