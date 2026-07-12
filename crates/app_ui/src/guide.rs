@@ -1079,6 +1079,12 @@ fn wrf(ui: &mut egui::Ui) {
         "— the full 27-point pulse-volume rule for one frame or a short loop. Source-model \
          resolution still limits the real information content.",
     );
+    action(
+        ui,
+        "P3/ISHMAEL T-matrix (research)",
+        "— opt-in 2.8 GHz property-aware dual-pol with bounded offline T-matrix tables. \
+         Exact supported inputs are required; it never substitutes Rayleigh.",
+    );
     para(
         ui,
         "Choosing a recipe resets every interacting physics, presentation, instrument and \
@@ -1154,17 +1160,23 @@ fn wrf(ui: &mut egui::Ui) {
          P3 50–53 and ISHMAEL 55 raw tuples. Its versioned PyTMatrix tables use exactly 2.8 GHz, \
          symmetric Bruggeman air/ice/water mixing, separate oblate/prolate shapes, and a fixed \
          mean-zero Gaussian canting distribution with 20\u{00b0} standard deviation and \
-         deterministic 50-point orientation integration. Raw spatial/temporal state is blended \
-         before nonlinear closure; signed KDP remains signed.",
+         deterministic 5 × 10 orientation integration. Solver-complete diameter domains are \
+         role-specific: dry oblate to 89 mm, dry prolate to 50 mm, wet oblate to 15 mm, and wet \
+         prolate to 6.3 mm. Unsupported phase/shape coordinates are rejected rather than \
+         clamped. Each active source cell is closed from \
+         its native properties, then only additive scattering quantities are integrated through \
+         space, pulse volume and adjacent model times; signed KDP remains signed.",
     );
     para(
         ui,
-        "A research lookup has no clamping or extrapolation. The view axis covers pulse-volume \
-         offsets around named 0.1\u{00b0}–19.5\u{00b0} cut centers (at least about \
-         -0.5\u{00b0}–20\u{00b0}); a wider custom beam fails closed. Missing or mismatched tables, \
-         properties, frequency, orientation, shape or view coordinates are errors, never silent \
-         Rayleigh fallback. This characteristic-particle approximation is not PSD-integrated, \
-         is research-only and not independently validated, and makes no operational claim.",
+        "A research lookup has no clamping or extrapolation. Its -0.5\u{00b0} to 20\u{00b0} view axis \
+         covers all 19 custom/named cut centers plus or minus the correctly converted \
+         0.95\u{00b0}-FWHM Gaussian beam sigma; a wider custom beam fails closed. Within the \
+         declared axes, Waterman T-matrix nodes retain nonspherical, non-Rayleigh/resonant \
+         behavior. Missing or mismatched tables, properties, frequency, orientation, shape or \
+         view coordinates are errors, never silent Rayleigh fallback. This \
+         characteristic-particle approximation is not PSD-integrated, is research-only and not \
+         independently validated, and makes no operational claim.",
     );
     cite(
         ui,
@@ -2575,6 +2587,7 @@ mod tests {
             "Clean dual-pol",
             "Real radar (balanced)",
             "Maximum fidelity (slow)",
+            "P3/ISHMAEL T-matrix (research)",
         ] {
             assert!(guide_src.contains(recipe), "missing recipe {recipe}");
         }

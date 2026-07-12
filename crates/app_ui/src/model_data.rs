@@ -163,15 +163,17 @@ enum SyntheticRadarRecipe {
     CleanDualPol,
     RealRadar,
     MaximumFidelity,
+    PropertyTMatrixResearch,
 }
 
 impl SyntheticRadarRecipe {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::StormView,
         Self::CleanTruth,
         Self::CleanDualPol,
         Self::RealRadar,
         Self::MaximumFidelity,
+        Self::PropertyTMatrixResearch,
     ];
 
     const fn label(self) -> &'static str {
@@ -181,6 +183,7 @@ impl SyntheticRadarRecipe {
             Self::CleanDualPol => "Clean dual-pol",
             Self::RealRadar => "Real radar (balanced) - recommended",
             Self::MaximumFidelity => "Maximum fidelity (slow)",
+            Self::PropertyTMatrixResearch => "P3/ISHMAEL T-matrix (research)",
         }
     }
 
@@ -201,13 +204,19 @@ impl SyntheticRadarRecipe {
             Self::MaximumFidelity => {
                 "The full virtual instrument with 27-point pulse-volume integration. Best for one file or a short loop; source-model resolution still limits detail."
             }
+            Self::PropertyTMatrixResearch => {
+                "Opt-in, fail-closed 2.8 GHz T-matrix dual-pol for exact supported P3/ISHMAEL property files. Research-only and substantially slower; no Rayleigh fallback."
+            }
         }
     }
 
     const fn products(self) -> &'static str {
         match self {
             Self::StormView | Self::CleanTruth => "REF / VEL",
-            Self::CleanDualPol | Self::RealRadar | Self::MaximumFidelity => {
+            Self::CleanDualPol
+            | Self::RealRadar
+            | Self::MaximumFidelity
+            | Self::PropertyTMatrixResearch => {
                 "REF / VEL / SW / ZDR / CC / KDP / PHI + attenuation/corrected fields"
             }
         }
@@ -301,6 +310,11 @@ struct SyntheticRadarUiState {
     spectrum_width_floor_mps: f32,
     #[serde(default)]
     dual_pol: bool,
+    /// Polarimetric forward operator. The research T-matrix path has a strict
+    /// table/property applicability contract and never falls back to the bulk
+    /// Rayleigh operator when that contract is not met.
+    #[serde(default)]
+    polarimetric_kernel: crate::wrf_radar::PolarimetricKernel,
     #[serde(default)]
     propagation: bool,
     #[serde(default)]
@@ -431,6 +445,7 @@ impl Default for SyntheticRadarUiState {
             spectrum_width: false,
             spectrum_width_floor_mps: default_synth_spectrum_width_floor_mps(),
             dual_pol: false,
+            polarimetric_kernel: crate::wrf_radar::PolarimetricKernel::default(),
             propagation: false,
             system_phidp_deg: 0.0,
             zdr_bias_db: 0.0,
@@ -476,6 +491,7 @@ impl SyntheticRadarUiState {
             terrain_blockage: self.terrain_blockage,
             spectrum_width: self.spectrum_width,
             dual_pol: self.dual_pol,
+            polarimetric_kernel: self.polarimetric_kernel,
             propagation: self.propagation,
             scan_timing: self.scan_timing,
             atmosphere_time_mode: self.atmosphere_time_mode,
@@ -496,6 +512,7 @@ impl SyntheticRadarUiState {
         self.terrain_blockage = preset.terrain_blockage;
         self.spectrum_width = preset.spectrum_width;
         self.dual_pol = preset.dual_pol;
+        self.polarimetric_kernel = preset.polarimetric_kernel;
         self.propagation = preset.propagation;
         self.scan_timing = preset.scan_timing;
         self.atmosphere_time_mode = preset.atmosphere_time_mode;
@@ -521,6 +538,7 @@ impl SyntheticRadarUiState {
         self.beam_width_deg = defaults.beam_width_deg;
         self.pulse_width_us = defaults.pulse_width_us;
         self.radar_frequency_mhz = defaults.radar_frequency_mhz;
+        self.polarimetric_kernel = defaults.polarimetric_kernel;
         self.spectrum_width_floor_mps = defaults.spectrum_width_floor_mps;
         self.system_phidp_deg = 0.0;
         self.zdr_bias_db = 0.0;
@@ -562,6 +580,19 @@ impl SyntheticRadarUiState {
             SyntheticRadarRecipe::MaximumFidelity => {
                 self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
                 self.beam_integration = crate::wrf_radar::BeamIntegration::Reference;
+                self.atmosphere_time_mode =
+                    app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
+                self.missing_neighbor_policy =
+                    app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
+            }
+            SyntheticRadarRecipe::PropertyTMatrixResearch => {
+                self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
+                self.polarimetric_kernel =
+                    crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1;
+                self.radar_frequency_mhz =
+                    crate::wrf_radar::PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ;
+                self.reflectivity_sampling = crate::wrf_radar::ReflectivitySampling::LinearZ;
+                self.beam_integration = crate::wrf_radar::BeamIntegration::Balanced;
                 self.atmosphere_time_mode =
                     app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
                 self.missing_neighbor_policy =
@@ -640,12 +671,13 @@ impl SyntheticRadarUiState {
             spectrum_width: self.spectrum_width,
             spectrum_width_floor_mps: self.spectrum_width_floor_mps,
             dual_pol: self.dual_pol,
+            polarimetric_kernel: self.polarimetric_kernel,
             propagation: self.propagation,
             system_phidp_deg: self.system_phidp_deg,
             zdr_bias_db: self.zdr_bias_db,
-            // Raw-state interpolation is meaningful only for a timed scan.
-            // Normalize stale/manually-edited settings instead of emitting an
-            // internally contradictory renderer configuration.
+            // Adjacent-scene atmosphere/scattering interpolation is meaningful
+            // only for a timed scan. Normalize stale/manually-edited settings
+            // instead of emitting an internally contradictory configuration.
             scan_timing: if matches!(
                 self.atmosphere_time_mode,
                 app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
@@ -2820,6 +2852,14 @@ impl ModelDataDock {
                         .small()
                         .weak(),
                     );
+                } else if matches!(recipe, SyntheticRadarRecipe::PropertyTMatrixResearch) {
+                    ui.label(
+                        egui::RichText::new(
+                            "Research T-matrix requires exact P3 50-53 or ISHMAEL 55 property tuples and matching LUT axes. Any unsupported field, particle, temperature, beam, or table stops the run; it never substitutes Rayleigh.",
+                        )
+                        .small()
+                        .weak(),
+                    );
                 }
             } else {
                 ui.label(
@@ -3593,13 +3633,47 @@ impl ModelDataDock {
                                 .on_hover_text(
                                     "Derive ZH, ZDR, rhoHV, KDP, PhiDP and attenuation from raw WRF bulk hydrometeors when the microphysics scheme is supported.",
                                 );
-                            ui.label(
-                                egui::RichText::new(
-                                    "Scheme-aware bulk S-band Rayleigh operator. Unsupported P3/ISHMAEL or missing hydrometeor fields fall back explicitly to REF/VEL; this is not a T-matrix solver.",
-                                )
-                                .small()
-                                .weak(),
-                            );
+                            ui.add_enabled_ui(state.dual_pol, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Scattering:");
+                                    ui.selectable_value(
+                                        &mut state.polarimetric_kernel,
+                                        crate::wrf_radar::PolarimetricKernel::BulkRayleighV1,
+                                        "Bulk Rayleigh",
+                                    )
+                                    .on_hover_text(
+                                        "Fast scheme-aware bulk approximation used by BowEcho v0.33.0. Unsupported schemes are explicitly labeled scalar fallbacks.",
+                                    );
+                                    if ui
+                                        .selectable_value(
+                                            &mut state.polarimetric_kernel,
+                                            crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1,
+                                            "Property T-matrix (research)",
+                                        )
+                                        .on_hover_text(
+                                            "Opt-in research operator for exact supported P3/ISHMAEL property tuples. It uses versioned offline T-matrix tables and fails closed on any scheme, field, frequency, geometry, or table mismatch.",
+                                        )
+                                        .clicked()
+                                    {
+                                        // The v1 research table is generated specifically at
+                                        // 2.8 GHz. Keep selection and instrument metadata
+                                        // coherent instead of waiting for a runtime mismatch.
+                                        state.radar_frequency_mhz =
+                                            crate::wrf_radar::PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ;
+                                        state.reflectivity_sampling =
+                                            crate::wrf_radar::ReflectivitySampling::LinearZ;
+                                    }
+                                });
+                            });
+                            let kernel_note = match state.polarimetric_kernel {
+                                crate::wrf_radar::PolarimetricKernel::BulkRayleighV1 => {
+                                    "Scheme-aware bulk S-band Rayleigh operator. Unsupported or incomplete conventional schemes fall back explicitly to REF/VEL."
+                                }
+                                crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1 => {
+                                    "Research-only, not independently validated for operational use. Requires an exact supported P3/ISHMAEL raw-property contract and 2.8 GHz table applicability; no silent Rayleigh fallback or LUT extrapolation."
+                                }
+                            };
+                            ui.label(egui::RichText::new(kernel_note).small().weak());
                         });
 
                     egui::CollapsingHeader::new("Instrument & propagation")
@@ -3608,14 +3682,23 @@ impl ModelDataDock {
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("S-band:");
-                                ui.add(
+                                let research_tmatrix = matches!(
+                                    state.polarimetric_kernel,
+                                    crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
+                                );
+                                ui.add_enabled(
+                                    !research_tmatrix,
                                     egui::DragValue::new(&mut state.radar_frequency_mhz)
                                         .range(2_000..=4_000)
                                         .speed(10)
                                         .suffix(" MHz"),
                                 )
                                 .on_hover_text(
-                                    "Transmit frequency written to the volume and CfRadial provenance.",
+                                    if research_tmatrix {
+                                        "The research T-matrix tables have an exact 2.8 GHz applicability contract. Choose Bulk Rayleigh to use another S-band frequency."
+                                    } else {
+                                        "Transmit frequency written to the volume and CfRadial provenance."
+                                    },
                                 );
                                 ui.add(
                                     egui::DragValue::new(&mut state.beam_width_deg)
@@ -5858,6 +5941,11 @@ mod tests {
             default_synth_spectrum_width_floor_mps()
         );
         assert!(!empty.dual_pol);
+        assert_eq!(
+            empty.polarimetric_kernel,
+            crate::wrf_radar::PolarimetricKernel::BulkRayleighV1,
+            "older settings retain the compatible bulk Rayleigh operator"
+        );
         assert!(!empty.propagation);
         assert_eq!(empty.system_phidp_deg, 0.0);
         assert_eq!(empty.zdr_bias_db, 0.0);
@@ -5928,6 +6016,7 @@ mod tests {
             spectrum_width: true,
             spectrum_width_floor_mps: 1.25,
             dual_pol: true,
+            polarimetric_kernel: crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1,
             propagation: true,
             system_phidp_deg: 12.5,
             zdr_bias_db: -0.35,
@@ -6000,6 +6089,7 @@ mod tests {
             historical.spectrum_width_floor_mps
         );
         assert_eq!(config.dual_pol, historical.dual_pol);
+        assert_eq!(config.polarimetric_kernel, historical.polarimetric_kernel);
         assert_eq!(config.propagation, historical.propagation);
         assert_eq!(config.system_phidp_deg, historical.system_phidp_deg);
         assert_eq!(config.zdr_bias_db, historical.zdr_bias_db);
@@ -6043,7 +6133,9 @@ mod tests {
 
     #[test]
     fn synth_radar_deep_controls_flow_into_config() {
-        use crate::wrf_radar::{BeamIntegration, ReflectivitySampling, ScanTiming, SimulationMode};
+        use crate::wrf_radar::{
+            BeamIntegration, PolarimetricKernel, ReflectivitySampling, ScanTiming, SimulationMode,
+        };
 
         let state = SyntheticRadarUiState {
             simulation_mode: SimulationMode::Instrument,
@@ -6051,12 +6143,13 @@ mod tests {
             beam_integration: BeamIntegration::Reference,
             beam_width_deg: 1.2,
             pulse_width_us: 2.4,
-            radar_frequency_mhz: 2_925,
+            radar_frequency_mhz: 2_800,
             terminal_fall_speed: true,
             terrain_blockage: true,
             spectrum_width: true,
             spectrum_width_floor_mps: 1.1,
             dual_pol: true,
+            polarimetric_kernel: PolarimetricKernel::PropertyTMatrixResearchV1,
             propagation: true,
             system_phidp_deg: 18.5,
             zdr_bias_db: -0.4,
@@ -6081,12 +6174,16 @@ mod tests {
         assert_eq!(config.beam_integration, BeamIntegration::Reference);
         assert_eq!(config.beam_width_deg, 1.2);
         assert_eq!(config.pulse_width_us, 2.4);
-        assert_eq!(config.radar_frequency_mhz, 2_925);
+        assert_eq!(config.radar_frequency_mhz, 2_800);
         assert!(config.terminal_fall_speed);
         assert!(config.terrain_blockage);
         assert!(config.spectrum_width);
         assert_eq!(config.spectrum_width_floor_mps, 1.1);
         assert!(config.dual_pol);
+        assert_eq!(
+            config.polarimetric_kernel,
+            PolarimetricKernel::PropertyTMatrixResearchV1
+        );
         assert!(config.propagation);
         assert_eq!(config.system_phidp_deg, 18.5);
         assert_eq!(config.zdr_bias_db, -0.4);
@@ -6257,6 +6354,20 @@ mod tests {
             maximum.atmosphere_time_mode,
             app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
         );
+
+        state.apply_recipe(SyntheticRadarRecipe::PropertyTMatrixResearch);
+        let research = state.to_config().unwrap();
+        assert_eq!(
+            research.polarimetric_kernel,
+            crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
+        );
+        assert_eq!(
+            research.radar_frequency_mhz,
+            crate::wrf_radar::PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ
+        );
+        assert_eq!(research.beam_integration, BeamIntegration::Balanced);
+        assert!(research.dual_pol && research.propagation);
+        assert!(research.validate_science_contract().is_ok());
     }
 
     #[test]
@@ -6265,6 +6376,11 @@ mod tests {
         assert_eq!(state.active_recipe(), Some(SyntheticRadarRecipe::StormView));
         state.apply_recipe(SyntheticRadarRecipe::RealRadar);
         assert_eq!(state.active_recipe(), Some(SyntheticRadarRecipe::RealRadar));
+        state.apply_recipe(SyntheticRadarRecipe::PropertyTMatrixResearch);
+        assert_eq!(
+            state.active_recipe(),
+            Some(SyntheticRadarRecipe::PropertyTMatrixResearch)
+        );
         state.zdr_bias_db = 0.25;
         assert_eq!(state.active_recipe(), None);
     }

@@ -65,6 +65,9 @@ range, and gate geometry:
 - **Real radar (balanced)** is the recommended practical S-band simulation.
 - **Maximum fidelity (slow)** uses the 27-point pulse-volume rule for one file
   or a short loop.
+- **P3/ISHMAEL T-matrix (research)** selects the exact 2.8 GHz,
+  property-aware, fail-closed research operator without changing the chosen
+  antenna or scan geometry.
 
 Changing an advanced control after applying a recipe labels the setup as
 `Custom tuning`. Selecting a recipe again resets all interacting physics,
@@ -80,6 +83,7 @@ leak into a new run.
 | Clean dual-pol | Microphysics comparison | Balanced (9) | Polarimetry/propagation without noise, folds, or blockage |
 | Real radar (balanced) | Practical virtual radar | Balanced (9) | Full S-band instrument path |
 | Maximum fidelity (slow) | One frame or short loop | Reference (27) | Full deterministic 3 x 3 x 3 integration |
+| P3/ISHMAEL T-matrix (research) | Supported P3/ISHMAEL experiments | Balanced (9) | Research-only non-Rayleigh dual-pol; no fallback |
 
 Recipes preserve antenna placement, maximum range, and gate geometry. They
 reset the interacting physics and calibration controls; this is why selecting
@@ -170,8 +174,11 @@ must remain between the two WRF times; the renderer never extrapolates.
 The compatibility renderer interpolates linear received power (`Z`), winds,
 and additive polarimetric scattering quantities. ZDR and rhoHV are derived
 afterward rather than interpolated as ratios. The property-aware research
-contract is stricter: raw mass/number/property state is blended before its
-nonlinear closure and T-matrix lookup.
+path closes each active source cell from its native mass/number/property tuple,
+evaluates additive T-matrix quantities at the validated view-angle nodes, and
+then performs spatial, pulse-volume, and adjacent-scene integration only in
+that additive space. It never interpolates ZDR/rhoHV ratios or treats a derived
+radar moment as a surrogate WRF property.
 
 If there is no complete later scene, or the scan would cross beyond it, the
 explicit policy can **hold the anchor**, **drop the frame**, or **stop with an
@@ -240,21 +247,23 @@ operator. A build may evaluate this mode only when its versioned property-aware
 tables and runtime descriptor match the request exactly; an absent or
 inapplicable asset is an error, never a silent fallback to Rayleigh.
 
-The intended data path preserves each scheme's native raw tuples. P3 category
+The data path preserves each scheme's native raw tuples. P3 category
 1/category 2 and ISHMAEL planar/columnar/aggregate mass, number, rime, bulk
 density, liquid fraction, aspect ratio, temperature, and air density are read
-as available. Spatial and adjacent-scene temporal weights apply to that raw
-state first. Nonlinear closure happens only after blending, so a derived radar
-moment is never used as a surrogate WRF property.
+as available. Each active source cell is closed once before its bounded LUT
+evaluation; the resulting ZH/ZV/covariance/KDP/attenuation/fall moments remain
+additive through spatial, beam, and time sampling. Nonlinear products are
+derived only after those sums.
 
 The research tables use PyTMatrix at exactly **2.8 GHz**, with distinct oblate
 and prolate spheroids and a symmetric Bruggeman effective-medium mixture of
 air, ice, and liquid water. Their radar-view axis covers pulse-volume offsets
-around named cut centers from 0.1 degrees through 19.5 degrees (at least about
--0.5 degrees through 20 degrees). A custom beam or quadrature sample outside
-the table's declared view axis fails closed. Frozen-particle orientation is a
-mean-zero Gaussian canting distribution with a fixed 20-degree standard
-deviation and deterministic 50-point orientation integration.
+around all 19 custom/named cut centers from 0.1 degrees through 19.5 degrees,
+including center plus/minus the correctly converted 0.95-degree-FWHM Gaussian
+beam sigma. The declared view axis is -0.5 through 20 degrees. A custom beam or
+quadrature sample outside that axis fails closed. Frozen-particle orientation
+is a mean-zero Gaussian canting distribution with a fixed 20-degree standard
+deviation and deterministic 5 by 10 (50-point) orientation integration.
 
 Dielectric applicability is table-specific. Dry-ice nodes use the declared
 Mätzler parameterization over roughly 190-273.15 K; Warren and Brandt
@@ -262,13 +271,29 @@ Mätzler parameterization over roughly 190-273.15 K; Warren and Brandt
 part of the research uncertainty rather than evidence of validation. Wet
 coexistence nodes use Liebe-Hufford-Manabe liquid water with symmetric
 Bruggeman mixing only over 269.15-275.15 K (-4 to +2 degrees C).
+Standalone and unpaired residual rain uses its separate temperature-dependent
+Liebe-Hufford-Manabe table over 250-313.15 K; paired liquid is removed exactly
+once before residual rain is evaluated.
 
 Lookup is bounded: there is no clamping or extrapolation across particle,
 material, temperature, frequency, orientation, or view axes. Signed KDP is
 preserved through per-particle lookup, accumulation, compact storage, and
 radial PhiDP integration. Within those declared bounds, a T-matrix table can
-represent nonspherical and non-Rayleigh/resonant scattering that the bulk
-Rayleigh kernel cannot.
+represent nonspherical Waterman T-matrix and non-Rayleigh/resonant scattering
+that the bulk Rayleigh kernel cannot. The reproducible PyTMatrix solver uses
+role-specific, contiguous convergence envelopes rather than reducing every
+particle to the hardest wet-column corner: dry oblate reaches 89 mm, dry
+prolate 50 mm, wet oblate 15 mm, and wet prolate 6.3 mm. These axes passed an
+exhaustive 12-to-14 solver-order comparison over 104,960 nodes and 944,640
+components with zero solver/tolerance failures. A particle outside its own
+phase/shape envelope fails closed; an isolated numerical pass above a failed
+endpoint is not used to bridge the gap or clamp the particle.
+
+The frozen solver contract is `ddelt=0.001`, `ndgs=14`; its exhaustive
+12-to-14 convergence report is identified by SHA-256
+`556d31a3afa8fcba12b3654826ad14f9c248327dca92c3d9a9f195e49c1a07fb`.
+This is same-implementation numerical convergence evidence, not independent
+scientific validation.
 
 This remains **research-only and not independently validated**. It scales a
 single closure-derived characteristic particle by number concentration; it is
@@ -310,11 +335,14 @@ meteorological structure.
 
 Large convection-resolving WRF files make one f32 3-D field hundreds of MiB.
 The bulk path reads hydrometeor species sequentially and retains compact
-scattering fields rather than every raw mass/number field. Adjacent-scene mode
-uses a bounded two-input-scene cache and accounts for input, read/cut scratch,
-and retained output volumes in its memory preflight. A research property path
-must include its sparse raw-property state in that accounting; it may not
-silently exceed the configured ceiling.
+scattering fields rather than every raw mass/number field. The property path
+reads a sparse native scene, includes that raw state in its pre-build peak,
+precomputes only active-cell additive scattering at the five elevation nodes,
+and then drops the raw property arrays. Adjacent-scene mode uses a bounded
+two-input-scene cache and checks the exact retained sparse-scene size after
+each read in addition to input, embedded tables, read/build/cut scratch, and
+retained output volumes. It does not silently substitute a smaller kernel when
+the configured ceiling is exceeded.
 
 CfRadial export includes all native and attenuation moments, real ray times,
 frequency, beam width, pulse width, PRT, unambiguous range, scan name, model and
@@ -349,6 +377,8 @@ numeric variables.
 
 Independent comparison against trusted polarimetric forward operators and
 observations is still required before any production-science claim. A true
-scheme-native PSD integral, richer frozen-particle orientation distributions,
-prognostic melting-state evolution, and operational VCP adaptations remain
-outside the characteristic-particle research contract.
+scheme-native PSD integral, category- or flow-dependent frozen-particle
+orientation distributions, prognostic melting-state evolution, scattering
+beyond each strict role-specific PyTMatrix convergence envelope, and adaptive
+operational VCP behaviors remain outside the characteristic-particle research
+contract.
