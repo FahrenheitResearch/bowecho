@@ -42,6 +42,25 @@ pub enum TMatrixPopulationRole {
     PropertyAwareWetCharacteristicParticle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DensityApplicability {
+    ConventionalCategory,
+    DryBulkDensity15To917KgM3Above1225Air,
+    WetCondensedVolumeFraction00015To1Above1225Air,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TMatrixExecutionDescriptor {
+    FreshProcessPerGridPoint,
+    FreshProcessPerMaterialStateGroup {
+        material_state_axes: Vec<AxisKind>,
+        tmatrix_state_axes: Vec<AxisKind>,
+        geometry_axis: AxisKind,
+        maximum_points_per_process: u32,
+        group_timeout_seconds: u64,
+    },
+}
+
 impl TMatrixParticleCategory {
     #[must_use]
     pub const fn conventional_family(self) -> Option<MicrophysicsFamily> {
@@ -116,6 +135,7 @@ pub enum TMatrixMaterial {
         homotopy_steps: u32,
         newton_max_iterations: u32,
         newton_relative_tolerance: f64,
+        temperature_range_k: [f64; 2],
     },
     SymmetricBruggemanSphericalAirIceMatzler2006V1 {
         air_relative_permittivity: ComplexRefractiveIndex,
@@ -264,11 +284,13 @@ pub struct TMatrixTableDescriptor {
     table_id: String,
     category: TMatrixParticleCategory,
     population_role: TMatrixPopulationRole,
+    density_applicability: DensityApplicability,
     spheroid: SpheroidConvention,
     material: TMatrixMaterial,
     odf: TMatrixOdfConvention,
     radar: RadarConventionDescriptor,
     terminal_speed: TerminalSpeedPolicy,
+    execution: TMatrixExecutionDescriptor,
     normalization_number_concentration_m3: f64,
 }
 
@@ -286,6 +308,11 @@ impl TMatrixTableDescriptor {
     #[must_use]
     pub const fn population_role(&self) -> TMatrixPopulationRole {
         self.population_role
+    }
+
+    #[must_use]
+    pub const fn density_applicability(&self) -> DensityApplicability {
+        self.density_applicability
     }
 
     #[must_use]
@@ -311,6 +338,11 @@ impl TMatrixTableDescriptor {
     #[must_use]
     pub const fn terminal_speed(&self) -> &TerminalSpeedPolicy {
         &self.terminal_speed
+    }
+
+    #[must_use]
+    pub const fn execution(&self) -> &TMatrixExecutionDescriptor {
+        &self.execution
     }
 
     #[must_use]
@@ -1031,6 +1063,7 @@ struct RawPropertyStateDescriptor {
     rime_effect_on_dielectric: String,
     psd_mapping: String,
     extrapolation: String,
+    density_applicability: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1086,6 +1119,7 @@ enum RawDielectric {
         homotopy_steps: u32,
         newton_max_iterations: u32,
         newton_relative_tolerance: f64,
+        temperature_range_k: [f64; 2],
         applicability: String,
     },
     #[serde(rename = "temperature_dependent_liquid_water_liebe_1991")]
@@ -1196,6 +1230,20 @@ struct RawExecution {
     result_collection_order: String,
     partial_grid_policy: String,
     thread_count_per_process: u32,
+    #[serde(default)]
+    grouping: Option<RawExecutionGrouping>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExecutionGrouping {
+    model: String,
+    material_state_axis_kinds: Vec<AxisKind>,
+    tmatrix_state_axis_kinds: Vec<AxisKind>,
+    geometry_axis_kind: AxisKind,
+    partial_group_policy: String,
+    maximum_points_per_process: u32,
+    group_timeout_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1222,7 +1270,8 @@ fn bind_descriptor(
             "must be exactly 1 m^-3",
         );
     }
-    let (category, spheroid, population_role) = bind_population(config.particle_population)?;
+    let (category, spheroid, population_role, density_applicability) =
+        bind_population(config.particle_population)?;
 
     verify_axes(lut, &config.axes)?;
     let material = bind_material(config.dielectric)?;
@@ -1237,7 +1286,7 @@ fn bind_descriptor(
         &config.temporal.sampling,
         "instantaneous",
     )?;
-    verify_execution(config.execution)?;
+    let execution = verify_execution(config.execution, &material)?;
     exact_text(
         "payload.encoding",
         &config.payload.encoding,
@@ -1257,11 +1306,13 @@ fn bind_descriptor(
         table_id: config.table_id,
         category,
         population_role,
+        density_applicability,
         spheroid,
         material,
         odf,
         radar,
         terminal_speed,
+        execution,
         normalization_number_concentration_m3: 1.0,
     })
 }
@@ -1273,6 +1324,7 @@ fn bind_population(
         TMatrixParticleCategory,
         SpheroidConvention,
         TMatrixPopulationRole,
+        DensityApplicability,
     ),
     TMatrixLoadError,
 > {
@@ -1286,7 +1338,7 @@ fn bind_population(
             );
         }
     };
-    let (category, role) = match raw.microphysics_family.as_str() {
+    let (category, role, density_applicability) = match raw.microphysics_family.as_str() {
         "conventional" => {
             if raw.phase_regime.is_some() {
                 return invalid(
@@ -1328,7 +1380,7 @@ fn bind_population(
             } else {
                 TMatrixPopulationRole::OrdinaryConventional
             };
-            (category, role)
+            (category, role, DensityApplicability::ConventionalCategory)
         }
         "property_aware_p3_ishmael" => {
             let phase = match raw.phase_regime.as_deref() {
@@ -1351,7 +1403,7 @@ fn bind_population(
                 &raw.size_distribution,
                 "monodisperse_characteristic_particle_node",
             )?;
-            verify_property_state_descriptor(
+            let density_applicability = verify_property_state_descriptor(
                 raw.state_descriptor
                     .ok_or_else(|| TMatrixLoadError::InvalidConfig {
                         field: "particle_population.state_descriptor",
@@ -1368,6 +1420,7 @@ fn bind_population(
             (
                 TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle,
                 phase,
+                density_applicability,
             )
         }
         other => {
@@ -1377,7 +1430,7 @@ fn bind_population(
             );
         }
     };
-    Ok((category, spheroid, role))
+    Ok((category, spheroid, role, density_applicability))
 }
 
 fn verify_coexistence_descriptor(raw: RawCoexistenceDescriptor) -> Result<(), TMatrixLoadError> {
@@ -1411,7 +1464,7 @@ fn verify_coexistence_descriptor(raw: RawCoexistenceDescriptor) -> Result<(), TM
 fn verify_property_state_descriptor(
     raw: RawPropertyStateDescriptor,
     phase: TMatrixPopulationRole,
-) -> Result<(), TMatrixLoadError> {
+) -> Result<DensityApplicability, TMatrixLoadError> {
     if raw.compatible_closed_state_families != ["p3", "ishmael"] {
         return invalid(
             "particle_population.state_descriptor.compatible_closed_state_families",
@@ -1480,7 +1533,7 @@ fn verify_property_state_descriptor(
     ] {
         exact_text(field, actual, expected)?;
     }
-    match phase {
+    let density_applicability = match phase {
         TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle => {
             if raw.condensed_volume_fraction_definition.is_some() {
                 return invalid(
@@ -1488,20 +1541,34 @@ fn verify_property_state_descriptor(
                     "is forbidden for dry bulk-density tables",
                 );
             }
+            exact_text(
+                "particle_population.state_descriptor.density_applicability",
+                &raw.density_applicability,
+                "bulk_density_1p5_to_917_kg_m3_downward_fall_requires_density_above_1p225_kg_m3_air",
+            )?;
+            DensityApplicability::DryBulkDensity15To917KgM3Above1225Air
         }
-        TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle => exact_text(
-            "particle_population.state_descriptor.condensed_volume_fraction_definition",
-            raw.condensed_volume_fraction_definition
-                .as_deref()
-                .ok_or_else(|| TMatrixLoadError::InvalidConfig {
-                    field: "particle_population.state_descriptor.condensed_volume_fraction_definition",
-                    detail: "is required for wet tables".to_owned(),
-                })?,
-            "rho_bulk_times_open_parenthesis_one_minus_w_over_917_plus_w_over_999p84_close_parenthesis",
-        )?,
+        TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle => {
+            exact_text(
+                "particle_population.state_descriptor.condensed_volume_fraction_definition",
+                raw.condensed_volume_fraction_definition
+                    .as_deref()
+                    .ok_or_else(|| TMatrixLoadError::InvalidConfig {
+                        field: "particle_population.state_descriptor.condensed_volume_fraction_definition",
+                        detail: "is required for wet tables".to_owned(),
+                    })?,
+                "rho_bulk_times_open_parenthesis_one_minus_w_over_917_plus_w_over_999p84_close_parenthesis",
+            )?;
+            exact_text(
+                "particle_population.state_descriptor.density_applicability",
+                &raw.density_applicability,
+                "condensed_volume_fraction_0p0015_to_1_downward_fall_requires_reconstructed_density_above_1p225_kg_m3_air",
+            )?;
+            DensityApplicability::WetCondensedVolumeFraction00015To1Above1225Air
+        }
         _ => unreachable!("only property-aware roles reach state descriptor validation"),
-    }
-    Ok(())
+    };
+    Ok(density_applicability)
 }
 
 fn verify_axes(lut: &OfflineLut, config_axes: &[RawAxis]) -> Result<(), TMatrixLoadError> {
@@ -1720,6 +1787,7 @@ fn bind_material(raw: RawDielectric) -> Result<TMatrixMaterial, TMatrixLoadError
             homotopy_steps,
             newton_max_iterations,
             newton_relative_tolerance,
+            temperature_range_k,
             applicability,
         } => {
             let air_relative_permittivity = bind_refractive_index(
@@ -1815,6 +1883,12 @@ fn bind_material(raw: RawDielectric) -> Result<TMatrixMaterial, TMatrixLoadError
                     "must exactly equal 1e-12",
                 );
             }
+            if temperature_range_k != [269.15, 275.15] {
+                return invalid(
+                    "dielectric.temperature_range_k",
+                    "must exactly equal [269.15, 275.15] K",
+                );
+            }
             Ok(TMatrixMaterial::SymmetricBruggemanSphericalAirIceWaterV1 {
                 air_relative_permittivity,
                 ice_permittivity_model,
@@ -1825,6 +1899,7 @@ fn bind_material(raw: RawDielectric) -> Result<TMatrixMaterial, TMatrixLoadError
                 homotopy_steps,
                 newton_max_iterations,
                 newton_relative_tolerance,
+                temperature_range_k,
             })
         }
         RawDielectric::TemperatureDependentLiquidWaterLiebe1991 {
@@ -2319,15 +2394,13 @@ fn verify_category_terminal(
     }
 }
 
-fn verify_execution(raw: RawExecution) -> Result<(), TMatrixLoadError> {
+fn verify_execution(
+    raw: RawExecution,
+    material: &TMatrixMaterial,
+) -> Result<TMatrixExecutionDescriptor, TMatrixLoadError> {
     if raw.point_timeout_seconds == 0 {
         return invalid("execution.point_timeout_seconds", "must be nonzero");
     }
-    exact_text(
-        "execution.process_isolation",
-        &raw.process_isolation,
-        "fresh_python_subprocess_per_grid_point",
-    )?;
     exact_text(
         "execution.result_collection_order",
         &raw.result_collection_order,
@@ -2341,7 +2414,116 @@ fn verify_execution(raw: RawExecution) -> Result<(), TMatrixLoadError> {
     if raw.thread_count_per_process != 1 {
         return invalid("execution.thread_count_per_process", "must be exactly one");
     }
-    Ok(())
+    match raw.process_isolation.as_str() {
+        "fresh_python_subprocess_per_grid_point" => {
+            if raw.grouping.is_some() {
+                return invalid(
+                    "execution.grouping",
+                    "is forbidden for per-grid-point isolation",
+                );
+            }
+            Ok(TMatrixExecutionDescriptor::FreshProcessPerGridPoint)
+        }
+        "fresh_python_subprocess_per_material_state_group" => {
+            if raw.point_timeout_seconds != 300 {
+                return invalid(
+                    "execution.point_timeout_seconds",
+                    "grouped property generation requires exactly 300 seconds",
+                );
+            }
+            let grouping = raw
+                .grouping
+                .ok_or_else(|| TMatrixLoadError::InvalidConfig {
+                    field: "execution.grouping",
+                    detail: "is required for grouped material-state execution".to_owned(),
+                })?;
+            exact_text(
+                "execution.grouping.model",
+                &grouping.model,
+                "fresh_crash_isolated_material_state_process",
+            )?;
+            exact_text(
+                "execution.grouping.partial_group_policy",
+                &grouping.partial_group_policy,
+                "reject_entire_lut",
+            )?;
+            if grouping.maximum_points_per_process != 1024 {
+                return invalid(
+                    "execution.grouping.maximum_points_per_process",
+                    "must be exactly 1024",
+                );
+            }
+            if grouping.group_timeout_seconds != 3600 {
+                return invalid(
+                    "execution.grouping.group_timeout_seconds",
+                    "must be exactly 3600",
+                );
+            }
+            let expected_material_axes: &[AxisKind] = match material {
+                TMatrixMaterial::SymmetricBruggemanSphericalAirIceMatzler2006V1 { .. } => &[
+                    AxisKind::Temperature,
+                    AxisKind::BulkDensity,
+                    AxisKind::Frequency,
+                ],
+                TMatrixMaterial::SymmetricBruggemanSphericalAirIceWaterV1 { .. } => &[
+                    AxisKind::Temperature,
+                    AxisKind::CondensedVolumeFraction,
+                    AxisKind::LiquidMassFraction,
+                    AxisKind::Frequency,
+                ],
+                TMatrixMaterial::TemperatureDependentLiquidWaterLiebe1991 { .. } => {
+                    &[AxisKind::Temperature, AxisKind::Frequency]
+                }
+                _ => {
+                    return invalid(
+                        "execution.grouping",
+                        "grouped execution is unsupported for this dielectric material",
+                    );
+                }
+            };
+            if grouping.material_state_axis_kinds != expected_material_axes {
+                return invalid(
+                    "execution.grouping.material_state_axis_kinds",
+                    format!(
+                        "expected {expected_material_axes:?}, got {:?}",
+                        grouping.material_state_axis_kinds
+                    ),
+                );
+            }
+            let expected_tmatrix_axes = [
+                AxisKind::EquivolumeDiameter,
+                AxisKind::MinorToMajorAxisRatio,
+            ];
+            if grouping.tmatrix_state_axis_kinds != expected_tmatrix_axes {
+                return invalid(
+                    "execution.grouping.tmatrix_state_axis_kinds",
+                    format!(
+                        "expected {expected_tmatrix_axes:?}, got {:?}",
+                        grouping.tmatrix_state_axis_kinds
+                    ),
+                );
+            }
+            if grouping.geometry_axis_kind != AxisKind::RadarElevation {
+                return invalid(
+                    "execution.grouping.geometry_axis_kind",
+                    "must be radar_elevation",
+                );
+            }
+            Ok(
+                TMatrixExecutionDescriptor::FreshProcessPerMaterialStateGroup {
+                    material_state_axes: grouping.material_state_axis_kinds,
+                    tmatrix_state_axes: grouping.tmatrix_state_axis_kinds,
+                    geometry_axis: grouping.geometry_axis_kind,
+                    maximum_points_per_process: grouping.maximum_points_per_process,
+                    group_timeout_seconds: grouping.group_timeout_seconds,
+                },
+            )
+        }
+        other => invalid(
+            "execution.process_isolation",
+            format!("unsupported isolation model {other:?}"),
+        ),
+    }
 }
 
 fn verify_header_science(
@@ -2875,6 +3057,8 @@ mod tests {
             table_id: "software-test-wet-property".to_owned(),
             category: TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle,
             population_role: TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle,
+            density_applicability:
+                DensityApplicability::WetCondensedVolumeFraction00015To1Above1225Air,
             spheroid: SpheroidConvention::OblateMinorVertical,
             material: TMatrixMaterial::SymmetricBruggemanSphericalAirIceWaterV1 {
                 air_relative_permittivity: ComplexRefractiveIndex {
@@ -2891,10 +3075,12 @@ mod tests {
                 homotopy_steps: 64,
                 newton_max_iterations: 100,
                 newton_relative_tolerance: 1.0e-12,
+                temperature_range_k: [269.15, 275.15],
             },
             odf: gaussian20_odf(),
             radar: test_radar_descriptor(),
             terminal_speed: test_drag_policy(),
+            execution: TMatrixExecutionDescriptor::FreshProcessPerGridPoint,
             normalization_number_concentration_m3: 1.0,
         };
         let table = constant_runtime(axes, science, descriptor);
@@ -2977,6 +3163,7 @@ mod tests {
             table_id: "software-test-residual-rain".to_owned(),
             category: TMatrixParticleCategory::Conventional(ConventionalHydrometeor::Rain),
             population_role: TMatrixPopulationRole::ConventionalRainStandaloneAndResidual,
+            density_applicability: DensityApplicability::ConventionalCategory,
             spheroid: SpheroidConvention::OblateMinorVertical,
             material: TMatrixMaterial::TemperatureDependentLiquidWaterLiebe1991 {
                 mass_density_kg_m3: 999.84,
@@ -2991,6 +3178,7 @@ mod tests {
                 c_per_mm: 0.6,
                 valid_diameter_range_m: [1.0e-4, 0.01],
             },
+            execution: TMatrixExecutionDescriptor::FreshProcessPerGridPoint,
             normalization_number_concentration_m3: 1.0,
         };
         let table = constant_runtime(axes, science, descriptor);
@@ -3021,5 +3209,183 @@ mod tests {
         assert_eq!(contribution.represented_mixing_ratio_kgkg(), 2.5e-5);
         assert_eq!(contribution.consumed_paired_liquid_mass_kgkg(), 0.0);
         assert!((contribution.additive().zh().get() - 1.5).abs() <= 1.0e-14);
+    }
+
+    fn raw_property_descriptor(wet: bool) -> RawPropertyStateDescriptor {
+        RawPropertyStateDescriptor {
+            compatible_closed_state_families: vec!["p3".to_owned(), "ishmael".to_owned()],
+            characteristic_diameter_mapping:
+                "closure_derived_equivolume_characteristic_diameter".to_owned(),
+            bulk_density_mapping: if wet {
+                "closure_bulk_density_and_liquid_mass_fraction_mapped_to_condensed_volume_fraction"
+                    .to_owned()
+            } else {
+                "closure_derived_effective_bulk_density_including_rime_mass_and_rime_density"
+                    .to_owned()
+            },
+            condensed_volume_fraction_definition: wet.then(|| {
+                "rho_bulk_times_open_parenthesis_one_minus_w_over_917_plus_w_over_999p84_close_parenthesis"
+                    .to_owned()
+            }),
+            shape_mapping: "closure_derived_minor_to_major_axis_ratio".to_owned(),
+            liquid_mapping: if wet {
+                "diagnosed_or_prescribed_strictly_positive_liquid_mass_fraction".to_owned()
+            } else {
+                "required_exactly_zero_liquid_mass_fraction".to_owned()
+            },
+            phase_dispatch: if wet {
+                "liquid_mass_fraction_greater_than_zero_selects_wet_table".to_owned()
+            } else {
+                "liquid_mass_fraction_equal_zero_selects_dry_table".to_owned()
+            },
+            rime_axes:
+                "not_explicit_rime_influences_only_through_bulk_density_and_shape".to_owned(),
+            rime_effect_on_dielectric: "none_given_bulk_density".to_owned(),
+            psd_mapping: "none_monodisperse_characteristic_particle_not_scheme_native_psd"
+                .to_owned(),
+            extrapolation: "forbidden".to_owned(),
+            density_applicability: if wet {
+                "condensed_volume_fraction_0p0015_to_1_downward_fall_requires_reconstructed_density_above_1p225_kg_m3_air".to_owned()
+            } else {
+                "bulk_density_1p5_to_917_kg_m3_downward_fall_requires_density_above_1p225_kg_m3_air".to_owned()
+            },
+        }
+    }
+
+    #[test]
+    fn property_density_applicability_is_exact_and_phase_typed() {
+        assert_eq!(
+            verify_property_state_descriptor(
+                raw_property_descriptor(false),
+                TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle,
+            )
+            .unwrap(),
+            DensityApplicability::DryBulkDensity15To917KgM3Above1225Air
+        );
+        assert_eq!(
+            verify_property_state_descriptor(
+                raw_property_descriptor(true),
+                TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle,
+            )
+            .unwrap(),
+            DensityApplicability::WetCondensedVolumeFraction00015To1Above1225Air
+        );
+        let mut changed = raw_property_descriptor(true);
+        changed.density_applicability.push_str("_changed");
+        assert!(
+            verify_property_state_descriptor(
+                changed,
+                TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle,
+            )
+            .is_err()
+        );
+    }
+
+    fn wet_material_for_execution() -> TMatrixMaterial {
+        TMatrixMaterial::SymmetricBruggemanSphericalAirIceWaterV1 {
+            air_relative_permittivity: ComplexRefractiveIndex {
+                real: 1.0,
+                imaginary: 0.0,
+            },
+            ice_permittivity_model: "matzler_2006".to_owned(),
+            liquid_water_permittivity_model: "liebe_hufford_manabe_1991_double_debye".to_owned(),
+            ice_temperature_treatment:
+                "minimum_environment_temperature_and_273p15_k_phase_equilibrium".to_owned(),
+            ice_material_density_kg_m3: 917.0,
+            liquid_water_density_kg_m3: 999.84,
+            homotopy_steps: 64,
+            newton_max_iterations: 100,
+            newton_relative_tolerance: 1.0e-12,
+            temperature_range_k: [269.15, 275.15],
+        }
+    }
+
+    fn grouped_wet_execution() -> RawExecution {
+        RawExecution {
+            point_timeout_seconds: 300,
+            process_isolation: "fresh_python_subprocess_per_material_state_group".to_owned(),
+            result_collection_order: "declared_axis_order_last_axis_fastest".to_owned(),
+            partial_grid_policy: "reject_entire_lut".to_owned(),
+            thread_count_per_process: 1,
+            grouping: Some(RawExecutionGrouping {
+                model: "fresh_crash_isolated_material_state_process".to_owned(),
+                material_state_axis_kinds: vec![
+                    AxisKind::Temperature,
+                    AxisKind::CondensedVolumeFraction,
+                    AxisKind::LiquidMassFraction,
+                    AxisKind::Frequency,
+                ],
+                tmatrix_state_axis_kinds: vec![
+                    AxisKind::EquivolumeDiameter,
+                    AxisKind::MinorToMajorAxisRatio,
+                ],
+                geometry_axis_kind: AxisKind::RadarElevation,
+                partial_group_policy: "reject_entire_lut".to_owned(),
+                maximum_points_per_process: 1024,
+                group_timeout_seconds: 3600,
+            }),
+        }
+    }
+
+    #[test]
+    fn grouped_execution_contract_is_exact_and_typed() {
+        let bound =
+            verify_execution(grouped_wet_execution(), &wet_material_for_execution()).unwrap();
+        assert!(matches!(
+            bound,
+            TMatrixExecutionDescriptor::FreshProcessPerMaterialStateGroup {
+                maximum_points_per_process: 1024,
+                group_timeout_seconds: 3600,
+                ..
+            }
+        ));
+        let mut changed = grouped_wet_execution();
+        changed
+            .grouping
+            .as_mut()
+            .unwrap()
+            .material_state_axis_kinds
+            .swap(0, 1);
+        assert!(verify_execution(changed, &wet_material_for_execution()).is_err());
+    }
+
+    #[test]
+    fn wet_dielectric_temperature_range_is_bound_exactly() {
+        let raw = |temperature_range_k| RawDielectric::SymmetricBruggemanSphericalAirIceWaterV1 {
+            air_relative_permittivity: RawComplexIndex {
+                real: 1.0,
+                imaginary: 0.0,
+            },
+            ice_permittivity_model: "matzler_2006".to_owned(),
+            liquid_water_permittivity_model: "liebe_hufford_manabe_1991_double_debye".to_owned(),
+            ice_temperature_treatment:
+                "minimum_environment_temperature_and_273p15_k_phase_equilibrium".to_owned(),
+            ice_material_density_kg_m3: 917.0,
+            liquid_water_density_kg_m3: 999.84,
+            condensed_volume_fraction_interpretation:
+                "ice_plus_liquid_component_volume_over_outer_spheroid_volume".to_owned(),
+            liquid_mass_fraction_interpretation: "liquid_mass_over_total_condensed_mass".to_owned(),
+            component_volume_fraction_conversion:
+                "condensed_volume_fraction_times_mass_specific_volume_shares".to_owned(),
+            bulk_density_reconstruction:
+                "condensed_volume_fraction_divided_by_total_component_specific_volume".to_owned(),
+            mixing_equation:
+                "sum_f_j_times_eps_j_minus_eps_eff_over_eps_j_plus_2eps_eff_equals_zero".to_owned(),
+            root_selection: "vacuum_to_constituents_homotopy_passive_continuous_branch".to_owned(),
+            homotopy_steps: 64,
+            newton_max_iterations: 100,
+            newton_relative_tolerance: 1.0e-12,
+            temperature_range_k,
+            applicability: "quasistatic_spherical_inclusions_homogeneous_effective_medium"
+                .to_owned(),
+        };
+        assert!(matches!(
+            bind_material(raw([269.15, 275.15])).unwrap(),
+            TMatrixMaterial::SymmetricBruggemanSphericalAirIceWaterV1 {
+                temperature_range_k: [269.15, 275.15],
+                ..
+            }
+        ));
+        assert!(bind_material(raw([269.15, 276.15])).is_err());
     }
 }

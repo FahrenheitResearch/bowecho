@@ -52,9 +52,10 @@ pub use science::{
     ScienceMetadata, TMatrixImplementation, TableValidation, TemporalSampling,
 };
 pub use tmatrix_runtime::{
-    ComplexRefractiveIndex, EvaluationError, FallMomentPolicy, HomogeneousMaterial,
-    NumberScalingPolicy, RadarConventionDescriptor, RadarHvConvention, RadarViewApplicability,
-    RadarViewGeometry, ResearchTMatrixLut, ScaledScatteringContribution, SpheroidConvention,
-    TMatrixEvaluationRequest, TMatrixLoadError, TMatrixMaterial, TMatrixOdfConvention,
-    TMatrixParticleCategory, TMatrixPopulationRole, TMatrixTableDescriptor, TerminalSpeedPolicy,
+    ComplexRefractiveIndex, DensityApplicability, EvaluationError, FallMomentPolicy,
+    HomogeneousMaterial, NumberScalingPolicy, RadarConventionDescriptor, RadarHvConvention,
+    RadarViewApplicability, RadarViewGeometry, ResearchTMatrixLut, ScaledScatteringContribution,
+    SpheroidConvention, TMatrixEvaluationRequest, TMatrixExecutionDescriptor, TMatrixLoadError,
+    TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory, TMatrixPopulationRole,
+    TMatrixTableDescriptor, TerminalSpeedPolicy,
 };

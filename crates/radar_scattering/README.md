@@ -137,6 +137,23 @@ with `ZH*v` and `ZH*v^2` from the closed category or diagnosed wet category's
 positive-down fall speed, explicitly declaring zero within-category speed
 variance in `FallMomentPolicy`.
 
+Generated artifacts can be smoke-loaded through the exact production loader:
+
+```text
+cargo run -p radar_scattering --example validate_tmatrix_lut -- TABLE.lut CONFIG.json LUT_SHA256
+```
+
+The command verifies the complete file digest, embedded/external config byte
+identity, header and payload digests, and every typed applicability contract;
+it prints the bound population, density, execution, and axis descriptors only
+after all gates pass.
+
+Property-table descriptors also bind the declared density applicability and
+the crash-isolated material-state grouping plan (material axes, T-matrix
+state axes, elevation geometry axis, 1,024-point process cap, and 3,600-second
+group timeout). Grouping is reproducibility metadata, not permission to accept
+partial output: any failed group still rejects the complete LUT.
+
 ## Evidence status
 
 There is no generic "production" label. `TableValidation` distinguishes
