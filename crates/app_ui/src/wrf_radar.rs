@@ -59,7 +59,8 @@ use app_ui::vcp_catalog::{
     VcpDefinition, Waveform, build_24_definition,
 };
 use app_ui::wrf_radar_validation::{
-    CompactPolarPrecisionAudit, GateQuality, GateQualityFractions, QualityMoment,
+    CompactPolarPrecisionAudit, ExactScanTemplate, GateQuality, GateQualityFractions,
+    QualityMoment, UnavailableObservedMoment, build_difference_volume_overlap,
     compact_quality_grid, encode_quality_fraction, relative_error,
 };
 use app_ui::wrf_scene_adapter::inventory_selected_wrf_paths;
@@ -339,6 +340,10 @@ pub struct SyntheticRadarConfig {
     /// default; a Build 24 selection owns its rows, rates, periods, waveform,
     /// moment coverage and PRF-code provenance.
     pub scan_strategy: SyntheticScanStrategy,
+    /// Exact observed acquisition geometry for Level-II replay. This preserves
+    /// source cuts/rays/gates/times/moment availability verbatim and takes
+    /// precedence over `scan_strategy`; it is not a VCP reconstruction.
+    pub exact_replay_template: Option<Arc<ExactScanTemplate>>,
     /// Site id stamped on the volume (drives the loop-engine cross-site guard —
     /// every hour of one run must share it).
     pub site_id: String,
@@ -501,6 +506,7 @@ impl Default for SyntheticRadarConfig {
         Self {
             simulation_mode: SimulationMode::Presentation,
             scan_strategy: SyntheticScanStrategy::CustomLegacy,
+            exact_replay_template: None,
             site_id: "WRF".to_string(),
             site_name: Some("Simulated WRF radar".to_string()),
             site_lat_deg: None,
@@ -611,6 +617,12 @@ impl SyntheticRadarConfig {
     /// scene. These are exact applicability checks, not automatic clamps or
     /// fallback rules.
     pub fn validate_science_contract(&self) -> Result<(), String> {
+        if self.exact_replay_template.is_some() && self.coupled_single_prf_estimator {
+            return Err(
+                "exact observed replay cannot use custom coupled-PRF timing; the source radial Nyquist metadata owns replay ambiguity"
+                    .to_string(),
+            );
+        }
         if self.emit_stage_diagnostics && !self.coupled_single_prf_estimator {
             return Err(
                 "Ideal/Measured stage diagnostics require the coupled single-PRF estimator"
@@ -760,6 +772,10 @@ impl SyntheticRadarConfig {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.site_id.hash(&mut hasher);
+        if let Some(template) = self.exact_replay_template.as_deref() {
+            "exact-observed-replay-v1".hash(&mut hasher);
+            template.geometry_fingerprint().hash(&mut hasher);
+        }
         // Do not hash the CustomLegacy discriminant: omitting that no-op value
         // preserves the pre-catalog default fingerprint exactly. A named VCP,
         // however, is version-locked to its primary source and every physical
@@ -857,6 +873,9 @@ impl SyntheticRadarConfig {
     /// the duration supplied to temporal planning, not the end of an unused
     /// transition after the final cut.
     pub fn planned_scan_duration_ms(&self) -> i64 {
+        if let Some(template) = self.exact_replay_template.as_deref() {
+            return template.latest_acquisition_offset_ms().max(0);
+        }
         if !matches!(self.scan_timing, ScanTiming::TimedVolume) {
             return 0;
         }
@@ -2244,6 +2263,96 @@ pub fn build_synthetic_volume_reporting(
         .expect("validated single-scene synthetic-radar render")
 }
 
+/// Exact-geometry replay products returned together so the caller cannot
+/// accidentally compare against a separately regridded synthetic volume.
+pub struct ExactReplayProducts {
+    pub observed: Arc<RadarVolume>,
+    pub simulated: RadarVolume,
+    pub difference: RadarVolume,
+    pub unavailable_observed_moments: Vec<UnavailableObservedMoment>,
+}
+
+fn is_dual_pol_replay_moment(moment: &MomentType) -> bool {
+    matches!(
+        moment,
+        MomentType::DifferentialReflectivity
+            | MomentType::CorrelationCoefficient
+            | MomentType::DifferentialPhase
+            | MomentType::SpecificDifferentialPhase
+    )
+}
+
+fn normalize_replay_config_for_observed(config: &mut SyntheticRadarConfig, observed: &RadarVolume) {
+    // The explicit Replay action intentionally replaces custom instrument
+    // ambiguity with source radial Nyquist. Direct hand-built contradictory
+    // configs still fail closed in `validate_science_contract`.
+    config.coupled_single_prf_estimator = false;
+    config.emit_stage_diagnostics = false;
+    config.fold_velocity = false;
+    if observed
+        .cuts
+        .iter()
+        .any(|cut| cut.moments.contains_key(&MomentType::SpectrumWidth))
+    {
+        config.spectrum_width = true;
+    }
+    if observed
+        .cuts
+        .iter()
+        .flat_map(|cut| cut.moments.keys())
+        .any(is_dual_pol_replay_moment)
+    {
+        config.dual_pol = true;
+    }
+}
+
+/// Render the WRF atmosphere on an observed scan's exact acquisition geometry
+/// and return both the simulated and `simulated - observed` volumes. This is a
+/// scan replay, not a reconstruction of the numbered VCP carried by the file.
+pub fn build_exact_replay_products(
+    fields: &WrfRadarFields,
+    observed: Arc<RadarVolume>,
+    config: &SyntheticRadarConfig,
+) -> Result<ExactReplayProducts, String> {
+    let template = ExactScanTemplate::from_volume(&observed)
+        .map_err(|error| format!("extract exact observed scan template: {error}"))?;
+    let mut replay_config = config.clone();
+    normalize_replay_config_for_observed(&mut replay_config, &observed);
+    replay_config.exact_replay_template = Some(Arc::new(template));
+    let simulated = try_build_synthetic_volume_reporting(
+        fields,
+        observed.volume_time,
+        &replay_config,
+        &|_| {},
+    )?;
+    let overlap = build_difference_volume_overlap(&observed, &simulated)
+        .map_err(|error| format!("build exact-geometry replay difference: {error}"))?;
+    Ok(ExactReplayProducts {
+        observed,
+        simulated,
+        difference: overlap.volume,
+        unavailable_observed_moments: overlap.unavailable_observed_moments,
+    })
+}
+
+/// Background form of [`build_exact_replay_products`]. The observed volume is
+/// retained by `Arc` through completion and returned in the product bundle.
+pub fn spawn_exact_replay_worker(
+    fields: Arc<WrfRadarFields>,
+    observed: Arc<RadarVolume>,
+    config: SyntheticRadarConfig,
+) -> Receiver<Result<ExactReplayProducts, String>> {
+    let (tx, rx) = channel();
+    std::thread::Builder::new()
+        .name("wrf-exact-radar-replay".to_string())
+        .spawn(move || {
+            let result = build_exact_replay_products(&fields, observed, &config);
+            let _ = tx.send(result);
+        })
+        .expect("spawn exact WRF radar replay worker");
+    rx
+}
+
 fn try_build_synthetic_volume_reporting(
     fields: &WrfRadarFields,
     valid_time: DateTime<Utc>,
@@ -2283,6 +2392,16 @@ fn build_synthetic_volume_reporting_inner(
     temporal: Option<TemporalRenderContext<'_>>,
 ) -> Result<RadarVolume, String> {
     config.validate_science_contract()?;
+    if let Some(template) = config.exact_replay_template.as_deref() {
+        return build_exact_replay_volume(
+            fields,
+            valid_time,
+            config,
+            template,
+            progress,
+            temporal.as_ref(),
+        );
+    }
     let coupled_instrument = resolve_coupled_instrument(config)?;
     let cells = fields.cells();
     let center = fields.center_cell();
@@ -2575,6 +2694,7 @@ fn build_synthetic_volume_reporting_inner(
             antenna_msl,
             naz,
             gate_count,
+            0,
             spacing,
         )
     });
@@ -2607,6 +2727,7 @@ fn build_synthetic_volume_reporting_inner(
             terrain_horizon.as_ref(),
             cut_start_ms,
             coupled_instrument.as_ref(),
+            None,
         )?;
         decoded_radials += cut.radials.len();
         volume.cuts.push(cut);
@@ -2615,6 +2736,307 @@ fn build_synthetic_volume_reporting_inner(
         }
     }
     volume.metadata.decoded_radial_count = decoded_radials;
+    Ok(volume)
+}
+
+fn build_exact_replay_volume(
+    fields: &WrfRadarFields,
+    model_valid_time: DateTime<Utc>,
+    config: &SyntheticRadarConfig,
+    template: &ExactScanTemplate,
+    progress: &dyn Fn(&str),
+    temporal: Option<&TemporalRenderContext<'_>>,
+) -> Result<RadarVolume, String> {
+    let cells = fields.cells();
+    let site_lat = f64::from(
+        template
+            .site
+            .latitude_deg
+            .ok_or_else(|| format!("exact replay site {} has no latitude", template.site.id))?,
+    );
+    let site_lon = f64::from(
+        template
+            .site
+            .longitude_deg
+            .ok_or_else(|| format!("exact replay site {} has no longitude", template.site.id))?,
+    );
+    let center = fields.center_cell();
+    let antenna_msl = template.site.elevation_m.map(f64::from).unwrap_or_else(|| {
+        let site_cell = fields
+            .lut
+            .lookup(site_lat as f32, site_lon as f32)
+            .unwrap_or(center);
+        f64::from(fields.terrain_m[site_cell]) + DEFAULT_TOWER_M
+    });
+    let geometry_fingerprint = template.geometry_fingerprint();
+    let mut volume = RadarVolume::new(template.site.clone(), template.volume_time);
+    volume.vcp = template.vcp.clone();
+    volume.metadata = VolumeMetadata {
+        archive_version: Some("simulated-wrf-exact-observed-replay-v1".to_string()),
+        decoded_radial_count: template.cuts.iter().map(|cut| cut.rays.len()).sum(),
+        scan_mode: Some(ScanMode::Ppi),
+        radar_frequency_mhz: Some(config.radar_frequency_mhz),
+        beam_width_h_deg: Some(config.beam_width_deg),
+        beam_width_v_deg: Some(config.beam_width_deg),
+        pulse_width_us: Some(config.pulse_width_us),
+        prt_s: template.source_prt_s,
+        unambiguous_range_km: template.source_unambiguous_range_km,
+        scan_name: Some("Exact observed scan-geometry replay (not a VCP reconstruction)".into()),
+        scan_id: Some(format!("bowecho-exact-replay-{geometry_fingerprint:016x}")),
+        polarization: Some(if config.dual_pol && fields.has_polarimetric_input() {
+            "simultaneous horizontal/vertical".to_string()
+        } else {
+            "horizontal".to_string()
+        }),
+        calibration: Some(format!(
+            "ZDR bias={:.2} dB; system PhiDP={:.2} deg",
+            config.zdr_bias_db, config.system_phidp_deg
+        )),
+        forward_operator: Some("BowEcho WRF exact observed-geometry replay v1".to_string()),
+        forward_operator_config: Some(format!(
+            "scan_source=exact_observed_geometry; geometry_fingerprint={geometry_fingerprint:016x}; \
+             vcp_reconstruction=false; cut_order=source; split_cuts=preserved; missing_sectors=preserved; \
+             radial_geometry=source; moment_availability=source; acquisition_offsets=source_normalized_utc; \
+             radial_nyquist=source; volume_prt=source; source_time_encoding={:?}; \
+             model_valid_time={}; config_fingerprint={:016x}",
+            template.time_encoding,
+            model_valid_time.to_rfc3339(),
+            config.data_fingerprint(),
+        )),
+        source_model: Some("WRF".to_string()),
+        microphysics_scheme: fields
+            .property_scattering
+            .as_ref()
+            .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
+            .or_else(|| {
+                fields
+                    .polarimetric
+                    .as_ref()
+                    .map(|polar| format!("{} ({:?})", polar.profile.name, polar.profile.capability))
+            }),
+        ..VolumeMetadata::default()
+    };
+
+    let frame_seed = clutter_frame_seed(&template.site.id, model_valid_time);
+    let mut render_config = config.clone();
+    render_config.exact_replay_template = None;
+    render_config.scan_strategy = SyntheticScanStrategy::CustomLegacy;
+    render_config.site_id = template.site.id.clone();
+    render_config.site_name = template.site.name.clone();
+    render_config.site_lat_deg = Some(site_lat);
+    render_config.site_lon_deg = Some(site_lon);
+    render_config.antenna_msl_m = Some(antenna_msl);
+    // Replay ambiguity is applied from each observed radial's own Nyquist.
+    render_config.fold_velocity = false;
+    render_config.coupled_single_prf_estimator = false;
+    render_config.emit_stage_diagnostics = false;
+    if template
+        .cuts
+        .iter()
+        .flat_map(|cut| &cut.moments)
+        .any(|plan| plan.moment == MomentType::SpectrumWidth)
+    {
+        render_config.spectrum_width = true;
+    }
+    if template
+        .cuts
+        .iter()
+        .flat_map(|cut| &cut.moments)
+        .any(|plan| is_dual_pol_replay_moment(&plan.moment))
+    {
+        render_config.dual_pol = true;
+    }
+    // Replay always retains pulse-volume support fields. They are synthetic-
+    // only diagnostics and the exact-geometry difference builder ignores them.
+    render_config.emit_quality_fields = true;
+    let replay_leg = SyntheticScanLeg {
+        elevation_deg: 0.0,
+        azimuth_rate_deg_per_second: render_config.rotation_rate_deg_s,
+        source_period_seconds: 0.0,
+        transition_after_seconds: 0.0,
+        moments: MomentCoverage::ALL,
+        waveform: None,
+        source_row_index: None,
+        source_row: None,
+    };
+    let mut unavailable_observed_moments = Vec::new();
+
+    for (cut_index, replay_cut) in template.cuts.iter().enumerate() {
+        progress(&format!(
+            "replaying observed cut {}/{} ({:.2} deg)...",
+            cut_index + 1,
+            template.cuts.len(),
+            replay_cut.elevation_deg
+        ));
+        let mut output_cut =
+            ElevationCut::new(replay_cut.elevation_deg, replay_cut.elevation_number);
+        for ray in &replay_cut.rays {
+            let time_offset_ms = i32::try_from(ray.acquisition_offset_ms).map_err(|_| {
+                format!(
+                    "exact replay cut {} radial {} acquisition offset {} ms exceeds i32",
+                    cut_index + 1,
+                    ray.source_radial_index + 1,
+                    ray.acquisition_offset_ms
+                )
+            })?;
+            output_cut.radials.push(Radial {
+                azimuth_deg: ray.azimuth_deg,
+                elevation_deg: ray.elevation_deg,
+                time_offset_ms,
+                gate_range: ray.gate_range.clone(),
+                nyquist_velocity_mps: ray.nyquist_velocity_mps,
+                radial_status: ray.radial_status,
+            });
+        }
+
+        let quality_source_index = replay_cut
+            .moments
+            .iter()
+            .position(|plan| plan.moment == MomentType::Reflectivity)
+            .or_else(|| (!replay_cut.moments.is_empty()).then_some(0));
+        for (moment_index, moment_plan) in replay_cut.moments.iter().enumerate() {
+            let supported = match &moment_plan.moment {
+                MomentType::Reflectivity | MomentType::Velocity => true,
+                MomentType::SpectrumWidth => render_config.spectrum_width,
+                moment if is_dual_pol_replay_moment(moment) => {
+                    render_config.dual_pol && fields.has_polarimetric_input()
+                }
+                MomentType::Unknown(_) => true,
+                _ => false,
+            };
+            if !supported && !matches!(moment_plan.moment, MomentType::Unknown(_)) {
+                unavailable_observed_moments.push(format!(
+                    "cut{}:{}",
+                    cut_index + 1,
+                    moment_plan.moment.short_name()
+                ));
+            }
+            if !supported && quality_source_index != Some(moment_index) {
+                continue;
+            }
+            let gate_count = moment_plan.gate_range.gate_count;
+            let mut values = vec![f32::NAN; moment_plan.radial_indices.len() * gate_count];
+            if !moment_plan.radial_indices.is_empty() {
+                let mut ray_plan = Vec::with_capacity(moment_plan.radial_indices.len());
+                for &source_index in &moment_plan.radial_indices {
+                    let source = replay_cut.rays.get(source_index).ok_or_else(|| {
+                        format!(
+                            "exact replay cut {} moment {} refers to missing radial {}",
+                            cut_index + 1,
+                            moment_plan.moment.short_name(),
+                            source_index
+                        )
+                    })?;
+                    let sampling_offset_ms =
+                        temporal.map_or(source.acquisition_offset_ms, |context| {
+                            (source.acquisition_time_utc.to_owned()
+                                - context.plan.anchor_time.to_owned())
+                            .num_milliseconds()
+                        });
+                    ray_plan.push(SyntheticRayPlan {
+                        source_index,
+                        azimuth_deg: source.azimuth_deg,
+                        elevation_deg: source.elevation_deg,
+                        time_offset_ms: i32::try_from(sampling_offset_ms).map_err(|_| {
+                            format!(
+                                "exact replay cut {} radial {} temporal acquisition offset exceeds i32",
+                                cut_index + 1,
+                                source_index + 1
+                            )
+                        })?,
+                        atmosphere_alpha: 0.0,
+                        radial_status: source
+                            .radial_status
+                            .unwrap_or(radar_core::RadialStatus::Intermediate),
+                    });
+                }
+                let spacing = f64::from(moment_plan.gate_range.gate_spacing_m);
+                let terrain_horizon = render_config.terrain_blockage.then(|| {
+                    TerrainHorizon::build(
+                        fields,
+                        site_lat,
+                        site_lon,
+                        antenna_msl,
+                        // Fixed azimuth lookup sampled by each ray's actual
+                        // angle; never treat irregular source indices as bins.
+                        720,
+                        gate_count,
+                        moment_plan.gate_range.first_gate_m,
+                        spacing,
+                    )
+                });
+                let mut rendered = build_cut(
+                    fields,
+                    temporal,
+                    cells,
+                    site_lat,
+                    site_lon,
+                    antenna_msl,
+                    f64::from(replay_cut.elevation_deg),
+                    cut_index,
+                    replay_cut.rays.len(),
+                    spacing,
+                    moment_plan.gate_range.clone(),
+                    &render_config,
+                    &replay_leg,
+                    template.cuts.len(),
+                    frame_seed,
+                    terrain_horizon.as_ref(),
+                    0,
+                    None,
+                    Some(&ray_plan),
+                )?;
+                if quality_source_index == Some(moment_index) {
+                    for quality in QualityMoment::ALL {
+                        let moment = quality.moment_type();
+                        if let Some(mut grid) = rendered.moments.remove(&moment) {
+                            grid.radial_indices = moment_plan.radial_indices.clone();
+                            output_cut.moments.insert(moment, grid);
+                        }
+                    }
+                }
+                if let Some(grid) = rendered.moments.remove(&moment_plan.moment)
+                    && let MomentStorage::F32(rendered_values) = grid.storage
+                    && rendered_values.len() == values.len()
+                {
+                    values = rendered_values;
+                }
+            }
+            if moment_plan.moment == MomentType::Velocity {
+                for (row, &source_index) in moment_plan.radial_indices.iter().enumerate() {
+                    let Some(nyquist) = replay_cut.rays[source_index]
+                        .nyquist_velocity_mps
+                        .filter(|value| value.is_finite() && *value > 0.0)
+                    else {
+                        continue;
+                    };
+                    for value in &mut values[row * gate_count..(row + 1) * gate_count] {
+                        if value.is_finite() {
+                            *value = fold_velocity_mps(*value, nyquist);
+                        }
+                    }
+                }
+            }
+            if supported {
+                output_cut.moments.insert(
+                    moment_plan.moment.clone(),
+                    f32_grid(
+                        moment_plan.moment.clone(),
+                        moment_plan.gate_range.clone(),
+                        moment_plan.radial_indices.clone(),
+                        values,
+                    ),
+                );
+            }
+        }
+        volume.cuts.push(output_cut);
+    }
+    if !unavailable_observed_moments.is_empty()
+        && let Some(provenance) = volume.metadata.forward_operator_config.as_mut()
+    {
+        provenance.push_str("; unavailable_observed_moments=");
+        provenance.push_str(&unavailable_observed_moments.join(","));
+    }
     Ok(volume)
 }
 
@@ -2636,6 +3058,7 @@ impl TerrainHorizon {
         antenna_msl: f64,
         azimuth_count: usize,
         gate_count: usize,
+        first_gate_m: i32,
         spacing_m: f64,
     ) -> Self {
         let rows: Vec<Vec<f32>> = (0..azimuth_count)
@@ -2646,7 +3069,7 @@ impl TerrainHorizon {
                 let mut horizon = f32::NEG_INFINITY;
                 let mut row = Vec::with_capacity(gate_count);
                 for gate in 0..gate_count {
-                    let slant_m = gate as f64 * spacing_m;
+                    let slant_m = f64::from(first_gate_m) + gate as f64 * spacing_m;
                     let ground_m = beam_ground_range_m(slant_m, 0.0);
                     if ground_m < spacing_m.max(1.0) {
                         row.push(horizon);
@@ -3204,6 +3627,7 @@ impl StageDiagnosticRow {
 struct SyntheticRayPlan {
     source_index: usize,
     azimuth_deg: f32,
+    elevation_deg: f32,
     time_offset_ms: i32,
     atmosphere_alpha: f64,
     radial_status: radar_core::RadialStatus,
@@ -3241,6 +3665,7 @@ fn plan_synthetic_rays(
             SyntheticRayPlan {
                 source_index,
                 azimuth_deg,
+                elevation_deg: 0.0,
                 time_offset_ms,
                 atmosphere_alpha: 0.0,
                 radial_status,
@@ -3294,6 +3719,7 @@ fn build_cut(
     terrain_horizon: Option<&TerrainHorizon>,
     cut_start_ms: i32,
     coupled_instrument: Option<&CoupledInstrumentContext>,
+    ray_plan_override: Option<&[SyntheticRayPlan]>,
 ) -> Result<ElevationCut, String> {
     let gate_count = gate_range.gate_count;
     // Instrument mode already applies its range-varying radar-equation
@@ -3317,14 +3743,22 @@ fn build_cut(
         Vec::new()
     };
 
-    let mut ray_plan = plan_synthetic_rays(
-        cut_index,
-        scan_leg_count,
-        naz,
-        config.scan_timing,
-        scan_leg.azimuth_rate_deg_per_second,
-        cut_start_ms,
-    );
+    let mut ray_plan = if let Some(override_plan) = ray_plan_override {
+        override_plan.to_vec()
+    } else {
+        let mut planned = plan_synthetic_rays(
+            cut_index,
+            scan_leg_count,
+            naz,
+            config.scan_timing,
+            scan_leg.azimuth_rate_deg_per_second,
+            cut_start_ms,
+        );
+        for ray in &mut planned {
+            ray.elevation_deg = elevation_deg as f32;
+        }
+        planned
+    };
     if let Some(temporal) = temporal {
         for ray in &mut ray_plan {
             ray.atmosphere_alpha = temporal
@@ -3340,6 +3774,7 @@ fn build_cut(
                 })?;
         }
     }
+    let rendered_ray_count = ray_plan.len();
 
     // One row per radial, sampled in parallel. Each row is `gate_count` REF and
     // `gate_count` VEL f32 values (NaN = no data / below floor / off-domain).
@@ -3348,6 +3783,7 @@ fn build_cut(
         .map(|ray| -> Result<CutMomentRow, String> {
             let iaz = ray.source_index;
             let az_deg = f64::from(ray.azimuth_deg);
+            let ray_elevation_deg = f64::from(ray.elevation_deg);
             let mut row = CutMomentRow::blank(gate_count, config.emit_stage_diagnostics);
             let dr_km = (spacing / 1_000.0).max(0.0) as f32;
             let mut previous_kdp = 0.0f32;
@@ -3357,10 +3793,10 @@ fn build_cut(
             let mut tau_h = 0.0f32;
             let mut tau_dp = 0.0f32;
             for gate in 0..gate_count {
-                let slant_m = gate as f64 * spacing;
+                let slant_m = f64::from(gate_range.first_gate_m) + gate as f64 * spacing;
                 // Doviak & Zrnić (1993) eq. 2.28b/c under the 4/3-earth model.
-                let beam_height_m = beam_height_above_radar_m(slant_m, elevation_deg);
-                let ground_m = beam_ground_range_m(slant_m, elevation_deg);
+                let beam_height_m = beam_height_above_radar_m(slant_m, ray_elevation_deg);
+                let ground_m = beam_ground_range_m(slant_m, ray_elevation_deg);
                 let sampled = sample_gate_with_quality_instrument(
                     fields,
                     temporal.map(|context| context.neighbor),
@@ -3370,7 +3806,7 @@ fn build_cut(
                     site_lon,
                     antenna_msl,
                     az_deg,
-                    elevation_deg,
+                    ray_elevation_deg,
                     slant_m,
                     gate,
                     spacing,
@@ -3690,29 +4126,29 @@ fn build_cut(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut cut = ElevationCut::new(elevation_deg as f32, u8::try_from(cut_index + 1).ok());
-    let mut ref_values = Vec::with_capacity(naz * gate_count);
-    let mut vel_values = Vec::with_capacity(naz * gate_count);
-    let mut sw_values = Vec::with_capacity(naz * gate_count);
-    let mut zdr_values = Vec::with_capacity(naz * gate_count);
-    let mut rho_values = Vec::with_capacity(naz * gate_count);
-    let mut phi_values = Vec::with_capacity(naz * gate_count);
-    let mut kdp_values = Vec::with_capacity(naz * gate_count);
-    let mut ah_values = Vec::with_capacity(naz * gate_count);
-    let mut pia_values = Vec::with_capacity(naz * gate_count);
-    let mut refc_values = Vec::with_capacity(naz * gate_count);
-    let mut adp_values = Vec::with_capacity(naz * gate_count);
-    let mut pida_values = Vec::with_capacity(naz * gate_count);
-    let mut zdrc_values = Vec::with_capacity(naz * gate_count);
-    let mut model_coverage_values = Vec::with_capacity(naz * gate_count);
-    let mut terrain_unblocked_values = Vec::with_capacity(naz * gate_count);
-    let mut meteorological_signal_values = Vec::with_capacity(naz * gate_count);
+    let mut ref_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut vel_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut sw_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut zdr_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut rho_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut phi_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut kdp_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut ah_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut pia_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut refc_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut adp_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut pida_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut zdrc_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut model_coverage_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut terrain_unblocked_values = Vec::with_capacity(rendered_ray_count * gate_count);
+    let mut meteorological_signal_values = Vec::with_capacity(rendered_ray_count * gate_count);
     let mut stage_diagnostics = config
         .emit_stage_diagnostics
-        .then(|| StageDiagnosticRow::with_capacity(naz * gate_count));
+        .then(|| StageDiagnosticRow::with_capacity(rendered_ray_count * gate_count));
     for (ray, row) in ray_plan.into_iter().zip(rows) {
         cut.radials.push(Radial {
             azimuth_deg: ray.azimuth_deg,
-            elevation_deg: elevation_deg as f32,
+            elevation_deg: ray.elevation_deg,
             time_offset_ms: ray.time_offset_ms,
             gate_range: gate_range.clone(),
             nyquist_velocity_mps: Some(coupled_instrument.map_or_else(
@@ -3744,7 +4180,7 @@ fn build_cut(
         }
     }
 
-    let radial_indices: Vec<usize> = (0..naz).collect();
+    let radial_indices: Vec<usize> = (0..rendered_ray_count).collect();
     if scan_leg.moments.has_reflectivity() {
         cut.moments.insert(
             MomentType::Reflectivity,
@@ -4651,6 +5087,115 @@ impl std::fmt::Debug for SyntheticRadarOutput {
 pub struct SyntheticRadarTask {
     pub label: String,
     pub rx: Receiver<SyntheticRadarMessage>,
+}
+
+pub enum SyntheticRadarReplayMessage {
+    Progress(String),
+    Done(Result<SyntheticRadarReplayOutput, String>),
+}
+
+pub struct SyntheticRadarReplayFrame {
+    pub observed: Arc<RadarVolume>,
+    pub simulated: Arc<RadarVolume>,
+    pub difference: Arc<RadarVolume>,
+    pub unavailable_observed_moments: Vec<UnavailableObservedMoment>,
+}
+
+pub struct SyntheticRadarReplayOutput {
+    pub label: String,
+    pub frames: Vec<SyntheticRadarReplayFrame>,
+    pub notes: Vec<String>,
+    pub config_fingerprint: u64,
+}
+
+pub struct SyntheticRadarReplayTask {
+    pub label: String,
+    pub rx: Receiver<SyntheticRadarReplayMessage>,
+}
+
+/// Existing-file worker seam for the ThreeStacked validation workspace. It
+/// reuses the normal inventory, WRF field-read, temporal-plan, and progress
+/// worker, then attaches the retained observed source and exact differences
+/// without rereading either WRF or observed gate values.
+pub fn spawn_synthetic_radar_replay(
+    paths: Vec<PathBuf>,
+    mut config: SyntheticRadarConfig,
+    observed: Arc<RadarVolume>,
+) -> SyntheticRadarReplayTask {
+    let label = format!("Exact radar replay from {} WRF source(s)", paths.len());
+    let (tx, rx) = channel();
+    let template = match ExactScanTemplate::from_volume(&observed) {
+        Ok(template) => template,
+        Err(error) => {
+            let _ = tx.send(SyntheticRadarReplayMessage::Done(Err(format!(
+                "extract exact observed scan template: {error}"
+            ))));
+            return SyntheticRadarReplayTask { label, rx };
+        }
+    };
+    normalize_replay_config_for_observed(&mut config, &observed);
+    config.exact_replay_template = Some(Arc::new(template));
+    let base = spawn_synthetic_radar(paths, config);
+    std::thread::Builder::new()
+        .name("wrf-exact-replay-products".to_string())
+        .spawn(move || {
+            while let Ok(message) = base.rx.recv() {
+                match message {
+                    SyntheticRadarMessage::Progress(progress) => {
+                        let _ = tx.send(SyntheticRadarReplayMessage::Progress(progress));
+                    }
+                    SyntheticRadarMessage::Done(result) => {
+                        let replay_result = result.and_then(|output| {
+                            let mut frames = Vec::with_capacity(output.volumes.len());
+                            let mut notes = output.notes;
+                            notes.push(
+                                "Exact replay uses observed radial Nyquist/PRT; custom coupled PRF, stage diagnostics, and manual folding were disabled"
+                                    .to_string(),
+                            );
+                            for simulated in output.volumes {
+                                let overlap = build_difference_volume_overlap(&observed, &simulated)
+                                    .map_err(|error| {
+                                        format!(
+                                            "build exact-geometry replay difference: {error}"
+                                        )
+                                    })?;
+                                if !overlap.unavailable_observed_moments.is_empty() {
+                                    notes.push(format!(
+                                        "Replay unavailable observed moments: {}",
+                                        overlap
+                                            .unavailable_observed_moments
+                                            .iter()
+                                            .map(|entry| format!(
+                                                "cut {} {} ({})",
+                                                entry.cut, entry.moment, entry.reason
+                                            ))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    ));
+                                }
+                                frames.push(SyntheticRadarReplayFrame {
+                                    observed: Arc::clone(&observed),
+                                    simulated,
+                                    difference: Arc::new(overlap.volume),
+                                    unavailable_observed_moments: overlap
+                                        .unavailable_observed_moments,
+                                });
+                            }
+                            Ok(SyntheticRadarReplayOutput {
+                                label: output.label,
+                                frames,
+                                notes,
+                                config_fingerprint: output.config_fingerprint,
+                            })
+                        });
+                        let _ = tx.send(SyntheticRadarReplayMessage::Done(replay_result));
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn exact replay product bridge");
+    SyntheticRadarReplayTask { label, rx }
 }
 
 /// Spawn a worker that turns each forecast time of the given wrfout file(s)
@@ -6514,7 +7059,7 @@ mod tests {
     fn terrain_horizon_blocks_downstream_low_tilt() {
         let mut fields = uniform_box_fields();
         fields.terrain_m.fill(1_500.0);
-        let horizon = TerrainHorizon::build(&fields, 39.0, -95.0, 200.0, 36, 20, 500.0);
+        let horizon = TerrainHorizon::build(&fields, 39.0, -95.0, 200.0, 36, 20, 0, 500.0);
         let config = SyntheticRadarConfig {
             terrain_blockage: true,
             ref_gate_texture: false,
@@ -7229,6 +7774,227 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {name} stage diagnostic"));
             assert!(matches!(&grid.storage, MomentStorage::F32(_)));
         }
+    }
+
+    fn irregular_observed_replay_volume() -> RadarVolume {
+        let mut site = RadarSite::new("KOBS");
+        site.name = Some("Observed replay fixture".to_string());
+        site.latitude_deg = Some(39.0);
+        site.longitude_deg = Some(-95.0);
+        site.elevation_m = Some(200.0);
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut volume = RadarVolume::new(site, time);
+        volume.vcp = Some(VcpInfo { pattern: 212 });
+        volume.metadata.archive_version = Some("AR2V0006".to_string());
+        volume.metadata.prt_s = Some(0.001_25);
+        volume.metadata.unambiguous_range_km = Some(119.9);
+        let midnight_ms = ((time.timestamp() % 86_400) * 1_000) as i32;
+        for split in 0..2usize {
+            let mut cut = ElevationCut::new(0.5, Some((split + 1) as u8));
+            for (ray_index, azimuth_deg) in [12.25, 97.75, 281.5].into_iter().enumerate() {
+                cut.radials.push(Radial {
+                    azimuth_deg,
+                    elevation_deg: 0.48 + split as f32 * 0.04 + ray_index as f32 * 0.01,
+                    time_offset_ms: midnight_ms + (split * 2_000 + ray_index * 175) as i32,
+                    gate_range: GateRange {
+                        first_gate_m: 125 + ray_index as i32 * 25,
+                        gate_spacing_m: 250,
+                        gate_count: 5 - usize::from(ray_index == 2),
+                    },
+                    nyquist_velocity_mps: Some(18.0 + ray_index as f32),
+                    radial_status: Some(if ray_index == 0 {
+                        radar_core::RadialStatus::StartElevation
+                    } else if ray_index == 2 {
+                        radar_core::RadialStatus::EndElevation
+                    } else {
+                        radar_core::RadialStatus::Intermediate
+                    }),
+                });
+            }
+            let ref_range = GateRange {
+                first_gate_m: 125,
+                gate_spacing_m: 250,
+                gate_count: 4,
+            };
+            cut.moments.insert(
+                MomentType::Reflectivity,
+                f32_grid(
+                    MomentType::Reflectivity,
+                    ref_range,
+                    if split == 0 {
+                        vec![0, 2]
+                    } else {
+                        vec![0, 1, 2]
+                    },
+                    if split == 0 {
+                        vec![20.0; 8]
+                    } else {
+                        vec![25.0; 12]
+                    },
+                ),
+            );
+            if split == 0 {
+                cut.moments.insert(
+                    MomentType::Velocity,
+                    f32_grid(
+                        MomentType::Velocity,
+                        GateRange {
+                            first_gate_m: 500,
+                            gate_spacing_m: 500,
+                            gate_count: 2,
+                        },
+                        vec![1, 2],
+                        vec![3.0, 4.0, -3.0, -4.0],
+                    ),
+                );
+            }
+            volume.cuts.push(cut);
+        }
+        volume.metadata.decoded_radial_count = 6;
+        volume
+    }
+
+    #[test]
+    fn exact_observed_replay_preserves_irregular_geometry_and_builds_difference() {
+        let fields = uniform_box_fields();
+        let observed = Arc::new(irregular_observed_replay_volume());
+        let observed_handle = Arc::clone(&observed);
+        let config = SyntheticRadarConfig {
+            ref_gate_texture: false,
+            vel_gate_texture: false,
+            emit_quality_fields: false,
+            ..box_model_config()
+        };
+        let products = build_exact_replay_products(&fields, observed, &config).unwrap();
+        assert!(Arc::ptr_eq(&products.observed, &observed_handle));
+        assert!(products.unavailable_observed_moments.is_empty());
+        let simulated = &products.simulated;
+        assert_eq!(simulated.site, observed_handle.site);
+        assert_eq!(simulated.volume_time, observed_handle.volume_time);
+        assert_eq!(simulated.vcp, observed_handle.vcp);
+        assert_eq!(simulated.metadata.prt_s, observed_handle.metadata.prt_s);
+        assert_eq!(
+            simulated.metadata.unambiguous_range_km,
+            observed_handle.metadata.unambiguous_range_km
+        );
+        assert_eq!(simulated.cuts.len(), 2);
+        for (observed_cut, simulated_cut) in observed_handle.cuts.iter().zip(&simulated.cuts) {
+            assert_eq!(simulated_cut.elevation_deg, observed_cut.elevation_deg);
+            assert_eq!(
+                simulated_cut.elevation_number,
+                observed_cut.elevation_number
+            );
+            assert_eq!(simulated_cut.radials.len(), observed_cut.radials.len());
+            for (observed_ray, simulated_ray) in
+                observed_cut.radials.iter().zip(&simulated_cut.radials)
+            {
+                assert_eq!(simulated_ray.azimuth_deg, observed_ray.azimuth_deg);
+                assert_eq!(simulated_ray.elevation_deg, observed_ray.elevation_deg);
+                assert_eq!(simulated_ray.gate_range, observed_ray.gate_range);
+                assert_eq!(
+                    simulated_ray.nyquist_velocity_mps,
+                    observed_ray.nyquist_velocity_mps
+                );
+                assert_eq!(simulated_ray.radial_status, observed_ray.radial_status);
+                assert_eq!(
+                    app_ui::wrf_radar_validation::radial_acquisition_time_utc(
+                        &observed_handle,
+                        observed_ray
+                    ),
+                    app_ui::wrf_radar_validation::radial_acquisition_time_utc(
+                        simulated,
+                        simulated_ray
+                    )
+                );
+            }
+            for (moment, observed_grid) in &observed_cut.moments {
+                let simulated_grid = &simulated_cut.moments[moment];
+                assert_eq!(simulated_grid.gate_range, observed_grid.gate_range);
+                assert_eq!(simulated_grid.radial_indices, observed_grid.radial_indices);
+            }
+            for quality in QualityMoment::ALL {
+                assert!(simulated_cut.moments.contains_key(&quality.moment_type()));
+            }
+        }
+        assert!(
+            simulated
+                .metadata
+                .forward_operator_config
+                .as_deref()
+                .unwrap()
+                .contains("vcp_reconstruction=false")
+        );
+        assert_eq!(products.difference.cuts.len(), observed_handle.cuts.len());
+        assert!(
+            products.difference.cuts[0]
+                .moments
+                .contains_key(&MomentType::Unknown("DIF_REF".to_string()))
+        );
+        assert!(
+            products.difference.cuts[0]
+                .moments
+                .contains_key(&MomentType::Unknown("DIF_VEL".to_string()))
+        );
+    }
+
+    #[test]
+    fn exact_replay_geometry_moves_config_fingerprint() {
+        let observed = irregular_observed_replay_volume();
+        let first = Arc::new(ExactScanTemplate::from_volume(&observed).unwrap());
+        let mut changed = observed.clone();
+        changed.cuts[0].radials[1].azimuth_deg += 0.25;
+        let second = Arc::new(ExactScanTemplate::from_volume(&changed).unwrap());
+        let first_config = SyntheticRadarConfig {
+            exact_replay_template: Some(first),
+            ..SyntheticRadarConfig::default()
+        };
+        let second_config = SyntheticRadarConfig {
+            exact_replay_template: Some(second),
+            ..SyntheticRadarConfig::default()
+        };
+        assert_ne!(
+            first_config.data_fingerprint(),
+            second_config.data_fingerprint()
+        );
+    }
+
+    #[test]
+    fn exact_replay_reports_unavailable_observed_polar_moment() {
+        let mut observed = irregular_observed_replay_volume();
+        observed.cuts[0].moments.insert(
+            MomentType::DifferentialReflectivity,
+            f32_grid(
+                MomentType::DifferentialReflectivity,
+                GateRange {
+                    first_gate_m: 125,
+                    gate_spacing_m: 250,
+                    gate_count: 4,
+                },
+                vec![0, 2],
+                vec![1.0; 8],
+            ),
+        );
+        let products = build_exact_replay_products(
+            &uniform_box_fields(),
+            Arc::new(observed),
+            &SyntheticRadarConfig {
+                ref_gate_texture: false,
+                ..box_model_config()
+            },
+        )
+        .unwrap();
+        assert_eq!(products.unavailable_observed_moments.len(), 1);
+        assert_eq!(products.unavailable_observed_moments[0].moment, "ZDR");
+        assert!(
+            !products.simulated.cuts[0]
+                .moments
+                .contains_key(&MomentType::DifferentialReflectivity)
+        );
+        assert!(
+            !products.difference.cuts[0]
+                .moments
+                .contains_key(&MomentType::Unknown("DIF_ZDR".to_string()))
+        );
     }
 
     /// The pure gate-spacing resolver, exercised without a file: matching off

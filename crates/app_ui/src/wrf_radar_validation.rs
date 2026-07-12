@@ -70,9 +70,20 @@ pub struct ObservedScanTemplate {
     pub site: RadarSite,
     pub volume_time: DateTime<Utc>,
     pub vcp: Option<VcpInfo>,
+    /// Source-declared volume PRT. This is replay metadata, not an inference
+    /// from a VCP number or Appendix-C PRF code.
+    #[serde(default)]
+    pub source_prt_s: Option<f32>,
+    /// Source-declared unambiguous range, retained independently of PRT.
+    #[serde(default)]
+    pub source_unambiguous_range_km: Option<f32>,
     pub time_encoding: RadialTimeEncoding,
     pub cuts: Vec<ReplayCutPlan>,
 }
+
+/// Public name used by the renderer: this is exact observed acquisition
+/// geometry, never a reconstructed or idealized VCP.
+pub type ExactScanTemplate = ObservedScanTemplate;
 
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ReplayTemplateError {
@@ -227,6 +238,8 @@ impl ObservedScanTemplate {
             site: volume.site.clone(),
             volume_time: volume.volume_time,
             vcp: volume.vcp.clone(),
+            source_prt_s: volume.metadata.prt_s,
+            source_unambiguous_range_km: volume.metadata.unambiguous_range_km,
             time_encoding,
             cuts,
         })
@@ -241,6 +254,10 @@ impl ObservedScanTemplate {
         self.site.elevation_m.map(f32::to_bits).hash(&mut hasher);
         self.volume_time.timestamp_millis().hash(&mut hasher);
         self.vcp.as_ref().map(|vcp| vcp.pattern).hash(&mut hasher);
+        self.source_prt_s.map(f32::to_bits).hash(&mut hasher);
+        self.source_unambiguous_range_km
+            .map(f32::to_bits)
+            .hash(&mut hasher);
         (self.time_encoding as u8).hash(&mut hasher);
         for cut in &self.cuts {
             cut.source_cut_index.hash(&mut hasher);
@@ -377,6 +394,49 @@ pub enum DifferenceVolumeError {
     MomentRadialsMismatch { cut: usize, moment: String },
     #[error("observed and synthetic volumes have no comparable moments")]
     NoComparableMoments,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnavailableObservedMoment {
+    pub cut: usize,
+    pub moment: String,
+    pub reason: String,
+}
+
+pub struct DifferenceVolumeOverlap {
+    pub volume: RadarVolume,
+    pub unavailable_observed_moments: Vec<UnavailableObservedMoment>,
+}
+
+/// Build an exact-geometry difference over the canonical moments the forward
+/// operator could actually emit. Missing canonical observations are reported,
+/// never silently converted to all-NaN difference grids.
+pub fn build_difference_volume_overlap(
+    observed: &RadarVolume,
+    synthetic: &RadarVolume,
+) -> Result<DifferenceVolumeOverlap, DifferenceVolumeError> {
+    let mut comparable = observed.clone();
+    let mut unavailable_observed_moments = Vec::new();
+    for (cut_index, (observed_cut, synthetic_cut)) in
+        observed.cuts.iter().zip(&synthetic.cuts).enumerate()
+    {
+        for moment in observed_cut.moments.keys() {
+            if is_canonical_radar_moment(moment) && !synthetic_cut.moments.contains_key(moment) {
+                comparable.cuts[cut_index].moments.remove(moment);
+                unavailable_observed_moments.push(UnavailableObservedMoment {
+                    cut: cut_index + 1,
+                    moment: moment.short_name().to_owned(),
+                    reason: "forward operator did not provide this observed canonical moment"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+    let volume = build_difference_volume(&comparable, synthetic)?;
+    Ok(DifferenceVolumeOverlap {
+        volume,
+        unavailable_observed_moments,
+    })
 }
 
 /// Build `synthetic - observed` on the observed scan's exact polar geometry.
@@ -843,6 +903,8 @@ mod tests {
         site.longitude_deg = Some(-97.277);
         let mut volume = RadarVolume::new(site, time);
         volume.metadata.archive_version = Some("AR2V0006".to_owned());
+        volume.metadata.prt_s = Some(0.001);
+        volume.metadata.unambiguous_range_km = Some(149.9);
         for cut_number in 0..2 {
             let mut cut = ElevationCut::new(0.5, Some(cut_number + 1));
             for (radial_index, azimuth_deg) in [12.0, 47.5, 301.0].into_iter().enumerate() {
@@ -903,6 +965,8 @@ mod tests {
             RadialTimeEncoding::NexradMillisecondsSinceMidnight
         );
         assert_eq!(template.cuts.len(), 2);
+        assert_eq!(template.source_prt_s, Some(0.001));
+        assert_eq!(template.source_unambiguous_range_km, Some(149.9));
         assert_eq!(
             template.cuts[0].elevation_deg,
             template.cuts[1].elevation_deg
@@ -1005,6 +1069,27 @@ mod tests {
             build_difference_volume(&observed, &synthetic),
             Err(DifferenceVolumeError::MomentGeometryMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn overlap_difference_reports_unavailable_canonical_moment() {
+        let observed = observed_fixture();
+        let mut synthetic = observed.clone();
+        for cut in &mut synthetic.cuts {
+            cut.moments.remove(&MomentType::Velocity);
+        }
+        let overlap = build_difference_volume_overlap(&observed, &synthetic).unwrap();
+        assert_eq!(overlap.unavailable_observed_moments.len(), 2);
+        assert!(
+            overlap
+                .unavailable_observed_moments
+                .iter()
+                .all(|entry| entry.moment == "VEL")
+        );
+        assert!(overlap.volume.cuts.iter().all(|cut| {
+            !cut.moments
+                .contains_key(&MomentType::Unknown("DIF_VEL".to_owned()))
+        }));
     }
 
     #[test]
