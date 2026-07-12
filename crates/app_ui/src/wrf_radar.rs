@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, RadarSite, RadarVolume, Radial,
     ScanLegMetadata, ScanMode, VcpInfo, VolumeMetadata, beam_ground_range_m,
@@ -54,6 +54,11 @@ use app_ui::vcp_catalog::{
 };
 use app_ui::wrf_scene_adapter::inventory_selected_wrf_paths;
 use app_ui::wrf_scene_inventory::{WrfScene, WrfSceneGroup, WrfSceneTime};
+use app_ui::wrf_temporal::{
+    AtmosphereTimeMode, HoldReason, MissingNeighborPolicy, TemporalMemoryDecision,
+    TemporalMemoryEstimate, TemporalSamplingOutcome, TemporalScenePlan, TwoSceneCache,
+    plan_for_scene,
+};
 
 /// Operational adaptations intentionally outside the checked base-pattern
 /// catalog and this synthetic renderer.
@@ -153,9 +158,9 @@ pub enum SimulationMode {
     Presentation,
 }
 
-/// Whether all rays represent one model instant or carry synthetic acquisition
-/// times for a rotating volume scan. A timed scan still samples one WRF scene;
-/// its provenance says so rather than implying temporal model interpolation.
+/// Whether all rays represent one model instant or carry acquisition times for
+/// a rotating volume scan. Atmosphere sampling is configured independently by
+/// [`SyntheticRadarConfig::atmosphere_time_mode`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanTiming {
@@ -377,6 +382,15 @@ pub struct SyntheticRadarConfig {
     pub zdr_bias_db: f32,
     /// Acquisition timing and nominal instrument cadence.
     pub scan_timing: ScanTiming,
+    /// Sample every ray from the anchor WRF scene or interpolate its atmosphere
+    /// from the adjacent compatible model scene at the ray acquisition time.
+    pub atmosphere_time_mode: AtmosphereTimeMode,
+    /// Explicit behavior when a later compatible WRF scene is unavailable or
+    /// cannot cover the complete scan without extrapolation.
+    pub missing_neighbor_policy: MissingNeighborPolicy,
+    /// Peak-memory ceiling for a rolling two-scene temporal build. The worker
+    /// preflights before reading a second scene and never silently exceeds it.
+    pub temporal_memory_budget_mib: usize,
     pub rotation_rate_deg_s: f32,
     pub transition_delay_s: f32,
     /// Pulse repetition frequency used for CfRadial metadata. Velocity folding
@@ -456,6 +470,9 @@ impl Default for SyntheticRadarConfig {
             system_phidp_deg: 0.0,
             zdr_bias_db: 0.0,
             scan_timing: ScanTiming::InstantaneousTruth,
+            atmosphere_time_mode: AtmosphereTimeMode::FrozenAtVolumeStart,
+            missing_neighbor_policy: MissingNeighborPolicy::HoldAnchor,
+            temporal_memory_budget_mib: 8_192,
             rotation_rate_deg_s: 18.0,
             transition_delay_s: 3.5,
             prf_hz: 1_000.0,
@@ -529,6 +546,7 @@ impl SyntheticRadarConfig {
                 self.dual_pol = false;
                 self.propagation = false;
                 self.scan_timing = ScanTiming::InstantaneousTruth;
+                self.atmosphere_time_mode = AtmosphereTimeMode::FrozenAtVolumeStart;
                 self.instrument_noise = false;
                 self.ref_gate_texture = false;
                 self.vel_gate_texture = false;
@@ -544,6 +562,7 @@ impl SyntheticRadarConfig {
                 self.dual_pol = true;
                 self.propagation = true;
                 self.scan_timing = ScanTiming::TimedVolume;
+                self.atmosphere_time_mode = AtmosphereTimeMode::LinearAdjacent;
                 self.instrument_noise = true;
                 self.ref_gate_texture = false;
                 self.vel_gate_texture = false;
@@ -559,6 +578,7 @@ impl SyntheticRadarConfig {
                 self.dual_pol = false;
                 self.propagation = false;
                 self.scan_timing = ScanTiming::InstantaneousTruth;
+                self.atmosphere_time_mode = AtmosphereTimeMode::FrozenAtVolumeStart;
                 self.instrument_noise = false;
                 self.ref_gate_texture = true;
                 self.vel_gate_texture = false;
@@ -640,6 +660,8 @@ impl SyntheticRadarConfig {
         self.system_phidp_deg.to_bits().hash(&mut hasher);
         self.zdr_bias_db.to_bits().hash(&mut hasher);
         (self.scan_timing as u8).hash(&mut hasher);
+        (self.atmosphere_time_mode as u8).hash(&mut hasher);
+        (self.missing_neighbor_policy as u8).hash(&mut hasher);
         self.rotation_rate_deg_s.to_bits().hash(&mut hasher);
         self.transition_delay_s.to_bits().hash(&mut hasher);
         self.prf_hz.to_bits().hash(&mut hasher);
@@ -664,6 +686,55 @@ impl SyntheticRadarConfig {
             UNFOLDED_NYQUIST_MPS
         }
     }
+
+    /// Latest ray-acquisition offset in the configured physical scan. This is
+    /// the duration supplied to temporal planning, not the end of an unused
+    /// transition after the final cut.
+    pub fn planned_scan_duration_ms(&self) -> i64 {
+        if !matches!(self.scan_timing, ScanTiming::TimedVolume) {
+            return 0;
+        }
+        let legs = self.physical_scan_legs();
+        let mut cut_start_ms = 0i32;
+        let mut latest_ray_ms = 0i32;
+        for (cut_index, leg) in legs.iter().enumerate() {
+            let rays = plan_synthetic_rays(
+                cut_index,
+                legs.len(),
+                self.azimuth_count.max(1),
+                self.scan_timing,
+                leg.azimuth_rate_deg_per_second,
+                cut_start_ms,
+            );
+            latest_ray_ms =
+                latest_ray_ms.max(rays.last().map_or(cut_start_ms, |ray| ray.time_offset_ms));
+            cut_start_ms = advance_cut_start_ms(self, leg, cut_start_ms);
+        }
+        i64::from(latest_ray_ms)
+    }
+}
+
+fn advance_cut_start_ms(
+    config: &SyntheticRadarConfig,
+    leg: &SyntheticScanLeg,
+    cut_start_ms: i32,
+) -> i32 {
+    let (sweep_ms, transition_ms) = if config.scan_strategy.is_named_vcp() {
+        (
+            1_000.0 * leg.source_period_seconds.max(0.0),
+            1_000.0 * leg.transition_after_seconds.max(0.0),
+        )
+    } else {
+        // Preserve the historical custom-mode arithmetic order: the f32
+        // rounding of `360_000 / rate` is part of existing ray timestamps.
+        (
+            360_000.0 / config.rotation_rate_deg_s.max(0.1),
+            1_000.0 * config.transition_delay_s.max(0.0),
+        )
+    };
+    (f64::from(cut_start_ms) + f64::from(sweep_ms + transition_ms))
+        .round()
+        .clamp(0.0, f64::from(i32::MAX)) as i32
 }
 
 /// Lower clamp for a grid-matched gate spacing (m). A WRF `DX` finer than this
@@ -1492,6 +1563,39 @@ pub fn build_synthetic_volume_reporting(
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
 ) -> RadarVolume {
+    build_synthetic_volume_reporting_inner(fields, valid_time, config, progress, None)
+        .expect("a frozen single-scene render has no temporal failure path")
+}
+
+struct TemporalRenderContext<'a> {
+    neighbor: &'a WrfRadarFields,
+    plan: &'a TemporalScenePlan,
+}
+
+fn build_synthetic_volume_reporting_temporal(
+    fields: &WrfRadarFields,
+    neighbor: &WrfRadarFields,
+    valid_time: DateTime<Utc>,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+    plan: &TemporalScenePlan,
+) -> Result<RadarVolume, String> {
+    build_synthetic_volume_reporting_inner(
+        fields,
+        valid_time,
+        config,
+        progress,
+        Some(TemporalRenderContext { neighbor, plan }),
+    )
+}
+
+fn build_synthetic_volume_reporting_inner(
+    fields: &WrfRadarFields,
+    valid_time: DateTime<Utc>,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+    temporal: Option<TemporalRenderContext<'_>>,
+) -> Result<RadarVolume, String> {
     let cells = fields.cells();
     let center = fields.center_cell();
     let site_lat = config
@@ -1681,6 +1785,7 @@ pub fn build_synthetic_volume_reporting(
         ));
         let cut = build_cut(
             fields,
+            temporal.as_ref(),
             cells,
             site_lat,
             site_lon,
@@ -1696,31 +1801,15 @@ pub fn build_synthetic_volume_reporting(
             frame_seed,
             terrain_horizon.as_ref(),
             cut_start_ms,
-        );
+        )?;
         decoded_radials += cut.radials.len();
         volume.cuts.push(cut);
         if matches!(config.scan_timing, ScanTiming::TimedVolume) {
-            let (sweep_ms, transition_ms) = if named_vcp.is_some() {
-                (
-                    1_000.0 * leg.source_period_seconds.max(0.0),
-                    1_000.0 * leg.transition_after_seconds.max(0.0),
-                )
-            } else {
-                // Preserve the historical custom-mode arithmetic order: the
-                // f32 rounding of `360_000 / rate` is part of existing ray
-                // timestamps and therefore of the bit-for-bit default contract.
-                (
-                    360_000.0 / config.rotation_rate_deg_s.max(0.1),
-                    1_000.0 * config.transition_delay_s.max(0.0),
-                )
-            };
-            cut_start_ms = (f64::from(cut_start_ms) + f64::from(sweep_ms + transition_ms))
-                .round()
-                .clamp(0.0, f64::from(i32::MAX)) as i32;
+            cut_start_ms = advance_cut_start_ms(config, leg, cut_start_ms);
         }
     }
     volume.metadata.decoded_radial_count = decoded_radials;
-    volume
+    Ok(volume)
 }
 
 /// Cumulative apparent terrain elevation for every azimuth/range cell. The
@@ -1938,6 +2027,8 @@ struct GatePhysicalSample {
 #[allow(clippy::too_many_arguments)]
 fn sample_gate(
     fields: &WrfRadarFields,
+    neighbor_fields: Option<&WrfRadarFields>,
+    atmosphere_alpha: f64,
     cells: usize,
     site_lat: f64,
     site_lon: f64,
@@ -1972,8 +2063,10 @@ fn sample_gate(
         let east_km = ground_m * azimuth.sin() / 1_000.0;
         let north_km = ground_m * azimuth.cos() / 1_000.0;
         let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
-        let Some(sample) = sample_column(
+        let Some(sample) = sample_column_temporal(
             fields,
+            neighbor_fields,
+            atmosphere_alpha,
             cells,
             lat as f32,
             lon as f32,
@@ -2084,6 +2177,7 @@ struct SyntheticRayPlan {
     source_index: usize,
     azimuth_deg: f32,
     time_offset_ms: i32,
+    atmosphere_alpha: f64,
     radial_status: radar_core::RadialStatus,
 }
 
@@ -2120,6 +2214,7 @@ fn plan_synthetic_rays(
                 source_index,
                 azimuth_deg,
                 time_offset_ms,
+                atmosphere_alpha: 0.0,
                 radial_status,
             }
         })
@@ -2150,6 +2245,7 @@ impl CutMomentRow {
 #[allow(clippy::too_many_arguments)]
 fn build_cut(
     fields: &WrfRadarFields,
+    temporal: Option<&TemporalRenderContext<'_>>,
     cells: usize,
     site_lat: f64,
     site_lon: f64,
@@ -2165,7 +2261,7 @@ fn build_cut(
     frame_seed: u32,
     terrain_horizon: Option<&TerrainHorizon>,
     cut_start_ms: i32,
-) -> ElevationCut {
+) -> Result<ElevationCut, String> {
     let gate_count = gate_range.gate_count;
     // Instrument mode already applies its range-varying radar-equation
     // sensitivity gate below; a fixed 0 dBZ presentation floor would erase
@@ -2188,7 +2284,7 @@ fn build_cut(
         Vec::new()
     };
 
-    let ray_plan = plan_synthetic_rays(
+    let mut ray_plan = plan_synthetic_rays(
         cut_index,
         scan_leg_count,
         naz,
@@ -2196,6 +2292,21 @@ fn build_cut(
         scan_leg.azimuth_rate_deg_per_second,
         cut_start_ms,
     );
+    if let Some(temporal) = temporal {
+        for ray in &mut ray_plan {
+            ray.atmosphere_alpha = temporal
+                .plan
+                .ray_alpha(i64::from(ray.time_offset_ms))
+                .map_err(|error| {
+                    format!(
+                        "temporal weight for cut {} ray {} at {} ms: {error}",
+                        cut_index + 1,
+                        ray.source_index + 1,
+                        ray.time_offset_ms
+                    )
+                })?;
+        }
+    }
 
     // One row per radial, sampled in parallel. Each row is `gate_count` REF and
     // `gate_count` VEL f32 values (NaN = no data / below floor / off-domain).
@@ -2219,6 +2330,8 @@ fn build_cut(
                 let ground_m = beam_ground_range_m(slant_m, elevation_deg);
                 let Some(sample) = sample_gate(
                     fields,
+                    temporal.map(|context| context.neighbor),
+                    ray.atmosphere_alpha,
                     cells,
                     site_lat,
                     site_lon,
@@ -2487,7 +2600,7 @@ fn build_cut(
             );
         }
     }
-    cut
+    Ok(cut)
 }
 
 fn f32_grid(
@@ -2522,6 +2635,63 @@ struct ColumnSample {
     w: f32,
     polar: Option<crate::wrf_radar_physics::IntrinsicPolarSample>,
     tke_m2s2: f32,
+}
+
+fn sample_column_temporal(
+    fields: &WrfRadarFields,
+    neighbor_fields: Option<&WrfRadarFields>,
+    alpha: f64,
+    cells: usize,
+    lat: f32,
+    lon: f32,
+    z_msl: f32,
+    reflectivity_sampling: ReflectivitySampling,
+) -> Option<ColumnSample> {
+    if alpha <= 0.0 || neighbor_fields.is_none() {
+        return sample_column(fields, cells, lat, lon, z_msl, reflectivity_sampling);
+    }
+    let neighbor = neighbor_fields?;
+    if alpha >= 1.0 {
+        return sample_column(neighbor, cells, lat, lon, z_msl, reflectivity_sampling);
+    }
+    let left = sample_column(fields, cells, lat, lon, z_msl, reflectivity_sampling)?;
+    let right = sample_column(neighbor, cells, lat, lon, z_msl, reflectivity_sampling)?;
+    Some(blend_column_samples(left, right, alpha as f32))
+}
+
+/// Blend quantities that remain linear/additive through the radar operator.
+/// ZH/ZV/covariance/KDP/attenuation are combined as additive scattering
+/// quantities; ratios such as ZDR and rhoHV are derived only afterwards.
+fn blend_column_samples(left: ColumnSample, right: ColumnSample, alpha: f32) -> ColumnSample {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let beta = 1.0 - alpha;
+    let polar = match (left.polar, right.polar) {
+        (Some(left), Some(right)) => {
+            let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+            accumulator.add(beta, intrinsic_as_contribution(left));
+            accumulator.add(alpha, intrinsic_as_contribution(right));
+            Some(accumulator.finalize())
+        }
+        (Some(left), None) => {
+            let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+            accumulator.add(beta, intrinsic_as_contribution(left));
+            Some(accumulator.finalize())
+        }
+        (None, Some(right)) => {
+            let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+            accumulator.add(alpha, intrinsic_as_contribution(right));
+            Some(accumulator.finalize())
+        }
+        (None, None) => None,
+    };
+    ColumnSample {
+        z_linear: beta * left.z_linear + alpha * right.z_linear,
+        u: beta * left.u + alpha * right.u,
+        v: beta * left.v + alpha * right.v,
+        w: beta * left.w + alpha * right.w,
+        polar,
+        tke_m2s2: beta * left.tke_m2s2 + alpha * right.tke_m2s2,
+    }
 }
 
 fn intrinsic_as_contribution(
@@ -3181,12 +3351,26 @@ fn build_synthetic_from_paths(
     let scenes = selected.group.scenes.clone();
     let config_fingerprint = scene_build_fingerprint(config, &selected.group);
 
-    let mut volumes = Vec::new();
     let mut notes = selected
         .notes
         .into_iter()
         .map(|note| format!("{}: {}", note.source_name, note.message))
         .collect::<Vec<_>>();
+    if matches!(
+        config.atmosphere_time_mode,
+        AtmosphereTimeMode::LinearAdjacent
+    ) {
+        return build_temporal_synthetic_from_scenes(
+            &selected.group,
+            config,
+            label,
+            tx,
+            notes,
+            config_fingerprint,
+        );
+    }
+
+    let mut volumes = Vec::new();
     let one_scene_per_file = {
         let mut identities = std::collections::BTreeSet::new();
         scenes
@@ -3291,6 +3475,405 @@ fn build_synthetic_from_paths(
         notes,
         config_fingerprint,
     })
+}
+
+fn build_temporal_synthetic_from_scenes(
+    group: &WrfSceneGroup,
+    config: &SyntheticRadarConfig,
+    label: &str,
+    tx: &Sender<SyntheticRadarMessage>,
+    mut notes: Vec<String>,
+    config_fingerprint: u64,
+) -> Result<SyntheticRadarOutput, String> {
+    if !matches!(config.scan_timing, ScanTiming::TimedVolume) {
+        return Err(
+            "Adjacent-scene atmosphere interpolation requires Timed volume scan timing".to_string(),
+        );
+    }
+    let scan_duration_ms = config.planned_scan_duration_ms();
+    let scan_duration = Duration::milliseconds(scan_duration_ms);
+    let estimate = temporal_memory_estimate(group, config)?;
+    let budget_bytes = config
+        .temporal_memory_budget_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "Temporal memory budget overflows address space".to_string())?;
+    match estimate.preflight(budget_bytes) {
+        TemporalMemoryDecision::Fits { required_bytes, .. } => notes.push(format!(
+            "Temporal two-scene preflight: {:.2} GiB estimated peak within {:.2} GiB budget",
+            required_bytes as f64 / 1024.0_f64.powi(3),
+            budget_bytes as f64 / 1024.0_f64.powi(3),
+        )),
+        TemporalMemoryDecision::Exceeds {
+            required_bytes,
+            budget_bytes,
+        } => {
+            return Err(format!(
+                "Temporal two-scene build needs an estimated {:.2} GiB, above the configured {:.2} GiB budget",
+                required_bytes as f64 / 1024.0_f64.powi(3),
+                budget_bytes as f64 / 1024.0_f64.powi(3),
+            ));
+        }
+        TemporalMemoryDecision::Overflow => {
+            return Err("Temporal two-scene memory estimate overflowed".to_string());
+        }
+    }
+
+    let mut cache: TwoSceneCache<(String, usize), Arc<WrfRadarFields>> = TwoSceneCache::default();
+    let mut volumes = Vec::new();
+    for (frame_index, scene) in group.scenes.iter().enumerate() {
+        let Some(plan) = plan_for_scene(
+            group,
+            frame_index,
+            scan_duration,
+            config.atmosphere_time_mode,
+            config.missing_neighbor_policy,
+        )
+        .map_err(|error| {
+            format!(
+                "Plan temporal sampling for {}: {error}",
+                display_name(&scene.path)
+            )
+        })?
+        else {
+            notes.push(format!(
+                "{} time {} dropped: no adjacent WRF scene covers the timed scan",
+                display_name(&scene.path),
+                scene.time_index
+            ));
+            continue;
+        };
+
+        let frame_prefix = format!(
+            "frame {}/{} ({}, time {}): ",
+            frame_index + 1,
+            group.scenes.len(),
+            display_name(&scene.path),
+            scene.time_index + 1,
+        );
+        let progress = |stage: &str| {
+            let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+                "{frame_prefix}{stage}"
+            )));
+        };
+        let anchor = match cached_temporal_fields(&mut cache, scene, config, &progress) {
+            Ok(fields) => fields,
+            Err(error) => {
+                notes.push(format!(
+                    "{} time {}: {error}",
+                    display_name(&scene.path),
+                    scene.time_index
+                ));
+                continue;
+            }
+        };
+        let valid_time = scene
+            .time
+            .valid_time()
+            .cloned()
+            .expect("scene adapter rejects untimed scenes");
+
+        let (mut volume, runtime_outcome) = match plan.outcome {
+            TemporalSamplingOutcome::LinearAdjacent => {
+                let neighbor_locator = plan
+                    .neighbor
+                    .as_ref()
+                    .expect("linear temporal plan carries a neighbor");
+                let neighbor_scene = group
+                    .scenes
+                    .iter()
+                    .find(|candidate| {
+                        candidate.source_identity == neighbor_locator.source_identity
+                            && candidate.time_index == neighbor_locator.time_index
+                    })
+                    .expect("temporal planner selected a scene from this group");
+                let neighbor =
+                    match cached_temporal_fields(&mut cache, neighbor_scene, config, &progress) {
+                        Ok(fields) => TemporalNeighborResolution::Fields(fields),
+                        Err(error) => match config.missing_neighbor_policy {
+                            MissingNeighborPolicy::HoldAnchor => {
+                                notes.push(format!(
+                                "{} time {} held at anchor: adjacent scene read failed ({error})",
+                                display_name(&scene.path),
+                                scene.time_index
+                            ));
+                                let volume = build_synthetic_volume_reporting(
+                                    &anchor, valid_time, config, &progress,
+                                );
+                                TemporalNeighborResolution::Held(
+                                    volume,
+                                    "held_anchor_neighbor_read_error".to_string(),
+                                )
+                            }
+                            MissingNeighborPolicy::DropFrame => {
+                                notes.push(format!(
+                                    "{} time {} dropped: adjacent scene read failed ({error})",
+                                    display_name(&scene.path),
+                                    scene.time_index
+                                ));
+                                continue;
+                            }
+                            MissingNeighborPolicy::Error => {
+                                return Err(format!(
+                                    "Read adjacent WRF scene for {}: {error}",
+                                    display_name(&scene.path)
+                                ));
+                            }
+                        },
+                    };
+                match neighbor {
+                    TemporalNeighborResolution::Held(volume, outcome) => (volume, outcome),
+                    TemporalNeighborResolution::Fields(neighbor) => {
+                        if let Err(error) = validate_temporal_field_pair(&anchor, &neighbor) {
+                            match config.missing_neighbor_policy {
+                                MissingNeighborPolicy::HoldAnchor => {
+                                    notes.push(format!(
+                                        "{} time {} held at anchor: {error}",
+                                        display_name(&scene.path),
+                                        scene.time_index
+                                    ));
+                                    (
+                                        build_synthetic_volume_reporting(
+                                            &anchor, valid_time, config, &progress,
+                                        ),
+                                        "held_anchor_property_mismatch".to_string(),
+                                    )
+                                }
+                                MissingNeighborPolicy::DropFrame => {
+                                    notes.push(format!(
+                                        "{} time {} dropped: {error}",
+                                        display_name(&scene.path),
+                                        scene.time_index
+                                    ));
+                                    continue;
+                                }
+                                MissingNeighborPolicy::Error => return Err(error),
+                            }
+                        } else {
+                            (
+                                build_synthetic_volume_reporting_temporal(
+                                    &anchor, &neighbor, valid_time, config, &progress, &plan,
+                                )?,
+                                "linear_adjacent".to_string(),
+                            )
+                        }
+                    }
+                }
+            }
+            TemporalSamplingOutcome::Frozen => (
+                build_synthetic_volume_reporting(&anchor, valid_time, config, &progress),
+                "frozen".to_string(),
+            ),
+            TemporalSamplingOutcome::HeldAnchor(reason) => (
+                build_synthetic_volume_reporting(&anchor, valid_time, config, &progress),
+                match reason {
+                    HoldReason::NoLaterScene => "held_anchor_no_later_scene".to_string(),
+                    HoldReason::ScanCrossesNeighbor => {
+                        "held_anchor_scan_crosses_neighbor".to_string()
+                    }
+                },
+            ),
+        };
+        append_scene_provenance(&mut volume, scene);
+        append_temporal_provenance(&mut volume, &plan, &runtime_outcome);
+        notes.push(format!(
+            "{} time {}: {} radials, atmosphere {runtime_outcome}",
+            display_name(&scene.path),
+            scene.time_index,
+            volume.metadata.decoded_radial_count,
+        ));
+        volumes.push(Arc::new(volume));
+    }
+
+    if volumes.is_empty() {
+        return Err(if notes.is_empty() {
+            "WRF temporal build produced no simulated radar volumes".to_string()
+        } else {
+            format!(
+                "WRF temporal build produced no simulated radar volumes: {}",
+                notes.join("; ")
+            )
+        });
+    }
+    Ok(SyntheticRadarOutput {
+        label: label.to_string(),
+        volumes,
+        notes,
+        config_fingerprint,
+    })
+}
+
+enum TemporalNeighborResolution {
+    Fields(Arc<WrfRadarFields>),
+    Held(RadarVolume, String),
+}
+
+fn temporal_memory_estimate(
+    group: &WrfSceneGroup,
+    config: &SyntheticRadarConfig,
+) -> Result<TemporalMemoryEstimate, String> {
+    let grid = &group.key.grid_signature;
+    let nz = grid.nz.ok_or_else(|| {
+        "WRF grid has no vertical-size metadata for temporal preflight".to_string()
+    })?;
+    let horizontal_cells = grid
+        .nx
+        .checked_mul(grid.ny)
+        .ok_or_else(|| "WRF horizontal grid size overflowed".to_string())?;
+    let cells_per_scene = horizontal_cells
+        .checked_mul(nz)
+        .ok_or_else(|| "WRF 3-D grid size overflowed".to_string())?;
+    let mut compact_bytes_per_scene = horizontal_cells
+        .checked_mul(28)
+        .ok_or_else(|| "WRF geolocation memory estimate overflowed".to_string())?;
+    if config.dual_pol || config.terminal_fall_speed {
+        compact_bytes_per_scene = compact_bytes_per_scene
+            .checked_add(
+                cells_per_scene
+                    .checked_mul(8)
+                    .ok_or_else(|| "WRF polar memory estimate overflowed".to_string())?,
+            )
+            .ok_or_else(|| "WRF polar memory estimate overflowed".to_string())?;
+    }
+    if config.spectrum_width {
+        compact_bytes_per_scene = compact_bytes_per_scene
+            .checked_add(cells_per_scene)
+            .ok_or_else(|| "WRF TKE memory estimate overflowed".to_string())?;
+    }
+
+    let dx_m = grid.dx_millimeters.map(|value| value as f64 / 1_000.0);
+    let spacing_m = effective_gate_spacing(config, dx_m).max(1.0);
+    let gate_count = ((config.max_range_m / spacing_m).floor() as usize).max(1);
+    let radial_count = config
+        .physical_scan_legs()
+        .len()
+        .checked_mul(config.azimuth_count.max(1))
+        .ok_or_else(|| "Synthetic radial count overflowed".to_string())?;
+    let moment_count =
+        2usize + usize::from(config.spectrum_width) + if config.dual_pol { 10 } else { 0 };
+    let output_bytes = radial_count
+        .checked_mul(gate_count)
+        .and_then(|value| value.checked_mul(moment_count))
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|value| value.checked_add(radial_count.saturating_mul(96)))
+        .ok_or_else(|| "Synthetic output memory estimate overflowed".to_string())?;
+    let shared_static_bytes = config
+        .azimuth_count
+        .max(1)
+        .checked_mul(gate_count)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .unwrap_or(usize::MAX);
+
+    Ok(TemporalMemoryEstimate {
+        cells_per_scene,
+        dense_fields_per_scene: 5,
+        bytes_per_dense_value: std::mem::size_of::<f32>(),
+        compact_bytes_per_scene,
+        shared_static_bytes,
+        output_bytes,
+    })
+}
+
+fn cached_temporal_fields(
+    cache: &mut TwoSceneCache<(String, usize), Arc<WrfRadarFields>>,
+    scene: &WrfScene,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+) -> Result<Arc<WrfRadarFields>, String> {
+    let key = (scene.source_identity.0.clone(), scene.time_index);
+    if let Some(fields) = cache.get(&key) {
+        return Ok(Arc::clone(fields));
+    }
+    progress(&format!(
+        "reading WRF atmosphere at {}â€¦",
+        scene
+            .time
+            .valid_time()
+            .map(DateTime::<Utc>::to_rfc3339)
+            .unwrap_or_else(|| "unknown time".to_string())
+    ));
+    let file = WrfFile::open(&scene.path).map_err(|error| {
+        format!(
+            "Open inventoried WRF {}: {error}",
+            display_name(&scene.path)
+        )
+    })?;
+    let fields = Arc::new(read_wrf_radar_fields_for_config_reporting(
+        &file,
+        scene.time_index,
+        config,
+        progress,
+    )?);
+    cache.insert(key, Arc::clone(&fields));
+    Ok(fields)
+}
+
+fn validate_temporal_field_pair(
+    anchor: &WrfRadarFields,
+    neighbor: &WrfRadarFields,
+) -> Result<(), String> {
+    if (anchor.nx, anchor.ny, anchor.nz) != (neighbor.nx, neighbor.ny, neighbor.nz) {
+        return Err(format!(
+            "Adjacent WRF field shape changed from {}x{}x{} to {}x{}x{}",
+            anchor.nx, anchor.ny, anchor.nz, neighbor.nx, neighbor.ny, neighbor.nz
+        ));
+    }
+    if anchor.ref_source != neighbor.ref_source {
+        return Err(format!(
+            "Adjacent WRF reflectivity source changed from {} to {}",
+            anchor.ref_source, neighbor.ref_source
+        ));
+    }
+    match (&anchor.polarimetric, &neighbor.polarimetric) {
+        (None, None) => {}
+        (Some(left), Some(right))
+            if left.profile == right.profile && left.present_fields == right.present_fields => {}
+        (Some(left), Some(right)) => {
+            return Err(format!(
+                "Adjacent WRF microphysics inventory changed from {} [{}] to {} [{}]",
+                left.profile.name,
+                left.present_fields.join(","),
+                right.profile.name,
+                right.present_fields.join(",")
+            ));
+        }
+        _ => {
+            return Err(
+                "Adjacent WRF scene has incompatible polarimetric field availability".to_string(),
+            );
+        }
+    }
+    if anchor.tke_tenths_m2s2.is_some() != neighbor.tke_tenths_m2s2.is_some() {
+        return Err("Adjacent WRF scene has incompatible TKE availability".to_string());
+    }
+    Ok(())
+}
+
+fn append_temporal_provenance(
+    volume: &mut RadarVolume,
+    plan: &TemporalScenePlan,
+    runtime_outcome: &str,
+) {
+    let neighbor = plan
+        .neighbor
+        .as_ref()
+        .map(|scene| format!("{}:time{}", scene.source_identity.0, scene.time_index))
+        .unwrap_or_else(|| "none".to_string());
+    let neighbor_time = plan
+        .neighbor_time
+        .as_ref()
+        .map(DateTime::<Utc>::to_rfc3339)
+        .unwrap_or_else(|| "none".to_string());
+    let provenance = format!(
+        "atmosphere_time_mode=linear_adjacent; temporal_outcome={runtime_outcome}; temporal_neighbor={neighbor}; temporal_neighbor_time={neighbor_time}; temporal_scan_duration_ms={}",
+        plan.scan_duration_ms,
+    );
+    match volume.metadata.forward_operator_config.as_mut() {
+        Some(config) => {
+            config.push_str("; ");
+            config.push_str(&provenance);
+        }
+        None => volume.metadata.forward_operator_config = Some(provenance),
+    }
 }
 
 fn scene_time_authority(time: &WrfSceneTime) -> &'static str {
@@ -3665,6 +4248,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn temporal_column_sampling_blends_linear_z_and_wind_before_gate_physics() {
+        let mut anchor = uniform_box_fields();
+        anchor.dbz.fill(0.0);
+        anchor.u.fill(10.0);
+        let mut neighbor = uniform_box_fields();
+        neighbor.dbz.fill(20.0);
+        neighbor.u.fill(30.0);
+
+        let midpoint = sample_column_temporal(
+            &anchor,
+            Some(&neighbor),
+            0.5,
+            anchor.cells(),
+            39.0,
+            -95.0,
+            1_000.0,
+            ReflectivitySampling::LinearZ,
+        )
+        .expect("midpoint model column");
+        assert!((z_to_dbz(midpoint.z_linear) - 17.032913).abs() < 1.0e-5);
+        assert!((midpoint.u - 20.0).abs() < 1.0e-6);
+
+        let exact_anchor = sample_column_temporal(
+            &anchor,
+            None,
+            0.0,
+            anchor.cells(),
+            39.0,
+            -95.0,
+            1_000.0,
+            ReflectivitySampling::LinearZ,
+        )
+        .expect("exact anchor column");
+        assert_eq!(z_to_dbz(exact_anchor.z_linear), 0.0);
+        assert_eq!(exact_anchor.u, 10.0);
+    }
+
     fn attach_uniform_polar(
         fields: &mut WrfRadarFields,
         sample: crate::wrf_radar_physics::IntrinsicPolarSample,
@@ -3738,6 +4359,8 @@ mod tests {
             samples.push(
                 sample_gate(
                     &fields,
+                    None,
+                    0.0,
                     fields.cells(),
                     39.0,
                     -95.0,
@@ -3819,6 +4442,12 @@ mod tests {
         assert_eq!(offsets[0], 0);
         assert!(offsets.windows(2).all(|pair| pair[1] > pair[0]));
         assert!(offsets.last().copied().unwrap_or(0) > 50_000);
+        assert_eq!(config.planned_scan_duration_ms(), 59_500);
+        assert_eq!(
+            config.planned_scan_duration_ms(),
+            i64::from(*offsets.last().expect("last timed ray")),
+            "temporal planner duration must be the exact latest sampled ray"
+        );
     }
 
     #[test]
@@ -3927,6 +4556,8 @@ mod tests {
         };
         let air = sample_gate(
             &fields,
+            None,
+            0.0,
             fields.cells(),
             39.0,
             -95.0,
@@ -3943,6 +4574,8 @@ mod tests {
         config.terminal_fall_speed = true;
         let scatterer = sample_gate(
             &fields,
+            None,
+            0.0,
             fields.cells(),
             39.0,
             -95.0,
@@ -3971,6 +4604,8 @@ mod tests {
         };
         let blocked = sample_gate(
             &fields,
+            None,
+            0.0,
             fields.cells(),
             39.0,
             -95.0,
@@ -3990,6 +4625,8 @@ mod tests {
         assert!(
             sample_gate(
                 &fields,
+                None,
+                0.0,
                 fields.cells(),
                 39.0,
                 -95.0,
@@ -4343,6 +4980,16 @@ mod tests {
             "site_name is a label — it must not move the data fingerprint"
         );
 
+        let larger_memory_budget = SyntheticRadarConfig {
+            temporal_memory_budget_mib: base.temporal_memory_budget_mib * 2,
+            ..base.clone()
+        };
+        assert_eq!(
+            larger_memory_budget.data_fingerprint(),
+            fingerprint,
+            "memory budget gates execution but does not alter a successful sample"
+        );
+
         // Every data-affecting field must move the fingerprint. `differs`
         // clones the base, applies one edit, and reports whether it changed.
         let differs = |mutate: &dyn Fn(&mut SyntheticRadarConfig)| {
@@ -4418,6 +5065,14 @@ mod tests {
         assert!(
             differs(&|c| c.scan_timing = ScanTiming::TimedVolume),
             "scan_timing"
+        );
+        assert!(
+            differs(&|c| c.atmosphere_time_mode = AtmosphereTimeMode::LinearAdjacent),
+            "atmosphere_time_mode"
+        );
+        assert!(
+            differs(&|c| c.missing_neighbor_policy = MissingNeighborPolicy::DropFrame),
+            "missing_neighbor_policy"
         );
         assert!(
             differs(&|c| c.rotation_rate_deg_s = 12.0),
