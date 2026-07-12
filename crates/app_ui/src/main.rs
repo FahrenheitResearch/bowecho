@@ -20629,17 +20629,7 @@ impl ViewerApp {
                 if self.simradar_truth_lab.open {
                     self.simradar_truth_lab.open = false;
                 } else {
-                    let source = if self.active_pane == 0 {
-                        self.volume.clone()
-                    } else {
-                        self.extra_pane_display_volume(self.active_pane - 1)
-                    };
-                    if let Some(volume) = source {
-                        self.simradar_truth_lab.open_with_volume(volume);
-                    } else {
-                        self.simradar_truth_lab.open = true;
-                        self.simradar_truth_lab.set_volume(None);
-                    }
+                    self.open_simradar_truth_lab_for_active_pane();
                 }
                 ui.close();
             }
@@ -20695,6 +20685,48 @@ impl ViewerApp {
         button.on_hover_text(
             "Data windows: Formula Lab · WRF · Models · Algorithm Truth Lab · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding",
         );
+    }
+
+    fn open_simradar_truth_lab_for_active_pane(&mut self) {
+        let (source, selected_cut) = if self.active_pane == 0 {
+            (self.volume.clone(), self.selected_cut)
+        } else {
+            let pane_slot = self.active_pane - 1;
+            (
+                self.extra_pane_display_volume(pane_slot),
+                self.extra_panes
+                    .get(pane_slot)
+                    .and_then(|pane| pane.cut)
+                    .unwrap_or(self.selected_cut),
+            )
+        };
+        let Some(volume) = source else {
+            self.simradar_truth_lab.open = true;
+            self.simradar_truth_lab.set_volume(None);
+            return;
+        };
+
+        // Resolve through the same process-wide production dealias cache used
+        // by rendering and analysis. A replay/synthetic pane has no earlier
+        // observed anchor, so Analyst 3D receives the honest no-anchor form.
+        let engine = self.dealias_engine;
+        let engine_label = match engine {
+            DealiasEngine::Region => "Region dealias",
+            DealiasEngine::RegionGlobal => "Region Global dealias",
+            DealiasEngine::Analyst3d => "Analyst 3D dealias (no external anchor)",
+        };
+        let dealiased = volume
+            .cuts
+            .get(selected_cut)
+            .filter(|cut| cut.moments.contains_key(&MomentType::Velocity))
+            .and_then(|_| resolve_dealiased_grid(&volume, None, None, selected_cut, engine));
+        self.simradar_truth_lab.open_with_volume(volume);
+        self.simradar_truth_lab.select_cut(selected_cut);
+        if let Some(grid) = dealiased {
+            let _ =
+                self.simradar_truth_lab
+                    .supply_dealiased_velocity(selected_cut, grid, engine_label);
+        }
     }
 
     /// Drain the embedded SimSat worker whether or not its pane is visible.

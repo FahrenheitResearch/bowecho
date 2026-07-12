@@ -273,6 +273,21 @@ impl AlgorithmTruthLabState {
         self.open = true;
     }
 
+    /// Start the lab on the pane's currently displayed cut. Invalid indices
+    /// are ignored so a just-replaced/shorter volume cannot create stale UI
+    /// state; the ordinary report error path remains reserved for real data
+    /// contract failures.
+    pub(crate) fn select_cut(&mut self, cut_index: usize) {
+        let Some(volume) = self.volume.as_ref() else {
+            return;
+        };
+        if cut_index >= volume.cuts.len() || self.selected_cut == cut_index {
+            return;
+        }
+        self.selected_cut = cut_index;
+        self.refresh_report();
+    }
+
     /// Replace the source behind an already-open lab. `None` leaves the window
     /// open with an honest empty state instead of retaining stale scorecards.
     pub(crate) fn set_volume(&mut self, volume: Option<Arc<RadarVolume>>) {
