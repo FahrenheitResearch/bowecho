@@ -2,13 +2,15 @@
 //! WRF simulated radar.
 //!
 //! Timed acquisition and atmosphere sampling are separate choices. The legacy
-//! renderer remains frozen at the volume start; [`AtmosphereTimeMode::LinearAdjacent`]
-//! requires a compatible later WRF scene covering the whole scan. Interpolation
+//! renderer remains frozen at the volume start; both adjacent-time modes
+//! require a compatible later WRF scene covering the whole scan. Interpolation
 //! weights are bounded per ray with no extrapolation. [`interpolate_raw_gate`]
-//! is the contract for a property-aware renderer: raw fields must be blended
-//! before nonlinear closure/scattering. The compatibility renderer can use the
-//! same plan for linear Z, wind, and additive scattering quantities, but must
-//! label that interpolation space explicitly rather than claiming raw state.
+//! is the generic raw-atmosphere contract, while
+//! [`interpolate_raw_state_linear`] also blends scheme-native P3/ISHMAEL
+//! properties before nonlinear closure/scattering. The compatibility renderer
+//! can use the same plan for linear Z, wind, and additive scattering
+//! quantities, but must label that interpolation space explicitly rather than
+//! claiming raw state.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -16,7 +18,12 @@ use std::hash::Hash;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
+use crate::wrf_property_reader::{
+    RawPropertyBlendError, RawPropertyCell, WeightedRawPropertyCell, WrfPropertyReadError,
+    WrfPropertyScene, blend_raw_property_cells,
+};
 use crate::wrf_scene_inventory::{WrfSceneGroup, WrfSceneLocator};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -29,6 +36,51 @@ pub enum AtmosphereTimeMode {
     /// the anchor to the next compatible model time using each ray's
     /// acquisition time. Consumers must stamp which representation they used.
     LinearAdjacent,
+    /// Interpolate raw thermodynamics, dynamics, and scheme-native
+    /// microphysics before nonlinear closure and scattering. This mode is
+    /// fail-closed when the adjacent raw inventories are not identical.
+    RawStateLinear,
+}
+
+impl AtmosphereTimeMode {
+    /// Concise user-facing label which does not overstate the interpolation
+    /// space used by the legacy derived-field path.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::FrozenAtVolumeStart => "Frozen at volume start",
+            Self::LinearAdjacent => "Linear adjacent (derived/additive)",
+            Self::RawStateLinear => "Raw-state linear (pre-closure)",
+        }
+    }
+
+    /// Stable value for scan provenance. `linear_adjacent` deliberately stays
+    /// unchanged for settings and files written before RawStateLinear existed.
+    #[must_use]
+    pub const fn provenance_name(self) -> &'static str {
+        match self {
+            Self::FrozenAtVolumeStart => "frozen_at_volume_start",
+            Self::LinearAdjacent => "linear_adjacent",
+            Self::RawStateLinear => "raw_state_linear",
+        }
+    }
+
+    /// Scientific space in which the temporal blend occurs.
+    #[must_use]
+    pub const fn interpolation_space_name(self) -> &'static str {
+        match self {
+            Self::FrozenAtVolumeStart => "anchor model state",
+            Self::LinearAdjacent => "linear Z, winds, and additive scattering quantities",
+            Self::RawStateLinear => {
+                "raw thermodynamics, dynamics, and scheme-native microphysics before closure/scattering"
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn uses_adjacent_scene(self) -> bool {
+        matches!(self, Self::LinearAdjacent | Self::RawStateLinear)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -63,6 +115,9 @@ pub struct TemporalScenePlan {
     pub neighbor: Option<WrfSceneLocator>,
     pub neighbor_time: Option<DateTime<Utc>>,
     pub scan_duration_ms: i64,
+    /// Retained so provenance can distinguish a derived/additive blend from a
+    /// raw-state pre-closure blend even though both use the same time bracket.
+    pub mode: AtmosphereTimeMode,
     pub outcome: TemporalSamplingOutcome,
 }
 
@@ -183,13 +238,14 @@ pub fn plan_for_scene(
         });
     }
 
-    if mode == AtmosphereTimeMode::FrozenAtVolumeStart {
+    if !mode.uses_adjacent_scene() {
         return Ok(Some(TemporalScenePlan {
             anchor: anchor.locator(),
             anchor_time,
             neighbor: None,
             neighbor_time: None,
             scan_duration_ms,
+            mode,
             outcome: TemporalSamplingOutcome::Frozen,
         }));
     }
@@ -209,6 +265,7 @@ pub fn plan_for_scene(
                     neighbor: None,
                     neighbor_time: None,
                     scan_duration_ms,
+                    mode,
                     outcome,
                 })
             },
@@ -230,6 +287,7 @@ pub fn plan_for_scene(
                 neighbor: Some(neighbor.locator()),
                 neighbor_time: Some(neighbor_time),
                 scan_duration_ms,
+                mode,
                 outcome: TemporalSamplingOutcome::HeldAnchor(HoldReason::ScanCrossesNeighbor),
             })),
             MissingNeighborPolicy::DropFrame => Ok(None),
@@ -247,6 +305,7 @@ pub fn plan_for_scene(
         neighbor: Some(neighbor.locator()),
         neighbor_time: Some(neighbor_time),
         scan_duration_ms,
+        mode,
         outcome: TemporalSamplingOutcome::LinearAdjacent,
     }))
 }
@@ -371,13 +430,41 @@ pub struct RawGateState {
     pub fields: BTreeMap<String, f32>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Error, PartialEq)]
 pub enum RawInterpolationError {
+    #[error("raw-state interpolation alpha {0} is outside the closed interval [0, 1]")]
     AlphaOutOfRange(f64),
+    #[error("raw-state interpolation has no left model coverage")]
     MissingLeftCoverage,
+    #[error("raw-state interpolation has no right model coverage")]
     MissingRightCoverage,
+    #[error("raw-state field inventory differs between model times")]
     FieldInventoryMismatch,
+    #[error("raw-state field {field} is non-finite")]
     NonFiniteValue { field: String },
+}
+
+fn validate_raw_gate_state(state: &RawGateState) -> Result<(), RawInterpolationError> {
+    for (field, value) in [
+        ("wind_u_mps", state.wind_u_mps),
+        ("wind_v_mps", state.wind_v_mps),
+        ("wind_w_mps", state.wind_w_mps),
+        ("temperature_k", state.temperature_k),
+        ("pressure_pa", state.pressure_pa),
+        ("air_density_kgm3", state.air_density_kgm3),
+    ] {
+        if !value.is_finite() {
+            return Err(RawInterpolationError::NonFiniteValue {
+                field: field.to_owned(),
+            });
+        }
+    }
+    if let Some((field, _)) = state.fields.iter().find(|(_, value)| !value.is_finite()) {
+        return Err(RawInterpolationError::NonFiniteValue {
+            field: field.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Interpolate two raw gate states. Missing domain coverage is never treated
@@ -391,14 +478,14 @@ pub fn interpolate_raw_gate(
         return Err(RawInterpolationError::AlphaOutOfRange(alpha));
     }
     if alpha == 0.0 {
-        return left
-            .cloned()
-            .ok_or(RawInterpolationError::MissingLeftCoverage);
+        let left = left.ok_or(RawInterpolationError::MissingLeftCoverage)?;
+        validate_raw_gate_state(left)?;
+        return Ok(left.clone());
     }
     if alpha == 1.0 {
-        return right
-            .cloned()
-            .ok_or(RawInterpolationError::MissingRightCoverage);
+        let right = right.ok_or(RawInterpolationError::MissingRightCoverage)?;
+        validate_raw_gate_state(right)?;
+        return Ok(right.clone());
     }
     let left = left.ok_or(RawInterpolationError::MissingLeftCoverage)?;
     let right = right.ok_or(RawInterpolationError::MissingRightCoverage)?;
@@ -430,6 +517,144 @@ pub fn interpolate_raw_gate(
             right.air_density_kgm3,
         )?,
         fields,
+    })
+}
+
+/// One covered endpoint for raw-state temporal interpolation. The property
+/// scene owns normalized scheme-native P3/ISHMAEL fields; `gate_state` carries
+/// the collocated thermodynamics/dynamics used by the renderer.
+#[derive(Clone, Copy, Debug)]
+pub struct RawStateLinearEndpoint<'a> {
+    pub property_scene: &'a WrfPropertyScene,
+    pub property_cell_index: usize,
+    pub gate_state: &'a RawGateState,
+}
+
+impl<'a> RawStateLinearEndpoint<'a> {
+    #[must_use]
+    pub const fn new(
+        property_scene: &'a WrfPropertyScene,
+        property_cell_index: usize,
+        gate_state: &'a RawGateState,
+    ) -> Self {
+        Self {
+            property_scene,
+            property_cell_index,
+            gate_state,
+        }
+    }
+}
+
+/// Raw, pre-closure gate state ready for exactly one nonlinear closure and
+/// scattering evaluation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawStateLinearCell {
+    pub property_cell: RawPropertyCell,
+    pub gate_state: RawGateState,
+}
+
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum RawStateLinearError {
+    #[error("raw-state temporal alpha {0} is outside the closed interval [0, 1]")]
+    AlphaOutOfRange(f64),
+    #[error("raw-state temporal interpolation has no left model coverage")]
+    MissingLeftCoverage,
+    #[error("raw-state temporal interpolation has no right model coverage")]
+    MissingRightCoverage,
+    #[error("raw-state temporal microphysics scheme differs: left {left}, right {right}")]
+    SchemeMismatch { left: i32, right: i32 },
+    #[error("raw-state temporal required-field inventory differs between model times")]
+    PropertyInventoryMismatch,
+    #[error("raw-state temporal property category layout differs between model times")]
+    PropertyCategoryLayoutMismatch,
+    #[error("raw-state temporal rain availability differs between model times")]
+    RainAvailabilityMismatch,
+    #[error(transparent)]
+    PropertyRead(#[from] WrfPropertyReadError),
+    #[error("blend raw property state: {0}")]
+    PropertyBlend(RawPropertyBlendError),
+    #[error("interpolate raw thermodynamics/dynamics: {0}")]
+    Gate(#[source] RawInterpolationError),
+}
+
+fn map_raw_property_blend_error(error: RawPropertyBlendError) -> RawStateLinearError {
+    match error {
+        RawPropertyBlendError::FieldSignatureMismatch { .. } => {
+            RawStateLinearError::PropertyInventoryMismatch
+        }
+        RawPropertyBlendError::CategoryLayoutMismatch { .. } => {
+            RawStateLinearError::PropertyCategoryLayoutMismatch
+        }
+        RawPropertyBlendError::RainAvailabilityMismatch { .. } => {
+            RawStateLinearError::RainAvailabilityMismatch
+        }
+        RawPropertyBlendError::Sample(source) => RawStateLinearError::PropertyRead(source),
+        other => RawStateLinearError::PropertyBlend(other),
+    }
+}
+
+fn exact_raw_state_endpoint(
+    endpoint: RawStateLinearEndpoint<'_>,
+) -> Result<RawStateLinearCell, RawStateLinearError> {
+    validate_raw_gate_state(endpoint.gate_state).map_err(RawStateLinearError::Gate)?;
+    Ok(RawStateLinearCell {
+        property_cell: endpoint
+            .property_scene
+            .raw_cell(endpoint.property_cell_index)?,
+        gate_state: endpoint.gate_state.clone(),
+    })
+}
+
+/// Interpolate complete raw state across two adjacent model times.
+///
+/// Alpha is closed and bounded; extrapolation is rejected. Exact endpoints
+/// need only their endpoint coverage and are returned without a zero-weight
+/// blend, preserving exact equality and source-cell provenance. Interior
+/// samples require both endpoints and exact agreement in microphysics scheme,
+/// normalized raw-field inventory/category layout, and rain availability.
+/// [`blend_raw_property_cells`] performs the property blend so nonlinear
+/// closure/scattering can occur exactly once afterward.
+pub fn interpolate_raw_state_linear(
+    left: Option<RawStateLinearEndpoint<'_>>,
+    right: Option<RawStateLinearEndpoint<'_>>,
+    alpha: f64,
+) -> Result<RawStateLinearCell, RawStateLinearError> {
+    if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+        return Err(RawStateLinearError::AlphaOutOfRange(alpha));
+    }
+    if alpha == 0.0 {
+        return exact_raw_state_endpoint(left.ok_or(RawStateLinearError::MissingLeftCoverage)?);
+    }
+    if alpha == 1.0 {
+        return exact_raw_state_endpoint(right.ok_or(RawStateLinearError::MissingRightCoverage)?);
+    }
+
+    let left = left.ok_or(RawStateLinearError::MissingLeftCoverage)?;
+    let right = right.ok_or(RawStateLinearError::MissingRightCoverage)?;
+    let left_scheme = left.property_scene.microphysics_scheme_id();
+    let right_scheme = right.property_scene.microphysics_scheme_id();
+    if left_scheme != right_scheme {
+        return Err(RawStateLinearError::SchemeMismatch {
+            left: left_scheme,
+            right: right_scheme,
+        });
+    }
+    if left.property_scene.required_field_signature()
+        != right.property_scene.required_field_signature()
+    {
+        return Err(RawStateLinearError::PropertyInventoryMismatch);
+    }
+
+    let property_cell = blend_raw_property_cells(&[
+        WeightedRawPropertyCell::new(left.property_scene, left.property_cell_index, 1.0 - alpha),
+        WeightedRawPropertyCell::new(right.property_scene, right.property_cell_index, alpha),
+    ])
+    .map_err(map_raw_property_blend_error)?;
+    let gate_state = interpolate_raw_gate(Some(left.gate_state), Some(right.gate_state), alpha)
+        .map_err(RawStateLinearError::Gate)?;
+    Ok(RawStateLinearCell {
+        property_cell,
+        gate_state,
     })
 }
 
@@ -564,11 +789,17 @@ impl<K: Eq + Hash, V> TwoSceneCache<K, V> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use chrono::TimeZone;
+    use radar_scattering::OrientationDefinition;
 
     use super::*;
+    use crate::wrf_property_reader::{
+        PropertyFieldProvider, RawPropertyField, WrfPropertyScene, close_raw_property_cell,
+        read_property_scene,
+    };
     use crate::wrf_scene_inventory::{
         WrfDomainId, WrfGridSignature, WrfRunDomain, WrfRunId, WrfScene, WrfSceneDiagnostics,
         WrfSceneGroupKey, WrfSceneTime, WrfSourceIdentity,
@@ -648,6 +879,19 @@ mod tests {
             plan.ray_alpha(3_600_001),
             Err(TemporalPlanError::RayPastScan { .. })
         ));
+
+        let raw_plan = plan_for_scene(
+            &group(&[0, 1]),
+            0,
+            Duration::minutes(30),
+            AtmosphereTimeMode::RawStateLinear,
+            MissingNeighborPolicy::Error,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw_plan.mode, AtmosphereTimeMode::RawStateLinear);
+        assert_eq!(raw_plan.outcome, TemporalSamplingOutcome::LinearAdjacent);
+        assert_eq!(raw_plan.ray_alpha(1_800_000).unwrap(), 0.5);
     }
 
     #[test]
@@ -752,6 +996,102 @@ mod tests {
         }
     }
 
+    struct TemporalPropertyProvider {
+        identity: WrfSourceIdentity,
+        scheme_id: i32,
+        fields: BTreeMap<&'static str, RawPropertyField>,
+    }
+
+    impl PropertyFieldProvider for TemporalPropertyProvider {
+        fn source_identity(&self) -> WrfSourceIdentity {
+            self.identity.clone()
+        }
+
+        fn microphysics_scheme_id(&self) -> Result<i32, String> {
+            Ok(self.scheme_id)
+        }
+
+        fn cell_count(&self) -> usize {
+            1
+        }
+
+        fn time_count(&self) -> usize {
+            1
+        }
+
+        fn has_field(&self, name: &str) -> bool {
+            self.fields.contains_key(name)
+        }
+
+        fn read_field(&self, name: &str, _time_index: usize) -> Result<RawPropertyField, String> {
+            self.fields
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("{name} absent"))
+        }
+
+        fn clear_cache(&self) {}
+    }
+
+    fn property_provider(
+        name: &str,
+        scheme_id: i32,
+        temperature_k: f64,
+        qice: f64,
+        qnice: f64,
+        qir: f64,
+        qib: f64,
+        rain: Option<(f64, f64)>,
+    ) -> TemporalPropertyProvider {
+        let mut fields = BTreeMap::from([
+            ("QICE", RawPropertyField::new(vec![qice], "kg kg-1")),
+            ("QNICE", RawPropertyField::new(vec![qnice], "kg-1")),
+            ("QIR", RawPropertyField::new(vec![qir], "kg kg-1")),
+            ("QIB", RawPropertyField::new(vec![qib], "m3 kg-1")),
+            ("T", RawPropertyField::new(vec![temperature_k - 300.0], "K")),
+            ("P", RawPropertyField::new(vec![0.0], "Pa")),
+            ("PB", RawPropertyField::new(vec![100_000.0], "Pa")),
+            ("QVAPOR", RawPropertyField::new(vec![0.0], "kg kg-1")),
+        ]);
+        if let Some((qrain, qnrain)) = rain {
+            fields.insert("QRAIN", RawPropertyField::new(vec![qrain], "kg kg-1"));
+            fields.insert("QNRAIN", RawPropertyField::new(vec![qnrain], "kg-1"));
+        }
+        TemporalPropertyProvider {
+            identity: WrfSourceIdentity(name.to_owned()),
+            scheme_id,
+            fields,
+        }
+    }
+
+    fn property_scene(
+        name: &str,
+        temperature_k: f64,
+        qice: f64,
+        qnice: f64,
+        qir: f64,
+        qib: f64,
+        rain: Option<(f64, f64)>,
+    ) -> WrfPropertyScene {
+        read_property_scene(
+            &property_provider(name, 50, temperature_k, qice, qnice, qir, qib, rain),
+            0,
+        )
+        .unwrap()
+    }
+
+    fn endpoint_gate(temperature_k: f32, qrain: f32, wind_u_mps: f32) -> RawGateState {
+        RawGateState {
+            wind_u_mps,
+            wind_v_mps: -5.0,
+            wind_w_mps: 1.0,
+            temperature_k,
+            pressure_pa: 100_000.0,
+            air_density_kgm3: 100_000.0 / (287.05 * temperature_k),
+            fields: [("QRAIN".to_owned(), qrain)].into_iter().collect(),
+        }
+    }
+
     #[test]
     fn raw_state_interpolation_supports_echo_birth_and_exact_endpoints() {
         let clear = raw(0.0, 10.0);
@@ -766,6 +1106,209 @@ mod tests {
         assert_eq!(
             interpolate_raw_gate(None, Some(&storm), 1.0).unwrap(),
             storm
+        );
+    }
+
+    #[test]
+    fn raw_state_linear_preserves_endpoints_and_supports_echo_birth_and_decay() {
+        let clear_scene = property_scene("clear", 268.0, 0.0, 0.0, 0.0, 0.0, Some((0.0, 0.0)));
+        let echo_scene = property_scene(
+            "echo",
+            272.0,
+            1.0e-4,
+            1.0e6,
+            4.0e-5,
+            1.0e-7,
+            Some((2.0e-3, 1.0e6)),
+        );
+        let clear_gate = endpoint_gate(268.0, 0.0, 10.0);
+        let echo_gate = endpoint_gate(272.0, 2.0e-3, 30.0);
+        let clear = RawStateLinearEndpoint::new(&clear_scene, 0, &clear_gate);
+        let echo = RawStateLinearEndpoint::new(&echo_scene, 0, &echo_gate);
+
+        let left_endpoint = interpolate_raw_state_linear(Some(clear), None, 0.0).unwrap();
+        assert_eq!(
+            left_endpoint.property_cell,
+            clear_scene.raw_cell(0).unwrap()
+        );
+        assert_eq!(left_endpoint.gate_state, clear_gate);
+        let right_endpoint = interpolate_raw_state_linear(None, Some(echo), 1.0).unwrap();
+        assert_eq!(
+            right_endpoint.property_cell,
+            echo_scene.raw_cell(0).unwrap()
+        );
+        assert_eq!(right_endpoint.gate_state, echo_gate);
+
+        let birth = interpolate_raw_state_linear(Some(clear), Some(echo), 0.25).unwrap();
+        assert!((birth.gate_state.fields["QRAIN"] - 5.0e-4).abs() < 1.0e-9);
+        assert_eq!(birth.gate_state.wind_u_mps, 15.0);
+        assert_eq!(birth.property_cell.source_cell_index(), None);
+        assert!((birth.property_cell.environment().temperature_k() - 269.0).abs() < 2.0e-5);
+        assert!((birth.property_cell.categories()[0].mixing_ratio_kgkg() - 2.5e-5).abs() < 1.0e-10);
+
+        let decay = interpolate_raw_state_linear(Some(echo), Some(clear), 0.75).unwrap();
+        assert!((decay.property_cell.categories()[0].mixing_ratio_kgkg() - 2.5e-5).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn raw_state_closure_is_not_additive_endpoint_interpolation() {
+        let left_scene = property_scene(
+            "left",
+            268.0,
+            1.0e-4,
+            1.0e6,
+            4.0e-5,
+            1.0e-7,
+            Some((0.0, 0.0)),
+        );
+        let right_scene = property_scene(
+            "right",
+            272.0,
+            8.0e-4,
+            2.0e6,
+            3.2e-4,
+            8.0e-7,
+            Some((0.0, 0.0)),
+        );
+        let left_gate = endpoint_gate(268.0, 0.0, 10.0);
+        let right_gate = endpoint_gate(272.0, 0.0, 30.0);
+        let midpoint = interpolate_raw_state_linear(
+            Some(RawStateLinearEndpoint::new(&left_scene, 0, &left_gate)),
+            Some(RawStateLinearEndpoint::new(&right_scene, 0, &right_gate)),
+            0.5,
+        )
+        .unwrap();
+        let left_closed = close_raw_property_cell(
+            &left_scene.raw_cell(0).unwrap(),
+            OrientationDefinition::SchemeDefault,
+        )
+        .unwrap();
+        let right_closed = close_raw_property_cell(
+            &right_scene.raw_cell(0).unwrap(),
+            OrientationDefinition::SchemeDefault,
+        )
+        .unwrap();
+        let midpoint_closed = close_raw_property_cell(
+            &midpoint.property_cell,
+            OrientationDefinition::SchemeDefault,
+        )
+        .unwrap();
+        let additive_diameter = 0.5
+            * (left_closed.categories()[0]
+                .closed()
+                .characteristic_diameter_m()
+                .value()
+                + right_closed.categories()[0]
+                    .closed()
+                    .characteristic_diameter_m()
+                    .value());
+        let raw_state_diameter = midpoint_closed.categories()[0]
+            .closed()
+            .characteristic_diameter_m()
+            .value();
+        assert!(
+            (raw_state_diameter - additive_diameter).abs() > 1.0e-8,
+            "nonlinear closure must follow raw-state blending, not endpoint-output averaging"
+        );
+    }
+
+    #[test]
+    fn raw_state_linear_rejects_scheme_inventory_rain_and_extrapolation_mismatches() {
+        let left_provider = property_provider(
+            "left",
+            50,
+            270.0,
+            1.0e-4,
+            1.0e6,
+            4.0e-5,
+            1.0e-7,
+            Some((1.0e-4, 1.0e6)),
+        );
+        let left_scene = read_property_scene(&left_provider, 0).unwrap();
+        let gate = endpoint_gate(270.0, 1.0e-4, 20.0);
+        let left = RawStateLinearEndpoint::new(&left_scene, 0, &gate);
+
+        let scheme_scene = read_property_scene(
+            &property_provider(
+                "scheme",
+                51,
+                270.0,
+                1.0e-4,
+                1.0e6,
+                4.0e-5,
+                1.0e-7,
+                Some((1.0e-4, 1.0e6)),
+            ),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            interpolate_raw_state_linear(
+                Some(left),
+                Some(RawStateLinearEndpoint::new(&scheme_scene, 0, &gate)),
+                0.5,
+            ),
+            Err(RawStateLinearError::SchemeMismatch {
+                left: 50,
+                right: 51,
+            })
+        );
+
+        let inventory_scene =
+            property_scene("inventory", 270.0, 1.0e-4, 1.0e6, 4.0e-5, 1.0e-7, None);
+        assert_eq!(
+            interpolate_raw_state_linear(
+                Some(left),
+                Some(RawStateLinearEndpoint::new(&inventory_scene, 0, &gate)),
+                0.5,
+            ),
+            Err(RawStateLinearError::PropertyInventoryMismatch)
+        );
+
+        let invalid_rain_scene = property_scene(
+            "invalid-rain",
+            270.0,
+            1.0e-4,
+            1.0e6,
+            4.0e-5,
+            1.0e-7,
+            Some((1.0e-4, 0.0)),
+        );
+        assert_eq!(
+            interpolate_raw_state_linear(
+                Some(left),
+                Some(RawStateLinearEndpoint::new(&invalid_rain_scene, 0, &gate,)),
+                0.5,
+            ),
+            Err(RawStateLinearError::RainAvailabilityMismatch)
+        );
+        assert!(matches!(
+            interpolate_raw_state_linear(Some(left), Some(left), 1.000_001),
+            Err(RawStateLinearError::AlphaOutOfRange(_))
+        ));
+    }
+
+    #[test]
+    fn atmosphere_time_mode_serde_keeps_legacy_linear_adjacent_stable() {
+        assert_eq!(
+            serde_json::from_str::<AtmosphereTimeMode>("\"linear_adjacent\"").unwrap(),
+            AtmosphereTimeMode::LinearAdjacent
+        );
+        assert_eq!(
+            serde_json::to_string(&AtmosphereTimeMode::LinearAdjacent).unwrap(),
+            "\"linear_adjacent\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AtmosphereTimeMode>("\"raw_state_linear\"").unwrap(),
+            AtmosphereTimeMode::RawStateLinear
+        );
+        assert_eq!(
+            AtmosphereTimeMode::LinearAdjacent.interpolation_space_name(),
+            "linear Z, winds, and additive scattering quantities"
+        );
+        assert_eq!(
+            AtmosphereTimeMode::RawStateLinear.provenance_name(),
+            "raw_state_linear"
         );
     }
 
