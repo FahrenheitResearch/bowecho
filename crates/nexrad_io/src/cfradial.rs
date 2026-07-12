@@ -95,6 +95,32 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     volume.metadata.compression = Some("cfradial1-netcdf3".to_owned());
     volume.metadata.scan_mode = combined_scan_mode(&sweep_modes);
     volume.metadata.radar_frequency_mhz = cfradial_radar_frequency_mhz(&file);
+    volume.metadata.beam_width_h_deg =
+        cfradial_beam_width_deg(&file, &["radar_beam_width_h", "radar_beam_width_h_deg"]);
+    volume.metadata.beam_width_v_deg =
+        cfradial_beam_width_deg(&file, &["radar_beam_width_v", "radar_beam_width_v_deg"]);
+    volume.metadata.pulse_width_us = cfradial_pulse_width_us(&file);
+    volume.metadata.prt_s = cfradial_prt_s(&file);
+    volume.metadata.unambiguous_range_km = cfradial_unambiguous_range_km(&file);
+    volume.metadata.scan_name = metadata_text(&file, "scan_name");
+    volume.metadata.scan_id = metadata_text(&file, "scan_id").or_else(|| {
+        file.gattr_f64("scan_id")
+            .filter(|value| value.is_finite())
+            .map(|value| {
+                if value.fract() == 0.0 {
+                    format!("{value:.0}")
+                } else {
+                    value.to_string()
+                }
+            })
+    });
+    volume.metadata.polarization = metadata_text(&file, "polarization");
+    volume.metadata.calibration = metadata_text(&file, "calibration");
+    volume.metadata.forward_operator = metadata_text(&file, "forward_operator");
+    volume.metadata.forward_operator_config = metadata_text(&file, "forward_operator_config");
+    volume.metadata.source_model = metadata_text(&file, "source_model");
+    volume.metadata.microphysics_scheme = metadata_text(&file, "microphysics_scheme");
+    volume.metadata.scattering_model = metadata_text(&file, "scattering_model");
 
     // Ray times (seconds offset from time_coverage_start).
     let ray_seconds = read_f64s(&file, "time").ok();
@@ -379,6 +405,15 @@ fn parse_time_coverage_start(file: &Nc3File<'_>) -> Option<DateTime<Utc>> {
 }
 
 fn cfradial_radar_frequency_mhz(file: &Nc3File<'_>) -> Option<u32> {
+    // CfRadial's instrument-parameter coordinate is a numeric
+    // `frequency(frequency)` variable in Hz. Prefer it over the historical
+    // global-attribute spellings below so a standards-compliant file wins
+    // even when a stale compatibility attribute is also present.
+    if let Some(value) = numeric_var_first(file, "frequency")
+        && let Some(mhz) = normalize_frequency_mhz(value)
+    {
+        return Some(mhz);
+    }
     for name in [
         "radar_frequency",
         "frequency",
@@ -399,6 +434,111 @@ fn cfradial_radar_frequency_mhz(file: &Nc3File<'_>) -> Option<u32> {
         }
     }
     None
+}
+
+fn cfradial_beam_width_deg(file: &Nc3File<'_>, names: &[&str]) -> Option<f32> {
+    for name in names {
+        if let Some(value) = numeric_var_first(file, name).or_else(|| file.gattr_f64(name)) {
+            let units = file
+                .vars
+                .get(*name)
+                .and_then(|var| var.attr_str("units"))
+                .unwrap_or("degrees")
+                .to_ascii_lowercase();
+            let degrees = if units.contains("rad") {
+                value.to_degrees()
+            } else {
+                value
+            };
+            if degrees.is_finite() && degrees > 0.0 && degrees <= 180.0 {
+                return Some(degrees as f32);
+            }
+        }
+    }
+    None
+}
+
+fn cfradial_pulse_width_us(file: &Nc3File<'_>) -> Option<f32> {
+    if let Some(seconds) = time_var_seconds(file, "pulse_width") {
+        return positive_f32(seconds * 1.0e6);
+    }
+    file.gattr_f64("pulse_width_us")
+        .and_then(positive_f32)
+        .or_else(|| {
+            file.gattr_f64("pulse_width")
+                .and_then(|seconds| positive_f32(seconds * 1.0e6))
+        })
+}
+
+fn cfradial_prt_s(file: &Nc3File<'_>) -> Option<f32> {
+    if let Some(seconds) = time_var_seconds(file, "prt") {
+        return positive_f32(seconds);
+    }
+    file.gattr_f64("prt_s")
+        .or_else(|| file.gattr_f64("prt"))
+        .and_then(positive_f32)
+}
+
+fn cfradial_unambiguous_range_km(file: &Nc3File<'_>) -> Option<f32> {
+    if let Some(value) = numeric_var_first(file, "unambiguous_range") {
+        let units = file
+            .vars
+            .get("unambiguous_range")
+            .and_then(|var| var.attr_str("units"))
+            .unwrap_or("meters")
+            .to_ascii_lowercase();
+        let km = if units.contains("kilometer") || units.contains("kilometre") || units == "km" {
+            value
+        } else {
+            value / 1000.0
+        };
+        return positive_f32(km);
+    }
+    file.gattr_f64("unambiguous_range_km")
+        .and_then(positive_f32)
+        .or_else(|| {
+            file.gattr_f64("unambiguous_range")
+                .and_then(|meters| positive_f32(meters / 1000.0))
+        })
+}
+
+fn numeric_var_first(file: &Nc3File<'_>, name: &str) -> Option<f64> {
+    let values = file.read_var(name).ok()?;
+    (0..values.len()).find_map(|index| {
+        values
+            .get_f64(index)
+            .filter(|value| value.is_finite() && *value > 0.0)
+    })
+}
+
+fn time_var_seconds(file: &Nc3File<'_>, name: &str) -> Option<f64> {
+    let value = numeric_var_first(file, name)?;
+    let units = file
+        .vars
+        .get(name)
+        .and_then(|var| var.attr_str("units"))
+        .unwrap_or("seconds")
+        .trim()
+        .to_ascii_lowercase();
+    let seconds = if units.contains("microsecond") || matches!(units.as_str(), "us" | "µs") {
+        value * 1.0e-6
+    } else if units.contains("millisecond") || units == "ms" {
+        value * 1.0e-3
+    } else {
+        value
+    };
+    seconds.is_finite().then_some(seconds)
+}
+
+fn positive_f32(value: f64) -> Option<f32> {
+    (value.is_finite() && value > 0.0 && value <= f32::MAX as f64).then_some(value as f32)
+}
+
+fn metadata_text(file: &Nc3File<'_>, name: &str) -> Option<String> {
+    file.gattr_str(name)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn normalize_frequency_mhz(value: f64) -> Option<u32> {

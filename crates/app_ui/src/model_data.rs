@@ -208,6 +208,51 @@ struct SyntheticRadarUiState {
     /// model native.
     #[serde(default)]
     reflectivity_operator: crate::wrf_radar::ReflectivityOperator,
+    /// Named intent plus the forward-operator controls introduced by the
+    /// deeper simulated-radar path. Every field is persisted explicitly so a
+    /// tuned virtual instrument is reproducible across restarts; the serde
+    /// defaults below deliberately reproduce the shipped Presentation mode
+    /// for settings written before these controls existed.
+    #[serde(default)]
+    simulation_mode: crate::wrf_radar::SimulationMode,
+    #[serde(default)]
+    reflectivity_sampling: crate::wrf_radar::ReflectivitySampling,
+    #[serde(default)]
+    beam_integration: crate::wrf_radar::BeamIntegration,
+    #[serde(default = "default_synth_beam_width_deg")]
+    beam_width_deg: f32,
+    #[serde(default = "default_synth_pulse_width_us")]
+    pulse_width_us: f32,
+    #[serde(default = "default_synth_radar_frequency_mhz")]
+    radar_frequency_mhz: u32,
+    #[serde(default)]
+    terminal_fall_speed: bool,
+    #[serde(default)]
+    terrain_blockage: bool,
+    #[serde(default)]
+    spectrum_width: bool,
+    #[serde(default = "default_synth_spectrum_width_floor_mps")]
+    spectrum_width_floor_mps: f32,
+    #[serde(default)]
+    dual_pol: bool,
+    #[serde(default)]
+    propagation: bool,
+    #[serde(default)]
+    system_phidp_deg: f32,
+    #[serde(default)]
+    zdr_bias_db: f32,
+    #[serde(default)]
+    scan_timing: crate::wrf_radar::ScanTiming,
+    #[serde(default = "default_synth_rotation_rate_deg_s")]
+    rotation_rate_deg_s: f32,
+    #[serde(default = "default_synth_transition_delay_s")]
+    transition_delay_s: f32,
+    #[serde(default = "default_synth_prf_hz")]
+    prf_hz: f32,
+    #[serde(default)]
+    instrument_noise: bool,
+    #[serde(default = "default_synth_sensitivity_dbz_at_1km")]
+    sensitivity_dbz_at_1km: f32,
     /// Opt-in extra 0.1° tilt below the standard 0.5° lowest tilt (the
     /// community exports start here). Off restores the classic ladder.
     #[serde(default)]
@@ -245,6 +290,38 @@ fn default_fold_nyquist_mps() -> f32 {
     crate::wrf_radar::DEFAULT_FOLD_NYQUIST_MPS
 }
 
+fn default_synth_beam_width_deg() -> f32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().beam_width_deg
+}
+
+fn default_synth_pulse_width_us() -> f32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().pulse_width_us
+}
+
+fn default_synth_radar_frequency_mhz() -> u32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().radar_frequency_mhz
+}
+
+fn default_synth_spectrum_width_floor_mps() -> f32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().spectrum_width_floor_mps
+}
+
+fn default_synth_rotation_rate_deg_s() -> f32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().rotation_rate_deg_s
+}
+
+fn default_synth_transition_delay_s() -> f32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().transition_delay_s
+}
+
+fn default_synth_prf_hz() -> f32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().prf_hz
+}
+
+fn default_synth_sensitivity_dbz_at_1km() -> f32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().sensitivity_dbz_at_1km
+}
+
 impl Default for SyntheticRadarUiState {
     fn default() -> Self {
         Self {
@@ -259,6 +336,26 @@ impl Default for SyntheticRadarUiState {
             ref_gate_texture: true,
             vel_gate_texture: false,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::default(),
+            simulation_mode: crate::wrf_radar::SimulationMode::default(),
+            reflectivity_sampling: crate::wrf_radar::ReflectivitySampling::default(),
+            beam_integration: crate::wrf_radar::BeamIntegration::default(),
+            beam_width_deg: default_synth_beam_width_deg(),
+            pulse_width_us: default_synth_pulse_width_us(),
+            radar_frequency_mhz: default_synth_radar_frequency_mhz(),
+            terminal_fall_speed: false,
+            terrain_blockage: false,
+            spectrum_width: false,
+            spectrum_width_floor_mps: default_synth_spectrum_width_floor_mps(),
+            dual_pol: false,
+            propagation: false,
+            system_phidp_deg: 0.0,
+            zdr_bias_db: 0.0,
+            scan_timing: crate::wrf_radar::ScanTiming::default(),
+            rotation_rate_deg_s: default_synth_rotation_rate_deg_s(),
+            transition_delay_s: default_synth_transition_delay_s(),
+            prf_hz: default_synth_prf_hz(),
+            instrument_noise: false,
+            sensitivity_dbz_at_1km: default_synth_sensitivity_dbz_at_1km(),
             include_low_tilt: false,
             clutter_intensity: 0.0,
             fold_velocity: false,
@@ -279,6 +376,44 @@ impl SyntheticRadarUiState {
     /// Gate count of the classic default volume (230 km / 250 m); auto
     /// spacing preserves it as the range grows.
     const DEFAULT_GATE_COUNT: f64 = 920.0;
+
+    /// Apply only the controls owned by a named mode. This mirrors the
+    /// backend preset exactly, but it runs solely in response to an explicit
+    /// mode-button click; expert edits are otherwise left untouched.
+    fn apply_mode_preset(&mut self, mode: crate::wrf_radar::SimulationMode) {
+        let mut preset = crate::wrf_radar::SyntheticRadarConfig {
+            simulation_mode: self.simulation_mode,
+            reflectivity_sampling: self.reflectivity_sampling,
+            beam_integration: self.beam_integration,
+            terminal_fall_speed: self.terminal_fall_speed,
+            terrain_blockage: self.terrain_blockage,
+            spectrum_width: self.spectrum_width,
+            dual_pol: self.dual_pol,
+            propagation: self.propagation,
+            scan_timing: self.scan_timing,
+            instrument_noise: self.instrument_noise,
+            ref_gate_texture: self.ref_gate_texture,
+            vel_gate_texture: self.vel_gate_texture,
+            clutter_intensity: self.clutter_intensity,
+            fold_velocity: self.fold_velocity,
+            ..crate::wrf_radar::SyntheticRadarConfig::default()
+        };
+        preset.apply_mode_preset(mode);
+        self.simulation_mode = preset.simulation_mode;
+        self.reflectivity_sampling = preset.reflectivity_sampling;
+        self.beam_integration = preset.beam_integration;
+        self.terminal_fall_speed = preset.terminal_fall_speed;
+        self.terrain_blockage = preset.terrain_blockage;
+        self.spectrum_width = preset.spectrum_width;
+        self.dual_pol = preset.dual_pol;
+        self.propagation = preset.propagation;
+        self.scan_timing = preset.scan_timing;
+        self.instrument_noise = preset.instrument_noise;
+        self.ref_gate_texture = preset.ref_gate_texture;
+        self.vel_gate_texture = preset.vel_gate_texture;
+        self.clutter_intensity = preset.clutter_intensity;
+        self.fold_velocity = preset.fold_velocity;
+    }
 
     fn clamped_range_km(&self) -> f64 {
         let range = self.max_range_km;
@@ -330,6 +465,26 @@ impl SyntheticRadarUiState {
             ref_gate_texture: self.ref_gate_texture,
             vel_gate_texture: self.vel_gate_texture,
             reflectivity_operator: self.reflectivity_operator,
+            simulation_mode: self.simulation_mode,
+            reflectivity_sampling: self.reflectivity_sampling,
+            beam_integration: self.beam_integration,
+            beam_width_deg: self.beam_width_deg,
+            pulse_width_us: self.pulse_width_us,
+            radar_frequency_mhz: self.radar_frequency_mhz,
+            terminal_fall_speed: self.terminal_fall_speed,
+            terrain_blockage: self.terrain_blockage,
+            spectrum_width: self.spectrum_width,
+            spectrum_width_floor_mps: self.spectrum_width_floor_mps,
+            dual_pol: self.dual_pol,
+            propagation: self.propagation,
+            system_phidp_deg: self.system_phidp_deg,
+            zdr_bias_db: self.zdr_bias_db,
+            scan_timing: self.scan_timing,
+            rotation_rate_deg_s: self.rotation_rate_deg_s,
+            transition_delay_s: self.transition_delay_s,
+            prf_hz: self.prf_hz,
+            instrument_noise: self.instrument_noise,
+            sensitivity_dbz_at_1km: self.sensitivity_dbz_at_1km,
             elevations_deg: crate::wrf_radar::elevation_ladder(self.include_low_tilt),
             clutter_intensity: self.clutter_intensity.clamp(0.0, 1.0),
             fold_velocity: self.fold_velocity,
@@ -2295,6 +2450,50 @@ impl ModelDataDock {
                     .weak(),
                 );
                 ui.add_enabled_ui(!busy, |ui| {
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Simulation mode").strong());
+                        for (mode, label, help) in [
+                            (
+                                crate::wrf_radar::SimulationMode::Truth,
+                                "Truth",
+                                "Model truth: one model instant, center sampling, no virtual-instrument effects.",
+                            ),
+                            (
+                                crate::wrf_radar::SimulationMode::Instrument,
+                                "Instrument",
+                                "Virtual S-band radar: beam integration, scatterer fall speed, blockage, dual-pol, propagation, scan timing, and sensitivity.",
+                            ),
+                            (
+                                crate::wrf_radar::SimulationMode::Presentation,
+                                "Presentation",
+                                "Display-oriented output: linear-Z center sampling with reflectivity texture and no measurement effects.",
+                            ),
+                        ] {
+                            if ui
+                                .selectable_label(state.simulation_mode == mode, label)
+                                .on_hover_text(format!(
+                                    "{help} Clicking applies this preset once; controls remain independently editable afterward."
+                                ))
+                                .clicked()
+                            {
+                                state.apply_mode_preset(mode);
+                            }
+                        }
+                    });
+                    let mode_summary = match state.simulation_mode {
+                        crate::wrf_radar::SimulationMode::Truth => {
+                            "Truth preset active · direct model scene"
+                        }
+                        crate::wrf_radar::SimulationMode::Instrument => {
+                            "Instrument preset active · virtual S-band measurement"
+                        }
+                        crate::wrf_radar::SimulationMode::Presentation => {
+                            "Presentation preset active · display-oriented gates"
+                        }
+                    };
+                    ui.label(egui::RichText::new(mode_summary).small().weak());
+                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.selectable_value(
                             &mut state.placement,
@@ -2462,6 +2661,10 @@ impl ModelDataDock {
                             .weak(),
                         );
                     }
+                    egui::CollapsingHeader::new("Presentation & velocity")
+                        .id_salt("wrf_synth_radar_presentation")
+                        .default_open(false)
+                        .show(ui, |ui| {
                     ui.checkbox(&mut state.ref_gate_texture, "Gate texture (reflectivity)")
                         .on_hover_text(
                             "Add subtle, deterministic gate-to-gate speckle (a couple of \
@@ -2548,6 +2751,204 @@ impl ModelDataDock {
                              so hooks stand out of moderate echo.",
                         );
                     });
+                        });
+
+                    egui::CollapsingHeader::new("Physics & moments")
+                        .id_salt("wrf_synth_radar_physics")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Reflectivity sampling:");
+                                ui.selectable_value(
+                                    &mut state.reflectivity_sampling,
+                                    crate::wrf_radar::ReflectivitySampling::LinearZ,
+                                    "Linear Z",
+                                )
+                                .on_hover_text(
+                                    "Average received power in linear reflectivity before converting to dBZ. This is the scientific default.",
+                                );
+                                ui.selectable_value(
+                                    &mut state.reflectivity_sampling,
+                                    crate::wrf_radar::ReflectivitySampling::LegacyDbz,
+                                    "Legacy dBZ",
+                                )
+                                .on_hover_text(
+                                    "Directly interpolate dBZ to reproduce older BowEcho simulated-radar renders.",
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Pulse volume:");
+                                ui.selectable_value(
+                                    &mut state.beam_integration,
+                                    crate::wrf_radar::BeamIntegration::Center,
+                                    "Center",
+                                )
+                                .on_hover_text("One center sample per gate; fastest.");
+                                ui.selectable_value(
+                                    &mut state.beam_integration,
+                                    crate::wrf_radar::BeamIntegration::Balanced,
+                                    "Balanced (9)",
+                                )
+                                .on_hover_text(
+                                    "Nine deterministic Gaussian-weighted samples across the beam and pulse.",
+                                );
+                                ui.selectable_value(
+                                    &mut state.beam_integration,
+                                    crate::wrf_radar::BeamIntegration::Reference,
+                                    "Reference (27)",
+                                )
+                                .on_hover_text(
+                                    "Full 3 x 3 x 3 deterministic quadrature; highest fidelity and slowest.",
+                                );
+                            });
+                            ui.checkbox(
+                                &mut state.terminal_fall_speed,
+                                "Scatterer-weighted Doppler + terminal fall speed",
+                            )
+                            .on_hover_text(
+                                "Weight radial velocity by returned power and include hydrometeor terminal fall speed when raw model species are available.",
+                            );
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut state.spectrum_width, "Spectrum width (SW)")
+                                    .on_hover_text(
+                                        "Emit SW from pulse-volume velocity variance, model TKE/fall-speed diversity when available, and the floor at right.",
+                                    );
+                                ui.add_enabled(
+                                    state.spectrum_width,
+                                    egui::DragValue::new(
+                                        &mut state.spectrum_width_floor_mps,
+                                    )
+                                    .range(0.0..=10.0)
+                                    .speed(0.1)
+                                    .suffix(" m/s floor"),
+                                );
+                            });
+                            ui.checkbox(&mut state.dual_pol, "S-band dual polarization")
+                                .on_hover_text(
+                                    "Derive ZH, ZDR, rhoHV, KDP, PhiDP and attenuation from raw WRF bulk hydrometeors when the microphysics scheme is supported.",
+                                );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Scheme-aware bulk S-band Rayleigh operator. Unsupported P3/ISHMAEL or missing hydrometeor fields fall back explicitly to REF/VEL; this is not a T-matrix solver.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
+
+                    egui::CollapsingHeader::new("Instrument & propagation")
+                        .id_salt("wrf_synth_radar_instrument")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("S-band:");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.radar_frequency_mhz)
+                                        .range(2_000..=4_000)
+                                        .speed(10)
+                                        .suffix(" MHz"),
+                                )
+                                .on_hover_text(
+                                    "Transmit frequency written to the volume and CfRadial provenance.",
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut state.beam_width_deg)
+                                        .range(0.1..=5.0)
+                                        .speed(0.05)
+                                        .suffix(" deg beam"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut state.pulse_width_us)
+                                        .range(0.1..=10.0)
+                                        .speed(0.05)
+                                        .suffix(" us pulse"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut state.prf_hz)
+                                        .range(100.0..=5_000.0)
+                                        .speed(25.0)
+                                        .suffix(" Hz PRF"),
+                                );
+                            });
+                            ui.checkbox(
+                                &mut state.terrain_blockage,
+                                "Terrain horizon + partial beam blockage",
+                            )
+                            .on_hover_text(
+                                "Apply cumulative terrain-horizon blockage along each radial, including partial beam occultation.",
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Scan timing:");
+                                ui.selectable_value(
+                                    &mut state.scan_timing,
+                                    crate::wrf_radar::ScanTiming::InstantaneousTruth,
+                                    "Instantaneous",
+                                );
+                                ui.selectable_value(
+                                    &mut state.scan_timing,
+                                    crate::wrf_radar::ScanTiming::TimedVolume,
+                                    "Timed volume",
+                                )
+                                .on_hover_text(
+                                    "Assign per-ray acquisition offsets while sampling the same WRF model time.",
+                                );
+                                let timed = matches!(
+                                    state.scan_timing,
+                                    crate::wrf_radar::ScanTiming::TimedVolume
+                                );
+                                ui.add_enabled(
+                                    timed,
+                                    egui::DragValue::new(&mut state.rotation_rate_deg_s)
+                                        .range(1.0..=60.0)
+                                        .speed(0.5)
+                                        .suffix(" deg/s"),
+                                );
+                                ui.add_enabled(
+                                    timed,
+                                    egui::DragValue::new(&mut state.transition_delay_s)
+                                        .range(0.0..=30.0)
+                                        .speed(0.25)
+                                        .suffix(" s transition"),
+                                );
+                            });
+                            ui.add_enabled_ui(state.dual_pol, |ui| {
+                                ui.checkbox(
+                                    &mut state.propagation,
+                                    "Radial propagation (PhiDP + differential attenuation)",
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Calibration:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut state.system_phidp_deg)
+                                            .range(-180.0..=180.0)
+                                            .speed(0.25)
+                                            .suffix(" deg PhiDP"),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(&mut state.zdr_bias_db)
+                                            .range(-5.0..=5.0)
+                                            .speed(0.05)
+                                            .suffix(" dB ZDR"),
+                                    );
+                                });
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(
+                                    &mut state.instrument_noise,
+                                    "Range-dependent sensitivity",
+                                );
+                                ui.add_enabled(
+                                    state.instrument_noise,
+                                    egui::DragValue::new(
+                                        &mut state.sensitivity_dbz_at_1km,
+                                    )
+                                    .range(-80.0..=20.0)
+                                    .speed(0.5)
+                                    .suffix(" dBZ at 1 km"),
+                                );
+                            });
+                        });
+
                     ui.checkbox(
                         &mut state.include_low_tilt,
                         "Include 0.1° low tilt (community lowest tilt)",
@@ -2561,10 +2962,10 @@ impl ModelDataDock {
                     if ui
                         .button("Reset to defaults")
                         .on_hover_text(
-                            "Domain centre, 230 km range, 250 m gates, textured reflectivity \
-                             gates, clean velocity, model native reflectivity, no extra low \
-                             tilt, no ground clutter, true unfolded velocity (no realistic \
-                             Nyquist).",
+                            "Restore Presentation mode: domain centre, 230 km / 250 m gates, \
+                             linear-Z center sampling, model-native reflectivity, textured REF, \
+                             clean unfolded velocity, and no dual-pol, propagation, blockage, \
+                             scan timing, instrument noise, clutter, or extra low tilt.",
                         )
                         .clicked()
                     {
@@ -4383,6 +4784,50 @@ mod tests {
             crate::wrf_radar::ReflectivityOperator::ModelNative,
             "reflectivity operator restores model native"
         );
+        assert_eq!(
+            empty.simulation_mode,
+            crate::wrf_radar::SimulationMode::Presentation
+        );
+        assert_eq!(
+            empty.reflectivity_sampling,
+            crate::wrf_radar::ReflectivitySampling::LinearZ
+        );
+        assert_eq!(
+            empty.beam_integration,
+            crate::wrf_radar::BeamIntegration::Center
+        );
+        assert_eq!(empty.beam_width_deg, default_synth_beam_width_deg());
+        assert_eq!(empty.pulse_width_us, default_synth_pulse_width_us());
+        assert_eq!(
+            empty.radar_frequency_mhz,
+            default_synth_radar_frequency_mhz()
+        );
+        assert!(!empty.terminal_fall_speed);
+        assert!(!empty.terrain_blockage);
+        assert!(!empty.spectrum_width);
+        assert_eq!(
+            empty.spectrum_width_floor_mps,
+            default_synth_spectrum_width_floor_mps()
+        );
+        assert!(!empty.dual_pol);
+        assert!(!empty.propagation);
+        assert_eq!(empty.system_phidp_deg, 0.0);
+        assert_eq!(empty.zdr_bias_db, 0.0);
+        assert_eq!(
+            empty.scan_timing,
+            crate::wrf_radar::ScanTiming::InstantaneousTruth
+        );
+        assert_eq!(
+            empty.rotation_rate_deg_s,
+            default_synth_rotation_rate_deg_s()
+        );
+        assert_eq!(empty.transition_delay_s, default_synth_transition_delay_s());
+        assert_eq!(empty.prf_hz, default_synth_prf_hz());
+        assert!(!empty.instrument_noise);
+        assert_eq!(
+            empty.sensitivity_dbz_at_1km,
+            default_synth_sensitivity_dbz_at_1km()
+        );
         assert!(!empty.include_low_tilt, "low tilt restores OFF");
         assert_eq!(
             empty.clutter_intensity, 0.0,
@@ -4409,6 +4854,26 @@ mod tests {
             ref_gate_texture: false,
             vel_gate_texture: true,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::ClassicStoelinga,
+            simulation_mode: crate::wrf_radar::SimulationMode::Instrument,
+            reflectivity_sampling: crate::wrf_radar::ReflectivitySampling::LegacyDbz,
+            beam_integration: crate::wrf_radar::BeamIntegration::Reference,
+            beam_width_deg: 1.25,
+            pulse_width_us: 2.0,
+            radar_frequency_mhz: 2_900,
+            terminal_fall_speed: true,
+            terrain_blockage: true,
+            spectrum_width: true,
+            spectrum_width_floor_mps: 1.25,
+            dual_pol: true,
+            propagation: true,
+            system_phidp_deg: 12.5,
+            zdr_bias_db: -0.35,
+            scan_timing: crate::wrf_radar::ScanTiming::TimedVolume,
+            rotation_rate_deg_s: 24.0,
+            transition_delay_s: 4.25,
+            prf_hz: 1_200.0,
+            instrument_noise: true,
+            sensitivity_dbz_at_1km: -37.5,
             include_low_tilt: true,
             clutter_intensity: 0.5,
             fold_velocity: true,
@@ -4451,6 +4916,35 @@ mod tests {
             crate::wrf_radar::ReflectivityOperator::ModelNative,
             "default operator is model native"
         );
+        assert_eq!(config.simulation_mode, historical.simulation_mode);
+        assert_eq!(
+            config.reflectivity_sampling,
+            historical.reflectivity_sampling
+        );
+        assert_eq!(config.beam_integration, historical.beam_integration);
+        assert_eq!(config.beam_width_deg, historical.beam_width_deg);
+        assert_eq!(config.pulse_width_us, historical.pulse_width_us);
+        assert_eq!(config.radar_frequency_mhz, historical.radar_frequency_mhz);
+        assert_eq!(config.terminal_fall_speed, historical.terminal_fall_speed);
+        assert_eq!(config.terrain_blockage, historical.terrain_blockage);
+        assert_eq!(config.spectrum_width, historical.spectrum_width);
+        assert_eq!(
+            config.spectrum_width_floor_mps,
+            historical.spectrum_width_floor_mps
+        );
+        assert_eq!(config.dual_pol, historical.dual_pol);
+        assert_eq!(config.propagation, historical.propagation);
+        assert_eq!(config.system_phidp_deg, historical.system_phidp_deg);
+        assert_eq!(config.zdr_bias_db, historical.zdr_bias_db);
+        assert_eq!(config.scan_timing, historical.scan_timing);
+        assert_eq!(config.rotation_rate_deg_s, historical.rotation_rate_deg_s);
+        assert_eq!(config.transition_delay_s, historical.transition_delay_s);
+        assert_eq!(config.prf_hz, historical.prf_hz);
+        assert_eq!(config.instrument_noise, historical.instrument_noise);
+        assert_eq!(
+            config.sensitivity_dbz_at_1km,
+            historical.sensitivity_dbz_at_1km
+        );
         assert_eq!(
             config.elevations_deg,
             crate::wrf_radar::DEFAULT_ELEVATIONS_DEG,
@@ -4469,6 +4963,92 @@ mod tests {
             config.nyquist_mps, historical.nyquist_mps,
             "default folding Nyquist matches the library default"
         );
+    }
+
+    #[test]
+    fn synth_radar_deep_controls_flow_into_config() {
+        use crate::wrf_radar::{BeamIntegration, ReflectivitySampling, ScanTiming, SimulationMode};
+
+        let state = SyntheticRadarUiState {
+            simulation_mode: SimulationMode::Instrument,
+            reflectivity_sampling: ReflectivitySampling::LegacyDbz,
+            beam_integration: BeamIntegration::Reference,
+            beam_width_deg: 1.2,
+            pulse_width_us: 2.4,
+            radar_frequency_mhz: 2_925,
+            terminal_fall_speed: true,
+            terrain_blockage: true,
+            spectrum_width: true,
+            spectrum_width_floor_mps: 1.1,
+            dual_pol: true,
+            propagation: true,
+            system_phidp_deg: 18.5,
+            zdr_bias_db: -0.4,
+            scan_timing: ScanTiming::TimedVolume,
+            rotation_rate_deg_s: 22.0,
+            transition_delay_s: 4.5,
+            prf_hz: 1_350.0,
+            instrument_noise: true,
+            sensitivity_dbz_at_1km: -36.0,
+            ..SyntheticRadarUiState::default()
+        };
+        let config = state.to_config().unwrap();
+
+        assert_eq!(config.simulation_mode, SimulationMode::Instrument);
+        assert_eq!(
+            config.reflectivity_sampling,
+            ReflectivitySampling::LegacyDbz
+        );
+        assert_eq!(config.beam_integration, BeamIntegration::Reference);
+        assert_eq!(config.beam_width_deg, 1.2);
+        assert_eq!(config.pulse_width_us, 2.4);
+        assert_eq!(config.radar_frequency_mhz, 2_925);
+        assert!(config.terminal_fall_speed);
+        assert!(config.terrain_blockage);
+        assert!(config.spectrum_width);
+        assert_eq!(config.spectrum_width_floor_mps, 1.1);
+        assert!(config.dual_pol);
+        assert!(config.propagation);
+        assert_eq!(config.system_phidp_deg, 18.5);
+        assert_eq!(config.zdr_bias_db, -0.4);
+        assert_eq!(config.scan_timing, ScanTiming::TimedVolume);
+        assert_eq!(config.rotation_rate_deg_s, 22.0);
+        assert_eq!(config.transition_delay_s, 4.5);
+        assert_eq!(config.prf_hz, 1_350.0);
+        assert!(config.instrument_noise);
+        assert_eq!(config.sensitivity_dbz_at_1km, -36.0);
+    }
+
+    #[test]
+    fn synth_radar_mode_preset_is_explicit_and_coherent() {
+        use crate::wrf_radar::{BeamIntegration, ScanTiming, SimulationMode};
+
+        let mut state = SyntheticRadarUiState {
+            beam_width_deg: 1.35,
+            pulse_width_us: 2.1,
+            radar_frequency_mhz: 2_850,
+            ..SyntheticRadarUiState::default()
+        };
+        state.apply_mode_preset(SimulationMode::Instrument);
+        let instrument = state.to_config().unwrap();
+        assert_eq!(instrument.simulation_mode, SimulationMode::Instrument);
+        assert_eq!(instrument.beam_integration, BeamIntegration::Balanced);
+        assert!(instrument.terminal_fall_speed);
+        assert!(instrument.terrain_blockage);
+        assert!(instrument.spectrum_width);
+        assert!(instrument.dual_pol);
+        assert!(instrument.propagation);
+        assert_eq!(instrument.scan_timing, ScanTiming::TimedVolume);
+        assert!(instrument.instrument_noise);
+        assert!(instrument.fold_velocity);
+        assert!(!instrument.ref_gate_texture);
+        assert_eq!(instrument.beam_width_deg, 1.35);
+        assert_eq!(instrument.pulse_width_us, 2.1);
+        assert_eq!(instrument.radar_frequency_mhz, 2_850);
+
+        // Expert edits stay put until another mode button invokes the helper.
+        state.dual_pol = false;
+        assert!(!state.to_config().unwrap().dual_pol);
     }
 
     /// The "Match gate size to grid resolution" checkbox flows from the UI state

@@ -21,10 +21,12 @@
 //! padded. The round-trip tests below enforce that contract.
 //!
 //! Writer constraints inherited from `Nc3Writer` (a PINNED dep — solved
-//! app-side, never patched): every variable is `NC_FLOAT`, so the
-//! `sweep_mode(sweep, string_length)` char matrix of the CfRadial spec is
-//! OMITTED. Our reader tolerates its absence (scan mode defaults to
-//! unknown); strict py-ART wants it — documented gap, not a silent one.
+//! app-side, never patched): every variable is `NC_FLOAT`, so the CfRadial
+//! `sweep_mode(sweep, string_length)` and `prt_mode(sweep, string_length)`
+//! char matrices are OMITTED rather than being misrepresented as floats. Our
+//! reader tolerates their absence (scan mode defaults to unknown); strict
+//! consumers may require them. Numeric `prt(time)` is still written when it
+//! is known.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -39,8 +41,8 @@ use rw_store::netcdf3::{Nc3Attr, Nc3Dim, Nc3VarDef, Nc3Writer};
 pub(crate) const CFRADIAL_FILL: f32 = -9999.0;
 
 /// CfRadial field naming for the canonical moments: `(var name, units,
-/// long_name)`. `Unknown` moments are not exported — their names are
-/// arbitrary decoder strings with no NC-safety or downstream-name guarantee.
+/// long_name)`. Arbitrary `Unknown` moments are not exported; the explicitly
+/// stable simulated-radar attenuation/correction ids are whitelisted.
 fn moment_field_spec(moment: &MomentType) -> Option<(&'static str, &'static str, &'static str)> {
     Some(match moment {
         MomentType::Reflectivity => ("REF", "dBZ", "equivalent reflectivity factor"),
@@ -56,7 +58,31 @@ fn moment_field_spec(moment: &MomentType) -> Option<(&'static str, &'static str,
         MomentType::SpecificDifferentialPhase => {
             ("KDP", "degrees/km", "specific differential phase h/v")
         }
-        MomentType::Unknown(_) => return None,
+        MomentType::Unknown(name) => match name.as_str() {
+            "AH" => (
+                "AH",
+                "dB/km",
+                "specific attenuation at horizontal polarization",
+            ),
+            "PIA" => (
+                "PIA",
+                "dB",
+                "path integrated attenuation at horizontal polarization",
+            ),
+            "REFC" => (
+                "REFC",
+                "dBZ",
+                "attenuation corrected horizontal reflectivity",
+            ),
+            "ADP" => ("ADP", "dB/km", "specific differential attenuation"),
+            "PIDA" => ("PIDA", "dB", "path integrated differential attenuation"),
+            "ZDRC" => (
+                "ZDRC",
+                "dB",
+                "attenuation corrected differential reflectivity",
+            ),
+            _ => return None,
+        },
     })
 }
 
@@ -202,14 +228,14 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
         .collect();
 
     // Field matrices: (time, range) row-major, fill-padded. Union of the
-    // canonical moments across sweeps, in MomentType order.
+    // supported moments across sweeps, in MomentType order.
     let moments: BTreeSet<MomentType> = sweeps
         .iter()
         .flat_map(|cut| cut.moments.keys().cloned())
         .filter(|moment| moment_field_spec(moment).is_some())
         .collect();
     if moments.is_empty() {
-        return Err("volume has no canonical moments (REF/VEL/…) to export".to_owned());
+        return Err("volume has no supported moments (REF/VEL/…) to export".to_owned());
     }
     let mut field_data: Vec<(&'static str, &'static str, &'static str, Vec<f32>)> = Vec::new();
     for moment in &moments {
@@ -276,8 +302,8 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
         ),
         Nc3Attr::text(
             "comment",
-            "Simulated data, not a real radar measurement. Beam centerline sampling; \
-             no beam broadening, attenuation, or terrain blockage.",
+            "Simulated data, not a real radar measurement. Forward-operator \
+             configuration and science provenance are carried in file metadata.",
         ),
         Nc3Attr::text("instrument_name", volume.site.id.clone()),
     ];
@@ -286,12 +312,39 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
     }
     gattrs.push(Nc3Attr::text("time_coverage_start", start_iso.clone()));
     gattrs.push(Nc3Attr::text("time_coverage_end", end_iso));
+    for (name, value) in [
+        ("scan_name", volume.metadata.scan_name.as_deref()),
+        ("scan_id", volume.metadata.scan_id.as_deref()),
+        ("polarization", volume.metadata.polarization.as_deref()),
+        ("calibration", volume.metadata.calibration.as_deref()),
+        (
+            "forward_operator",
+            volume.metadata.forward_operator.as_deref(),
+        ),
+        (
+            "forward_operator_config",
+            volume.metadata.forward_operator_config.as_deref(),
+        ),
+        ("source_model", volume.metadata.source_model.as_deref()),
+        (
+            "microphysics_scheme",
+            volume.metadata.microphysics_scheme.as_deref(),
+        ),
+        (
+            "scattering_model",
+            volume.metadata.scattering_model.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            gattrs.push(Nc3Attr::text(name, value));
+        }
+    }
 
     // Dimensions: ids are vector positions.
     const TIME: usize = 0;
     const RANGE: usize = 1;
     const SWEEP: usize = 2;
-    let dims = vec![
+    let mut dims = vec![
         Nc3Dim {
             name: "time".to_owned(),
             len: n_rays,
@@ -305,6 +358,14 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
             len: n_sweeps,
         },
     ];
+    let frequency_dim = volume.metadata.radar_frequency_mhz.map(|_| {
+        let id = dims.len();
+        dims.push(Nc3Dim {
+            name: "frequency".to_owned(),
+            len: 1,
+        });
+        id
+    });
 
     // Variable definitions and their payloads, in one shared order —
     // Nc3Writer requires write_var calls to match definition order.
@@ -340,6 +401,19 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
     });
     payloads.push(range);
 
+    if let (Some(dim), Some(frequency_mhz)) = (frequency_dim, volume.metadata.radar_frequency_mhz) {
+        vars.push(Nc3VarDef {
+            name: "frequency".to_owned(),
+            dimids: vec![dim],
+            attrs: vec![
+                Nc3Attr::text("standard_name", "radiation_frequency"),
+                Nc3Attr::text("long_name", "transmit frequency"),
+                Nc3Attr::text("units", "Hz"),
+            ],
+        });
+        payloads.push(vec![frequency_mhz as f32 * 1.0e6]);
+    }
+
     vars.push(Nc3VarDef {
         name: "azimuth".to_owned(),
         dimids: vec![TIME],
@@ -373,6 +447,42 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
             ],
         });
         payloads.push(nyquist);
+    }
+
+    for (name, long_name, units, value) in [
+        (
+            "pulse_width",
+            "transmitted pulse width",
+            "seconds",
+            volume.metadata.pulse_width_us.map(|value| value * 1.0e-6),
+        ),
+        (
+            "prt",
+            "pulse repetition time",
+            "seconds",
+            volume.metadata.prt_s,
+        ),
+        (
+            "unambiguous_range",
+            "unambiguous range",
+            "meters",
+            volume
+                .metadata
+                .unambiguous_range_km
+                .map(|value| value * 1000.0),
+        ),
+    ] {
+        if let Some(value) = value.filter(|value| value.is_finite() && *value > 0.0) {
+            vars.push(Nc3VarDef {
+                name: name.to_owned(),
+                dimids: vec![TIME],
+                attrs: vec![
+                    Nc3Attr::text("long_name", long_name),
+                    Nc3Attr::text("units", units),
+                ],
+            });
+            payloads.push(vec![value; n_rays]);
+        }
     }
 
     vars.push(Nc3VarDef {
@@ -418,6 +528,30 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
                 name: name.to_owned(),
                 dimids: Vec::new(),
                 attrs: vec![Nc3Attr::text("units", units)],
+            });
+            payloads.push(vec![value]);
+        }
+    }
+    for (name, long_name, value) in [
+        (
+            "radar_beam_width_h",
+            "horizontal one-way 3 dB beam width",
+            volume.metadata.beam_width_h_deg,
+        ),
+        (
+            "radar_beam_width_v",
+            "vertical one-way 3 dB beam width",
+            volume.metadata.beam_width_v_deg,
+        ),
+    ] {
+        if let Some(value) = value.filter(|value| value.is_finite() && *value > 0.0) {
+            vars.push(Nc3VarDef {
+                name: name.to_owned(),
+                dimids: Vec::new(),
+                attrs: vec![
+                    Nc3Attr::text("long_name", long_name),
+                    Nc3Attr::text("units", "degrees"),
+                ],
             });
             payloads.push(vec![value]);
         }
@@ -647,6 +781,119 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn round_trip_instrument_metadata_and_dual_pol_attenuation_fields() {
+        let mut volume = sample_volume();
+        volume.metadata.radar_frequency_mhz = Some(2_800);
+        volume.metadata.beam_width_h_deg = Some(0.95);
+        volume.metadata.beam_width_v_deg = Some(1.05);
+        volume.metadata.pulse_width_us = Some(1.57);
+        volume.metadata.prt_s = Some(0.001);
+        volume.metadata.unambiguous_range_km = Some(149.896);
+        volume.metadata.scan_name = Some("Synthetic VCP 212".to_owned());
+        volume.metadata.scan_id = Some("SIM-VCP212-001".to_owned());
+        volume.metadata.polarization = Some("simultaneous H/V".to_owned());
+        volume.metadata.calibration = Some("ZDR bias +0.15 dB".to_owned());
+        volume.metadata.forward_operator = Some("bowecho-wrf-radar".to_owned());
+        volume.metadata.forward_operator_config =
+            Some(r#"{"beam_integration":"balanced"}"#.to_owned());
+        volume.metadata.source_model = Some("WRF-ARW".to_owned());
+        volume.metadata.microphysics_scheme = Some("Thompson aerosol-aware".to_owned());
+        volume.metadata.scattering_model = Some("S-band LUT v1".to_owned());
+
+        let exported_moments = [
+            MomentType::Reflectivity,
+            MomentType::Velocity,
+            MomentType::SpectrumWidth,
+            MomentType::DifferentialReflectivity,
+            MomentType::CorrelationCoefficient,
+            MomentType::DifferentialPhase,
+            MomentType::SpecificDifferentialPhase,
+            MomentType::Unknown("AH".to_owned()),
+            MomentType::Unknown("PIA".to_owned()),
+            MomentType::Unknown("REFC".to_owned()),
+            MomentType::Unknown("ADP".to_owned()),
+            MomentType::Unknown("PIDA".to_owned()),
+            MomentType::Unknown("ZDRC".to_owned()),
+        ];
+        for cut in &mut volume.cuts {
+            let gate_range = cut.radials[0].gate_range.clone();
+            for (moment_index, moment) in exported_moments.iter().enumerate() {
+                let rows = (0..cut.radials.len())
+                    .map(|ray| {
+                        (0..gate_range.gate_count)
+                            .map(|gate| {
+                                moment_index as f32 * 10.0 + ray as f32 + gate as f32 * 0.01
+                            })
+                            .collect()
+                    })
+                    .collect();
+                cut.moments.insert(
+                    moment.clone(),
+                    grid(moment.clone(), gate_range.clone(), rows),
+                );
+            }
+        }
+
+        let path = tmp_dir("instrument-metadata").join("instrument.nc");
+        export_volume_cfradial(&volume, &path).unwrap();
+        let decoded =
+            nexrad_io::decode_supported_volume_bytes(&std::fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(decoded.metadata.radar_frequency_mhz, Some(2_800));
+        assert_eq!(decoded.metadata.beam_width_h_deg, Some(0.95));
+        assert_eq!(decoded.metadata.beam_width_v_deg, Some(1.05));
+        assert!((decoded.metadata.pulse_width_us.unwrap() - 1.57).abs() < 1.0e-4);
+        assert!((decoded.metadata.prt_s.unwrap() - 0.001).abs() < 1.0e-7);
+        assert!((decoded.metadata.unambiguous_range_km.unwrap() - 149.896).abs() < 1.0e-3);
+        assert_eq!(
+            decoded.metadata.scan_name.as_deref(),
+            Some("Synthetic VCP 212")
+        );
+        assert_eq!(decoded.metadata.scan_id.as_deref(), Some("SIM-VCP212-001"));
+        assert_eq!(
+            decoded.metadata.polarization.as_deref(),
+            Some("simultaneous H/V")
+        );
+        assert_eq!(
+            decoded.metadata.calibration.as_deref(),
+            Some("ZDR bias +0.15 dB")
+        );
+        assert_eq!(
+            decoded.metadata.forward_operator.as_deref(),
+            Some("bowecho-wrf-radar")
+        );
+        assert_eq!(
+            decoded.metadata.forward_operator_config.as_deref(),
+            Some(r#"{"beam_integration":"balanced"}"#)
+        );
+        assert_eq!(decoded.metadata.source_model.as_deref(), Some("WRF-ARW"));
+        assert_eq!(
+            decoded.metadata.microphysics_scheme.as_deref(),
+            Some("Thompson aerosol-aware")
+        );
+        assert_eq!(
+            decoded.metadata.scattering_model.as_deref(),
+            Some("S-band LUT v1")
+        );
+        for cut in &decoded.cuts {
+            for moment in &exported_moments {
+                assert!(
+                    cut.moments.contains_key(moment),
+                    "missing round-tripped {moment:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arbitrary_unknown_moments_remain_outside_export_whitelist() {
+        assert!(moment_field_spec(&MomentType::Unknown("unsafe/name".to_owned())).is_none());
+        for id in ["AH", "PIA", "REFC", "ADP", "PIDA", "ZDRC"] {
+            assert!(moment_field_spec(&MomentType::Unknown(id.to_owned())).is_some());
         }
     }
 

@@ -771,7 +771,7 @@ pub enum ScanMode {
 }
 
 /// Provenance and decode statistics.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeMetadata {
     pub source_path: Option<String>,
     pub archive_version: Option<String>,
@@ -788,6 +788,48 @@ pub struct VolumeMetadata {
     /// coefficients without hard-coding every radar network.
     #[serde(default)]
     pub radar_frequency_mhz: Option<u32>,
+    /// Horizontal one-way 3 dB antenna beam width in degrees.
+    #[serde(default)]
+    pub beam_width_h_deg: Option<f32>,
+    /// Vertical one-way 3 dB antenna beam width in degrees.
+    #[serde(default)]
+    pub beam_width_v_deg: Option<f32>,
+    /// Transmitted pulse duration in microseconds.
+    #[serde(default)]
+    pub pulse_width_us: Option<f32>,
+    /// Pulse repetition time in seconds.
+    #[serde(default)]
+    pub prt_s: Option<f32>,
+    /// Instrument unambiguous range in kilometres.
+    #[serde(default)]
+    pub unambiguous_range_km: Option<f32>,
+    /// Human-readable scan/VCP name when supplied by the source.
+    #[serde(default)]
+    pub scan_name: Option<String>,
+    /// Source-specific scan identifier.
+    #[serde(default)]
+    pub scan_id: Option<String>,
+    /// Transmit/receive polarization description.
+    #[serde(default)]
+    pub polarization: Option<String>,
+    /// Calibration provenance or configuration summary.
+    #[serde(default)]
+    pub calibration: Option<String>,
+    /// Forward-operator implementation identifier.
+    #[serde(default)]
+    pub forward_operator: Option<String>,
+    /// Serialized forward-operator configuration (normally JSON).
+    #[serde(default)]
+    pub forward_operator_config: Option<String>,
+    /// Source model/run family (for example, WRF or HRRR).
+    #[serde(default)]
+    pub source_model: Option<String>,
+    /// Model microphysics scheme used by a scattering operator.
+    #[serde(default)]
+    pub microphysics_scheme: Option<String>,
+    /// Electromagnetic scattering model/LUT provenance.
+    #[serde(default)]
+    pub scattering_model: Option<String>,
 }
 
 /// Earth's mean radius (m).

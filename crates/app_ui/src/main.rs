@@ -119,6 +119,7 @@ mod wofs;
 mod wofs_georef;
 mod wrf_process;
 mod wrf_radar;
+mod wrf_radar_physics;
 mod wrf_volumes;
 
 use hazard_geom::append_flattened_hazard_fill_shapes;

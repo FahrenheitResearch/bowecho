@@ -83,6 +83,9 @@ pub const CALCDBZ_SOURCE: &str = "dbz/CALCDBZ";
 /// chosen, forcing the computed `dbz` (CALCDBZ) even when the file carries
 /// `REFL_10CM`.
 pub const STOELINGA_SOURCE: &str = "dbz/CALCDBZ (Stoelinga)";
+/// Reflectivity source stamped when raw WRF hydrometeors feed the internally
+/// consistent bulk S-band polarimetric scattering state.
+pub const BULK_S_BAND_SOURCE: &str = "scheme-aware bulk S-band ZH (Rayleigh v1)";
 
 /// Which reflectivity operator a synthetic scan uses. Both diagnostics are
 /// legitimate: `REFL_10CM` is the model's own Thompson-native 10-cm
@@ -102,6 +105,51 @@ pub enum ReflectivityOperator {
     /// intercepts) — the community wrf-python/GR2 look — even when the file
     /// carries `REFL_10CM`.
     ClassicStoelinga,
+}
+
+/// Domain used while interpolating model reflectivity onto a radar pulse.
+/// `LinearZ` is the physically meaningful received-power average; `LegacyDbz`
+/// remains available so old presentation renders can be reproduced exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReflectivitySampling {
+    LegacyDbz,
+    #[default]
+    LinearZ,
+}
+
+/// Deterministic antenna/pulse quadrature. The balanced rule is a symmetric
+/// nine-point cubature; reference is the full 3x3x3 tensor rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeamIntegration {
+    #[default]
+    Center,
+    Balanced,
+    Reference,
+}
+
+/// User intent for a synthetic volume. Fine-grained controls remain editable,
+/// but named modes make it explicit whether a volume is model truth, a virtual
+/// instrument measurement, or a display-oriented presentation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimulationMode {
+    Truth,
+    Instrument,
+    #[default]
+    Presentation,
+}
+
+/// Whether all rays represent one model instant or carry synthetic acquisition
+/// times for a rotating volume scan. A timed scan still samples one WRF scene;
+/// its provenance says so rather than implying temporal model interpolation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanTiming {
+    #[default]
+    InstantaneousTruth,
+    TimedVolume,
 }
 
 impl ReflectivityOperator {
@@ -154,6 +202,8 @@ pub const DEFAULT_FOLD_NYQUIST_MPS: f32 = 25.0;
 /// Configuration for one synthetic scan.
 #[derive(Clone, Debug)]
 pub struct SyntheticRadarConfig {
+    /// Named operating intent. This is also stamped in export provenance.
+    pub simulation_mode: SimulationMode,
     /// Site id stamped on the volume (drives the loop-engine cross-site guard —
     /// every hour of one run must share it).
     pub site_id: String,
@@ -204,6 +254,45 @@ pub struct SyntheticRadarConfig {
     /// classic Stoelinga `CALCDBZ` community diagnostic
     /// ([`ReflectivityOperator::ClassicStoelinga`]).
     pub reflectivity_operator: ReflectivityOperator,
+    /// Interpolate/average received power in linear Z (scientific default) or
+    /// reproduce the historical direct-dBZ interpolation.
+    pub reflectivity_sampling: ReflectivitySampling,
+    /// Antenna/pulse-volume integration tier.
+    pub beam_integration: BeamIntegration,
+    /// Horizontal/vertical one-way 3-dB beam width (degrees).
+    pub beam_width_deg: f32,
+    /// Transmitted pulse duration (microseconds).
+    pub pulse_width_us: f32,
+    /// Radar transmit frequency. 2.8 GHz is a representative S-band system.
+    pub radar_frequency_mhz: u32,
+    /// Use hydrometeor/scatterer fall speed in the Doppler projection.
+    pub terminal_fall_speed: bool,
+    /// Apply cumulative terrain-horizon partial beam blockage.
+    pub terrain_blockage: bool,
+    /// Emit Doppler spectrum width from pulse-volume velocity variance, model
+    /// TKE when available, terminal-speed diversity, and the instrument floor.
+    pub spectrum_width: bool,
+    pub spectrum_width_floor_mps: f32,
+    /// Build scheme-aware S-band ZH/ZV/covariance/KDP/attenuation from raw WRF
+    /// hydrometeors. Unsupported schemes fall back to scalar REF/VEL with an
+    /// explicit note instead of fabricating polarimetric fields.
+    pub dual_pol: bool,
+    /// Integrate KDP/Ah/Av along each radial into PhiDP and attenuation.
+    pub propagation: bool,
+    /// Optional synthetic-system calibration offsets.
+    pub system_phidp_deg: f32,
+    pub zdr_bias_db: f32,
+    /// Acquisition timing and nominal instrument cadence.
+    pub scan_timing: ScanTiming,
+    pub rotation_rate_deg_s: f32,
+    pub transition_delay_s: f32,
+    /// Pulse repetition frequency used for CfRadial metadata. Velocity folding
+    /// remains controlled independently by `nyquist_mps`.
+    pub prf_hz: f32,
+    /// Range-dependent sensitivity/noise model. The threshold follows the
+    /// radar equation from this 1-km dBZ reference when enabled.
+    pub instrument_noise: bool,
+    pub sensitivity_dbz_at_1km: f32,
     /// "Gate texture" on REFLECTIVITY: deterministic, range-correlated speckle
     /// added to the sampled dBZ so the synthetic gates read like real Level-II
     /// texture instead of a perfectly smooth trilinear field. ON is the product
@@ -236,6 +325,7 @@ pub const DEFAULT_TOWER_M: f64 = 10.0;
 impl Default for SyntheticRadarConfig {
     fn default() -> Self {
         Self {
+            simulation_mode: SimulationMode::Presentation,
             site_id: "WRF".to_string(),
             site_name: Some("Simulated WRF radar".to_string()),
             site_lat_deg: None,
@@ -258,6 +348,25 @@ impl Default for SyntheticRadarConfig {
             // Default operator. Flip this one line to ClassicStoelinga to
             // re-default the community look after the owner's comparison.
             reflectivity_operator: ReflectivityOperator::ModelNative,
+            reflectivity_sampling: ReflectivitySampling::LinearZ,
+            beam_integration: BeamIntegration::Center,
+            beam_width_deg: 0.95,
+            pulse_width_us: 1.57,
+            radar_frequency_mhz: 2_800,
+            terminal_fall_speed: false,
+            terrain_blockage: false,
+            spectrum_width: false,
+            spectrum_width_floor_mps: 0.5,
+            dual_pol: false,
+            propagation: false,
+            system_phidp_deg: 0.0,
+            zdr_bias_db: 0.0,
+            scan_timing: ScanTiming::InstantaneousTruth,
+            rotation_rate_deg_s: 18.0,
+            transition_delay_s: 3.5,
+            prf_hz: 1_000.0,
+            instrument_noise: false,
+            sensitivity_dbz_at_1km: -40.0,
             // Reflectivity texture ON by default (owner verdict: a smooth
             // simulated field "looks garbage without" it); velocity texture
             // OFF so the clean Vr keeps feeding dealias/GBVTD.
@@ -271,6 +380,59 @@ impl Default for SyntheticRadarConfig {
 }
 
 impl SyntheticRadarConfig {
+    /// Apply a coherent named preset while leaving site/range/geometry choices
+    /// alone. The UI calls this only when the user selects a different mode;
+    /// subsequent expert edits are intentionally preserved.
+    pub fn apply_mode_preset(&mut self, mode: SimulationMode) {
+        self.simulation_mode = mode;
+        match mode {
+            SimulationMode::Truth => {
+                self.reflectivity_sampling = ReflectivitySampling::LinearZ;
+                self.beam_integration = BeamIntegration::Center;
+                self.terminal_fall_speed = false;
+                self.terrain_blockage = false;
+                self.spectrum_width = false;
+                self.dual_pol = false;
+                self.propagation = false;
+                self.scan_timing = ScanTiming::InstantaneousTruth;
+                self.instrument_noise = false;
+                self.ref_gate_texture = false;
+                self.vel_gate_texture = false;
+                self.clutter_intensity = 0.0;
+                self.fold_velocity = false;
+            }
+            SimulationMode::Instrument => {
+                self.reflectivity_sampling = ReflectivitySampling::LinearZ;
+                self.beam_integration = BeamIntegration::Balanced;
+                self.terminal_fall_speed = true;
+                self.terrain_blockage = true;
+                self.spectrum_width = true;
+                self.dual_pol = true;
+                self.propagation = true;
+                self.scan_timing = ScanTiming::TimedVolume;
+                self.instrument_noise = true;
+                self.ref_gate_texture = false;
+                self.vel_gate_texture = false;
+                self.clutter_intensity = 0.0;
+                self.fold_velocity = true;
+            }
+            SimulationMode::Presentation => {
+                self.reflectivity_sampling = ReflectivitySampling::LinearZ;
+                self.beam_integration = BeamIntegration::Center;
+                self.terminal_fall_speed = false;
+                self.terrain_blockage = false;
+                self.spectrum_width = false;
+                self.dual_pol = false;
+                self.propagation = false;
+                self.scan_timing = ScanTiming::InstantaneousTruth;
+                self.instrument_noise = false;
+                self.ref_gate_texture = true;
+                self.vel_gate_texture = false;
+                self.fold_velocity = false;
+            }
+        }
+    }
+
     /// A 64-bit fingerprint of every field that changes the SAMPLED DATA of a
     /// synthetic scan. The loop-engine dedupe keys a re-import on scan time +
     /// site id (see [`crate`]'s install path); that alone cannot tell a
@@ -314,6 +476,26 @@ impl SyntheticRadarConfig {
         self.nyquist_mps.to_bits().hash(&mut hasher);
         self.fold_velocity.hash(&mut hasher);
         (self.reflectivity_operator as u8).hash(&mut hasher);
+        (self.simulation_mode as u8).hash(&mut hasher);
+        (self.reflectivity_sampling as u8).hash(&mut hasher);
+        (self.beam_integration as u8).hash(&mut hasher);
+        self.beam_width_deg.to_bits().hash(&mut hasher);
+        self.pulse_width_us.to_bits().hash(&mut hasher);
+        self.radar_frequency_mhz.hash(&mut hasher);
+        self.terminal_fall_speed.hash(&mut hasher);
+        self.terrain_blockage.hash(&mut hasher);
+        self.spectrum_width.hash(&mut hasher);
+        self.spectrum_width_floor_mps.to_bits().hash(&mut hasher);
+        self.dual_pol.hash(&mut hasher);
+        self.propagation.hash(&mut hasher);
+        self.system_phidp_deg.to_bits().hash(&mut hasher);
+        self.zdr_bias_db.to_bits().hash(&mut hasher);
+        (self.scan_timing as u8).hash(&mut hasher);
+        self.rotation_rate_deg_s.to_bits().hash(&mut hasher);
+        self.transition_delay_s.to_bits().hash(&mut hasher);
+        self.prf_hz.to_bits().hash(&mut hasher);
+        self.instrument_noise.hash(&mut hasher);
+        self.sensitivity_dbz_at_1km.to_bits().hash(&mut hasher);
         self.ref_gate_texture.hash(&mut hasher);
         self.vel_gate_texture.hash(&mut hasher);
         self.clutter_intensity.to_bits().hash(&mut hasher);
@@ -442,6 +624,16 @@ pub struct WrfRadarFields {
     pub v: Vec<f32>,
     pub w: Vec<f32>,
     pub terrain_m: Vec<f32>,
+    /// Compact scheme-aware polarimetric state. Eight one-byte planes retain
+    /// the ratios/propagation/fall moments while `dbz` remains the full-precision
+    /// ZH plane, avoiding several additional 193 MiB f32 volumes on the
+    /// documented 800x800x79 nest.
+    polarimetric: Option<CompactPolarFields>,
+    /// Why requested dual-pol was unavailable (unsupported scheme or missing
+    /// required raw fields). Scalar REF/VEL remain usable in this case.
+    pub dual_pol_status: Option<String>,
+    /// Optional one-byte turbulent kinetic energy (0.1 m2/s2 increments).
+    tke_tenths_m2s2: Option<Vec<u8>>,
     /// Which reflectivity source populated `dbz` ("REFL_10CM" or "dbz/CALCDBZ").
     pub ref_source: &'static str,
     /// The source file's `DX` global attribute (grid resolution, metres) if the
@@ -450,6 +642,103 @@ pub struct WrfRadarFields {
     /// gates to the grid via [`effective_gate_spacing`] without re-opening it.
     pub dx_m: Option<f64>,
     lut: InverseLut,
+}
+
+const COMPACT_ZDR_STEP_DB: f32 = 0.05;
+const COMPACT_PHASE_STEP_DEG: f32 = 0.1;
+const COMPACT_KDP_STEP_DEG_KM: f32 = 0.1;
+const COMPACT_ATTEN_STEP_DB_KM: f32 = 0.001;
+const COMPACT_FALL_STEP_MPS: f32 = 0.1;
+const COMPACT_FALL_STD_STEP_MPS: f32 = 0.05;
+
+struct CompactPolarFields {
+    profile: crate::wrf_radar_physics::SchemeProfile,
+    present_fields: Vec<String>,
+    zdr: Vec<i8>,
+    rho: Vec<u8>,
+    covariance_phase: Vec<i8>,
+    kdp: Vec<u8>,
+    ah: Vec<u8>,
+    adp: Vec<i8>,
+    fall_speed: Vec<u8>,
+    fall_speed_std: Vec<u8>,
+}
+
+impl CompactPolarFields {
+    fn new(
+        len: usize,
+        profile: crate::wrf_radar_physics::SchemeProfile,
+        present_fields: Vec<String>,
+    ) -> Self {
+        Self {
+            profile,
+            present_fields,
+            zdr: vec![0; len],
+            rho: vec![u8::MAX; len],
+            covariance_phase: vec![0; len],
+            kdp: vec![0; len],
+            ah: vec![0; len],
+            adp: vec![0; len],
+            fall_speed: vec![0; len],
+            fall_speed_std: vec![0; len],
+        }
+    }
+
+    fn contribution_at(&self, index: usize, zh: f32) -> crate::wrf_radar_physics::BulkContribution {
+        if !zh.is_finite() || zh <= 0.0 || index >= self.zdr.len() {
+            return crate::wrf_radar_physics::BulkContribution::default();
+        }
+        let zdr = self.zdr[index] as f32 * COMPACT_ZDR_STEP_DB;
+        let zv = zh / 10.0f32.powf(zdr * 0.1);
+        let rho = self.rho[index] as f32 / u8::MAX as f32;
+        let covariance = rho * (zh * zv).max(0.0).sqrt();
+        let phase = (self.covariance_phase[index] as f32 * COMPACT_PHASE_STEP_DEG).to_radians();
+        let ah = self.ah[index] as f32 * COMPACT_ATTEN_STEP_DB_KM;
+        let adp = self.adp[index] as f32 * COMPACT_ATTEN_STEP_DB_KM;
+        let fall_std = self.fall_speed_std[index] as f32 * COMPACT_FALL_STD_STEP_MPS;
+        crate::wrf_radar_physics::BulkContribution {
+            zh,
+            zv,
+            cov_re: covariance * phase.cos(),
+            cov_im: covariance * phase.sin(),
+            kdp_deg_km: self.kdp[index] as f32 * COMPACT_KDP_STEP_DEG_KM,
+            ah_db_km: ah,
+            av_db_km: (ah - adp).max(0.0),
+            fall_speed_mps: self.fall_speed[index] as f32 * COMPACT_FALL_STEP_MPS,
+            fall_speed_variance_m2s2: fall_std * fall_std,
+        }
+    }
+
+    fn store(&mut self, index: usize, sample: crate::wrf_radar_physics::IntrinsicPolarSample) {
+        self.zdr[index] = quantize_i8(sample.zdr_db, COMPACT_ZDR_STEP_DB);
+        self.rho[index] = (sample.rho_hv.clamp(0.0, 1.0) * u8::MAX as f32).round() as u8;
+        let phase_deg = sample.cov_im.atan2(sample.cov_re).to_degrees();
+        self.covariance_phase[index] = quantize_i8(phase_deg, COMPACT_PHASE_STEP_DEG);
+        self.kdp[index] = quantize_u8(sample.kdp_deg_km, COMPACT_KDP_STEP_DEG_KM);
+        self.ah[index] = quantize_u8(sample.ah_db_km, COMPACT_ATTEN_STEP_DB_KM);
+        self.adp[index] = quantize_i8(sample.ah_db_km - sample.av_db_km, COMPACT_ATTEN_STEP_DB_KM);
+        self.fall_speed[index] = quantize_u8(sample.fall_speed_mps, COMPACT_FALL_STEP_MPS);
+        self.fall_speed_std[index] = quantize_u8(
+            sample.fall_speed_variance_m2s2.max(0.0).sqrt(),
+            COMPACT_FALL_STD_STEP_MPS,
+        );
+    }
+}
+
+fn quantize_u8(value: f32, step: f32) -> u8 {
+    if value.is_finite() && step > 0.0 {
+        (value.max(0.0) / step).round().clamp(0.0, u8::MAX as f32) as u8
+    } else {
+        0
+    }
+}
+
+fn quantize_i8(value: f32, step: f32) -> i8 {
+    if value.is_finite() && step > 0.0 {
+        (value / step).round().clamp(i8::MIN as f32, i8::MAX as f32) as i8
+    } else {
+        0
+    }
 }
 
 impl WrfRadarFields {
@@ -587,10 +876,297 @@ pub fn read_wrf_radar_fields_reporting(
         v,
         w,
         terrain_m,
+        polarimetric: None,
+        dual_pol_status: None,
+        tke_tenths_m2s2: None,
         ref_source,
         dx_m,
         lut,
     })
+}
+
+/// Config-aware field reader used by the production worker. The public
+/// operator-only reader above remains the compatibility/fixture seam; advanced
+/// modes add compact microphysical scattering and optional TKE here.
+fn read_wrf_radar_fields_for_config_reporting(
+    file: &WrfFile,
+    timeidx: usize,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+) -> Result<WrfRadarFields, String> {
+    let mut fields =
+        read_wrf_radar_fields_reporting(file, timeidx, config.reflectivity_operator, progress)?;
+    let expected = fields.nx * fields.ny * fields.nz;
+
+    if config.dual_pol || config.terminal_fall_speed {
+        progress("deriving scheme-aware hydrometeor scattering…");
+        match build_compact_polar_fields(file, timeidx, expected, progress) {
+            Ok((polar, bulk_zh_dbz)) => {
+                fields.dual_pol_status = Some(format!(
+                    "{} ({:?}{})",
+                    polar.profile.name,
+                    polar.profile.capability,
+                    if polar.profile.assumption_heavy {
+                        "; assumed PSD parameters"
+                    } else {
+                        ""
+                    }
+                ));
+                if config.dual_pol {
+                    fields.dbz = bulk_zh_dbz;
+                    fields.ref_source = BULK_S_BAND_SOURCE;
+                }
+                fields.polarimetric = Some(polar);
+            }
+            Err(reason) => {
+                fields.dual_pol_status = Some(reason);
+            }
+        }
+    }
+
+    if config.spectrum_width {
+        fields.tke_tenths_m2s2 = read_compact_tke(file, timeidx, expected);
+    }
+    Ok(fields)
+}
+
+const MICROPHYSICS_FIELD_NAMES: &[&str] = &[
+    "QCLOUD",
+    "QRAIN",
+    "QICE",
+    "QICE2",
+    "QICE3",
+    "QSNOW",
+    "QGRAUP",
+    "QGRAUPEL",
+    "QHAIL",
+    "QNDROP",
+    "QNCLOUD",
+    "QNRAIN",
+    "QNICE",
+    "QNICE2",
+    "QNICE3",
+    "QNSNOW",
+    "QNGRAUP",
+    "QNGRAUPEL",
+    "QNHAIL",
+    "QVGRAUPEL",
+    "QVHAIL",
+];
+
+struct SpeciesReadSpec {
+    kind: crate::wrf_radar_physics::HydrometeorKind,
+    mass: &'static [&'static str],
+    number: &'static [&'static str],
+    volume: &'static [&'static str],
+}
+
+const SPECIES_READ_SPECS: &[SpeciesReadSpec] = &[
+    SpeciesReadSpec {
+        kind: crate::wrf_radar_physics::HydrometeorKind::CloudWater,
+        mass: &["QCLOUD"],
+        number: &["QNCLOUD", "QNDROP"],
+        volume: &[],
+    },
+    SpeciesReadSpec {
+        kind: crate::wrf_radar_physics::HydrometeorKind::Rain,
+        mass: &["QRAIN"],
+        number: &["QNRAIN"],
+        volume: &[],
+    },
+    SpeciesReadSpec {
+        kind: crate::wrf_radar_physics::HydrometeorKind::CloudIce,
+        mass: &["QICE", "QICE2", "QICE3"],
+        number: &["QNICE", "QNICE2", "QNICE3"],
+        volume: &[],
+    },
+    SpeciesReadSpec {
+        kind: crate::wrf_radar_physics::HydrometeorKind::Snow,
+        mass: &["QSNOW"],
+        number: &["QNSNOW"],
+        volume: &[],
+    },
+    SpeciesReadSpec {
+        kind: crate::wrf_radar_physics::HydrometeorKind::Graupel,
+        mass: &["QGRAUP", "QGRAUPEL"],
+        number: &["QNGRAUPEL", "QNGRAUP"],
+        volume: &["QVGRAUPEL"],
+    },
+    SpeciesReadSpec {
+        kind: crate::wrf_radar_physics::HydrometeorKind::Hail,
+        mass: &["QHAIL"],
+        number: &["QNHAIL"],
+        volume: &["QVHAIL"],
+    },
+];
+
+fn build_compact_polar_fields(
+    file: &WrfFile,
+    timeidx: usize,
+    expected: usize,
+    progress: &dyn Fn(&str),
+) -> Result<(CompactPolarFields, Vec<f32>), String> {
+    let present_fields: Vec<String> = MICROPHYSICS_FIELD_NAMES
+        .iter()
+        .filter(|name| file.has_var(name))
+        .map(|name| (*name).to_string())
+        .collect();
+    let scheme_id = file.global_attr_i32("MP_PHYSICS").ok();
+    let profile = crate::wrf_radar_physics::detect_scheme(scheme_id, &present_fields);
+    if profile.capability == crate::wrf_radar_physics::MicrophysicsCapability::Unsupported {
+        return Err(format!(
+            "dual-pol unavailable: {} cannot be represented by the bulk-category operator",
+            profile.name
+        ));
+    }
+
+    let temperature = file
+        .temperature(timeidx)
+        .map_err(|error| format!("dual-pol temperature: {error}"))?
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    file.clear_cache();
+    if temperature.len() != expected {
+        return Err(format!(
+            "dual-pol temperature has {} values, expected {expected}",
+            temperature.len()
+        ));
+    }
+
+    let qv = if file.has_var("QVAPOR") {
+        file.read_var("QVAPOR", timeidx)
+            .map_err(|error| format!("dual-pol QVAPOR: {error}"))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect::<Vec<_>>()
+    } else {
+        vec![0.0; expected]
+    };
+    let pressure = file
+        .full_pressure(timeidx)
+        .map_err(|error| format!("dual-pol pressure: {error}"))?;
+    if pressure.len() != expected || qv.len() != expected {
+        file.clear_cache();
+        return Err("dual-pol pressure/QVAPOR grid shape mismatch".to_string());
+    }
+    let air_density = pressure
+        .iter()
+        .zip(&temperature)
+        .zip(&qv)
+        .map(|((&pressure, &temperature), &qv)| {
+            crate::wrf_radar_physics::air_density(pressure as f32, temperature, qv)
+        })
+        .collect::<Vec<_>>();
+    drop(pressure);
+    file.clear_cache();
+
+    let mut compact = CompactPolarFields::new(expected, profile.clone(), present_fields);
+    let mut zh_linear = vec![0.0f32; expected];
+    let mut species_used = 0usize;
+    for spec in SPECIES_READ_SPECS {
+        let Some(mass_name) = first_existing_var(file, spec.mass) else {
+            continue;
+        };
+        progress(&format!("scattering {mass_name}…"));
+        let number = read_optional_first_var_f32(file, timeidx, spec.number, expected)?;
+        let volume = read_optional_first_var_f32(file, timeidx, spec.volume, expected)?;
+        let mass = file
+            .read_var(mass_name, timeidx)
+            .map_err(|error| format!("dual-pol {mass_name}: {error}"))?;
+        if mass.len() != expected {
+            return Err(format!(
+                "dual-pol {mass_name} has {} values, expected {expected}",
+                mass.len()
+            ));
+        }
+        species_used += 1;
+        for index in 0..expected {
+            let q = mass[index] as f32;
+            if !q.is_finite() || q <= 0.0 {
+                continue;
+            }
+            let contribution = crate::wrf_radar_physics::bulk_sband_contribution(
+                crate::wrf_radar_physics::BulkSpeciesInput {
+                    kind: spec.kind,
+                    q_kgkg: q,
+                    number_per_kg: number.as_ref().map(|values| values[index]),
+                    volume_m3_per_kg: volume.as_ref().map(|values| values[index]),
+                    temperature_k: temperature[index],
+                    air_density_kgm3: air_density[index],
+                },
+                &profile,
+            );
+            if contribution.zh <= 0.0 {
+                continue;
+            }
+            let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+            if zh_linear[index] > 0.0 {
+                accumulator.add(1.0, compact.contribution_at(index, zh_linear[index]));
+            }
+            accumulator.add(1.0, contribution);
+            let combined = accumulator.finalize();
+            zh_linear[index] = combined.zh;
+            compact.store(index, combined);
+        }
+    }
+    if species_used == 0 || zh_linear.iter().all(|value| *value <= 0.0) {
+        return Err(format!(
+            "dual-pol unavailable: {} contains no usable bulk hydrometeor mass fields",
+            profile.name
+        ));
+    }
+    let zh_dbz = zh_linear
+        .into_iter()
+        .map(|value| {
+            if value.is_finite() && value > 0.0 {
+                crate::wrf_radar_physics::z_to_dbz(value)
+            } else {
+                f32::NAN
+            }
+        })
+        .collect();
+    Ok((compact, zh_dbz))
+}
+
+fn first_existing_var<'a>(file: &WrfFile, names: &'a [&str]) -> Option<&'a str> {
+    names.iter().copied().find(|name| file.has_var(name))
+}
+
+fn read_optional_first_var_f32(
+    file: &WrfFile,
+    timeidx: usize,
+    names: &[&str],
+    expected: usize,
+) -> Result<Option<Vec<f32>>, String> {
+    let Some(name) = first_existing_var(file, names) else {
+        return Ok(None);
+    };
+    let values = file
+        .read_var(name, timeidx)
+        .map_err(|error| format!("dual-pol {name}: {error}"))?;
+    if values.len() != expected {
+        return Err(format!(
+            "dual-pol {name} has {} values, expected {expected}",
+            values.len()
+        ));
+    }
+    Ok(Some(values.into_iter().map(|value| value as f32).collect()))
+}
+
+fn read_compact_tke(file: &WrfFile, timeidx: usize, expected: usize) -> Option<Vec<u8>> {
+    let name = first_existing_var(file, &["TKE_PBL", "TKE", "QKE"])?;
+    let values = file.read_var(name, timeidx).ok()?;
+    if values.len() != expected {
+        return None;
+    }
+    let qke_halving = if name == "QKE" { 0.5 } else { 1.0 };
+    Some(
+        values
+            .into_iter()
+            .map(|value| quantize_u8((value as f32 * qke_halving).max(0.0), 0.1))
+            .collect(),
+    )
 }
 
 /// Earth-relative winds. `uvmet` returns `[u_earth.., v_earth..]`
@@ -735,6 +1311,11 @@ pub fn build_synthetic_volume_reporting(
     site.elevation_m = Some(antenna_msl as f32);
 
     let mut volume = RadarVolume::new(site, valid_time);
+    let microphysics_inventory = fields
+        .polarimetric
+        .as_ref()
+        .map(|polar| polar.present_fields.join(","))
+        .unwrap_or_default();
     volume.metadata = VolumeMetadata {
         source_path: None,
         archive_version: Some("simulated-wrf".to_string()),
@@ -743,7 +1324,52 @@ pub fn build_synthetic_volume_reporting(
         decoded_radial_count: 0,
         skipped_message_count: 0,
         scan_mode: Some(ScanMode::Ppi),
-        radar_frequency_mhz: None,
+        radar_frequency_mhz: Some(config.radar_frequency_mhz),
+        beam_width_h_deg: Some(config.beam_width_deg),
+        beam_width_v_deg: Some(config.beam_width_deg),
+        pulse_width_us: Some(config.pulse_width_us),
+        prt_s: (config.prf_hz.is_finite() && config.prf_hz > 0.0).then_some(1.0 / config.prf_hz),
+        unambiguous_range_km: (config.prf_hz.is_finite() && config.prf_hz > 0.0)
+            .then_some(299_792.458 / (2.0 * config.prf_hz)),
+        scan_name: Some(match config.scan_timing {
+            ScanTiming::InstantaneousTruth => "BowEcho instantaneous model volume".to_string(),
+            ScanTiming::TimedVolume => "BowEcho timed synthetic volume".to_string(),
+        }),
+        scan_id: Some("bowecho-synthetic-14-cut".to_string()),
+        polarization: Some(if config.dual_pol && fields.polarimetric.is_some() {
+            "simultaneous horizontal/vertical".to_string()
+        } else {
+            "horizontal".to_string()
+        }),
+        calibration: Some(format!(
+            "ZDR bias={:.2} dB; system PhiDP={:.2} deg",
+            config.zdr_bias_db, config.system_phidp_deg
+        )),
+        forward_operator: Some("BowEcho WRF polar-volume forward operator v2".to_string()),
+        forward_operator_config: Some(format!(
+            "mode={:?}; reflectivity_sampling={:?}; beam_integration={:?}; \
+             fall_speed={}; terrain_blockage={}; spectrum_width={}; dual_pol={}; \
+             propagation={}; microphysics_fields={microphysics_inventory}",
+            config.simulation_mode,
+            config.reflectivity_sampling,
+            config.beam_integration,
+            config.terminal_fall_speed,
+            config.terrain_blockage,
+            config.spectrum_width,
+            config.dual_pol,
+            config.propagation,
+        )),
+        source_model: Some("WRF".to_string()),
+        microphysics_scheme: fields
+            .polarimetric
+            .as_ref()
+            .map(|polar| format!("{} ({:?})", polar.profile.name, polar.profile.capability)),
+        scattering_model: (config.dual_pol && fields.polarimetric.is_some()).then(|| {
+            format!(
+                "{} (scheme-aware bulk S-band Rayleigh; not T-matrix)",
+                crate::wrf_radar_physics::bulk_sband_model_id()
+            )
+        }),
     };
 
     // One deterministic seed per forecast frame, folded into every clutter
@@ -753,7 +1379,21 @@ pub fn build_synthetic_volume_reporting(
     // in per cut. Cheap to compute even when clutter is off (unused then).
     let frame_seed = clutter_frame_seed(&config.site_id, valid_time);
 
+    let terrain_horizon = config.terrain_blockage.then(|| {
+        progress("tracing terrain horizon…");
+        TerrainHorizon::build(
+            fields,
+            site_lat,
+            site_lon,
+            antenna_msl,
+            naz,
+            gate_count,
+            spacing,
+        )
+    });
+
     let mut decoded_radials = 0usize;
+    let mut cut_start_ms = 0i32;
     let tilt_total = config.elevations_deg.len();
     for (cut_index, &elevation_deg) in config.elevations_deg.iter().enumerate() {
         progress(&format!(
@@ -773,12 +1413,392 @@ pub fn build_synthetic_volume_reporting(
             gate_range.clone(),
             config,
             frame_seed,
+            terrain_horizon.as_ref(),
+            cut_start_ms,
         );
         decoded_radials += cut.radials.len();
         volume.cuts.push(cut);
+        if matches!(config.scan_timing, ScanTiming::TimedVolume) {
+            let sweep_ms = 360_000.0 / config.rotation_rate_deg_s.max(0.1);
+            let transition_ms = 1_000.0 * config.transition_delay_s.max(0.0);
+            cut_start_ms = (f64::from(cut_start_ms) + f64::from(sweep_ms + transition_ms))
+                .round()
+                .clamp(0.0, f64::from(i32::MAX)) as i32;
+        }
     }
     volume.metadata.decoded_radial_count = decoded_radials;
     volume
+}
+
+/// Cumulative apparent terrain elevation for every azimuth/range cell. The
+/// running maximum is the terrain horizon seen by the virtual antenna; storing
+/// it once makes blockage independent of elevation-cut count.
+struct TerrainHorizon {
+    azimuth_count: usize,
+    gate_count: usize,
+    elevation_deg: Vec<f32>,
+}
+
+impl TerrainHorizon {
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        fields: &WrfRadarFields,
+        site_lat: f64,
+        site_lon: f64,
+        antenna_msl: f64,
+        azimuth_count: usize,
+        gate_count: usize,
+        spacing_m: f64,
+    ) -> Self {
+        let rows: Vec<Vec<f32>> = (0..azimuth_count)
+            .into_par_iter()
+            .map(|iaz| {
+                let azimuth_deg = iaz as f64 * 360.0 / azimuth_count as f64;
+                let azimuth = azimuth_deg.to_radians();
+                let mut horizon = f32::NEG_INFINITY;
+                let mut row = Vec::with_capacity(gate_count);
+                for gate in 0..gate_count {
+                    let slant_m = gate as f64 * spacing_m;
+                    let ground_m = beam_ground_range_m(slant_m, 0.0);
+                    if ground_m < spacing_m.max(1.0) {
+                        row.push(horizon);
+                        continue;
+                    }
+                    let east_km = ground_m * azimuth.sin() / 1_000.0;
+                    let north_km = ground_m * azimuth.cos() / 1_000.0;
+                    let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
+                    if let Some(terrain_m) = sample_terrain(fields, lat as f32, lon as f32) {
+                        let ae = radar_core::EFFECTIVE_EARTH_RADIUS_M;
+                        let phi = ground_m / ae;
+                        let terrain_radius = ae + f64::from(terrain_m);
+                        let horizontal = terrain_radius * phi.sin();
+                        let vertical = terrain_radius * phi.cos() - (ae + antenna_msl);
+                        let apparent = vertical.atan2(horizontal).to_degrees() as f32;
+                        if apparent.is_finite() {
+                            horizon = horizon.max(apparent);
+                        }
+                    }
+                    row.push(horizon);
+                }
+                row
+            })
+            .collect();
+        Self {
+            azimuth_count,
+            gate_count,
+            elevation_deg: rows.into_iter().flatten().collect(),
+        }
+    }
+
+    fn at(&self, azimuth_deg: f64, gate: usize) -> f32 {
+        if self.azimuth_count == 0 || self.gate_count == 0 {
+            return f32::NEG_INFINITY;
+        }
+        let az = azimuth_deg.rem_euclid(360.0) * self.azimuth_count as f64 / 360.0;
+        let lo = az.floor() as usize % self.azimuth_count;
+        let hi = (lo + 1) % self.azimuth_count;
+        let t = (az - az.floor()) as f32;
+        let gate = gate.min(self.gate_count - 1);
+        let a = self.elevation_deg[lo * self.gate_count + gate];
+        let b = self.elevation_deg[hi * self.gate_count + gate];
+        if a.is_finite() && b.is_finite() {
+            a + t * (b - a)
+        } else if a.is_finite() {
+            a
+        } else {
+            b
+        }
+    }
+}
+
+fn sample_terrain(fields: &WrfRadarFields, lat: f32, lon: f32) -> Option<f32> {
+    let mut weighted = 0.0f32;
+    let mut weight_sum = 0.0f32;
+    for (column, weight) in horizontal_stencil(fields, lat, lon)? {
+        let value = fields.terrain_m.get(column).copied()?;
+        if weight > 0.0 && value.is_finite() {
+            weighted += weight * value;
+            weight_sum += weight;
+        }
+    }
+    (weight_sum > 0.0).then_some(weighted / weight_sum)
+}
+
+#[derive(Clone, Copy)]
+struct QuadraturePoint {
+    az_sigma: f64,
+    el_sigma: f64,
+    range_gate: f64,
+    weight: f64,
+}
+
+const CENTER_QUADRATURE: [QuadraturePoint; 1] = [QuadraturePoint {
+    az_sigma: 0.0,
+    el_sigma: 0.0,
+    range_gate: 0.0,
+    weight: 1.0,
+}];
+
+// Center plus all eight corners of a symmetric 3-D pulse cubature. The center
+// receives four times one corner's weight; normalization happens per gate.
+const BALANCED_QUADRATURE: [QuadraturePoint; 9] = [
+    QuadraturePoint {
+        az_sigma: 0.0,
+        el_sigma: 0.0,
+        range_gate: 0.0,
+        weight: 4.0,
+    },
+    QuadraturePoint {
+        az_sigma: -1.0,
+        el_sigma: -1.0,
+        range_gate: -0.35,
+        weight: 1.0,
+    },
+    QuadraturePoint {
+        az_sigma: -1.0,
+        el_sigma: -1.0,
+        range_gate: 0.35,
+        weight: 1.0,
+    },
+    QuadraturePoint {
+        az_sigma: -1.0,
+        el_sigma: 1.0,
+        range_gate: -0.35,
+        weight: 1.0,
+    },
+    QuadraturePoint {
+        az_sigma: -1.0,
+        el_sigma: 1.0,
+        range_gate: 0.35,
+        weight: 1.0,
+    },
+    QuadraturePoint {
+        az_sigma: 1.0,
+        el_sigma: -1.0,
+        range_gate: -0.35,
+        weight: 1.0,
+    },
+    QuadraturePoint {
+        az_sigma: 1.0,
+        el_sigma: -1.0,
+        range_gate: 0.35,
+        weight: 1.0,
+    },
+    QuadraturePoint {
+        az_sigma: 1.0,
+        el_sigma: 1.0,
+        range_gate: -0.35,
+        weight: 1.0,
+    },
+    QuadraturePoint {
+        az_sigma: 1.0,
+        el_sigma: 1.0,
+        range_gate: 0.35,
+        weight: 1.0,
+    },
+];
+
+const fn make_reference_quadrature() -> [QuadraturePoint; 27] {
+    let coordinates = [-1.0, 0.0, 1.0];
+    let weights = [1.0, 2.0, 1.0];
+    let mut points = [CENTER_QUADRATURE[0]; 27];
+    let mut index = 0usize;
+    let mut iaz = 0usize;
+    while iaz < 3 {
+        let mut iel = 0usize;
+        while iel < 3 {
+            let mut irange = 0usize;
+            while irange < 3 {
+                points[index] = QuadraturePoint {
+                    az_sigma: coordinates[iaz],
+                    el_sigma: coordinates[iel],
+                    range_gate: 0.35 * coordinates[irange],
+                    weight: weights[iaz] * weights[iel] * weights[irange],
+                };
+                index += 1;
+                irange += 1;
+            }
+            iel += 1;
+        }
+        iaz += 1;
+    }
+    points
+}
+
+const REFERENCE_QUADRATURE: [QuadraturePoint; 27] = make_reference_quadrature();
+
+fn quadrature_points(mode: BeamIntegration) -> &'static [QuadraturePoint] {
+    match mode {
+        BeamIntegration::Center => &CENTER_QUADRATURE,
+        BeamIntegration::Balanced => &BALANCED_QUADRATURE,
+        BeamIntegration::Reference => &REFERENCE_QUADRATURE,
+    }
+}
+
+struct GatePhysicalSample {
+    z_linear: f32,
+    velocity_mps: f32,
+    spectrum_width_mps: f32,
+    polar: Option<crate::wrf_radar_physics::IntrinsicPolarSample>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_gate(
+    fields: &WrfRadarFields,
+    cells: usize,
+    site_lat: f64,
+    site_lon: f64,
+    antenna_msl: f64,
+    center_azimuth_deg: f64,
+    center_elevation_deg: f64,
+    center_slant_m: f64,
+    gate_index: usize,
+    spacing_m: f64,
+    config: &SyntheticRadarConfig,
+    terrain_horizon: Option<&TerrainHorizon>,
+) -> Option<GatePhysicalSample> {
+    let beam_sigma_deg = f64::from(config.beam_width_deg.max(0.05)) / (2.0 * (2.0_f64.ln()).sqrt());
+    let points = quadrature_points(config.beam_integration);
+    let mut valid_weight = 0.0f64;
+    let mut signal_weight = 0.0f64;
+    let mut sum_z = 0.0f64;
+    let mut sum_z_vr = 0.0f64;
+    let mut sum_z_vr2 = 0.0f64;
+    let mut sum_z_subgrid_variance = 0.0f64;
+    let mut polar_accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+    let mut any_polar = false;
+
+    for point in points {
+        let azimuth_deg = center_azimuth_deg + point.az_sigma * beam_sigma_deg;
+        let elevation_deg = center_elevation_deg + point.el_sigma * beam_sigma_deg;
+        let slant_m = (center_slant_m + point.range_gate * spacing_m).max(0.0);
+        let beam_height_m = beam_height_above_radar_m(slant_m, elevation_deg);
+        let z_msl = antenna_msl + beam_height_m;
+        let ground_m = beam_ground_range_m(slant_m, elevation_deg);
+        let azimuth = azimuth_deg.to_radians();
+        let east_km = ground_m * azimuth.sin() / 1_000.0;
+        let north_km = ground_m * azimuth.cos() / 1_000.0;
+        let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
+        let Some(sample) = sample_column(
+            fields,
+            cells,
+            lat as f32,
+            lon as f32,
+            z_msl as f32,
+            config.reflectivity_sampling,
+        ) else {
+            continue;
+        };
+        valid_weight += point.weight;
+
+        let blocked = terrain_horizon.is_some_and(|horizon| {
+            let horizon_deg = horizon.at(azimuth_deg, gate_index);
+            horizon_deg.is_finite() && elevation_deg as f32 <= horizon_deg
+        });
+        if blocked {
+            continue;
+        }
+
+        let el = elevation_deg.to_radians();
+        let fall_speed = if config.terminal_fall_speed {
+            sample.polar.map_or(0.0, |polar| polar.fall_speed_mps)
+        } else {
+            0.0
+        };
+        let vr = f64::from(sample.u) * azimuth.sin() * el.cos()
+            + f64::from(sample.v) * azimuth.cos() * el.cos()
+            + f64::from(sample.w - fall_speed) * el.sin();
+        let z = f64::from(sample.z_linear);
+        if !z.is_finite() || z <= 0.0 || !vr.is_finite() {
+            continue;
+        }
+        signal_weight += point.weight;
+        sum_z += point.weight * z;
+        sum_z_vr += point.weight * z * vr;
+        sum_z_vr2 += point.weight * z * vr * vr;
+        let terminal_variance = if config.terminal_fall_speed {
+            sample
+                .polar
+                .map_or(0.0, |polar| f64::from(polar.fall_speed_variance_m2s2))
+                * el.sin().powi(2)
+        } else {
+            0.0
+        };
+        let turbulent_variance = if config.spectrum_width {
+            // Isotropic one-dimensional variance from TKE = 1/2(u'^2+v'^2+w'^2).
+            f64::from((2.0 / 3.0) * sample.tke_m2s2.max(0.0))
+        } else {
+            0.0
+        };
+        sum_z_subgrid_variance += point.weight * z * (terminal_variance + turbulent_variance);
+        if let Some(polar) = sample.polar {
+            any_polar = true;
+            polar_accumulator.add(point.weight as f32, intrinsic_as_contribution(polar));
+        }
+    }
+
+    if valid_weight <= 0.0 || signal_weight <= 0.0 || sum_z <= 0.0 {
+        return None;
+    }
+    // Missing model-domain quadrature points are renormalized away. Terrain-
+    // blocked points remain in `valid_weight` but contribute no signal, so
+    // partial blockage correctly reduces received power.
+    let mut polar =
+        any_polar.then(|| normalize_intrinsic(polar_accumulator.finalize(), valid_weight as f32));
+    let z_linear = polar
+        .filter(|sample| sample.zh > 0.0)
+        .map_or((sum_z / valid_weight) as f32, |sample| sample.zh);
+    let velocity = sum_z_vr / sum_z;
+    let variance =
+        (sum_z_vr2 / sum_z - velocity * velocity).max(0.0) + sum_z_subgrid_variance / sum_z;
+    let floor = if config.spectrum_width {
+        f64::from(config.spectrum_width_floor_mps.max(0.0))
+    } else {
+        0.0
+    };
+    Some(GatePhysicalSample {
+        z_linear,
+        velocity_mps: velocity as f32,
+        spectrum_width_mps: (variance + floor * floor).sqrt() as f32,
+        polar: polar.take(),
+    })
+}
+
+struct CutMomentRow {
+    reflectivity: Vec<f32>,
+    velocity: Vec<f32>,
+    spectrum_width: Vec<f32>,
+    zdr: Vec<f32>,
+    rho_hv: Vec<f32>,
+    phi_dp: Vec<f32>,
+    kdp: Vec<f32>,
+    ah: Vec<f32>,
+    pia: Vec<f32>,
+    ref_corrected: Vec<f32>,
+    adp: Vec<f32>,
+    pida: Vec<f32>,
+    zdr_corrected: Vec<f32>,
+}
+
+impl CutMomentRow {
+    fn blank(gates: usize) -> Self {
+        let blank = || vec![f32::NAN; gates];
+        Self {
+            reflectivity: blank(),
+            velocity: blank(),
+            spectrum_width: blank(),
+            zdr: blank(),
+            rho_hv: blank(),
+            phi_dp: blank(),
+            kdp: blank(),
+            ah: blank(),
+            pia: blank(),
+            ref_corrected: blank(),
+            adp: blank(),
+            pida: blank(),
+            zdr_corrected: blank(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -795,12 +1815,18 @@ fn build_cut(
     gate_range: GateRange,
     config: &SyntheticRadarConfig,
     frame_seed: u32,
+    terrain_horizon: Option<&TerrainHorizon>,
+    cut_start_ms: i32,
 ) -> ElevationCut {
     let gate_count = gate_range.gate_count;
-    let el_rad = elevation_deg.to_radians();
-    let sin_el = el_rad.sin();
-    let cos_el = el_rad.cos();
-    let floor = config.ref_floor_dbz;
+    // Instrument mode already applies its range-varying radar-equation
+    // sensitivity gate below; a fixed 0 dBZ presentation floor would erase
+    // valid weak nearby returns a real instrument can see.
+    let floor = if config.instrument_noise {
+        f32::NEG_INFINITY
+    } else {
+        config.ref_floor_dbz
+    };
 
     // Ground clutter (opt-in). When the amount is 0 the whole clutter path is
     // skipped and the output is bit-identical to a build without the feature.
@@ -816,38 +1842,88 @@ fn build_cut(
 
     // One row per radial, sampled in parallel. Each row is `gate_count` REF and
     // `gate_count` VEL f32 values (NaN = no data / below floor / off-domain).
-    let rows: Vec<(Vec<f32>, Vec<f32>)> = (0..naz)
+    let rows: Vec<CutMomentRow> = (0..naz)
         .into_par_iter()
         .map(|iaz| {
             let az_deg = iaz as f64 * 360.0 / naz as f64;
-            let az_rad = az_deg.to_radians();
-            let sin_az = az_rad.sin();
-            let cos_az = az_rad.cos();
-
-            let mut ref_row = vec![f32::NAN; gate_count];
-            let mut vel_row = vec![f32::NAN; gate_count];
+            let mut row = CutMomentRow::blank(gate_count);
+            let dr_km = (spacing / 1_000.0).max(0.0) as f32;
+            let mut previous_kdp = 0.0f32;
+            let mut previous_ah = 0.0f32;
+            let mut previous_adp = 0.0f32;
+            let mut phi_path = 0.0f32;
+            let mut tau_h = 0.0f32;
+            let mut tau_dp = 0.0f32;
             for gate in 0..gate_count {
                 let slant_m = gate as f64 * spacing;
                 // Doviak & Zrnić (1993) eq. 2.28b/c under the 4/3-earth model.
                 let beam_height_m = beam_height_above_radar_m(slant_m, elevation_deg);
-                let z_msl = antenna_msl + beam_height_m;
                 let ground_m = beam_ground_range_m(slant_m, elevation_deg);
-                let east_km = ground_m * sin_az / 1000.0;
-                let north_km = ground_m * cos_az / 1000.0;
-                let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
-
-                let Some(sample) =
-                    sample_column(fields, cells, lat as f32, lon as f32, z_msl as f32)
-                else {
+                let Some(sample) = sample_gate(
+                    fields,
+                    cells,
+                    site_lat,
+                    site_lon,
+                    antenna_msl,
+                    az_deg,
+                    elevation_deg,
+                    slant_m,
+                    gate,
+                    spacing,
+                    config,
+                    terrain_horizon,
+                ) else {
                     continue;
                 };
                 // Reflectivity gate texture (default ON): perturb BEFORE the
                 // floor test so echo edges go ragged the way marginal-SNR gates
                 // do on a real scope. When off, `dbz` is `sample.dbz` untouched
                 // — the output stays bit-identical to a textureless build.
-                let mut dbz = sample.dbz;
+                let intrinsic_dbz = z_to_dbz(sample.z_linear);
+                let mut intrinsic_zdr = f32::NAN;
+                let mut rho_hv = f32::NAN;
+                let mut kdp = f32::NAN;
+                let mut ah = f32::NAN;
+                let mut adp = f32::NAN;
+                let mut pia = f32::NAN;
+                let mut pida = f32::NAN;
+                let mut phi_dp = f32::NAN;
+                if let Some(polar) = sample.polar {
+                    intrinsic_zdr = polar.zdr_db;
+                    rho_hv = polar.rho_hv;
+                    kdp = polar.kdp_deg_km;
+                    ah = polar.ah_db_km;
+                    adp = polar.ah_db_km - polar.av_db_km;
+                    if config.propagation && gate > 0 {
+                        phi_path += (previous_kdp + kdp) * dr_km;
+                        tau_h += 0.5 * (previous_ah + ah) * dr_km;
+                        tau_dp += 0.5 * (previous_adp + adp) * dr_km;
+                    }
+                    previous_kdp = kdp;
+                    previous_ah = ah;
+                    previous_adp = adp;
+                    pia = if config.propagation { 2.0 * tau_h } else { 0.0 };
+                    pida = if config.propagation {
+                        2.0 * tau_dp
+                    } else {
+                        0.0
+                    };
+                    phi_dp =
+                        config.system_phidp_deg + if config.propagation { phi_path } else { 0.0 };
+                }
+                let mut dbz = intrinsic_dbz - if pia.is_finite() { pia } else { 0.0 };
                 if config.ref_gate_texture {
                     dbz += ref_gate_texture_db(cut_index, iaz, gate);
+                }
+                let range_km = (slant_m / 1_000.0).max(1.0) as f32;
+                let sensitivity = config.sensitivity_dbz_at_1km + 20.0 * range_km.log10();
+                if config.instrument_noise {
+                    let snr_db = dbz - sensitivity;
+                    if !snr_db.is_finite() || snr_db < 0.0 {
+                        continue;
+                    }
+                    let sigma_db = (1.5 / (1.0 + snr_db / 6.0)).clamp(0.12, 1.5);
+                    dbz += sigma_db * clutter_signed(frame_seed, cut_index, iaz, gate, 0x534e_525a);
                 }
                 // Physics reflectivity + velocity for this gate. Both stay NaN
                 // below the floor (clear air) so ground clutter can fill them,
@@ -856,15 +1932,23 @@ fn build_cut(
                 // committed unchanged, so the output is bit-identical.
                 let mut ref_val = f32::NAN;
                 let mut vel_val = f32::NAN;
+                let mut sw_val = f32::NAN;
+                let mut clutter_replaced = false;
                 if dbz.is_finite() && dbz >= floor {
                     ref_val = dbz;
                     // Radial velocity: wind projected onto the beam unit vector
                     // (east, north, up) = (sinAz·cosEl, cosAz·cosEl, sinEl), with
                     // azimuth clockwise from north. Positive = away from the radar
                     // (NEXRAD convention). Sun & Crook (1997).
-                    let vr = sample.u * (sin_az as f32) * (cos_el as f32)
-                        + sample.v * (cos_az as f32) * (cos_el as f32)
-                        + sample.w * (sin_el as f32);
+                    let mut vr = sample.velocity_mps;
+                    let mut velocity_noise_variance = 0.0f32;
+                    if config.instrument_noise {
+                        let snr_db = (dbz - sensitivity).max(0.0);
+                        let sigma_velocity = (1.2 / (1.0 + snr_db / 8.0)).clamp(0.08, 1.2);
+                        velocity_noise_variance = sigma_velocity * sigma_velocity;
+                        vr += sigma_velocity
+                            * clutter_signed(frame_seed, cut_index, iaz, gate, 0x534e_5256);
+                    }
                     if vr.is_finite() {
                         // Velocity gate texture (default OFF): opt-in wobble; the
                         // clean Vr is what dealias/GBVTD consume.
@@ -873,6 +1957,11 @@ fn build_cut(
                         } else {
                             vr
                         };
+                    }
+                    if config.spectrum_width && sample.spectrum_width_mps.is_finite() {
+                        sw_val = (sample.spectrum_width_mps.max(0.0).powi(2)
+                            + velocity_noise_variance)
+                            .sqrt();
                     }
                 }
 
@@ -893,6 +1982,7 @@ fn build_cut(
                     )
                     && (!ref_val.is_finite() || ref_val < cv)
                 {
+                    clutter_replaced = true;
                     ref_val = cv;
                     // The ground is stationary: where clutter dominates a gate
                     // that already carried a velocity, replace the wind
@@ -901,6 +1991,9 @@ fn build_cut(
                     // is gated on data existing).
                     if vel_val.is_finite() {
                         vel_val = clutter_velocity_mps(frame_seed, cut_index, iaz, gate);
+                        if config.spectrum_width {
+                            sw_val = sw_val.max(config.spectrum_width_floor_mps.max(0.0));
+                        }
                     }
                 }
 
@@ -915,31 +2008,89 @@ fn build_cut(
                 }
 
                 if ref_val.is_finite() {
-                    ref_row[gate] = ref_val;
+                    row.reflectivity[gate] = ref_val;
                 }
                 if vel_val.is_finite() {
-                    vel_row[gate] = vel_val;
+                    row.velocity[gate] = vel_val;
+                }
+                if sw_val.is_finite() {
+                    row.spectrum_width[gate] = sw_val;
+                }
+                if config.dual_pol
+                    && !clutter_replaced
+                    && ref_val.is_finite()
+                    && intrinsic_zdr.is_finite()
+                {
+                    row.zdr[gate] = intrinsic_zdr + config.zdr_bias_db - pida;
+                    row.rho_hv[gate] = rho_hv.clamp(0.0, 1.0);
+                    row.phi_dp[gate] = phi_dp;
+                    row.kdp[gate] = kdp;
+                    row.ah[gate] = ah;
+                    row.pia[gate] = pia;
+                    row.ref_corrected[gate] = intrinsic_dbz;
+                    row.adp[gate] = adp;
+                    row.pida[gate] = pida;
+                    row.zdr_corrected[gate] = intrinsic_zdr;
                 }
             }
-            (ref_row, vel_row)
+            row
         })
         .collect();
 
     let mut cut = ElevationCut::new(elevation_deg as f32, u8::try_from(cut_index + 1).ok());
     let mut ref_values = Vec::with_capacity(naz * gate_count);
     let mut vel_values = Vec::with_capacity(naz * gate_count);
-    for (iaz, (ref_row, vel_row)) in rows.into_iter().enumerate() {
+    let mut sw_values = Vec::with_capacity(naz * gate_count);
+    let mut zdr_values = Vec::with_capacity(naz * gate_count);
+    let mut rho_values = Vec::with_capacity(naz * gate_count);
+    let mut phi_values = Vec::with_capacity(naz * gate_count);
+    let mut kdp_values = Vec::with_capacity(naz * gate_count);
+    let mut ah_values = Vec::with_capacity(naz * gate_count);
+    let mut pia_values = Vec::with_capacity(naz * gate_count);
+    let mut refc_values = Vec::with_capacity(naz * gate_count);
+    let mut adp_values = Vec::with_capacity(naz * gate_count);
+    let mut pida_values = Vec::with_capacity(naz * gate_count);
+    let mut zdrc_values = Vec::with_capacity(naz * gate_count);
+    for (iaz, row) in rows.into_iter().enumerate() {
         let az_deg = iaz as f32 * 360.0 / naz as f32;
+        let time_offset_ms = match config.scan_timing {
+            ScanTiming::InstantaneousTruth => 0,
+            ScanTiming::TimedVolume => {
+                let radial_ms = 1_000.0 * az_deg / config.rotation_rate_deg_s.max(0.1);
+                cut_start_ms.saturating_add(radial_ms.round() as i32)
+            }
+        };
         cut.radials.push(Radial {
             azimuth_deg: az_deg,
             elevation_deg: elevation_deg as f32,
-            time_offset_ms: 0,
+            time_offset_ms,
             gate_range: gate_range.clone(),
             nyquist_velocity_mps: Some(config.stamped_nyquist_mps()),
-            radial_status: None,
+            radial_status: Some(if iaz == 0 && cut_index == 0 {
+                radar_core::RadialStatus::StartVolume
+            } else if iaz == 0 {
+                radar_core::RadialStatus::StartElevation
+            } else if iaz + 1 == naz && cut_index + 1 == config.elevations_deg.len() {
+                radar_core::RadialStatus::EndVolume
+            } else if iaz + 1 == naz {
+                radar_core::RadialStatus::EndElevation
+            } else {
+                radar_core::RadialStatus::Intermediate
+            }),
         });
-        ref_values.extend(ref_row);
-        vel_values.extend(vel_row);
+        ref_values.extend(row.reflectivity);
+        vel_values.extend(row.velocity);
+        sw_values.extend(row.spectrum_width);
+        zdr_values.extend(row.zdr);
+        rho_values.extend(row.rho_hv);
+        phi_values.extend(row.phi_dp);
+        kdp_values.extend(row.kdp);
+        ah_values.extend(row.ah);
+        pia_values.extend(row.pia);
+        refc_values.extend(row.ref_corrected);
+        adp_values.extend(row.adp);
+        pida_values.extend(row.pida);
+        zdrc_values.extend(row.zdr_corrected);
     }
 
     let radial_indices: Vec<usize> = (0..naz).collect();
@@ -954,8 +2105,44 @@ fn build_cut(
     );
     cut.moments.insert(
         MomentType::Velocity,
-        f32_grid(MomentType::Velocity, gate_range, radial_indices, vel_values),
+        f32_grid(
+            MomentType::Velocity,
+            gate_range.clone(),
+            radial_indices.clone(),
+            vel_values,
+        ),
     );
+    if config.spectrum_width {
+        cut.moments.insert(
+            MomentType::SpectrumWidth,
+            f32_grid(
+                MomentType::SpectrumWidth,
+                gate_range.clone(),
+                radial_indices.clone(),
+                sw_values,
+            ),
+        );
+    }
+    if config.dual_pol && fields.polarimetric.is_some() {
+        let polar_moments = [
+            (MomentType::DifferentialReflectivity, zdr_values),
+            (MomentType::CorrelationCoefficient, rho_values),
+            (MomentType::DifferentialPhase, phi_values),
+            (MomentType::SpecificDifferentialPhase, kdp_values),
+            (MomentType::Unknown("AH".to_string()), ah_values),
+            (MomentType::Unknown("PIA".to_string()), pia_values),
+            (MomentType::Unknown("REFC".to_string()), refc_values),
+            (MomentType::Unknown("ADP".to_string()), adp_values),
+            (MomentType::Unknown("PIDA".to_string()), pida_values),
+            (MomentType::Unknown("ZDRC".to_string()), zdrc_values),
+        ];
+        for (moment, values) in polar_moments {
+            cut.moments.insert(
+                moment.clone(),
+                f32_grid(moment, gate_range.clone(), radial_indices.clone(), values),
+            );
+        }
+    }
     cut
 }
 
@@ -982,10 +2169,48 @@ fn f32_grid(
 
 /// One trilinearly-sampled model column value at a gate.
 struct ColumnSample {
-    dbz: f32,
+    /// Equivalent reflectivity factor in linear mm^6 m^-3. Keeping received
+    /// power linear through every interpolation and pulse-volume average is the
+    /// core scientific correction; convert to dBZ only at the finished gate.
+    z_linear: f32,
     u: f32,
     v: f32,
     w: f32,
+    polar: Option<crate::wrf_radar_physics::IntrinsicPolarSample>,
+    tke_m2s2: f32,
+}
+
+fn intrinsic_as_contribution(
+    sample: crate::wrf_radar_physics::IntrinsicPolarSample,
+) -> crate::wrf_radar_physics::BulkContribution {
+    crate::wrf_radar_physics::BulkContribution {
+        zh: sample.zh,
+        zv: sample.zv,
+        cov_re: sample.cov_re,
+        cov_im: sample.cov_im,
+        kdp_deg_km: sample.kdp_deg_km,
+        ah_db_km: sample.ah_db_km,
+        av_db_km: sample.av_db_km,
+        fall_speed_mps: sample.fall_speed_mps,
+        fall_speed_variance_m2s2: sample.fall_speed_variance_m2s2,
+    }
+}
+
+fn normalize_intrinsic(
+    mut sample: crate::wrf_radar_physics::IntrinsicPolarSample,
+    divisor: f32,
+) -> crate::wrf_radar_physics::IntrinsicPolarSample {
+    if divisor.is_finite() && divisor > 0.0 {
+        sample.zh /= divisor;
+        sample.zv /= divisor;
+        sample.cov_re /= divisor;
+        sample.cov_im /= divisor;
+        sample.covariance_magnitude /= divisor;
+        sample.kdp_deg_km /= divisor;
+        sample.ah_db_km /= divisor;
+        sample.av_db_km /= divisor;
+    }
+    sample
 }
 
 /// Sample the 3-D model fields at (lat, lon, MSL height) by horizontal 2×2
@@ -999,14 +2224,17 @@ fn sample_column(
     lat: f32,
     lon: f32,
     z_msl: f32,
+    reflectivity_sampling: ReflectivitySampling,
 ) -> Option<ColumnSample> {
     let stencil = horizontal_stencil(fields, lat, lon)?;
 
     let mut wsum = 0.0f32;
-    let mut dbz = 0.0f32;
+    let mut reflectivity = 0.0f32;
     let mut u = 0.0f32;
     let mut v = 0.0f32;
     let mut w = 0.0f32;
+    let mut tke = 0.0f32;
+    let mut polar_accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
     for (col, weight) in stencil {
         if weight <= 0.0 {
             continue;
@@ -1016,7 +2244,12 @@ fn sample_column(
         };
         let i0 = k * cells + col;
         let i1 = (k + 1) * cells + col;
-        let Some(d) = lerp(fields.dbz[i0], fields.dbz[i1], t) else {
+        let Some(d) = (match reflectivity_sampling {
+            ReflectivitySampling::LegacyDbz => lerp(fields.dbz[i0], fields.dbz[i1], t),
+            ReflectivitySampling::LinearZ => {
+                lerp(dbz_to_z(fields.dbz[i0]), dbz_to_z(fields.dbz[i1]), t)
+            }
+        }) else {
             continue;
         };
         let (Some(su), Some(sv), Some(sw)) = (
@@ -1026,8 +2259,19 @@ fn sample_column(
         ) else {
             continue;
         };
+        if let Some(polar) = &fields.polarimetric {
+            let mut vertical = crate::wrf_radar_physics::PolarAccumulator::default();
+            vertical.add(1.0 - t, polar.contribution_at(i0, dbz_to_z(fields.dbz[i0])));
+            vertical.add(t, polar.contribution_at(i1, dbz_to_z(fields.dbz[i1])));
+            polar_accumulator.add(weight, intrinsic_as_contribution(vertical.finalize()));
+        }
+        if let Some(tke_grid) = &fields.tke_tenths_m2s2 {
+            let t0 = tke_grid[i0] as f32 * 0.1;
+            let t1 = tke_grid[i1] as f32 * 0.1;
+            tke += weight * (t0 + t * (t1 - t0));
+        }
         wsum += weight;
-        dbz += weight * d;
+        reflectivity += weight * d;
         u += weight * su;
         v += weight * sv;
         w += weight * sw;
@@ -1035,12 +2279,41 @@ fn sample_column(
     if wsum <= 0.0 {
         return None;
     }
+    let reflectivity = reflectivity / wsum;
+    let z_linear = match reflectivity_sampling {
+        ReflectivitySampling::LegacyDbz => dbz_to_z(reflectivity),
+        ReflectivitySampling::LinearZ => reflectivity,
+    };
+    let polar = fields.polarimetric.as_ref().and_then(|_| {
+        let sample = normalize_intrinsic(polar_accumulator.finalize(), wsum);
+        (sample.zh > 0.0).then_some(sample)
+    });
     Some(ColumnSample {
-        dbz: dbz / wsum,
+        z_linear: polar.map_or(z_linear, |sample| sample.zh),
         u: u / wsum,
         v: v / wsum,
         w: w / wsum,
+        polar,
+        tke_m2s2: tke / wsum,
     })
+}
+
+#[inline]
+fn dbz_to_z(dbz: f32) -> f32 {
+    if dbz.is_finite() {
+        crate::wrf_radar_physics::dbz_to_z(dbz)
+    } else {
+        f32::NAN
+    }
+}
+
+#[inline]
+fn z_to_dbz(z: f32) -> f32 {
+    if z.is_finite() && z > 0.0 {
+        10.0 * z.log10()
+    } else {
+        f32::NAN
+    }
 }
 
 /// Up to four `(column index, horizontal weight)` pairs for the WRF cell
@@ -1125,17 +2398,37 @@ fn bracket_height(
     if !h0.is_finite() || !htop.is_finite() || z < h0 || z > htop {
         return None;
     }
-    for k in 0..nz - 1 {
-        let hk = fields.height_msl[k * cells + col];
-        let hk1 = fields.height_msl[(k + 1) * cells + col];
-        if !hk.is_finite() || !hk1.is_finite() || hk1 <= hk {
-            continue;
+    // WRF mass-level heights are monotonic in ordinary columns. Binary search
+    // matters once a pulse gate carries 9 or 27 quadrature points: the former
+    // O(nz) scan otherwise dominates the forward operator on deep nests.
+    let mut lo = 0usize;
+    let mut hi = nz - 1;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let hm = fields.height_msl[mid * cells + col];
+        if !hm.is_finite() {
+            break;
         }
-        if z >= hk && z <= hk1 {
-            return Some((k, (z - hk) / (hk1 - hk)));
+        if hm <= z {
+            lo = mid;
+        } else {
+            hi = mid;
         }
     }
-    None
+    let hlo = fields.height_msl[lo * cells + col];
+    let hhi = fields.height_msl[(lo + 1) * cells + col];
+    if hlo.is_finite() && hhi.is_finite() && hhi > hlo && z >= hlo && z <= hhi {
+        return Some((lo, (z - hlo) / (hhi - hlo)));
+    }
+
+    // A malformed/non-monotonic column is uncommon but should not turn into a
+    // fabricated gate. Fall back to the former defensive linear search.
+    (0..nz - 1).find_map(|k| {
+        let hk = fields.height_msl[k * cells + col];
+        let hk1 = fields.height_msl[(k + 1) * cells + col];
+        (hk.is_finite() && hk1.is_finite() && hk1 > hk && z >= hk && z <= hk1)
+            .then_some((k, (z - hk) / (hk1 - hk)))
+    })
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> Option<f32> {
@@ -1579,18 +2872,15 @@ fn build_synthetic_from_paths(
                 )));
             };
             progress("reading…");
-            let fields = match read_wrf_radar_fields_reporting(
-                &file,
-                timeidx,
-                config.reflectivity_operator,
-                &progress,
-            ) {
-                Ok(fields) => fields,
-                Err(err) => {
-                    notes.push(format!("{name} time {timeidx}: {err}"));
-                    continue;
-                }
-            };
+            let fields =
+                match read_wrf_radar_fields_for_config_reporting(&file, timeidx, config, &progress)
+                {
+                    Ok(fields) => fields,
+                    Err(err) => {
+                        notes.push(format!("{name} time {timeidx}: {err}"));
+                        continue;
+                    }
+                };
             let valid_time = times
                 .get(timeidx)
                 .and_then(|raw| parse_wrf_time(raw))
@@ -1615,9 +2905,14 @@ fn build_synthetic_from_paths(
             } else {
                 String::new()
             };
+            let polar_note = fields
+                .dual_pol_status
+                .as_deref()
+                .map(|status| format!(", {status}"))
+                .unwrap_or_default();
             notes.push(format!(
-                "{name} time {timeidx}: {} radials from {}{gate_note}",
-                volume.metadata.decoded_radial_count, fields.ref_source
+                "{name} time {timeidx}: {} radials from {}{gate_note}{polar_note}",
+                volume.metadata.decoded_radial_count, fields.ref_source,
             ));
             volumes.push(Arc::new(volume));
         }
@@ -1926,10 +3221,328 @@ mod tests {
             v,
             w,
             terrain_m,
+            polarimetric: None,
+            dual_pol_status: None,
+            tke_tenths_m2s2: None,
             ref_source: "test",
             dx_m: None,
             lut,
         }
+    }
+
+    fn attach_uniform_polar(
+        fields: &mut WrfRadarFields,
+        sample: crate::wrf_radar_physics::IntrinsicPolarSample,
+    ) {
+        let profile = crate::wrf_radar_physics::detect_scheme(
+            Some(10),
+            ["QRAIN", "QNRAIN", "QSNOW", "QNSNOW"],
+        );
+        let mut compact = CompactPolarFields::new(
+            fields.dbz.len(),
+            profile,
+            vec!["QRAIN".to_string(), "QNRAIN".to_string()],
+        );
+        for index in 0..fields.dbz.len() {
+            compact.store(index, sample);
+        }
+        fields.polarimetric = Some(compact);
+    }
+
+    #[test]
+    fn linear_z_interpolation_preserves_received_power() {
+        let mut fields = uniform_box_fields();
+        // West half 0 dBZ, east half 60 dBZ at both vertical levels. The box
+        // centre therefore has equal contributors at the two powers.
+        for level in 0..fields.nz {
+            let base = level * fields.cells();
+            fields.dbz[base] = 0.0;
+            fields.dbz[base + 1] = 60.0;
+            fields.dbz[base + 2] = 0.0;
+            fields.dbz[base + 3] = 60.0;
+        }
+        let legacy = sample_column(
+            &fields,
+            fields.cells(),
+            39.0,
+            -95.0,
+            1_000.0,
+            ReflectivitySampling::LegacyDbz,
+        )
+        .expect("legacy sample");
+        let linear = sample_column(
+            &fields,
+            fields.cells(),
+            39.0,
+            -95.0,
+            1_000.0,
+            ReflectivitySampling::LinearZ,
+        )
+        .expect("linear-Z sample");
+        assert!((z_to_dbz(legacy.z_linear) - 30.0).abs() < 0.05);
+        assert!((z_to_dbz(linear.z_linear) - 56.9897).abs() < 0.05);
+    }
+
+    #[test]
+    fn quadrature_tiers_leave_a_uniform_scene_invariant() {
+        let fields = uniform_box_fields();
+        let mut config = SyntheticRadarConfig {
+            ref_gate_texture: false,
+            vel_gate_texture: false,
+            spectrum_width: true,
+            spectrum_width_floor_mps: 0.0,
+            ..SyntheticRadarConfig::default()
+        };
+        let mut samples = Vec::new();
+        for tier in [
+            BeamIntegration::Center,
+            BeamIntegration::Balanced,
+            BeamIntegration::Reference,
+        ] {
+            config.beam_integration = tier;
+            samples.push(
+                sample_gate(
+                    &fields,
+                    fields.cells(),
+                    39.0,
+                    -95.0,
+                    200.0,
+                    90.0,
+                    0.5,
+                    2_000.0,
+                    8,
+                    250.0,
+                    &config,
+                    None,
+                )
+                .expect("uniform gate"),
+            );
+        }
+        for sample in &samples {
+            assert!((z_to_dbz(sample.z_linear) - 40.0).abs() < 0.02);
+            assert!((sample.velocity_mps - 10.0).abs() < 0.02);
+        }
+        assert!(samples[0].spectrum_width_mps < 1.0e-4);
+        assert!(samples[1].spectrum_width_mps >= 0.0);
+        assert!(samples[2].spectrum_width_mps >= 0.0);
+    }
+
+    #[test]
+    fn timed_volume_stamps_monotonic_nonzero_ray_times() {
+        let fields = uniform_box_fields();
+        let config = SyntheticRadarConfig {
+            site_lat_deg: Some(39.0),
+            site_lon_deg: Some(-95.0),
+            antenna_msl_m: Some(200.0),
+            elevations_deg: vec![0.5, 1.5],
+            azimuth_count: 12,
+            gate_spacing_m: 500.0,
+            max_range_m: 5_000.0,
+            scan_timing: ScanTiming::TimedVolume,
+            rotation_rate_deg_s: 12.0,
+            transition_delay_s: 2.0,
+            ref_gate_texture: false,
+            ..SyntheticRadarConfig::default()
+        };
+        let volume = build_synthetic_volume(
+            &fields,
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            &config,
+        );
+        let offsets: Vec<i32> = volume
+            .cuts
+            .iter()
+            .flat_map(|cut| cut.radials.iter().map(|radial| radial.time_offset_ms))
+            .collect();
+        assert_eq!(offsets[0], 0);
+        assert!(offsets.windows(2).all(|pair| pair[1] > pair[0]));
+        assert!(offsets.last().copied().unwrap_or(0) > 50_000);
+    }
+
+    #[test]
+    fn dual_pol_path_emits_propagation_and_attenuation_moments() {
+        let mut fields = uniform_box_fields();
+        let zh = dbz_to_z(40.0);
+        let zv = zh / 10.0f32.powf(0.1);
+        let covariance = 0.97 * (zh * zv).sqrt();
+        attach_uniform_polar(
+            &mut fields,
+            crate::wrf_radar_physics::IntrinsicPolarSample {
+                zh,
+                zv,
+                cov_re: covariance,
+                cov_im: 0.0,
+                covariance_magnitude: covariance,
+                kdp_deg_km: 1.0,
+                ah_db_km: 0.01,
+                av_db_km: 0.008,
+                fall_speed_mps: 5.0,
+                fall_speed_variance_m2s2: 1.0,
+                zdr_db: 1.0,
+                rho_hv: 0.97,
+            },
+        );
+        let config = SyntheticRadarConfig {
+            site_lat_deg: Some(39.0),
+            site_lon_deg: Some(-95.0),
+            antenna_msl_m: Some(200.0),
+            elevations_deg: vec![0.5],
+            azimuth_count: 4,
+            gate_spacing_m: 1_000.0,
+            max_range_m: 5_000.0,
+            ref_floor_dbz: -20.0,
+            ref_gate_texture: false,
+            dual_pol: true,
+            propagation: true,
+            system_phidp_deg: 7.0,
+            ..SyntheticRadarConfig::default()
+        };
+        let volume = build_synthetic_volume(
+            &fields,
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            &config,
+        );
+        let cut = &volume.cuts[0];
+        for moment in [
+            MomentType::DifferentialReflectivity,
+            MomentType::CorrelationCoefficient,
+            MomentType::DifferentialPhase,
+            MomentType::SpecificDifferentialPhase,
+            MomentType::Unknown("AH".to_string()),
+            MomentType::Unknown("PIA".to_string()),
+            MomentType::Unknown("REFC".to_string()),
+            MomentType::Unknown("ADP".to_string()),
+            MomentType::Unknown("PIDA".to_string()),
+            MomentType::Unknown("ZDRC".to_string()),
+        ] {
+            assert!(cut.moments.contains_key(&moment), "missing {moment}");
+        }
+        let phi = cut.moments[&MomentType::DifferentialPhase]
+            .scaled_value(0, 2)
+            .expect("PhiDP gate");
+        let pia = cut.moments[&MomentType::Unknown("PIA".to_string())]
+            .scaled_value(0, 2)
+            .expect("PIA gate");
+        let refc = cut.moments[&MomentType::Unknown("REFC".to_string())]
+            .scaled_value(0, 2)
+            .expect("REFC gate");
+        let observed = cut.moments[&MomentType::Reflectivity]
+            .scaled_value(0, 2)
+            .expect("REF gate");
+        assert!((phi - 11.0).abs() < 0.05, "PhiDP={phi}");
+        assert!((pia - 0.04).abs() < 0.005, "PIA={pia}");
+        assert!((refc - observed - pia).abs() < 0.005);
+        let rho = cut.moments[&MomentType::CorrelationCoefficient]
+            .scaled_value(0, 2)
+            .expect("rho gate");
+        assert!((0.0..=1.0).contains(&rho));
+    }
+
+    #[test]
+    fn terminal_fall_speed_projects_toward_an_upward_beam() {
+        let mut fields = uniform_box_fields();
+        let zh = dbz_to_z(40.0);
+        attach_uniform_polar(
+            &mut fields,
+            crate::wrf_radar_physics::IntrinsicPolarSample {
+                zh,
+                zv: zh,
+                cov_re: zh,
+                cov_im: 0.0,
+                covariance_magnitude: zh,
+                kdp_deg_km: 0.0,
+                ah_db_km: 0.0,
+                av_db_km: 0.0,
+                fall_speed_mps: 5.0,
+                fall_speed_variance_m2s2: 0.0,
+                zdr_db: 0.0,
+                rho_hv: 1.0,
+            },
+        );
+        let mut config = SyntheticRadarConfig {
+            ref_gate_texture: false,
+            ..SyntheticRadarConfig::default()
+        };
+        let air = sample_gate(
+            &fields,
+            fields.cells(),
+            39.0,
+            -95.0,
+            200.0,
+            90.0,
+            30.0,
+            2_000.0,
+            8,
+            250.0,
+            &config,
+            None,
+        )
+        .expect("air-motion gate");
+        config.terminal_fall_speed = true;
+        let scatterer = sample_gate(
+            &fields,
+            fields.cells(),
+            39.0,
+            -95.0,
+            200.0,
+            90.0,
+            30.0,
+            2_000.0,
+            8,
+            250.0,
+            &config,
+            None,
+        )
+        .expect("scatterer-motion gate");
+        assert!((scatterer.velocity_mps - (air.velocity_mps - 2.5)).abs() < 0.08);
+    }
+
+    #[test]
+    fn terrain_horizon_blocks_downstream_low_tilt() {
+        let mut fields = uniform_box_fields();
+        fields.terrain_m.fill(1_500.0);
+        let horizon = TerrainHorizon::build(&fields, 39.0, -95.0, 200.0, 36, 20, 500.0);
+        let config = SyntheticRadarConfig {
+            terrain_blockage: true,
+            ref_gate_texture: false,
+            ..SyntheticRadarConfig::default()
+        };
+        let blocked = sample_gate(
+            &fields,
+            fields.cells(),
+            39.0,
+            -95.0,
+            200.0,
+            90.0,
+            0.5,
+            2_000.0,
+            4,
+            500.0,
+            &config,
+            Some(&horizon),
+        );
+        assert!(
+            blocked.is_none(),
+            "a 1.5-km ridge must block the 0.5-degree beam"
+        );
+        assert!(
+            sample_gate(
+                &fields,
+                fields.cells(),
+                39.0,
+                -95.0,
+                200.0,
+                90.0,
+                0.5,
+                2_000.0,
+                4,
+                500.0,
+                &config,
+                None,
+            )
+            .is_some(),
+            "same model gate is visible without blockage"
+        );
     }
 
     /// A tiny synthetic 2×2×2 model verifies the whole sampling chain end to
@@ -2166,6 +3779,7 @@ mod tests {
             ref_gate_texture: true,
             vel_gate_texture: false,
             clutter_intensity: 0.0,
+            ..SyntheticRadarConfig::default()
         };
         let fingerprint = base.data_fingerprint();
 
@@ -2222,6 +3836,56 @@ mod tests {
         assert!(
             differs(&|c| c.reflectivity_operator = ClassicStoelinga),
             "operator"
+        );
+        assert!(
+            differs(&|c| c.simulation_mode = SimulationMode::Truth),
+            "simulation_mode"
+        );
+        assert!(
+            differs(&|c| c.reflectivity_sampling = ReflectivitySampling::LegacyDbz),
+            "reflectivity_sampling"
+        );
+        assert!(
+            differs(&|c| c.beam_integration = BeamIntegration::Balanced),
+            "beam_integration"
+        );
+        assert!(differs(&|c| c.beam_width_deg = 1.2), "beam_width_deg");
+        assert!(differs(&|c| c.pulse_width_us = 2.0), "pulse_width_us");
+        assert!(
+            differs(&|c| c.radar_frequency_mhz = 5_600),
+            "radar_frequency_mhz"
+        );
+        assert!(
+            differs(&|c| c.terminal_fall_speed = true),
+            "terminal_fall_speed"
+        );
+        assert!(differs(&|c| c.terrain_blockage = true), "terrain_blockage");
+        assert!(differs(&|c| c.spectrum_width = true), "spectrum_width");
+        assert!(
+            differs(&|c| c.spectrum_width_floor_mps = 0.8),
+            "spectrum_width_floor_mps"
+        );
+        assert!(differs(&|c| c.dual_pol = true), "dual_pol");
+        assert!(differs(&|c| c.propagation = true), "propagation");
+        assert!(differs(&|c| c.system_phidp_deg = 11.0), "system_phidp_deg");
+        assert!(differs(&|c| c.zdr_bias_db = 0.3), "zdr_bias_db");
+        assert!(
+            differs(&|c| c.scan_timing = ScanTiming::TimedVolume),
+            "scan_timing"
+        );
+        assert!(
+            differs(&|c| c.rotation_rate_deg_s = 12.0),
+            "rotation_rate_deg_s"
+        );
+        assert!(
+            differs(&|c| c.transition_delay_s = 5.0),
+            "transition_delay_s"
+        );
+        assert!(differs(&|c| c.prf_hz = 1_200.0), "prf_hz");
+        assert!(differs(&|c| c.instrument_noise = true), "instrument_noise");
+        assert!(
+            differs(&|c| c.sensitivity_dbz_at_1km = -38.0),
+            "sensitivity_dbz_at_1km"
         );
     }
 
@@ -3085,6 +4749,9 @@ mod tests {
             v: vec![0.0f32; nz * cells],
             w: vec![0.0f32; nz * cells],
             terrain_m: vec![0.0f32; cells],
+            polarimetric: None,
+            dual_pol_status: None,
+            tke_tenths_m2s2: None,
             ref_source: "test",
             dx_m: None,
             lut,
