@@ -83,6 +83,7 @@ mod mping;
 mod oa_derived;
 mod obs;
 mod obs_soundings;
+mod operational_radar_grib;
 mod overlays;
 mod panel_kit;
 mod placefiles;
