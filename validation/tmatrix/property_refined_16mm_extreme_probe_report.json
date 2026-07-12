@@ -1,0 +1,1209 @@
+{
+  "classification": "analytic_contract_and_solver_sanity_only",
+  "config_sha256": {
+    "property_p3_ishmael_dry_oblate_sband_unvalidated": "f9c961c374015f1473f7344739c7a58770c3f099e9759cd769f9d5516a58dc66",
+    "property_p3_ishmael_dry_prolate_sband_unvalidated": "40c5fd7d9c606f4f00845f9b00b3e340093d644421f273209bf1c47a8bb9c2e4",
+    "property_p3_ishmael_wet_oblate_sband_unvalidated": "424ce195c70a2d2fd205e9122ca3dd8d20327a9a33074f705b32370630aaf2ea",
+    "property_p3_ishmael_wet_prolate_sband_unvalidated": "395c7fcc37224f61d7ec8f772b3fb31fd2814430185b499e60f9855078e575b4",
+    "property_rain_sband_unvalidated": "f70cf89ecef9e3e4ff3472a1f107a29c3fd2bc3aa4528e26182b0f20cd69277a"
+  },
+  "config_snapshots": {
+    "property_p3_ishmael_dry_oblate_sband_unvalidated": {
+      "axes": [
+        {
+          "coordinates": [
+            5e-05,
+            0.0002,
+            0.0005,
+            0.001,
+            0.002,
+            0.004,
+            0.008,
+            0.012,
+            0.014,
+            0.016
+          ],
+          "kind": "equivolume_diameter",
+          "unit": "meter"
+        },
+        {
+          "coordinates": [
+            190.0,
+            230.0,
+            260.0,
+            273.15
+          ],
+          "kind": "temperature",
+          "unit": "kelvin"
+        },
+        {
+          "coordinates": [
+            1.5,
+            20.0,
+            100.0,
+            400.0,
+            850.0,
+            917.0
+          ],
+          "kind": "bulk_density",
+          "unit": "kilogram_per_cubic_meter"
+        },
+        {
+          "coordinates": [
+            0.1,
+            0.4,
+            0.7,
+            1.0
+          ],
+          "kind": "minor_to_major_axis_ratio",
+          "unit": "unitless_fraction"
+        },
+        {
+          "coordinates": [
+            2800000000.0
+          ],
+          "kind": "frequency",
+          "unit": "hertz"
+        },
+        {
+          "coordinates": [
+            -0.5,
+            0.9,
+            4.5,
+            10.0,
+            20.0
+          ],
+          "kind": "radar_elevation",
+          "unit": "degree"
+        }
+      ],
+      "dielectric": {
+        "air_relative_permittivity": {
+          "imaginary": 0.0,
+          "real": 1.0
+        },
+        "applicability": "quasistatic_spherical_air_in_ice_or_ice_in_air_topology_neutral_homogeneous_effective_medium",
+        "bulk_density_interpretation": "total_ice_mass_per_outer_spheroid_volume",
+        "component_volume_fraction_conversion": "bulk_density_divided_by_ice_material_density",
+        "homotopy_steps": 64,
+        "ice_material_density_kg_m3": 917.0,
+        "ice_permittivity_model": "matzler_2006",
+        "mixing_equation": "sum_f_j_times_eps_j_minus_eps_eff_over_eps_j_plus_2eps_eff_equals_zero",
+        "model": "symmetric_bruggeman_spherical_air_ice_matzler_2006_v1",
+        "newton_max_iterations": 100,
+        "newton_relative_tolerance": 1e-12,
+        "root_selection": "vacuum_to_constituents_homotopy_passive_continuous_branch",
+        "temperature_evidence": "matzler_2006_formula_warren_brandt_2008_reports_accurate_fit_190_to_258_k_warm_extension_declared_to_273p15_k",
+        "temperature_range_k": [
+          190.0,
+          273.15
+        ]
+      },
+      "execution": {
+        "grouping": {
+          "geometry_axis_kind": "radar_elevation",
+          "group_timeout_seconds": 3600,
+          "material_state_axis_kinds": [
+            "temperature",
+            "bulk_density",
+            "frequency"
+          ],
+          "maximum_points_per_process": 1024,
+          "model": "fresh_crash_isolated_material_state_process",
+          "partial_group_policy": "reject_entire_lut",
+          "tmatrix_state_axis_kinds": [
+            "equivolume_diameter",
+            "minor_to_major_axis_ratio"
+          ]
+        },
+        "partial_grid_policy": "reject_entire_lut",
+        "point_timeout_seconds": 300,
+        "process_isolation": "fresh_python_subprocess_per_material_state_group",
+        "result_collection_order": "declared_axis_order_last_axis_fastest",
+        "thread_count_per_process": 1
+      },
+      "kernel": "pytmatrix-0.3.3",
+      "orientation": {
+        "alpha_quadrature_points": 5,
+        "beta_quadrature_points": 10,
+        "mean_deg": 0.0,
+        "model": "gaussian_canting",
+        "quadrature_method": "pytmatrix_orient_averaged_fixed_gautschi",
+        "reference_symmetry_axis": "vertical_at_zero_canting",
+        "standard_deviation_deg": 20.0
+      },
+      "particle_population": {
+        "category": "frozen_characteristic_particle",
+        "microphysics_family": "property_aware_p3_ishmael",
+        "normalization_number_concentration_m3": 1.0,
+        "phase_regime": "dry",
+        "shape_family": "oblate_spheroid",
+        "size_distribution": "monodisperse_characteristic_particle_node",
+        "state_descriptor": {
+          "bulk_density_mapping": "closure_derived_effective_bulk_density_including_rime_mass_and_rime_density",
+          "characteristic_diameter_mapping": "closure_derived_equivolume_characteristic_diameter",
+          "compatible_closed_state_families": [
+            "p3",
+            "ishmael"
+          ],
+          "density_applicability": "bulk_density_1p5_to_917_kg_m3_downward_fall_requires_density_above_1p225_kg_m3_air",
+          "extrapolation": "forbidden",
+          "liquid_mapping": "required_exactly_zero_liquid_mass_fraction",
+          "phase_dispatch": "liquid_mass_fraction_equal_zero_selects_dry_table",
+          "psd_mapping": "none_monodisperse_characteristic_particle_not_scheme_native_psd",
+          "rime_axes": "not_explicit_rime_influences_only_through_bulk_density_and_shape",
+          "rime_effect_on_dielectric": "none_given_bulk_density",
+          "shape_mapping": "closure_derived_minor_to_major_axis_ratio"
+        }
+      },
+      "payload": {
+        "encoding": "f64_le_point_major_last_axis_fastest"
+      },
+      "radar": {
+        "backscatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          180.0,
+          0.0,
+          0.0
+        ],
+        "beam_elevation_transform": "pytmatrix_theta0_90_minus_e_theta_back_90_plus_e_theta_forward_90_minus_e_degrees",
+        "covariance_phase_convention": "pytmatrix_delta_hv_hh_times_conjugate_vv",
+        "forward_scatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "length_unit_passed_to_pytmatrix": "millimeter",
+        "polarization_basis": "pytmatrix_local_horizontal_vertical_scattering_basis",
+        "reference_water_dielectric_factor_squared": 0.93,
+        "solver": {
+          "ddelt": 0.001,
+          "ndgs": 2,
+          "shape": "spheroid"
+        },
+        "speed_of_light_m_s": 299792458.0,
+        "view_applicability": "ppi_beam_elevation_minus0p5_to_20_axisymmetric_gaussian_odf_not_general_body_frame"
+      },
+      "references": [
+        "https://github.com/jleinonen/pytmatrix/tree/0.3.3",
+        "https://atmos.uw.edu/ice_optical_constants/Matzler.pdf",
+        "https://doi.org/10.1029/2007JD009744",
+        "https://doi.org/10.1002/andp.19354160705",
+        "https://doi.org/10.1109/36.3045"
+      ],
+      "schema": 1,
+      "status": "research_only_unvalidated",
+      "table_id": "property-p3-ishmael-dry-oblate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "temporal": {
+        "sampling": "instantaneous"
+      },
+      "terminal_velocity": {
+        "air_density_kg_m3": 1.225,
+        "air_dynamic_viscosity_pa_s": 1.7894e-05,
+        "drag_transition_reynolds": 1000.0,
+        "gravity_m_s2": 9.80665,
+        "high_reynolds_drag_coefficient": 0.44,
+        "law": "schiller_naumann_gravity_drag",
+        "maximum_iterations": 200,
+        "relative_tolerance": 1e-12
+      }
+    },
+    "property_p3_ishmael_dry_prolate_sband_unvalidated": {
+      "axes": [
+        {
+          "coordinates": [
+            5e-05,
+            0.0002,
+            0.0005,
+            0.001,
+            0.002,
+            0.004,
+            0.008,
+            0.012,
+            0.014,
+            0.016
+          ],
+          "kind": "equivolume_diameter",
+          "unit": "meter"
+        },
+        {
+          "coordinates": [
+            190.0,
+            230.0,
+            260.0,
+            273.15
+          ],
+          "kind": "temperature",
+          "unit": "kelvin"
+        },
+        {
+          "coordinates": [
+            1.5,
+            20.0,
+            100.0,
+            400.0,
+            850.0,
+            917.0
+          ],
+          "kind": "bulk_density",
+          "unit": "kilogram_per_cubic_meter"
+        },
+        {
+          "coordinates": [
+            0.1,
+            0.4,
+            0.7,
+            1.0
+          ],
+          "kind": "minor_to_major_axis_ratio",
+          "unit": "unitless_fraction"
+        },
+        {
+          "coordinates": [
+            2800000000.0
+          ],
+          "kind": "frequency",
+          "unit": "hertz"
+        },
+        {
+          "coordinates": [
+            -0.5,
+            0.9,
+            4.5,
+            10.0,
+            20.0
+          ],
+          "kind": "radar_elevation",
+          "unit": "degree"
+        }
+      ],
+      "dielectric": {
+        "air_relative_permittivity": {
+          "imaginary": 0.0,
+          "real": 1.0
+        },
+        "applicability": "quasistatic_spherical_air_in_ice_or_ice_in_air_topology_neutral_homogeneous_effective_medium",
+        "bulk_density_interpretation": "total_ice_mass_per_outer_spheroid_volume",
+        "component_volume_fraction_conversion": "bulk_density_divided_by_ice_material_density",
+        "homotopy_steps": 64,
+        "ice_material_density_kg_m3": 917.0,
+        "ice_permittivity_model": "matzler_2006",
+        "mixing_equation": "sum_f_j_times_eps_j_minus_eps_eff_over_eps_j_plus_2eps_eff_equals_zero",
+        "model": "symmetric_bruggeman_spherical_air_ice_matzler_2006_v1",
+        "newton_max_iterations": 100,
+        "newton_relative_tolerance": 1e-12,
+        "root_selection": "vacuum_to_constituents_homotopy_passive_continuous_branch",
+        "temperature_evidence": "matzler_2006_formula_warren_brandt_2008_reports_accurate_fit_190_to_258_k_warm_extension_declared_to_273p15_k",
+        "temperature_range_k": [
+          190.0,
+          273.15
+        ]
+      },
+      "execution": {
+        "grouping": {
+          "geometry_axis_kind": "radar_elevation",
+          "group_timeout_seconds": 3600,
+          "material_state_axis_kinds": [
+            "temperature",
+            "bulk_density",
+            "frequency"
+          ],
+          "maximum_points_per_process": 1024,
+          "model": "fresh_crash_isolated_material_state_process",
+          "partial_group_policy": "reject_entire_lut",
+          "tmatrix_state_axis_kinds": [
+            "equivolume_diameter",
+            "minor_to_major_axis_ratio"
+          ]
+        },
+        "partial_grid_policy": "reject_entire_lut",
+        "point_timeout_seconds": 300,
+        "process_isolation": "fresh_python_subprocess_per_material_state_group",
+        "result_collection_order": "declared_axis_order_last_axis_fastest",
+        "thread_count_per_process": 1
+      },
+      "kernel": "pytmatrix-0.3.3",
+      "orientation": {
+        "alpha_quadrature_points": 5,
+        "beta_quadrature_points": 10,
+        "mean_deg": 0.0,
+        "model": "gaussian_canting",
+        "quadrature_method": "pytmatrix_orient_averaged_fixed_gautschi",
+        "reference_symmetry_axis": "vertical_at_zero_canting",
+        "standard_deviation_deg": 20.0
+      },
+      "particle_population": {
+        "category": "frozen_characteristic_particle",
+        "microphysics_family": "property_aware_p3_ishmael",
+        "normalization_number_concentration_m3": 1.0,
+        "phase_regime": "dry",
+        "shape_family": "prolate_spheroid",
+        "size_distribution": "monodisperse_characteristic_particle_node",
+        "state_descriptor": {
+          "bulk_density_mapping": "closure_derived_effective_bulk_density_including_rime_mass_and_rime_density",
+          "characteristic_diameter_mapping": "closure_derived_equivolume_characteristic_diameter",
+          "compatible_closed_state_families": [
+            "p3",
+            "ishmael"
+          ],
+          "density_applicability": "bulk_density_1p5_to_917_kg_m3_downward_fall_requires_density_above_1p225_kg_m3_air",
+          "extrapolation": "forbidden",
+          "liquid_mapping": "required_exactly_zero_liquid_mass_fraction",
+          "phase_dispatch": "liquid_mass_fraction_equal_zero_selects_dry_table",
+          "psd_mapping": "none_monodisperse_characteristic_particle_not_scheme_native_psd",
+          "rime_axes": "not_explicit_rime_influences_only_through_bulk_density_and_shape",
+          "rime_effect_on_dielectric": "none_given_bulk_density",
+          "shape_mapping": "closure_derived_minor_to_major_axis_ratio"
+        }
+      },
+      "payload": {
+        "encoding": "f64_le_point_major_last_axis_fastest"
+      },
+      "radar": {
+        "backscatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          180.0,
+          0.0,
+          0.0
+        ],
+        "beam_elevation_transform": "pytmatrix_theta0_90_minus_e_theta_back_90_plus_e_theta_forward_90_minus_e_degrees",
+        "covariance_phase_convention": "pytmatrix_delta_hv_hh_times_conjugate_vv",
+        "forward_scatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "length_unit_passed_to_pytmatrix": "millimeter",
+        "polarization_basis": "pytmatrix_local_horizontal_vertical_scattering_basis",
+        "reference_water_dielectric_factor_squared": 0.93,
+        "solver": {
+          "ddelt": 0.001,
+          "ndgs": 2,
+          "shape": "spheroid"
+        },
+        "speed_of_light_m_s": 299792458.0,
+        "view_applicability": "ppi_beam_elevation_minus0p5_to_20_axisymmetric_gaussian_odf_not_general_body_frame"
+      },
+      "references": [
+        "https://github.com/jleinonen/pytmatrix/tree/0.3.3",
+        "https://atmos.uw.edu/ice_optical_constants/Matzler.pdf",
+        "https://doi.org/10.1029/2007JD009744",
+        "https://doi.org/10.1002/andp.19354160705",
+        "https://doi.org/10.1109/36.3045"
+      ],
+      "schema": 1,
+      "status": "research_only_unvalidated",
+      "table_id": "property-p3-ishmael-dry-prolate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "temporal": {
+        "sampling": "instantaneous"
+      },
+      "terminal_velocity": {
+        "air_density_kg_m3": 1.225,
+        "air_dynamic_viscosity_pa_s": 1.7894e-05,
+        "drag_transition_reynolds": 1000.0,
+        "gravity_m_s2": 9.80665,
+        "high_reynolds_drag_coefficient": 0.44,
+        "law": "schiller_naumann_gravity_drag",
+        "maximum_iterations": 200,
+        "relative_tolerance": 1e-12
+      }
+    },
+    "property_p3_ishmael_wet_oblate_sband_unvalidated": {
+      "axes": [
+        {
+          "coordinates": [
+            5e-05,
+            0.0002,
+            0.0005,
+            0.001,
+            0.002,
+            0.004,
+            0.008,
+            0.012,
+            0.014,
+            0.016
+          ],
+          "kind": "equivolume_diameter",
+          "unit": "meter"
+        },
+        {
+          "coordinates": [
+            269.15,
+            273.15,
+            275.15
+          ],
+          "kind": "temperature",
+          "unit": "kelvin"
+        },
+        {
+          "coordinates": [
+            0.0015,
+            0.05,
+            0.2,
+            0.5,
+            0.85,
+            1.0
+          ],
+          "kind": "condensed_volume_fraction",
+          "unit": "unitless_fraction"
+        },
+        {
+          "coordinates": [
+            0.0,
+            0.2,
+            0.6,
+            0.98
+          ],
+          "kind": "liquid_mass_fraction",
+          "unit": "unitless_fraction"
+        },
+        {
+          "coordinates": [
+            0.1,
+            0.4,
+            0.7,
+            1.0
+          ],
+          "kind": "minor_to_major_axis_ratio",
+          "unit": "unitless_fraction"
+        },
+        {
+          "coordinates": [
+            2800000000.0
+          ],
+          "kind": "frequency",
+          "unit": "hertz"
+        },
+        {
+          "coordinates": [
+            -0.5,
+            0.9,
+            4.5,
+            10.0,
+            20.0
+          ],
+          "kind": "radar_elevation",
+          "unit": "degree"
+        }
+      ],
+      "dielectric": {
+        "air_relative_permittivity": {
+          "imaginary": 0.0,
+          "real": 1.0
+        },
+        "applicability": "quasistatic_spherical_inclusions_homogeneous_effective_medium",
+        "bulk_density_reconstruction": "condensed_volume_fraction_divided_by_total_component_specific_volume",
+        "component_volume_fraction_conversion": "condensed_volume_fraction_times_mass_specific_volume_shares",
+        "condensed_volume_fraction_interpretation": "ice_plus_liquid_component_volume_over_outer_spheroid_volume",
+        "homotopy_steps": 64,
+        "ice_material_density_kg_m3": 917.0,
+        "ice_permittivity_model": "matzler_2006",
+        "ice_temperature_treatment": "minimum_environment_temperature_and_273p15_k_phase_equilibrium",
+        "liquid_mass_fraction_interpretation": "liquid_mass_over_total_condensed_mass",
+        "liquid_water_density_kg_m3": 999.84,
+        "liquid_water_permittivity_model": "liebe_hufford_manabe_1991_double_debye",
+        "mixing_equation": "sum_f_j_times_eps_j_minus_eps_eff_over_eps_j_plus_2eps_eff_equals_zero",
+        "model": "symmetric_bruggeman_spherical_air_ice_water_v1",
+        "newton_max_iterations": 100,
+        "newton_relative_tolerance": 1e-12,
+        "root_selection": "vacuum_to_constituents_homotopy_passive_continuous_branch",
+        "temperature_range_k": [
+          269.15,
+          275.15
+        ]
+      },
+      "execution": {
+        "grouping": {
+          "geometry_axis_kind": "radar_elevation",
+          "group_timeout_seconds": 3600,
+          "material_state_axis_kinds": [
+            "temperature",
+            "condensed_volume_fraction",
+            "liquid_mass_fraction",
+            "frequency"
+          ],
+          "maximum_points_per_process": 1024,
+          "model": "fresh_crash_isolated_material_state_process",
+          "partial_group_policy": "reject_entire_lut",
+          "tmatrix_state_axis_kinds": [
+            "equivolume_diameter",
+            "minor_to_major_axis_ratio"
+          ]
+        },
+        "partial_grid_policy": "reject_entire_lut",
+        "point_timeout_seconds": 300,
+        "process_isolation": "fresh_python_subprocess_per_material_state_group",
+        "result_collection_order": "declared_axis_order_last_axis_fastest",
+        "thread_count_per_process": 1
+      },
+      "kernel": "pytmatrix-0.3.3",
+      "orientation": {
+        "alpha_quadrature_points": 5,
+        "beta_quadrature_points": 10,
+        "mean_deg": 0.0,
+        "model": "gaussian_canting",
+        "quadrature_method": "pytmatrix_orient_averaged_fixed_gautschi",
+        "reference_symmetry_axis": "vertical_at_zero_canting",
+        "standard_deviation_deg": 20.0
+      },
+      "particle_population": {
+        "category": "frozen_characteristic_particle",
+        "microphysics_family": "property_aware_p3_ishmael",
+        "normalization_number_concentration_m3": 1.0,
+        "phase_regime": "wet",
+        "shape_family": "oblate_spheroid",
+        "size_distribution": "monodisperse_characteristic_particle_node",
+        "state_descriptor": {
+          "bulk_density_mapping": "closure_bulk_density_and_liquid_mass_fraction_mapped_to_condensed_volume_fraction",
+          "characteristic_diameter_mapping": "closure_derived_equivolume_characteristic_diameter",
+          "compatible_closed_state_families": [
+            "p3",
+            "ishmael"
+          ],
+          "condensed_volume_fraction_definition": "rho_bulk_times_open_parenthesis_one_minus_w_over_917_plus_w_over_999p84_close_parenthesis",
+          "density_applicability": "condensed_volume_fraction_0p0015_to_1_downward_fall_requires_reconstructed_density_above_1p225_kg_m3_air",
+          "extrapolation": "forbidden",
+          "liquid_mapping": "diagnosed_or_prescribed_strictly_positive_liquid_mass_fraction",
+          "phase_dispatch": "liquid_mass_fraction_greater_than_zero_selects_wet_table",
+          "psd_mapping": "none_monodisperse_characteristic_particle_not_scheme_native_psd",
+          "rime_axes": "not_explicit_rime_influences_only_through_bulk_density_and_shape",
+          "rime_effect_on_dielectric": "none_given_bulk_density",
+          "shape_mapping": "closure_derived_minor_to_major_axis_ratio"
+        }
+      },
+      "payload": {
+        "encoding": "f64_le_point_major_last_axis_fastest"
+      },
+      "radar": {
+        "backscatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          180.0,
+          0.0,
+          0.0
+        ],
+        "beam_elevation_transform": "pytmatrix_theta0_90_minus_e_theta_back_90_plus_e_theta_forward_90_minus_e_degrees",
+        "covariance_phase_convention": "pytmatrix_delta_hv_hh_times_conjugate_vv",
+        "forward_scatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "length_unit_passed_to_pytmatrix": "millimeter",
+        "polarization_basis": "pytmatrix_local_horizontal_vertical_scattering_basis",
+        "reference_water_dielectric_factor_squared": 0.93,
+        "solver": {
+          "ddelt": 0.001,
+          "ndgs": 2,
+          "shape": "spheroid"
+        },
+        "speed_of_light_m_s": 299792458.0,
+        "view_applicability": "ppi_beam_elevation_minus0p5_to_20_axisymmetric_gaussian_odf_not_general_body_frame"
+      },
+      "references": [
+        "https://github.com/jleinonen/pytmatrix/tree/0.3.3",
+        "https://atmos.uw.edu/ice_optical_constants/Matzler.pdf",
+        "https://doi.org/10.1007/BF01008897",
+        "https://doi.org/10.1175/1520-0426(2000)017%3C0628:EDCOMP%3E2.0.CO;2",
+        "https://doi.org/10.1002/andp.19354160705",
+        "https://doi.org/10.1109/36.3045"
+      ],
+      "schema": 1,
+      "status": "research_only_unvalidated",
+      "table_id": "property-p3-ishmael-wet-oblate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "temporal": {
+        "sampling": "instantaneous"
+      },
+      "terminal_velocity": {
+        "air_density_kg_m3": 1.225,
+        "air_dynamic_viscosity_pa_s": 1.7894e-05,
+        "drag_transition_reynolds": 1000.0,
+        "gravity_m_s2": 9.80665,
+        "high_reynolds_drag_coefficient": 0.44,
+        "law": "schiller_naumann_gravity_drag",
+        "maximum_iterations": 200,
+        "relative_tolerance": 1e-12
+      }
+    },
+    "property_p3_ishmael_wet_prolate_sband_unvalidated": {
+      "axes": [
+        {
+          "coordinates": [
+            5e-05,
+            0.0002,
+            0.0005,
+            0.001,
+            0.002,
+            0.004,
+            0.008,
+            0.012,
+            0.014,
+            0.016
+          ],
+          "kind": "equivolume_diameter",
+          "unit": "meter"
+        },
+        {
+          "coordinates": [
+            269.15,
+            273.15,
+            275.15
+          ],
+          "kind": "temperature",
+          "unit": "kelvin"
+        },
+        {
+          "coordinates": [
+            0.0015,
+            0.05,
+            0.2,
+            0.5,
+            0.85,
+            1.0
+          ],
+          "kind": "condensed_volume_fraction",
+          "unit": "unitless_fraction"
+        },
+        {
+          "coordinates": [
+            0.0,
+            0.2,
+            0.6,
+            0.98
+          ],
+          "kind": "liquid_mass_fraction",
+          "unit": "unitless_fraction"
+        },
+        {
+          "coordinates": [
+            0.1,
+            0.4,
+            0.7,
+            1.0
+          ],
+          "kind": "minor_to_major_axis_ratio",
+          "unit": "unitless_fraction"
+        },
+        {
+          "coordinates": [
+            2800000000.0
+          ],
+          "kind": "frequency",
+          "unit": "hertz"
+        },
+        {
+          "coordinates": [
+            -0.5,
+            0.9,
+            4.5,
+            10.0,
+            20.0
+          ],
+          "kind": "radar_elevation",
+          "unit": "degree"
+        }
+      ],
+      "dielectric": {
+        "air_relative_permittivity": {
+          "imaginary": 0.0,
+          "real": 1.0
+        },
+        "applicability": "quasistatic_spherical_inclusions_homogeneous_effective_medium",
+        "bulk_density_reconstruction": "condensed_volume_fraction_divided_by_total_component_specific_volume",
+        "component_volume_fraction_conversion": "condensed_volume_fraction_times_mass_specific_volume_shares",
+        "condensed_volume_fraction_interpretation": "ice_plus_liquid_component_volume_over_outer_spheroid_volume",
+        "homotopy_steps": 64,
+        "ice_material_density_kg_m3": 917.0,
+        "ice_permittivity_model": "matzler_2006",
+        "ice_temperature_treatment": "minimum_environment_temperature_and_273p15_k_phase_equilibrium",
+        "liquid_mass_fraction_interpretation": "liquid_mass_over_total_condensed_mass",
+        "liquid_water_density_kg_m3": 999.84,
+        "liquid_water_permittivity_model": "liebe_hufford_manabe_1991_double_debye",
+        "mixing_equation": "sum_f_j_times_eps_j_minus_eps_eff_over_eps_j_plus_2eps_eff_equals_zero",
+        "model": "symmetric_bruggeman_spherical_air_ice_water_v1",
+        "newton_max_iterations": 100,
+        "newton_relative_tolerance": 1e-12,
+        "root_selection": "vacuum_to_constituents_homotopy_passive_continuous_branch",
+        "temperature_range_k": [
+          269.15,
+          275.15
+        ]
+      },
+      "execution": {
+        "grouping": {
+          "geometry_axis_kind": "radar_elevation",
+          "group_timeout_seconds": 3600,
+          "material_state_axis_kinds": [
+            "temperature",
+            "condensed_volume_fraction",
+            "liquid_mass_fraction",
+            "frequency"
+          ],
+          "maximum_points_per_process": 1024,
+          "model": "fresh_crash_isolated_material_state_process",
+          "partial_group_policy": "reject_entire_lut",
+          "tmatrix_state_axis_kinds": [
+            "equivolume_diameter",
+            "minor_to_major_axis_ratio"
+          ]
+        },
+        "partial_grid_policy": "reject_entire_lut",
+        "point_timeout_seconds": 300,
+        "process_isolation": "fresh_python_subprocess_per_material_state_group",
+        "result_collection_order": "declared_axis_order_last_axis_fastest",
+        "thread_count_per_process": 1
+      },
+      "kernel": "pytmatrix-0.3.3",
+      "orientation": {
+        "alpha_quadrature_points": 5,
+        "beta_quadrature_points": 10,
+        "mean_deg": 0.0,
+        "model": "gaussian_canting",
+        "quadrature_method": "pytmatrix_orient_averaged_fixed_gautschi",
+        "reference_symmetry_axis": "vertical_at_zero_canting",
+        "standard_deviation_deg": 20.0
+      },
+      "particle_population": {
+        "category": "frozen_characteristic_particle",
+        "microphysics_family": "property_aware_p3_ishmael",
+        "normalization_number_concentration_m3": 1.0,
+        "phase_regime": "wet",
+        "shape_family": "prolate_spheroid",
+        "size_distribution": "monodisperse_characteristic_particle_node",
+        "state_descriptor": {
+          "bulk_density_mapping": "closure_bulk_density_and_liquid_mass_fraction_mapped_to_condensed_volume_fraction",
+          "characteristic_diameter_mapping": "closure_derived_equivolume_characteristic_diameter",
+          "compatible_closed_state_families": [
+            "p3",
+            "ishmael"
+          ],
+          "condensed_volume_fraction_definition": "rho_bulk_times_open_parenthesis_one_minus_w_over_917_plus_w_over_999p84_close_parenthesis",
+          "density_applicability": "condensed_volume_fraction_0p0015_to_1_downward_fall_requires_reconstructed_density_above_1p225_kg_m3_air",
+          "extrapolation": "forbidden",
+          "liquid_mapping": "diagnosed_or_prescribed_strictly_positive_liquid_mass_fraction",
+          "phase_dispatch": "liquid_mass_fraction_greater_than_zero_selects_wet_table",
+          "psd_mapping": "none_monodisperse_characteristic_particle_not_scheme_native_psd",
+          "rime_axes": "not_explicit_rime_influences_only_through_bulk_density_and_shape",
+          "rime_effect_on_dielectric": "none_given_bulk_density",
+          "shape_mapping": "closure_derived_minor_to_major_axis_ratio"
+        }
+      },
+      "payload": {
+        "encoding": "f64_le_point_major_last_axis_fastest"
+      },
+      "radar": {
+        "backscatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          180.0,
+          0.0,
+          0.0
+        ],
+        "beam_elevation_transform": "pytmatrix_theta0_90_minus_e_theta_back_90_plus_e_theta_forward_90_minus_e_degrees",
+        "covariance_phase_convention": "pytmatrix_delta_hv_hh_times_conjugate_vv",
+        "forward_scatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "length_unit_passed_to_pytmatrix": "millimeter",
+        "polarization_basis": "pytmatrix_local_horizontal_vertical_scattering_basis",
+        "reference_water_dielectric_factor_squared": 0.93,
+        "solver": {
+          "ddelt": 0.001,
+          "ndgs": 2,
+          "shape": "spheroid"
+        },
+        "speed_of_light_m_s": 299792458.0,
+        "view_applicability": "ppi_beam_elevation_minus0p5_to_20_axisymmetric_gaussian_odf_not_general_body_frame"
+      },
+      "references": [
+        "https://github.com/jleinonen/pytmatrix/tree/0.3.3",
+        "https://atmos.uw.edu/ice_optical_constants/Matzler.pdf",
+        "https://doi.org/10.1007/BF01008897",
+        "https://doi.org/10.1175/1520-0426(2000)017%3C0628:EDCOMP%3E2.0.CO;2",
+        "https://doi.org/10.1002/andp.19354160705",
+        "https://doi.org/10.1109/36.3045"
+      ],
+      "schema": 1,
+      "status": "research_only_unvalidated",
+      "table_id": "property-p3-ishmael-wet-prolate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "temporal": {
+        "sampling": "instantaneous"
+      },
+      "terminal_velocity": {
+        "air_density_kg_m3": 1.225,
+        "air_dynamic_viscosity_pa_s": 1.7894e-05,
+        "drag_transition_reynolds": 1000.0,
+        "gravity_m_s2": 9.80665,
+        "high_reynolds_drag_coefficient": 0.44,
+        "law": "schiller_naumann_gravity_drag",
+        "maximum_iterations": 200,
+        "relative_tolerance": 1e-12
+      }
+    },
+    "property_rain_sband_unvalidated": {
+      "axes": [
+        {
+          "coordinates": [
+            0.0003,
+            0.0005,
+            0.0008,
+            0.0012,
+            0.0018,
+            0.0026,
+            0.0036,
+            0.0048,
+            0.006,
+            0.007
+          ],
+          "kind": "equivolume_diameter",
+          "unit": "meter"
+        },
+        {
+          "coordinates": [
+            250.0,
+            269.15,
+            293.15,
+            313.15
+          ],
+          "kind": "temperature",
+          "unit": "kelvin"
+        },
+        {
+          "coordinates": [
+            0.5,
+            0.7,
+            0.85,
+            1.0
+          ],
+          "kind": "minor_to_major_axis_ratio",
+          "unit": "unitless_fraction"
+        },
+        {
+          "coordinates": [
+            2800000000.0
+          ],
+          "kind": "frequency",
+          "unit": "hertz"
+        },
+        {
+          "coordinates": [
+            -0.5,
+            0.9,
+            4.5,
+            10.0,
+            20.0
+          ],
+          "kind": "radar_elevation",
+          "unit": "degree"
+        }
+      ],
+      "dielectric": {
+        "applicability": "pure_fresh_supercooled_or_liquid_water_250_to_313p15_k",
+        "frequency_range_hz": [
+          2000000000.0,
+          4000000000.0
+        ],
+        "liquid_water_permittivity_model": "liebe_hufford_manabe_1991_double_debye",
+        "mass_density_kg_m3": 999.84,
+        "model": "temperature_dependent_liquid_water_liebe_1991",
+        "temperature_range_k": [
+          250.0,
+          313.15
+        ]
+      },
+      "execution": {
+        "grouping": {
+          "geometry_axis_kind": "radar_elevation",
+          "group_timeout_seconds": 3600,
+          "material_state_axis_kinds": [
+            "temperature",
+            "frequency"
+          ],
+          "maximum_points_per_process": 1024,
+          "model": "fresh_crash_isolated_material_state_process",
+          "partial_group_policy": "reject_entire_lut",
+          "tmatrix_state_axis_kinds": [
+            "equivolume_diameter",
+            "minor_to_major_axis_ratio"
+          ]
+        },
+        "partial_grid_policy": "reject_entire_lut",
+        "point_timeout_seconds": 300,
+        "process_isolation": "fresh_python_subprocess_per_material_state_group",
+        "result_collection_order": "declared_axis_order_last_axis_fastest",
+        "thread_count_per_process": 1
+      },
+      "kernel": "pytmatrix-0.3.3",
+      "orientation": {
+        "alpha_quadrature_points": 5,
+        "beta_quadrature_points": 10,
+        "mean_deg": 0.0,
+        "model": "gaussian_canting",
+        "quadrature_method": "pytmatrix_orient_averaged_fixed_gautschi",
+        "reference_symmetry_axis": "vertical_at_zero_canting",
+        "standard_deviation_deg": 20.0
+      },
+      "particle_population": {
+        "category": "rain",
+        "coexistence_descriptor": {
+          "allocation_rule": "max_total_rain_mass_minus_liquid_mass_paired_into_wet_frozen_categories_zero",
+          "double_count_policy": "paired_liquid_mass_removed_exactly_once_before_rain_lookup",
+          "over_pairing_policy": "reject",
+          "role": "standalone_rain_and_residual_after_mixed_phase_pairing"
+        },
+        "microphysics_family": "conventional",
+        "normalization_number_concentration_m3": 1.0,
+        "shape_family": "oblate_spheroid",
+        "size_distribution": "monodisperse_node"
+      },
+      "payload": {
+        "encoding": "f64_le_point_major_last_axis_fastest"
+      },
+      "radar": {
+        "backscatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          180.0,
+          0.0,
+          0.0
+        ],
+        "beam_elevation_transform": "pytmatrix_theta0_90_minus_e_theta_back_90_plus_e_theta_forward_90_minus_e_degrees",
+        "covariance_phase_convention": "pytmatrix_delta_hv_hh_times_conjugate_vv",
+        "forward_scatter_geometry_deg": [
+          90.0,
+          90.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "length_unit_passed_to_pytmatrix": "millimeter",
+        "polarization_basis": "pytmatrix_local_horizontal_vertical_scattering_basis",
+        "reference_water_dielectric_factor_squared": 0.93,
+        "solver": {
+          "ddelt": 0.001,
+          "ndgs": 2,
+          "shape": "spheroid"
+        },
+        "speed_of_light_m_s": 299792458.0,
+        "view_applicability": "ppi_beam_elevation_minus0p5_to_20_axisymmetric_gaussian_odf_not_general_body_frame"
+      },
+      "references": [
+        "https://github.com/jleinonen/pytmatrix/tree/0.3.3",
+        "https://doi.org/10.1007/BF01008897",
+        "https://doi.org/10.1029/JC078i033p07847"
+      ],
+      "schema": 1,
+      "status": "research_only_unvalidated",
+      "table_id": "property-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "temporal": {
+        "sampling": "instantaneous"
+      },
+      "terminal_velocity": {
+        "a_m_s": 9.65,
+        "b_m_s": 10.3,
+        "c_per_mm": 0.6,
+        "law": "atlas_rain_1973_exponential",
+        "valid_diameter_range_m": [
+          0.0003,
+          0.007
+        ]
+      }
+    }
+  },
+  "crate_table_validation_status_after_report": "research_only_unvalidated",
+  "dielectric_formula_golden": {
+    "frequency_hz": 2700832954.954955,
+    "ice_relative_permittivity": {
+      "imaginary": 0.0004856843534998671,
+      "real": 3.1885365
+    },
+    "temperature_k": 273.15,
+    "water_relative_permittivity": {
+      "imaginary": 22.867698897212513,
+      "real": 80.85236952274157
+    },
+    "within_published_formula_golden_tolerance": true
+  },
+  "environment_report_sha256": "240027118e2489461d84a844bab7811748603582d78c999094fcb394c97a7b83",
+  "extreme_solver_probes": [
+    {
+      "asset_directory": "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "coordinates": {
+        "bulk_density": 917.0,
+        "equivolume_diameter": 0.016,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 273.15
+      },
+      "direct_pytmatrix": {
+        "ah": 0.03723586849775316,
+        "av": 0.01560923963689202,
+        "fall_speed_first_moment": 69808894.33835828,
+        "fall_speed_second_moment": 1316135083.612243,
+        "hh_vv_covariance_imaginary": 30154.167182369772,
+        "hh_vv_covariance_real": 2238007.0798844295,
+        "kdp": 2.867400000533241,
+        "zh": 3702721.543877503,
+        "zv": 1471741.7875638928
+      },
+      "solver_completed_with_finite_schema_valid_outputs": true
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_prolate_sband_unvalidated",
+      "coordinates": {
+        "bulk_density": 1.5,
+        "equivolume_diameter": 0.016,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "direct_pytmatrix": {
+        "ah": 5.546649882832907e-08,
+        "av": 5.970818385003239e-08,
+        "fall_speed_first_moment": 1.515220446342092,
+        "fall_speed_second_moment": 0.39278239120898845,
+        "hh_vv_covariance_imaginary": -2.6156363512634102e-05,
+        "hh_vv_covariance_real": 5.863100825246247,
+        "kdp": -5.268714203625505e-06,
+        "zh": 5.845203482636645,
+        "zv": 5.881076731549648
+      },
+      "solver_completed_with_finite_schema_valid_outputs": true
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_oblate_sband_unvalidated",
+      "coordinates": {
+        "condensed_volume_fraction": 1.0,
+        "equivolume_diameter": 0.016,
+        "frequency": 2800000000.0,
+        "liquid_mass_fraction": 0.98,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 275.15
+      },
+      "failure": "GeneratorError: point {'equivolume_diameter': 0.016, 'temperature': 275.15, 'condensed_volume_fraction': 1.0, 'liquid_mass_fraction': 0.98, 'minor_to_major_axis_ratio': 0.1, 'frequency': 2800000000.0, 'radar_elevation': 20.0} emitted 0 result markers; stdout=''",
+      "solver_completed_with_finite_schema_valid_outputs": false
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_prolate_sband_unvalidated",
+      "coordinates": {
+        "condensed_volume_fraction": 0.0015,
+        "equivolume_diameter": 0.016,
+        "frequency": 2800000000.0,
+        "liquid_mass_fraction": 0.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 269.15
+      },
+      "direct_pytmatrix": {
+        "ah": 1.335591262607047e-07,
+        "av": 1.418338117113835e-07,
+        "fall_speed_first_moment": 0.7220839043013726,
+        "fall_speed_second_moment": 0.1282339970583506,
+        "hh_vv_covariance_imaginary": 0.00010948060653025654,
+        "hh_vv_covariance_real": 5.051972835412481,
+        "kdp": -4.414165293722744e-06,
+        "zh": 4.066044705865775,
+        "zv": 6.330168569898938
+      },
+      "solver_completed_with_finite_schema_valid_outputs": true
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "coordinates": {
+        "equivolume_diameter": 0.007,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.5,
+        "radar_elevation": 20.0,
+        "temperature": 313.15
+      },
+      "direct_pytmatrix": {
+        "ah": 0.006361838748936933,
+        "av": 0.0028906098219895517,
+        "fall_speed_first_moment": 1478384.6358518153,
+        "fall_speed_second_moment": 14038068.663085582,
+        "hh_vv_covariance_imaginary": -300.87185857388073,
+        "hh_vv_covariance_real": 102533.73260503937,
+        "kdp": 0.5113214638665474,
+        "zh": 155692.43775463218,
+        "zv": 71133.85984846651
+      },
+      "solver_completed_with_finite_schema_valid_outputs": true
+    }
+  ],
+  "generator_source_sha256": "6083fbac0932ea9dd1d0a35c4d2ce98d36c90017ab69d70a9054af4bf3d51da6",
+  "limitations": [
+    "These checks use the same PyTMatrix generator and are not independent scattering validation.",
+    "The symmetric Bruggeman topology is an explicit research approximation, not measured particle morphology.",
+    "The tables represent one characteristic monodisperse particle at exactly 1 m^-3, not a scheme-native PSD integral.",
+    "Radar-elevation checks remain in the configured axisymmetric Gaussian20 PPI basis, not a general body-frame transform."
+  ],
+  "production_validation": false,
+  "rain_mass_accounting_cases": [
+    {
+      "mass_closes_without_double_count": true,
+      "paired_liquid_masses": [],
+      "residual_rain_mass": 1.0,
+      "total_rain_mass": 1.0
+    },
+    {
+      "mass_closes_without_double_count": true,
+      "paired_liquid_masses": [
+        0.2,
+        0.3
+      ],
+      "residual_rain_mass": 0.5,
+      "total_rain_mass": 1.0
+    },
+    {
+      "mass_closes_without_double_count": true,
+      "paired_liquid_masses": [
+        0.4,
+        0.6
+      ],
+      "residual_rain_mass": 0.0,
+      "total_rain_mass": 1.0
+    }
+  ],
+  "rain_over_pairing_rejected": true,
+  "report_id": "pytmatrix-0.3.3-property-material-view-sanity-v1",
+  "sanity_checks_passed": false,
+  "schema": 1,
+  "scientifically_independent_validation": false,
+  "sphere_oblate_prolate_identity_relative_differences": {
+    "ah": 0.0,
+    "av": 0.0,
+    "fall_speed_first_moment": 0.0,
+    "fall_speed_second_moment": 0.0,
+    "hh_vv_covariance_imaginary": 0.0,
+    "hh_vv_covariance_real": 0.0,
+    "kdp": 0.0,
+    "zh": 0.0,
+    "zv": 0.0
+  },
+  "validation_source_sha256": "79e80f9e93c53ed251824c834f48dada4543402635b2f1a14c42c84f2d55cb7d"
+}

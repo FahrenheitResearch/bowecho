@@ -1,31 +1,38 @@
 use std::{env, fs, io::Write, path::PathBuf, process::ExitCode};
 
-use radar_scattering::{AdditiveScattering, Axis, GeneratorMetadata, OfflineLut, ScienceMetadata};
+use radar_scattering::{
+    AdditiveScattering, Axis, AxisKind, GeneratorMetadata, OfflineLut, ScienceMetadata, Unit,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EmitAxis {
+    kind: AxisKind,
+    unit: Unit,
+    coordinate_f64_bits_hex: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EmitRequest {
-    axes: Vec<Axis>,
+    axes: Vec<EmitAxis>,
     generator: GeneratorMetadata,
     generator_config_utf8: String,
     science: ScienceMetadata,
     value_f64_bits_hex: Vec<[String; AdditiveScattering::COMPONENT_COUNT]>,
 }
 
-fn decode_component(point: usize, component: usize, text: &str) -> Result<f64, String> {
+fn decode_f64_bits(label: &str, text: &str) -> Result<f64, String> {
     if text.len() != 16
         || text
             .bytes()
             .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
     {
-        return Err(format!(
-            "point {point} component {component} is not 16 lowercase hex digits"
-        ));
+        return Err(format!("{label} is not 16 lowercase hex digits"));
     }
-    let bits = u64::from_str_radix(text, 16).map_err(|error| {
-        format!("point {point} component {component} has invalid bits: {error}")
-    })?;
+    let bits = u64::from_str_radix(text, 16)
+        .map_err(|error| format!("{label} has invalid bits: {error}"))?;
     Ok(f64::from_bits(bits))
 }
 
@@ -52,6 +59,26 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("read {}: {error}", request_path.display()))?;
     let request: EmitRequest = serde_json::from_slice(&request_bytes)
         .map_err(|error| format!("parse {}: {error}", request_path.display()))?;
+    let axes = request
+        .axes
+        .into_iter()
+        .enumerate()
+        .map(|(axis_index, axis)| {
+            let coordinates = axis
+                .coordinate_f64_bits_hex
+                .into_iter()
+                .enumerate()
+                .map(|(coordinate_index, text)| {
+                    decode_f64_bits(
+                        &format!("axis {axis_index} coordinate {coordinate_index}"),
+                        &text,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Axis::new(axis.kind, axis.unit, coordinates)
+                .map_err(|error| format!("invalid axis {axis_index}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let values = request
         .value_f64_bits_hex
         .into_iter()
@@ -59,14 +86,15 @@ fn run() -> Result<(), String> {
         .map(|(point, encoded)| {
             let mut components = [0.0; AdditiveScattering::COMPONENT_COUNT];
             for (component, (destination, text)) in components.iter_mut().zip(encoded).enumerate() {
-                *destination = decode_component(point, component, &text)?;
+                *destination =
+                    decode_f64_bits(&format!("point {point} component {component}"), &text)?;
             }
             AdditiveScattering::from_components(components)
                 .map_err(|error| format!("invalid point {point}: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let lut = OfflineLut::new(
-        request.axes,
+        axes,
         request.generator,
         request.generator_config_utf8,
         request.science,

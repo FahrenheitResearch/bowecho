@@ -1,0 +1,627 @@
+{
+  "classification": "solver_domain_design_probe_only",
+  "config_sha256": "c2b973ab36fa26edb8d9d82f7dbb2ae5df52feec4bf93c880e304cad5aa2ff49",
+  "ddelt_values": [
+    0.001,
+    0.00025,
+    1e-05,
+    1e-06,
+    1e-07,
+    1e-08
+  ],
+  "interpretation_limit": "This records sensitivity and native completion only. It does not establish an asymptotic limit or identify the cause of the ddelt=1e-8 native exits.",
+  "point_count": 3,
+  "points": [
+    {
+      "coordinates": {
+        "bulk_density": 1.5,
+        "equivolume_diameter": 0.0361256265495798,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "runs": [
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 0.0,
+            "av": 0.0,
+            "fall_speed_first_moment": 0.0,
+            "fall_speed_second_moment": 0.0,
+            "hh_vv_covariance_imaginary": 0.0,
+            "hh_vv_covariance_real": 0.0,
+            "kdp": 0.0,
+            "zh": 0.0,
+            "zv": 0.0
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.4452660185077652e-06,
+            "av": 3.114141306390394e-06,
+            "fall_speed_first_moment": 155.76823769455825,
+            "fall_speed_second_moment": 76.46950359041921,
+            "hh_vv_covariance_imaginary": -0.03495713729031882,
+            "hh_vv_covariance_real": 318.3114569128802,
+            "kdp": -6.872657160288288e-08,
+            "zh": 317.2996127244166,
+            "zv": 319.3273580177563
+          },
+          "ddelt": 0.001,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[317.2996127244166,319.3273580177563,318.3114569128802,-0.03495713729031882,-6.872657160288288e-08,2.4452660185077652e-06,3.114141306390394e-06,155.76823769455825,76.46950359041921]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 4.87042752357153e-10,
+            "av": 1.5079224495314471e-09,
+            "fall_speed_first_moment": 0.049620967399278015,
+            "fall_speed_second_moment": 0.02435984897088872,
+            "hh_vv_covariance_imaginary": 8.450743942586131e-05,
+            "hh_vv_covariance_real": 0.9440699975525604,
+            "kdp": 5.879053505400857e-05,
+            "zh": 0.1010778190203041,
+            "zv": 1.7909704679571519
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.4457530612601224e-06,
+            "av": 3.1156492288399256e-06,
+            "fall_speed_first_moment": 155.71861672715897,
+            "fall_speed_second_moment": 76.44514374144832,
+            "hh_vv_covariance_imaginary": -0.03504164472974468,
+            "hh_vv_covariance_real": 317.36738691532764,
+            "kdp": -5.8859261625611454e-05,
+            "zh": 317.1985349053963,
+            "zv": 317.53638754979914
+          },
+          "ddelt": 0.00025,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[317.1985349053963,317.53638754979914,317.36738691532764,-0.03504164472974468,-5.8859261625611454e-05,2.4457530612601224e-06,3.1156492288399256e-06,155.71861672715897,76.44514374144832]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 4.934438103329904e-10,
+            "av": 1.4413816712322899e-09,
+            "fall_speed_first_moment": 0.13085049877125243,
+            "fall_speed_second_moment": 0.0642369255355959,
+            "hh_vv_covariance_imaginary": 5.930418937129256e-05,
+            "hh_vv_covariance_real": 0.9457024364638187,
+            "kdp": 5.788331998476206e-05,
+            "zh": 0.2665422245215723,
+            "zv": 1.6285427875329788
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.445759462318098e-06,
+            "av": 3.1155826880616265e-06,
+            "fall_speed_first_moment": 155.637387195787,
+            "fall_speed_second_moment": 76.40526666488361,
+            "hh_vv_covariance_imaginary": -0.03501644147969011,
+            "hh_vv_covariance_real": 317.3657544764164,
+            "kdp": -5.795204655636494e-05,
+            "zh": 317.033070499895,
+            "zv": 317.6988152302233
+          },
+          "ddelt": 1e-05,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[317.033070499895,317.6988152302233,317.3657544764164,-0.03501644147969011,-5.795204655636494e-05,2.445759462318098e-06,3.1155826880616265e-06,155.637387195787,76.40526666488361]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 5.011357124502371e-10,
+            "av": 1.4943671470227987e-09,
+            "fall_speed_first_moment": 0.13814713851351712,
+            "fall_speed_second_moment": 0.06781898069156966,
+            "hh_vv_covariance_imaginary": 6.21993703672219e-05,
+            "hh_vv_covariance_real": 1.0002563601483416,
+            "kdp": 6.087672348450644e-05,
+            "zh": 0.28140546621114026,
+            "zv": 1.7228716731880809
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.4457671542202155e-06,
+            "av": 3.115635673537417e-06,
+            "fall_speed_first_moment": 155.63009055604473,
+            "fall_speed_second_moment": 76.40168460972764,
+            "hh_vv_covariance_imaginary": -0.03501933666068604,
+            "hh_vv_covariance_real": 317.31120055273186,
+            "kdp": -6.0945450056109324e-05,
+            "zh": 317.01820725820545,
+            "zv": 317.6044863445682
+          },
+          "ddelt": 1e-06,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[317.01820725820545,317.6044863445682,317.31120055273186,-0.03501933666068604,-6.0945450056109324e-05,2.4457671542202155e-06,3.115635673537417e-06,155.63009055604473,76.40168460972764]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 4.985060367350957e-10,
+            "av": 1.4835426631045287e-09,
+            "fall_speed_first_moment": 0.14123899463933753,
+            "fall_speed_second_moment": 0.06933682994385038,
+            "hh_vv_covariance_imaginary": 6.138193009196102e-05,
+            "hh_vv_covariance_real": 1.0026395892211895,
+            "kdp": 6.059003346832499e-05,
+            "zh": 0.28770357143361025,
+            "zv": 1.7213316195612265
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.4457645245445003e-06,
+            "av": 3.1156248490534987e-06,
+            "fall_speed_first_moment": 155.62699869991891,
+            "fall_speed_second_moment": 76.40016676047536,
+            "hh_vv_covariance_imaginary": -0.03501851922041078,
+            "hh_vv_covariance_real": 317.308817323659,
+            "kdp": -6.065876003992787e-05,
+            "zh": 317.011909152983,
+            "zv": 317.60602639819507
+          },
+          "ddelt": 1e-07,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[317.011909152983,317.60602639819507,317.308817323659,-0.03501851922041078,-6.065876003992787e-05,2.4457645245445003e-06,3.1156248490534987e-06,155.62699869991891,76.40016676047536]\n"
+        },
+        {
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": false,
+          "ddelt": 1e-08,
+          "result_marker_count": 0,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        }
+      ]
+    },
+    {
+      "coordinates": {
+        "bulk_density": 1.6055648176571813,
+        "equivolume_diameter": 0.0361256265495798,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "runs": [
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 0.0,
+            "av": 0.0,
+            "fall_speed_first_moment": 0.0,
+            "fall_speed_second_moment": 0.0,
+            "hh_vv_covariance_imaginary": 0.0,
+            "hh_vv_covariance_real": 0.0,
+            "kdp": 0.0,
+            "zh": 0.0,
+            "zv": 0.0
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.7857186418776295e-06,
+            "av": 3.5039052633644878e-06,
+            "fall_speed_first_moment": 178.51086922971157,
+            "fall_speed_second_moment": 103.09129625091663,
+            "hh_vv_covariance_imaginary": -0.03891152242426717,
+            "hh_vv_covariance_real": 310.1711428946572,
+            "kdp": 5.003514120992025e-07,
+            "zh": 309.1059244767606,
+            "zv": 311.2411219112166
+          },
+          "ddelt": 0.001,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[309.1059244767606,311.2411219112166,310.1711428946572,-0.03891152242426717,5.003514120992025e-07,2.7857186418776295e-06,3.5039052633644878e-06,178.51086922971157,103.09129625091663]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 5.057025896403561e-10,
+            "av": 1.7984287506439245e-09,
+            "fall_speed_first_moment": 0.01974239225751262,
+            "fall_speed_second_moment": 0.011401371903588142,
+            "hh_vv_covariance_imaginary": 9.758499588371355e-05,
+            "hh_vv_covariance_real": 0.8394914440044658,
+            "kdp": 6.883385427952769e-05,
+            "zh": 0.034185539717952906,
+            "zv": 1.7177180147116928
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.78622434446727e-06,
+            "av": 3.5057036921151317e-06,
+            "fall_speed_first_moment": 178.5306116219691,
+            "fall_speed_second_moment": 103.10269762282022,
+            "hh_vv_covariance_imaginary": -0.03900910742015088,
+            "hh_vv_covariance_real": 309.3316514506527,
+            "kdp": -6.833350286742848e-05,
+            "zh": 309.14011001647856,
+            "zv": 309.52340389650493
+          },
+          "ddelt": 0.00025,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[309.14011001647856,309.52340389650493,309.3316514506527,-0.03900910742015088,-6.833350286742848e-05,2.78622434446727e-06,3.5057036921151317e-06,178.5306116219691,103.10269762282022]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 4.706525040545761e-10,
+            "av": 1.5886213084062083e-09,
+            "fall_speed_first_moment": 0.05399315116312664,
+            "fall_speed_second_moment": 0.031181428705693293,
+            "hh_vv_covariance_imaginary": 7.10319922770028e-05,
+            "hh_vv_covariance_real": 0.7985627886176871,
+            "kdp": 6.545921933056865e-05,
+            "zh": 0.09349348293307003,
+            "zv": 1.507953482042069
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.786189294381684e-06,
+            "av": 3.505493884672894e-06,
+            "fall_speed_first_moment": 178.45687607854845,
+            "fall_speed_second_moment": 103.06011482221093,
+            "hh_vv_covariance_imaginary": -0.03898255441654417,
+            "hh_vv_covariance_real": 309.3725801060395,
+            "kdp": -6.495886791846944e-05,
+            "zh": 309.01243099382754,
+            "zv": 309.73316842917455
+          },
+          "ddelt": 1e-05,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[309.01243099382754,309.73316842917455,309.3725801060395,-0.03898255441654417,-6.495886791846944e-05,2.786189294381684e-06,3.505493884672894e-06,178.45687607854845,103.06011482221093]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 4.70058693381861e-10,
+            "av": 1.6357296969967558e-09,
+            "fall_speed_first_moment": 0.053535598821781605,
+            "fall_speed_second_moment": 0.030917188975223553,
+            "hh_vv_covariance_imaginary": 7.451740403627977e-05,
+            "hh_vv_covariance_real": 0.8352645152821196,
+            "kdp": 6.83953413782566e-05,
+            "zh": 0.0927011942613376,
+            "zv": 1.5822365869805708
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.7861887005710114e-06,
+            "av": 3.5055409930614845e-06,
+            "fall_speed_first_moment": 178.4573336308898,
+            "fall_speed_second_moment": 103.0603790619414,
+            "hh_vv_covariance_imaginary": -0.03898603982830345,
+            "hh_vv_covariance_real": 309.33587837937506,
+            "kdp": -6.789498996615739e-05,
+            "zh": 309.01322328249927,
+            "zv": 309.65888532423605
+          },
+          "ddelt": 1e-06,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[309.01322328249927,309.65888532423605,309.33587837937506,-0.03898603982830345,-6.789498996615739e-05,2.7861887005710114e-06,3.5055409930614845e-06,178.4573336308898,103.0603790619414]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 4.658293905942757e-10,
+            "av": 1.6214024736786524e-09,
+            "fall_speed_first_moment": 0.055223090397362284,
+            "fall_speed_second_moment": 0.03189172735874024,
+            "hh_vv_covariance_imaginary": 7.385138554912019e-05,
+            "hh_vv_covariance_real": 0.8338806676827062,
+            "kdp": 6.819722883119524e-05,
+            "zh": 0.09562322161895054,
+            "zv": 1.5765367276458733
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 2.7861844712682238e-06,
+            "av": 3.5055266658381664e-06,
+            "fall_speed_first_moment": 178.4556461393142,
+            "fall_speed_second_moment": 103.05940452355789,
+            "hh_vv_covariance_imaginary": -0.03898537380981629,
+            "hh_vv_covariance_real": 309.3372622269745,
+            "kdp": -6.769687741909604e-05,
+            "zh": 309.01030125514166,
+            "zv": 309.66458518357075
+          },
+          "ddelt": 1e-07,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[309.01030125514166,309.66458518357075,309.3372622269745,-0.03898537380981629,-6.769687741909604e-05,2.7861844712682238e-06,3.5055266658381664e-06,178.4556461393142,103.05940452355789]\n"
+        },
+        {
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": false,
+          "ddelt": 1e-08,
+          "result_marker_count": 0,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        }
+      ]
+    },
+    {
+      "coordinates": {
+        "bulk_density": 1.6055648176571813,
+        "equivolume_diameter": 0.0361256265495798,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 230.0
+      },
+      "runs": [
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 0.0,
+            "av": 0.0,
+            "fall_speed_first_moment": 0.0,
+            "fall_speed_second_moment": 0.0,
+            "hh_vv_covariance_imaginary": 0.0,
+            "hh_vv_covariance_real": 0.0,
+            "kdp": 0.0,
+            "zh": 0.0,
+            "zv": 0.0
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 3.0075773675231288e-06,
+            "av": 3.7404521521474105e-06,
+            "fall_speed_first_moment": 182.11596672904176,
+            "fall_speed_second_moment": 105.17326569020402,
+            "hh_vv_covariance_imaginary": -0.0401018643279941,
+            "hh_vv_covariance_real": 316.43856044910564,
+            "kdp": -1.8049924868740814e-07,
+            "zh": 315.3484406897388,
+            "zv": 317.53356037611843
+          },
+          "ddelt": 0.001,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[315.3484406897388,317.53356037611843,316.43856044910564,-0.0401018643279941,-1.8049924868740814e-07,3.0075773675231288e-06,3.7404521521474105e-06,182.11596672904176,105.17326569020402]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 5.671851404629612e-10,
+            "av": 2.013195169383136e-09,
+            "fall_speed_first_moment": 0.020145027526922377,
+            "fall_speed_second_moment": 0.01163389663453529,
+            "hh_vv_covariance_imaginary": 0.00010051805527615254,
+            "hh_vv_covariance_real": 0.8564886168342696,
+            "kdp": 6.952999765474184e-05,
+            "zh": 0.03488273506366113,
+            "zv": 1.752520604159713
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 3.0081445526635917e-06,
+            "av": 3.7424653473167936e-06,
+            "fall_speed_first_moment": 182.13611175656868,
+            "fall_speed_second_moment": 105.18489958683855,
+            "hh_vv_covariance_imaginary": -0.04020238238327025,
+            "hh_vv_covariance_real": 315.58207183227137,
+            "kdp": -6.971049690342925e-05,
+            "zh": 315.3833234248025,
+            "zv": 315.7810397719587
+          },
+          "ddelt": 0.00025,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[315.3833234248025,315.7810397719587,315.58207183227137,-0.04020238238327025,-6.971049690342925e-05,3.0081445526635917e-06,3.7424653473167936e-06,182.13611175656868,105.18489958683855]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 5.378383443575084e-10,
+            "av": 1.7991587943973066e-09,
+            "fall_speed_first_moment": 0.055068837279890204,
+            "fall_speed_second_moment": 0.031802645086614234,
+            "hh_vv_covariance_imaginary": 7.316271274274838e-05,
+            "hh_vv_covariance_real": 0.8147041185360422,
+            "kdp": 6.61185244337745e-05,
+            "zh": 0.09535611994220972,
+            "zv": 1.5384760359907546
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 3.0081152058674863e-06,
+            "av": 3.742251310941808e-06,
+            "fall_speed_first_moment": 182.06089789176187,
+            "fall_speed_second_moment": 105.1414630451174,
+            "hh_vv_covariance_imaginary": -0.040175027040736846,
+            "hh_vv_covariance_real": 315.6238563305696,
+            "kdp": -6.629902368246191e-05,
+            "zh": 315.2530845697966,
+            "zv": 315.9950843401277
+          },
+          "ddelt": 1e-05,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[315.2530845697966,315.9950843401277,315.6238563305696,-0.040175027040736846,-6.629902368246191e-05,3.0081152058674863e-06,3.742251310941808e-06,182.06089789176187,105.1414630451174]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 5.367711279582133e-10,
+            "av": 1.8522016843522992e-09,
+            "fall_speed_first_moment": 0.054609510756733926,
+            "fall_speed_second_moment": 0.03153738075353374,
+            "hh_vv_covariance_imaginary": 7.675678087948334e-05,
+            "hh_vv_covariance_real": 0.8521728909552166,
+            "kdp": 6.908613406937224e-05,
+            "zh": 0.09456075913203676,
+            "zv": 1.6142989190063304
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 3.008114138651087e-06,
+            "av": 3.742304353831763e-06,
+            "fall_speed_first_moment": 182.06135721828502,
+            "fall_speed_second_moment": 105.14172830945049,
+            "hh_vv_covariance_imaginary": -0.04017862110887358,
+            "hh_vv_covariance_real": 315.5863875581504,
+            "kdp": -6.926663331805965e-05,
+            "zh": 315.2538799306068,
+            "zv": 315.9192614571121
+          },
+          "ddelt": 1e-06,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[315.2538799306068,315.9192614571121,315.5863875581504,-0.04017862110887358,-6.926663331805965e-05,3.008114138651087e-06,3.742304353831763e-06,182.06135721828502,105.14172830945049]\n"
+        },
+        {
+          "absolute_difference_from_ddelt_0p001": {
+            "ah": 5.323460948109973e-10,
+            "av": 1.8375319716759753e-09,
+            "fall_speed_first_moment": 0.05630858265089955,
+            "fall_speed_second_moment": 0.03251860685337249,
+            "hh_vv_covariance_imaginary": 7.607529537358854e-05,
+            "hh_vv_covariance_real": 0.8506468760747339,
+            "kdp": 6.889007204790142e-05,
+            "zh": 0.09750283874245724,
+            "zv": 1.608294195671192
+          },
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": true,
+          "components": {
+            "ah": 3.0081097136179398e-06,
+            "av": 3.7422896841190865e-06,
+            "fall_speed_first_moment": 182.05965814639086,
+            "fall_speed_second_moment": 105.14074708335065,
+            "hh_vv_covariance_imaginary": -0.04017793962336769,
+            "hh_vv_covariance_real": 315.5879135730309,
+            "kdp": -6.907057129658883e-05,
+            "zh": 315.25093785099637,
+            "zv": 315.92526618044724
+          },
+          "ddelt": 1e-07,
+          "result_marker_count": 1,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "BRSLUT_DDELT_PROBE_RESULT=[315.25093785099637,315.92526618044724,315.5879135730309,-0.04017793962336769,-6.907057129658883e-05,3.0081097136179398e-06,3.7422896841190865e-06,182.05965814639086,105.14074708335065]\n"
+        },
+        {
+          "command": [
+            "/usr/local/bin/python",
+            "/workspace/validation/tmatrix/run_ddelt_probe.py",
+            "_worker"
+          ],
+          "completed": false,
+          "ddelt": 1e-08,
+          "result_marker_count": 0,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        }
+      ]
+    }
+  ],
+  "production_validation": false,
+  "report_id": "pytmatrix-0.3.3-dry-prolate-ddelt-sensitivity-v1",
+  "schema": 1,
+  "scientifically_independent": false,
+  "source_hashes": {
+    "config_sha256": "c2b973ab36fa26edb8d9d82f7dbb2ae5df52feec4bf93c880e304cad5aa2ff49",
+    "environment_report_sha256": "ea4fd9324350cfb2819bb1fef53f251c61bb887a0fa63d7963666d22d03482c7",
+    "failure_report_sha256": "8b4b524344e29fe596a3f725db5fa1d8605136ae97b3d673097f3cf0f67d83c3",
+    "generator_source_sha256": "75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
+    "probe_source_sha256": "7d9df1508eadc461c74240652e0ac54d4acecb9f5314053dec9af4bcf816064e"
+  }
+}

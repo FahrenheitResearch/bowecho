@@ -1,0 +1,498 @@
+{
+  "absolute_floor": 1e-12,
+  "axis_budget_check_passed": true,
+  "classification": "grid_design_not_final_held_out_validation",
+  "environment_report_sha256": "febf88d918b623f29415c0662b557363de59187b79c58ac9cb3d3664523e4789",
+  "generator_source_sha256": "7a07f173dd2ebbb7c3d6fe4aca4cbad64f2c2ed1db6ce221bf3d10c2c1287b3a",
+  "parent_failure_report_sha256": "1d6230e1088dd3afdc3871eaa88097a33549e14995151f749f23e4b594419335",
+  "production_validation": false,
+  "relative_budgets": {
+    "ah": 0.15,
+    "av": 0.15,
+    "fall_speed_first_moment": 0.2,
+    "fall_speed_second_moment": 0.2,
+    "hh_vv_covariance_imaginary": 0.15,
+    "hh_vv_covariance_real": 0.15,
+    "kdp": 0.15,
+    "zh": 0.15,
+    "zv": 0.15
+  },
+  "report_id": "pytmatrix-0.3.3-candidate-grid-one-axis-budget-v1",
+  "sample_count": 8,
+  "schema": 1,
+  "scientifically_independent": false,
+  "selection_protocol": "Deterministic recursive refinement audit. Only child cells wholly inside failed ranges from the identified parent report are tested, with unchanged within-cell fractions and error budgets. A full audit is required after this narrow audit passes and before the axes may be frozen.",
+  "tables": [
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "axes": [
+        {
+          "axis": "equivolume_diameter",
+          "sample_count": 6,
+          "samples": [
+            {
+              "coordinate": 0.039776053269551304,
+              "errors": [
+                {
+                  "component": "zh",
+                  "relative_error_with_absolute_floor": 0.0375353475132232,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "zv",
+                  "relative_error_with_absolute_floor": 0.007328702689055376,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_real",
+                  "relative_error_with_absolute_floor": 0.02722691141176682,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_imaginary",
+                  "relative_error_with_absolute_floor": 0.013918208621032642,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "kdp",
+                  "relative_error_with_absolute_floor": 0.0009948224952834519,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "ah",
+                  "relative_error_with_absolute_floor": 7.408505943703016e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "av",
+                  "relative_error_with_absolute_floor": 0.00010467657236032782,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_first_moment",
+                  "relative_error_with_absolute_floor": 0.0375033999141662,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_second_moment",
+                  "relative_error_with_absolute_floor": 0.03747202758871805,
+                  "within_axis_budget": true
+                }
+              ],
+              "interval_index": 40,
+              "lower": 0.03971681795726306,
+              "upper": 0.03983528858183955,
+              "within_axis_budget": true,
+              "within_cell_fraction": 0.5
+            },
+            {
+              "coordinate": 0.039894700586139004,
+              "errors": [
+                {
+                  "component": "zh",
+                  "relative_error_with_absolute_floor": 0.03855608954317073,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "zv",
+                  "relative_error_with_absolute_floor": 0.010932875372661787,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_real",
+                  "relative_error_with_absolute_floor": 0.05671985697490684,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_imaginary",
+                  "relative_error_with_absolute_floor": 0.013869747954101657,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "kdp",
+                  "relative_error_with_absolute_floor": 0.0011388900062329773,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "ah",
+                  "relative_error_with_absolute_floor": 6.871421265438219e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "av",
+                  "relative_error_with_absolute_floor": 0.00010319485758626427,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_first_moment",
+                  "relative_error_with_absolute_floor": 0.03863595632087607,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_second_moment",
+                  "relative_error_with_absolute_floor": 0.038716398876140055,
+                  "within_axis_budget": true
+                }
+              ],
+              "interval_index": 41,
+              "lower": 0.03983528858183955,
+              "upper": 0.03995411259043846,
+              "within_axis_budget": true,
+              "within_cell_fraction": 0.5
+            },
+            {
+              "coordinate": 0.04001370181380074,
+              "errors": [
+                {
+                  "component": "zh",
+                  "relative_error_with_absolute_floor": 0.0306092591024967,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "zv",
+                  "relative_error_with_absolute_floor": 0.015972820076474742,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_real",
+                  "relative_error_with_absolute_floor": 0.10830246161348904,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_imaginary",
+                  "relative_error_with_absolute_floor": 0.012725966776655346,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "kdp",
+                  "relative_error_with_absolute_floor": 0.001320368248356829,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "ah",
+                  "relative_error_with_absolute_floor": 6.285804819194973e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "av",
+                  "relative_error_with_absolute_floor": 0.00010130218855184752,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_first_moment",
+                  "relative_error_with_absolute_floor": 0.030755013529764872,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_second_moment",
+                  "relative_error_with_absolute_floor": 0.03090133929198353,
+                  "within_axis_budget": true
+                }
+              ],
+              "interval_index": 42,
+              "lower": 0.03995411259043846,
+              "upper": 0.04007329103716302,
+              "within_axis_budget": true,
+              "within_cell_fraction": 0.5
+            },
+            {
+              "coordinate": 0.04013305800821186,
+              "errors": [
+                {
+                  "component": "zh",
+                  "relative_error_with_absolute_floor": 0.021840768810905277,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "zv",
+                  "relative_error_with_absolute_floor": 0.021544856843629785,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_real",
+                  "relative_error_with_absolute_floor": 0.10454048531068277,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_imaginary",
+                  "relative_error_with_absolute_floor": 0.011114694658648066,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "kdp",
+                  "relative_error_with_absolute_floor": 0.0015616426091029545,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "ah",
+                  "relative_error_with_absolute_floor": 5.6504383655408034e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "av",
+                  "relative_error_with_absolute_floor": 9.906846566603574e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_first_moment",
+                  "relative_error_with_absolute_floor": 0.021999624332036623,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_second_moment",
+                  "relative_error_with_absolute_floor": 0.02215904631921203,
+                  "within_axis_budget": true
+                }
+              ],
+              "interval_index": 43,
+              "lower": 0.04007329103716302,
+              "upper": 0.04019282497926071,
+              "within_axis_budget": true,
+              "within_cell_fraction": 0.5
+            },
+            {
+              "coordinate": 0.04025277022819669,
+              "errors": [
+                {
+                  "component": "zh",
+                  "relative_error_with_absolute_floor": 0.015490262341819652,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "zv",
+                  "relative_error_with_absolute_floor": 0.024793731110187348,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_real",
+                  "relative_error_with_absolute_floor": 0.05819913859512474,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_imaginary",
+                  "relative_error_with_absolute_floor": 0.009488987738680935,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "kdp",
+                  "relative_error_with_absolute_floor": 0.0019051581129405735,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "ah",
+                  "relative_error_with_absolute_floor": 4.962104594905498e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "av",
+                  "relative_error_with_absolute_floor": 9.6325387920536e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_first_moment",
+                  "relative_error_with_absolute_floor": 0.015639754374019516,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_second_moment",
+                  "relative_error_with_absolute_floor": 0.01578980935645131,
+                  "within_axis_budget": true
+                }
+              ],
+              "interval_index": 44,
+              "lower": 0.04019282497926071,
+              "upper": 0.04031271547713267,
+              "within_axis_budget": true,
+              "within_cell_fraction": 0.5
+            },
+            {
+              "coordinate": 0.04037283953573789,
+              "errors": [
+                {
+                  "component": "zh",
+                  "relative_error_with_absolute_floor": 0.011293976518224587,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "zv",
+                  "relative_error_with_absolute_floor": 0.02354956962123364,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_real",
+                  "relative_error_with_absolute_floor": 0.03222090850507596,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_imaginary",
+                  "relative_error_with_absolute_floor": 0.00804507853068537,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "kdp",
+                  "relative_error_with_absolute_floor": 0.0024408101555528014,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "ah",
+                  "relative_error_with_absolute_floor": 4.2273478493111974e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "av",
+                  "relative_error_with_absolute_floor": 9.317828385361613e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_first_moment",
+                  "relative_error_with_absolute_floor": 0.011428771926612395,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_second_moment",
+                  "relative_error_with_absolute_floor": 0.011564127966772211,
+                  "within_axis_budget": true
+                }
+              ],
+              "interval_index": 45,
+              "lower": 0.04031271547713267,
+              "upper": 0.040432963594343105,
+              "within_axis_budget": true,
+              "within_cell_fraction": 0.5
+            }
+          ],
+          "within_axis_budget": true
+        }
+      ],
+      "config_sha256": "28eb5f7b80a3dffe0aca762e6e72edf0723aa08dedd4df40638a05884da3bf13",
+      "table_id": "conventional-wet-hail-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_axis_budget": true
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "axes": [
+        {
+          "axis": "equivolume_diameter",
+          "sample_count": 2,
+          "samples": [
+            {
+              "coordinate": 0.006949621770764863,
+              "errors": [
+                {
+                  "component": "zh",
+                  "relative_error_with_absolute_floor": 4.6088128699025744e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "zv",
+                  "relative_error_with_absolute_floor": 4.704423818775605e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_real",
+                  "relative_error_with_absolute_floor": 4.6573439288325946e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_imaginary",
+                  "relative_error_with_absolute_floor": 0.01652367836342735,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "kdp",
+                  "relative_error_with_absolute_floor": 3.321066501369346e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "ah",
+                  "relative_error_with_absolute_floor": 0.00011839830426950007,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "av",
+                  "relative_error_with_absolute_floor": 0.00011399860043497744,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_first_moment",
+                  "relative_error_with_absolute_floor": 4.7279548459508575e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_second_moment",
+                  "relative_error_with_absolute_floor": 4.849934717169723e-05,
+                  "within_axis_budget": true
+                }
+              ],
+              "interval_index": 34,
+              "lower": 0.006932882913751411,
+              "upper": 0.006966360627778315,
+              "within_axis_budget": true,
+              "within_cell_fraction": 0.5
+            },
+            {
+              "coordinate": 0.006983180313889158,
+              "errors": [
+                {
+                  "component": "zh",
+                  "relative_error_with_absolute_floor": 4.523451276755254e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "zv",
+                  "relative_error_with_absolute_floor": 4.619662109402528e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_real",
+                  "relative_error_with_absolute_floor": 4.572272142310819e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "hh_vv_covariance_imaginary",
+                  "relative_error_with_absolute_floor": 0.045768693306927385,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "kdp",
+                  "relative_error_with_absolute_floor": 3.3564696157349295e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "ah",
+                  "relative_error_with_absolute_floor": 0.00011971715753262382,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "av",
+                  "relative_error_with_absolute_floor": 0.0001151731880545472,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_first_moment",
+                  "relative_error_with_absolute_floor": 4.6395051484170556e-05,
+                  "within_axis_budget": true
+                },
+                {
+                  "component": "fall_speed_second_moment",
+                  "relative_error_with_absolute_floor": 4.758309451634789e-05,
+                  "within_axis_budget": true
+                }
+              ],
+              "interval_index": 35,
+              "lower": 0.006966360627778315,
+              "upper": 0.007,
+              "within_axis_budget": true,
+              "within_cell_fraction": 0.5
+            }
+          ],
+          "within_axis_budget": true
+        }
+      ],
+      "config_sha256": "b6ac330212174ce863ee14abe94bb3347c6ae208913a760cead418c6d67d879d",
+      "table_id": "property-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_axis_budget": true
+    }
+  ],
+  "validation_source_sha256": "c7f685ae9b5abff2e8494d25bf573363f4a2ef7a03df9a7467398dcf0b47023a"
+}

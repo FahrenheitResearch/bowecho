@@ -9,6 +9,8 @@ OfflineLut API, so this script does not duplicate the binary format writer.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import copy
 import hashlib
 import importlib.metadata
 import itertools
@@ -31,13 +33,52 @@ MAGIC = b"BRSLUT01"
 SCHEMA_VERSION = 1
 POINT_COMPONENT_COUNT = 9
 POINT_MARKER = "BRSLUT_POINT_RESULT="
+GROUP_MARKER = "BRSLUT_GROUP_RESULT="
+PROPERTY_SOLVER_NDGS = 14
+GENERATION_WORKERS = 12
+CONVENTIONAL_SOLVER_NDGS = 2
+CONVERGENCE_SOLVER_NDGS = (8, 10, 12, 14, 16, 18, 20)
 
 AXIS_UNITS = {
     "equivolume_diameter": "meter",
+    "temperature": "kelvin",
+    "bulk_density": "kilogram_per_cubic_meter",
+    "condensed_volume_fraction": "unitless_fraction",
     "liquid_mass_fraction": "unitless_fraction",
     "minor_to_major_axis_ratio": "unitless_fraction",
     "frequency": "hertz",
+    "radar_elevation": "degree",
 }
+
+PROPERTY_FAMILY = "property_aware_p3_ishmael"
+PROPERTY_CATEGORY = "frozen_characteristic_particle"
+DRY_PROPERTY_DIELECTRIC_MODEL = (
+    "symmetric_bruggeman_spherical_air_ice_matzler_2006_v1"
+)
+WET_PROPERTY_DIELECTRIC_MODEL = "symmetric_bruggeman_spherical_air_ice_water_v1"
+TEMPERATURE_WATER_DIELECTRIC_MODEL = "temperature_dependent_liquid_water_liebe_1991"
+WET_PROPERTY_AXIS_ORDER = (
+    "equivolume_diameter",
+    "temperature",
+    "condensed_volume_fraction",
+    "liquid_mass_fraction",
+    "minor_to_major_axis_ratio",
+    "frequency",
+    "radar_elevation",
+)
+DRY_PROPERTY_AXIS_ORDER = (
+    "equivolume_diameter",
+    "temperature",
+    "bulk_density",
+    "minor_to_major_axis_ratio",
+    "frequency",
+    "radar_elevation",
+)
+CONVENTIONAL_AXIS_SUFFIX = (
+    "minor_to_major_axis_ratio",
+    "frequency",
+    "radar_elevation",
+)
 
 OUTPUTS = [
     {"kind": "zh", "unit": "linear_reflectivity_millimeter6_per_meter3"},
@@ -76,6 +117,7 @@ TOOL_FILES = (
     "emitter/Cargo.toml",
     "emitter/Cargo.lock",
     "emitter/src/main.rs",
+    "emitter/src/bin/validate_tmatrix_lut.rs",
 )
 
 
@@ -197,6 +239,37 @@ def _complex_index(value: Any, path: str) -> complex:
     return complex(real, imaginary)
 
 
+def _is_property_aware(config: dict[str, Any]) -> bool:
+    population = config.get("particle_population")
+    return (
+        isinstance(population, dict)
+        and population.get("microphysics_family") == PROPERTY_FAMILY
+    )
+
+
+def _is_residual_rain(config: dict[str, Any]) -> bool:
+    population = config.get("particle_population")
+    return (
+        isinstance(population, dict)
+        and population.get("microphysics_family") == "conventional"
+        and population.get("category") == "rain"
+        and isinstance(population.get("coexistence_descriptor"), dict)
+    )
+
+
+def _uses_material_state_grouping(config: dict[str, Any]) -> bool:
+    return _is_property_aware(config) or _is_residual_rain(config)
+
+
+def _property_phase_regime(config: dict[str, Any]) -> str:
+    if not _is_property_aware(config):
+        raise GeneratorError("config is not property-aware")
+    phase = config["particle_population"].get("phase_regime")
+    if phase not in ("dry", "wet"):
+        raise GeneratorError("property-aware phase regime is invalid")
+    return str(phase)
+
+
 def validate_config(config: dict[str, Any]) -> None:
     top_keys = (
         "schema",
@@ -224,22 +297,147 @@ def validate_config(config: dict[str, Any]) -> None:
     _text(config["table_id"], "config.table_id")
 
     population = _require_object(config["particle_population"], "particle_population")
-    population_keys = (
+    conventional_population_keys = (
         "microphysics_family",
         "category",
         "shape_family",
         "size_distribution",
         "normalization_number_concentration_m3",
     )
-    _keys(population, required=population_keys, allowed=population_keys, path="particle_population")
-    if population["microphysics_family"] != "conventional":
-        raise GeneratorError("only conventional particle tables are supported")
-    if population["category"] not in ("rain", "hail"):
-        raise GeneratorError("particle_population.category must be rain or hail")
+    property_population_keys = conventional_population_keys + (
+        "phase_regime",
+        "state_descriptor",
+    )
+    family = population.get("microphysics_family")
+    if family == "conventional":
+        conventional_allowed = conventional_population_keys + (
+            ("coexistence_descriptor",)
+            if "coexistence_descriptor" in population
+            else ()
+        )
+        _keys(
+            population,
+            required=conventional_allowed,
+            allowed=conventional_allowed,
+            path="particle_population",
+        )
+        if population["category"] not in ("rain", "hail"):
+            raise GeneratorError("conventional particle_population.category must be rain or hail")
+        if population["size_distribution"] != "monodisperse_node":
+            raise GeneratorError("conventional size_distribution must be monodisperse_node")
+        if "coexistence_descriptor" in population:
+            if population["category"] != "rain":
+                raise GeneratorError("coexistence_descriptor is restricted to rain")
+            descriptor = _require_object(
+                population["coexistence_descriptor"],
+                "particle_population.coexistence_descriptor",
+            )
+            descriptor_contract = {
+                "role": "standalone_rain_and_residual_after_mixed_phase_pairing",
+                "allocation_rule": (
+                    "max_total_rain_mass_minus_liquid_mass_paired_into_"
+                    "wet_frozen_categories_zero"
+                ),
+                "double_count_policy": (
+                    "paired_liquid_mass_removed_exactly_once_before_rain_lookup"
+                ),
+                "over_pairing_policy": "reject",
+            }
+            _keys(
+                descriptor,
+                required=descriptor_contract,
+                allowed=descriptor_contract,
+                path="particle_population.coexistence_descriptor",
+            )
+            for key, expected in descriptor_contract.items():
+                if descriptor[key] != expected:
+                    raise GeneratorError(
+                        f"particle_population.coexistence_descriptor.{key} "
+                        f"must equal {expected!r}"
+                    )
+    elif family == PROPERTY_FAMILY:
+        _keys(
+            population,
+            required=property_population_keys,
+            allowed=property_population_keys,
+            path="particle_population",
+        )
+        if population["category"] != PROPERTY_CATEGORY:
+            raise GeneratorError(
+                f"property-aware particle_population.category must be {PROPERTY_CATEGORY}"
+            )
+        if population["size_distribution"] != "monodisperse_characteristic_particle_node":
+            raise GeneratorError(
+                "property-aware size_distribution must be "
+                "monodisperse_characteristic_particle_node"
+            )
+        phase_regime = population["phase_regime"]
+        if phase_regime not in ("dry", "wet"):
+            raise GeneratorError("property-aware phase_regime must be dry or wet")
+        descriptor = _require_object(
+            population["state_descriptor"], "particle_population.state_descriptor"
+        )
+        descriptor_contract = {
+            "compatible_closed_state_families": ["p3", "ishmael"],
+            "characteristic_diameter_mapping": (
+                "closure_derived_equivolume_characteristic_diameter"
+            ),
+            "bulk_density_mapping": (
+                "closure_derived_effective_bulk_density_including_rime_mass_and_rime_density"
+                if phase_regime == "dry"
+                else "closure_bulk_density_and_liquid_mass_fraction_mapped_to_"
+                "condensed_volume_fraction"
+            ),
+            "shape_mapping": "closure_derived_minor_to_major_axis_ratio",
+            "liquid_mapping": (
+                "required_exactly_zero_liquid_mass_fraction"
+                if phase_regime == "dry"
+                else "diagnosed_or_prescribed_strictly_positive_liquid_mass_fraction"
+            ),
+            "phase_dispatch": (
+                "liquid_mass_fraction_equal_zero_selects_dry_table"
+                if phase_regime == "dry"
+                else "liquid_mass_fraction_greater_than_zero_selects_wet_table"
+            ),
+            "rime_axes": (
+                "not_explicit_rime_influences_only_through_bulk_density_and_shape"
+            ),
+            "rime_effect_on_dielectric": "none_given_bulk_density",
+            "psd_mapping": (
+                "none_monodisperse_characteristic_particle_not_scheme_native_psd"
+            ),
+            "extrapolation": "forbidden",
+            "density_applicability": (
+                "bulk_density_1p5_to_917_kg_m3_downward_fall_requires_density_"
+                "above_1p225_kg_m3_air"
+                if phase_regime == "dry"
+                else "condensed_volume_fraction_0p0015_to_1_downward_fall_"
+                "requires_reconstructed_density_above_1p225_kg_m3_air"
+            ),
+        }
+        if phase_regime == "wet":
+            descriptor_contract["condensed_volume_fraction_definition"] = (
+                "rho_bulk_times_open_parenthesis_one_minus_w_over_917_plus_w_"
+                "over_999p84_close_parenthesis"
+            )
+        _keys(
+            descriptor,
+            required=descriptor_contract,
+            allowed=descriptor_contract,
+            path="particle_population.state_descriptor",
+        )
+        for key, expected in descriptor_contract.items():
+            if descriptor[key] != expected:
+                raise GeneratorError(
+                    f"particle_population.state_descriptor.{key} must equal {expected!r}"
+                )
+    else:
+        raise GeneratorError(
+            "particle_population.microphysics_family must be conventional or "
+            f"{PROPERTY_FAMILY}"
+        )
     if population["shape_family"] not in ("oblate_spheroid", "prolate_spheroid"):
         raise GeneratorError("shape_family must be oblate_spheroid or prolate_spheroid")
-    if population["size_distribution"] != "monodisperse_node":
-        raise GeneratorError("size_distribution must be monodisperse_node")
     concentration = _number(
         population["normalization_number_concentration_m3"],
         "particle_population.normalization_number_concentration_m3",
@@ -267,6 +465,43 @@ def validate_config(config: dict[str, Any]) -> None:
         _number(dielectric["temperature_k"], "dielectric.temperature_k", positive=True)
         if dielectric["frequency_dependence"] != "constant_over_configured_s_band_nodes":
             raise GeneratorError("explicit dielectric frequency dependence must be declared constant")
+    elif model == TEMPERATURE_WATER_DIELECTRIC_MODEL:
+        required = (
+            "model",
+            "liquid_water_permittivity_model",
+            "mass_density_kg_m3",
+            "temperature_range_k",
+            "frequency_range_hz",
+            "applicability",
+        )
+        _keys(dielectric, required=required, allowed=required, path="dielectric")
+        if not _is_residual_rain(config):
+            raise GeneratorError(
+                f"dielectric.model {TEMPERATURE_WATER_DIELECTRIC_MODEL} requires "
+                "the residual-rain coexistence descriptor"
+            )
+        exact_water_contract = {
+            "liquid_water_permittivity_model": (
+                "liebe_hufford_manabe_1991_double_debye"
+            ),
+            "temperature_range_k": [250.0, 313.15],
+            "frequency_range_hz": [2.0e9, 4.0e9],
+            "applicability": (
+                "pure_fresh_supercooled_or_liquid_water_250_to_313p15_k"
+            ),
+        }
+        for key, expected in exact_water_contract.items():
+            if dielectric[key] != expected:
+                raise GeneratorError(f"dielectric.{key} must equal {expected!r}")
+        if (
+            _number(
+                dielectric["mass_density_kg_m3"],
+                "dielectric.mass_density_kg_m3",
+                positive=True,
+            )
+            != 999.84
+        ):
+            raise GeneratorError("residual-rain density must be exactly 999.84 kg m^-3")
     elif model == "maxwell_garnett_ice_host_water_inclusion":
         required = (
             "model",
@@ -295,16 +530,207 @@ def validate_config(config: dict[str, Any]) -> None:
             raise GeneratorError("wet mixture must use component_specific_volume conversion")
         if dielectric["frequency_dependence"] != "constant_over_configured_s_band_nodes":
             raise GeneratorError("explicit dielectric frequency dependence must be declared constant")
+    elif model == WET_PROPERTY_DIELECTRIC_MODEL:
+        required = (
+            "model",
+            "air_relative_permittivity",
+            "ice_permittivity_model",
+            "liquid_water_permittivity_model",
+            "ice_material_density_kg_m3",
+            "liquid_water_density_kg_m3",
+            "condensed_volume_fraction_interpretation",
+            "liquid_mass_fraction_interpretation",
+            "component_volume_fraction_conversion",
+            "bulk_density_reconstruction",
+            "mixing_equation",
+            "root_selection",
+            "homotopy_steps",
+            "newton_max_iterations",
+            "newton_relative_tolerance",
+            "temperature_range_k",
+            "ice_temperature_treatment",
+            "applicability",
+        )
+        _keys(dielectric, required=required, allowed=required, path="dielectric")
+        if not _is_property_aware(config):
+            raise GeneratorError(
+                f"dielectric.model {WET_PROPERTY_DIELECTRIC_MODEL} requires {PROPERTY_FAMILY}"
+            )
+        if _property_phase_regime(config) != "wet":
+            raise GeneratorError("three-component dielectric requires wet phase_regime")
+        air_permittivity = _complex_index(
+            dielectric["air_relative_permittivity"],
+            "dielectric.air_relative_permittivity",
+        )
+        if air_permittivity != complex(1.0, 0.0):
+            raise GeneratorError("air_relative_permittivity must be exactly 1+0i")
+        exact_dielectric = {
+            "ice_permittivity_model": "matzler_2006",
+            "liquid_water_permittivity_model": (
+                "liebe_hufford_manabe_1991_double_debye"
+            ),
+            "condensed_volume_fraction_interpretation": (
+                "ice_plus_liquid_component_volume_over_outer_spheroid_volume"
+            ),
+            "liquid_mass_fraction_interpretation": (
+                "liquid_mass_over_total_condensed_mass"
+            ),
+            "component_volume_fraction_conversion": (
+                "condensed_volume_fraction_times_mass_specific_volume_shares"
+            ),
+            "bulk_density_reconstruction": (
+                "condensed_volume_fraction_divided_by_total_component_specific_volume"
+            ),
+            "mixing_equation": (
+                "sum_f_j_times_eps_j_minus_eps_eff_over_eps_j_plus_2eps_eff_equals_zero"
+            ),
+            "root_selection": (
+                "vacuum_to_constituents_homotopy_passive_continuous_branch"
+            ),
+            "temperature_range_k": [269.15, 275.15],
+            "ice_temperature_treatment": (
+                "minimum_environment_temperature_and_273p15_k_phase_equilibrium"
+            ),
+            "applicability": (
+                "quasistatic_spherical_inclusions_homogeneous_effective_medium"
+            ),
+        }
+        for key, expected in exact_dielectric.items():
+            if dielectric[key] != expected:
+                raise GeneratorError(f"dielectric.{key} must equal {expected!r}")
+        ice_density = _number(
+            dielectric["ice_material_density_kg_m3"],
+            "dielectric.ice_material_density_kg_m3",
+            positive=True,
+        )
+        water_density = _number(
+            dielectric["liquid_water_density_kg_m3"],
+            "dielectric.liquid_water_density_kg_m3",
+            positive=True,
+        )
+        if ice_density != 917.0 or water_density != 999.84:
+            raise GeneratorError(
+                "property-aware component densities must be exactly 917.0 and 999.84 kg m^-3"
+            )
+        if _positive_integer(dielectric["homotopy_steps"], "dielectric.homotopy_steps") < 16:
+            raise GeneratorError("dielectric.homotopy_steps must be at least 16")
+        if (
+            _positive_integer(
+                dielectric["newton_max_iterations"],
+                "dielectric.newton_max_iterations",
+            )
+            < 16
+        ):
+            raise GeneratorError("dielectric.newton_max_iterations must be at least 16")
+        tolerance = _number(
+            dielectric["newton_relative_tolerance"],
+            "dielectric.newton_relative_tolerance",
+            positive=True,
+        )
+        if tolerance > 1.0e-10:
+            raise GeneratorError("dielectric Newton tolerance must be <= 1e-10")
+    elif model == DRY_PROPERTY_DIELECTRIC_MODEL:
+        required = (
+            "model",
+            "air_relative_permittivity",
+            "ice_permittivity_model",
+            "ice_material_density_kg_m3",
+            "bulk_density_interpretation",
+            "component_volume_fraction_conversion",
+            "mixing_equation",
+            "root_selection",
+            "homotopy_steps",
+            "newton_max_iterations",
+            "newton_relative_tolerance",
+            "temperature_range_k",
+            "temperature_evidence",
+            "applicability",
+        )
+        _keys(dielectric, required=required, allowed=required, path="dielectric")
+        if not _is_property_aware(config) or _property_phase_regime(config) != "dry":
+            raise GeneratorError("dry air/ice dielectric requires dry property-aware phase")
+        air_permittivity = _complex_index(
+            dielectric["air_relative_permittivity"],
+            "dielectric.air_relative_permittivity",
+        )
+        if air_permittivity != complex(1.0, 0.0):
+            raise GeneratorError("air_relative_permittivity must be exactly 1+0i")
+        dry_contract = {
+            "ice_permittivity_model": "matzler_2006",
+            "bulk_density_interpretation": (
+                "total_ice_mass_per_outer_spheroid_volume"
+            ),
+            "component_volume_fraction_conversion": (
+                "bulk_density_divided_by_ice_material_density"
+            ),
+            "mixing_equation": (
+                "sum_f_j_times_eps_j_minus_eps_eff_over_eps_j_plus_2eps_eff_equals_zero"
+            ),
+            "root_selection": (
+                "vacuum_to_constituents_homotopy_passive_continuous_branch"
+            ),
+            "temperature_range_k": [190.0, 273.15],
+            "temperature_evidence": (
+                "matzler_2006_formula_warren_brandt_2008_reports_accurate_fit_"
+                "190_to_258_k_warm_extension_declared_to_273p15_k"
+            ),
+            "applicability": (
+                "quasistatic_spherical_air_in_ice_or_ice_in_air_"
+                "topology_neutral_homogeneous_effective_medium"
+            ),
+        }
+        for key, expected in dry_contract.items():
+            if dielectric[key] != expected:
+                raise GeneratorError(f"dielectric.{key} must equal {expected!r}")
+        if (
+            _number(
+                dielectric["ice_material_density_kg_m3"],
+                "dielectric.ice_material_density_kg_m3",
+                positive=True,
+            )
+            != 917.0
+        ):
+            raise GeneratorError("dry property ice density must be exactly 917 kg m^-3")
+        if _positive_integer(dielectric["homotopy_steps"], "dielectric.homotopy_steps") < 16:
+            raise GeneratorError("dielectric.homotopy_steps must be at least 16")
+        if (
+            _positive_integer(
+                dielectric["newton_max_iterations"],
+                "dielectric.newton_max_iterations",
+            )
+            < 16
+        ):
+            raise GeneratorError("dielectric.newton_max_iterations must be at least 16")
+        tolerance = _number(
+            dielectric["newton_relative_tolerance"],
+            "dielectric.newton_relative_tolerance",
+            positive=True,
+        )
+        if tolerance > 1.0e-10:
+            raise GeneratorError("dielectric Newton tolerance must be <= 1e-10")
     else:
         raise GeneratorError(f"unsupported dielectric.model {model!r}")
 
     axes = config["axes"]
     if not isinstance(axes, list):
         raise GeneratorError("axes must be an array")
-    expected_kinds = ["equivolume_diameter"]
-    if model == "maxwell_garnett_ice_host_water_inclusion":
-        expected_kinds.append("liquid_mass_fraction")
-    expected_kinds.extend(("minor_to_major_axis_ratio", "frequency"))
+    if model == WET_PROPERTY_DIELECTRIC_MODEL:
+        expected_kinds = list(WET_PROPERTY_AXIS_ORDER)
+    elif model == DRY_PROPERTY_DIELECTRIC_MODEL:
+        expected_kinds = list(DRY_PROPERTY_AXIS_ORDER)
+    elif model == TEMPERATURE_WATER_DIELECTRIC_MODEL:
+        expected_kinds = [
+            "equivolume_diameter",
+            "temperature",
+            "minor_to_major_axis_ratio",
+            "frequency",
+            "radar_elevation",
+        ]
+    else:
+        expected_kinds = ["equivolume_diameter"]
+        if model == "maxwell_garnett_ice_host_water_inclusion":
+            expected_kinds.append("liquid_mass_fraction")
+        expected_kinds.extend(CONVENTIONAL_AXIS_SUFFIX)
     if len(axes) != len(expected_kinds):
         raise GeneratorError(f"axes must be in exact order {expected_kinds}")
     for index, (axis_value, expected_kind) in enumerate(zip(axes, expected_kinds)):
@@ -322,12 +748,69 @@ def validate_config(config: dict[str, Any]) -> None:
             raise GeneratorError(f"axes[{index}].coordinates must be strictly increasing")
         if expected_kind == "equivolume_diameter" and any(not (0.0 < v <= 0.1) for v in numeric):
             raise GeneratorError("diameters must lie in (0, 0.1] m")
+        if expected_kind == "temperature" and any(not (190.0 <= v <= 313.15) for v in numeric):
+            raise GeneratorError("configured temperatures must lie in [190, 313.15] K")
+        if expected_kind == "bulk_density" and any(not (1.5 <= v <= 917.0) for v in numeric):
+            raise GeneratorError("bulk densities must lie in [1.5, 917.0] kg m^-3")
+        if expected_kind == "condensed_volume_fraction" and any(
+            not (0.0 < v <= 1.0) for v in numeric
+        ):
+            raise GeneratorError("condensed volume fractions must lie in (0, 1]")
         if expected_kind == "liquid_mass_fraction" and any(not (0.0 <= v <= 1.0) for v in numeric):
             raise GeneratorError("liquid mass fractions must lie in [0, 1]")
         if expected_kind == "minor_to_major_axis_ratio" and any(not (0.0 < v <= 1.0) for v in numeric):
             raise GeneratorError("minor-to-major ratios must lie in (0, 1]")
         if expected_kind == "frequency" and any(not (2.0e9 <= v <= 4.0e9) for v in numeric):
             raise GeneratorError("frequency nodes must remain in S band [2, 4] GHz")
+        if expected_kind == "radar_elevation" and any(not (-90.0 <= v <= 90.0) for v in numeric):
+            raise GeneratorError("radar elevations must lie in [-90, 90] degrees")
+
+    if _is_property_aware(config) or _is_residual_rain(config):
+        if axis_coordinates(config, "frequency") != [2.8e9]:
+            raise GeneratorError("view-aware frequency axis must be singleton exactly 2.8 GHz")
+        temperatures = axis_coordinates(config, "temperature")
+        elevations = axis_coordinates(config, "radar_elevation")
+        if elevations[0] != -0.5 or elevations[-1] != 20.0:
+            raise GeneratorError(
+                "property-aware radar elevation axis must cover exactly -0.5 through 20 degrees"
+            )
+        if _is_property_aware(config):
+            ice_density = float(dielectric["ice_material_density_kg_m3"])
+            if _property_phase_regime(config) == "dry":
+                bulk_densities = axis_coordinates(config, "bulk_density")
+                if temperatures[0] != 190.0 or temperatures[-1] != 273.15:
+                    raise GeneratorError(
+                        "dry property temperature axis must cover exactly 190 through 273.15 K"
+                    )
+                if any(bulk_density > ice_density for bulk_density in bulk_densities):
+                    raise GeneratorError("dry bulk density exceeds solid-ice density")
+                if bulk_densities[0] != 1.5 or bulk_densities[-1] != 917.0:
+                    raise GeneratorError(
+                        "dry bulk-density axis must cover exactly 1.5 through 917 kg m^-3"
+                    )
+            else:
+                if temperatures[0] != 269.15 or temperatures[-1] != 275.15:
+                    raise GeneratorError(
+                        "wet property temperature axis must cover exactly 269.15 through 275.15 K"
+                    )
+                liquid_fractions = axis_coordinates(config, "liquid_mass_fraction")
+                if liquid_fractions[0] != 0.0 or liquid_fractions[-1] <= 0.0:
+                    raise GeneratorError(
+                        "wet liquid-fraction axis must include zero boundary support and positive states"
+                    )
+                condensed = axis_coordinates(config, "condensed_volume_fraction")
+                if condensed[0] != 0.0015 or condensed[-1] != 1.0:
+                    raise GeneratorError(
+                        "wet condensed-volume axis must cover exactly 0.0015 through 1"
+                    )
+        elif temperatures[0] != 250.0 or temperatures[-1] != 313.15:
+            raise GeneratorError(
+                "view-aware liquid-rain temperature axis must cover exactly 250 through 313.15 K"
+            )
+    elif axis_coordinates(config, "radar_elevation") != [0.0]:
+        raise GeneratorError(
+            "legacy conventional configs are restricted to singleton 0-degree elevation"
+        )
 
     orientation = _require_object(config["orientation"], "orientation")
     if orientation.get("model") == "fixed_euler":
@@ -400,8 +883,25 @@ def validate_config(config: dict[str, Any]) -> None:
     else:
         raise GeneratorError("orientation.model must be fixed_euler or gaussian_canting")
 
+    if _uses_material_state_grouping(config):
+        if orientation["model"] != "gaussian_canting":
+            raise GeneratorError("view-aware tables require Gaussian canting")
+        exact_orientation = {
+            "mean_deg": 0.0,
+            "standard_deviation_deg": 20.0,
+            "alpha_quadrature_points": 5,
+            "beta_quadrature_points": 10,
+            "quadrature_method": "pytmatrix_orient_averaged_fixed_gautschi",
+            "reference_symmetry_axis": "vertical_at_zero_canting",
+        }
+        for key, expected in exact_orientation.items():
+            if orientation[key] != expected:
+                raise GeneratorError(
+                    f"view-aware orientation.{key} must equal {expected!r}"
+                )
+
     radar = _require_object(config["radar"], "radar")
-    radar_keys = (
+    base_radar_keys = (
         "speed_of_light_m_s",
         "reference_water_dielectric_factor_squared",
         "length_unit_passed_to_pytmatrix",
@@ -410,6 +910,12 @@ def validate_config(config: dict[str, Any]) -> None:
         "covariance_phase_convention",
         "solver",
     )
+    property_radar_keys = base_radar_keys + (
+        "beam_elevation_transform",
+        "polarization_basis",
+        "view_applicability",
+    )
+    radar_keys = property_radar_keys
     _keys(radar, required=radar_keys, allowed=radar_keys, path="radar")
     if _number(radar["speed_of_light_m_s"], "radar.speed_of_light_m_s", positive=True) != 299_792_458.0:
         raise GeneratorError("speed_of_light_m_s must be exactly 299792458")
@@ -428,12 +934,37 @@ def validate_config(config: dict[str, Any]) -> None:
         raise GeneratorError("forward geometry must equal PyTMatrix geom_horiz_forw")
     if radar["covariance_phase_convention"] != "pytmatrix_delta_hv_hh_times_conjugate_vv":
         raise GeneratorError("unsupported covariance phase convention")
+    geometry_contract = {
+        "beam_elevation_transform": (
+            "pytmatrix_theta0_90_minus_e_theta_back_90_plus_e_"
+            "theta_forward_90_minus_e_degrees"
+        ),
+        "polarization_basis": "pytmatrix_local_horizontal_vertical_scattering_basis",
+        "view_applicability": (
+            "ppi_beam_elevation_minus0p5_to_20_axisymmetric_gaussian_odf_"
+            "not_general_body_frame"
+            if _uses_material_state_grouping(config)
+            else "horizontal_singleton_zero_degree_axis"
+        ),
+    }
+    for key, expected in geometry_contract.items():
+        if radar[key] != expected:
+            raise GeneratorError(f"radar.{key} must equal {expected!r}")
     solver = _require_object(radar["solver"], "radar.solver")
     _keys(solver, required=("shape", "ddelt", "ndgs"), allowed=("shape", "ddelt", "ndgs"), path="radar.solver")
     if solver["shape"] != "spheroid":
         raise GeneratorError("solver shape must be spheroid")
-    _number(solver["ddelt"], "radar.solver.ddelt", positive=True)
-    _positive_integer(solver["ndgs"], "radar.solver.ndgs")
+    if _number(solver["ddelt"], "radar.solver.ddelt", positive=True) != 0.001:
+        raise GeneratorError("radar.solver.ddelt must be exactly 0.001")
+    expected_ndgs = (
+        PROPERTY_SOLVER_NDGS
+        if _uses_material_state_grouping(config)
+        else CONVENTIONAL_SOLVER_NDGS
+    )
+    if _positive_integer(solver["ndgs"], "radar.solver.ndgs") != expected_ndgs:
+        raise GeneratorError(
+            f"radar.solver.ndgs must be exactly {expected_ndgs} for this table"
+        )
 
     terminal = _require_object(config["terminal_velocity"], "terminal_velocity")
     law = terminal.get("law")
@@ -457,6 +988,7 @@ def validate_config(config: dict[str, Any]) -> None:
             "air_dynamic_viscosity_pa_s",
             "drag_transition_reynolds",
             "high_reynolds_drag_coefficient",
+            "drag_transition_boundary_policy",
             "maximum_iterations",
             "relative_tolerance",
         )
@@ -471,6 +1003,11 @@ def validate_config(config: dict[str, Any]) -> None:
         ):
             _number(terminal[key], f"terminal_velocity.{key}", positive=True)
         _positive_integer(terminal["maximum_iterations"], "terminal_velocity.maximum_iterations")
+        if terminal["drag_transition_boundary_policy"] != (
+            "select_exact_transition_reynolds_boundary_when_piecewise_drag_"
+            "residual_jump_straddles_zero"
+        ):
+            raise GeneratorError("unsupported terminal drag-transition boundary policy")
     else:
         raise GeneratorError(f"unsupported terminal_velocity.law {law!r}")
 
@@ -479,23 +1016,91 @@ def validate_config(config: dict[str, Any]) -> None:
     if temporal["sampling"] != "instantaneous":
         raise GeneratorError("temporal sampling must be instantaneous")
     execution = _require_object(config["execution"], "execution")
-    execution_keys = (
+    base_execution_keys = (
         "point_timeout_seconds",
         "process_isolation",
         "result_collection_order",
         "partial_grid_policy",
         "thread_count_per_process",
     )
+    execution_keys = (
+        base_execution_keys + ("grouping",)
+        if _uses_material_state_grouping(config)
+        else base_execution_keys
+    )
     _keys(execution, required=execution_keys, allowed=execution_keys, path="execution")
     _positive_integer(execution["point_timeout_seconds"], "execution.point_timeout_seconds")
-    if execution["process_isolation"] != "fresh_python_subprocess_per_grid_point":
-        raise GeneratorError("each point must use a fresh Python subprocess")
+    expected_isolation = (
+        "fresh_python_subprocess_per_material_state_group"
+        if _uses_material_state_grouping(config)
+        else "fresh_python_subprocess_per_grid_point"
+    )
+    if execution["process_isolation"] != expected_isolation:
+        raise GeneratorError(
+            f"execution.process_isolation must equal {expected_isolation!r}"
+        )
     if execution["result_collection_order"] != "declared_axis_order_last_axis_fastest":
         raise GeneratorError("result collection order is not canonical")
     if execution["partial_grid_policy"] != "reject_entire_lut":
         raise GeneratorError("partial grids must be rejected")
     if execution["thread_count_per_process"] != 1:
         raise GeneratorError("thread_count_per_process must equal 1")
+    if _uses_material_state_grouping(config):
+        grouping = _require_object(execution["grouping"], "execution.grouping")
+        material_state_axis_kinds = (
+            (
+                ["temperature", "bulk_density", "frequency"]
+                if _property_phase_regime(config) == "dry"
+                else [
+                    "temperature",
+                    "condensed_volume_fraction",
+                    "liquid_mass_fraction",
+                    "frequency",
+                ]
+            )
+            if _is_property_aware(config)
+            else ["temperature", "frequency"]
+        )
+        grouping_contract = {
+            "model": "fresh_crash_isolated_material_state_process",
+            "material_state_axis_kinds": material_state_axis_kinds,
+            "tmatrix_state_axis_kinds": [
+                "equivolume_diameter",
+                "minor_to_major_axis_ratio",
+            ],
+            "geometry_axis_kind": "radar_elevation",
+            "partial_group_policy": "reject_entire_lut",
+        }
+        grouping_keys = tuple(grouping_contract) + (
+            "maximum_points_per_process",
+            "group_timeout_seconds",
+        )
+        _keys(
+            grouping,
+            required=grouping_keys,
+            allowed=grouping_keys,
+            path="execution.grouping",
+        )
+        for key, expected in grouping_contract.items():
+            if grouping[key] != expected:
+                raise GeneratorError(f"execution.grouping.{key} must equal {expected!r}")
+        maximum_points = _positive_integer(
+            grouping["maximum_points_per_process"],
+            "execution.grouping.maximum_points_per_process",
+        )
+        _positive_integer(
+            grouping["group_timeout_seconds"],
+            "execution.grouping.group_timeout_seconds",
+        )
+        in_process_points = (
+            len(axis_coordinates(config, "equivolume_diameter"))
+            * len(axis_coordinates(config, "minor_to_major_axis_ratio"))
+            * len(axis_coordinates(config, "radar_elevation"))
+        )
+        if in_process_points > maximum_points:
+            raise GeneratorError(
+                "property-aware material-state group exceeds maximum_points_per_process"
+            )
     payload = _require_object(config["payload"], "payload")
     _keys(payload, required=("encoding",), allowed=("encoding",), path="payload")
     if payload["encoding"] != "f64_le_point_major_last_axis_fastest":
@@ -518,6 +1123,349 @@ def point_coordinates(config: dict[str, Any]) -> Iterable[dict[str, float]]:
         yield {axis["kind"]: float(value) for axis, value in zip(axes, coordinates)}
 
 
+def _ice_permittivity_matzler_2006(temperature_k: float, frequency_hz: float) -> complex:
+    """Pure-ice relative permittivity, Matzler (2006), PyTMatrix +i-loss."""
+    temperature_k = _number(temperature_k, "temperature_k", positive=True)
+    frequency_hz = _number(frequency_hz, "frequency_hz", positive=True)
+    frequency_ghz = frequency_hz * 1.0e-9
+    if not 190.0 <= temperature_k <= 273.15:
+        raise GeneratorError("Matzler ice model is restricted here to [190, 273.15] K")
+    if not 0.01 <= frequency_ghz <= 300.0:
+        raise GeneratorError("Matzler ice model is restricted to [0.01, 300] GHz")
+    theta = 300.0 / temperature_k - 1.0
+    alpha = (0.00504 + 0.0062 * theta) * math.exp(-22.1 * theta)
+    exp_b = math.exp(335.0 / temperature_k)
+    beta = (
+        0.0207
+        * exp_b
+        / (temperature_k * (exp_b - 1.0) * (exp_b - 1.0))
+        + 1.16e-11 * frequency_ghz * frequency_ghz
+        + math.exp(-9.963 + 0.0372 * (temperature_k - 273.16))
+    )
+    real = 3.1884 + 9.1e-4 * (temperature_k - 273.0)
+    imaginary = alpha / frequency_ghz + beta * frequency_ghz
+    if not all(math.isfinite(value) and value >= 0.0 for value in (real, imaginary)):
+        raise GeneratorError("Matzler ice model produced a non-passive value")
+    return complex(real, imaginary)
+
+
+def _water_permittivity_liebe_1991(
+    temperature_k: float, frequency_hz: float
+) -> complex:
+    """Liebe-Hufford-Manabe (1991) double-Debye water, +i-loss convention."""
+    temperature_k = _number(temperature_k, "temperature_k", positive=True)
+    frequency_hz = _number(frequency_hz, "frequency_hz", positive=True)
+    frequency_ghz = frequency_hz * 1.0e-9
+    if not 250.0 <= temperature_k <= 313.15:
+        raise GeneratorError(
+            "this research use of Liebe-Hufford-Manabe water is restricted to [250, 313.15] K"
+        )
+    theta = 1.0 - 300.0 / temperature_k
+    epsilon_0 = 77.66 - 103.3 * theta
+    epsilon_1 = 0.0671 * epsilon_0
+    epsilon_2 = 3.52 + 7.52 * theta
+    gamma_1 = 20.20 + 146.4 * theta + 316.0 * theta * theta
+    gamma_2 = 39.8 * gamma_1
+    if gamma_1 <= 0.0 or gamma_2 <= 0.0:
+        raise GeneratorError("Liebe-Hufford-Manabe relaxation frequency is nonpositive")
+    result = (
+        complex(epsilon_2, 0.0)
+        + (epsilon_0 - epsilon_1) / complex(1.0, -frequency_ghz / gamma_1)
+        + (epsilon_1 - epsilon_2) / complex(1.0, -frequency_ghz / gamma_2)
+    )
+    if not all(math.isfinite(value) for value in (result.real, result.imag)):
+        raise GeneratorError("Liebe-Hufford-Manabe water model produced nonfinite output")
+    if result.real <= 0.0 or result.imag < 0.0:
+        raise GeneratorError("Liebe-Hufford-Manabe water model produced non-passive output")
+    return result
+
+
+def _component_volume_fractions(
+    bulk_density_kg_m3: float,
+    liquid_mass_fraction: float,
+    ice_density_kg_m3: float,
+    water_density_kg_m3: float,
+) -> tuple[float, float, float]:
+    bulk_density_kg_m3 = _number(
+        bulk_density_kg_m3, "bulk_density_kg_m3", positive=True
+    )
+    liquid_mass_fraction = _number(liquid_mass_fraction, "liquid_mass_fraction")
+    if not 0.0 <= liquid_mass_fraction <= 1.0:
+        raise GeneratorError("liquid mass fraction must lie in [0, 1]")
+    ice_density_kg_m3 = _number(
+        ice_density_kg_m3, "ice_density_kg_m3", positive=True
+    )
+    water_density_kg_m3 = _number(
+        water_density_kg_m3, "water_density_kg_m3", positive=True
+    )
+    ice_fraction = (
+        bulk_density_kg_m3 * (1.0 - liquid_mass_fraction) / ice_density_kg_m3
+    )
+    water_fraction = (
+        bulk_density_kg_m3 * liquid_mass_fraction / water_density_kg_m3
+    )
+    air_fraction = 1.0 - ice_fraction - water_fraction
+    tolerance = 64.0 * sys.float_info.epsilon
+    if air_fraction < -tolerance:
+        raise GeneratorError(
+            "bulk density and liquid mass fraction imply negative pore-air volume"
+        )
+    if air_fraction < 0.0:
+        air_fraction = 0.0
+    fractions = (air_fraction, ice_fraction, water_fraction)
+    if any(not math.isfinite(value) or value < 0.0 for value in fractions):
+        raise GeneratorError("component volume fractions are invalid")
+    if abs(sum(fractions) - 1.0) > 128.0 * sys.float_info.epsilon:
+        raise GeneratorError("component volume fractions do not sum to one")
+    return fractions
+
+
+def _wet_component_volume_fractions(
+    condensed_volume_fraction: float,
+    liquid_mass_fraction: float,
+    ice_density_kg_m3: float,
+    water_density_kg_m3: float,
+) -> tuple[tuple[float, float, float], float]:
+    condensed = _number(
+        condensed_volume_fraction, "condensed_volume_fraction", positive=True
+    )
+    if condensed > 1.0:
+        raise GeneratorError("condensed volume fraction must not exceed one")
+    liquid = _number(liquid_mass_fraction, "liquid_mass_fraction")
+    if not 0.0 <= liquid <= 1.0:
+        raise GeneratorError("liquid mass fraction must lie in [0,1]")
+    ice_density = _number(ice_density_kg_m3, "ice_density_kg_m3", positive=True)
+    water_density = _number(
+        water_density_kg_m3, "water_density_kg_m3", positive=True
+    )
+    ice_specific_volume = (1.0 - liquid) / ice_density
+    water_specific_volume = liquid / water_density
+    total_specific_volume = ice_specific_volume + water_specific_volume
+    if total_specific_volume <= 0.0 or not math.isfinite(total_specific_volume):
+        raise GeneratorError("wet component total specific volume is invalid")
+    ice_fraction = condensed * ice_specific_volume / total_specific_volume
+    water_fraction = condensed * water_specific_volume / total_specific_volume
+    air_fraction = 1.0 - condensed
+    fractions = (air_fraction, ice_fraction, water_fraction)
+    if any(not math.isfinite(value) or value < 0.0 for value in fractions):
+        raise GeneratorError("wet component volume fractions are invalid")
+    if abs(sum(fractions) - 1.0) > 128.0 * sys.float_info.epsilon:
+        raise GeneratorError("wet component volume fractions do not sum to one")
+    bulk_density = condensed / total_specific_volume
+    if not math.isfinite(bulk_density) or bulk_density <= 0.0:
+        raise GeneratorError("reconstructed wet bulk density is invalid")
+    return fractions, bulk_density
+
+
+def residual_rain_mass_after_wet_pairing(
+    total_rain_mass: float, paired_liquid_masses: Sequence[float]
+) -> float:
+    """Allocate rain exactly once after wet-frozen pairing; reject over-pairing."""
+    total = _number(total_rain_mass, "total_rain_mass")
+    if total < 0.0:
+        raise GeneratorError("total rain mass must be nonnegative")
+    paired_values = [
+        _number(value, f"paired_liquid_masses[{index}]")
+        for index, value in enumerate(paired_liquid_masses)
+    ]
+    if any(value < 0.0 for value in paired_values):
+        raise GeneratorError("paired liquid masses must be nonnegative")
+    paired = math.fsum(paired_values)
+    if paired > total:
+        raise GeneratorError("paired liquid mass exceeds total rain mass")
+    residual = total - paired
+    if not math.isfinite(residual) or residual < 0.0:
+        raise GeneratorError("residual rain mass is invalid")
+    return residual
+
+
+def _bruggeman_residual(
+    effective_permittivity: complex,
+    constituent_permittivities: Sequence[complex],
+    volume_fractions: Sequence[float],
+) -> complex:
+    return sum(
+        fraction
+        * (constituent - effective_permittivity)
+        / (constituent + 2.0 * effective_permittivity)
+        for constituent, fraction in zip(
+            constituent_permittivities, volume_fractions
+        )
+    )
+
+
+def _bruggeman_newton(
+    initial: complex,
+    constituent_permittivities: Sequence[complex],
+    volume_fractions: Sequence[float],
+    *,
+    maximum_iterations: int,
+    tolerance: float,
+) -> complex | None:
+    value = initial
+    for _ in range(maximum_iterations):
+        residual = _bruggeman_residual(
+            value, constituent_permittivities, volume_fractions
+        )
+        if abs(residual) <= tolerance:
+            return value
+        derivative = -3.0 * sum(
+            fraction
+            * constituent
+            / (constituent + 2.0 * value) ** 2
+            for constituent, fraction in zip(
+                constituent_permittivities, volume_fractions
+            )
+        )
+        if not math.isfinite(derivative.real) or not math.isfinite(derivative.imag):
+            return None
+        if abs(derivative) <= sys.float_info.min:
+            return None
+        step = residual / derivative
+        accepted = False
+        for line_search in range(24):
+            scale = 2.0 ** (-line_search)
+            candidate = value - scale * step
+            if (
+                not math.isfinite(candidate.real)
+                or not math.isfinite(candidate.imag)
+                or candidate.real <= 0.0
+                or candidate.imag < -tolerance
+            ):
+                continue
+            constituent_scale = max(
+                1.0,
+                abs(candidate),
+                *(abs(component) for component in constituent_permittivities),
+            )
+            minimum_denominator = min(
+                abs(component + 2.0 * candidate)
+                for component in constituent_permittivities
+            )
+            if minimum_denominator <= 1.0e-12 * constituent_scale:
+                continue
+            candidate_residual = _bruggeman_residual(
+                candidate, constituent_permittivities, volume_fractions
+            )
+            if abs(candidate_residual) < abs(residual):
+                value = candidate
+                accepted = True
+                break
+        if not accepted:
+            return None
+    residual = _bruggeman_residual(value, constituent_permittivities, volume_fractions)
+    return value if abs(residual) <= tolerance else None
+
+
+def _bruggeman_continuation(
+    constituent_permittivities: Sequence[complex],
+    volume_fractions: Sequence[float],
+    *,
+    initial_steps: int,
+    maximum_iterations: int,
+    tolerance: float,
+) -> complex:
+    value = complex(1.0, 0.0)
+    progress = 0.0
+    step = 1.0 / initial_steps
+    minimum_step = 1.0 / (initial_steps * 4096.0)
+    while progress < 1.0:
+        candidate_progress = min(1.0, progress + step)
+        staged = [
+            1.0 + candidate_progress * (component - 1.0)
+            for component in constituent_permittivities
+        ]
+        candidate = _bruggeman_newton(
+            value,
+            staged,
+            volume_fractions,
+            maximum_iterations=maximum_iterations,
+            tolerance=tolerance,
+        )
+        if candidate is None:
+            step *= 0.5
+            if step < minimum_step:
+                raise GeneratorError(
+                    "symmetric Bruggeman passive-branch homotopy did not converge"
+                )
+            continue
+        value = candidate
+        progress = candidate_progress
+        step = min(1.0 / initial_steps, step * 2.0)
+    return value
+
+
+def _symmetric_bruggeman_permittivity(
+    constituent_permittivities: Sequence[complex],
+    volume_fractions: Sequence[float],
+    *,
+    homotopy_steps: int,
+    maximum_iterations: int,
+    tolerance: float,
+) -> complex:
+    if len(constituent_permittivities) != len(volume_fractions):
+        raise GeneratorError("Bruggeman constituents and fractions differ in length")
+    active = [
+        (complex(permittivity), float(fraction))
+        for permittivity, fraction in zip(
+            constituent_permittivities, volume_fractions
+        )
+        if float(fraction) > 0.0
+    ]
+    if not active:
+        raise GeneratorError("Bruggeman mixture has no active constituent")
+    total = sum(fraction for _, fraction in active)
+    active = [(permittivity, fraction / total) for permittivity, fraction in active]
+    for permittivity, fraction in active:
+        if (
+            not math.isfinite(permittivity.real)
+            or not math.isfinite(permittivity.imag)
+            or permittivity.real <= 0.0
+            or permittivity.imag < 0.0
+            or not math.isfinite(fraction)
+            or fraction <= 0.0
+        ):
+            raise GeneratorError("Bruggeman mixture contains an invalid passive constituent")
+    if len(active) == 1:
+        return active[0][0]
+    permittivities = [item[0] for item in active]
+    fractions = [item[1] for item in active]
+    result = _bruggeman_continuation(
+        permittivities,
+        fractions,
+        initial_steps=homotopy_steps,
+        maximum_iterations=maximum_iterations,
+        tolerance=tolerance,
+    )
+    refined = _bruggeman_continuation(
+        permittivities,
+        fractions,
+        initial_steps=2 * homotopy_steps,
+        maximum_iterations=maximum_iterations,
+        tolerance=tolerance,
+    )
+    agreement_tolerance = 256.0 * tolerance * max(1.0, abs(result), abs(refined))
+    if abs(result - refined) > agreement_tolerance:
+        raise GeneratorError("Bruggeman homotopy step refinement selected another root")
+    residual = _bruggeman_residual(refined, permittivities, fractions)
+    if abs(residual) > tolerance:
+        raise GeneratorError("Bruggeman rational residual exceeds configured tolerance")
+    if refined.real <= 0.0 or refined.imag < -tolerance:
+        raise GeneratorError("Bruggeman root is not on the passive positive-real branch")
+    return complex(refined.real, max(refined.imag, 0.0))
+
+
+def _passive_refractive_index(permittivity: complex) -> complex:
+    result = permittivity**0.5
+    if result.real < 0.0:
+        result = -result
+    if result.imag < 0.0:
+        result = result.conjugate()
+    if result.real < 0.0 or result.imag < 0.0:
+        raise GeneratorError("could not select passive refractive-index square root")
+    return result
+
+
 def _material(config: dict[str, Any], coordinates: dict[str, float]) -> tuple[complex, float]:
     dielectric = config["dielectric"]
     if dielectric["model"] == "explicit_homogeneous":
@@ -525,6 +1473,69 @@ def _material(config: dict[str, Any], coordinates: dict[str, float]) -> tuple[co
             _complex_index(dielectric["refractive_index"], "dielectric.refractive_index"),
             float(dielectric["mass_density_kg_m3"]),
         )
+
+    if dielectric["model"] == TEMPERATURE_WATER_DIELECTRIC_MODEL:
+        permittivity = _water_permittivity_liebe_1991(
+            coordinates["temperature"], coordinates["frequency"]
+        )
+        return (
+            _passive_refractive_index(permittivity),
+            float(dielectric["mass_density_kg_m3"]),
+        )
+
+    if dielectric["model"] == WET_PROPERTY_DIELECTRIC_MODEL:
+        temperature_k = coordinates["temperature"]
+        frequency_hz = coordinates["frequency"]
+        condensed_volume_fraction = coordinates["condensed_volume_fraction"]
+        liquid_mass_fraction = coordinates["liquid_mass_fraction"]
+        ice_density = float(dielectric["ice_material_density_kg_m3"])
+        water_density = float(dielectric["liquid_water_density_kg_m3"])
+        fractions, bulk_density = _wet_component_volume_fractions(
+            condensed_volume_fraction,
+            liquid_mass_fraction,
+            ice_density,
+            water_density,
+        )
+        permittivity = _symmetric_bruggeman_permittivity(
+            (
+                _complex_index(
+                    dielectric["air_relative_permittivity"],
+                    "dielectric.air_relative_permittivity",
+                ),
+                _ice_permittivity_matzler_2006(
+                    min(temperature_k, 273.15), frequency_hz
+                ),
+                _water_permittivity_liebe_1991(temperature_k, frequency_hz),
+            ),
+            fractions,
+            homotopy_steps=int(dielectric["homotopy_steps"]),
+            maximum_iterations=int(dielectric["newton_max_iterations"]),
+            tolerance=float(dielectric["newton_relative_tolerance"]),
+        )
+        return _passive_refractive_index(permittivity), bulk_density
+
+    if dielectric["model"] == DRY_PROPERTY_DIELECTRIC_MODEL:
+        temperature_k = coordinates["temperature"]
+        frequency_hz = coordinates["frequency"]
+        bulk_density = coordinates["bulk_density"]
+        ice_density = float(dielectric["ice_material_density_kg_m3"])
+        ice_fraction = bulk_density / ice_density
+        if not 0.0 < ice_fraction <= 1.0:
+            raise GeneratorError("dry-property ice volume fraction is outside (0,1]")
+        permittivity = _symmetric_bruggeman_permittivity(
+            (
+                _complex_index(
+                    dielectric["air_relative_permittivity"],
+                    "dielectric.air_relative_permittivity",
+                ),
+                _ice_permittivity_matzler_2006(temperature_k, frequency_hz),
+            ),
+            (1.0 - ice_fraction, ice_fraction),
+            homotopy_steps=int(dielectric["homotopy_steps"]),
+            maximum_iterations=int(dielectric["newton_max_iterations"]),
+            tolerance=float(dielectric["newton_relative_tolerance"]),
+        )
+        return _passive_refractive_index(permittivity), bulk_density
 
     liquid_mass_fraction = coordinates["liquid_mass_fraction"]
     ice_density = float(dielectric["ice_density_kg_m3"])
@@ -551,12 +1562,7 @@ def _material(config: dict[str, Any], coordinates: dict[str, float]) -> tuple[co
     effective_permittivity = ice_permittivity * (1.0 + 2.0 * contrast) / (
         1.0 - contrast
     )
-    effective_index = effective_permittivity**0.5
-    if effective_index.real < 0.0:
-        effective_index = -effective_index
-    if effective_index.imag < 0.0:
-        effective_index = effective_index.conjugate()
-    return effective_index, mixture_density
+    return _passive_refractive_index(effective_permittivity), mixture_density
 
 
 def _terminal_speed(
@@ -582,23 +1588,55 @@ def _terminal_speed(
     density_difference = particle_density_kg_m3 - air_density
     if density_difference <= 0.0:
         raise GeneratorError("particle density must exceed air density for gravitational fall")
-    speed = 1.0
-    for _ in range(iterations):
+    def drag_at_speed(speed: float) -> float:
         reynolds = max(air_density * speed * diameter_m / viscosity, 1.0e-15)
         if reynolds < transition:
-            drag = (24.0 / reynolds) * (1.0 + 0.15 * reynolds**0.687)
-        else:
-            drag = high_re_drag
-        updated = math.sqrt(
-            (4.0 * gravity * diameter_m * density_difference)
-            / (3.0 * drag * air_density)
+            return (24.0 / reynolds) * (1.0 + 0.15 * reynolds**0.687)
+        return high_re_drag
+
+    force_scale = (4.0 * gravity * diameter_m * density_difference) / (
+        3.0 * air_density
+    )
+
+    transition_speed = transition * viscosity / (air_density * diameter_m)
+    low_re_transition_drag = (24.0 / transition) * (
+        1.0 + 0.15 * transition**0.687
+    )
+    residual_below_transition = (
+        transition_speed * transition_speed * low_re_transition_drag - force_scale
+    )
+    residual_above_transition = (
+        transition_speed * transition_speed * high_re_drag - force_scale
+    )
+    if residual_below_transition <= 0.0 <= residual_above_transition:
+        # The piecewise Cd approximation has a small upward jump at Re=1000.
+        # When that jump straddles zero there is no exact force-balance root;
+        # the declared policy selects the transition boundary itself.
+        return transition_speed
+
+    def residual(speed: float) -> float:
+        return speed * speed * drag_at_speed(speed) - force_scale
+
+    lower = 0.0
+    upper = 1.0
+    bracket_iterations = 0
+    while residual(upper) < 0.0 and bracket_iterations < iterations:
+        upper *= 2.0
+        bracket_iterations += 1
+    if residual(upper) < 0.0:
+        raise GeneratorError(
+            f"terminal-speed root could not be bracketed at D={diameter_m} m"
         )
-        if abs(updated - speed) <= tolerance * max(updated, 1.0):
-            return updated
-        # Damping avoids a two-cycle around the configured drag transition.
-        speed = 0.5 * (speed + updated)
+    for _ in range(iterations - bracket_iterations):
+        midpoint = 0.5 * (lower + upper)
+        if upper - lower <= tolerance * max(midpoint, 1.0):
+            return midpoint
+        if residual(midpoint) < 0.0:
+            lower = midpoint
+        else:
+            upper = midpoint
     raise GeneratorError(
-        f"terminal-speed iteration did not converge at D={diameter_m} m"
+        f"terminal-speed bisection did not converge at D={diameter_m} m"
     )
 
 
@@ -622,14 +1660,7 @@ def _nonnegative(value: float, field: str, scale: float = 1.0) -> float:
     return max(value, 0.0)
 
 
-def compute_point(config: dict[str, Any], coordinates: dict[str, float]) -> list[float]:
-    # Imports live only in isolated worker processes. A fatal Fortran STOP or
-    # native crash therefore cannot leave the parent with a partial table.
-    from pytmatrix import orientation as pytmatrix_orientation  # type: ignore[import-not-found]
-    from pytmatrix import radar  # type: ignore[import-not-found]
-    from pytmatrix.tmatrix import Scatterer  # type: ignore[import-not-found]
-
-    validate_config(config)
+def _validate_coordinates(config: dict[str, Any], coordinates: dict[str, float]) -> None:
     expected = {axis["kind"] for axis in config["axes"]}
     if set(coordinates) != expected:
         raise GeneratorError(
@@ -646,10 +1677,59 @@ def compute_point(config: dict[str, Any], coordinates: dict[str, float]) -> list
                 f"coordinate {axis['kind']}={coordinate} is outside [{lower}, {upper}]"
             )
 
+
+def _radar_geometries(
+    config: dict[str, Any], coordinates: dict[str, float]
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    elevation_deg = float(coordinates["radar_elevation"])
+    if not -90.0 <= elevation_deg <= 90.0:
+        raise GeneratorError("radar elevation is outside PyTMatrix zenith-angle transform")
+    radar_config = config["radar"]
+    back_reference = tuple(
+        float(value) for value in radar_config["backscatter_geometry_deg"]
+    )
+    forward_reference = tuple(
+        float(value) for value in radar_config["forward_scatter_geometry_deg"]
+    )
+    if back_reference != (90.0, 90.0, 0.0, 180.0, 0.0, 0.0):
+        raise GeneratorError("backscatter reference geometry changed after validation")
+    if forward_reference != (90.0, 90.0, 0.0, 0.0, 0.0, 0.0):
+        raise GeneratorError("forward reference geometry changed after validation")
+    backscatter = (
+        90.0 - elevation_deg,
+        90.0 + elevation_deg,
+        0.0,
+        180.0,
+        0.0,
+        0.0,
+    )
+    forward = (
+        90.0 - elevation_deg,
+        90.0 - elevation_deg,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    )
+    return backscatter, forward
+
+
+def _prepare_scatterer(
+    config: dict[str, Any],
+    coordinates: dict[str, float],
+    material: tuple[complex, float] | None = None,
+) -> tuple[Any, float]:
+    # Imports live only in isolated worker processes. A fatal Fortran STOP or
+    # native crash therefore cannot leave the parent with a partial table.
+    from pytmatrix import orientation as pytmatrix_orientation  # type: ignore[import-not-found]
+    from pytmatrix.tmatrix import Scatterer  # type: ignore[import-not-found]
+
+    _validate_coordinates(config, coordinates)
+
     diameter_m = coordinates["equivolume_diameter"]
     frequency_hz = coordinates["frequency"]
     minor_to_major = coordinates["minor_to_major_axis_ratio"]
-    refractive_index, particle_density = _material(config, coordinates)
+    refractive_index, particle_density = material or _material(config, coordinates)
     population = config["particle_population"]
     pytmatrix_axis_ratio = _pytmatrix_axis_ratio(
         population["shape_family"], minor_to_major
@@ -688,8 +1768,19 @@ def compute_point(config: dict[str, Any], coordinates: dict[str, float]) -> list
         )
         scatterer.n_alpha = int(orientation_config["alpha_quadrature_points"])
         scatterer.n_beta = int(orientation_config["beta_quadrature_points"])
+    return scatterer, particle_density
 
-    scatterer.set_geometry(tuple(float(v) for v in radar_config["backscatter_geometry_deg"]))
+
+def _evaluate_prepared_scatterer(
+    config: dict[str, Any],
+    coordinates: dict[str, float],
+    scatterer: Any,
+    particle_density: float,
+) -> list[float]:
+    from pytmatrix import radar  # type: ignore[import-not-found]
+
+    backscatter_geometry, forward_geometry = _radar_geometries(config, coordinates)
+    scatterer.set_geometry(backscatter_geometry)
     zh_single = _nonnegative(float(radar.refl(scatterer, h_pol=True)), "ZH")
     zv_single = _nonnegative(float(radar.refl(scatterer, h_pol=False)), "ZV")
     rho_hv = float(radar.rho_hv(scatterer))
@@ -705,14 +1796,16 @@ def compute_point(config: dict[str, Any], coordinates: dict[str, float]) -> list
         covariance_magnitude * math.sin(delta_hv),
     )
 
-    scatterer.set_geometry(tuple(float(v) for v in radar_config["forward_scatter_geometry_deg"]))
+    scatterer.set_geometry(forward_geometry)
     kdp_single = float(radar.Kdp(scatterer))
     ah_single = _nonnegative(float(radar.Ai(scatterer, h_pol=True)), "AH")
     av_single = _nonnegative(float(radar.Ai(scatterer, h_pol=False)), "AV")
     if not math.isfinite(kdp_single):
         raise GeneratorError("KDP is non-finite")
 
+    population = config["particle_population"]
     number_density = float(population["normalization_number_concentration_m3"])
+    diameter_m = coordinates["equivolume_diameter"]
     zh = zh_single * number_density
     zv = zv_single * number_density
     covariance = covariance_single * number_density
@@ -733,6 +1826,75 @@ def compute_point(config: dict[str, Any], coordinates: dict[str, float]) -> list
     ]
     validate_components(components)
     return components
+
+
+def compute_point(config: dict[str, Any], coordinates: dict[str, float]) -> list[float]:
+    validate_config(config)
+    scatterer, particle_density = _prepare_scatterer(config, coordinates)
+    return _evaluate_prepared_scatterer(
+        config, coordinates, scatterer, particle_density
+    )
+
+
+def _compute_material_state_group_unchecked(
+    config: dict[str, Any], points: Sequence[dict[str, float]]
+) -> list[list[float]]:
+    if not _uses_material_state_grouping(config):
+        raise GeneratorError("material-state grouping is not configured for this table")
+    if not points:
+        raise GeneratorError("material-state group is empty")
+    grouping = config["execution"]["grouping"]
+    material_axis_kinds = tuple(grouping["material_state_axis_kinds"])
+    material_key = tuple(points[0][kind] for kind in material_axis_kinds)
+    for point in points:
+        _validate_coordinates(config, point)
+        if tuple(point[kind] for kind in material_axis_kinds) != material_key:
+            raise GeneratorError("material-state group mixes material coordinates")
+    material = _material(config, points[0])
+    tmatrix_axis_kinds = tuple(grouping["tmatrix_state_axis_kinds"])
+    current_tmatrix_key: tuple[float, ...] | None = None
+    scatterer: Any | None = None
+    particle_density = material[1]
+    results: list[list[float]] = []
+    for point in points:
+        tmatrix_key = tuple(point[kind] for kind in tmatrix_axis_kinds)
+        if tmatrix_key != current_tmatrix_key:
+            scatterer, particle_density = _prepare_scatterer(
+                config, point, material=material
+            )
+            current_tmatrix_key = tmatrix_key
+        if scatterer is None:
+            raise GeneratorError("internal grouped scatterer was not initialized")
+        results.append(
+            _evaluate_prepared_scatterer(
+                config, point, scatterer, particle_density
+            )
+        )
+    return results
+
+
+def compute_material_state_group(
+    config: dict[str, Any], points: Sequence[dict[str, float]]
+) -> list[list[float]]:
+    """Evaluate one crash-isolated material group, reusing T matrices by view angle."""
+    validate_config(config)
+    return _compute_material_state_group_unchecked(config, points)
+
+
+def compute_solver_ndgs_comparison_group(
+    config: dict[str, Any],
+    points: Sequence[dict[str, float]],
+    solver_ndgs: int,
+) -> list[list[float]]:
+    """Evaluate a validated property group at a predeclared comparison ndgs."""
+    validate_config(config)
+    if solver_ndgs not in CONVERGENCE_SOLVER_NDGS:
+        raise GeneratorError(
+            f"comparison solver ndgs must be one of {CONVERGENCE_SOLVER_NDGS}"
+        )
+    comparison = copy.deepcopy(config)
+    comparison["radar"]["solver"]["ndgs"] = solver_ndgs
+    return _compute_material_state_group_unchecked(comparison, points)
 
 
 def validate_components(components: Sequence[float]) -> None:
@@ -820,6 +1982,154 @@ def run_isolated_point(
     return values
 
 
+def run_isolated_material_state_group(
+    config: dict[str, Any],
+    points: Sequence[dict[str, float]],
+    timeout_seconds: int,
+) -> list[list[float]]:
+    request = json.dumps(
+        {"config": config, "points": points},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "LC_ALL": "C.UTF-8",
+            "TZ": "UTC",
+        }
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "_group_worker"],
+            input=request,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise GeneratorError(
+            f"material-state group of {len(points)} points exceeded {timeout_seconds} s"
+        ) from error
+    stdout = completed.stdout.decode("utf-8", errors="replace")
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    if completed.returncode != 0:
+        raise GeneratorError(
+            f"material-state group worker exited {completed.returncode}; "
+            f"stdout={stdout[-4000:]!r}; stderr={stderr[-4000:]!r}"
+        )
+    result_lines = [
+        line for line in stdout.splitlines() if line.startswith(GROUP_MARKER)
+    ]
+    if len(result_lines) != 1:
+        raise GeneratorError(
+            f"material-state group emitted {len(result_lines)} result markers; "
+            f"stdout={stdout[-4000:]!r}"
+        )
+    try:
+        decoded = json.loads(result_lines[0][len(GROUP_MARKER) :])
+    except json.JSONDecodeError as error:
+        raise GeneratorError("material-state group emitted invalid result JSON") from error
+    if not isinstance(decoded, list) or len(decoded) != len(points):
+        raise GeneratorError("material-state group result has incorrect point count")
+    results: list[list[float]] = []
+    for point_index, components in enumerate(decoded):
+        if not isinstance(components, list):
+            raise GeneratorError(
+                f"material-state group point {point_index} is not an array"
+            )
+        values = [float(value) for value in components]
+        validate_components(values)
+        results.append(values)
+    return results
+
+
+def run_isolated_solver_ndgs_comparison_group(
+    config: dict[str, Any],
+    points: Sequence[dict[str, float]],
+    solver_ndgs: int,
+    timeout_seconds: int,
+) -> list[list[float]]:
+    request = json.dumps(
+        {"config": config, "points": points, "solver_ndgs": solver_ndgs},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "LC_ALL": "C.UTF-8",
+            "TZ": "UTC",
+        }
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "_ndgs_group_worker"],
+            input=request,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise GeneratorError(
+            f"ndgs={solver_ndgs} comparison group of {len(points)} points "
+            f"exceeded {timeout_seconds} s"
+        ) from error
+    stdout = completed.stdout.decode("utf-8", errors="replace")
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    if completed.returncode != 0:
+        raise GeneratorError(
+            f"ndgs={solver_ndgs} comparison worker exited {completed.returncode}; "
+            f"stdout={stdout[-4000:]!r}; stderr={stderr[-4000:]!r}"
+        )
+    result_lines = [
+        line for line in stdout.splitlines() if line.startswith(GROUP_MARKER)
+    ]
+    if len(result_lines) != 1:
+        raise GeneratorError(
+            f"ndgs={solver_ndgs} comparison group emitted {len(result_lines)} "
+            f"result markers; stdout={stdout[-4000:]!r}"
+        )
+    try:
+        decoded = json.loads(result_lines[0][len(GROUP_MARKER) :])
+    except json.JSONDecodeError as error:
+        raise GeneratorError(
+            f"ndgs={solver_ndgs} comparison group emitted invalid result JSON"
+        ) from error
+    if not isinstance(decoded, list) or len(decoded) != len(points):
+        raise GeneratorError(
+            f"ndgs={solver_ndgs} comparison group result has incorrect point count"
+        )
+    results: list[list[float]] = []
+    for point_index, components in enumerate(decoded):
+        if not isinstance(components, list):
+            raise GeneratorError(
+                f"ndgs={solver_ndgs} comparison point {point_index} is not an array"
+            )
+        values = [float(value) for value in components]
+        validate_components(values)
+        results.append(values)
+    return results
+
+
 def _point_worker() -> int:
     try:
         request = json.loads(
@@ -849,6 +2159,85 @@ def _point_worker() -> int:
         return 2
 
 
+def _group_worker() -> int:
+    try:
+        request = json.loads(
+            sys.stdin.buffer.read().decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_nonfinite_constant,
+        )
+        if not isinstance(request, dict) or set(request) != {"config", "points"}:
+            raise GeneratorError("group worker request has incorrect fields")
+        raw_points = request["points"]
+        if not isinstance(raw_points, list):
+            raise GeneratorError("group worker points must be an array")
+        points = [
+            {
+                str(key): _number(value, f"group.points[{index}].{key}")
+                for key, value in _require_object(
+                    raw_point, f"group.points[{index}]"
+                ).items()
+            }
+            for index, raw_point in enumerate(raw_points)
+        ]
+        results = compute_material_state_group(
+            _require_object(request["config"], "group.config"), points
+        )
+        print(
+            GROUP_MARKER
+            + json.dumps(results, separators=(",", ":"), allow_nan=False),
+            flush=True,
+        )
+        return 0
+    except BaseException as error:
+        print(f"group worker failed: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+
+def _ndgs_group_worker() -> int:
+    try:
+        request = json.loads(
+            sys.stdin.buffer.read().decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_nonfinite_constant,
+        )
+        if not isinstance(request, dict) or set(request) != {
+            "config",
+            "points",
+            "solver_ndgs",
+        }:
+            raise GeneratorError("ndgs comparison worker request has incorrect fields")
+        raw_points = request["points"]
+        if not isinstance(raw_points, list):
+            raise GeneratorError("ndgs comparison worker points must be an array")
+        points = [
+            {
+                str(key): _number(value, f"ndgs.points[{index}].{key}")
+                for key, value in _require_object(
+                    raw_point, f"ndgs.points[{index}]"
+                ).items()
+            }
+            for index, raw_point in enumerate(raw_points)
+        ]
+        results = compute_solver_ndgs_comparison_group(
+            _require_object(request["config"], "ndgs.config"),
+            points,
+            _positive_integer(request["solver_ndgs"], "ndgs.solver_ndgs"),
+        )
+        print(
+            GROUP_MARKER
+            + json.dumps(results, separators=(",", ":"), allow_nan=False),
+            flush=True,
+        )
+        return 0
+    except BaseException as error:
+        print(
+            f"ndgs comparison worker failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return 2
+
+
 def package_versions() -> dict[str, str]:
     versions: dict[str, str] = {}
     for package in ("numpy", "pytmatrix", "scipy", "setuptools"):
@@ -874,15 +2263,17 @@ def generator_metadata() -> dict[str, Any]:
 
 def science_metadata(config: dict[str, Any]) -> dict[str, Any]:
     dielectric = config["dielectric"]
-    if dielectric["model"] == "maxwell_garnett_ice_host_water_inclusion":
+    model = dielectric["model"]
+    if model == "maxwell_garnett_ice_host_water_inclusion":
         melting = {"model": "homogeneous_effective_medium", "rule": "maxwell_garnett"}
-    elif dielectric["material"] == "ice":
+    elif model == WET_PROPERTY_DIELECTRIC_MODEL:
+        melting = {"model": "homogeneous_effective_medium", "rule": "bruggeman"}
+    elif model in (DRY_PROPERTY_DIELECTRIC_MODEL, TEMPERATURE_WATER_DIELECTRIC_MODEL):
+        melting = {"model": "dry"}
+    elif model == "explicit_homogeneous":
         melting = {"model": "dry"}
     else:
-        # The schema's melting field has no pure-liquid variant. SchemeResolved
-        # is used only to say that the conventional category explicitly supplies
-        # its all-liquid phase; the exact material remains in the config bytes.
-        melting = {"model": "scheme_resolved"}
+        raise GeneratorError(f"unsupported science metadata dielectric model {model!r}")
     orientation = config["orientation"]
     if orientation["model"] == "fixed_euler":
         orientation_metadata = {
@@ -1023,6 +2414,132 @@ def hash_tool_files(tool_root: Path) -> dict[str, str]:
     return result
 
 
+def scope_metadata(config: dict[str, Any]) -> dict[str, Any]:
+    if _is_property_aware(config):
+        descriptor = config["particle_population"]["state_descriptor"]
+        return {
+            "microphysics_family": PROPERTY_FAMILY,
+            "phase_regime": _property_phase_regime(config),
+            "source_closed_state_families": ["p3", "ishmael"],
+            "p3_coverage": False,
+            "ishmael_coverage": False,
+            "p3_ishmael_style_closed_state_coordinate_coverage": True,
+            "scheme_native_psd_coverage": False,
+            "psd": (
+                "characteristic_particle_monodisperse_node_normalized_to_"
+                "exactly_1_per_m3"
+            ),
+            "rime_axes_explicit": False,
+            "rime_mapping": descriptor["rime_axes"],
+            "rime_effect_on_dielectric": descriptor["rime_effect_on_dielectric"],
+            "density_applicability": descriptor["density_applicability"],
+            "radar_view": config["radar"]["view_applicability"],
+            "extrapolation": "forbidden",
+        }
+    if _is_residual_rain(config):
+        coexistence = config["particle_population"]["coexistence_descriptor"]
+        return {
+            "microphysics_family": "conventional",
+            "category": "rain",
+            "coexistence_role": coexistence["role"],
+            "standalone_rain_coverage": True,
+            "residual_after_wet_pairing_coverage": True,
+            "p3_coverage": False,
+            "ishmael_coverage": False,
+            "psd": "monodisperse_node_normalized_to_exactly_1_per_m3",
+            "mass_allocation_rule": coexistence["allocation_rule"],
+            "double_count_policy": coexistence["double_count_policy"],
+            "over_pairing_policy": coexistence["over_pairing_policy"],
+            "radar_view": config["radar"]["view_applicability"],
+            "extrapolation": "forbidden",
+        }
+    return {
+        "microphysics_family": "conventional",
+        "p3_coverage": False,
+        "ishmael_coverage": False,
+        "psd": "monodisperse_node_normalized_to_exactly_1_per_m3",
+        "radar_view": config["radar"]["view_applicability"],
+        "extrapolation": "forbidden",
+    }
+
+
+def _compute_isolated_grid(
+    config: dict[str, Any], coordinates: Sequence[dict[str, float]]
+) -> tuple[list[list[float]], int, int]:
+    """Compute isolated solver points concurrently and restore flat grid order."""
+    timeout_seconds = int(config["execution"]["point_timeout_seconds"])
+    if _uses_material_state_grouping(config):
+        grouping = config["execution"]["grouping"]
+        material_axes = tuple(grouping["material_state_axis_kinds"])
+        grouped: dict[tuple[float, ...], list[tuple[int, dict[str, float]]]] = {}
+        for flat_index, point in enumerate(coordinates):
+            key = tuple(point[kind] for kind in material_axes)
+            grouped.setdefault(key, []).append((flat_index, point))
+        group_items = list(grouped.values())
+        collected: list[list[float] | None] = [None] * len(coordinates)
+        group_timeout = int(grouping["group_timeout_seconds"])
+
+        def evaluate_group(
+            indexed_entries: tuple[int, list[tuple[int, dict[str, float]]]],
+        ) -> tuple[int, list[tuple[int, dict[str, float]]], list[list[float]]]:
+            group_index, entries = indexed_entries
+            group_points = [point for _, point in entries]
+            try:
+                group_values = run_isolated_material_state_group(
+                    config, group_points, group_timeout
+                )
+            except GeneratorError as error:
+                raise GeneratorError(
+                    f"material-state group {group_index} failed: {error}"
+                ) from error
+            return group_index, entries, group_values
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=GENERATION_WORKERS
+        ) as executor:
+            futures = [
+                executor.submit(evaluate_group, item)
+                for item in enumerate(group_items)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                _, entries, group_values = future.result()
+                for (flat_index, _), point_values in zip(entries, group_values):
+                    collected[flat_index] = point_values
+        if any(point is None for point in collected):
+            raise GeneratorError("grouped generation left an uncomputed grid point")
+        values = [point for point in collected if point is not None]
+        return (
+            values,
+            len(grouped),
+            max(len(entries) for entries in grouped.values()),
+        )
+
+    collected = [None] * len(coordinates)
+
+    def evaluate_point(
+        indexed_point: tuple[int, dict[str, float]],
+    ) -> tuple[int, list[float]]:
+        flat_index, point = indexed_point
+        try:
+            return flat_index, run_isolated_point(config, point, timeout_seconds)
+        except GeneratorError as error:
+            raise GeneratorError(f"flat grid point {flat_index} failed: {error}") from error
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=GENERATION_WORKERS
+    ) as executor:
+        futures = [
+            executor.submit(evaluate_point, item)
+            for item in enumerate(coordinates)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            flat_index, point_values = future.result()
+            collected[flat_index] = point_values
+    if any(point is None for point in collected):
+        raise GeneratorError("point generation left an uncomputed grid point")
+    return ([point for point in collected if point is not None], len(coordinates), 1)
+
+
 def generate(args: argparse.Namespace) -> None:
     config_path = args.config.resolve()
     output_path = args.output.resolve()
@@ -1044,22 +2561,28 @@ def generate(args: argparse.Namespace) -> None:
         )
     science = science_metadata(config)
     coordinates = list(point_coordinates(config))
-    timeout_seconds = int(config["execution"]["point_timeout_seconds"])
-    values: list[list[float]] = []
-    for flat_index, point in enumerate(coordinates):
-        try:
-            values.append(run_isolated_point(config, point, timeout_seconds))
-        except GeneratorError as error:
-            raise GeneratorError(f"flat grid point {flat_index} failed: {error}") from error
+    values, isolated_process_count, maximum_points_per_process = (
+        _compute_isolated_grid(config, coordinates)
+    )
 
+    header_axes = [
+        {
+            "kind": axis["kind"],
+            "unit": axis["unit"],
+            "coordinates": [float(value) for value in axis["coordinates"]],
+        }
+        for axis in config["axes"]
+    ]
     request = {
         "axes": [
             {
                 "kind": axis["kind"],
                 "unit": axis["unit"],
-                "coordinates": [float(value) for value in axis["coordinates"]],
+                "coordinate_f64_bits_hex": [
+                    f64_bits_hex(value) for value in axis["coordinates"]
+                ],
             }
-            for axis in config["axes"]
+            for axis in header_axes
         ],
         "generator": generator,
         "generator_config_utf8": config_text,
@@ -1118,17 +2641,17 @@ def generate(args: argparse.Namespace) -> None:
         "environment_report_sha256": sha256_bytes(environment_bytes),
         "generator": generator,
         "science": science,
-        "axes": request["axes"],
+        "axes": header_axes,
         "grid_point_count": len(values),
-        "isolated_solver_process_count": len(values),
+        "isolated_solver_process_count": isolated_process_count,
+        "maximum_solver_points_per_process": maximum_points_per_process,
+        "generation_worker_limit": GENERATION_WORKERS,
+        "generation_effective_worker_count": min(
+            GENERATION_WORKERS, isolated_process_count
+        ),
         "solver_failures": [],
         "tool_file_sha256": hash_tool_files(tool_root),
-        "scope": {
-            "microphysics_family": "conventional",
-            "p3_coverage": False,
-            "ishmael_coverage": False,
-            "psd": "monodisperse_node_normalized_to_exactly_1_per_m3",
-        },
+        "scope": scope_metadata(config),
         "validation_claim": (
             "No independent scientific validation. Separate direct-PyTMatrix held-out "
             "nodes test generator/LUT interpolation only."
@@ -1293,6 +2816,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments == ["_point_worker"]:
         return _point_worker()
+    if arguments == ["_group_worker"]:
+        return _group_worker()
+    if arguments == ["_ndgs_group_worker"]:
+        return _ndgs_group_worker()
     parser = build_parser()
     args = parser.parse_args(arguments)
     try:

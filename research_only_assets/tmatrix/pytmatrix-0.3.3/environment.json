@@ -1,10 +1,10 @@
 {
   "artifact_classification": "reproducibility_environment_not_scientific_validation",
   "base_image_linux_amd64_digest": "python:3.11.9-slim-bookworm@sha256:2856e6af199e8128161abd320575eb9b341f3b76f017b5d0c9cd364f60d8a050",
-  "container_image_id": "sha256:06d75ad1599220236a5a33a138c102782197a67b8dda0d8e23f58f9b6b8c7a5e",
+  "container_image_id": "sha256:8fa858ff203a6d4148d8e8fbea8ac556694216ebfaf5cbc5913f9e84362a135d",
   "debian_snapshot": "20240904T000000Z",
   "emitter_executable": "/usr/local/bin/brslut-emitter",
-  "emitter_executable_sha256": "8a9a493f6aad760c0c130a5b453c1b3ab057dde7c793552b48bd34db12a8aff7",
+  "emitter_executable_sha256": "f1df06c23f1bd163fcb238f6adaf04f681f077377b33b5fff65e509e7609c5cd",
   "gfortran_version": {
     "command": [
       "gfortran",
@@ -118,17 +118,18 @@
     "TZ": "UTC"
   },
   "tool_file_sha256": {
-    "Dockerfile": "59916e908147a48033fe56061dc3ae05b569cc68178b553d3843a8d33e2103bd",
-    "FAILURE_RECORD.md": "094e888a664170630649e59927bfb7fd61b7f1cf48074714d1d495c204afa951",
-    "README.md": "a2f69fc3bcfbafaa65be771640a0e010c447c81f06fd6b2a0e0909a158c0a4a8",
-    "emitter/Cargo.lock": "3504f82e975270fa286ce0c4474698931bd8c44059b1ec95e6eebb6a3be880f1",
+    "Dockerfile": "b747657bc43a638d0aa638fb31d2089a5e459569c3228098483ed68f907bbc62",
+    "FAILURE_RECORD.md": "9add818971596ed8fd9dbf4c2d1e46849b28c87321cf69bff7564fd3dbe8edd7",
+    "README.md": "71af22000c2d4cbbd02a868a749300f1d85a7ab048b5187d4180af58e1aa34bf",
+    "emitter/Cargo.lock": "450a54baf04fd9adbb710181add46583b1ae1ded8669b1ce85a69eda50e3c6dc",
     "emitter/Cargo.toml": "6b93d4b0d27e3773fa48001d1321f59eb7dc30f1e196e72accbeec938f2088a5",
-    "emitter/src/main.rs": "ed51bf266c14ec5aeab8c653298722596d00c7413ccd87f2ce4866caf7405ef7",
-    "generate_lut.py": "66998381079f3c69a04dcbf920fdcabaf906c10786f1a3c28c89a8274e6f253f",
-    "generator_config.example.json": "6a36f795495b06a3f3a82452f702b1d017233c13a230c053573b4f19ce652e1e",
+    "emitter/src/bin/validate_tmatrix_lut.rs": "00c39c4c1c950b42f7cf31aa974bf90508cad86dafe75eafa97556f212b3c173",
+    "emitter/src/main.rs": "47615ca581798d118abc14e794c4f0e0b817704581036be363aa0bf9f416e10e",
+    "generate_lut.py": "75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
+    "generator_config.example.json": "868231be3d01eeaae4225650e36c9592f3eb8e711e693ccfae868e59e5b72dbb",
     "requirements-bootstrap-pinned.txt": "c01ccf75c8634abd7c32f6ae203a64a8bf7e090b0b4f61aa9e7e5c69fd556184",
     "requirements-pytmatrix-pinned.txt": "d754b6589041548bbb2fbb3c3aae49b17252b1f35629b5f8bef91ab0e24f3f72",
-    "run_all.ps1": "e17c4ccd6661e2173159f1b19271c70f74289310f0d074898570ed57a8afd214",
+    "run_all.ps1": "4e9702273f2e92595987ff57ac84bb3dd299a4aa67a321a5f802c9d0442ea841",
     "toolchain.json": "84befbbe97d9c87e0aa73da6e001a8b2f034a5441f95d2a8df88ada56931c222"
   }
 }

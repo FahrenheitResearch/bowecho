@@ -1,0 +1,1125 @@
+{
+  "absolute_tolerance": 1e-12,
+  "candidate_selection_history": "Exploratory crash-isolated probes attempted diameters above 50 mm and then scanned each phase/shape role at q=0.1. Role-specific candidate ceilings were initially fixed at 89 mm dry-oblate, 50 mm dry-prolate, 15 mm wet-oblate, and 6.3 mm wet-prolate. The immediately higher retained probes failed at 90, 51, 15.5, and 6.325 mm, respectively. After the 104,960-point candidate passed solver convergence, seeded and systematic interpolation design checks exposed coarse density, condensed-fraction, liquid-fraction, diameter, and narrow resonance cells. The v3 through v8 failures were preserved. The first exhaustive refined grid then found three dry-prolate near-zero KDP disagreements at the inserted 36.12562655 mm node. Removing that node while retaining the 50 mm domain failed 2,195 interpolation component budgets across all declared states, and higher solver-order probes were pairwise nonmonotonic. The rigorous fail-closed resolution caps dry-prolate at the last all-grid-converged 32.31174268 mm node, so interpolation cannot bridge the unresolved resonance.",
+  "classification": "native_solver_resolution_convergence_check_only",
+  "comparison_solver_ndgs": [
+    12,
+    14
+  ],
+  "crate_table_validation_status_after_report": "research_only_unvalidated",
+  "effective_worker_count": 12,
+  "environment_report_sha256": "ea4fd9324350cfb2819bb1fef53f251c61bb887a0fa63d7963666d22d03482c7",
+  "generator_source_sha256": "75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
+  "grid_design_audit_sha256": "66777866909cb858ebbc42dbcd048772250c949e6693cd1810d8b02662684c2a",
+  "grid_design_validation_source_sha256": "cffdfdadc1fb897732ba2d60175a57aa97d55370ebdbdeba96cf5e657bcbd07c",
+  "independence_limit": "Both sides use the same PyTMatrix implementation and differ only in the PyTMatrix ndgs shape-integration resolution. This is numerical convergence evidence, not independent scattering validation.",
+  "interpolation_grid_design_lineage": [
+    {
+      "file": "dense_grid_v3_design_failure_report.json",
+      "sha256": "3c19ca82060ded230521915ff7e6b389d604245f4d1b2a0087d0e733681bf40d"
+    },
+    {
+      "file": "dense_grid_v3_axis_audit_report.json",
+      "sha256": "2eb9dce292c9d6d4e41f795866709210b2cbebd30f07f9bc7c7e48bb2b04c9f7"
+    },
+    {
+      "file": "refined_grid_v4_axis_budget_report.json",
+      "sha256": "a3359d08d8b8b40bf8feb548533bf04670c647598812ebb68f2e86f4bb4a5141"
+    },
+    {
+      "file": "refined_grid_v5_axis_budget_report.json",
+      "sha256": "75cd9332adb59fe6ce31ab57b10853dc4c9da76b9e49eaa9c76aaeb331fd2ec2"
+    },
+    {
+      "file": "refined_grid_v6_axis_budget_report.json",
+      "sha256": "c9a8caa0bef94a7ce46a102be7e0714b4fbd875955d38e9cd39d4599de13878e"
+    },
+    {
+      "file": "refined_grid_v7_axis_budget_report.json",
+      "sha256": "1d6230e1088dd3afdc3871eaa88097a33549e14995151f749f23e4b594419335"
+    },
+    {
+      "file": "refined_grid_v8_narrow_axis_budget_report.json",
+      "sha256": "7a7287ea0077f0816e104e7367731781246773df969f94b9d670e427d4e0cc2a"
+    },
+    {
+      "file": "refined_grid_v8_stale_environment_axis_budget_report.json",
+      "sha256": "60d4c6aa70da63d82da38f9b27315a7dbf6867196e1562198cf64dc35db90ca2"
+    },
+    {
+      "file": "refined_grid_v9_full_axis_budget_report.json",
+      "sha256": "66777866909cb858ebbc42dbcd048772250c949e6693cd1810d8b02662684c2a"
+    }
+  ],
+  "post_pass_policy": "A passing result freezes these solver and grid configs before LUT generation and held-out selection. Later held-out outputs may not tune the generated tables. Any failed rerun requires a separately retained report.",
+  "predeclared_component_criterion": "For every scalar except covariance real/imaginary: abs(value_high-value_low) <= 1e-12 + 1e-3*max(abs(value_low),abs(value_high)). For each covariance component, the scale is max(hypot(cov_real_low,cov_imag_low),hypot(cov_real_high,cov_imag_high)), so numerical phase noise in a physically zero imaginary component is judged against the converged complex covariance rather than against zero.",
+  "production_validation": false,
+  "refined_grid_design_audit_file": "refined_grid_v9_full_axis_budget_report.json",
+  "refined_grid_design_audit_sample_count": 719,
+  "refined_grid_design_audit_sha256": "66777866909cb858ebbc42dbcd048772250c949e6693cd1810d8b02662684c2a",
+  "relative_tolerance": 0.001,
+  "report_id": "pytmatrix-0.3.3-property-refined-v9-all-grid-ndgs12-to14-v4",
+  "schema": 1,
+  "scientifically_independent": false,
+  "scope": "Every Cartesian grid point in all five property configs, including every declared particle, material, frequency, and radar-view node.",
+  "selected_final_solver_ddelt": 0.001,
+  "selected_final_solver_ndgs": 14,
+  "solver_convergence_check_passed": true,
+  "solver_domain_design_evidence": [
+    {
+      "file": "solver_ndgs12_to14_refined_v8_failure_report.json",
+      "sha256": "8b4b524344e29fe596a3f725db5fa1d8605136ae97b3d673097f3cf0f67d83c3"
+    },
+    {
+      "file": "dry_prolate_rejected_points_preliminary_12_14_16_20_probe_report.json",
+      "sha256": "23bf57e8559dbb66296cf3fadbad1dc6aade759dd8163fb98ee7a6d14788c2fb"
+    },
+    {
+      "file": "dry_prolate_rejected_points_12_14_16_18_20_probe_report.json",
+      "sha256": "7ae5712db2cbe8119c91463a7bcd399b1f3cea1a0a2b961988b9aab849b49399"
+    },
+    {
+      "file": "dry_prolate_removed_diameter_parent_interval_audit_report.json",
+      "sha256": "69f583d8e14fb14a4054734cdd844dff246da7a7e795795210094d920b01ff3f"
+    },
+    {
+      "file": "dry_prolate_ddelt_sensitivity_probe_report.json",
+      "sha256": "3b5ec35b61c93ea202c33bb94f19c03f93f4d1dd260c31ecb10eeb875ac37c7d"
+    }
+  ],
+  "tables": [
+    {
+      "asset_directory": "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "compared_grid_point_count": 163520,
+      "component_comparison_count": 1471680,
+      "component_tolerance_failure_count": 0,
+      "config_sha256": "0dc4ca0c648c386f923de3155103aaa806e1c2234959cd44b19a55a129200bff",
+      "configured_solver": {
+        "ddelt": 0.001,
+        "ndgs": 14,
+        "shape": "spheroid"
+      },
+      "effective_worker_count": 12,
+      "grid_point_count": 163520,
+      "material_group_count": 112,
+      "recorded_component_tolerance_failures": [],
+      "recorded_failure_limit": 100,
+      "solver_group_failure_count": 0,
+      "solver_group_failures": [],
+      "table_id": "property-p3-ishmael-dry-oblate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_solver_convergence_tolerance": true,
+      "worker_limit": 12,
+      "worst_comparison_by_component": [
+        {
+          "absolute_difference": 40844.25276371837,
+          "allowed_absolute_difference": 176505.43866732495,
+          "component": "zh",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.089,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 190.0
+          },
+          "difference_to_allowed_ratio": 0.2314050664506778,
+          "flat_grid_index": 161820,
+          "lower_ndgs": 12,
+          "lower_value": 176505438.66732496,
+          "upper_ndgs": 14,
+          "upper_value": 176464594.41456124,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 14055.267472356558,
+          "allowed_absolute_difference": 38197.434083191685,
+          "component": "zv",
+          "coordinates": {
+            "bulk_density": 661.0635639550661,
+            "equivolume_diameter": 0.089,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 190.0
+          },
+          "difference_to_allowed_ratio": 0.3679636554053616,
+          "flat_grid_index": 161780,
+          "lower_ndgs": 12,
+          "lower_value": 38183378.81571933,
+          "upper_ndgs": 14,
+          "upper_value": 38197434.083191685,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 15783.352900102735,
+          "allowed_absolute_difference": 56176.458650822016,
+          "component": "hh_vv_covariance_real",
+          "coordinates": {
+            "bulk_density": 850.0,
+            "equivolume_diameter": 0.08379058453350832,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": 0.9,
+            "temperature": 190.0
+          },
+          "difference_to_allowed_ratio": 0.2809602683965516,
+          "flat_grid_index": 159561,
+          "lower_ndgs": 12,
+          "lower_value": 38486101.93504761,
+          "upper_ndgs": 14,
+          "upper_value": 38501885.287947714,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 19441.740742996335,
+          "allowed_absolute_difference": 43163.396858843575,
+          "component": "hh_vv_covariance_imaginary",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.08379058453350832,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": 4.5,
+            "temperature": 260.0
+          },
+          "difference_to_allowed_ratio": 0.45042193520070456,
+          "flat_grid_index": 160702,
+          "lower_ndgs": 12,
+          "lower_value": 35028008.22155874,
+          "upper_ndgs": 14,
+          "upper_value": 35047449.96230174,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 3.4871087753484974e-13,
+          "allowed_absolute_difference": 1.000261533158151e-12,
+          "component": "kdp",
+          "coordinates": {
+            "bulk_density": 661.0635639550661,
+            "equivolume_diameter": 0.089,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 1.0,
+            "radar_elevation": -0.5,
+            "temperature": 190.0
+          },
+          "difference_to_allowed_ratio": 0.34861970192321207,
+          "flat_grid_index": 161795,
+          "lower_ndgs": 12,
+          "lower_value": -2.615331581511373e-13,
+          "upper_ndgs": 14,
+          "upper_value": 8.717771938371243e-14,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 0.0002977864463247215,
+          "allowed_absolute_difference": 0.11828104637349145,
+          "component": "ah",
+          "coordinates": {
+            "bulk_density": 661.0635639550661,
+            "equivolume_diameter": 0.089,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": 0.9,
+            "temperature": 273.15
+          },
+          "difference_to_allowed_ratio": 0.0025176176188399014,
+          "flat_grid_index": 163461,
+          "lower_ndgs": 12,
+          "lower_value": 118.28074858604512,
+          "upper_ndgs": 14,
+          "upper_value": 118.28104637249145,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 0.0004773362130663372,
+          "allowed_absolute_difference": 0.037408539880761225,
+          "component": "av",
+          "coordinates": {
+            "bulk_density": 661.0635639550661,
+            "equivolume_diameter": 0.089,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 190.0
+          },
+          "difference_to_allowed_ratio": 0.012760086723187656,
+          "flat_grid_index": 161780,
+          "lower_ndgs": 12,
+          "lower_value": 37.40806254354816,
+          "upper_ndgs": 14,
+          "upper_value": 37.40853987976123,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 1816166.5544719696,
+          "allowed_absolute_difference": 7848430.383692859,
+          "component": "fall_speed_first_moment",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.089,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 190.0
+          },
+          "difference_to_allowed_ratio": 0.23140506645067843,
+          "flat_grid_index": 161820,
+          "lower_ndgs": 12,
+          "lower_value": 7848430383.692859,
+          "upper_ndgs": 14,
+          "upper_value": 7846614217.138387,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 80757039.98461914,
+          "allowed_absolute_difference": 348985617.3994277,
+          "component": "fall_speed_second_moment",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.089,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 190.0
+          },
+          "difference_to_allowed_ratio": 0.23140506645060258,
+          "flat_grid_index": 161820,
+          "lower_ndgs": 12,
+          "lower_value": 348985617399.42773,
+          "upper_ndgs": 14,
+          "upper_value": 348904860359.4431,
+          "within_predeclared_tolerance": true
+        }
+      ]
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_prolate_sband_unvalidated",
+      "compared_grid_point_count": 132160,
+      "component_comparison_count": 1189440,
+      "component_tolerance_failure_count": 0,
+      "config_sha256": "c2b973ab36fa26edb8d9d82f7dbb2ae5df52feec4bf93c880e304cad5aa2ff49",
+      "configured_solver": {
+        "ddelt": 0.001,
+        "ndgs": 14,
+        "shape": "spheroid"
+      },
+      "effective_worker_count": 12,
+      "grid_point_count": 132160,
+      "material_group_count": 112,
+      "recorded_component_tolerance_failures": [],
+      "recorded_failure_limit": 100,
+      "solver_group_failure_count": 0,
+      "solver_group_failures": [],
+      "table_id": "property-p3-ishmael-dry-prolate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_solver_convergence_tolerance": true,
+      "worker_limit": 12,
+      "worst_comparison_by_component": [
+        {
+          "absolute_difference": 23.462246924638748,
+          "allowed_absolute_difference": 83202.76849146749,
+          "component": "zh",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.03231174267785264,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 260.0
+          },
+          "difference_to_allowed_ratio": 0.00028198877693648883,
+          "flat_grid_index": 131580,
+          "lower_ndgs": 12,
+          "lower_value": 83202745.02922057,
+          "upper_ndgs": 14,
+          "upper_value": 83202768.49146749,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 180.93240213394165,
+          "allowed_absolute_difference": 252555.111891067,
+          "component": "zv",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.03231174267785264,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": 10.0,
+            "temperature": 260.0
+          },
+          "difference_to_allowed_ratio": 0.0007164076022028098,
+          "flat_grid_index": 131583,
+          "lower_ndgs": 12,
+          "lower_value": 252554930.95866486,
+          "upper_ndgs": 14,
+          "upper_value": 252555111.891067,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 71.55958041548729,
+          "allowed_absolute_difference": 156456.36817284042,
+          "component": "hh_vv_covariance_real",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.03231174267785264,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 260.0
+          },
+          "difference_to_allowed_ratio": 0.00045737723079724066,
+          "flat_grid_index": 131580,
+          "lower_ndgs": 12,
+          "lower_value": 154252570.96590844,
+          "upper_ndgs": 14,
+          "upper_value": 154252642.52548885,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 15.959256198257208,
+          "allowed_absolute_difference": 118416.71715466352,
+          "component": "hh_vv_covariance_imaginary",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.03231174267785264,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": 10.0,
+            "temperature": 260.0
+          },
+          "difference_to_allowed_ratio": 0.00013477198643678745,
+          "flat_grid_index": 131583,
+          "lower_ndgs": 12,
+          "lower_value": -22791528.280292902,
+          "upper_ndgs": 14,
+          "upper_value": -22791544.2395491,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 4.3735778412329793e-10,
+          "allowed_absolute_difference": 3.3245115250382437e-09,
+          "component": "kdp",
+          "coordinates": {
+            "bulk_density": 1.5,
+            "equivolume_diameter": 0.028900501239663836,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 230.0
+          },
+          "difference_to_allowed_ratio": 0.1315555024638595,
+          "flat_grid_index": 128240,
+          "lower_ndgs": 12,
+          "lower_value": -3.3235115250382438e-06,
+          "upper_ndgs": 14,
+          "upper_value": -3.3230741672541205e-06,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 1.2017266493025147e-07,
+          "allowed_absolute_difference": 0.0006149678104309728,
+          "component": "ah",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.03231174267785264,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 260.0
+          },
+          "difference_to_allowed_ratio": 0.00019541293526572362,
+          "flat_grid_index": 131580,
+          "lower_ndgs": 12,
+          "lower_value": 0.6149676892583078,
+          "upper_ndgs": 14,
+          "upper_value": 0.6149678094309727,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 9.175169410902129e-07,
+          "allowed_absolute_difference": 0.002297136956655362,
+          "component": "av",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.03231174267785264,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 260.0
+          },
+          "difference_to_allowed_ratio": 0.00039941760478492326,
+          "flat_grid_index": 131580,
+          "lower_ndgs": 12,
+          "lower_value": 2.297136038138421,
+          "upper_ndgs": 14,
+          "upper_value": 2.297136955655362,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 628.6074256896973,
+          "allowed_absolute_difference": 2229193.064775319,
+          "component": "fall_speed_first_moment",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.03231174267785264,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 260.0
+          },
+          "difference_to_allowed_ratio": 0.0002819887768460534,
+          "flat_grid_index": 131580,
+          "lower_ndgs": 12,
+          "lower_value": 2229192436.167893,
+          "upper_ndgs": 14,
+          "upper_value": 2229193064.7753186,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 16841.83518218994,
+          "allowed_absolute_difference": 59725196.77097023,
+          "component": "fall_speed_second_moment",
+          "coordinates": {
+            "bulk_density": 917.0,
+            "equivolume_diameter": 0.03231174267785264,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 260.0
+          },
+          "difference_to_allowed_ratio": 0.0002819887768101253,
+          "flat_grid_index": 131580,
+          "lower_ndgs": 12,
+          "lower_value": 59725179929.13505,
+          "upper_ndgs": 14,
+          "upper_value": 59725196770.97023,
+          "within_predeclared_tolerance": true
+        }
+      ]
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_oblate_sband_unvalidated",
+      "compared_grid_point_count": 1017600,
+      "component_comparison_count": 9158400,
+      "component_tolerance_failure_count": 0,
+      "config_sha256": "61cd6f72beaf503485168a9b43e72db8ebc49ef993389e67ff8906e0c42e9bf8",
+      "configured_solver": {
+        "ddelt": 0.001,
+        "ndgs": 14,
+        "shape": "spheroid"
+      },
+      "effective_worker_count": 12,
+      "grid_point_count": 1017600,
+      "material_group_count": 960,
+      "recorded_component_tolerance_failures": [],
+      "recorded_failure_limit": 100,
+      "solver_group_failure_count": 0,
+      "solver_group_failures": [],
+      "table_id": "property-p3-ishmael-wet-oblate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_solver_convergence_tolerance": true,
+      "worker_limit": 12,
+      "worst_comparison_by_component": [
+        {
+          "absolute_difference": 15985.90327116847,
+          "allowed_absolute_difference": 245252.8059187813,
+          "component": "zh",
+          "coordinates": {
+            "condensed_volume_fraction": 1.0,
+            "equivolume_diameter": 0.015,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 275.15
+          },
+          "difference_to_allowed_ratio": 0.065181326718286,
+          "flat_grid_index": 1017580,
+          "lower_ndgs": 12,
+          "lower_value": 245236820.0155101,
+          "upper_ndgs": 14,
+          "upper_value": 245252805.91878128,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 1492.9395195692778,
+          "allowed_absolute_difference": 23570.419379767605,
+          "component": "zv",
+          "coordinates": {
+            "condensed_volume_fraction": 1.0,
+            "equivolume_diameter": 0.015,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 275.15
+          },
+          "difference_to_allowed_ratio": 0.06333953993414256,
+          "flat_grid_index": 1017580,
+          "lower_ndgs": 12,
+          "lower_value": 23568926.440248035,
+          "upper_ndgs": 14,
+          "upper_value": 23570419.379767604,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 3955.7459448203444,
+          "allowed_absolute_difference": 57091.495105375456,
+          "component": "hh_vv_covariance_real",
+          "coordinates": {
+            "condensed_volume_fraction": 1.0,
+            "equivolume_diameter": 0.015,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 275.15
+          },
+          "difference_to_allowed_ratio": 0.06928783240864698,
+          "flat_grid_index": 1017580,
+          "lower_ndgs": 12,
+          "lower_value": 57000190.03753015,
+          "upper_ndgs": 14,
+          "upper_value": 57004145.78347497,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 470.29532084520906,
+          "allowed_absolute_difference": 59162.99170000995,
+          "component": "hh_vv_covariance_imaginary",
+          "coordinates": {
+            "condensed_volume_fraction": 1.0,
+            "equivolume_diameter": 0.015,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.007949147048375682,
+          "flat_grid_index": 1004780,
+          "lower_ndgs": 12,
+          "lower_value": 2306330.0324755493,
+          "upper_ndgs": 14,
+          "upper_value": 2306800.3277963945,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 1.9470291481300458e-13,
+          "allowed_absolute_difference": 1.0001947027485347e-12,
+          "component": "kdp",
+          "coordinates": {
+            "condensed_volume_fraction": 0.0030461558254015037,
+            "equivolume_diameter": 0.00606087439757635,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.05,
+            "minor_to_major_axis_ratio": 1.0,
+            "radar_elevation": -0.5,
+            "temperature": 273.15
+          },
+          "difference_to_allowed_ratio": 0.19466501299992994,
+          "flat_grid_index": 833435,
+          "lower_ndgs": 12,
+          "lower_value": 1.662783038782357e-19,
+          "upper_ndgs": 14,
+          "upper_value": -1.947027485347007e-13,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 0.00011287187909392316,
+          "allowed_absolute_difference": 0.0048623830656174755,
+          "component": "ah",
+          "coordinates": {
+            "condensed_volume_fraction": 1.0,
+            "equivolume_diameter": 0.015,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": 20.0,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.023213284015415087,
+          "flat_grid_index": 1004784,
+          "lower_ndgs": 12,
+          "lower_value": 4.862383064617475,
+          "upper_ndgs": 14,
+          "upper_value": 4.862270192738381,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 1.8759470650886456e-05,
+          "allowed_absolute_difference": 0.0012301258140242828,
+          "component": "av",
+          "coordinates": {
+            "condensed_volume_fraction": 1.0,
+            "equivolume_diameter": 0.015,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": 20.0,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.015250042261543943,
+          "flat_grid_index": 1004784,
+          "lower_ndgs": 12,
+          "lower_value": 1.2301258130242827,
+          "upper_ndgs": 14,
+          "upper_value": 1.2301070535536318,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 304456.1252717972,
+          "allowed_absolute_difference": 4670910.222305507,
+          "component": "fall_speed_first_moment",
+          "coordinates": {
+            "condensed_volume_fraction": 1.0,
+            "equivolume_diameter": 0.015,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 275.15
+          },
+          "difference_to_allowed_ratio": 0.06518132671826887,
+          "flat_grid_index": 1017580,
+          "lower_ndgs": 12,
+          "lower_value": 4670605766.180236,
+          "upper_ndgs": 14,
+          "upper_value": 4670910222.305508,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 5798454.465988159,
+          "allowed_absolute_difference": 88958828.51616877,
+          "component": "fall_speed_second_moment",
+          "coordinates": {
+            "condensed_volume_fraction": 1.0,
+            "equivolume_diameter": 0.015,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 275.15
+          },
+          "difference_to_allowed_ratio": 0.06518132671828358,
+          "flat_grid_index": 1017580,
+          "lower_ndgs": 12,
+          "lower_value": 88953030061.70279,
+          "upper_ndgs": 14,
+          "upper_value": 88958828516.16878,
+          "within_predeclared_tolerance": true
+        }
+      ]
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_prolate_sband_unvalidated",
+      "compared_grid_point_count": 864000,
+      "component_comparison_count": 7776000,
+      "component_tolerance_failure_count": 0,
+      "config_sha256": "0fa0bd759b64c8e6f62bcf629fd2d5c2733aa433fb0e2eb2793c2cbaa58e1758",
+      "configured_solver": {
+        "ddelt": 0.001,
+        "ndgs": 14,
+        "shape": "spheroid"
+      },
+      "effective_worker_count": 12,
+      "grid_point_count": 864000,
+      "material_group_count": 960,
+      "recorded_component_tolerance_failures": [],
+      "recorded_failure_limit": 100,
+      "solver_group_failure_count": 0,
+      "solver_group_failures": [],
+      "table_id": "property-p3-ishmael-wet-prolate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_solver_convergence_tolerance": true,
+      "worker_limit": 12,
+      "worst_comparison_by_component": [
+        {
+          "absolute_difference": 3.5485969559522346,
+          "allowed_absolute_difference": 314.415525702224,
+          "component": "zh",
+          "coordinates": {
+            "condensed_volume_fraction": 0.85,
+            "equivolume_diameter": 0.0063,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.01128632865068194,
+          "flat_grid_index": 850980,
+          "lower_ndgs": 12,
+          "lower_value": 314411.977105267,
+          "upper_ndgs": 14,
+          "upper_value": 314415.52570222295,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 84.82088405545801,
+          "allowed_absolute_difference": 5757.065911658542,
+          "component": "zv",
+          "coordinates": {
+            "condensed_volume_fraction": 0.85,
+            "equivolume_diameter": 0.0063,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 275.15
+          },
+          "difference_to_allowed_ratio": 0.014733352953921995,
+          "flat_grid_index": 863780,
+          "lower_ndgs": 12,
+          "lower_value": 5756981.090774486,
+          "upper_ndgs": 14,
+          "upper_value": 5757065.911658541,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 10.10611888312269,
+          "allowed_absolute_difference": 922.8566588174632,
+          "component": "hh_vv_covariance_real",
+          "coordinates": {
+            "condensed_volume_fraction": 0.85,
+            "equivolume_diameter": 0.0063,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.01095090855829392,
+          "flat_grid_index": 850980,
+          "lower_ndgs": 12,
+          "lower_value": 919797.242545158,
+          "upper_ndgs": 14,
+          "upper_value": 919807.3486640411,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 0.4116507857252145,
+          "allowed_absolute_difference": 1007.2843530925684,
+          "component": "hh_vv_covariance_imaginary",
+          "coordinates": {
+            "condensed_volume_fraction": 1.0,
+            "equivolume_diameter": 0.0063,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": 20.0,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.0004086738610218283,
+          "flat_grid_index": 851184,
+          "lower_ndgs": 12,
+          "lower_value": -70935.76129714005,
+          "upper_ndgs": 14,
+          "upper_value": -70935.34964635433,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 3.0505040593438357e-12,
+          "allowed_absolute_difference": 2.6037734352437127e-11,
+          "component": "kdp",
+          "coordinates": {
+            "condensed_volume_fraction": 0.0015,
+            "equivolume_diameter": 0.0027755575615628914,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.05,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 275.15
+          },
+          "difference_to_allowed_ratio": 0.11715704669436068,
+          "flat_grid_index": 704020,
+          "lower_ndgs": 12,
+          "lower_value": -2.5037734352437125e-08,
+          "upper_ndgs": 14,
+          "upper_value": -2.503468384837778e-08,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 1.6763170151284923e-07,
+          "allowed_absolute_difference": 2.7405598241618488e-05,
+          "component": "ah",
+          "coordinates": {
+            "condensed_volume_fraction": 0.85,
+            "equivolume_diameter": 0.0063,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.006116695575660947,
+          "flat_grid_index": 850980,
+          "lower_ndgs": 12,
+          "lower_value": 0.027405429609916977,
+          "upper_ndgs": 14,
+          "upper_value": 0.02740559724161849,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 1.43685339840105e-06,
+          "allowed_absolute_difference": 0.00020807189807283606,
+          "component": "av",
+          "coordinates": {
+            "condensed_volume_fraction": 0.85,
+            "equivolume_diameter": 0.0063,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.006905562027881709,
+          "flat_grid_index": 850980,
+          "lower_ndgs": 12,
+          "lower_value": 0.20807046021943765,
+          "upper_ndgs": 14,
+          "upper_value": 0.20807189707283605,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 40.37673723185435,
+          "allowed_absolute_difference": 3577.490828215426,
+          "component": "fall_speed_first_moment",
+          "coordinates": {
+            "condensed_volume_fraction": 0.85,
+            "equivolume_diameter": 0.0063,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.01128632865063015,
+          "flat_grid_index": 850980,
+          "lower_ndgs": 12,
+          "lower_value": 3577450.451478193,
+          "upper_ndgs": 14,
+          "upper_value": 3577490.828215425,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 459.4156309515238,
+          "allowed_absolute_difference": 40705.49823320955,
+          "component": "fall_speed_second_moment",
+          "coordinates": {
+            "condensed_volume_fraction": 0.85,
+            "equivolume_diameter": 0.0063,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.98,
+            "minor_to_major_axis_ratio": 0.1,
+            "radar_elevation": -0.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 0.011286328650725368,
+          "flat_grid_index": 850980,
+          "lower_ndgs": 12,
+          "lower_value": 40705038.8175786,
+          "upper_ndgs": 14,
+          "upper_value": 40705498.23320955,
+          "within_predeclared_tolerance": true
+        }
+      ]
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "compared_grid_point_count": 2960,
+      "component_comparison_count": 26640,
+      "component_tolerance_failure_count": 0,
+      "config_sha256": "b6ac330212174ce863ee14abe94bb3347c6ae208913a760cead418c6d67d879d",
+      "configured_solver": {
+        "ddelt": 0.001,
+        "ndgs": 14,
+        "shape": "spheroid"
+      },
+      "effective_worker_count": 4,
+      "grid_point_count": 2960,
+      "material_group_count": 4,
+      "recorded_component_tolerance_failures": [],
+      "recorded_failure_limit": 100,
+      "solver_group_failure_count": 0,
+      "solver_group_failures": [],
+      "table_id": "property-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_solver_convergence_tolerance": true,
+      "worker_limit": 12,
+      "worst_comparison_by_component": [
+        {
+          "absolute_difference": 2.6020852139652106e-18,
+          "allowed_absolute_difference": 4.606914487808761e-06,
+          "component": "zh",
+          "coordinates": {
+            "equivolume_diameter": 0.0004075965548029613,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 1.0,
+            "radar_elevation": 4.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 5.648216872379739e-13,
+          "flat_grid_index": 277,
+          "lower_ndgs": 12,
+          "lower_value": 0.004606913487808761,
+          "upper_ndgs": 14,
+          "upper_value": 0.0046069134878087585,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 1.0408340855860843e-17,
+          "allowed_absolute_difference": 1.5578513203219486e-05,
+          "component": "zv",
+          "coordinates": {
+            "equivolume_diameter": 0.0005,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 1.0,
+            "radar_elevation": 4.5,
+            "temperature": 293.15
+          },
+          "difference_to_allowed_ratio": 6.681215800304893e-13,
+          "flat_grid_index": 457,
+          "lower_ndgs": 12,
+          "lower_value": 0.015578512203219477,
+          "upper_ndgs": 14,
+          "upper_value": 0.015578512203219487,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 6.938893903907228e-18,
+          "allowed_absolute_difference": 1.557851320321941e-05,
+          "component": "hh_vv_covariance_real",
+          "coordinates": {
+            "equivolume_diameter": 0.0005,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 1.0,
+            "radar_elevation": 10.0,
+            "temperature": 293.15
+          },
+          "difference_to_allowed_ratio": 4.4541438668699513e-13,
+          "flat_grid_index": 458,
+          "lower_ndgs": 12,
+          "lower_value": 0.015578512203219402,
+          "upper_ndgs": 14,
+          "upper_value": 0.01557851220321941,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 4.0318768289304696e-16,
+          "allowed_absolute_difference": 8.286309930983696e-05,
+          "component": "hh_vv_covariance_imaginary",
+          "coordinates": {
+            "equivolume_diameter": 0.0006628908034679974,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.85,
+            "radar_elevation": -0.5,
+            "temperature": 250.0
+          },
+          "difference_to_allowed_ratio": 4.86570845468223e-12,
+          "flat_grid_index": 650,
+          "lower_ndgs": 12,
+          "lower_value": 0.00022932153535361514,
+          "upper_ndgs": 14,
+          "upper_value": 0.00022932153535321195,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 2.128362289641417e-17,
+          "allowed_absolute_difference": 1.000000021283623e-12,
+          "component": "kdp",
+          "coordinates": {
+            "equivolume_diameter": 0.0032299275672523706,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 1.0,
+            "radar_elevation": 0.9,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 2.1283622443421576e-05,
+          "flat_grid_index": 1956,
+          "lower_ndgs": 12,
+          "lower_value": 2.128362289641417e-17,
+          "upper_ndgs": 14,
+          "upper_value": 0.0,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 5.8106460181645e-19,
+          "allowed_absolute_difference": 2.624389164647931e-09,
+          "component": "ah",
+          "coordinates": {
+            "equivolume_diameter": 0.0008,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.85,
+            "radar_elevation": -0.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 2.2140946535054052e-10,
+          "flat_grid_index": 830,
+          "lower_ndgs": 12,
+          "lower_value": 2.623389164647931e-06,
+          "upper_ndgs": 14,
+          "upper_value": 2.62338916464735e-06,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 5.692061405548898e-19,
+          "allowed_absolute_difference": 2.480734539952141e-09,
+          "component": "av",
+          "coordinates": {
+            "equivolume_diameter": 0.0008853455357602572,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.7,
+            "radar_elevation": -0.5,
+            "temperature": 269.15
+          },
+          "difference_to_allowed_ratio": 2.2945064511653517e-10,
+          "flat_grid_index": 905,
+          "lower_ndgs": 12,
+          "lower_value": 2.479734539952141e-06,
+          "upper_ndgs": 14,
+          "upper_value": 2.479734539951572e-06,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 1.7763568394002505e-15,
+          "allowed_absolute_difference": 0.003455840810469855,
+          "component": "fall_speed_first_moment",
+          "coordinates": {
+            "equivolume_diameter": 0.0009797958971132711,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 1.0,
+            "radar_elevation": 4.5,
+            "temperature": 293.15
+          },
+          "difference_to_allowed_ratio": 5.140158175164144e-13,
+          "flat_grid_index": 1017,
+          "lower_ndgs": 12,
+          "lower_value": 3.455840809469855,
+          "upper_ndgs": 14,
+          "upper_value": 3.455840809469853,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "absolute_difference": 3.3306690738754696e-16,
+          "allowed_absolute_difference": 0.0006300663425621661,
+          "component": "fall_speed_second_moment",
+          "coordinates": {
+            "equivolume_diameter": 0.0006628908034679974,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 1.0,
+            "radar_elevation": -0.5,
+            "temperature": 293.15
+          },
+          "difference_to_allowed_ratio": 5.28621963892135e-13,
+          "flat_grid_index": 695,
+          "lower_ndgs": 12,
+          "lower_value": 0.6300663415621661,
+          "upper_ndgs": 14,
+          "upper_value": 0.6300663415621658,
+          "within_predeclared_tolerance": true
+        }
+      ]
+    }
+  ],
+  "total_component_comparison_count": 19622160,
+  "total_grid_point_count": 2180240,
+  "validation_source_sha256": "53c1e03a8c083e1df1af15d97af7cf611c84c6bbb15e0f980254fcc2d59562a7",
+  "worker_limit": 12
+}

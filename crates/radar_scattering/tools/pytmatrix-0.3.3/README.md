@@ -1,41 +1,36 @@
 # Reproducible PyTMatrix 0.3.3 research generator
 
-This directory contains an executable, locked generator for schema-v1 radar
-scattering LUTs. Every output is `research_only_unvalidated` in the crate
-header and `unvalidated_research` in the external manifest. Nothing here
-activates a production path.
+This directory contains the locked generator for schema-v1 radar-scattering
+LUTs. Every output remains `research_only_unvalidated`; generating or loading
+one of these files does not make it production-ready.
 
-The generator currently covers three **conventional**, monodisperse particle
-tables in `research_only_assets/tmatrix/pytmatrix-0.3.3`:
+The end-to-end run emits eight tables under
+`research_only_assets/tmatrix/pytmatrix-0.3.3`:
 
-- homogeneous liquid-water rain spheroids;
-- homogeneous dry-ice spheroids; and
-- homogeneous Maxwell-Garnett wet-hail spheroids.
+- three historical conventional monodisperse tables for liquid rain, dry ice,
+  and Maxwell-Garnett wet hail; and
+- five view-aware property-coordinate tables: dry oblate, dry prolate, wet
+  oblate, wet prolate, and rain used both standalone and as the residual after
+  liquid mass paired into wet frozen categories is removed exactly once.
 
-It does not represent P3 or ISHMAEL properties. It does not infer a PSD or WRF
-category mapping. Each electromagnetic node is normalized to exactly one
-particle per cubic metre, so all nine stored components remain additive.
+The property tables are compatible with bounded, closure-derived P3/ISHMAEL-
+style characteristic-particle coordinates. They are not scheme-native PSD
+integrals and do not claim full P3 or ISHMAEL scientific validation.
 
 ## Locked environment
 
-`Dockerfile` pins platform-specific CPython 3.11.9 and Rust 1.85.1 image
-manifests, an immutable Debian snapshot, native package versions, hashed Python
-wheels, the full upstream PyTMatrix release commit, and its downloaded archive
-SHA-256. NumPy/SciPy BLAS linkage, the compiled Fortran extension, native
-packages, compiler versions, and executable hashes are captured in the emitted
-`environment.json`.
+`Dockerfile` pins CPython 3.11.9 and Rust 1.85.1 image manifests, an immutable
+Debian snapshot, native package versions, hashed Python wheels, and the full
+upstream PyTMatrix 0.3.3 release commit. The image build runs the upstream
+`python -m unittest pytmatrix.test.test_tmatrix` gate and builds both the Rust
+LUT emitter and the typed runtime-loader smoke executable. NumPy/SciPy BLAS
+linkage, the compiled Fortran extension, compilers, packages, executables, and
+tool-file SHA-256 identities are captured in `environment.json`.
 
-PyTMatrix 0.3.3 uses `numpy.distutils`; its build requires `setuptools < 60`.
-The official PyPI sdist and GitHub release ZIP omit the required
-`pytmatrix.pyf`. The pinned source therefore comes from the official 0.3.3 tag
-commit rather than those incomplete packaging artifacts. Exact failures and
-hashes are retained in `FAILURE_RECORD.md`.
-
-The image build runs the fail-closed upstream gate:
-
-```sh
-python -m unittest pytmatrix.test.test_tmatrix
-```
+PyTMatrix 0.3.3 uses `numpy.distutils` and requires `setuptools < 60`. Its PyPI
+sdist and GitHub release ZIP omit the required `pytmatrix.pyf`, so the locked
+source is the official 0.3.3 tag commit. Exact packaging and native-solver
+failures are retained in `FAILURE_RECORD.md`.
 
 ## End-to-end command
 
@@ -45,88 +40,107 @@ From the repository root on Windows with Docker Desktop running:
 powershell -ExecutionPolicy Bypass -File crates/radar_scattering/tools/pytmatrix-0.3.3/run_all.ps1
 ```
 
-The script builds the locked image, captures the environment, generates all
-three LUTs, runs analytic/sphere/resonance sanity checks, computes direct
-PyTMatrix held-out nodes in fresh processes, and writes the interpolation-only
-report. The exact expanded commands are in `run_all.ps1`; the built image ID
-and result are recorded in `reproduction_run.json`.
-
-To generate only one already-configured table inside the image:
-
-```sh
-python crates/radar_scattering/tools/pytmatrix-0.3.3/generate_lut.py generate \
-  --config research_only_assets/tmatrix/pytmatrix-0.3.3/conventional_wet_hail_sband_unvalidated/config.json \
-  --output research_only_assets/tmatrix/pytmatrix-0.3.3/conventional_wet_hail_sband_unvalidated/table.lut \
-  --manifest research_only_assets/tmatrix/pytmatrix-0.3.3/conventional_wet_hail_sband_unvalidated/manifest.json \
-  --environment-report research_only_assets/tmatrix/pytmatrix-0.3.3/environment.json \
-  --overwrite
-```
+The script rebuilds the locked image, recaptures the environment, verifies the
+already-passing refined-grid all-node convergence report against exact
+environment/generator/validator/audit/config hashes, generates all eight LUTs,
+loads every exact LUT/config/hash tuple through the Rust runtime, runs sanity
+checks, selects the final held-out nodes, compares direct PyTMatrix with LUT
+interpolation, and checks every supported scan center at center and plus/minus
+the default beam sigma. The convergence command is deliberately run and
+preserved before this script; `run_all.ps1` never silently recomputes or
+replaces that expensive scientific gate. The image ID, table hashes, node
+counts, and report hashes are written to `reproduction_run.json`.
 
 ## Deterministic and fail-closed behavior
 
 `generate_lut.py`:
 
-1. reads exact bytes, rejects invalid UTF-8, duplicate JSON keys and
-   `NaN`/`Infinity`, then hashes those unmodified bytes;
-2. requires table-specific material, geometry, orientation, shape,
-   normalization, terminal-velocity, process, and payload declarations;
-3. maps crate `minor_to_major_axis_ratio` to PyTMatrix's
-   horizontal-to-rotational ratio (`1/q` for oblate, `q` for prolate);
-4. runs every grid point in a fresh Python process with one numerical thread;
-5. rejects the whole table after any timeout, native exit, nonfinite value, or
-   schema invariant failure;
-6. collects points in declared axis order with the last axis fastest; and
-7. asks the locked Rust `brslut-emitter` to construct and serialize
-   `OfflineLut`, then independently cross-checks the exact header, config,
-   payload bytes, and their SHA-256 digests before the atomic rename.
+1. hashes exact config bytes and rejects duplicate keys, invalid UTF-8, and
+   nonfinite JSON numbers;
+2. requires table-specific particle, material, geometry, orientation,
+   terminal-speed, execution, and payload declarations;
+3. maps minor/major ratio `q` to PyTMatrix horizontal/rotational ratio as
+   `1/q` for oblate and `q` for prolate spheroids;
+4. runs conventional points in crash-isolated processes and property tables in
+   fresh crash-isolated material-state groups with at most 12 concurrent
+   workers, reusing a T matrix only across declared radar-elevation samples of
+   the same particle state and restoring results by flat index regardless of
+   completion order;
+5. rejects an entire LUT after any timeout, native exit, nonfinite result,
+   partial group, or schema invariant failure;
+6. stores points in declared axis order with the last axis fastest; and
+7. passes both axis coordinates and payload scalars to the locked Rust emitter
+   as exact IEEE-754 bit strings, constructs `OfflineLut`, then independently
+   checks exact header, config, payload bytes, and SHA-256 digests before an
+   atomic rename.
 
-The canonical output order is ZH, ZV, complex HH/VV covariance real/imaginary,
-KDP, AH, AV, and ZH-weighted first/second fall-speed moments. Backscatter is
-computed in PyTMatrix horizontal backscatter geometry. KDP and attenuation use
-horizontal forward geometry. Covariance magnitude/phase come from PyTMatrix
-`rho_hv` and `delta_hv`, with the configured HH × conjugate(VV) convention.
+All electromagnetic nodes are normalized to exactly one particle per cubic
+metre. The canonical additive output order is ZH, ZV, complex HH/VV covariance
+real/imaginary, signed KDP, AH, AV, and ZH-weighted first/second fall-speed
+moments. The radar transform uses the PyTMatrix local H/V scattering basis and
+turns beam elevation `e` into the declared backscatter and forward geometries.
 
-Frozen dry-ice and wet-hail tables use PyTMatrix's fixed-order orientation
-average with a 20-degree Gaussian canting distribution, five alpha points and
-ten Gautschi-derived beta points (50 deterministic angle pairs per particle).
-The liquid-rain table retains explicitly fixed vertical symmetry axes.
+## Property-coordinate physics and limits
 
-PyTMatrix does not supply terminal speeds. Rain uses the explicitly configured
-Atlas et al. exponential law over its stated diameter range. Dry/wet hail uses
-the configured Schiller-Naumann gravity/drag iteration. The stored moments are
-always `ZH*v_t` and `ZH*v_t^2`; nonzero reflectivity is never paired with zero
-placeholder moments.
+All five property tables use exactly 2.8 GHz, a radar-elevation axis spanning
+-0.5 through 20 degrees, and mean-zero Gaussian canting with 20-degree standard
+deviation and deterministic 5-by-10 orientation quadrature. Oblate and prolate
+frozen states are separate tables. Frozen minor/major ratio covers 0.1 through
+1.0; rain covers 0.5 through 1.0.
 
-## Scientific scope and validation status
+Dry states span 190 through 273.15 K and bulk density 1.5 through 917 kg/m3.
+They use Matzler (2006) ice permittivity and a passive, symmetric Bruggeman
+air/ice mixture. Wet states span 269.15 through 275.15 K, condensed volume
+fraction 0.0015 through 1.0, and liquid mass fraction 0 through 0.98. They use
+temperature-dependent Liebe-Hufford-Manabe water, ice temperature capped at
+273.15 K for phase equilibrium, and a symmetric air/ice/water Bruggeman root
+followed continuously from vacuum. Rain spans 250 through 313.15 K using the
+same temperature-dependent liquid-water model.
 
-The dielectric constants are explicit, table-specific narrow-S-band values at
-273.15 K. Frequency is a configurable schema axis restricted to 2–4 GHz, but
-these supplied configs contain a single 2.700832954954955 GHz node (111 mm) and
-declare their refractive indices constant over configured nodes. Wet hail is a
-homogeneous ice-host/water-inclusion Maxwell-Garnett approximation with mass
-fraction converted to volume fraction using component densities. It is not a
-coated-hail or laboratory-validated morphology model.
+Native PyTMatrix is resolution-sensitive at the joint extreme of large
+diameter and minor/major ratio 0.1. The initial `ndgs=2` probes, failed all-grid
+`ndgs=8` to `10` comparison, and failed first refined-grid `ndgs=12` to `14`
+sweep are retained. Final property configs use exactly `ddelt=0.001` and
+`ndgs=14`. Rule-based interpolation refinement preserves the original anchors,
+adds diameter midpoints, spaces dry density and wet condensed fraction by
+density excess over 1.225 kg/m3 air, and resolves wet liquid-fraction curvature.
+The final five-table Cartesian grid contains 2,180,240 points.
 
-The first coarse-grid interpolation attempt is preserved as
-`validation/tmatrix/initial_grid_design_failure_report.json`; every table
-failed its predeclared thresholds, so those nodes became grid-design/tuning
-data and the coarse LUTs were discarded. The shipped diameter grids use at
-most 1.25 spacing (1.20 for wet hail below 25 mm and about 1.10 above it) and
-contain 48 rain, 87 dry-ice and 575 wet-hail points. The wet table also uses
-five liquid-fraction and five shape-ratio coordinates to resolve the
-resonance-region interpolation failure preserved in the v2 report.
+Runtime dispatch is phase/shape-specific, so solver-complete domains are
+retained separately: dry oblate through 89 mm, dry prolate through
+32.31174267785264 mm, wet oblate through 15 mm, and wet prolate through 6.3 mm.
+The first refined sweep found three near-zero dry-prolate KDP disagreements at
+the inserted 36.12562655 mm node. Removing only that node while retaining the
+50 mm domain failed 2,195 interpolation component budgets, and higher-order
+probes were pairwise nonmonotonic. The final domain therefore stops at the last
+all-grid-converged node so interpolation cannot bridge the unresolved
+resonance. Future recovery requires a diagnostic/dimension-expanded PyTMatrix
+rebuild or an independent scattering solver to determine the numerical cause;
+the current evidence does not prove a specific native array limit. These are
+numerical applicability boundaries, not claims that larger atmospheric
+particles do not exist.
 
-`validation/tmatrix/held_out_interpolation_report.json` compares multilinear
-LUT interpolation with direct PyTMatrix evaluations at nodes absent from the
-LUT. Because both paths share this generator, PyTMatrix, dielectric models,
-orientation, and velocity closures, that report checks generator/interpolation
-behavior only. It is deliberately not attached as
-`held_out_validated` science metadata.
+PyTMatrix does not provide terminal velocity. Rain uses the configured Atlas
+exponential law. Frozen nodes use a bracketed Schiller-Naumann gravity/drag
+solve. The empirical drag coefficient has a small jump at Re=1000; if its
+one-sided force residuals straddle zero, the exact declared policy selects the
+Re=1000 boundary because no exact root exists across that jump. Runtime
+population evaluation replaces these normalized per-node moments with
+closure-derived fall moments as required by the typed descriptor.
 
-The final off-grid nodes are selected only after grid bytes are frozen by
-`select_held_out_nodes.py`, using a public seed and SHA-256-derived within-cell
-fractions without evaluating scattering. The production gate remains failed
-until independent Mie, PSD integration,
-covariance/basis, propagation-unit, and wet-particle evidence exists and is
-reviewed. Upstream self-tests and the shipped Rayleigh sanity test do not meet
-that bar.
+## Validation status
+
+The reports exercise serialization, strict runtime binding, analytic limits,
+mass accounting, native solver completion, multilinear interpolation, and the
+view axis at the union of the optional 0.1-degree cut, historical 14-cut
+ladder, and Build-24 VCP 12/34/35/112/212/215 centers. Long-running audit and
+convergence commands snapshot generator, validator, environment, and config
+hashes before computation and reject any mid-run change before atomic output.
+They use the same generator, PyTMatrix implementation, dielectric formulas,
+orientation model, and geometry as the LUTs, so they are
+software/interpolation evidence only.
+
+Independent Mie/PSD comparisons, covariance and propagation convention
+verification, wet-particle evidence, operational calibration, and reviewed
+scheme-native PSD mapping remain unmet. No report changes the embedded
+`research_only_unvalidated` status.

@@ -1,32 +1,53 @@
-# Non-production PyTMatrix research assets
+# Non-production PyTMatrix 0.3.3 research assets
 
-Everything below this directory is an explicitly non-production research
-artifact. None of these files is loaded or activated by application code.
-
-Each table directory contains the exact UTF-8 `config.json` embedded in its
-schema-v1 `table.lut` and a `manifest.json` with full LUT-header, config,
-payload, environment, generator, and tool-source SHA-256 identities. The shared
+Everything in this directory is an explicitly non-production research
+artifact. Each table directory contains the exact UTF-8 `config.json` embedded
+in `table.lut` and a `manifest.json` with complete LUT, header, config, payload,
+environment, generator, and tool-source SHA-256 identities. The shared
 `environment.json` records the locked native runtime; `reproduction_run.json`
-records the exact top-level command and built container image ID.
+records the top-level command, image ID, table identities, counts, and reports.
 
-All electromagnetic values are conventional spheroids normalized to a
-monodisperse number density of exactly 1 m^-3. Frozen dry/wet particles use a
-declared 20-degree Gaussian canting distribution with deterministic 5-by-10
-PyTMatrix orientation quadrature. The tables are:
+The conventional tables are:
 
-- `conventional_liquid_rain_sband_unvalidated`: explicit liquid water;
-- `conventional_dry_ice_spheroids_sband_unvalidated`: explicit solid ice; and
-- `conventional_wet_hail_sband_unvalidated`: homogeneous Maxwell-Garnett
-  ice-host/water-inclusion mixture, including resonance-sized nodes.
+- `conventional_liquid_rain_sband_unvalidated`;
+- `conventional_dry_ice_spheroids_sband_unvalidated`; and
+- `conventional_wet_hail_sband_unvalidated`.
 
-The shape ratio is an independent LUT coordinate; these assets do not impose a
-diameter-dependent raindrop or hail shape relation. Rain fall speed uses the
-configured Atlas exponential law. Frozen-particle fall speed uses a
-sphere-equivalent Schiller-Naumann gravity/drag balance with the configured air
-density/viscosity and particle or mixture density; no nonspherical projected-
-area correction is inferred. Those velocity choices are separate closures,
-not PyTMatrix outputs.
+The view-aware property-coordinate bundle is:
 
-All headers remain `research_only_unvalidated`. These assets do not establish
-P3 coverage, ISHMAEL coverage, production readiness, independently held-out
-science validation, a PSD closure, or a native microphysics-scheme mapping.
+- `property_p3_ishmael_dry_oblate_sband_unvalidated`;
+- `property_p3_ishmael_dry_prolate_sband_unvalidated`;
+- `property_p3_ishmael_wet_oblate_sband_unvalidated`;
+- `property_p3_ishmael_wet_prolate_sband_unvalidated`; and
+- `property_rain_sband_unvalidated`, used for standalone rain and for residual
+  rain after liquid paired into wet frozen categories is removed exactly once.
+
+Every electromagnetic node is monodisperse and normalized to exactly 1 m^-3.
+The property bundle uses exactly 2.8 GHz, separate oblate/prolate shapes,
+Gaussian20 orientation with deterministic 5-by-10 quadrature, temperature-
+dependent dielectric formulas, porous/wet symmetric Bruggeman mixing, and a
+radar-elevation axis spanning -0.5 through 20 degrees. Property configs use
+exactly `ddelt=0.001` and `ndgs=14`. The final property bundle contains
+2,180,240 Cartesian points: 163,520 dry-oblate, 132,160 dry-prolate, 1,017,600
+wet-oblate, 864,000 wet-prolate, and 2,960 rain points. Role-specific dense
+diameter grids preserve solver-complete domains at shape ratio 0.1: 89 mm dry
+oblate, exactly 32.31174267785264 mm dry prolate, 15 mm wet oblate, and 6.3 mm
+wet prolate. The dry-prolate cap prevents interpolation across an unresolved
+large/slender-particle KDP resonance; rejected domains, order/ddelt probes,
+node-removal failures, and lower-order convergence failures are retained under
+`validation/tmatrix`.
+
+Frozen Schiller-Naumann terminal speeds use bracketed force balance and an
+explicit Re=1000 boundary selection when the piecewise drag-coefficient jump
+straddles zero. Stored normalized fall moments follow that declared generator
+law; runtime property evaluation replaces them with closure-derived moments.
+
+The property coordinates can consume bounded characteristic-particle states
+closed from P3/ISHMAEL-style inputs. They do not reproduce either scheme's
+native PSD, do not expose rime axes independently of closure-derived density
+and shape, and do not constitute full P3 or ISHMAEL validation.
+
+All headers remain `research_only_unvalidated`. Strict runtime loading,
+held-out interpolation, analytic sanity, and Build-24/default-beam view checks
+are software evidence, not operational calibration or independent science
+validation. Extrapolation and silent fallback are forbidden.

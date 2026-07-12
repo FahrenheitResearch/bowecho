@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "status": "research_only_unvalidated",
+  "kernel": "pytmatrix-0.3.3",
+  "table_id": "property-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
+  "particle_population": {
+    "microphysics_family": "conventional",
+    "category": "rain",
+    "shape_family": "oblate_spheroid",
+    "size_distribution": "monodisperse_node",
+    "normalization_number_concentration_m3": 1.0,
+    "coexistence_descriptor": {
+      "role": "standalone_rain_and_residual_after_mixed_phase_pairing",
+      "allocation_rule": "max_total_rain_mass_minus_liquid_mass_paired_into_wet_frozen_categories_zero",
+      "double_count_policy": "paired_liquid_mass_removed_exactly_once_before_rain_lookup",
+      "over_pairing_policy": "reject"
+    }
+  },
+  "axes": [
+    {"kind": "equivolume_diameter", "unit": "meter", "coordinates": [0.0003, 0.000332269902974487, 0.0003680109614089166, 0.0004075965548029613, 0.0004514402257237171, 0.0005, 0.000549280271653059, 0.0006034176336545163, 0.0006628908034679974, 0.0007282256812104322, 0.0008, 0.0008853455357602572, 0.0009797958971132711, 0.0010843224043318137, 0.0012, 0.0013280183036403859, 0.0014696938456699065, 0.0016264836064977205, 0.0018, 0.0019733209007916346, 0.0021633307652783934, 0.0023716365635830087, 0.0026, 0.0028978978026935596, 0.0032299275672523706, 0.0036, 0.003962312698673552, 0.004361089422797134, 0.0048, 0.005366563145999495, 0.006, 0.006480740698407861, 0.00673536820737033, 0.006866409356540893, 0.006932882913751411, 0.006966360627778315, 0.007]},
+    {"kind": "temperature", "unit": "kelvin", "coordinates": [250.0, 269.15, 293.15, 313.15]},
+    {"kind": "minor_to_major_axis_ratio", "unit": "unitless_fraction", "coordinates": [0.5, 0.7, 0.85, 1.0]},
+    {"kind": "frequency", "unit": "hertz", "coordinates": [2800000000.0]},
+    {"kind": "radar_elevation", "unit": "degree", "coordinates": [-0.5, 0.9, 4.5, 10.0, 20.0]}
+  ],
+  "dielectric": {
+    "model": "temperature_dependent_liquid_water_liebe_1991",
+    "liquid_water_permittivity_model": "liebe_hufford_manabe_1991_double_debye",
+    "mass_density_kg_m3": 999.84,
+    "temperature_range_k": [250.0, 313.15],
+    "frequency_range_hz": [2000000000.0, 4000000000.0],
+    "applicability": "pure_fresh_supercooled_or_liquid_water_250_to_313p15_k"
+  },
+  "orientation": {
+    "model": "gaussian_canting",
+    "mean_deg": 0.0,
+    "standard_deviation_deg": 20.0,
+    "alpha_quadrature_points": 5,
+    "beta_quadrature_points": 10,
+    "quadrature_method": "pytmatrix_orient_averaged_fixed_gautschi",
+    "reference_symmetry_axis": "vertical_at_zero_canting"
+  },
+  "radar": {
+    "speed_of_light_m_s": 299792458.0,
+    "reference_water_dielectric_factor_squared": 0.93,
+    "length_unit_passed_to_pytmatrix": "millimeter",
+    "backscatter_geometry_deg": [90.0, 90.0, 0.0, 180.0, 0.0, 0.0],
+    "forward_scatter_geometry_deg": [90.0, 90.0, 0.0, 0.0, 0.0, 0.0],
+    "beam_elevation_transform": "pytmatrix_theta0_90_minus_e_theta_back_90_plus_e_theta_forward_90_minus_e_degrees",
+    "polarization_basis": "pytmatrix_local_horizontal_vertical_scattering_basis",
+    "view_applicability": "ppi_beam_elevation_minus0p5_to_20_axisymmetric_gaussian_odf_not_general_body_frame",
+    "covariance_phase_convention": "pytmatrix_delta_hv_hh_times_conjugate_vv",
+    "solver": {"shape": "spheroid", "ddelt": 0.001, "ndgs": 14}
+  },
+  "terminal_velocity": {
+    "law": "atlas_rain_1973_exponential",
+    "a_m_s": 9.65,
+    "b_m_s": 10.3,
+    "c_per_mm": 0.6,
+    "valid_diameter_range_m": [0.0003, 0.007]
+  },
+  "temporal": {"sampling": "instantaneous"},
+  "execution": {
+    "point_timeout_seconds": 300,
+    "process_isolation": "fresh_python_subprocess_per_material_state_group",
+    "result_collection_order": "declared_axis_order_last_axis_fastest",
+    "partial_grid_policy": "reject_entire_lut",
+    "thread_count_per_process": 1,
+    "grouping": {
+      "model": "fresh_crash_isolated_material_state_process",
+      "material_state_axis_kinds": ["temperature", "frequency"],
+      "tmatrix_state_axis_kinds": ["equivolume_diameter", "minor_to_major_axis_ratio"],
+      "geometry_axis_kind": "radar_elevation",
+      "partial_group_policy": "reject_entire_lut",
+      "maximum_points_per_process": 2048,
+      "group_timeout_seconds": 3600
+    }
+  },
+  "payload": {"encoding": "f64_le_point_major_last_axis_fastest"},
+  "references": [
+    "https://github.com/jleinonen/pytmatrix/tree/0.3.3",
+    "https://doi.org/10.1007/BF01008897",
+    "https://doi.org/10.1029/JC078i033p07847"
+  ]
+}

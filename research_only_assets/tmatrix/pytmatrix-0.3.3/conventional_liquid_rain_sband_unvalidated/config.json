@@ -25,6 +25,11 @@
       "kind": "frequency",
       "unit": "hertz",
       "coordinates": [2700832954.954955]
+    },
+    {
+      "kind": "radar_elevation",
+      "unit": "degree",
+      "coordinates": [0.0]
     }
   ],
   "dielectric": {
@@ -53,6 +58,9 @@
     "length_unit_passed_to_pytmatrix": "millimeter",
     "backscatter_geometry_deg": [90.0, 90.0, 0.0, 180.0, 0.0, 0.0],
     "forward_scatter_geometry_deg": [90.0, 90.0, 0.0, 0.0, 0.0, 0.0],
+    "beam_elevation_transform": "pytmatrix_theta0_90_minus_e_theta_back_90_plus_e_theta_forward_90_minus_e_degrees",
+    "polarization_basis": "pytmatrix_local_horizontal_vertical_scattering_basis",
+    "view_applicability": "horizontal_singleton_zero_degree_axis",
     "covariance_phase_convention": "pytmatrix_delta_hv_hh_times_conjugate_vv",
     "solver": {
       "shape": "spheroid",

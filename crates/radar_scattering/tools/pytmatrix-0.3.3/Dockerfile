@@ -59,9 +59,10 @@ COPY Cargo.toml /opt/source/Cargo.toml
 COPY crates/radar_scattering/Cargo.toml /opt/source/crates/radar_scattering/Cargo.toml
 COPY crates/radar_scattering/src /opt/source/crates/radar_scattering/src
 COPY crates/radar_scattering/tools/pytmatrix-0.3.3/emitter /opt/source/crates/radar_scattering/tools/pytmatrix-0.3.3/emitter
-RUN cargo build --locked --release \
+RUN cargo build --locked --release --bins \
       --manifest-path /opt/source/crates/radar_scattering/tools/pytmatrix-0.3.3/emitter/Cargo.toml \
     && cp /opt/source/crates/radar_scattering/tools/pytmatrix-0.3.3/emitter/target/release/brslut-emitter /usr/local/bin/brslut-emitter \
+    && cp /opt/source/crates/radar_scattering/tools/pytmatrix-0.3.3/emitter/target/release/validate_tmatrix_lut /usr/local/bin/validate_tmatrix_lut \
     && rm -rf /opt/source/crates/radar_scattering/tools/pytmatrix-0.3.3/emitter/target /usr/local/cargo/registry /usr/local/cargo/git
 
 WORKDIR /workspace

@@ -1,0 +1,667 @@
+{
+  "absolute_tolerance": 1e-12,
+  "classification": "solver_order_design_probe_only",
+  "config_sha256": "f99740b5f8b971b9548dc8281f430dc258109da6feac9253750d763e9b035f2b",
+  "orders": [
+    12,
+    14,
+    16,
+    20
+  ],
+  "point_count": 3,
+  "points": [
+    {
+      "coordinates": {
+        "bulk_density": 1.5,
+        "equivolume_diameter": 0.0361256265495798,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "transitions": [
+        {
+          "comparisons": [
+            {
+              "component": "zh",
+              "difference_to_allowed_ratio": 6.445015873433779e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "zv",
+              "difference_to_allowed_ratio": 8.395234454703785e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_real",
+              "difference_to_allowed_ratio": 7.416007213292331e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_imaginary",
+              "difference_to_allowed_ratio": 5.899115067389251e-10,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "kdp",
+              "difference_to_allowed_ratio": 1.1457939236169223,
+              "within_predeclared_tolerance": false
+            },
+            {
+              "component": "ah",
+              "difference_to_allowed_ratio": 3.181753471253446e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "av",
+              "difference_to_allowed_ratio": 7.965026388957914e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_first_moment",
+              "difference_to_allowed_ratio": 6.44501579508983e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_second_moment",
+              "difference_to_allowed_ratio": 6.445015825205199e-06,
+              "within_predeclared_tolerance": true
+            }
+          ],
+          "lower_ndgs": 12,
+          "upper_ndgs": 14,
+          "within_predeclared_tolerance": false
+        },
+        {
+          "comparisons": [
+            {
+              "component": "zh",
+              "difference_to_allowed_ratio": 3.203191462202748e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "zv",
+              "difference_to_allowed_ratio": 3.8059503521894702e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_real",
+              "difference_to_allowed_ratio": 3.0200823066509686e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_imaginary",
+              "difference_to_allowed_ratio": 3.8908628880229775e-10,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "kdp",
+              "difference_to_allowed_ratio": 0.09375052868338958,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "ah",
+              "difference_to_allowed_ratio": 1.2534568569528785e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "av",
+              "difference_to_allowed_ratio": 9.970104417811541e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_first_moment",
+              "difference_to_allowed_ratio": 3.2031913455378485e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_second_moment",
+              "difference_to_allowed_ratio": 3.2031912934335277e-06,
+              "within_predeclared_tolerance": true
+            }
+          ],
+          "lower_ndgs": 14,
+          "upper_ndgs": 16,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "comparisons": [
+            {
+              "component": "zh",
+              "difference_to_allowed_ratio": 5.269154330889742e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "zv",
+              "difference_to_allowed_ratio": 3.923386783915837e-05,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_real",
+              "difference_to_allowed_ratio": 2.2256073714347152e-05,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_imaginary",
+              "difference_to_allowed_ratio": 4.214879628690956e-09,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "kdp",
+              "difference_to_allowed_ratio": 16.352902105074108,
+              "within_predeclared_tolerance": false
+            },
+            {
+              "component": "ah",
+              "difference_to_allowed_ratio": 1.5568258016079464e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "av",
+              "difference_to_allowed_ratio": 3.1520218721498653e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_first_moment",
+              "difference_to_allowed_ratio": 5.26915423111969e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_second_moment",
+              "difference_to_allowed_ratio": 5.269154300631485e-06,
+              "within_predeclared_tolerance": true
+            }
+          ],
+          "lower_ndgs": 16,
+          "upper_ndgs": 20,
+          "within_predeclared_tolerance": false
+        }
+      ],
+      "values_by_ndgs": {
+        "12": [
+          317.29961476941764,
+          319.32736069858436,
+          318.3114592734803,
+          -0.03495713710254322,
+          -6.864667932082566e-08,
+          2.4452660192861068e-06,
+          3.114141303909176e-06,
+          155.768238698487,
+          76.46950408326637
+        ],
+        "14": [
+          317.2996127244166,
+          319.3273580177563,
+          318.3114569128802,
+          -0.03495713729031882,
+          -6.872657160288288e-08,
+          2.4452660185077652e-06,
+          3.114141306390394e-06,
+          155.76823769455825,
+          76.46950359041921
+        ],
+        "16": [
+          317.299613740788,
+          319.3273568024122,
+          318.3114568167475,
+          -0.03495713741416944,
+          -6.872003469993183e-08,
+          2.445266018814394e-06,
+          3.1141413094962226e-06,
+          155.76823819351372,
+          76.46950383536566
+        ],
+        "20": [
+          317.29961206888737,
+          319.3273442739649,
+          318.31144973238423,
+          -0.034957138755813924,
+          -6.987911391101302e-08,
+          2.445266015005984e-06,
+          3.114141299677229e-06,
+          155.76823737274685,
+          76.46950343243604
+        ]
+      }
+    },
+    {
+      "coordinates": {
+        "bulk_density": 1.6055648176571813,
+        "equivolume_diameter": 0.0361256265495798,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "transitions": [
+        {
+          "comparisons": [
+            {
+              "component": "zh",
+              "difference_to_allowed_ratio": 4.537989435497262e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "zv",
+              "difference_to_allowed_ratio": 3.799025179947913e-05,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_real",
+              "difference_to_allowed_ratio": 2.1273917232317966e-05,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_imaginary",
+              "difference_to_allowed_ratio": 6.303913355293148e-09,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "kdp",
+              "difference_to_allowed_ratio": 2.6671658335520783,
+              "within_predeclared_tolerance": false
+            },
+            {
+              "component": "ah",
+              "difference_to_allowed_ratio": 2.7190533173372444e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "av",
+              "difference_to_allowed_ratio": 4.318668896967382e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_first_moment",
+              "difference_to_allowed_ratio": 4.537989343666917e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_second_moment",
+              "difference_to_allowed_ratio": 4.537989367834238e-06,
+              "within_predeclared_tolerance": true
+            }
+          ],
+          "lower_ndgs": 12,
+          "upper_ndgs": 14,
+          "within_predeclared_tolerance": false
+        },
+        {
+          "comparisons": [
+            {
+              "component": "zh",
+              "difference_to_allowed_ratio": 2.1155970167556774e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "zv",
+              "difference_to_allowed_ratio": 6.857740504895602e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_real",
+              "difference_to_allowed_ratio": 4.484778156811592e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_imaginary",
+              "difference_to_allowed_ratio": 5.046042887865819e-12,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "kdp",
+              "difference_to_allowed_ratio": 0.5368017527365723,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "ah",
+              "difference_to_allowed_ratio": 9.80979446353486e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "av",
+              "difference_to_allowed_ratio": 6.953446367387644e-08,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_first_moment",
+              "difference_to_allowed_ratio": 2.1155970750807784e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_second_moment",
+              "difference_to_allowed_ratio": 2.1155970552549532e-06,
+              "within_predeclared_tolerance": true
+            }
+          ],
+          "lower_ndgs": 14,
+          "upper_ndgs": 16,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "comparisons": [
+            {
+              "component": "zh",
+              "difference_to_allowed_ratio": 9.516408980127034e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "zv",
+              "difference_to_allowed_ratio": 4.575742392208103e-05,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_real",
+              "difference_to_allowed_ratio": 1.8122559664996046e-05,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_imaginary",
+              "difference_to_allowed_ratio": 8.149134903360106e-09,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "kdp",
+              "difference_to_allowed_ratio": 1.898622317998846,
+              "within_predeclared_tolerance": false
+            },
+            {
+              "component": "ah",
+              "difference_to_allowed_ratio": 1.0704743067374173e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "av",
+              "difference_to_allowed_ratio": 1.2333620016371435e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_first_moment",
+              "difference_to_allowed_ratio": 9.516408959920841e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_second_moment",
+              "difference_to_allowed_ratio": 9.516408953402067e-06,
+              "within_predeclared_tolerance": true
+            }
+          ],
+          "lower_ndgs": 16,
+          "upper_ndgs": 20,
+          "within_predeclared_tolerance": false
+        }
+      ],
+      "values_by_ndgs": {
+        "12": [
+          309.1059230740412,
+          311.24111008708803,
+          310.1711362961019,
+          -0.03891152437955919,
+          4.990142247422484e-07,
+          2.785718634300393e-06,
+          3.5039052648781403e-06,
+          178.51086841963115,
+          103.09129578308942
+        ],
+        "14": [
+          309.1059244767606,
+          311.2411219112166,
+          310.1711428946572,
+          -0.03891152242426717,
+          5.003514120992025e-07,
+          2.7857186418776295e-06,
+          3.5039052633644878e-06,
+          178.51086922971157,
+          103.09129625091663
+        ],
+        "16": [
+          309.1059251307042,
+          311.2411240456275,
+          310.17114428570596,
+          -0.03891152242270203,
+          5.006206829610249e-07,
+          2.785718639143916e-06,
+          3.503905263120776e-06,
+          178.51086960736865,
+          103.09129646901627
+        ],
+        "20": [
+          309.1059280722826,
+          311.24110980403543,
+          310.17113866461085,
+          -0.03891152495032855,
+          4.996682947371853e-07,
+          2.785718636160805e-06,
+          3.503905267443593e-06,
+          178.5108713061511,
+          103.09129745007522
+        ]
+      }
+    },
+    {
+      "coordinates": {
+        "bulk_density": 1.6055648176571813,
+        "equivolume_diameter": 0.0361256265495798,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 230.0
+      },
+      "transitions": [
+        {
+          "comparisons": [
+            {
+              "component": "zh",
+              "difference_to_allowed_ratio": 7.132267987198208e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "zv",
+              "difference_to_allowed_ratio": 3.921833633876253e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_real",
+              "difference_to_allowed_ratio": 5.5271477966750464e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_imaginary",
+              "difference_to_allowed_ratio": 5.38580968904385e-09,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "kdp",
+              "difference_to_allowed_ratio": 1.5717221874666276,
+              "within_predeclared_tolerance": false
+            },
+            {
+              "component": "ah",
+              "difference_to_allowed_ratio": 2.2100347079274194e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "av",
+              "difference_to_allowed_ratio": 9.54788563375849e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_first_moment",
+              "difference_to_allowed_ratio": 7.132268039435505e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_second_moment",
+              "difference_to_allowed_ratio": 7.13226812955318e-06,
+              "within_predeclared_tolerance": true
+            }
+          ],
+          "lower_ndgs": 12,
+          "upper_ndgs": 14,
+          "within_predeclared_tolerance": false
+        },
+        {
+          "comparisons": [
+            {
+              "component": "zh",
+              "difference_to_allowed_ratio": 2.713151683247785e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "zv",
+              "difference_to_allowed_ratio": 2.1513941081207544e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_real",
+              "difference_to_allowed_ratio": 2.8139057185423433e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_imaginary",
+              "difference_to_allowed_ratio": 6.809158824073096e-09,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "kdp",
+              "difference_to_allowed_ratio": 0.8539777883358922,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "ah",
+              "difference_to_allowed_ratio": 1.2120832536613103e-08,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "av",
+              "difference_to_allowed_ratio": 9.913445640979268e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_first_moment",
+              "difference_to_allowed_ratio": 2.7131516403938627e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_second_moment",
+              "difference_to_allowed_ratio": 2.7131516586918573e-06,
+              "within_predeclared_tolerance": true
+            }
+          ],
+          "lower_ndgs": 14,
+          "upper_ndgs": 16,
+          "within_predeclared_tolerance": true
+        },
+        {
+          "comparisons": [
+            {
+              "component": "zh",
+              "difference_to_allowed_ratio": 1.920890022677653e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "zv",
+              "difference_to_allowed_ratio": 3.6153588027082717e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_real",
+              "difference_to_allowed_ratio": 7.805895725091234e-07,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "hh_vv_covariance_imaginary",
+              "difference_to_allowed_ratio": 7.386497498785877e-11,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "kdp",
+              "difference_to_allowed_ratio": 0.06526037127590173,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "ah",
+              "difference_to_allowed_ratio": 1.1059337636157858e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "av",
+              "difference_to_allowed_ratio": 1.1336923256819497e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_first_moment",
+              "difference_to_allowed_ratio": 1.920890023163663e-06,
+              "within_predeclared_tolerance": true
+            },
+            {
+              "component": "fall_speed_second_moment",
+              "difference_to_allowed_ratio": 1.920889961947233e-06,
+              "within_predeclared_tolerance": true
+            }
+          ],
+          "lower_ndgs": 16,
+          "upper_ndgs": 20,
+          "within_predeclared_tolerance": true
+        }
+      ],
+      "values_by_ndgs": {
+        "12": [
+          315.34843844058923,
+          317.53355913080463,
+          316.43855870010293,
+          -0.04010186603227198,
+          -1.807849641489088e-07,
+          3.007577368188035e-06,
+          3.7404521164244533e-06,
+          182.11596543014187,
+          105.17326494008009
+        ],
+        "14": [
+          315.3484406897388,
+          317.53356037611843,
+          316.43856044910564,
+          -0.0401018643279941,
+          -1.8049924868740814e-07,
+          3.0075773675231288e-06,
+          3.7404521521474105e-06,
+          182.11596672904176,
+          105.17326569020402
+        ],
+        "16": [
+          315.348441545327,
+          317.5335596929786,
+          316.43856053814847,
+          -0.04010186648267453,
+          -1.8065437749093938e-07,
+          3.0075773674866623e-06,
+          3.740452115056728e-06,
+          182.11596722315,
+          105.17326597555504
+        ],
+        "20": [
+          315.34844215107665,
+          317.5335595781788,
+          316.4385607851571,
+          -0.04010186650604826,
+          -1.8066623309675957e-07,
+          3.0075773708139496e-06,
+          3.7404521108150724e-06,
+          182.11596757297474,
+          105.17326617758131
+        ]
+      }
+    }
+  ],
+  "production_validation": false,
+  "relative_tolerance": 0.001,
+  "report_id": "pytmatrix-0.3.3-rejected-dry-prolate-higher-order-probe-v1",
+  "schema": 1,
+  "scientifically_independent": false,
+  "source_hashes": {
+    "environment": "febf88d918b623f29415c0662b557363de59187b79c58ac9cb3d3664523e4789",
+    "failure": "8b4b524344e29fe596a3f725db5fa1d8605136ae97b3d673097f3cf0f67d83c3",
+    "generator": "fa6c44c1f1b2c7bf4a1b194a8e8e11d0044c5f726f562e0321e2ed7f78a60f5f",
+    "probe": "8c8b094a639059f0684978439118945841fe7d27a42c252e4c8afe8693c2509a"
+  }
+}

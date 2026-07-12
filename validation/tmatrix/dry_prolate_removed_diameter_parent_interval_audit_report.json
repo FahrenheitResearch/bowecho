@@ -1,0 +1,1351 @@
+{
+  "absolute_floor": 1e-12,
+  "classification": "grid_design_not_final_held_out_validation",
+  "component_comparison_count": 20160,
+  "component_failure_count": 2195,
+  "config_sha256": "9a81e1a8d5461d788f0fcbbcd8106f9423feff01848ff52f9dcf5fb6cc2e54d8",
+  "effective_worker_count": 12,
+  "lower_diameter_m": 0.03231174267785264,
+  "material_group_count": 112,
+  "production_validation": false,
+  "raw_linear_fraction": 0.4721359549995799,
+  "recorded_failure_limit": 100,
+  "recorded_failures": [
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.28564571757998763,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.7730856624016621,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.2765560601425226,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 1.7338424473663019,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.25554273556424184,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 711.5354260820327,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.24723032411350315,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 11.73104865612195,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.2873794632234778,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48105835738445596,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48103783105180864,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4800233795779218,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.47590520633696254,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4609605370836143,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48462353838264016,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4846200232617461,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4842286723270506,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48258470245263424,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4765395906396877,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.28564549663838246,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.6603295631012356,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.27655578984769863,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 1.3779313775269597,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.25554240484145174,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 11.338837299098573,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.24723035245106287,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 116.13413352239449,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.28737975931431325,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4809904640363935,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4809699285346332,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.47995554537797697,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.47583773735082147,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.46089450457951997,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48451059460205265,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4845070807401991,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4841157674216356,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48247194939641547,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.6055648176571813,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4764273821810367,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.28564492108492506,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.5513807781580999,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.27655514359302485,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 1.0764041334351666,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.25554166862504707,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 4.823144992747527,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.24723010621142152,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 10.34295314809995,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.28737988994678676,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48089369828531653,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4808731501412134,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4798588606853707,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4757415543846123,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.46080029750442997,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48434890003345415,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48434538759918117,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4839541211879355,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48231049319004266,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.7516530197761586,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.47626660403993387,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.28564453966419145,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4515916954542032,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.2765546658582774,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.8303285371879282,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.2555410701897419,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 2.701474745907607,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.24723018922118847,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 4.153011100512972,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.2873804874112351,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48076156174408435,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4807409960470046,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.47972683973383995,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.47561024313578687,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.46067178008361676,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4841294185653717,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4841259083754737,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4837347086654223,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4820913497198209,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.9538204015989735,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4760484229994872,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.2856437606313365,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.364048949229329,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.27655375223717815,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.6348788223298498,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.25553998661621363,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 1.6894300535364075,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.24723004727440584,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 2.2864581344415815,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.28738106658965373,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48057611582788823,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48055552592672907,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4795415503926594,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4754259200227862,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.4,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.46049125968201465,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48383395523222505,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48383044813989573,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48343934898470436,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 10.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4817963975489225,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.233594193597626,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 20.0,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.4757549318126592,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.620765328642081,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.28564297550890355,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.620765328642081,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": -0.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.29044829966005875,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.620765328642081,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.2765527841980105,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.620765328642081,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 0.9,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.48334379364909713,
+      "within_axis_budget": false
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 2.620765328642081,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 0.2555387907756034,
+      "within_axis_budget": false
+    }
+  ],
+  "relative_budgets": {
+    "ah": 0.15,
+    "av": 0.15,
+    "fall_speed_first_moment": 0.2,
+    "fall_speed_second_moment": 0.2,
+    "hh_vv_covariance_imaginary": 0.15,
+    "hh_vv_covariance_real": 0.15,
+    "kdp": 0.15,
+    "zh": 0.15,
+    "zv": 0.15
+  },
+  "removed_diameter_m": 0.0361256265495798,
+  "removed_node_audit_passed": false,
+  "report_id": "pytmatrix-0.3.3-dry-prolate-removed-diameter-parent-cell-v1",
+  "sample_count": 2240,
+  "schema": 1,
+  "scientifically_independent": false,
+  "selection_protocol": "The inserted diameter node is treated as an off-grid direct point. Raw-linear interpolation from its two retained parent endpoints is checked at every declared temperature, density, shape, frequency, and radar-view state with the unchanged 15 percent scattering and 20 percent fall-moment budgets.",
+  "source_hashes": {
+    "audit": "cdab0de3028d6be1c083f33a9d8e8fb3578dfa1606a3cddeea35f6fc4cc83de1",
+    "config": "9a81e1a8d5461d788f0fcbbcd8106f9423feff01848ff52f9dcf5fb6cc2e54d8",
+    "environment": "febf88d918b623f29415c0662b557363de59187b79c58ac9cb3d3664523e4789",
+    "generator": "5eafc20882fdfa46951bbc52a216f4a4513ec9c25f467c7aac77a082da24e9c9"
+  },
+  "upper_diameter_m": 0.0403896783473158,
+  "worker_limit": 12,
+  "worst_by_component": [
+    {
+      "component": "zh",
+      "coordinates_without_diameter": {
+        "bulk_density": 100.0,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 273.15
+      },
+      "relative_error_with_absolute_floor": 0.12091002575650996,
+      "within_axis_budget": true
+    },
+    {
+      "component": "zv",
+      "coordinates_without_diameter": {
+        "bulk_density": 302.8808462808638,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 273.15
+      },
+      "relative_error_with_absolute_floor": 0.1261728341035088,
+      "within_axis_budget": true
+    },
+    {
+      "component": "hh_vv_covariance_real",
+      "coordinates_without_diameter": {
+        "bulk_density": 302.8808462808638,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 273.15
+      },
+      "relative_error_with_absolute_floor": 0.121795226775273,
+      "within_axis_budget": true
+    },
+    {
+      "component": "hh_vv_covariance_imaginary",
+      "coordinates_without_diameter": {
+        "bulk_density": 100.0,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 1.0,
+        "radar_elevation": 10.0,
+        "temperature": 230.0
+      },
+      "relative_error_with_absolute_floor": 180.64215682076326,
+      "within_axis_budget": false
+    },
+    {
+      "component": "kdp",
+      "coordinates_without_diameter": {
+        "bulk_density": 1.5,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 4.5,
+        "temperature": 190.0
+      },
+      "relative_error_with_absolute_floor": 711.5354260820327,
+      "within_axis_budget": false
+    },
+    {
+      "component": "ah",
+      "coordinates_without_diameter": {
+        "bulk_density": 917.0,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 1.0,
+        "radar_elevation": -0.5,
+        "temperature": 273.15
+      },
+      "relative_error_with_absolute_floor": 0.14335572223636678,
+      "within_axis_budget": true
+    },
+    {
+      "component": "av",
+      "coordinates_without_diameter": {
+        "bulk_density": 917.0,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 1.0,
+        "radar_elevation": -0.5,
+        "temperature": 273.15
+      },
+      "relative_error_with_absolute_floor": 0.1433557222363666,
+      "within_axis_budget": true
+    },
+    {
+      "component": "fall_speed_first_moment",
+      "coordinates_without_diameter": {
+        "bulk_density": 100.0,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 273.15
+      },
+      "relative_error_with_absolute_floor": 0.1505500635880192,
+      "within_axis_budget": true
+    },
+    {
+      "component": "fall_speed_second_moment",
+      "coordinates_without_diameter": {
+        "bulk_density": 100.0,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.1,
+        "radar_elevation": 20.0,
+        "temperature": 273.15
+      },
+      "relative_error_with_absolute_floor": 0.18377161700764028,
+      "within_axis_budget": true
+    }
+  ]
+}
