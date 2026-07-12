@@ -1731,13 +1731,18 @@ pub fn builtin_generic_table() -> ColorTable {
     .expect("built-in generic color table is valid")
 }
 
-/// Purpose-built validation palette for a BowEcho synthetic-radar diagnostic
-/// moment. These fields deliberately bypass the user-facing radar-family
-/// bindings: a 0..1 quality fraction must never inherit the Generic 0..100
-/// scale, and a signed synthetic-minus-observed residual must always retain a
-/// visually neutral zero.
+/// Purpose-built palette resolver for a BowEcho synthetic-radar diagnostic
+/// moment. Instrument stages retain their canonical moment palette, while a
+/// 0..1 quality fraction must never inherit the Generic 0..100 scale and a
+/// signed synthetic-minus-observed residual must always retain a neutral zero.
 pub fn validation_table_for_moment_id(moment_id: &str) -> Option<ColorTable> {
     Some(match moment_id.trim().to_ascii_uppercase().as_str() {
+        "IREF" | "MREF" => builtin_reflectivity_table(),
+        "IVEL" | "MVEL" => builtin_velocity_table(),
+        "ISW" | "MSW" => builtin_spectrum_width_table(),
+        "IZDR" | "MZDR" => builtin_differential_reflectivity_table(),
+        "IRHO" | "MRHO" => builtin_correlation_coefficient_table(),
+        "IKDP" | "MKDP" => builtin_specific_differential_phase_table(),
         "MCOV" | "TUNB" | "MSIG" => builtin_quality_fraction_table(),
         "DIF_REF" => validation_difference_table("Reflectivity difference", 5.0, 15.0, 40.0),
         "DIF_VEL" => validation_difference_table("Velocity difference", 3.0, 12.0, 35.0),
@@ -4375,6 +4380,21 @@ mod export_tests {
             let resolved = validation_table_for_moment_id(id).expect("quality palette");
             assert_eq!(resolved.stops().first().unwrap().value, 0.0);
             assert_eq!(resolved.stops().last().unwrap().value, 1.0);
+        }
+    }
+
+    #[test]
+    fn instrument_stage_diagnostics_reuse_their_physical_moment_palettes() {
+        for (stage, canonical) in [
+            ("IREF", builtin_reflectivity_table()),
+            ("MVEL", builtin_velocity_table()),
+            ("ISW", builtin_spectrum_width_table()),
+            ("MZDR", builtin_differential_reflectivity_table()),
+            ("IRHO", builtin_correlation_coefficient_table()),
+            ("MKDP", builtin_specific_differential_phase_table()),
+        ] {
+            let resolved = validation_table_for_moment_id(stage).expect("stage palette");
+            assert_eq!(resolved.stops(), canonical.stops(), "{stage}");
         }
     }
 

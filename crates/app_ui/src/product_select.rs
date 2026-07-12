@@ -68,16 +68,28 @@ fn picker_product_rank(product: &DisplayProduct) -> (u16, &str) {
         DisplayProduct::Derived(DerivedProduct::AzimuthalShear) => 160,
         DisplayProduct::Derived(DerivedProduct::Divergence) => 161,
         DisplayProduct::Moment(MomentType::Unknown(name)) => match name.as_str() {
-            "MCOV" => 90,
-            "TUNB" => 91,
-            "MSIG" => 92,
-            "DIF_REF" => 93,
-            "DIF_VEL" => 94,
-            "DIF_SW" => 95,
-            "DIF_ZDR" => 96,
-            "DIF_RHO" => 97,
-            "DIF_PHI" => 98,
-            "DIF_KDP" => 99,
+            "IREF" => 81,
+            "IVEL" => 82,
+            "ISW" => 83,
+            "IZDR" => 84,
+            "IRHO" => 85,
+            "IKDP" => 86,
+            "MREF" => 87,
+            "MVEL" => 88,
+            "MSW" => 89,
+            "MZDR" => 90,
+            "MRHO" => 91,
+            "MKDP" => 92,
+            "MCOV" => 100,
+            "TUNB" => 101,
+            "MSIG" => 102,
+            "DIF_REF" => 110,
+            "DIF_VEL" => 111,
+            "DIF_SW" => 112,
+            "DIF_ZDR" => 113,
+            "DIF_RHO" => 114,
+            "DIF_PHI" => 115,
+            "DIF_KDP" => 116,
             "PHIF" => 200,
             "KDP_SD" => 201,
             "AH" => 210,
@@ -124,6 +136,18 @@ pub(crate) fn validation_product_label(product: &DisplayProduct) -> Option<&'sta
         return None;
     };
     Some(match name.as_str() {
+        "IREF" => "Ideal reflectivity (IREF)",
+        "IVEL" => "Ideal velocity (IVEL)",
+        "ISW" => "Ideal spectrum width (ISW)",
+        "IZDR" => "Ideal differential reflectivity (IZDR)",
+        "IRHO" => "Ideal correlation coefficient (IRHO)",
+        "IKDP" => "Ideal specific differential phase (IKDP)",
+        "MREF" => "Measured reflectivity (MREF)",
+        "MVEL" => "Measured velocity (MVEL)",
+        "MSW" => "Measured spectrum width (MSW)",
+        "MZDR" => "Measured differential reflectivity (MZDR)",
+        "MRHO" => "Measured correlation coefficient (MRHO)",
+        "MKDP" => "Measured specific differential phase (MKDP)",
         "MCOV" => "Model coverage (MCOV)",
         "TUNB" => "Terrain unblocked (TUNB)",
         "MSIG" => "Meteorological signal (MSIG)",
@@ -146,6 +170,11 @@ pub(crate) fn validation_product_units(product: &DisplayProduct) -> Option<&'sta
         return None;
     };
     Some(match name.as_str() {
+        "IREF" | "MREF" => "dBZ",
+        "IVEL" | "MVEL" | "ISW" | "MSW" => "m/s",
+        "IZDR" | "MZDR" => "dB",
+        "IRHO" | "MRHO" => "fraction",
+        "IKDP" | "MKDP" => "deg/km",
         "MCOV" | "TUNB" | "MSIG" | "DIF_RHO" => "fraction",
         "DIF_REF" => "dBZ",
         "DIF_VEL" | "DIF_SW" => "m/s",
@@ -1371,6 +1400,14 @@ mod tests {
     fn validation_products_have_scientific_labels_units_and_first_class_order() {
         let product = |id: &str| DisplayProduct::Moment(MomentType::Unknown(id.to_owned()));
         assert_eq!(
+            validation_product_label(&product("IREF")),
+            Some("Ideal reflectivity (IREF)")
+        );
+        assert_eq!(
+            validation_product_label(&product("MVEL")),
+            Some("Measured velocity (MVEL)")
+        );
+        assert_eq!(
             validation_product_label(&product("MCOV")),
             Some("Model coverage (MCOV)")
         );
@@ -1379,12 +1416,16 @@ mod tests {
             Some("Reflectivity difference (sim - obs)")
         );
         assert_eq!(validation_product_units(&product("MCOV")), Some("fraction"));
+        assert_eq!(validation_product_units(&product("IRHO")), Some("fraction"));
+        assert_eq!(validation_product_units(&product("MREF")), Some("dBZ"));
         assert_eq!(validation_product_units(&product("DIF_VEL")), Some("m/s"));
         assert_eq!(validation_product_label(&product("OTHER")), None);
 
         let mut products = vec![
             product("DIF_KDP"),
             DisplayProduct::Derived(DerivedProduct::CompositeReflectivity),
+            product("MVEL"),
+            product("IREF"),
             product("MCOV"),
             DisplayProduct::Moment(MomentType::SpecificDifferentialPhase),
             product("DIF_REF"),
@@ -1399,6 +1440,8 @@ mod tests {
             labels,
             vec![
                 "KDP",
+                "Ideal reflectivity (IREF)",
+                "Measured velocity (MVEL)",
                 "Model coverage (MCOV)",
                 "Meteorological signal (MSIG)",
                 "Reflectivity difference (sim - obs)",
