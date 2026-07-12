@@ -532,6 +532,10 @@ impl<K: Eq + Hash, V> TwoSceneCache<K, V> {
             .find_map(|(candidate, value)| (candidate == key).then_some(value))
     }
 
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.iter().map(|(_, value)| value)
+    }
+
     /// Insert/replace and return an evicted oldest scene, if any.
     pub fn insert(&mut self, key: K, value: V) -> Option<(K, V)> {
         if let Some(position) = self

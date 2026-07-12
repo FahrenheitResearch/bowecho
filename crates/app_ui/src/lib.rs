@@ -5,6 +5,7 @@ pub mod wrf_property_reader;
 pub mod wrf_scene_adapter;
 pub mod wrf_scene_inventory;
 pub mod wrf_temporal;
+pub mod wrf_tmatrix_assets;
 pub mod wrf_tmatrix_scene;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

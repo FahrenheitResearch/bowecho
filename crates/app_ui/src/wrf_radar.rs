@@ -53,7 +53,7 @@ use app_ui::vcp_catalog::{
     VcpDefinition, Waveform, build_24_definition,
 };
 use app_ui::wrf_scene_adapter::inventory_selected_wrf_paths;
-use app_ui::wrf_scene_inventory::{WrfScene, WrfSceneGroup, WrfSceneTime};
+use app_ui::wrf_scene_inventory::{WrfScene, WrfSceneGroup, WrfSceneTime, WrfSourceIdentity};
 use app_ui::wrf_temporal::{
     AtmosphereTimeMode, HoldReason, MissingNeighborPolicy, TemporalMemoryEstimate,
     TemporalSamplingOutcome, TemporalScenePlan, TwoSceneCache, plan_for_scene,
@@ -102,6 +102,8 @@ pub const STOELINGA_SOURCE: &str = "dbz/CALCDBZ (Stoelinga)";
 /// Reflectivity source stamped when raw WRF hydrometeors feed the internally
 /// consistent bulk S-band polarimetric scattering state.
 pub const BULK_S_BAND_SOURCE: &str = "scheme-aware bulk S-band ZH (Rayleigh v1)";
+pub const PROPERTY_TMATRIX_S_BAND_SOURCE: &str =
+    "P3/ISHMAEL property-aware S-band T-matrix ZH (research v1)";
 
 /// Which reflectivity operator a synthetic scan uses. Both diagnostics are
 /// legitimate: `REFL_10CM` is the model's own Thompson-native 10-cm
@@ -132,6 +134,19 @@ pub enum ReflectivitySampling {
     LegacyDbz,
     #[default]
     LinearZ,
+}
+
+/// Polarimetric scattering implementation selected for synthetic radar.
+///
+/// The T-matrix variant is intentionally explicit about its evidence status:
+/// its bundled tables are reproducible research assets, not independently
+/// validated operational calibration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolarimetricKernel {
+    #[default]
+    BulkRayleighV1,
+    PropertyTMatrixResearchV1,
 }
 
 /// Deterministic antenna/pulse quadrature. The balanced rule is a symmetric
@@ -292,6 +307,14 @@ pub const UNFOLDED_NYQUIST_MPS: f32 = 320.0;
 /// around here (roughly 8–33 m/s depending on VCP/PRF).
 pub const DEFAULT_FOLD_NYQUIST_MPS: f32 = 25.0;
 
+/// Exact transmit frequency represented by the v0.33.1 property-aware
+/// research T-matrix tables.
+pub const PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ: u32 = 2_800;
+/// View-angle applicability includes every Build-24/optional-cut center plus
+/// the default one-degree beam's ±sigma pulse-volume quadrature offsets.
+pub const PROPERTY_TMATRIX_MIN_VIEW_ELEVATION_DEG: f64 = -0.5;
+pub const PROPERTY_TMATRIX_MAX_VIEW_ELEVATION_DEG: f64 = 20.0;
+
 /// Configuration for one synthetic scan.
 #[derive(Clone, Debug)]
 pub struct SyntheticRadarConfig {
@@ -374,6 +397,10 @@ pub struct SyntheticRadarConfig {
     /// hydrometeors. Unsupported schemes fall back to scalar REF/VEL with an
     /// explicit note instead of fabricating polarimetric fields.
     pub dual_pol: bool,
+    /// Scattering kernel behind dual-pol fields. Research T-matrix mode is
+    /// fail-closed when the file/category/table applicability contract does
+    /// not match exactly; it never silently falls back to Rayleigh.
+    pub polarimetric_kernel: PolarimetricKernel,
     /// Integrate KDP/Ah/Av along each radial into PhiDP and attenuation.
     pub propagation: bool,
     /// Optional synthetic-system calibration offsets.
@@ -465,6 +492,7 @@ impl Default for SyntheticRadarConfig {
             spectrum_width: false,
             spectrum_width_floor_mps: 0.5,
             dual_pol: false,
+            polarimetric_kernel: PolarimetricKernel::BulkRayleighV1,
             propagation: false,
             system_phidp_deg: 0.0,
             zdr_bias_db: 0.0,
@@ -530,6 +558,60 @@ impl SyntheticRadarConfig {
             .collect()
     }
 
+    /// Reject a research-table request before decoding a multi-gigabyte WRF
+    /// scene. These are exact applicability checks, not automatic clamps or
+    /// fallback rules.
+    pub fn validate_science_contract(&self) -> Result<(), String> {
+        if !matches!(
+            self.polarimetric_kernel,
+            PolarimetricKernel::PropertyTMatrixResearchV1
+        ) {
+            return Ok(());
+        }
+        if !self.dual_pol {
+            return Err(
+                "Property T-matrix research mode requires S-band dual polarization".to_string(),
+            );
+        }
+        if self.radar_frequency_mhz != PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ {
+            return Err(format!(
+                "Property T-matrix research mode requires exactly {} MHz, got {} MHz",
+                PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ, self.radar_frequency_mhz,
+            ));
+        }
+        if !matches!(self.reflectivity_sampling, ReflectivitySampling::LinearZ) {
+            return Err("Property T-matrix research mode requires linear-Z sampling".to_string());
+        }
+        let beam_width_deg = f64::from(self.beam_width_deg);
+        if !beam_width_deg.is_finite() || beam_width_deg <= 0.0 {
+            return Err(format!(
+                "Property T-matrix beam width must be finite and positive, got {beam_width_deg}°"
+            ));
+        }
+        let legs = self.physical_scan_legs();
+        if legs.is_empty() {
+            return Err("Property T-matrix scan has no physical cuts".to_string());
+        }
+        let beam_sigma_deg = beam_width_deg / (2.0 * (2.0_f64.ln()).sqrt());
+        for leg in legs {
+            for point in quadrature_points(self.beam_integration) {
+                let view_elevation_deg = leg.elevation_deg + point.el_sigma * beam_sigma_deg;
+                if !(PROPERTY_TMATRIX_MIN_VIEW_ELEVATION_DEG
+                    ..=PROPERTY_TMATRIX_MAX_VIEW_ELEVATION_DEG)
+                    .contains(&view_elevation_deg)
+                {
+                    return Err(format!(
+                        "Property T-matrix view elevation {view_elevation_deg:.3}° for the {:.3}° cut is outside the exact [{:.1}°, {:.1}°] table range; reduce beam width/change cuts or use Bulk Rayleigh",
+                        leg.elevation_deg,
+                        PROPERTY_TMATRIX_MIN_VIEW_ELEVATION_DEG,
+                        PROPERTY_TMATRIX_MAX_VIEW_ELEVATION_DEG,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a coherent named preset while leaving site/range/geometry choices
     /// alone. The UI calls this only when the user selects a different mode;
     /// subsequent expert edits are intentionally preserved.
@@ -543,6 +625,7 @@ impl SyntheticRadarConfig {
                 self.terrain_blockage = false;
                 self.spectrum_width = false;
                 self.dual_pol = false;
+                self.polarimetric_kernel = PolarimetricKernel::BulkRayleighV1;
                 self.propagation = false;
                 self.scan_timing = ScanTiming::InstantaneousTruth;
                 self.atmosphere_time_mode = AtmosphereTimeMode::FrozenAtVolumeStart;
@@ -559,6 +642,7 @@ impl SyntheticRadarConfig {
                 self.terrain_blockage = true;
                 self.spectrum_width = true;
                 self.dual_pol = true;
+                self.polarimetric_kernel = PolarimetricKernel::BulkRayleighV1;
                 self.propagation = true;
                 self.scan_timing = ScanTiming::TimedVolume;
                 self.atmosphere_time_mode = AtmosphereTimeMode::LinearAdjacent;
@@ -575,6 +659,7 @@ impl SyntheticRadarConfig {
                 self.terrain_blockage = false;
                 self.spectrum_width = false;
                 self.dual_pol = false;
+                self.polarimetric_kernel = PolarimetricKernel::BulkRayleighV1;
                 self.propagation = false;
                 self.scan_timing = ScanTiming::InstantaneousTruth;
                 self.atmosphere_time_mode = AtmosphereTimeMode::FrozenAtVolumeStart;
@@ -655,6 +740,7 @@ impl SyntheticRadarConfig {
         self.spectrum_width.hash(&mut hasher);
         self.spectrum_width_floor_mps.to_bits().hash(&mut hasher);
         self.dual_pol.hash(&mut hasher);
+        (self.polarimetric_kernel as u8).hash(&mut hasher);
         self.propagation.hash(&mut hasher);
         self.system_phidp_deg.to_bits().hash(&mut hasher);
         self.zdr_bias_db.to_bits().hash(&mut hasher);
@@ -913,6 +999,11 @@ pub struct WrfRadarFields {
     pub v: Vec<f32>,
     pub w: Vec<f32>,
     pub terrain_m: Vec<f32>,
+    /// Sparse additive scattering precomputed from native P3/ISHMAEL state for
+    /// the opt-in research T-matrix kernel. Raw model-property arrays are
+    /// dropped after closure and LUT evaluation; gate sampling interpolates
+    /// only additive scattering quantities.
+    property_scattering: Option<Arc<app_ui::wrf_tmatrix_scene::WrfTMatrixScene>>,
     /// Compact scheme-aware polarimetric state. Seven one-byte planes and one
     /// signed two-byte KDP plane retain
     /// the ratios/propagation/fall moments while `dbz` remains the full-precision
@@ -1046,6 +1137,10 @@ impl WrfRadarFields {
         self.nx * self.ny
     }
 
+    fn has_polarimetric_input(&self) -> bool {
+        self.polarimetric.is_some() || self.property_scattering.is_some()
+    }
+
     /// Domain-centre grid cell (used for the default antenna position).
     fn center_cell(&self) -> usize {
         (self.ny / 2) * self.nx + (self.nx / 2)
@@ -1091,6 +1186,16 @@ pub fn read_wrf_radar_fields_reporting(
     operator: ReflectivityOperator,
     progress: &dyn Fn(&str),
 ) -> Result<WrfRadarFields, String> {
+    read_wrf_radar_fields_reporting_inner(file, timeidx, operator, progress, true)
+}
+
+fn read_wrf_radar_fields_reporting_inner(
+    file: &WrfFile,
+    timeidx: usize,
+    operator: ReflectivityOperator,
+    progress: &dyn Fn(&str),
+    require_native_reflectivity: bool,
+) -> Result<WrfRadarFields, String> {
     let nx = file.nx;
     let ny = file.ny;
     let nz = file.nz;
@@ -1130,7 +1235,13 @@ pub fn read_wrf_radar_fields_reporting(
     let mut terrain_m: Vec<f32> = Vec::new();
     std::thread::scope(|scope| {
         let th_height = scope.spawn(|| read_3d(file, "height", timeidx, nz * cells));
-        let th_refl = scope.spawn(|| read_reflectivity(file, timeidx, nz * cells, operator));
+        let th_refl = scope.spawn(|| {
+            if require_native_reflectivity {
+                read_reflectivity(file, timeidx, nz * cells, operator)
+            } else {
+                Ok((Vec::new(), PROPERTY_TMATRIX_S_BAND_SOURCE))
+            }
+        });
         let th_winds = scope.spawn(|| read_earth_relative_winds(file, timeidx, nz * cells));
         let th_w = scope.spawn(|| read_3d(file, "wa", timeidx, nz * cells));
         let th_terrain = scope.spawn(|| read_terrain_m(file, timeidx, cells));
@@ -1144,7 +1255,7 @@ pub fn read_wrf_radar_fields_reporting(
 
     let height = height_res?;
     let (dbz, ref_source) = refl_res?;
-    if dbz.iter().all(|value| !value.is_finite()) {
+    if require_native_reflectivity && dbz.iter().all(|value| !value.is_finite()) {
         return Err(format!(
             "WRF reflectivity ({ref_source}) is entirely missing — is this a \
              post-processed/climate wrfout without hydrometeor mixing ratios?"
@@ -1176,6 +1287,7 @@ pub fn read_wrf_radar_fields_reporting(
         v,
         w,
         terrain_m,
+        property_scattering: None,
         polarimetric: None,
         dual_pol_status: None,
         tke_tenths_m2s2: None,
@@ -1190,15 +1302,60 @@ pub fn read_wrf_radar_fields_reporting(
 /// modes add compact microphysical scattering and optional TKE here.
 fn read_wrf_radar_fields_for_config_reporting(
     file: &WrfFile,
+    source_identity: &WrfSourceIdentity,
     timeidx: usize,
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
 ) -> Result<WrfRadarFields, String> {
-    let mut fields =
-        read_wrf_radar_fields_reporting(file, timeidx, config.reflectivity_operator, progress)?;
+    let property_tmatrix = matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    );
+    let mut fields = read_wrf_radar_fields_reporting_inner(
+        file,
+        timeidx,
+        config.reflectivity_operator,
+        progress,
+        !property_tmatrix,
+    )?;
     let expected = fields.nx * fields.ny * fields.nz;
 
-    if config.dual_pol || config.terminal_fall_speed {
+    if property_tmatrix {
+        if !config.dual_pol {
+            return Err(
+                "Property T-matrix research mode requires S-band dual polarization".to_string(),
+            );
+        }
+        progress("reading native P3/ISHMAEL property state…");
+        let property_scene = app_ui::wrf_property_reader::read_wrf_property_scene(
+            file,
+            source_identity.clone(),
+            timeidx,
+        )
+        .map_err(|error| format!("read native P3/ISHMAEL property state: {error}"))?;
+        if property_scene.cell_count() != expected {
+            return Err(format!(
+                "property scene has {} cells, expected {expected}",
+                property_scene.cell_count()
+            ));
+        }
+        let fields_read = property_scene
+            .source_fields()
+            .iter()
+            .map(app_ui::wrf_property_reader::SourceFieldProvenance::source_name)
+            .collect::<Vec<_>>()
+            .join(",");
+        progress("evaluating property T-matrix scene…");
+        let property_scattering =
+            app_ui::wrf_tmatrix_assets::build_embedded_property_tmatrix_scene(&property_scene)
+                .map_err(|error| format!("build property T-matrix scene: {error}"))?;
+        fields.dual_pol_status = Some(format!(
+            "property-aware T-matrix research input (mp_physics={}; raw fields={fields_read})",
+            property_scattering.microphysics_scheme_id(),
+        ));
+        fields.ref_source = PROPERTY_TMATRIX_S_BAND_SOURCE;
+        fields.property_scattering = Some(Arc::new(property_scattering));
+    } else if config.dual_pol || config.terminal_fall_speed {
         progress("deriving scheme-aware hydrometeor scattering…");
         match build_compact_polar_fields(file, timeidx, expected, progress) {
             Ok((polar, bulk_zh_dbz)) => {
@@ -1573,8 +1730,17 @@ pub fn build_synthetic_volume_reporting(
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
 ) -> RadarVolume {
+    try_build_synthetic_volume_reporting(fields, valid_time, config, progress)
+        .expect("validated single-scene synthetic-radar render")
+}
+
+fn try_build_synthetic_volume_reporting(
+    fields: &WrfRadarFields,
+    valid_time: DateTime<Utc>,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+) -> Result<RadarVolume, String> {
     build_synthetic_volume_reporting_inner(fields, valid_time, config, progress, None)
-        .expect("a frozen single-scene render has no temporal failure path")
 }
 
 struct TemporalRenderContext<'a> {
@@ -1606,6 +1772,7 @@ fn build_synthetic_volume_reporting_inner(
     progress: &dyn Fn(&str),
     temporal: Option<TemporalRenderContext<'_>>,
 ) -> Result<RadarVolume, String> {
+    config.validate_science_contract()?;
     let cells = fields.cells();
     let center = fields.center_cell();
     let site_lat = config
@@ -1646,9 +1813,22 @@ fn build_synthetic_volume_reporting_inner(
     let mut volume = RadarVolume::new(site, valid_time);
     let scan_legs = config.physical_scan_legs();
     let microphysics_inventory = fields
-        .polarimetric
+        .property_scattering
         .as_ref()
-        .map(|polar| polar.present_fields.join(","))
+        .map(|scene| {
+            scene
+                .source_fields()
+                .iter()
+                .map(app_ui::wrf_property_reader::SourceFieldProvenance::source_name)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .or_else(|| {
+            fields
+                .polarimetric
+                .as_ref()
+                .map(|polar| polar.present_fields.join(","))
+        })
         .unwrap_or_default();
     let named_vcp = config.scan_strategy.definition();
     if let Some(definition) = named_vcp {
@@ -1658,7 +1838,7 @@ fn build_synthetic_volume_reporting_inner(
     }
     let mut forward_operator_config = format!(
         "mode={:?}; reflectivity_sampling={:?}; beam_integration={:?}; \
-         fall_speed={}; terrain_blockage={}; spectrum_width={}; dual_pol={}; \
+         fall_speed={}; terrain_blockage={}; spectrum_width={}; dual_pol={}; polarimetric_kernel={:?}; \
          propagation={}; microphysics_fields={microphysics_inventory}",
         config.simulation_mode,
         config.reflectivity_sampling,
@@ -1667,6 +1847,7 @@ fn build_synthetic_volume_reporting_inner(
         config.terrain_blockage,
         config.spectrum_width,
         config.dual_pol,
+        config.polarimetric_kernel,
         config.propagation,
     );
     if let Some(definition) = named_vcp {
@@ -1679,6 +1860,36 @@ fn build_synthetic_volume_reporting_inner(
             definition.source.revision,
             definition.rows.len(),
             config.data_fingerprint(),
+        );
+    }
+    if let Some(scene) = fields.property_scattering.as_deref() {
+        use std::fmt::Write as _;
+        let provenance = scene.provenance();
+        let tables = provenance
+            .tables
+            .iter()
+            .map(|table| format!("{}={}@{}", table.role, table.table_id, table.file_sha256))
+            .collect::<Vec<_>>()
+            .join(",");
+        let counts = provenance.counts;
+        let _ = write!(
+            forward_operator_config,
+            "; tmatrix_status={}; tmatrix_frequency_hz={:.0}; tmatrix_orientation={:?}; \
+             tmatrix_rain_mode={:?}; tmatrix_fall_policy_closed={:?}; \
+             tmatrix_fall_policy_wet={:?}; tmatrix_tables={tables}; \
+             tmatrix_populations=source_cells:{},dry_frozen:{},wet_frozen:{},residual_rain:{},standalone_rain:{}; \
+             tmatrix_interpolation=source_cell_closure_then_additive_space_beam_and_time",
+            provenance.status,
+            provenance.frequency_hz,
+            provenance.orientation,
+            provenance.rain_mode,
+            provenance.fall_moment_policy.closed_category,
+            provenance.fall_moment_policy.diagnostic_wet_category,
+            counts.source_cells,
+            counts.dry_frozen_populations,
+            counts.wet_frozen_populations,
+            counts.residual_rain_populations,
+            counts.standalone_rain_populations,
         );
     }
     volume.metadata = VolumeMetadata {
@@ -1740,7 +1951,7 @@ fn build_synthetic_volume_reporting_inner(
         scan_legs: named_vcp
             .map(|_| scan_legs.iter().map(scan_leg_metadata).collect())
             .unwrap_or_default(),
-        polarization: Some(if config.dual_pol && fields.polarimetric.is_some() {
+        polarization: Some(if config.dual_pol && fields.has_polarimetric_input() {
             "simultaneous horizontal/vertical".to_string()
         } else {
             "horizontal".to_string()
@@ -1749,19 +1960,32 @@ fn build_synthetic_volume_reporting_inner(
             "ZDR bias={:.2} dB; system PhiDP={:.2} deg",
             config.zdr_bias_db, config.system_phidp_deg
         )),
-        forward_operator: Some("BowEcho WRF polar-volume forward operator v2".to_string()),
+        forward_operator: Some("BowEcho WRF polar-volume forward operator v3".to_string()),
         forward_operator_config: Some(forward_operator_config),
         source_model: Some("WRF".to_string()),
         microphysics_scheme: fields
-            .polarimetric
+            .property_scattering
             .as_ref()
-            .map(|polar| format!("{} ({:?})", polar.profile.name, polar.profile.capability)),
-        scattering_model: (config.dual_pol && fields.polarimetric.is_some()).then(|| {
-            format!(
-                "{} (scheme-aware bulk S-band Rayleigh; not T-matrix)",
-                crate::wrf_radar_physics::bulk_sband_model_id()
-            )
-        }),
+            .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
+            .or_else(|| {
+                fields
+                    .polarimetric
+                    .as_ref()
+                    .map(|polar| format!("{} ({:?})", polar.profile.name, polar.profile.capability))
+            }),
+        scattering_model: if config.dual_pol && fields.has_polarimetric_input() {
+            Some(match config.polarimetric_kernel {
+                PolarimetricKernel::BulkRayleighV1 => format!(
+                    "{} (scheme-aware bulk S-band Rayleigh; not T-matrix)",
+                    crate::wrf_radar_physics::bulk_sband_model_id()
+                ),
+                PolarimetricKernel::PropertyTMatrixResearchV1 => {
+                    "PyTMatrix 0.3.3 property-aware characteristic-particle LUT v1 (research_only_unvalidated; not PSD-integrated)".to_string()
+                }
+            })
+        } else {
+            None
+        },
     };
 
     // One deterministic seed per forecast frame, folded into every clutter
@@ -2050,7 +2274,7 @@ fn sample_gate(
     spacing_m: f64,
     config: &SyntheticRadarConfig,
     terrain_horizon: Option<&TerrainHorizon>,
-) -> Option<GatePhysicalSample> {
+) -> Result<Option<GatePhysicalSample>, String> {
     let beam_sigma_deg = f64::from(config.beam_width_deg.max(0.05)) / (2.0 * (2.0_f64.ln()).sqrt());
     let points = quadrature_points(config.beam_integration);
     let mut valid_weight = 0.0f64;
@@ -2081,8 +2305,10 @@ fn sample_gate(
             lat as f32,
             lon as f32,
             z_msl as f32,
+            elevation_deg,
             config.reflectivity_sampling,
-        ) else {
+        )?
+        else {
             continue;
         };
         valid_weight += point.weight;
@@ -2134,7 +2360,7 @@ fn sample_gate(
     }
 
     if valid_weight <= 0.0 || signal_weight <= 0.0 || sum_z <= 0.0 {
-        return None;
+        return Ok(None);
     }
     // Missing model-domain quadrature points are renormalized away. Terrain-
     // blocked points remain in `valid_weight` but contribute no signal, so
@@ -2152,12 +2378,12 @@ fn sample_gate(
     } else {
         0.0
     };
-    Some(GatePhysicalSample {
+    Ok(Some(GatePhysicalSample {
         z_linear,
         velocity_mps: velocity as f32,
         spectrum_width_mps: (variance + floor * floor).sqrt() as f32,
         polar: polar.take(),
-    })
+    }))
 }
 
 struct CutMomentRow {
@@ -2322,7 +2548,7 @@ fn build_cut(
     // `gate_count` VEL f32 values (NaN = no data / below floor / off-domain).
     let rows: Vec<CutMomentRow> = ray_plan
         .par_iter()
-        .map(|ray| {
+        .map(|ray| -> Result<CutMomentRow, String> {
             let iaz = ray.source_index;
             let az_deg = f64::from(ray.azimuth_deg);
             let mut row = CutMomentRow::blank(gate_count);
@@ -2353,7 +2579,8 @@ fn build_cut(
                     spacing,
                     config,
                     terrain_horizon,
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 // Reflectivity gate texture (default ON): perturb BEFORE the
@@ -2514,9 +2741,9 @@ fn build_cut(
                     row.zdr_corrected[gate] = intrinsic_zdr;
                 }
             }
-            row
+            Ok(row)
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut cut = ElevationCut::new(elevation_deg as f32, u8::try_from(cut_index + 1).ok());
     let mut ref_values = Vec::with_capacity(naz * gate_count);
@@ -2590,7 +2817,7 @@ fn build_cut(
             ),
         );
     }
-    if config.dual_pol && fields.polarimetric.is_some() && scan_leg.moments.has_reflectivity() {
+    if config.dual_pol && fields.has_polarimetric_input() && scan_leg.moments.has_reflectivity() {
         let polar_moments = [
             (MomentType::DifferentialReflectivity, zdr_values),
             (MomentType::CorrelationCoefficient, rho_values),
@@ -2655,18 +2882,64 @@ fn sample_column_temporal(
     lat: f32,
     lon: f32,
     z_msl: f32,
+    beam_elevation_deg: f64,
     reflectivity_sampling: ReflectivitySampling,
-) -> Option<ColumnSample> {
-    if alpha <= 0.0 || neighbor_fields.is_none() {
-        return sample_column(fields, cells, lat, lon, z_msl, reflectivity_sampling);
+) -> Result<Option<ColumnSample>, String> {
+    if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+        return Err(format!(
+            "temporal atmosphere weight {alpha} is outside the closed [0,1] interval"
+        ));
     }
-    let neighbor = neighbor_fields?;
+    if alpha <= 0.0 {
+        return sample_column(
+            fields,
+            cells,
+            lat,
+            lon,
+            z_msl,
+            beam_elevation_deg,
+            reflectivity_sampling,
+        );
+    }
+    let neighbor = neighbor_fields.ok_or_else(|| {
+        "temporal sampling has a positive atmosphere weight but no adjacent WRF scene".to_string()
+    })?;
     if alpha >= 1.0 {
-        return sample_column(neighbor, cells, lat, lon, z_msl, reflectivity_sampling);
+        return sample_column(
+            neighbor,
+            cells,
+            lat,
+            lon,
+            z_msl,
+            beam_elevation_deg,
+            reflectivity_sampling,
+        );
     }
-    let left = sample_column(fields, cells, lat, lon, z_msl, reflectivity_sampling)?;
-    let right = sample_column(neighbor, cells, lat, lon, z_msl, reflectivity_sampling)?;
-    Some(blend_column_samples(left, right, alpha as f32))
+    let Some(left) = sample_column(
+        fields,
+        cells,
+        lat,
+        lon,
+        z_msl,
+        beam_elevation_deg,
+        reflectivity_sampling,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(right) = sample_column(
+        neighbor,
+        cells,
+        lat,
+        lon,
+        z_msl,
+        beam_elevation_deg,
+        reflectivity_sampling,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(blend_column_samples(left, right, alpha as f32)))
 }
 
 /// Blend quantities that remain linear/additive through the radar operator.
@@ -2720,6 +2993,22 @@ fn intrinsic_as_contribution(
     }
 }
 
+fn tmatrix_as_contribution(
+    sample: radar_scattering::PolarAccumulatorQuantities,
+) -> crate::wrf_radar_physics::BulkContribution {
+    crate::wrf_radar_physics::BulkContribution {
+        zh: sample.zh,
+        zv: sample.zv,
+        cov_re: sample.cov_re,
+        cov_im: sample.cov_im,
+        kdp_deg_km: sample.kdp_deg_km,
+        ah_db_km: sample.ah_db_km,
+        av_db_km: sample.av_db_km,
+        fall_speed_mps: sample.fall_speed_mps,
+        fall_speed_variance_m2s2: sample.fall_speed_variance_m2s2,
+    }
+}
+
 fn normalize_intrinsic(
     mut sample: crate::wrf_radar_physics::IntrinsicPolarSample,
     divisor: f32,
@@ -2748,9 +3037,12 @@ fn sample_column(
     lat: f32,
     lon: f32,
     z_msl: f32,
+    beam_elevation_deg: f64,
     reflectivity_sampling: ReflectivitySampling,
-) -> Option<ColumnSample> {
-    let stencil = horizontal_stencil(fields, lat, lon)?;
+) -> Result<Option<ColumnSample>, String> {
+    let Some(stencil) = horizontal_stencil(fields, lat, lon) else {
+        return Ok(None);
+    };
 
     let mut wsum = 0.0f32;
     let mut reflectivity = 0.0f32;
@@ -2759,6 +3051,7 @@ fn sample_column(
     let mut w = 0.0f32;
     let mut tke = 0.0f32;
     let mut polar_accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+    let property_scattering = fields.property_scattering.as_deref();
     for (col, weight) in stencil {
         if weight <= 0.0 {
             continue;
@@ -2768,14 +3061,6 @@ fn sample_column(
         };
         let i0 = k * cells + col;
         let i1 = (k + 1) * cells + col;
-        let Some(d) = (match reflectivity_sampling {
-            ReflectivitySampling::LegacyDbz => lerp(fields.dbz[i0], fields.dbz[i1], t),
-            ReflectivitySampling::LinearZ => {
-                lerp(dbz_to_z(fields.dbz[i0]), dbz_to_z(fields.dbz[i1]), t)
-            }
-        }) else {
-            continue;
-        };
         let (Some(su), Some(sv), Some(sw)) = (
             lerp(fields.u[i0], fields.u[i1], t),
             lerp(fields.v[i0], fields.v[i1], t),
@@ -2783,7 +3068,39 @@ fn sample_column(
         ) else {
             continue;
         };
-        if let Some(polar) = &fields.polarimetric {
+
+        let d = if let Some(property) = property_scattering {
+            let mut vertical = crate::wrf_radar_physics::PolarAccumulator::default();
+            if let Some(lower) = property
+                .polar_at(i0, beam_elevation_deg)
+                .map_err(|error| format!("query lower property T-matrix cell {i0}: {error}"))?
+            {
+                vertical.add(1.0 - t, tmatrix_as_contribution(lower));
+            }
+            if let Some(upper) = property
+                .polar_at(i1, beam_elevation_deg)
+                .map_err(|error| format!("query upper property T-matrix cell {i1}: {error}"))?
+            {
+                vertical.add(t, tmatrix_as_contribution(upper));
+            }
+            let sample = vertical.finalize();
+            polar_accumulator.add(weight, intrinsic_as_contribution(sample));
+            sample.zh
+        } else {
+            let Some(d) = (match reflectivity_sampling {
+                ReflectivitySampling::LegacyDbz => lerp(fields.dbz[i0], fields.dbz[i1], t),
+                ReflectivitySampling::LinearZ => {
+                    lerp(dbz_to_z(fields.dbz[i0]), dbz_to_z(fields.dbz[i1]), t)
+                }
+            }) else {
+                continue;
+            };
+            d
+        };
+
+        if property_scattering.is_none()
+            && let Some(polar) = &fields.polarimetric
+        {
             let mut vertical = crate::wrf_radar_physics::PolarAccumulator::default();
             vertical.add(1.0 - t, polar.contribution_at(i0, dbz_to_z(fields.dbz[i0])));
             vertical.add(t, polar.contribution_at(i1, dbz_to_z(fields.dbz[i1])));
@@ -2801,25 +3118,27 @@ fn sample_column(
         w += weight * sw;
     }
     if wsum <= 0.0 {
-        return None;
+        return Ok(None);
     }
     let reflectivity = reflectivity / wsum;
     let z_linear = match reflectivity_sampling {
         ReflectivitySampling::LegacyDbz => dbz_to_z(reflectivity),
         ReflectivitySampling::LinearZ => reflectivity,
     };
-    let polar = fields.polarimetric.as_ref().and_then(|_| {
-        let sample = normalize_intrinsic(polar_accumulator.finalize(), wsum);
-        (sample.zh > 0.0).then_some(sample)
-    });
-    Some(ColumnSample {
+    let polar = (fields.polarimetric.is_some() || property_scattering.is_some())
+        .then(|| {
+            let sample = normalize_intrinsic(polar_accumulator.finalize(), wsum);
+            sample
+        })
+        .filter(|sample| sample.zh > 0.0);
+    Ok(Some(ColumnSample {
         z_linear: polar.map_or(z_linear, |sample| sample.zh),
         u: u / wsum,
         v: v / wsum,
         w: w / wsum,
         polar,
         tke_m2s2: tke / wsum,
-    })
+    }))
 }
 
 #[inline]
@@ -3319,11 +3638,17 @@ pub fn spawn_synthetic_radar(
     paths: Vec<PathBuf>,
     config: SyntheticRadarConfig,
 ) -> SyntheticRadarTask {
-    let label = if paths.len() == 1 {
+    let mut label = if paths.len() == 1 {
         format!("Simulated radar from {}", display_name(&paths[0]))
     } else {
         format!("Simulated radar from {} WRF files", paths.len())
     };
+    if matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        label.push_str(" [T-matrix research]");
+    }
     let (tx, rx) = channel();
     let label_for_thread = label.clone();
     std::thread::Builder::new()
@@ -3342,6 +3667,16 @@ fn build_synthetic_from_paths(
     label: &str,
     tx: &Sender<SyntheticRadarMessage>,
 ) -> Result<SyntheticRadarOutput, String> {
+    config.validate_science_contract()?;
+    if matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        return Err(
+            "Property T-matrix research mode is not available until its exact LUT evaluator is connected; BowEcho refused to substitute the bulk Rayleigh kernel"
+                .to_string(),
+        );
+    }
     if paths.is_empty() {
         return Err("No WRF files selected".to_string());
     }
@@ -3366,6 +3701,15 @@ fn build_synthetic_from_paths(
         .into_iter()
         .map(|note| format!("{}: {}", note.source_name, note.message))
         .collect::<Vec<_>>();
+    if matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        notes.push(
+            "T-matrix output is research_only_unvalidated, characteristic-particle, and not operational calibration"
+                .to_string(),
+        );
+    }
     if matches!(
         config.atmosphere_time_mode,
         AtmosphereTimeMode::LinearAdjacent
@@ -3426,20 +3770,32 @@ fn build_synthetic_from_paths(
             )));
         };
         progress("reading…");
-        let fields =
-            match read_wrf_radar_fields_for_config_reporting(file, timeidx, config, &progress) {
-                Ok(fields) => fields,
-                Err(error) => {
-                    notes.push(format!("{name} time {timeidx}: {error}"));
-                    continue;
-                }
-            };
+        let fields = match read_wrf_radar_fields_for_config_reporting(
+            file,
+            &scene.source_identity,
+            timeidx,
+            config,
+            &progress,
+        ) {
+            Ok(fields) => fields,
+            Err(error) => {
+                notes.push(format!("{name} time {timeidx}: {error}"));
+                continue;
+            }
+        };
         let valid_time = scene
             .time
             .valid_time()
             .cloned()
             .expect("scene adapter rejects untimed scenes");
-        let mut volume = build_synthetic_volume_reporting(&fields, valid_time, config, &progress);
+        let mut volume =
+            match try_build_synthetic_volume_reporting(&fields, valid_time, config, &progress) {
+                Ok(volume) => volume,
+                Err(error) => {
+                    notes.push(format!("{name} time {timeidx}: {error}"));
+                    continue;
+                }
+            };
         append_scene_provenance(&mut volume, scene);
         // Self-document the gate spacing when grid-matching is on: record the
         // effective size and whether it came from the grid DX or fell back.
@@ -3538,8 +3894,14 @@ fn build_temporal_synthetic_from_scenes(
         } else {
             "single-scene held"
         };
+        let property_suffix = matches!(
+            config.polarimetric_kernel,
+            PolarimetricKernel::PropertyTMatrixResearchV1
+        )
+        .then_some(" minimum; exact sparse T-matrix cache is checked after each scene read")
+        .unwrap_or_default();
         notes.push(format!(
-            "Temporal {scene_label} preflight: {:.2} GiB estimated peak within {:.2} GiB budget",
+            "Temporal {scene_label} preflight: {:.2} GiB estimated peak within {:.2} GiB budget{property_suffix}",
             required_bytes as f64 / 1024.0_f64.powi(3),
             budget_bytes as f64 / 1024.0_f64.powi(3),
         ));
@@ -3575,7 +3937,14 @@ fn build_temporal_synthetic_from_scenes(
                 "{frame_prefix}{stage}"
             )));
         };
-        let anchor = match cached_temporal_fields(&mut cache, scene, config, &progress) {
+        let anchor = match cached_temporal_fields(
+            &mut cache,
+            scene,
+            config,
+            &progress,
+            estimate,
+            budget_bytes,
+        ) {
             Ok(fields) => fields,
             Err(error) => {
                 notes.push(format!(
@@ -3593,7 +3962,7 @@ fn build_temporal_synthetic_from_scenes(
                 scene.time_index
             ));
         }
-        if (config.dual_pol || config.terminal_fall_speed) && anchor.polarimetric.is_none() {
+        if (config.dual_pol || config.terminal_fall_speed) && !anchor.has_polarimetric_input() {
             notes.push(format!(
                 "{} time {}: requested polarimetric/fall-speed physics unavailable; emitting explicitly labeled scalar fallback",
                 display_name(&scene.path),
@@ -3620,40 +3989,46 @@ fn build_temporal_synthetic_from_scenes(
                             && candidate.time_index == neighbor_locator.time_index
                     })
                     .expect("temporal planner selected a scene from this group");
-                let neighbor =
-                    match cached_temporal_fields(&mut cache, neighbor_scene, config, &progress) {
-                        Ok(fields) => TemporalNeighborResolution::Fields(fields),
-                        Err(error) => match config.missing_neighbor_policy {
-                            MissingNeighborPolicy::HoldAnchor => {
-                                notes.push(format!(
+                let neighbor = match cached_temporal_fields(
+                    &mut cache,
+                    neighbor_scene,
+                    config,
+                    &progress,
+                    estimate,
+                    budget_bytes,
+                ) {
+                    Ok(fields) => TemporalNeighborResolution::Fields(fields),
+                    Err(error) => match config.missing_neighbor_policy {
+                        MissingNeighborPolicy::HoldAnchor => {
+                            notes.push(format!(
                                 "{} time {} held at anchor: adjacent scene read failed ({error})",
                                 display_name(&scene.path),
                                 scene.time_index
                             ));
-                                let volume = build_synthetic_volume_reporting(
-                                    &anchor, valid_time, config, &progress,
-                                );
-                                TemporalNeighborResolution::Held(
-                                    volume,
-                                    "held_anchor_neighbor_read_error".to_string(),
-                                )
-                            }
-                            MissingNeighborPolicy::DropFrame => {
-                                notes.push(format!(
-                                    "{} time {} dropped: adjacent scene read failed ({error})",
-                                    display_name(&scene.path),
-                                    scene.time_index
-                                ));
-                                continue;
-                            }
-                            MissingNeighborPolicy::Error => {
-                                return Err(format!(
-                                    "Read adjacent WRF scene for {}: {error}",
-                                    display_name(&scene.path)
-                                ));
-                            }
-                        },
-                    };
+                            let volume = try_build_synthetic_volume_reporting(
+                                &anchor, valid_time, config, &progress,
+                            )?;
+                            TemporalNeighborResolution::Held(
+                                volume,
+                                "held_anchor_neighbor_read_error".to_string(),
+                            )
+                        }
+                        MissingNeighborPolicy::DropFrame => {
+                            notes.push(format!(
+                                "{} time {} dropped: adjacent scene read failed ({error})",
+                                display_name(&scene.path),
+                                scene.time_index
+                            ));
+                            continue;
+                        }
+                        MissingNeighborPolicy::Error => {
+                            return Err(format!(
+                                "Read adjacent WRF scene for {}: {error}",
+                                display_name(&scene.path)
+                            ));
+                        }
+                    },
+                };
                 match neighbor {
                     TemporalNeighborResolution::Held(volume, outcome) => (volume, outcome),
                     TemporalNeighborResolution::Fields(neighbor) => {
@@ -3673,9 +4048,9 @@ fn build_temporal_synthetic_from_scenes(
                                         scene.time_index
                                     ));
                                     (
-                                        build_synthetic_volume_reporting(
+                                        try_build_synthetic_volume_reporting(
                                             &anchor, valid_time, config, &progress,
-                                        ),
+                                        )?,
                                         "held_anchor_property_mismatch".to_string(),
                                     )
                                 }
@@ -3701,11 +4076,11 @@ fn build_temporal_synthetic_from_scenes(
                 }
             }
             TemporalSamplingOutcome::Frozen => (
-                build_synthetic_volume_reporting(&anchor, valid_time, config, &progress),
+                try_build_synthetic_volume_reporting(&anchor, valid_time, config, &progress)?,
                 "frozen".to_string(),
             ),
             TemporalSamplingOutcome::HeldAnchor(reason) => (
-                build_synthetic_volume_reporting(&anchor, valid_time, config, &progress),
+                try_build_synthetic_volume_reporting(&anchor, valid_time, config, &progress)?,
                 match reason {
                     HoldReason::NoLaterScene => "held_anchor_no_later_scene".to_string(),
                     HoldReason::ScanCrossesNeighbor => {
@@ -3767,7 +4142,24 @@ fn temporal_memory_estimate(
     let mut compact_bytes_per_scene = horizontal_cells
         .checked_mul(28)
         .ok_or_else(|| "WRF geolocation memory estimate overflowed".to_string())?;
-    if config.dual_pol || config.terminal_fall_speed {
+    if matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        // The full-cell -> compact-scattering-row map is the only mandatory
+        // dense property allocation. Active-cell scattering is genuinely
+        // sparse and cannot be estimated from inventory metadata; it is added
+        // from WrfTMatrixScene::memory_estimate immediately after each scene
+        // is built, before rendering begins.
+        const PROPERTY_DENSE_LOOKUP_BYTES_PER_CELL: usize = std::mem::size_of::<u32>();
+        compact_bytes_per_scene = compact_bytes_per_scene
+            .checked_add(
+                cells_per_scene
+                    .checked_mul(PROPERTY_DENSE_LOOKUP_BYTES_PER_CELL)
+                    .ok_or_else(|| "WRF property memory estimate overflowed".to_string())?,
+            )
+            .ok_or_else(|| "WRF property memory estimate overflowed".to_string())?;
+    } else if config.dual_pol || config.terminal_fall_speed {
         compact_bytes_per_scene = compact_bytes_per_scene
             .checked_add(
                 cells_per_scene
@@ -3850,11 +4242,53 @@ fn temporal_required_peak_bytes(
         .checked_add(estimate.output_bytes)
 }
 
+fn ensure_temporal_runtime_cache_budget(
+    cache: &TwoSceneCache<(String, usize), Arc<WrfRadarFields>>,
+    estimate: TemporalMemoryEstimate,
+    budget_bytes: usize,
+) -> Result<(), String> {
+    let cached_scene_count = cache.len();
+    let base_scene_bytes = estimate
+        .scene_bytes()
+        .ok_or_else(|| "Temporal runtime scene-memory estimate overflowed".to_string())?;
+    let property_dense_lookup_bytes = estimate
+        .cells_per_scene
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| "Temporal runtime property-memory estimate overflowed".to_string())?;
+    let property_extra_bytes = cache.values().try_fold(0usize, |total, fields| {
+        let retained = fields
+            .property_scattering
+            .as_deref()
+            .map(|scene| scene.memory_estimate().retained_bytes())
+            .unwrap_or(0);
+        total.checked_add(retained.saturating_sub(property_dense_lookup_bytes))
+    });
+    let required_bytes = base_scene_bytes
+        .checked_mul(cached_scene_count)
+        .and_then(|value| value.checked_add(property_extra_bytes?))
+        .and_then(|value| value.checked_add(estimate.shared_static_bytes))
+        .and_then(|value| value.checked_add(estimate.output_bytes))
+        .and_then(|value| {
+            value.checked_add(app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes())
+        })
+        .ok_or_else(|| "Temporal runtime memory estimate overflowed".to_string())?;
+    if required_bytes > budget_bytes {
+        return Err(format!(
+            "Temporal sparse T-matrix cache needs {:.2} GiB with {cached_scene_count} retained scene(s), above the configured {:.2} GiB budget",
+            required_bytes as f64 / 1024.0_f64.powi(3),
+            budget_bytes as f64 / 1024.0_f64.powi(3),
+        ));
+    }
+    Ok(())
+}
+
 fn cached_temporal_fields(
     cache: &mut TwoSceneCache<(String, usize), Arc<WrfRadarFields>>,
     scene: &WrfScene,
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
+    estimate: TemporalMemoryEstimate,
+    budget_bytes: usize,
 ) -> Result<Arc<WrfRadarFields>, String> {
     let key = (scene.source_identity.0.clone(), scene.time_index);
     if let Some(fields) = cache.get(&key) {
@@ -3876,11 +4310,13 @@ fn cached_temporal_fields(
     })?;
     let fields = Arc::new(read_wrf_radar_fields_for_config_reporting(
         &file,
+        &scene.source_identity,
         scene.time_index,
         config,
         progress,
     )?);
     cache.insert(key, Arc::clone(&fields));
+    ensure_temporal_runtime_cache_budget(cache, estimate, budget_bytes)?;
     Ok(fields)
 }
 
@@ -3919,6 +4355,25 @@ fn validate_temporal_field_pair(
             );
         }
     }
+    match (&anchor.property_scattering, &neighbor.property_scattering) {
+        (None, None) => {}
+        (Some(left), Some(right))
+            if left.required_field_signature() == right.required_field_signature()
+                && left.microphysics_scheme_id() == right.microphysics_scheme_id() => {}
+        (Some(left), Some(right)) => {
+            return Err(format!(
+                "Adjacent WRF property-scattering contracts differ (mp_physics {} vs {})",
+                left.microphysics_scheme_id(),
+                right.microphysics_scheme_id(),
+            ));
+        }
+        _ => {
+            return Err(
+                "Adjacent WRF scene has incompatible P3/ISHMAEL property-scattering availability"
+                    .to_string(),
+            );
+        }
+    }
     if anchor.tke_tenths_m2s2.is_some() != neighbor.tke_tenths_m2s2.is_some() {
         return Err("Adjacent WRF scene has incompatible TKE availability".to_string());
     }
@@ -3952,11 +4407,16 @@ fn append_temporal_provenance(
         .as_deref()
         .unwrap_or("not_requested")
         .replace(';', ",");
+    let interpolation_space = if anchor.property_scattering.is_some() {
+        "source_cell_closure_then_additive_scattering_and_wind"
+    } else {
+        "derived_linear_z_wind_and_additive_polar"
+    };
     let provenance = format!(
-        "atmosphere_time_mode=linear_adjacent; temporal_interpolation_space=derived_linear_z_wind_and_additive_polar; temporal_policy={policy}; temporal_outcome={runtime_outcome}; temporal_neighbor={neighbor}; temporal_neighbor_time={neighbor_time}; temporal_scan_duration_ms={}; temporal_reflectivity_source={}; temporal_polar_available={}; temporal_microphysics_status={physics_status}",
+        "atmosphere_time_mode=linear_adjacent; temporal_interpolation_space={interpolation_space}; temporal_policy={policy}; temporal_outcome={runtime_outcome}; temporal_neighbor={neighbor}; temporal_neighbor_time={neighbor_time}; temporal_scan_duration_ms={}; temporal_reflectivity_source={}; temporal_polar_available={}; temporal_microphysics_status={physics_status}",
         plan.scan_duration_ms,
         anchor.ref_source,
-        anchor.polarimetric.is_some(),
+        anchor.has_polarimetric_input(),
     );
     match volume.metadata.forward_operator_config.as_mut() {
         Some(config) => {
@@ -4373,6 +4833,7 @@ mod tests {
             v,
             w,
             terrain_m,
+            property_scattering: None,
             polarimetric: None,
             dual_pol_status: None,
             tke_tenths_m2s2: None,
@@ -4399,8 +4860,10 @@ mod tests {
             39.0,
             -95.0,
             1_000.0,
+            0.5,
             ReflectivitySampling::LinearZ,
         )
+        .expect("midpoint query")
         .expect("midpoint model column");
         assert!((z_to_dbz(midpoint.z_linear) - 17.032913).abs() < 1.0e-5);
         assert!((midpoint.u - 20.0).abs() < 1.0e-6);
@@ -4413,8 +4876,10 @@ mod tests {
             39.0,
             -95.0,
             1_000.0,
+            0.5,
             ReflectivitySampling::LinearZ,
         )
+        .expect("anchor query")
         .expect("exact anchor column");
         assert_eq!(z_to_dbz(exact_anchor.z_linear), 0.0);
         assert_eq!(exact_anchor.u, 10.0);
@@ -4488,8 +4953,10 @@ mod tests {
             39.0,
             -95.0,
             1_000.0,
+            0.5,
             ReflectivitySampling::LegacyDbz,
         )
+        .expect("legacy query")
         .expect("legacy sample");
         let linear = sample_column(
             &fields,
@@ -4497,8 +4964,10 @@ mod tests {
             39.0,
             -95.0,
             1_000.0,
+            0.5,
             ReflectivitySampling::LinearZ,
         )
+        .expect("linear-Z query")
         .expect("linear-Z sample");
         assert!((z_to_dbz(legacy.z_linear) - 30.0).abs() < 0.05);
         assert!((z_to_dbz(linear.z_linear) - 56.9897).abs() < 0.05);
@@ -4538,6 +5007,7 @@ mod tests {
                     &config,
                     None,
                 )
+                .expect("sample uniform gate")
                 .expect("uniform gate"),
             );
         }
@@ -4735,6 +5205,7 @@ mod tests {
             &config,
             None,
         )
+        .expect("sample air-motion gate")
         .expect("air-motion gate");
         config.terminal_fall_speed = true;
         let scatterer = sample_gate(
@@ -4753,6 +5224,7 @@ mod tests {
             &config,
             None,
         )
+        .expect("sample scatterer-motion gate")
         .expect("scatterer-motion gate");
         assert!((scatterer.velocity_mps - (air.velocity_mps - 2.5)).abs() < 0.08);
     }
@@ -4782,7 +5254,8 @@ mod tests {
             500.0,
             &config,
             Some(&horizon),
-        );
+        )
+        .expect("sample blocked gate");
         assert!(
             blocked.is_none(),
             "a 1.5-km ridge must block the 0.5-degree beam"
@@ -4804,6 +5277,7 @@ mod tests {
                 &config,
                 None,
             )
+            .expect("sample visible gate")
             .is_some(),
             "same model gate is visible without blockage"
         );
@@ -5106,6 +5580,70 @@ mod tests {
     /// setting rebuilds and replaces). `site_name` is presentation-only and must
     /// NOT move it.
     #[test]
+    fn property_tmatrix_static_contract_is_exact_and_fail_closed() {
+        assert!(
+            SyntheticRadarConfig::default()
+                .validate_science_contract()
+                .is_ok()
+        );
+
+        let supported = SyntheticRadarConfig {
+            dual_pol: true,
+            polarimetric_kernel: PolarimetricKernel::PropertyTMatrixResearchV1,
+            radar_frequency_mhz: PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ,
+            reflectivity_sampling: ReflectivitySampling::LinearZ,
+            beam_integration: BeamIntegration::Balanced,
+            elevations_deg: elevation_ladder(true),
+            ..SyntheticRadarConfig::default()
+        };
+        assert!(
+            supported.validate_science_contract().is_ok(),
+            "the optional 0.1-degree cut and default one-degree beam fit the declared view axis"
+        );
+
+        let wrong_frequency = SyntheticRadarConfig {
+            radar_frequency_mhz: 2_900,
+            ..supported.clone()
+        };
+        assert!(
+            wrong_frequency
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("exactly 2800 MHz")
+        );
+        let legacy_log_sampling = SyntheticRadarConfig {
+            reflectivity_sampling: ReflectivitySampling::LegacyDbz,
+            ..supported.clone()
+        };
+        assert!(
+            legacy_log_sampling
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("linear-Z")
+        );
+        let no_dual_pol = SyntheticRadarConfig {
+            dual_pol: false,
+            ..supported.clone()
+        };
+        assert!(
+            no_dual_pol
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("requires S-band dual polarization")
+        );
+        let too_wide_for_low_cut = SyntheticRadarConfig {
+            beam_width_deg: 1.5,
+            ..supported
+        };
+        assert!(
+            too_wide_for_low_cut
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("outside the exact")
+        );
+    }
+
+    #[test]
     fn data_fingerprint_changes_with_every_data_field() {
         use ReflectivityOperator::ClassicStoelinga;
 
@@ -5224,6 +5762,10 @@ mod tests {
             "spectrum_width_floor_mps"
         );
         assert!(differs(&|c| c.dual_pol = true), "dual_pol");
+        assert!(
+            differs(&|c| c.polarimetric_kernel = PolarimetricKernel::PropertyTMatrixResearchV1),
+            "polarimetric_kernel"
+        );
         assert!(differs(&|c| c.propagation = true), "propagation");
         assert!(differs(&|c| c.system_phidp_deg = 11.0), "system_phidp_deg");
         assert!(differs(&|c| c.zdr_bias_db = 0.3), "zdr_bias_db");
@@ -6115,6 +6657,7 @@ mod tests {
             v: vec![0.0f32; nz * cells],
             w: vec![0.0f32; nz * cells],
             terrain_m: vec![0.0f32; cells],
+            property_scattering: None,
             polarimetric: None,
             dual_pol_status: None,
             tke_tenths_m2s2: None,
