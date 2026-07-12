@@ -1128,9 +1128,11 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &again));
         assert_eq!(loads.load(Ordering::SeqCst), 1);
 
-        assert!(cache
-            .load(digest("missing-c"), || Err::<String, _>("missing"))
-            .is_err());
+        assert!(
+            cache
+                .load(digest("missing-c"), || Err::<String, _>("missing"))
+                .is_err()
+        );
         let retained = cache
             .load(key_s, || Ok::<_, ()>("unexpected".to_owned()))
             .expect("failed replacement retained S");
