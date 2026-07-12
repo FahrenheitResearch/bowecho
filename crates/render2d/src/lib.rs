@@ -303,7 +303,10 @@ pub fn render_moment_image(
 
     let mut pixels = vec![0; width as usize * height as usize * 4];
     let color_tables = ColorTableSet::default();
-    let color_table = color_tables.for_family(color_family_for_moment(&grid.moment));
+    let validation_table = validation_color_table_for_moment(&grid.moment);
+    let color_table = validation_table
+        .as_ref()
+        .unwrap_or_else(|| color_tables.for_family(color_family_for_moment(&grid.moment)));
 
     match &grid.storage {
         MomentStorage::U8(values) => {
@@ -647,7 +650,8 @@ impl CachedColorLookup {
         color_tables: &ColorTableSet,
         family: ColorTableFamily,
     ) -> Self {
-        let color_table = color_tables.for_family(family).clone();
+        let color_table = validation_color_table_for_moment(&grid.moment)
+            .unwrap_or_else(|| color_tables.for_family(family).clone());
         match &grid.storage {
             MomentStorage::U8(_) => Self::U8 {
                 palette: Box::new(build_u8_palette(grid, &color_table)),
@@ -3947,6 +3951,18 @@ pub fn color_family_for_moment(moment: &MomentType) -> ColorTableFamily {
     }
 }
 
+/// A validation moment carries a physical display scale that is independent
+/// of the user's ordinary radar-family palette binding. Keeping this resolver
+/// at the render seam means every cache path (native, smoothed, interpolated,
+/// and direct PNG) sees the same true 0..1 quality ramp or centered residual
+/// ramp even when the caller supplied the Generic family for an Unknown id.
+pub fn validation_color_table_for_moment(moment: &MomentType) -> Option<ColorTable> {
+    let MomentType::Unknown(name) = moment else {
+        return None;
+    };
+    color_tables::validation_table_for_moment_id(name)
+}
+
 fn unknown_reflectivity_like(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_uppercase().as_str(),
@@ -4050,6 +4066,29 @@ mod tests {
         assert_eq!(
             color_family_for_moment(&MomentType::Unknown("mystery".to_owned())),
             ColorTableFamily::Generic
+        );
+    }
+
+    #[test]
+    fn synthetic_validation_moments_resolve_physical_palettes() {
+        let quality = validation_color_table_for_moment(&MomentType::Unknown("MCOV".to_owned()))
+            .expect("quality palette");
+        assert_eq!(quality.stops().first().unwrap().value, 0.0);
+        assert_eq!(quality.stops().last().unwrap().value, 1.0);
+
+        for id in [
+            "DIF_REF", "DIF_VEL", "DIF_ZDR", "DIF_RHO", "DIF_PHI", "DIF_KDP",
+        ] {
+            let table = validation_color_table_for_moment(&MomentType::Unknown(id.to_owned()))
+                .expect("difference palette");
+            assert_eq!(
+                table.stops().first().unwrap().value,
+                -table.stops().last().unwrap().value,
+                "{id}"
+            );
+        }
+        assert!(
+            validation_color_table_for_moment(&MomentType::Unknown("OTHER".to_owned())).is_none()
         );
     }
 

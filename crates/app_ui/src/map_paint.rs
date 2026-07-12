@@ -575,7 +575,10 @@ impl ViewerApp {
         product: &DisplayProduct,
     ) {
         let render_tables = self.render_color_tables_for_product(product);
-        let table = render_tables.for_family(product.color_family());
+        let validation_table = validation_table_for_product(product);
+        let table = validation_table
+            .as_ref()
+            .unwrap_or_else(|| render_tables.for_family(product.color_family()));
         let stops = table.stops();
         let (Some(first), Some(last)) = (stops.first(), stops.last()) else {
             return;
@@ -635,7 +638,8 @@ impl ViewerApp {
 
         // value ticks + units — both in the table's DECLARED unit space
         // (an mph velocity table ticks in mph under an mph chip).
-        let (unit_label, unit_scale) = table_display_unit(table, product, self.units());
+        let (unit_label, unit_scale) = validation_display_unit(product)
+            .unwrap_or_else(|| table_display_unit(table, product, self.units()));
         let label_color = egui::Color32::from_rgb(214, 220, 228);
         let font = egui::FontId::proportional(11.0);
         let decimals = if (vmax - vmin) / unit_scale < 5.0 {
@@ -742,14 +746,18 @@ impl ViewerApp {
             // Value in the active table's declared unit space (an mph
             // velocity table reads out mph) — the SI diagnostics below
             // (raw VEL, Nyquist) deliberately stay m/s.
-            let (units, unit_scale) = table_display_unit(
-                self.active_table_for_product(&readout.product),
-                &readout.product,
-                self.units(),
-            );
+            let validation_table = validation_table_for_product(&readout.product);
+            let active_table = validation_table
+                .as_ref()
+                .unwrap_or_else(|| self.active_table_for_product(&readout.product));
+            let (units, unit_scale) =
+                validation_display_unit(&readout.product).unwrap_or_else(|| {
+                    table_display_unit(active_table, &readout.product, self.units())
+                });
             lines.push(format!(
                 "{} {:.1}{}{}",
-                readout.product.label(),
+                product_select::validation_product_label(&readout.product)
+                    .unwrap_or_else(|| readout.product.label()),
                 readout.value / unit_scale,
                 if units.is_empty() { "" } else { " " },
                 units
@@ -759,9 +767,7 @@ impl ViewerApp {
             // transparent sample (below display threshold) contributes no
             // chip — the gate reads out but paints nothing.
             if self.inspector_show_hex {
-                let c = self
-                    .active_table_for_product(&readout.product)
-                    .color_for_value(readout.value);
+                let c = active_table.color_for_value(readout.value);
                 if c[3] > 0 {
                     swatches.push((lines.len(), egui::Color32::from_rgb(c[0], c[1], c[2])));
                     lines.push(hex_rgb_line(c));
@@ -791,6 +797,20 @@ impl ViewerApp {
                     "{:.1} km @ {:03.0}° · tilt {:.1}°",
                     readout.range_km, readout.azimuth_deg, readout.elevation_deg
                 ));
+            }
+            if let Some(volume) = self
+                .volume
+                .clone()
+                .map(|volume| self.display_source_volume_for_product(&readout.product, volume))
+                && let Some(quality) = quality_fractions_for_gate(
+                    &volume,
+                    readout.cut,
+                    &readout.product.base_moment(),
+                    readout.row,
+                    readout.gate,
+                )
+            {
+                lines.push(format_quality_fractions(quality));
             }
             if self.inspector_show_beam {
                 let beam_m = readout.height_above_radar_m;
@@ -2874,7 +2894,8 @@ pub(crate) fn format_cursor_readout(
         "{} {} {} cut {} {} raw {} row {} gate {} @ {} m{}{} az {:05.1} src {:05.1} range {:.1} km elev {:.2}{}{}{}",
         readout.site_id,
         time_zone.format_hms(readout.volume_time_utc),
-        readout.product.label(),
+        product_select::validation_product_label(&readout.product)
+            .unwrap_or_else(|| readout.product.label()),
         readout.cut,
         value,
         raw,
@@ -2890,6 +2911,58 @@ pub(crate) fn format_cursor_readout(
         height,
         nyquist,
         realtime
+    )
+}
+
+fn validation_table_for_product(product: &DisplayProduct) -> Option<ColorTable> {
+    let DisplayProduct::Moment(moment) = product else {
+        return None;
+    };
+    render2d::validation_color_table_for_moment(moment)
+}
+
+fn validation_display_unit(product: &DisplayProduct) -> Option<(&'static str, f32)> {
+    product_select::validation_product_units(product).map(|units| (units, 1.0))
+}
+
+/// Resolve MCOV/TUNB/MSIG at the same physical radial and gate as a cursor
+/// sample. Moment grids may omit radials independently, so row numbers cannot
+/// be assumed interchangeable; map through the source radial index first.
+fn quality_fractions_for_gate(
+    volume: &RadarVolume,
+    cut_index: usize,
+    source_moment: &MomentType,
+    source_row: usize,
+    gate: usize,
+) -> Option<[Option<f32>; 3]> {
+    let cut = volume.cuts.get(cut_index)?;
+    let source_grid = cut.moments.get(source_moment)?;
+    let radial_index = *source_grid.radial_indices.get(source_row)?;
+    let values = ["MCOV", "TUNB", "MSIG"].map(|id| {
+        let moment = MomentType::Unknown(id.to_owned());
+        let grid = cut.moments.get(&moment)?;
+        let quality_row = grid
+            .radial_indices
+            .iter()
+            .position(|candidate| *candidate == radial_index)?;
+        grid.scaled_value(quality_row, gate)
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 1.0))
+    });
+    values.iter().any(Option::is_some).then_some(values)
+}
+
+fn format_quality_fractions(values: [Option<f32>; 3]) -> String {
+    let percent = |value: Option<f32>| {
+        value
+            .map(|value| format!("{:.0}%", value * 100.0))
+            .unwrap_or_else(|| "--".to_owned())
+    };
+    format!(
+        "quality model {} · terrain {} · signal {}",
+        percent(values[0]),
+        percent(values[1]),
+        percent(values[2])
     )
 }
 
@@ -5122,6 +5195,52 @@ mod loupe_native_gates_tests {
         grid.radial_indices = (0..radial_count).collect();
         grid.storage = MomentStorage::U8(vec![raw; radial_count * gate_count]);
         (cut, grid)
+    }
+
+    fn compact_quality(
+        id: &str,
+        range: GateRange,
+        radials: Vec<usize>,
+        raw: Vec<u8>,
+    ) -> MomentGrid {
+        MomentGrid {
+            moment: MomentType::Unknown(id.to_owned()),
+            gate_range: range,
+            scale: u8::MAX as f32,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: radials,
+            storage: MomentStorage::U8(raw),
+        }
+    }
+
+    #[test]
+    fn cursor_quality_readout_maps_by_radial_index_and_preserves_missing_fields() {
+        let (mut cut, source) = uniform_ref(3, 2, 70);
+        let range = source.gate_range.clone();
+        cut.moments.insert(MomentType::Reflectivity, source);
+        // Quality rows deliberately use a different radial order from REF.
+        cut.moments.insert(
+            MomentType::Unknown("MCOV".to_owned()),
+            compact_quality("MCOV", range.clone(), vec![2, 0], vec![255, 128, 64, 0]),
+        );
+        cut.moments.insert(
+            MomentType::Unknown("MSIG".to_owned()),
+            compact_quality("MSIG", range, vec![0, 2], vec![0, 0, 128, 64]),
+        );
+        let mut volume = RadarVolume::default();
+        volume.cuts.push(cut);
+
+        let values = quality_fractions_for_gate(&volume, 0, &MomentType::Reflectivity, 2, 0)
+            .expect("quality at REF row 2 / radial 2");
+        assert_eq!(values[0], Some(1.0));
+        assert_eq!(values[1], None);
+        assert!((values[2].unwrap() - 128.0 / 255.0).abs() < 1.0e-6);
+        assert_eq!(
+            format_quality_fractions(values),
+            "quality model 100% · terrain -- · signal 50%"
+        );
     }
 
     fn ref_grid_only(gate_count: usize, raws: &[u8]) -> MomentGrid {

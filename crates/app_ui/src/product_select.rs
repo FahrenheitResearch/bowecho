@@ -68,6 +68,16 @@ fn picker_product_rank(product: &DisplayProduct) -> (u16, &str) {
         DisplayProduct::Derived(DerivedProduct::AzimuthalShear) => 160,
         DisplayProduct::Derived(DerivedProduct::Divergence) => 161,
         DisplayProduct::Moment(MomentType::Unknown(name)) => match name.as_str() {
+            "MCOV" => 90,
+            "TUNB" => 91,
+            "MSIG" => 92,
+            "DIF_REF" => 93,
+            "DIF_VEL" => 94,
+            "DIF_SW" => 95,
+            "DIF_ZDR" => 96,
+            "DIF_RHO" => 97,
+            "DIF_PHI" => 98,
+            "DIF_KDP" => 99,
             "PHIF" => 200,
             "KDP_SD" => 201,
             "AH" => 210,
@@ -100,7 +110,50 @@ fn picker_product_rank(product: &DisplayProduct) -> (u16, &str) {
             _ => 900,
         },
     };
-    (rank, product.label())
+    (
+        rank,
+        validation_product_label(product).unwrap_or_else(|| product.label()),
+    )
+}
+
+/// Human-facing names for synthetic-radar support and validation fields.
+/// The stable ids remain the data contract and are included in the labels so
+/// exports, screenshots, and scientific discussion stay unambiguous.
+pub(crate) fn validation_product_label(product: &DisplayProduct) -> Option<&'static str> {
+    let DisplayProduct::Moment(MomentType::Unknown(name)) = product else {
+        return None;
+    };
+    Some(match name.as_str() {
+        "MCOV" => "Model coverage (MCOV)",
+        "TUNB" => "Terrain unblocked (TUNB)",
+        "MSIG" => "Meteorological signal (MSIG)",
+        "DIF_REF" => "Reflectivity difference (sim - obs)",
+        "DIF_VEL" => "Velocity difference (sim - obs)",
+        "DIF_SW" => "Spectrum-width difference (sim - obs)",
+        "DIF_ZDR" => "ZDR difference (sim - obs)",
+        "DIF_RHO" => "RHOHV difference (sim - obs)",
+        "DIF_PHI" => "PHIDP difference (sim - obs)",
+        "DIF_KDP" => "KDP difference (sim - obs)",
+        _ => return None,
+    })
+}
+
+/// Physical display units for the validation fields. Quality moments are
+/// fractions, not percentages; this intentionally matches their 0..1 grid
+/// encoding and palette domain.
+pub(crate) fn validation_product_units(product: &DisplayProduct) -> Option<&'static str> {
+    let DisplayProduct::Moment(MomentType::Unknown(name)) = product else {
+        return None;
+    };
+    Some(match name.as_str() {
+        "MCOV" | "TUNB" | "MSIG" | "DIF_RHO" => "fraction",
+        "DIF_REF" => "dBZ",
+        "DIF_VEL" | "DIF_SW" => "m/s",
+        "DIF_ZDR" => "dB",
+        "DIF_PHI" => "deg",
+        "DIF_KDP" => "deg/km",
+        _ => return None,
+    })
 }
 
 fn retain_non_advanced_products(products: &mut Vec<DisplayProduct>) {
@@ -1310,6 +1363,47 @@ mod tests {
             labels,
             vec![
                 "REF", "VEL", "DVEL", "SRV", "DSRV", "RHO", "ZDR", "SW", "PHI", "KDP"
+            ]
+        );
+    }
+
+    #[test]
+    fn validation_products_have_scientific_labels_units_and_first_class_order() {
+        let product = |id: &str| DisplayProduct::Moment(MomentType::Unknown(id.to_owned()));
+        assert_eq!(
+            validation_product_label(&product("MCOV")),
+            Some("Model coverage (MCOV)")
+        );
+        assert_eq!(
+            validation_product_label(&product("DIF_REF")),
+            Some("Reflectivity difference (sim - obs)")
+        );
+        assert_eq!(validation_product_units(&product("MCOV")), Some("fraction"));
+        assert_eq!(validation_product_units(&product("DIF_VEL")), Some("m/s"));
+        assert_eq!(validation_product_label(&product("OTHER")), None);
+
+        let mut products = vec![
+            product("DIF_KDP"),
+            DisplayProduct::Derived(DerivedProduct::CompositeReflectivity),
+            product("MCOV"),
+            DisplayProduct::Moment(MomentType::SpecificDifferentialPhase),
+            product("DIF_REF"),
+            product("MSIG"),
+        ];
+        products.sort_by(|left, right| picker_product_rank(left).cmp(&picker_product_rank(right)));
+        let labels = products
+            .iter()
+            .map(|product| validation_product_label(product).unwrap_or_else(|| product.label()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "KDP",
+                "Model coverage (MCOV)",
+                "Meteorological signal (MSIG)",
+                "Reflectivity difference (sim - obs)",
+                "KDP difference (sim - obs)",
+                "CREF",
             ]
         );
     }

@@ -1731,6 +1731,64 @@ pub fn builtin_generic_table() -> ColorTable {
     .expect("built-in generic color table is valid")
 }
 
+/// Purpose-built validation palette for a BowEcho synthetic-radar diagnostic
+/// moment. These fields deliberately bypass the user-facing radar-family
+/// bindings: a 0..1 quality fraction must never inherit the Generic 0..100
+/// scale, and a signed synthetic-minus-observed residual must always retain a
+/// visually neutral zero.
+pub fn validation_table_for_moment_id(moment_id: &str) -> Option<ColorTable> {
+    Some(match moment_id.trim().to_ascii_uppercase().as_str() {
+        "MCOV" | "TUNB" | "MSIG" => builtin_quality_fraction_table(),
+        "DIF_REF" => validation_difference_table("Reflectivity difference", 5.0, 15.0, 40.0),
+        "DIF_VEL" => validation_difference_table("Velocity difference", 3.0, 12.0, 35.0),
+        "DIF_SW" => validation_difference_table("Spectrum-width difference", 1.0, 4.0, 12.0),
+        "DIF_ZDR" => validation_difference_table("ZDR difference", 0.5, 1.5, 5.0),
+        "DIF_RHO" => validation_difference_table("RHOHV difference", 0.02, 0.10, 0.40),
+        "DIF_PHI" => validation_difference_table("PHIDP difference", 10.0, 45.0, 180.0),
+        "DIF_KDP" => validation_difference_table("KDP difference", 0.5, 2.0, 8.0),
+        _ => return None,
+    })
+}
+
+/// Continuous support-quality ramp over the physical fraction domain 0..1.
+/// Low support is warm/dark, while fully supported gates are cool/bright.
+pub fn builtin_quality_fraction_table() -> ColorTable {
+    ColorTable::new(
+        "Synthetic radar gate quality",
+        vec![
+            stop(0.00, 92, 20, 30),
+            stop(0.20, 190, 48, 38),
+            stop(0.40, 238, 126, 34),
+            stop(0.60, 232, 210, 72),
+            stop(0.80, 62, 184, 158),
+            stop(1.00, 202, 250, 222),
+        ],
+    )
+    .expect("built-in synthetic-radar quality table is valid")
+}
+
+fn validation_difference_table(
+    name: &'static str,
+    inner: f32,
+    middle: f32,
+    outer: f32,
+) -> ColorTable {
+    debug_assert!(0.0 < inner && inner < middle && middle < outer);
+    ColorTable::new(
+        name,
+        vec![
+            stop(-outer, 27, 48, 112),
+            stop(-middle, 44, 112, 190),
+            stop(-inner, 152, 202, 230),
+            stop(0.0, 238, 238, 236),
+            stop(inner, 244, 184, 154),
+            stop(middle, 210, 80, 70),
+            stop(outer, 112, 20, 40),
+        ],
+    )
+    .expect("built-in synthetic-minus-observed difference table is valid")
+}
+
 // ─── GURT V3 research-radar palettes ────────────────────────────────────────
 //
 // Color tables from GURT V3 — the Graphic Utility Radar Toolkit by ambient330
@@ -4305,5 +4363,39 @@ mod export_tests {
         let reparsed = ColorTable::parse_gr_pal(table.name(), &pal).expect("reparse");
         assert_eq!(reparsed.sample_mode_label(), "GR pal");
         assert_eq!(reparsed.step_size(), None);
+    }
+
+    #[test]
+    fn synthetic_gate_quality_palette_uses_the_fraction_domain() {
+        let table = builtin_quality_fraction_table();
+        assert_eq!(table.stops().first().unwrap().value, 0.0);
+        assert_eq!(table.stops().last().unwrap().value, 1.0);
+        assert_ne!(table.color_for_value(0.0), table.color_for_value(1.0));
+        for id in ["MCOV", "tunb", "MSIG"] {
+            let resolved = validation_table_for_moment_id(id).expect("quality palette");
+            assert_eq!(resolved.stops().first().unwrap().value, 0.0);
+            assert_eq!(resolved.stops().last().unwrap().value, 1.0);
+        }
+    }
+
+    #[test]
+    fn validation_difference_palettes_are_centered_and_moment_scaled() {
+        let mut spans = Vec::new();
+        for id in [
+            "DIF_REF", "DIF_VEL", "DIF_SW", "DIF_ZDR", "DIF_RHO", "DIF_PHI", "DIF_KDP",
+        ] {
+            let table = validation_table_for_moment_id(id).expect("difference palette");
+            let minimum = table.stops().first().unwrap().value;
+            let maximum = table.stops().last().unwrap().value;
+            assert_eq!(minimum, -maximum, "{id}");
+            let zero = table.color_for_value(0.0);
+            assert!(zero[0].abs_diff(zero[1]) <= 2, "{id} zero is not neutral");
+            assert!(zero[1].abs_diff(zero[2]) <= 2, "{id} zero is not neutral");
+            assert_ne!(table.color_for_value(minimum), zero, "{id}");
+            assert_ne!(table.color_for_value(maximum), zero, "{id}");
+            spans.push(maximum);
+        }
+        assert!(spans.windows(2).any(|pair| pair[0] != pair[1]));
+        assert!(validation_table_for_moment_id("DIF_BOGUS").is_none());
     }
 }

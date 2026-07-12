@@ -40,54 +40,224 @@ use rw_store::netcdf3::{Nc3Attr, Nc3Dim, Nc3VarDef, Nc3Writer};
 /// exactly what the in-app F32 moment convention expects.
 pub(crate) const CFRADIAL_FILL: f32 = -9999.0;
 
-/// CfRadial field naming for the canonical moments: `(var name, units,
-/// long_name)`. Arbitrary `Unknown` moments are not exported; the explicitly
-/// stable simulated-radar attenuation/correction ids are whitelisted.
-fn moment_field_spec(moment: &MomentType) -> Option<(&'static str, &'static str, &'static str)> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FieldRole {
+    RadarMoment,
+    ForwardOperator,
+    QualityFraction,
+    SyntheticMinusObserved,
+}
+
+impl FieldRole {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::RadarMoment => "radar_moment",
+            Self::ForwardOperator => "forward_operator_diagnostic",
+            Self::QualityFraction => "pulse_volume_support_fraction",
+            Self::SyntheticMinusObserved => "synthetic_minus_observed_difference",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MomentFieldSpec {
+    name: &'static str,
+    units: &'static str,
+    long_name: &'static str,
+    role: FieldRole,
+}
+
+const fn field(
+    name: &'static str,
+    units: &'static str,
+    long_name: &'static str,
+    role: FieldRole,
+) -> MomentFieldSpec {
+    MomentFieldSpec {
+        name,
+        units,
+        long_name,
+        role,
+    }
+}
+
+/// CfRadial naming plus scientific role for every supported field. Arbitrary
+/// `Unknown` moments remain excluded; only versioned forward-operator,
+/// support-quality, and exact-geometry comparison ids are whitelisted.
+fn moment_field_spec(moment: &MomentType) -> Option<MomentFieldSpec> {
+    use FieldRole::{ForwardOperator, QualityFraction, RadarMoment, SyntheticMinusObserved};
     Some(match moment {
-        MomentType::Reflectivity => ("REF", "dBZ", "equivalent reflectivity factor"),
-        MomentType::Velocity => (
+        MomentType::Reflectivity => {
+            field("REF", "dBZ", "equivalent reflectivity factor", RadarMoment)
+        }
+        MomentType::Velocity => field(
             "VEL",
             "m/s",
             "radial velocity of scatterers away from instrument",
+            RadarMoment,
         ),
-        MomentType::SpectrumWidth => ("SW", "m/s", "doppler spectrum width"),
-        MomentType::DifferentialReflectivity => ("ZDR", "dB", "log differential reflectivity h/v"),
-        MomentType::CorrelationCoefficient => ("RHOHV", "unitless", "cross correlation ratio h/v"),
-        MomentType::DifferentialPhase => ("PHIDP", "degrees", "differential phase h/v"),
-        MomentType::SpecificDifferentialPhase => {
-            ("KDP", "degrees/km", "specific differential phase h/v")
+        MomentType::SpectrumWidth => field("SW", "m/s", "doppler spectrum width", RadarMoment),
+        MomentType::DifferentialReflectivity => field(
+            "ZDR",
+            "dB",
+            "log differential reflectivity h/v",
+            RadarMoment,
+        ),
+        MomentType::CorrelationCoefficient => field(
+            "RHOHV",
+            "unitless",
+            "cross correlation ratio h/v",
+            RadarMoment,
+        ),
+        MomentType::DifferentialPhase => {
+            field("PHIDP", "degrees", "differential phase h/v", RadarMoment)
         }
+        MomentType::SpecificDifferentialPhase => field(
+            "KDP",
+            "degrees/km",
+            "specific differential phase h/v",
+            RadarMoment,
+        ),
         MomentType::Unknown(name) => match name.as_str() {
-            "AH" => (
+            "AH" => field(
                 "AH",
                 "dB/km",
                 "specific attenuation at horizontal polarization",
+                ForwardOperator,
             ),
-            "PIA" => (
+            "PIA" => field(
                 "PIA",
                 "dB",
                 "path integrated attenuation at horizontal polarization",
+                ForwardOperator,
             ),
-            "REFC" => (
+            "REFC" => field(
                 "REFC",
                 "dBZ",
                 "attenuation corrected horizontal reflectivity",
+                ForwardOperator,
             ),
-            "ADP" => ("ADP", "dB/km", "specific differential attenuation"),
-            "PIDA" => ("PIDA", "dB", "path integrated differential attenuation"),
-            "ZDRC" => (
+            "ADP" => field(
+                "ADP",
+                "dB/km",
+                "specific differential attenuation",
+                ForwardOperator,
+            ),
+            "PIDA" => field(
+                "PIDA",
+                "dB",
+                "path integrated differential attenuation",
+                ForwardOperator,
+            ),
+            "ZDRC" => field(
                 "ZDRC",
                 "dB",
                 "attenuation corrected differential reflectivity",
+                ForwardOperator,
+            ),
+            "MCOV" => field(
+                "MCOV",
+                "1",
+                "fraction of pulse volume covered by the source model",
+                QualityFraction,
+            ),
+            "TUNB" => field(
+                "TUNB",
+                "1",
+                "fraction of pulse volume not blocked by terrain",
+                QualityFraction,
+            ),
+            "MSIG" => field(
+                "MSIG",
+                "1",
+                "fraction of pulse volume containing meteorological signal",
+                QualityFraction,
+            ),
+            "DIF_REF" => field(
+                "DIF_REF",
+                "dBZ",
+                "synthetic minus observed equivalent reflectivity factor",
+                SyntheticMinusObserved,
+            ),
+            "DIF_VEL" => field(
+                "DIF_VEL",
+                "m/s",
+                "synthetic minus observed radial velocity",
+                SyntheticMinusObserved,
+            ),
+            "DIF_SW" => field(
+                "DIF_SW",
+                "m/s",
+                "synthetic minus observed doppler spectrum width",
+                SyntheticMinusObserved,
+            ),
+            "DIF_ZDR" => field(
+                "DIF_ZDR",
+                "dB",
+                "synthetic minus observed differential reflectivity",
+                SyntheticMinusObserved,
+            ),
+            "DIF_RHO" => field(
+                "DIF_RHO",
+                "1",
+                "synthetic minus observed cross correlation ratio h/v",
+                SyntheticMinusObserved,
+            ),
+            "DIF_PHI" => field(
+                "DIF_PHI",
+                "degrees",
+                "wrapped synthetic minus observed differential phase",
+                SyntheticMinusObserved,
+            ),
+            "DIF_KDP" => field(
+                "DIF_KDP",
+                "degrees/km",
+                "synthetic minus observed specific differential phase",
+                SyntheticMinusObserved,
             ),
             _ => return None,
         },
     })
 }
 
-/// Default export file name: `{site}_{YYYYMMDD_HHMMSS}_simwrf.nc` (site id
-/// squeezed to filesystem-safe characters).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExportRole {
+    Radar,
+    Simulated,
+    SyntheticMinusObserved,
+}
+
+fn export_role(volume: &RadarVolume) -> ExportRole {
+    let has_difference = volume.cuts.iter().any(|cut| {
+        cut.moments
+            .keys()
+            .any(|moment| matches!(moment, MomentType::Unknown(name) if name.starts_with("DIF_")))
+    });
+    if has_difference
+        || volume
+            .metadata
+            .archive_version
+            .as_deref()
+            .is_some_and(|version| version.contains("sim-minus-observed"))
+    {
+        ExportRole::SyntheticMinusObserved
+    } else if volume
+        .metadata
+        .archive_version
+        .as_deref()
+        .is_some_and(|version| version.contains("simulated"))
+        || volume.metadata.forward_operator.is_some()
+        || volume.metadata.source_model.is_some()
+    {
+        ExportRole::Simulated
+    } else {
+        ExportRole::Radar
+    }
+}
+
+/// Role-aware export file name: `{site}_{YYYYMMDD_HHMMSS}_{role}.nc` (site id
+/// squeezed to filesystem-safe characters). Synthetic scans retain the
+/// established `simwrf` suffix; comparison volumes use `sim_minus_obs`.
 // Reached from the native-dialog export UI; tests cover all platforms.
 #[cfg_attr(
     not(any(windows, target_os = "macos", target_os = "linux")),
@@ -105,8 +275,13 @@ pub(crate) fn export_file_name(volume: &RadarVolume) -> String {
     } else {
         site
     };
+    let suffix = match export_role(volume) {
+        ExportRole::SyntheticMinusObserved => "sim_minus_obs",
+        ExportRole::Simulated => "simwrf",
+        ExportRole::Radar => "radar",
+    };
     format!(
-        "{site}_{}_simwrf.nc",
+        "{site}_{}_{suffix}.nc",
         volume.volume_time.format("%Y%m%d_%H%M%S")
     )
 }
@@ -243,10 +418,9 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
     if moments.is_empty() {
         return Err("volume has no supported moments (REF/VEL/…) to export".to_owned());
     }
-    let mut field_data: Vec<(&'static str, &'static str, &'static str, Vec<f32>)> = Vec::new();
+    let mut field_data: Vec<(MomentFieldSpec, Vec<f32>)> = Vec::new();
     for moment in &moments {
-        let (name, units, long_name) =
-            moment_field_spec(moment).expect("union filtered to canonical moments");
+        let spec = moment_field_spec(moment).expect("union filtered to supported moments");
         let mut data = vec![CFRADIAL_FILL; n_rays * n_gates];
         let mut ray_base = 0usize;
         for cut in &sweeps {
@@ -275,7 +449,7 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
             }
             ray_base += cut.radials.len();
         }
-        field_data.push((name, units, long_name, data));
+        field_data.push((spec, data));
     }
 
     // Global attributes. `time_coverage_start` as a global TEXT attribute is
@@ -291,28 +465,46 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
     let end_iso = (volume.volume_time + chrono::Duration::milliseconds(max_offset_ms))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
+    let role = export_role(volume);
+    let (title, source, comment, role_id) = match role {
+        ExportRole::Radar => (
+            "BowEcho radar volume",
+            "radar observation exported by BowEcho",
+            "Radar moments exported without altering their physical values.",
+            "radar_observation",
+        ),
+        ExportRole::Simulated => (
+            "BowEcho simulated radar volume (WRF forward operator)",
+            "simulated-wrf: synthetic NEXRAD-style scan forward-modelled from WRF model output",
+            "Simulated data, not a real radar measurement. Forward-operator configuration and science provenance are carried in file metadata.",
+            "synthetic_radar",
+        ),
+        ExportRole::SyntheticMinusObserved => (
+            "BowEcho exact-geometry synthetic-minus-observed radar differences",
+            "validation: BowEcho synthetic radar minus collocated observed radar",
+            "Signed residuals use synthetic minus observed. DIF_PHI is wrapped to [-180, 180) degrees. This is validation output, not a radar measurement.",
+            "synthetic_minus_observed",
+        ),
+    };
     let mut gattrs = vec![
         Nc3Attr::text("Conventions", "CF/Radial"),
         Nc3Attr::text("version", "1.3"),
-        Nc3Attr::text(
-            "title",
-            "BowEcho simulated radar volume (WRF forward operator)",
-        ),
-        Nc3Attr::text(
-            "source",
-            "simulated-wrf: synthetic NEXRAD-style scan forward-modelled from WRF model output",
-        ),
+        Nc3Attr::text("title", title),
+        Nc3Attr::text("source", source),
         Nc3Attr::text(
             "history",
             "exported by BowEcho radar_export as CfRadial-1 over classic NetCDF-3 (CDF-2)",
         ),
-        Nc3Attr::text(
-            "comment",
-            "Simulated data, not a real radar measurement. Forward-operator \
-             configuration and science provenance are carried in file metadata.",
-        ),
+        Nc3Attr::text("comment", comment),
+        Nc3Attr::text("bowecho_volume_role", role_id),
         Nc3Attr::text("instrument_name", volume.site.id.clone()),
     ];
+    if role == ExportRole::SyntheticMinusObserved {
+        gattrs.push(Nc3Attr::text(
+            "bowecho_difference_convention",
+            "synthetic_minus_observed",
+        ));
+    }
     if let Some(vcp) = &volume.vcp {
         gattrs.push(Nc3Attr::floats("vcp_pattern", vec![vcp.pattern as f32]));
     }
@@ -693,16 +885,27 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
         }
     }
 
-    for (name, units, long_name, data) in field_data {
+    for (spec, data) in field_data {
+        let mut attrs = vec![
+            Nc3Attr::text("long_name", spec.long_name),
+            Nc3Attr::text("units", spec.units),
+            Nc3Attr::text("coordinates", "elevation azimuth range"),
+            Nc3Attr::text("bowecho_field_role", spec.role.id()),
+            Nc3Attr::floats("_FillValue", vec![CFRADIAL_FILL]),
+        ];
+        if spec.role == FieldRole::QualityFraction {
+            attrs.push(Nc3Attr::floats("valid_min", vec![0.0]));
+            attrs.push(Nc3Attr::floats("valid_max", vec![1.0]));
+        } else if spec.role == FieldRole::SyntheticMinusObserved {
+            attrs.push(Nc3Attr::text(
+                "bowecho_difference_convention",
+                "synthetic_minus_observed",
+            ));
+        }
         vars.push(Nc3VarDef {
-            name: name.to_owned(),
+            name: spec.name.to_owned(),
             dimids: vec![TIME, RANGE],
-            attrs: vec![
-                Nc3Attr::text("long_name", long_name),
-                Nc3Attr::text("units", units),
-                Nc3Attr::text("coordinates", "elevation azimuth range"),
-                Nc3Attr::floats("_FillValue", vec![CFRADIAL_FILL]),
-            ],
+            attrs,
         });
         payloads.push(data);
     }
@@ -804,6 +1007,24 @@ mod tests {
             range_folded: None,
             radial_indices,
             storage: MomentStorage::F32(rows.into_iter().flatten().collect()),
+        }
+    }
+
+    fn compact_quality_grid(
+        id: &str,
+        gate_range: GateRange,
+        radial_count: usize,
+        encoded: Vec<u8>,
+    ) -> MomentGrid {
+        MomentGrid {
+            moment: MomentType::Unknown(id.to_owned()),
+            gate_range,
+            scale: u8::MAX as f32,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: (0..radial_count).collect(),
+            storage: MomentStorage::U8(encoded),
         }
     }
 
@@ -1069,6 +1290,86 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_quality_and_difference_fields_with_role_metadata() {
+        let mut volume = sample_volume();
+        volume.metadata.archive_version = Some("bowecho-sim-minus-observed-v1".to_owned());
+        volume.metadata.forward_operator =
+            Some("BowEcho exact-geometry synthetic-minus-observed difference v1".to_owned());
+        let difference_ids = [
+            "DIF_REF", "DIF_VEL", "DIF_SW", "DIF_ZDR", "DIF_RHO", "DIF_PHI", "DIF_KDP",
+        ];
+        for cut in &mut volume.cuts {
+            let range = cut.radials[0].gate_range.clone();
+            let samples = cut.radials.len() * range.gate_count;
+            for (index, id) in ["MCOV", "TUNB", "MSIG"].into_iter().enumerate() {
+                let encoded = (0..samples)
+                    .map(|sample| [0_u8, 64, 128, 255][(sample + index) % 4])
+                    .collect();
+                cut.moments.insert(
+                    MomentType::Unknown(id.to_owned()),
+                    compact_quality_grid(id, range.clone(), cut.radials.len(), encoded),
+                );
+            }
+            for (index, id) in difference_ids.into_iter().enumerate() {
+                let rows = (0..cut.radials.len())
+                    .map(|ray| {
+                        (0..range.gate_count)
+                            .map(|gate| {
+                                index as f32 * 0.25 + ray as f32 * 0.5 - gate as f32 * 0.125
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let moment = MomentType::Unknown(id.to_owned());
+                cut.moments
+                    .insert(moment.clone(), grid(moment, range.clone(), rows));
+            }
+        }
+
+        assert_eq!(export_role(&volume), ExportRole::SyntheticMinusObserved);
+        assert_eq!(
+            export_file_name(&volume),
+            "KTST_20260519_043000_sim_minus_obs.nc"
+        );
+        let path = tmp_dir("validation-roundtrip").join(export_file_name(&volume));
+        export_volume_cfradial(&volume, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let header = String::from_utf8_lossy(&bytes);
+        for marker in [
+            "bowecho_volume_role",
+            "synthetic_minus_observed",
+            "bowecho_field_role",
+            "pulse_volume_support_fraction",
+        ] {
+            assert!(
+                header.contains(marker),
+                "missing CfRadial metadata {marker}"
+            );
+        }
+        let decoded = nexrad_io::decode_supported_volume_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded.metadata.forward_operator.as_deref(),
+            Some("BowEcho exact-geometry synthetic-minus-observed difference v1")
+        );
+        for cut in &decoded.cuts {
+            for id in ["MCOV", "TUNB", "MSIG"].into_iter().chain(difference_ids) {
+                assert!(
+                    cut.moments
+                        .contains_key(&MomentType::Unknown(id.to_owned())),
+                    "missing round-tripped {id}"
+                );
+            }
+        }
+        let mcov = &decoded.cuts[0].moments[&MomentType::Unknown("MCOV".to_owned())];
+        assert_eq!(mcov.scaled_value(0, 0), Some(0.0));
+        assert!((mcov.scaled_value(0, 1).unwrap() - 64.0 / 255.0).abs() < 1.0e-6);
+        assert!((mcov.scaled_value(0, 3).unwrap() - 1.0).abs() < 1.0e-6);
+        let difference = &decoded.cuts[0].moments[&MomentType::Unknown("DIF_REF".to_owned())];
+        assert_eq!(difference.scaled_value(0, 0), Some(0.0));
+        assert_eq!(difference.scaled_value(0, 1), Some(-0.125));
+    }
+
+    #[test]
     fn round_trip_vcp_physical_rows_without_inventing_prt() {
         let mut volume = sample_volume();
         volume.vcp = Some(VcpInfo { pattern: 212 });
@@ -1190,9 +1491,27 @@ mod tests {
     #[test]
     fn arbitrary_unknown_moments_remain_outside_export_whitelist() {
         assert!(moment_field_spec(&MomentType::Unknown("unsafe/name".to_owned())).is_none());
-        for id in ["AH", "PIA", "REFC", "ADP", "PIDA", "ZDRC"] {
+        for id in [
+            "AH", "PIA", "REFC", "ADP", "PIDA", "ZDRC", "MCOV", "TUNB", "MSIG", "DIF_REF",
+            "DIF_VEL", "DIF_SW", "DIF_ZDR", "DIF_RHO", "DIF_PHI", "DIF_KDP",
+        ] {
             assert!(moment_field_spec(&MomentType::Unknown(id.to_owned())).is_some());
         }
+        assert_eq!(
+            moment_field_spec(&MomentType::Unknown("MCOV".to_owned()))
+                .unwrap()
+                .role,
+            FieldRole::QualityFraction
+        );
+        assert_eq!(
+            moment_field_spec(&MomentType::Unknown("DIF_PHI".to_owned())).unwrap(),
+            field(
+                "DIF_PHI",
+                "degrees",
+                "wrapped synthetic minus observed differential phase",
+                FieldRole::SyntheticMinusObserved,
+            )
+        );
     }
 
     #[test]
@@ -1260,6 +1579,21 @@ mod tests {
         assert_eq!(
             export_file_name(&no_site),
             "SIMWRF_20260519_043000_simwrf.nc"
+        );
+
+        let mut difference = sample_volume();
+        let range = difference.cuts[0].radials[0].gate_range.clone();
+        difference.cuts[0].moments.insert(
+            MomentType::Unknown("DIF_REF".to_owned()),
+            grid(
+                MomentType::Unknown("DIF_REF".to_owned()),
+                range,
+                vec![vec![0.0; 16]; 8],
+            ),
+        );
+        assert_eq!(
+            export_file_name(&difference),
+            "KTST_20260519_043000_sim_minus_obs.nc"
         );
     }
 
