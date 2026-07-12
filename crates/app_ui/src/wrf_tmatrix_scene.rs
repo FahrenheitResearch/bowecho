@@ -10,25 +10,31 @@ use std::mem::size_of;
 
 use radar_scattering::{
     AdditiveScattering, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
-    DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K, EvaluationError,
-    FallMomentPolicy, IshmaelIceCategory, MixtureTopology, OrientationDefinition, OutputError,
-    ParticleState, PolarAccumulatorQuantities, RadarViewApplicability, RadarViewGeometry,
-    ResearchTMatrixLut, Sha256Digest, SpheroidConvention, TMatrixEvaluationRequest,
-    TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory, TMatrixPopulationRole,
+    DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K, DiagnosticWetCategory,
+    EvaluationError, FallMomentPolicy, IshmaelIceCategory, MixtureTopology, OrientationDefinition,
+    OutputError, ParticleState, PolarAccumulatorQuantities, RadarViewApplicability,
+    RadarViewGeometry, ResearchTMatrixLut, Sha256Digest, SpheroidConvention,
+    TMatrixEvaluationRequest, TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory,
+    TMatrixPopulationRole,
 };
 use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::wrf_property_reader::{
-    ClosedRainState, CoexistenceScatteringComponent, CoexistenceUnavailable, PropertySceneIdentity,
-    RainUnavailableReason, RequiredFieldSignature, SourceFieldProvenance, WrfPropertyCategory,
-    WrfPropertyReadError, WrfPropertyScene,
+    ClosedCellCategory, ClosedPropertyCell, ClosedRainState, CoexistenceUnavailable,
+    PropertySceneIdentity, RainUnavailableReason, RequiredFieldContract, RequiredFieldSignature,
+    SourceFieldProvenance, WrfPropertyCategory, WrfPropertyReadError, WrfPropertyScene,
 };
 use crate::wrf_temporal::ScenePropertySignature;
 
 pub const PROPERTY_TMATRIX_FREQUENCY_HZ: f64 = 2_800_000_000.0;
 pub const PROPERTY_TMATRIX_MIN_ELEVATION_DEG: f64 = -0.5;
 pub const PROPERTY_TMATRIX_MAX_ELEVATION_DEG: f64 = 20.0;
+pub const MAX_WEIGHTED_PROPERTY_CELLS: usize = 8;
+
+const WEIGHT_SUM_TOLERANCE: f64 = 1.0e-9;
+const MAX_PROPERTY_CATEGORIES_PER_CELL: usize = 3;
+const PER_WORKER_ALLOCATION_GUARD_BYTES: usize = 16 * 1024;
 
 const DRY_OBLATE_TABLE_ID: &str =
     "property-p3-ishmael-dry-oblate-sband-pytmatrix-0.3.3-unvalidated-v1";
@@ -253,6 +259,43 @@ impl WrfTMatrixSceneMemoryEstimate {
     }
 }
 
+/// Conservative peak for memory owned directly by property-scene building.
+///
+/// It includes the already-retained [`WrfPropertyScene`], the worst-case flat
+/// component buffer (every active source cell retained), dense and sparse
+/// lookup storage, FrozenOnly filter summaries, cloned scene metadata, and a
+/// per-Rayon-worker allowance for one borrowed output chunk plus transient
+/// closed-category/coexistence state. The per-worker allowance deliberately
+/// double-counts the borrowed chunk to remain conservative.
+///
+/// It does not include LUT bytes (borrowed and expected to be resident before
+/// this build), allocator bookkeeping/slack, Rayon thread stacks/runtime
+/// internals, NetCDF decoder caches, or allocations owned by the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WrfTMatrixBuildPeakEstimate {
+    pub source_scene_retained_bytes: usize,
+    pub active_source_cells: usize,
+    pub radar_elevation_nodes: usize,
+    pub parallel_workers: usize,
+    pub component_buffer_bytes: usize,
+    pub dense_lookup_bytes: usize,
+    pub sparse_index_bytes: usize,
+    pub frozen_filter_summary_bytes: usize,
+    pub scene_metadata_bytes: usize,
+    pub worker_chunk_and_closure_scratch_bytes: usize,
+    pub estimated_peak_bytes: usize,
+}
+
+impl WrfTMatrixBuildPeakEstimate {
+    #[must_use]
+    pub const fn retained_scene_upper_bound_bytes(self) -> usize {
+        self.component_buffer_bytes
+            .saturating_add(self.dense_lookup_bytes)
+            .saturating_add(self.sparse_index_bytes)
+            .saturating_add(self.scene_metadata_bytes)
+    }
+}
+
 /// Sparse precomputed additive scattering for one WRF property scene.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WrfTMatrixScene {
@@ -285,58 +328,74 @@ impl WrfTMatrixScene {
         rain_mode: WrfTMatrixRainMode,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
         let validated = validate_bundle(tables)?;
-        if source.cell_count() > u32::MAX as usize {
-            return Err(WrfTMatrixSceneBuildError::GridTooLarge {
-                cell_count: source.cell_count(),
-            });
-        }
-        validate_sparse_indices(source)?;
+        validate_source_shape(source)?;
         let elevations = validated.radar_elevations_deg;
-        let rows = source
-            .active_cell_indices()
-            .par_iter()
-            .map(|&cell_index| {
-                build_cell(
-                    source,
-                    usize::try_from(cell_index).expect("u32 always fits usize"),
-                    tables,
-                    elevations,
-                    rain_mode,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
         let components_per_cell = elevations
             .len()
             .checked_mul(AdditiveScattering::COMPONENT_COUNT)
             .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
-        let retained_rows = rows.iter().filter(|row| !row.components.is_empty()).count();
-        let total_components = retained_rows
+        let total_components = source
+            .active_cell_indices()
+            .len()
             .checked_mul(components_per_cell)
             .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
-        let mut additive_components = Vec::with_capacity(total_components);
-        let mut source_cell_indices = Vec::with_capacity(retained_rows);
-        let mut counts = WrfTMatrixAuditCounts::default();
-        for row in rows {
-            if row.components.is_empty() {
-                continue;
+        let mut additive_components = vec![0.0_f32; total_components];
+
+        let (source_cell_indices, counts) = match rain_mode {
+            WrfTMatrixRainMode::FullProperty => {
+                let counts = additive_components
+                    .par_chunks_mut(components_per_cell)
+                    .zip(source.active_cell_indices().par_iter())
+                    .try_fold(
+                        WrfTMatrixAuditCounts::default,
+                        |counts, (output, &cell_index)| {
+                            let summary = build_cell_into(
+                                source,
+                                cell_index as usize,
+                                tables,
+                                elevations,
+                                rain_mode,
+                                output,
+                            )?;
+                            if !summary.retained {
+                                return Err(WrfTMatrixSceneBuildError::UnexpectedClearActiveCell {
+                                    cell_index: cell_index as usize,
+                                });
+                            }
+                            counts
+                                .checked_add(summary.counts)
+                                .ok_or(WrfTMatrixSceneBuildError::AuditCountOverflow)
+                        },
+                    )
+                    .try_reduce(WrfTMatrixAuditCounts::default, |left, right| {
+                        left.checked_add(right)
+                            .ok_or(WrfTMatrixSceneBuildError::AuditCountOverflow)
+                    })?;
+                (source.active_cell_indices().to_vec(), counts)
             }
-            if row.components.len() != components_per_cell {
-                return Err(WrfTMatrixSceneBuildError::InternalRowLength {
-                    cell_index: row.cell_index,
-                    expected: components_per_cell,
-                    actual: row.components.len(),
-                });
+            WrfTMatrixRainMode::FrozenOnly => {
+                let summaries = additive_components
+                    .par_chunks_mut(components_per_cell)
+                    .zip(source.active_cell_indices().par_iter())
+                    .map(|(output, &cell_index)| {
+                        build_cell_into(
+                            source,
+                            cell_index as usize,
+                            tables,
+                            elevations,
+                            rain_mode,
+                            output,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                compact_frozen_only_rows(
+                    &mut additive_components,
+                    components_per_cell,
+                    source.active_cell_indices(),
+                    summaries,
+                )?
             }
-            source_cell_indices.push(
-                u32::try_from(row.cell_index)
-                    .map_err(|_| WrfTMatrixSceneBuildError::SizeOverflow)?,
-            );
-            additive_components.extend(row.components);
-            counts = counts
-                .checked_add(row.counts)
-                .ok_or(WrfTMatrixSceneBuildError::AuditCountOverflow)?;
-        }
+        };
         let mut full_cell_to_compact_row = vec![u32::MAX; source.cell_count()];
         for (compact_row, &source_cell) in source_cell_indices.iter().enumerate() {
             let compact_row =
@@ -377,6 +436,23 @@ impl WrfTMatrixScene {
                 counts,
             },
         })
+    }
+
+    /// Estimate the upper-bound peak of memory directly owned by this build
+    /// before allocating the output component plane.
+    pub fn estimate_build_peak(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        rain_mode: WrfTMatrixRainMode,
+    ) -> Result<WrfTMatrixBuildPeakEstimate, WrfTMatrixSceneBuildError> {
+        let validated = validate_bundle(tables)?;
+        validate_source_shape(source)?;
+        estimate_build_peak_from_shape(
+            source,
+            validated.radar_elevations_deg.len(),
+            rain_mode,
+            rayon::current_num_threads().max(1),
+        )
     }
 
     #[must_use]
@@ -481,6 +557,85 @@ impl WrfTMatrixScene {
             .map_err(WrfTMatrixSceneQueryError::Output)
     }
 
+    /// Interpolate and accumulate one normalized spatial stencil.
+    ///
+    /// Elevation is bracketed once. Up to eight full-grid cells are then
+    /// accumulated directly in the nine additive components and converted to
+    /// [`AdditiveScattering`] once. Weights must be finite, nonnegative, and
+    /// sum to one within `1e-9`. Clear cells contribute exact zero; their
+    /// weight is never redistributed to echoing cells.
+    #[inline]
+    pub fn weighted_additive_at(
+        &self,
+        contributions: &[(usize, f64)],
+        beam_elevation_deg: f64,
+    ) -> Result<AdditiveScattering, WrfTMatrixSceneQueryError> {
+        if contributions.is_empty() {
+            return Err(WrfTMatrixSceneQueryError::NoWeightedContributions);
+        }
+        if contributions.len() > MAX_WEIGHTED_PROPERTY_CELLS {
+            return Err(WrfTMatrixSceneQueryError::TooManyWeightedContributions {
+                actual: contributions.len(),
+                maximum: MAX_WEIGHTED_PROPERTY_CELLS,
+            });
+        }
+        let bracket = elevation_bracket(&self.radar_elevations_deg, beam_elevation_deg)?;
+        let mut weight_sum = 0.0;
+        let mut accumulated = [0.0; AdditiveScattering::COMPONENT_COUNT];
+        for (contribution_index, &(full_cell_index, weight)) in contributions.iter().enumerate() {
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(WrfTMatrixSceneQueryError::InvalidWeight {
+                    contribution_index,
+                    weight,
+                });
+            }
+            if full_cell_index >= self.source_cell_count {
+                return Err(WrfTMatrixSceneQueryError::CellOutOfRange {
+                    cell_index: full_cell_index,
+                    cell_count: self.source_cell_count,
+                });
+            }
+            weight_sum += weight;
+            let compact_cell = *self
+                .full_cell_to_compact_row
+                .get(full_cell_index)
+                .ok_or(WrfTMatrixSceneQueryError::CorruptStorage)?;
+            if compact_cell == u32::MAX || weight == 0.0 {
+                continue;
+            }
+            let compact_cell = compact_cell as usize;
+            let lower = self.component_row(compact_cell, bracket.lower)?;
+            if bracket.lower == bracket.upper {
+                for component in 0..AdditiveScattering::COMPONENT_COUNT {
+                    accumulated[component] += weight * f64::from(lower[component]);
+                }
+                continue;
+            }
+            let upper = self.component_row(compact_cell, bracket.upper)?;
+            for component in 0..AdditiveScattering::COMPONENT_COUNT {
+                let interpolated = f64::from(lower[component])
+                    + bracket.fraction
+                        * (f64::from(upper[component]) - f64::from(lower[component]));
+                accumulated[component] += weight * interpolated;
+            }
+        }
+        if (weight_sum - 1.0).abs() > WEIGHT_SUM_TOLERANCE {
+            return Err(WrfTMatrixSceneQueryError::WeightSum { sum: weight_sum });
+        }
+        AdditiveScattering::from_components(accumulated).map_err(WrfTMatrixSceneQueryError::Output)
+    }
+
+    #[inline]
+    pub fn weighted_polar_at(
+        &self,
+        contributions: &[(usize, f64)],
+        beam_elevation_deg: f64,
+    ) -> Result<PolarAccumulatorQuantities, WrfTMatrixSceneQueryError> {
+        self.weighted_additive_at(contributions, beam_elevation_deg)?
+            .to_polar_accumulator_quantities()
+            .map_err(WrfTMatrixSceneQueryError::Output)
+    }
+
     #[must_use]
     pub fn memory_estimate(&self) -> WrfTMatrixSceneMemoryEstimate {
         let required_field_contract_bytes = self.required_field_signature.fields.len()
@@ -505,6 +660,7 @@ impl WrfTMatrixScene {
         }
     }
 
+    #[inline]
     fn component_row(
         &self,
         compact_cell: usize,
@@ -529,27 +685,37 @@ struct ValidatedBundle<'a> {
 }
 
 #[derive(Debug)]
-struct BuiltCell {
-    cell_index: usize,
-    components: Vec<f32>,
+struct CellBuildSummary {
+    retained: bool,
     counts: WrfTMatrixAuditCounts,
 }
 
-fn build_cell(
+fn build_cell_into(
     source: &WrfPropertyScene,
     cell_index: usize,
     tables: WrfTMatrixLutBundle<'_>,
     elevations: &[f64],
     rain_mode: WrfTMatrixRainMode,
-) -> Result<BuiltCell, WrfTMatrixSceneBuildError> {
+    output: &mut [f32],
+) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
+    let expected_components = elevations
+        .len()
+        .checked_mul(AdditiveScattering::COMPONENT_COUNT)
+        .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+    if output.len() != expected_components {
+        return Err(WrfTMatrixSceneBuildError::InternalRowLength {
+            cell_index,
+            expected: expected_components,
+            actual: output.len(),
+        });
+    }
     let closed = source
         .close_cell(cell_index, OrientationDefinition::Gaussian20Research)
         .map_err(|source| WrfTMatrixSceneBuildError::SourceCell { cell_index, source })?;
     let Some(closed) = closed else {
         return if rain_mode == WrfTMatrixRainMode::FrozenOnly {
-            Ok(BuiltCell {
-                cell_index,
-                components: Vec::new(),
+            Ok(CellBuildSummary {
+                retained: false,
                 counts: WrfTMatrixAuditCounts::default(),
             })
         } else {
@@ -572,9 +738,8 @@ fn build_cell(
     };
     let has_frozen = !closed.categories().is_empty();
     if rain_mode == WrfTMatrixRainMode::FrozenOnly && !has_frozen {
-        return Ok(BuiltCell {
-            cell_index,
-            components: Vec::new(),
+        return Ok(CellBuildSummary {
+            retained: false,
             counts: WrfTMatrixAuditCounts::default(),
         });
     }
@@ -613,76 +778,65 @@ fn build_cell(
         }
     };
 
-    let component_capacity = elevations
-        .len()
-        .checked_mul(AdditiveScattering::COMPONENT_COUNT)
-        .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
-    let mut compact = Vec::with_capacity(component_capacity);
-    for &elevation_deg in elevations {
+    for (elevation_index, &elevation_deg) in elevations.iter().enumerate() {
         let mut additive = AdditiveScattering::default();
         if let Some(partition) = &coexistence {
-            for component in partition.scattering_components() {
-                match component {
-                    CoexistenceScatteringComponent::WetCategory(wet) => {
-                        let spheroid = spheroid_for_particle(wet.source_category())?;
-                        let request = evaluation_request(elevation_deg, spheroid)?;
-                        let contribution = tables
-                            .wet(spheroid)
-                            .evaluate_wet_category(wet, request)
-                            .map_err(|source| WrfTMatrixSceneBuildError::Evaluation {
-                                cell_index,
-                                elevation_deg,
-                                contribution: WrfTMatrixContribution::WetFrozen,
-                                source,
-                            })?;
-                        verify_fall_moment_policy(
-                            contribution.fall_moments(),
-                            FallMomentPolicy::DiagnosticWetCategoryPositiveDownZeroWithinCategoryVariance,
-                            WrfTMatrixContribution::WetFrozen,
-                        )?;
-                        additive =
-                            additive
-                                .checked_add(contribution.additive())
-                                .map_err(|source| WrfTMatrixSceneBuildError::Accumulation {
-                                    cell_index,
-                                    elevation_deg,
-                                    contribution: WrfTMatrixContribution::WetFrozen,
-                                    source,
-                                })?;
-                    }
-                    CoexistenceScatteringComponent::UnusedRain {
-                        source: rain_source,
-                        mixing_ratio_kgkg,
-                    } => {
-                        let request = evaluation_request(
-                            elevation_deg,
-                            SpheroidConvention::OblateMinorVertical,
-                        )?;
-                        let contribution = tables
-                            .rain_standalone_and_residual
-                            .evaluate_unused_rain(rain_source, mixing_ratio_kgkg, request)
-                            .map_err(|source| WrfTMatrixSceneBuildError::Evaluation {
-                                cell_index,
-                                elevation_deg,
-                                contribution: WrfTMatrixContribution::ResidualRain,
-                                source,
-                            })?;
-                        verify_fall_moment_policy(
-                            contribution.fall_moments(),
-                            FallMomentPolicy::ClosedCategoryPositiveDownZeroWithinCategoryVariance,
-                            WrfTMatrixContribution::ResidualRain,
-                        )?;
-                        additive =
-                            additive
-                                .checked_add(contribution.additive())
-                                .map_err(|source| WrfTMatrixSceneBuildError::Accumulation {
-                                    cell_index,
-                                    elevation_deg,
-                                    contribution: WrfTMatrixContribution::ResidualRain,
-                                    source,
-                                })?;
-                    }
-                }
+            for wet in partition.diagnosis().wet_categories() {
+                let spheroid = spheroid_for_particle(wet.source_category())?;
+                let request = evaluation_request(elevation_deg, spheroid)?;
+                let contribution = tables
+                    .wet(spheroid)
+                    .evaluate_wet_category(wet, request)
+                    .map_err(|source| WrfTMatrixSceneBuildError::Evaluation {
+                        cell_index,
+                        elevation_deg,
+                        contribution: WrfTMatrixContribution::WetFrozen,
+                        source,
+                    })?;
+                verify_fall_moment_policy(
+                    contribution.fall_moments(),
+                    FallMomentPolicy::DiagnosticWetCategoryPositiveDownZeroWithinCategoryVariance,
+                    WrfTMatrixContribution::WetFrozen,
+                )?;
+                additive = additive
+                    .checked_add(contribution.additive())
+                    .map_err(|source| WrfTMatrixSceneBuildError::Accumulation {
+                        cell_index,
+                        elevation_deg,
+                        contribution: WrfTMatrixContribution::WetFrozen,
+                        source,
+                    })?;
+            }
+            let unused_rain_mass = partition.diagnosis().unused_rain_mass_kgkg();
+            if unused_rain_mass > 0.0 {
+                let rain_source =
+                    rain.ok_or(WrfTMatrixSceneBuildError::CoexistenceMissingRainSource {
+                        cell_index,
+                    })?;
+                let request =
+                    evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+                let contribution = tables
+                    .rain_standalone_and_residual
+                    .evaluate_unused_rain(rain_source, unused_rain_mass, request)
+                    .map_err(|source| WrfTMatrixSceneBuildError::Evaluation {
+                        cell_index,
+                        elevation_deg,
+                        contribution: WrfTMatrixContribution::ResidualRain,
+                        source,
+                    })?;
+                verify_fall_moment_policy(
+                    contribution.fall_moments(),
+                    FallMomentPolicy::ClosedCategoryPositiveDownZeroWithinCategoryVariance,
+                    WrfTMatrixContribution::ResidualRain,
+                )?;
+                additive = additive
+                    .checked_add(contribution.additive())
+                    .map_err(|source| WrfTMatrixSceneBuildError::Accumulation {
+                        cell_index,
+                        elevation_deg,
+                        contribution: WrfTMatrixContribution::ResidualRain,
+                        source,
+                    })?;
             }
         } else {
             for category in closed.categories() {
@@ -730,18 +884,195 @@ fn build_cell(
                 })?;
             }
         }
-        compact.extend(compact_components(additive).map_err(|source| {
-            WrfTMatrixSceneBuildError::Compact {
+        let compact =
+            compact_components(additive).map_err(|source| WrfTMatrixSceneBuildError::Compact {
                 cell_index,
                 elevation_deg,
                 source,
-            }
-        })?);
+            })?;
+        let start = elevation_index
+            .checked_mul(AdditiveScattering::COMPONENT_COUNT)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+        output[start..start + AdditiveScattering::COMPONENT_COUNT].copy_from_slice(&compact);
     }
-    Ok(BuiltCell {
-        cell_index,
-        components: compact,
+    Ok(CellBuildSummary {
+        retained: true,
         counts,
+    })
+}
+
+fn compact_frozen_only_rows(
+    components: &mut Vec<f32>,
+    components_per_cell: usize,
+    source_indices: &[u32],
+    summaries: Vec<CellBuildSummary>,
+) -> Result<(Vec<u32>, WrfTMatrixAuditCounts), WrfTMatrixSceneBuildError> {
+    let expected_components = source_indices
+        .len()
+        .checked_mul(components_per_cell)
+        .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+    if components.len() != expected_components {
+        return Err(WrfTMatrixSceneBuildError::InternalComponentPlaneLength {
+            expected: expected_components,
+            actual: components.len(),
+        });
+    }
+    if summaries.len() != source_indices.len() {
+        return Err(WrfTMatrixSceneBuildError::InternalSummaryLength {
+            expected: source_indices.len(),
+            actual: summaries.len(),
+        });
+    }
+    let mut retained_indices = Vec::with_capacity(source_indices.len());
+    let mut retained_rows = 0_usize;
+    let mut counts = WrfTMatrixAuditCounts::default();
+    for (source_row, (source_index, summary)) in
+        source_indices.iter().copied().zip(summaries).enumerate()
+    {
+        if !summary.retained {
+            continue;
+        }
+        let source_start = source_row
+            .checked_mul(components_per_cell)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+        let source_end = source_start
+            .checked_add(components_per_cell)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+        let destination = retained_rows
+            .checked_mul(components_per_cell)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+        if source_start != destination {
+            components.copy_within(source_start..source_end, destination);
+        }
+        retained_indices.push(source_index);
+        retained_rows += 1;
+        counts = counts
+            .checked_add(summary.counts)
+            .ok_or(WrfTMatrixSceneBuildError::AuditCountOverflow)?;
+    }
+    components.truncate(
+        retained_rows
+            .checked_mul(components_per_cell)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?,
+    );
+    Ok((retained_indices, counts))
+}
+
+fn validate_source_shape(source: &WrfPropertyScene) -> Result<(), WrfTMatrixSceneBuildError> {
+    if source.cell_count() > u32::MAX as usize {
+        return Err(WrfTMatrixSceneBuildError::GridTooLarge {
+            cell_count: source.cell_count(),
+        });
+    }
+    validate_sparse_indices(source)
+}
+
+fn estimate_build_peak_from_shape(
+    source: &WrfPropertyScene,
+    elevation_nodes: usize,
+    rain_mode: WrfTMatrixRainMode,
+    parallel_workers: usize,
+) -> Result<WrfTMatrixBuildPeakEstimate, WrfTMatrixSceneBuildError> {
+    let active_source_cells = source.active_cell_indices().len();
+    let components_per_cell =
+        checked_product(&[elevation_nodes, AdditiveScattering::COMPONENT_COUNT])?;
+    let component_buffer_bytes =
+        checked_product(&[active_source_cells, components_per_cell, size_of::<f32>()])?;
+    let dense_lookup_bytes = checked_product(&[source.cell_count(), size_of::<u32>()])?;
+    let sparse_index_bytes = checked_product(&[active_source_cells, size_of::<u32>()])?;
+    let frozen_filter_summary_bytes = if rain_mode == WrfTMatrixRainMode::FrozenOnly {
+        checked_product(&[active_source_cells, size_of::<CellBuildSummary>()])?
+    } else {
+        0
+    };
+
+    let required_contract_bytes = checked_product(&[
+        source.required_field_signature().fields.len(),
+        size_of::<RequiredFieldContract>() + 4 * size_of::<usize>(),
+    ])?;
+    let source_field_structure_bytes = checked_product(&[
+        source.source_fields().len(),
+        size_of::<SourceFieldProvenance>(),
+    ])?;
+    let source_field_text_bytes = checked_sum(
+        source
+            .source_fields()
+            .iter()
+            .map(|field| field.source_units().len()),
+    )?;
+    let elevation_axis_bytes = checked_product(&[elevation_nodes, size_of::<f64>()])?;
+    let scene_metadata_bytes = checked_sum([
+        size_of::<WrfTMatrixScene>(),
+        source.identity().source_identity.0.len(),
+        required_contract_bytes,
+        source_field_structure_bytes,
+        source_field_text_bytes,
+        elevation_axis_bytes,
+    ])?;
+
+    let closure_source_copy_bytes = checked_product(&[
+        MAX_PROPERTY_CATEGORIES_PER_CELL + 1,
+        checked_sum([
+            source_field_structure_bytes,
+            source_field_text_bytes,
+            required_contract_bytes,
+        ])?,
+    ])?;
+    let per_worker_scratch = checked_sum([
+        checked_product(&[components_per_cell, size_of::<f32>()])?,
+        size_of::<ClosedPropertyCell>(),
+        checked_product(&[
+            MAX_PROPERTY_CATEGORIES_PER_CELL,
+            size_of::<ClosedCellCategory>(),
+        ])?,
+        checked_product(&[
+            MAX_PROPERTY_CATEGORIES_PER_CELL,
+            size_of::<DiagnosticWetCategory>(),
+        ])?,
+        closure_source_copy_bytes,
+        PER_WORKER_ALLOCATION_GUARD_BYTES,
+    ])?;
+    let worker_chunk_and_closure_scratch_bytes =
+        checked_product(&[parallel_workers.max(1), per_worker_scratch])?;
+    let source_scene_retained_bytes = source.memory_estimate().retained_bytes();
+    let estimated_peak_bytes = checked_sum([
+        source_scene_retained_bytes,
+        component_buffer_bytes,
+        dense_lookup_bytes,
+        sparse_index_bytes,
+        frozen_filter_summary_bytes,
+        scene_metadata_bytes,
+        worker_chunk_and_closure_scratch_bytes,
+    ])?;
+    Ok(WrfTMatrixBuildPeakEstimate {
+        source_scene_retained_bytes,
+        active_source_cells,
+        radar_elevation_nodes: elevation_nodes,
+        parallel_workers: parallel_workers.max(1),
+        component_buffer_bytes,
+        dense_lookup_bytes,
+        sparse_index_bytes,
+        frozen_filter_summary_bytes,
+        scene_metadata_bytes,
+        worker_chunk_and_closure_scratch_bytes,
+        estimated_peak_bytes,
+    })
+}
+
+fn checked_product(values: &[usize]) -> Result<usize, WrfTMatrixSceneBuildError> {
+    values.iter().try_fold(1_usize, |product, value| {
+        product
+            .checked_mul(*value)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)
+    })
+}
+
+fn checked_sum(
+    values: impl IntoIterator<Item = usize>,
+) -> Result<usize, WrfTMatrixSceneBuildError> {
+    values.into_iter().try_fold(0_usize, |sum, value| {
+        sum.checked_add(value)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)
     })
 }
 
@@ -1163,6 +1494,8 @@ pub enum WrfTMatrixSceneBuildError {
         #[source]
         source: CoexistenceUnavailable,
     },
+    #[error("diagnosed coexistence at cell {cell_index} lost its closed rain source")]
+    CoexistenceMissingRainSource { cell_index: usize },
     #[error("construct exact T-matrix evaluation request: {0}")]
     EvaluationRequest(#[source] EvaluationError),
     #[error(
@@ -1210,6 +1543,10 @@ pub enum WrfTMatrixSceneBuildError {
         expected: usize,
         actual: usize,
     },
+    #[error("internal component plane has {actual} values, expected {expected}")]
+    InternalComponentPlaneLength { expected: usize, actual: usize },
+    #[error("internal FrozenOnly summary has {actual} rows, expected {expected}")]
+    InternalSummaryLength { expected: usize, actual: usize },
 }
 
 #[derive(Debug, Error)]
@@ -1287,6 +1624,19 @@ pub enum CompactScatteringError {
 
 #[derive(Debug, Error)]
 pub enum WrfTMatrixSceneQueryError {
+    #[error("weighted property query requires at least one contribution")]
+    NoWeightedContributions,
+    #[error("weighted property query has {actual} contributions; maximum is {maximum}")]
+    TooManyWeightedContributions { actual: usize, maximum: usize },
+    #[error(
+        "weighted property contribution {contribution_index} has invalid nonnegative weight {weight}"
+    )]
+    InvalidWeight {
+        contribution_index: usize,
+        weight: f64,
+    },
+    #[error("weighted property contribution weights sum to {sum}, expected 1")]
+    WeightSum { sum: f64 },
     #[error("property scattering cell {cell_index} is outside {cell_count} source cells")]
     CellOutOfRange {
         cell_index: usize,
@@ -1461,6 +1811,63 @@ mod tests {
     }
 
     #[test]
+    fn weighted_query_keeps_clear_weight_as_exact_zero_and_signed_kdp() {
+        let scene = synthetic_scene();
+        let weighted = scene
+            .weighted_additive_at(&[(3, 0.25), (1, 0.75)], -0.5)
+            .unwrap();
+        let values = weighted.components();
+        assert_eq!(values[0], 25.0);
+        assert_eq!(values[1], 20.0);
+        assert_eq!(values[2], 17.5);
+        assert_eq!(values[3], -1.25);
+        assert_eq!(values[4], -0.25);
+        assert!((values[5] - 0.025).abs() < 1.0e-8);
+        assert!((values[6] - 0.0125).abs() < 1.0e-8);
+        assert_eq!(values[7], 125.0);
+        assert_eq!(values[8], 675.0);
+
+        let all_clear = scene
+            .weighted_additive_at(&[(0, 0.4), (1, 0.6)], 10.0)
+            .unwrap();
+        assert_eq!(all_clear, AdditiveScattering::default());
+    }
+
+    #[test]
+    fn weighted_query_rejects_bad_shape_weights_cells_and_view() {
+        let scene = synthetic_scene();
+        assert!(matches!(
+            scene.weighted_additive_at(&[], 0.0),
+            Err(WrfTMatrixSceneQueryError::NoWeightedContributions)
+        ));
+        let too_many = [(0, 0.125); MAX_WEIGHTED_PROPERTY_CELLS + 1];
+        assert!(matches!(
+            scene.weighted_additive_at(&too_many, 0.0),
+            Err(WrfTMatrixSceneQueryError::TooManyWeightedContributions { .. })
+        ));
+        assert!(matches!(
+            scene.weighted_additive_at(&[(3, -0.1), (1, 1.1)], 0.0),
+            Err(WrfTMatrixSceneQueryError::InvalidWeight { .. })
+        ));
+        assert!(matches!(
+            scene.weighted_additive_at(&[(3, f64::NAN), (1, 0.0)], 0.0),
+            Err(WrfTMatrixSceneQueryError::InvalidWeight { .. })
+        ));
+        assert!(matches!(
+            scene.weighted_additive_at(&[(3, 0.5), (1, 0.4)], 0.0),
+            Err(WrfTMatrixSceneQueryError::WeightSum { .. })
+        ));
+        assert!(matches!(
+            scene.weighted_additive_at(&[(5, 1.0)], 0.0),
+            Err(WrfTMatrixSceneQueryError::CellOutOfRange { .. })
+        ));
+        assert!(matches!(
+            scene.weighted_additive_at(&[(3, 1.0)], 20.1),
+            Err(WrfTMatrixSceneQueryError::ElevationOutsideAxis { .. })
+        ));
+    }
+
+    #[test]
     fn query_never_clamps_or_extrapolates() {
         let scene = synthetic_scene();
         assert!(matches!(
@@ -1484,6 +1891,18 @@ mod tests {
     #[test]
     fn retained_memory_includes_every_owned_vector_and_identity() {
         let scene = synthetic_scene();
+        assert_eq!(
+            scene.additive_components.len(),
+            scene.source_cell_indices.len()
+                * scene.radar_elevations_deg.len()
+                * AdditiveScattering::COMPONENT_COUNT
+        );
+        assert_eq!(
+            scene.full_cell_to_compact_row.len(),
+            scene.source_cell_count
+        );
+        assert_eq!(scene.full_cell_to_compact_row[3], 0);
+        assert_eq!(scene.full_cell_to_compact_row[1], u32::MAX);
         let estimate = scene.memory_estimate();
         assert_eq!(estimate.source_index_bytes, size_of::<u32>());
         assert_eq!(estimate.dense_row_lookup_bytes, 5 * size_of::<u32>());
@@ -1537,5 +1956,38 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn frozen_only_compaction_is_in_place_and_preserves_order() {
+        let mut components = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let summaries = vec![
+            CellBuildSummary {
+                retained: false,
+                counts: WrfTMatrixAuditCounts::default(),
+            },
+            CellBuildSummary {
+                retained: true,
+                counts: WrfTMatrixAuditCounts {
+                    source_cells: 1,
+                    dry_frozen_populations: 2,
+                    ..WrfTMatrixAuditCounts::default()
+                },
+            },
+            CellBuildSummary {
+                retained: true,
+                counts: WrfTMatrixAuditCounts {
+                    source_cells: 1,
+                    dry_frozen_populations: 1,
+                    ..WrfTMatrixAuditCounts::default()
+                },
+            },
+        ];
+        let (indices, counts) =
+            compact_frozen_only_rows(&mut components, 2, &[1, 3, 4], summaries).unwrap();
+        assert_eq!(indices, vec![3, 4]);
+        assert_eq!(components, vec![3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(counts.source_cells, 2);
+        assert_eq!(counts.dry_frozen_populations, 3);
     }
 }
