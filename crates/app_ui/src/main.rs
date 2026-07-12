@@ -101,6 +101,7 @@ mod sat_worker;
 mod self_update;
 mod settings_persistence;
 mod settings_ui;
+mod simradar_truth_lab;
 mod simsat_hrrr;
 mod simsat_store;
 mod simsat_ui;
@@ -2889,6 +2890,9 @@ struct ViewerApp {
     /// Transient observed/simulated/difference presentation. It owns three
     /// local volumes without changing or saving ordinary pane settings.
     simradar_comparison: Option<SimradarComparisonPresentation>,
+    /// Exact-gate Ideal -> Measured -> Presented audit for synthetic radar.
+    /// Session-only: it follows the active pane and never mutates loop data.
+    simradar_truth_lab: simradar_truth_lab::AlgorithmTruthLabState,
     /// The last-clicked pane (0 = main). The sidebar product picker and tilt
     /// list drive this pane: the main pane edits the whole bunch, an extra
     /// pane edits itself independently.
@@ -8403,6 +8407,7 @@ impl ViewerApp {
             grid_layout: restored_grid_layout,
             extra_panes: Vec::new(),
             simradar_comparison: None,
+            simradar_truth_lab: simradar_truth_lab::AlgorithmTruthLabState::default(),
             active_pane: 0,
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
@@ -19795,6 +19800,15 @@ impl eframe::App for ViewerApp {
         self.wofs_window(&ctx);
         self.farm_window(&ctx);
         self.table_editor_window(&ctx);
+        let truth_lab_volume = if self.active_pane == 0 {
+            self.volume.clone()
+        } else {
+            self.extra_pane_display_volume(self.active_pane - 1)
+        };
+        if self.simradar_truth_lab.open {
+            self.simradar_truth_lab.set_volume(truth_lab_volume);
+        }
+        self.simradar_truth_lab.show_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
 
         self.sounding_window(&ctx);
@@ -20605,6 +20619,30 @@ impl ViewerApp {
                 self.event_loop_builder.open = !self.event_loop_builder.open;
                 ui.close();
             }
+            if ui
+                .selectable_label(self.simradar_truth_lab.open, "Algorithm Truth Lab")
+                .on_hover_text(
+                    "Audit exact co-gridded Ideal, Measured, and Presented synthetic-radar moments, including velocity folding and dealias recovery",
+                )
+                .clicked()
+            {
+                if self.simradar_truth_lab.open {
+                    self.simradar_truth_lab.open = false;
+                } else {
+                    let source = if self.active_pane == 0 {
+                        self.volume.clone()
+                    } else {
+                        self.extra_pane_display_volume(self.active_pane - 1)
+                    };
+                    if let Some(volume) = source {
+                        self.simradar_truth_lab.open_with_volume(volume);
+                    } else {
+                        self.simradar_truth_lab.open = true;
+                        self.simradar_truth_lab.set_volume(None);
+                    }
+                }
+                ui.close();
+            }
             // Sounding finally gets a front door (it used to open only as a
             // side effect of Alt-click and could never be reopened). Always
             // clickable — with no sounding yet the pane shows the Alt-click
@@ -20655,7 +20693,7 @@ impl ViewerApp {
             }
         });
         button.on_hover_text(
-            "Data windows: Formula Lab · WRF · Models · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding",
+            "Data windows: Formula Lab · WRF · Models · Algorithm Truth Lab · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding",
         );
     }
 
@@ -63626,6 +63664,7 @@ mod tests {
             grid_layout: PanelLayout::One,
             extra_panes: Vec::new(),
             simradar_comparison: None,
+            simradar_truth_lab: simradar_truth_lab::AlgorithmTruthLabState::default(),
             active_pane: 0,
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
