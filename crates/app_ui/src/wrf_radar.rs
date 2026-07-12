@@ -52,6 +52,10 @@ use app_ui::vcp_catalog::{
     BUILD_24_SOURCE, Build24Vcp, DopplerPrfValue, MomentCoverage, PhysicalScanRow, PulseLength,
     VcpDefinition, Waveform, build_24_definition,
 };
+use app_ui::wrf_radar_validation::{
+    CompactPolarPrecisionAudit, GateQuality, GateQualityFractions, QualityMoment,
+    compact_quality_grid, encode_quality_fraction, relative_error,
+};
 use app_ui::wrf_scene_adapter::inventory_selected_wrf_paths;
 use app_ui::wrf_scene_inventory::{WrfScene, WrfSceneGroup, WrfSceneTime, WrfSourceIdentity};
 use app_ui::wrf_temporal::{
@@ -455,6 +459,14 @@ pub struct SyntheticRadarConfig {
     /// tilt) so a loop never shimmers between rebuilds of the same hour. See the
     /// ground-clutter section (`ground_clutter_dbz`) for the model.
     pub clutter_intensity: f32,
+    /// Emit compact per-gate pulse-volume support diagnostics (MCOV, TUNB,
+    /// MSIG). These never alter the physical samples and use three bytes per
+    /// gate in the finished volume.
+    pub emit_quality_fields: bool,
+    /// Mask physical moments where less than this fraction of the configured
+    /// quadrature support is covered by the model domain. Quality grids remain
+    /// present so a masked gate can still explain why it was rejected.
+    pub minimum_model_coverage_fraction: f32,
 }
 
 /// Antenna height above model terrain when no explicit MSL altitude is given.
@@ -518,6 +530,8 @@ impl Default for SyntheticRadarConfig {
             // No clutter by default: the operator stays pure physics and the
             // output is bit-identical to a build without the feature.
             clutter_intensity: 0.0,
+            emit_quality_fields: true,
+            minimum_model_coverage_fraction: 0.0,
         }
     }
 }
@@ -763,7 +777,19 @@ impl SyntheticRadarConfig {
         self.ref_gate_texture.hash(&mut hasher);
         self.vel_gate_texture.hash(&mut hasher);
         self.clutter_intensity.to_bits().hash(&mut hasher);
+        self.emit_quality_fields.hash(&mut hasher);
+        self.minimum_model_coverage_fraction
+            .to_bits()
+            .hash(&mut hasher);
         hasher.finish()
+    }
+
+    pub fn clamped_minimum_model_coverage_fraction(&self) -> f32 {
+        if self.minimum_model_coverage_fraction.is_finite() {
+            self.minimum_model_coverage_fraction.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     }
 
     /// The Nyquist velocity (m/s) stamped on every radial of the built volume.
@@ -1051,6 +1077,7 @@ struct CompactPolarFields {
     adp: Vec<i8>,
     fall_speed: Vec<u8>,
     fall_speed_std: Vec<u8>,
+    precision_audit: CompactPolarPrecisionAudit,
 }
 
 impl CompactPolarFields {
@@ -1070,6 +1097,7 @@ impl CompactPolarFields {
             adp: vec![0; len],
             fall_speed: vec![0; len],
             fall_speed_std: vec![0; len],
+            precision_audit: CompactPolarPrecisionAudit::default(),
         }
     }
 
@@ -1111,6 +1139,93 @@ impl CompactPolarFields {
             sample.fall_speed_variance_m2s2.max(0.0).sqrt(),
             COMPACT_FALL_STD_STEP_MPS,
         );
+
+        // Audit the exact compact representation after encoding. The stored
+        // codes and reconstruction path above are unchanged; this only records
+        // loss/saturation so production runs can prove whether the memory
+        // compression remained inside its declared precision envelope.
+        let reconstructed_zdr = self.zdr[index] as f32 * COMPACT_ZDR_STEP_DB;
+        let reconstructed_zv = sample.zh / 10.0f32.powf(reconstructed_zdr * 0.1);
+        let reconstructed_rho = self.rho[index] as f32 / u8::MAX as f32;
+        let reconstructed_covariance =
+            reconstructed_rho * (sample.zh * reconstructed_zv).max(0.0).sqrt();
+        let reconstructed_phase = self.covariance_phase[index] as f32 * COMPACT_PHASE_STEP_DEG;
+        let source_phase = sample.cov_im.atan2(sample.cov_re).to_degrees();
+        let source_adp = sample.ah_db_km - sample.av_db_km;
+        let reconstructed_kdp = self.kdp[index] as f32 * COMPACT_KDP_STEP_DEG_KM;
+        let reconstructed_ah = self.ah[index] as f32 * COMPACT_ATTEN_STEP_DB_KM;
+        let encoded_adp = self.adp[index] as f32 * COMPACT_ATTEN_STEP_DB_KM;
+        let reconstructed_av = (reconstructed_ah - encoded_adp).max(0.0);
+        let reconstructed_adp = reconstructed_ah - reconstructed_av;
+        let reconstructed_fall = self.fall_speed[index] as f32 * COMPACT_FALL_STEP_MPS;
+        let source_fall_std = sample.fall_speed_variance_m2s2.max(0.0).sqrt();
+        let reconstructed_fall_std = self.fall_speed_std[index] as f32 * COMPACT_FALL_STD_STEP_MPS;
+        let reconstructed_fall_variance = reconstructed_fall_std * reconstructed_fall_std;
+
+        self.precision_audit.zdr_db.observe(
+            sample.zdr_db,
+            reconstructed_zdr,
+            i8::MIN as f32 * COMPACT_ZDR_STEP_DB,
+            i8::MAX as f32 * COMPACT_ZDR_STEP_DB,
+        );
+        self.precision_audit
+            .rho_hv
+            .observe(sample.rho_hv, reconstructed_rho, 0.0, 1.0);
+        self.precision_audit.covariance_phase_deg.observe(
+            source_phase,
+            reconstructed_phase,
+            i8::MIN as f32 * COMPACT_PHASE_STEP_DEG,
+            i8::MAX as f32 * COMPACT_PHASE_STEP_DEG,
+        );
+        self.precision_audit.kdp_deg_km.observe(
+            sample.kdp_deg_km,
+            reconstructed_kdp,
+            i16::MIN as f32 * COMPACT_KDP_STEP_DEG_KM,
+            i16::MAX as f32 * COMPACT_KDP_STEP_DEG_KM,
+        );
+        self.precision_audit.ah_db_km.observe(
+            sample.ah_db_km,
+            reconstructed_ah,
+            0.0,
+            u8::MAX as f32 * COMPACT_ATTEN_STEP_DB_KM,
+        );
+        self.precision_audit.adp_db_km.observe(
+            source_adp,
+            reconstructed_adp,
+            i8::MIN as f32 * COMPACT_ATTEN_STEP_DB_KM,
+            i8::MAX as f32 * COMPACT_ATTEN_STEP_DB_KM,
+        );
+        self.precision_audit.fall_speed_mps.observe(
+            sample.fall_speed_mps,
+            reconstructed_fall,
+            0.0,
+            u8::MAX as f32 * COMPACT_FALL_STEP_MPS,
+        );
+        self.precision_audit.fall_speed_std_mps.observe(
+            source_fall_std,
+            reconstructed_fall_std,
+            0.0,
+            u8::MAX as f32 * COMPACT_FALL_STD_STEP_MPS,
+        );
+        self.precision_audit.max_zv_relative_error = self
+            .precision_audit
+            .max_zv_relative_error
+            .max(relative_error(sample.zv, reconstructed_zv));
+        self.precision_audit.max_covariance_magnitude_relative_error = self
+            .precision_audit
+            .max_covariance_magnitude_relative_error
+            .max(relative_error(
+                sample.covariance_magnitude,
+                reconstructed_covariance,
+            ));
+        self.precision_audit.max_av_abs_error_db_km = self
+            .precision_audit
+            .max_av_abs_error_db_km
+            .max((reconstructed_av - sample.av_db_km).abs());
+        self.precision_audit.max_fall_variance_abs_error_m2s2 = self
+            .precision_audit
+            .max_fall_variance_abs_error_m2s2
+            .max((reconstructed_fall_variance - sample.fall_speed_variance_m2s2).abs());
     }
 }
 
@@ -1501,15 +1616,22 @@ fn read_wrf_radar_fields_for_config_reporting(
         progress("deriving scheme-aware hydrometeor scattering…");
         match build_compact_polar_fields(file, timeidx, expected, progress) {
             Ok((polar, bulk_zh_dbz)) => {
+                let audit = &polar.precision_audit;
                 fields.dual_pol_status = Some(format!(
-                    "{} ({:?}{})",
+                    "{} ({:?}{}; compact audit: clamps={}, quantized-to-zero={}, max error ZDR={:.4} dB rho={:.5} KDP={:.4} deg/km AH={:.4} dB/km)",
                     polar.profile.name,
                     polar.profile.capability,
                     if polar.profile.assumption_heavy {
                         "; assumed PSD parameters"
                     } else {
                         ""
-                    }
+                    },
+                    audit.total_clamps(),
+                    audit.total_quantized_to_zero(),
+                    audit.zdr_db.max_abs_reconstruction_error,
+                    audit.rho_hv.max_abs_reconstruction_error,
+                    audit.kdp_deg_km.max_abs_reconstruction_error,
+                    audit.ah_db_km.max_abs_reconstruction_error,
                 ));
                 if config.dual_pol {
                     fields.dbz = bulk_zh_dbz;
@@ -1981,7 +2103,7 @@ fn build_synthetic_volume_reporting_inner(
     let mut forward_operator_config = format!(
         "mode={:?}; reflectivity_sampling={:?}; beam_integration={:?}; \
          fall_speed={}; terrain_blockage={}; spectrum_width={}; dual_pol={}; polarimetric_kernel={:?}; \
-         propagation={}; microphysics_fields={microphysics_inventory}",
+         propagation={}; quality_fields={}; minimum_model_coverage_fraction={:.4}; microphysics_fields={microphysics_inventory}",
         config.simulation_mode,
         config.reflectivity_sampling,
         config.beam_integration,
@@ -1991,7 +2113,24 @@ fn build_synthetic_volume_reporting_inner(
         config.dual_pol,
         config.polarimetric_kernel,
         config.propagation,
+        config.emit_quality_fields,
+        config.clamped_minimum_model_coverage_fraction(),
     );
+    if let Some(polar) = fields.polarimetric.as_ref() {
+        use std::fmt::Write as _;
+        let audit = &polar.precision_audit;
+        let _ = write!(
+            forward_operator_config,
+            "; compact_dual_pol_audit={}; compact_dual_pol_clamps={}; compact_dual_pol_quantized_to_zero={}; compact_dual_pol_max_zv_relative_error={:.6}; compact_dual_pol_max_covariance_relative_error={:.6}; compact_dual_pol_max_av_error_db_km={:.6}; compact_dual_pol_max_fall_variance_error_m2s2={:.6}",
+            audit.provenance_fragment(),
+            audit.total_clamps(),
+            audit.total_quantized_to_zero(),
+            audit.max_zv_relative_error,
+            audit.max_covariance_magnitude_relative_error,
+            audit.max_av_abs_error_db_km,
+            audit.max_fall_variance_abs_error_m2s2,
+        );
+    }
     if let Some(definition) = named_vcp {
         use std::fmt::Write as _;
         let _ = write!(
@@ -2400,8 +2539,13 @@ struct GatePhysicalSample {
     polar: Option<crate::wrf_radar_physics::IntrinsicPolarSample>,
 }
 
+struct GateSampleResult {
+    physical: Option<GatePhysicalSample>,
+    quality: GateQualityFractions,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn sample_gate(
+fn sample_gate_with_quality(
     fields: &WrfRadarFields,
     neighbor_fields: Option<&WrfRadarFields>,
     atmosphere_alpha: f64,
@@ -2416,10 +2560,12 @@ fn sample_gate(
     spacing_m: f64,
     config: &SyntheticRadarConfig,
     terrain_horizon: Option<&TerrainHorizon>,
-) -> Result<Option<GatePhysicalSample>, String> {
+) -> Result<GateSampleResult, String> {
     let beam_sigma_deg = gaussian_beam_sigma_deg(f64::from(config.beam_width_deg.max(0.05)));
     let points = quadrature_points(config.beam_integration);
+    let total_weight = points.iter().map(|point| point.weight).sum::<f64>();
     let mut valid_weight = 0.0f64;
+    let mut terrain_unblocked_weight = 0.0f64;
     let mut signal_weight = 0.0f64;
     let mut sum_z = 0.0f64;
     let mut sum_z_vr = 0.0f64;
@@ -2462,6 +2608,7 @@ fn sample_gate(
         if blocked {
             continue;
         }
+        terrain_unblocked_weight += point.weight;
 
         let el = elevation_deg.to_radians();
         let fall_speed = if config.terminal_fall_speed {
@@ -2501,8 +2648,18 @@ fn sample_gate(
         }
     }
 
+    let quality = GateQuality {
+        total_weight,
+        model_covered_weight: valid_weight,
+        terrain_unblocked_weight,
+        meteorological_signal_weight: signal_weight,
+    }
+    .fractions();
     if valid_weight <= 0.0 || signal_weight <= 0.0 || sum_z <= 0.0 {
-        return Ok(None);
+        return Ok(GateSampleResult {
+            physical: None,
+            quality,
+        });
     }
     // Missing model-domain quadrature points are renormalized away. Terrain-
     // blocked points remain in `valid_weight` but contribute no signal, so
@@ -2520,12 +2677,53 @@ fn sample_gate(
     } else {
         0.0
     };
-    Ok(Some(GatePhysicalSample {
-        z_linear,
-        velocity_mps: velocity as f32,
-        spectrum_width_mps: (variance + floor * floor).sqrt() as f32,
-        polar: polar.take(),
-    }))
+    Ok(GateSampleResult {
+        physical: Some(GatePhysicalSample {
+            z_linear,
+            velocity_mps: velocity as f32,
+            spectrum_width_mps: (variance + floor * floor).sqrt() as f32,
+            polar: polar.take(),
+        }),
+        quality,
+    })
+}
+
+/// Compatibility seam for focused physics tests and callers that need only
+/// the sampled moments. Production cut building uses the quality-bearing form.
+#[allow(clippy::too_many_arguments)]
+fn sample_gate(
+    fields: &WrfRadarFields,
+    neighbor_fields: Option<&WrfRadarFields>,
+    atmosphere_alpha: f64,
+    cells: usize,
+    site_lat: f64,
+    site_lon: f64,
+    antenna_msl: f64,
+    center_azimuth_deg: f64,
+    center_elevation_deg: f64,
+    center_slant_m: f64,
+    gate_index: usize,
+    spacing_m: f64,
+    config: &SyntheticRadarConfig,
+    terrain_horizon: Option<&TerrainHorizon>,
+) -> Result<Option<GatePhysicalSample>, String> {
+    Ok(sample_gate_with_quality(
+        fields,
+        neighbor_fields,
+        atmosphere_alpha,
+        cells,
+        site_lat,
+        site_lon,
+        antenna_msl,
+        center_azimuth_deg,
+        center_elevation_deg,
+        center_slant_m,
+        gate_index,
+        spacing_m,
+        config,
+        terrain_horizon,
+    )?
+    .physical)
 }
 
 struct CutMomentRow {
@@ -2542,6 +2740,9 @@ struct CutMomentRow {
     adp: Vec<f32>,
     pida: Vec<f32>,
     zdr_corrected: Vec<f32>,
+    model_coverage: Vec<u8>,
+    terrain_unblocked: Vec<u8>,
+    meteorological_signal: Vec<u8>,
 }
 
 /// Acquisition geometry and timing resolved before gate sampling begins.
@@ -2616,6 +2817,9 @@ impl CutMomentRow {
             adp: blank(),
             pida: blank(),
             zdr_corrected: blank(),
+            model_coverage: vec![0; gates],
+            terrain_unblocked: vec![0; gates],
+            meteorological_signal: vec![0; gates],
         }
     }
 }
@@ -2706,7 +2910,7 @@ fn build_cut(
                 // Doviak & Zrnić (1993) eq. 2.28b/c under the 4/3-earth model.
                 let beam_height_m = beam_height_above_radar_m(slant_m, elevation_deg);
                 let ground_m = beam_ground_range_m(slant_m, elevation_deg);
-                let Some(sample) = sample_gate(
+                let sampled = sample_gate_with_quality(
                     fields,
                     temporal.map(|context| context.neighbor),
                     ray.atmosphere_alpha,
@@ -2721,8 +2925,21 @@ fn build_cut(
                     spacing,
                     config,
                     terrain_horizon,
-                )?
-                else {
+                )?;
+                if config.emit_quality_fields {
+                    row.model_coverage[gate] =
+                        encode_quality_fraction(sampled.quality.model_coverage_fraction);
+                    row.terrain_unblocked[gate] =
+                        encode_quality_fraction(sampled.quality.terrain_unblocked_fraction);
+                    row.meteorological_signal[gate] =
+                        encode_quality_fraction(sampled.quality.meteorological_signal_fraction);
+                }
+                if sampled.quality.model_coverage_fraction
+                    < config.clamped_minimum_model_coverage_fraction()
+                {
+                    continue;
+                }
+                let Some(sample) = sampled.physical else {
                     continue;
                 };
                 // Reflectivity gate texture (default ON): perturb BEFORE the
@@ -2901,6 +3118,9 @@ fn build_cut(
     let mut adp_values = Vec::with_capacity(naz * gate_count);
     let mut pida_values = Vec::with_capacity(naz * gate_count);
     let mut zdrc_values = Vec::with_capacity(naz * gate_count);
+    let mut model_coverage_values = Vec::with_capacity(naz * gate_count);
+    let mut terrain_unblocked_values = Vec::with_capacity(naz * gate_count);
+    let mut meteorological_signal_values = Vec::with_capacity(naz * gate_count);
     for (ray, row) in ray_plan.into_iter().zip(rows) {
         cut.radials.push(Radial {
             azimuth_deg: ray.azimuth_deg,
@@ -2923,6 +3143,9 @@ fn build_cut(
         adp_values.extend(row.adp);
         pida_values.extend(row.pida);
         zdrc_values.extend(row.zdr_corrected);
+        model_coverage_values.extend(row.model_coverage);
+        terrain_unblocked_values.extend(row.terrain_unblocked);
+        meteorological_signal_values.extend(row.meteorological_signal);
     }
 
     let radial_indices: Vec<usize> = (0..naz).collect();
@@ -2977,6 +3200,20 @@ fn build_cut(
                 moment.clone(),
                 f32_grid(moment, gate_range.clone(), radial_indices.clone(), values),
             );
+        }
+    }
+    if config.emit_quality_fields {
+        for (quality, values) in [
+            (QualityMoment::ModelCoverage, model_coverage_values),
+            (QualityMoment::TerrainUnblocked, terrain_unblocked_values),
+            (
+                QualityMoment::MeteorologicalSignal,
+                meteorological_signal_values,
+            ),
+        ] {
+            let grid =
+                compact_quality_grid(quality, gate_range.clone(), radial_indices.clone(), values)?;
+            cut.moments.insert(grid.moment.clone(), grid);
         }
     }
     Ok(cut)
@@ -4383,12 +4620,21 @@ fn temporal_memory_estimate(
         .len()
         .checked_mul(config.azimuth_count.max(1))
         .ok_or_else(|| "Synthetic radial count overflowed".to_string())?;
-    let moment_count =
+    let f32_moment_count =
         2usize + usize::from(config.spectrum_width) + if config.dual_pol { 10 } else { 0 };
-    let one_output_bytes = radial_count
+    let gate_samples = radial_count
         .checked_mul(gate_count)
-        .and_then(|value| value.checked_mul(moment_count))
+        .ok_or_else(|| "Synthetic output sample count overflowed".to_string())?;
+    let one_output_bytes = gate_samples
+        .checked_mul(f32_moment_count)
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|value| {
+            value.checked_add(if config.emit_quality_fields {
+                gate_samples.saturating_mul(QualityMoment::ALL.len())
+            } else {
+                0
+            })
+        })
         .and_then(|value| value.checked_add(radial_count.saturating_mul(96)))
         .ok_or_else(|| "Synthetic output memory estimate overflowed".to_string())?;
     let output_bytes = one_output_bytes
@@ -4400,14 +4646,15 @@ fn temporal_memory_estimate(
         .checked_mul(gate_count)
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
         .ok_or_else(|| "Terrain-horizon memory estimate overflowed".to_string())?;
-    // `CutMomentRow` owns all thirteen possible moment arrays until a cut is
-    // assembled, regardless of which moments the VCP ultimately stores.
+    // `CutMomentRow` owns thirteen f32 moment arrays plus three compact quality
+    // arrays until a cut is assembled, regardless of final VCP availability.
     let cut_row_scratch_bytes = config
         .azimuth_count
         .max(1)
         .checked_mul(gate_count)
-        .and_then(|value| value.checked_mul(13))
-        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|value| {
+            value.checked_mul(13 * std::mem::size_of::<f32>() + QualityMoment::ALL.len())
+        })
         .ok_or_else(|| "Cut-row scratch memory estimate overflowed".to_string())?;
     // Concurrent WRF reads temporarily retain f64 decoder buffers while the
     // five f32 model planes are narrowed. Six planes is a conservative bound
@@ -5200,6 +5447,51 @@ mod tests {
     }
 
     #[test]
+    fn compact_polar_precision_audit_counts_zeroing_and_saturation_without_changing_codes() {
+        let profile = crate::wrf_radar_physics::detect_scheme(Some(10), ["QRAIN", "QNRAIN"]);
+        let mut compact = CompactPolarFields::new(1, profile, vec!["QRAIN".to_string()]);
+        let zh = 100.0;
+        let zv = 10.0;
+        let covariance = 20.0;
+        let phase = 45.0f32.to_radians();
+        compact.store(
+            0,
+            crate::wrf_radar_physics::IntrinsicPolarSample {
+                zh,
+                zv,
+                cov_re: covariance * phase.cos(),
+                cov_im: covariance * phase.sin(),
+                covariance_magnitude: covariance,
+                kdp_deg_km: 0.04,
+                ah_db_km: 0.5,
+                av_db_km: 0.1,
+                fall_speed_mps: 30.0,
+                fall_speed_variance_m2s2: 20.0f32.powi(2),
+                zdr_db: 10.0,
+                rho_hv: 0.8,
+            },
+        );
+
+        assert_eq!(compact.zdr[0], i8::MAX);
+        assert_eq!(compact.covariance_phase[0], i8::MAX);
+        assert_eq!(compact.kdp[0], 0);
+        assert_eq!(compact.ah[0], u8::MAX);
+        assert_eq!(compact.adp[0], i8::MAX);
+        assert_eq!(compact.fall_speed[0], u8::MAX);
+        assert_eq!(compact.fall_speed_std[0], u8::MAX);
+        assert!(compact.precision_audit.total_clamps() >= 6);
+        assert!(compact.precision_audit.kdp_deg_km.quantized_to_zero >= 1);
+        assert!(compact.precision_audit.zdr_db.max_abs_reconstruction_error > 3.0);
+        assert!(
+            compact
+                .precision_audit
+                .ah_db_km
+                .max_abs_reconstruction_error
+                > 0.2
+        );
+    }
+
+    #[test]
     fn linear_z_interpolation_preserves_received_power() {
         let mut fields = uniform_box_fields();
         // West half 0 dBZ, east half 60 dBZ at both vertical levels. The box
@@ -5282,6 +5574,109 @@ mod tests {
         assert!(samples[0].spectrum_width_mps < 1.0e-4);
         assert!(samples[1].spectrum_width_mps >= 0.0);
         assert!(samples[2].spectrum_width_mps >= 0.0);
+    }
+
+    #[test]
+    fn gate_quality_reports_full_and_missing_model_support() {
+        let fields = uniform_box_fields();
+        let config = SyntheticRadarConfig {
+            beam_integration: BeamIntegration::Balanced,
+            ref_gate_texture: false,
+            ..SyntheticRadarConfig::default()
+        };
+        let full = sample_gate_with_quality(
+            &fields,
+            None,
+            0.0,
+            fields.cells(),
+            39.0,
+            -95.0,
+            200.0,
+            90.0,
+            0.5,
+            1_000.0,
+            4,
+            250.0,
+            &config,
+            None,
+        )
+        .unwrap();
+        assert_eq!(full.quality.model_coverage_fraction, 1.0);
+        assert_eq!(full.quality.terrain_unblocked_fraction, 1.0);
+        assert_eq!(full.quality.meteorological_signal_fraction, 1.0);
+        assert!(full.physical.is_some());
+
+        let missing = sample_gate_with_quality(
+            &fields,
+            None,
+            0.0,
+            fields.cells(),
+            39.0,
+            -95.0,
+            200.0,
+            90.0,
+            0.5,
+            2_000_000.0,
+            8_000,
+            250.0,
+            &config,
+            None,
+        )
+        .unwrap();
+        assert_eq!(missing.quality, GateQualityFractions::default());
+        assert!(missing.physical.is_none());
+    }
+
+    #[test]
+    fn synthetic_volume_emits_compact_quality_grids_and_coverage_mask_is_configurable() {
+        let fields = uniform_box_fields();
+        let base = SyntheticRadarConfig {
+            site_lat_deg: Some(39.0),
+            site_lon_deg: Some(-95.0),
+            antenna_msl_m: Some(200.0),
+            elevations_deg: vec![0.5],
+            azimuth_count: 36,
+            gate_spacing_m: 500.0,
+            max_range_m: 20_000.0,
+            beam_integration: BeamIntegration::Balanced,
+            ref_floor_dbz: -20.0,
+            ref_gate_texture: false,
+            emit_quality_fields: true,
+            minimum_model_coverage_fraction: 0.0,
+            ..SyntheticRadarConfig::default()
+        };
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let permissive = build_synthetic_volume(&fields, time, &base);
+        for quality in QualityMoment::ALL {
+            let grid = &permissive.cuts[0].moments[&quality.moment_type()];
+            assert!(matches!(&grid.storage, MomentStorage::U8(_)));
+            assert_eq!(grid.scale, 255.0);
+        }
+
+        let strict = build_synthetic_volume(
+            &fields,
+            time,
+            &SyntheticRadarConfig {
+                minimum_model_coverage_fraction: 1.0,
+                ..base
+            },
+        );
+        let finite_count = |volume: &RadarVolume| {
+            let MomentStorage::F32(values) =
+                &volume.cuts[0].moments[&MomentType::Reflectivity].storage
+            else {
+                panic!("synthetic reflectivity is f32");
+            };
+            values.iter().filter(|value| value.is_finite()).count()
+        };
+        assert!(
+            finite_count(&strict) < finite_count(&permissive),
+            "a strict full-support threshold must mask partially covered edge gates"
+        );
+        assert_eq!(
+            strict.cuts[0].moments[&QualityMoment::ModelCoverage.moment_type()].radial_count(),
+            strict.cuts[0].radials.len()
+        );
     }
 
     #[test]
@@ -6059,6 +6454,14 @@ mod tests {
         assert!(
             differs(&|c| c.sensitivity_dbz_at_1km = -38.0),
             "sensitivity_dbz_at_1km"
+        );
+        assert!(
+            differs(&|c| c.emit_quality_fields = false),
+            "emit_quality_fields"
+        );
+        assert!(
+            differs(&|c| c.minimum_model_coverage_fraction = 0.75),
+            "minimum_model_coverage_fraction"
         );
     }
 

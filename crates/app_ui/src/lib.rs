@@ -2,6 +2,7 @@
 
 pub mod vcp_catalog;
 pub mod wrf_property_reader;
+pub mod wrf_radar_validation;
 pub mod wrf_scene_adapter;
 pub mod wrf_scene_inventory;
 pub mod wrf_temporal;
