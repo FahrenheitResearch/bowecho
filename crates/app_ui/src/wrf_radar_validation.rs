@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, RadarSite, RadarVolume, Radial,
-    RadialStatus, VcpInfo,
+    RadialStatus, RayInstrumentMetadata, VcpInfo,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -43,6 +43,10 @@ pub struct ReplayRayPlan {
     pub acquisition_offset_ms: i64,
     pub gate_range: GateRange,
     pub nyquist_velocity_mps: Option<f32>,
+    /// Physical source parameters for this ray. Source-table PRF codes are
+    /// intentionally not copied or interpreted as timing quantities.
+    #[serde(default)]
+    pub instrument_metadata: Option<RayInstrumentMetadata>,
     pub radial_status: Option<RadialStatus>,
 }
 
@@ -93,6 +97,14 @@ pub enum ReplayTemplateError {
     MissingSiteLocation { site_id: String },
     #[error("observed cut {cut} has no radials")]
     EmptyCut { cut: usize },
+    #[error(
+        "observed cut {cut} has {metadata_count} ray instrument records for {radial_count} radials"
+    )]
+    MisalignedRayInstrumentMetadata {
+        cut: usize,
+        radial_count: usize,
+        metadata_count: usize,
+    },
     #[error("observed cut {cut} radial {radial} has invalid gate geometry {geometry:?}")]
     InvalidRadialGeometry {
         cut: usize,
@@ -150,6 +162,13 @@ impl ObservedScanTemplate {
             if cut.radials.is_empty() {
                 return Err(ReplayTemplateError::EmptyCut { cut: cut_index + 1 });
             }
+            let instrument_metadata = cut.aligned_ray_instrument_metadata().map_err(|error| {
+                ReplayTemplateError::MisalignedRayInstrumentMetadata {
+                    cut: cut_index + 1,
+                    radial_count: error.radial_count,
+                    metadata_count: error.metadata_count,
+                }
+            })?;
             let mut rays = Vec::with_capacity(cut.radials.len());
             for (radial_index, radial) in cut.radials.iter().enumerate() {
                 validate_gate_range(&radial.gate_range).map_err(|()| {
@@ -189,6 +208,7 @@ impl ObservedScanTemplate {
                         .num_milliseconds(),
                     gate_range: radial.gate_range.clone(),
                     nyquist_velocity_mps: radial.nyquist_velocity_mps,
+                    instrument_metadata: instrument_metadata.map(|values| values[radial_index]),
                     radial_status: radial.radial_status,
                 });
             }
@@ -274,6 +294,7 @@ impl ObservedScanTemplate {
                 ray.acquisition_offset_ms.hash(&mut hasher);
                 hash_gate_range(&ray.gate_range, &mut hasher);
                 ray.nyquist_velocity_mps.map(f32::to_bits).hash(&mut hasher);
+                hash_ray_instrument_metadata(ray.instrument_metadata, &mut hasher);
                 format!("{:?}", ray.radial_status).hash(&mut hasher);
             }
             for moment in &cut.moments {
@@ -299,6 +320,15 @@ fn hash_gate_range(range: &GateRange, hasher: &mut impl Hasher) {
     range.first_gate_m.hash(hasher);
     range.gate_spacing_m.hash(hasher);
     range.gate_count.hash(hasher);
+}
+
+fn hash_ray_instrument_metadata(metadata: Option<RayInstrumentMetadata>, hasher: &mut impl Hasher) {
+    metadata.is_some().hash(hasher);
+    let Some(metadata) = metadata else { return };
+    metadata.prt_s.map(f32::to_bits).hash(hasher);
+    metadata.unambiguous_range_km.map(f32::to_bits).hash(hasher);
+    metadata.pulse_count.hash(hasher);
+    metadata.independent_samples.map(f32::to_bits).hash(hasher);
 }
 
 fn validate_gate_range(range: &GateRange) -> Result<(), ()> {
@@ -974,6 +1004,13 @@ mod tests {
         assert_eq!(template.cuts[0].rays.len(), 3);
         assert_eq!(template.cuts[0].rays[2].azimuth_deg, 301.0);
         assert_eq!(template.cuts[0].rays[1].nyquist_velocity_mps, Some(25.5));
+        assert!(
+            template.cuts[0]
+                .rays
+                .iter()
+                .all(|ray| ray.instrument_metadata.is_none()),
+            "an absent cut sidecar must remain absent"
+        );
         assert_eq!(template.cuts[0].moments[0].radial_indices, vec![0, 2]);
         assert_ne!(
             template.cuts[0].moments[0].gate_range,
@@ -984,6 +1021,101 @@ mod tests {
         let mut changed = template.clone();
         changed.cuts[0].rays[0].azimuth_deg += 0.01;
         assert_ne!(fingerprint, changed.geometry_fingerprint());
+    }
+
+    #[test]
+    fn observed_template_preserves_aligned_ray_instrument_metadata() {
+        let mut volume = observed_fixture();
+        volume.cuts[0].ray_instrument_metadata = vec![
+            RayInstrumentMetadata {
+                prt_s: Some(0.001),
+                pulse_count: Some(60),
+                ..RayInstrumentMetadata::default()
+            },
+            RayInstrumentMetadata {
+                unambiguous_range_km: Some(140.0),
+                independent_samples: Some(15.5),
+                ..RayInstrumentMetadata::default()
+            },
+            RayInstrumentMetadata::default(),
+        ];
+
+        let template = ObservedScanTemplate::from_volume(&volume).unwrap();
+        assert_eq!(
+            template.cuts[0].rays[0].instrument_metadata,
+            Some(RayInstrumentMetadata {
+                prt_s: Some(0.001),
+                pulse_count: Some(60),
+                ..RayInstrumentMetadata::default()
+            })
+        );
+        assert_eq!(
+            template.cuts[0].rays[1]
+                .instrument_metadata
+                .unwrap()
+                .independent_samples,
+            Some(15.5)
+        );
+        assert_eq!(
+            template.cuts[0].rays[2].instrument_metadata,
+            Some(RayInstrumentMetadata::default()),
+            "an aligned entry remains present even when all of its fields are absent"
+        );
+        assert!(
+            template.cuts[1]
+                .rays
+                .iter()
+                .all(|ray| ray.instrument_metadata.is_none())
+        );
+
+        let fingerprint = template.geometry_fingerprint();
+        let mut changed = template.clone();
+        changed.cuts[0].rays[0]
+            .instrument_metadata
+            .as_mut()
+            .unwrap()
+            .pulse_count = Some(61);
+        assert_ne!(fingerprint, changed.geometry_fingerprint());
+    }
+
+    #[test]
+    fn observed_template_rejects_misaligned_ray_instrument_metadata() {
+        let mut volume = observed_fixture();
+        volume.cuts[0].ray_instrument_metadata = vec![RayInstrumentMetadata::default()];
+
+        assert_eq!(
+            ObservedScanTemplate::from_volume(&volume),
+            Err(ReplayTemplateError::MisalignedRayInstrumentMetadata {
+                cut: 1,
+                radial_count: 3,
+                metadata_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn replay_never_interprets_source_prf_codes_as_physical_metadata() {
+        let mut volume = observed_fixture();
+        volume.metadata.prt_s = None;
+        volume.metadata.unambiguous_range_km = None;
+        volume.metadata.scan_legs = vec![radar_core::ScanLegMetadata {
+            surveillance_prf_code: Some(1),
+            surveillance_pulse_count: Some(15),
+            doppler_prf_code: Some(6),
+            doppler_pulse_count: Some(64),
+            ..radar_core::ScanLegMetadata::default()
+        }];
+
+        let template = ObservedScanTemplate::from_volume(&volume).unwrap();
+        assert_eq!(template.source_prt_s, None);
+        assert_eq!(template.source_unambiguous_range_km, None);
+        assert!(
+            template
+                .cuts
+                .iter()
+                .flat_map(|cut| &cut.rays)
+                .all(|ray| ray.instrument_metadata.is_none())
+        );
     }
 
     #[test]
