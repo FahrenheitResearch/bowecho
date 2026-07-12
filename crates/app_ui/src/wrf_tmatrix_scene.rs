@@ -174,10 +174,6 @@ const DRY_PROLATE_DIAMETER_M: &[f64] = &[
     0.025849394142282114,
     0.028900501239663836,
     0.03231174267785264,
-    0.0361256265495798,
-    0.0403896783473158,
-    0.044938668397781774,
-    0.05,
 ];
 const WET_OBLATE_DIAMETER_M: &[f64] = &[
     0.00005,
@@ -2302,10 +2298,10 @@ mod tests {
     }
 
     #[test]
-    fn v8_exact_axis_coordinate_counts_are_frozen() {
+    fn v9_exact_axis_coordinate_counts_are_frozen() {
         for (role, expected_counts) in [
             (WrfTMatrixTableRole::DryOblate, &[73, 4, 28, 4, 1, 5][..]),
-            (WrfTMatrixTableRole::DryProlate, &[63, 4, 28, 4, 1, 5][..]),
+            (WrfTMatrixTableRole::DryProlate, &[59, 4, 28, 4, 1, 5][..]),
             (
                 WrfTMatrixTableRole::WetOblate,
                 &[53, 3, 32, 10, 4, 1, 5][..],
