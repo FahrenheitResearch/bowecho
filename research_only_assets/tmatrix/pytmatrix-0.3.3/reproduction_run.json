@@ -1,0 +1,23 @@
+{
+    "schema":  1,
+    "command":  "powershell -ExecutionPolicy Bypass -File crates/radar_scattering/tools/pytmatrix-0.3.3/run_all.ps1",
+    "image_id":  "sha256:06d75ad1599220236a5a33a138c102782197a67b8dda0d8e23f58f9b6b8c7a5e",
+    "build_status":  "passed",
+    "upstream_unittest_status":  "passed_during_image_build",
+    "generated_tables":  [
+                             "conventional_liquid_rain_sband_unvalidated",
+                             "conventional_dry_ice_spheroids_sband_unvalidated",
+                             "conventional_wet_hail_sband_unvalidated"
+                         ],
+    "solver_failure_count":  0,
+    "sanity_checks_passed":  true,
+    "interpolation_check_passed":  true,
+    "environment_sha256":  "240027118e2489461d84a844bab7811748603582d78c999094fcb394c97a7b83",
+    "sanity_report_sha256":  "aef51ff0cb8cff99d3f763819a6ee2c137cc09cf0aaeb23ba634f14cf1f152d0",
+    "held_out_interpolation_report_sha256":  "72b168bc6697d26fa572acdb367e6e15590ac1dfb0c711d36d3213672e2863c1",
+    "table_validation_status":  "research_only_unvalidated",
+    "production_activation":  false,
+    "historical_failures":  [
+                                "See crates/radar_scattering/tools/pytmatrix-0.3.3/FAILURE_RECORD.md"
+                            ]
+}

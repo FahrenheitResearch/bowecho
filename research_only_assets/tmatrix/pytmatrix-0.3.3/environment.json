@@ -1,0 +1,134 @@
+{
+  "artifact_classification": "reproducibility_environment_not_scientific_validation",
+  "base_image_linux_amd64_digest": "python:3.11.9-slim-bookworm@sha256:2856e6af199e8128161abd320575eb9b341f3b76f017b5d0c9cd364f60d8a050",
+  "container_image_id": "sha256:06d75ad1599220236a5a33a138c102782197a67b8dda0d8e23f58f9b6b8c7a5e",
+  "debian_snapshot": "20240904T000000Z",
+  "emitter_executable": "/usr/local/bin/brslut-emitter",
+  "emitter_executable_sha256": "8a9a493f6aad760c0c130a5b453c1b3ab057dde7c793552b48bd34db12a8aff7",
+  "gfortran_version": {
+    "command": [
+      "gfortran",
+      "--version"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "GNU Fortran (Debian 12.2.0-14) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"
+  },
+  "native_packages": {
+    "command": [
+      "dpkg-query",
+      "-W",
+      "-f=${Package}=${Version}\\n",
+      "build-essential",
+      "gcc",
+      "gfortran",
+      "gfortran-12",
+      "libgfortran5",
+      "libstdc++6"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "build-essential=12.9\ngcc=4:12.2.0-3\ngfortran=4:12.2.0-3\ngfortran-12=12.2.0-14\nlibgfortran5=12.2.0-14\nlibstdc++6=12.2.0-14\n"
+  },
+  "numpy_core_extension": "/usr/local/lib/python3.11/site-packages/numpy/core/_multiarray_umath.cpython-311-x86_64-linux-gnu.so",
+  "numpy_core_extension_sha256": "a735e4e8355b75c800112af8a5b1731b891b2016ed57067352eea6cab0aa00bc",
+  "numpy_core_ldd": {
+    "command": [
+      "ldd",
+      "/usr/local/lib/python3.11/site-packages/numpy/core/_multiarray_umath.cpython-311-x86_64-linux-gnu.so"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "\tlinux-vdso.so.1\n\tlibopenblas64_p-r0-0cf96a72.3.23.dev.so => /usr/local/lib/python3.11/site-packages/numpy/core/../../numpy.libs/libopenblas64_p-r0-0cf96a72.3.23.dev.so\n\tlibm.so.6 => /lib/x86_64-linux-gnu/libm.so.6\n\tlibgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1\n\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6\n\tlibpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0\n\tlibgfortran-040039e1.so.5.0.0 => /usr/local/lib/python3.11/site-packages/numpy/core/../../numpy.libs/libgfortran-040039e1.so.5.0.0\n\t/lib64/ld-linux-x86-64.so.2\n\tlibquadmath-96973f99.so.0.0.0 => /usr/local/lib/python3.11/site-packages/numpy/core/../../numpy.libs/libquadmath-96973f99.so.0.0.0\n\tlibz.so.1 => /lib/x86_64-linux-gnu/libz.so.1\n"
+  },
+  "numpy_show_config": {
+    "command": [
+      "/usr/local/bin/python",
+      "-c",
+      "import numpy; numpy.show_config()"
+    ],
+    "returncode": 0,
+    "stderr": "/usr/local/lib/python3.11/site-packages/numpy/__config__.py:155: UserWarning: Install `pyyaml` for better output\n  warnings.warn(\"Install `pyyaml` for better output\", stacklevel=1)\n",
+    "stdout": "{\n  \"Compilers\": {\n    \"c\": {\n      \"name\": \"gcc\",\n      \"linker\": \"ld.bfd\",\n      \"version\": \"10.2.1\",\n      \"commands\": \"cc\",\n      \"args\": \"-fno-strict-aliasing\",\n      \"linker args\": \"-Wl,--strip-debug, -fno-strict-aliasing\"\n    },\n    \"cython\": {\n      \"name\": \"cython\",\n      \"linker\": \"cython\",\n      \"version\": \"3.0.8\",\n      \"commands\": \"cython\"\n    },\n    \"c++\": {\n      \"name\": \"gcc\",\n      \"linker\": \"ld.bfd\",\n      \"version\": \"10.2.1\",\n      \"commands\": \"c++\",\n      \"linker args\": \"-Wl,--strip-debug\"\n    }\n  },\n  \"Machine Information\": {\n    \"host\": {\n      \"cpu\": \"x86_64\",\n      \"family\": \"x86_64\",\n      \"endian\": \"little\",\n      \"system\": \"linux\"\n    },\n    \"build\": {\n      \"cpu\": \"x86_64\",\n      \"family\": \"x86_64\",\n      \"endian\": \"little\",\n      \"system\": \"linux\"\n    }\n  },\n  \"Build Dependencies\": {\n    \"blas\": {\n      \"name\": \"openblas64\",\n      \"found\": true,\n      \"version\": \"0.3.23.dev\",\n      \"detection method\": \"pkgconfig\",\n      \"include directory\": \"/usr/local/include\",\n      \"lib directory\": \"/usr/local/lib\",\n      \"openblas configuration\": \"USE_64BITINT=1 DYNAMIC_ARCH=1 DYNAMIC_OLDER= NO_CBLAS= NO_LAPACK= NO_LAPACKE= NO_AFFINITY=1 USE_OPENMP= HASWELL MAX_THREADS=2\",\n      \"pc file directory\": \"/usr/local/lib/pkgconfig\"\n    },\n    \"lapack\": {\n      \"name\": \"dep140213194937296\",\n      \"found\": true,\n      \"version\": \"1.26.4\",\n      \"detection method\": \"internal\",\n      \"include directory\": \"unknown\",\n      \"lib directory\": \"unknown\",\n      \"openblas configuration\": \"unknown\",\n      \"pc file directory\": \"unknown\"\n    }\n  },\n  \"Python Information\": {\n    \"path\": \"/opt/python/cp311-cp311/bin/python\",\n    \"version\": \"3.11\"\n  },\n  \"SIMD Extensions\": {\n    \"baseline\": [\n      \"SSE\",\n      \"SSE2\",\n      \"SSE3\"\n    ],\n    \"found\": [\n      \"SSSE3\",\n      \"SSE41\",\n      \"POPCNT\",\n      \"SSE42\",\n      \"AVX\",\n      \"F16C\",\n      \"FMA3\",\n      \"AVX2\",\n      \"AVX512F\",\n      \"AVX512CD\",\n      \"AVX512_SKX\",\n      \"AVX512_CLX\",\n      \"AVX512_CNL\",\n      \"AVX512_ICL\"\n    ],\n    \"not found\": [\n      \"AVX512_KNL\",\n      \"AVX512_KNM\"\n    ]\n  }\n}\n"
+  },
+  "os_release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nVERSION_ID=\"12\"\nVERSION=\"12 (bookworm)\"\nVERSION_CODENAME=bookworm\nID=debian\nHOME_URL=\"https://www.debian.org/\"\nSUPPORT_URL=\"https://www.debian.org/support\"\nBUG_REPORT_URL=\"https://bugs.debian.org/\"\n",
+  "package_versions": {
+    "numpy": "1.26.4",
+    "pytmatrix": "0.3.3",
+    "scipy": "1.11.4",
+    "setuptools": "59.8.0"
+  },
+  "pip_freeze_all": {
+    "command": [
+      "/usr/local/bin/python",
+      "-m",
+      "pip",
+      "freeze",
+      "--all"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "numpy @ https://files.pythonhosted.org/packages/3a/d0/edc009c27b406c4f9cbc79274d6e46d634d139075492ad055e3d68445925/numpy-1.26.4-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=666dbfb6ec68962c033a450943ded891bed2d54e6755e35e5835d63f4f6931d5\npip==24.0\npytmatrix @ file:///opt/pytmatrix/source\nscipy @ https://files.pythonhosted.org/packages/6b/d4/d62ce38ba00dc67d7ec4ec5cc19d36958d8ed70e63778715ad626bcbc796/scipy-1.11.4-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=530f9ad26440e85766509dbf78edcfe13ffd0ab7fec2560ee5c36ff74d6269ff\nsetuptools @ https://files.pythonhosted.org/packages/8d/25/88b377b99ffb4ad0fc44ff5735fd6be605b2183f743d1ff5c10b7790cea5/setuptools-59.8.0-py3-none-any.whl#sha256=608a7885b664342ae9fafc43840b29d219c5a578876f6f7e00c4e2612160587f\nwheel @ https://files.pythonhosted.org/packages/7d/cd/d7460c9a869b16c3dd4e1e403cce337df165368c71d6af229a74699622ce/wheel-0.43.0-py3-none-any.whl#sha256=55c570405f142630c6b9f72fe09d9b67cf1477fcf543ae5b8dcb1f5b7377da81\n"
+  },
+  "platform": "Linux-6.6.87.1-microsoft-standard-WSL2-x86_64-with-glibc2.36",
+  "python_executable": "/usr/local/bin/python3.11",
+  "python_executable_sha256": "8219d0acbf6e1b78e322a221c438244034afc7d8c9d08b68019ba320de50afbb",
+  "python_version": "3.11.9",
+  "python_vv": {
+    "command": [
+      "/usr/local/bin/python",
+      "-VV"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "Python 3.11.9 (main, Sep  4 2024, 23:15:21) [GCC 12.2.0]\n"
+  },
+  "pytmatrix_fortran_extension": "/usr/local/lib/python3.11/site-packages/pytmatrix/fortran_tm/pytmatrix.cpython-311-x86_64-linux-gnu.so",
+  "pytmatrix_fortran_extension_ldd": {
+    "command": [
+      "ldd",
+      "/usr/local/lib/python3.11/site-packages/pytmatrix/fortran_tm/pytmatrix.cpython-311-x86_64-linux-gnu.so"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "\tlinux-vdso.so.1\n\tlibgfortran.so.5 => /lib/x86_64-linux-gnu/libgfortran.so.5\n\tlibm.so.6 => /lib/x86_64-linux-gnu/libm.so.6\n\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6\n\tlibquadmath.so.0 => /lib/x86_64-linux-gnu/libquadmath.so.0\n\tlibgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1\n\t/lib64/ld-linux-x86-64.so.2\n"
+  },
+  "pytmatrix_fortran_extension_sha256": "eea611fcca5a318a34354b3e41b2e69329b1f073b36f81a1c0ef9ab836b5c71e",
+  "rust_toolchain_image_linux_amd64_digest": "rust:1.85.1-slim-bookworm@sha256:3490aa77d179a59d67e94239cca96dd84030b564470859200f535b942bdffedf",
+  "rustc_version": {
+    "command": [
+      "rustc",
+      "-Vv"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "rustc 1.85.1 (4eb161250 2025-03-15)\nbinary: rustc\ncommit-hash: 4eb161250e340c8f48f66e2b929ef4a5bed7c181\ncommit-date: 2025-03-15\nhost: x86_64-unknown-linux-gnu\nrelease: 1.85.1\nLLVM version: 19.1.7\n"
+  },
+  "schema": 1,
+  "target": "x86_64",
+  "thread_environment": {
+    "LC_ALL": "C.UTF-8",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONHASHSEED": "0",
+    "SOURCE_DATE_EPOCH": "1725408000",
+    "TZ": "UTC"
+  },
+  "tool_file_sha256": {
+    "Dockerfile": "59916e908147a48033fe56061dc3ae05b569cc68178b553d3843a8d33e2103bd",
+    "FAILURE_RECORD.md": "094e888a664170630649e59927bfb7fd61b7f1cf48074714d1d495c204afa951",
+    "README.md": "a2f69fc3bcfbafaa65be771640a0e010c447c81f06fd6b2a0e0909a158c0a4a8",
+    "emitter/Cargo.lock": "3504f82e975270fa286ce0c4474698931bd8c44059b1ec95e6eebb6a3be880f1",
+    "emitter/Cargo.toml": "6b93d4b0d27e3773fa48001d1321f59eb7dc30f1e196e72accbeec938f2088a5",
+    "emitter/src/main.rs": "ed51bf266c14ec5aeab8c653298722596d00c7413ccd87f2ce4866caf7405ef7",
+    "generate_lut.py": "66998381079f3c69a04dcbf920fdcabaf906c10786f1a3c28c89a8274e6f253f",
+    "generator_config.example.json": "6a36f795495b06a3f3a82452f702b1d017233c13a230c053573b4f19ce652e1e",
+    "requirements-bootstrap-pinned.txt": "c01ccf75c8634abd7c32f6ae203a64a8bf7e090b0b4f61aa9e7e5c69fd556184",
+    "requirements-pytmatrix-pinned.txt": "d754b6589041548bbb2fbb3c3aae49b17252b1f35629b5f8bef91ab0e24f3f72",
+    "run_all.ps1": "e17c4ccd6661e2173159f1b19271c70f74289310f0d074898570ed57a8afd214",
+    "toolchain.json": "84befbbe97d9c87e0aa73da6e001a8b2f034a5441f95d2a8df88ada56931c222"
+  }
+}

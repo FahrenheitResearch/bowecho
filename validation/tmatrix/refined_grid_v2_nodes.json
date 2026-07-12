@@ -1,0 +1,161 @@
+{
+  "classification": "held_out_from_lut_interpolation_check_only",
+  "schema": 1,
+  "selection_protocol": "Grid/config bytes were frozen before selection. This script uses only axis coordinates, a public fixed seed, fixed diameter quantiles, and SHA-256-derived within-cell fractions in [0.2,0.8]. It does not import PyTMatrix or inspect scattering outputs. No selected-node result may be used to alter these tables.",
+  "selection_seed": "bowecho-pytmatrix-0.3.3-post-grid-heldout-v2",
+  "selector_source_sha256": "7abdf36b19bcb175fd4591fa56dc9f5892d72e2ca719b9e371759c296aaacf39",
+  "tables": [
+    {
+      "asset_directory": "conventional_liquid_rain_sband_unvalidated",
+      "config_sha256_at_selection": "9329639ba40871186baf32d5a56fcecc6f5975f74ad075d61192f2af352823a3",
+      "nodes": [
+        {
+          "equivolume_diameter": 0.0004178462070058944,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8221734147424717
+        },
+        {
+          "equivolume_diameter": 0.0006423566166312241,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.9530317537936249
+        },
+        {
+          "equivolume_diameter": 0.0012551856070227335,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8732932824708615
+        },
+        {
+          "equivolume_diameter": 0.0021445077793086813,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.9217176972545998
+        },
+        {
+          "equivolume_diameter": 0.003736361933821964,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8525662412545016
+        },
+        {
+          "equivolume_diameter": 0.005981344215805351,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.9516409758704671
+        }
+      ]
+    },
+    {
+      "asset_directory": "conventional_dry_ice_spheroids_sband_unvalidated",
+      "config_sha256_at_selection": "258503691739c401c700f7a20fba3db6a7231e58ed656f0568788c9e0fa3fff1",
+      "nodes": [
+        {
+          "equivolume_diameter": 0.0001804068602704624,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.740554357340991
+        },
+        {
+          "equivolume_diameter": 0.00043716110687461217,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8835273554654016
+        },
+        {
+          "equivolume_diameter": 0.0012404263250602862,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.791381789107755
+        },
+        {
+          "equivolume_diameter": 0.004218649340752596,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.9447880990081408
+        },
+        {
+          "equivolume_diameter": 0.012292954885042201,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.7485307444875143
+        },
+        {
+          "equivolume_diameter": 0.02979969099580107,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.9498844479891458
+        }
+      ]
+    },
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "config_sha256_at_selection": "c1fd0a3ef20998e35e0aa621583c11dd40dc49bcddccc15909fc13b08d648b8e",
+      "nodes": [
+        {
+          "equivolume_diameter": 0.0025911762050768476,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.15233235204649787,
+          "minor_to_major_axis_ratio": 0.7927675172774042
+        },
+        {
+          "equivolume_diameter": 0.004734074455706319,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.3657193955649727,
+          "minor_to_major_axis_ratio": 0.9032320337268369
+        },
+        {
+          "equivolume_diameter": 0.007492729646788125,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.219171538115923,
+          "minor_to_major_axis_ratio": 0.7880437412397464
+        },
+        {
+          "equivolume_diameter": 0.013681318880574453,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.3210885228775345,
+          "minor_to_major_axis_ratio": 0.9129049402048046
+        },
+        {
+          "equivolume_diameter": 0.02312728254567266,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.15304684267702598,
+          "minor_to_major_axis_ratio": 0.7742122067052399
+        },
+        {
+          "equivolume_diameter": 0.03996570932549261,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.32034051258399354,
+          "minor_to_major_axis_ratio": 0.8811357738494897
+        }
+      ]
+    }
+  ],
+  "thresholds": {
+    "ah": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "av": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "fall_speed_first_moment": {
+      "absolute": 1e-12,
+      "relative": 0.75
+    },
+    "fall_speed_second_moment": {
+      "absolute": 1e-12,
+      "relative": 0.75
+    },
+    "hh_vv_covariance_imaginary": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "hh_vv_covariance_real": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "kdp": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "zh": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "zv": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    }
+  }
+}

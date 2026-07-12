@@ -2,10 +2,10 @@
   "schema": 1,
   "status": "research_only_unvalidated",
   "kernel": "pytmatrix-0.3.3",
-  "table_id": "example-conventional-dry-ice-sband-unvalidated-v1",
+  "table_id": "conventional-liquid-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
   "particle_population": {
     "microphysics_family": "conventional",
-    "category": "hail",
+    "category": "rain",
     "shape_family": "oblate_spheroid",
     "size_distribution": "monodisperse_node",
     "normalization_number_concentration_m3": 1.0
@@ -14,12 +14,12 @@
     {
       "kind": "equivolume_diameter",
       "unit": "meter",
-      "coordinates": [0.0001, 0.05]
+      "coordinates": [0.0003, 0.000375, 0.00046875, 0.0005859375, 0.000732421875, 0.00091552734375, 0.0011444091796875, 0.00143051147460937, 0.00178813934326172, 0.00223517417907715, 0.00279396772384644, 0.00349245965480804, 0.00436557456851005, 0.00545696821063757, 0.00682121026329696, 0.007]
     },
     {
       "kind": "minor_to_major_axis_ratio",
       "unit": "unitless_fraction",
-      "coordinates": [0.7, 1.0]
+      "coordinates": [0.8, 0.9, 1.0]
     },
     {
       "kind": "frequency",
@@ -29,23 +29,23 @@
   ],
   "dielectric": {
     "model": "explicit_homogeneous",
-    "material": "ice",
+    "material": "liquid_water",
     "refractive_index": {
-      "real": 1.7861,
-      "imaginary": 0.0000966
+      "real": 9.075,
+      "imaginary": 1.253
     },
-    "mass_density_kg_m3": 916.7,
+    "mass_density_kg_m3": 999.84,
     "temperature_k": 273.15,
     "frequency_dependence": "constant_over_configured_s_band_nodes"
   },
   "orientation": {
-    "model": "gaussian_canting",
-    "mean_deg": 0.0,
-    "standard_deviation_deg": 20.0,
-    "alpha_quadrature_points": 5,
-    "beta_quadrature_points": 10,
-    "quadrature_method": "pytmatrix_orient_averaged_fixed_gautschi",
-    "reference_symmetry_axis": "vertical_at_zero_canting"
+    "model": "fixed_euler",
+    "yaw_deg": 0.0,
+    "pitch_deg": 0.0,
+    "roll_deg": 0.0,
+    "pytmatrix_alpha_deg": 0.0,
+    "pytmatrix_beta_deg": 0.0,
+    "symmetry_axis": "vertical"
   },
   "radar": {
     "speed_of_light_m_s": 299792458.0,
@@ -61,14 +61,11 @@
     }
   },
   "terminal_velocity": {
-    "law": "schiller_naumann_gravity_drag",
-    "gravity_m_s2": 9.80665,
-    "air_density_kg_m3": 1.225,
-    "air_dynamic_viscosity_pa_s": 0.000017894,
-    "drag_transition_reynolds": 1000.0,
-    "high_reynolds_drag_coefficient": 0.44,
-    "maximum_iterations": 200,
-    "relative_tolerance": 1e-12
+    "law": "atlas_rain_1973_exponential",
+    "a_m_s": 9.65,
+    "b_m_s": 10.3,
+    "c_per_mm": 0.6,
+    "valid_diameter_range_m": [0.0003, 0.007]
   },
   "temporal": {
     "sampling": "instantaneous"
@@ -85,8 +82,7 @@
   },
   "references": [
     "https://github.com/jleinonen/pytmatrix/tree/0.3.3",
-    "https://github.com/jleinonen/pytmatrix/blob/0.3.3/pytmatrix/orientation.py",
     "https://github.com/jleinonen/pytmatrix/blob/0.3.3/pytmatrix/refractive.py",
-    "https://doi.org/10.1002/aic.690020110"
+    "https://doi.org/10.1029/JC078i033p07847"
   ]
 }

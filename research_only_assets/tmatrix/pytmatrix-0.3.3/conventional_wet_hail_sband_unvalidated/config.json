@@ -2,7 +2,7 @@
   "schema": 1,
   "status": "research_only_unvalidated",
   "kernel": "pytmatrix-0.3.3",
-  "table_id": "example-conventional-dry-ice-sband-unvalidated-v1",
+  "table_id": "conventional-wet-hail-sband-pytmatrix-0.3.3-unvalidated-v1",
   "particle_population": {
     "microphysics_family": "conventional",
     "category": "hail",
@@ -14,12 +14,17 @@
     {
       "kind": "equivolume_diameter",
       "unit": "meter",
-      "coordinates": [0.0001, 0.05]
+      "coordinates": [0.002, 0.0024, 0.00288, 0.003456, 0.0041472, 0.00497664, 0.005971968, 0.0071663616, 0.00859963392, 0.010319560704, 0.0123834728448, 0.01486016741376, 0.017832200896512, 0.0213986410758144, 0.0256783692909773, 0.028246206220075003, 0.0308140431491727, 0.03389544746409, 0.0369768517790073, 0.040674536956908, 0.0443722221348087, 0.04718611106740435, 0.05]
+    },
+    {
+      "kind": "liquid_mass_fraction",
+      "unit": "unitless_fraction",
+      "coordinates": [0.1, 0.175, 0.25, 0.325, 0.4]
     },
     {
       "kind": "minor_to_major_axis_ratio",
       "unit": "unitless_fraction",
-      "coordinates": [0.7, 1.0]
+      "coordinates": [0.7, 0.775, 0.85, 0.925, 1.0]
     },
     {
       "kind": "frequency",
@@ -28,14 +33,19 @@
     }
   ],
   "dielectric": {
-    "model": "explicit_homogeneous",
-    "material": "ice",
-    "refractive_index": {
+    "model": "maxwell_garnett_ice_host_water_inclusion",
+    "ice_refractive_index": {
       "real": 1.7861,
       "imaginary": 0.0000966
     },
-    "mass_density_kg_m3": 916.7,
+    "liquid_water_refractive_index": {
+      "real": 9.075,
+      "imaginary": 1.253
+    },
+    "ice_density_kg_m3": 916.7,
+    "liquid_water_density_kg_m3": 999.84,
     "temperature_k": 273.15,
+    "mass_to_volume_fraction_conversion": "component_specific_volume",
     "frequency_dependence": "constant_over_configured_s_band_nodes"
   },
   "orientation": {
@@ -87,6 +97,7 @@
     "https://github.com/jleinonen/pytmatrix/tree/0.3.3",
     "https://github.com/jleinonen/pytmatrix/blob/0.3.3/pytmatrix/orientation.py",
     "https://github.com/jleinonen/pytmatrix/blob/0.3.3/pytmatrix/refractive.py",
+    "https://github.com/jleinonen/pytmatrix/blob/0.3.3/pytmatrix/refractive.py#L27-L54",
     "https://doi.org/10.1002/aic.690020110"
   ]
 }

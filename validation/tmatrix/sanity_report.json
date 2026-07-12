@@ -1,0 +1,88 @@
+{
+  "classification": "analytic_and_solver_sanity_only",
+  "crate_table_validation_status_after_report": "research_only_unvalidated",
+  "dry_config_sha256": "258503691739c401c700f7a20fba3db6a7231e58ed656f0568788c9e0fa3fff1",
+  "environment_report_sha256": "240027118e2489461d84a844bab7811748603582d78c999094fcb394c97a7b83",
+  "generator_source_sha256": "66998381079f3c69a04dcbf920fdcabaf906c10786f1a3c28c89a8274e6f253f",
+  "limitations": [
+    "Rayleigh comparison is an analytic small-particle sanity check, not an independent Mie implementation.",
+    "Wet-hail checks establish solver completion and finite schema-valid outputs, not laboratory or independent-model agreement.",
+    "The same generator implements direct points and tables.",
+    "No PSD-integrated scientific comparison is made; all tables are monodisperse at exactly 1 m^-3."
+  ],
+  "production_validation": false,
+  "rayleigh_sphere_checks": [
+    {
+      "analytic_rayleigh_zh": 1.914721857448901e-07,
+      "diameter_m": 0.0001,
+      "direct_pytmatrix_zh": 1.914718075067669e-07,
+      "relative_error": 1.9754207210089056e-06
+    },
+    {
+      "analytic_rayleigh_zh": 1.2254219887672967e-05,
+      "diameter_m": 0.0002,
+      "direct_pytmatrix_zh": 1.2254119678538924e-05,
+      "relative_error": 8.177520475486935e-06
+    }
+  ],
+  "report_id": "pytmatrix-0.3.3-rayleigh-and-wet-hail-sanity-v1",
+  "resonance_sized_wet_hail_solver_checks": [
+    {
+      "coordinates": {
+        "equivolume_diameter": 0.035,
+        "frequency": 2700832954.954955,
+        "liquid_mass_fraction": 0.4,
+        "minor_to_major_axis_ratio": 0.7
+      },
+      "direct_pytmatrix": {
+        "ah": 26.512516559514047,
+        "av": 13.10591842277938,
+        "fall_speed_first_moment": 17126726137.116997,
+        "fall_speed_second_moment": 485648509841.1607,
+        "hh_vv_covariance_imaginary": 61825246.51701883,
+        "hh_vv_covariance_real": 99932719.46520303,
+        "kdp": -7.218586488797319,
+        "zh": 603985685.597477,
+        "zv": 43680180.06823341
+      },
+      "size_parameter_pi_d_over_lambda": 0.990592278158944,
+      "solver_completed_with_finite_schema_valid_outputs": true
+    },
+    {
+      "coordinates": {
+        "equivolume_diameter": 0.05,
+        "frequency": 2700832954.954955,
+        "liquid_mass_fraction": 0.4,
+        "minor_to_major_axis_ratio": 0.7
+      },
+      "direct_pytmatrix": {
+        "ah": 40.041961146984065,
+        "av": 37.545042012632884,
+        "fall_speed_first_moment": 113535121822.93227,
+        "fall_speed_second_moment": 3847945546098.6826,
+        "hh_vv_covariance_imaginary": 2625029349.296512,
+        "hh_vv_covariance_real": 1831897917.2386312,
+        "kdp": -81.956847337403,
+        "zh": 3349897687.7199016,
+        "zv": 3419441518.26879
+      },
+      "size_parameter_pi_d_over_lambda": 1.4151318259413483,
+      "solver_completed_with_finite_schema_valid_outputs": true
+    }
+  ],
+  "sanity_checks_passed": true,
+  "schema": 1,
+  "scientifically_independent_validation": false,
+  "sphere_symmetry_and_scaling_checks": {
+    "ah_av_relative_difference": 0.0,
+    "covariance_imaginary_absolute": 1.5976778771246528e-27,
+    "covariance_real_zh_relative_difference": 4.838531051244446e-15,
+    "doubled_diameter_zh_ratio": 63.9996030648316,
+    "kdp_absolute_deg_km": 5.0503001638763e-22,
+    "rayleigh_expected_ratio": 64.0,
+    "rayleigh_ratio_relative_error": 6.202112006303828e-06,
+    "zh_zv_relative_difference": 9.677062102488892e-15
+  },
+  "validation_source_sha256": "9dfb5456a7ea535a2057641f7a987b03766637a2ee78663fe5087cb9d30c7926",
+  "wet_config_sha256": "eed185ff2e5007aef4895acc15d7349b231ff463b14998b8f493ad261fc610f2"
+}

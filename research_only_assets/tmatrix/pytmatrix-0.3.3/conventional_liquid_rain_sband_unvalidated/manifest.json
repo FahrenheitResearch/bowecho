@@ -1,0 +1,117 @@
+{
+  "artifact_classification": "unvalidated_research",
+  "axes": [
+    {
+      "coordinates": [
+        0.0003,
+        0.000375,
+        0.00046875,
+        0.0005859375,
+        0.000732421875,
+        0.00091552734375,
+        0.0011444091796875,
+        0.00143051147460937,
+        0.00178813934326172,
+        0.00223517417907715,
+        0.00279396772384644,
+        0.00349245965480804,
+        0.00436557456851005,
+        0.00545696821063757,
+        0.00682121026329696,
+        0.007
+      ],
+      "kind": "equivolume_diameter",
+      "unit": "meter"
+    },
+    {
+      "coordinates": [
+        0.8,
+        0.9,
+        1.0
+      ],
+      "kind": "minor_to_major_axis_ratio",
+      "unit": "unitless_fraction"
+    },
+    {
+      "coordinates": [
+        2700832954.954955
+      ],
+      "kind": "frequency",
+      "unit": "hertz"
+    }
+  ],
+  "crate_validation_status": "research_only_unvalidated",
+  "environment_report_file": "environment.json",
+  "environment_report_sha256": "240027118e2489461d84a844bab7811748603582d78c999094fcb394c97a7b83",
+  "generator": {
+    "executable": "crates/radar_scattering/tools/pytmatrix-0.3.3/generate_lut.py",
+    "name": "bowecho-pytmatrix-research-generator",
+    "package_versions": {
+      "numpy": "1.26.4",
+      "pytmatrix": "0.3.3",
+      "scipy": "1.11.4",
+      "setuptools": "59.8.0"
+    },
+    "python_version": "3.11.9",
+    "source_revision": "sha256:66998381079f3c69a04dcbf920fdcabaf906c10786f1a3c28c89a8274e6f253f",
+    "version": "1.0.0"
+  },
+  "generator_config_sha256": "9329639ba40871186baf32d5a56fcecc6f5975f74ad075d61192f2af352823a3",
+  "grid_point_count": 48,
+  "isolated_solver_process_count": 48,
+  "lut_byte_length": 8664,
+  "lut_file": "table.lut",
+  "lut_header_json_byte_length": 5194,
+  "lut_header_json_sha256": "f387d4449993f331a12bb236238a69b29e32356513557db3fd3f8e7e003089c3",
+  "lut_sha256": "a6923ae402b5a947574fa9ea2cdb794cf841854762125ba5c202711f1de2143a",
+  "payload_byte_length": 3456,
+  "payload_sha256": "e01cbf60e21504b1b1e2af216db139a54e2b21f2d5bcec41bf4c9e9081fd8399",
+  "production_activation": false,
+  "schema": 1,
+  "science": {
+    "kernel": {
+      "implementation": {
+        "implementation": "pytmatrix_0_3_3"
+      },
+      "model": "t_matrix"
+    },
+    "melting": {
+      "model": "scheme_resolved"
+    },
+    "orientation": {
+      "model": "fixed_euler",
+      "pitch_deg": 0.0,
+      "roll_deg": 0.0,
+      "yaw_deg": 0.0
+    },
+    "temporal": {
+      "sampling": "instantaneous"
+    },
+    "validation": {
+      "status": "research_only_unvalidated"
+    }
+  },
+  "scope": {
+    "ishmael_coverage": false,
+    "microphysics_family": "conventional",
+    "p3_coverage": false,
+    "psd": "monodisperse_node_normalized_to_exactly_1_per_m3"
+  },
+  "solver_failures": [],
+  "table_id": "conventional-liquid-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
+  "tool_file_sha256": {
+    "Dockerfile": "59916e908147a48033fe56061dc3ae05b569cc68178b553d3843a8d33e2103bd",
+    "FAILURE_RECORD.md": "094e888a664170630649e59927bfb7fd61b7f1cf48074714d1d495c204afa951",
+    "README.md": "a2f69fc3bcfbafaa65be771640a0e010c447c81f06fd6b2a0e0909a158c0a4a8",
+    "emitter/Cargo.lock": "3504f82e975270fa286ce0c4474698931bd8c44059b1ec95e6eebb6a3be880f1",
+    "emitter/Cargo.toml": "6b93d4b0d27e3773fa48001d1321f59eb7dc30f1e196e72accbeec938f2088a5",
+    "emitter/src/main.rs": "ed51bf266c14ec5aeab8c653298722596d00c7413ccd87f2ce4866caf7405ef7",
+    "generate_lut.py": "66998381079f3c69a04dcbf920fdcabaf906c10786f1a3c28c89a8274e6f253f",
+    "generator_config.example.json": "6a36f795495b06a3f3a82452f702b1d017233c13a230c053573b4f19ce652e1e",
+    "requirements-bootstrap-pinned.txt": "c01ccf75c8634abd7c32f6ae203a64a8bf7e090b0b4f61aa9e7e5c69fd556184",
+    "requirements-pytmatrix-pinned.txt": "d754b6589041548bbb2fbb3c3aae49b17252b1f35629b5f8bef91ab0e24f3f72",
+    "run_all.ps1": "e17c4ccd6661e2173159f1b19271c70f74289310f0d074898570ed57a8afd214",
+    "toolchain.json": "84befbbe97d9c87e0aa73da6e001a8b2f034a5441f95d2a8df88ada56931c222"
+  },
+  "validation_claim": "No independent scientific validation. Separate direct-PyTMatrix held-out nodes test generator/LUT interpolation only."
+}

@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "classification": "held_out_from_lut_interpolation_check_only",
+  "selection_protocol": "Coordinates were fixed before direct-node results were generated. Every point is absent from the LUT grid and lies strictly inside every non-singleton axis used for interpolation.",
+  "thresholds": {
+    "zh": {"relative": 0.5, "absolute": 1e-12},
+    "zv": {"relative": 0.5, "absolute": 1e-12},
+    "hh_vv_covariance_real": {"relative": 0.5, "absolute": 1e-12},
+    "hh_vv_covariance_imaginary": {"relative": 0.5, "absolute": 1e-12},
+    "kdp": {"relative": 0.5, "absolute": 1e-12},
+    "ah": {"relative": 0.5, "absolute": 1e-12},
+    "av": {"relative": 0.5, "absolute": 1e-12},
+    "fall_speed_first_moment": {"relative": 0.75, "absolute": 1e-12},
+    "fall_speed_second_moment": {"relative": 0.75, "absolute": 1e-12}
+  },
+  "tables": [
+    {
+      "asset_directory": "conventional_liquid_rain_sband_unvalidated",
+      "nodes": [
+        {"equivolume_diameter": 0.0005, "minor_to_major_axis_ratio": 0.85, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.0011, "minor_to_major_axis_ratio": 0.95, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.00225, "minor_to_major_axis_ratio": 0.85, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.004, "minor_to_major_axis_ratio": 0.95, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.006, "minor_to_major_axis_ratio": 0.85, "frequency": 2700832954.954955}
+      ]
+    },
+    {
+      "asset_directory": "conventional_dry_ice_spheroids_sband_unvalidated",
+      "nodes": [
+        {"equivolume_diameter": 0.0003, "minor_to_major_axis_ratio": 0.775, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.00125, "minor_to_major_axis_ratio": 0.925, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.005, "minor_to_major_axis_ratio": 0.775, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.014, "minor_to_major_axis_ratio": 0.925, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.0275, "minor_to_major_axis_ratio": 0.775, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.0425, "minor_to_major_axis_ratio": 0.925, "frequency": 2700832954.954955}
+      ]
+    },
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "nodes": [
+        {"equivolume_diameter": 0.005, "liquid_mass_fraction": 0.175, "minor_to_major_axis_ratio": 0.775, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.014, "liquid_mass_fraction": 0.325, "minor_to_major_axis_ratio": 0.925, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.0275, "liquid_mass_fraction": 0.175, "minor_to_major_axis_ratio": 0.925, "frequency": 2700832954.954955},
+        {"equivolume_diameter": 0.0425, "liquid_mass_fraction": 0.325, "minor_to_major_axis_ratio": 0.775, "frequency": 2700832954.954955}
+      ]
+    }
+  ]
+}

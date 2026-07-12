@@ -3,14 +3,29 @@
   "status": "research_only_unvalidated",
   "target": "linux-x86_64",
   "os_family": "debian-12-bookworm",
+  "debian_snapshot": "20240904T000000Z",
+  "source_date_epoch": 1725408000,
+  "python_base_image_linux_amd64": "python:3.11.9-slim-bookworm@sha256:2856e6af199e8128161abd320575eb9b341f3b76f017b5d0c9cd364f60d8a050",
   "python": "CPython 3.11.9",
-  "fortran_compiler": "GNU Fortran 12.2.0 (Debian package 12.2.0-14+deb12u1)",
-  "native_runtime": "libgfortran5 12.2.0-14+deb12u1",
+  "python_packages": {
+    "pip": "24.0",
+    "setuptools": "59.8.0",
+    "wheel": "0.43.0",
+    "numpy": "1.26.4",
+    "scipy": "1.11.4"
+  },
+  "fortran_compiler": "GNU Fortran 12.2.0 (Debian package gfortran-12=12.2.0-14)",
+  "native_runtime": "libgfortran5=12.2.0-14",
+  "rust_emitter": {
+    "compiler": "rustc 1.85.1",
+    "base_image_linux_amd64": "rust:1.85.1-slim-bookworm@sha256:3490aa77d179a59d67e94239cca96dd84030b564470859200f535b942bdffedf"
+  },
   "pytmatrix": {
     "version": "0.3.3",
     "release_tag": "0.3.3",
-    "release_commit_short": "22432e7",
-    "sdist_sha256": "34a1962a89c0f123ff815a05318abd09ad247613d3a2684747119a4cd67b9e5a"
+    "release_commit": "22432e7468f6fc0848be54b13016a846a4518979",
+    "commit_archive_sha256": "65345df72b6bad5585ded6bb62edf87b6dfa7d7cb35d92dbf16e4b82739fca97",
+    "broken_pypi_sdist_sha256": "34a1962a89c0f123ff815a05318abd09ad247613d3a2684747119a4cd67b9e5a"
   },
   "output_lut_schema": 1
 }

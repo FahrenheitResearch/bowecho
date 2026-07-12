@@ -1,2 +1,4 @@
-# Official PyPI 0.3.3 source distribution, pinned by artifact SHA-256.
-https://files.pythonhosted.org/packages/03/0e/9ab5caf01bd7c62107f2b997555b3f97b25b62db55573d09fd43bf48cad0/pytmatrix-0.3.3.tar.gz#sha256=34a1962a89c0f123ff815a05318abd09ad247613d3a2684747119a4cd67b9e5a
+# Official upstream 0.3.3 release commit, pinned by full revision and archive
+# SHA-256. The PyPI sdist and GitHub release ZIP accidentally omit the required
+# pytmatrix/fortran_tm/pytmatrix.pyf interface; see FAILURE_RECORD.md.
+https://codeload.github.com/jleinonen/pytmatrix/tar.gz/22432e7468f6fc0848be54b13016a846a4518979#sha256=65345df72b6bad5585ded6bb62edf87b6dfa7d7cb35d92dbf16e4b82739fca97

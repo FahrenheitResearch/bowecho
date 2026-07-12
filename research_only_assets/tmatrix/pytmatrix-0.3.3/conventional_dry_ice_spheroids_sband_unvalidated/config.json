@@ -2,7 +2,7 @@
   "schema": 1,
   "status": "research_only_unvalidated",
   "kernel": "pytmatrix-0.3.3",
-  "table_id": "example-conventional-dry-ice-sband-unvalidated-v1",
+  "table_id": "conventional-dry-ice-spheroids-sband-pytmatrix-0.3.3-unvalidated-v1",
   "particle_population": {
     "microphysics_family": "conventional",
     "category": "hail",
@@ -14,12 +14,12 @@
     {
       "kind": "equivolume_diameter",
       "unit": "meter",
-      "coordinates": [0.0001, 0.05]
+      "coordinates": [0.0001, 0.000125, 0.00015625, 0.0001953125, 0.000244140625, 0.00030517578125, 0.0003814697265625, 0.000476837158203125, 0.000596046447753906, 0.000745058059692383, 0.000931322574615479, 0.00116415321826935, 0.00145519152283669, 0.00181898940354586, 0.00227373675443232, 0.0028421709430404, 0.0035527136788005, 0.00444089209850063, 0.00555111512312578, 0.00693889390390723, 0.00867361737988404, 0.010842021724855, 0.0135525271560688, 0.016940658945086, 0.0211758236813575, 0.0264697796016969, 0.0330872245021211, 0.0413590306276514, 0.05]
     },
     {
       "kind": "minor_to_major_axis_ratio",
       "unit": "unitless_fraction",
-      "coordinates": [0.7, 1.0]
+      "coordinates": [0.7, 0.85, 1.0]
     },
     {
       "kind": "frequency",
