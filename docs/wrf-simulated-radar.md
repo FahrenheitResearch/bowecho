@@ -103,10 +103,11 @@ calibration, and instrument values together, so stale expert values cannot
 leak into a new run.
 
 The recipes also choose coherent temporal defaults. **Storm view**, **Clean
-model truth**, and **Clean dual-pol** start Frozen. **Real radar**, **Maximum
-fidelity**, and **P3/ISHMAEL T-matrix** start with Timed volume, **Interpolate
-adjacent WRF scenes**, and **Hold last**. These remain editable after applying
-the recipe.
+model truth**, and **Clean dual-pol** start Frozen. **Real radar** and
+**Maximum fidelity** start with Timed volume, fast derived/additive adjacent
+sampling, and Hold last. **P3/ISHMAEL T-matrix** starts with the slower
+Raw-state pre-closure reference and Hold last. These remain editable after
+applying the recipe.
 
 ### Recipe comparison
 
@@ -225,11 +226,11 @@ of record is the [ROC Build 24 interface control document](https://www.roc.noaa.
 ## Atmosphere time sampling
 
 **Frozen at volume start** remains available and makes every ray sample the
-anchor WRF scene, even when the ray carries an acquisition time. **Interpolate
-adjacent WRF scenes** instead requires the next chronologically later scene in
-the same compatible run/domain/grid group. For each ray, BowEcho derives one
-weight from its acquisition offset within the model-time bracket. The weight
-must remain between the two WRF times; the renderer never extrapolates.
+anchor WRF scene, even when the ray carries an acquisition time. Both adjacent
+options require the next chronologically later scene in the same compatible
+run/domain/grid group. For each ray, BowEcho derives one weight from its
+acquisition offset within the model-time bracket. The weight must remain
+between the two WRF times; the renderer never extrapolates.
 
 This interpolation changes the atmosphere sampled *inside one output radar
 volume*: low-level/early rays stay nearer the anchor scene and later rays or
@@ -244,14 +245,27 @@ last frame has no later scene and therefore follows **Hold last**, **Drop**, or
 **Error**; Drop can make the output loop shorter than N frames. A scan that
 extends beyond its next scene follows the same explicit policy.
 
-The compatibility renderer interpolates linear received power (`Z`), winds,
-and additive polarimetric scattering quantities. ZDR and rhoHV are derived
-afterward rather than interpolated as ratios. The property-aware research
-path closes each active source cell from its native mass/number/property tuple,
-evaluates additive T-matrix quantities at the validated view-angle nodes, and
-then performs spatial, pulse-volume, and adjacent-scene integration only in
-that additive space. It never interpolates ZDR/rhoHV ratios or treats a derived
-radar moment as a surrogate WRF property.
+**Linear adjacent (derived/additive)** interpolates linear received power
+(`Z`), winds, and additive polarimetric scattering quantities. ZDR and rhoHV
+are derived afterward rather than interpolated as ratios. This is the fast,
+well-behaved compatibility path: the property-aware kernel closes each source
+cell first and blends its additive scattering afterward.
+
+**Raw-state pre-closure** is the slow research reference for the P3/ISHMAEL
+property T-matrix kernel. At every pulse-volume quadrature point it forms the
+actual up-to-eight trilinear model-cell weights in each scene, multiplies those
+groups by `(1-alpha)` and `alpha`, and blends the resulting up-to-sixteen raw
+property contributors. Winds, TKE, temperature, pressure, and density use the
+same spatial/time weights. BowEcho then performs exactly one nonlinear
+microphysical closure and one validated T-matrix/PSD evaluation for that
+intermediate state. Endpoints are exact, and scheme, property-inventory,
+category-layout, rain-availability, spatial-coverage, or table mismatches stop
+the run rather than falling back to additive-time interpolation.
+
+Raw-state and additive-scattering interpolation are intentionally not expected
+to agree in rapidly growing, melting, or riming regions. Comparing them is the
+purpose of the reference mode; neither creates extra forecast frames or claims
+to integrate WRF forward in time.
 
 If there is no complete later scene, or the scan would cross beyond it, the
 explicit policy can **hold the anchor**, **drop the frame**, or **stop with an
@@ -489,8 +503,11 @@ precomputes only active-cell additive scattering at the five elevation nodes,
 and then drops the raw property arrays. Adjacent-scene mode uses a bounded
 two-input-scene cache and checks the exact retained sparse-scene size after
 each read in addition to input, embedded tables, read/build/cut scratch, and
-retained output volumes. It does not silently substitute a smaller kernel when
-the configured ceiling is exceeded.
+retained output volumes. Raw-state mode deliberately retains the two normalized
+raw property scenes and dense dynamics/thermodynamics needed for on-demand
+pre-closure evaluation; its stricter preflight includes that extra ownership.
+It does not silently substitute a smaller kernel when the configured ceiling
+is exceeded.
 
 For one generated frame, CfRadial export opens a `.nc` save dialog. For a loop,
 it opens a folder picker and writes one CfRadial-1 file per frame. Every file
@@ -505,8 +522,9 @@ variables.
 
 - Source-model resolution is the information ceiling. Smaller radar gates and
   more quadrature samples cannot recover unresolved storm structure.
-- Adjacent-scene mode is bounded linear interpolation between two compatible
-  WRF scenes, not model integration and never temporal extrapolation. Frozen,
+- Adjacent-scene modes are bounded interpolation between two compatible WRF
+  scenes, not model integration and never temporal extrapolation. Derived/
+  additive and raw pre-closure spaces remain explicitly distinct. Frozen,
   held, dropped, and failed outcomes remain distinguishable in provenance.
 - Named Build 24 VCPs reproduce their checked Appendix C base rows, not SAILS,
   MRLE, AVSET, Add-MPDA, site adaptations, or an observed operational volume.
