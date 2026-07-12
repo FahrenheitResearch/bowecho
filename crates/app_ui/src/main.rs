@@ -120,6 +120,7 @@ mod wofs;
 mod wofs_georef;
 mod wrf_process;
 mod wrf_radar;
+mod wrf_radar_estimator;
 mod wrf_radar_physics;
 mod wrf_volumes;
 
