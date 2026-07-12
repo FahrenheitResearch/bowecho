@@ -274,9 +274,14 @@ use product_select::sweep_cut_at_or_before_in_frame;
 use product_select::sweep_cuts_for_history_entry;
 use product_select::sweep_cuts_for_product;
 use product_select::sweep_history_cut_at_or_before;
+use product_select::validation_product_label;
 use product_select::volume_can_materialize_product_with_live_filter;
 use product_select::volume_has_displayable_product;
 use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
+
+fn product_display_label(product: &DisplayProduct) -> &str {
+    validation_product_label(product).unwrap_or_else(|| product.label())
+}
 // v0.30 phase-1 extraction #5: the satellite window/worker/map-layer
 // family and the pure sat sampling helpers moved VERBATIM to
 // `sat_paint.rs` (docs/main-decomposition-plan.md); these re-exports keep
@@ -2881,6 +2886,9 @@ struct ViewerApp {
     // primary view's own state above).
     grid_layout: PanelLayout,
     extra_panes: Vec<PaneView>,
+    /// Transient observed/simulated/difference presentation. It owns three
+    /// local volumes without changing or saving ordinary pane settings.
+    simradar_comparison: Option<SimradarComparisonPresentation>,
     /// The last-clicked pane (0 = main). The sidebar product picker and tilt
     /// list drive this pane: the main pane edits the whole bunch, an extra
     /// pane edits itself independently.
@@ -5334,6 +5342,107 @@ struct RotationMarker {
     persistence: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SimradarComparisonRole {
+    Observed,
+    Simulated,
+    Difference,
+}
+
+impl SimradarComparisonRole {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Observed => "OBSERVED",
+            Self::Simulated => "SIMULATED",
+            Self::Difference => "DIFFERENCE",
+        }
+    }
+
+    const fn source_slug(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Simulated => "simulated",
+            Self::Difference => "difference",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SimradarComparisonPresentation {
+    previous_layout: PanelLayout,
+    previous_active_pane: usize,
+    synchronized_cut: usize,
+}
+
+fn simradar_comparison_grid_geometry_matches(left: &MomentGrid, right: &MomentGrid) -> bool {
+    left.gate_range == right.gate_range && left.radial_indices == right.radial_indices
+}
+
+/// Validate the three inputs without silently aligning or resampling them.
+/// Returns the first cut that carries REF/REF/DIF_REF on the exact shared
+/// radial geometry.
+fn simradar_comparison_synchronized_cut(
+    observed: &RadarVolume,
+    synthetic: &RadarVolume,
+    difference: &RadarVolume,
+) -> Result<usize, String> {
+    if observed.site.id != synthetic.site.id || observed.site.id != difference.site.id {
+        return Err("comparison volumes do not share one radar site id".to_owned());
+    }
+    if observed.volume_time != synthetic.volume_time
+        || observed.volume_time != difference.volume_time
+    {
+        return Err("comparison volumes do not share one exact volume time".to_owned());
+    }
+    if observed.cuts.len() != synthetic.cuts.len() || observed.cuts.len() != difference.cuts.len() {
+        return Err("comparison volumes do not have the same cut count".to_owned());
+    }
+
+    let difference_ref = MomentType::Unknown("DIF_REF".to_owned());
+    let mut default_cut = None;
+    for (cut_index, ((observed_cut, synthetic_cut), difference_cut)) in observed
+        .cuts
+        .iter()
+        .zip(&synthetic.cuts)
+        .zip(&difference.cuts)
+        .enumerate()
+    {
+        if observed_cut.elevation_deg.to_bits() != synthetic_cut.elevation_deg.to_bits()
+            || observed_cut.elevation_deg.to_bits() != difference_cut.elevation_deg.to_bits()
+            || observed_cut.elevation_number != synthetic_cut.elevation_number
+            || observed_cut.elevation_number != difference_cut.elevation_number
+            || observed_cut.radials != synthetic_cut.radials
+            || observed_cut.radials != difference_cut.radials
+        {
+            return Err(format!(
+                "comparison cut {} does not share exact radial geometry/timing",
+                cut_index + 1
+            ));
+        }
+        let Some(observed_ref) = observed_cut.moments.get(&MomentType::Reflectivity) else {
+            continue;
+        };
+        let Some(synthetic_ref) = synthetic_cut.moments.get(&MomentType::Reflectivity) else {
+            continue;
+        };
+        let Some(difference_ref_grid) = difference_cut.moments.get(&difference_ref) else {
+            continue;
+        };
+        if !simradar_comparison_grid_geometry_matches(observed_ref, synthetic_ref)
+            || !simradar_comparison_grid_geometry_matches(observed_ref, difference_ref_grid)
+        {
+            return Err(format!(
+                "comparison cut {} REF/DIF_REF gate geometry differs",
+                cut_index + 1
+            ));
+        }
+        default_cut.get_or_insert(cut_index);
+    }
+    default_cut.ok_or_else(|| {
+        "comparison volumes have no shared cut containing REF/REF/DIF_REF".to_owned()
+    })
+}
+
 /// An extra synchronized view pane in the multi-pane grid. Pane 0 is the
 /// primary view (ViewerApp's own product/texture state, untouched); extra
 /// panes are 1-based. All panes share the loaded volume, the geo transform
@@ -5389,6 +5498,10 @@ struct PaneView {
     /// source, the Follow-primary `None==None` combo no-op); one enum
     /// makes those states unrepresentable.
     pin: Option<SiteRef>,
+    /// Transient ownership for the observed/simulated/difference validation
+    /// workspace. Unlike `pin`, this is never persisted and never enables the
+    /// ordinary independent-panels setting or a live feed.
+    comparison_role: Option<SimradarComparisonRole>,
     /// Arc address of the primary frame most recently mirrored into this
     /// pane by the same-site dedupe (`follow_primary_volume_into_pane`),
     /// so an unchanged primary volume is not re-installed every tick.
@@ -5437,6 +5550,7 @@ impl PaneView {
             pending_product_restore: None,
             cut: None,
             pin: None,
+            comparison_role: None,
             followed_primary_volume_ptr: None,
             volume: None,
             source_path: None,
@@ -5470,6 +5584,9 @@ impl PaneView {
     /// [`PaneView`]). Called by `extra_pane_live_action` before every
     /// engine consultation; cheap when already in sync.
     fn sync_engine_feed_to_pin(&mut self) {
+        if self.comparison_role.is_some() {
+            return;
+        }
         let want = match &self.pin {
             Some(site) => FeedSource::Live(site.clone()),
             None => Self::follow_primary_feed(),
@@ -5480,7 +5597,7 @@ impl PaneView {
     }
 
     fn owns_radar(&self) -> bool {
-        self.pin.is_some()
+        self.pin.is_some() || self.comparison_role.is_some()
     }
 
     /// Pinned US Level-II id, if this pane's pin is a US-catalog site.
@@ -8285,6 +8402,7 @@ impl ViewerApp {
             hazard_overlay_generation: 0,
             grid_layout: restored_grid_layout,
             extra_panes: Vec::new(),
+            simradar_comparison: None,
             active_pane: 0,
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
@@ -9269,6 +9387,7 @@ impl ViewerApp {
     }
 
     fn clear_displayed_volume_for_pending_load(&mut self, ctx: &egui::Context) {
+        self.clear_simradar_comparison_presentation();
         self.remember_current_primary_product_cut();
         self.volume = None;
         self.load_timing = None;
@@ -9500,7 +9619,7 @@ impl ViewerApp {
             InstallSelection::DeferredLivePartial { anchor } => {
                 self.status = format!(
                     "Waiting for {} in {}",
-                    self.selected_product.label(),
+                    product_display_label(&self.selected_product),
                     anchor.site_id
                 );
                 ctx.request_repaint();
@@ -9597,6 +9716,196 @@ impl ViewerApp {
         }
         self.status = format!("Simulated WRF radar loop — {frame_count} frame(s)");
         ctx.request_repaint();
+    }
+
+    fn simradar_comparison_frame(
+        role: SimradarComparisonRole,
+        volume: Arc<RadarVolume>,
+    ) -> FrameHistoryEntry {
+        FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from(format!("simradar-comparison://{}", role.source_slug())),
+            volume,
+            timings: None,
+            status: FrameStatus::Local,
+            source_label: format!("simulated-radar comparison {}", role.label()),
+        }
+    }
+
+    fn configure_simradar_comparison_pane(
+        &mut self,
+        pane_slot: usize,
+        role: SimradarComparisonRole,
+        volume: Arc<RadarVolume>,
+        product: DisplayProduct,
+        cut: usize,
+    ) {
+        let map_center_lat = self.map_center_lat;
+        let map_center_lon = self.map_center_lon;
+        let map_scale = self.map_scale;
+        let frame = Self::simradar_comparison_frame(role, Arc::clone(&volume));
+        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
+            return;
+        };
+        pane.pin = None;
+        pane.comparison_role = Some(role);
+        pane.followed_primary_volume_ptr = None;
+        pane.volume = Some(volume);
+        pane.source_path = Some(frame.path.clone());
+        pane.load_timing = None;
+        pane.archive_load_progress = None;
+        pane.load_receiver = None;
+        pane.load_mode = None;
+        pane.pending_site_id = None;
+        pane.product = product;
+        pane.pending_product_restore = None;
+        pane.cut = Some(cut);
+        pane.map_center_lat = map_center_lat;
+        pane.map_center_lon = map_center_lon;
+        pane.map_scale = map_scale;
+        pane.engine.feed = FeedSource::LocalFiles {
+            label: format!("simradar comparison {}", role.label()),
+        };
+        pane.engine.clear_history();
+        pane.engine.history.push(frame);
+        pane.engine.cursor.index = 0;
+        pane.engine.cursor.playing = false;
+        pane.engine.cursor.browsing = false;
+        pane.engine.cursor.last_step = None;
+        pane.engine.live.enabled = false;
+        pane.engine.live.last_refresh = None;
+        pane.engine.status = format!("{} comparison volume", role.label());
+        pane.clear_texture();
+    }
+
+    /// Leave the transient comparison workspace without writing any ordinary
+    /// pane setting. A subsequent normal load calls this before it installs,
+    /// so stale comparison ownership can never survive into live/archive data.
+    fn clear_simradar_comparison_presentation(&mut self) -> bool {
+        let Some(presentation) = self.simradar_comparison.take() else {
+            return false;
+        };
+        for pane_slot in 0..self.extra_panes.len() {
+            self.clear_extra_pane_radar(pane_slot);
+        }
+        self.pending_grid_layout = None;
+        self.grid_layout = presentation.previous_layout;
+        self.active_pane = presentation
+            .previous_active_pane
+            .min(self.grid_layout.panel_count().saturating_sub(1));
+        self.sync_extra_panes();
+
+        // Comparison never edits the saved pins. Re-arm them only in memory
+        // when ordinary independent panes were already enabled by the user.
+        if self.app_settings.independent_panels {
+            let saved_pins = (0..self.extra_panes.len())
+                .filter_map(|pane_slot| {
+                    let slot = u8::try_from(pane_slot).ok()?;
+                    self.app_settings
+                        .extra_pane_pins
+                        .get(&slot)
+                        .map(|key| (pane_slot, SiteRef::parse_settings_key(key)))
+                })
+                .collect::<Vec<_>>();
+            for (pane_slot, pin) in saved_pins {
+                self.restore_extra_pane_pin(pane_slot, &pin);
+            }
+        }
+        true
+    }
+
+    fn simradar_comparison_role(&self, pane_index: usize) -> Option<SimradarComparisonRole> {
+        self.simradar_comparison.as_ref()?;
+        if pane_index == 0 {
+            return Some(SimradarComparisonRole::Observed);
+        }
+        self.extra_panes
+            .get(pane_index - 1)
+            .and_then(|pane| pane.comparison_role)
+    }
+
+    /// Install exact-geometry observed, simulated, and simulated-minus-
+    /// observed volumes into the existing three-pane radar renderer. This is
+    /// deliberately local presentation state: it neither enables nor saves
+    /// ordinary independent-panel settings.
+    fn install_simradar_comparison_volumes(
+        &mut self,
+        observed: Arc<RadarVolume>,
+        synthetic: Arc<RadarVolume>,
+        difference: Arc<RadarVolume>,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let synchronized_cut = simradar_comparison_synchronized_cut(
+            observed.as_ref(),
+            synthetic.as_ref(),
+            difference.as_ref(),
+        )?;
+        self.clear_simradar_comparison_presentation();
+        let previous_layout = self.grid_layout;
+        let previous_active_pane = self.active_pane;
+
+        self.poll_active = false;
+        self.poll_next = None;
+        self.poll_rx = None;
+        self.primary.live.enabled = false;
+        self.primary.live.last_refresh = None;
+        self.primary_load_is_auto_refresh = false;
+        self.pending_local_autoplay = false;
+        self.load_receiver = None;
+        self.clear_frame_history();
+        self.primary.feed = FeedSource::LocalFiles {
+            label: "simradar observed/simulated/difference comparison".to_owned(),
+        };
+        let observed_path = PathBuf::from("simradar-comparison://observed");
+        self.install_volume_arc_without_comparison_cleanup(
+            Arc::clone(&observed),
+            None,
+            false,
+            Some(observed_path),
+            FrameStatus::Local,
+            ctx,
+        );
+        self.primary.history.clear();
+        self.primary.history.push(Self::simradar_comparison_frame(
+            SimradarComparisonRole::Observed,
+            observed,
+        ));
+        self.primary.cursor.index = 0;
+        self.primary.cursor.playing = false;
+        self.primary.cursor.browsing = false;
+        self.primary.cursor.last_step = None;
+        self.selected_cut = synchronized_cut;
+        self.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        self.pending_product_restore = None;
+        self.clear_texture();
+
+        self.pending_grid_layout = None;
+        self.grid_layout = PanelLayout::ThreeStacked;
+        self.active_pane = 0;
+        self.sync_extra_panes();
+        self.simradar_comparison = Some(SimradarComparisonPresentation {
+            previous_layout,
+            previous_active_pane,
+            synchronized_cut,
+        });
+        self.configure_simradar_comparison_pane(
+            0,
+            SimradarComparisonRole::Simulated,
+            synthetic,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            synchronized_cut,
+        );
+        self.configure_simradar_comparison_pane(
+            1,
+            SimradarComparisonRole::Difference,
+            difference,
+            DisplayProduct::Moment(MomentType::Unknown("DIF_REF".to_owned())),
+            synchronized_cut,
+        );
+        self.status = "Simulated-radar comparison: observed / simulated / synthetic minus observed"
+            .to_owned();
+        ctx.request_repaint();
+        Ok(())
     }
 
     /// Re-apply the primary frame limit: the trim itself lives in
@@ -9960,6 +10269,26 @@ impl ViewerApp {
     }
 
     fn install_volume_arc(
+        &mut self,
+        volume: Arc<RadarVolume>,
+        load_timing: Option<LoadTimings>,
+        record_final_decode: bool,
+        source_path: Option<PathBuf>,
+        frame_status: FrameStatus,
+        ctx: &egui::Context,
+    ) {
+        self.clear_simradar_comparison_presentation();
+        self.install_volume_arc_without_comparison_cleanup(
+            volume,
+            load_timing,
+            record_final_decode,
+            source_path,
+            frame_status,
+            ctx,
+        );
+    }
+
+    fn install_volume_arc_without_comparison_cleanup(
         &mut self,
         volume: Arc<RadarVolume>,
         load_timing: Option<LoadTimings>,
@@ -15382,6 +15711,8 @@ impl ViewerApp {
     fn clear_extra_pane_radar(&mut self, pane_slot: usize) {
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.pin = None;
+            pane.comparison_role = None;
+            pane.engine.feed = PaneView::follow_primary_feed();
             pane.engine.live.enabled = true;
             pane.engine.live.last_refresh = None;
             pane.followed_primary_volume_ptr = None;
@@ -19704,7 +20035,7 @@ impl ViewerApp {
                         .map(|vcp| vcp.pattern);
                     let scan = chrome_readouts::top_bar_scan_readout(
                         &frame.identity.site_id,
-                        product.label(),
+                        product_display_label(&product),
                         vcp,
                         &self
                             .time_zone()
@@ -20567,7 +20898,7 @@ impl ViewerApp {
             .iter()
             .take(self.grid_layout.panel_count().saturating_sub(1))
             .enumerate()
-            .map(|(slot, pane)| (slot, pane.product.label().to_owned()))
+            .map(|(slot, pane)| (slot, product_display_label(&pane.product).to_owned()))
             .collect::<Vec<_>>();
         let mut open = self.sweep_controls_open;
         let mut changed = false;
@@ -23012,8 +23343,9 @@ impl ViewerApp {
         let chips: Vec<panel_kit::Chip<'_>> = product_buttons
             .iter()
             .map(|(product, _target_cut)| {
-                let label = product.label();
-                let hotkey = hotkey_for_label.get(label).map(String::as_str);
+                let stable_label = product.label();
+                let label = product_display_label(product);
+                let hotkey = hotkey_for_label.get(stable_label).map(String::as_str);
                 panel_kit::Chip {
                     label,
                     hotkey,
@@ -25935,7 +26267,13 @@ impl ViewerApp {
         }
         let pane = self.extra_panes.get(pane_index - 1)?;
         let product = pane.product.clone();
-        let preferred_cut = pane.cut.unwrap_or(self.selected_cut);
+        let preferred_cut = if pane.comparison_role.is_some() {
+            self.simradar_comparison
+                .map(|presentation| presentation.synchronized_cut)
+                .unwrap_or(self.selected_cut)
+        } else {
+            pane.cut.unwrap_or(self.selected_cut)
+        };
         let volume = pane.volume.as_deref().or(self.volume.as_deref());
         let cut = volume
             .and_then(|volume| best_cut_for_product(volume, preferred_cut, &product))
@@ -27916,17 +28254,35 @@ impl ViewerApp {
             .get(cut)
             .map(|c| format!(" {:.1}°", c.elevation_deg))
             .unwrap_or_default();
-        let (_, accent, mode) = self.pane_mode_chip_state(pane_index).unwrap_or((
+        let (_, mode_accent, mode) = self.pane_mode_chip_state(pane_index).unwrap_or((
             "ARCHIVE".to_owned(),
             egui::Color32::from_rgb(132, 96, 24),
             "ARCH",
         ));
-        let candidates = [
-            format!("{mode} {site_id} {}{tilt} · {scan_time}", product.label()),
-            format!("{site_id} {}{tilt} · {scan_time}", product.label()),
-            format!("{site_id} {}{tilt}", product.label()),
-            format!("{}{tilt}", product.label()),
-        ];
+        let product_label = product_display_label(product);
+        let comparison_role = self.simradar_comparison_role(pane_index);
+        let accent = match comparison_role {
+            Some(SimradarComparisonRole::Observed) => egui::Color32::from_rgb(76, 145, 214),
+            Some(SimradarComparisonRole::Simulated) => egui::Color32::from_rgb(69, 171, 122),
+            Some(SimradarComparisonRole::Difference) => egui::Color32::from_rgb(170, 105, 210),
+            None => mode_accent,
+        };
+        let candidates = if let Some(role) = comparison_role {
+            let role = role.label();
+            [
+                format!("{role} {site_id} {product_label}{tilt} · {scan_time}"),
+                format!("{role} {product_label}{tilt} · {scan_time}"),
+                format!("{role} {product_label}{tilt}"),
+                role.to_owned(),
+            ]
+        } else {
+            [
+                format!("{mode} {site_id} {product_label}{tilt} · {scan_time}"),
+                format!("{site_id} {product_label}{tilt} · {scan_time}"),
+                format!("{site_id} {product_label}{tilt}"),
+                format!("{product_label}{tilt}"),
+            ]
+        };
         let max_width = (cell.width() - 18.0).max(48.0);
         let label = candidates
             .iter()
@@ -36680,7 +37036,7 @@ impl ViewerApp {
                 );
                 let value_line = format!(
                     "{} {:.1}{}{}",
-                    readout.product.label(),
+                    product_display_label(&readout.product),
                     value / unit_scale,
                     if unit_label.is_empty() { "" } else { " " },
                     unit_label
@@ -48198,6 +48554,122 @@ mod tests {
             "poll paused so no tick stomps the synthetic loop"
         );
         assert!(!app.primary.live.enabled, "live auto-refresh paused");
+    }
+
+    fn simradar_comparison_test_volumes(
+        time: DateTime<Utc>,
+    ) -> (Arc<RadarVolume>, Arc<RadarVolume>, Arc<RadarVolume>) {
+        let observed = test_volume_with_site_time("KTLX", time);
+        let synthetic = observed.clone();
+        let mut difference = observed.clone();
+        for cut in &mut difference.cuts {
+            let mut grid = cut
+                .moments
+                .remove(&MomentType::Reflectivity)
+                .expect("test REF");
+            let moment = MomentType::Unknown("DIF_REF".to_owned());
+            grid.moment = moment.clone();
+            cut.moments.insert(moment, grid);
+        }
+        (
+            Arc::new(observed),
+            Arc::new(synthetic),
+            Arc::new(difference),
+        )
+    }
+
+    #[test]
+    fn simradar_comparison_installs_three_local_synchronized_roles() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        let saved_pane_count = app.app_settings.grid_pane_count;
+        let saved_independent = app.app_settings.independent_panels;
+        let time = Utc.with_ymd_and_hms(2026, 7, 12, 3, 0, 0).unwrap();
+        let (observed, synthetic, difference) = simradar_comparison_test_volumes(time);
+
+        app.install_simradar_comparison_volumes(
+            Arc::clone(&observed),
+            Arc::clone(&synthetic),
+            Arc::clone(&difference),
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(app.grid_layout, PanelLayout::ThreeStacked);
+        assert_eq!(app.app_settings.grid_pane_count, saved_pane_count);
+        assert_eq!(app.app_settings.independent_panels, saved_independent);
+        assert_eq!(app.extra_panes.len(), 2);
+        assert_eq!(app.simradar_comparison_role(0).unwrap().label(), "OBSERVED");
+        assert_eq!(
+            app.simradar_comparison_role(1).unwrap().label(),
+            "SIMULATED"
+        );
+        assert_eq!(
+            app.simradar_comparison_role(2).unwrap().label(),
+            "DIFFERENCE"
+        );
+        assert!(Arc::ptr_eq(app.volume.as_ref().unwrap(), &observed));
+        assert!(Arc::ptr_eq(
+            app.extra_panes[0].volume.as_ref().unwrap(),
+            &synthetic
+        ));
+        assert!(Arc::ptr_eq(
+            app.extra_panes[1].volume.as_ref().unwrap(),
+            &difference
+        ));
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Reflectivity)
+        );
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Reflectivity)
+        );
+        assert_eq!(
+            app.extra_panes[1].product,
+            DisplayProduct::Moment(MomentType::Unknown("DIF_REF".to_owned()))
+        );
+        assert_eq!(app.selected_cut, 0);
+        assert!(app.extra_panes.iter().all(|pane| pane.cut == Some(0)));
+        assert!(!app.poll_active && !app.primary.live.enabled);
+        assert!(app.extra_panes.iter().all(|pane| !pane.engine.live.enabled));
+        assert_eq!(app.primary.history.len(), 1);
+        assert!(
+            app.extra_panes
+                .iter()
+                .all(|pane| pane.engine.history.len() == 1)
+        );
+
+        let normal = Arc::new(test_volume_with_site_time(
+            "KOUN",
+            time + chrono::Duration::minutes(5),
+        ));
+        app.install_volume_arc(normal, None, false, None, FrameStatus::Local, &ctx);
+        assert!(app.simradar_comparison.is_none());
+        assert_eq!(app.grid_layout, PanelLayout::TwoVertical);
+        assert!(
+            app.extra_panes
+                .iter()
+                .all(|pane| pane.comparison_role.is_none())
+        );
+    }
+
+    #[test]
+    fn simradar_comparison_rejects_nonidentical_time_geometry_without_mutation() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let time = Utc.with_ymd_and_hms(2026, 7, 12, 4, 0, 0).unwrap();
+        let (observed, synthetic, difference) = simradar_comparison_test_volumes(time);
+        let mut mismatched = synthetic.as_ref().clone();
+        mismatched.cuts[0].radials[0].time_offset_ms += 1;
+        let error = app
+            .install_simradar_comparison_volumes(observed, Arc::new(mismatched), difference, &ctx)
+            .unwrap_err();
+        assert!(error.contains("exact radial geometry/timing"));
+        assert!(app.simradar_comparison.is_none());
+        assert_eq!(app.grid_layout, PanelLayout::One);
     }
 
     /// Crash guard (v0.30.1): while a heavy WRF/model import runs, the live
@@ -63108,6 +63580,7 @@ mod tests {
             hazard_overlay_generation: 0,
             grid_layout: PanelLayout::One,
             extra_panes: Vec::new(),
+            simradar_comparison: None,
             active_pane: 0,
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
