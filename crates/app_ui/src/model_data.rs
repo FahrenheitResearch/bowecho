@@ -321,6 +321,10 @@ struct SyntheticRadarUiState {
     polarimetric_kernel: crate::wrf_radar::PolarimetricKernel,
     #[serde(default)]
     propagation: bool,
+    /// Geometric beam propagation is separate from polarimetric attenuation.
+    /// Older settings retain the standard 4/3-Earth path.
+    #[serde(default)]
+    propagation_geometry: crate::wrf_radar::PropagationGeometry,
     #[serde(default)]
     system_phidp_deg: f32,
     #[serde(default)]
@@ -483,6 +487,7 @@ impl Default for SyntheticRadarUiState {
             dual_pol: false,
             polarimetric_kernel: crate::wrf_radar::PolarimetricKernel::default(),
             propagation: false,
+            propagation_geometry: crate::wrf_radar::PropagationGeometry::default(),
             system_phidp_deg: 0.0,
             zdr_bias_db: 0.0,
             scan_timing: crate::wrf_radar::ScanTiming::default(),
@@ -542,6 +547,8 @@ impl SyntheticRadarUiState {
         config.dual_pol = true;
         config.terminal_fall_speed = true;
         config.atmosphere_time_mode = app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
+        config.propagation_geometry =
+            crate::wrf_radar::PropagationGeometry::StandardFourThirdsEarth;
         config.site_name = Some(match (config.site_lat_deg, config.site_lon_deg) {
             (Some(lat), Some(lon)) => {
                 format!("Operational forecast radar @ {lat:.3}, {lon:.3}")
@@ -568,6 +575,7 @@ impl SyntheticRadarUiState {
             dual_pol: self.dual_pol,
             polarimetric_kernel: self.polarimetric_kernel,
             propagation: self.propagation,
+            propagation_geometry: self.propagation_geometry,
             scan_timing: self.scan_timing,
             atmosphere_time_mode: self.atmosphere_time_mode,
             missing_neighbor_policy: self.missing_neighbor_policy,
@@ -595,6 +603,7 @@ impl SyntheticRadarUiState {
         self.dual_pol = preset.dual_pol;
         self.polarimetric_kernel = preset.polarimetric_kernel;
         self.propagation = preset.propagation;
+        self.propagation_geometry = preset.propagation_geometry;
         self.scan_timing = preset.scan_timing;
         self.atmosphere_time_mode = preset.atmosphere_time_mode;
         self.missing_neighbor_policy = preset.missing_neighbor_policy;
@@ -766,6 +775,7 @@ impl SyntheticRadarUiState {
             dual_pol: self.dual_pol,
             polarimetric_kernel: self.polarimetric_kernel,
             propagation: self.propagation,
+            propagation_geometry: self.propagation_geometry,
             system_phidp_deg: self.system_phidp_deg,
             zdr_bias_db: self.zdr_bias_db,
             // Adjacent-scene atmosphere/scattering interpolation is meaningful
@@ -2255,14 +2265,22 @@ impl ModelDataDock {
                     }
                 }
                 match done {
-                    Some(Ok(output)) => PollResult::FinishedSynthetic {
-                        message: format!(
-                            "Built {} radar frame(s) from {} — looping in the radar view",
-                            output.volumes.len(),
-                            output.label
-                        ),
-                        output,
-                    },
+                    Some(Ok(output)) => {
+                        let ducting = output
+                            .notes
+                            .iter()
+                            .find(|note| note.contains("DUCTING LAYER PRESENT"))
+                            .map(|note| format!(" — {note}"))
+                            .unwrap_or_default();
+                        PollResult::FinishedSynthetic {
+                            message: format!(
+                                "Built {} radar frame(s) from {} — looping in the radar view{ducting}",
+                                output.volumes.len(),
+                                output.label
+                            ),
+                            output,
+                        }
+                    }
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("Synthetic radar failed: {error}"),
                         plot: None,
@@ -4539,6 +4557,37 @@ impl ModelDataDock {
                                     .weak(),
                                 );
                             }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Beam geometry:");
+                                ui.selectable_value(
+                                    &mut state.propagation_geometry,
+                                    crate::wrf_radar::PropagationGeometry::StandardFourThirdsEarth,
+                                    "Standard 4/3 Earth",
+                                )
+                                .on_hover_text(
+                                    "Operational default. Uses the conventional effective-Earth-radius beam path.",
+                                );
+                                ui.selectable_value(
+                                    &mut state.propagation_geometry,
+                                    crate::wrf_radar::PropagationGeometry::WrfRefractivityResearch,
+                                    "WRF refractivity (research)",
+                                )
+                                .on_hover_text(
+                                    "Read P/PB/T/QVAPOR at the actual radar site and ray-trace every gate through the model refractivity profile. Invalid or uncovered profiles stop the build.",
+                                );
+                            });
+                            if matches!(
+                                state.propagation_geometry,
+                                crate::wrf_radar::PropagationGeometry::WrfRefractivityResearch
+                            ) {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "⚠ Research geometry: anomalous propagation and ducting are physical profile outcomes. BowEcho reports the gradient/regime and shows an explicit ducting warning; operational HRRR/RRFS stays on standard 4/3 Earth.",
+                                    )
+                                    .small()
+                                    .color(egui::Color32::YELLOW),
+                                );
+                            }
                             ui.add_enabled_ui(state.dual_pol, |ui| {
                                 ui.checkbox(
                                     &mut state.propagation,
@@ -6626,6 +6675,10 @@ mod tests {
             "older settings retain the compatible bulk Rayleigh operator"
         );
         assert!(!empty.propagation);
+        assert_eq!(
+            empty.propagation_geometry,
+            crate::wrf_radar::PropagationGeometry::StandardFourThirdsEarth
+        );
         assert_eq!(empty.system_phidp_deg, 0.0);
         assert_eq!(empty.zdr_bias_db, 0.0);
         assert_eq!(
@@ -6708,6 +6761,7 @@ mod tests {
             dual_pol: true,
             polarimetric_kernel: crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1,
             propagation: true,
+            propagation_geometry: crate::wrf_radar::PropagationGeometry::WrfRefractivityResearch,
             system_phidp_deg: 12.5,
             zdr_bias_db: -0.35,
             scan_timing: crate::wrf_radar::ScanTiming::TimedVolume,
@@ -6868,6 +6922,10 @@ mod tests {
         assert_eq!(
             config.atmosphere_time_mode,
             app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart
+        );
+        assert_eq!(
+            config.propagation_geometry,
+            crate::wrf_radar::PropagationGeometry::StandardFourThirdsEarth
         );
         assert!(config.dual_pol && config.terminal_fall_speed);
 

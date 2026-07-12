@@ -161,6 +161,18 @@ pub enum PolarimetricKernel {
     PropertyTMatrixResearchV1,
 }
 
+/// Beam-path geometry used to map slant range/elevation into model latitude,
+/// longitude, and MSL height. The default preserves the historical 4/3-Earth
+/// operator exactly; WRF refractivity is explicit research mode and fails
+/// closed when its thermodynamic profile cannot be qualified.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagationGeometry {
+    #[default]
+    StandardFourThirdsEarth,
+    WrfRefractivityResearch,
+}
+
 /// Deterministic antenna/pulse quadrature. The balanced rule is a symmetric
 /// nine-point cubature; reference is the full 3x3x3 tensor rule.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -424,6 +436,9 @@ pub struct SyntheticRadarConfig {
     pub polarimetric_kernel: PolarimetricKernel,
     /// Integrate KDP/Ah/Av along each radial into PhiDP and attenuation.
     pub propagation: bool,
+    /// Geometric beam propagation. This is independent of polarimetric path
+    /// attenuation above.
+    pub propagation_geometry: PropagationGeometry,
     /// Optional synthetic-system calibration offsets.
     pub system_phidp_deg: f32,
     pub zdr_bias_db: f32,
@@ -542,6 +557,7 @@ impl Default for SyntheticRadarConfig {
             dual_pol: false,
             polarimetric_kernel: PolarimetricKernel::BulkRayleighV1,
             propagation: false,
+            propagation_geometry: PropagationGeometry::StandardFourThirdsEarth,
             system_phidp_deg: 0.0,
             zdr_bias_db: 0.0,
             scan_timing: ScanTiming::InstantaneousTruth,
@@ -712,6 +728,7 @@ impl SyntheticRadarConfig {
                 self.dual_pol = false;
                 self.polarimetric_kernel = PolarimetricKernel::BulkRayleighV1;
                 self.propagation = false;
+                self.propagation_geometry = PropagationGeometry::StandardFourThirdsEarth;
                 self.scan_timing = ScanTiming::InstantaneousTruth;
                 self.atmosphere_time_mode = AtmosphereTimeMode::FrozenAtVolumeStart;
                 self.instrument_noise = false;
@@ -729,6 +746,7 @@ impl SyntheticRadarConfig {
                 self.dual_pol = true;
                 self.polarimetric_kernel = PolarimetricKernel::BulkRayleighV1;
                 self.propagation = true;
+                self.propagation_geometry = PropagationGeometry::StandardFourThirdsEarth;
                 self.scan_timing = ScanTiming::TimedVolume;
                 self.atmosphere_time_mode = AtmosphereTimeMode::LinearAdjacent;
                 self.instrument_noise = true;
@@ -746,6 +764,7 @@ impl SyntheticRadarConfig {
                 self.dual_pol = false;
                 self.polarimetric_kernel = PolarimetricKernel::BulkRayleighV1;
                 self.propagation = false;
+                self.propagation_geometry = PropagationGeometry::StandardFourThirdsEarth;
                 self.scan_timing = ScanTiming::InstantaneousTruth;
                 self.atmosphere_time_mode = AtmosphereTimeMode::FrozenAtVolumeStart;
                 self.instrument_noise = false;
@@ -831,6 +850,12 @@ impl SyntheticRadarConfig {
         self.dual_pol.hash(&mut hasher);
         (self.polarimetric_kernel as u8).hash(&mut hasher);
         self.propagation.hash(&mut hasher);
+        if matches!(
+            self.propagation_geometry,
+            PropagationGeometry::WrfRefractivityResearch
+        ) {
+            "wrf-refractivity-research-v1".hash(&mut hasher);
+        }
         self.system_phidp_deg.to_bits().hash(&mut hasher);
         self.zdr_bias_db.to_bits().hash(&mut hasher);
         (self.scan_timing as u8).hash(&mut hasher);
@@ -1319,6 +1344,9 @@ pub struct WrfRadarFields {
     /// RawStateLinear. Spatial and temporal weights are applied before the
     /// single per-quadrature closure/T-matrix evaluation.
     raw_property_scene: Option<Arc<app_ui::wrf_property_reader::WrfPropertyScene>>,
+    /// Compact site column and bounded elevation/gate trace cache used only by
+    /// the explicit WRF-refractivity research geometry.
+    refractivity_model: Option<Arc<crate::wrf_refractivity::WrfRefractivityModel>>,
     /// Compact scheme-aware polarimetric state. Seven one-byte planes and one
     /// signed two-byte KDP plane retain
     /// the ratios/propagation/fall moments while `dbz` remains the full-precision
@@ -1608,6 +1636,11 @@ impl WrfRadarFields {
                     .as_ref()
                     .map_or(0, std::string::String::len),
             )
+            .saturating_add(self.refractivity_model.as_deref().map_or(0, |model| {
+                std::mem::size_of::<crate::wrf_refractivity::WrfRefractivityModel>()
+                    + model.profile().levels().len()
+                        * std::mem::size_of::<radar_core::RefractivityLevel>()
+            }))
     }
 
     fn retained_bytes_estimate(&self) -> usize {
@@ -1628,6 +1661,41 @@ impl WrfRadarFields {
     fn center_cell(&self) -> usize {
         (self.ny / 2) * self.nx + (self.nx / 2)
     }
+}
+
+fn resolve_radar_site(
+    fields: &WrfRadarFields,
+    config: &SyntheticRadarConfig,
+) -> Result<(f64, f64, f64), String> {
+    let center = fields.center_cell();
+    let site_lat = config
+        .site_lat_deg
+        .unwrap_or_else(|| f64::from(fields.lat[center]));
+    let site_lon = config
+        .site_lon_deg
+        .unwrap_or_else(|| f64::from(fields.lon[center]));
+    if !site_lat.is_finite()
+        || !site_lon.is_finite()
+        || !(-90.0..=90.0).contains(&site_lat)
+        || !(-180.0..=180.0).contains(&site_lon)
+    {
+        return Err(format!(
+            "synthetic radar site is invalid: lat={site_lat}, lon={site_lon}"
+        ));
+    }
+    let antenna_msl = config.antenna_msl_m.unwrap_or_else(|| {
+        let site_cell = fields
+            .lut
+            .lookup(site_lat as f32, site_lon as f32)
+            .unwrap_or(center);
+        f64::from(fields.terrain_m[site_cell]) + DEFAULT_TOWER_M
+    });
+    if !antenna_msl.is_finite() {
+        return Err(format!(
+            "synthetic radar antenna altitude is invalid: {antenna_msl} m MSL"
+        ));
+    }
+    Ok((site_lat, site_lon, antenna_msl))
 }
 
 fn remaining_property_tmatrix_build_budget_bytes(
@@ -1882,6 +1950,7 @@ fn read_wrf_radar_fields_reporting_inner(
         terrain_m,
         property_scattering: None,
         raw_property_scene: None,
+        refractivity_model: None,
         polarimetric: None,
         dual_pol_status: None,
         tke_tenths_m2s2: None,
@@ -1918,6 +1987,31 @@ fn read_wrf_radar_fields_for_config_reporting(
         !property_tmatrix,
     )?;
     let expected = fields.nx * fields.ny * fields.nz;
+
+    if matches!(
+        config.propagation_geometry,
+        PropagationGeometry::WrfRefractivityResearch
+    ) {
+        progress("reading WRF refractivity profile at the radar site…");
+        let (site_lat, site_lon, antenna_msl) = resolve_radar_site(&fields, config)?;
+        let model = crate::wrf_refractivity::read_wrf_refractivity_model(
+            file,
+            timeidx,
+            crate::wrf_refractivity::WrfRefractivityGrid {
+                nx: fields.nx,
+                ny: fields.ny,
+                nz: fields.nz,
+                latitude_deg: &fields.lat,
+                longitude_deg: &fields.lon,
+                height_msl: &fields.height_msl,
+                site_latitude_deg: site_lat,
+                site_longitude_deg: site_lon,
+                antenna_msl_m: antenna_msl,
+            },
+        )
+        .map_err(|error| format!("build WRF refractivity geometry: {error}"))?;
+        fields.refractivity_model = Some(Arc::new(model));
+    }
 
     if property_tmatrix {
         if !config.dual_pol {
@@ -2499,6 +2593,7 @@ pub(crate) fn operational_radar_fields(
         terrain_m: state.terrain_m,
         property_scattering: None,
         raw_property_scene: None,
+        refractivity_model: None,
         polarimetric: Some(compact),
         dual_pol_status,
         tke_tenths_m2s2: compact_tke,
@@ -2678,24 +2773,7 @@ fn build_synthetic_volume_reporting_inner(
     }
     let coupled_instrument = resolve_coupled_instrument(config)?;
     let cells = fields.cells();
-    let center = fields.center_cell();
-    let site_lat = config
-        .site_lat_deg
-        .unwrap_or_else(|| fields.lat[center] as f64);
-    let site_lon = config
-        .site_lon_deg
-        .unwrap_or_else(|| fields.lon[center] as f64);
-    let antenna_msl = config.antenna_msl_m.unwrap_or_else(|| {
-        // Default antenna height: MODEL terrain under the ANTENNA plus a
-        // short tower — a virtual site placed off-centre (explicit lat/lon
-        // or a real NEXRAD id) must stand on its own ground, not the domain
-        // centre's. A site outside the domain falls back to centre terrain.
-        let site_cell = fields
-            .lut
-            .lookup(site_lat as f32, site_lon as f32)
-            .unwrap_or(center);
-        fields.terrain_m[site_cell] as f64 + DEFAULT_TOWER_M
-    });
+    let (site_lat, site_lon, antenna_msl) = resolve_radar_site(fields, config)?;
 
     let naz = config.azimuth_count.max(1);
     // Match-gate-to-grid resolves against the file's DX (carried on `fields`);
@@ -2707,6 +2785,8 @@ fn build_synthetic_volume_reporting_inner(
         gate_spacing_m: spacing.round() as i32,
         gate_count,
     };
+    let beam_geometry =
+        BeamPropagationGeometry::resolve(fields, config, site_lat, site_lon, antenna_msl)?;
 
     let mut site = RadarSite::new(config.site_id.clone());
     site.name = config.site_name.clone();
@@ -2869,6 +2949,11 @@ fn build_synthetic_volume_reporting_inner(
         forward_operator_config.push_str("; ");
         forward_operator_config.push_str(source_provenance);
     }
+    append_beam_geometry_provenance(
+        &mut forward_operator_config,
+        fields,
+        config.propagation_geometry,
+    );
     volume.metadata = VolumeMetadata {
         source_path: None,
         archive_version: Some("simulated-wrf".to_string()),
@@ -2998,19 +3083,20 @@ fn build_synthetic_volume_reporting_inner(
     // in per cut. Cheap to compute even when clutter is off (unused then).
     let frame_seed = clutter_frame_seed(&config.site_id, valid_time);
 
-    let terrain_horizon = config.terrain_blockage.then(|| {
-        progress("tracing terrain horizon…");
-        TerrainHorizon::build(
-            fields,
-            site_lat,
-            site_lon,
-            antenna_msl,
-            naz,
-            gate_count,
-            0,
-            spacing,
-        )
-    });
+    let terrain_horizon =
+        (config.terrain_blockage && !beam_geometry.is_wrf_refractivity()).then(|| {
+            progress("tracing terrain horizon…");
+            TerrainHorizon::build(
+                fields,
+                site_lat,
+                site_lon,
+                antenna_msl,
+                naz,
+                gate_count,
+                0,
+                spacing,
+            )
+        });
 
     let mut decoded_radials = 0usize;
     let mut cut_start_ms = 0i32;
@@ -3033,6 +3119,7 @@ fn build_synthetic_volume_reporting_inner(
             naz,
             spacing,
             gate_range.clone(),
+            beam_geometry,
             config,
             leg,
             tilt_total,
@@ -3135,6 +3222,9 @@ fn build_exact_replay_volume(
             }),
         ..VolumeMetadata::default()
     };
+    if let Some(provenance) = volume.metadata.forward_operator_config.as_mut() {
+        append_beam_geometry_provenance(provenance, fields, config.propagation_geometry);
+    }
 
     let frame_seed = clutter_frame_seed(&template.site.id, model_valid_time);
     let mut render_config = config.clone();
@@ -3168,6 +3258,8 @@ fn build_exact_replay_volume(
     // Replay always retains pulse-volume support fields. They are synthetic-
     // only diagnostics and the exact-geometry difference builder ignores them.
     render_config.emit_quality_fields = true;
+    let beam_geometry =
+        BeamPropagationGeometry::resolve(fields, &render_config, site_lat, site_lon, antenna_msl)?;
     let replay_leg = SyntheticScanLeg {
         elevation_deg: 0.0,
         azimuth_rate_deg_per_second: render_config.rotation_rate_deg_s,
@@ -3270,7 +3362,9 @@ fn build_exact_replay_volume(
                     });
                 }
                 let spacing = f64::from(moment_plan.gate_range.gate_spacing_m);
-                let terrain_horizon = render_config.terrain_blockage.then(|| {
+                let terrain_horizon = (render_config.terrain_blockage
+                    && !beam_geometry.is_wrf_refractivity())
+                .then(|| {
                     TerrainHorizon::build(
                         fields,
                         site_lat,
@@ -3296,6 +3390,7 @@ fn build_exact_replay_volume(
                     replay_cut.rays.len(),
                     spacing,
                     moment_plan.gate_range.clone(),
+                    beam_geometry,
                     &render_config,
                     &replay_leg,
                     template.cuts.len(),
@@ -3565,6 +3660,155 @@ fn quadrature_points(mode: BeamIntegration) -> &'static [QuadraturePoint] {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BeamPropagationGeometry<'a> {
+    StandardFourThirdsEarth,
+    WrfRefractivity(&'a crate::wrf_refractivity::WrfRefractivityModel),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BeamGeometryPoint {
+    ground_range_m: f64,
+    height_above_radar_m: f64,
+}
+
+impl<'a> BeamPropagationGeometry<'a> {
+    fn resolve(
+        fields: &'a WrfRadarFields,
+        config: &SyntheticRadarConfig,
+        site_lat: f64,
+        site_lon: f64,
+        antenna_msl: f64,
+    ) -> Result<Self, String> {
+        match config.propagation_geometry {
+            PropagationGeometry::StandardFourThirdsEarth => Ok(Self::StandardFourThirdsEarth),
+            PropagationGeometry::WrfRefractivityResearch => {
+                let model = fields.refractivity_model.as_deref().ok_or_else(|| {
+                    if fields.source_model_override.is_some() {
+                        "WRF refractivity geometry is unavailable for operational HRRR/RRFS GRIB; use Standard 4/3 Earth"
+                            .to_owned()
+                    } else {
+                        "WRF refractivity geometry was selected but no qualified P/PB/T/QVAPOR profile was retained"
+                            .to_owned()
+                    }
+                })?;
+                let provenance = model.provenance();
+                let horizontal = &provenance.horizontal;
+                if (horizontal.site_latitude_deg - site_lat).abs() > 1.0e-6
+                    || (horizontal.site_longitude_deg - site_lon).abs() > 1.0e-6
+                    || (provenance.antenna_msl_m - antenna_msl).abs() > 1.0e-3
+                {
+                    return Err(
+                        "retained WRF refractivity profile does not match the active radar site/antenna"
+                            .to_owned(),
+                    );
+                }
+                Ok(Self::WrfRefractivity(model))
+            }
+        }
+    }
+
+    const fn is_wrf_refractivity(self) -> bool {
+        matches!(self, Self::WrfRefractivity(_))
+    }
+
+    fn point(
+        self,
+        elevation_deg: f64,
+        gate_range: &GateRange,
+        gate_index: usize,
+        range_offset_m: f64,
+        standard_center_slant_m: f64,
+    ) -> Result<BeamGeometryPoint, String> {
+        match self {
+            Self::StandardFourThirdsEarth => {
+                let slant_m = (standard_center_slant_m + range_offset_m).max(0.0);
+                Ok(BeamGeometryPoint {
+                    ground_range_m: beam_ground_range_m(slant_m, elevation_deg),
+                    height_above_radar_m: beam_height_above_radar_m(slant_m, elevation_deg),
+                })
+            }
+            Self::WrfRefractivity(model) => {
+                let offset_m = range_offset_m
+                    .round()
+                    .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                let adjusted = GateRange {
+                    first_gate_m: gate_range.first_gate_m.saturating_add(offset_m).max(0),
+                    gate_spacing_m: gate_range.gate_spacing_m,
+                    gate_count: gate_range.gate_count,
+                };
+                let trace = model
+                    .trace_for_gate_range(elevation_deg, &adjusted)
+                    .map_err(|error| format!("trace WRF refracted beam: {error}"))?;
+                let point = trace.point(gate_index).ok_or_else(|| {
+                    format!(
+                        "WRF refracted trace has no gate {gate_index} of {}",
+                        adjusted.gate_count
+                    )
+                })?;
+                Ok(BeamGeometryPoint {
+                    ground_range_m: point.ground_range_m,
+                    height_above_radar_m: point.height_above_radar_m,
+                })
+            }
+        }
+    }
+}
+
+fn append_beam_geometry_provenance(
+    output: &mut String,
+    fields: &WrfRadarFields,
+    geometry: PropagationGeometry,
+) {
+    use std::fmt::Write as _;
+    match geometry {
+        PropagationGeometry::StandardFourThirdsEarth => {
+            output.push_str("; propagation_geometry=standard_four_thirds_earth");
+        }
+        PropagationGeometry::WrfRefractivityResearch => {
+            if let Some(model) = fields.refractivity_model.as_deref() {
+                let provenance = model.provenance();
+                let gradients = &provenance.gradients;
+                let _ = write!(
+                    output,
+                    "; propagation_geometry=wrf_refractivity_research; refractivity_fields={}/{}/{}; refractivity_humidity={}; refractivity_formula={}; refractivity_time_index={}; refractivity_profile_levels={}; refractivity_antenna_gradient_n_per_km={:.6}; refractivity_antenna_regime={:?}; refractivity_min_gradient_n_per_km={:.6}; refractivity_max_gradient_n_per_km={:.6}; refractivity_contains_ducting_layer={}; refractivity_antenna_level_inserted={}; refractivity_antenna_extrapolation_m={:.3}",
+                    provenance.pressure_source,
+                    provenance.temperature_source,
+                    provenance.humidity_source,
+                    "QVAPOR_dry_mixing_ratio_to_moist_specific_humidity",
+                    provenance.formula,
+                    provenance.time_index,
+                    provenance.retained_level_count,
+                    gradients.antenna_gradient_n_per_km,
+                    gradients.antenna_regime,
+                    gradients.minimum_gradient_n_per_km,
+                    gradients.maximum_gradient_n_per_km,
+                    gradients.contains_ducting_layer,
+                    provenance.antenna_level_inserted,
+                    provenance.antenna_extrapolation_m,
+                );
+            }
+        }
+    }
+}
+
+fn refractivity_run_note(fields: &WrfRadarFields) -> Option<String> {
+    let model = fields.refractivity_model.as_deref()?;
+    let gradients = &model.provenance().gradients;
+    Some(format!(
+        "WRF refractivity: antenna gradient {:.2} N/km ({:?}), profile {:.2}..{:.2} N/km{}",
+        gradients.antenna_gradient_n_per_km,
+        gradients.antenna_regime,
+        gradients.minimum_gradient_n_per_km,
+        gradients.maximum_gradient_n_per_km,
+        if gradients.contains_ducting_layer {
+            "; ⚠ DUCTING LAYER PRESENT"
+        } else {
+            ""
+        }
+    ))
+}
+
 struct GatePhysicalSample {
     z_linear: f32,
     velocity_mps: f32,
@@ -3591,8 +3835,11 @@ fn sample_gate_with_quality_instrument(
     center_slant_m: f64,
     gate_index: usize,
     spacing_m: f64,
+    gate_range: &GateRange,
+    beam_geometry: BeamPropagationGeometry<'_>,
     config: &SyntheticRadarConfig,
     terrain_horizon: Option<&TerrainHorizon>,
+    mut refracted_terrain_blockage: Option<&mut [bool]>,
     coupled_instrument: Option<&CoupledInstrumentContext>,
 ) -> Result<GateSampleResult, String> {
     let beam_sigma_deg = gaussian_beam_sigma_deg(f64::from(config.beam_width_deg.max(0.05)));
@@ -3617,85 +3864,111 @@ fn sample_gate_with_quality_instrument(
     let mut polar_accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
     let mut any_polar = false;
 
-    let mut accumulate_point =
-        |az_sigma: f64, el_sigma: f64, range_offset_m: f64, weight: f64| -> Result<(), String> {
-            let azimuth_deg = center_azimuth_deg + az_sigma * beam_sigma_deg;
-            let elevation_deg = center_elevation_deg + el_sigma * beam_sigma_deg;
-            let slant_m = (center_slant_m + range_offset_m).max(0.0);
-            let beam_height_m = beam_height_above_radar_m(slant_m, elevation_deg);
-            let z_msl = antenna_msl + beam_height_m;
-            let ground_m = beam_ground_range_m(slant_m, elevation_deg);
-            let azimuth = azimuth_deg.to_radians();
-            let east_km = ground_m * azimuth.sin() / 1_000.0;
-            let north_km = ground_m * azimuth.cos() / 1_000.0;
-            let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
-            let Some(sample) = sample_column_temporal(
-                fields,
-                neighbor_fields,
-                atmosphere_alpha,
-                cells,
-                lat as f32,
-                lon as f32,
-                z_msl as f32,
-                elevation_deg,
-                config.atmosphere_time_mode,
-                config.reflectivity_sampling,
-            )?
-            else {
-                return Ok(());
+    let mut accumulate_point = |point_index: usize,
+                                az_sigma: f64,
+                                el_sigma: f64,
+                                range_offset_m: f64,
+                                weight: f64|
+     -> Result<(), String> {
+        let azimuth_deg = center_azimuth_deg + az_sigma * beam_sigma_deg;
+        let elevation_deg = center_elevation_deg + el_sigma * beam_sigma_deg;
+        let geometry = beam_geometry.point(
+            elevation_deg,
+            gate_range,
+            gate_index,
+            range_offset_m,
+            center_slant_m,
+        )?;
+        let z_msl = antenna_msl + geometry.height_above_radar_m;
+        let ground_m = geometry.ground_range_m;
+        let azimuth = azimuth_deg.to_radians();
+        let east_km = ground_m * azimuth.sin() / 1_000.0;
+        let north_km = ground_m * azimuth.cos() / 1_000.0;
+        let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
+        let refracted_blocked =
+            if let Some(blocked_by_point) = refracted_terrain_blockage.as_deref_mut() {
+                let blocked = blocked_by_point.get_mut(point_index).ok_or_else(|| {
+                    "WRF refractivity terrain state does not match beam quadrature".to_owned()
+                })?;
+                if sample_terrain(fields, lat as f32, lon as f32)
+                    .is_some_and(|terrain_m| f64::from(terrain_m) >= z_msl)
+                {
+                    *blocked = true;
+                }
+                Some(*blocked)
+            } else {
+                None
             };
-            valid_weight += weight;
+        let Some(sample) = sample_column_temporal(
+            fields,
+            neighbor_fields,
+            atmosphere_alpha,
+            cells,
+            lat as f32,
+            lon as f32,
+            z_msl as f32,
+            elevation_deg,
+            config.atmosphere_time_mode,
+            config.reflectivity_sampling,
+        )?
+        else {
+            return Ok(());
+        };
+        valid_weight += weight;
 
-            let blocked = terrain_horizon.is_some_and(|horizon| {
+        let blocked = refracted_blocked.unwrap_or_else(|| {
+            terrain_horizon.is_some_and(|horizon| {
                 let horizon_deg = horizon.at(azimuth_deg, gate_index);
                 horizon_deg.is_finite() && elevation_deg as f32 <= horizon_deg
-            });
-            if blocked {
-                return Ok(());
-            }
-            terrain_unblocked_weight += weight;
+            })
+        });
+        if blocked {
+            return Ok(());
+        }
+        terrain_unblocked_weight += weight;
 
-            let el = elevation_deg.to_radians();
-            let fall_speed = if config.terminal_fall_speed {
-                sample.polar.map_or(0.0, |polar| polar.fall_speed_mps)
-            } else {
-                0.0
-            };
-            let vr = f64::from(sample.u) * azimuth.sin() * el.cos()
-                + f64::from(sample.v) * azimuth.cos() * el.cos()
-                + f64::from(sample.w - fall_speed) * el.sin();
-            let z = f64::from(sample.z_linear);
-            if !z.is_finite() || z <= 0.0 || !vr.is_finite() {
-                return Ok(());
-            }
-            signal_weight += weight;
-            sum_z += weight * z;
-            sum_z_vr += weight * z * vr;
-            sum_z_vr2 += weight * z * vr * vr;
-            let terminal_variance = if config.terminal_fall_speed {
-                sample
-                    .polar
-                    .map_or(0.0, |polar| f64::from(polar.fall_speed_variance_m2s2))
-                    * el.sin().powi(2)
-            } else {
-                0.0
-            };
-            let turbulent_variance = if config.spectrum_width {
-                // Isotropic one-dimensional variance from TKE = 1/2(u'^2+v'^2+w'^2).
-                f64::from((2.0 / 3.0) * sample.tke_m2s2.max(0.0))
-            } else {
-                0.0
-            };
-            sum_z_subgrid_variance += weight * z * (terminal_variance + turbulent_variance);
-            if let Some(polar) = sample.polar {
-                any_polar = true;
-                polar_accumulator.add(weight as f32, intrinsic_as_contribution(polar));
-            }
-            Ok(())
+        let el = elevation_deg.to_radians();
+        let fall_speed = if config.terminal_fall_speed {
+            sample.polar.map_or(0.0, |polar| polar.fall_speed_mps)
+        } else {
+            0.0
         };
+        let vr = f64::from(sample.u) * azimuth.sin() * el.cos()
+            + f64::from(sample.v) * azimuth.cos() * el.cos()
+            + f64::from(sample.w - fall_speed) * el.sin();
+        let z = f64::from(sample.z_linear);
+        if !z.is_finite() || z <= 0.0 || !vr.is_finite() {
+            return Ok(());
+        }
+        signal_weight += weight;
+        sum_z += weight * z;
+        sum_z_vr += weight * z * vr;
+        sum_z_vr2 += weight * z * vr * vr;
+        let terminal_variance = if config.terminal_fall_speed {
+            sample
+                .polar
+                .map_or(0.0, |polar| f64::from(polar.fall_speed_variance_m2s2))
+                * el.sin().powi(2)
+        } else {
+            0.0
+        };
+        let turbulent_variance = if config.spectrum_width {
+            // Isotropic one-dimensional variance from TKE = 1/2(u'^2+v'^2+w'^2).
+            f64::from((2.0 / 3.0) * sample.tke_m2s2.max(0.0))
+        } else {
+            0.0
+        };
+        sum_z_subgrid_variance += weight * z * (terminal_variance + turbulent_variance);
+        if let Some(polar) = sample.polar {
+            any_polar = true;
+            polar_accumulator.add(weight as f32, intrinsic_as_contribution(polar));
+        }
+        Ok(())
+    };
     if let Some(points) = physical_points {
-        for point in points {
+        for (point_index, point) in points.iter().enumerate() {
             accumulate_point(
+                point_index,
                 point.az_sigma,
                 point.el_sigma,
                 point.range_offset_m,
@@ -3703,8 +3976,12 @@ fn sample_gate_with_quality_instrument(
             )?;
         }
     } else {
-        for point in quadrature_points(config.beam_integration) {
+        for (point_index, point) in quadrature_points(config.beam_integration)
+            .iter()
+            .enumerate()
+        {
             accumulate_point(
+                point_index,
                 point.az_sigma,
                 point.el_sigma,
                 point.range_gate * spacing_m,
@@ -3770,6 +4047,13 @@ fn sample_gate_with_quality(
     config: &SyntheticRadarConfig,
     terrain_horizon: Option<&TerrainHorizon>,
 ) -> Result<GateSampleResult, String> {
+    let gate_range = GateRange {
+        first_gate_m: (center_slant_m - gate_index as f64 * spacing_m)
+            .round()
+            .max(0.0) as i32,
+        gate_spacing_m: spacing_m.round().max(1.0) as i32,
+        gate_count: gate_index.saturating_add(1),
+    };
     sample_gate_with_quality_instrument(
         fields,
         neighbor_fields,
@@ -3783,8 +4067,11 @@ fn sample_gate_with_quality(
         center_slant_m,
         gate_index,
         spacing_m,
+        &gate_range,
+        BeamPropagationGeometry::StandardFourThirdsEarth,
         config,
         terrain_horizon,
+        None,
         None,
     )
 }
@@ -4032,6 +4319,7 @@ fn build_cut(
     naz: usize,
     spacing: f64,
     gate_range: GateRange,
+    beam_geometry: BeamPropagationGeometry<'_>,
     config: &SyntheticRadarConfig,
     scan_leg: &SyntheticScanLeg,
     scan_leg_count: usize,
@@ -4112,11 +4400,21 @@ fn build_cut(
             let mut phi_path = 0.0f32;
             let mut tau_h = 0.0f32;
             let mut tau_dp = 0.0f32;
+            let quadrature_count = coupled_instrument
+                .and_then(|instrument| instrument.quadrature(config.beam_integration))
+                .map_or_else(
+                    || quadrature_points(config.beam_integration).len(),
+                    |points| points.len(),
+                );
+            let mut refracted_terrain_blockage = (config.terrain_blockage
+                && beam_geometry.is_wrf_refractivity())
+            .then(|| vec![false; quadrature_count]);
             for gate in 0..gate_count {
                 let slant_m = f64::from(gate_range.first_gate_m) + gate as f64 * spacing;
-                // Doviak & Zrnić (1993) eq. 2.28b/c under the 4/3-earth model.
-                let beam_height_m = beam_height_above_radar_m(slant_m, ray_elevation_deg);
-                let ground_m = beam_ground_range_m(slant_m, ray_elevation_deg);
+                let center_geometry =
+                    beam_geometry.point(ray_elevation_deg, &gate_range, gate, 0.0, slant_m)?;
+                let beam_height_m = center_geometry.height_above_radar_m;
+                let ground_m = center_geometry.ground_range_m;
                 let sampled = sample_gate_with_quality_instrument(
                     fields,
                     temporal.map(|context| context.neighbor),
@@ -4130,8 +4428,11 @@ fn build_cut(
                     slant_m,
                     gate,
                     spacing,
+                    &gate_range,
+                    beam_geometry,
                     config,
                     terrain_horizon,
+                    refracted_terrain_blockage.as_deref_mut(),
                     coupled_instrument,
                 )?;
                 if config.emit_quality_fields {
@@ -5682,6 +5983,14 @@ pub fn spawn_synthetic_radar_replay(
         }
     };
     normalize_replay_config_for_observed(&mut config, &observed);
+    if matches!(
+        config.propagation_geometry,
+        PropagationGeometry::WrfRefractivityResearch
+    ) {
+        config.site_lat_deg = observed.site.latitude_deg.map(f64::from);
+        config.site_lon_deg = observed.site.longitude_deg.map(f64::from);
+        config.antenna_msl_m = observed.site.elevation_m.map(f64::from);
+    }
     config.exact_replay_template = Some(Arc::new(template));
     let base = spawn_synthetic_radar(paths, config);
     std::thread::Builder::new()
@@ -5933,6 +6242,15 @@ fn build_operational_radar(
     tx: &Sender<SyntheticRadarMessage>,
 ) -> Result<SyntheticRadarOutput, String> {
     config.validate_science_contract()?;
+    if !matches!(
+        config.propagation_geometry,
+        PropagationGeometry::StandardFourThirdsEarth
+    ) {
+        return Err(
+            "Operational HRRR/RRFS radar has no qualified native refractivity profile; use Standard 4/3 Earth"
+                .to_owned(),
+        );
+    }
     if !matches!(
         config.polarimetric_kernel,
         PolarimetricKernel::BulkRayleighV1
@@ -6245,6 +6563,9 @@ fn build_synthetic_from_paths(
             .as_deref()
             .map(|status| format!(", {status}"))
             .unwrap_or_default();
+        if let Some(note) = refractivity_run_note(&fields) {
+            notes.push(format!("{name} time {timeidx}: {note}"));
+        }
         notes.push(format!(
             "{name} time {timeidx} ({}): {} radials from {}{gate_note}{polar_note}",
             scene_time_authority(&scene.time),
@@ -6409,6 +6730,13 @@ fn build_temporal_synthetic_from_scenes(
         if let Some(status) = anchor.dual_pol_status.as_deref() {
             notes.push(format!(
                 "{} time {} microphysics: {status}",
+                display_name(&scene.path),
+                scene.time_index
+            ));
+        }
+        if let Some(note) = refractivity_run_note(&anchor) {
+            notes.push(format!(
+                "{} time {}: {note}",
                 display_name(&scene.path),
                 scene.time_index
             ));
@@ -6877,6 +7205,11 @@ fn validate_temporal_field_pair(
             );
         }
     }
+    if anchor.refractivity_model.is_some() != neighbor.refractivity_model.is_some() {
+        return Err(
+            "Adjacent WRF scene has incompatible refractivity-profile availability".to_owned(),
+        );
+    }
     if anchor.tke_tenths_m2s2.is_some() != neighbor.tke_tenths_m2s2.is_some() {
         return Err("Adjacent WRF scene has incompatible TKE availability".to_string());
     }
@@ -7144,6 +7477,39 @@ mod tests {
                 PathBuf::from("experimental_rrfs_native")
             ]
         );
+    }
+
+    #[test]
+    fn standard_geometry_matches_the_historical_four_thirds_earth_path() {
+        let gate_range = GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 250,
+            gate_count: 10,
+        };
+        let slant_m = 1_250.0;
+        let point = BeamPropagationGeometry::StandardFourThirdsEarth
+            .point(0.5, &gate_range, 5, 0.0, slant_m)
+            .unwrap();
+        assert_eq!(
+            point,
+            BeamGeometryPoint {
+                ground_range_m: beam_ground_range_m(slant_m, 0.5),
+                height_above_radar_m: beam_height_above_radar_m(slant_m, 0.5),
+            }
+        );
+    }
+
+    #[test]
+    fn wrf_refractivity_selection_fails_closed_without_a_qualified_profile() {
+        let fields = uniform_box_fields();
+        let config = SyntheticRadarConfig {
+            propagation_geometry: PropagationGeometry::WrfRefractivityResearch,
+            ..SyntheticRadarConfig::default()
+        };
+        let error = BeamPropagationGeometry::resolve(&fields, &config, 39.0, -95.0, 10.0)
+            .err()
+            .unwrap();
+        assert!(error.contains("no qualified P/PB/T/QVAPOR profile"));
     }
 
     fn fingerprint_scene(
@@ -7495,6 +7861,7 @@ mod tests {
             terrain_m,
             property_scattering: None,
             raw_property_scene: None,
+            refractivity_model: None,
             polarimetric: None,
             dual_pol_status: None,
             tke_tenths_m2s2: None,
@@ -8600,6 +8967,10 @@ mod tests {
             "polarimetric_kernel"
         );
         assert!(differs(&|c| c.propagation = true), "propagation");
+        assert!(
+            differs(&|c| { c.propagation_geometry = PropagationGeometry::WrfRefractivityResearch }),
+            "propagation geometry"
+        );
         assert!(differs(&|c| c.system_phidp_deg = 11.0), "system_phidp_deg");
         assert!(differs(&|c| c.zdr_bias_db = 0.3), "zdr_bias_db");
         assert!(
@@ -9865,6 +10236,7 @@ mod tests {
             terrain_m: vec![0.0f32; cells],
             property_scattering: None,
             raw_property_scene: None,
+            refractivity_model: None,
             polarimetric: None,
             dual_pol_status: None,
             tke_tenths_m2s2: None,
