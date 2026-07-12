@@ -20,8 +20,8 @@ const GUIDE_TOP_BAR_TEXT: &str = "The top bar leads with LIVE plus one Timeline 
     warnings by default. Reload, Screenshot, Annotate, and Workflows remain one click \
     away. View contains Reset map view and Map only. \
     On the right, the Windows menu opens every data workspace (Models, WRF, \
-    Formula Lab, Radar overlays, Satellite, SimSat, WoFS, FARM, 3D Volume, \
-    Sounding) beside this Guide. Status chips appear \
+    Formula Lab, Algorithm Truth Lab, Radar overlays, Satellite, SimSat, WoFS, \
+    FARM, 3D Volume, Sounding) beside this Guide. Status chips appear \
     beside the menus. Map Only hides chrome for a clean capture; Tab or Esc \
     brings it back.";
 const GUIDE_PANES_LABEL: &str = "Panes 1 / 2 / 3 / 4";
@@ -1022,6 +1022,23 @@ fn wrf(ui: &mut egui::Ui) {
     );
     action(
         ui,
+        "Replay displayed observed scan\u{2026}",
+        "\u{2014} choose one raw wrfout file and run it through the scan geometry currently \
+         displayed in BowEcho. Replay preserves the observed site's cuts, split cuts, rays, \
+         acquisition times, gate layout, missing sectors, moment availability, radial status, \
+         Nyquist and PRT instead of approximating them with a named VCP.",
+    );
+    para(
+        ui,
+        "A completed replay opens one linked three-pane validation workspace: Observed, \
+         Simulated and Difference. Tilt selection stays synchronized only where all three \
+         volumes have identical cut geometry; the Difference pane is synthetic minus observed \
+         on exact overlapping gates. An observed moment that is absent or cannot be compared is \
+         reported unavailable, never fabricated. The observed radial timing owns ambiguity, so \
+         replay disables custom coupled-PRF timing, manual folding and stage diagnostics.",
+    );
+    action(
+        ui,
         "Export latest as CfRadial\u{2026}",
         "— one generated frame opens a .nc save dialog; a loop opens a folder picker and writes \
          one CfRadial-1 file per frame. Each file includes moments, ray timing, instrument \
@@ -1164,6 +1181,44 @@ fn wrf(ui: &mut egui::Ui) {
         "— specific horizontal/differential attenuation and their two-way radial integrals.",
     );
 
+    subhead(ui, "QUALITY FIELDS & ALGORITHM TRUTH LAB");
+    para(
+        ui,
+        "The current WRF UI retains three compact pulse-volume support fractions in synthetic builds. \
+         MCOV is the configured quadrature weight covered by the model domain; TUNB is the \
+         nested fraction that also remains terrain-unblocked; MSIG is the still-smaller fraction \
+         that contains meteorological signal. These fields explain off-domain, blocked and \
+         clear-air gates; they do not alter the physical moments.",
+    );
+    para(
+        ui,
+        "The coupled instrument can additionally retain six exact stage triples: IREF/IVEL/ISW/ \
+         IZDR/IRHO/IKDP are Ideal pulse-volume moments after propagation and before receiver \
+         effects; the matching M* fields add PRF/dwell/pulse-count/SNR censoring, uncertainty, \
+         bias and PRF-derived velocity ambiguity; canonical REF/VEL/SW/ZDR/RHO/KDP are Presented \
+         values after optional deterministic texture and stylized clutter. All three stages share \
+         gate geometry, so comparisons require no regridding.",
+    );
+    action(
+        ui,
+        "Enable stage diagnostics",
+        "\u{2014} in WRF simulated radar open Radar location & fine tuning (advanced) \
+         \u{2192} Instrument & propagation. Use a custom scan, turn on Physically coupled \
+         single-PRF moment estimator, then turn on Emit Ideal + Measured diagnostic moments. \
+         Build or Refresh current frame(s). Named Build 24 VCP rows carry PRF identifiers rather \
+         than authoritative Hz values, so they cannot enable this custom single-PRF estimator.",
+    );
+    action(
+        ui,
+        "Windows \u{25be} \u{25b8} Algorithm Truth Lab",
+        "\u{2014} opens the active synthetic pane at its selected cut. Choose any retained cut; \
+         the lab reports exact Ideal \u{2192} Measured, Measured \u{2192} Presented and end-to-end \
+         bias/MAE/RMSE/p95/max scorecards. It also runs the selected production dealias engine for \
+         that cut when VEL is present and scores fold exposure, recovered folds, wrong Nyquist \
+         branches and false unfolds against IVEL. It deliberately does not invent VWP or GBVTD \
+         truth metrics.",
+    );
+
     subhead(ui, "FORWARD-OPERATOR SCIENCE");
     para(
         ui,
@@ -1191,11 +1246,12 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "BowEcho v0.33.1 adds an opt-in property-aware T-matrix research contract for \
+        "The opt-in property-aware T-matrix research contract accepts \
          P3 50–53 and ISHMAEL 55 raw tuples. Its versioned PyTMatrix tables use exactly 2.8 GHz, \
          symmetric Bruggeman air/ice/water mixing, separate oblate/prolate shapes, and a fixed \
          mean-zero Gaussian canting distribution with 20\u{00b0} standard deviation and \
-         deterministic 5 × 10 orientation integration. Solver-complete diameter domains are \
+         deterministic 50-node (5 by 10) orientation integration. Solver-complete diameter \
+         domains are \
          role-specific: dry oblate to 89 mm, dry prolate to 32.312 mm, wet oblate to 15 mm, and wet \
          prolate to 6.3 mm. Unsupported phase/shape coordinates are rejected rather than \
          clamped. Each active source cell is closed from \
@@ -1204,14 +1260,26 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
+        "The frozen-particle path is deliberately scheme-specific. ISHMAEL dry frozen \
+         categories reconstruct their native gamma PSD from each QICE/QNICE/QVOLI/QAOLI tuple \
+         and integrate per-particle scattering through the dry property tables. Table support \
+         and omitted number, mass and sixth-moment fractions are audited; unsupported tails or \
+         particle nodes fail instead of clamping. Wet ISHMAEL PSD allocation is unavailable \
+         rather than replaced by a characteristic particle. P3 50–53 remains the explicit \
+         versioned characteristic-particle closure because an exact native P3 PSD reconstruction \
+         is not implemented. The two schemes therefore must not be described as equivalent PSD \
+         science.",
+    );
+    para(
+        ui,
         "A research lookup has no clamping or extrapolation. Its -0.5\u{00b0} to 20\u{00b0} view axis \
          covers all 19 custom/named cut centers plus or minus the correctly converted \
          0.95\u{00b0}-FWHM Gaussian beam sigma; a wider custom beam fails closed. Within the \
          declared axes, Waterman T-matrix nodes retain nonspherical, non-Rayleigh/resonant \
          behavior. Missing or mismatched tables, properties, frequency, orientation, shape or \
-         view coordinates are errors, never silent Rayleigh fallback. This \
-         characteristic-particle approximation is not PSD-integrated, is research-only and not \
-         independently validated, and makes no operational claim.",
+         view coordinates are errors, never silent Rayleigh fallback. Both the scheme-native \
+         ISHMAEL dry PSD branch and the P3 characteristic-particle branch are research-only, are \
+         not independently validated, and make no operational claim.",
     );
     para(
         ui,
@@ -1255,9 +1323,10 @@ fn wrf(ui: &mut egui::Ui) {
         "Bulk Rayleigh remains the default. In that mode P3, ISHMAEL, incomplete hydrometeor \
          inputs, or unsupported closures fall back explicitly to scalar REF/VEL with a note. \
          The opt-in T-matrix contract is table-bounded research: it can represent nonspherical \
-         and non-Rayleigh/resonant scattering within its declared axes, but it is a \
-         characteristic-particle approximation rather than scheme-native PSD integration or a \
-         complete prognostic melting-layer model.",
+         and non-Rayleigh/resonant scattering within its declared axes. ISHMAEL dry frozen \
+         categories use scheme-native PSD integration; P3 still uses characteristic particles; \
+         wet ISHMAEL PSD allocation and a complete prognostic melting-layer model remain \
+         unavailable.",
     );
     para(
         ui,
@@ -1666,7 +1735,7 @@ fn simsat(ui: &mut egui::Ui) {
     ui.heading("SimSat");
     para(
         ui,
-        "Windows \u{25be} \u{25b8} SimSat opens the embedded SimSat v0.1.9 renderer. It turns \
+        "Windows \u{25be} \u{25b8} SimSat opens the embedded SimSat renderer. It turns \
          WRF or HRRR native-level model atmospheres into physically based visible, thermal, \
          water-vapor and derived satellite products. Durable CPU renders enter BowEcho's normal \
          Satellite player; a separate one-frame GPU preview is available for visual iteration.",
@@ -1926,7 +1995,7 @@ fn simsat(ui: &mut egui::Ui) {
     para(
         ui,
         "Restore shipped display calibration resets the visible display-tuning controls without \
-         changing the source or product. SimSat v0.1.9 also shares one 0–12 degree low-sun help \
+         changing the source or product. SimSat also shares one 0–12 degree low-sun help \
          ramp across land normalization, dark-toe recovery, ground lift and water-albedo help; \
          direct water sunlight is no longer artificially day-gated. The reviewed display \
          cloud-shadow floor is 0.45.",
@@ -1957,7 +2026,7 @@ fn simsat(ui: &mut egui::Ui) {
     subhead(ui, "CACHE, LOOPS & OUTPUT");
     para(
         ui,
-        "SimSat v0.1.9 uses compact SSB cache format v6; ScienceCloudF16 uses a disjoint v7 \
+        "SimSat uses compact SSB cache format v6; ScienceCloudF16 uses a disjoint v7 \
          cache. Older bricks must be ingested once again from their original WRF/HRRR source; a \
          cached-only brick cannot be upgraded without that source. A retained wrfnat source \
          re-ingests without downloading again.",
@@ -2222,6 +2291,26 @@ fn tools(ui: &mut egui::Ui) {
          In grid layouts the pin works on the main pane.",
     );
 
+    subhead(ui, "WHY THIS SYNTHETIC GATE?");
+    action(
+        ui,
+        "Right-click a synthetic gate \u{2192} Why this synthetic gate?",
+        "\u{2014} opens an exact selected-gate report. The fast embedded path shows the retained \
+         cut/radial/gate geometry, ray acquisition time, range, Nyquist, MCOV/TUNB/MSIG support \
+         fractions, available Ideal/Measured/Presented values and volume/operator provenance. \
+         A field with different geometry stays unavailable; BowEcho does not substitute a \
+         neighboring row or gate.",
+    );
+    para(
+        ui,
+        "Range-dependent sensitivity, estimator uncertainty/noise draws, hydrometeor \
+         contributions and true/aliased/noise/measured Doppler spectra are not recoverable from \
+         an ordinary RadarVolume. The inspector shows them only when a generation-matched real \
+         retained-source GateExplanation exists. Otherwise it says why the source explanation is \
+         unavailable; it never infers a species mixture or synthetic spectrum from REF, VEL or \
+         dual-pol moments.",
+    );
+
     subhead(ui, "BEST RADAR");
     action(
         ui,
@@ -2466,7 +2555,7 @@ fn shortcuts(ui: &mut egui::Ui) {
     key_row(
         ui,
         "right-click",
-        "\"Lowest beam here\" menu (US + international radars) + jump to the nearest site",
+        "context menu: Why this synthetic gate? when applicable, Lowest beam here (US + international), and nearest-site jump",
     );
     key_row(ui, "Ctrl+right-click", GUIDE_CUSTOM_OVERLAY_TEXT);
     key_row(ui, "Shift+click", "pin / release the inspector card");
@@ -2697,6 +2786,7 @@ mod tests {
         assert!(GUIDE_TOP_BAR_TEXT.contains("Workflows"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Radar overlays"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Formula Lab"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("Algorithm Truth Lab"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("SimSat"));
         // The consolidated source/timeline front stays documented with its
         // sync default and full-player path.
@@ -2740,7 +2830,7 @@ mod tests {
     }
 
     #[test]
-    fn guide_documents_the_v0331_science_workspaces_honestly() {
+    fn guide_documents_the_science_workspaces_honestly() {
         let guide_src = include_str!("guide.rs");
 
         // Simulated radar includes the fast experimentation path, the full
@@ -2774,16 +2864,40 @@ mod tests {
         assert!(guide_src.contains("MP_PHYSICS alone is not sufficient"));
         assert!(guide_src.contains("Real radar, Maximum"));
 
+        // Exact observed replay and the retained validation products must stay
+        // discoverable without suggesting geometry or missing moments.
+        assert!(guide_src.contains("Replay displayed observed scan"));
+        assert!(guide_src.contains("Observed, Simulated and Difference"));
+        assert!(guide_src.contains("synthetic minus observed"));
+        assert!(guide_src.contains("missing sectors"));
+        for product in ["MCOV", "TUNB", "MSIG", "IREF", "MREF"] {
+            assert!(
+                guide_src.contains(product),
+                "missing validation product {product}"
+            );
+        }
+        assert!(guide_src.contains("Physically coupled single-PRF moment estimator"));
+        assert!(guide_src.contains("Emit Ideal + Measured diagnostic moments"));
+        assert!(guide_src.contains("Algorithm Truth Lab"));
+        assert!(guide_src.contains("wrong Nyquist branches"));
+        assert!(guide_src.contains("Why this synthetic gate?"));
+        assert!(guide_src.contains("generation-matched real retained-source GateExplanation"));
+        assert!(guide_src.contains("never infers a species mixture"));
+
         assert!(guide_src.contains("property-aware T-matrix research contract"));
         assert!(guide_src.contains("P3 50–53 and ISHMAEL 55"));
         assert!(guide_src.contains("symmetric Bruggeman air/ice/water"));
         assert!(guide_src.contains("exactly 2.8 GHz"));
-        assert!(guide_src.contains("deterministic 50-point orientation integration"));
+        assert!(guide_src.contains("deterministic 50-node (5 by 10) orientation integration"));
         assert!(guide_src.contains("signed KDP remains signed"));
         assert!(guide_src.contains("never silent Rayleigh fallback"));
-        assert!(guide_src.contains("not PSD-integrated"));
-        assert!(guide_src.contains("research-only and not independently validated"));
-        assert!(guide_src.contains("makes no operational claim"));
+        assert!(guide_src.contains("reconstruct their native gamma PSD"));
+        assert!(guide_src.contains("Wet ISHMAEL PSD allocation is unavailable"));
+        assert!(guide_src.contains("P3 still uses characteristic particles"));
+        assert!(guide_src.contains("not independently validated"));
+        assert!(guide_src.contains("make no operational claim"));
+        assert!(!guide_src.contains("BowEcho v0."));
+        assert!(!guide_src.contains("SimSat v0."));
 
         // Formula Lab must retain the explicit capability boundary rather
         // than implying every stored model has raw-WRF grid geometry.
