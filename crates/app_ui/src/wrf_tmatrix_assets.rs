@@ -97,8 +97,12 @@ static EXTERNAL_PROPERTY_LUT_CACHE: OnceLock<TMatrixBandPackCache> = OnceLock::n
 /// Explicit table source. Selection never changes this request to another
 /// source or another frequency: callers that request an external pack receive
 /// an error if that exact pack is unavailable or unvalidated.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum PropertyTMatrixTableSourceKind {
+    #[default]
     LegacyEmbeddedSResearchV1,
     ExternalValidatedPack,
 }
@@ -160,6 +164,20 @@ impl PropertyTMatrixTables {
         match &self.storage {
             PropertyTMatrixTableStorage::LegacyEmbeddedS(tables) => tables.bundle(),
             PropertyTMatrixTableStorage::ExternalValidated(bundle) => bundle.borrowed_bundle(),
+        }
+    }
+
+    /// Conservative resident bytes owned by this exact table source. Embedded
+    /// tables use the established compiled-asset bound; external packs bound
+    /// source bytes plus decoded runtime storage at twice the validated source
+    /// total, matching the embedded accounting policy.
+    #[must_use]
+    pub fn retained_source_bytes(&self) -> usize {
+        match &self.storage {
+            PropertyTMatrixTableStorage::LegacyEmbeddedS(_) => embedded_lut_memory_bytes(),
+            PropertyTMatrixTableStorage::ExternalValidated(bundle) => {
+                bundle.retained_source_bytes().saturating_mul(2)
+            }
         }
     }
 }
@@ -249,10 +267,16 @@ fn validate_table_source_frequency(
     Ok(band)
 }
 
-pub struct EmbeddedPropertySceneBuild {
+pub struct PropertyTMatrixSceneBuild {
     pub scene: WrfTMatrixScene,
     pub peak: WrfTMatrixBuildPeakEstimate,
+    pub table_identity: TMatrixBandPackIdentity,
+    pub table_source: PropertyTMatrixTableSourceKind,
+    pub exact_frequency_hz: f64,
+    pub rain_mode: WrfTMatrixRainMode,
 }
+
+pub type EmbeddedPropertySceneBuild = PropertyTMatrixSceneBuild;
 
 /// Load and validate the complete five-table bundle before opening the heavy
 /// WRF property fields. The result is cached for the lifetime of the process;
@@ -344,19 +368,27 @@ fn embedded_p3_resources(
         .map_err(|error| format!("configure P3 projected-area T-matrix integration: {error}"))
 }
 
-/// Build one compact scattering scene from the exact embedded research tables.
-pub fn build_embedded_property_tmatrix_scene(
+/// Build one compact scattering scene from an already-resolved exact table
+/// owner. The owner remains alive through estimation and evaluation, so an
+/// external bundle is never self-referenced or promoted to a fake `'static`
+/// lifetime.
+pub fn build_property_tmatrix_scene(
     source: &WrfPropertyScene,
     maximum_owned_peak_bytes: usize,
-) -> Result<EmbeddedPropertySceneBuild, String> {
-    let tables = embedded_luts()?.bundle();
-    let rain_mode = WrfTMatrixRainMode::FullProperty;
-    let p3 = embedded_p3_resources(source.microphysics_scheme_id(), &|_| {})?;
+    table_owner: PropertyTMatrixTables,
+    rain_mode: WrfTMatrixRainMode,
+    progress: &(impl Fn(&str) + ?Sized),
+) -> Result<PropertyTMatrixSceneBuild, String> {
+    let table_identity = table_owner.identity();
+    let table_source = table_owner.source_kind();
+    let exact_frequency_hz = table_owner.exact_frequency_hz();
+    let tables = table_owner.borrowed_bundle();
+    let p3 = embedded_p3_resources(source.microphysics_scheme_id(), progress)?;
     let peak = match p3.as_ref() {
         Some(p3) => WrfTMatrixScene::estimate_build_peak_with_p3(source, tables, rain_mode, p3),
         None => WrfTMatrixScene::estimate_build_peak(source, tables, rain_mode),
     }
-    .map_err(|error| format!("estimate embedded property-scattering build: {error}"))?;
+    .map_err(|error| format!("estimate property-scattering build: {error}"))?;
     if peak.estimated_peak_bytes > maximum_owned_peak_bytes {
         return Err(format!(
             "property-scattering build needs {:.2} GiB for raw state, output plane, lookups and build scratch, but only {:.2} GiB remains inside the configured budget",
@@ -368,8 +400,33 @@ pub fn build_embedded_property_tmatrix_scene(
         Some(p3) => WrfTMatrixScene::build_with_p3_and_rain_mode(source, tables, p3, rain_mode),
         None => WrfTMatrixScene::build_with_rain_mode(source, tables, rain_mode),
     }
-    .map_err(|error| format!("evaluate embedded property-scattering tables: {error}"))?;
-    Ok(EmbeddedPropertySceneBuild { scene, peak })
+    .map_err(|error| format!("evaluate selected property-scattering tables: {error}"))?;
+    Ok(PropertyTMatrixSceneBuild {
+        scene,
+        peak,
+        table_identity,
+        table_source,
+        exact_frequency_hz,
+        rain_mode,
+    })
+}
+
+/// Backward-compatible embedded-S/full-property seam used by focused assets
+/// tests and older callers.
+pub fn build_embedded_property_tmatrix_scene(
+    source: &WrfPropertyScene,
+    maximum_owned_peak_bytes: usize,
+) -> Result<EmbeddedPropertySceneBuild, String> {
+    build_property_tmatrix_scene(
+        source,
+        maximum_owned_peak_bytes,
+        load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )?,
+        WrfTMatrixRainMode::FullProperty,
+        &|_| {},
+    )
 }
 
 fn embedded_luts() -> Result<&'static EmbeddedPropertyTMatrixLuts, String> {

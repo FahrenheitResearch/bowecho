@@ -38,7 +38,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, RadarSite, RadarVolume, Radial,
-    ScanLegMetadata, ScanMode, VcpInfo, VolumeMetadata, beam_ground_range_m,
+    RayInstrumentMetadata, ScanLegMetadata, ScanMode, VcpInfo, VolumeMetadata, beam_ground_range_m,
     beam_height_above_radar_m,
 };
 use rayon::prelude::*;
@@ -121,6 +121,21 @@ pub const STOELINGA_SOURCE: &str = "dbz/CALCDBZ (Stoelinga)";
 pub const BULK_S_BAND_SOURCE: &str = "scheme-aware bulk S-band ZH (Rayleigh v1)";
 pub const PROPERTY_TMATRIX_S_BAND_SOURCE: &str =
     "P3/ISHMAEL property-aware S-band T-matrix ZH (research v1)";
+pub const PROPERTY_TMATRIX_C_BAND_SOURCE: &str =
+    "P3/ISHMAEL property-aware C-band T-matrix ZH (research)";
+pub const PROPERTY_TMATRIX_X_BAND_SOURCE: &str =
+    "P3/ISHMAEL property-aware X-band T-matrix ZH (research)";
+
+fn property_tmatrix_ref_source(frequency_mhz: u32) -> Result<&'static str, String> {
+    match frequency_mhz {
+        2_800 => Ok(PROPERTY_TMATRIX_S_BAND_SOURCE),
+        5_600 => Ok(PROPERTY_TMATRIX_C_BAND_SOURCE),
+        9_400 => Ok(PROPERTY_TMATRIX_X_BAND_SOURCE),
+        other => Err(format!(
+            "unsupported exact property T-matrix frequency {other} MHz"
+        )),
+    }
+}
 
 /// Which reflectivity operator a synthetic scan uses. Both diagnostics are
 /// legitimate: `REFL_10CM` is the model's own Thompson-native 10-cm
@@ -336,9 +351,31 @@ pub const UNFOLDED_NYQUIST_MPS: f32 = 320.0;
 /// around here (roughly 8–33 m/s depending on VCP/PRF).
 pub const DEFAULT_FOLD_NYQUIST_MPS: f32 = 25.0;
 
-/// Exact transmit frequency represented by the v0.33.1 property-aware
-/// research T-matrix tables.
+/// Exact transmit frequency of the coherent legacy embedded-S recipe.
 pub const PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ: u32 = 2_800;
+pub const PROPERTY_TMATRIX_EXACT_FREQUENCIES_MHZ: [u32; 3] = [2_800, 5_600, 9_400];
+
+/// Explicit rain/melting sensitivity for property T-matrix evaluation.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyTMatrixRainSensitivity {
+    /// Evaluate standalone rain and qualified wet frozen/rain coexistence.
+    #[default]
+    FullProperty,
+    /// Deliberately omit rain and wet coexistence; frozen categories stay dry.
+    FrozenOnly,
+}
+
+impl PropertyTMatrixRainSensitivity {
+    fn runtime(self) -> app_ui::wrf_tmatrix_scene::WrfTMatrixRainMode {
+        match self {
+            Self::FullProperty => app_ui::wrf_tmatrix_scene::WrfTMatrixRainMode::FullProperty,
+            Self::FrozenOnly => app_ui::wrf_tmatrix_scene::WrfTMatrixRainMode::FrozenOnly,
+        }
+    }
+}
 /// View-angle applicability includes every Build-24/optional-cut center plus
 /// the default one-degree beam's ±sigma pulse-volume quadrature offsets.
 pub const PROPERTY_TMATRIX_MIN_VIEW_ELEVATION_DEG: f64 = -0.5;
@@ -439,6 +476,11 @@ pub struct SyntheticRadarConfig {
     /// fail-closed when the file/category/table applicability contract does
     /// not match exactly; it never silently falls back to Rayleigh.
     pub polarimetric_kernel: PolarimetricKernel,
+    /// Exact property-table source. Legacy embedded is the coherent default;
+    /// external selection never falls back or chooses a nearest band.
+    pub property_tmatrix_table_source: app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind,
+    /// Whether the property operator includes rain/melting sensitivity.
+    pub property_tmatrix_rain_sensitivity: PropertyTMatrixRainSensitivity,
     /// Integrate KDP/Ah/Av along each radial into PhiDP and attenuation.
     pub propagation: bool,
     /// Geometric beam propagation. This is independent of polarimetric path
@@ -561,6 +603,9 @@ impl Default for SyntheticRadarConfig {
             spectrum_width_floor_mps: 0.5,
             dual_pol: false,
             polarimetric_kernel: PolarimetricKernel::BulkRayleighV1,
+            property_tmatrix_table_source:
+                app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            property_tmatrix_rain_sensitivity: PropertyTMatrixRainSensitivity::FullProperty,
             propagation: false,
             propagation_geometry: PropagationGeometry::StandardFourThirdsEarth,
             system_phidp_deg: 0.0,
@@ -672,16 +717,39 @@ impl SyntheticRadarConfig {
             return Ok(());
         }
         if !self.dual_pol {
-            return Err(
-                "Property T-matrix research mode requires S-band dual polarization".to_string(),
-            );
+            return Err("Property T-matrix research mode requires dual polarization".to_string());
         }
-        if self.radar_frequency_mhz != PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ {
+        if !PROPERTY_TMATRIX_EXACT_FREQUENCIES_MHZ.contains(&self.radar_frequency_mhz) {
             return Err(format!(
-                "Property T-matrix research mode requires exactly {} MHz, got {} MHz",
-                PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ, self.radar_frequency_mhz,
+                "Property T-matrix frequency must be one exact supported choice (2800, 5600, or 9400 MHz), got {} MHz; no nearest-band substitution is allowed",
+                self.radar_frequency_mhz,
             ));
         }
+        let exact_frequency_hz = f64::from(self.radar_frequency_mhz) * 1.0e6;
+        if matches!(
+            self.atmosphere_time_mode,
+            AtmosphereTimeMode::RawStateLinear
+        ) && (!matches!(
+            self.property_tmatrix_table_source,
+            app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+        ) || self.radar_frequency_mhz != PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ
+            || !matches!(
+                self.property_tmatrix_rain_sensitivity,
+                PropertyTMatrixRainSensitivity::FullProperty
+            ))
+        {
+            return Err(
+                "RawStateLinear currently requires legacy embedded S at exactly 2800 MHz with Full property rain/melting; external packs and Frozen-only use Frozen or additive adjacent-scene timing"
+                    .to_owned(),
+            );
+        }
+        // Resolve the exact source now so an external selection fails before
+        // the multi-gigabyte WRF read, with the deterministic pack directory
+        // included in the actionable error. The validated result is cached.
+        app_ui::wrf_tmatrix_assets::load_property_tmatrix_tables_exact(
+            self.property_tmatrix_table_source,
+            exact_frequency_hz,
+        )?;
         if !matches!(self.reflectivity_sampling, ReflectivitySampling::LinearZ) {
             return Err("Property T-matrix research mode requires linear-Z sampling".to_string());
         }
@@ -854,6 +922,8 @@ impl SyntheticRadarConfig {
         self.spectrum_width_floor_mps.to_bits().hash(&mut hasher);
         self.dual_pol.hash(&mut hasher);
         (self.polarimetric_kernel as u8).hash(&mut hasher);
+        self.property_tmatrix_table_source.hash(&mut hasher);
+        self.property_tmatrix_rain_sensitivity.hash(&mut hasher);
         self.propagation.hash(&mut hasher);
         if matches!(
             self.propagation_geometry,
@@ -1345,6 +1415,10 @@ pub struct WrfRadarFields {
     /// dropped after closure and LUT evaluation; gate sampling interpolates
     /// only additive scattering quantities.
     property_scattering: Option<Arc<app_ui::wrf_tmatrix_scene::WrfTMatrixScene>>,
+    /// Exact session table identity retained beside the derived scene so pack
+    /// provenance survives through volume construction without table borrows.
+    property_table_identity: Option<app_ui::wrf_tmatrix_band_assets::TMatrixBandPackIdentity>,
+    property_table_resident_bytes: usize,
     /// Exact normalized P3/ISHMAEL source state retained only for
     /// RawStateLinear. Spatial and temporal weights are applied before the
     /// single per-quadrature closure/T-matrix evaluation.
@@ -1708,6 +1782,7 @@ fn remaining_property_tmatrix_build_budget_bytes(
     fields: &WrfRadarFields,
     expected_cells: usize,
     reserved_memory_bytes: usize,
+    selected_table_bytes: usize,
 ) -> Result<usize, String> {
     let budget_bytes = config
         .temporal_memory_budget_mib
@@ -1721,7 +1796,7 @@ fn remaining_property_tmatrix_build_budget_bytes(
         } else {
             0
         },
-        app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes(),
+        selected_table_bytes,
         reserved_memory_bytes,
         minimum_property_tmatrix_owned_peak_bytes(expected_cells)?,
     )
@@ -1954,6 +2029,8 @@ fn read_wrf_radar_fields_reporting_inner(
         w,
         terrain_m,
         property_scattering: None,
+        property_table_identity: None,
+        property_table_resident_bytes: 0,
         raw_property_scene: None,
         refractivity_model: None,
         polarimetric: None,
@@ -2020,14 +2097,18 @@ fn read_wrf_radar_fields_for_config_reporting(
 
     if property_tmatrix {
         if !config.dual_pol {
-            return Err(
-                "Property T-matrix research mode requires S-band dual polarization".to_string(),
-            );
+            return Err("Property T-matrix research mode requires dual polarization".to_string());
         }
         let raw_state_linear = matches!(
             config.atmosphere_time_mode,
             AtmosphereTimeMode::RawStateLinear
         );
+        let table_owner = app_ui::wrf_tmatrix_assets::load_property_tmatrix_tables_exact(
+            config.property_tmatrix_table_source,
+            f64::from(config.radar_frequency_mhz) * 1.0e6,
+        )?;
+        let table_identity = table_owner.identity();
+        let table_resident_bytes = table_owner.retained_source_bytes();
         let maximum_owned_peak_bytes = if raw_state_linear {
             None
         } else {
@@ -2036,6 +2117,7 @@ fn read_wrf_radar_fields_for_config_reporting(
                 &fields,
                 expected,
                 reserved_memory_bytes,
+                table_resident_bytes,
             )?)
         };
         progress("reading native P3/ISHMAEL property state…");
@@ -2051,11 +2133,13 @@ fn read_wrf_radar_fields_for_config_reporting(
                 property_scene.cell_count()
             ));
         }
-        app_ui::wrf_tmatrix_assets::preload_embedded_property_tmatrix_for_scheme(
-            property_scene.microphysics_scheme_id(),
-            progress,
-        )
-        .map_err(|error| format!("preload property T-matrix scheme assets: {error}"))?;
+        if raw_state_linear {
+            app_ui::wrf_tmatrix_assets::preload_embedded_property_tmatrix_for_scheme(
+                property_scene.microphysics_scheme_id(),
+                progress,
+            )
+            .map_err(|error| format!("preload property T-matrix scheme assets: {error}"))?;
+        }
         let fields_read = property_scene
             .source_fields()
             .iter()
@@ -2067,7 +2151,9 @@ fn read_wrf_radar_fields_for_config_reporting(
         } else {
             progress("evaluating property T-matrix scene…");
         }
-        fields.ref_source = PROPERTY_TMATRIX_S_BAND_SOURCE;
+        fields.ref_source = property_tmatrix_ref_source(config.radar_frequency_mhz)?;
+        fields.property_table_identity = Some(table_identity.clone());
+        fields.property_table_resident_bytes = table_resident_bytes;
         if raw_state_linear {
             ensure_raw_property_retention_budget(
                 config,
@@ -2077,21 +2163,31 @@ fn read_wrf_radar_fields_for_config_reporting(
                 reserved_memory_bytes,
             )?;
             fields.dual_pol_status = Some(format!(
-                "property-aware T-matrix raw_state_linear input (mp_physics={}; raw fields={fields_read}; retained raw state {:.2} GiB)",
+                "property-aware T-matrix raw_state_linear input (mp_physics={}; table={}; frequency={:.0} Hz; rain={:?}; raw fields={fields_read}; retained raw state {:.2} GiB)",
                 property_scene.microphysics_scheme_id(),
+                table_identity.pack_id(),
+                table_identity.exact_frequency_hz(),
+                config.property_tmatrix_rain_sensitivity,
                 property_scene.memory_estimate().retained_bytes() as f64 / 1024.0_f64.powi(3),
             ));
             fields.raw_property_scene = Some(Arc::new(property_scene));
         } else {
-            let built = app_ui::wrf_tmatrix_assets::build_embedded_property_tmatrix_scene(
+            let built = app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene(
                 &property_scene,
                 maximum_owned_peak_bytes.expect("non-raw property build has a budget"),
+                table_owner,
+                config.property_tmatrix_rain_sensitivity.runtime(),
+                progress,
             )
             .map_err(|error| format!("build property T-matrix scene: {error}"))?;
             let property_scattering = built.scene;
             fields.dual_pol_status = Some(format!(
-                "property-aware T-matrix research input (mp_physics={}; raw fields={fields_read}; build peak {:.2} GiB)",
+                "property-aware T-matrix research input (mp_physics={}; table={}; source={:?}; frequency={:.0} Hz; rain={:?}; raw fields={fields_read}; build peak {:.2} GiB)",
                 property_scattering.microphysics_scheme_id(),
+                built.table_identity.pack_id(),
+                built.table_source,
+                built.exact_frequency_hz,
+                built.rain_mode,
                 built.peak.estimated_peak_bytes as f64 / 1024.0_f64.powi(3),
             ));
             fields.property_scattering = Some(Arc::new(property_scattering));
@@ -2599,6 +2695,8 @@ pub(crate) fn operational_radar_fields(
         w: state.w,
         terrain_m: state.terrain_m,
         property_scattering: None,
+        property_table_identity: None,
+        property_table_resident_bytes: 0,
         raw_property_scene: None,
         refractivity_model: None,
         polarimetric: Some(compact),
@@ -2695,12 +2793,13 @@ pub fn build_exact_replay_products(
     let mut replay_config = config.clone();
     normalize_replay_config_for_observed(&mut replay_config, &observed);
     replay_config.exact_replay_template = Some(Arc::new(template));
-    let simulated = try_build_synthetic_volume_reporting(
+    let mut simulated = try_build_synthetic_volume_reporting(
         fields,
         observed.volume_time,
         &replay_config,
         &|_| {},
     )?;
+    copy_observed_ray_instrument_metadata(&observed, &mut simulated)?;
     let overlap = build_difference_volume_overlap(&observed, &simulated)
         .map_err(|error| format!("build exact-geometry replay difference: {error}"))?;
     Ok(ExactReplayProducts {
@@ -2709,6 +2808,43 @@ pub fn build_exact_replay_products(
         difference: overlap.volume,
         unavailable_observed_moments: overlap.unavailable_observed_moments,
     })
+}
+
+fn copy_observed_ray_instrument_metadata(
+    observed: &RadarVolume,
+    simulated: &mut RadarVolume,
+) -> Result<(), String> {
+    if observed.cuts.len() != simulated.cuts.len() {
+        return Err(format!(
+            "exact replay has {} observed cuts but {} simulated cuts while copying per-ray instrument metadata",
+            observed.cuts.len(),
+            simulated.cuts.len(),
+        ));
+    }
+    for (cut_index, (simulated_cut, observed_cut)) in
+        simulated.cuts.iter_mut().zip(&observed.cuts).enumerate()
+    {
+        let metadata = observed_cut
+            .aligned_ray_instrument_metadata()
+            .map_err(|error| {
+                format!(
+                    "exact replay observed cut {} has invalid per-ray instrument metadata: {error}",
+                    cut_index + 1
+                )
+            })?;
+        if let Some(metadata) = metadata {
+            if metadata.len() != simulated_cut.radials.len() {
+                return Err(format!(
+                    "exact replay cut {} per-ray instrument metadata has {} entries for {} simulated radials",
+                    cut_index + 1,
+                    metadata.len(),
+                    simulated_cut.radials.len(),
+                ));
+            }
+            simulated_cut.ray_instrument_metadata = metadata.to_vec();
+        }
+    }
+    Ok(())
 }
 
 /// Background form of [`build_exact_replay_products`]. The observed volume is
@@ -2938,15 +3074,33 @@ fn build_synthetic_volume_reporting_inner(
             counts.residual_rain_populations,
             counts.standalone_rain_populations,
         );
+        if let Some(identity) = fields.property_table_identity.as_ref() {
+            let _ = write!(
+                forward_operator_config,
+                "; tmatrix_table_source={:?}; tmatrix_pack_id={}; tmatrix_pack_band={:?}; tmatrix_pack_exact_frequency_hz={:.0}; tmatrix_rain_sensitivity={:?}",
+                config.property_tmatrix_table_source,
+                identity.pack_id(),
+                identity.band(),
+                identity.exact_frequency_hz(),
+                config.property_tmatrix_rain_sensitivity,
+            );
+        }
     }
     if let Some(scene) = fields.raw_property_scene.as_deref() {
         use std::fmt::Write as _;
         let _ = write!(
             forward_operator_config,
             "; tmatrix_status=research_only_unvalidated; tmatrix_frequency_hz={:.0}; \
+             tmatrix_table_source={:?}; tmatrix_pack_id={}; tmatrix_rain_sensitivity={:?}; \
              tmatrix_raw_mp_physics={}; tmatrix_raw_source={}:time{}; \
              tmatrix_interpolation=raw_state_linear_spatial_and_temporal_preclosure_then_single_scattering_evaluation",
-            app_ui::wrf_tmatrix_scene::PROPERTY_TMATRIX_FREQUENCY_HZ,
+            f64::from(config.radar_frequency_mhz) * 1.0e6,
+            config.property_tmatrix_table_source,
+            fields
+                .property_table_identity
+                .as_ref()
+                .map_or("unresolved", |identity| identity.pack_id()),
+            config.property_tmatrix_rain_sensitivity,
             scene.microphysics_scheme_id(),
             scene.identity().source_identity.0.as_str(),
             scene.identity().time_index,
@@ -3075,7 +3229,16 @@ fn build_synthetic_volume_reporting_inner(
                     crate::wrf_radar_physics::bulk_sband_model_id()
                 ),
                 PolarimetricKernel::PropertyTMatrixResearchV1 => {
-                    "PyTMatrix 0.3.3 property-aware characteristic-particle LUT v1 (research_only_unvalidated; not PSD-integrated)".to_string()
+                    let identity = fields
+                        .property_table_identity
+                        .as_ref()
+                        .map(|identity| identity.pack_id())
+                        .unwrap_or("unresolved");
+                    format!(
+                        "Property-aware PSD T-matrix ({identity}; {} MHz; {:?}; research_only_unvalidated)",
+                        config.radar_frequency_mhz,
+                        config.property_tmatrix_rain_sensitivity,
+                    )
                 }
             }))
         } else {
@@ -3230,6 +3393,24 @@ fn build_exact_replay_volume(
         ..VolumeMetadata::default()
     };
     if let Some(provenance) = volume.metadata.forward_operator_config.as_mut() {
+        if let Some(identity) = fields.property_table_identity.as_ref() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                provenance,
+                "; tmatrix_table_source={:?}; tmatrix_pack_id={}; tmatrix_pack_band={:?}; tmatrix_pack_exact_frequency_hz={:.0}; tmatrix_rain_sensitivity={:?}",
+                config.property_tmatrix_table_source,
+                identity.pack_id(),
+                identity.band(),
+                identity.exact_frequency_hz(),
+                config.property_tmatrix_rain_sensitivity,
+            );
+            volume.metadata.scattering_model = Some(format!(
+                "Property-aware PSD T-matrix ({}; {} MHz; {:?}; research_only_unvalidated)",
+                identity.pack_id(),
+                config.radar_frequency_mhz,
+                config.property_tmatrix_rain_sensitivity,
+            ));
+        }
         append_beam_geometry_provenance(provenance, fields, config.propagation_geometry);
     }
 
@@ -4866,6 +5047,14 @@ fn build_cut(
             )),
             radial_status: Some(ray.radial_status),
         });
+        if let Some(coupled) = coupled_instrument {
+            cut.ray_instrument_metadata.push(RayInstrumentMetadata {
+                prt_s: Some(coupled.timing.prt_s as f32),
+                unambiguous_range_km: Some((coupled.timing.unambiguous_range_m / 1_000.0) as f32),
+                pulse_count: Some(coupled.sampling.transmitted_pulses),
+                independent_samples: Some(coupled.sampling.independent_samples as f32),
+            });
+        }
         ref_values.extend(row.reflectivity);
         vel_values.extend(row.velocity);
         sw_values.extend(row.spectrum_width);
@@ -7360,9 +7549,13 @@ pub fn spawn_synthetic_radar_replay(
                                 "Exact replay uses observed radial Nyquist/PRT; custom coupled PRF, stage diagnostics, and manual folding were disabled"
                                     .to_string(),
                             );
-                            for (simulated, source_descriptor) in
+                            for (mut simulated, source_descriptor) in
                                 output.volumes.into_iter().zip(output.frame_sources)
                             {
+                                copy_observed_ray_instrument_metadata(
+                                    &observed,
+                                    Arc::make_mut(&mut simulated),
+                                )?;
                                 let overlap = build_difference_volume_overlap(&observed, &simulated)
                                     .map_err(|error| {
                                         format!(
@@ -7814,7 +8007,7 @@ fn build_synthetic_from_paths(
             "T-matrix output is research_only_unvalidated; raw_state_linear blends full spatial/temporal P3/ISHMAEL state before one closure/scattering evaluation"
                 .to_string()
         } else {
-            "T-matrix output is research_only_unvalidated; P3 is characteristic-particle and ISHMAEL is scheme-native PSD; not operational calibration"
+            "T-matrix output is research_only_unvalidated; P3/ISHMAEL use scheme-native PSD integration with the exact selected table pack; not operational calibration"
                 .to_string()
         });
     }
@@ -8452,15 +8645,13 @@ fn ensure_temporal_runtime_cache_budget(
     budget_bytes: usize,
 ) -> Result<(), String> {
     let cached_scene_count = cache.len();
-    let has_property_scattering = cache
+    let property_table_resident_bytes = cache
         .values()
-        .any(|fields| fields.property_scattering.is_some() || fields.raw_property_scene.is_some());
+        .map(|fields| fields.property_table_resident_bytes)
+        .max()
+        .unwrap_or(0);
     let required_bytes = temporal_runtime_reserved_bytes(cache, estimate)?
-        .checked_add(if has_property_scattering {
-            app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes()
-        } else {
-            0
-        })
+        .checked_add(property_table_resident_bytes)
         .ok_or_else(|| "Temporal runtime memory estimate overflowed".to_string())?;
     if required_bytes > budget_bytes {
         return Err(format!(
@@ -8588,6 +8779,12 @@ fn validate_temporal_field_pair(
                     .to_string(),
             );
         }
+    }
+    if anchor.property_table_identity != neighbor.property_table_identity {
+        return Err(
+            "Adjacent WRF scenes resolved different property T-matrix table-pack identities"
+                .to_owned(),
+        );
     }
     match (&anchor.raw_property_scene, &neighbor.raw_property_scene) {
         (None, None) => {}
@@ -9262,6 +9459,8 @@ mod tests {
             w,
             terrain_m,
             property_scattering: None,
+            property_table_identity: None,
+            property_table_resident_bytes: 0,
             raw_property_scene: None,
             refractivity_model: None,
             polarimetric: None,
@@ -10211,7 +10410,42 @@ mod tests {
             wrong_frequency
                 .validate_science_contract()
                 .unwrap_err()
-                .contains("exactly 2800 MHz")
+                .contains("one exact supported choice")
+        );
+        let legacy_c_band = SyntheticRadarConfig {
+            radar_frequency_mhz: 5_600,
+            ..supported.clone()
+        };
+        assert!(
+            legacy_c_band
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("legacy embedded S research v1 exists only")
+        );
+        let raw_external = SyntheticRadarConfig {
+            atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
+            scan_timing: ScanTiming::TimedVolume,
+            property_tmatrix_table_source:
+                app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::ExternalValidatedPack,
+            ..supported.clone()
+        };
+        assert!(
+            raw_external
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("RawStateLinear currently requires legacy embedded S")
+        );
+        let raw_frozen_only = SyntheticRadarConfig {
+            atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
+            scan_timing: ScanTiming::TimedVolume,
+            property_tmatrix_rain_sensitivity: PropertyTMatrixRainSensitivity::FrozenOnly,
+            ..supported.clone()
+        };
+        assert!(
+            raw_frozen_only
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("Full property rain/melting")
         );
         let legacy_log_sampling = SyntheticRadarConfig {
             reflectivity_sampling: ReflectivitySampling::LegacyDbz,
@@ -10231,7 +10465,7 @@ mod tests {
             no_dual_pol
                 .validate_science_contract()
                 .unwrap_err()
-                .contains("requires S-band dual polarization")
+                .contains("requires dual polarization")
         );
         let too_wide_for_low_cut = SyntheticRadarConfig {
             beam_width_deg: 1.5,
@@ -10368,6 +10602,18 @@ mod tests {
             differs(&|c| c.polarimetric_kernel = PolarimetricKernel::PropertyTMatrixResearchV1),
             "polarimetric_kernel"
         );
+        assert!(
+            differs(&|c| {
+                c.property_tmatrix_table_source = app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::ExternalValidatedPack
+            }),
+            "property_tmatrix_table_source"
+        );
+        assert!(
+            differs(&|c| {
+                c.property_tmatrix_rain_sensitivity = PropertyTMatrixRainSensitivity::FrozenOnly
+            }),
+            "property_tmatrix_rain_sensitivity"
+        );
         assert!(differs(&|c| c.propagation = true), "propagation");
         assert!(
             differs(&|c| { c.propagation_geometry = PropagationGeometry::WrfRefractivityResearch }),
@@ -10499,6 +10745,28 @@ mod tests {
         let error = config.validate_science_contract().unwrap_err();
         assert!(error.contains("PRF codes are identifiers, not frequencies"));
         assert!(resolve_coupled_instrument(&config).is_err());
+
+        let named_without_physical_prf = SyntheticRadarConfig {
+            coupled_single_prf_estimator: false,
+            scan_strategy: SyntheticScanStrategy::Build24Vcp12,
+            azimuth_count: 4,
+            gate_spacing_m: 500.0,
+            max_range_m: 500.0,
+            ref_gate_texture: false,
+            ..box_model_config()
+        };
+        let volume = build_synthetic_volume(
+            &uniform_box_fields(),
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            &named_without_physical_prf,
+        );
+        assert!(
+            volume
+                .cuts
+                .iter()
+                .all(|cut| cut.ray_instrument_metadata.is_empty()),
+            "named VCP PRF codes never become physical per-ray timing"
+        );
     }
 
     #[test]
@@ -10536,6 +10804,23 @@ mod tests {
             volume.metadata.unambiguous_range_km.unwrap().to_bits(),
             ((coupled.timing.unambiguous_range_m / 1_000.0) as f32).to_bits()
         );
+        let ray_metadata = volume.cuts[0]
+            .aligned_ray_instrument_metadata()
+            .unwrap()
+            .expect("coupled synthetic rays carry physical metadata");
+        assert_eq!(ray_metadata.len(), volume.cuts[0].radials.len());
+        for metadata in ray_metadata {
+            assert_eq!(
+                metadata.prt_s.unwrap().to_bits(),
+                (coupled.timing.prt_s as f32).to_bits()
+            );
+            assert_eq!(
+                metadata.unambiguous_range_km.unwrap().to_bits(),
+                ((coupled.timing.unambiguous_range_m / 1_000.0) as f32).to_bits()
+            );
+            assert_eq!(metadata.pulse_count, Some(50));
+            assert_eq!(metadata.independent_samples, Some(25.0));
+        }
         let provenance = volume.metadata.forward_operator_config.as_deref().unwrap();
         assert!(provenance.contains("estimator=CustomSinglePrfV1"));
         assert!(provenance.contains("transmitted_pulses=50"));
@@ -10636,7 +10921,18 @@ mod tests {
     #[test]
     fn exact_observed_replay_preserves_irregular_geometry_and_builds_difference() {
         let fields = uniform_box_fields();
-        let observed = Arc::new(irregular_observed_replay_volume());
+        let mut observed_volume = irregular_observed_replay_volume();
+        for (cut_index, cut) in observed_volume.cuts.iter_mut().enumerate() {
+            cut.ray_instrument_metadata = (0..cut.radials.len())
+                .map(|ray_index| RayInstrumentMetadata {
+                    prt_s: Some(0.000_8 + cut_index as f32 * 0.000_1),
+                    unambiguous_range_km: Some(100.0 + ray_index as f32),
+                    pulse_count: Some(40 + ray_index as u32),
+                    independent_samples: Some(12.0 + ray_index as f32),
+                })
+                .collect();
+        }
+        let observed = Arc::new(observed_volume);
         let observed_handle = Arc::clone(&observed);
         let config = SyntheticRadarConfig {
             ref_gate_texture: false,
@@ -10658,6 +10954,10 @@ mod tests {
         );
         assert_eq!(simulated.cuts.len(), 2);
         for (observed_cut, simulated_cut) in observed_handle.cuts.iter().zip(&simulated.cuts) {
+            assert_eq!(
+                simulated_cut.ray_instrument_metadata,
+                observed_cut.ray_instrument_metadata
+            );
             assert_eq!(simulated_cut.elevation_deg, observed_cut.elevation_deg);
             assert_eq!(
                 simulated_cut.elevation_number,
@@ -11637,6 +11937,8 @@ mod tests {
             w: vec![0.0f32; nz * cells],
             terrain_m: vec![0.0f32; cells],
             property_scattering: None,
+            property_table_identity: None,
+            property_table_resident_bytes: 0,
             raw_property_scene: None,
             refractivity_model: None,
             polarimetric: None,

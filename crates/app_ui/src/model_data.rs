@@ -209,7 +209,7 @@ impl SyntheticRadarRecipe {
                 "The full virtual instrument with 27-point pulse-volume integration. Best for one file or a short loop; source-model resolution still limits detail."
             }
             Self::PropertyTMatrixResearch => {
-                "Opt-in, fail-closed 2.8 GHz T-matrix dual-pol for exact supported P3/ISHMAEL property files, with full-stencil raw-state interpolation before closure. Research-only and substantially slower; no Rayleigh fallback."
+                "Opt-in, fail-closed property T-matrix for exact supported P3/ISHMAEL files. Defaults to embedded 2.8 GHz S with full-stencil raw-state interpolation; experts can select validated local S/C/X packs for frozen/additive timing."
             }
         }
     }
@@ -320,6 +320,10 @@ struct SyntheticRadarUiState {
     #[serde(default)]
     polarimetric_kernel: crate::wrf_radar::PolarimetricKernel,
     #[serde(default)]
+    property_tmatrix_table_source: app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind,
+    #[serde(default)]
+    property_tmatrix_rain_sensitivity: crate::wrf_radar::PropertyTMatrixRainSensitivity,
+    #[serde(default)]
     propagation: bool,
     /// Geometric beam propagation is separate from polarimetric attenuation.
     /// Older settings retain the standard 4/3-Earth path.
@@ -372,6 +376,13 @@ struct SyntheticRadarUiState {
     instrument_noise: bool,
     #[serde(default = "default_synth_sensitivity_dbz_at_1km")]
     sensitivity_dbz_at_1km: f32,
+    /// Emit compact MCOV/TUNB/MSIG support fields with every synthetic frame.
+    #[serde(default = "wrf_default_true")]
+    emit_quality_fields: bool,
+    /// Mask physical moments below this pulse-volume model-coverage fraction.
+    /// Zero preserves every historically accepted gate.
+    #[serde(default)]
+    minimum_model_coverage_fraction: f32,
     /// Opt-in extra 0.1° tilt below the standard 0.5° lowest tilt (the
     /// community exports start here). Off restores the classic ladder.
     #[serde(default)]
@@ -486,6 +497,10 @@ impl Default for SyntheticRadarUiState {
             spectrum_width_floor_mps: default_synth_spectrum_width_floor_mps(),
             dual_pol: false,
             polarimetric_kernel: crate::wrf_radar::PolarimetricKernel::default(),
+            property_tmatrix_table_source:
+                app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::default(),
+            property_tmatrix_rain_sensitivity:
+                crate::wrf_radar::PropertyTMatrixRainSensitivity::default(),
             propagation: false,
             propagation_geometry: crate::wrf_radar::PropagationGeometry::default(),
             system_phidp_deg: 0.0,
@@ -506,6 +521,8 @@ impl Default for SyntheticRadarUiState {
             emit_stage_diagnostics: false,
             instrument_noise: false,
             sensitivity_dbz_at_1km: default_synth_sensitivity_dbz_at_1km(),
+            emit_quality_fields: true,
+            minimum_model_coverage_fraction: 0.0,
             include_low_tilt: false,
             clutter_intensity: 0.0,
             fold_velocity: false,
@@ -574,6 +591,8 @@ impl SyntheticRadarUiState {
             spectrum_width: self.spectrum_width,
             dual_pol: self.dual_pol,
             polarimetric_kernel: self.polarimetric_kernel,
+            property_tmatrix_table_source: self.property_tmatrix_table_source,
+            property_tmatrix_rain_sensitivity: self.property_tmatrix_rain_sensitivity,
             propagation: self.propagation,
             propagation_geometry: self.propagation_geometry,
             scan_timing: self.scan_timing,
@@ -587,6 +606,8 @@ impl SyntheticRadarUiState {
             estimator_minimum_snr_db: self.estimator_minimum_snr_db,
             emit_stage_diagnostics: self.emit_stage_diagnostics,
             instrument_noise: self.instrument_noise,
+            emit_quality_fields: self.emit_quality_fields,
+            minimum_model_coverage_fraction: self.minimum_model_coverage_fraction,
             ref_gate_texture: self.ref_gate_texture,
             vel_gate_texture: self.vel_gate_texture,
             clutter_intensity: self.clutter_intensity,
@@ -602,6 +623,8 @@ impl SyntheticRadarUiState {
         self.spectrum_width = preset.spectrum_width;
         self.dual_pol = preset.dual_pol;
         self.polarimetric_kernel = preset.polarimetric_kernel;
+        self.property_tmatrix_table_source = preset.property_tmatrix_table_source;
+        self.property_tmatrix_rain_sensitivity = preset.property_tmatrix_rain_sensitivity;
         self.propagation = preset.propagation;
         self.propagation_geometry = preset.propagation_geometry;
         self.scan_timing = preset.scan_timing;
@@ -615,6 +638,8 @@ impl SyntheticRadarUiState {
         self.estimator_minimum_snr_db = preset.estimator_minimum_snr_db;
         self.emit_stage_diagnostics = preset.emit_stage_diagnostics;
         self.instrument_noise = preset.instrument_noise;
+        self.emit_quality_fields = preset.emit_quality_fields;
+        self.minimum_model_coverage_fraction = preset.minimum_model_coverage_fraction;
         self.ref_gate_texture = preset.ref_gate_texture;
         self.vel_gate_texture = preset.vel_gate_texture;
         self.clutter_intensity = preset.clutter_intensity;
@@ -635,6 +660,8 @@ impl SyntheticRadarUiState {
         self.pulse_width_us = defaults.pulse_width_us;
         self.radar_frequency_mhz = defaults.radar_frequency_mhz;
         self.polarimetric_kernel = defaults.polarimetric_kernel;
+        self.property_tmatrix_table_source = defaults.property_tmatrix_table_source;
+        self.property_tmatrix_rain_sensitivity = defaults.property_tmatrix_rain_sensitivity;
         self.spectrum_width_floor_mps = defaults.spectrum_width_floor_mps;
         self.system_phidp_deg = 0.0;
         self.zdr_bias_db = 0.0;
@@ -651,6 +678,8 @@ impl SyntheticRadarUiState {
         self.missing_neighbor_policy = app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
         self.temporal_memory_budget_mib = default_synth_temporal_memory_budget_mib();
         self.sensitivity_dbz_at_1km = defaults.sensitivity_dbz_at_1km;
+        self.emit_quality_fields = defaults.emit_quality_fields;
+        self.minimum_model_coverage_fraction = defaults.minimum_model_coverage_fraction;
         self.include_low_tilt = false;
         self.vel_gate_texture = false;
         self.clutter_intensity = 0.0;
@@ -691,6 +720,10 @@ impl SyntheticRadarUiState {
                 self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
                 self.polarimetric_kernel =
                     crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1;
+                self.property_tmatrix_table_source =
+                    app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1;
+                self.property_tmatrix_rain_sensitivity =
+                    crate::wrf_radar::PropertyTMatrixRainSensitivity::FullProperty;
                 self.radar_frequency_mhz =
                     crate::wrf_radar::PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ;
                 self.reflectivity_sampling = crate::wrf_radar::ReflectivitySampling::LinearZ;
@@ -774,6 +807,8 @@ impl SyntheticRadarUiState {
             spectrum_width_floor_mps: self.spectrum_width_floor_mps,
             dual_pol: self.dual_pol,
             polarimetric_kernel: self.polarimetric_kernel,
+            property_tmatrix_table_source: self.property_tmatrix_table_source,
+            property_tmatrix_rain_sensitivity: self.property_tmatrix_rain_sensitivity,
             propagation: self.propagation,
             propagation_geometry: self.propagation_geometry,
             system_phidp_deg: self.system_phidp_deg,
@@ -800,6 +835,8 @@ impl SyntheticRadarUiState {
             emit_stage_diagnostics: self.emit_stage_diagnostics,
             instrument_noise: self.instrument_noise,
             sensitivity_dbz_at_1km: self.sensitivity_dbz_at_1km,
+            emit_quality_fields: self.emit_quality_fields,
+            minimum_model_coverage_fraction: self.minimum_model_coverage_fraction.clamp(0.0, 1.0),
             elevations_deg: self
                 .scan_strategy
                 .definition()
@@ -4190,7 +4227,7 @@ impl ModelDataDock {
                                     .suffix(" m/s floor"),
                                 );
                             });
-                            ui.checkbox(&mut state.dual_pol, "S-band dual polarization")
+                            ui.checkbox(&mut state.dual_pol, "Dual polarization")
                                 .on_hover_text(
                                     "Derive ZH, ZDR, rhoHV, KDP, PhiDP and attenuation from raw WRF bulk hydrometeors when the microphysics scheme is supported.",
                                 );
@@ -4216,11 +4253,14 @@ impl ModelDataDock {
                                         )
                                         .clicked()
                                     {
-                                        // The v1 research table is generated specifically at
-                                        // 2.8 GHz. Keep selection and instrument metadata
-                                        // coherent instead of waiting for a runtime mismatch.
-                                        state.radar_frequency_mhz =
-                                            crate::wrf_radar::PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ;
+                                        // Keep the coherent legacy recipe at 2.8 GHz while
+                                        // preserving an explicit external exact-band choice.
+                                        if matches!(
+                                            state.property_tmatrix_table_source,
+                                            app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+                                        ) {
+                                            state.radar_frequency_mhz = crate::wrf_radar::PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ;
+                                        }
                                         state.reflectivity_sampling =
                                             crate::wrf_radar::ReflectivitySampling::LinearZ;
                                     }
@@ -4231,10 +4271,153 @@ impl ModelDataDock {
                                     "Scheme-aware bulk S-band Rayleigh operator. Unsupported or incomplete conventional schemes fall back explicitly to REF/VEL."
                                 }
                                 crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1 => {
-                                    "Research-only, not independently validated for operational use. Requires an exact supported P3/ISHMAEL raw-property contract and 2.8 GHz table applicability; no silent Rayleigh fallback or LUT extrapolation."
+                                    "Research-only, not independently validated for operational use. Requires an exact supported P3/ISHMAEL raw-property contract and an exact selected S/C/X table pack; no silent source, band, Rayleigh, or LUT fallback."
                                 }
                             };
                             ui.label(egui::RichText::new(kernel_note).small().weak());
+                            if matches!(
+                                state.polarimetric_kernel,
+                                crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
+                            ) {
+                                ui.separator();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Table source:");
+                                    if ui
+                                        .selectable_value(
+                                            &mut state.property_tmatrix_table_source,
+                                            app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+                                            "Legacy embedded S",
+                                        )
+                                        .on_hover_text(
+                                            "The shipped research-v1 tables. They exist only at exactly 2.8 GHz.",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.radar_frequency_mhz = 2_800;
+                                    }
+                                    if ui
+                                        .selectable_value(
+                                            &mut state.property_tmatrix_table_source,
+                                            app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::ExternalValidatedPack,
+                                            "Validated local pack",
+                                        )
+                                        .on_hover_text(
+                                            "Load one manifest-validated five-table pack at the exact selected frequency. Missing, invalid, unvalidated, or ambiguous packs fail closed.",
+                                        )
+                                        .clicked()
+                                        && matches!(
+                                            state.atmosphere_time_mode,
+                                            app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
+                                        )
+                                    {
+                                        state.atmosphere_time_mode =
+                                            app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
+                                    }
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Exact band:");
+                                    for (frequency, label) in [
+                                        (2_800, "S · 2.8 GHz"),
+                                        (5_600, "C · 5.6 GHz"),
+                                        (9_400, "X · 9.4 GHz"),
+                                    ] {
+                                        let enabled = frequency == 2_800
+                                            || matches!(
+                                                state.property_tmatrix_table_source,
+                                                app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::ExternalValidatedPack
+                                            );
+                                        ui.add_enabled_ui(enabled, |ui| {
+                                            ui.selectable_value(
+                                                &mut state.radar_frequency_mhz,
+                                                frequency,
+                                                label,
+                                            );
+                                        });
+                                    }
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Rain / melting:");
+                                    ui.selectable_value(
+                                        &mut state.property_tmatrix_rain_sensitivity,
+                                        crate::wrf_radar::PropertyTMatrixRainSensitivity::FullProperty,
+                                        "Full property",
+                                    )
+                                    .on_hover_text(
+                                        "Include standalone rain and qualified wet frozen/rain coexistence.",
+                                    );
+                                    if ui
+                                        .selectable_value(
+                                            &mut state.property_tmatrix_rain_sensitivity,
+                                            crate::wrf_radar::PropertyTMatrixRainSensitivity::FrozenOnly,
+                                            "Frozen-only",
+                                        )
+                                        .on_hover_text(
+                                            "Deliberately omit rain and melting coexistence so only dry frozen categories contribute.",
+                                        )
+                                        .clicked()
+                                        && matches!(
+                                            state.atmosphere_time_mode,
+                                            app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
+                                        )
+                                    {
+                                        state.atmosphere_time_mode =
+                                            app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
+                                    }
+                                });
+                                if matches!(
+                                    state.property_tmatrix_table_source,
+                                    app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::ExternalValidatedPack
+                                ) {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Validated packs: {}",
+                                            app_ui::wrf_tmatrix_assets::property_tmatrix_pack_cache_dir().display()
+                                        ))
+                                        .small()
+                                        .monospace(),
+                                    )
+                                    .on_hover_text(
+                                        "Place the exact pack directory and manifest here. The run error reports this same deterministic location and the failed validation gate.",
+                                    );
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Raw-state pre-closure is currently limited to legacy embedded S · 2.8 GHz · Full property. External S/C/X uses Frozen or additive adjacent-scene timing.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            ui.separator();
+                            ui.checkbox(
+                                &mut state.emit_quality_fields,
+                                "Gate support fields (MCOV / TUNB / MSIG)",
+                            )
+                            .on_hover_text(
+                                "Emit compact model-coverage, terrain-unblocked, and meteorological-signal fractions so masked or weak gates remain auditable.",
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Minimum model coverage:");
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut state.minimum_model_coverage_fraction,
+                                        0.0..=1.0,
+                                    )
+                                    .show_value(false),
+                                );
+                                ui.label(format!(
+                                    "{:.0}%",
+                                    state.minimum_model_coverage_fraction.clamp(0.0, 1.0)
+                                        * 100.0
+                                ));
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "Physical moments are masked when less than this fraction of the configured pulse volume is inside the model. 0% preserves every historically accepted gate; quality fields, when enabled, still explain coverage/blockage/signal.",
+                                )
+                                .small()
+                                .weak(),
+                            );
                         });
 
                     egui::CollapsingHeader::new("Instrument & propagation")
@@ -4242,7 +4425,7 @@ impl ModelDataDock {
                         .default_open(false)
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                ui.label("S-band:");
+                                ui.label("Frequency:");
                                 let research_tmatrix = matches!(
                                     state.polarimetric_kernel,
                                     crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
@@ -4256,7 +4439,7 @@ impl ModelDataDock {
                                 )
                                 .on_hover_text(
                                     if research_tmatrix {
-                                        "The research T-matrix tables have an exact 2.8 GHz applicability contract. Choose Bulk Rayleigh to use another S-band frequency."
+                                        "Property T-matrix frequency is owned by the exact S/C/X table selection under Microphysics & pulse volume."
                                     } else {
                                         "Transmit frequency written to the volume and CfRadial provenance."
                                     },
@@ -4465,11 +4648,19 @@ impl ModelDataDock {
                                         app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
                                     state.scan_timing = crate::wrf_radar::ScanTiming::TimedVolume;
                                 }
+                                let raw_state_available = matches!(
+                                    state.polarimetric_kernel,
+                                    crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
+                                ) && matches!(
+                                    state.property_tmatrix_table_source,
+                                    app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+                                ) && state.radar_frequency_mhz == 2_800
+                                    && matches!(
+                                        state.property_tmatrix_rain_sensitivity,
+                                        crate::wrf_radar::PropertyTMatrixRainSensitivity::FullProperty
+                                    );
                                 ui.add_enabled_ui(
-                                    matches!(
-                                        state.polarimetric_kernel,
-                                        crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
-                                    ),
+                                    raw_state_available,
                                     |ui| {
                                         if ui
                                             .selectable_label(
@@ -6671,6 +6862,14 @@ mod tests {
             crate::wrf_radar::PolarimetricKernel::BulkRayleighV1,
             "older settings retain the compatible bulk Rayleigh operator"
         );
+        assert_eq!(
+            empty.property_tmatrix_table_source,
+            app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+        );
+        assert_eq!(
+            empty.property_tmatrix_rain_sensitivity,
+            crate::wrf_radar::PropertyTMatrixRainSensitivity::FullProperty
+        );
         assert!(!empty.propagation);
         assert_eq!(
             empty.propagation_geometry,
@@ -6716,6 +6915,8 @@ mod tests {
             empty.sensitivity_dbz_at_1km,
             default_synth_sensitivity_dbz_at_1km()
         );
+        assert!(empty.emit_quality_fields);
+        assert_eq!(empty.minimum_model_coverage_fraction, 0.0);
         assert!(!empty.include_low_tilt, "low tilt restores OFF");
         assert_eq!(
             empty.clutter_intensity, 0.0,
@@ -6776,6 +6977,12 @@ mod tests {
             emit_stage_diagnostics: true,
             instrument_noise: true,
             sensitivity_dbz_at_1km: -37.5,
+            property_tmatrix_table_source:
+                app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::ExternalValidatedPack,
+            property_tmatrix_rain_sensitivity:
+                crate::wrf_radar::PropertyTMatrixRainSensitivity::FrozenOnly,
+            emit_quality_fields: false,
+            minimum_model_coverage_fraction: 0.65,
             include_low_tilt: true,
             clutter_intensity: 0.5,
             fold_velocity: true,
@@ -6837,6 +7044,14 @@ mod tests {
         );
         assert_eq!(config.dual_pol, historical.dual_pol);
         assert_eq!(config.polarimetric_kernel, historical.polarimetric_kernel);
+        assert_eq!(
+            config.property_tmatrix_table_source,
+            historical.property_tmatrix_table_source
+        );
+        assert_eq!(
+            config.property_tmatrix_rain_sensitivity,
+            historical.property_tmatrix_rain_sensitivity
+        );
         assert_eq!(config.propagation, historical.propagation);
         assert_eq!(config.system_phidp_deg, historical.system_phidp_deg);
         assert_eq!(config.zdr_bias_db, historical.zdr_bias_db);
@@ -6878,6 +7093,11 @@ mod tests {
         assert_eq!(
             config.sensitivity_dbz_at_1km,
             historical.sensitivity_dbz_at_1km
+        );
+        assert_eq!(config.emit_quality_fields, historical.emit_quality_fields);
+        assert_eq!(
+            config.minimum_model_coverage_fraction,
+            historical.minimum_model_coverage_fraction
         );
         assert_eq!(
             config.elevations_deg,
@@ -6949,6 +7169,10 @@ mod tests {
             spectrum_width_floor_mps: 1.1,
             dual_pol: true,
             polarimetric_kernel: PolarimetricKernel::PropertyTMatrixResearchV1,
+            property_tmatrix_table_source:
+                app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::ExternalValidatedPack,
+            property_tmatrix_rain_sensitivity:
+                crate::wrf_radar::PropertyTMatrixRainSensitivity::FrozenOnly,
             propagation: true,
             system_phidp_deg: 18.5,
             zdr_bias_db: -0.4,
@@ -6967,6 +7191,8 @@ mod tests {
             emit_stage_diagnostics: true,
             instrument_noise: true,
             sensitivity_dbz_at_1km: -36.0,
+            emit_quality_fields: false,
+            minimum_model_coverage_fraction: 0.7,
             ..SyntheticRadarUiState::default()
         };
         let config = state.to_config().unwrap();
@@ -6988,6 +7214,14 @@ mod tests {
         assert_eq!(
             config.polarimetric_kernel,
             PolarimetricKernel::PropertyTMatrixResearchV1
+        );
+        assert_eq!(
+            config.property_tmatrix_table_source,
+            app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::ExternalValidatedPack
+        );
+        assert_eq!(
+            config.property_tmatrix_rain_sensitivity,
+            crate::wrf_radar::PropertyTMatrixRainSensitivity::FrozenOnly
         );
         assert!(config.propagation);
         assert_eq!(config.system_phidp_deg, 18.5);
@@ -7013,6 +7247,8 @@ mod tests {
         assert!(config.emit_stage_diagnostics);
         assert!(config.instrument_noise);
         assert_eq!(config.sensitivity_dbz_at_1km, -36.0);
+        assert!(!config.emit_quality_fields);
+        assert_eq!(config.minimum_model_coverage_fraction, 0.7);
     }
 
     #[test]
@@ -7203,12 +7439,22 @@ mod tests {
             research.radar_frequency_mhz,
             crate::wrf_radar::PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ
         );
+        assert_eq!(
+            research.property_tmatrix_table_source,
+            app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+        );
+        assert_eq!(
+            research.property_tmatrix_rain_sensitivity,
+            crate::wrf_radar::PropertyTMatrixRainSensitivity::FullProperty
+        );
         assert_eq!(research.beam_integration, BeamIntegration::Balanced);
         assert_eq!(
             research.atmosphere_time_mode,
             app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
         );
         assert!(research.dual_pol && research.propagation);
+        assert!(research.emit_quality_fields);
+        assert_eq!(research.minimum_model_coverage_fraction, 0.0);
         assert!(research.validate_science_contract().is_ok());
     }
 
