@@ -13,6 +13,7 @@ mod digest;
 mod lut;
 mod orientation;
 mod output;
+mod p3_psd;
 mod particle;
 mod scheme_psd;
 mod science;
@@ -42,6 +43,17 @@ pub use orientation::{
 pub use output::{
     AdditiveScattering, ComplexCovariance, FallSpeedMoments, LinearReflectivity, OutputError,
     PolarAccumulatorQuantities, SpecificAttenuation, SpecificDifferentialPhase,
+};
+pub use p3_psd::{
+    P3_MODULE_VERSION, P3_MU_RANGE, P3_MULTICATEGORY_DOI, P3_PART_I_DOI, P3_PSD_REVISION,
+    P3_RIME_DENSITY_RANGE_KG_M3, P3_TABLE_GENERATOR_VERSION, P3_THREE_MOMENT_TABLE_SHA256,
+    P3_THREE_MOMENT_TABLE_VERSION, P3_TRIPLE_MOMENT_CONTEXT_DOI, P3_TWO_MOMENT_TABLE_SHA256,
+    P3_TWO_MOMENT_TABLE_VERSION, P3_WRF_RELEASE, P3_WRF_SOURCE_COMMIT, P3IceMomentInput,
+    P3IceMomentOrder, P3LookupAxisClamps, P3LookupFailure, P3LookupQuery, P3LookupSolution,
+    P3LookupTableDescriptor, P3LookupTableV54, P3MomentClosureAudit, P3OmissionTailAudit,
+    P3ParticleGeometry, P3ParticleRegion, P3PiecewiseParticleLaw, P3Psd, P3PsdError, P3PsdInput,
+    P3PsdProvenance, P3Quadrature, P3QuadratureAudit, P3QuadratureConfig, P3QuadratureNode,
+    P3ReconstructionConfig, P3ShapeAuthority, P3WrfScheme,
 };
 pub use particle::{
     ClosureAssumption, ConventionalHydrometeor, ConventionalParticleState, ConventionalProvenance,
