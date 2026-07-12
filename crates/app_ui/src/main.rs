@@ -20171,6 +20171,11 @@ impl ViewerApp {
                     "GOES satellite: live follow + frame playback (rw-sat)",
                 ),
                 (
+                    dock::WorkspacePane::Simsat,
+                    "SimSat",
+                    "SimSat v0.1.6: physically based WRF/HRRR satellite rendering, CPU-stored loops and native plots, plus an optional non-stored GPU preview",
+                ),
+                (
                     dock::WorkspacePane::Wofs,
                     "WoFS",
                     "NSSL Warn-on-Forecast System: rapid-cycling ensemble guidance (paintballs, probabilities, ensemble means), radar-time-synced",
@@ -20261,7 +20266,9 @@ impl ViewerApp {
                 }
             }
         });
-        button.on_hover_text("Data windows: Model · VWP · Satellite · WoFS · FARM · 3D · Sounding");
+        button.on_hover_text(
+            "Data windows: Model · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding",
+        );
     }
 
     /// Drain the embedded SimSat worker whether or not its pane is visible.

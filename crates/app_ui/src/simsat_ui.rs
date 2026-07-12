@@ -16,10 +16,15 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use chrono::Utc;
 use eframe::egui;
-use simsat::api::{BlueMarble, FrameData, Product, RenderParams, RenderResult, SunOverride};
+use simsat::api::{
+    BlueMarble, FrameData, Product, RenderBackend, RenderParams, RenderResult, SunOverride,
+};
 use simsat::camera::{ResolutionMode, SatellitePreset, ViewMode};
-use simsat::clouds::StepQuality;
+use simsat::clouds::{CloudMultiscatterMode, StepQuality};
 use simsat::derived::DerivedField;
+use simsat::render::{
+    CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, GROUND_DAY_LIFT, LandAppearanceConfig, RHO_HIGHLIGHT_MAX,
+};
 use simsat::store_out::{self, IrFrame, VisibleFrame};
 use simsat::wv::WvBand;
 
@@ -27,7 +32,10 @@ use crate::sat_plot::{SatellitePlotPalette, SatellitePlotSource};
 use crate::simsat_hrrr::{HrrrNativeSpec, discover_native_files, download_native, latest_specs};
 use crate::simsat_store::{DerivedFrame, write_derived_frame};
 
-const ENGINE_CACHE_SUBDIR: &str = "engine";
+// SimSat v0.1.4 moved the brick schema from v3 to v5. A versioned directory keeps
+// old cached-only manifests from masquerading as current inputs while raw WRF/GRIB
+// sources re-ingest normally.
+const ENGINE_CACHE_SUBDIR: &str = "engine-v5";
 
 /// A completion request owned by the app shell. The pane never reaches into the
 /// Satellite or native-plot viewer state directly.
@@ -249,6 +257,30 @@ impl RenderQuality {
     }
 }
 
+const CLOUD_TRANSPORTS: [CloudMultiscatterMode; 4] = [
+    CloudMultiscatterMode::LegacyOctaves,
+    CloudMultiscatterMode::SingleScatter,
+    CloudMultiscatterMode::DeltaFluxV1,
+    CloudMultiscatterMode::DeltaFluxV2,
+];
+
+fn cloud_transport_label(mode: CloudMultiscatterMode) -> &'static str {
+    match mode {
+        CloudMultiscatterMode::LegacyOctaves => "Legacy octaves (shipped)",
+        CloudMultiscatterMode::SingleScatter => "Single scatter",
+        CloudMultiscatterMode::DeltaFluxV1 => "Delta-flux v1 (experimental)",
+        CloudMultiscatterMode::DeltaFluxV2 => "Delta-flux v2b P1 (experimental)",
+    }
+}
+
+fn resolution_short_label(mode: ResolutionMode) -> &'static str {
+    match mode {
+        ResolutionMode::Native => "Model native",
+        ResolutionMode::Abi1km => "ABI 1 km",
+        ResolutionMode::Abi2km => "ABI 2 km",
+    }
+}
+
 #[derive(Clone, Debug)]
 enum JobSource {
     Local(PathBuf),
@@ -282,6 +314,7 @@ impl JobSource {
 #[derive(Clone, Debug)]
 struct RenderJob {
     source: JobSource,
+    backend: RenderBackend,
     product: SimSatProduct,
     view: OutputView,
     satellite: SatelliteChoice,
@@ -292,8 +325,26 @@ struct RenderJob {
     bluemarble_download: bool,
     bluemarble_month: u32,
     exposure: f32,
+    ground_gain: f32,
+    cloud_softclip: f32,
+    cloud_highlight_max: f32,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
+    land_sza_normalization: bool,
+    land_sza_max_gain: f32,
+    land_dark_toe: bool,
+    land_dark_toe_knee: f32,
+    land_dark_toe_gamma: f32,
+    land_dark_toe_max_gain: f32,
     clouds: bool,
-    multiscatter: bool,
+    fractional_clouds: bool,
+    cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
+    cloud_transport: CloudMultiscatterMode,
+    beer_powder: bool,
+    topdown_stratiform_regularization: bool,
     sun_override: bool,
     sun_elevation_deg: f32,
     sun_azimuth_deg: f32,
@@ -455,8 +506,26 @@ pub(crate) struct SimSatPane {
     bluemarble_download: bool,
     bluemarble_month: u32,
     exposure: f32,
+    ground_gain: f32,
+    cloud_softclip: f32,
+    cloud_highlight_max: f32,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
+    land_sza_normalization: bool,
+    land_sza_max_gain: f32,
+    land_dark_toe: bool,
+    land_dark_toe_knee: f32,
+    land_dark_toe_gamma: f32,
+    land_dark_toe_max_gain: f32,
     clouds: bool,
-    multiscatter: bool,
+    fractional_clouds: bool,
+    cloud_optical_depth_scale: f32,
+    feather_exposed_domain_edges: bool,
+    cloud_transport: CloudMultiscatterMode,
+    beer_powder: bool,
+    topdown_stratiform_regularization: bool,
     sun_override: bool,
     sun_elevation_deg: f32,
     sun_azimuth_deg: f32,
@@ -467,6 +536,7 @@ pub(crate) struct SimSatPane {
     completed: usize,
     failed: usize,
     cancellation_requested: bool,
+    last_notice: Option<String>,
     last_plot: Option<PlotPayload>,
     last_plot_label: Option<String>,
     last_stored: Option<StoredFrame>,
@@ -481,6 +551,7 @@ impl Default for SimSatPane {
         let (date, cycle) = latest
             .map(|spec| (spec.date, spec.cycle))
             .unwrap_or((fallback_date, fallback_cycle));
+        let land = LandAppearanceConfig::default();
         Self {
             source_mode: SourceMode::Local,
             local_path: String::new(),
@@ -496,12 +567,30 @@ impl Default for SimSatPane {
             resolution: ResolutionMode::Native,
             quality: RenderQuality::Final,
             margin_frac: 0.0,
-            granulation: true,
+            granulation: false,
             bluemarble_download: true,
             bluemarble_month: 0,
-            exposure: simsat::render::DEFAULT_EXPOSURE as f32,
+            exposure: DEFAULT_EXPOSURE as f32,
+            ground_gain: GROUND_DAY_LIFT as f32,
+            cloud_softclip: CLOUD_SOFTCLIP_KNEE as f32,
+            cloud_highlight_max: RHO_HIGHLIGHT_MAX as f32,
+            aerosol_optical_depth: simsat::atmosphere::DEFAULT_AOD as f32,
+            rh_aerosol_swelling: false,
+            atmosphere_correction: true,
+            terrain_atmosphere: true,
+            land_sza_normalization: land.sza_normalization,
+            land_sza_max_gain: land.sza_max_gain as f32,
+            land_dark_toe: land.dark_toe,
+            land_dark_toe_knee: land.dark_toe_knee as f32,
+            land_dark_toe_gamma: land.dark_toe_gamma as f32,
+            land_dark_toe_max_gain: land.dark_toe_max_gain as f32,
             clouds: true,
-            multiscatter: true,
+            fractional_clouds: true,
+            cloud_optical_depth_scale: simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            feather_exposed_domain_edges: true,
+            cloud_transport: CloudMultiscatterMode::LegacyOctaves,
+            beer_powder: false,
+            topdown_stratiform_regularization: false,
             sun_override: false,
             sun_elevation_deg: 45.0,
             sun_azimuth_deg: 180.0,
@@ -512,6 +601,7 @@ impl Default for SimSatPane {
             completed: 0,
             failed: 0,
             cancellation_requested: false,
+            last_notice: None,
             last_plot: None,
             last_plot_label: None,
             last_stored: None,
@@ -579,7 +669,8 @@ impl SimSatPane {
                         self.failed += 1;
                         self.error = Some(format!("{label}: satellite-store write failed: {err}"));
                     } else if let Some(warning) = warning {
-                        self.status = format!("{label}: {warning}");
+                        self.last_notice = Some(warning);
+                        self.status = format!("Rendered {label} with a notice.");
                     } else {
                         self.status = format!("Rendered {label}.");
                     }
@@ -657,8 +748,9 @@ impl SimSatPane {
         ui.heading("SimSat");
         ui.label(
             "Render physically based simulated satellite imagery from WRF or HRRR native levels. \
-             Every product lands in BowEcho's normal satellite player and loops by source run. \
-             Native plot reopens the georeferenced image or raw physical scalar field.",
+             CPU output lands in BowEcho's satellite player and loops by source run; the optional \
+             one-frame GPU preview opens only in Native plot. Raw physical scalar fields stay \
+             georeferenced for plotting and PNG export.",
         );
         ui.add_space(6.0);
 
@@ -721,24 +813,29 @@ impl SimSatPane {
                     ui.end_row();
 
                     ui.label("Resolution");
-                    ui.add_enabled_ui(self.view == OutputView::Geostationary, |ui| {
-                        egui::ComboBox::from_id_salt("simsat-resolution")
-                            .selected_text(self.resolution.label())
-                            .show_ui(ui, |ui| {
-                                for resolution in ResolutionMode::ALL {
-                                    ui.selectable_value(
-                                        &mut self.resolution,
-                                        resolution,
-                                        resolution.label(),
-                                    );
-                                }
-                            });
-                    });
+                    egui::ComboBox::from_id_salt("simsat-resolution")
+                        .selected_text(resolution_short_label(self.resolution))
+                        .show_ui(ui, |ui| {
+                            for resolution in ResolutionMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.resolution,
+                                    resolution,
+                                    resolution_short_label(resolution),
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Model native keeps one output pixel per source grid cell. ABI 1 km / \
+                             2 km use physical map spacing in top-down view and scan pitch in \
+                             geostationary view.",
+                        );
                     ui.end_row();
                 });
             if self.view == OutputView::TopDown {
                 ui.small(
-                    "Top-down is map-registered; the satellite choice is not used by the camera.",
+                    "Top-down is map-registered; satellite choice is ignored, while Native / ABI \
+                     resolution remains active.",
                 );
             }
         });
@@ -767,85 +864,12 @@ impl SimSatPane {
                         .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
                 );
                 if self.product.uses_visible_ground() {
-                    ui.checkbox(
-                        &mut self.bluemarble_download,
-                        "Download missing 2 km Blue Marble months",
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.bluemarble_month, 0..=12)
-                            .text("Blue Marble month")
-                            .custom_formatter(|value, _| {
-                                if value < 0.5 {
-                                    "Auto".to_owned()
-                                } else {
-                                    format!("{value:.0}")
-                                }
-                            }),
-                    )
-                    .on_hover_text(
-                        "Auto blends seasonal ground imagery for the valid date; 1-12 forces \
-                         a specific month as a what-if surface.",
-                    );
-                    ui.add_enabled_ui(self.clouds, |ui| {
-                        ui.checkbox(
-                            &mut self.granulation,
-                            "Sub-grid cloud granulation (experimental)",
-                        );
-                    });
-                    egui::CollapsingHeader::new("Atmosphere, clouds, and lighting")
-                        .id_salt("simsat-atmosphere-controls")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Slider::new(&mut self.exposure, 0.25..=4.0)
-                                    .text("Exposure"),
-                            )
-                            .on_hover_text(
-                                "Display brightness gain applied before the ABI-style stretch. \
-                                 1.0 retains physical reflectance.",
-                            );
-                            ui.horizontal_wrapped(|ui| {
-                                ui.checkbox(&mut self.clouds, "Volumetric clouds");
-                                ui.add_enabled_ui(self.clouds, |ui| {
-                                    ui.checkbox(&mut self.multiscatter, "Multi-scatter")
-                                        .on_hover_text(
-                                            "Multiple-scattering octaves brighten thick anvils \
-                                             and deep cloud decks.",
-                                        );
-                                });
-                            });
-                            ui.checkbox(&mut self.sun_override, "Override sun (what-if)")
-                                .on_hover_text(
-                                    "Use a chosen sun position instead of the source valid time. \
-                                     This is a non-physical visualization override.",
-                                );
-                            ui.add_enabled_ui(self.sun_override, |ui| {
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.sun_elevation_deg,
-                                        -10.0..=90.0,
-                                    )
-                                    .text("Sun elevation"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.sun_azimuth_deg, 0.0..=360.0)
-                                        .text("Sun azimuth"),
-                                );
-                                ui.colored_label(
-                                    ui.visuals().warn_fg_color,
-                                    "what-if lighting",
-                                );
-                            });
-                            ui.small(
-                                "The embedded v0.1.2 API derives atmospheric water from the \
-                                 model and keeps its standard aerosol profile. Studio-only AOD/RH \
-                                 debug tuning is not exposed by the released engine API.",
-                            );
-                        });
+                    self.visible_controls_ui(ui);
                 }
                 ui.small(
-                    "Final/stored frames use the CPU path. First use ingests a reusable SimSat brick; \
-                     a full HRRR native file can briefly require more than 2 GB of memory.",
+                    "Satellite frames and loops always use the full CPU path. First use ingests a \
+                     reusable SimSat v5 brick; a full HRRR native file can briefly require more \
+                     than 2 GB of memory.",
                 );
             });
 
@@ -862,8 +886,26 @@ impl SimSatPane {
                 {
                     self.request_cancel();
                 }
-            } else if ui.button("Render").clicked() {
-                self.start_current_job(ui.ctx());
+            } else {
+                if ui.button("Render to Satellite").clicked() {
+                    self.start_current_job(ui.ctx(), RenderBackend::Cpu);
+                }
+                let gpu_ready = self.product == SimSatProduct::Visible;
+                if ui
+                    .add_enabled(gpu_ready, egui::Button::new("GPU preview"))
+                    .on_hover_text(
+                        "Render the first frame through SimSat's synchronous wgpu preview and \
+                         open it in Native plot. Preview output is never added to Satellite loops, \
+                         and every temporary compatibility substitution is reported.",
+                    )
+                    .on_disabled_hover_text(
+                        "GPU preview is intentionally limited to Visible true color. Use the CPU \
+                         render for GeoColor, Sandwich, thermal, and derived products.",
+                    )
+                    .clicked()
+                {
+                    self.start_current_job(ui.ctx(), RenderBackend::GpuPreview);
+                }
             }
             if self.total > 0 {
                 let progress = self.completed.min(self.total) as f32 / self.total as f32;
@@ -875,6 +917,9 @@ impl SimSatPane {
             }
         });
         ui.label(&self.status);
+        if let Some(notice) = &self.last_notice {
+            ui.small(notice);
+        }
         if self.cancellation_requested {
             ui.small(
                 "Cancellation requested. A download may stop between chunks; an active render \
@@ -913,6 +958,256 @@ impl SimSatPane {
         }
 
         actions
+    }
+
+    fn visible_controls_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Atmosphere and surface")
+            .id_salt("simsat-atmosphere-controls")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add(egui::Slider::new(&mut self.exposure, 0.25..=4.0).text("Exposure"))
+                    .on_hover_text(
+                        "Finished-visible display gain. SimSat's shipped value is 1.5; 1.0 is \
+                     neutral physical reflectance.",
+                    );
+                ui.add(
+                    egui::Slider::new(&mut self.aerosol_optical_depth, 0.0..=0.6)
+                        .text("Aerosol optical depth")
+                        .fixed_decimals(2),
+                )
+                .on_hover_text(
+                    "Visible aerosol optical depth at 550 nm. Zero removes aerosol but keeps \
+                     molecular Rayleigh scattering.",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.rh_aerosol_swelling, "RH aerosol swelling")
+                        .on_hover_text(
+                            "Apply SimSat's documented 1.5x humid-growth multiplier to aerosol \
+                             extinction.",
+                        );
+                    if self.rh_aerosol_swelling {
+                        ui.weak(format!(
+                            "effective AOD {:.2}",
+                            self.aerosol_optical_depth * 1.5
+                        ));
+                    }
+                });
+                ui.checkbox(
+                    &mut self.atmosphere_correction,
+                    "Daytime aerial-veil correction",
+                )
+                .on_hover_text(
+                    "Reduce modeled daytime path airlight for finished true color. Off retains \
+                     the full modeled veil.",
+                );
+                ui.checkbox(&mut self.terrain_atmosphere, "Terrain-height atmosphere")
+                    .on_hover_text(
+                        "Shorten the view and sunlight atmospheric columns to each model pixel's \
+                     terrain elevation. On is the physical shipped path.",
+                    );
+            });
+
+        egui::CollapsingHeader::new("Clouds")
+            .id_salt("simsat-cloud-controls")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.checkbox(&mut self.clouds, "Volumetric clouds");
+                ui.add_enabled_ui(self.clouds, |ui| {
+                    ui.checkbox(&mut self.fractional_clouds, "Use model cloud fraction")
+                        .on_hover_text(
+                            "Use WRF CLDFRA or HRRR's native cloud-fraction field for fractional \
+                             subcolumns. Missing fields safely fall back to full cells.",
+                        );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Cloud transport");
+                        egui::ComboBox::from_id_salt("simsat-cloud-transport")
+                            .selected_text(cloud_transport_label(self.cloud_transport))
+                            .show_ui(ui, |ui| {
+                                for mode in CLOUD_TRANSPORTS {
+                                    ui.selectable_value(
+                                        &mut self.cloud_transport,
+                                        mode,
+                                        cloud_transport_label(mode),
+                                    );
+                                }
+                            });
+                    });
+                    ui.weak(match self.cloud_transport {
+                        CloudMultiscatterMode::LegacyOctaves => {
+                            "Established bright-anvil transport; the shipped default."
+                        }
+                        CloudMultiscatterMode::SingleScatter => {
+                            "Direct single scattering only; a dimmer diagnostic path."
+                        }
+                        CloudMultiscatterMode::DeltaFluxV1 => {
+                            "Research Stage-2 isotropic closure; CPU-only and opt-in."
+                        }
+                        CloudMultiscatterMode::DeltaFluxV2 => {
+                            "Research brightness-neutral P1 closure; CPU-only and opt-in."
+                        }
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut self.cloud_optical_depth_scale, 0.0..=4.0)
+                            .text("Cloud optical-depth scale")
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text(
+                        "Visible cloud extinction sensitivity. SimSat ships 0.15; 1.00 uses \
+                         model extinction unscaled. IR and quantitative cloud optical depth do \
+                         not consume this display control.",
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Reset 0.15").clicked() {
+                            self.cloud_optical_depth_scale =
+                                simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE;
+                        }
+                        if ui.button("Unscaled 1.00").clicked() {
+                            self.cloud_optical_depth_scale = 1.0;
+                        }
+                    });
+                    ui.checkbox(
+                        &mut self.feather_exposed_domain_edges,
+                        "Feather exposed domain edges",
+                    )
+                    .on_hover_text(
+                        "Fade finished visible cloud extinction across the outer 4% only when \
+                         the camera exposes the finite WRF/HRRR boundary.",
+                    );
+                    ui.checkbox(&mut self.beer_powder, "Beer-powder shading")
+                        .on_hover_text(
+                            "Optional cloud appearance shaping. It is off in SimSat's shipped \
+                             preset because the transport model already supplies buildup.",
+                        );
+                    ui.checkbox(
+                        &mut self.granulation,
+                        "Sub-grid cloud granulation (experimental)",
+                    )
+                    .on_hover_text(
+                        "Subtract-only edge detail for unresolved boundary-layer cumulus. It is \
+                         off by default and never changes thermal or derived products.",
+                    );
+                    ui.add_enabled_ui(self.view == OutputView::TopDown, |ui| {
+                        ui.checkbox(
+                            &mut self.topdown_stratiform_regularization,
+                            "Top-down stratiform reconstruction (experimental)",
+                        )
+                        .on_hover_text(
+                            "Opt-in v0.1.6 observation operator for broad low/liquid decks. It \
+                             can reduce native-grid HRRR rings while conserving selected-area \
+                             optical depth; geostationary and raw-band output are unchanged.",
+                        );
+                    });
+                    if self.view != OutputView::TopDown {
+                        ui.weak(
+                            "Stratiform reconstruction applies only to top-down visible output.",
+                        );
+                    }
+                });
+            });
+
+        egui::CollapsingHeader::new("Lighting")
+            .id_salt("simsat-lighting-controls")
+            .show(ui, |ui| {
+                ui.checkbox(&mut self.sun_override, "Override sun (what-if)")
+                    .on_hover_text(
+                        "Use a chosen sun position instead of source valid time. This is a \
+                         non-physical visualization override.",
+                    );
+                ui.add_enabled_ui(self.sun_override, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.sun_elevation_deg, -10.0..=90.0)
+                            .text("Sun elevation"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.sun_azimuth_deg, 0.0..=360.0)
+                            .text("Sun azimuth"),
+                    );
+                    ui.colored_label(ui.visuals().warn_fg_color, "what-if lighting");
+                });
+            });
+
+        egui::CollapsingHeader::new("Ground / Blue Marble")
+            .id_salt("simsat-ground-controls")
+            .show(ui, |ui| {
+                ui.checkbox(
+                    &mut self.bluemarble_download,
+                    "Download missing 2 km Blue Marble months",
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.bluemarble_month, 0..=12)
+                        .text("Blue Marble month")
+                        .custom_formatter(|value, _| {
+                            if value < 0.5 {
+                                "Auto".to_owned()
+                            } else {
+                                format!("{value:.0}")
+                            }
+                        }),
+                )
+                .on_hover_text(
+                    "Auto blends seasonal ground imagery for valid date; 1-12 forces a \
+                     specific month as a what-if surface.",
+                );
+            });
+
+        egui::CollapsingHeader::new("Advanced display calibration")
+            .id_salt("simsat-display-calibration")
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.ground_gain, 0.25..=4.0).text("Ground lift"),
+                )
+                .on_hover_text("Display-only daytime ground gain; 1.0 is neutral.");
+                ui.add(
+                    egui::Slider::new(&mut self.cloud_softclip, 0.05..=1.0)
+                        .text("Highlight knee"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.cloud_highlight_max, 0.25..=4.0)
+                        .text("Highlight ceiling"),
+                );
+                ui.separator();
+                ui.checkbox(
+                    &mut self.land_sza_normalization,
+                    "Land solar-zenith normalization",
+                );
+                ui.add_enabled_ui(self.land_sza_normalization, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.land_sza_max_gain, 1.0..=4.0)
+                            .text("SZA max gain"),
+                    );
+                });
+                ui.checkbox(&mut self.land_dark_toe, "Dark-land reflectance toe");
+                ui.add_enabled_ui(self.land_dark_toe, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.land_dark_toe_knee, 0.001..=0.25)
+                            .text("Toe knee"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.land_dark_toe_gamma, 0.05..=1.0)
+                            .text("Toe gamma"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.land_dark_toe_max_gain, 1.0..=4.0)
+                            .text("Toe max gain"),
+                    );
+                });
+                if ui.button("Restore shipped display calibration").clicked() {
+                    let land = LandAppearanceConfig::default();
+                    self.exposure = DEFAULT_EXPOSURE as f32;
+                    self.ground_gain = GROUND_DAY_LIFT as f32;
+                    self.cloud_softclip = CLOUD_SOFTCLIP_KNEE as f32;
+                    self.cloud_highlight_max = RHO_HIGHLIGHT_MAX as f32;
+                    self.land_sza_normalization = land.sza_normalization;
+                    self.land_sza_max_gain = land.sza_max_gain as f32;
+                    self.land_dark_toe = land.dark_toe;
+                    self.land_dark_toe_knee = land.dark_toe_knee as f32;
+                    self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
+                    self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
+                }
+                ui.weak(
+                    "Display-only: raw visible bands, IR, water vapor, and derived fields are unchanged.",
+                );
+            });
     }
 
     fn local_source_ui(&mut self, ui: &mut egui::Ui) {
@@ -1052,7 +1347,7 @@ impl SimSatPane {
         }
     }
 
-    fn start_current_job(&mut self, ctx: &egui::Context) {
+    fn start_current_job(&mut self, ctx: &egui::Context, backend: RenderBackend) {
         if self.task.is_some() {
             return;
         }
@@ -1068,6 +1363,7 @@ impl SimSatPane {
         let sector = qualified_sector(&source.group_base(), self.product, self.view);
         let job = RenderJob {
             source,
+            backend,
             product: self.product,
             view: self.view,
             satellite: if self.view == OutputView::TopDown {
@@ -1082,8 +1378,26 @@ impl SimSatPane {
             bluemarble_download: self.bluemarble_download,
             bluemarble_month: self.bluemarble_month,
             exposure: self.exposure,
+            ground_gain: self.ground_gain,
+            cloud_softclip: self.cloud_softclip,
+            cloud_highlight_max: self.cloud_highlight_max,
+            aerosol_optical_depth: self.aerosol_optical_depth,
+            rh_aerosol_swelling: self.rh_aerosol_swelling,
+            atmosphere_correction: self.atmosphere_correction,
+            terrain_atmosphere: self.terrain_atmosphere,
+            land_sza_normalization: self.land_sza_normalization,
+            land_sza_max_gain: self.land_sza_max_gain,
+            land_dark_toe: self.land_dark_toe,
+            land_dark_toe_knee: self.land_dark_toe_knee,
+            land_dark_toe_gamma: self.land_dark_toe_gamma,
+            land_dark_toe_max_gain: self.land_dark_toe_max_gain,
             clouds: self.clouds,
-            multiscatter: self.multiscatter,
+            fractional_clouds: self.fractional_clouds,
+            cloud_optical_depth_scale: self.cloud_optical_depth_scale,
+            feather_exposed_domain_edges: self.feather_exposed_domain_edges,
+            cloud_transport: self.cloud_transport,
+            beer_powder: self.beer_powder,
+            topdown_stratiform_regularization: self.topdown_stratiform_regularization,
             sun_override: self.sun_override,
             sun_elevation_deg: self.sun_elevation_deg,
             sun_azimuth_deg: self.sun_azimuth_deg,
@@ -1116,6 +1430,7 @@ impl SimSatPane {
                 self.completed = 0;
                 self.failed = 0;
                 self.cancellation_requested = false;
+                self.last_notice = None;
                 self.last_plot = None;
                 self.last_plot_label = None;
                 self.last_stored = None;
@@ -1177,7 +1492,9 @@ fn run_render_job(
         repaint.request_repaint();
         return;
     }
-    if let Err(error) = std::fs::create_dir_all(&job.store_root) {
+    if job.backend == RenderBackend::Cpu
+        && let Err(error) = std::fs::create_dir_all(&job.store_root)
+    {
         let _ = tx.send(WorkerEvent::Fatal(format!(
             "Could not create satellite store {}: {error}",
             job.store_root.display()
@@ -1242,6 +1559,9 @@ fn run_render_job(
         }
     };
     sort_frame_inputs(&mut inputs);
+    if job.backend == RenderBackend::GpuPreview {
+        inputs.truncate(1);
+    }
     let total = inputs.len();
     let _ = tx.send(WorkerEvent::Started { total });
     repaint.request_repaint();
@@ -1267,7 +1587,11 @@ fn run_render_job(
         let params = render_params_for(&job, &frame);
         match simsat::api::render(&params, job.product.api_product()) {
             Ok(result) => {
-                let store = write_result_to_store(&job, &result);
+                let store = if job.backend == RenderBackend::Cpu {
+                    write_result_to_store(&job, &result)
+                } else {
+                    Ok(None)
+                };
                 let warning = result_warning(&result);
                 match plot_payload_from_result(job.product, &frame.label, result) {
                     Ok(plot) => {
@@ -1317,6 +1641,7 @@ fn run_render_job(
 
 fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
     let mut params = RenderParams::new(frame.path.clone());
+    params.backend = job.backend;
     params.timestep = frame.timestep;
     params.cache = job.cache_root.clone();
     params.satellite = job.satellite.api_satellite();
@@ -1324,10 +1649,32 @@ fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
     params.resolution = job.resolution;
     params.margin_frac = job.margin_frac;
     params.exposure = f64::from(job.exposure);
+    params.ground_gain = Some(f64::from(job.ground_gain));
+    params.cloud_softclip = Some(f64::from(job.cloud_softclip));
+    params.cloud_highlight_max = Some(f64::from(job.cloud_highlight_max));
+    params.aerosol_optical_depth = job.aerosol_optical_depth;
+    params.rh_aerosol_swelling = job.rh_aerosol_swelling;
+    params.atmosphere_correction = job.atmosphere_correction;
+    params.terrain_atmosphere = job.terrain_atmosphere;
+    params.land_appearance = LandAppearanceConfig {
+        sza_normalization: job.land_sza_normalization,
+        sza_max_gain: f64::from(job.land_sza_max_gain),
+        dark_toe: job.land_dark_toe,
+        dark_toe_knee: f64::from(job.land_dark_toe_knee),
+        dark_toe_gamma: f64::from(job.land_dark_toe_gamma),
+        dark_toe_max_gain: f64::from(job.land_dark_toe_max_gain),
+    };
     params.steps = job.quality.steps();
-    params.multiscatter = job.multiscatter;
+    params.multiscatter = job.cloud_transport == CloudMultiscatterMode::LegacyOctaves;
+    params.cloud_multiscatter = Some(job.cloud_transport);
+    params.beer_powder = job.beer_powder;
     params.clouds = job.clouds;
+    params.fractional_clouds = job.fractional_clouds;
+    params.cloud_optical_depth_scale = job.cloud_optical_depth_scale;
+    params.feather_exposed_domain_edges = job.feather_exposed_domain_edges;
     params.granulation = Some(job.clouds && job.granulation && job.product.uses_visible_ground());
+    params.topdown_stratiform_regularization =
+        job.topdown_stratiform_regularization && job.view == OutputView::TopDown;
     params.sun_override = job.sun_override.then_some(SunOverride {
         elev_deg: Some(f64::from(job.sun_elevation_deg)),
         az_deg: Some(f64::from(job.sun_azimuth_deg)),
@@ -1712,16 +2059,38 @@ fn plot_payload_from_parts(
 }
 
 fn result_warning(result: &RenderResult) -> Option<String> {
+    let mut notices = Vec::new();
     if result.time_is_fallback {
-        return Some(
+        notices.push(
             "source had no parseable valid time; SimSat used its documented fallback date"
                 .to_owned(),
         );
     }
     if !result.ground_status.is_empty() {
-        return Some(result.ground_status.join(" · "));
+        notices.push(result.ground_status.join(" · "));
     }
-    None
+    if result.res_clamped {
+        notices
+            .push("requested output resolution was capped with aspect ratio preserved".to_owned());
+    }
+    if result.backend == RenderBackend::GpuPreview {
+        let adapter = result.gpu_adapter.as_deref().unwrap_or("unknown adapter");
+        notices.push(format!(
+            "GPU preview on {adapter}; opened in Native plot and not written to Satellite"
+        ));
+        if !result.diagnostics.is_empty() {
+            notices.push(format!(
+                "temporary preview substitutions: {}",
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|adjustment| adjustment.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    (!notices.is_empty()).then(|| notices.join(" · "))
 }
 
 fn frame_hhmm(result: &RenderResult) -> u16 {
@@ -1805,8 +2174,9 @@ mod tests {
     fn render_controls_map_to_the_released_simsat_api() {
         let job = RenderJob {
             source: JobSource::Local(PathBuf::from("wrfout")),
+            backend: RenderBackend::GpuPreview,
             product: SimSatProduct::Visible,
-            view: OutputView::Geostationary,
+            view: OutputView::TopDown,
             satellite: SatelliteChoice::GoesWest,
             resolution: ResolutionMode::Abi1km,
             quality: RenderQuality::Preview,
@@ -1815,8 +2185,26 @@ mod tests {
             bluemarble_download: false,
             bluemarble_month: 1,
             exposure: 2.25,
+            ground_gain: 1.25,
+            cloud_softclip: 0.7,
+            cloud_highlight_max: 1.75,
+            aerosol_optical_depth: 0.12,
+            rh_aerosol_swelling: true,
+            atmosphere_correction: false,
+            terrain_atmosphere: false,
+            land_sza_normalization: false,
+            land_sza_max_gain: 1.4,
+            land_dark_toe: false,
+            land_dark_toe_knee: 0.06,
+            land_dark_toe_gamma: 0.75,
+            land_dark_toe_max_gain: 1.3,
             clouds: true,
-            multiscatter: false,
+            fractional_clouds: false,
+            cloud_optical_depth_scale: 0.42,
+            feather_exposed_domain_edges: false,
+            cloud_transport: CloudMultiscatterMode::DeltaFluxV2,
+            beer_powder: true,
+            topdown_stratiform_regularization: true,
             sun_override: true,
             sun_elevation_deg: 35.0,
             sun_azimuth_deg: 225.0,
@@ -1831,14 +2219,34 @@ mod tests {
             label: "time".to_owned(),
         };
         let params = render_params_for(&job, &frame);
+        assert_eq!(params.backend, RenderBackend::GpuPreview);
         assert_eq!(params.satellite, SatellitePreset::GoesWest);
+        assert_eq!(params.view, ViewMode::TopDownMap);
         assert_eq!(params.resolution, ResolutionMode::Abi1km);
         assert_eq!(params.timestep, 3);
         assert_eq!(params.margin_frac, 0.25);
         assert_eq!(params.exposure, 2.25);
+        assert_eq!(params.ground_gain, Some(1.25));
+        assert_eq!(params.cloud_softclip, Some(f64::from(0.7_f32)));
+        assert_eq!(params.cloud_highlight_max, Some(1.75));
+        assert_eq!(params.aerosol_optical_depth, 0.12);
+        assert!(params.rh_aerosol_swelling);
+        assert!(!params.atmosphere_correction);
+        assert!(!params.terrain_atmosphere);
+        assert!(!params.land_appearance.sza_normalization);
+        assert!(!params.land_appearance.dark_toe);
         assert!(params.clouds);
         assert!(!params.multiscatter);
+        assert_eq!(
+            params.cloud_multiscatter,
+            Some(CloudMultiscatterMode::DeltaFluxV2)
+        );
+        assert!(params.beer_powder);
+        assert!(!params.fractional_clouds);
+        assert_eq!(params.cloud_optical_depth_scale, 0.42);
+        assert!(!params.feather_exposed_domain_edges);
         assert_eq!(params.granulation, Some(true));
+        assert!(params.topdown_stratiform_regularization);
         assert_eq!(
             params.sun_override,
             Some(SunOverride {
@@ -1853,6 +2261,35 @@ mod tests {
                 download: false,
             }
         ));
+    }
+
+    #[test]
+    fn pane_defaults_match_the_simsat_shipped_preset() {
+        let pane = SimSatPane::default();
+        let land = LandAppearanceConfig::default();
+        assert_eq!(pane.resolution, ResolutionMode::Native);
+        assert_eq!(pane.quality, RenderQuality::Final);
+        assert_eq!(pane.exposure, DEFAULT_EXPOSURE as f32);
+        assert_eq!(
+            pane.aerosol_optical_depth,
+            simsat::atmosphere::DEFAULT_AOD as f32
+        );
+        assert!(!pane.rh_aerosol_swelling);
+        assert!(pane.atmosphere_correction);
+        assert!(pane.terrain_atmosphere);
+        assert_eq!(pane.land_sza_normalization, land.sza_normalization);
+        assert_eq!(pane.land_dark_toe, land.dark_toe);
+        assert!(pane.clouds);
+        assert!(pane.fractional_clouds);
+        assert_eq!(
+            pane.cloud_optical_depth_scale,
+            simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
+        );
+        assert!(pane.feather_exposed_domain_edges);
+        assert_eq!(pane.cloud_transport, CloudMultiscatterMode::LegacyOctaves);
+        assert!(!pane.beer_powder);
+        assert!(!pane.granulation);
+        assert!(!pane.topdown_stratiform_regularization);
     }
 
     #[test]

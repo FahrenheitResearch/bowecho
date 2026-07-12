@@ -5641,11 +5641,12 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simsat"
-version = "0.1.2"
-source = "git+https://github.com/FahrenheitResearch/simsat.git?rev=edd19b1bf9fac84d7a8e6cf788ae89f995b35c3d#edd19b1bf9fac84d7a8e6cf788ae89f995b35c3d"
+version = "0.1.6"
+source = "git+https://github.com/FahrenheitResearch/simsat.git?rev=3b4b180d57e24c065521874e26db6299ff375811#3b4b180d57e24c065521874e26db6299ff375811"
 dependencies = [
  "chrono",
  "eframe",
+ "find-msvc-tools",
  "flate2",
  "grib-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=edb9d277cce7fe1cfa1080d159053c583ca07b6a)",
  "image",

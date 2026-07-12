@@ -28,10 +28,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 quick-xml.workspace = true
-# Released SimSat engine. Kept at the public v0.1.2 commit so BowEcho's
+# Released SimSat engine. Kept at the public v0.1.6 commit so BowEcho's
 # embedded renderer and the standalone Studio produce the same physics and
 # sat-store contract.
-simsat = { git = "https://github.com/FahrenheitResearch/simsat.git", rev = "edd19b1bf9fac84d7a8e6cf788ae89f995b35c3d" }
+simsat = { git = "https://github.com/FahrenheitResearch/simsat.git", rev = "3b4b180d57e24c065521874e26db6299ff375811" }
 # In-app updater (Settings > security): streaming release-asset download with
 # progress, hashing the streamed bytes for the SHA-256 gate that runs before
 # the Authenticode gate (docs/SIGNING.md).

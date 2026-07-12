@@ -1082,16 +1082,45 @@ fn satellite(ui: &mut egui::Ui) {
     subhead(ui, "SIMULATED SATELLITE");
     para(
         ui,
-        "The embedded SimSat engine is still being tuned, so its launcher is intentionally \
-         hidden in this build. It renders physically based visible, GeoColor, sandwich, thermal-IR, water-vapor, \
-         and derived products from local WRF output or HRRR native-level data. Finished \
-         frames are written directly into this same satellite store, grouped into loops by \
-         source run, selected in the player, and can follow onto the radar map. The Render \
-         controls expose exposure, clouds, multiple scattering, granulation, and an explicitly \
-         labeled what-if sun override for visible-family products. SimSat needs HRRR wrfnat files; the \
-         normal Model download's smaller pressure + surface pair cannot reconstruct native \
-         cloud volumes. BowEcho therefore downloads wrfnat only when requested by SimSat and \
-         reuses it from the SimSat input cache afterward.",
+        "Windows ▾ ▸ SimSat opens the embedded SimSat v0.1.6 renderer. It produces \
+         physically based visible, GeoColor, sandwich, thermal-IR, water-vapor, and derived \
+         products from a local WRF file or sequence, a previously cached HRRR native-level \
+         file, or an HRRR native-level download requested in the pane. SimSat needs the HRRR \
+         wrfnat cloud volume; the Model downloader's smaller pressure + surface pair cannot \
+         reconstruct it. Downloaded wrfnat inputs are retained in the SimSat input cache for \
+         later runs.",
+    );
+    para(
+        ui,
+        "The normal Render action uses SimSat's CPU quality path. A single source produces one \
+         stored frame; a folder or multi-time source renders the sequence and groups its frames \
+         into one loop. Completed output enters the same local satellite store as real imagery, \
+         is available in the frame player and Native plot, and can follow onto the radar map. \
+         GPU preview is an optional faster action: it reports any temporary compatibility \
+         substitutions, does not change the saved controls, is never written to the satellite \
+         store, and is never used for a stored loop. Use normal Render for a frame that should \
+         persist or join a loop.",
+    );
+    para(
+        ui,
+        "Atmosphere controls include aerosol optical depth, relative-humidity aerosol swelling, \
+         daytime aerial-veil correction, and terrain-height atmospheric columns. Cloud controls \
+         include model fractional-cloud coverage, the visible cloud optical-depth scale (the \
+         shipped calibration is 0.15), and exposed-domain edge feathering. Fractional clouds use \
+         WRF CLDFRA or HRRR's native 50-level cloud-fraction field when available; the legacy-off \
+         choice fills every non-zero cloudy cell. Edge feathering is on by default and only fades \
+         finished visible clouds where the finite model boundary is exposed. Top-down stratiform \
+         reconstruction is experimental and off by default; it can reduce native-grid rings in \
+         broad low liquid decks, but does not affect geostationary, raw-band, thermal, or derived \
+         products. Exposure, land-visibility calibration, cloud transport, granulation, and the \
+         explicitly labeled what-if sun override remain independently controllable.",
+    );
+    para(
+        ui,
+        "SimSat v0.1.6 uses SSB cache format v5 for corrected cloud-fraction provenance. An old \
+         v0.1.2 brick cache must be ingested once again from its original WRF or HRRR source; a \
+         cached-only brick without that source cannot be upgraded. Re-ingesting the retained raw \
+         HRRR wrfnat input does not require downloading it again.",
     );
 
     subhead(ui, "NATIVE PLOTS & EXPORT");
