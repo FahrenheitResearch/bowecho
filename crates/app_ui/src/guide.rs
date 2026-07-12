@@ -1045,6 +1045,28 @@ fn wrf(ui: &mut egui::Ui) {
          settings, calibration, model/microphysics identity, and forward-operator provenance.",
     );
 
+    subhead(ui, "OPERATIONAL HRRR/RRFS FORECAST RADAR");
+    para(
+        ui,
+        "The Operational forecast radar card turns native hybrid-level HRRR or RRFS GRIB into \
+         the same ordinary polar RadarVolume, loop, products, Refresh action and CfRadial export \
+         as raw WRF. Latest HRRR can build f00, f01, or a same-cycle f00/f01 loop through \
+         SimSat's existing publication-aware, resumable downloader. Cached HRRR discovery uses \
+         the same SimSat input and model-cache directories; BowEcho does not create a second \
+         cache. The local picker is unrestricted and accepts multiple native GRIB files.",
+    );
+    para(
+        ui,
+        "The reader crops around the chosen virtual radar, converts omega to geometric vertical \
+         velocity, rotates grid-relative winds when declared, and streams native cloud liquid, \
+         cloud ice, rain, snow and graupel through additive scattering. HRRR uses an explicit \
+         Thompson-family category mapping. RRFS uses only the inventory carried by the file and \
+         never invents a hidden scheme identity. Missing number fields use documented bulk-PSD \
+         defaults. The result is bulk S-band dual-pol-like forecast guidance, not property \
+         T-matrix science or observed calibration; incomplete/inconsistent inventories fail \
+         closed and all assumptions are exported in provenance.",
+    );
+
     subhead(ui, "BUILD 24 VCP & ATMOSPHERE TIME");
     para(
         ui,
@@ -2866,7 +2888,7 @@ mod tests {
         assert!(guide_src.contains("SAILS, MRLE, AVSET, Add-MPDA"));
         assert!(guide_src.contains("Linear adjacent is the fast path"));
         assert!(guide_src.contains("Raw-state pre-closure is the slower"));
-        assert!(guide_src.contains("It never extrapolates"));
+        assert!(guide_src.contains("Both adjacent modes never extrapolate"));
         assert!(guide_src.contains("hold, drop or error"));
         assert!(guide_src.contains("does not create extra loop frames"));
         assert!(guide_src.contains("the first N\\u{2212}1 frames"));
@@ -2874,6 +2896,9 @@ mod tests {
         assert!(guide_src.contains("one CfRadial-1 file per frame"));
         assert!(guide_src.contains("MP_PHYSICS alone is not sufficient"));
         assert!(guide_src.contains("Real radar, Maximum"));
+        assert!(guide_src.contains("OPERATIONAL HRRR/RRFS FORECAST RADAR"));
+        assert!(guide_src.contains("same SimSat input and model-cache directories"));
+        assert!(guide_src.contains("bulk S-band dual-pol-like forecast guidance"));
 
         // Exact observed replay and the retained validation products must stay
         // discoverable without suggesting geometry or missing moments.
