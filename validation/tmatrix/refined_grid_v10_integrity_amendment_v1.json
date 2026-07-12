@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "amendment_id": "pytmatrix-0.3.3-refined-grid-v10-integrity-amendment-v1",
+  "classification": "predeclared_recursive_audit_integrity_amendment_not_validation",
+  "protocol_file": "refined_grid_v10_design_protocol_v2.json",
+  "protocol_sha256": "666f19fea907d2f4479b38ed0604f78c1472ef2898728d298e4d0f4c8dd53fbe",
+  "previous_audit_source_sha256": "82552b8a676bd3348b15bcc7e603e7f87b9e58c99c30a78a30d1e0944e58b3fe",
+  "audit_source_sha256": "b26aabe488feb4129c9a1fe3b4eac7d84ffccb6ac5b240da27cc8a204de04d79",
+  "reason": "The depth-2 report passed all source and stage guards but exposed recursive-runner continuation defects before depth 3: exact midpoint regressions touched two leaves, schema-2 prior lineage was rejected, exact-bit/source failures prescribed grid refinement, and config mutation outside the controlled diameter slab was not structurally frozen. This amendment changes only audit integrity and reporting; the fixed seed, samples, budgets, table configs, and scattering outputs are unchanged.",
+  "non_diameter_config_projection_protocol": "Canonical JSON SHA-256 after replacing only the inclusive controlled diameter-slab interior with one sentinel. Every non-diameter field and every diameter coordinate outside the declared v9 parent slab remains hashed. Exact staged leaf derivation separately controls every coordinate inside the slab.",
+  "non_diameter_config_projection_sha256": {
+    "conventional_wet_hail_sband_unvalidated": "eeb457e9ee7db7cd51e9849d446bb6160ee69fdb48f162d82e233f695f667627",
+    "property_p3_ishmael_dry_oblate_sband_unvalidated": "2ec054ef002ec9e754178cf9e287fcd4cdfa98486b7f34d4ca7dcc34e7368fb8",
+    "property_rain_sband_unvalidated": "8a44e7d6a36ccfab3ef03f6fe4d06f6e958b99b1c6bf76a57b5769830d24a327"
+  },
+  "continuation_guards": [
+    "Every schema-2 prior report is bound by exact report and parent-stage hashes.",
+    "Any solver failure, direct-bit reproduction mismatch, or interpolation implementation failure blocks grid refinement.",
+    "A diameter stage splits every and only failed parent leaf; a passing table remains unchanged.",
+    "Every accumulated failure coordinate remains an immutable development regression."
+  ]
+}

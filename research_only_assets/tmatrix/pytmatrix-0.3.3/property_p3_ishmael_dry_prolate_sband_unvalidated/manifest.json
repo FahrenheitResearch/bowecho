@@ -1,0 +1,233 @@
+{
+  "artifact_classification": "unvalidated_research",
+  "axes": [
+    {
+      "coordinates": [
+        5e-05,
+        5.590169943749475e-05,
+        6.25e-05,
+        6.987712429686843e-05,
+        7.8125e-05,
+        8.734640537108554e-05,
+        9.765625e-05,
+        0.00010918300671385693,
+        0.0001220703125,
+        0.00013647875839232116,
+        0.000152587890625,
+        0.00017059844799040144,
+        0.00019073486328125,
+        0.0002132480599880018,
+        0.0002384185791015625,
+        0.00026656007498500225,
+        0.0002980232238769531,
+        0.0003332000937312528,
+        0.0003725290298461914,
+        0.00041650011716406603,
+        0.00046566128730773926,
+        0.0005206251464550826,
+        0.0005820766091346741,
+        0.0006507814330688531,
+        0.0007275957614183426,
+        0.0008134767913360665,
+        0.0009094947017729282,
+        0.001016845989170083,
+        0.0011368683772161603,
+        0.0012710574864626038,
+        0.0014210854715202004,
+        0.0015888218580782547,
+        0.0017763568394002505,
+        0.0019860273225978187,
+        0.002220446049250313,
+        0.002482534153247273,
+        0.0027755575615628914,
+        0.0031031676915590912,
+        0.003469446951953614,
+        0.003878959614448864,
+        0.004336808689942018,
+        0.004848699518061081,
+        0.005421010862427522,
+        0.00606087439757635,
+        0.006776263578034403,
+        0.007576092996970438,
+        0.008470329472543003,
+        0.009470116246213047,
+        0.010587911840678754,
+        0.01183764530776631,
+        0.013234889800848443,
+        0.014797056634707886,
+        0.016543612251060553,
+        0.018496320793384858,
+        0.02067951531382569,
+        0.02312040099173107,
+        0.025849394142282114,
+        0.028900501239663836,
+        0.03231174267785264
+      ],
+      "kind": "equivolume_diameter",
+      "unit": "meter"
+    },
+    {
+      "coordinates": [
+        190.0,
+        230.0,
+        260.0,
+        273.15
+      ],
+      "kind": "temperature",
+      "unit": "kelvin"
+    },
+    {
+      "coordinates": [
+        1.5,
+        1.6055648176571813,
+        1.7516530197761586,
+        1.9538204015989735,
+        2.233594193597626,
+        2.620765328642081,
+        3.156560646497779,
+        3.898032819011689,
+        4.924135444941254,
+        6.344130203975579,
+        8.30922128232486,
+        11.028655929276663,
+        14.792005567632435,
+        20.0,
+        27.394375822523575,
+        37.70096436433989,
+        52.06671610862251,
+        72.0902983386734,
+        100.0,
+        131.80095637754007,
+        173.84034177584655,
+        229.41445419202336,
+        302.8808462808638,
+        400.0,
+        514.1841829192471,
+        661.0635639550661,
+        850.0,
+        917.0
+      ],
+      "kind": "bulk_density",
+      "unit": "kilogram_per_cubic_meter"
+    },
+    {
+      "coordinates": [
+        0.1,
+        0.4,
+        0.7,
+        1.0
+      ],
+      "kind": "minor_to_major_axis_ratio",
+      "unit": "unitless_fraction"
+    },
+    {
+      "coordinates": [
+        2800000000.0
+      ],
+      "kind": "frequency",
+      "unit": "hertz"
+    },
+    {
+      "coordinates": [
+        -0.5,
+        0.9,
+        4.5,
+        10.0,
+        20.0
+      ],
+      "kind": "radar_elevation",
+      "unit": "degree"
+    }
+  ],
+  "crate_validation_status": "research_only_unvalidated",
+  "environment_report_file": "environment.json",
+  "environment_report_sha256": "ea4fd9324350cfb2819bb1fef53f251c61bb887a0fa63d7963666d22d03482c7",
+  "generation_effective_worker_count": 12,
+  "generation_worker_limit": 12,
+  "generator": {
+    "executable": "crates/radar_scattering/tools/pytmatrix-0.3.3/generate_lut.py",
+    "name": "bowecho-pytmatrix-research-generator",
+    "package_versions": {
+      "numpy": "1.26.4",
+      "pytmatrix": "0.3.3",
+      "scipy": "1.11.4",
+      "setuptools": "59.8.0"
+    },
+    "python_version": "3.11.9",
+    "source_revision": "sha256:75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
+    "version": "1.0.0"
+  },
+  "generator_config_sha256": "c2b973ab36fa26edb8d9d82f7dbb2ae5df52feec4bf93c880e304cad5aa2ff49",
+  "grid_point_count": 132160,
+  "isolated_solver_process_count": 112,
+  "lut_byte_length": 9527106,
+  "lut_file": "table.lut",
+  "lut_header_json_byte_length": 11572,
+  "lut_header_json_sha256": "bbf8b36d931f38ae127618b654f8efb33fc1f8c938691f1e8f71f296e5bde70b",
+  "lut_sha256": "7a563e1103cb1a61ccb94ce72513d82b9fdd68a6faddb4aa8ae46112fb0109c0",
+  "maximum_solver_points_per_process": 1180,
+  "payload_byte_length": 9515520,
+  "payload_sha256": "35556bcec49bd36068455d7c1c344e009222f0c52649313446e0171f40354fc5",
+  "production_activation": false,
+  "schema": 1,
+  "science": {
+    "kernel": {
+      "implementation": {
+        "implementation": "pytmatrix_0_3_3"
+      },
+      "model": "t_matrix"
+    },
+    "melting": {
+      "model": "dry"
+    },
+    "orientation": {
+      "mean_deg": 0.0,
+      "model": "gaussian_canting",
+      "quadrature_points": 50,
+      "standard_deviation_deg": 20.0
+    },
+    "temporal": {
+      "sampling": "instantaneous"
+    },
+    "validation": {
+      "status": "research_only_unvalidated"
+    }
+  },
+  "scope": {
+    "density_applicability": "bulk_density_1p5_to_917_kg_m3_downward_fall_requires_density_above_1p225_kg_m3_air",
+    "extrapolation": "forbidden",
+    "ishmael_coverage": false,
+    "microphysics_family": "property_aware_p3_ishmael",
+    "p3_coverage": false,
+    "p3_ishmael_style_closed_state_coordinate_coverage": true,
+    "phase_regime": "dry",
+    "psd": "characteristic_particle_monodisperse_node_normalized_to_exactly_1_per_m3",
+    "radar_view": "ppi_beam_elevation_minus0p5_to_20_axisymmetric_gaussian_odf_not_general_body_frame",
+    "rime_axes_explicit": false,
+    "rime_effect_on_dielectric": "none_given_bulk_density",
+    "rime_mapping": "not_explicit_rime_influences_only_through_bulk_density_and_shape",
+    "scheme_native_psd_coverage": false,
+    "source_closed_state_families": [
+      "p3",
+      "ishmael"
+    ]
+  },
+  "solver_failures": [],
+  "table_id": "property-p3-ishmael-dry-prolate-sband-pytmatrix-0.3.3-unvalidated-v1",
+  "tool_file_sha256": {
+    "Dockerfile": "b747657bc43a638d0aa638fb31d2089a5e459569c3228098483ed68f907bbc62",
+    "FAILURE_RECORD.md": "9add818971596ed8fd9dbf4c2d1e46849b28c87321cf69bff7564fd3dbe8edd7",
+    "README.md": "71af22000c2d4cbbd02a868a749300f1d85a7ab048b5187d4180af58e1aa34bf",
+    "emitter/Cargo.lock": "450a54baf04fd9adbb710181add46583b1ae1ded8669b1ce85a69eda50e3c6dc",
+    "emitter/Cargo.toml": "6b93d4b0d27e3773fa48001d1321f59eb7dc30f1e196e72accbeec938f2088a5",
+    "emitter/src/bin/validate_tmatrix_lut.rs": "00c39c4c1c950b42f7cf31aa974bf90508cad86dafe75eafa97556f212b3c173",
+    "emitter/src/main.rs": "47615ca581798d118abc14e794c4f0e0b817704581036be363aa0bf9f416e10e",
+    "generate_lut.py": "75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
+    "generator_config.example.json": "868231be3d01eeaae4225650e36c9592f3eb8e711e693ccfae868e59e5b72dbb",
+    "requirements-bootstrap-pinned.txt": "c01ccf75c8634abd7c32f6ae203a64a8bf7e090b0b4f61aa9e7e5c69fd556184",
+    "requirements-pytmatrix-pinned.txt": "d754b6589041548bbb2fbb3c3aae49b17252b1f35629b5f8bef91ab0e24f3f72",
+    "run_all.ps1": "4e9702273f2e92595987ff57ac84bb3dd299a4aa67a321a5f802c9d0442ea841",
+    "toolchain.json": "84befbbe97d9c87e0aa73da6e001a8b2f034a5441f95d2a8df88ada56931c222"
+  },
+  "validation_claim": "No independent scientific validation. Separate direct-PyTMatrix held-out nodes test generator/LUT interpolation only."
+}

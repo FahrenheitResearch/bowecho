@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SEED = "bowecho-pytmatrix-0.3.3-post-grid-heldout-v4-refined-v9-final"
+SEED = "bowecho-pytmatrix-0.3.3-post-grid-heldout-v5-refined-v10-final"
 CONVENTIONAL_ASSET_DIRECTORIES = (
     "conventional_liquid_rain_sband_unvalidated",
     "conventional_dry_ice_spheroids_sband_unvalidated",

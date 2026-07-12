@@ -2505,10 +2505,10 @@ fn verify_execution(
                 &grouping.partial_group_policy,
                 "reject_entire_lut",
             )?;
-            if grouping.maximum_points_per_process != 2048 {
+            if !matches!(grouping.maximum_points_per_process, 2048 | 4096) {
                 return invalid(
                     "execution.grouping.maximum_points_per_process",
-                    "must be exactly 2048",
+                    "must be exactly 2048 or 4096",
                 );
             }
             if grouping.group_timeout_seconds != 3600 {
@@ -3457,6 +3457,19 @@ mod tests {
             .material_state_axis_kinds
             .swap(0, 1);
         assert!(verify_execution(changed, &wet_material_for_execution()).is_err());
+        let mut expanded = grouped_wet_execution();
+        expanded
+            .grouping
+            .as_mut()
+            .unwrap()
+            .maximum_points_per_process = 4096;
+        assert!(matches!(
+            verify_execution(expanded, &wet_material_for_execution()).unwrap(),
+            TMatrixExecutionDescriptor::FreshProcessPerMaterialStateGroup {
+                maximum_points_per_process: 4096,
+                ..
+            }
+        ));
         let mut changed = grouped_wet_execution();
         changed
             .grouping

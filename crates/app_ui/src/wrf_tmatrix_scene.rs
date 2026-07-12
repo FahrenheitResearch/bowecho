@@ -107,6 +107,13 @@ const DRY_OBLATE_DIAMETER_M: &[f64] = &[
     0.06310887241768094,
     0.06672950816259267,
     0.06861699195817748,
+    0.0688596010077363,
+    0.069102210057295124,
+    0.069344819106853944,
+    0.06958742815641276,
+    0.069830037205971585,
+    0.0700726462555304,
+    0.070315255305089225,
     0.07055786435464804,
     0.07255363548030914,
     0.07460585817834214,
@@ -278,7 +285,64 @@ const WET_PROLATE_DIAMETER_M: &[f64] = &[
     0.0063,
 ];
 const DRY_TEMPERATURE_K: &[f64] = &[190.0, 230.0, 260.0, 273.15];
-const DRY_BULK_DENSITY_KG_M3: &[f64] = &[
+const DRY_OBLATE_BULK_DENSITY_KG_M3: &[f64] = &[
+    1.5,
+    1.5527824088285906,
+    1.6055648176571813,
+    1.67860891871667,
+    1.7516530197761586,
+    1.8527367106875661,
+    1.9538204015989735,
+    2.0937072975983,
+    2.233594193597626,
+    2.4271797611198536,
+    2.620765328642081,
+    2.88866298756993,
+    3.156560646497779,
+    3.527296732754734,
+    3.898032819011689,
+    4.4110841319764713,
+    4.924135444941254,
+    5.6341328244584172,
+    6.344130203975579,
+    7.3266757431502194,
+    8.30922128232486,
+    9.6689386058007614,
+    11.028655929276663,
+    12.91033074845455,
+    14.792005567632435,
+    17.396002783816218,
+    20.0,
+    23.697187911261786,
+    27.394375822523575,
+    32.547670093431734,
+    37.70096436433989,
+    44.8838402364812,
+    52.06671610862251,
+    62.078507223647961,
+    72.0902983386734,
+    86.0451491693367,
+    100.0,
+    115.90047818877004,
+    131.80095637754007,
+    152.82064907669331,
+    173.84034177584655,
+    201.62739798393494,
+    229.41445419202336,
+    266.14765023644361,
+    302.8808462808638,
+    351.4404231404319,
+    400.0,
+    457.09209145962353,
+    514.1841829192471,
+    587.62387343715659,
+    661.0635639550661,
+    755.531781977533,
+    850.0,
+    883.5,
+    917.0,
+];
+const DRY_PROLATE_BULK_DENSITY_KG_M3: &[f64] = &[
     1.5,
     1.6055648176571813,
     1.7516530197761586,
@@ -308,7 +372,8 @@ const DRY_BULK_DENSITY_KG_M3: &[f64] = &[
     850.0,
     917.0,
 ];
-const FROZEN_MINOR_TO_MAJOR: &[f64] = &[0.1, 0.4, 0.7, 1.0];
+const DRY_OBLATE_MINOR_TO_MAJOR: &[f64] = &[0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0];
+const FROZEN_COARSE_MINOR_TO_MAJOR: &[f64] = &[0.1, 0.4, 0.7, 1.0];
 const WET_TEMPERATURE_K: &[f64] = &[269.15, 273.15, 275.15];
 const WET_CONDENSED_VOLUME_FRACTION: &[f64] = &[
     0.0015,
@@ -380,14 +445,22 @@ const RAIN_DIAMETER_M: &[f64] = &[
     0.006480740698407861,
     0.00673536820737033,
     0.006866409356540893,
+    0.0068747185511922075,
+    0.0068830277458435223,
+    0.006891336940494837,
+    0.006899646135146152,
+    0.0069079553297974666,
+    0.0069162645244487814,
+    0.0069245737191000961,
     0.006932882913751411,
     0.006966360627778315,
     0.007,
 ];
 const RAIN_TEMPERATURE_K: &[f64] = &[250.0, 269.15, 293.15, 313.15];
-const RAIN_MINOR_TO_MAJOR: &[f64] = &[0.5, 0.7, 0.85, 1.0];
+const RAIN_MINOR_TO_MAJOR: &[f64] = &[0.5, 0.6, 0.7, 0.775, 0.85, 0.925, 1.0];
 const PROPERTY_FREQUENCY_HZ: &[f64] = &[2800000000.0];
-const PROPERTY_RADAR_ELEVATION_DEG: &[f64] = &[-0.5, 0.9, 4.5, 10.0, 20.0];
+const FROZEN_RADAR_ELEVATION_DEG: &[f64] = &[-0.5, 0.9, 4.5, 10.0, 20.0];
+const RAIN_RADAR_ELEVATION_DEG: &[f64] = &[-0.5, 0.2, 0.9, 2.7, 4.5, 7.25, 10.0, 15.0, 20.0];
 const PROPERTY_SOLVER_DDELT: f64 = 0.001;
 const DRY_OBLATE_SOLVER_NDGS: u32 = 14;
 const DRY_PROLATE_SOLVER_NDGS: u32 = 14;
@@ -1709,8 +1782,13 @@ fn validate_bundle(
             return Err(WrfTMatrixBundleError::SharedFrequencyAxis { role });
         }
         let elevations = axis_coordinates(table, role, AxisKind::RadarElevation)?;
-        if elevations != reference_elevations {
-            return Err(WrfTMatrixBundleError::SharedElevationAxis { role });
+        if elevations.first() != reference_elevations.first()
+            || elevations.last() != reference_elevations.last()
+        {
+            return Err(WrfTMatrixBundleError::ElevationRange {
+                role,
+                actual: elevations.to_vec(),
+            });
         }
     }
 
@@ -1769,17 +1847,21 @@ fn exact_axis_coordinates(role: WrfTMatrixTableRole, kind: AxisKind) -> Option<&
             WrfTMatrixTableRole::DryOblate | WrfTMatrixTableRole::DryProlate,
             AxisKind::Temperature,
         ) => Some(DRY_TEMPERATURE_K),
+        (WrfTMatrixTableRole::DryOblate, AxisKind::BulkDensity) => {
+            Some(DRY_OBLATE_BULK_DENSITY_KG_M3)
+        }
+        (WrfTMatrixTableRole::DryProlate, AxisKind::BulkDensity) => {
+            Some(DRY_PROLATE_BULK_DENSITY_KG_M3)
+        }
+        (WrfTMatrixTableRole::DryOblate, AxisKind::MinorToMajorAxisRatio) => {
+            Some(DRY_OBLATE_MINOR_TO_MAJOR)
+        }
         (
-            WrfTMatrixTableRole::DryOblate | WrfTMatrixTableRole::DryProlate,
-            AxisKind::BulkDensity,
-        ) => Some(DRY_BULK_DENSITY_KG_M3),
-        (
-            WrfTMatrixTableRole::DryOblate
-            | WrfTMatrixTableRole::DryProlate
+            WrfTMatrixTableRole::DryProlate
             | WrfTMatrixTableRole::WetOblate
             | WrfTMatrixTableRole::WetProlate,
             AxisKind::MinorToMajorAxisRatio,
-        ) => Some(FROZEN_MINOR_TO_MAJOR),
+        ) => Some(FROZEN_COARSE_MINOR_TO_MAJOR),
         (
             WrfTMatrixTableRole::WetOblate | WrfTMatrixTableRole::WetProlate,
             AxisKind::Temperature,
@@ -1802,7 +1884,10 @@ fn exact_axis_coordinates(role: WrfTMatrixTableRole, kind: AxisKind) -> Option<&
             Some(RAIN_MINOR_TO_MAJOR)
         }
         (_, AxisKind::Frequency) => Some(PROPERTY_FREQUENCY_HZ),
-        (_, AxisKind::RadarElevation) => Some(PROPERTY_RADAR_ELEVATION_DEG),
+        (WrfTMatrixTableRole::RainStandaloneAndResidual, AxisKind::RadarElevation) => {
+            Some(RAIN_RADAR_ELEVATION_DEG)
+        }
+        (_, AxisKind::RadarElevation) => Some(FROZEN_RADAR_ELEVATION_DEG),
         _ => None,
     }
 }
@@ -2298,9 +2383,9 @@ mod tests {
     }
 
     #[test]
-    fn v9_exact_axis_coordinate_counts_are_frozen() {
+    fn final_property_bundle_exact_axis_coordinate_counts_are_frozen() {
         for (role, expected_counts) in [
-            (WrfTMatrixTableRole::DryOblate, &[73, 4, 28, 4, 1, 5][..]),
+            (WrfTMatrixTableRole::DryOblate, &[80, 4, 55, 7, 1, 5][..]),
             (WrfTMatrixTableRole::DryProlate, &[59, 4, 28, 4, 1, 5][..]),
             (
                 WrfTMatrixTableRole::WetOblate,
@@ -2312,7 +2397,7 @@ mod tests {
             ),
             (
                 WrfTMatrixTableRole::RainStandaloneAndResidual,
-                &[37, 4, 4, 1, 5][..],
+                &[44, 4, 7, 1, 9][..],
             ),
         ] {
             let kinds = match role {

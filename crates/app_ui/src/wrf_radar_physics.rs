@@ -6,9 +6,10 @@
 //! species in linear scattering space, and derive polarimetric observables
 //! only after accumulation.  Rain oblateness uses the Brandes et al. drop
 //! axis-ratio polynomial.  The approximation does not resolve particle
-//! orientation distributions, detailed melting-layer physics, Mie resonance,
-//! or scheme-native particle-property categories.  P3 and ISHMAEL therefore
-//! remain explicitly unsupported until property-aware scattering is added.
+//! orientation distributions, detailed melting-layer physics, resonance, or
+//! scheme-native particle-property categories. P3 and ISHMAEL therefore stay
+//! unsupported by this *bulk* kernel; BowEcho's separate opt-in property-aware
+//! T-matrix path owns those inputs and fails closed instead of entering here.
 
 use std::collections::HashSet;
 use std::f64::consts::PI;

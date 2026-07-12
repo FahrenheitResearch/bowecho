@@ -36,7 +36,7 @@ class GeneratorContractTests(unittest.TestCase):
             counts[config["table_id"]] = len(list(GENERATOR.point_coordinates(config)))
         self.assertEqual(
             sorted(counts.values()),
-            [48, 87, 1400, 2960, 132160, 163520, 864000, 1017600],
+            [48, 87, 5103, 11088, 132160, 616000, 864000, 1017600],
         )
 
     def test_parallel_group_generation_restores_flat_grid_order(self):

@@ -1,0 +1,105 @@
+{
+  "schema": 1,
+  "protocol_id": "pytmatrix-0.3.3-refined-grid-v10-cross-cell-design-v1",
+  "classification": "predeclared_grid_design_protocol_not_validation",
+  "scientifically_independent": false,
+  "production_validation": false,
+  "parent_v9_failure": {
+    "nodes_file": "refined_grid_v9_post_freeze_held_out_nodes.json",
+    "nodes_sha256": "b49119bdd75aa443c71cc1fb9e0f5c9066242982ee99cd775319d196f3de2f3f",
+    "report_file": "refined_grid_v9_post_freeze_held_out_failure_report.json",
+    "report_sha256": "162d1102503dbf4ddbe06cbb26c6713f1fb89778f826a6626cb9609fa714f451",
+    "use": "development_regression_and_grid_design_only"
+  },
+  "initial_refinement_rule": "For each v9 table with a failed held-out node, insert only the arithmetic midpoint of that node's containing equivolume-diameter interval. Do not insert any held-out coordinate and do not change a non-diameter axis.",
+  "initial_refinements": [
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "v9_config_sha256": "4e9240d544556f79e255dfa4dad44a0ef825c2803cd36f94154211a06c7fbcdb",
+      "initial_v10_config_sha256": "55491cf2969f0303874ff9f5c35049179c764432243ddc00272d2584a590b07f",
+      "parent_diameter_interval": [0.042483168303251675, 0.0443722221348087],
+      "inserted_midpoint": 0.043427695219030185,
+      "added_cartesian_grid_point_count": 25
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "v9_config_sha256": "0dc4ca0c648c386f923de3155103aaa806e1c2234959cd44b19a55a129200bff",
+      "initial_v10_config_sha256": "430818790684a47cb0fa9b962fedf8cf4ca7891db76cc5de5192b6c5fb4a6a54",
+      "parent_diameter_interval": [0.06861699195817748, 0.07055786435464804],
+      "inserted_midpoint": 0.06958742815641276,
+      "added_cartesian_grid_point_count": 2240
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "v9_config_sha256": "b6ac330212174ce863ee14abe94bb3347c6ae208913a760cead418c6d67d879d",
+      "initial_v10_config_sha256": "8cbe66652038440b05c087b6402e9d08abc598f894802f478a26935b6b16fcfc",
+      "parent_diameter_interval": [0.006866409356540893, 0.006932882913751411],
+      "inserted_midpoint": 0.006899646135146152,
+      "added_cartesian_grid_point_count": 80
+    }
+  ],
+  "cross_cell_audit": {
+    "selection_seed": "bowecho-pytmatrix-0.3.3-refined-v10-cross-cell-design-v1",
+    "diameter_scope": "Every current diameter leaf wholly contained in each identified v9 parent diameter interval.",
+    "other_axis_scope": "The Cartesian product of every interval on every other nonsingleton configured axis.",
+    "sample_count_per_cross_cell": 3,
+    "base_within_cell_fractions": [0.2, 0.5, 0.8],
+    "permutation_rule": "For each axis interval independently, SHA-256 of seed, candidate config SHA-256, table ID, axis kind, lower float.hex(), and upper float.hex() selects one of the six lexicographic permutations. Sample k uses element k. The hash never changes a fraction and never depends on scattering output.",
+    "initial_cross_cell_combo_counts_excluding_diameter_child": {
+      "conventional_wet_hail_sband_unvalidated": 16,
+      "property_p3_ishmael_dry_oblate_sband_unvalidated": 972,
+      "property_rain_sband_unvalidated": 36
+    },
+    "initial_direct_sample_count": 6144,
+    "relative_budgets": {
+      "zh": 0.15,
+      "zv": 0.15,
+      "hh_vv_covariance_real": 0.15,
+      "hh_vv_covariance_imaginary": 0.15,
+      "kdp": 0.15,
+      "ah": 0.15,
+      "av": 0.15,
+      "fall_speed_first_moment": 0.2,
+      "fall_speed_second_moment": 0.2
+    },
+    "absolute_floor": 1e-12,
+    "worker_limit": 12
+  },
+  "v9_regression_rule": "Recompute and interpolate the three exact failed v9 development nodes against every candidate. Each must satisfy the same 15 percent electromagnetic and 20 percent fall-moment design budgets. These known nodes are never final validation.",
+  "recursive_diameter_rule": {
+    "operation": "After a complete audit, bisect only diameter leaves containing one or more failing cross-cell or v9-regression samples, using exact arithmetic midpoints.",
+    "maximum_depth_relative_to_v9_parent": 3,
+    "complete_rerun_required_after_each_refinement": true
+  },
+  "non_diameter_fallback": {
+    "trigger": "A complete depth-3 diameter-only audit still fails.",
+    "implicated_intervals": "For every failing cross-cell, collect its non-diameter intervals by axis.",
+    "candidate_subsets": "Enumerate every nonempty subset of implicated nonsingleton non-diameter axes, at most 15 because the largest table has four such axes. For a chosen axis, insert the arithmetic midpoint of every unique implicated interval on that axis.",
+    "selection": "Run the complete audit for every candidate. Select a passing candidate with the smallest total Cartesian grid-point count; ties use lexicographic subset order induced by the configured axis order. Rerun the complete audit once more on the selected bytes.",
+    "failure": "If no candidate passes, refined v10 is rejected."
+  },
+  "solver_freeze_rule": {
+    "recompute": [
+      "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "property_rain_sband_unvalidated"
+    ],
+    "reuse_by_exact_hash_and_report_reference": [
+      "property_p3_ishmael_dry_prolate_sband_unvalidated",
+      "property_p3_ishmael_wet_oblate_sband_unvalidated",
+      "property_p3_ishmael_wet_prolate_sband_unvalidated"
+    ],
+    "reused_v9_report_sha256": "352e259f02b606ac71579b7d3b4591c3088b41f8e74becd949a27e5721030067",
+    "comparison_solver_ndgs": [12, 14],
+    "require_truthful_composite_report": true
+  },
+  "final_held_out_rule": {
+    "selection_seed": "bowecho-pytmatrix-0.3.3-post-grid-heldout-v5-refined-v10-final",
+    "nodes_per_table": 6,
+    "diameter_quantiles": [0.08, 0.24, 0.4, 0.58, 0.76, 0.92],
+    "scattering_component_relative_threshold": 0.5,
+    "fall_moment_relative_threshold": 0.75,
+    "selection_count": 1,
+    "reroll_forbidden": true,
+    "failure_disposition": "Reject v10 and begin v11."
+  }
+}

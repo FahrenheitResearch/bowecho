@@ -1,0 +1,138 @@
+{
+  "schema": 1,
+  "stage_id": "refined-grid-v10-diameter-depth2-integrity-v1",
+  "classification": "frozen_recursive_grid_design_stage_not_validation",
+  "protocol_sha256": "666f19fea907d2f4479b38ed0604f78c1472ef2898728d298e4d0f4c8dd53fbe",
+  "audit_source_sha256": "82552b8a676bd3348b15bcc7e603e7f87b9e58c99c30a78a30d1e0944e58b3fe",
+  "generator_source_sha256": "75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
+  "environment_report_sha256": "ea4fd9324350cfb2819bb1fef53f251c61bb887a0fa63d7963666d22d03482c7",
+  "prior_audit_report_file": "refined_grid_v10_cross_cell_design_audit_depth1_report.json",
+  "prior_audit_report_sha256": "ab3bdec36e1c6a09047d482dff0582c0a406f8761ba101305bc8c45887f6ee59",
+  "prior_audit_disposition": "The legacy depth-1 run is internally consistent: all three initial config hashes and 6144 samples match its predeclared protocol, and the live config salt at that stage equals the now-permanent initial-v10 salt.",
+  "expected_output_filename": "refined_grid_v10_cross_cell_design_audit_depth2_integrity_report.json",
+  "expected_total_cross_cell_count": 4096,
+  "expected_total_cross_cell_sample_count": 12288,
+  "expected_accumulated_prior_failure_count": 5620,
+  "tables": [
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "config_sha256": "b03a19c9e1b4f7f122f3b55cd8a6b7970c2ea1f9e566f08b74c04a32d5ee3045",
+      "split_parent_leaves": [
+        {
+          "lower": 0.042483168303251675,
+          "upper": 0.043427695219030185
+        },
+        {
+          "lower": 0.043427695219030185,
+          "upper": 0.0443722221348087
+        }
+      ],
+      "diameter_leaves": [
+        {
+          "lower": 0.042483168303251675,
+          "upper": 0.04295543176114093,
+          "depth": 2
+        },
+        {
+          "lower": 0.04295543176114093,
+          "upper": 0.043427695219030185,
+          "depth": 2
+        },
+        {
+          "lower": 0.043427695219030185,
+          "upper": 0.04389995867691944,
+          "depth": 2
+        },
+        {
+          "lower": 0.04389995867691944,
+          "upper": 0.0443722221348087,
+          "depth": 2
+        }
+      ],
+      "other_axis_interval_combo_count": 16,
+      "cross_cell_count": 64,
+      "cross_cell_sample_count": 192,
+      "accumulated_prior_failure_count": 83
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "config_sha256": "80f4e402926dfa19d5a5ee7ec6bd72e0d4012b5fa909bf8beab253138ec399e6",
+      "split_parent_leaves": [
+        {
+          "lower": 0.06861699195817748,
+          "upper": 0.06958742815641276
+        },
+        {
+          "lower": 0.06958742815641276,
+          "upper": 0.07055786435464804
+        }
+      ],
+      "diameter_leaves": [
+        {
+          "lower": 0.06861699195817748,
+          "upper": 0.06910221005729512,
+          "depth": 2
+        },
+        {
+          "lower": 0.06910221005729512,
+          "upper": 0.06958742815641276,
+          "depth": 2
+        },
+        {
+          "lower": 0.06958742815641276,
+          "upper": 0.0700726462555304,
+          "depth": 2
+        },
+        {
+          "lower": 0.0700726462555304,
+          "upper": 0.07055786435464804,
+          "depth": 2
+        }
+      ],
+      "other_axis_interval_combo_count": 972,
+      "cross_cell_count": 3888,
+      "cross_cell_sample_count": 11664,
+      "accumulated_prior_failure_count": 5404
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "config_sha256": "7267d2092cd65dbeb23ca49b3b47046796fbd90c482dc388de3977aac5d61ad7",
+      "split_parent_leaves": [
+        {
+          "lower": 0.006866409356540893,
+          "upper": 0.006899646135146152
+        },
+        {
+          "lower": 0.006899646135146152,
+          "upper": 0.006932882913751411
+        }
+      ],
+      "diameter_leaves": [
+        {
+          "lower": 0.006866409356540893,
+          "upper": 0.006883027745843522,
+          "depth": 2
+        },
+        {
+          "lower": 0.006883027745843522,
+          "upper": 0.006899646135146152,
+          "depth": 2
+        },
+        {
+          "lower": 0.006899646135146152,
+          "upper": 0.006916264524448781,
+          "depth": 2
+        },
+        {
+          "lower": 0.006916264524448781,
+          "upper": 0.006932882913751411,
+          "depth": 2
+        }
+      ],
+      "other_axis_interval_combo_count": 36,
+      "cross_cell_count": 144,
+      "cross_cell_sample_count": 432,
+      "accumulated_prior_failure_count": 133
+    }
+  ]
+}

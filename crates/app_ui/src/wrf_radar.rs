@@ -1201,6 +1201,76 @@ impl WrfRadarFields {
     }
 }
 
+fn remaining_property_tmatrix_build_budget_bytes(
+    config: &SyntheticRadarConfig,
+    fields: &WrfRadarFields,
+    expected_cells: usize,
+    reserved_memory_bytes: usize,
+) -> Result<usize, String> {
+    let budget_bytes = config
+        .temporal_memory_budget_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "Simulated-radar memory budget overflows address space".to_string())?;
+    checked_property_tmatrix_build_remainder(
+        budget_bytes,
+        fields.base_retained_bytes_without_property_scattering(),
+        if config.spectrum_width {
+            expected_cells
+        } else {
+            0
+        },
+        app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes(),
+        reserved_memory_bytes,
+        minimum_property_tmatrix_owned_peak_bytes(expected_cells)?,
+    )
+}
+
+fn minimum_property_tmatrix_owned_peak_bytes(expected_cells: usize) -> Result<usize, String> {
+    // The raw source always owns dense temperature and air-density f32 planes.
+    // While that source is retained, the scattering scene must also allocate
+    // one dense u32 full-cell -> sparse-row map. Sparse categories, additive
+    // output rows, provenance, and worker scratch only increase this bound.
+    let unavoidable_dense_bytes = expected_cells
+        .checked_mul(2 * std::mem::size_of::<f32>() + std::mem::size_of::<u32>())
+        .ok_or_else(|| "Property T-matrix minimum source-memory estimate overflowed".to_string())?;
+    unavoidable_dense_bytes
+        .checked_add(std::mem::size_of::<
+            app_ui::wrf_property_reader::WrfPropertyScene,
+        >())
+        .and_then(|value| {
+            value.checked_add(std::mem::size_of::<
+                app_ui::wrf_tmatrix_scene::WrfTMatrixScene,
+            >())
+        })
+        .ok_or_else(|| "Property T-matrix minimum source-memory estimate overflowed".to_string())
+}
+
+fn checked_property_tmatrix_build_remainder(
+    budget_bytes: usize,
+    retained_field_bytes: usize,
+    spectrum_width_bytes: usize,
+    embedded_lut_bytes: usize,
+    reserved_memory_bytes: usize,
+    minimum_owned_peak_bytes: usize,
+) -> Result<usize, String> {
+    let current_base_bytes = retained_field_bytes
+        .checked_add(spectrum_width_bytes)
+        .and_then(|value| value.checked_add(embedded_lut_bytes))
+        .and_then(|value| value.checked_add(reserved_memory_bytes))
+        .ok_or_else(|| "Property T-matrix build-memory reservation overflowed".to_string())?;
+    let remaining = budget_bytes.checked_sub(current_base_bytes).unwrap_or(0);
+    if remaining >= minimum_owned_peak_bytes {
+        Ok(remaining)
+    } else {
+        Err(format!(
+            "Property T-matrix raw read and dense lookup need at least {:.2} GiB after retained fields, tables, outputs, and cache, but only {:.2} GiB remains inside the configured {:.2} GiB budget",
+            minimum_owned_peak_bytes as f64 / 1024.0_f64.powi(3),
+            remaining as f64 / 1024.0_f64.powi(3),
+            budget_bytes as f64 / 1024.0_f64.powi(3),
+        ))
+    }
+}
+
 /// Read the WRF 3-D reflectivity + earth-relative winds + height for one time.
 ///
 /// Reflectivity: `REFL_10CM` (the model's own Thompson 10-cm reflectivity) when
@@ -1385,6 +1455,15 @@ fn read_wrf_radar_fields_for_config_reporting(
                 "Property T-matrix research mode requires S-band dual polarization".to_string(),
             );
         }
+        let maximum_owned_peak_bytes = remaining_property_tmatrix_build_budget_bytes(
+            config,
+            &fields,
+            expected,
+            reserved_memory_bytes,
+        )?;
+        progress("validating embedded property T-matrix tables…");
+        app_ui::wrf_tmatrix_assets::preload_embedded_property_tmatrix_luts()
+            .map_err(|error| format!("preload embedded property T-matrix bundle: {error}"))?;
         progress("reading native P3/ISHMAEL property state…");
         let property_scene = app_ui::wrf_property_reader::read_wrf_property_scene(
             file,
@@ -1404,25 +1483,6 @@ fn read_wrf_radar_fields_for_config_reporting(
             .map(app_ui::wrf_property_reader::SourceFieldProvenance::source_name)
             .collect::<Vec<_>>()
             .join(",");
-        let budget_bytes = config
-            .temporal_memory_budget_mib
-            .checked_mul(1024 * 1024)
-            .ok_or_else(|| "Simulated-radar memory budget overflows address space".to_string())?;
-        let current_base_bytes = fields
-            .base_retained_bytes_without_property_scattering()
-            .checked_add(if config.spectrum_width { expected } else { 0 })
-            .and_then(|value| {
-                value.checked_add(app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes())
-            })
-            .and_then(|value| value.checked_add(reserved_memory_bytes))
-            .ok_or_else(|| "Property T-matrix build-memory reservation overflowed".to_string())?;
-        let maximum_owned_peak_bytes = budget_bytes.checked_sub(current_base_bytes).ok_or_else(|| {
-            format!(
-                "Property T-matrix build has no memory remaining inside the configured {:.2} GiB budget after {:.2} GiB of retained fields, tables, outputs, and cache",
-                budget_bytes as f64 / 1024.0_f64.powi(3),
-                current_base_bytes as f64 / 1024.0_f64.powi(3),
-            )
-        })?;
         progress("evaluating property T-matrix scene…");
         let built = app_ui::wrf_tmatrix_assets::build_embedded_property_tmatrix_scene(
             &property_scene,
@@ -3771,15 +3831,6 @@ fn build_synthetic_from_paths(
     tx: &Sender<SyntheticRadarMessage>,
 ) -> Result<SyntheticRadarOutput, String> {
     config.validate_science_contract()?;
-    if matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
-        return Err(
-            "Property T-matrix research mode is not available until its exact LUT evaluator is connected; BowEcho refused to substitute the bulk Rayleigh kernel"
-                .to_string(),
-        );
-    }
     if paths.is_empty() {
         return Err("No WRF files selected".to_string());
     }
@@ -3895,7 +3946,11 @@ fn build_synthetic_from_paths(
         ) {
             Ok(fields) => fields,
             Err(error) => {
-                notes.push(format!("{name} time {timeidx}: {error}"));
+                record_or_propagate_scene_failure(
+                    config,
+                    &mut notes,
+                    format!("{name} time {timeidx}: {error}"),
+                )?;
                 continue;
             }
         };
@@ -3908,7 +3963,11 @@ fn build_synthetic_from_paths(
             match try_build_synthetic_volume_reporting(&fields, valid_time, config, &progress) {
                 Ok(volume) => volume,
                 Err(error) => {
-                    notes.push(format!("{name} time {timeidx}: {error}"));
+                    record_or_propagate_scene_failure(
+                        config,
+                        &mut notes,
+                        format!("{name} time {timeidx}: {error}"),
+                    )?;
                     continue;
                 }
             };
@@ -3957,6 +4016,22 @@ fn build_synthetic_from_paths(
         notes,
         config_fingerprint,
     })
+}
+
+fn record_or_propagate_scene_failure(
+    config: &SyntheticRadarConfig,
+    notes: &mut Vec<String>,
+    message: String,
+) -> Result<(), String> {
+    if matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        Err(message)
+    } else {
+        notes.push(message);
+        Ok(())
+    }
 }
 
 fn build_temporal_synthetic_from_scenes(
@@ -4063,11 +4138,15 @@ fn build_temporal_synthetic_from_scenes(
         ) {
             Ok(fields) => fields,
             Err(error) => {
-                notes.push(format!(
-                    "{} time {}: {error}",
-                    display_name(&scene.path),
-                    scene.time_index
-                ));
+                record_or_propagate_scene_failure(
+                    config,
+                    &mut notes,
+                    format!(
+                        "{} time {}: {error}",
+                        display_name(&scene.path),
+                        scene.time_index
+                    ),
+                )?;
                 continue;
             }
         };
@@ -4627,6 +4706,41 @@ fn display_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn property_build_budget_reserves_every_owned_category_before_raw_read() {
+        assert_eq!(
+            checked_property_tmatrix_build_remainder(1_000, 100, 200, 300, 50, 300).unwrap(),
+            350
+        );
+        assert!(checked_property_tmatrix_build_remainder(650, 100, 200, 300, 50, 1).is_err());
+        assert!(checked_property_tmatrix_build_remainder(651, 100, 200, 300, 50, 2).is_err());
+        assert!(
+            checked_property_tmatrix_build_remainder(usize::MAX, usize::MAX, 1, 0, 0, 1,).is_err()
+        );
+    }
+
+    #[test]
+    fn property_scene_failures_propagate_while_bulk_failures_remain_skippable() {
+        let mut research = SyntheticRadarConfig::default();
+        research.polarimetric_kernel = PolarimetricKernel::PropertyTMatrixResearchV1;
+        let mut notes = Vec::new();
+        assert_eq!(
+            record_or_propagate_scene_failure(
+                &research,
+                &mut notes,
+                "property scene failed".to_string(),
+            )
+            .unwrap_err(),
+            "property scene failed"
+        );
+        assert!(notes.is_empty());
+
+        let bulk = SyntheticRadarConfig::default();
+        record_or_propagate_scene_failure(&bulk, &mut notes, "bulk scene failed".to_string())
+            .unwrap();
+        assert_eq!(notes, vec!["bulk scene failed".to_string()]);
+    }
 
     fn fingerprint_scene(
         path: &str,

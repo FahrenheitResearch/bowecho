@@ -281,19 +281,38 @@ preserved through per-particle lookup, accumulation, compact storage, and
 radial PhiDP integration. Within those declared bounds, a T-matrix table can
 represent nonspherical Waterman T-matrix and non-Rayleigh/resonant scattering
 that the bulk Rayleigh kernel cannot. The reproducible PyTMatrix solver uses
-role-specific, contiguous convergence envelopes rather than reducing every
-particle to the hardest wet-column corner: dry oblate reaches 89 mm, dry
-prolate 50 mm, wet oblate 15 mm, and wet prolate 6.3 mm. These axes passed an
-exhaustive 12-to-14 solver-order comparison over 104,960 nodes and 944,640
-components with zero solver/tolerance failures. A particle outside its own
-phase/shape envelope fails closed; an isolated numerical pass above a failed
-endpoint is not used to bridge the gap or clamp the particle.
+role-specific, contiguous envelopes rather than reducing every particle to
+the hardest wet-column corner: dry oblate reaches 89 mm, dry prolate 32.312
+mm, wet oblate 15 mm, and wet prolate 6.3 mm. The dry-prolate cap stops before
+an unresolved, solver-sensitive KDP resonance exposed by the next 36.126 mm
+node; higher isolated passes are not bridged. A particle outside its own
+phase/shape envelope fails closed instead of being clamped.
 
-The frozen solver contract is `ddelt=0.001`, `ndgs=14`; its exhaustive
-12-to-14 convergence report is identified by SHA-256
-`556d31a3afa8fcba12b3654826ad14f9c248327dca92c3d9a9f195e49c1a07fb`.
-This is same-implementation numerical convergence evidence, not independent
-scientific validation.
+The five embedded property tables contain **2,640,848 grid points**: 616,000
+dry-oblate, 132,160 dry-prolate, 1,017,600 wet-oblate, 864,000 wet-prolate,
+and 11,088 residual-rain points. The frozen solver contract is
+`ddelt=0.001`, `ndgs=14`. The v9 12-to-14 convergence report (SHA-256
+`352e259f02b606ac71579b7d3b4591c3088b41f8e74becd949a27e5721030067`)
+is reusable by exact config hash only for dry-prolate, wet-oblate, and
+wet-prolate: 2,013,760 points and 18,123,840 component comparisons. It does
+not establish all-node convergence for the later-refined dry-oblate or rain
+configs.
+
+The predeclared diameter-only design audit stopped after its depth-three bound
+without passing (report SHA-256
+`e883060f67f72d8be7abe6bf0e53d8e572f2d7299fbb04d4a4ad96ee97d8832c`).
+The final candidate therefore uses a finite midpoint refinement of the
+affected diameter cells and implicated non-diameter intervals; it does not
+copy held-out coordinates, extend a physical domain, change a threshold, or
+reroll a seed. The one frozen held-out request (SHA-256
+`2b4d143d86aaf78913df165b329ae62f6076e2574f34c1d393b6b9ddd90a45c5`)
+then passed all **30 of 30** selected nodes across the five embedded property
+tables. Its shared eight-table report (SHA-256
+`82f07bc736f6b5f20c7a59117204b69d97b9cbcb9f915cc54be394b0d8b742ce`)
+is not an all-eight pass: two of six nodes failed in the separate,
+non-embedded conventional dry-ice fixture. Exact table/config hashes and the
+scope boundary are recorded in
+`validation/tmatrix/refined_grid_v10_property_bundle_acceptance.json`.
 
 This remains **research-only and not independently validated**. It scales a
 single closure-derived characteristic particle by number concentration; it is

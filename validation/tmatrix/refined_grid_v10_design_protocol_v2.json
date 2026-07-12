@@ -1,0 +1,126 @@
+{
+  "schema": 2,
+  "protocol_id": "pytmatrix-0.3.3-refined-grid-v10-cross-cell-design-v2",
+  "classification": "predeclared_grid_design_protocol_not_validation",
+  "scientifically_independent": false,
+  "production_validation": false,
+  "integrity_amendment": "The legacy depth-1 run happened to use each initial-v10 config hash as its live salt, so its 6144 selected samples are unchanged. Recursive stages bind that initial hash permanently, freeze every stage before evaluation, and retain every previously failing cross-cell coordinate as a development regression.",
+  "audit_source_sha256": "82552b8a676bd3348b15bcc7e603e7f87b9e58c99c30a78a30d1e0944e58b3fe",
+  "generator_source_sha256": "75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
+  "environment_report_sha256": "ea4fd9324350cfb2819bb1fef53f251c61bb887a0fa63d7963666d22d03482c7",
+  "legacy_protocol": {
+    "file": "refined_grid_v10_design_protocol.json",
+    "sha256": "39e911f46f9bdee4664feb931ac57ac30c5e3f2eef2b873ae9bdb98b8a06fc1b",
+    "depth1_report_file": "refined_grid_v10_cross_cell_design_audit_depth1_report.json",
+    "depth1_report_sha256": "ab3bdec36e1c6a09047d482dff0582c0a406f8761ba101305bc8c45887f6ee59",
+    "depth1_audit_source_sha256": "396674371591ae3850687e22ad5ea1145a904361f0bfa4f5c10015cd72dc11c7",
+    "depth1_cross_cell_sample_count": 6144,
+    "depth1_failing_cross_cell_sample_count": 5620
+  },
+  "parent_v9_failure": {
+    "nodes_file": "refined_grid_v9_post_freeze_held_out_nodes.json",
+    "nodes_sha256": "b49119bdd75aa443c71cc1fb9e0f5c9066242982ee99cd775319d196f3de2f3f",
+    "report_file": "refined_grid_v9_post_freeze_held_out_failure_report.json",
+    "report_sha256": "162d1102503dbf4ddbe06cbb26c6713f1fb89778f826a6626cb9609fa714f451",
+    "validation_source_sha256": "53c1e03a8c083e1df1af15d97af7cf611c84c6bbb15e0f980254fcc2d59562a7",
+    "use": "development_regression_and_grid_design_only"
+  },
+  "initial_refinements": [
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "v9_config_sha256": "4e9240d544556f79e255dfa4dad44a0ef825c2803cd36f94154211a06c7fbcdb",
+      "initial_v10_config_sha256": "55491cf2969f0303874ff9f5c35049179c764432243ddc00272d2584a590b07f",
+      "parent_diameter_interval": [
+        0.042483168303251675,
+        0.0443722221348087
+      ]
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "v9_config_sha256": "0dc4ca0c648c386f923de3155103aaa806e1c2234959cd44b19a55a129200bff",
+      "initial_v10_config_sha256": "430818790684a47cb0fa9b962fedf8cf4ca7891db76cc5de5192b6c5fb4a6a54",
+      "parent_diameter_interval": [
+        0.06861699195817748,
+        0.07055786435464804
+      ]
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "v9_config_sha256": "b6ac330212174ce863ee14abe94bb3347c6ae208913a760cead418c6d67d879d",
+      "initial_v10_config_sha256": "8cbe66652038440b05c087b6402e9d08abc598f894802f478a26935b6b16fcfc",
+      "parent_diameter_interval": [
+        0.006866409356540893,
+        0.006932882913751411
+      ]
+    }
+  ],
+  "cross_cell_audit": {
+    "selection_seed": "bowecho-pytmatrix-0.3.3-refined-v10-cross-cell-design-v1",
+    "sample_count_per_cross_cell": 3,
+    "base_within_cell_fractions": [
+      0.2,
+      0.5,
+      0.8
+    ],
+    "stable_permutation_salt_protocol": "For every table and every recursive stage, use the frozen initial_v10_config_sha256. Axis kind plus exact interval endpoints distinguish new diameter leaves. Unchanged intervals therefore never reroll.",
+    "permutation_rule": "For each axis interval independently, SHA-256 of selection seed, the table's frozen initial-v10 config SHA-256, table ID, axis kind, lower float.hex(), and upper float.hex() selects one of the six lexicographic permutations of 0.2,0.5,0.8. Sample k uses element k. No hash input depends on scattering output.",
+    "relative_budgets": {
+      "zh": 0.15,
+      "zv": 0.15,
+      "hh_vv_covariance_real": 0.15,
+      "hh_vv_covariance_imaginary": 0.15,
+      "kdp": 0.15,
+      "ah": 0.15,
+      "av": 0.15,
+      "fall_speed_first_moment": 0.2,
+      "fall_speed_second_moment": 0.2
+    },
+    "absolute_floor": 1e-12,
+    "worker_limit": 12
+  },
+  "v9_regression_rule": "Recompute and interpolate the three exact failed v9 development nodes against every candidate. Each must satisfy the same 15 percent electromagnetic and 20 percent fall-moment design budgets and reproduce its v9 direct value bit-for-bit.",
+  "recursive_diameter_rule": {
+    "operation": "After a complete audit, bisect only diameter leaves containing a failing current sample, immutable accumulated development regression, or v9 regression.",
+    "maximum_depth_relative_to_v9_parent": 3,
+    "complete_rerun_required_after_each_refinement": true
+  },
+  "non_diameter_fallback": {
+    "trigger": "A complete depth-3 diameter-only audit still fails.",
+    "selection": "Enumerate every nonempty subset of implicated nonsingleton non-diameter axes. Insert the arithmetic midpoint of every unique implicated interval on a selected axis. Choose the passing candidate with the smallest total Cartesian grid-point count, with configured-axis lexicographic order as the tie break, then rerun it once from frozen bytes.",
+    "failure": "If no candidate passes, reject refined v10 and begin a separately declared v11."
+  },
+  "solver_freeze_rule": {
+    "recompute": [
+      "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "property_rain_sband_unvalidated"
+    ],
+    "reuse_by_exact_hash_and_report_reference": [
+      "property_p3_ishmael_dry_prolate_sband_unvalidated",
+      "property_p3_ishmael_wet_oblate_sband_unvalidated",
+      "property_p3_ishmael_wet_prolate_sband_unvalidated"
+    ],
+    "reused_v9_report_sha256": "352e259f02b606ac71579b7d3b4591c3088b41f8e74becd949a27e5721030067",
+    "comparison_solver_ndgs": [
+      12,
+      14
+    ],
+    "require_truthful_composite_report": true
+  },
+  "final_held_out_rule": {
+    "selection_seed": "bowecho-pytmatrix-0.3.3-post-grid-heldout-v5-refined-v10-final",
+    "nodes_per_table": 6,
+    "diameter_quantiles": [
+      0.08,
+      0.24,
+      0.4,
+      0.58,
+      0.76,
+      0.92
+    ],
+    "scattering_component_relative_threshold": 0.5,
+    "fall_moment_relative_threshold": 0.75,
+    "selection_count": 1,
+    "reroll_forbidden": true,
+    "failure_disposition": "Reject v10 and begin v11."
+  }
+}

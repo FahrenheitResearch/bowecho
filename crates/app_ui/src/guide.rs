@@ -1161,7 +1161,7 @@ fn wrf(ui: &mut egui::Ui) {
          symmetric Bruggeman air/ice/water mixing, separate oblate/prolate shapes, and a fixed \
          mean-zero Gaussian canting distribution with 20\u{00b0} standard deviation and \
          deterministic 5 × 10 orientation integration. Solver-complete diameter domains are \
-         role-specific: dry oblate to 89 mm, dry prolate to 50 mm, wet oblate to 15 mm, and wet \
+         role-specific: dry oblate to 89 mm, dry prolate to 32.312 mm, wet oblate to 15 mm, and wet \
          prolate to 6.3 mm. Unsupported phase/shape coordinates are rejected rather than \
          clamped. Each active source cell is closed from \
          its native properties, then only additive scattering quantities are integrated through \
@@ -1177,6 +1177,17 @@ fn wrf(ui: &mut egui::Ui) {
          view coordinates are errors, never silent Rayleigh fallback. This \
          characteristic-particle approximation is not PSD-integrated, is research-only and not \
          independently validated, and makes no operational claim.",
+    );
+    para(
+        ui,
+        "The embedded property bundle contains 2,640,848 grid points across five tables. Its \
+         one frozen held-out request passed all 30 of 30 selected property-table nodes. The \
+         shared eight-table report is not an all-eight pass: two nodes failed only in a \
+         separate conventional dry-ice fixture that this path does not embed. The bounded \
+         depth-three design audit also remained failed, and the older all-node solver report \
+         applies by exact hash only to the unchanged dry-prolate, wet-oblate, and wet-prolate \
+         configs. These are transparent software/interpolation checks, not independent \
+         scientific validation.",
     );
     cite(
         ui,

@@ -68,6 +68,40 @@ bundle. A v10 candidate must use the v9 failures only to design a deterministic
 refinement and multi-axis cross-cell audit, then freeze and use a new public
 held-out seed exactly once.
 
+## Refined v10 property-bundle disposition
+
+The v10 diameter-only cross-cell audit stopped at its predeclared depth-three
+bound without passing. Its 42.64 MiB full diagnostic is intentionally not
+committed; the immutable SHA-256 is
+`e883060f67f72d8be7abe6bf0e53d8e572f2d7299fbb04d4a4ad96ee97d8832c`,
+and the compact disposition is retained in
+`refined_grid_v10_property_bundle_acceptance.json`. It is failed development
+evidence, not validation. The bounded follow-on
+candidate inserts arithmetic midpoints only inside the affected diameter
+parent intervals and implicated non-diameter intervals. It does not copy a
+held-out coordinate, extend a declared physical domain, relax a threshold, or
+change the public seed.
+
+After those bytes were frozen,
+`refined_grid_v10_post_freeze_held_out_nodes.json` (SHA-256
+`2b4d143d86aaf78913df165b329ae62f6076e2574f34c1d393b6b9ddd90a45c5`)
+selected six absent nodes per table exactly once. The resulting shared report,
+`refined_grid_v10_post_freeze_held_out_interpolation_report.json` (SHA-256
+`82f07bc736f6b5f20c7a59117204b69d97b9cbcb9f915cc54be394b0d8b742ce`),
+passed all 30 nodes across the five property tables embedded by BowEcho. The
+report's root all-eight result is still failed: two nodes missed only in the
+separate conventional dry-ice research fixture. This is therefore a scoped
+five-table property-bundle acceptance, not an all-eight pass.
+
+The five property grids contain 2,640,848 points: dry-oblate 616,000,
+dry-prolate 132,160, wet-oblate 1,017,600, wet-prolate 864,000, and rain
+11,088. The v9 convergence report is reusable by exact config hash only for
+dry-prolate, wet-oblate, and wet-prolate (2,013,760 points and 18,123,840
+component comparisons). It does not cover every node in the refined
+dry-oblate or rain configs. Exact config/LUT hashes, both OCI identities,
+generator/environment hashes, and these scope limits are recorded compactly
+in `refined_grid_v10_property_bundle_acceptance.json`.
+
 Every report retains `research_only_unvalidated`. Direct points share
 PyTMatrix, dielectric, orientation, geometry, and fall-speed implementations
 with the generator, so neither interpolation nor view checks are scientifically

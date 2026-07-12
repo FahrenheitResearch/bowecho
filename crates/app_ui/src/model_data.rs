@@ -3749,7 +3749,7 @@ impl ModelDataDock {
                                     "Timed volume",
                                 )
                                 .on_hover_text(
-                                    "Assign per-ray acquisition offsets while sampling the same WRF model time.",
+                                    "Assign per-ray acquisition offsets. Atmosphere time below controls whether those rays hold one WRF scene or interpolate adjacent scenes.",
                                 );
                                 let custom_timed = matches!(
                                     state.scan_timing,
