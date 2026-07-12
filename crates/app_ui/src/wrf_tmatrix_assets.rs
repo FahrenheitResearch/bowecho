@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use radar_scattering::{PolarAccumulatorQuantities, ResearchTMatrixLut, Sha256Digest};
+use radar_scattering::{
+    P3OfficialTableKind, PolarAccumulatorQuantities, ResearchTMatrixLut, Sha256Digest,
+};
 
 use crate::wrf_property_reader::{RawPropertyCell, WrfPropertyScene};
 use crate::wrf_tmatrix_band_assets::{
@@ -13,8 +15,8 @@ use crate::wrf_tmatrix_band_assets::{
     discover_tmatrix_band_packs, legacy_embedded_s_research_v1_identity,
 };
 use crate::wrf_tmatrix_scene::{
-    WrfTMatrixBuildPeakEstimate, WrfTMatrixLutBundle, WrfTMatrixRainMode, WrfTMatrixRawEvaluator,
-    WrfTMatrixScene,
+    WrfTMatrixBuildPeakEstimate, WrfTMatrixLutBundle, WrfTMatrixP3Resources, WrfTMatrixRainMode,
+    WrfTMatrixRawEvaluator, WrfTMatrixScene,
 };
 
 const ASSET_ROOT: &str = "../../../research_only_assets/tmatrix/pytmatrix-0.3.3";
@@ -86,6 +88,10 @@ impl EmbeddedPropertyTMatrixLuts {
 
 static PROPERTY_LUTS: OnceLock<Result<EmbeddedPropertyTMatrixLuts, String>> = OnceLock::new();
 static RAW_EVALUATOR: OnceLock<Result<WrfTMatrixRawEvaluator<'static>, String>> = OnceLock::new();
+static P3_TWO_MOMENT_RAW_EVALUATOR: OnceLock<Result<WrfTMatrixRawEvaluator<'static>, String>> =
+    OnceLock::new();
+static P3_THREE_MOMENT_RAW_EVALUATOR: OnceLock<Result<WrfTMatrixRawEvaluator<'static>, String>> =
+    OnceLock::new();
 static EXTERNAL_PROPERTY_LUT_CACHE: OnceLock<TMatrixBandPackCache> = OnceLock::new();
 
 /// Explicit table source. Selection never changes this request to another
@@ -255,6 +261,24 @@ pub fn preload_embedded_property_tmatrix_luts() -> Result<(), String> {
     embedded_luts().map(|_| ())
 }
 
+/// Qualify every immutable table needed by one native property scheme before
+/// the heavy WRF scene read begins. P3 50--53 lazily acquires the exact pinned
+/// official 2-moment or 3-moment v5.4 table; ISHMAEL needs only the embedded
+/// five-role scattering bundle.
+pub fn preload_embedded_property_tmatrix_for_scheme(
+    microphysics_scheme_id: i32,
+    progress: &(impl Fn(&str) + ?Sized),
+) -> Result<(), String> {
+    match microphysics_scheme_id {
+        50..=52 => embedded_p3_raw_evaluator(P3OfficialTableKind::TwoMoment, progress).map(drop),
+        53 => embedded_p3_raw_evaluator(P3OfficialTableKind::ThreeMoment, progress).map(drop),
+        55 => preload_embedded_property_tmatrix_luts(),
+        other => Err(format!(
+            "property T-matrix tables do not support WRF mp_physics={other}"
+        )),
+    }
+}
+
 /// Evaluate one already spatially/temporally blended raw property cell through
 /// the validated embedded bundle. The reusable evaluator is cached, so the
 /// complete table contract is gated once rather than once per radar sample.
@@ -262,7 +286,12 @@ pub fn evaluate_embedded_raw_property_cell(
     raw: &RawPropertyCell,
     elevation_deg: f64,
 ) -> Result<Option<PolarAccumulatorQuantities>, String> {
-    embedded_raw_evaluator()?
+    let evaluator = match raw.microphysics_scheme_id() {
+        50..=52 => embedded_p3_raw_evaluator(P3OfficialTableKind::TwoMoment, &|_| {})?,
+        53 => embedded_p3_raw_evaluator(P3OfficialTableKind::ThreeMoment, &|_| {})?,
+        _ => embedded_raw_evaluator()?,
+    };
+    evaluator
         .evaluate(raw, elevation_deg)
         .map_err(|error| format!("evaluate embedded raw property cell: {error}"))
 }
@@ -277,6 +306,44 @@ fn embedded_raw_evaluator() -> Result<WrfTMatrixRawEvaluator<'static>, String> {
     }
 }
 
+fn embedded_p3_raw_evaluator(
+    kind: P3OfficialTableKind,
+    progress: &(impl Fn(&str) + ?Sized),
+) -> Result<WrfTMatrixRawEvaluator<'static>, String> {
+    // Acquisition sits outside OnceLock initialization so a transient network
+    // failure is retryable. The asset module itself success-caches the Arc.
+    let table = crate::wrf_p3_assets::load_or_download_official_p3_table(kind, progress)?;
+    let slot = match kind {
+        P3OfficialTableKind::TwoMoment => &P3_TWO_MOMENT_RAW_EVALUATOR,
+        P3OfficialTableKind::ThreeMoment => &P3_THREE_MOMENT_RAW_EVALUATOR,
+    };
+    match slot.get_or_init(move || {
+        let p3 = WrfTMatrixP3Resources::projected_area_equivalent_oblate_research(table).map_err(
+            |error| format!("configure P3 projected-area T-matrix integration: {error}"),
+        )?;
+        WrfTMatrixRawEvaluator::new_with_p3(embedded_luts()?.bundle(), p3)
+            .map_err(|error| format!("validate embedded P3 raw property evaluator: {error}"))
+    }) {
+        Ok(evaluator) => Ok(evaluator.clone()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn embedded_p3_resources(
+    microphysics_scheme_id: i32,
+    progress: &(impl Fn(&str) + ?Sized),
+) -> Result<Option<WrfTMatrixP3Resources>, String> {
+    let kind = match microphysics_scheme_id {
+        50..=52 => P3OfficialTableKind::TwoMoment,
+        53 => P3OfficialTableKind::ThreeMoment,
+        _ => return Ok(None),
+    };
+    let table = crate::wrf_p3_assets::load_or_download_official_p3_table(kind, progress)?;
+    WrfTMatrixP3Resources::projected_area_equivalent_oblate_research(table)
+        .map(Some)
+        .map_err(|error| format!("configure P3 projected-area T-matrix integration: {error}"))
+}
+
 /// Build one compact scattering scene from the exact embedded research tables.
 pub fn build_embedded_property_tmatrix_scene(
     source: &WrfPropertyScene,
@@ -284,8 +351,12 @@ pub fn build_embedded_property_tmatrix_scene(
 ) -> Result<EmbeddedPropertySceneBuild, String> {
     let tables = embedded_luts()?.bundle();
     let rain_mode = WrfTMatrixRainMode::FullProperty;
-    let peak = WrfTMatrixScene::estimate_build_peak(source, tables, rain_mode)
-        .map_err(|error| format!("estimate embedded property-scattering build: {error}"))?;
+    let p3 = embedded_p3_resources(source.microphysics_scheme_id(), &|_| {})?;
+    let peak = match p3.as_ref() {
+        Some(p3) => WrfTMatrixScene::estimate_build_peak_with_p3(source, tables, rain_mode, p3),
+        None => WrfTMatrixScene::estimate_build_peak(source, tables, rain_mode),
+    }
+    .map_err(|error| format!("estimate embedded property-scattering build: {error}"))?;
     if peak.estimated_peak_bytes > maximum_owned_peak_bytes {
         return Err(format!(
             "property-scattering build needs {:.2} GiB for raw state, output plane, lookups and build scratch, but only {:.2} GiB remains inside the configured budget",
@@ -293,8 +364,11 @@ pub fn build_embedded_property_tmatrix_scene(
             maximum_owned_peak_bytes as f64 / 1024.0_f64.powi(3),
         ));
     }
-    let scene = WrfTMatrixScene::build_with_rain_mode(source, tables, rain_mode)
-        .map_err(|error| format!("evaluate embedded property-scattering tables: {error}"))?;
+    let scene = match p3 {
+        Some(p3) => WrfTMatrixScene::build_with_p3_and_rain_mode(source, tables, p3, rain_mode),
+        None => WrfTMatrixScene::build_with_rain_mode(source, tables, rain_mode),
+    }
+    .map_err(|error| format!("evaluate embedded property-scattering tables: {error}"))?;
     Ok(EmbeddedPropertySceneBuild { scene, peak })
 }
 
