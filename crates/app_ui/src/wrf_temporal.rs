@@ -1,10 +1,14 @@
-//! Pure temporal-planning and raw-state interpolation for WRF simulated radar.
+//! Pure temporal planning plus strict raw-state interpolation primitives for
+//! WRF simulated radar.
 //!
 //! Timed acquisition and atmosphere sampling are separate choices. The legacy
 //! renderer remains frozen at the volume start; [`AtmosphereTimeMode::LinearAdjacent`]
 //! requires a compatible later WRF scene covering the whole scan. Interpolation
-//! happens in linear model state before nonlinear radar scattering. In particular,
-//! this module never averages dBZ, ZDR, rhoHV, KDP, or attenuation products.
+//! weights are bounded per ray with no extrapolation. [`interpolate_raw_gate`]
+//! is the contract for a property-aware renderer: raw fields must be blended
+//! before nonlinear closure/scattering. The compatibility renderer can use the
+//! same plan for linear Z, wind, and additive scattering quantities, but must
+//! label that interpolation space explicitly rather than claiming raw state.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -21,8 +25,9 @@ pub enum AtmosphereTimeMode {
     /// Bit-compatible legacy behavior: every ray samples the anchor scene.
     #[default]
     FrozenAtVolumeStart,
-    /// Interpolate raw atmospheric and microphysical state from the anchor to
-    /// the next compatible model time using each ray's acquisition time.
+    /// Interpolate a declared linear atmosphere/scattering representation from
+    /// the anchor to the next compatible model time using each ray's
+    /// acquisition time. Consumers must stamp which representation they used.
     LinearAdjacent,
 }
 
@@ -220,8 +225,10 @@ pub fn plan_for_scene(
             MissingNeighborPolicy::HoldAnchor => Ok(Some(TemporalScenePlan {
                 anchor: anchor.locator(),
                 anchor_time,
-                neighbor: None,
-                neighbor_time: None,
+                // Retain the discovered boundary in provenance even though
+                // this policy samples the anchor at alpha=0 for every ray.
+                neighbor: Some(neighbor.locator()),
+                neighbor_time: Some(neighbor_time),
                 scan_duration_ms,
                 outcome: TemporalSamplingOutcome::HeldAnchor(HoldReason::ScanCrossesNeighbor),
             })),
@@ -685,6 +692,12 @@ mod tests {
             held.outcome,
             TemporalSamplingOutcome::HeldAnchor(HoldReason::ScanCrossesNeighbor)
         );
+        assert!(held.neighbor.is_some());
+        assert_eq!(
+            held.neighbor_time,
+            Some(Utc.with_ymd_and_hms(2026, 7, 12, 1, 0, 0).unwrap())
+        );
+        assert_eq!(held.ray_alpha(30_000).unwrap(), 0.0);
     }
 
     #[test]

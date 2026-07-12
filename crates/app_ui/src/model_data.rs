@@ -310,7 +310,9 @@ struct SyntheticRadarUiState {
     #[serde(default)]
     scan_timing: crate::wrf_radar::ScanTiming,
     /// Whether rays sample one frozen WRF scene or interpolate compatible
-    /// adjacent scenes in raw model-state space. Older settings remain frozen.
+    /// adjacent scenes in linear received-power/wind/scattering space. Older
+    /// settings remain frozen. The property-aware raw-microphysics path uses
+    /// the same persisted choice once its stricter field contract is active.
     #[serde(default)]
     atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode,
     /// What to do when interpolation cannot obtain a complete later scene.
@@ -3704,7 +3706,7 @@ impl ModelDataDock {
                                         "Interpolate adjacent WRF scenes",
                                     )
                                     .on_hover_text(
-                                        "Use each timed ray's acquisition time to linearly interpolate raw atmospheric and microphysical model state between compatible adjacent WRF scenes, before nonlinear radar scattering. Selecting this also enables Timed volume.",
+                                        "Use each timed ray's acquisition time to interpolate compatible adjacent WRF scenes in linear received-power, wind, and additive-scattering space without extrapolation. Selecting this also enables Timed volume.",
                                     )
                                     .clicked()
                                 {
@@ -3719,7 +3721,7 @@ impl ModelDataDock {
                             ) {
                                 ui.label(
                                     egui::RichText::new(
-                                        "Timed rays interpolate linear raw model state before scattering; radar products are never blended, and the renderer never extrapolates beyond the next compatible WRF scene.",
+                                        "Timed rays interpolate linear Z, winds, and additive polar scattering quantities; ratios such as ZDR and rhoHV are derived afterward. The renderer never extrapolates beyond the next compatible WRF scene.",
                                     )
                                     .small()
                                     .weak(),
@@ -3762,7 +3764,7 @@ impl ModelDataDock {
                                         .suffix(" MiB"),
                                     )
                                     .on_hover_text(
-                                        "Preflight limit for the bounded two-scene raw-state cache. The run stops before allocation if the compatible scene pair would exceed this budget.",
+                                        "Preflight limit for input scenes, read/cut scratch, and every retained output frame. The run stops before allocating a build whose estimated peak would exceed this budget.",
                                     );
                                 });
                             }

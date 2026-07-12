@@ -55,9 +55,8 @@ use app_ui::vcp_catalog::{
 use app_ui::wrf_scene_adapter::inventory_selected_wrf_paths;
 use app_ui::wrf_scene_inventory::{WrfScene, WrfSceneGroup, WrfSceneTime};
 use app_ui::wrf_temporal::{
-    AtmosphereTimeMode, HoldReason, MissingNeighborPolicy, TemporalMemoryDecision,
-    TemporalMemoryEstimate, TemporalSamplingOutcome, TemporalScenePlan, TwoSceneCache,
-    plan_for_scene,
+    AtmosphereTimeMode, HoldReason, MissingNeighborPolicy, TemporalMemoryEstimate,
+    TemporalSamplingOutcome, TemporalScenePlan, TwoSceneCache, plan_for_scene,
 };
 
 /// Operational adaptations intentionally outside the checked base-pattern
@@ -3492,49 +3491,59 @@ fn build_temporal_synthetic_from_scenes(
     }
     let scan_duration_ms = config.planned_scan_duration_ms();
     let scan_duration = Duration::milliseconds(scan_duration_ms);
-    let estimate = temporal_memory_estimate(group, config)?;
+    let mut plans = Vec::with_capacity(group.scenes.len());
+    for (frame_index, scene) in group.scenes.iter().enumerate() {
+        plans.push(
+            plan_for_scene(
+                group,
+                frame_index,
+                scan_duration,
+                config.atmosphere_time_mode,
+                config.missing_neighbor_policy,
+            )
+            .map_err(|error| {
+                format!(
+                    "Plan temporal sampling for {}: {error}",
+                    display_name(&scene.path)
+                )
+            })?,
+        );
+    }
+    let emitted_frame_count = plans.iter().filter(|plan| plan.is_some()).count();
+    let requires_two_scenes = plans
+        .iter()
+        .flatten()
+        .any(|plan| matches!(plan.outcome, TemporalSamplingOutcome::LinearAdjacent));
+    let estimate = temporal_memory_estimate(group, config, emitted_frame_count)?;
     let budget_bytes = config
         .temporal_memory_budget_mib
         .checked_mul(1024 * 1024)
         .ok_or_else(|| "Temporal memory budget overflows address space".to_string())?;
-    match estimate.preflight(budget_bytes) {
-        TemporalMemoryDecision::Fits { required_bytes, .. } => notes.push(format!(
-            "Temporal two-scene preflight: {:.2} GiB estimated peak within {:.2} GiB budget",
+    let required_bytes = temporal_required_peak_bytes(estimate, requires_two_scenes)
+        .ok_or_else(|| "Temporal memory estimate overflowed".to_string())?;
+    if required_bytes <= budget_bytes {
+        let scene_label = if requires_two_scenes {
+            "two-scene"
+        } else {
+            "single-scene held"
+        };
+        notes.push(format!(
+            "Temporal {scene_label} preflight: {:.2} GiB estimated peak within {:.2} GiB budget",
             required_bytes as f64 / 1024.0_f64.powi(3),
             budget_bytes as f64 / 1024.0_f64.powi(3),
-        )),
-        TemporalMemoryDecision::Exceeds {
-            required_bytes,
-            budget_bytes,
-        } => {
-            return Err(format!(
-                "Temporal two-scene build needs an estimated {:.2} GiB, above the configured {:.2} GiB budget",
-                required_bytes as f64 / 1024.0_f64.powi(3),
-                budget_bytes as f64 / 1024.0_f64.powi(3),
-            ));
-        }
-        TemporalMemoryDecision::Overflow => {
-            return Err("Temporal two-scene memory estimate overflowed".to_string());
-        }
+        ));
+    } else {
+        return Err(format!(
+            "Temporal build needs an estimated {:.2} GiB, above the configured {:.2} GiB budget",
+            required_bytes as f64 / 1024.0_f64.powi(3),
+            budget_bytes as f64 / 1024.0_f64.powi(3),
+        ));
     }
 
     let mut cache: TwoSceneCache<(String, usize), Arc<WrfRadarFields>> = TwoSceneCache::default();
     let mut volumes = Vec::new();
-    for (frame_index, scene) in group.scenes.iter().enumerate() {
-        let Some(plan) = plan_for_scene(
-            group,
-            frame_index,
-            scan_duration,
-            config.atmosphere_time_mode,
-            config.missing_neighbor_policy,
-        )
-        .map_err(|error| {
-            format!(
-                "Plan temporal sampling for {}: {error}",
-                display_name(&scene.path)
-            )
-        })?
-        else {
+    for (frame_index, (scene, plan)) in group.scenes.iter().zip(plans).enumerate() {
+        let Some(plan) = plan else {
             notes.push(format!(
                 "{} time {} dropped: no adjacent WRF scene covers the timed scan",
                 display_name(&scene.path),
@@ -3566,6 +3575,20 @@ fn build_temporal_synthetic_from_scenes(
                 continue;
             }
         };
+        if let Some(status) = anchor.dual_pol_status.as_deref() {
+            notes.push(format!(
+                "{} time {} microphysics: {status}",
+                display_name(&scene.path),
+                scene.time_index
+            ));
+        }
+        if (config.dual_pol || config.terminal_fall_speed) && anchor.polarimetric.is_none() {
+            notes.push(format!(
+                "{} time {}: requested polarimetric/fall-speed physics unavailable; emitting explicitly labeled scalar fallback",
+                display_name(&scene.path),
+                scene.time_index
+            ));
+        }
         let valid_time = scene
             .time
             .valid_time()
@@ -3623,6 +3646,13 @@ fn build_temporal_synthetic_from_scenes(
                 match neighbor {
                     TemporalNeighborResolution::Held(volume, outcome) => (volume, outcome),
                     TemporalNeighborResolution::Fields(neighbor) => {
+                        if let Some(status) = neighbor.dual_pol_status.as_deref() {
+                            notes.push(format!(
+                                "{} time {} adjacent microphysics: {status}",
+                                display_name(&neighbor_scene.path),
+                                neighbor_scene.time_index
+                            ));
+                        }
                         if let Err(error) = validate_temporal_field_pair(&anchor, &neighbor) {
                             match config.missing_neighbor_policy {
                                 MissingNeighborPolicy::HoldAnchor => {
@@ -3674,7 +3704,7 @@ fn build_temporal_synthetic_from_scenes(
             ),
         };
         append_scene_provenance(&mut volume, scene);
-        append_temporal_provenance(&mut volume, &plan, &runtime_outcome);
+        append_temporal_provenance(&mut volume, &plan, &runtime_outcome, config, &anchor);
         notes.push(format!(
             "{} time {}: {} radials, atmosphere {runtime_outcome}",
             display_name(&scene.path),
@@ -3710,6 +3740,7 @@ enum TemporalNeighborResolution {
 fn temporal_memory_estimate(
     group: &WrfSceneGroup,
     config: &SyntheticRadarConfig,
+    emitted_frame_count: usize,
 ) -> Result<TemporalMemoryEstimate, String> {
     let grid = &group.key.grid_signature;
     let nz = grid.nz.ok_or_else(|| {
@@ -3750,18 +3781,41 @@ fn temporal_memory_estimate(
         .ok_or_else(|| "Synthetic radial count overflowed".to_string())?;
     let moment_count =
         2usize + usize::from(config.spectrum_width) + if config.dual_pol { 10 } else { 0 };
-    let output_bytes = radial_count
+    let one_output_bytes = radial_count
         .checked_mul(gate_count)
         .and_then(|value| value.checked_mul(moment_count))
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
         .and_then(|value| value.checked_add(radial_count.saturating_mul(96)))
         .ok_or_else(|| "Synthetic output memory estimate overflowed".to_string())?;
-    let shared_static_bytes = config
+    let output_bytes = one_output_bytes
+        .checked_mul(emitted_frame_count)
+        .ok_or_else(|| "Retained loop-output memory estimate overflowed".to_string())?;
+    let terrain_horizon_bytes = config
         .azimuth_count
         .max(1)
         .checked_mul(gate_count)
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
-        .unwrap_or(usize::MAX);
+        .ok_or_else(|| "Terrain-horizon memory estimate overflowed".to_string())?;
+    // `CutMomentRow` owns all thirteen possible moment arrays until a cut is
+    // assembled, regardless of which moments the VCP ultimately stores.
+    let cut_row_scratch_bytes = config
+        .azimuth_count
+        .max(1)
+        .checked_mul(gate_count)
+        .and_then(|value| value.checked_mul(13))
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| "Cut-row scratch memory estimate overflowed".to_string())?;
+    // Concurrent WRF reads temporarily retain f64 decoder buffers while the
+    // five f32 model planes are narrowed. Six planes is a conservative bound
+    // for winds that arrive as two components plus height/REF/W.
+    let read_conversion_scratch_bytes = cells_per_scene
+        .checked_mul(6)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| "WRF read-scratch memory estimate overflowed".to_string())?;
+    let shared_static_bytes = terrain_horizon_bytes
+        .checked_add(cut_row_scratch_bytes)
+        .and_then(|value| value.checked_add(read_conversion_scratch_bytes))
+        .ok_or_else(|| "Temporal shared-memory estimate overflowed".to_string())?;
 
     Ok(TemporalMemoryEstimate {
         cells_per_scene,
@@ -3771,6 +3825,18 @@ fn temporal_memory_estimate(
         shared_static_bytes,
         output_bytes,
     })
+}
+
+fn temporal_required_peak_bytes(
+    estimate: TemporalMemoryEstimate,
+    requires_two_scenes: bool,
+) -> Option<usize> {
+    let scene_count = if requires_two_scenes { 2 } else { 1 };
+    estimate
+        .scene_bytes()?
+        .checked_mul(scene_count)?
+        .checked_add(estimate.shared_static_bytes)?
+        .checked_add(estimate.output_bytes)
 }
 
 fn cached_temporal_fields(
@@ -3852,6 +3918,8 @@ fn append_temporal_provenance(
     volume: &mut RadarVolume,
     plan: &TemporalScenePlan,
     runtime_outcome: &str,
+    config: &SyntheticRadarConfig,
+    anchor: &WrfRadarFields,
 ) {
     let neighbor = plan
         .neighbor
@@ -3863,9 +3931,21 @@ fn append_temporal_provenance(
         .as_ref()
         .map(DateTime::<Utc>::to_rfc3339)
         .unwrap_or_else(|| "none".to_string());
+    let policy = match config.missing_neighbor_policy {
+        MissingNeighborPolicy::HoldAnchor => "hold_anchor",
+        MissingNeighborPolicy::DropFrame => "drop_frame",
+        MissingNeighborPolicy::Error => "error",
+    };
+    let physics_status = anchor
+        .dual_pol_status
+        .as_deref()
+        .unwrap_or("not_requested")
+        .replace(';', ",");
     let provenance = format!(
-        "atmosphere_time_mode=linear_adjacent; temporal_outcome={runtime_outcome}; temporal_neighbor={neighbor}; temporal_neighbor_time={neighbor_time}; temporal_scan_duration_ms={}",
+        "atmosphere_time_mode=linear_adjacent; temporal_interpolation_space=derived_linear_z_wind_and_additive_polar; temporal_policy={policy}; temporal_outcome={runtime_outcome}; temporal_neighbor={neighbor}; temporal_neighbor_time={neighbor_time}; temporal_scan_duration_ms={}; temporal_reflectivity_source={}; temporal_polar_available={}; temporal_microphysics_status={physics_status}",
         plan.scan_duration_ms,
+        anchor.ref_source,
+        anchor.polarimetric.is_some(),
     );
     match volume.metadata.forward_operator_config.as_mut() {
         Some(config) => {
@@ -3977,6 +4057,29 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    #[test]
+    fn temporal_preflight_counts_retained_frames_scratch_and_actual_scene_count() {
+        let group = fingerprint_group(fingerprint_scene(
+            "C:/private/a/wrfout_d03",
+            "sha256:source-a",
+            0,
+        ));
+        let config = SyntheticRadarConfig {
+            elevations_deg: vec![0.5],
+            azimuth_count: 12,
+            gate_spacing_m: 1_000.0,
+            max_range_m: 10_000.0,
+            ..SyntheticRadarConfig::default()
+        };
+        let one = temporal_memory_estimate(&group, &config, 1).unwrap();
+        let three = temporal_memory_estimate(&group, &config, 3).unwrap();
+        assert_eq!(three.output_bytes, one.output_bytes * 3);
+        assert!(one.shared_static_bytes > 12 * 10 * 13 * std::mem::size_of::<f32>());
+        let single_peak = temporal_required_peak_bytes(one, false).unwrap();
+        let two_scene_peak = temporal_required_peak_bytes(one, true).unwrap();
+        assert_eq!(two_scene_peak - single_peak, one.scene_bytes().unwrap());
     }
 
     #[test]
