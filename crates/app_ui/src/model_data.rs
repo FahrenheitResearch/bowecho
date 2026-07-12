@@ -59,6 +59,10 @@ enum ImportJob {
     /// (via [`ModelDataDock::take_synthetic_radar`]) to LOOP in the radar
     /// viewer. Streams progress messages then a `Done`.
     SyntheticRadar(crate::wrf_radar::SyntheticRadarTask),
+    /// Exact observed-geometry replay. The retained observed volume, generated
+    /// synthetic volume, and exact-gate differences are installed together in
+    /// the radar viewer's validation workspace.
+    SyntheticRadarReplay(crate::wrf_radar::SyntheticRadarReplayTask),
 }
 
 /// Editable + persisted state for the WRF "full diagnostics" processing-
@@ -931,6 +935,16 @@ pub struct ModelDataDock {
     /// Finished synthetic-radar volumes waiting for the app to install them in
     /// the loop engine (one-shot, drained by [`Self::take_synthetic_radar`]).
     synthetic_radar_result: Option<crate::wrf_radar::SyntheticRadarOutput>,
+    /// Finished exact observed-geometry replay waiting for the app to install
+    /// its Observed / Simulated / Difference workspace.
+    synthetic_radar_replay_result: Option<crate::wrf_radar::SyntheticRadarReplayOutput>,
+    /// Current radar-view volume when it is eligible to provide an exact
+    /// observed acquisition template. This is an Arc snapshot only; no gate
+    /// data is copied into the WRF dock.
+    displayed_replay_source: Option<std::sync::Arc<radar_core::RadarVolume>>,
+    /// Observed source retained with the last replay selection so Refresh can
+    /// rerun the same scan after instrument/scattering tuning.
+    synthetic_radar_replay_source: Option<std::sync::Arc<radar_core::RadarVolume>>,
     /// Retained handles to the most recent finished synthetic-radar frames so
     /// the export control can write them as CfRadial files AFTER the one-shot
     /// result above is drained into the loop engine. Arc clones of the loop
@@ -1089,6 +1103,9 @@ impl ModelDataDock {
             store_root,
             import_job: None,
             synthetic_radar_result: None,
+            synthetic_radar_replay_result: None,
+            displayed_replay_source: None,
+            synthetic_radar_replay_source: None,
             synthetic_export_frames: Vec::new(),
             synthetic_radar_source_files: Vec::new(),
             import_message: None,
@@ -2075,6 +2092,12 @@ impl ModelDataDock {
                 message: String,
                 output: crate::wrf_radar::SyntheticRadarOutput,
             },
+            /// An exact observed-geometry replay finished. Unlike an ordinary
+            /// synthetic loop this is consumed as a three-volume comparison.
+            FinishedReplay {
+                message: String,
+                output: crate::wrf_radar::SyntheticRadarReplayOutput,
+            },
         }
 
         let result = match self.import_job.as_ref() {
@@ -2205,6 +2228,45 @@ impl ModelDataDock {
                     },
                 }
             }
+            Some(ImportJob::SyntheticRadarReplay(task)) => {
+                let mut latest = None;
+                let mut done = None;
+                loop {
+                    match task.rx.try_recv() {
+                        Ok(crate::wrf_radar::SyntheticRadarReplayMessage::Progress(message)) => {
+                            latest = Some(message);
+                        }
+                        Ok(crate::wrf_radar::SyntheticRadarReplayMessage::Done(outcome)) => {
+                            done = Some(outcome);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            done = Some(Err(
+                                "Exact radar replay worker stopped unexpectedly".to_owned()
+                            ));
+                            break;
+                        }
+                    }
+                }
+                match done {
+                    Some(Ok(output)) => PollResult::FinishedReplay {
+                        message: format!(
+                            "Replayed {} WRF frame(s) through the displayed observed scan",
+                            output.frames.len()
+                        ),
+                        output,
+                    },
+                    Some(Err(error)) => PollResult::Finished {
+                        message: format!("Exact radar replay failed: {error}"),
+                        plot: None,
+                    },
+                    None => match latest {
+                        Some(message) => PollResult::Progress(message),
+                        None => PollResult::Progress(String::new()),
+                    },
+                }
+            }
         };
 
         match result {
@@ -2240,6 +2302,17 @@ impl ModelDataDock {
                 // `poll_model_layer`); nothing was written to the store, so no
                 // rescan.
                 self.synthetic_radar_result = Some(output);
+                self.repaint.request_repaint();
+            }
+            PollResult::FinishedReplay { message, output } => {
+                self.import_message = Some(message);
+                self.import_job = None;
+                self.synthetic_export_frames = output
+                    .frames
+                    .iter()
+                    .map(|frame| frame.simulated.clone())
+                    .collect();
+                self.synthetic_radar_replay_result = Some(output);
                 self.repaint.request_repaint();
             }
         }
@@ -2369,6 +2442,38 @@ impl ModelDataDock {
     ) -> Option<(String, u64, Vec<std::sync::Arc<radar_core::RadarVolume>>)> {
         let output = self.synthetic_radar_result.take()?;
         Some((output.label, output.config_fingerprint, output.volumes))
+    }
+
+    /// One-shot: take a completed exact observed-geometry replay. The app
+    /// installs the first returned frame as a linked three-pane validation
+    /// workspace; the replay action deliberately selects one WRF source file.
+    pub fn take_synthetic_radar_replay(
+        &mut self,
+    ) -> Option<crate::wrf_radar::SyntheticRadarReplayOutput> {
+        self.synthetic_radar_replay_result.take()
+    }
+
+    /// Update the exact-replay candidate from the radar viewer. Synthetic and
+    /// difference volumes are intentionally excluded so Replay always starts
+    /// from an independently observed acquisition.
+    pub fn set_displayed_radar_for_replay(
+        &mut self,
+        volume: Option<std::sync::Arc<radar_core::RadarVolume>>,
+    ) {
+        self.displayed_replay_source = volume.filter(|volume| {
+            let provenance_is_synthetic = volume
+                .metadata
+                .forward_operator
+                .as_deref()
+                .is_some_and(|value| value.contains("BowEcho WRF"))
+                || volume
+                    .metadata
+                    .archive_version
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("simulated-wrf"));
+            !provenance_is_synthetic
+                && crate::wrf_radar_validation::ExactScanTemplate::from_volume(volume).is_ok()
+        });
     }
 
     /// True while a WRF/NetCDF import or synthetic-radar build runs on the dock
@@ -2805,6 +2910,35 @@ impl ModelDataDock {
                         }
                     }
                 });
+                let can_replay = !busy && self.displayed_replay_source.is_some();
+                let replay_hover = if self.displayed_replay_source.is_some() {
+                    "Choose one raw wrfout file and simulate it through the displayed observed scan's exact cuts, rays, acquisition times, gate layout, split cuts, missing sectors, moment availability, Nyquist, and PRT. Opens linked Observed / Simulated / Difference panes."
+                } else {
+                    "Load an observed radar volume with valid site coordinates and ray geometry first. Synthetic and difference volumes cannot be replay templates."
+                };
+                if ui
+                    .add_enabled_ui(can_replay, |ui| {
+                        ui.add_sized(
+                            [ui.available_width().max(120.0), 28.0],
+                            egui::Button::new("Replay displayed observed scan…"),
+                        )
+                    })
+                    .inner
+                    .on_hover_text(replay_hover)
+                    .clicked()
+                {
+                    match self.synth_radar.to_config() {
+                        Err(message) => self.import_message = Some(message),
+                        Ok(config) => {
+                            if let Some(file) = rfd::FileDialog::new()
+                                .set_title("Choose one raw wrfout file for exact scan replay")
+                                .pick_file()
+                            {
+                                self.launch_synthetic_radar_replay(file, config);
+                            }
+                        }
+                    }
+                }
                 let source_count = self.synthetic_radar_source_files.len();
                 let can_refresh = !busy && source_count > 0;
                 let refresh_hover = if source_count == 0 {
@@ -3030,6 +3164,7 @@ impl ModelDataDock {
         self.stage_formula_raw_from_files(&files);
         let count = files.len();
         self.synthetic_radar_source_files = files.clone();
+        self.synthetic_radar_replay_source = None;
         let task = crate::wrf_radar::spawn_synthetic_radar(files, config);
         self.import_message = Some(if count == 1 {
             "Simulating radar from 1 WRF file…".to_string()
@@ -3037,6 +3172,41 @@ impl ModelDataDock {
             format!("Simulating radar loop from {count} WRF files…")
         });
         self.import_job = Some(ImportJob::SyntheticRadar(task));
+    }
+
+    /// Spawn an exact observed-acquisition replay from one WRF source. The
+    /// observed Arc and file snapshot are retained so Refresh remains the fast
+    /// tuning loop users expect from ordinary synthetic radar.
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    fn launch_synthetic_radar_replay(
+        &mut self,
+        file: PathBuf,
+        config: crate::wrf_radar::SyntheticRadarConfig,
+    ) {
+        if self.import_job.is_some() {
+            self.import_message =
+                Some("Exact radar replay cannot start while another import is running".to_owned());
+            return;
+        }
+        if self.formula_lab.busy() {
+            self.import_message =
+                Some("Exact radar replay cannot start while Formula Lab is evaluating".to_owned());
+            return;
+        }
+        let Some(observed) = self.displayed_replay_source.clone() else {
+            self.import_message = Some(
+                "Load an eligible observed radar scan before starting exact replay".to_owned(),
+            );
+            return;
+        };
+        self.stage_formula_raw_from_files(std::slice::from_ref(&file));
+        self.synthetic_radar_source_files = vec![file.clone()];
+        self.synthetic_radar_replay_source = Some(observed.clone());
+        let task = crate::wrf_radar::spawn_synthetic_radar_replay(vec![file], config, observed);
+        self.import_message = Some(
+            "Replaying WRF through the displayed scan's exact observed acquisition…".to_owned(),
+        );
+        self.import_job = Some(ImportJob::SyntheticRadarReplay(task));
     }
 
     /// Build a refresh request from the remembered source snapshot and the
@@ -3071,7 +3241,19 @@ impl ModelDataDock {
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn refresh_synthetic_radar(&mut self) {
         match self.synthetic_radar_refresh_request() {
-            Ok((files, config)) => self.launch_synthetic_radar(files, config),
+            Ok((files, config)) => {
+                if let Some(observed) = self.synthetic_radar_replay_source.clone() {
+                    let Some(file) = files.into_iter().next() else {
+                        self.import_message =
+                            Some("Exact radar replay has no retained WRF source file".to_owned());
+                        return;
+                    };
+                    self.displayed_replay_source = Some(observed);
+                    self.launch_synthetic_radar_replay(file, config);
+                } else {
+                    self.launch_synthetic_radar(files, config);
+                }
+            }
             Err(message) => self.import_message = Some(message),
         }
     }

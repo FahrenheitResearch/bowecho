@@ -30305,6 +30305,7 @@ impl ViewerApp {
     fn wrf_pane_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.ensure_model_data_dock(&ctx);
+        let displayed_radar = self.volume.clone();
         let mut open_models = false;
         ui.horizontal_wrapped(|ui| {
             ui.weak("Processed fields and Formula Lab results are displayed in Models.");
@@ -30312,6 +30313,7 @@ impl ViewerApp {
         });
         ui.separator();
         if let Some(dock) = self.model_dock.as_mut() {
+            dock.set_displayed_radar_for_replay(displayed_radar);
             dock.wrf_ui(ui);
         }
         if open_models {
@@ -33007,6 +33009,49 @@ impl ViewerApp {
             .and_then(|dock| dock.take_synthetic_radar());
         if let Some((label, config_fingerprint, volumes)) = synthetic_radar {
             self.install_synthetic_radar_volumes(label, config_fingerprint, volumes, ctx);
+        }
+        let synthetic_replay = self
+            .model_dock
+            .as_mut()
+            .and_then(|dock| dock.take_synthetic_radar_replay());
+        if let Some(replay) = synthetic_replay {
+            let frame_count = replay.frames.len();
+            let notes = replay.notes;
+            if let Some(frame) = replay.frames.into_iter().next() {
+                let unavailable_count = frame.unavailable_observed_moments.len();
+                match self.install_simradar_comparison_volumes(
+                    frame.observed,
+                    frame.simulated,
+                    frame.difference,
+                    ctx,
+                ) {
+                    Ok(()) => {
+                        let mut detail = Vec::new();
+                        if frame_count > 1 {
+                            detail.push(format!("showing the first of {frame_count} model times"));
+                        }
+                        if unavailable_count > 0 {
+                            detail.push(format!(
+                                "{unavailable_count} observed moment/cut combinations unavailable for difference"
+                            ));
+                        }
+                        if !notes.is_empty() {
+                            detail.push(notes.join("; "));
+                        }
+                        if !detail.is_empty() {
+                            self.status = format!(
+                                "Simulated-radar comparison installed — {}",
+                                detail.join(" — ")
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.status = format!("Cannot open simulated-radar comparison: {error}");
+                    }
+                }
+            } else {
+                self.status = "Exact radar replay returned no model frames".to_owned();
+            }
         }
         if let Some(receiver) = &self.model_layer_build_rx {
             match receiver.try_recv() {
