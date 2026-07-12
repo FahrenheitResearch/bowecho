@@ -46,6 +46,12 @@ use wrf_core::{ComputeOpts, WrfFile, getvar};
 use crate::model_layer::{
     InverseLut, neighboring_cell_starts, solve_bilinear_coords, unwrap_lon_near,
 };
+use crate::wrf_radar_estimator::{
+    CustomSinglePrf, IdealMoments, MatchedFilterRangeResponse, MeasuredMoments,
+    MomentEstimatorConfig, NoiseKey, PresentationConfig, PresentedMoments, PrfSpecification,
+    RadarInstrument, RadarMomentValues, ResolvedEstimatorSampling, ResolvedSinglePrf,
+    estimate_measured_moments, present_measured_moments, resolve_estimator_sampling, resolve_prf,
+};
 use ui_core::geo::aeqd_inverse_km;
 
 use app_ui::vcp_catalog::{
@@ -431,6 +437,24 @@ pub struct SyntheticRadarConfig {
     /// Pulse repetition frequency used for CfRadial metadata. Velocity folding
     /// remains controlled independently by `nyquist_mps`.
     pub prf_hz: f32,
+    /// Opt into the physically coupled custom single-PRF instrument. When on,
+    /// exact frequency + PRF jointly determine wavelength, Nyquist and
+    /// unambiguous range; the moment estimator owns sensitivity, uncertainty,
+    /// bias and folding. Named VCP PRF codes fail closed because they are not
+    /// frequencies. Off preserves the v0.33.1 path bit-for-bit.
+    pub coupled_single_prf_estimator: bool,
+    /// Nominal dwell used by the coupled moment estimator.
+    pub estimator_dwell_ms: f32,
+    /// Optional authoritative transmitted-pulse count. `None` derives
+    /// `floor(dwell * PRF)`.
+    pub estimator_pulse_count: Option<u32>,
+    /// Fraction of transmitted pulses treated as statistically independent.
+    pub estimator_independent_sample_fraction: f32,
+    /// Minimum received SNR admitted by the coupled estimator.
+    pub estimator_minimum_snr_db: f32,
+    /// Emit opt-in f32 Ideal (`I*`) and Measured (`M*`) diagnostic fields for
+    /// REF/VEL/SW/ZDR/rhoHV/KDP. Canonical fields remain Presented.
+    pub emit_stage_diagnostics: bool,
     /// Range-dependent sensitivity/noise model. The threshold follows the
     /// radar equation from this 1-km dBZ reference when enabled.
     pub instrument_noise: bool,
@@ -520,6 +544,12 @@ impl Default for SyntheticRadarConfig {
             rotation_rate_deg_s: 18.0,
             transition_delay_s: 3.5,
             prf_hz: 1_000.0,
+            coupled_single_prf_estimator: false,
+            estimator_dwell_ms: 50.0,
+            estimator_pulse_count: None,
+            estimator_independent_sample_fraction: 0.5,
+            estimator_minimum_snr_db: 0.0,
+            emit_stage_diagnostics: false,
             instrument_noise: false,
             sensitivity_dbz_at_1km: -40.0,
             // Reflectivity texture ON by default (owner verdict: a smooth
@@ -581,6 +611,15 @@ impl SyntheticRadarConfig {
     /// scene. These are exact applicability checks, not automatic clamps or
     /// fallback rules.
     pub fn validate_science_contract(&self) -> Result<(), String> {
+        if self.emit_stage_diagnostics && !self.coupled_single_prf_estimator {
+            return Err(
+                "Ideal/Measured stage diagnostics require the coupled single-PRF estimator"
+                    .to_string(),
+            );
+        }
+        if self.coupled_single_prf_estimator {
+            validate_coupled_estimator_inputs(self)?;
+        }
         if !matches!(
             self.polarimetric_kernel,
             PolarimetricKernel::PropertyTMatrixResearchV1
@@ -772,6 +811,14 @@ impl SyntheticRadarConfig {
         self.rotation_rate_deg_s.to_bits().hash(&mut hasher);
         self.transition_delay_s.to_bits().hash(&mut hasher);
         self.prf_hz.to_bits().hash(&mut hasher);
+        self.coupled_single_prf_estimator.hash(&mut hasher);
+        self.estimator_dwell_ms.to_bits().hash(&mut hasher);
+        self.estimator_pulse_count.hash(&mut hasher);
+        self.estimator_independent_sample_fraction
+            .to_bits()
+            .hash(&mut hasher);
+        self.estimator_minimum_snr_db.to_bits().hash(&mut hasher);
+        self.emit_stage_diagnostics.hash(&mut hasher);
         self.instrument_noise.hash(&mut hasher);
         self.sensitivity_dbz_at_1km.to_bits().hash(&mut hasher);
         self.ref_gate_texture.hash(&mut hasher);
@@ -831,6 +878,205 @@ impl SyntheticRadarConfig {
         }
         i64::from(latest_ray_ms)
     }
+}
+
+const IDEAL_STAGE_DEFINITION: &str = "Ideal=pulse-volume moments after propagation, before receiver censoring, uncertainty, bias, ambiguity, texture, or clutter";
+const MEASURED_STAGE_DEFINITION: &str = "Measured=Ideal plus PRF/dwell/pulse-count SNR estimator, receiver censoring, moment bias/uncertainty, and PRF-derived velocity ambiguity";
+const PRESENTED_STAGE_DEFINITION: &str = "Presented=Measured plus optional deterministic display texture and stylized ground clutter; canonical output fields use this stage";
+
+fn validate_coupled_estimator_inputs(config: &SyntheticRadarConfig) -> Result<(), String> {
+    if let Some(definition) = config.scan_strategy.definition() {
+        return Err(format!(
+            "coupled single-PRF estimator cannot use named VCP {}: Appendix C PRF codes are identifiers, not frequencies",
+            definition.vcp.number()
+        ));
+    }
+    for (name, value, positive) in [
+        ("radar_frequency_mhz", config.radar_frequency_mhz, true),
+        ("pulse_width_us", config.pulse_width_us, true),
+        ("prf_hz", config.prf_hz, true),
+        ("estimator_dwell_ms", config.estimator_dwell_ms, true),
+        (
+            "estimator_independent_sample_fraction",
+            config.estimator_independent_sample_fraction,
+            true,
+        ),
+        (
+            "sensitivity_dbz_at_1km",
+            config.sensitivity_dbz_at_1km,
+            false,
+        ),
+        (
+            "estimator_minimum_snr_db",
+            config.estimator_minimum_snr_db,
+            false,
+        ),
+        ("zdr_bias_db", config.zdr_bias_db, false),
+    ] {
+        if !value.is_finite() || (positive && value <= 0.0) {
+            return Err(format!("coupled estimator {name} is invalid: {value}"));
+        }
+    }
+    if config.estimator_independent_sample_fraction > 1.0 {
+        return Err(format!(
+            "coupled estimator independent-sample fraction exceeds 1: {}",
+            config.estimator_independent_sample_fraction
+        ));
+    }
+    if config.estimator_pulse_count == Some(0) {
+        return Err("coupled estimator pulse count must be positive".to_string());
+    }
+    if config.estimator_pulse_count.is_none()
+        && f64::from(config.estimator_dwell_ms) * 1.0e-3 * f64::from(config.prf_hz) < 1.0
+    {
+        return Err(
+            "coupled estimator dwell and PRF resolve to fewer than one transmitted pulse"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhysicalQuadraturePoint {
+    az_sigma: f64,
+    el_sigma: f64,
+    range_offset_m: f64,
+    weight: f64,
+}
+
+struct CoupledInstrumentContext {
+    instrument: RadarInstrument,
+    timing: ResolvedSinglePrf,
+    estimator_config: MomentEstimatorConfig,
+    sampling: ResolvedEstimatorSampling,
+    range_resolution_m: f64,
+    balanced_quadrature: Vec<PhysicalQuadraturePoint>,
+    reference_quadrature: Vec<PhysicalQuadraturePoint>,
+}
+
+impl CoupledInstrumentContext {
+    fn quadrature(&self, mode: BeamIntegration) -> Option<&[PhysicalQuadraturePoint]> {
+        match mode {
+            BeamIntegration::Center => None,
+            BeamIntegration::Balanced => Some(&self.balanced_quadrature),
+            BeamIntegration::Reference => Some(&self.reference_quadrature),
+        }
+    }
+
+    fn stamped_nyquist_mps(&self) -> f32 {
+        self.timing.nyquist_velocity_mps as f32
+    }
+}
+
+fn resolve_coupled_instrument(
+    config: &SyntheticRadarConfig,
+) -> Result<Option<CoupledInstrumentContext>, String> {
+    if !config.coupled_single_prf_estimator {
+        return Ok(None);
+    }
+    if let Some(definition) = config.scan_strategy.definition() {
+        let source_code = definition
+            .rows
+            .iter()
+            .find_map(|row| {
+                row.doppler_prfs
+                    .iter()
+                    .find(|cell| cell.is_default)
+                    .map(|cell| cell.code)
+                    .or_else(|| row.surveillance_prf.map(|prf| prf.code))
+            })
+            .unwrap_or(0);
+        return match resolve_prf(
+            &RadarInstrument::new(
+                "BowEcho virtual radar",
+                f64::from(config.radar_frequency_mhz) * 1.0e6,
+                f64::from(config.pulse_width_us) * 1.0e-6,
+            )
+            .map_err(|error| format!("resolve coupled radar instrument: {error}"))?,
+            PrfSpecification::NamedVcpCode {
+                vcp: definition.vcp.number(),
+                code: source_code,
+            },
+        ) {
+            Ok(_) => {
+                Err("named VCP PRF code unexpectedly resolved as a physical frequency".to_string())
+            }
+            Err(error) => Err(format!("resolve coupled single-PRF estimator: {error}")),
+        };
+    }
+
+    let instrument = RadarInstrument::new(
+        "BowEcho virtual radar",
+        f64::from(config.radar_frequency_mhz) * 1.0e6,
+        f64::from(config.pulse_width_us) * 1.0e-6,
+    )
+    .map_err(|error| format!("resolve coupled radar instrument: {error}"))?;
+    let custom_prf = CustomSinglePrf::new(f64::from(config.prf_hz))
+        .map_err(|error| format!("resolve coupled custom PRF: {error}"))?;
+    let timing = resolve_prf(&instrument, PrfSpecification::CustomSinglePrf(custom_prf))
+        .map_err(|error| format!("resolve coupled custom PRF: {error}"))?;
+    let estimator_config = MomentEstimatorConfig {
+        dwell_s: f64::from(config.estimator_dwell_ms) * 1.0e-3,
+        pulse_count: config.estimator_pulse_count,
+        independent_sample_fraction: f64::from(config.estimator_independent_sample_fraction),
+        sensitivity_dbz_at_1km: f64::from(config.sensitivity_dbz_at_1km),
+        minimum_snr_db: f64::from(config.estimator_minimum_snr_db),
+        zdr_system_bias_db: f64::from(config.zdr_bias_db),
+        kdp_baseline_km: (config.gate_spacing_m / 1_000.0).max(0.001),
+    };
+    let sampling = resolve_estimator_sampling(&timing, &estimator_config)
+        .map_err(|error| format!("resolve coupled moment-estimator sampling: {error}"))?;
+    // Five response nodes include the zero-weight support endpoints; the
+    // three interior nodes form a normalized center/half-pulse quadrature.
+    let response = MatchedFilterRangeResponse::new(instrument.pulse_width_s, 5)
+        .map_err(|error| format!("resolve matched-filter range response: {error}"))?;
+    let samples = &response.samples()[1..4];
+    let negative = samples[0];
+    let center = samples[1];
+    let positive = samples[2];
+    let mut balanced_quadrature = Vec::with_capacity(9);
+    balanced_quadrature.push(PhysicalQuadraturePoint {
+        az_sigma: 0.0,
+        el_sigma: 0.0,
+        range_offset_m: center.offset_m,
+        weight: center.weight,
+    });
+    for &(az_sigma, el_sigma) in &[(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+        for range in [negative, positive] {
+            balanced_quadrature.push(PhysicalQuadraturePoint {
+                az_sigma,
+                el_sigma,
+                range_offset_m: range.offset_m,
+                weight: range.weight / 4.0,
+            });
+        }
+    }
+
+    let coordinates = [-1.0, 0.0, 1.0];
+    let angular_weights = [0.25, 0.5, 0.25];
+    let mut reference_quadrature = Vec::with_capacity(27);
+    for (az_index, az_sigma) in coordinates.iter().copied().enumerate() {
+        for (el_index, el_sigma) in coordinates.iter().copied().enumerate() {
+            for range in samples {
+                reference_quadrature.push(PhysicalQuadraturePoint {
+                    az_sigma,
+                    el_sigma,
+                    range_offset_m: range.offset_m,
+                    weight: angular_weights[az_index] * angular_weights[el_index] * range.weight,
+                });
+            }
+        }
+    }
+    Ok(Some(CoupledInstrumentContext {
+        instrument,
+        timing,
+        estimator_config,
+        sampling,
+        range_resolution_m: response.range_resolution_m,
+        balanced_quadrature,
+        reference_quadrature,
+    }))
 }
 
 fn advance_cut_start_ms(
@@ -2037,6 +2283,7 @@ fn build_synthetic_volume_reporting_inner(
     temporal: Option<TemporalRenderContext<'_>>,
 ) -> Result<RadarVolume, String> {
     config.validate_science_contract()?;
+    let coupled_instrument = resolve_coupled_instrument(config)?;
     let cells = fields.cells();
     let center = fields.center_cell();
     let site_lat = config
@@ -2131,6 +2378,33 @@ fn build_synthetic_volume_reporting_inner(
             audit.max_fall_variance_abs_error_m2s2,
         );
     }
+    if let Some(coupled) = coupled_instrument.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(
+            forward_operator_config,
+            "; estimator=CustomSinglePrfV1; frequency_hz={:.3}; wavelength_m={:.12}; \
+             prf_hz={:.6}; prt_s={:.9}; nyquist_mps={:.6}; unambiguous_range_km={:.6}; \
+             pulse_range_response=matched_filter_triangular; pulse_range_resolution_m={:.6}; \
+             dwell_ms={:.3}; transmitted_pulses={}; independent_samples={:.3}; \
+             minimum_snr_db={:.3}; velocity_folding=always_prf_derived; \
+             stage_diagnostics={}; stage_definitions={} | {} | {}",
+            coupled.timing.frequency_hz,
+            coupled.timing.wavelength_m,
+            coupled.timing.prf_hz,
+            coupled.timing.prt_s,
+            coupled.timing.nyquist_velocity_mps,
+            coupled.timing.unambiguous_range_m / 1_000.0,
+            coupled.range_resolution_m,
+            coupled.sampling.dwell_s * 1_000.0,
+            coupled.sampling.transmitted_pulses,
+            coupled.sampling.independent_samples,
+            coupled.estimator_config.minimum_snr_db,
+            config.emit_stage_diagnostics,
+            IDEAL_STAGE_DEFINITION,
+            MEASURED_STAGE_DEFINITION,
+            PRESENTED_STAGE_DEFINITION,
+        );
+    }
     if let Some(definition) = named_vcp {
         use std::fmt::Write as _;
         let _ = write!(
@@ -2187,19 +2461,30 @@ fn build_synthetic_volume_reporting_inner(
         pulse_width_us: Some(config.pulse_width_us),
         // Appendix C supplies numbered PRF codes, not Hz. Never turn those
         // codes into a fictitious standard PRT/unambiguous range.
-        prt_s: named_vcp
-            .is_none()
-            .then(|| {
-                (config.prf_hz.is_finite() && config.prf_hz > 0.0).then_some(1.0 / config.prf_hz)
-            })
-            .flatten(),
-        unambiguous_range_km: named_vcp
-            .is_none()
-            .then(|| {
-                (config.prf_hz.is_finite() && config.prf_hz > 0.0)
-                    .then_some(299_792.47 / (2.0 * config.prf_hz))
-            })
-            .flatten(),
+        prt_s: coupled_instrument.as_ref().map_or_else(
+            || {
+                named_vcp
+                    .is_none()
+                    .then(|| {
+                        (config.prf_hz.is_finite() && config.prf_hz > 0.0)
+                            .then_some(1.0 / config.prf_hz)
+                    })
+                    .flatten()
+            },
+            |coupled| Some(coupled.timing.prt_s as f32),
+        ),
+        unambiguous_range_km: coupled_instrument.as_ref().map_or_else(
+            || {
+                named_vcp
+                    .is_none()
+                    .then(|| {
+                        (config.prf_hz.is_finite() && config.prf_hz > 0.0)
+                            .then_some(299_792.47 / (2.0 * config.prf_hz))
+                    })
+                    .flatten()
+            },
+            |coupled| Some((coupled.timing.unambiguous_range_m / 1_000.0) as f32),
+        ),
         scan_name: Some(if let Some(definition) = named_vcp {
             format!("Build 24 VCP {} baseline", definition.vcp.number())
         } else {
@@ -2241,7 +2526,12 @@ fn build_synthetic_volume_reporting_inner(
             "ZDR bias={:.2} dB; system PhiDP={:.2} deg",
             config.zdr_bias_db, config.system_phidp_deg
         )),
-        forward_operator: Some("BowEcho WRF polar-volume forward operator v3".to_string()),
+        forward_operator: Some(if coupled_instrument.is_some() {
+            "BowEcho WRF polar-volume forward operator v4 (coupled single-PRF estimator)"
+                .to_string()
+        } else {
+            "BowEcho WRF polar-volume forward operator v3".to_string()
+        }),
         forward_operator_config: Some(forward_operator_config),
         source_model: Some("WRF".to_string()),
         microphysics_scheme: fields
@@ -2316,6 +2606,7 @@ fn build_synthetic_volume_reporting_inner(
             frame_seed,
             terrain_horizon.as_ref(),
             cut_start_ms,
+            coupled_instrument.as_ref(),
         )?;
         decoded_radials += cut.radials.len();
         volume.cuts.push(cut);
@@ -2545,7 +2836,7 @@ struct GateSampleResult {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sample_gate_with_quality(
+fn sample_gate_with_quality_instrument(
     fields: &WrfRadarFields,
     neighbor_fields: Option<&WrfRadarFields>,
     atmosphere_alpha: f64,
@@ -2560,10 +2851,20 @@ fn sample_gate_with_quality(
     spacing_m: f64,
     config: &SyntheticRadarConfig,
     terrain_horizon: Option<&TerrainHorizon>,
+    coupled_instrument: Option<&CoupledInstrumentContext>,
 ) -> Result<GateSampleResult, String> {
     let beam_sigma_deg = gaussian_beam_sigma_deg(f64::from(config.beam_width_deg.max(0.05)));
-    let points = quadrature_points(config.beam_integration);
-    let total_weight = points.iter().map(|point| point.weight).sum::<f64>();
+    let physical_points =
+        coupled_instrument.and_then(|instrument| instrument.quadrature(config.beam_integration));
+    let total_weight = physical_points.map_or_else(
+        || {
+            quadrature_points(config.beam_integration)
+                .iter()
+                .map(|point| point.weight)
+                .sum::<f64>()
+        },
+        |points| points.iter().map(|point| point.weight).sum::<f64>(),
+    );
     let mut valid_weight = 0.0f64;
     let mut terrain_unblocked_weight = 0.0f64;
     let mut signal_weight = 0.0f64;
@@ -2574,77 +2875,98 @@ fn sample_gate_with_quality(
     let mut polar_accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
     let mut any_polar = false;
 
-    for point in points {
-        let azimuth_deg = center_azimuth_deg + point.az_sigma * beam_sigma_deg;
-        let elevation_deg = center_elevation_deg + point.el_sigma * beam_sigma_deg;
-        let slant_m = (center_slant_m + point.range_gate * spacing_m).max(0.0);
-        let beam_height_m = beam_height_above_radar_m(slant_m, elevation_deg);
-        let z_msl = antenna_msl + beam_height_m;
-        let ground_m = beam_ground_range_m(slant_m, elevation_deg);
-        let azimuth = azimuth_deg.to_radians();
-        let east_km = ground_m * azimuth.sin() / 1_000.0;
-        let north_km = ground_m * azimuth.cos() / 1_000.0;
-        let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
-        let Some(sample) = sample_column_temporal(
-            fields,
-            neighbor_fields,
-            atmosphere_alpha,
-            cells,
-            lat as f32,
-            lon as f32,
-            z_msl as f32,
-            elevation_deg,
-            config.reflectivity_sampling,
-        )?
-        else {
-            continue;
-        };
-        valid_weight += point.weight;
+    let mut accumulate_point =
+        |az_sigma: f64, el_sigma: f64, range_offset_m: f64, weight: f64| -> Result<(), String> {
+            let azimuth_deg = center_azimuth_deg + az_sigma * beam_sigma_deg;
+            let elevation_deg = center_elevation_deg + el_sigma * beam_sigma_deg;
+            let slant_m = (center_slant_m + range_offset_m).max(0.0);
+            let beam_height_m = beam_height_above_radar_m(slant_m, elevation_deg);
+            let z_msl = antenna_msl + beam_height_m;
+            let ground_m = beam_ground_range_m(slant_m, elevation_deg);
+            let azimuth = azimuth_deg.to_radians();
+            let east_km = ground_m * azimuth.sin() / 1_000.0;
+            let north_km = ground_m * azimuth.cos() / 1_000.0;
+            let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
+            let Some(sample) = sample_column_temporal(
+                fields,
+                neighbor_fields,
+                atmosphere_alpha,
+                cells,
+                lat as f32,
+                lon as f32,
+                z_msl as f32,
+                elevation_deg,
+                config.reflectivity_sampling,
+            )?
+            else {
+                return Ok(());
+            };
+            valid_weight += weight;
 
-        let blocked = terrain_horizon.is_some_and(|horizon| {
-            let horizon_deg = horizon.at(azimuth_deg, gate_index);
-            horizon_deg.is_finite() && elevation_deg as f32 <= horizon_deg
-        });
-        if blocked {
-            continue;
-        }
-        terrain_unblocked_weight += point.weight;
+            let blocked = terrain_horizon.is_some_and(|horizon| {
+                let horizon_deg = horizon.at(azimuth_deg, gate_index);
+                horizon_deg.is_finite() && elevation_deg as f32 <= horizon_deg
+            });
+            if blocked {
+                return Ok(());
+            }
+            terrain_unblocked_weight += weight;
 
-        let el = elevation_deg.to_radians();
-        let fall_speed = if config.terminal_fall_speed {
-            sample.polar.map_or(0.0, |polar| polar.fall_speed_mps)
-        } else {
-            0.0
+            let el = elevation_deg.to_radians();
+            let fall_speed = if config.terminal_fall_speed {
+                sample.polar.map_or(0.0, |polar| polar.fall_speed_mps)
+            } else {
+                0.0
+            };
+            let vr = f64::from(sample.u) * azimuth.sin() * el.cos()
+                + f64::from(sample.v) * azimuth.cos() * el.cos()
+                + f64::from(sample.w - fall_speed) * el.sin();
+            let z = f64::from(sample.z_linear);
+            if !z.is_finite() || z <= 0.0 || !vr.is_finite() {
+                return Ok(());
+            }
+            signal_weight += weight;
+            sum_z += weight * z;
+            sum_z_vr += weight * z * vr;
+            sum_z_vr2 += weight * z * vr * vr;
+            let terminal_variance = if config.terminal_fall_speed {
+                sample
+                    .polar
+                    .map_or(0.0, |polar| f64::from(polar.fall_speed_variance_m2s2))
+                    * el.sin().powi(2)
+            } else {
+                0.0
+            };
+            let turbulent_variance = if config.spectrum_width {
+                // Isotropic one-dimensional variance from TKE = 1/2(u'^2+v'^2+w'^2).
+                f64::from((2.0 / 3.0) * sample.tke_m2s2.max(0.0))
+            } else {
+                0.0
+            };
+            sum_z_subgrid_variance += weight * z * (terminal_variance + turbulent_variance);
+            if let Some(polar) = sample.polar {
+                any_polar = true;
+                polar_accumulator.add(weight as f32, intrinsic_as_contribution(polar));
+            }
+            Ok(())
         };
-        let vr = f64::from(sample.u) * azimuth.sin() * el.cos()
-            + f64::from(sample.v) * azimuth.cos() * el.cos()
-            + f64::from(sample.w - fall_speed) * el.sin();
-        let z = f64::from(sample.z_linear);
-        if !z.is_finite() || z <= 0.0 || !vr.is_finite() {
-            continue;
+    if let Some(points) = physical_points {
+        for point in points {
+            accumulate_point(
+                point.az_sigma,
+                point.el_sigma,
+                point.range_offset_m,
+                point.weight,
+            )?;
         }
-        signal_weight += point.weight;
-        sum_z += point.weight * z;
-        sum_z_vr += point.weight * z * vr;
-        sum_z_vr2 += point.weight * z * vr * vr;
-        let terminal_variance = if config.terminal_fall_speed {
-            sample
-                .polar
-                .map_or(0.0, |polar| f64::from(polar.fall_speed_variance_m2s2))
-                * el.sin().powi(2)
-        } else {
-            0.0
-        };
-        let turbulent_variance = if config.spectrum_width {
-            // Isotropic one-dimensional variance from TKE = 1/2(u'^2+v'^2+w'^2).
-            f64::from((2.0 / 3.0) * sample.tke_m2s2.max(0.0))
-        } else {
-            0.0
-        };
-        sum_z_subgrid_variance += point.weight * z * (terminal_variance + turbulent_variance);
-        if let Some(polar) = sample.polar {
-            any_polar = true;
-            polar_accumulator.add(point.weight as f32, intrinsic_as_contribution(polar));
+    } else {
+        for point in quadrature_points(config.beam_integration) {
+            accumulate_point(
+                point.az_sigma,
+                point.el_sigma,
+                point.range_gate * spacing_m,
+                point.weight,
+            )?;
         }
     }
 
@@ -2686,6 +3008,42 @@ fn sample_gate_with_quality(
         }),
         quality,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_gate_with_quality(
+    fields: &WrfRadarFields,
+    neighbor_fields: Option<&WrfRadarFields>,
+    atmosphere_alpha: f64,
+    cells: usize,
+    site_lat: f64,
+    site_lon: f64,
+    antenna_msl: f64,
+    center_azimuth_deg: f64,
+    center_elevation_deg: f64,
+    center_slant_m: f64,
+    gate_index: usize,
+    spacing_m: f64,
+    config: &SyntheticRadarConfig,
+    terrain_horizon: Option<&TerrainHorizon>,
+) -> Result<GateSampleResult, String> {
+    sample_gate_with_quality_instrument(
+        fields,
+        neighbor_fields,
+        atmosphere_alpha,
+        cells,
+        site_lat,
+        site_lon,
+        antenna_msl,
+        center_azimuth_deg,
+        center_elevation_deg,
+        center_slant_m,
+        gate_index,
+        spacing_m,
+        config,
+        terrain_horizon,
+        None,
+    )
 }
 
 /// Compatibility seam for focused physics tests and callers that need only
@@ -2743,6 +3101,97 @@ struct CutMomentRow {
     model_coverage: Vec<u8>,
     terrain_unblocked: Vec<u8>,
     meteorological_signal: Vec<u8>,
+    stage_diagnostics: Option<StageDiagnosticRow>,
+}
+
+struct StageDiagnosticRow {
+    ideal_reflectivity: Vec<f32>,
+    ideal_velocity: Vec<f32>,
+    ideal_spectrum_width: Vec<f32>,
+    ideal_zdr: Vec<f32>,
+    ideal_rho_hv: Vec<f32>,
+    ideal_kdp: Vec<f32>,
+    measured_reflectivity: Vec<f32>,
+    measured_velocity: Vec<f32>,
+    measured_spectrum_width: Vec<f32>,
+    measured_zdr: Vec<f32>,
+    measured_rho_hv: Vec<f32>,
+    measured_kdp: Vec<f32>,
+}
+
+fn diagnostic_value(value: Option<f64>) -> f32 {
+    value
+        .filter(|value| value.is_finite())
+        .map_or(f32::NAN, |value| value as f32)
+}
+
+impl StageDiagnosticRow {
+    fn with_len(len: usize) -> Self {
+        let blank = || vec![f32::NAN; len];
+        Self {
+            ideal_reflectivity: blank(),
+            ideal_velocity: blank(),
+            ideal_spectrum_width: blank(),
+            ideal_zdr: blank(),
+            ideal_rho_hv: blank(),
+            ideal_kdp: blank(),
+            measured_reflectivity: blank(),
+            measured_velocity: blank(),
+            measured_spectrum_width: blank(),
+            measured_zdr: blank(),
+            measured_rho_hv: blank(),
+            measured_kdp: blank(),
+        }
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        let values = || Vec::with_capacity(capacity);
+        Self {
+            ideal_reflectivity: values(),
+            ideal_velocity: values(),
+            ideal_spectrum_width: values(),
+            ideal_zdr: values(),
+            ideal_rho_hv: values(),
+            ideal_kdp: values(),
+            measured_reflectivity: values(),
+            measured_velocity: values(),
+            measured_spectrum_width: values(),
+            measured_zdr: values(),
+            measured_rho_hv: values(),
+            measured_kdp: values(),
+        }
+    }
+
+    fn record(&mut self, gate: usize, ideal: IdealMoments, measured: MeasuredMoments) {
+        self.ideal_reflectivity[gate] = diagnostic_value(ideal.values.reflectivity_dbz);
+        self.ideal_velocity[gate] = diagnostic_value(ideal.values.velocity_mps);
+        self.ideal_spectrum_width[gate] = diagnostic_value(ideal.values.spectrum_width_mps);
+        self.ideal_zdr[gate] = diagnostic_value(ideal.values.zdr_db);
+        self.ideal_rho_hv[gate] = diagnostic_value(ideal.values.rho_hv);
+        self.ideal_kdp[gate] = diagnostic_value(ideal.values.kdp_deg_km);
+        self.measured_reflectivity[gate] = diagnostic_value(measured.values.reflectivity_dbz);
+        self.measured_velocity[gate] = diagnostic_value(measured.values.velocity_mps);
+        self.measured_spectrum_width[gate] = diagnostic_value(measured.values.spectrum_width_mps);
+        self.measured_zdr[gate] = diagnostic_value(measured.values.zdr_db);
+        self.measured_rho_hv[gate] = diagnostic_value(measured.values.rho_hv);
+        self.measured_kdp[gate] = diagnostic_value(measured.values.kdp_deg_km);
+    }
+
+    fn append(&mut self, row: Self) {
+        self.ideal_reflectivity.extend(row.ideal_reflectivity);
+        self.ideal_velocity.extend(row.ideal_velocity);
+        self.ideal_spectrum_width.extend(row.ideal_spectrum_width);
+        self.ideal_zdr.extend(row.ideal_zdr);
+        self.ideal_rho_hv.extend(row.ideal_rho_hv);
+        self.ideal_kdp.extend(row.ideal_kdp);
+        self.measured_reflectivity.extend(row.measured_reflectivity);
+        self.measured_velocity.extend(row.measured_velocity);
+        self.measured_spectrum_width
+            .extend(row.measured_spectrum_width);
+        self.measured_zdr.extend(row.measured_zdr);
+        self.measured_rho_hv.extend(row.measured_rho_hv);
+        self.measured_kdp.extend(row.measured_kdp);
+    }
 }
 
 /// Acquisition geometry and timing resolved before gate sampling begins.
@@ -2801,7 +3250,7 @@ fn plan_synthetic_rays(
 }
 
 impl CutMomentRow {
-    fn blank(gates: usize) -> Self {
+    fn blank(gates: usize, emit_stage_diagnostics: bool) -> Self {
         let blank = || vec![f32::NAN; gates];
         Self {
             reflectivity: blank(),
@@ -2820,6 +3269,7 @@ impl CutMomentRow {
             model_coverage: vec![0; gates],
             terrain_unblocked: vec![0; gates],
             meteorological_signal: vec![0; gates],
+            stage_diagnostics: emit_stage_diagnostics.then(|| StageDiagnosticRow::with_len(gates)),
         }
     }
 }
@@ -2843,6 +3293,7 @@ fn build_cut(
     frame_seed: u32,
     terrain_horizon: Option<&TerrainHorizon>,
     cut_start_ms: i32,
+    coupled_instrument: Option<&CoupledInstrumentContext>,
 ) -> Result<ElevationCut, String> {
     let gate_count = gate_range.gate_count;
     // Instrument mode already applies its range-varying radar-equation
@@ -2897,7 +3348,7 @@ fn build_cut(
         .map(|ray| -> Result<CutMomentRow, String> {
             let iaz = ray.source_index;
             let az_deg = f64::from(ray.azimuth_deg);
-            let mut row = CutMomentRow::blank(gate_count);
+            let mut row = CutMomentRow::blank(gate_count, config.emit_stage_diagnostics);
             let dr_km = (spacing / 1_000.0).max(0.0) as f32;
             let mut previous_kdp = 0.0f32;
             let mut previous_ah = 0.0f32;
@@ -2910,7 +3361,7 @@ fn build_cut(
                 // Doviak & Zrnić (1993) eq. 2.28b/c under the 4/3-earth model.
                 let beam_height_m = beam_height_above_radar_m(slant_m, elevation_deg);
                 let ground_m = beam_ground_range_m(slant_m, elevation_deg);
-                let sampled = sample_gate_with_quality(
+                let sampled = sample_gate_with_quality_instrument(
                     fields,
                     temporal.map(|context| context.neighbor),
                     ray.atmosphere_alpha,
@@ -2925,6 +3376,7 @@ fn build_cut(
                     spacing,
                     config,
                     terrain_horizon,
+                    coupled_instrument,
                 )?;
                 if config.emit_quality_fields {
                     row.model_coverage[gate] =
@@ -2977,6 +3429,139 @@ fn build_cut(
                     };
                     phi_dp =
                         config.system_phidp_deg + if config.propagation { phi_path } else { 0.0 };
+                }
+                if let Some(coupled) = coupled_instrument {
+                    let propagated_reflectivity =
+                        intrinsic_dbz - if pia.is_finite() { pia } else { 0.0 };
+                    let ideal = IdealMoments {
+                        values: RadarMomentValues {
+                            reflectivity_dbz: propagated_reflectivity
+                                .is_finite()
+                                .then_some(f64::from(propagated_reflectivity)),
+                            velocity_mps: sample
+                                .velocity_mps
+                                .is_finite()
+                                .then_some(f64::from(sample.velocity_mps)),
+                            spectrum_width_mps: (config.spectrum_width
+                                && sample.spectrum_width_mps.is_finite())
+                            .then_some(f64::from(sample.spectrum_width_mps.max(0.0))),
+                            zdr_db: (config.dual_pol && intrinsic_zdr.is_finite()).then_some(
+                                f64::from(
+                                    intrinsic_zdr - if pida.is_finite() { pida } else { 0.0 },
+                                ),
+                            ),
+                            rho_hv: (config.dual_pol && rho_hv.is_finite())
+                                .then_some(f64::from(rho_hv.clamp(0.0, 1.0))),
+                            kdp_deg_km: (config.dual_pol && kdp.is_finite())
+                                .then_some(f64::from(kdp)),
+                        },
+                    };
+                    let noise_key = NoiseKey {
+                        seed: u64::from(frame_seed),
+                        frame: 0,
+                        cut: u16::try_from(cut_index).unwrap_or(u16::MAX),
+                        ray: u32::try_from(iaz).unwrap_or(u32::MAX),
+                        gate: u32::try_from(gate).unwrap_or(u32::MAX),
+                    };
+                    let measured = estimate_measured_moments(
+                        ideal,
+                        &coupled.instrument,
+                        &coupled.timing,
+                        &coupled.estimator_config,
+                        slant_m,
+                        noise_key,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "estimate coupled moments for cut {} ray {} gate {}: {error}",
+                            cut_index + 1,
+                            iaz + 1,
+                            gate + 1
+                        )
+                    })?;
+                    if let Some(diagnostics) = row.stage_diagnostics.as_mut() {
+                        diagnostics.record(gate, ideal, measured);
+                    }
+                    let clutter_reflectivity_dbz = clutter_on
+                        .then(|| {
+                            ground_clutter_dbz(
+                                frame_seed,
+                                cut_index,
+                                iaz,
+                                gate,
+                                az_deg as f32,
+                                (ground_m / 1_000.0) as f32,
+                                beam_height_m as f32,
+                                in_clutter_hotspot(&hotspots, iaz, gate),
+                                clutter_amount,
+                            )
+                        })
+                        .flatten();
+                    let presentation = PresentationConfig {
+                        reflectivity_texture_sigma_db: if config.ref_gate_texture {
+                            f64::from(REF_TEXTURE_CORRELATED_DB.hypot(REF_TEXTURE_JITTER_DB))
+                        } else {
+                            0.0
+                        },
+                        velocity_texture_sigma_mps: if config.vel_gate_texture {
+                            f64::from(VEL_TEXTURE_MPS)
+                        } else {
+                            0.0
+                        },
+                        zdr_display_bias_db: 0.0,
+                        reflectivity_display_floor_dbz: None,
+                        clutter_reflectivity_dbz: clutter_reflectivity_dbz.map(f64::from),
+                        clutter_velocity_mps: if clutter_reflectivity_dbz.is_some() {
+                            f64::from(clutter_velocity_mps(frame_seed, cut_index, iaz, gate))
+                        } else {
+                            0.0
+                        },
+                    };
+                    let presented: PresentedMoments =
+                        present_measured_moments(measured, &presentation, noise_key);
+                    let mut presented_values = presented.values;
+                    if let Some(velocity) = presented_values.velocity_mps.as_mut() {
+                        *velocity = f64::from(fold_velocity_mps(
+                            *velocity as f32,
+                            coupled.stamped_nyquist_mps(),
+                        ));
+                    }
+                    if presented.adjustment.clutter_replaced
+                        && let Some(width) = presented_values.spectrum_width_mps.as_mut()
+                    {
+                        *width = (*width).max(f64::from(config.spectrum_width_floor_mps.max(0.0)));
+                    }
+                    if let Some(value) = presented_values.reflectivity_dbz {
+                        row.reflectivity[gate] = value as f32;
+                    }
+                    if let Some(value) = presented_values.velocity_mps {
+                        row.velocity[gate] = value as f32;
+                    }
+                    if let Some(value) = presented_values.spectrum_width_mps {
+                        row.spectrum_width[gate] = value as f32;
+                    }
+                    if config.dual_pol
+                        && !presented.adjustment.clutter_replaced
+                        && presented_values.reflectivity_dbz.is_some()
+                    {
+                        if let Some(value) = presented_values.zdr_db {
+                            row.zdr[gate] = value as f32;
+                        }
+                        if let Some(value) = presented_values.rho_hv {
+                            row.rho_hv[gate] = value as f32;
+                        }
+                        if let Some(value) = presented_values.kdp_deg_km {
+                            row.kdp[gate] = value as f32;
+                        }
+                        row.phi_dp[gate] = phi_dp;
+                        row.ah[gate] = ah;
+                        row.pia[gate] = pia;
+                        row.ref_corrected[gate] = intrinsic_dbz;
+                        row.adp[gate] = adp;
+                        row.pida[gate] = pida;
+                        row.zdr_corrected[gate] = intrinsic_zdr;
+                    }
+                    continue;
                 }
                 let mut dbz = intrinsic_dbz - if pia.is_finite() { pia } else { 0.0 };
                 if config.ref_gate_texture {
@@ -3121,13 +3706,19 @@ fn build_cut(
     let mut model_coverage_values = Vec::with_capacity(naz * gate_count);
     let mut terrain_unblocked_values = Vec::with_capacity(naz * gate_count);
     let mut meteorological_signal_values = Vec::with_capacity(naz * gate_count);
+    let mut stage_diagnostics = config
+        .emit_stage_diagnostics
+        .then(|| StageDiagnosticRow::with_capacity(naz * gate_count));
     for (ray, row) in ray_plan.into_iter().zip(rows) {
         cut.radials.push(Radial {
             azimuth_deg: ray.azimuth_deg,
             elevation_deg: elevation_deg as f32,
             time_offset_ms: ray.time_offset_ms,
             gate_range: gate_range.clone(),
-            nyquist_velocity_mps: Some(config.stamped_nyquist_mps()),
+            nyquist_velocity_mps: Some(coupled_instrument.map_or_else(
+                || config.stamped_nyquist_mps(),
+                CoupledInstrumentContext::stamped_nyquist_mps,
+            )),
             radial_status: Some(ray.radial_status),
         });
         ref_values.extend(row.reflectivity);
@@ -3146,6 +3737,11 @@ fn build_cut(
         model_coverage_values.extend(row.model_coverage);
         terrain_unblocked_values.extend(row.terrain_unblocked);
         meteorological_signal_values.extend(row.meteorological_signal);
+        if let (Some(all_diagnostics), Some(row_diagnostics)) =
+            (stage_diagnostics.as_mut(), row.stage_diagnostics)
+        {
+            all_diagnostics.append(row_diagnostics);
+        }
     }
 
     let radial_indices: Vec<usize> = (0..naz).collect();
@@ -3214,6 +3810,28 @@ fn build_cut(
             let grid =
                 compact_quality_grid(quality, gate_range.clone(), radial_indices.clone(), values)?;
             cut.moments.insert(grid.moment.clone(), grid);
+        }
+    }
+    if let Some(diagnostics) = stage_diagnostics {
+        for (name, values) in [
+            ("IREF", diagnostics.ideal_reflectivity),
+            ("IVEL", diagnostics.ideal_velocity),
+            ("ISW", diagnostics.ideal_spectrum_width),
+            ("IZDR", diagnostics.ideal_zdr),
+            ("IRHO", diagnostics.ideal_rho_hv),
+            ("IKDP", diagnostics.ideal_kdp),
+            ("MREF", diagnostics.measured_reflectivity),
+            ("MVEL", diagnostics.measured_velocity),
+            ("MSW", diagnostics.measured_spectrum_width),
+            ("MZDR", diagnostics.measured_zdr),
+            ("MRHO", diagnostics.measured_rho_hv),
+            ("MKDP", diagnostics.measured_kdp),
+        ] {
+            let moment = MomentType::Unknown(name.to_string());
+            cut.moments.insert(
+                moment.clone(),
+                f32_grid(moment, gate_range.clone(), radial_indices.clone(), values),
+            );
         }
     }
     Ok(cut)
@@ -4620,8 +5238,10 @@ fn temporal_memory_estimate(
         .len()
         .checked_mul(config.azimuth_count.max(1))
         .ok_or_else(|| "Synthetic radial count overflowed".to_string())?;
-    let f32_moment_count =
-        2usize + usize::from(config.spectrum_width) + if config.dual_pol { 10 } else { 0 };
+    let f32_moment_count = 2usize
+        + usize::from(config.spectrum_width)
+        + if config.dual_pol { 10 } else { 0 }
+        + if config.emit_stage_diagnostics { 12 } else { 0 };
     let gate_samples = radial_count
         .checked_mul(gate_count)
         .ok_or_else(|| "Synthetic output sample count overflowed".to_string())?;
@@ -4646,15 +5266,17 @@ fn temporal_memory_estimate(
         .checked_mul(gate_count)
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
         .ok_or_else(|| "Terrain-horizon memory estimate overflowed".to_string())?;
-    // `CutMomentRow` owns thirteen f32 moment arrays plus three compact quality
-    // arrays until a cut is assembled, regardless of final VCP availability.
+    // `CutMomentRow` owns thirteen canonical f32 moment arrays plus three
+    // compact quality arrays until a cut is assembled, regardless of final VCP
+    // availability. Opt-in diagnostics add twelve more f32 stage arrays.
+    let cut_row_bytes_per_gate = (13 + if config.emit_stage_diagnostics { 12 } else { 0 })
+        * std::mem::size_of::<f32>()
+        + QualityMoment::ALL.len();
     let cut_row_scratch_bytes = config
         .azimuth_count
         .max(1)
         .checked_mul(gate_count)
-        .and_then(|value| {
-            value.checked_mul(13 * std::mem::size_of::<f32>() + QualityMoment::ALL.len())
-        })
+        .and_then(|value| value.checked_mul(cut_row_bytes_per_gate))
         .ok_or_else(|| "Cut-row scratch memory estimate overflowed".to_string())?;
     // Concurrent WRF reads temporarily retain f64 decoder buffers while the
     // five f32 model planes are narrowed. Six planes is a conservative bound
@@ -6450,6 +7072,30 @@ mod tests {
             "transition_delay_s"
         );
         assert!(differs(&|c| c.prf_hz = 1_200.0), "prf_hz");
+        assert!(
+            differs(&|c| c.coupled_single_prf_estimator = true),
+            "coupled_single_prf_estimator"
+        );
+        assert!(
+            differs(&|c| c.estimator_dwell_ms = 75.0),
+            "estimator_dwell_ms"
+        );
+        assert!(
+            differs(&|c| c.estimator_pulse_count = Some(64)),
+            "estimator_pulse_count"
+        );
+        assert!(
+            differs(&|c| c.estimator_independent_sample_fraction = 0.75),
+            "estimator_independent_sample_fraction"
+        );
+        assert!(
+            differs(&|c| c.estimator_minimum_snr_db = 3.0),
+            "estimator_minimum_snr_db"
+        );
+        assert!(
+            differs(&|c| c.emit_stage_diagnostics = true),
+            "emit_stage_diagnostics"
+        );
         assert!(differs(&|c| c.instrument_noise = true), "instrument_noise");
         assert!(
             differs(&|c| c.sensitivity_dbz_at_1km = -38.0),
@@ -6463,6 +7109,126 @@ mod tests {
             differs(&|c| c.minimum_model_coverage_fraction = 0.75),
             "minimum_model_coverage_fraction"
         );
+    }
+
+    #[test]
+    fn coupled_custom_instrument_resolves_one_physical_timing_contract() {
+        let config = SyntheticRadarConfig {
+            coupled_single_prf_estimator: true,
+            radar_frequency_mhz: 2_800,
+            pulse_width_us: 2.0,
+            prf_hz: 1_200.0,
+            estimator_dwell_ms: 40.0,
+            estimator_pulse_count: None,
+            estimator_independent_sample_fraction: 0.5,
+            ..SyntheticRadarConfig::default()
+        };
+        config.validate_science_contract().unwrap();
+        let coupled = resolve_coupled_instrument(&config).unwrap().unwrap();
+        assert!((coupled.timing.prf_hz - 1_200.0).abs() < f64::EPSILON);
+        assert!((coupled.timing.prt_s - 1.0 / 1_200.0).abs() < 1.0e-15);
+        assert_eq!(coupled.sampling.transmitted_pulses, 48);
+        assert!((coupled.sampling.independent_samples - 24.0).abs() < f64::EPSILON);
+        assert_eq!(coupled.balanced_quadrature.len(), 9);
+        assert_eq!(coupled.reference_quadrature.len(), 27);
+        for points in [&coupled.balanced_quadrature, &coupled.reference_quadrature] {
+            let weight_sum = points.iter().map(|point| point.weight).sum::<f64>();
+            assert!((weight_sum - 1.0).abs() < 1.0e-12);
+            assert!(points.iter().any(|point| point.range_offset_m < 0.0));
+            assert!(points.iter().any(|point| point.range_offset_m > 0.0));
+            assert!(
+                points
+                    .iter()
+                    .all(|point| point.range_offset_m.abs() <= coupled.range_resolution_m)
+            );
+        }
+
+        let different_gate_spacing = SyntheticRadarConfig {
+            gate_spacing_m: 4_000.0,
+            ..config
+        };
+        let other = resolve_coupled_instrument(&different_gate_spacing)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coupled
+                .reference_quadrature
+                .iter()
+                .map(|point| point.range_offset_m.to_bits())
+                .collect::<Vec<_>>(),
+            other
+                .reference_quadrature
+                .iter()
+                .map(|point| point.range_offset_m.to_bits())
+                .collect::<Vec<_>>(),
+            "matched-filter range offsets depend on pulse width, not gate spacing"
+        );
+    }
+
+    #[test]
+    fn coupled_estimator_rejects_named_vcp_prf_codes() {
+        let config = SyntheticRadarConfig {
+            coupled_single_prf_estimator: true,
+            scan_strategy: SyntheticScanStrategy::Build24Vcp12,
+            ..SyntheticRadarConfig::default()
+        };
+        let error = config.validate_science_contract().unwrap_err();
+        assert!(error.contains("PRF codes are identifiers, not frequencies"));
+        assert!(resolve_coupled_instrument(&config).is_err());
+    }
+
+    #[test]
+    fn coupled_builder_stamps_timing_and_opt_in_stage_grids() {
+        let fields = uniform_box_fields();
+        let config = SyntheticRadarConfig {
+            coupled_single_prf_estimator: true,
+            emit_stage_diagnostics: true,
+            elevations_deg: vec![0.5],
+            azimuth_count: 4,
+            gate_spacing_m: 500.0,
+            max_range_m: 2_000.0,
+            beam_integration: BeamIntegration::Balanced,
+            spectrum_width: true,
+            ref_gate_texture: false,
+            vel_gate_texture: false,
+            prf_hz: 1_000.0,
+            estimator_dwell_ms: 50.0,
+            estimator_pulse_count: Some(50),
+            ..box_model_config()
+        };
+        let coupled = resolve_coupled_instrument(&config).unwrap().unwrap();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let volume = build_synthetic_volume(&fields, time, &config);
+        assert!(
+            stamped_nyquists(&volume)
+                .iter()
+                .all(|nyquist| { (*nyquist - coupled.stamped_nyquist_mps()).abs() < f32::EPSILON })
+        );
+        assert_eq!(
+            volume.metadata.prt_s.unwrap().to_bits(),
+            (coupled.timing.prt_s as f32).to_bits()
+        );
+        assert_eq!(
+            volume.metadata.unambiguous_range_km.unwrap().to_bits(),
+            ((coupled.timing.unambiguous_range_m / 1_000.0) as f32).to_bits()
+        );
+        let provenance = volume.metadata.forward_operator_config.as_deref().unwrap();
+        assert!(provenance.contains("estimator=CustomSinglePrfV1"));
+        assert!(provenance.contains("transmitted_pulses=50"));
+        assert!(provenance.contains(IDEAL_STAGE_DEFINITION));
+        assert!(provenance.contains(MEASURED_STAGE_DEFINITION));
+        assert!(provenance.contains(PRESENTED_STAGE_DEFINITION));
+        for name in [
+            "IREF", "IVEL", "ISW", "IZDR", "IRHO", "IKDP", "MREF", "MVEL", "MSW", "MZDR", "MRHO",
+            "MKDP",
+        ] {
+            let moment = MomentType::Unknown(name.to_string());
+            let grid = volume.cuts[0]
+                .moments
+                .get(&moment)
+                .unwrap_or_else(|| panic!("missing {name} stage diagnostic"));
+            assert!(matches!(&grid.storage, MomentStorage::F32(_)));
+        }
     }
 
     /// The pure gate-spacing resolver, exercised without a file: matching off
