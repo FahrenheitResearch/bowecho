@@ -342,6 +342,24 @@ struct SyntheticRadarUiState {
     transition_delay_s: f32,
     #[serde(default = "default_synth_prf_hz")]
     prf_hz: f32,
+    /// Opt-in physically coupled custom single-PRF instrument. Frequency,
+    /// PRF, pulse width, dwell and sample count become one estimator contract
+    /// instead of independent display metadata.
+    #[serde(default)]
+    coupled_single_prf_estimator: bool,
+    #[serde(default = "default_synth_estimator_dwell_ms")]
+    estimator_dwell_ms: f32,
+    /// `None` derives pulse count from dwell * PRF.
+    #[serde(default)]
+    estimator_pulse_count: Option<u32>,
+    #[serde(default = "default_synth_estimator_independent_sample_fraction")]
+    estimator_independent_sample_fraction: f32,
+    #[serde(default)]
+    estimator_minimum_snr_db: f32,
+    /// Add Ideal and Measured diagnostic moment grids beside the canonical
+    /// Presented products for instrument/debug comparisons.
+    #[serde(default)]
+    emit_stage_diagnostics: bool,
     #[serde(default)]
     instrument_noise: bool,
     #[serde(default = "default_synth_sensitivity_dbz_at_1km")]
@@ -411,6 +429,14 @@ fn default_synth_prf_hz() -> f32 {
     crate::wrf_radar::SyntheticRadarConfig::default().prf_hz
 }
 
+fn default_synth_estimator_dwell_ms() -> f32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().estimator_dwell_ms
+}
+
+fn default_synth_estimator_independent_sample_fraction() -> f32 {
+    crate::wrf_radar::SyntheticRadarConfig::default().estimator_independent_sample_fraction
+}
+
 fn default_synth_temporal_memory_budget_mib() -> usize {
     8192
 }
@@ -456,6 +482,13 @@ impl Default for SyntheticRadarUiState {
             rotation_rate_deg_s: default_synth_rotation_rate_deg_s(),
             transition_delay_s: default_synth_transition_delay_s(),
             prf_hz: default_synth_prf_hz(),
+            coupled_single_prf_estimator: false,
+            estimator_dwell_ms: default_synth_estimator_dwell_ms(),
+            estimator_pulse_count: None,
+            estimator_independent_sample_fraction:
+                default_synth_estimator_independent_sample_fraction(),
+            estimator_minimum_snr_db: 0.0,
+            emit_stage_diagnostics: false,
             instrument_noise: false,
             sensitivity_dbz_at_1km: default_synth_sensitivity_dbz_at_1km(),
             include_low_tilt: false,
@@ -497,6 +530,12 @@ impl SyntheticRadarUiState {
             atmosphere_time_mode: self.atmosphere_time_mode,
             missing_neighbor_policy: self.missing_neighbor_policy,
             temporal_memory_budget_mib: self.temporal_memory_budget_mib,
+            coupled_single_prf_estimator: self.coupled_single_prf_estimator,
+            estimator_dwell_ms: self.estimator_dwell_ms,
+            estimator_pulse_count: self.estimator_pulse_count,
+            estimator_independent_sample_fraction: self.estimator_independent_sample_fraction,
+            estimator_minimum_snr_db: self.estimator_minimum_snr_db,
+            emit_stage_diagnostics: self.emit_stage_diagnostics,
             instrument_noise: self.instrument_noise,
             ref_gate_texture: self.ref_gate_texture,
             vel_gate_texture: self.vel_gate_texture,
@@ -518,6 +557,12 @@ impl SyntheticRadarUiState {
         self.atmosphere_time_mode = preset.atmosphere_time_mode;
         self.missing_neighbor_policy = preset.missing_neighbor_policy;
         self.temporal_memory_budget_mib = preset.temporal_memory_budget_mib;
+        self.coupled_single_prf_estimator = preset.coupled_single_prf_estimator;
+        self.estimator_dwell_ms = preset.estimator_dwell_ms;
+        self.estimator_pulse_count = preset.estimator_pulse_count;
+        self.estimator_independent_sample_fraction = preset.estimator_independent_sample_fraction;
+        self.estimator_minimum_snr_db = preset.estimator_minimum_snr_db;
+        self.emit_stage_diagnostics = preset.emit_stage_diagnostics;
         self.instrument_noise = preset.instrument_noise;
         self.ref_gate_texture = preset.ref_gate_texture;
         self.vel_gate_texture = preset.vel_gate_texture;
@@ -545,6 +590,12 @@ impl SyntheticRadarUiState {
         self.rotation_rate_deg_s = defaults.rotation_rate_deg_s;
         self.transition_delay_s = defaults.transition_delay_s;
         self.prf_hz = defaults.prf_hz;
+        self.coupled_single_prf_estimator = defaults.coupled_single_prf_estimator;
+        self.estimator_dwell_ms = defaults.estimator_dwell_ms;
+        self.estimator_pulse_count = defaults.estimator_pulse_count;
+        self.estimator_independent_sample_fraction = defaults.estimator_independent_sample_fraction;
+        self.estimator_minimum_snr_db = defaults.estimator_minimum_snr_db;
+        self.emit_stage_diagnostics = defaults.emit_stage_diagnostics;
         self.atmosphere_time_mode = app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
         self.missing_neighbor_policy = app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
         self.temporal_memory_budget_mib = default_synth_temporal_memory_budget_mib();
@@ -692,6 +743,12 @@ impl SyntheticRadarUiState {
             rotation_rate_deg_s: self.rotation_rate_deg_s,
             transition_delay_s: self.transition_delay_s,
             prf_hz: self.prf_hz,
+            coupled_single_prf_estimator: self.coupled_single_prf_estimator,
+            estimator_dwell_ms: self.estimator_dwell_ms,
+            estimator_pulse_count: self.estimator_pulse_count,
+            estimator_independent_sample_fraction: self.estimator_independent_sample_fraction,
+            estimator_minimum_snr_db: self.estimator_minimum_snr_db,
+            emit_stage_diagnostics: self.emit_stage_diagnostics,
             instrument_noise: self.instrument_noise,
             sensitivity_dbz_at_1km: self.sensitivity_dbz_at_1km,
             elevations_deg: self
@@ -3503,9 +3560,12 @@ impl ModelDataDock {
                          frame — a loop does not shimmer.",
                     );
                     ui.horizontal(|ui| {
-                        ui.checkbox(
-                            &mut state.fold_velocity,
-                            "Realistic Nyquist (velocity folds)",
+                        ui.add_enabled(
+                            !state.coupled_single_prf_estimator,
+                            egui::Checkbox::new(
+                                &mut state.fold_velocity,
+                                "Realistic Nyquist (velocity folds)",
+                            ),
                         )
                         .on_hover_text(
                             "Fold the simulated radial velocity like a real pulse-pair radar: \
@@ -3517,7 +3577,7 @@ impl ModelDataDock {
                              the folded field — a dealias practice ground on known ground truth.",
                         );
                         ui.add_enabled(
-                            state.fold_velocity,
+                            state.fold_velocity && !state.coupled_single_prf_estimator,
                             egui::DragValue::new(&mut state.fold_nyquist_mps)
                                 .range(
                                     SyntheticRadarUiState::MIN_FOLD_NYQUIST_MPS
@@ -3531,6 +3591,15 @@ impl ModelDataDock {
                              Nyquists run ~8-33 m/s; velocity wraps every twice this value.",
                         );
                     });
+                    if state.coupled_single_prf_estimator {
+                        ui.label(
+                            egui::RichText::new(
+                                "Velocity ambiguity is derived from exact frequency and PRF by the coupled estimator; the manual Nyquist control is inactive.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Reflectivity:");
                         ui.selectable_value(
@@ -3720,6 +3789,113 @@ impl ModelDataDock {
                                         .suffix(" Hz PRF"),
                                 );
                             });
+                            let named_vcp = state.scan_strategy.is_named_vcp();
+                            if named_vcp {
+                                // Build-24 catalog values are PRF identifiers,
+                                // not authoritative frequencies. Never retain a
+                                // stale custom-frequency estimator across a
+                                // switch to a named VCP.
+                                state.coupled_single_prf_estimator = false;
+                            }
+                            ui.add_enabled(
+                                !named_vcp,
+                                egui::Checkbox::new(
+                                    &mut state.coupled_single_prf_estimator,
+                                    "Physically coupled single-PRF moment estimator",
+                                ),
+                            )
+                            .on_hover_text(
+                                "Use exact frequency, PRF, pulse width, dwell and pulse count as one instrument contract. Nyquist, unambiguous range, matched-filter pulse weighting, SNR uncertainty and velocity folding are then derived rather than independently dialed.",
+                            );
+                            if state.coupled_single_prf_estimator {
+                                let frequency_hz =
+                                    f64::from(state.radar_frequency_mhz) * 1.0e6;
+                                let prf_hz = f64::from(state.prf_hz);
+                                if frequency_hz.is_finite()
+                                    && frequency_hz > 0.0
+                                    && prf_hz.is_finite()
+                                    && prf_hz > 0.0
+                                {
+                                    let wavelength_m = 299_792_458.0 / frequency_hz;
+                                    let nyquist_mps = wavelength_m * prf_hz / 4.0;
+                                    let unambiguous_range_km =
+                                        299_792_458.0 / (2.0 * prf_hz) / 1_000.0;
+                                    let pulse_resolution_m =
+                                        299_792_458.0 * f64::from(state.pulse_width_us) * 1.0e-6
+                                            / 2.0;
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Derived: λ {:.2} cm · Nyquist ±{nyquist_mps:.1} m/s · unambiguous range {unambiguous_range_km:.1} km · pulse resolution {pulse_resolution_m:.0} m",
+                                            wavelength_m * 100.0,
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Estimator sampling:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut state.estimator_dwell_ms)
+                                            .range(0.1..=10_000.0)
+                                            .speed(1.0)
+                                            .suffix(" ms dwell"),
+                                    );
+                                    let mut derive_pulses =
+                                        state.estimator_pulse_count.is_none();
+                                    if ui
+                                        .checkbox(&mut derive_pulses, "derive pulse count")
+                                        .changed()
+                                    {
+                                        state.estimator_pulse_count = if derive_pulses {
+                                            None
+                                        } else {
+                                            Some(64)
+                                        };
+                                    }
+                                    if let Some(pulses) = state.estimator_pulse_count.as_mut() {
+                                        ui.add(
+                                            egui::DragValue::new(pulses)
+                                                .range(1..=100_000)
+                                                .speed(1.0)
+                                                .suffix(" pulses"),
+                                        );
+                                    }
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Independent samples:");
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut state.estimator_independent_sample_fraction,
+                                            0.01..=1.0,
+                                        )
+                                        .custom_formatter(|value, _| {
+                                            format!("{:.0}%", value * 100.0)
+                                        }),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut state.estimator_minimum_snr_db,
+                                        )
+                                        .range(-20.0..=30.0)
+                                        .speed(0.25)
+                                        .suffix(" dB min SNR"),
+                                    );
+                                });
+                                ui.checkbox(
+                                    &mut state.emit_stage_diagnostics,
+                                    "Emit Ideal + Measured diagnostic moments",
+                                )
+                                .on_hover_text(
+                                    "Keep canonical products as Presented moments and add opt-in I*/M* grids so Ideal, Measured and Presented values can be compared gate by gate. This increases output memory.",
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Ideal = pulse-volume atmosphere; Measured = receiver/PRF/dwell/SNR effects; Presented = optional display texture and stylized clutter.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
                             ui.checkbox(
                                 &mut state.terrain_blockage,
                                 "Terrain horizon + partial beam blockage",
@@ -5973,6 +6149,15 @@ mod tests {
         );
         assert_eq!(empty.transition_delay_s, default_synth_transition_delay_s());
         assert_eq!(empty.prf_hz, default_synth_prf_hz());
+        assert!(!empty.coupled_single_prf_estimator);
+        assert_eq!(empty.estimator_dwell_ms, default_synth_estimator_dwell_ms());
+        assert_eq!(empty.estimator_pulse_count, None);
+        assert_eq!(
+            empty.estimator_independent_sample_fraction,
+            default_synth_estimator_independent_sample_fraction()
+        );
+        assert_eq!(empty.estimator_minimum_snr_db, 0.0);
+        assert!(!empty.emit_stage_diagnostics);
         assert!(!empty.instrument_noise);
         assert_eq!(
             empty.sensitivity_dbz_at_1km,
@@ -6027,6 +6212,12 @@ mod tests {
             rotation_rate_deg_s: 24.0,
             transition_delay_s: 4.25,
             prf_hz: 1_200.0,
+            coupled_single_prf_estimator: true,
+            estimator_dwell_ms: 75.0,
+            estimator_pulse_count: Some(64),
+            estimator_independent_sample_fraction: 0.75,
+            estimator_minimum_snr_db: 2.5,
+            emit_stage_diagnostics: true,
             instrument_noise: true,
             sensitivity_dbz_at_1km: -37.5,
             include_low_tilt: true,
@@ -6106,6 +6297,27 @@ mod tests {
         assert_eq!(config.rotation_rate_deg_s, historical.rotation_rate_deg_s);
         assert_eq!(config.transition_delay_s, historical.transition_delay_s);
         assert_eq!(config.prf_hz, historical.prf_hz);
+        assert_eq!(
+            config.coupled_single_prf_estimator,
+            historical.coupled_single_prf_estimator
+        );
+        assert_eq!(config.estimator_dwell_ms, historical.estimator_dwell_ms);
+        assert_eq!(
+            config.estimator_pulse_count,
+            historical.estimator_pulse_count
+        );
+        assert_eq!(
+            config.estimator_independent_sample_fraction,
+            historical.estimator_independent_sample_fraction
+        );
+        assert_eq!(
+            config.estimator_minimum_snr_db,
+            historical.estimator_minimum_snr_db
+        );
+        assert_eq!(
+            config.emit_stage_diagnostics,
+            historical.emit_stage_diagnostics
+        );
         assert_eq!(config.instrument_noise, historical.instrument_noise);
         assert_eq!(
             config.sensitivity_dbz_at_1km,
@@ -6160,6 +6372,12 @@ mod tests {
             rotation_rate_deg_s: 22.0,
             transition_delay_s: 4.5,
             prf_hz: 1_350.0,
+            coupled_single_prf_estimator: true,
+            estimator_dwell_ms: 80.0,
+            estimator_pulse_count: Some(72),
+            estimator_independent_sample_fraction: 0.6,
+            estimator_minimum_snr_db: 3.0,
+            emit_stage_diagnostics: true,
             instrument_noise: true,
             sensitivity_dbz_at_1km: -36.0,
             ..SyntheticRadarUiState::default()
@@ -6200,6 +6418,12 @@ mod tests {
         assert_eq!(config.rotation_rate_deg_s, 22.0);
         assert_eq!(config.transition_delay_s, 4.5);
         assert_eq!(config.prf_hz, 1_350.0);
+        assert!(config.coupled_single_prf_estimator);
+        assert_eq!(config.estimator_dwell_ms, 80.0);
+        assert_eq!(config.estimator_pulse_count, Some(72));
+        assert_eq!(config.estimator_independent_sample_fraction, 0.6);
+        assert_eq!(config.estimator_minimum_snr_db, 3.0);
+        assert!(config.emit_stage_diagnostics);
         assert!(config.instrument_noise);
         assert_eq!(config.sensitivity_dbz_at_1km, -36.0);
     }
