@@ -951,9 +951,10 @@ fn wrf(ui: &mut egui::Ui) {
     para(
         ui,
         "File pickers are deliberately unfiltered: ordinary extensionless wrfout_* names from \
-         every domain are valid. Multi-select handles one to hundreds of files; a folder scan \
-         finds supported files and sorts them before work begins. Each WRF time becomes a \
-         store timestep for import, or a radar-loop frame for simulated radar.",
+         every domain are valid. Open file imports one file; Process files and Build from files \
+         multi-select one to hundreds. Folder actions find supported files and sort them before \
+         work begins. Each WRF time becomes a store timestep for import, or normally one \
+         radar-loop frame for simulated radar.",
     );
     action(
         ui,
@@ -989,15 +990,19 @@ fn wrf(ui: &mut egui::Ui) {
     para(
         ui,
         "Imported raw names receive readable labels and Solarpower07 model palettes where a \
-         matching style exists. Automatically plot new imports can write every field/hour to \
-         the screenshots folder; it is independent from the simulated-radar path.",
+         matching style exists. Automatically plot new imports is on by default and persisted; \
+         light, full-diagnostic and GDEX imports can write every field/hour to the screenshots \
+         folder. It is independent from the simulated-radar path.",
     );
 
     subhead(ui, "SIMULATED RADAR: BUILD, REFRESH & EXPORT");
     para(
         ui,
         "Pick one or more raw WRF files, or a folder. Every selected forecast time becomes a \
-         frame in one radar loop; nothing is written to the model store. Completed elevations, \
+         frame in one radar loop unless the adjacent-scene Drop policy omits an unbracketed \
+         frame; nothing is written to the model store. One loop must contain exactly one \
+         compatible run, WRF domain and grid. Mixed d01/d02, remeshed grids, duplicate/restart \
+         times and untimed scenes are rejected instead of silently merged. Completed elevations, \
          radials, gates and moments enter the ordinary radar viewer, so tilts, readouts, \
          cross-sections, derived products and velocity tools work through the same path as an \
          observed Level-II volume.",
@@ -1018,8 +1023,9 @@ fn wrf(ui: &mut egui::Ui) {
     action(
         ui,
         "Export latest as CfRadial\u{2026}",
-        "— writes the newest generated volume with moments, ray timing, instrument settings, \
-         calibration, model/microphysics identity, and forward-operator provenance.",
+        "— one generated frame opens a .nc save dialog; a loop opens a folder picker and writes \
+         one CfRadial-1 file per frame. Each file includes moments, ray timing, instrument \
+         settings, calibration, model/microphysics identity, and forward-operator provenance.",
     );
 
     subhead(ui, "BUILD 24 VCP & ATMOSPHERE TIME");
@@ -1040,12 +1046,23 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "Atmosphere time is independent of ray timing. Frozen samples the anchor scene. \
-         Interpolate adjacent WRF scenes uses every timed ray's acquisition offset within the \
+        "Find this at WRF simulated radar \u{2192} Radar location & fine tuning (advanced) \
+         \u{2192} Instrument & propagation \u{2192} Atmosphere time. Ray timing and atmosphere \
+         sampling are separate concepts, but selecting Interpolate adjacent WRF scenes also \
+         enables Timed volume because instantaneous rays have no acquisition offsets. Frozen \
+         samples the anchor scene. Interpolate uses every timed ray's acquisition offset within the \
          next compatible model-time bracket. The compatibility renderer blends linear Z, winds \
          and additive polar scattering, then derives ratios such as ZDR and rhoHV. It never \
          extrapolates. A missing or too-short bracket follows the explicit hold, drop or error \
          policy, and a rolling two-scene cache is checked against the memory budget before work.",
+    );
+    para(
+        ui,
+        "Interpolation changes sampling inside each output radar volume: later rays and cuts \
+         blend slightly farther toward the next WRF scene. It does not create extra loop frames, \
+         add low-level-update frames, run WRF forward, or update live. With N compatible scenes, \
+         the first N\u{2212}1 frames can use their following scene; the last follows Hold last, Drop \
+         or Error, so Drop can produce fewer than N output frames.",
     );
 
     subhead(ui, "START WITH A COMPLETE RECIPE");
@@ -1090,6 +1107,24 @@ fn wrf(ui: &mut egui::Ui) {
         "Choosing a recipe resets every interacting physics, presentation, instrument and \
          calibration control to a compatible set while preserving antenna placement, range \
          and gate geometry. A later expert edit is labeled Custom tuning.",
+    );
+    para(
+        ui,
+        "Storm view, Clean model truth and Clean dual-pol start Frozen. Real radar, Maximum \
+         fidelity and P3/ISHMAEL T-matrix start with Timed volume plus adjacent-scene \
+         interpolation and Hold last. You can change those temporal controls after choosing a \
+         recipe.",
+    );
+
+    subhead(ui, "WILL THE P3/ISHMAEL RECIPE ACCEPT MY FILE?");
+    para(
+        ui,
+        "The research recipe requires a raw WRF file whose global MP_PHYSICS value is P3 \
+         50\u{2013}53 or ISHMAEL 55, and the file must retain the native property variables that \
+         the matching reader needs. MP_PHYSICS alone is not sufficient. Thompson 8 and other \
+         conventional schemes belong on Storm view, Clean model truth, Clean dual-pol, Real \
+         radar or Maximum fidelity; the research recipe fails closed with a readable \
+         property-reader error instead of guessing or falling back.",
     );
 
     subhead(ui, "WHAT THE MOMENTS MEAN");
@@ -1156,7 +1191,7 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "The v0.33.1 branch also defines an opt-in property-aware T-matrix research contract for \
+        "BowEcho v0.33.1 adds an opt-in property-aware T-matrix research contract for \
          P3 50–53 and ISHMAEL 55 raw tuples. Its versioned PyTMatrix tables use exactly 2.8 GHz, \
          symmetric Bruggeman air/ice/water mixing, separate oblate/prolate shapes, and a fixed \
          mean-zero Gaussian canting distribution with 20\u{00b0} standard deviation and \
@@ -1352,8 +1387,9 @@ fn formula_lab(ui: &mut egui::Ui) {
     action(
         ui,
         "Stored model",
-        "— model-slug-neutral pointwise 2-D algebra over the fields actually present in HRRR, \
-         GFS, RAP, NAM, RRFS, NBM or imported WRF stores. Pressure-volume fields can use \
+        "— model-slug-neutral pointwise 2-D algebra over the fields actually present in any \
+         compatible stored run, including HRRR, GFS/GEFS, AI-GFS/AI-GEFS, HGEFS, ECMWF Open \
+         Data, RAP, NAM, RRFS, NBM and imported WRF. Pressure-volume fields can use \
          mean_z/integrate_z/interpolate_z when an explicit compatible height field is supplied. \
          dt works only on a complete, distinct, increasing, host-verified time axis.",
     );
@@ -1391,9 +1427,10 @@ fn formula_lab(ui: &mut egui::Ui) {
     para(
         ui,
         "dt uses the actual nonuniform time coordinate and a three-time Lagrange stencil where \
-         available. Endpoints depend on the chosen boundary policy. Nested dt is rejected, and \
-         moving nests or changing grids require explicit remapping rather than fixed-index time \
-         differencing.",
+         available. Endpoints depend on the chosen boundary policy. Nested dt is rejected. Raw \
+         WRF dt requires adjacent times inside the one selected multi-time file; selecting \
+         separate single-time wrfout files does not assemble a Formula Lab time axis. Moving \
+         nests or changing grids require explicit remapping rather than fixed-index time differencing.",
     );
 
     subhead(ui, "POLICIES, RECIPES & RESOURCE LIMITS");
@@ -1404,6 +1441,12 @@ fn formula_lab(ui: &mut egui::Ui) {
          reductions; it is not a general license to erase bad data. The standard desktop profile \
          is bounded; the explicit Large research profile raises the documented memory/work meter \
          but does not remove immutable host ceilings.",
+    );
+    para(
+        ui,
+        "A selected raw WRF file at least 1 GiB also shows a separate memory-cost consent box. \
+         Evaluation stays disabled until the \"I understand the memory cost; allow evaluation\" \
+         box is checked for that exact file revision.",
     );
     para(
         ui,
@@ -1645,7 +1688,8 @@ fn simsat(ui: &mut egui::Ui) {
     action(
         ui,
         "3. Render controls",
-        "— choose Final (384 steps) or Preview (192 steps), earth margin, and the visible-family \
+        "— start with Recommended, High Quality or Sensor QA when compatible, then choose Final \
+         (384 steps) or Preview (192 steps), earth margin, and the visible-family \
          atmosphere/cloud/lighting controls when applicable.",
     );
     action(
@@ -1690,6 +1734,14 @@ fn simsat(ui: &mut egui::Ui) {
          simsat-fast-gray-v1 operator on a temporary request, reports each neutralized display \
          transform, and requires CPU. It is not a complete ABI/AHI channel simulator. Manual \
          edits remain available and change the Quick mode label to Custom.",
+    );
+    para(
+        ui,
+        "Quick modes preserve the source, product, earth margin, forced/automatic ground month \
+         and what-if sun override. Recommended and High Quality also preserve view, satellite \
+         and navigation; Sensor QA selects its required geometry. The Current label describes \
+         only preset-owned controls. For an actual-time baseline, separately choose Auto ground \
+         and turn off Override sun.",
     );
 
     subhead(ui, "INPUTS");
@@ -1871,6 +1923,14 @@ fn simsat(ui: &mut egui::Ui) {
          visibility controls affect finished visible-family RGB only, not raw visible bands, \
          IR, water vapor or derived scalar fields.",
     );
+    para(
+        ui,
+        "Restore shipped display calibration resets the visible display-tuning controls without \
+         changing the source or product. SimSat v0.1.9 also shares one 0–12 degree low-sun help \
+         ramp across land normalization, dark-toe recovery, ground lift and water-albedo help; \
+         direct water sunlight is no longer artificially day-gated. The reviewed display \
+         cloud-shadow floor is 0.45.",
+    );
 
     subhead(ui, "SENSOR & PRECISION CONTROLS");
     action(
@@ -1904,10 +1964,25 @@ fn simsat(ui: &mut egui::Ui) {
     );
     para(
         ui,
+        "Product, view, quick/science, atmosphere, cloud, lighting and display choices persist \
+         in BowEcho settings. Source paths, active jobs, progress, errors and rendered output \
+         are deliberately session-only.",
+    );
+    para(
+        ui,
         "CPU frames share the real-satellite store and player. Equal source run, product, view \
-         and UTC-day values join one loop. Map follows player and Show on radar map work normally. \
-         Native plots keep Kelvin or derived scalar values and physical colorbars; RGB products \
-         omit a false scalar legend.",
+         and UTC-day values join one loop. Resolution is not a separate run key, so rerendering \
+         the same source/product/view at another resolution can replace that valid-time frame. \
+         Map follows player and Show on radar map work normally. Native plots keep Kelvin or \
+         derived scalar values and physical colorbars; RGB products omit a false scalar legend.",
+    );
+    para(
+        ui,
+        "After a successful render the SimSat pane reports operator, storage, intent adjustment, \
+         sensor, footprint and science-limit notices. The native-plot title identifies SimSat, \
+         but those full notices and NASA ground credit are not currently embedded into Satellite \
+         frames or PNG metadata; the Sources chapter and docs/simsat-guide.md are the attribution \
+         record.",
     );
 
     subhead(ui, "HONEST SCIENCE BOUNDARIES");
@@ -2692,6 +2767,12 @@ mod tests {
         assert!(guide_src.contains("Interpolate adjacent WRF scenes"));
         assert!(guide_src.contains("It never extrapolates"));
         assert!(guide_src.contains("hold, drop or error"));
+        assert!(guide_src.contains("does not create extra loop frames"));
+        assert!(guide_src.contains("the first N\\u{2212}1 frames"));
+        assert!(guide_src.contains("Mixed d01/d02"));
+        assert!(guide_src.contains("one CfRadial-1 file per frame"));
+        assert!(guide_src.contains("MP_PHYSICS alone is not sufficient"));
+        assert!(guide_src.contains("Real radar, Maximum"));
 
         assert!(guide_src.contains("property-aware T-matrix research contract"));
         assert!(guide_src.contains("P3 50–53 and ISHMAEL 55"));
@@ -2711,6 +2792,9 @@ mod tests {
         assert!(guide_src.contains("rw-store does not persist horizontal spacing/map factors"));
         assert!(guide_src.contains("Three-dimensional grad/div/curl/laplacian remain"));
         assert!(guide_src.contains("source fingerprint"));
+        assert!(guide_src.contains("any compatible stored run"));
+        assert!(guide_src.contains("one selected multi-time file"));
+        assert!(guide_src.contains("at least 1 GiB"));
 
         // SimSat's durable CPU path and preview-only GPU path are distinct,
         // and HRRR's native volume requirement cannot be watered down.
@@ -2719,6 +2803,11 @@ mod tests {
         assert!(guide_src.contains("never enters the satellite store"));
         assert!(guide_src.contains("SSB cache format v6"));
         assert!(guide_src.contains("band-averaged absorption rather than line-by-line"));
+        assert!(guide_src.contains("The Current label describes"));
+        assert!(guide_src.contains("0–12 degree low-sun help"));
+        assert!(guide_src.contains("Source paths, active jobs, progress, errors"));
+        assert!(guide_src.contains("Resolution is not a separate run key"));
+        assert!(guide_src.contains("not currently embedded into Satellite"));
     }
 
     /// International radars are not second-class: the guide's gesture and

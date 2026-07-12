@@ -178,9 +178,10 @@ the computed result; they are not an unchecked display label.
 | Field inventory | Exact selected timestep | Common browser plus final resolver |
 | Display result | Must reduce to two dimensions | Must reduce to two dimensions |
 
-There is no model-slug allowlist for stored pointwise formulas. HRRR, GFS,
-RAP, NAM, NBM, RRFS, and compatible imported WRF stores use the same adapter.
-Readiness depends on the selected timestep's real manifest, not its model name.
+There is no model-slug allowlist for stored pointwise formulas. Any compatible
+stored run uses the same adapter, including HRRR, GFS/GEFS, AI-GFS/AI-GEFS,
+HGEFS, ECMWF Open Data, RAP, NAM, NBM, RRFS, and imported WRF. Readiness
+depends on the selected timestep's real manifest, not its model name.
 
 Display-only synthesized pressure-level layers are not automatically Formula
 Lab variables. A name such as a synthesized **temperature_850hpa** is usable
@@ -307,6 +308,11 @@ stencil. A centered result uses surrounding times. A second-order endpoint
 needs two times on the available side; behavior at a boundary follows the
 selected boundary policy.
 
+For **Raw WRF**, those adjacent times must be inside the one selected
+multi-time file. Choosing separate single-time **wrfout_*** files does not
+assemble a Formula Lab time axis. For **Stored model**, BowEcho instead needs a
+complete, distinct, increasing, host-verified run time axis.
+
 The derivative is evaluated at a fixed model-grid index. Moving nests or
 changing grids require explicit remapping. BowEcho does not infer time from
 filesystem modification times or treat ordinal store slots as meteorological
@@ -356,6 +362,11 @@ The standard desktop profile meters source size, tokens, AST depth/nodes,
 dependencies, output elements, working and cumulative memory, and operations.
 The explicit Large research profile raises BowEcho's documented desktop meter
 for large scientific grids but remains bounded.
+
+A selected raw WRF file of at least 1 GiB also requires the separate **I
+understand the memory cost; allow evaluation** consent. The consent applies to
+that exact file revision and is cleared if the file changes; it does not raise
+the Formula Lab resource ceilings.
 
 ## Safety
 

@@ -28,8 +28,13 @@ Use **Render to Satellite** for any frame that should persist or join a loop.
 ## Quick modes and render intent
 
 Quick modes apply reviewed settings without changing the selected source or
-product. All individual controls remain visible, and any manual edit makes the
-current mode **Custom**.
+product. They also preserve earth margin, the forced/automatic Blue Marble
+month, and the sun override. Recommended and High Quality preserve the current
+view, satellite, and navigation; Sensor QA selects the geometry it requires.
+The displayed Quick-mode name covers the controls owned by that preset. For an
+actual-time baseline, separately choose an automatic ground month and turn off
+the what-if sun override. All individual controls remain visible, and edits to
+preset-owned controls make the current mode **Custom**.
 
 - **Recommended Display** restores the reviewed visible baseline: CPU offline
   quality, Model native, CompactU8, exposure 1.5, AOD 0.05, cloud OD 0.15,
@@ -47,8 +52,10 @@ current mode **Custom**.
 The **Intent** selector remains independently available. **Display** preserves
 the reviewed SimSat look. **Sensor Fast Gray** neutralizes display-only
 exposure, land, edge, highlight, granulation, and reconstruction transforms on
-a temporary request and reports every adjustment with the output. It requires
-CPU and is not a complete ABI/AHI channel observation operator.
+a temporary request. After a successful render the SimSat pane reports every
+adjustment and science warning. Those notices are not embedded in Satellite
+store frames or PNG metadata. Sensor Fast Gray requires CPU and is not a
+complete ABI/AHI channel observation operator.
 
 ## Input modes
 
@@ -67,8 +74,9 @@ The File picker is deliberately unfiltered because normal WRF output often has
 no extension. Folder inputs are probed and sorted by valid time. Files that do
 not look like WRF/GRIB sequence candidates are ignored. A mixed folder can skip
 an unreadable candidate; if no readable frame remains, BowEcho reports an
-actionable empty-input error. Per-frame render failures remain visible in job
-progress while successful frames are kept.
+actionable empty-input error. During the job, BowEcho shows the latest frame
+error and a final completed/failed count while retaining successful frames; it
+does not keep an on-screen ledger of every earlier failure.
 
 ### Downloaded HRRR
 
@@ -391,8 +399,9 @@ errors, and rendered output deliberately do not.
 ## Satellite player, map, and native plot
 
 Durable output uses the same store/player as real imagery. Equal source run,
-product, view, grid, and UTC-day values join one loop rather than creating one
-sidebar run per frame.
+product, view, and UTC-day values join one loop rather than creating one sidebar
+run per frame. Rendering the same source/product/view at another resolution can
+replace the same valid-time frame; resolution is not a separate run key.
 
 **Map follows player** and **Show on radar map** work normally. Native plots
 preserve:
@@ -402,8 +411,11 @@ preserve:
 - georeferencing and fixed cross-frame palettes
 - RGB composites without a false scalar colorbar
 
-Save PNG exports the plotted title, valid time, map context, and attribution
-carried by the normal plotting surface.
+The native-plot title identifies SimSat and the selected product, with source,
+valid time, and view context in the plot subtitles. Save PNG captures that
+visible plotting surface. Full render-operator provenance, science warnings,
+and NASA ground-imagery credit are documented here and in BowEcho's in-app
+Guide; they are not currently burned into the PNG or stored as PNG metadata.
 
 ## Scientific implementation
 

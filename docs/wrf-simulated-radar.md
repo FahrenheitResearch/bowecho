@@ -16,7 +16,8 @@ NetCDF**, **WRF full diagnostics**, or **Formula Lab** instead.
    is the recommended first choice for a practical virtual S-band scan.
 2. Open **Radar location & fine tuning (advanced)** only when the recipe's
    antenna, geometry, moments, presentation, or instrument assumptions need
-   changing.
+   changing. Atmosphere controls are under **Instrument & propagation >
+   Atmosphere time**.
 3. Choose the custom ladder or a source-qualified **Build 24 VCP**. Choose
    whether timed rays hold one WRF scene or interpolate a compatible adjacent
    scene.
@@ -33,6 +34,25 @@ Extensionless **wrfout_*** names from every domain are valid. A folder build
 captures the files found at selection time. Refresh deliberately reuses that
 ordered session snapshot; it does not rescan the folder or silently add files
 created later.
+
+One simulated-radar loop must be exactly one compatible WRF run, domain, and
+grid. BowEcho accepts d01, d02, and other domains individually; it rejects a
+mixed d01/d02 selection, remeshed grids, duplicate/restart valid times, or
+untimed scenes rather than silently combining them. Multi-time files are
+inventoried by internal time index.
+
+## Related WRF import and processing controls
+
+The lighter **Open file...** action imports one WRF/NetCDF file; use **Open
+folder...** for a light batch. **Process files...** under WRF full diagnostics
+and **Build from files...** under WRF simulated radar are the multi-select
+actions for one to hundreds of files. Their folder counterparts scan and sort
+supported files before starting.
+
+**Automatically plot new imports** is on by default and persisted. It can write
+every field and hour from light, full-diagnostic, and GDEX imports to the
+screenshots folder. It is separate from simulated radar, which enters the radar
+viewer instead of the model store.
 
 ## Operating modes
 
@@ -73,6 +93,12 @@ Changing an advanced control after applying a recipe labels the setup as
 `Custom tuning`. Selecting a recipe again resets all interacting physics,
 calibration, and instrument values together, so stale expert values cannot
 leak into a new run.
+
+The recipes also choose coherent temporal defaults. **Storm view**, **Clean
+model truth**, and **Clean dual-pol** start Frozen. **Real radar**, **Maximum
+fidelity**, and **P3/ISHMAEL T-matrix** start with Timed volume, **Interpolate
+adjacent WRF scenes**, and **Hold last**. These remain editable after applying
+the recipe.
 
 ### Recipe comparison
 
@@ -171,6 +197,19 @@ the same compatible run/domain/grid group. For each ray, BowEcho derives one
 weight from its acquisition offset within the model-time bracket. The weight
 must remain between the two WRF times; the renderer never extrapolates.
 
+This interpolation changes the atmosphere sampled *inside one output radar
+volume*: low-level/early rays stay nearer the anchor scene and later rays or
+cuts blend slightly farther toward the next scene. It does not create extra
+loop frames, add rapid low-level-update frames, run WRF forward, or update in
+real time. Selecting it automatically enables **Timed volume**, because an
+instantaneous scan has no per-ray acquisition offsets to interpolate.
+
+With N compatible WRF scenes, BowEcho normally presents N radar-loop frames.
+Frames 1 through N-1 can use the following scene as their temporal bracket. The
+last frame has no later scene and therefore follows **Hold last**, **Drop**, or
+**Error**; Drop can make the output loop shorter than N frames. A scan that
+extends beyond its next scene follows the same explicit policy.
+
 The compatibility renderer interpolates linear received power (`Z`), winds,
 and additive polarimetric scattering quantities. ZDR and rhoHV are derived
 afterward rather than interpolated as ratios. The property-aware research
@@ -241,11 +280,21 @@ those schemes therefore fall back to scalar REF/VEL with an explicit note.
 
 ## Opt-in v0.33.1 property-aware T-matrix research contract
 
-The v0.33.1 branch defines a separate, opt-in research-mode contract for P3
+BowEcho v0.33.1 defines a separate, opt-in research-mode contract for P3
 `mp_physics` 50-53 and ISHMAEL `mp_physics` 55. It is not the default bulk
 operator. A build may evaluate this mode only when its versioned property-aware
 tables and runtime descriptor match the request exactly; an absent or
 inapplicable asset is an error, never a silent fallback to Rayleigh.
+
+### Practical file check
+
+The global `MP_PHYSICS` value must be 50-53 for P3 or 55 for ISHMAEL, **and**
+the raw WRF output must retain the native property variables required by the
+matching reader. The scheme number alone is not sufficient. Thompson
+`mp_physics=8` and other conventional schemes should use Storm view, Clean
+model truth, Clean dual-pol, Real radar, or Maximum fidelity. The research
+recipe fails closed with a property-reader error rather than guessing or
+falling back.
 
 The data path preserves each scheme's native raw tuples. P3 category
 1/category 2 and ISHMAEL planar/columnar/aggregate mass, number, rime, bulk
@@ -363,12 +412,14 @@ each read in addition to input, embedded tables, read/build/cut scratch, and
 retained output volumes. It does not silently substitute a smaller kernel when
 the configured ceiling is exceeded.
 
-CfRadial export includes all native and attenuation moments, real ray times,
-frequency, beam width, pulse width, PRT, unambiguous range, scan name, model and
-microphysics provenance, calibration settings, and the forward-operator
-configuration. The pinned NetCDF writer cannot yet emit the required character
-variables for strict `sweep_mode` and `prt_mode`; BowEcho does not fake them as
-numeric variables.
+For one generated frame, CfRadial export opens a `.nc` save dialog. For a loop,
+it opens a folder picker and writes one CfRadial-1 file per frame. Every file
+includes all native and attenuation moments, real ray times, frequency, beam
+width, pulse width, PRT, unambiguous range, scan name, model and microphysics
+provenance, calibration settings, and the forward-operator configuration. The
+pinned NetCDF writer cannot yet emit the required character variables for
+strict `sweep_mode` and `prt_mode`; BowEcho does not fake them as numeric
+variables.
 
 ## Honest limitations
 
