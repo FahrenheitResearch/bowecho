@@ -1022,8 +1022,10 @@ fn validate_coupled_estimator_inputs(config: &SyntheticRadarConfig) -> Result<()
             definition.vcp.number()
         ));
     }
+    if config.radar_frequency_mhz == 0 {
+        return Err("coupled estimator radar_frequency_mhz is invalid: 0".to_string());
+    }
     for (name, value, positive) in [
-        ("radar_frequency_mhz", config.radar_frequency_mhz, true),
         ("pulse_width_us", config.pulse_width_us, true),
         ("prf_hz", config.prf_hz, true),
         ("estimator_dwell_ms", config.estimator_dwell_ms, true),
@@ -6348,7 +6350,7 @@ fn explain_selected_gate(
         return Err(WhyThisGateUnavailable::StaleFrameWitness);
     }
 
-    let mut config = inspector_render_config(&descriptor.config, volume);
+    let config = inspector_render_config(&descriptor.config, volume);
     let anchor_file = reopen_wrf_scene(anchor)?;
     let progress = |_: &str| {};
     let anchor_fields = read_wrf_radar_fields_for_config_reporting(
@@ -7891,7 +7893,7 @@ fn build_operational_radar(
             config,
             &progress,
         )?;
-        volume.metadata.source_path = Some(path.clone());
+        volume.metadata.source_path = Some(path.display().to_string());
         volume.metadata.archive_version = Some("simulated-operational-forecast".to_owned());
         volume.metadata.forward_operator = Some(
             "BowEcho operational HRRR/RRFS category-bulk polar-volume forward operator v1"
@@ -12661,7 +12663,7 @@ mod tests {
         // Source paths are deliberately outside the export-safe witness. The
         // retained descriptor owns them privately for this session.
         let mut moved_source = volume;
-        moved_source.metadata.source_path = Some(PathBuf::from("private/moved/wrfout"));
+        moved_source.metadata.source_path = Some("private/moved/wrfout".to_owned());
         assert!(witness.matches(0x1234, &moved_source));
     }
 }
