@@ -315,6 +315,11 @@ pub const PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ: u32 = 2_800;
 pub const PROPERTY_TMATRIX_MIN_VIEW_ELEVATION_DEG: f64 = -0.5;
 pub const PROPERTY_TMATRIX_MAX_VIEW_ELEVATION_DEG: f64 = 20.0;
 
+#[inline]
+fn gaussian_beam_sigma_deg(fwhm_deg: f64) -> f64 {
+    fwhm_deg / (2.0 * (2.0 * std::f64::consts::LN_2).sqrt())
+}
+
 /// Configuration for one synthetic scan.
 #[derive(Clone, Debug)]
 pub struct SyntheticRadarConfig {
@@ -592,7 +597,10 @@ impl SyntheticRadarConfig {
         if legs.is_empty() {
             return Err("Property T-matrix scan has no physical cuts".to_string());
         }
-        let beam_sigma_deg = beam_width_deg / (2.0 * (2.0_f64.ln()).sqrt());
+        // Match the exact lower bound used by sample_gate so validation and
+        // runtime can never disagree at a table-elevation boundary.
+        let effective_beam_width_deg = beam_width_deg.max(0.05);
+        let beam_sigma_deg = gaussian_beam_sigma_deg(effective_beam_width_deg);
         for leg in legs {
             for point in quadrature_points(self.beam_integration) {
                 let view_elevation_deg = leg.elevation_deg + point.el_sigma * beam_sigma_deg;
@@ -1224,7 +1232,11 @@ fn read_wrf_radar_fields_reporting_inner(
         ));
     }
 
-    progress("reading model fields (reflectivity, winds, height)…");
+    progress(if require_native_reflectivity {
+        "reading model fields (reflectivity, winds, height)…"
+    } else {
+        "reading model fields (winds and height; reflectivity comes from property T-matrix)…"
+    });
 
     // Read the four heavy 3-D fields concurrently. Placeholders are overwritten
     // inside the scope; the scope join guarantees they are all set on exit.
@@ -2275,7 +2287,7 @@ fn sample_gate(
     config: &SyntheticRadarConfig,
     terrain_horizon: Option<&TerrainHorizon>,
 ) -> Result<Option<GatePhysicalSample>, String> {
-    let beam_sigma_deg = f64::from(config.beam_width_deg.max(0.05)) / (2.0 * (2.0_f64.ln()).sqrt());
+    let beam_sigma_deg = gaussian_beam_sigma_deg(f64::from(config.beam_width_deg.max(0.05)));
     let points = quadrature_points(config.beam_integration);
     let mut valid_weight = 0.0f64;
     let mut signal_weight = 0.0f64;
@@ -4255,6 +4267,9 @@ fn ensure_temporal_runtime_cache_budget(
         .cells_per_scene
         .checked_mul(std::mem::size_of::<u32>())
         .ok_or_else(|| "Temporal runtime property-memory estimate overflowed".to_string())?;
+    let has_property_scattering = cache
+        .values()
+        .any(|fields| fields.property_scattering.is_some());
     let property_extra_bytes = cache.values().try_fold(0usize, |total, fields| {
         let retained = fields
             .property_scattering
@@ -4269,7 +4284,11 @@ fn ensure_temporal_runtime_cache_budget(
         .and_then(|value| value.checked_add(estimate.shared_static_bytes))
         .and_then(|value| value.checked_add(estimate.output_bytes))
         .and_then(|value| {
-            value.checked_add(app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes())
+            value.checked_add(if has_property_scattering {
+                app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes()
+            } else {
+                0
+            })
         })
         .ok_or_else(|| "Temporal runtime memory estimate overflowed".to_string())?;
     if required_bytes > budget_bytes {
@@ -4315,8 +4334,14 @@ fn cached_temporal_fields(
         config,
         progress,
     )?);
-    cache.insert(key, Arc::clone(&fields));
-    ensure_temporal_runtime_cache_budget(cache, estimate, budget_bytes)?;
+    let evicted = cache.insert(key.clone(), Arc::clone(&fields));
+    if let Err(error) = ensure_temporal_runtime_cache_budget(cache, estimate, budget_bytes) {
+        let _ = cache.remove(&key);
+        if let Some((evicted_key, evicted_fields)) = evicted {
+            cache.insert(evicted_key, evicted_fields);
+        }
+        return Err(error);
+    }
     Ok(fields)
 }
 
@@ -4359,7 +4384,8 @@ fn validate_temporal_field_pair(
         (None, None) => {}
         (Some(left), Some(right))
             if left.required_field_signature() == right.required_field_signature()
-                && left.microphysics_scheme_id() == right.microphysics_scheme_id() => {}
+                && left.microphysics_scheme_id() == right.microphysics_scheme_id()
+                && property_scattering_contract_matches(left, right) => {}
         (Some(left), Some(right)) => {
             return Err(format!(
                 "Adjacent WRF property-scattering contracts differ (mp_physics {} vs {})",
@@ -4378,6 +4404,21 @@ fn validate_temporal_field_pair(
         return Err("Adjacent WRF scene has incompatible TKE availability".to_string());
     }
     Ok(())
+}
+
+fn property_scattering_contract_matches(
+    left: &app_ui::wrf_tmatrix_scene::WrfTMatrixScene,
+    right: &app_ui::wrf_tmatrix_scene::WrfTMatrixScene,
+) -> bool {
+    let left_provenance = left.provenance();
+    let right_provenance = right.provenance();
+    left_provenance.status == right_provenance.status
+        && left_provenance.frequency_hz == right_provenance.frequency_hz
+        && left_provenance.orientation == right_provenance.orientation
+        && left_provenance.fall_moment_policy == right_provenance.fall_moment_policy
+        && left_provenance.rain_mode == right_provenance.rain_mode
+        && left_provenance.tables == right_provenance.tables
+        && left.radar_elevations_deg() == right.radar_elevations_deg()
 }
 
 fn append_temporal_provenance(
@@ -5596,9 +5637,10 @@ mod tests {
             elevations_deg: elevation_ladder(true),
             ..SyntheticRadarConfig::default()
         };
+        let supported_result = supported.validate_science_contract();
         assert!(
-            supported.validate_science_contract().is_ok(),
-            "the optional 0.1-degree cut and default one-degree beam fit the declared view axis"
+            supported_result.is_ok(),
+            "the optional 0.1-degree cut and default one-degree beam fit the declared view axis: {supported_result:?}"
         );
 
         let wrong_frequency = SyntheticRadarConfig {

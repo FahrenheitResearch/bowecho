@@ -536,6 +536,14 @@ impl<K: Eq + Hash, V> TwoSceneCache<K, V> {
         self.entries.iter().map(|(_, value)| value)
     }
 
+    pub fn remove(&mut self, key: &K) -> Option<(K, V)> {
+        let position = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == key)?;
+        self.entries.remove(position)
+    }
+
     /// Insert/replace and return an evicted oldest scene, if any.
     pub fn insert(&mut self, key: K, value: V) -> Option<(K, V)> {
         if let Some(position) = self
