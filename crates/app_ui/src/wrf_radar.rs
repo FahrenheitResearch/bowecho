@@ -37,7 +37,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, RadarSite, RadarVolume, Radial,
-    ScanMode, VolumeMetadata, beam_ground_range_m, beam_height_above_radar_m,
+    ScanMode, VcpInfo, VolumeMetadata, beam_ground_range_m, beam_height_above_radar_m,
 };
 use rayon::prelude::*;
 use wrf_core::{ComputeOpts, WrfFile, getvar};
@@ -46,6 +46,11 @@ use crate::model_layer::{
     InverseLut, neighboring_cell_starts, solve_bilinear_coords, unwrap_lon_near,
 };
 use ui_core::geo::aeqd_inverse_km;
+
+use app_ui::vcp_catalog::{
+    BUILD_24_SOURCE, Build24Vcp, DopplerPrfValue, MomentCoverage, PhysicalScanRow, VcpDefinition,
+    Waveform, build_24_definition,
+};
 
 /// Default WSR-88D-like elevation ladder (deg). Covers the low tilts that
 /// dominate a plan-view display plus enough high tilts for cross-sections.
@@ -152,6 +157,83 @@ pub enum ScanTiming {
     TimedVolume,
 }
 
+/// Scan strategy used by the WRF synthetic-radar forward operator.
+///
+/// `CustomLegacy` is deliberately the serde/default variant: settings written
+/// before the Build 24 catalog existed, and programmatic callers that use
+/// [`SyntheticRadarConfig::default`], retain the historical fourteen-cut
+/// ladder and every custom timing/PRF knob exactly as before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntheticScanStrategy {
+    #[default]
+    CustomLegacy,
+    Build24Vcp12,
+    Build24Vcp34,
+    Build24Vcp35,
+    Build24Vcp112,
+    Build24Vcp212,
+    Build24Vcp215,
+}
+
+impl SyntheticScanStrategy {
+    pub const BUILD_24: [Self; 6] = [
+        Self::Build24Vcp12,
+        Self::Build24Vcp34,
+        Self::Build24Vcp35,
+        Self::Build24Vcp112,
+        Self::Build24Vcp212,
+        Self::Build24Vcp215,
+    ];
+
+    pub const fn vcp(self) -> Option<Build24Vcp> {
+        match self {
+            Self::CustomLegacy => None,
+            Self::Build24Vcp12 => Some(Build24Vcp::Vcp12),
+            Self::Build24Vcp34 => Some(Build24Vcp::Vcp34),
+            Self::Build24Vcp35 => Some(Build24Vcp::Vcp35),
+            Self::Build24Vcp112 => Some(Build24Vcp::Vcp112),
+            Self::Build24Vcp212 => Some(Build24Vcp::Vcp212),
+            Self::Build24Vcp215 => Some(Build24Vcp::Vcp215),
+        }
+    }
+
+    pub fn definition(self) -> Option<&'static VcpDefinition> {
+        build_24_definition(self.vcp()?.number())
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CustomLegacy => "Custom legacy ladder",
+            Self::Build24Vcp12 => "Build 24 VCP 12",
+            Self::Build24Vcp34 => "Build 24 VCP 34",
+            Self::Build24Vcp35 => "Build 24 VCP 35",
+            Self::Build24Vcp112 => "Build 24 VCP 112",
+            Self::Build24Vcp212 => "Build 24 VCP 212",
+            Self::Build24Vcp215 => "Build 24 VCP 215",
+        }
+    }
+
+    pub const fn is_named_vcp(self) -> bool {
+        !matches!(self, Self::CustomLegacy)
+    }
+}
+
+/// One physical antenna rotation to sample. Named VCPs produce one leg for
+/// every catalog row, including equal-elevation split cuts. The legacy custom
+/// mode produces one all-moment leg per configured elevation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SyntheticScanLeg {
+    pub elevation_deg: f64,
+    pub azimuth_rate_deg_per_second: f32,
+    pub source_period_seconds: f32,
+    pub transition_after_seconds: f32,
+    pub moments: MomentCoverage,
+    pub waveform: Option<Waveform>,
+    pub source_row_index: Option<usize>,
+    pub source_row: Option<&'static PhysicalScanRow>,
+}
+
 impl ReflectivityOperator {
     /// Whether to prefer the model's own `REFL_10CM` when the file carries it.
     /// Only the model-native operator does; Stoelinga always recomputes.
@@ -204,6 +286,10 @@ pub const DEFAULT_FOLD_NYQUIST_MPS: f32 = 25.0;
 pub struct SyntheticRadarConfig {
     /// Named operating intent. This is also stamped in export provenance.
     pub simulation_mode: SimulationMode,
+    /// Physical scan definition. The historical custom ladder remains the
+    /// default; a Build 24 selection owns its rows, rates, periods, waveform,
+    /// moment coverage and PRF-code provenance.
+    pub scan_strategy: SyntheticScanStrategy,
     /// Site id stamped on the volume (drives the loop-engine cross-site guard —
     /// every hour of one run must share it).
     pub site_id: String,
@@ -326,6 +412,7 @@ impl Default for SyntheticRadarConfig {
     fn default() -> Self {
         Self {
             simulation_mode: SimulationMode::Presentation,
+            scan_strategy: SyntheticScanStrategy::CustomLegacy,
             site_id: "WRF".to_string(),
             site_name: Some("Simulated WRF radar".to_string()),
             site_lat_deg: None,
@@ -380,6 +467,46 @@ impl Default for SyntheticRadarConfig {
 }
 
 impl SyntheticRadarConfig {
+    /// Resolve configuration into physical antenna rotations before any model
+    /// sampling begins. This is intentionally separate from the renderer loop:
+    /// duplicate split cuts must remain duplicate cuts, not be collapsed into
+    /// a unique elevation ladder.
+    pub fn physical_scan_legs(&self) -> Vec<SyntheticScanLeg> {
+        if let Some(definition) = self.scan_strategy.definition() {
+            return definition
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(source_row_index, row)| SyntheticScanLeg {
+                    elevation_deg: f64::from(row.elevation_deg),
+                    azimuth_rate_deg_per_second: row.azimuth_rate_deg_per_second,
+                    source_period_seconds: row.source_period_seconds,
+                    transition_after_seconds: 0.0,
+                    moments: row.moments,
+                    waveform: Some(row.waveform),
+                    source_row_index: Some(source_row_index),
+                    source_row: Some(row),
+                })
+                .collect();
+        }
+
+        let rate = self.rotation_rate_deg_s.max(0.1);
+        self.elevations_deg
+            .iter()
+            .copied()
+            .map(|elevation_deg| SyntheticScanLeg {
+                elevation_deg,
+                azimuth_rate_deg_per_second: rate,
+                source_period_seconds: 360.0 / rate,
+                transition_after_seconds: self.transition_delay_s.max(0.0),
+                moments: MomentCoverage::ALL,
+                waveform: None,
+                source_row_index: None,
+                source_row: None,
+            })
+            .collect()
+    }
+
     /// Apply a coherent named preset while leaving site/range/geometry choices
     /// alone. The UI calls this only when the user selects a different mode;
     /// subsequent expert edits are intentionally preserved.
@@ -461,6 +588,21 @@ impl SyntheticRadarConfig {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.site_id.hash(&mut hasher);
+        // Do not hash the CustomLegacy discriminant: omitting that no-op value
+        // preserves the pre-catalog default fingerprint exactly. A named VCP,
+        // however, is version-locked to its primary source and every physical
+        // row so a catalog revision cannot silently reuse cached scan data.
+        if let Some(definition) = self.scan_strategy.definition() {
+            "build-24-vcp".hash(&mut hasher);
+            definition.vcp.number().hash(&mut hasher);
+            definition.source.document_number.hash(&mut hasher);
+            definition.source.revision.hash(&mut hasher);
+            definition.source.rda_build.hash(&mut hasher);
+            definition.rows.len().hash(&mut hasher);
+            for row in definition.rows {
+                hash_vcp_row(row, &mut hasher);
+            }
+        }
         hash_opt_f64(self.site_lat_deg, &mut hasher);
         hash_opt_f64(self.site_lon_deg, &mut hasher);
         hash_opt_f64(self.antenna_msl_m, &mut hasher);
@@ -530,6 +672,43 @@ pub const GRID_GATE_MAX_M: f64 = 10_000.0;
 /// note so both agree on whether the grid resolution was actually applied.
 fn valid_grid_dx(dx_m: Option<f64>) -> Option<f64> {
     dx_m.filter(|dx| dx.is_finite() && *dx > 0.0)
+}
+
+fn hash_vcp_row(row: &PhysicalScanRow, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+
+    row.elevation_deg.to_bits().hash(hasher);
+    row.azimuth_rate_deg_per_second.to_bits().hash(hasher);
+    row.source_period_seconds.to_bits().hash(hasher);
+    row.waveform.abbreviation().hash(hasher);
+    for present in [
+        row.moments.has_reflectivity(),
+        row.moments.has_velocity(),
+        row.moments.has_spectrum_width(),
+        row.moments.has_differential_reflectivity(),
+        row.moments.has_correlation_coefficient(),
+        row.moments.has_differential_phase(),
+    ] {
+        present.hash(hasher);
+    }
+    row.surveillance_prf
+        .map(|prf| (prf.code, prf.pulse_count))
+        .hash(hasher);
+    row.doppler_prfs.len().hash(hasher);
+    for cell in row.doppler_prfs {
+        cell.code.hash(hasher);
+        cell.is_default.hash(hasher);
+        match cell.value {
+            DopplerPrfValue::PulseCount(count) => {
+                0u8.hash(hasher);
+                count.hash(hasher);
+            }
+            DopplerPrfValue::AzimuthRateDegPerSecond(rate) => {
+                1u8.hash(hasher);
+                rate.to_bits().hash(hasher);
+            }
+        }
+    }
 }
 
 /// The gate spacing (m) one synthetic scan actually uses, given its config and
@@ -1316,6 +1495,12 @@ pub fn build_synthetic_volume_reporting(
         .as_ref()
         .map(|polar| polar.present_fields.join(","))
         .unwrap_or_default();
+    let named_vcp = config.scan_strategy.definition();
+    if let Some(definition) = named_vcp {
+        volume.vcp = Some(VcpInfo {
+            pattern: definition.vcp.number(),
+        });
+    }
     volume.metadata = VolumeMetadata {
         source_path: None,
         archive_version: Some("simulated-wrf".to_string()),
@@ -1328,14 +1513,40 @@ pub fn build_synthetic_volume_reporting(
         beam_width_h_deg: Some(config.beam_width_deg),
         beam_width_v_deg: Some(config.beam_width_deg),
         pulse_width_us: Some(config.pulse_width_us),
-        prt_s: (config.prf_hz.is_finite() && config.prf_hz > 0.0).then_some(1.0 / config.prf_hz),
-        unambiguous_range_km: (config.prf_hz.is_finite() && config.prf_hz > 0.0)
-            .then_some(299_792.47 / (2.0 * config.prf_hz)),
-        scan_name: Some(match config.scan_timing {
-            ScanTiming::InstantaneousTruth => "BowEcho instantaneous model volume".to_string(),
-            ScanTiming::TimedVolume => "BowEcho timed synthetic volume".to_string(),
+        // Appendix C supplies numbered PRF codes, not Hz. Never turn those
+        // codes into a fictitious standard PRT/unambiguous range.
+        prt_s: named_vcp
+            .is_none()
+            .then(|| {
+                (config.prf_hz.is_finite() && config.prf_hz > 0.0).then_some(1.0 / config.prf_hz)
+            })
+            .flatten(),
+        unambiguous_range_km: named_vcp
+            .is_none()
+            .then(|| {
+                (config.prf_hz.is_finite() && config.prf_hz > 0.0)
+                    .then_some(299_792.47 / (2.0 * config.prf_hz))
+            })
+            .flatten(),
+        scan_name: Some(if let Some(definition) = named_vcp {
+            format!("Build 24 VCP {} baseline", definition.vcp.number())
+        } else {
+            match config.scan_timing {
+                ScanTiming::InstantaneousTruth => "BowEcho instantaneous model volume".to_string(),
+                ScanTiming::TimedVolume => "BowEcho timed synthetic volume".to_string(),
+            }
         }),
-        scan_id: Some("bowecho-synthetic-14-cut".to_string()),
+        scan_id: Some(if let Some(definition) = named_vcp {
+            format!(
+                "bowecho-build24-vcp{}-{}-rev{}-{}rows",
+                definition.vcp.number(),
+                BUILD_24_SOURCE.document_number,
+                BUILD_24_SOURCE.revision,
+                definition.rows.len(),
+            )
+        } else {
+            "bowecho-synthetic-14-cut".to_string()
+        }),
         polarization: Some(if config.dual_pol && fields.polarimetric.is_some() {
             "simultaneous horizontal/vertical".to_string()
         } else {
@@ -1392,10 +1603,12 @@ pub fn build_synthetic_volume_reporting(
         )
     });
 
+    let scan_legs = config.physical_scan_legs();
     let mut decoded_radials = 0usize;
     let mut cut_start_ms = 0i32;
-    let tilt_total = config.elevations_deg.len();
-    for (cut_index, &elevation_deg) in config.elevations_deg.iter().enumerate() {
+    let tilt_total = scan_legs.len();
+    for (cut_index, leg) in scan_legs.iter().enumerate() {
+        let elevation_deg = leg.elevation_deg;
         progress(&format!(
             "building tilt {}/{tilt_total} ({elevation_deg:.1}°)…",
             cut_index + 1
@@ -1412,6 +1625,8 @@ pub fn build_synthetic_volume_reporting(
             spacing,
             gate_range.clone(),
             config,
+            leg,
+            tilt_total,
             frame_seed,
             terrain_horizon.as_ref(),
             cut_start_ms,
@@ -1419,8 +1634,20 @@ pub fn build_synthetic_volume_reporting(
         decoded_radials += cut.radials.len();
         volume.cuts.push(cut);
         if matches!(config.scan_timing, ScanTiming::TimedVolume) {
-            let sweep_ms = 360_000.0 / config.rotation_rate_deg_s.max(0.1);
-            let transition_ms = 1_000.0 * config.transition_delay_s.max(0.0);
+            let (sweep_ms, transition_ms) = if named_vcp.is_some() {
+                (
+                    1_000.0 * leg.source_period_seconds.max(0.0),
+                    1_000.0 * leg.transition_after_seconds.max(0.0),
+                )
+            } else {
+                // Preserve the historical custom-mode arithmetic order: the
+                // f32 rounding of `360_000 / rate` is part of existing ray
+                // timestamps and therefore of the bit-for-bit default contract.
+                (
+                    360_000.0 / config.rotation_rate_deg_s.max(0.1),
+                    1_000.0 * config.transition_delay_s.max(0.0),
+                )
+            };
             cut_start_ms = (f64::from(cut_start_ms) + f64::from(sweep_ms + transition_ms))
                 .round()
                 .clamp(0.0, f64::from(i32::MAX)) as i32;
@@ -1814,6 +2041,8 @@ fn build_cut(
     spacing: f64,
     gate_range: GateRange,
     config: &SyntheticRadarConfig,
+    scan_leg: &SyntheticScanLeg,
+    scan_leg_count: usize,
     frame_seed: u32,
     terrain_horizon: Option<&TerrainHorizon>,
     cut_start_ms: i32,
@@ -2056,7 +2285,7 @@ fn build_cut(
         let time_offset_ms = match config.scan_timing {
             ScanTiming::InstantaneousTruth => 0,
             ScanTiming::TimedVolume => {
-                let radial_ms = 1_000.0 * az_deg / config.rotation_rate_deg_s.max(0.1);
+                let radial_ms = 1_000.0 * az_deg / scan_leg.azimuth_rate_deg_per_second.max(0.1);
                 cut_start_ms.saturating_add(radial_ms.round() as i32)
             }
         };
@@ -2070,7 +2299,7 @@ fn build_cut(
                 radar_core::RadialStatus::StartVolume
             } else if iaz == 0 {
                 radar_core::RadialStatus::StartElevation
-            } else if iaz + 1 == naz && cut_index + 1 == config.elevations_deg.len() {
+            } else if iaz + 1 == naz && cut_index + 1 == scan_leg_count {
                 radar_core::RadialStatus::EndVolume
             } else if iaz + 1 == naz {
                 radar_core::RadialStatus::EndElevation
@@ -2094,25 +2323,29 @@ fn build_cut(
     }
 
     let radial_indices: Vec<usize> = (0..naz).collect();
-    cut.moments.insert(
-        MomentType::Reflectivity,
-        f32_grid(
+    if scan_leg.moments.has_reflectivity() {
+        cut.moments.insert(
             MomentType::Reflectivity,
-            gate_range.clone(),
-            radial_indices.clone(),
-            ref_values,
-        ),
-    );
-    cut.moments.insert(
-        MomentType::Velocity,
-        f32_grid(
+            f32_grid(
+                MomentType::Reflectivity,
+                gate_range.clone(),
+                radial_indices.clone(),
+                ref_values,
+            ),
+        );
+    }
+    if scan_leg.moments.has_velocity() {
+        cut.moments.insert(
             MomentType::Velocity,
-            gate_range.clone(),
-            radial_indices.clone(),
-            vel_values,
-        ),
-    );
-    if config.spectrum_width {
+            f32_grid(
+                MomentType::Velocity,
+                gate_range.clone(),
+                radial_indices.clone(),
+                vel_values,
+            ),
+        );
+    }
+    if config.spectrum_width && scan_leg.moments.has_spectrum_width() {
         cut.moments.insert(
             MomentType::SpectrumWidth,
             f32_grid(
@@ -2123,7 +2356,7 @@ fn build_cut(
             ),
         );
     }
-    if config.dual_pol && fields.polarimetric.is_some() {
+    if config.dual_pol && fields.polarimetric.is_some() && scan_leg.moments.has_reflectivity() {
         let polar_moments = [
             (MomentType::DifferentialReflectivity, zdr_values),
             (MomentType::CorrelationCoefficient, rho_values),
@@ -3750,6 +3983,90 @@ mod tests {
             DEFAULT_ELEVATIONS_DEG,
             "the standard ladder follows unchanged"
         );
+    }
+
+    #[test]
+    fn physical_scan_plan_keeps_every_build_24_source_row() {
+        for strategy in SyntheticScanStrategy::BUILD_24 {
+            let config = SyntheticRadarConfig {
+                scan_strategy: strategy,
+                ..SyntheticRadarConfig::default()
+            };
+            let definition = strategy.definition().unwrap();
+            let legs = config.physical_scan_legs();
+            assert_eq!(legs.len(), definition.rows.len(), "{strategy:?}");
+            for (index, (leg, row)) in legs.iter().zip(definition.rows).enumerate() {
+                assert_eq!(leg.source_row_index, Some(index));
+                assert_eq!(leg.source_row, Some(row));
+                assert_eq!(leg.elevation_deg, f64::from(row.elevation_deg));
+                assert_eq!(
+                    leg.azimuth_rate_deg_per_second,
+                    row.azimuth_rate_deg_per_second
+                );
+                assert_eq!(leg.source_period_seconds, row.source_period_seconds);
+                assert_eq!(leg.transition_after_seconds, 0.0);
+                assert_eq!(leg.moments, row.moments);
+                assert_eq!(leg.waveform, Some(row.waveform));
+            }
+        }
+    }
+
+    #[test]
+    fn physical_scan_plan_preserves_vcp_112_duplicate_split_and_mpda_cuts() {
+        let config = SyntheticRadarConfig {
+            scan_strategy: SyntheticScanStrategy::Build24Vcp112,
+            ..SyntheticRadarConfig::default()
+        };
+        let legs = config.physical_scan_legs();
+        assert_eq!(legs.len(), 20);
+        assert_eq!(
+            legs.iter()
+                .take(3)
+                .map(|leg| leg.elevation_deg)
+                .collect::<Vec<_>>(),
+            vec![0.5, 0.5, 0.5]
+        );
+        assert_eq!(legs[0].waveform, Some(Waveform::Sz2ContiguousSurveillance));
+        assert_eq!(legs[1].waveform, Some(Waveform::Sz2ContiguousDoppler));
+        assert_eq!(legs[2].waveform, Some(Waveform::Sz2ContiguousDoppler));
+        assert_eq!(legs[0].moments, MomentCoverage::SURVEILLANCE);
+        assert_eq!(legs[1].moments, MomentCoverage::DOPPLER);
+        assert_eq!(legs[2].moments, MomentCoverage::DOPPLER);
+    }
+
+    #[test]
+    fn custom_scan_plan_remains_the_legacy_all_moment_ladder() {
+        let config = SyntheticRadarConfig::default();
+        assert_eq!(config.scan_strategy, SyntheticScanStrategy::CustomLegacy);
+        let legs = config.physical_scan_legs();
+        assert_eq!(legs.len(), DEFAULT_ELEVATIONS_DEG.len());
+        assert_eq!(
+            legs.iter().map(|leg| leg.elevation_deg).collect::<Vec<_>>(),
+            DEFAULT_ELEVATIONS_DEG
+        );
+        assert!(legs.iter().all(|leg| {
+            leg.moments == MomentCoverage::ALL && leg.waveform.is_none() && leg.source_row.is_none()
+        }));
+    }
+
+    #[test]
+    fn named_vcp_identity_and_versioned_rows_move_the_fingerprint() {
+        let custom = SyntheticRadarConfig::default();
+        let vcp12 = SyntheticRadarConfig {
+            scan_strategy: SyntheticScanStrategy::Build24Vcp12,
+            // VCP 12 has the same unique elevation ladder as the legacy
+            // default; identity/physical rows must still distinguish it.
+            elevations_deg: DEFAULT_ELEVATIONS_DEG.to_vec(),
+            ..custom.clone()
+        };
+        let vcp212 = SyntheticRadarConfig {
+            scan_strategy: SyntheticScanStrategy::Build24Vcp212,
+            elevations_deg: DEFAULT_ELEVATIONS_DEG.to_vec(),
+            ..custom.clone()
+        };
+        assert_ne!(custom.data_fingerprint(), vcp12.data_fingerprint());
+        assert_ne!(vcp12.data_fingerprint(), vcp212.data_fingerprint());
+        assert_eq!(vcp12.data_fingerprint(), vcp12.clone().data_fingerprint());
     }
 
     /// The config fingerprint is the loop-engine dedupe discriminator: an
