@@ -1,5 +1,8 @@
 //! Native app-shell state shared by future winit/wgpu UI code.
 
+pub mod vcp_catalog;
+pub mod wrf_scene_inventory;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PanelLayout {
     #[default]
