@@ -2,6 +2,7 @@
 
 pub mod vcp_catalog;
 pub mod wrf_scene_inventory;
+pub mod wrf_temporal;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PanelLayout {
