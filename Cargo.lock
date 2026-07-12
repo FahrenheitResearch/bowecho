@@ -5652,6 +5652,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "simradar_validation"
+version = "0.33.1"
+dependencies = [
+ "chrono",
+ "nexrad_io",
+ "radar_core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "simsat"
 version = "0.1.9"
 source = "git+https://github.com/FahrenheitResearch/simsat.git?rev=39f928a44232de6a6304e67f97b94c1ed86f4339#39f928a44232de6a6304e67f97b94c1ed86f4339"
