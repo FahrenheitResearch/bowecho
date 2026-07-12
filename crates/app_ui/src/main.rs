@@ -28070,7 +28070,7 @@ impl ViewerApp {
                     // eager nearest-site load here raced the menu pick —
                     // see the single-pane handler).
                     self.context_menu_lonlat = Some(self.screen_to_lon_lat(cell, pointer));
-                    self.context_menu_gate = self.cursor_readout_at(cell, pointer);
+                    self.context_menu_gate = hovered_readout.clone();
                 }
             }
             if !armed
