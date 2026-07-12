@@ -5653,8 +5653,8 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simsat"
-version = "0.1.6"
-source = "git+https://github.com/FahrenheitResearch/simsat.git?rev=3b4b180d57e24c065521874e26db6299ff375811#3b4b180d57e24c065521874e26db6299ff375811"
+version = "0.1.9"
+source = "git+https://github.com/FahrenheitResearch/simsat.git?rev=39f928a44232de6a6304e67f97b94c1ed86f4339#39f928a44232de6a6304e67f97b94c1ed86f4339"
 dependencies = [
  "chrono",
  "eframe",

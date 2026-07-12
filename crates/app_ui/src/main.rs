@@ -20223,7 +20223,7 @@ impl ViewerApp {
                 (
                     dock::WorkspacePane::Simsat,
                     "SimSat",
-                    "SimSat v0.1.6: physically based WRF/HRRR satellite rendering, CPU-stored loops and native plots, plus an optional non-stored GPU preview",
+                    "SimSat v0.1.9: physically based WRF/HRRR satellite rendering, reviewed quick modes, sensor/precision controls, CPU-stored loops and native plots, plus an optional non-stored GPU preview",
                 ),
                 (
                     dock::WorkspacePane::Wofs,

@@ -675,7 +675,7 @@ pub struct AppSettings {
     /// state and one-session raw-file consent are deliberately never saved.
     #[serde(default)]
     pub formula_lab_state: Option<serde_json::Value>,
-    /// Last-used embedded SimSat source/product/view and rendering controls.
+    /// Last-used embedded SimSat product/view and rendering controls.
     /// The app-ui crate owns the versioned schema; settings keeps the value
     /// opaque so SimSat can evolve without coupling this crate to its types.
     /// Active jobs, progress, errors, and rendered output are never saved.

@@ -3,7 +3,7 @@
 > **Historical design document (superseded integration shape).** This records
 > the original pre-implementation engine plan and explains scientific/design
 > choices, but its statement below that SimSat is standalone-only is no longer
-> current. SimSat v0.1.6 now ships both its standalone Studio and an embedded
+> current. SimSat v0.1.9 now ships both its standalone Studio and an embedded
 > first-class BowEcho workspace under **Windows > SimSat**. For supported
 > inputs, controls, products, cache behavior, output routing, and current
 > limitations in BowEcho, use [docs/simsat-guide.md](simsat-guide.md).

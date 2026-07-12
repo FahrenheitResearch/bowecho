@@ -17,25 +17,31 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use chrono::Utc;
 use eframe::egui;
 use simsat::api::{
-    BlueMarble, FrameData, Product, RenderBackend, RenderParams, RenderResult, SunOverride,
+    BlueMarble, FractionalCloudMode, FrameData, Product, RenderBackend, RenderIntent, RenderParams,
+    RenderResult, SunOverride,
 };
-use simsat::camera::{ResolutionMode, SatellitePreset, ViewMode};
+use simsat::bricks::StorageProfile;
+use simsat::camera::{GeoNavigation, ResolutionMode, SatellitePreset, ViewMode};
 use simsat::clouds::{CloudMultiscatterMode, StepQuality};
 use simsat::derived::DerivedField;
+use simsat::instrument_footprint::InstrumentFootprint;
+use simsat::optics::CloudOpticsMode;
 use simsat::render::{
     CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, GROUND_DAY_LIFT, LandAppearanceConfig, RHO_HIGHLIGHT_MAX,
 };
 use simsat::store_out::{self, IrFrame, VisibleFrame};
+use simsat::thermal_sensor::ThermalSensor;
 use simsat::wv::WvBand;
 
 use crate::sat_plot::{SatellitePlotPalette, SatellitePlotSource};
 use crate::simsat_hrrr::{HrrrNativeSpec, discover_native_files, download_native, latest_specs};
 use crate::simsat_store::{DerivedFrame, write_derived_frame};
 
-// SimSat v0.1.4 moved the brick schema from v3 to v5. A versioned directory keeps
-// old cached-only manifests from masquerading as current inputs while raw WRF/GRIB
-// sources re-ingest normally.
-const ENGINE_CACHE_SUBDIR: &str = "engine-v5";
+// SimSat v0.1.9 moved the compact brick schema from v5 to v6. A versioned
+// directory keeps old cached-only manifests from masquerading as current inputs
+// while raw WRF/GRIB sources re-ingest normally. The engine adds a further
+// disjoint namespace for its optional ScienceCloudF16 v7 profile.
+const ENGINE_CACHE_SUBDIR: &str = "engine-v6";
 
 /// A completion request owned by the app shell. The pane never reaches into the
 /// Satellite or native-plot viewer state directly.
@@ -99,7 +105,7 @@ impl SimSatProduct {
     fn label(self) -> &'static str {
         match self {
             Self::Visible => "Visible true color",
-            Self::GeoColor => "GeoColor day / night",
+            Self::GeoColor => "SimSat day / night color (GeoColor style)",
             Self::Sandwich => "Sandwich (visible + cold-top IR)",
             Self::Ir13 => "IR 10.3 um (band 13)",
             Self::Wv8 => "Water vapor 6.2 um (band 8)",
@@ -167,6 +173,18 @@ impl SimSatProduct {
         self.uses_visible_ground()
     }
 
+    fn has_band13_component(self) -> bool {
+        matches!(self, Self::Ir13 | Self::GeoColor | Self::Sandwich)
+    }
+
+    fn supports_native_cloud_optics(self) -> bool {
+        self == Self::Visible
+    }
+
+    fn supports_sensor_qa(self) -> bool {
+        matches!(self, Self::Visible | Self::Ir13)
+    }
+
     fn derived_field(self) -> Option<DerivedField> {
         match self {
             Self::PrecipitableWater => Some(DerivedField::PrecipitableWater),
@@ -226,6 +244,14 @@ impl SatelliteChoice {
         }
     }
 
+    fn slug(self) -> &'static str {
+        match self {
+            Self::GoesEast => "goes-east",
+            Self::GoesWest => "goes-west",
+            Self::Himawari => "himawari",
+        }
+    }
+
     fn api_satellite(self) -> SatellitePreset {
         match self {
             Self::GoesEast => SatellitePreset::GoesEast,
@@ -249,6 +275,13 @@ impl RenderQuality {
         }
     }
 
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Final => "offline",
+            Self::Preview => "interactive",
+        }
+    }
+
     fn steps(self) -> StepQuality {
         match self {
             Self::Final => StepQuality::Offline,
@@ -257,11 +290,63 @@ impl RenderQuality {
     }
 }
 
-const CLOUD_TRANSPORTS: [CloudMultiscatterMode; 4] = [
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SimSatQuickMode {
+    RecommendedDisplay,
+    HighQualityVisible,
+    SensorQa,
+}
+
+impl SimSatQuickMode {
+    const ALL: [Self; 3] = [
+        Self::RecommendedDisplay,
+        Self::HighQualityVisible,
+        Self::SensorQa,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RecommendedDisplay => "Recommended",
+            Self::HighQualityVisible => "High Quality",
+            Self::SensorQa => "Sensor QA",
+        }
+    }
+
+    fn full_label(self) -> &'static str {
+        match self {
+            Self::RecommendedDisplay => "Recommended Display",
+            Self::HighQualityVisible => "High Quality Visible",
+            Self::SensorQa => "Sensor QA",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::RecommendedDisplay => {
+                "Owner-reviewed visible defaults: CPU-quality rendering, model-native output, \
+                 OD 0.15, exposure 1.5, AOD 0.05, fixed optics, Effective OD, corrections and \
+                 edge feathering on, and experimental storage/footprints off."
+            }
+            Self::HighQualityVisible => {
+                "Recommended Display plus the deterministic four-subcolumn cloud reference and \
+                 a 0.45 highlight knee. It is slower, but does not silently enable experimental \
+                 storage, sensor footprint, or scheme-native particle optics."
+            }
+            Self::SensorQa => {
+                "CPU sensor-comparison setup: exact GOES-R fixed-grid navigation and neutral \
+                 visible transforms, or the official FM4/GOES-19 Band 13 response for a \
+                 compatible GOES-East IR selection."
+            }
+        }
+    }
+}
+
+const CLOUD_TRANSPORTS: [CloudMultiscatterMode; 5] = [
     CloudMultiscatterMode::LegacyOctaves,
     CloudMultiscatterMode::SingleScatter,
     CloudMultiscatterMode::DeltaFluxV1,
     CloudMultiscatterMode::DeltaFluxV2,
+    CloudMultiscatterMode::DeltaFluxV3,
 ];
 
 fn cloud_transport_label(mode: CloudMultiscatterMode) -> &'static str {
@@ -270,6 +355,25 @@ fn cloud_transport_label(mode: CloudMultiscatterMode) -> &'static str {
         CloudMultiscatterMode::SingleScatter => "Single scatter",
         CloudMultiscatterMode::DeltaFluxV1 => "Delta-flux v1 (experimental)",
         CloudMultiscatterMode::DeltaFluxV2 => "Delta-flux v2b P1 (experimental)",
+        CloudMultiscatterMode::DeltaFluxV3 => "Delta-flux v3 memory (experimental)",
+    }
+}
+
+fn fractional_cloud_mode_label(mode: FractionalCloudMode) -> &'static str {
+    match mode {
+        FractionalCloudMode::Off => "Off",
+        FractionalCloudMode::EffectiveOd => "Effective OD (fast / default)",
+        FractionalCloudMode::Deterministic4 => "Deterministic 4 (reference)",
+        FractionalCloudMode::Deterministic8 => "Deterministic 8 (convergence)",
+        FractionalCloudMode::Deterministic16 => "Deterministic 16 (convergence)",
+    }
+}
+
+fn cloud_optics_label(mode: CloudOpticsMode) -> &'static str {
+    match mode {
+        CloudOpticsMode::Fixed => "Fixed radii (production default)",
+        CloudOpticsMode::NsslNative => "NSSL MP18 native moments (experimental)",
+        CloudOpticsMode::HrrrThompsonNative => "HRRR Thompson native moments (experimental)",
     }
 }
 
@@ -279,6 +383,27 @@ fn resolution_short_label(mode: ResolutionMode) -> &'static str {
         ResolutionMode::Abi1km => "ABI 1 km",
         ResolutionMode::Abi2km => "ABI 2 km",
     }
+}
+
+fn resolution_slug(mode: ResolutionMode) -> &'static str {
+    match mode {
+        ResolutionMode::Native => "native",
+        ResolutionMode::Abi1km => "abi1km",
+        ResolutionMode::Abi2km => "abi2km",
+    }
+}
+
+fn resolution_from_slug(value: &str) -> Option<ResolutionMode> {
+    match value {
+        "native" => Some(ResolutionMode::Native),
+        "abi1km" | "abi-1km" => Some(ResolutionMode::Abi1km),
+        "abi2km" | "abi-2km" => Some(ResolutionMode::Abi2km),
+        _ => None,
+    }
+}
+
+fn near_f32(left: f32, right: f32) -> bool {
+    (left - right).abs() <= 1.0e-5
 }
 
 #[derive(Clone, Debug)]
@@ -315,9 +440,12 @@ impl JobSource {
 struct RenderJob {
     source: JobSource,
     backend: RenderBackend,
+    storage_profile: StorageProfile,
+    render_intent: RenderIntent,
     product: SimSatProduct,
     view: OutputView,
     satellite: SatelliteChoice,
+    geo_navigation: GeoNavigation,
     resolution: ResolutionMode,
     quality: RenderQuality,
     margin_frac: f32,
@@ -340,11 +468,16 @@ struct RenderJob {
     land_dark_toe_max_gain: f32,
     clouds: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: FractionalCloudMode,
     cloud_optical_depth_scale: f32,
+    cloud_optics: CloudOpticsMode,
     feather_exposed_domain_edges: bool,
     cloud_transport: CloudMultiscatterMode,
     beer_powder: bool,
     topdown_stratiform_regularization: bool,
+    topdown_cloud_footprint: bool,
+    thermal_sensor: ThermalSensor,
+    instrument_footprint: InstrumentFootprint,
     sun_override: bool,
     sun_elevation_deg: f32,
     sun_azimuth_deg: f32,
@@ -485,22 +618,23 @@ struct RenderTask {
     cancel: Arc<AtomicBool>,
 }
 
-/// State for the docked/floating SimSat pane. It owns no Satellite or plot viewer
-/// internals; all cross-window effects leave as [`SimSatAction`].
-pub(crate) struct SimSatPane {
-    source_mode: SourceMode,
-    local_path: String,
-    cached_hrrr: Vec<crate::simsat_hrrr::CachedNativeInput>,
-    cached_selected: usize,
-    cached_loaded: bool,
-    hrrr_date: String,
-    hrrr_cycle: u8,
-    hrrr_forecast_hour: u16,
-    product: SimSatProduct,
-    view: OutputView,
-    satellite: SatelliteChoice,
-    resolution: ResolutionMode,
-    quality: RenderQuality,
+const SIMSAT_STATE_SCHEMA: u32 = 1;
+
+/// Versioned opaque payload stored inside BowEcho's application settings. Source
+/// paths, cached-file selections, live jobs, progress, and rendered output stay
+/// session-only; this snapshot contains only reusable render/control choices.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+struct SimSatSavedState {
+    schema: u32,
+    product: String,
+    view: String,
+    satellite: String,
+    geo_navigation: String,
+    resolution: String,
+    quality: String,
+    storage_profile: String,
+    render_intent: String,
     margin_frac: f32,
     granulation: bool,
     bluemarble_download: bool,
@@ -521,11 +655,219 @@ pub(crate) struct SimSatPane {
     land_dark_toe_max_gain: f32,
     clouds: bool,
     fractional_clouds: bool,
+    fractional_cloud_mode: String,
     cloud_optical_depth_scale: f32,
+    cloud_optics: String,
+    feather_exposed_domain_edges: bool,
+    cloud_transport: String,
+    beer_powder: bool,
+    topdown_stratiform_regularization: bool,
+    topdown_cloud_footprint: bool,
+    thermal_sensor: String,
+    instrument_footprint: String,
+    sun_override: bool,
+    sun_elevation_deg: f32,
+    sun_azimuth_deg: f32,
+}
+
+impl Default for SimSatSavedState {
+    fn default() -> Self {
+        Self::from_pane(&SimSatPane::default())
+    }
+}
+
+impl SimSatSavedState {
+    fn from_pane(pane: &SimSatPane) -> Self {
+        Self {
+            schema: SIMSAT_STATE_SCHEMA,
+            product: pane.product.slug().to_owned(),
+            view: pane.view.slug().to_owned(),
+            satellite: pane.satellite.slug().to_owned(),
+            geo_navigation: pane.geo_navigation.slug().to_owned(),
+            resolution: resolution_slug(pane.resolution).to_owned(),
+            quality: pane.quality.slug().to_owned(),
+            storage_profile: pane.storage_profile.slug().to_owned(),
+            render_intent: pane.render_intent.slug().to_owned(),
+            margin_frac: pane.margin_frac,
+            granulation: pane.granulation,
+            bluemarble_download: pane.bluemarble_download,
+            bluemarble_month: pane.bluemarble_month,
+            exposure: pane.exposure,
+            ground_gain: pane.ground_gain,
+            cloud_softclip: pane.cloud_softclip,
+            cloud_highlight_max: pane.cloud_highlight_max,
+            aerosol_optical_depth: pane.aerosol_optical_depth,
+            rh_aerosol_swelling: pane.rh_aerosol_swelling,
+            atmosphere_correction: pane.atmosphere_correction,
+            terrain_atmosphere: pane.terrain_atmosphere,
+            land_sza_normalization: pane.land_sza_normalization,
+            land_sza_max_gain: pane.land_sza_max_gain,
+            land_dark_toe: pane.land_dark_toe,
+            land_dark_toe_knee: pane.land_dark_toe_knee,
+            land_dark_toe_gamma: pane.land_dark_toe_gamma,
+            land_dark_toe_max_gain: pane.land_dark_toe_max_gain,
+            clouds: pane.clouds,
+            fractional_clouds: pane.fractional_clouds,
+            fractional_cloud_mode: pane.fractional_cloud_mode.slug().to_owned(),
+            cloud_optical_depth_scale: pane.cloud_optical_depth_scale,
+            cloud_optics: pane.cloud_optics.token().to_owned(),
+            feather_exposed_domain_edges: pane.feather_exposed_domain_edges,
+            cloud_transport: pane.cloud_transport.slug().to_owned(),
+            beer_powder: pane.beer_powder,
+            topdown_stratiform_regularization: pane.topdown_stratiform_regularization,
+            topdown_cloud_footprint: pane.topdown_cloud_footprint,
+            thermal_sensor: pane.thermal_sensor.slug().to_owned(),
+            instrument_footprint: pane.instrument_footprint.slug().to_owned(),
+            sun_override: pane.sun_override,
+            sun_elevation_deg: pane.sun_elevation_deg,
+            sun_azimuth_deg: pane.sun_azimuth_deg,
+        }
+    }
+
+    fn apply_to(&self, pane: &mut SimSatPane) {
+        if let Some(product) = SimSatProduct::ALL
+            .into_iter()
+            .find(|candidate| candidate.slug() == self.product)
+        {
+            pane.product = product;
+        }
+        if let Some(view) = OutputView::ALL
+            .into_iter()
+            .find(|candidate| candidate.slug() == self.view)
+        {
+            pane.view = view;
+        }
+        if let Some(satellite) = SatelliteChoice::ALL
+            .into_iter()
+            .find(|candidate| candidate.slug() == self.satellite)
+        {
+            pane.satellite = satellite;
+        }
+        if let Some(navigation) = GeoNavigation::ALL
+            .into_iter()
+            .find(|candidate| candidate.slug() == self.geo_navigation)
+        {
+            pane.geo_navigation = navigation;
+        }
+        if let Some(resolution) = resolution_from_slug(&self.resolution) {
+            pane.resolution = resolution;
+        }
+        if let Some(quality) = [RenderQuality::Final, RenderQuality::Preview]
+            .into_iter()
+            .find(|candidate| candidate.slug() == self.quality)
+        {
+            pane.quality = quality;
+        }
+        if let Some(profile) = StorageProfile::parse(&self.storage_profile) {
+            pane.storage_profile = profile;
+        }
+        pane.render_intent = match self.render_intent.as_str() {
+            "sensor-fast-gray" => RenderIntent::SensorFastGray,
+            _ => RenderIntent::Display,
+        };
+        pane.margin_frac = self.margin_frac.clamp(0.0, 0.75);
+        pane.granulation = self.granulation;
+        pane.bluemarble_download = self.bluemarble_download;
+        pane.bluemarble_month = self.bluemarble_month.min(12);
+        pane.exposure = self.exposure.clamp(0.25, 4.0);
+        pane.ground_gain = self.ground_gain.clamp(0.25, 4.0);
+        pane.cloud_softclip = self.cloud_softclip.clamp(0.05, 1.0);
+        pane.cloud_highlight_max = self.cloud_highlight_max.clamp(0.25, 4.0);
+        pane.aerosol_optical_depth = self.aerosol_optical_depth.clamp(0.0, 0.6);
+        pane.rh_aerosol_swelling = self.rh_aerosol_swelling;
+        pane.atmosphere_correction = self.atmosphere_correction;
+        pane.terrain_atmosphere = self.terrain_atmosphere;
+        pane.land_sza_normalization = self.land_sza_normalization;
+        pane.land_sza_max_gain = self.land_sza_max_gain.clamp(1.0, 4.0);
+        pane.land_dark_toe = self.land_dark_toe;
+        pane.land_dark_toe_knee = self.land_dark_toe_knee.clamp(0.001, 0.25);
+        pane.land_dark_toe_gamma = self.land_dark_toe_gamma.clamp(0.05, 1.0);
+        pane.land_dark_toe_max_gain = self.land_dark_toe_max_gain.clamp(1.0, 4.0);
+        pane.clouds = self.clouds;
+        pane.fractional_clouds = self.fractional_clouds;
+        pane.fractional_cloud_mode = match self.fractional_cloud_mode.as_str() {
+            "off" => FractionalCloudMode::Off,
+            "deterministic-4" => FractionalCloudMode::Deterministic4,
+            "deterministic-8" => FractionalCloudMode::Deterministic8,
+            "deterministic-16" => FractionalCloudMode::Deterministic16,
+            _ => FractionalCloudMode::EffectiveOd,
+        };
+        pane.cloud_optical_depth_scale = self.cloud_optical_depth_scale.clamp(0.0, 4.0);
+        if let Some(optics) = CloudOpticsMode::parse(&self.cloud_optics) {
+            pane.cloud_optics = optics;
+        }
+        pane.feather_exposed_domain_edges = self.feather_exposed_domain_edges;
+        if let Some(transport) = CLOUD_TRANSPORTS
+            .into_iter()
+            .find(|candidate| candidate.slug() == self.cloud_transport)
+        {
+            pane.cloud_transport = transport;
+        }
+        pane.beer_powder = self.beer_powder;
+        pane.topdown_stratiform_regularization = self.topdown_stratiform_regularization;
+        pane.topdown_cloud_footprint = self.topdown_cloud_footprint;
+        if let Some(sensor) = ThermalSensor::parse(&self.thermal_sensor) {
+            pane.thermal_sensor = sensor;
+        }
+        if let Some(footprint) = InstrumentFootprint::parse(&self.instrument_footprint) {
+            pane.instrument_footprint = footprint;
+        }
+        pane.sun_override = self.sun_override;
+        pane.sun_elevation_deg = self.sun_elevation_deg.clamp(-10.0, 90.0);
+        pane.sun_azimuth_deg = self.sun_azimuth_deg.clamp(0.0, 360.0);
+        pane.normalize_incompatible_controls();
+    }
+}
+
+/// State for the docked/floating SimSat pane. It owns no Satellite or plot viewer
+/// internals; all cross-window effects leave as [`SimSatAction`].
+pub(crate) struct SimSatPane {
+    source_mode: SourceMode,
+    local_path: String,
+    cached_hrrr: Vec<crate::simsat_hrrr::CachedNativeInput>,
+    cached_selected: usize,
+    cached_loaded: bool,
+    hrrr_date: String,
+    hrrr_cycle: u8,
+    hrrr_forecast_hour: u16,
+    product: SimSatProduct,
+    view: OutputView,
+    satellite: SatelliteChoice,
+    geo_navigation: GeoNavigation,
+    resolution: ResolutionMode,
+    quality: RenderQuality,
+    storage_profile: StorageProfile,
+    render_intent: RenderIntent,
+    margin_frac: f32,
+    granulation: bool,
+    bluemarble_download: bool,
+    bluemarble_month: u32,
+    exposure: f32,
+    ground_gain: f32,
+    cloud_softclip: f32,
+    cloud_highlight_max: f32,
+    aerosol_optical_depth: f32,
+    rh_aerosol_swelling: bool,
+    atmosphere_correction: bool,
+    terrain_atmosphere: bool,
+    land_sza_normalization: bool,
+    land_sza_max_gain: f32,
+    land_dark_toe: bool,
+    land_dark_toe_knee: f32,
+    land_dark_toe_gamma: f32,
+    land_dark_toe_max_gain: f32,
+    clouds: bool,
+    fractional_clouds: bool,
+    fractional_cloud_mode: FractionalCloudMode,
+    cloud_optical_depth_scale: f32,
+    cloud_optics: CloudOpticsMode,
     feather_exposed_domain_edges: bool,
     cloud_transport: CloudMultiscatterMode,
     beer_powder: bool,
     topdown_stratiform_regularization: bool,
+    topdown_cloud_footprint: bool,
+    thermal_sensor: ThermalSensor,
+    instrument_footprint: InstrumentFootprint,
     sun_override: bool,
     sun_elevation_deg: f32,
     sun_azimuth_deg: f32,
@@ -540,6 +882,7 @@ pub(crate) struct SimSatPane {
     last_plot: Option<PlotPayload>,
     last_plot_label: Option<String>,
     last_stored: Option<StoredFrame>,
+    persisted_state_dirty: bool,
 }
 
 impl Default for SimSatPane {
@@ -564,8 +907,11 @@ impl Default for SimSatPane {
             product: SimSatProduct::Visible,
             view: OutputView::Geostationary,
             satellite: SatelliteChoice::GoesEast,
+            geo_navigation: GeoNavigation::ModelSphere,
             resolution: ResolutionMode::Native,
             quality: RenderQuality::Final,
+            storage_profile: StorageProfile::CompactU8,
+            render_intent: RenderIntent::Display,
             margin_frac: 0.0,
             granulation: false,
             bluemarble_download: true,
@@ -586,11 +932,16 @@ impl Default for SimSatPane {
             land_dark_toe_max_gain: land.dark_toe_max_gain as f32,
             clouds: true,
             fractional_clouds: true,
+            fractional_cloud_mode: FractionalCloudMode::EffectiveOd,
             cloud_optical_depth_scale: simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            cloud_optics: CloudOpticsMode::Fixed,
             feather_exposed_domain_edges: true,
             cloud_transport: CloudMultiscatterMode::LegacyOctaves,
             beer_powder: false,
             topdown_stratiform_regularization: false,
+            topdown_cloud_footprint: false,
+            thermal_sensor: ThermalSensor::FastGray,
+            instrument_footprint: InstrumentFootprint::Off,
             sun_override: false,
             sun_elevation_deg: 45.0,
             sun_azimuth_deg: 180.0,
@@ -605,13 +956,289 @@ impl Default for SimSatPane {
             last_plot: None,
             last_plot_label: None,
             last_stored: None,
+            persisted_state_dirty: false,
         }
     }
 }
 
 impl SimSatPane {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(saved: Option<&serde_json::Value>) -> Self {
+        let mut pane = Self::default();
+        if let Some(saved) = saved
+            && let Ok(state) = serde_json::from_value::<SimSatSavedState>(saved.clone())
+            && state.schema == SIMSAT_STATE_SCHEMA
+        {
+            state.apply_to(&mut pane);
+        }
+        pane.persisted_state_dirty = false;
+        pane
+    }
+
+    pub(crate) fn take_persisted_state_if_dirty(&mut self) -> Option<serde_json::Value> {
+        if !self.persisted_state_dirty {
+            return None;
+        }
+        let value = serde_json::to_value(SimSatSavedState::from_pane(self)).ok()?;
+        self.persisted_state_dirty = false;
+        Some(value)
+    }
+
+    fn normalize_incompatible_controls(&mut self) {
+        if !self.product.supports_native_cloud_optics() {
+            self.cloud_optics = CloudOpticsMode::Fixed;
+        }
+        if !self.product.has_band13_component() {
+            self.instrument_footprint = InstrumentFootprint::Off;
+        }
+        if self.satellite == SatelliteChoice::Himawari
+            && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
+        {
+            self.geo_navigation = GeoNavigation::ModelSphere;
+        }
+        if self.instrument_footprint != InstrumentFootprint::Off {
+            if self.satellite == SatelliteChoice::Himawari {
+                self.satellite = SatelliteChoice::GoesEast;
+            }
+            self.view = OutputView::Geostationary;
+            self.geo_navigation = GeoNavigation::GoesRAbiFixedGrid;
+            self.resolution = ResolutionMode::Abi2km;
+            self.thermal_sensor = ThermalSensor::GoesRAbiBand13Fm4;
+        }
+    }
+
+    fn apply_display_baseline(&mut self) {
+        let land = LandAppearanceConfig::default();
+        self.storage_profile = StorageProfile::CompactU8;
+        self.instrument_footprint = InstrumentFootprint::Off;
+        self.resolution = ResolutionMode::Native;
+        self.render_intent = RenderIntent::Display;
+        self.quality = RenderQuality::Final;
+        self.aerosol_optical_depth = simsat::atmosphere::DEFAULT_AOD as f32;
+        self.rh_aerosol_swelling = false;
+        self.atmosphere_correction = true;
+        self.terrain_atmosphere = true;
+        self.land_sza_normalization = land.sza_normalization;
+        self.land_sza_max_gain = land.sza_max_gain as f32;
+        self.land_dark_toe = land.dark_toe;
+        self.land_dark_toe_knee = land.dark_toe_knee as f32;
+        self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
+        self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
+        self.clouds = true;
+        self.fractional_clouds = true;
+        self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+        self.cloud_optical_depth_scale = simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE;
+        self.cloud_optics = CloudOpticsMode::Fixed;
+        self.feather_exposed_domain_edges = true;
+        self.cloud_transport = CloudMultiscatterMode::LegacyOctaves;
+        self.beer_powder = false;
+        self.granulation = false;
+        self.topdown_stratiform_regularization = false;
+        self.topdown_cloud_footprint = false;
+        self.exposure = DEFAULT_EXPOSURE as f32;
+        self.ground_gain = GROUND_DAY_LIFT as f32;
+        self.cloud_softclip = CLOUD_SOFTCLIP_KNEE as f32;
+        self.cloud_highlight_max = RHO_HIGHLIGHT_MAX as f32;
+    }
+
+    fn apply_quick_mode(&mut self, mode: SimSatQuickMode) -> Result<(), String> {
+        match mode {
+            SimSatQuickMode::RecommendedDisplay | SimSatQuickMode::HighQualityVisible => {
+                if !self.product.is_visible_family() {
+                    return Err(format!(
+                        "{} does not use the visible display path. Select Visible, SimSat day / night color, or Sandwich first; Quick mode never changes the product.",
+                        self.product.label()
+                    ));
+                }
+                self.apply_display_baseline();
+                if mode == SimSatQuickMode::HighQualityVisible {
+                    self.fractional_cloud_mode = FractionalCloudMode::Deterministic4;
+                    self.cloud_softclip = 0.45;
+                }
+            }
+            SimSatQuickMode::SensorQa => {
+                if !self.product.supports_sensor_qa() {
+                    return Err(format!(
+                        "{} is not an honest Sensor QA target. Select Visible or IR Band 13; Quick mode never converts the product.",
+                        self.product.label()
+                    ));
+                }
+                if self.satellite == SatelliteChoice::Himawari {
+                    return Err(
+                        "GOES-R Sensor QA is incompatible with Himawari. Select a GOES satellite first; the preset will not relabel the platform.".to_owned(),
+                    );
+                }
+                if self.product == SimSatProduct::Ir13
+                    && self.satellite != SatelliteChoice::GoesEast
+                {
+                    return Err(
+                        "The available official Band 13 response is FM4 / GOES-19 (GOES-East), not GOES-West. Select GOES-East first.".to_owned(),
+                    );
+                }
+                self.storage_profile = StorageProfile::CompactU8;
+                self.instrument_footprint = InstrumentFootprint::Off;
+                self.view = OutputView::Geostationary;
+                self.geo_navigation = GeoNavigation::GoesRAbiFixedGrid;
+                self.render_intent = RenderIntent::SensorFastGray;
+                self.quality = RenderQuality::Final;
+                match self.product {
+                    SimSatProduct::Visible => {
+                        self.apply_sensor_qa_visible();
+                    }
+                    SimSatProduct::Ir13 => {
+                        self.resolution = ResolutionMode::Abi2km;
+                        self.thermal_sensor = ThermalSensor::GoesRAbiBand13Fm4;
+                    }
+                    _ => unreachable!("Sensor QA scope validated above"),
+                }
+            }
+        }
+        self.persisted_state_dirty = true;
+        Ok(())
+    }
+
+    fn apply_sensor_qa_visible(&mut self) {
+        let land = LandAppearanceConfig::identity();
+        self.resolution = ResolutionMode::Abi1km;
+        self.aerosol_optical_depth = simsat::atmosphere::DEFAULT_AOD as f32;
+        self.rh_aerosol_swelling = false;
+        self.atmosphere_correction = false;
+        self.terrain_atmosphere = true;
+        self.land_sza_normalization = land.sza_normalization;
+        self.land_sza_max_gain = land.sza_max_gain as f32;
+        self.land_dark_toe = land.dark_toe;
+        self.land_dark_toe_knee = land.dark_toe_knee as f32;
+        self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
+        self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
+        self.clouds = true;
+        self.fractional_clouds = true;
+        self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+        self.cloud_optical_depth_scale = 1.0;
+        self.cloud_optics = CloudOpticsMode::Fixed;
+        self.feather_exposed_domain_edges = false;
+        self.cloud_transport = CloudMultiscatterMode::LegacyOctaves;
+        self.beer_powder = false;
+        self.granulation = false;
+        self.topdown_stratiform_regularization = false;
+        self.topdown_cloud_footprint = false;
+        self.exposure = 1.0;
+        self.ground_gain = 1.0;
+        self.cloud_softclip = 1.0;
+        self.cloud_highlight_max = 1.0;
+    }
+
+    fn active_quick_mode(&self) -> Option<SimSatQuickMode> {
+        if self.sensor_qa_matches() {
+            Some(SimSatQuickMode::SensorQa)
+        } else if self.display_baseline_matches(true) {
+            Some(SimSatQuickMode::HighQualityVisible)
+        } else if self.display_baseline_matches(false) {
+            Some(SimSatQuickMode::RecommendedDisplay)
+        } else {
+            None
+        }
+    }
+
+    fn display_baseline_matches(&self, high_quality: bool) -> bool {
+        let land = LandAppearanceConfig::default();
+        self.product.is_visible_family()
+            && self.storage_profile == StorageProfile::CompactU8
+            && self.instrument_footprint == InstrumentFootprint::Off
+            && self.resolution == ResolutionMode::Native
+            && self.render_intent == RenderIntent::Display
+            && self.quality == RenderQuality::Final
+            && near_f32(
+                self.aerosol_optical_depth,
+                simsat::atmosphere::DEFAULT_AOD as f32,
+            )
+            && !self.rh_aerosol_swelling
+            && self.atmosphere_correction
+            && self.terrain_atmosphere
+            && self.land_sza_normalization == land.sza_normalization
+            && near_f32(self.land_sza_max_gain, land.sza_max_gain as f32)
+            && self.land_dark_toe == land.dark_toe
+            && near_f32(self.land_dark_toe_knee, land.dark_toe_knee as f32)
+            && near_f32(self.land_dark_toe_gamma, land.dark_toe_gamma as f32)
+            && near_f32(self.land_dark_toe_max_gain, land.dark_toe_max_gain as f32)
+            && self.clouds
+            && self.fractional_clouds
+            && self.fractional_cloud_mode
+                == if high_quality {
+                    FractionalCloudMode::Deterministic4
+                } else {
+                    FractionalCloudMode::EffectiveOd
+                }
+            && near_f32(
+                self.cloud_optical_depth_scale,
+                simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
+            )
+            && self.cloud_optics == CloudOpticsMode::Fixed
+            && self.feather_exposed_domain_edges
+            && self.cloud_transport == CloudMultiscatterMode::LegacyOctaves
+            && !self.beer_powder
+            && !self.granulation
+            && !self.topdown_stratiform_regularization
+            && !self.topdown_cloud_footprint
+            && near_f32(self.exposure, DEFAULT_EXPOSURE as f32)
+            && near_f32(self.ground_gain, GROUND_DAY_LIFT as f32)
+            && near_f32(
+                self.cloud_softclip,
+                if high_quality {
+                    0.45
+                } else {
+                    CLOUD_SOFTCLIP_KNEE as f32
+                },
+            )
+            && near_f32(self.cloud_highlight_max, RHO_HIGHLIGHT_MAX as f32)
+    }
+
+    fn sensor_qa_matches(&self) -> bool {
+        let common = self.product.supports_sensor_qa()
+            && self.satellite != SatelliteChoice::Himawari
+            && self.storage_profile == StorageProfile::CompactU8
+            && self.instrument_footprint == InstrumentFootprint::Off
+            && self.view == OutputView::Geostationary
+            && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
+            && self.render_intent == RenderIntent::SensorFastGray
+            && self.quality == RenderQuality::Final;
+        if !common {
+            return false;
+        }
+        match self.product {
+            SimSatProduct::Visible => {
+                let land = LandAppearanceConfig::identity();
+                self.resolution == ResolutionMode::Abi1km
+                    && near_f32(
+                        self.aerosol_optical_depth,
+                        simsat::atmosphere::DEFAULT_AOD as f32,
+                    )
+                    && !self.rh_aerosol_swelling
+                    && !self.atmosphere_correction
+                    && self.terrain_atmosphere
+                    && self.land_sza_normalization == land.sza_normalization
+                    && self.land_dark_toe == land.dark_toe
+                    && self.clouds
+                    && self.fractional_clouds
+                    && self.fractional_cloud_mode == FractionalCloudMode::EffectiveOd
+                    && near_f32(self.cloud_optical_depth_scale, 1.0)
+                    && self.cloud_optics == CloudOpticsMode::Fixed
+                    && !self.feather_exposed_domain_edges
+                    && self.cloud_transport == CloudMultiscatterMode::LegacyOctaves
+                    && !self.beer_powder
+                    && !self.granulation
+                    && !self.topdown_stratiform_regularization
+                    && !self.topdown_cloud_footprint
+                    && near_f32(self.exposure, 1.0)
+                    && near_f32(self.ground_gain, 1.0)
+                    && near_f32(self.cloud_softclip, 1.0)
+                    && near_f32(self.cloud_highlight_max, 1.0)
+            }
+            SimSatProduct::Ir13 => {
+                self.satellite == SatelliteChoice::GoesEast
+                    && self.resolution == ResolutionMode::Abi2km
+                    && self.thermal_sensor == ThermalSensor::GoesRAbiBand13Fm4
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn is_busy(&self) -> bool {
@@ -740,6 +1367,7 @@ impl SimSatPane {
     }
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui) -> Vec<SimSatAction> {
+        let state_before = SimSatSavedState::from_pane(self);
         let mut actions = self.poll(ui.ctx());
         if !self.cached_loaded {
             self.refresh_cached_hrrr();
@@ -770,6 +1398,8 @@ impl SimSatPane {
         });
 
         ui.add_space(6.0);
+        let mut product_changed = false;
+        let mut satellite_changed = false;
         ui.group(|ui| {
             ui.strong("Product and view");
             egui::Grid::new("simsat-product-view-grid")
@@ -777,13 +1407,39 @@ impl SimSatPane {
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
                     ui.label("Product");
-                    egui::ComboBox::from_id_salt("simsat-product")
+                    product_changed = egui::ComboBox::from_id_salt("simsat-product")
                         .selected_text(self.product.label())
                         .show_ui(ui, |ui| {
                             for product in SimSatProduct::ALL {
                                 ui.selectable_value(&mut self.product, product, product.label());
                             }
-                        });
+                        })
+                        .response
+                        .changed();
+                    ui.end_row();
+
+                    ui.label("Intent");
+                    egui::ComboBox::from_id_salt("simsat-render-intent")
+                        .selected_text(self.render_intent.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.render_intent,
+                                RenderIntent::Display,
+                                RenderIntent::Display.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.render_intent,
+                                RenderIntent::SensorFastGray,
+                                RenderIntent::SensorFastGray.label(),
+                            );
+                        })
+                        .response
+                        .on_hover_text(
+                            "Display preserves SimSat's reviewed appearance. Sensor Fast Gray \
+                             applies the strict simsat-fast-gray-v1 operator on a temporary copy, \
+                             reports every neutralized display transform, and requires CPU. It is \
+                             not yet a complete ABI/AHI channel simulator.",
+                        );
                     ui.end_row();
 
                     ui.label("View");
@@ -798,7 +1454,7 @@ impl SimSatPane {
 
                     ui.label("Satellite");
                     ui.add_enabled_ui(self.view == OutputView::Geostationary, |ui| {
-                        egui::ComboBox::from_id_salt("simsat-satellite")
+                        satellite_changed = egui::ComboBox::from_id_salt("simsat-satellite")
                             .selected_text(self.satellite.label())
                             .show_ui(ui, |ui| {
                                 for satellite in SatelliteChoice::ALL {
@@ -808,8 +1464,37 @@ impl SimSatPane {
                                         satellite.label(),
                                     );
                                 }
-                            });
+                            })
+                            .response
+                            .changed();
                     });
+                    ui.end_row();
+
+                    ui.label("Navigation");
+                    ui.add_enabled_ui(
+                        self.view == OutputView::Geostationary
+                            && self.satellite != SatelliteChoice::Himawari,
+                        |ui| {
+                            egui::ComboBox::from_id_salt("simsat-geo-navigation")
+                                .selected_text(self.geo_navigation.label())
+                                .show_ui(ui, |ui| {
+                                    for navigation in GeoNavigation::ALL {
+                                        ui.selectable_value(
+                                            &mut self.geo_navigation,
+                                            navigation,
+                                            navigation.label(),
+                                        );
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Model sphere preserves the WRF-consistent shipped camera. \
+                                     GOES-R ABI uses official sweep-x ellipsoid navigation and is \
+                                     CPU-only. Navigation geometry does not by itself make the \
+                                     radiometry sensor-exact.",
+                                );
+                        },
+                    );
                     ui.end_row();
 
                     ui.label("Resolution");
@@ -839,6 +1524,25 @@ impl SimSatPane {
                 );
             }
         });
+        if product_changed || satellite_changed {
+            let previous_footprint = self.instrument_footprint;
+            let previous_optics = self.cloud_optics;
+            if satellite_changed && self.satellite == SatelliteChoice::Himawari {
+                self.instrument_footprint = InstrumentFootprint::Off;
+            }
+            self.normalize_incompatible_controls();
+            if self.instrument_footprint != previous_footprint
+                || self.cloud_optics != previous_optics
+            {
+                self.last_notice = Some(
+                    "Cleared a hidden SimSat science control that is incompatible with the new product or satellite selection."
+                        .to_owned(),
+                );
+            }
+        }
+
+        ui.add_space(6.0);
+        self.quick_mode_ui(ui);
 
         ui.add_space(6.0);
         egui::CollapsingHeader::new("Render controls")
@@ -863,13 +1567,17 @@ impl SimSatPane {
                         .text("earth margin")
                         .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
                 );
+                self.science_precision_ui(ui);
+                if self.product.has_band13_component() {
+                    self.thermal_response_ui(ui);
+                }
                 if self.product.uses_visible_ground() {
                     self.visible_controls_ui(ui);
                 }
                 ui.small(
                     "Satellite frames and loops always use the full CPU path. First use ingests a \
-                     reusable SimSat v5 brick; a full HRRR native file can briefly require more \
-                     than 2 GB of memory.",
+                     reusable SimSat v6 brick; a full HRRR native file can briefly require more \
+                     than 2 GB of memory. ScienceCloudF16 uses an isolated v7 cache.",
                 );
             });
 
@@ -890,7 +1598,8 @@ impl SimSatPane {
                 if ui.button("Render to Satellite").clicked() {
                     self.start_current_job(ui.ctx(), RenderBackend::Cpu);
                 }
-                let gpu_ready = self.product == SimSatProduct::Visible;
+                let gpu_unavailable = self.gpu_preview_unavailable_reason();
+                let gpu_ready = gpu_unavailable.is_none();
                 if ui
                     .add_enabled(gpu_ready, egui::Button::new("GPU preview"))
                     .on_hover_text(
@@ -899,8 +1608,9 @@ impl SimSatPane {
                          and every temporary compatibility substitution is reported.",
                     )
                     .on_disabled_hover_text(
-                        "GPU preview is intentionally limited to Visible true color. Use the CPU \
-                         render for GeoColor, Sandwich, thermal, and derived products.",
+                        gpu_unavailable.unwrap_or(
+                            "GPU preview is unavailable for the selected SimSat controls.",
+                        ),
                     )
                     .clicked()
                 {
@@ -957,7 +1667,180 @@ impl SimSatPane {
             }
         }
 
+        if state_before != SimSatSavedState::from_pane(self) {
+            self.persisted_state_dirty = true;
+        }
         actions
+    }
+
+    fn quick_mode_ui(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Quick mode");
+                for mode in SimSatQuickMode::ALL {
+                    if ui
+                        .add_enabled(!self.is_busy(), egui::Button::new(mode.label()))
+                        .on_hover_text(mode.description())
+                        .clicked()
+                    {
+                        match self.apply_quick_mode(mode) {
+                            Ok(()) => {
+                                self.error = None;
+                                self.status = format!(
+                                    "Applied {}. Render again to update the image.",
+                                    mode.full_label()
+                                );
+                            }
+                            Err(error) => self.error = Some(error),
+                        }
+                    }
+                }
+                let active = self.active_quick_mode();
+                let current = active.map_or("Custom", SimSatQuickMode::full_label);
+                ui.weak(format!("Current: {current}"));
+            });
+            ui.small(
+                "Presets never change the selected source or product. Every individual control \
+                 remains available below; manual edits intentionally change Current to Custom.",
+            );
+        });
+    }
+
+    fn science_precision_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Science and precision")
+            .id_salt("simsat-science-precision")
+            .show(ui, |ui| {
+                let mut science_f16 = self.storage_profile == StorageProfile::ScienceCloudF16;
+                if ui
+                    .checkbox(
+                        &mut science_f16,
+                        "ScienceCloudF16 extinction precision (CPU, experimental)",
+                    )
+                    .on_hover_text(
+                        "Stores liquid, ice, snow, and total-precipitation extinction as bounded \
+                         log2-f16 source values in an isolated v7 cache. CompactU8 v6 remains the \
+                         production default. Switching profiles re-ingests the original source.",
+                    )
+                    .changed()
+                {
+                    self.storage_profile = if science_f16 {
+                        StorageProfile::ScienceCloudF16
+                    } else {
+                        StorageProfile::CompactU8
+                    };
+                }
+                ui.weak(if science_f16 {
+                    "ScienceCloudF16 selected: larger isolated cache; GPU preview unavailable."
+                } else {
+                    "CompactU8 selected: production default."
+                });
+            });
+    }
+
+    fn thermal_response_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Thermal response")
+            .id_salt("simsat-thermal-response")
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Band 13 sensor");
+                    egui::ComboBox::from_id_salt("simsat-thermal-sensor")
+                        .selected_text(self.thermal_sensor.label())
+                        .show_ui(ui, |ui| {
+                            for sensor in ThermalSensor::ALL {
+                                ui.selectable_value(
+                                    &mut self.thermal_sensor,
+                                    sensor,
+                                    sensor.label(),
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Fast gray preserves the historical center-wavelength path. The FM4 \
+                             option integrates Planck emission through NOAA's official GOES-19 \
+                             Band 13 spectral response and uses that response for BT inversion.",
+                        );
+                });
+                if let Some(warning) = self.thermal_sensor.limitation_warning() {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("Science limitation: {warning}"),
+                    );
+                }
+                ui.separator();
+                let mut footprint_on =
+                    self.instrument_footprint == InstrumentFootprint::GoesRAbiBand13Mtf;
+                if ui
+                    .checkbox(
+                        &mut footprint_on,
+                        "ABI Band 13 MTF footprint (experimental)",
+                    )
+                    .on_hover_text(
+                        "Applies the GOES-16-measured Band 13 east-west MTF-informed response to \
+                         complete FM4 channel radiance before BT inversion. Enabling it selects \
+                         Geostationary, exact GOES-R navigation, ABI 2 km, FM4, and CPU-only \
+                         rendering. Transfer from GOES-16 to GOES-19 remains unvalidated.",
+                    )
+                    .changed()
+                {
+                    self.instrument_footprint = if footprint_on {
+                        if self.satellite == SatelliteChoice::Himawari {
+                            self.satellite = SatelliteChoice::GoesEast;
+                        }
+                        self.view = OutputView::Geostationary;
+                        self.geo_navigation = GeoNavigation::GoesRAbiFixedGrid;
+                        self.resolution = ResolutionMode::Abi2km;
+                        self.thermal_sensor = ThermalSensor::GoesRAbiBand13Fm4;
+                        InstrumentFootprint::GoesRAbiBand13Mtf
+                    } else {
+                        InstrumentFootprint::Off
+                    };
+                }
+                if self.instrument_footprint != InstrumentFootprint::Off {
+                    let compatible = self.view == OutputView::Geostationary
+                        && self.satellite != SatelliteChoice::Himawari
+                        && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
+                        && self.resolution == ResolutionMode::Abi2km
+                        && self.thermal_sensor == ThermalSensor::GoesRAbiBand13Fm4;
+                    ui.colored_label(
+                        if compatible {
+                            ui.visuals().strong_text_color()
+                        } else {
+                            ui.visuals().warn_fg_color
+                        },
+                        if compatible {
+                            "Exact 56-urad ABI lattice active; crop and invalid-mask perimeter are no-data."
+                        } else {
+                            "Footprint needs Geostationary + exact GOES-R + ABI 2 km + FM4. Toggle it off/on to restore those requirements."
+                        },
+                    );
+                    ui.weak(
+                        "GOES-16 east-west MTF is transferred to GOES-19/FM4 as an unvalidated \
+                         hypothesis; north-south MTF, temporal integration, and detector variation \
+                         are not modeled.",
+                    );
+                }
+            });
+    }
+
+    fn gpu_preview_unavailable_reason(&self) -> Option<&'static str> {
+        if self.product != SimSatProduct::Visible {
+            Some(
+                "GPU preview is limited to Visible true color. Use CPU for composites, thermal, and derived products.",
+            )
+        } else if self.storage_profile == StorageProfile::ScienceCloudF16 {
+            Some("ScienceCloudF16 is CPU-only because the GPU path consumes CompactU8 codes.")
+        } else if self.render_intent == RenderIntent::SensorFastGray {
+            Some("Sensor Fast Gray is CPU-only so its strict operator cannot be weakened.")
+        } else if self.instrument_footprint != InstrumentFootprint::Off {
+            Some("Instrument footprints are CPU-only.")
+        } else if self.view == OutputView::Geostationary
+            && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
+        {
+            Some("Exact GOES-R ellipsoid navigation is CPU-only.")
+        } else {
+            None
+        }
     }
 
     fn visible_controls_ui(&mut self, ui: &mut egui::Ui) {
@@ -1013,11 +1896,49 @@ impl SimSatPane {
             .show(ui, |ui| {
                 ui.checkbox(&mut self.clouds, "Volumetric clouds");
                 ui.add_enabled_ui(self.clouds, |ui| {
-                    ui.checkbox(&mut self.fractional_clouds, "Use model cloud fraction")
+                    if ui
+                        .checkbox(&mut self.fractional_clouds, "Use model cloud fraction")
                         .on_hover_text(
                             "Use WRF CLDFRA or HRRR's native cloud-fraction field for fractional \
                              subcolumns. Missing fields safely fall back to full cells.",
-                        );
+                        )
+                        .changed()
+                        && self.fractional_clouds
+                        && self.fractional_cloud_mode == FractionalCloudMode::Off
+                    {
+                        self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+                    }
+                    if self.fractional_clouds {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Fractional closure");
+                            egui::ComboBox::from_id_salt("simsat-fractional-cloud-mode")
+                                .selected_text(fractional_cloud_mode_label(
+                                    self.fractional_cloud_mode,
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for mode in [
+                                        FractionalCloudMode::EffectiveOd,
+                                        FractionalCloudMode::Deterministic4,
+                                        FractionalCloudMode::Deterministic8,
+                                        FractionalCloudMode::Deterministic16,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.fractional_cloud_mode,
+                                            mode,
+                                            fractional_cloud_mode_label(mode),
+                                        );
+                                    }
+                                });
+                        });
+                        if let Some(count) = self
+                            .fractional_cloud_mode
+                            .deterministic_subcolumn_count()
+                        {
+                            ui.weak(format!(
+                                "Deterministic {count}-member fixed-stratified CPU reference: roughly {count}x cloud-march cost."
+                            ));
+                        }
+                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Cloud transport");
                         egui::ComboBox::from_id_salt("simsat-cloud-transport")
@@ -1045,6 +1966,9 @@ impl SimSatPane {
                         CloudMultiscatterMode::DeltaFluxV2 => {
                             "Research brightness-neutral P1 closure; CPU-only and opt-in."
                         }
+                        CloudMultiscatterMode::DeltaFluxV3 => {
+                            "Research bounded second-order angular-memory closure; CPU-only and opt-in."
+                        }
                     });
                     ui.add(
                         egui::Slider::new(&mut self.cloud_optical_depth_scale, 0.0..=4.0)
@@ -1065,6 +1989,39 @@ impl SimSatPane {
                             self.cloud_optical_depth_scale = 1.0;
                         }
                     });
+                    ui.add_enabled_ui(self.product.supports_native_cloud_optics(), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Particle optics");
+                            egui::ComboBox::from_id_salt("simsat-cloud-optics")
+                                .selected_text(cloud_optics_label(self.cloud_optics))
+                                .show_ui(ui, |ui| {
+                                    for mode in [
+                                        CloudOpticsMode::Fixed,
+                                        CloudOpticsMode::NsslNative,
+                                        CloudOpticsMode::HrrrThompsonNative,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.cloud_optics,
+                                            mode,
+                                            cloud_optics_label(mode),
+                                        );
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Native modes use scheme-provided mass/number/temperature \
+                                     moments where valid and fall back per cell. They use distinct \
+                                     caches and are visible-only because thermal mass recovery \
+                                     remains tied to fixed radii.",
+                                );
+                        });
+                    });
+                    if !self.product.supports_native_cloud_optics() {
+                        ui.weak(
+                            "GeoColor and Sandwich keep fixed particle optics so their Band 13 \
+                             mass recovery remains internally consistent.",
+                        );
+                    }
                     ui.checkbox(
                         &mut self.feather_exposed_domain_edges,
                         "Feather exposed domain edges",
@@ -1096,10 +2053,19 @@ impl SimSatPane {
                              can reduce native-grid HRRR rings while conserving selected-area \
                              optical depth; geostationary and raw-band output are unchanged.",
                         );
+                        ui.checkbox(
+                            &mut self.topdown_cloud_footprint,
+                            "Top-down cloud footprint (experimental)",
+                        )
+                        .on_hover_text(
+                            "Display-only seven-tap footprint applied to pre-tonemap cloud \
+                             radiance while terrain remains sharp. CPU-only, top-down visible \
+                             output only; thermal, derived, and geostationary products ignore it.",
+                        );
                     });
                     if self.view != OutputView::TopDown {
                         ui.weak(
-                            "Stratiform reconstruction applies only to top-down visible output.",
+                            "Stratiform reconstruction and cloud footprint apply only to top-down visible output.",
                         );
                     }
                 });
@@ -1364,6 +2330,8 @@ impl SimSatPane {
         let job = RenderJob {
             source,
             backend,
+            storage_profile: self.storage_profile,
+            render_intent: self.render_intent,
             product: self.product,
             view: self.view,
             satellite: if self.view == OutputView::TopDown {
@@ -1371,6 +2339,7 @@ impl SimSatPane {
             } else {
                 self.satellite
             },
+            geo_navigation: self.geo_navigation,
             resolution: self.resolution,
             quality: self.quality,
             margin_frac: self.margin_frac,
@@ -1393,11 +2362,16 @@ impl SimSatPane {
             land_dark_toe_max_gain: self.land_dark_toe_max_gain,
             clouds: self.clouds,
             fractional_clouds: self.fractional_clouds,
+            fractional_cloud_mode: self.fractional_cloud_mode,
             cloud_optical_depth_scale: self.cloud_optical_depth_scale,
+            cloud_optics: self.cloud_optics,
             feather_exposed_domain_edges: self.feather_exposed_domain_edges,
             cloud_transport: self.cloud_transport,
             beer_powder: self.beer_powder,
             topdown_stratiform_regularization: self.topdown_stratiform_regularization,
+            topdown_cloud_footprint: self.topdown_cloud_footprint,
+            thermal_sensor: self.thermal_sensor,
+            instrument_footprint: self.instrument_footprint,
             sun_override: self.sun_override,
             sun_elevation_deg: self.sun_elevation_deg,
             sun_azimuth_deg: self.sun_azimuth_deg,
@@ -1642,9 +2616,12 @@ fn run_render_job(
 fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
     let mut params = RenderParams::new(frame.path.clone());
     params.backend = job.backend;
+    params.storage_profile = job.storage_profile;
+    params.intent = job.render_intent;
     params.timestep = frame.timestep;
     params.cache = job.cache_root.clone();
     params.satellite = job.satellite.api_satellite();
+    params.geo_navigation = job.geo_navigation;
     params.view = job.view.api_view();
     params.resolution = job.resolution;
     params.margin_frac = job.margin_frac;
@@ -1670,11 +2647,16 @@ fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
     params.beer_powder = job.beer_powder;
     params.clouds = job.clouds;
     params.fractional_clouds = job.fractional_clouds;
+    params.fractional_cloud_mode = job.fractional_cloud_mode;
     params.cloud_optical_depth_scale = job.cloud_optical_depth_scale;
+    params.cloud_optics = job.cloud_optics;
     params.feather_exposed_domain_edges = job.feather_exposed_domain_edges;
     params.granulation = Some(job.clouds && job.granulation && job.product.uses_visible_ground());
     params.topdown_stratiform_regularization =
         job.topdown_stratiform_regularization && job.view == OutputView::TopDown;
+    params.topdown_cloud_footprint = job.topdown_cloud_footprint && job.view == OutputView::TopDown;
+    params.thermal_sensor = job.thermal_sensor;
+    params.instrument_footprint = job.instrument_footprint;
     params.sun_override = job.sun_override.then_some(SunOverride {
         elev_deg: Some(f64::from(job.sun_elevation_deg)),
         az_deg: Some(f64::from(job.sun_azimuth_deg)),
@@ -2059,7 +3041,42 @@ fn plot_payload_from_parts(
 }
 
 fn result_warning(result: &RenderResult) -> Option<String> {
-    let mut notices = Vec::new();
+    let mut notices = vec![format!(
+        "operator {}; storage {}",
+        result.observation_operator,
+        result.storage_profile.slug()
+    )];
+    if !result.intent_adjustments.is_empty() {
+        notices.push(format!(
+            "strict-intent adjustments: {}",
+            result
+                .intent_adjustments
+                .iter()
+                .map(|adjustment| adjustment.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(sensor) = result.thermal_sensor
+        && sensor != ThermalSensor::FastGray
+    {
+        notices.push(format!("thermal response: {}", sensor.label()));
+    }
+    if result.instrument_footprint != InstrumentFootprint::Off {
+        notices.push(format!(
+            "instrument footprint: {}",
+            result.instrument_footprint.label()
+        ));
+    }
+    if result.topdown_cloud_footprint {
+        notices.push("top-down cloud-radiance footprint applied".to_owned());
+    }
+    notices.extend(
+        result
+            .science_warnings
+            .iter()
+            .map(|warning| format!("science limitation: {warning}")),
+    );
     if result.time_is_fallback {
         notices.push(
             "source had no parseable valid time; SimSat used its documented fallback date"
@@ -2175,9 +3192,12 @@ mod tests {
         let job = RenderJob {
             source: JobSource::Local(PathBuf::from("wrfout")),
             backend: RenderBackend::GpuPreview,
+            storage_profile: StorageProfile::ScienceCloudF16,
+            render_intent: RenderIntent::SensorFastGray,
             product: SimSatProduct::Visible,
             view: OutputView::TopDown,
             satellite: SatelliteChoice::GoesWest,
+            geo_navigation: GeoNavigation::GoesRAbiFixedGrid,
             resolution: ResolutionMode::Abi1km,
             quality: RenderQuality::Preview,
             margin_frac: 0.25,
@@ -2200,11 +3220,16 @@ mod tests {
             land_dark_toe_max_gain: 1.3,
             clouds: true,
             fractional_clouds: false,
+            fractional_cloud_mode: FractionalCloudMode::Deterministic8,
             cloud_optical_depth_scale: 0.42,
+            cloud_optics: CloudOpticsMode::NsslNative,
             feather_exposed_domain_edges: false,
             cloud_transport: CloudMultiscatterMode::DeltaFluxV2,
             beer_powder: true,
             topdown_stratiform_regularization: true,
+            topdown_cloud_footprint: true,
+            thermal_sensor: ThermalSensor::GoesRAbiBand13Fm4,
+            instrument_footprint: InstrumentFootprint::Off,
             sun_override: true,
             sun_elevation_deg: 35.0,
             sun_azimuth_deg: 225.0,
@@ -2220,7 +3245,10 @@ mod tests {
         };
         let params = render_params_for(&job, &frame);
         assert_eq!(params.backend, RenderBackend::GpuPreview);
+        assert_eq!(params.storage_profile, StorageProfile::ScienceCloudF16);
+        assert_eq!(params.intent, RenderIntent::SensorFastGray);
         assert_eq!(params.satellite, SatellitePreset::GoesWest);
+        assert_eq!(params.geo_navigation, GeoNavigation::GoesRAbiFixedGrid);
         assert_eq!(params.view, ViewMode::TopDownMap);
         assert_eq!(params.resolution, ResolutionMode::Abi1km);
         assert_eq!(params.timestep, 3);
@@ -2243,10 +3271,18 @@ mod tests {
         );
         assert!(params.beer_powder);
         assert!(!params.fractional_clouds);
+        assert_eq!(
+            params.fractional_cloud_mode,
+            FractionalCloudMode::Deterministic8
+        );
         assert_eq!(params.cloud_optical_depth_scale, 0.42);
+        assert_eq!(params.cloud_optics, CloudOpticsMode::NsslNative);
         assert!(!params.feather_exposed_domain_edges);
         assert_eq!(params.granulation, Some(true));
         assert!(params.topdown_stratiform_regularization);
+        assert!(params.topdown_cloud_footprint);
+        assert_eq!(params.thermal_sensor, ThermalSensor::GoesRAbiBand13Fm4);
+        assert_eq!(params.instrument_footprint, InstrumentFootprint::Off);
         assert_eq!(
             params.sun_override,
             Some(SunOverride {
@@ -2269,6 +3305,9 @@ mod tests {
         let land = LandAppearanceConfig::default();
         assert_eq!(pane.resolution, ResolutionMode::Native);
         assert_eq!(pane.quality, RenderQuality::Final);
+        assert_eq!(pane.storage_profile, StorageProfile::CompactU8);
+        assert_eq!(pane.render_intent, RenderIntent::Display);
+        assert_eq!(pane.geo_navigation, GeoNavigation::ModelSphere);
         assert_eq!(pane.exposure, DEFAULT_EXPOSURE as f32);
         assert_eq!(
             pane.aerosol_optical_depth,
@@ -2281,15 +3320,20 @@ mod tests {
         assert_eq!(pane.land_dark_toe, land.dark_toe);
         assert!(pane.clouds);
         assert!(pane.fractional_clouds);
+        assert_eq!(pane.fractional_cloud_mode, FractionalCloudMode::EffectiveOd);
         assert_eq!(
             pane.cloud_optical_depth_scale,
             simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
         );
         assert!(pane.feather_exposed_domain_edges);
         assert_eq!(pane.cloud_transport, CloudMultiscatterMode::LegacyOctaves);
+        assert_eq!(pane.cloud_optics, CloudOpticsMode::Fixed);
         assert!(!pane.beer_powder);
         assert!(!pane.granulation);
         assert!(!pane.topdown_stratiform_regularization);
+        assert!(!pane.topdown_cloud_footprint);
+        assert_eq!(pane.thermal_sensor, ThermalSensor::FastGray);
+        assert_eq!(pane.instrument_footprint, InstrumentFootprint::Off);
     }
 
     #[test]
@@ -2443,5 +3487,53 @@ mod tests {
             pixels: PlotPixels::Rgba(vec![1, 2, 3, 4, 5]),
         };
         assert!(payload.to_plot_source().unwrap_err().contains("expected 4"));
+    }
+
+    #[test]
+    fn quick_modes_apply_reviewed_values_and_refuse_mislabeled_sensor_qa() {
+        let mut pane = SimSatPane::default();
+        pane.apply_quick_mode(SimSatQuickMode::HighQualityVisible)
+            .unwrap();
+        assert_eq!(
+            pane.active_quick_mode(),
+            Some(SimSatQuickMode::HighQualityVisible)
+        );
+        assert_eq!(
+            pane.fractional_cloud_mode,
+            FractionalCloudMode::Deterministic4
+        );
+        assert!(near_f32(pane.cloud_softclip, 0.45));
+
+        pane.product = SimSatProduct::Ir13;
+        pane.satellite = SatelliteChoice::GoesWest;
+        assert!(
+            pane.apply_quick_mode(SimSatQuickMode::SensorQa)
+                .unwrap_err()
+                .contains("GOES-East")
+        );
+        pane.satellite = SatelliteChoice::GoesEast;
+        pane.apply_quick_mode(SimSatQuickMode::SensorQa).unwrap();
+        assert_eq!(pane.active_quick_mode(), Some(SimSatQuickMode::SensorQa));
+        assert_eq!(pane.geo_navigation, GeoNavigation::GoesRAbiFixedGrid);
+        assert_eq!(pane.resolution, ResolutionMode::Abi2km);
+        assert_eq!(pane.thermal_sensor, ThermalSensor::GoesRAbiBand13Fm4);
+    }
+
+    #[test]
+    fn persisted_state_round_trips_controls_but_not_source_or_runtime() {
+        let mut pane = SimSatPane::default();
+        pane.product = SimSatProduct::Ir13;
+        pane.satellite = SatelliteChoice::GoesEast;
+        pane.apply_quick_mode(SimSatQuickMode::SensorQa).unwrap();
+        pane.local_path = "C:/private/wrfout".to_owned();
+        let saved = pane.take_persisted_state_if_dirty().unwrap();
+
+        let restored = SimSatPane::new(Some(&saved));
+        assert_eq!(restored.product, SimSatProduct::Ir13);
+        assert_eq!(restored.render_intent, RenderIntent::SensorFastGray);
+        assert_eq!(restored.thermal_sensor, ThermalSensor::GoesRAbiBand13Fm4);
+        assert!(restored.local_path.is_empty());
+        assert!(restored.task.is_none());
+        assert!(!restored.persisted_state_dirty);
     }
 }

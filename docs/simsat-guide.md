@@ -1,6 +1,6 @@
 # SimSat in BowEcho
 
-BowEcho embeds SimSat v0.1.6 as a first-class simulated-satellite workspace.
+BowEcho embeds SimSat v0.1.9 as a first-class simulated-satellite workspace.
 Open **Windows > SimSat** to render WRF or HRRR native-level atmospheres into
 visible, thermal, water-vapor, and derived satellite products.
 
@@ -16,13 +16,39 @@ and does not enter saved loops.
 3. Choose **Geostationary (from space)** or **Top-down map**.
 4. For geostationary output, choose GOES-East, GOES-West, or Himawari.
 5. Choose Model native, ABI 1 km, or ABI 2 km output resolution.
-6. Leave the shipped visible controls in place for a first render.
+6. Start with **Recommended** Quick mode, or select **High Quality** / **Sensor
+   QA** for their explicitly described use cases.
 7. Choose **Render to Satellite**.
 8. Inspect the completed run in Satellite, or choose **Open native plot** for
    plotting and PNG output.
 
 Use **GPU preview** only when iterating on the appearance of one visible frame.
 Use **Render to Satellite** for any frame that should persist or join a loop.
+
+## Quick modes and render intent
+
+Quick modes apply reviewed settings without changing the selected source or
+product. All individual controls remain visible, and any manual edit makes the
+current mode **Custom**.
+
+- **Recommended Display** restores the reviewed visible baseline: CPU offline
+  quality, Model native, CompactU8, exposure 1.5, AOD 0.05, cloud OD 0.15,
+  Effective OD fractional clouds, fixed particle optics, and experimental
+  footprint/transport controls off.
+- **High Quality Visible** starts from Recommended Display, then selects the
+  deterministic four-subcolumn reference and a 0.45 highlight knee. It is
+  slower and is not a blanket claim of greater model accuracy.
+- **Sensor QA** accepts Visible or GOES-East IR Band 13 only. Visible uses the
+  explicitly limited `simsat-fast-gray-v1` operator on exact GOES-R navigation
+  at ABI 1 km. GOES-East IR uses exact navigation, ABI 2 km, and the official
+  FM4/GOES-19 Band 13 spectral response. Incompatible products and satellites
+  are refused rather than silently relabeled.
+
+The **Intent** selector remains independently available. **Display** preserves
+the reviewed SimSat look. **Sensor Fast Gray** neutralizes display-only
+exposure, land, edge, highlight, granulation, and reconstruction transforms on
+a temporary request and reports every adjustment with the output. It requires
+CPU and is not a complete ABI/AHI channel observation operator.
 
 ## Input modes
 
@@ -76,7 +102,7 @@ upgrades do not require another download.
 | Product | Stored output | Interpretation |
 |---|---|---|
 | Visible true color | RGB | Physically lit visible atmosphere, cloud, terrain, ground, and water |
-| GeoColor day / night | RGB | Visible by day, band-13 IR by night, blended through the terminator |
+| SimSat day / night color (GeoColor style) | RGB | Broad RGB by day, band-13 IR by night, blended through the terminator; not yet sensor-derived ABI GeoColor |
 | Sandwich | RGB | Visible texture combined with enhanced cold cloud tops |
 | IR 10.3 micrometers (band 13) | Kelvin scalar | Clean-window brightness temperature |
 | WV 6.2 micrometers (band 8) | Kelvin scalar | Upper-tropospheric water vapor |
@@ -104,6 +130,11 @@ The output uses the selected satellite's fixed-grid viewpoint:
 **Earth margin** controls how much real surrounding ground is visible around
 the finite model domain. Weather outside the model domain is clear, not
 extrapolated.
+
+**Navigation** selects either the shipped WRF/model sphere or the opt-in exact
+GOES-R ellipsoid/sweep-x fixed grid. Exact GOES-R navigation is CPU-only and is
+not available for Himawari. It improves registration geometry; it does not by
+itself make the radiometry sensor-exact.
 
 ### Top-down map
 
@@ -135,6 +166,32 @@ Quality modes:
 
 Both quality choices use the durable CPU renderer when **Render to Satellite**
 is selected.
+
+## Science, precision, and thermal response
+
+### Brick precision
+
+**CompactU8** is the production default and writes SSB v6. The optional
+**ScienceCloudF16** profile stores hydrometeor extinction as bounded log2-f16
+values in an isolated v7 cache. It is CPU-only, uses more disk, and re-ingests
+the retained source after switching. It can be selected for visible, thermal,
+water-vapor, or derived output.
+
+### Band 13 spectral response
+
+**Fast gray** preserves the historical 10.3 micrometer center-wavelength
+response. **GOES-R ABI Band 13 (FM4/GOES-19 SRF)** integrates Planck emission
+through NOAA's official FM4 response and uses that response for BT inversion.
+Cloud and water-vapor absorption remain SimSat's gray approximation, so the UI
+and result provenance retain that science limitation.
+
+### ABI Band 13 MTF footprint
+
+The optional footprint applies a GOES-16-measured east-west MTF-informed
+three-tap response to complete FM4 channel radiance before BT inversion. It
+automatically selects geostationary exact GOES-R navigation, ABI 2 km, FM4,
+and CPU. It is experimental: transfer to GOES-19 is unvalidated, while
+north-south MTF, temporal integration, and detector variation are unmodeled.
 
 ## CPU render and GPU preview
 
@@ -179,7 +236,7 @@ Progress displays completed frames versus the discovered total. Use
 
 ### Exposure
 
-Finished-visible display gain. SimSat v0.1.6 ships at 1.5; 1.0 is neutral
+Finished-visible display gain. SimSat v0.1.9 ships at 1.5; 1.0 is neutral
 physical reflectance. Exposure does not modify raw scalar products.
 
 ### Aerosol optical depth
@@ -226,9 +283,27 @@ horizontally full-cell interpretation wherever condensate is nonzero.
 - **Single scatter**: dimmer diagnostic path
 - **Delta-flux v1**: experimental isotropic closure, CPU-only
 - **Delta-flux v2b P1**: experimental brightness-neutral P1 closure, CPU-only
+- **Delta-flux v3 memory**: experimental bounded second-order angular-memory
+  closure, CPU-only
 
 Experimental transport choices are research comparisons, not upgrades that
 are automatically more accurate for every cloud.
+
+### Fractional-cloud closure
+
+**Effective OD** is the fast production default. Deterministic 4, 8, and 16
+perform that many fixed-stratified shared-u maximum-overlap cloud marches,
+average linear radiance, and tonemap once. They are CPU convergence/reference
+operators with approximately 4x/8x/16x cloud-march cost, not full stochastic
+McICA implementations.
+
+### Particle optics
+
+**Fixed radii** preserves the production v0.1.6 behavior. The opt-in NSSL MP18
+and HRRR Thompson modes use scheme-native saved moments where valid and fall
+back per cell. Each mode uses a distinct cache. They are visible-only because
+thermal mass recovery still depends on the fixed-radius representation;
+GeoColor, Sandwich, IR, and water vapor keep fixed optics.
 
 ### Cloud optical-depth scale
 
@@ -267,6 +342,13 @@ It cannot recover missing cloud/clear structure and is ignored by:
 - IR and water vapor
 - derived scalar products
 
+### Top-down cloud footprint
+
+Experimental, opt-in, and top-down-visible only. It applies a bounded
+seven-tap filter to the pre-tonemap cloud-radiance residual while leaving the
+terrain/base map sharp. It is CPU-only and ignored by geostationary, thermal,
+derived, cloud-layer, and perspective output.
+
 ## Lighting and ground
 
 ### Sun position
@@ -285,23 +367,26 @@ ground for valid date; forcing month 1-12 is a what-if surface.
 
 Ground lift, highlight knee/ceiling, solar-zenith land normalization, and the
 dark-land reflectance toe affect finished visible-family RGB. **Restore shipped
-display calibration** returns those controls to SimSat v0.1.6 defaults.
+display calibration** returns those controls to SimSat v0.1.9 defaults.
 
 Raw visible bands, IR, water vapor, and derived products do not consume these
 display-only controls.
 
 ## Cache behavior
 
-BowEcho uses a versioned SimSat engine cache. SimSat v0.1.6 writes SSB format
-v5, which carries corrected cloud-fraction provenance.
+BowEcho uses a versioned SimSat engine cache. SimSat v0.1.9 writes compact SSB
+format v6. The experimental ScienceCloudF16 profile uses a disjoint v7 cache.
 
-Older brick caches cannot masquerade as v5:
+Older brick caches cannot masquerade as v6:
 
 - a retained WRF or HRRR source re-ingests once
 - a retained wrfnat file does not need another download
 - a cached-only old brick without its original source cannot be upgraded
 
 The cache is an acceleration artifact, not the scientific source of record.
+Product, view, quick/science, atmosphere, cloud, lighting, and display control
+choices persist in BowEcho settings. Source paths, active jobs, progress,
+errors, and rendered output deliberately do not.
 
 ## Satellite player, map, and native plot
 
@@ -333,6 +418,12 @@ Visible true color combines:
 - Cox-Munk wind-ruffled water glint
 - an ABI-like display transform
 
+SimSat v0.1.9 also uses a shared 0--12 degree low-sun surface-help ramp for
+land normalization, dark-toe recovery, ground lift, and water-albedo
+assistance; direct water sunlight is no longer artificially day-gated. The
+reviewed display cloud-shadow floor is 0.45, and finite-sun shadow softening
+uses the Sun's angular radius.
+
 IR uses a gray-body emission march through the model cloud/atmosphere plus a
 surface term, then converts radiance to true-Kelvin brightness temperature.
 Water-vapor bands use related band-averaged moisture weighting.
@@ -340,8 +431,8 @@ Water-vapor bands use related band-averaged moisture weighting.
 ## Honest limitations
 
 - Weather exists only inside the source model domain.
-- Earth geometry follows WRF's sphere (radius 6370 km), not the full real ABI
-  navigation ellipsoid.
+- Model-sphere geometry follows WRF's 6370 km sphere. Exact GOES-R navigation
+  is available separately, but it does not imply exact sensor radiometry.
 - Physical plausibility is the target; pixel-for-pixel registration against a
   real satellite is not promised.
 - A coarse source grid cannot produce real cloud structure below its
@@ -349,10 +440,14 @@ Water-vapor bands use related band-averaged moisture weighting.
 - Visible rendering is physically based but is not a full atmospheric
   chemistry or line-by-line radiative-transfer model.
 - IR/WV absorption is gray and band-averaged, not line-by-line.
-- GeoColor night uses the IR composite; there is no city-lights layer.
+- SimSat day/night color is GeoColor-style broad RGB, not yet sensor-derived
+  ABI GeoColor. Its night side uses the IR composite; there is no city-lights
+  layer.
 - GPU output is a visible-only preview, not a stored quality tier.
-- Granulation, delta-flux transport, stratiform reconstruction, and sun
-  override are opt-in and explicitly experimental or what-if.
+- ScienceCloudF16, native particle optics, deterministic fractional clouds,
+  the ABI MTF footprint, granulation, delta-flux transport, stratiform/cloud
+  footprints, and sun override are opt-in and explicitly experimental,
+  reference, or what-if where appropriate.
 
 ## Troubleshooting
 
@@ -374,15 +469,16 @@ domain.
 
 ### Old cache cannot open
 
-SSB v5 needs the original source to rebuild corrected cloud-fraction
+SSB v6 needs the original source to rebuild the current cloud and snow
 provenance. Point Local at the retained WRF/wrfnat file. A cached-only old brick
 cannot be upgraded.
 
 ### GPU preview fails
 
 Preview requires a compatible wgpu adapter and supports Visible true color
-only. Use Render to Satellite for the normal CPU result; BowEcho will not
-silently turn the failed preview into a stored frame.
+only. Sensor Fast Gray, ScienceCloudF16, exact GOES-R geostationary navigation,
+and instrument footprints are CPU-only. Use Render to Satellite for the normal
+CPU result; BowEcho will not silently turn a failed preview into a stored frame.
 
 ### Broad top-down clouds show model-grid rings
 

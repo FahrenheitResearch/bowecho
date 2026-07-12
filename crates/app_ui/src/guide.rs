@@ -1623,7 +1623,7 @@ fn simsat(ui: &mut egui::Ui) {
     ui.heading("SimSat");
     para(
         ui,
-        "Windows \u{25be} \u{25b8} SimSat opens the embedded SimSat v0.1.6 renderer. It turns \
+        "Windows \u{25be} \u{25b8} SimSat opens the embedded SimSat v0.1.9 renderer. It turns \
          WRF or HRRR native-level model atmospheres into physically based visible, thermal, \
          water-vapor and derived satellite products. Durable CPU renders enter BowEcho's normal \
          Satellite player; a separate one-frame GPU preview is available for visual iteration.",
@@ -1662,6 +1662,36 @@ fn simsat(ui: &mut egui::Ui) {
          surface and Save PNG.",
     );
 
+    subhead(ui, "QUICK MODES & INTENT");
+    action(
+        ui,
+        "Recommended Display",
+        "— restores the reviewed visible baseline without changing source or product: CPU \
+         offline quality, Model native, CompactU8, exposure 1.5, AOD 0.05, cloud OD 0.15, \
+         Effective OD, fixed particle optics and experimental footprint controls off.",
+    );
+    action(
+        ui,
+        "High Quality Visible",
+        "— Recommended Display plus the deterministic four-subcolumn reference and 0.45 \
+         highlight knee. It is slower and remains explicit rather than silently enabling other \
+         experimental physics.",
+    );
+    action(
+        ui,
+        "Sensor QA",
+        "— accepts Visible or GOES-East IR Band 13 only. It selects exact GOES-R navigation \
+         and neutral visible transforms or the official FM4/GOES-19 Band 13 response; invalid \
+         product/platform combinations are refused rather than relabeled.",
+    );
+    para(
+        ui,
+        "Display intent preserves the reviewed SimSat look. Sensor Fast Gray applies the strict \
+         simsat-fast-gray-v1 operator on a temporary request, reports each neutralized display \
+         transform, and requires CPU. It is not a complete ABI/AHI channel simulator. Manual \
+         edits remain available and change the Quick mode label to Custom.",
+    );
+
     subhead(ui, "INPUTS");
     action(
         ui,
@@ -1698,8 +1728,9 @@ fn simsat(ui: &mut egui::Ui) {
     );
     action(
         ui,
-        "GeoColor day / night",
-        "— true color by day, band-13 IR at night, blended across the modeled terminator.",
+        "SimSat day / night color (GeoColor style)",
+        "— broad RGB by day, band-13 IR at night, blended across the modeled terminator. It is \
+         not yet sensor-derived ABI GeoColor.",
     );
     action(
         ui,
@@ -1728,6 +1759,12 @@ fn simsat(ui: &mut egui::Ui) {
          pixel per source cell; ABI 1 km / 2 km use physical spacing in top-down view and scan \
          pitch in geostationary view while preserving aspect ratio at the output cap.",
     );
+    para(
+        ui,
+        "Navigation can retain the shipped WRF/model sphere or use opt-in exact GOES-R \
+         ellipsoid/sweep-x geometry. Exact GOES-R navigation is CPU-only and unavailable for \
+         Himawari. It improves registration geometry but does not imply sensor-exact radiometry.",
+    );
 
     subhead(ui, "CPU OUTPUT VS GPU PREVIEW");
     action(
@@ -1742,7 +1779,8 @@ fn simsat(ui: &mut egui::Ui) {
         "GPU preview",
         "— a temporary visible-true-color first frame opened only in Native plot. It reports \
          every compatibility substitution, never changes saved controls, never enters the \
-         satellite store, and never silently falls back to a stored CPU frame.",
+         satellite store, and never silently falls back to a stored CPU frame. Sensor Fast Gray, \
+         ScienceCloudF16, exact GOES-R geostationary navigation and footprints are CPU-only.",
     );
     para(
         ui,
@@ -1782,7 +1820,20 @@ fn simsat(ui: &mut egui::Ui) {
         ui,
         "Cloud transport",
         "— Legacy octaves is the shipped bright-anvil path; Single scatter is a dim diagnostic; \
-         delta-flux v1/v2 are explicitly experimental, CPU-only research closures.",
+         delta-flux v1/v2/v3 are explicitly experimental, CPU-only research closures.",
+    );
+    action(
+        ui,
+        "Fractional-cloud closure",
+        "— Effective OD is the fast default. Deterministic 4/8/16 are fixed-stratified \
+         shared-u CPU reference/convergence operators with roughly 4x/8x/16x cloud-march cost.",
+    );
+    action(
+        ui,
+        "Particle optics",
+        "— Fixed radii is the production path. NSSL MP18 and HRRR Thompson native-moment \
+         experiments use per-cell fallback and separate caches; they are visible-only because \
+         thermal mass recovery remains tied to fixed radii.",
     );
     action(
         ui,
@@ -1797,6 +1848,12 @@ fn simsat(ui: &mut egui::Ui) {
         "— optional, experimental and off by default. It can reduce source-grid rings in broad \
          low liquid decks while conserving selected-area optical depth; geostationary, raw-band, \
          thermal and derived products ignore it.",
+    );
+    action(
+        ui,
+        "Top-down cloud footprint",
+        "— optional seven-tap pre-tonemap cloud-radiance footprint that leaves terrain sharp. \
+         It is experimental, CPU-only and ignored by geostationary, thermal and derived output.",
     );
     action(
         ui,
@@ -1815,13 +1872,35 @@ fn simsat(ui: &mut egui::Ui) {
          IR, water vapor or derived scalar fields.",
     );
 
+    subhead(ui, "SENSOR & PRECISION CONTROLS");
+    action(
+        ui,
+        "ScienceCloudF16",
+        "— CPU-only log2-f16 hydrometeor-extinction storage in an isolated v7 cache. CompactU8 \
+         v6 remains the production default; switching profiles re-ingests the retained source.",
+    );
+    action(
+        ui,
+        "FM4 / GOES-19 Band 13 response",
+        "— integrates Planck emission through NOAA's official FM4 spectral response and uses \
+         it for BT inversion. Cloud/gas absorption remains SimSat's gray approximation and is \
+         labeled as a science limitation.",
+    );
+    action(
+        ui,
+        "ABI Band 13 MTF footprint",
+        "— experimental GOES-16 east-west MTF-informed response applied to complete FM4 \
+         radiance. It selects exact GOES-R + ABI 2 km + CPU; transfer to GOES-19 is unvalidated \
+         and north-south/temporal/detector effects remain unmodeled.",
+    );
+
     subhead(ui, "CACHE, LOOPS & OUTPUT");
     para(
         ui,
-        "SimSat v0.1.6 uses SSB cache format v5 for corrected cloud-fraction provenance. Older \
-         bricks must be ingested once again from their original WRF/HRRR source; a cached-only \
-         brick cannot be upgraded without that source. A retained wrfnat source re-ingests \
-         without downloading again.",
+        "SimSat v0.1.9 uses compact SSB cache format v6; ScienceCloudF16 uses a disjoint v7 \
+         cache. Older bricks must be ingested once again from their original WRF/HRRR source; a \
+         cached-only brick cannot be upgraded without that source. A retained wrfnat source \
+         re-ingests without downloading again.",
     );
     para(
         ui,
@@ -1835,17 +1914,18 @@ fn simsat(ui: &mut egui::Ui) {
     para(
         ui,
         "Clouds and weather exist only inside the model domain; margin shows real ground under \
-         clear sky, not extrapolated weather. Geometry uses WRF's spherical Earth and aims for \
-         physical plausibility rather than pixel-for-pixel ABI registration. A coarse model \
-         cannot provide cloud-edge structure below its grid scale.",
+         clear sky, not extrapolated weather. Model-sphere geometry follows WRF; exact GOES-R \
+         navigation is available separately but does not imply exact sensor radiometry. A coarse \
+         model cannot provide cloud-edge structure below its grid scale.",
     );
     para(
         ui,
         "Visible rendering uses a physically based clear-sky/cloud approximation, not a full \
          atmospheric chemistry model. IR and water-vapor products use documented gray, \
-         band-averaged absorption rather than line-by-line radiative transfer. GeoColor night \
-         is the IR composite and has no city-lights layer. Experimental granulation, delta-flux \
-         transport, stratiform reconstruction and sun override remain opt-in and labeled.",
+         band-averaged absorption rather than line-by-line radiative transfer. SimSat day/night \
+         color is GeoColor-style broad RGB, not sensor-derived ABI GeoColor; its night side is \
+         IR with no city-lights layer. Precision, native-optics, footprint, granulation, \
+         delta-flux, reconstruction and sun experiments remain opt-in and labeled.",
     );
     cite(
         ui,
@@ -2637,7 +2717,7 @@ mod tests {
         assert!(guide_src.contains("full native-level wrfnat product"));
         assert!(guide_src.contains("GPU preview"));
         assert!(guide_src.contains("never enters the satellite store"));
-        assert!(guide_src.contains("SSB cache format v5"));
+        assert!(guide_src.contains("SSB cache format v6"));
         assert!(guide_src.contains("band-averaged absorption rather than line-by-line"));
     }
 
