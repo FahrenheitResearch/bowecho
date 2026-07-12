@@ -330,6 +330,67 @@ pub struct IshmaelDiagnostics {
     v_ice_m_s: Option<f64>,
 }
 
+/// Exact WRF variable names behind one ISHMAEL tuple.
+///
+/// The WRF file adapter supplies these names because category 2/3 use
+/// suffixes and official diagnostic variables are lower-case.  Keeping names
+/// on the input prevents a successfully closed category from being stamped as
+/// if it came from the unsuffixed shorthand tuple.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IshmaelSourceFields {
+    qice: &'static str,
+    qnice: &'static str,
+    qvoli: &'static str,
+    qaoli: &'static str,
+    d_ice: &'static str,
+    rho_ice: &'static str,
+    phi_ice: &'static str,
+    v_ice: &'static str,
+}
+
+impl IshmaelSourceFields {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        qice: &'static str,
+        qnice: &'static str,
+        qvoli: &'static str,
+        qaoli: &'static str,
+        d_ice: &'static str,
+        rho_ice: &'static str,
+        phi_ice: &'static str,
+        v_ice: &'static str,
+    ) -> Self {
+        Self {
+            qice,
+            qnice,
+            qvoli,
+            qaoli,
+            d_ice,
+            rho_ice,
+            phi_ice,
+            v_ice,
+        }
+    }
+
+    #[must_use]
+    pub const fn wrf_category_1_shorthand() -> Self {
+        Self::new(
+            "QICE", "QNICE", "QVOLI", "QAOLI", "D_ICE", "RHO_ICE", "PHI_ICE", "V_ICE",
+        )
+    }
+
+    #[must_use]
+    pub const fn required(self) -> [&'static str; 4] {
+        [self.qice, self.qnice, self.qvoli, self.qaoli]
+    }
+
+    #[must_use]
+    pub const fn diagnostics(self) -> [&'static str; 4] {
+        [self.d_ice, self.rho_ice, self.phi_ice, self.v_ice]
+    }
+}
+
 impl IshmaelDiagnostics {
     #[must_use]
     pub const fn new(
@@ -367,7 +428,11 @@ impl IshmaelDiagnostics {
     }
 }
 
-/// Raw scalar tuple for one of the five ISHMAEL categories.
+/// Raw scalar tuple for one ISHMAEL physical state.
+///
+/// WRF's three prognostic tuple ordinals are carried separately through
+/// [`IshmaelSourceFields`], so this physical category never fabricates a field
+/// mapping.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IshmaelCategoryInput {
     category: IshmaelIceCategory,
@@ -376,6 +441,7 @@ pub struct IshmaelCategoryInput {
     qvoli_m3_per_kg: Option<f64>,
     qaoli_m3_per_kg: Option<f64>,
     diagnostics: IshmaelDiagnostics,
+    source_fields: IshmaelSourceFields,
 }
 
 impl IshmaelCategoryInput {
@@ -394,6 +460,7 @@ impl IshmaelCategoryInput {
             qvoli_m3_per_kg: Some(qvoli_m3_per_kg),
             qaoli_m3_per_kg: Some(qaoli_m3_per_kg),
             diagnostics: IshmaelDiagnostics::new(None, None, None, None),
+            source_fields: IshmaelSourceFields::wrf_category_1_shorthand(),
         }
     }
 
@@ -413,6 +480,7 @@ impl IshmaelCategoryInput {
             qvoli_m3_per_kg,
             qaoli_m3_per_kg,
             diagnostics,
+            source_fields: IshmaelSourceFields::wrf_category_1_shorthand(),
         }
     }
 
@@ -420,6 +488,18 @@ impl IshmaelCategoryInput {
     pub const fn with_diagnostics(mut self, diagnostics: IshmaelDiagnostics) -> Self {
         self.diagnostics = diagnostics;
         self
+    }
+
+    /// Attach the exact WRF tuple names used by this input.
+    #[must_use]
+    pub const fn with_source_fields(mut self, source_fields: IshmaelSourceFields) -> Self {
+        self.source_fields = source_fields;
+        self
+    }
+
+    #[must_use]
+    pub const fn source_fields(self) -> IshmaelSourceFields {
+        self.source_fields
     }
 
     #[must_use]
@@ -583,7 +663,12 @@ pub fn close_conventional_category(
     context: &ClosureContext,
     input: &ConventionalCategoryInput,
 ) -> Result<ClosedParticleCategory, ClosureError> {
-    if matches!(context.wrf_mp_physics, 50..=53 | 55) {
+    // P3 and ISHMAEL retain a conventional two-moment liquid-rain tuple
+    // (QRAIN/QNRAIN).  Other conventional frozen/cloud categories would
+    // duplicate their property-aware scheme state and remain forbidden.
+    if matches!(context.wrf_mp_physics, 50..=53 | 55)
+        && input.category != ConventionalHydrometeor::Rain
+    {
         return Err(ClosureError::SchemeFamilyMismatch {
             wrf_mp_physics: context.wrf_mp_physics,
             requested: "conventional",
@@ -864,24 +949,29 @@ pub fn close_p3_category(
         positive("QZI", qzi)?;
         let qzi_squared = qzi * qzi;
         finite_result("QZI squared", qzi_squared)?;
-        let m6 = checked_ratio("P3 M6", qzi_squared, qnice)?;
-        positive("P3 M6", m6)?;
-        let diameter = (m6 / qnice).powf(1.0 / 6.0);
+        // Advected QZI=(N*Z)^0.5. Restore the bulk sixth moment
+        // M6=Z=QZI^2/N first, then obtain the number-mean sixth power
+        // D6=M6/N for the characteristic diameter. These are two distinct
+        // divisions by N, not a duplicated algebra step.
+        let bulk_m6 = checked_ratio("P3 bulk M6", qzi_squared, qnice)?;
+        positive("P3 bulk M6", bulk_m6)?;
+        let mean_d6 = checked_ratio("P3 number-mean D6", bulk_m6, qnice)?;
+        let diameter = mean_d6.powf(1.0 / 6.0);
         positive("P3 sixth-moment characteristic diameter", diameter)?;
         (
             Some(SourcedScalar::new(
-                m6,
+                bulk_m6,
                 PropertyProvenance::new(
                     PropertySourceKind::NativePrognostic,
                     vec!["QZI", names.qnice],
-                    "P3-53 exact recovery M6=QZI^2/QNICE",
+                    "P3-53 exact bulk M6 recovery: M6=QZI^2/QNICE",
                 ),
             )),
             diameter,
             PropertyProvenance::new(
                 PropertySourceKind::DocumentedClosure,
                 vec!["QZI", names.qnice],
-                "sixth-moment characteristic diameter (M6/QNICE)^(1/6)",
+                "number-mean D6=M6/QNICE; characteristic diameter D6^(1/6)",
             ),
         )
     } else {
@@ -982,7 +1072,10 @@ pub fn close_p3_category(
     })
 }
 
-/// Close one of the five ISHMAEL categories for WRF `mp_physics=55`.
+/// Close one physical ISHMAEL state for WRF `mp_physics=55`.
+///
+/// WRF currently carries three prognostic tuples.  [`IshmaelSourceFields`]
+/// keeps their exact suffix/case distinct from the physical-category enum.
 pub fn close_ishmael_category(
     context: &ClosureContext,
     input: &IshmaelCategoryInput,
@@ -993,23 +1086,24 @@ pub fn close_ishmael_category(
             requested: "ISHMAEL",
         });
     }
-    let qice = required(input.qice_kgkg, "QICE")?;
-    let qnice = required(input.qnice_per_kg, "QNICE")?;
-    let qvoli = required(input.qvoli_m3_per_kg, "QVOLI")?;
-    let qaoli = required(input.qaoli_m3_per_kg, "QAOLI")?;
-    positive("QICE", qice)?;
-    positive("QNICE", qnice)?;
-    positive("QVOLI", qvoli)?;
-    positive("QAOLI", qaoli)?;
+    let names = input.source_fields;
+    let qice = required(input.qice_kgkg, names.qice)?;
+    let qnice = required(input.qnice_per_kg, names.qnice)?;
+    let qvoli = required(input.qvoli_m3_per_kg, names.qvoli)?;
+    let qaoli = required(input.qaoli_m3_per_kg, names.qaoli)?;
+    positive(names.qice, qice)?;
+    positive(names.qnice, qnice)?;
+    positive(names.qvoli, qvoli)?;
+    positive(names.qaoli, qaoli)?;
 
     let (density, density_source) = if let Some(value) = input.diagnostics.rho_ice_kg_m3 {
-        physical_density("RHO_ICE", value, ICE_MATERIAL_DENSITY_KG_M3)?;
+        physical_density(names.rho_ice, value, ICE_MATERIAL_DENSITY_KG_M3)?;
         (
             value,
             PropertyProvenance::new(
                 PropertySourceKind::WrfDiagnostic,
-                vec!["RHO_ICE"],
-                "RHO_ICE takes precedence over QICE/QVOLI",
+                vec![names.rho_ice],
+                "WRF ice-density diagnostic takes precedence over prognostic mass/volume",
             ),
         )
     } else {
@@ -1023,20 +1117,20 @@ pub fn close_ishmael_category(
             value,
             PropertyProvenance::new(
                 PropertySourceKind::NativePrognostic,
-                vec!["QICE", "QVOLI"],
-                "QICE/QVOLI bulk effective density fallback",
+                vec![names.qice, names.qvoli],
+                "prognostic ice mass/volume bulk effective density fallback",
             ),
         )
     };
 
     let (diameter, diameter_source) = if let Some(value) = input.diagnostics.d_ice_m {
-        positive("D_ICE", value)?;
+        positive(names.d_ice, value)?;
         (
             value,
             PropertyProvenance::new(
                 PropertySourceKind::WrfDiagnostic,
-                vec!["D_ICE"],
-                "D_ICE takes precedence over the mass-equivalent size closure",
+                vec![names.d_ice],
+                "WRF ice-diameter diagnostic takes precedence over the mass-equivalent size closure",
             ),
         )
     } else {
@@ -1044,20 +1138,20 @@ pub fn close_ishmael_category(
             mass_equivalent_diameter(qice, qnice, density)?,
             PropertyProvenance::new(
                 PropertySourceKind::DocumentedClosure,
-                vec!["QICE", "QNICE", "QVOLI"],
+                vec![names.qice, names.qnice, names.qvoli],
                 "spherical mass-equivalent diameter from q, N, and selected density",
             ),
         )
     };
 
     let (axis_ratio, axis_source) = if let Some(value) = input.diagnostics.phi_ice {
-        axis_ratio_value("PHI_ICE", value)?;
+        axis_ratio_value(names.phi_ice, value)?;
         (
             value,
             PropertyProvenance::new(
                 PropertySourceKind::WrfDiagnostic,
-                vec!["PHI_ICE"],
-                "PHI_ICE takes precedence over the QAOLI/QVOLI closure metric",
+                vec![names.phi_ice],
+                "WRF ice-aspect diagnostic takes precedence over the aspect-volume closure metric",
             ),
         )
     } else {
@@ -1067,20 +1161,20 @@ pub fn close_ishmael_category(
             value,
             PropertyProvenance::new(
                 PropertySourceKind::DocumentedClosure,
-                vec!["QAOLI", "QVOLI"],
+                vec![names.qaoli, names.qvoli],
                 "volume-weighted QAOLI/QVOLI metric interpreted as closure-v1 shape; not PHI_ICE",
             ),
         )
     };
 
     let (fall_speed, fall_source) = if let Some(value) = input.diagnostics.v_ice_m_s {
-        positive("V_ICE", value)?;
+        positive(names.v_ice, value)?;
         (
             value,
             PropertyProvenance::new(
                 PropertySourceKind::WrfDiagnostic,
-                vec!["V_ICE"],
-                "V_ICE takes precedence over the analytic fall-speed closure",
+                vec![names.v_ice],
+                "WRF ice-fall-speed diagnostic takes precedence over the analytic closure",
             ),
         )
     } else {
@@ -1093,7 +1187,7 @@ pub fn close_ishmael_category(
             )?,
             PropertyProvenance::new(
                 PropertySourceKind::DocumentedClosure,
-                vec!["QICE", "QNICE", "QVOLI", "QAOLI"],
+                vec![names.qice, names.qnice, names.qvoli, names.qaoli],
                 "property-closure-v1 positive-downward density/size/aspect fall-speed relation",
             ),
         )
@@ -1114,20 +1208,20 @@ pub fn close_ishmael_category(
         rime_fraction,
     )?;
     let mut source_variables = vec![
-        SourceVariable::new("QICE", "kg kg-1 dry air")?,
-        SourceVariable::new("QNICE", "kg-1 dry air")?,
-        SourceVariable::new("QVOLI", "m3 kg-1 dry air")?,
-        SourceVariable::new("QAOLI", "m3 kg-1 dry air")?,
+        SourceVariable::new(names.qice, "kg kg-1 dry air")?,
+        SourceVariable::new(names.qnice, "kg-1 dry air")?,
+        SourceVariable::new(names.qvoli, "m3 kg-1 dry air")?,
+        SourceVariable::new(names.qaoli, "m3 kg-1 dry air")?,
     ];
     for (present, name, units) in [
-        (input.diagnostics.d_ice_m.is_some(), "D_ICE", "m"),
+        (input.diagnostics.d_ice_m.is_some(), names.d_ice, "m"),
         (
             input.diagnostics.rho_ice_kg_m3.is_some(),
-            "RHO_ICE",
+            names.rho_ice,
             "kg m-3",
         ),
-        (input.diagnostics.phi_ice.is_some(), "PHI_ICE", "1"),
-        (input.diagnostics.v_ice_m_s.is_some(), "V_ICE", "m s-1"),
+        (input.diagnostics.phi_ice.is_some(), names.phi_ice, "1"),
+        (input.diagnostics.v_ice_m_s.is_some(), names.v_ice, "m s-1"),
     ] {
         if present {
             source_variables.push(SourceVariable::new(name, units)?);
@@ -2111,7 +2205,7 @@ mod tests {
     }
 
     #[test]
-    fn all_five_ishmael_categories_retain_category_and_native_properties() {
+    fn all_five_ishmael_physical_states_retain_category_and_closed_properties() {
         let categories = [
             IshmaelIceCategory::SmallIce,
             IshmaelIceCategory::Planar,
@@ -2157,6 +2251,79 @@ mod tests {
                 PropertySourceKind::WrfDiagnostic
             );
             assert_eq!(property.provenance().source_variables(), &[variable]);
+        }
+    }
+
+    #[test]
+    fn ishmael_exact_tuple_names_flow_through_all_property_provenance() {
+        for (category, suffix) in [
+            (IshmaelIceCategory::Planar, ""),
+            (IshmaelIceCategory::Columnar, "2"),
+            (IshmaelIceCategory::Aggregate, "3"),
+        ] {
+            let (qice, qnice, qvoli, qaoli, d_ice, rho_ice, phi_ice, v_ice) = match suffix {
+                "" => (
+                    "QICE", "QNICE", "QVOLI", "QAOLI", "d_ice", "rho_ice", "phi_ice", "v_ice",
+                ),
+                "2" => (
+                    "QICE2", "QNICE2", "QVOLI2", "QAOLI2", "d_ice2", "rho_ice2", "phi_ice2",
+                    "v_ice2",
+                ),
+                "3" => (
+                    "QICE3", "QNICE3", "QVOLI3", "QAOLI3", "d_ice3", "rho_ice3", "phi_ice3",
+                    "v_ice3",
+                ),
+                _ => unreachable!(),
+            };
+            let input = ishmael_input(category)
+                .with_diagnostics(IshmaelDiagnostics::new(
+                    Some(0.002),
+                    Some(300.0),
+                    Some(0.45),
+                    Some(2.5),
+                ))
+                .with_source_fields(IshmaelSourceFields::new(
+                    qice, qnice, qvoli, qaoli, d_ice, rho_ice, phi_ice, v_ice,
+                ));
+            let closed = close_ishmael_category(&context(55), &input).unwrap();
+            assert_eq!(
+                closed
+                    .characteristic_diameter_m()
+                    .provenance()
+                    .source_variables(),
+                &[d_ice]
+            );
+            assert_eq!(
+                closed
+                    .effective_density_kg_m3()
+                    .provenance()
+                    .source_variables(),
+                &[rho_ice]
+            );
+            assert_eq!(
+                closed
+                    .minor_to_major_axis_ratio()
+                    .provenance()
+                    .source_variables(),
+                &[phi_ice]
+            );
+            assert_eq!(
+                closed.fall_speed_m_s().provenance().source_variables(),
+                &[v_ice]
+            );
+            let ParticleProvenance::Ishmael(record_provenance) = closed.record().provenance()
+            else {
+                panic!("expected ISHMAEL record provenance");
+            };
+            let names = record_provenance
+                .source_variables()
+                .iter()
+                .map(SourceVariable::name)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![qice, qnice, qvoli, qaoli, d_ice, rho_ice, phi_ice, v_ice]
+            );
         }
     }
 

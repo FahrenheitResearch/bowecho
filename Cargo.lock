@@ -312,6 +312,7 @@ dependencies = [
  "product_engine",
  "quick-xml",
  "radar_core",
+ "radar_scattering",
  "rayon",
  "render2d",
  "reqwest",

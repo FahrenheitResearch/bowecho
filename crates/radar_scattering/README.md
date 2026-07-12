@@ -31,8 +31,9 @@ closure, or assumption.
 
 - P3 50/51 use `QICE`, `QNICE`, `QIR`, and `QIB`. P3-52 additionally permits a
   second tuple named `QICE2`, `QNICE2`, `QIR2`, and `QIB2`. P3-53 requires
-  `QZI` and recovers the native sixth moment exactly as
-  `M6 = QZI^2 / QNICE`; it does not diagnose liquid fraction.
+  advected `QZI=(N*Z)^0.5` and recovers the native bulk sixth moment exactly as
+  `M6=Z=QZI^2/QNICE`; characteristic size then uses the distinct number-mean
+  `D6=M6/QNICE`. It does not diagnose liquid fraction.
 - P3 first validates `0 <= QIR <= QICE`, then bounds the numerical ratio
   `QIR/QICE` to `[0,1]`. Positive rime mass requires positive rime volume and
   rime density is `QIR/QIB`. Closure-v1 effective density is the explicitly
@@ -40,13 +41,17 @@ closure, or assumption.
   `QICE / (QIB + (QICE-QIR)/917 kg m^-3)`. The non-M6 characteristic diameter
   is spherical mass-equivalent diameter. Aspect and fall speed are documented
   analytic proxies and are not claimed to reproduce a P3 lookup table.
-- ISHMAEL 55 retains all five native categories and requires `QICE`, `QNICE`,
-  `QVOLI`, and `QAOLI` for each tuple. Present `D_ICE`, `RHO_ICE`, `PHI_ICE`,
-  and `V_ICE` diagnostics take field-by-field precedence; an invalid present
-  diagnostic fails rather than falling back. Otherwise density is
+- ISHMAEL 55 retains the three actual WRF prognostic tuples: unsuffixed
+  planar-nucleated ice, suffix `2` columnar-nucleated ice, and suffix `3`
+  aggregate ice. Each requires its matching `QICE`, `QNICE`, `QVOLI`, and
+  `QAOLI`; `SmallIce` and `Rimed` remain physical closure states, not invented
+  WRF tuples. Present `d_ice`, `rho_ice`, `phi_ice`, and `v_ice` diagnostics
+  (with the same suffix) take field-by-field precedence; an invalid present
+  diagnostic fails rather than falling back. Exact resolved variable names
+  are retained in property and record provenance. Otherwise density is
   `QICE/QVOLI`; the separately labeled `QAOLI/QVOLI` volume-weighted metric is
   interpreted by closure v1 as shape input but is never represented as the
-  `PHI_ICE` diagnostic.
+  `phi_ice` diagnostic.
 - P3 and ISHMAEL do not predict canting. Scheme-default orientation is an
   assumed zero-mean Gaussian: P3 standard deviation broadens from 10 to 40
   degrees with rime fraction; ISHMAEL small/planar/columnar use 10 degrees and

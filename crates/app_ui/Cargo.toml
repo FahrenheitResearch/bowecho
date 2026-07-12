@@ -20,6 +20,7 @@ image = { workspace = true, features = ["gif"] }
 nexrad_io = { path = "../nexrad_io" }
 product_engine = { path = "../product_engine" }
 radar_core = { path = "../radar_core" }
+radar_scattering = { path = "../radar_scattering" }
 render2d = { path = "../render2d" }
 settings = { path = "../settings" }
 styles = { path = "../styles" }
