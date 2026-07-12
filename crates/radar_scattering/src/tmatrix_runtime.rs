@@ -2291,7 +2291,7 @@ fn verify_solver_ndgs(
         TMatrixPopulationRole::OrdinaryConventional => 2,
         TMatrixPopulationRole::ConventionalRainStandaloneAndResidual
         | TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle
-        | TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle => 10,
+        | TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle => 14,
     };
     if ndgs == expected {
         Ok(())
@@ -2869,7 +2869,7 @@ mod tests {
                 RadarViewApplicability::PpiElevationAxisMinus05To20AxisymmetricGaussian,
             reference_water_dielectric_factor_squared: 0.93,
             solver_ddelt: 0.001,
-            solver_ndgs: 10,
+            solver_ndgs: 14,
         }
     }
 
@@ -3409,15 +3409,15 @@ mod tests {
             (TMatrixPopulationRole::OrdinaryConventional, 2),
             (
                 TMatrixPopulationRole::ConventionalRainStandaloneAndResidual,
-                10,
+                14,
             ),
             (
                 TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle,
-                10,
+                14,
             ),
             (
                 TMatrixPopulationRole::PropertyAwareWetCharacteristicParticle,
-                10,
+                14,
             ),
         ] {
             verify_solver_ndgs(role, expected_ndgs).unwrap();
