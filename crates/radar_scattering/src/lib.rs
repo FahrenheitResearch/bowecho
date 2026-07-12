@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod closure;
 mod digest;
 mod lut;
 mod orientation;
@@ -14,6 +15,15 @@ mod output;
 mod particle;
 mod science;
 
+pub use closure::{
+    ClosedOrientation, ClosedParticleCategory, ClosureContext, ClosureError,
+    ConventionalCategoryInput, DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K,
+    DiagnosticCantingTransition, DiagnosticCoexistenceInput, DiagnosticCoexistenceResult,
+    DiagnosticWetCategory, IshmaelCategoryInput, IshmaelDiagnostics, MixtureMetadata,
+    MixtureScatteringStatus, MixtureTopology, OrientationDefinition, P3Category, P3CategoryInput,
+    PROPERTY_CLOSURE_REVISION, PropertyProvenance, PropertySourceKind, SourcedScalar,
+    close_conventional_category, close_ishmael_category, close_p3_category, diagnose_coexistence,
+};
 pub use digest::{DigestError, Sha256Digest};
 pub use lut::{
     Axis, AxisCoordinate, AxisKind, GeneratorMetadata, InterpolationError, LUT_MAGIC,
