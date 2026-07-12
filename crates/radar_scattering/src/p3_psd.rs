@@ -482,13 +482,6 @@ impl P3PiecewiseParticleLaw {
             return Err(P3PsdError::InvalidPiecewiseOrdering);
         }
 
-        let mut primary_source_dois = vec![P3_PART_I_DOI.to_owned()];
-        if input.scheme == P3WrfScheme::Mp52TwoIcePredictedCloudNumber {
-            primary_source_dois.push(P3_MULTICATEGORY_DOI.to_owned());
-        }
-        if input.scheme == P3WrfScheme::Mp53OneIceTripleMoment {
-            primary_source_dois.push(P3_TRIPLE_MOMENT_CONTEXT_DOI.to_owned());
-        }
         Ok(Self {
             rime_mass_fraction,
             rime_density_kg_m3: effective_rime_density,
@@ -734,6 +727,13 @@ impl P3Psd {
         } else {
             0.0
         };
+        let mut primary_source_dois = vec![P3_PART_I_DOI.to_owned()];
+        if input.scheme == P3WrfScheme::Mp52TwoIcePredictedCloudNumber {
+            primary_source_dois.push(P3_MULTICATEGORY_DOI.to_owned());
+        }
+        if input.scheme == P3WrfScheme::Mp53OneIceTripleMoment {
+            primary_source_dois.push(P3_TRIPLE_MOMENT_CONTEXT_DOI.to_owned());
+        }
         let closure = P3MomentClosureAudit {
             expected_number_density_m3: number_density,
             reconstructed_number_density_m3: reconstructed_number,
@@ -1631,12 +1631,12 @@ mod tests {
     #[test]
     fn rimed_reconstruction_closes_total_rime_mass_and_rime_volume() {
         let scheme = P3WrfScheme::Mp50OneIceFixedCloudNumber;
-        let lambda = 8.0e3;
-        let mu = 1.0;
-        let number_per_kg = 8.0e4;
-        let dry_density = 0.8;
-        let rime_fraction = 0.5;
-        let rime_density = 400.0;
+        let lambda: f64 = 8.0e3;
+        let mu: f64 = 1.0;
+        let number_per_kg: f64 = 8.0e4;
+        let dry_density: f64 = 0.8;
+        let rime_fraction: f64 = 0.5;
+        let rime_density: f64 = 400.0;
         let law = P3PiecewiseParticleLaw::reconstruct(rime_fraction, rime_density).unwrap();
         let number_density = number_per_kg * dry_density;
         let n0 =

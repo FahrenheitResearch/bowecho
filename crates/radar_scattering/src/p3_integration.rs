@@ -350,7 +350,7 @@ where
 
     let mut additive = AdditiveScattering::default();
     for &(node_index, node) in &supported {
-        let per_particle = evaluate_one_particle_per_m3(node)
+        let per_particle = evaluate_one_particle_per_m3(&node)
             .map_err(|source| P3TMatrixIntegrationError::Evaluation { node_index, source })?;
         let scaled = per_particle
             .checked_scale(node.source.number_concentration_m3)

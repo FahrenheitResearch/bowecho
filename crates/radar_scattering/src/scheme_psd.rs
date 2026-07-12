@@ -1844,7 +1844,7 @@ mod tests {
 
     #[test]
     fn regularized_gamma_tail_matches_integer_closed_form() {
-        let x = 7.25;
+        let x: f64 = 7.25;
         let expected = (-x).exp() * (1.0 + x + x * x / 2.0 + x * x * x / 6.0);
         assert_relative(regularized_gamma_q(4.0, x).unwrap(), expected, 2.0e-14);
     }
@@ -2099,7 +2099,7 @@ mod tests {
 
     #[test]
     fn f32_scale_boundary_roundoff_is_accepted_without_losing_mass_closure() {
-        let a_scale = 50.0e-6;
+        let a_scale: f64 = 50.0e-6;
         let raw_delta = ISHMAEL_DELTA_RANGE[0] - 0.25 * SOURCE_BOUND_RELATIVE_TOLERANCE;
         let c_scale = ISHMAEL_MONOMER_SEMI_AXIS_M.powf(1.0 - raw_delta) * a_scale.powf(raw_delta);
         let delta_boundary = IshmaelPsd::reconstruct(input_from_scales(
