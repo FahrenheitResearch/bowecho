@@ -1136,6 +1136,9 @@ mod tests {
         fn clear_cache(&self) {}
     }
 
+    // Test builder keeps each independently varied native WRF coordinate
+    // explicit so mismatch cases remain readable at their call sites.
+    #[allow(clippy::too_many_arguments)]
     fn property_provider(
         name: &str,
         scheme_id: i32,

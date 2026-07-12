@@ -252,7 +252,7 @@ pub struct DiscoveredTMatrixBandPack {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TMatrixBandPackDiscovery {
-    Available(DiscoveredTMatrixBandPack),
+    Available(Box<DiscoveredTMatrixBandPack>),
     Invalid {
         provider_pack_id: String,
         error: String,
@@ -370,7 +370,7 @@ pub fn discover_tmatrix_band_packs<P: TMatrixBandPackProvider + ?Sized>(
                 })
                 .and_then(|bytes| validate_manifest(&provider_pack_id, &bytes));
             match result {
-                Ok(pack) => TMatrixBandPackDiscovery::Available(pack),
+                Ok(pack) => TMatrixBandPackDiscovery::Available(Box::new(pack)),
                 Err(error) => TMatrixBandPackDiscovery::Invalid {
                     provider_pack_id,
                     error: error.to_string(),
@@ -391,7 +391,7 @@ pub fn select_exact_tmatrix_band_pack(
             TMatrixBandPackDiscovery::Available(pack)
                 if pack.identity.frequency_bits == frequency_hz.to_bits() =>
             {
-                Some(pack)
+                Some(pack.as_ref())
             }
             _ => None,
         })
@@ -672,10 +672,10 @@ impl<T> OneSelectedPackCache<T> {
         F: FnOnce() -> Result<T, E>,
     {
         let mut slot = self.slot.lock().expect("one-pack cache mutex poisoned");
-        if let Some((cached_key, value)) = slot.as_ref() {
-            if *cached_key == key {
-                return Ok(Arc::clone(value));
-            }
+        if let Some((cached_key, value)) = slot.as_ref()
+            && *cached_key == key
+        {
+            return Ok(Arc::clone(value));
         }
         let loaded = Arc::new(loader()?);
         *slot = Some((key, Arc::clone(&loaded)));
