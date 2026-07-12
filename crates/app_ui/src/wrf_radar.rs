@@ -1719,8 +1719,7 @@ impl WrfRadarFields {
             )
             .saturating_add(self.refractivity_model.as_deref().map_or(0, |model| {
                 std::mem::size_of::<crate::wrf_refractivity::WrfRefractivityModel>()
-                    + model.profile().levels().len()
-                        * std::mem::size_of::<radar_core::RefractivityLevel>()
+                    + std::mem::size_of_val(model.profile().levels())
             }))
     }
 
@@ -4024,11 +4023,10 @@ fn append_beam_geometry_provenance(
                 let gradients = &provenance.gradients;
                 let _ = write!(
                     output,
-                    "; propagation_geometry=wrf_refractivity_research; refractivity_fields={}/{}/{}; refractivity_humidity={}; refractivity_formula={}; refractivity_time_index={}; refractivity_profile_levels={}; refractivity_antenna_gradient_n_per_km={:.6}; refractivity_antenna_regime={:?}; refractivity_min_gradient_n_per_km={:.6}; refractivity_max_gradient_n_per_km={:.6}; refractivity_contains_ducting_layer={}; refractivity_antenna_level_inserted={}; refractivity_antenna_extrapolation_m={:.3}",
+                    "; propagation_geometry=wrf_refractivity_research; refractivity_fields={}/{}/{}; refractivity_humidity=QVAPOR_dry_mixing_ratio_to_moist_specific_humidity; refractivity_formula={}; refractivity_time_index={}; refractivity_profile_levels={}; refractivity_antenna_gradient_n_per_km={:.6}; refractivity_antenna_regime={:?}; refractivity_min_gradient_n_per_km={:.6}; refractivity_max_gradient_n_per_km={:.6}; refractivity_contains_ducting_layer={}; refractivity_antenna_level_inserted={}; refractivity_antenna_extrapolation_m={:.3}",
                     provenance.pressure_source,
                     provenance.temperature_source,
                     provenance.humidity_source,
-                    "QVAPOR_dry_mixing_ratio_to_moist_specific_humidity",
                     provenance.formula,
                     provenance.time_index,
                     provenance.retained_level_count,
@@ -6187,12 +6185,15 @@ pub(crate) struct SyntheticFrameSourceDescriptor {
 
 #[derive(Clone)]
 enum SyntheticFrameSource {
-    Wrf {
-        anchor: WrfScene,
-        neighbor: Option<WrfScene>,
-        temporal_plan: Option<TemporalScenePlan>,
-    },
+    Wrf(Box<SyntheticWrfFrameSource>),
     OperationalForecast,
+}
+
+#[derive(Clone)]
+struct SyntheticWrfFrameSource {
+    anchor: WrfScene,
+    neighbor: Option<WrfScene>,
+    temporal_plan: Option<TemporalScenePlan>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6259,11 +6260,11 @@ impl SyntheticFrameSourceDescriptor {
         config_fingerprint: u64,
     ) -> Self {
         Self {
-            source: SyntheticFrameSource::Wrf {
+            source: SyntheticFrameSource::Wrf(Box::new(SyntheticWrfFrameSource {
                 anchor,
                 neighbor,
                 temporal_plan,
-            },
+            })),
             config: config.clone(),
             config_fingerprint,
             witness: SyntheticFrameWitness::from_volume(frame_ordinal, config_fingerprint, volume),
@@ -6322,14 +6323,14 @@ fn explain_selected_gate(
     if identity.frame_index != descriptor.witness.frame_ordinal {
         return Err(WhyThisGateUnavailable::StaleFrameWitness);
     }
-    let SyntheticFrameSource::Wrf {
+    let SyntheticFrameSource::Wrf(source) = &descriptor.source else {
+        return Err(WhyThisGateUnavailable::UnsupportedSourceContract);
+    };
+    let SyntheticWrfFrameSource {
         anchor,
         neighbor,
         temporal_plan,
-    } = &descriptor.source
-    else {
-        return Err(WhyThisGateUnavailable::UnsupportedSourceContract);
-    };
+    } = source.as_ref();
     let cut = volume
         .cuts
         .get(identity.cut_index)
@@ -7784,6 +7785,8 @@ fn resolve_operational_radar_paths(
     }
 }
 
+type OperationalInventoryContract = (String, Vec<(String, Option<String>)>);
+
 fn build_operational_radar(
     source: OperationalRadarSource,
     config: &SyntheticRadarConfig,
@@ -7831,7 +7834,7 @@ fn build_operational_radar(
     let maximum_range_km = config.max_range_m / 1_000.0;
     let mut frames = Vec::with_capacity(paths.len());
     let mut notes = Vec::new();
-    let mut inventory_contract: Option<(String, Vec<(String, Option<String>)>)> = None;
+    let mut inventory_contract: Option<OperationalInventoryContract> = None;
     for (index, path) in paths.iter().enumerate() {
         let _ = tx.send(SyntheticRadarMessage::Progress(format!(
             "Reading operational source {}/{}: {}",

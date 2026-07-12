@@ -9668,22 +9668,6 @@ impl ViewerApp {
     /// local-deployment autoplay contract (grow history to fit, pause live/poll
     /// so a tick can't stomp the loop, roll it) — no new file format, no store
     /// write; the frames are handed straight to `install_decoded_load_batch`.
-    fn install_synthetic_radar_volumes(
-        &mut self,
-        label: String,
-        config_fingerprint: u64,
-        volumes: Vec<Arc<RadarVolume>>,
-        ctx: &egui::Context,
-    ) {
-        self.install_synthetic_radar_volumes_with_sources(
-            label,
-            config_fingerprint,
-            volumes,
-            Vec::new(),
-            ctx,
-        );
-    }
-
     fn install_synthetic_radar_output(
         &mut self,
         output: wrf_radar::SyntheticRadarOutput,
@@ -9888,16 +9872,6 @@ impl ViewerApp {
     /// observed volumes into the existing three-pane radar renderer. This is
     /// deliberately local presentation state: it neither enables nor saves
     /// ordinary independent-panel settings.
-    fn install_simradar_comparison_volumes(
-        &mut self,
-        observed: Arc<RadarVolume>,
-        synthetic: Arc<RadarVolume>,
-        difference: Arc<RadarVolume>,
-        ctx: &egui::Context,
-    ) -> Result<(), String> {
-        self.install_simradar_comparison_with_source(observed, synthetic, difference, None, ctx)
-    }
-
     fn install_simradar_comparison_with_source(
         &mut self,
         observed: Arc<RadarVolume>,
@@ -29673,25 +29647,23 @@ impl ViewerApp {
                 .forward_operator
                 .as_deref()
                 .is_some_and(|operator| operator.contains("BowEcho"))
-        {
-            if ui
+            && ui
                 .button("Why this synthetic gate?")
                 .on_hover_text(
                     "Open exact gate quality, Ideal/Measured/Presented stages, propagation, hydrometeor contributions when retained, and the on-demand Doppler spectrum",
                 )
                 .clicked()
-            {
-                let mut selection = simradar_gate_inspector::GateSelection::new(
-                    readout.cut,
-                    readout.row,
-                    readout.gate,
-                )
-                .with_anchor(readout.product.base_moment());
-                selection.frame_index = self.primary.cursor.index;
-                self.simradar_gate_inspector
-                    .open_with_gate(volume, selection);
-                ui.close();
-            }
+        {
+            let mut selection = simradar_gate_inspector::GateSelection::new(
+                readout.cut,
+                readout.row,
+                readout.gate,
+            )
+            .with_anchor(readout.product.base_moment());
+            selection.frame_index = self.primary.cursor.index;
+            self.simradar_gate_inspector
+                .open_with_gate(volume, selection);
+            ui.close();
         }
         ui.separator();
         if let Some((site, distance_km)) = operational_site.as_ref() {
@@ -48805,7 +48777,13 @@ mod tests {
             .iter()
             .map(|time| Arc::new(test_volume_with_site_time("KILN", *time)))
             .collect();
-        app.install_synthetic_radar_volumes("simulated WRF".to_owned(), 0x00C0_FFEE, synth, &ctx);
+        app.install_synthetic_radar_volumes_with_sources(
+            "simulated WRF".to_owned(),
+            0x00C0_FFEE,
+            synth,
+            Vec::new(),
+            &ctx,
+        );
 
         // Single-source loop: only the synthetic forecast frames remain (the
         // real KILN frames were cleared, not mixed in by the shared id).
@@ -48871,10 +48849,11 @@ mod tests {
         let time = Utc.with_ymd_and_hms(2026, 7, 12, 3, 0, 0).unwrap();
         let (observed, synthetic, difference) = simradar_comparison_test_volumes(time);
 
-        app.install_simradar_comparison_volumes(
+        app.install_simradar_comparison_with_source(
             Arc::clone(&observed),
             Arc::clone(&synthetic),
             Arc::clone(&difference),
+            None,
             &ctx,
         )
         .unwrap();
@@ -48947,7 +48926,13 @@ mod tests {
         let mut mismatched = synthetic.as_ref().clone();
         mismatched.cuts[0].radials[0].time_offset_ms += 1;
         let error = app
-            .install_simradar_comparison_volumes(observed, Arc::new(mismatched), difference, &ctx)
+            .install_simradar_comparison_with_source(
+                observed,
+                Arc::new(mismatched),
+                difference,
+                None,
+                &ctx,
+            )
             .unwrap_err();
         assert!(error.contains("exact radial geometry/timing"));
         assert!(app.simradar_comparison.is_none());

@@ -1421,7 +1421,7 @@ mod tests {
         assert_eq!(validation_product_units(&product("DIF_VEL")), Some("m/s"));
         assert_eq!(validation_product_label(&product("OTHER")), None);
 
-        let mut products = vec![
+        let mut products = [
             product("DIF_KDP"),
             DisplayProduct::Derived(DerivedProduct::CompositeReflectivity),
             product("MVEL"),

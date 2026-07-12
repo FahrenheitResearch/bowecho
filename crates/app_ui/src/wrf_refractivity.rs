@@ -238,6 +238,7 @@ impl RefractedGateTrace {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn beam_height_msl_at_gate(&self, gate_index: usize) -> Option<f64> {
         self.point(gate_index)
             .map(|point| self.antenna_msl_m + point.height_above_radar_m)
@@ -366,6 +367,7 @@ impl WrfRefractivityModel {
         Ok(trace)
     }
 
+    #[cfg(test)]
     pub fn beam_height_msl_at_gate(
         &self,
         elevation_deg: f64,
@@ -384,16 +386,7 @@ impl WrfRefractivityModel {
             .ok_or(WrfRefractivityError::GateRangeOverflow)
     }
 
-    pub fn clear_trace_cache(&self) -> Result<(), WrfRefractivityError> {
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| WrfRefractivityError::CachePoisoned)?;
-        cache.values.clear();
-        cache.insertion_order.clear();
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub fn cached_trace_count(&self) -> Result<usize, WrfRefractivityError> {
         Ok(self
             .cache
