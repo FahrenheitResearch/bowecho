@@ -2266,7 +2266,7 @@ fn bind_radar(
         RadarViewApplicability::PpiElevationAxisMinus05To20AxisymmetricGaussian
     };
     exact_text("radar.solver.shape", &raw.solver.shape, "spheroid")?;
-    positive("radar.solver.ddelt", raw.solver.ddelt)?;
+    verify_solver_ddelt(raw.solver.ddelt)?;
     verify_solver_ndgs(population_role, raw.solver.ndgs)?;
     Ok(RadarConventionDescriptor {
         convention: RadarHvConvention::PytMatrixHorizontalHhConjugateVv,
@@ -2293,6 +2293,17 @@ fn verify_solver_ndgs(
         invalid(
             "radar.solver.ndgs",
             format!("population role {population_role:?} requires exactly {expected}, got {ndgs}"),
+        )
+    }
+}
+
+fn verify_solver_ddelt(ddelt: f64) -> Result<(), TMatrixLoadError> {
+    if ddelt == 0.001 {
+        Ok(())
+    } else {
+        invalid(
+            "radar.solver.ddelt",
+            format!("all accepted table contracts require exactly 0.001, got {ddelt}"),
         )
     }
 }
@@ -3388,6 +3399,14 @@ mod tests {
             verify_solver_ndgs(role, expected_ndgs).unwrap();
             assert!(verify_solver_ndgs(role, expected_ndgs - 1).is_err());
             assert!(verify_solver_ndgs(role, expected_ndgs + 1).is_err());
+        }
+    }
+
+    #[test]
+    fn solver_convergence_tolerance_is_exact() {
+        verify_solver_ddelt(0.001).unwrap();
+        for changed in [0.000_999, 0.001_001, 0.0, -0.001, f64::NAN] {
+            assert!(verify_solver_ddelt(changed).is_err());
         }
     }
 
