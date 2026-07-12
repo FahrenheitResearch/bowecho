@@ -152,6 +152,11 @@ when the workspace is hidden. It compiles data expressions through Rusty
 Weather's bounded formula engine; a formula is not arbitrary Rust, Python, or
 shell code.
 
+For the complete language/function reference, unit rules, source capability
+matrix, HRRR/GFS/WRF examples, numerical contracts, policies, recipes, safety,
+and provenance, see the dedicated
+[Formula Lab scientific reference](formula-lab.md).
+
 The normal workflow is:
 
 1. Choose **Model store** or **Raw WRF**. For stored data, select a
@@ -203,6 +208,17 @@ BowEcho generates a color scale over a result's full finite range unless an
 exact saved output-name binding supplies a user color table. Changing source
 data while evaluation is running causes the stale result to be discarded
 instead of displayed.
+
+## Related WRF and simulated-satellite guides
+
+- [WRF simulated radar](wrf-simulated-radar.md) explains which WRF workflow to
+  choose, the five complete radar recipes, the **Refresh current frame(s)**
+  experimentation path, moment meanings, dual-pol/propagation science,
+  CfRadial provenance, and current limitations.
+- [SimSat in BowEcho](simsat-guide.md) explains local WRF and HRRR wrfnat
+  inputs, all simulated-satellite products, view/resolution choices,
+  atmosphere and cloud controls, durable CPU output versus GPU preview, cache
+  upgrades, native plotting, and the renderer's honest science boundaries.
 
 ## EUMETNET ORD full-day archive loads
 

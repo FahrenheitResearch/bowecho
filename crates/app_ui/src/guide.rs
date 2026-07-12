@@ -1,10 +1,11 @@
 //! In-app Guide: a reference the user opens when they want to learn —
 //! never a forced tour. Left nav + content pane, all plain egui.
 //!
-//! Every feature claim in here was verified against the code in
-//! `main.rs`/`model_data.rs`/`sat_worker.rs` (v0.8.2), and every science
-//! entry carries its primary citation, matching the project convention
-//! (docs/products-guide.md, docs/hail-wind-algo-spec.md).
+//! Feature claims in this reference track the current BowEcho workspaces and
+//! their owning modules (`main.rs`, `model_data.rs`, `formula_lab.rs`,
+//! `wrf_radar.rs`, `simsat_ui.rs`, and `sat_worker.rs`). Science entries keep
+//! the implementation's honesty boundaries visible and point to the deeper
+//! repository references where appropriate.
 
 use eframe::egui;
 
@@ -18,8 +19,9 @@ const GUIDE_TOP_BAR_TEXT: &str = "The top bar leads with LIVE plus one Timeline 
     the full Unified Player into one place; live and archive entry both arm synced \
     warnings by default. Reload, Screenshot, Annotate, and Workflows remain one click \
     away. View contains Reset map view and Map only. \
-    On the right, the Windows menu opens every data window (Model, Radar \
-    overlays, Satellite, WoFS, FARM, 3D Volume, Sounding) beside this Guide. Status chips appear \
+    On the right, the Windows menu opens every data workspace (Models, WRF, \
+    Formula Lab, Radar overlays, Satellite, SimSat, WoFS, FARM, 3D Volume, \
+    Sounding) beside this Guide. Status chips appear \
     beside the menus. Map Only hides chrome for a clean capture; Tab or Esc \
     brings it back.";
 const GUIDE_PANES_LABEL: &str = "Panes 1 / 2 / 3 / 4";
@@ -34,6 +36,20 @@ const GUIDE_DEBUG_CASES_TEXT: &str = "— one-click repro launchers for known ra
 const GUIDE_CUSTOM_LAYER_ROW_LABEL: &str = "Layer row in Map";
 const GUIDE_CUSTOM_OVERLAY_TEXT: &str = "add the nearest radar — US or international, whichever is closer — as an overlay layer. Manage overlays (opacity, refresh, promote, remove) in Map.";
 
+/// Every equation printed as a worked Formula Lab example. Keeping these in
+/// one list lets the guide test compile them against the pinned engine instead
+/// of allowing documentation syntax to drift.
+const GUIDE_FORMULA_EXAMPLES: [&str; 8] = [
+    "sqrt(u_10m^2 + v_10m^2)",
+    "temperature_2m - dewpoint_2m",
+    r#"interpolate_z(temperature_iso, height_iso, quantity(3000, "m"))"#,
+    "div(grid_vector(U10, V10))",
+    "curl(grid_vector(U10, V10))",
+    r#"interpolate_z(tk, z, quantity(3000, "m"))"#,
+    "dt(T2)",
+    "z_to_dbz(dbz_to_z(composite_reflectivity) * 2)",
+];
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum GuideSection {
     #[default]
@@ -41,7 +57,10 @@ enum GuideSection {
     Products,
     Layers,
     ModelData,
+    Wrf,
+    FormulaLab,
     Satellite,
+    SimSat,
     Archive,
     Player,
     Tools,
@@ -52,12 +71,15 @@ enum GuideSection {
 }
 
 impl GuideSection {
-    const ALL: [GuideSection; 12] = [
+    const ALL: [GuideSection; 15] = [
         Self::GettingStarted,
         Self::Products,
         Self::Layers,
         Self::ModelData,
+        Self::Wrf,
+        Self::FormulaLab,
         Self::Satellite,
+        Self::SimSat,
         Self::Archive,
         Self::Player,
         Self::Tools,
@@ -72,8 +94,11 @@ impl GuideSection {
             Self::GettingStarted => "Getting started",
             Self::Products => "Products explained",
             Self::Layers => "Map & layers",
-            Self::ModelData => "Model data & soundings",
+            Self::ModelData => "Models & soundings",
+            Self::Wrf => "WRF & simulated radar",
+            Self::FormulaLab => "Formula Lab",
             Self::Satellite => "Satellite",
+            Self::SimSat => "SimSat",
             Self::Archive => "Archive & events",
             Self::Player => "Unified Player",
             Self::Tools => "Tools & inspector",
@@ -103,22 +128,27 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
                 .resizable(false)
                 .exact_size(172.0)
                 .show_inside(ui, |ui| {
-                    ui.add_space(4.0);
-                    for candidate in GuideSection::ALL {
-                        if ui
-                            .selectable_label(section == candidate, candidate.label())
-                            .clicked()
-                        {
-                            section = candidate;
-                        }
-                    }
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Reference, not a tour —\nopen it whenever.")
-                            .small()
-                            .weak(),
-                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("guide_nav_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            for candidate in GuideSection::ALL {
+                                if ui
+                                    .selectable_label(section == candidate, candidate.label())
+                                    .clicked()
+                                {
+                                    section = candidate;
+                                }
+                            }
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Reference, not a tour —\nopen it whenever.")
+                                    .small()
+                                    .weak(),
+                            );
+                        });
                 });
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 egui::ScrollArea::vertical()
@@ -132,7 +162,10 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
                             GuideSection::Products => products(ui),
                             GuideSection::Layers => layers(ui),
                             GuideSection::ModelData => model_data(ui),
+                            GuideSection::Wrf => wrf(ui),
+                            GuideSection::FormulaLab => formula_lab(ui),
                             GuideSection::Satellite => satellite(ui),
+                            GuideSection::SimSat => simsat(ui),
                             GuideSection::Archive => archive(ui),
                             GuideSection::Player => unified_player(ui),
                             GuideSection::Tools => tools(ui),
@@ -176,6 +209,21 @@ fn action(ui: &mut egui::Ui, lead: &str, rest: &str) {
         ui.spacing_mut().item_spacing.x = 5.0;
         ui.strong(lead);
         ui.label(rest);
+    });
+    ui.add_space(2.0);
+}
+
+/// A compact, selectable-looking formula example. The text itself lives in
+/// [`GUIDE_FORMULA_EXAMPLES`] so tests can compile every displayed equation.
+fn formula_example(ui: &mut egui::Ui, lead: &str, formula: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 7.0;
+        ui.strong(lead);
+        ui.label(
+            egui::RichText::new(formula)
+                .monospace()
+                .color(accent_color()),
+        );
     });
     ui.add_space(2.0);
 }
@@ -716,10 +764,10 @@ fn layers(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Model data & soundings
+// 4. Models & soundings
 
 fn model_data(ui: &mut egui::Ui) {
-    ui.heading("Model data & soundings");
+    ui.heading("Models & soundings");
     para(
         ui,
         "Model fields and skew-T soundings (HRRR/RAP/RRFS-style CONUS workflows plus GFS \
@@ -754,67 +802,18 @@ fn model_data(ui: &mut egui::Ui) {
          \u{2248}1.5 GB on disk).",
     );
 
-    subhead(ui, "WRF WORKFLOWS");
-    para(
+    subhead(ui, "RELATED WORKSPACES");
+    action(
         ui,
-        "WRF is a separate first-class window and dockable workspace, not a section buried in \
-         Models. Open data, wrf-rust full diagnostics, GDEX, and simulated radar \
-         live there. They share one backend with Models, so processed fields immediately appear \
-         in the Models run library for plotting, maps, and soundings.",
+        "Windows \u{25be} \u{25b8} WRF",
+        "— raw wrfout/NetCDF import, wrf-rust full diagnostics, GDEX climate archives, \
+         and simulated radar. Finished model fields enter this same Models library.",
     );
     action(
         ui,
-        "Open WRF / NetCDF",
-        "— import local model files into the store: 2-D surface fields plus skew-T sounding \
-         volumes, one forecast hour per file. Handles raw wrfout, post-processed climate \
-         wrfout, and plain NetCDF. Click a point in the field viewer afterwards to sound it.",
-    );
-    para(
-        ui,
-        "Imported WRF fields now list under readable names — the raw wrfout registry names \
-         (wrf_swupt\u{2026}) resolve to a catalog of friendly labels with hover descriptions, \
-         and most get a Solarpower07 model palette compiled into their style so the map draws \
-         in a tuned color ramp rather than the viridis fallback. This applies to runs already \
-         on disk — no re-import.",
-    );
-    action(
-        ui,
-        "WRF full diagnostics",
-        "— the full-diagnostics ingest (~117 fields: CAPE, severe, precip, soil, …) via \
-         wrf-core, minutes per file on large grids. A field selector narrows it to a \
-         core-only set when you don't need everything. This is NOT the simulated-radar button.",
-    );
-
-    subhead(ui, "FORMULA LAB");
-    para(
-        ui,
-        "Formula Lab is its own dockable workspace and shares the selected model/run/time with \
-         Models. Choose a compatible quick start or insert exact variable names from its \
-         searchable field browser. Syntax valid means the bounded equation compiled; Ready for \
-         selected source additionally checks the current inventory, units, source capabilities, \
-         and time axis before evaluation.",
-    );
-    action(
-        ui,
-        "Stored model",
-        "— model-neutral pointwise formulas work across practical stored models whenever the \
-         selected timestep actually contains the requested fields. Stored runs can use pressure \
-         volumes and explicit-height vertical operators, but do not retain the grid metrics \
-         needed for horizontal derivatives.",
-    );
-    action(
-        ui,
-        "Raw WRF",
-        "— choose any readable raw WRF file, including extensionless wrfout files from every \
-         domain. Raw WRF supplies native map factors, height, projected vectors, and grid-aware \
-         horizontal/vertical calculus. The resolver performs the final file-specific checks.",
-    );
-    para(
-        ui,
-        "A completed result enters the shared Models viewer. Formula Lab's result card can open \
-         Models, add the field to the radar map, open the native plot/PNG workflow, or adjust its \
-         color table. The editor draft and options persist across restarts; running worker state \
-         and large-file consent do not.",
+        "Windows \u{25be} \u{25b8} Formula Lab",
+        "— safe custom diagnostics over the selected stored run or a raw WRF file. Results \
+         return here for maps, native plots, PNG output, and color-table work.",
     );
 
     subhead(ui, "UPPER-AIR (ISOBARIC) FIELDS");
@@ -827,98 +826,6 @@ fn model_data(ui: &mut egui::Ui) {
          that field wins over the synthesized one. On WRF fields they draw through the \
          level-aware Solarpower07 model palettes — the resolver picks the table that matches \
          the level and units — instead of the plain fallback ramp.",
-    );
-
-    subhead(ui, "SIMULATED RADAR FROM WRF");
-    para(
-        ui,
-        "WRF simulated radar forward-models a raw wrfout file's hydrometeors and winds into a \
-         polar volume on a 14-tilt ladder (720 radials, 250 m gates to 230 km by default, \
-         4/3-Earth beam). It can emit REF, VEL, spectrum width, S-band dual-pol, phase, \
-         attenuation, and corrected fields, then renders and LOOPS through the same pipeline \
-         as Level II: colormaps, tilts, cross-sections, and velocity dealiasing. Pick one or \
-         more files; each forecast time becomes a loop frame and nothing is written to the \
-         model store.",
-    );
-    action(
-        ui,
-        "What do you want? presets",
-        "— Storm view (fast) is the readable loop default; Clean model truth removes every \
-         presentation/instrument effect; Clean dual-pol exposes polarimetric microphysics \
-         without noise or folding; Real radar (balanced) is the recommended complete virtual \
-         S-band scan; Maximum fidelity (slow) uses 27 pulse-volume samples. Each preset resets \
-         interacting physics and calibration values together while preserving your chosen \
-         radar location, range, and gate geometry.",
-    );
-    para(
-        ui,
-        "Dual-pol presets use supported raw bulk hydrometeor fields when the WRF microphysics \
-         permits it. Unsupported P3/ISHMAEL or incomplete inputs fall back explicitly to \
-         scalar REF/VEL and report why instead of fabricating polarimetric products.",
-    );
-    para(
-        ui,
-        "Radar location & fine tuning (advanced) contains the antenna, geometry, physics, and \
-         instrument controls. You can ignore it when a preset already matches your goal; every \
-         advanced change is persisted and marks the setup as Custom tuning.",
-    );
-    action(
-        ui,
-        "Antenna placement",
-        "— Domain center (default), an explicit Lat/Lon, or a real NEXRAD site id resolved \
-         through the app's site catalog, so you can compare the model directly against what \
-         that radar would see. Max range defaults to the classic 230 km and reaches 1000 km.",
-    );
-    action(
-        ui,
-        "Reflectivity operator",
-        "— Model native (REFL_10CM) renders the model's own Thompson 10-cm reflectivity \
-         (hotter, fatter cores in graupel and the melting layer); Classic Stoelinga (community \
-         look) always computes dBZ with fixed Marshall-Palmer intercepts, matching the \
-         wrf-python / GR2Analyst pipeline — roughly 10\u{2013}20 dB cooler in those regions, so \
-         hooks stand out of moderate echo.",
-    );
-    action(
-        ui,
-        "Gate texture",
-        "— adds deterministic, radially-correlated speckle to the simulated reflectivity so it \
-         reads like real Level-II gates instead of a smooth model field (on by default); a \
-         separate opt-in adds a gentle \u{00b1}0.5 m/s wobble to velocity, kept off so the clean \
-         Vr keeps feeding the dealias / GBVTD tools.",
-    );
-    action(
-        ui,
-        "Ground clutter",
-        "— a 0\u{2013}100% slider that paints fabricated near-radar ground return (concentrated \
-         within ~40 km on the low tilts, fading with range and beam height, with a few \
-         hotspots) modelled on the community WRF\u{2192}GR2 export. Our operator is pure physics \
-         at 0%; it only fills gates weaker than itself, so storms are never overwritten, and \
-         cluttered gates read near-zero velocity like real ground. Deterministic per frame, so \
-         a loop doesn't shimmer.",
-    );
-    action(
-        ui,
-        "Realistic Nyquist (velocity folds)",
-        "— folds the simulated radial velocity into a chosen Nyquist co-interval (default \
-         25 m/s) so fast winds alias the way a real pulse-pair radar measures them; the plain \
-         VEL product then folds while DVEL / DSRV (or the velocity dealiaser) reconstruct the \
-         true field — a dealiasing practice ground with known ground truth. Off stamps a wide \
-         Nyquist and shows the exact unfolded wind.",
-    );
-    action(
-        ui,
-        "Include 0.1\u{00b0} low tilt",
-        "— prepends a 0.1\u{00b0} sweep below the standard 0.5\u{00b0} lowest tilt (the \
-         community exports' lowest cut); the lower beam samples roughly half the height at \
-         range, so a low-level hook is better defined. Adds one sweep to every volume.",
-    );
-    action(
-        ui,
-        "Match gate size to grid resolution",
-        "— sets the gate spacing to the WRF file's own grid resolution (its DX, clamped \
-         100 m\u{2013}10 km) instead of a fixed 250 m, so a coarse model isn't oversampled into \
-         a dozen identical gates per cell. Off by default; a file with no grid-resolution \
-         attribute falls back to the configured spacing.",
     );
 
     subhead(ui, "THE MODEL WINDOW & MAP LAYER");
@@ -994,7 +901,476 @@ fn model_data(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Satellite
+// 5. WRF & simulated radar
+
+fn wrf(ui: &mut egui::Ui) {
+    ui.heading("WRF & simulated radar");
+    para(
+        ui,
+        "Windows \u{25be} \u{25b8} WRF is the first-class workspace for local raw WRF: \
+         quick import, the wrf-rust diagnostic suite, GDEX climate archives, simulated radar, \
+         and a handoff to Formula Lab. It shares one backend and selected run with Models, so \
+         stored output appears in Models without a second import.",
+    );
+
+    subhead(ui, "CHOOSE THE RIGHT WORKFLOW");
+    action(
+        ui,
+        "Open WRF / NetCDF",
+        "— the lighter store import. Use it for common 2-D surface fields and the isobaric \
+         temperature/dewpoint/wind/height volumes that drive soundings. It accepts raw wrfout, \
+         post-processed climate wrfout, and compatible NetCDF.",
+    );
+    action(
+        ui,
+        "WRF full diagnostics",
+        "— the comprehensive wrf-rust route for CAPE/CIN, shear, SRH, STP/SCP/EHI, \
+         LCL/LFC/EL, precipitation, radiation, soil and other diagnostics. This can take \
+         minutes and several GiB per file on a large convection-resolving grid.",
+    );
+    action(
+        ui,
+        "WRF simulated radar",
+        "— samples hydrometeors, winds and terrain into native polar radar volumes. Use it \
+         when the desired output is a radar loop, not a model-store field.",
+    );
+    action(
+        ui,
+        "Formula Lab",
+        "— builds a custom bounded diagnostic from the selected stored run or from one raw \
+         WRF file. Grid-aware calculus requires the raw-WRF source.",
+    );
+    action(
+        ui,
+        "Browse GDEX catalog\u{2026}",
+        "— downloads a whole file or an NCSS subset from NSF NCAR GDEX, including CONUS II \
+         regional climate WRF, then imports it through the same local model-store path.",
+    );
+
+    subhead(ui, "FILES, FOLDERS & PROCESSING");
+    para(
+        ui,
+        "File pickers are deliberately unfiltered: ordinary extensionless wrfout_* names from \
+         every domain are valid. Multi-select handles one to hundreds of files; a folder scan \
+         finds supported files and sorts them before work begins. Each WRF time becomes a \
+         store timestep for import, or a radar-loop frame for simulated radar.",
+    );
+    action(
+        ui,
+        "Core surface fields + sounding",
+        "— T2/Td2/RH, 10 m winds, pressure, PWAT, composite reflectivity, UH, precipitation, \
+         terrain, and isobaric sounding volumes.",
+    );
+    action(
+        ui,
+        "Severe / thermo diagnostics",
+        "— the normal 2-D getvar suite: CAPE/CIN, helicity, shear, composite indices and \
+         parcel levels.",
+    );
+    action(
+        ui,
+        "Heavy eCAPE (slow)",
+        "— entrainment-CAPE families and eCAPE composites. It is intentionally off by \
+         default because it materially raises processing cost.",
+    );
+    action(
+        ui,
+        "Raw model extras",
+        "— selected native fields such as PBL height, surface fluxes, radiation, skin/sea \
+         temperature, snow and graupel.",
+    );
+    para(
+        ui,
+        "Only is an allow-list and Skip is applied afterward as a deny-list. The live preview \
+         shows the store fields the current group/filter selection plans to write. Large grids \
+         receive an explicit memory/time warning before either import route begins; narrowing \
+         the field plan does not make a giant 3-D sounding interpolation free.",
+    );
+    para(
+        ui,
+        "Imported raw names receive readable labels and Solarpower07 model palettes where a \
+         matching style exists. Automatically plot new imports can write every field/hour to \
+         the screenshots folder; it is independent from the simulated-radar path.",
+    );
+
+    subhead(ui, "SIMULATED RADAR: BUILD, REFRESH & EXPORT");
+    para(
+        ui,
+        "Pick one or more raw WRF files, or a folder. Every selected forecast time becomes a \
+         frame in one radar loop; nothing is written to the model store. Completed elevations, \
+         radials, gates and moments enter the ordinary radar viewer, so tilts, readouts, \
+         cross-sections, derived products and velocity tools work through the same path as an \
+         observed Level-II volume.",
+    );
+    action(
+        ui,
+        "Build from files\u{2026} / Build from folder\u{2026}",
+        "— captures an ordered source set and runs the current recipe plus advanced controls.",
+    );
+    action(
+        ui,
+        "Refresh current frame(s)",
+        "— rebuilds that same remembered source set with the controls exactly as they are now. \
+         It does not reopen a picker, rescan the folder, or silently add new files. The source \
+         snapshot lasts for this app session and the completed refresh replaces the current \
+         simulated-radar loop.",
+    );
+    action(
+        ui,
+        "Export latest as CfRadial\u{2026}",
+        "— writes the newest generated volume with moments, ray timing, instrument settings, \
+         calibration, model/microphysics identity, and forward-operator provenance.",
+    );
+
+    subhead(ui, "START WITH A COMPLETE RECIPE");
+    action(
+        ui,
+        "Storm view (fast)",
+        "— sharp textured REF and clean unfolded VEL for browsing a run; no simulated \
+         hardware effects.",
+    );
+    action(
+        ui,
+        "Clean model truth",
+        "— artifact-free model REF/VEL: no texture, noise, folding, blockage or scan-time \
+         effects.",
+    );
+    action(
+        ui,
+        "Clean dual-pol",
+        "— polarimetric microphysics and propagation without noise, velocity folding or \
+         terrain blockage.",
+    );
+    action(
+        ui,
+        "Real radar (balanced) — recommended",
+        "— practical virtual S-band measurement with 9-point beam integration, fall speed, \
+         terrain blockage, dual-pol propagation, sensitivity, timed rays and folded velocity.",
+    );
+    action(
+        ui,
+        "Maximum fidelity (slow)",
+        "— the full 27-point pulse-volume rule for one frame or a short loop. Source-model \
+         resolution still limits the real information content.",
+    );
+    para(
+        ui,
+        "Choosing a recipe resets every interacting physics, presentation, instrument and \
+         calibration control to a compatible set while preserving antenna placement, range \
+         and gate geometry. A later expert edit is labeled Custom tuning.",
+    );
+
+    subhead(ui, "WHAT THE MOMENTS MEAN");
+    action(
+        ui,
+        "REF / REFC",
+        "— observed horizontal reflectivity after propagation loss / intrinsic corrected \
+         horizontal reflectivity before that loss.",
+    );
+    action(
+        ui,
+        "VEL / SW",
+        "— scatterer-weighted radial velocity / spectrum width from pulse-volume variance, \
+         terminal-speed diversity, optional model turbulence and the instrument floor.",
+    );
+    action(
+        ui,
+        "ZDR / ZDRC",
+        "— observed / intrinsic differential reflectivity; the observed field includes the \
+         configured ZDR bias and integrated differential attenuation.",
+    );
+    action(
+        ui,
+        "CC (rhoHV)",
+        "— copolar correlation from the bulk species mixture, not an independently invented \
+         display texture.",
+    );
+    action(
+        ui,
+        "KDP / PHI",
+        "— specific differential phase / accumulated two-way differential phase, including \
+         the configured system phase.",
+    );
+    action(
+        ui,
+        "AH / ADP, PIA / PIDA",
+        "— specific horizontal/differential attenuation and their two-way radial integrals.",
+    );
+
+    subhead(ui, "FORWARD-OPERATOR SCIENCE");
+    para(
+        ui,
+        "The scientific default interpolates and integrates linear equivalent reflectivity \
+         Z = 10^(dBZ/10), then converts the received-power average back to dBZ. Legacy direct-dBZ \
+         interpolation remains only to reproduce older renders. Pulse-volume choices are one \
+         center sample, nine deterministic Gaussian-weighted samples, or a 3 \u{00d7} 3 \u{00d7} 3 \
+         reference quadrature.",
+    );
+    para(
+        ui,
+        "The multi-sample operator accumulates linear Z, Z-weighted radial velocity and \
+         variance, polarimetric covariance, and terrain occultation. Terminal fall speed can \
+         make Doppler follow the scattering particles rather than air alone. Cumulative \
+         4/3-Earth terrain horizons remove blocked quadrature power instead of renormalizing it, \
+         so partial beam blockage remains visible.",
+    );
+    para(
+        ui,
+        "Dual-pol is a scheme-aware bulk S-band Rayleigh operator. It closes available mass \
+         mixing ratios and number concentrations into particle-size distributions, adds species \
+         in linear scattering space, and then applies near-to-far phase and attenuation. Common \
+         Lin/WSM/WDM, Thompson, Morrison, Milbrandt-Yau and NSSL bulk schemes are recognized; \
+         the result records whether closure was full two-moment, partial, or assumption-heavy.",
+    );
+    cite(
+        ui,
+        "Implementation lineage: Jung et al. (2008, 2010) bulk polarimetric forward operators; \
+         Brandes et al. rain-drop axis-ratio relation; 4/3-Earth beam geometry from Doviak & Zrni\u{107}.",
+    );
+
+    subhead(ui, "GEOMETRY, INSTRUMENT & PRESENTATION");
+    para(
+        ui,
+        "The virtual antenna can sit at domain center, an explicit latitude/longitude, or a \
+         catalog NEXRAD site; its altitude follows model terrain plus the tower height. Default \
+         geometry is 230 km at 250 m gates on the standard 14-tilt ladder, with an optional \
+         0.1\u{00b0} cut. Range can reach 1000 km, and gate spacing can follow WRF DX so a coarse \
+         grid is not oversampled into many identical gates.",
+    );
+    para(
+        ui,
+        "Timed rays receive real acquisition offsets from rotation rate and inter-sweep delay, \
+         but sample one WRF model instant. Sensitivity can rise with range, and velocity may be \
+         folded into a chosen Nyquist interval for dealiasing practice. Reflectivity texture, \
+         velocity wobble and ground clutter are deterministic presentation/instrument effects; \
+         they are not additional model-resolved weather.",
+    );
+
+    subhead(ui, "HONEST LIMITS");
+    para(
+        ui,
+        "This is not a T-matrix solver. Frozen-particle orientation, non-Rayleigh resonance, a \
+         complete melting-layer scattering treatment, and scheme-native P3 properties are not \
+         present. P3, ISHMAEL, incomplete hydrometeor inputs, or unsupported closures fall back \
+         explicitly to scalar REF/VEL with a note rather than fabricating dual-pol fields.",
+    );
+    para(
+        ui,
+        "Timed scans do not interpolate the atmosphere between forecast files and do not claim \
+         to reproduce a numbered operational VCP. A fine radar gate cannot recover structure \
+         absent from the WRF grid. The pinned NetCDF writer also cannot yet emit strict character \
+         variables for CfRadial sweep_mode/prt_mode, so BowEcho does not fake numeric substitutes.",
+    );
+    cite(ui, "Deeper reference: docs/wrf-simulated-radar.md.");
+}
+
+// ---------------------------------------------------------------------------
+// 6. Formula Lab
+
+fn formula_lab(ui: &mut egui::Ui) {
+    ui.heading("Formula Lab");
+    para(
+        ui,
+        "Windows \u{25be} \u{25b8} Formula Lab opens a dockable, first-class workspace for \
+         deterministic custom model diagnostics. It evaluates a bounded, unit-aware expression \
+         language through the pinned wrf-formula engine; it is not arbitrary Rust, Python, shell \
+         code, or a plugin runner.",
+    );
+
+    subhead(ui, "NORMAL WORKFLOW");
+    action(
+        ui,
+        "1. Choose the source",
+        "— Stored model follows the current Models run/time. Raw WRF uses a chosen readable \
+         wrfout file and time index.",
+    );
+    action(
+        ui,
+        "2. Insert exact fields",
+        "— use an enabled Quick start or click a searchable field-browser row. Do not assume \
+         that two models use the same token or that a display-only synthesized layer exists in \
+         the underlying store.",
+    );
+    action(
+        ui,
+        "3. Compile the equation",
+        "— Syntax valid proves that the bounded language parsed and planned the expression. It \
+         does not prove that this dataset contains compatible fields.",
+    );
+    action(
+        ui,
+        "4. Read source readiness",
+        "— Ready for selected source additionally checks known fields, dimensions, units, \
+         pressure axes, required geometry, cadence and time availability. Raw WRF performs final \
+         file-specific resolution when evaluation starts.",
+    );
+    action(
+        ui,
+        "5. Evaluate and display",
+        "— work runs in the background. The result enters Models and can be added to the radar \
+         map, opened in the native plot/PNG workflow, or styled with a model color table.",
+    );
+
+    subhead(ui, "LANGUAGE");
+    para(
+        ui,
+        "A program contains zero or more newline- or semicolon-delimited assignments and one \
+         final expression. There is no implicit multiplication. ^ binds more tightly than unary \
+         minus, so -2^2 means -(2^2). Chained comparisons are rejected; combine comparisons with \
+         and/or instead. Scalars broadcast to fields, but two fields must have compatible labeled \
+         shapes and grid locations.",
+    );
+    para(
+        ui,
+        "Arithmetic and comparisons use +, -, *, /, ^, ==, !=, <, <=, > and >=. Boolean \
+         operators are and, or and not. Constants include pi, e, true and false. The function \
+         families include where/min/max/clamp; common math and trigonometry; quantity/convert; \
+         explicit dBZ conversion; vector construction; horizontal and vertical calculus; and dt.",
+    );
+
+    subhead(ui, "WORKED EXAMPLES");
+    formula_example(ui, "Stored HRRR/GFS/WRF wind:", GUIDE_FORMULA_EXAMPLES[0]);
+    formula_example(ui, "Stored dewpoint depression:", GUIDE_FORMULA_EXAMPLES[1]);
+    formula_example(ui, "Stored 3-km temperature:", GUIDE_FORMULA_EXAMPLES[2]);
+    formula_example(ui, "Raw WRF divergence:", GUIDE_FORMULA_EXAMPLES[3]);
+    formula_example(ui, "Raw WRF vertical vorticity:", GUIDE_FORMULA_EXAMPLES[4]);
+    formula_example(ui, "Raw WRF 3-km temperature:", GUIDE_FORMULA_EXAMPLES[5]);
+    formula_example(
+        ui,
+        "Raw WRF temperature tendency:",
+        GUIDE_FORMULA_EXAMPLES[6],
+    );
+    formula_example(
+        ui,
+        "Linear-Z reflectivity experiment:",
+        GUIDE_FORMULA_EXAMPLES[7],
+    );
+    para(
+        ui,
+        "Examples are capability demonstrations, not promises that every run contains those \
+         tokens. HRRR commonly supplies composite reflectivity; GFS normally does not. The \
+         stored quick starts adapt to the exact selected inventory. A stored height_iso field \
+         labeled gpm may require accepting the offered conservative gpm \u{2192} m interpretation \
+         before the explicit-height example becomes Ready.",
+    );
+
+    subhead(ui, "UNITS ARE PART OF THE EQUATION");
+    para(
+        ui,
+        "Inputs are normalized to coherent SI. Addition, comparison and where branches require \
+         compatible dimensions. Absolute temperature and temperature differences have different \
+         arithmetic rules. quantity(value, \"unit\") creates a physical scalar and convert(value, \
+         \"unit\") requests explicit output units.",
+    );
+    para(
+        ui,
+        "dBZ is logarithmic: multiplication, division, powers and derivatives require an \
+         explicit dbz_to_z conversion to linear reflectivity and z_to_dbz to return. Expected \
+         output units in recipe metadata are validated rather than used as an unchecked label.",
+    );
+    para(
+        ui,
+        "A raw-field unit override is a scientific assertion, not a converter. BowEcho offers \
+         only conservative equivalent-label suggestions such as gpm \u{2192} m or fraction \
+         \u{2192} 1. A scale-changing case such as kPa versus Pa receives no automatic relabeling; \
+         fix the data or write an explicit conversion. Remove a stale override once the store \
+         itself carries recognized units.",
+    );
+
+    subhead(ui, "STORED MODEL VS RAW WRF");
+    action(
+        ui,
+        "Stored model",
+        "— model-slug-neutral pointwise 2-D algebra over the fields actually present in HRRR, \
+         GFS, RAP, NAM, RRFS, NBM or imported WRF stores. Pressure-volume fields can use \
+         mean_z/integrate_z/interpolate_z when an explicit compatible height field is supplied. \
+         dt works only on a complete, distinct, increasing, host-verified time axis.",
+    );
+    action(
+        ui,
+        "Raw WRF",
+        "— supplies DX/DY, MAPFAC_M, physical height, projected vector basis and native time \
+         information. This unlocks ddx, ddy, grad, div, curl, laplacian, default-height ddz and \
+         full explicit-height vertical operators.",
+    );
+    para(
+        ui,
+        "rw-store does not persist horizontal spacing/map factors, a default 3-D physical-height \
+         coordinate, or vector-basis metadata. Formula Lab therefore blocks horizontal calculus \
+         for stored runs instead of inventing geometry. Its exact stored inventory is authoritative; \
+         the Raw WRF browser is a useful common-field list, while the file resolver remains the \
+         authority for dimensions and availability.",
+    );
+
+    subhead(ui, "DIMENSIONS, VERTICALS & TIME");
+    para(
+        ui,
+        "A display result must resolve to a 2-D [Y, X] field. A bare pressure/native 3-D input \
+         is blocked until mean_z, integrate_z or interpolate_z reduces it. Stored pressure inputs \
+         must share an identical pressure axis. Vertical bounds are never silently clipped.",
+    );
+    para(
+        ui,
+        "WRF ddx/ddy are mass-point differences scaled by MAPFAC_M / DX or DY; on 3-D fields \
+         they follow terrain model levels, not constant geometric height. Two-dimensional \
+         divergence and curl use conformal metric forms, and laplacian is the conformal 2-D \
+         surface Laplace-Beltrami operator. Three-dimensional grad/div/curl/laplacian remain \
+         rejected because the full terrain-coordinate metric terms are not implemented.",
+    );
+    para(
+        ui,
+        "dt uses the actual nonuniform time coordinate and a three-time Lagrange stencil where \
+         available. Endpoints depend on the chosen boundary policy. Nested dt is rejected, and \
+         moving nests or changing grids require explicit remapping rather than fixed-index time \
+         differencing.",
+    );
+
+    subhead(ui, "POLICIES, RECIPES & RESOURCE LIMITS");
+    para(
+        ui,
+        "Evaluation options choose boundary behavior (one-sided second order, missing, or error), \
+         missing-value behavior, and non-finite behavior. Ignore in reductions applies only to \
+         reductions; it is not a general license to erase bad data. The standard desktop profile \
+         is bounded; the explicit Large research profile raises the documented memory/work meter \
+         but does not remove immutable host ceilings.",
+    );
+    para(
+        ui,
+        "Open recipe\u{2026} and Save recipe\u{2026} use the portable wrf-formula/v1 JSON schema. \
+         Recipes can carry parameters, expected units, authors, references, tags, required fields, \
+         cadence/spacing/vertical-level requirements and stricter resource ceilings. Untrusted \
+         recipe input is size-bounded and compile-validated before it becomes active.",
+    );
+
+    subhead(ui, "SAFETY, PROVENANCE & OUTPUT");
+    para(
+        ui,
+        "The language has no filesystem, network, shell, imports, loops, recursion, arbitrary \
+         code execution or unreviewed global solvers. Source, tokens, AST, dependencies, output \
+         elements, memory and operations are metered.",
+    );
+    para(
+        ui,
+        "Last result provenance records the engine version, source fingerprint, valid time, \
+         input identity, recipe/version, and every requested \u{2192} resolved field with shape \
+         and effective units. Warnings remain attached to the result card. If the selected source, \
+         file revision, equation, options, parameters or output changes during background work, \
+         the stale result is discarded instead of being displayed.",
+    );
+    para(
+        ui,
+        "A new result receives a finite-range color scale unless an exact saved output-name \
+         binding supplies a user color table. Formula output can then use the same Models viewer, \
+         map layer, native plot, Save PNG and color-table tools as an ingested field.",
+    );
+    cite(
+        ui,
+        "Detailed reference: docs/formula-lab.md; engine contract: wrf-formula/v1.",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Satellite
 
 fn satellite(ui: &mut egui::Ui) {
     ui.heading("Satellite");
@@ -1130,50 +1506,6 @@ fn satellite(ui: &mut egui::Ui) {
          refresh control re-scans the store for frames written since.",
     );
 
-    subhead(ui, "SIMULATED SATELLITE");
-    para(
-        ui,
-        "Windows ▾ ▸ SimSat opens the embedded SimSat v0.1.6 renderer. It produces \
-         physically based visible, GeoColor, sandwich, thermal-IR, water-vapor, and derived \
-         products from a local WRF file or sequence, a previously cached HRRR native-level \
-         file, or an HRRR native-level download requested in the pane. SimSat needs the HRRR \
-         wrfnat cloud volume; the Model downloader's smaller pressure + surface pair cannot \
-         reconstruct it. Downloaded wrfnat inputs are retained in the SimSat input cache for \
-         later runs.",
-    );
-    para(
-        ui,
-        "The normal Render action uses SimSat's CPU quality path. A single source produces one \
-         stored frame; a folder or multi-time source renders the sequence and groups its frames \
-         into one loop. Completed output enters the same local satellite store as real imagery, \
-         is available in the frame player and Native plot, and can follow onto the radar map. \
-         GPU preview is an optional faster action: it reports any temporary compatibility \
-         substitutions, does not change the saved controls, is never written to the satellite \
-         store, and is never used for a stored loop. Use normal Render for a frame that should \
-         persist or join a loop.",
-    );
-    para(
-        ui,
-        "Atmosphere controls include aerosol optical depth, relative-humidity aerosol swelling, \
-         daytime aerial-veil correction, and terrain-height atmospheric columns. Cloud controls \
-         include model fractional-cloud coverage, the visible cloud optical-depth scale (the \
-         shipped calibration is 0.15), and exposed-domain edge feathering. Fractional clouds use \
-         WRF CLDFRA or HRRR's native 50-level cloud-fraction field when available; the legacy-off \
-         choice fills every non-zero cloudy cell. Edge feathering is on by default and only fades \
-         finished visible clouds where the finite model boundary is exposed. Top-down stratiform \
-         reconstruction is experimental and off by default; it can reduce native-grid rings in \
-         broad low liquid decks, but does not affect geostationary, raw-band, thermal, or derived \
-         products. Exposure, land-visibility calibration, cloud transport, granulation, and the \
-         explicitly labeled what-if sun override remain independently controllable.",
-    );
-    para(
-        ui,
-        "SimSat v0.1.6 uses SSB cache format v5 for corrected cloud-fraction provenance. An old \
-         v0.1.2 brick cache must be ingested once again from its original WRF or HRRR source; a \
-         cached-only brick without that source cannot be upgraded. Re-ingesting the retained raw \
-         HRRR wrfnat input does not require downloading it again.",
-    );
-
     subhead(ui, "NATIVE PLOTS & EXPORT");
     para(
         ui,
@@ -1214,7 +1546,246 @@ fn satellite(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Archive & events
+// 8. SimSat
+
+fn simsat(ui: &mut egui::Ui) {
+    ui.heading("SimSat");
+    para(
+        ui,
+        "Windows \u{25be} \u{25b8} SimSat opens the embedded SimSat v0.1.6 renderer. It turns \
+         WRF or HRRR native-level model atmospheres into physically based visible, thermal, \
+         water-vapor and derived satellite products. Durable CPU renders enter BowEcho's normal \
+         Satellite player; a separate one-frame GPU preview is available for visual iteration.",
+    );
+
+    subhead(ui, "QUICK WORKFLOW");
+    action(
+        ui,
+        "1. Source",
+        "— choose Local WRF / GRIB, Downloaded HRRR, or Download HRRR. Local accepts one file, \
+         a multi-time file, a SimSat run.json, or a folder sequence.",
+    );
+    action(
+        ui,
+        "2. Product and view",
+        "— choose the product, geostationary or top-down geometry, satellite viewpoint, and \
+         Model native / ABI 1 km / ABI 2 km resolution.",
+    );
+    action(
+        ui,
+        "3. Render controls",
+        "— choose Final (384 steps) or Preview (192 steps), earth margin, and the visible-family \
+         atmosphere/cloud/lighting controls when applicable.",
+    );
+    action(
+        ui,
+        "4. Render to Satellite",
+        "— runs the full CPU path, writes every successful frame to the satellite store, opens \
+         the shared player, and groups a sequence by source run instead of making one run per \
+         forecast time.",
+    );
+    action(
+        ui,
+        "5. Inspect or export",
+        "— use the Satellite player/map layer, or Open native plot for the projected plotting \
+         surface and Save PNG.",
+    );
+
+    subhead(ui, "INPUTS");
+    action(
+        ui,
+        "Local WRF / GRIB",
+        "— ordinary extensionless wrfout files from any domain are accepted; no filename \
+         pattern or extension is required. Folders are probed and sorted by valid time.",
+    );
+    action(
+        ui,
+        "Downloaded HRRR",
+        "— reuses a previously retained HRRR native-level file from SimSat's input directory \
+         or BowEcho's model cache.",
+    );
+    action(
+        ui,
+        "Download HRRR",
+        "— selects date, cycle and forecast hour, downloads the NOAA wrfnat product with \
+         resumable cache reuse, then renders it.",
+    );
+    para(
+        ui,
+        "HRRR must be the full native-level wrfnat product because SimSat needs its vertical \
+         cloud, moisture and thermodynamic structure. BowEcho's smaller pressure + surface \
+         model download cannot reconstruct that volume. Retained wrfnat files remain reusable \
+         without another download.",
+    );
+
+    subhead(ui, "PRODUCTS");
+    action(
+        ui,
+        "Visible true color",
+        "— physically lit RGB with atmosphere, volumetric clouds, seasonal ground, terrain \
+         shadows and water glint.",
+    );
+    action(
+        ui,
+        "GeoColor day / night",
+        "— true color by day, band-13 IR at night, blended across the modeled terminator.",
+    );
+    action(
+        ui,
+        "Sandwich",
+        "— visible texture plus enhanced cold cloud tops for daytime convection.",
+    );
+    action(
+        ui,
+        "IR 10.3 \u{00b5}m / WV 6.2, 6.9, 7.3 \u{00b5}m",
+        "— true-Kelvin brightness-temperature fields for clean-window cloud tops and \
+         upper/mid/lower-tropospheric water vapor.",
+    );
+    action(
+        ui,
+        "Precipitable water / Cloud-top temperature / Cloud optical depth",
+        "— raw map-registered scalar fields in mm, K and dimensionless optical depth with \
+         fixed physical palettes across frames.",
+    );
+
+    subhead(ui, "VIEW & RESOLUTION");
+    para(
+        ui,
+        "Geostationary uses the GOES-East, GOES-West or Himawari fixed-grid viewpoint and keeps \
+         an optional earth margin around the finite model domain. Top-down is north/map-registered \
+         to the source projection and ignores satellite choice. Model native keeps one output \
+         pixel per source cell; ABI 1 km / 2 km use physical spacing in top-down view and scan \
+         pitch in geostationary view while preserving aspect ratio at the output cap.",
+    );
+
+    subhead(ui, "CPU OUTPUT VS GPU PREVIEW");
+    action(
+        ui,
+        "Render to Satellite",
+        "— the tested CPU quality path for every product and every stored frame/loop. A first \
+         use ingests a reusable volume brick; a full HRRR native file can briefly require more \
+         than 2 GiB of memory.",
+    );
+    action(
+        ui,
+        "GPU preview",
+        "— a temporary visible-true-color first frame opened only in Native plot. It reports \
+         every compatibility substitution, never changes saved controls, never enters the \
+         satellite store, and never silently falls back to a stored CPU frame.",
+    );
+    para(
+        ui,
+        "Cancel after current frame stops a sequence at the next safe boundary; an active render \
+         finishes its current frame, and a resumable HRRR download may stop between chunks. \
+         Successful frames already written remain available.",
+    );
+
+    subhead(ui, "ATMOSPHERE & CLOUD CONTROLS");
+    action(
+        ui,
+        "Aerosol optical depth",
+        "— visible AOD at 550 nm. Zero removes aerosol extinction while retaining molecular \
+         Rayleigh scattering; RH aerosol swelling applies the documented humid-growth factor.",
+    );
+    action(
+        ui,
+        "Aerial veil / terrain atmosphere",
+        "— controls finished daytime path airlight and shortens view/sunlight columns to model \
+         terrain height. Terrain-height atmosphere is the physical shipped path.",
+    );
+    action(
+        ui,
+        "Use model cloud fraction",
+        "— consumes WRF CLDFRA or HRRR's native 50-level cloud-fraction field when trustworthy; \
+         missing coverage falls back conservatively. Turning it off restores horizontally full \
+         cloudy cells wherever condensate is nonzero.",
+    );
+    action(
+        ui,
+        "Cloud optical-depth scale",
+        "— visible-cloud sensitivity. The shipped cross-file visual calibration is 0.15; 1.00 \
+         is unscaled model extinction. It does not modify thermal output or the quantitative \
+         cloud-optical-depth product.",
+    );
+    action(
+        ui,
+        "Cloud transport",
+        "— Legacy octaves is the shipped bright-anvil path; Single scatter is a dim diagnostic; \
+         delta-flux v1/v2 are explicitly experimental, CPU-only research closures.",
+    );
+    action(
+        ui,
+        "Edge feather / granulation",
+        "— exposed-edge feathering fades only finished visible clouds where the camera reveals \
+         the finite model boundary. Granulation is subtract-only experimental appearance detail \
+         and cannot create scientifically resolved structure.",
+    );
+    action(
+        ui,
+        "Top-down stratiform reconstruction",
+        "— optional, experimental and off by default. It can reduce source-grid rings in broad \
+         low liquid decks while conserving selected-area optical depth; geostationary, raw-band, \
+         thermal and derived products ignore it.",
+    );
+    action(
+        ui,
+        "Override sun (what-if)",
+        "— replaces the valid-time sun with a selected elevation/azimuth. The UI labels this \
+         non-physical visualization override so it cannot be mistaken for model time.",
+    );
+
+    subhead(ui, "GROUND & DISPLAY");
+    para(
+        ui,
+        "Seasonal NASA Blue Marble Next Generation imagery supplies the ground, with missing \
+         2 km months downloaded lazily and hash-verified. Auto blends by valid date; forcing a \
+         month is a what-if surface. Exposure, ground lift, highlight compression and land \
+         visibility controls affect finished visible-family RGB only, not raw visible bands, \
+         IR, water vapor or derived scalar fields.",
+    );
+
+    subhead(ui, "CACHE, LOOPS & OUTPUT");
+    para(
+        ui,
+        "SimSat v0.1.6 uses SSB cache format v5 for corrected cloud-fraction provenance. Older \
+         bricks must be ingested once again from their original WRF/HRRR source; a cached-only \
+         brick cannot be upgraded without that source. A retained wrfnat source re-ingests \
+         without downloading again.",
+    );
+    para(
+        ui,
+        "CPU frames share the real-satellite store and player. Equal source run, product, view \
+         and UTC-day values join one loop. Map follows player and Show on radar map work normally. \
+         Native plots keep Kelvin or derived scalar values and physical colorbars; RGB products \
+         omit a false scalar legend.",
+    );
+
+    subhead(ui, "HONEST SCIENCE BOUNDARIES");
+    para(
+        ui,
+        "Clouds and weather exist only inside the model domain; margin shows real ground under \
+         clear sky, not extrapolated weather. Geometry uses WRF's spherical Earth and aims for \
+         physical plausibility rather than pixel-for-pixel ABI registration. A coarse model \
+         cannot provide cloud-edge structure below its grid scale.",
+    );
+    para(
+        ui,
+        "Visible rendering uses a physically based clear-sky/cloud approximation, not a full \
+         atmospheric chemistry model. IR and water-vapor products use documented gray, \
+         band-averaged absorption rather than line-by-line radiative transfer. GeoColor night \
+         is the IR composite and has no city-lights layer. Experimental granulation, delta-flux \
+         transport, stratiform reconstruction and sun override remain opt-in and labeled.",
+    );
+    cite(
+        ui,
+        "Implementation references include Hillaire sky atmosphere, Frostbite/Nubis cloud \
+         rendering, Wrenninge multi-scatter, Cox-Munk water glint, and NASA Blue Marble. \
+         Detailed workflow: docs/simsat-guide.md.",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Archive & events
 
 fn archive(ui: &mut egui::Ui) {
     ui.heading("Archive & events");
@@ -1326,7 +1897,7 @@ fn archive(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Unified Player
+// 10. Unified Player
 
 fn unified_player(ui: &mut egui::Ui) {
     ui.heading("Unified Player");
@@ -1403,7 +1974,7 @@ fn unified_player(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Tools & inspector
+// 11. Tools & inspector
 
 fn tools(ui: &mut egui::Ui) {
     ui.heading("Tools & inspector");
@@ -1518,7 +2089,7 @@ fn tools(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. 3D Volume
+// 12. 3D Volume
 
 fn volume_3d(ui: &mut egui::Ui) {
     ui.heading("3D Volume");
@@ -1567,7 +2138,7 @@ fn volume_3d(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Capture & brand
+// 13. Capture & brand
 
 fn capture_brand(ui: &mut egui::Ui) {
     ui.heading("Capture & brand");
@@ -1614,7 +2185,7 @@ fn capture_brand(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Keyboard shortcuts
+// 14. Keyboard shortcuts
 
 fn shortcuts(ui: &mut egui::Ui) {
     ui.heading("Keyboard shortcuts");
@@ -1714,7 +2285,7 @@ fn shortcuts(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 11. Data sources & credits
+// 15. Data sources & credits
 
 fn sources(ui: &mut egui::Ui) {
     ui.heading("Data sources & credits");
@@ -1774,6 +2345,14 @@ fn sources(ui: &mut egui::Ui) {
          imagery is rendered by FahrenheitResearch/simsat (MIT OR Apache-2.0) from WRF or \
          HRRR native-level fields; its seasonal ground layer uses NASA Blue Marble Next \
          Generation imagery.",
+    );
+    para(
+        ui,
+        "Raw WRF diagnostics and native-field resolution use FahrenheitResearch/wrf-rust \
+         (wrf-core). Formula Lab's bounded language and raw-WRF evaluator are wrf-formula; \
+         rusty-weather's rw-formula supplies the deliberately narrower, store-backed adapter. \
+         BowEcho's simulated-radar operator records its own versioned scattering/configuration \
+         provenance in generated volumes and CfRadial output.",
     );
 
     para(
@@ -1853,6 +2432,12 @@ fn sources(ui: &mut egui::Ui) {
          Mitchell et al. 1998, Wea. Forecasting 13, 352\u{2013}366 — TVS detection.",
         "Doviak & Zrni\u{107} 1993: Doppler Radar and Weather Observations — 4/3-Earth beam \
          height (eq. 2.28b).",
+        "Jung et al. 2008 and 2010 — bulk polarimetric radar forward-operator lineage; \
+         Brandes et al. — equilibrium rain-drop axis-ratio relation used by the current \
+         bulk S-band Rayleigh kernel.",
+        "Hillaire 2020 sky atmosphere; Hillaire/Frostbite and Schneider/Nubis cloud \
+         rendering; Wrenninge multi-scatter; Cox & Munk 1954 water-glint distribution — \
+         physical-rendering lineage used by SimSat.",
         "Thyng et al. 2016 (cmocean) and Kovesi 2015 — the CVD-safe Balance VEL palette.",
     ] {
         cite(ui, citation);
@@ -1861,7 +2446,8 @@ fn sources(ui: &mut egui::Ui) {
     ui.add_space(4.0);
     para(
         ui,
-        "Deeper write-ups live in the repo: docs/products-guide.md and \
+        "Deeper write-ups live in the repo: docs/products-guide.md, docs/formula-lab.md, \
+         docs/wrf-simulated-radar.md, docs/simsat-guide.md, and \
          docs/hail-wind-algo-spec.md.",
     );
 }
@@ -1872,14 +2458,20 @@ mod tests {
 
     #[test]
     fn guide_copy_mentions_current_navigation_and_repro_surfaces() {
-        assert_eq!(GuideSection::ALL.len(), 12);
+        assert_eq!(GuideSection::ALL.len(), 15);
         assert_eq!(GuideSection::Layers.label(), "Map & layers");
+        assert_eq!(GuideSection::ModelData.label(), "Models & soundings");
+        assert_eq!(GuideSection::Wrf.label(), "WRF & simulated radar");
+        assert_eq!(GuideSection::FormulaLab.label(), "Formula Lab");
+        assert_eq!(GuideSection::SimSat.label(), "SimSat");
         assert_eq!(GuideSection::Player.label(), "Unified Player");
         assert_eq!(GuideSection::Volume3d.label(), "3D Volume");
         assert_eq!(GuideSection::CaptureBrand.label(), "Capture & brand");
         assert!(GUIDE_TOP_BAR_TEXT.contains("Map Only"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Workflows"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Radar overlays"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("Formula Lab"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("SimSat"));
         // The consolidated source/timeline front stays documented with its
         // sync default and full-player path.
         assert!(GUIDE_TOP_BAR_TEXT.contains("LIVE plus one Timeline"));
@@ -1910,6 +2502,53 @@ mod tests {
             .into_iter()
             .collect();
         assert!(!guide_src.contains(&stale_link));
+    }
+
+    #[test]
+    fn guide_formula_examples_compile_against_the_pinned_engine() {
+        for example in GUIDE_FORMULA_EXAMPLES {
+            wrf_formula::compile(example).unwrap_or_else(|error| {
+                panic!("guide formula did not compile: {example}: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn guide_documents_the_v033_science_workspaces_honestly() {
+        let guide_src = include_str!("guide.rs");
+
+        // Simulated radar includes the fast experimentation path, the full
+        // released recipe set, and the boundaries that must not be promoted
+        // into future capabilities by documentation.
+        assert!(guide_src.contains("Refresh current frame(s)"));
+        for recipe in [
+            "Storm view (fast)",
+            "Clean model truth",
+            "Clean dual-pol",
+            "Real radar (balanced)",
+            "Maximum fidelity (slow)",
+        ] {
+            assert!(guide_src.contains(recipe), "missing recipe {recipe}");
+        }
+        assert!(guide_src.contains("This is not a T-matrix solver"));
+        assert!(guide_src.contains("do not claim to reproduce a numbered operational VCP"));
+        assert!(guide_src.contains("P3, ISHMAEL"));
+
+        // Formula Lab must retain the explicit capability boundary rather
+        // than implying every stored model has raw-WRF grid geometry.
+        assert!(guide_src.contains("Syntax valid"));
+        assert!(guide_src.contains("Ready for selected source"));
+        assert!(guide_src.contains("rw-store does not persist horizontal spacing/map factors"));
+        assert!(guide_src.contains("Three-dimensional grad/div/curl/laplacian remain"));
+        assert!(guide_src.contains("source fingerprint"));
+
+        // SimSat's durable CPU path and preview-only GPU path are distinct,
+        // and HRRR's native volume requirement cannot be watered down.
+        assert!(guide_src.contains("full native-level wrfnat product"));
+        assert!(guide_src.contains("GPU preview"));
+        assert!(guide_src.contains("never enters the satellite store"));
+        assert!(guide_src.contains("SSB cache format v5"));
+        assert!(guide_src.contains("band-averaged absorption rather than line-by-line"));
     }
 
     /// International radars are not second-class: the guide's gesture and

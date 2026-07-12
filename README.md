@@ -128,6 +128,15 @@ Models viewer, radar-map layer, and native plot workflow with an automatic
 color scale spanning the finite output range; an exact saved color binding
 takes precedence when one exists.
 
+**Scientific guides:** the [Formula Lab reference](docs/formula-lab.md)
+documents syntax, units, source capabilities, numerical operators, examples,
+resource limits, and provenance. The
+[WRF simulated-radar guide](docs/wrf-simulated-radar.md) covers recipes,
+moments, refresh behavior, dual-pol physics, CfRadial output, and current
+limitations. The [SimSat guide](docs/simsat-guide.md) covers WRF/HRRR inputs,
+products, atmosphere/cloud controls, caches, plotting, and its honest
+radiative-rendering boundaries.
+
 **Storm analysis:** NSSL-style mesocyclone/TVS detection (Stumpf et al.
 1998; Mitchell et al. 1998) with time-association (CPLT → MESO), SCIT storm
 cell tracks with motion extrapolation (Johnson et al. 1998), maximum expected
