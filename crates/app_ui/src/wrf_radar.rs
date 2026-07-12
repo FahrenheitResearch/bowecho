@@ -1330,7 +1330,7 @@ pub fn build_synthetic_volume_reporting(
         pulse_width_us: Some(config.pulse_width_us),
         prt_s: (config.prf_hz.is_finite() && config.prf_hz > 0.0).then_some(1.0 / config.prf_hz),
         unambiguous_range_km: (config.prf_hz.is_finite() && config.prf_hz > 0.0)
-            .then_some(299_792.458 / (2.0 * config.prf_hz)),
+            .then_some(299_792.47 / (2.0 * config.prf_hz)),
         scan_name: Some(match config.scan_timing {
             ScanTiming::InstantaneousTruth => "BowEcho instantaneous model volume".to_string(),
             ScanTiming::TimedVolume => "BowEcho timed synthetic volume".to_string(),

@@ -3376,7 +3376,7 @@ type IntlFrameResult = std::result::Result<Option<(String, RadarVolume)>, String
 type IntlLoopFrameResult = std::result::Result<(String, RadarVolume), String>;
 enum IntlLoopFrameMessage {
     Progress(ArchiveLoadProgress),
-    Frame(IntlLoopFrameResult),
+    Frame(Box<IntlLoopFrameResult>),
 }
 type IntlCoverageProbeResult = std::result::Result<IntlCoverageProbe, String>;
 
@@ -31035,8 +31035,10 @@ impl ViewerApp {
                     Ok(IntlLoopFrameMessage::Progress(progress)) => {
                         progress_update = Some(progress);
                     }
-                    Ok(IntlLoopFrameMessage::Frame(Ok(frame))) => frames.push(frame),
-                    Ok(IntlLoopFrameMessage::Frame(Err(message))) => errors.push(message),
+                    Ok(IntlLoopFrameMessage::Frame(frame)) => match *frame {
+                        Ok(frame) => frames.push(frame),
+                        Err(message) => errors.push(message),
+                    },
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         done = true;
@@ -41849,15 +41851,15 @@ fn fetch_intl_recent_frames(
         .iter()
         .find(|provider| provider.id() == provider_id)
     else {
-        let _ = sender.send(IntlLoopFrameMessage::Frame(Err(format!(
+        let _ = sender.send(IntlLoopFrameMessage::Frame(Box::new(Err(format!(
             "unknown international provider '{provider_id}'"
-        ))));
+        )))));
         return;
     };
     let plans = match provider.recent(site_id, count) {
         Ok(plans) => plans,
         Err(err) => {
-            let _ = sender.send(IntlLoopFrameMessage::Frame(Err(err)));
+            let _ = sender.send(IntlLoopFrameMessage::Frame(Box::new(Err(err))));
             return;
         }
     };
@@ -41880,7 +41882,10 @@ fn fetch_intl_recent_frames(
             return;
         }
         let message = fetch_assemble_intl_plan(&plan, site_id);
-        if sender.send(IntlLoopFrameMessage::Frame(message)).is_err() {
+        if sender
+            .send(IntlLoopFrameMessage::Frame(Box::new(message)))
+            .is_err()
+        {
             return; // receiver dropped (source switched) — stop downloading
         }
         let _ = sender.send(IntlLoopFrameMessage::Progress(intl_plan_progress(
