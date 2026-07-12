@@ -37,7 +37,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, RadarSite, RadarVolume, Radial,
-    ScanMode, VcpInfo, VolumeMetadata, beam_ground_range_m, beam_height_above_radar_m,
+    ScanLegMetadata, ScanMode, VcpInfo, VolumeMetadata, beam_ground_range_m,
+    beam_height_above_radar_m,
 };
 use rayon::prelude::*;
 use wrf_core::{ComputeOpts, WrfFile, getvar};
@@ -48,9 +49,13 @@ use crate::model_layer::{
 use ui_core::geo::aeqd_inverse_km;
 
 use app_ui::vcp_catalog::{
-    BUILD_24_SOURCE, Build24Vcp, DopplerPrfValue, MomentCoverage, PhysicalScanRow, VcpDefinition,
-    Waveform, build_24_definition,
+    BUILD_24_SOURCE, Build24Vcp, DopplerPrfValue, MomentCoverage, PhysicalScanRow, PulseLength,
+    VcpDefinition, Waveform, build_24_definition,
 };
+
+/// Operational adaptations intentionally outside the checked base-pattern
+/// catalog and this synthetic renderer.
+pub const BUILD_24_NO_ADAPTATIONS_CAVEAT: &str = "Base pattern only: SAILS, MRLE, AVSET, Add-MPDA, and site-specific low-tilt adaptations are absent.";
 
 /// Default WSR-88D-like elevation ladder (deg). Covers the low tilts that
 /// dominate a plan-view display plus enough high tilts for cross-sections.
@@ -708,6 +713,39 @@ fn hash_vcp_row(row: &PhysicalScanRow, hasher: &mut impl std::hash::Hasher) {
                 rate.to_bits().hash(hasher);
             }
         }
+    }
+}
+
+fn scan_leg_metadata(leg: &SyntheticScanLeg) -> ScanLegMetadata {
+    let Some(row) = leg.source_row else {
+        return ScanLegMetadata::default();
+    };
+    let default_doppler = row.doppler_prfs.iter().find(|cell| cell.is_default);
+    ScanLegMetadata {
+        source_row_index: leg
+            .source_row_index
+            .and_then(|index| u16::try_from(index).ok()),
+        elevation_deg: Some(row.elevation_deg),
+        azimuth_rate_deg_per_second: Some(row.azimuth_rate_deg_per_second),
+        source_period_seconds: Some(row.source_period_seconds),
+        waveform: Some(row.waveform.abbreviation().to_owned()),
+        moment_coverage: Some(
+            if row.moments == MomentCoverage::SURVEILLANCE {
+                "surveillance"
+            } else if row.moments == MomentCoverage::DOPPLER {
+                "doppler"
+            } else {
+                "all"
+            }
+            .to_owned(),
+        ),
+        surveillance_prf_code: row.surveillance_prf.map(|prf| prf.code),
+        surveillance_pulse_count: row.surveillance_prf.map(|prf| prf.pulse_count),
+        doppler_prf_code: default_doppler.map(|cell| cell.code),
+        doppler_pulse_count: default_doppler.and_then(|cell| match cell.value {
+            DopplerPrfValue::PulseCount(count) => Some(count),
+            DopplerPrfValue::AzimuthRateDegPerSecond(_) => None,
+        }),
     }
 }
 
@@ -1490,6 +1528,7 @@ pub fn build_synthetic_volume_reporting(
     site.elevation_m = Some(antenna_msl as f32);
 
     let mut volume = RadarVolume::new(site, valid_time);
+    let scan_legs = config.physical_scan_legs();
     let microphysics_inventory = fields
         .polarimetric
         .as_ref()
@@ -1500,6 +1539,31 @@ pub fn build_synthetic_volume_reporting(
         volume.vcp = Some(VcpInfo {
             pattern: definition.vcp.number(),
         });
+    }
+    let mut forward_operator_config = format!(
+        "mode={:?}; reflectivity_sampling={:?}; beam_integration={:?}; \
+         fall_speed={}; terrain_blockage={}; spectrum_width={}; dual_pol={}; \
+         propagation={}; microphysics_fields={microphysics_inventory}",
+        config.simulation_mode,
+        config.reflectivity_sampling,
+        config.beam_integration,
+        config.terminal_fall_speed,
+        config.terrain_blockage,
+        config.spectrum_width,
+        config.dual_pol,
+        config.propagation,
+    );
+    if let Some(definition) = named_vcp {
+        use std::fmt::Write as _;
+        let _ = write!(
+            forward_operator_config,
+            "; scan_strategy=Build24Vcp{}; vcp_source={} rev {}; physical_rows={}; config_fingerprint={:016x}",
+            definition.vcp.number(),
+            definition.source.document_number,
+            definition.source.revision,
+            definition.rows.len(),
+            config.data_fingerprint(),
+        );
     }
     volume.metadata = VolumeMetadata {
         source_path: None,
@@ -1547,6 +1611,19 @@ pub fn build_synthetic_volume_reporting(
         } else {
             "bowecho-synthetic-14-cut".to_string()
         }),
+        vcp_source_document: named_vcp
+            .map(|definition| definition.source.document_number.to_owned()),
+        vcp_source_revision: named_vcp.map(|definition| definition.source.revision.to_owned()),
+        vcp_source_rda_build: named_vcp.map(|definition| definition.source.rda_build.to_owned()),
+        vcp_source_figure: named_vcp.map(|definition| definition.source_figure.to_owned()),
+        vcp_pulse_length: named_vcp.map(|definition| match definition.pulse_length {
+            PulseLength::Short => "short".to_owned(),
+            PulseLength::Long => "long".to_owned(),
+        }),
+        vcp_adaptations: named_vcp.map(|_| BUILD_24_NO_ADAPTATIONS_CAVEAT.to_owned()),
+        scan_legs: named_vcp
+            .map(|_| scan_legs.iter().map(scan_leg_metadata).collect())
+            .unwrap_or_default(),
         polarization: Some(if config.dual_pol && fields.polarimetric.is_some() {
             "simultaneous horizontal/vertical".to_string()
         } else {
@@ -1557,19 +1634,7 @@ pub fn build_synthetic_volume_reporting(
             config.zdr_bias_db, config.system_phidp_deg
         )),
         forward_operator: Some("BowEcho WRF polar-volume forward operator v2".to_string()),
-        forward_operator_config: Some(format!(
-            "mode={:?}; reflectivity_sampling={:?}; beam_integration={:?}; \
-             fall_speed={}; terrain_blockage={}; spectrum_width={}; dual_pol={}; \
-             propagation={}; microphysics_fields={microphysics_inventory}",
-            config.simulation_mode,
-            config.reflectivity_sampling,
-            config.beam_integration,
-            config.terminal_fall_speed,
-            config.terrain_blockage,
-            config.spectrum_width,
-            config.dual_pol,
-            config.propagation,
-        )),
+        forward_operator_config: Some(forward_operator_config),
         source_model: Some("WRF".to_string()),
         microphysics_scheme: fields
             .polarimetric
@@ -1603,7 +1668,6 @@ pub fn build_synthetic_volume_reporting(
         )
     });
 
-    let scan_legs = config.physical_scan_legs();
     let mut decoded_radials = 0usize;
     let mut cut_start_ms = 0i32;
     let tilt_total = scan_legs.len();

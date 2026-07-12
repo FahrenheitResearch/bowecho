@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentRow, MomentType, RadarSite, RadarVolume, Radial,
-    ScanMode,
+    ScanLegMetadata, ScanMode, VcpInfo,
 };
 
 use crate::dorade::canonical_moment;
@@ -114,6 +114,18 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
                 }
             })
     });
+    volume.vcp = file
+        .gattr_f64("vcp_pattern")
+        .filter(|value| value.is_finite() && value.fract() == 0.0)
+        .and_then(|value| u16::try_from(value as i64).ok())
+        .filter(|pattern| *pattern > 0)
+        .map(|pattern| VcpInfo { pattern });
+    volume.metadata.vcp_source_document = metadata_text(&file, "vcp_source_document");
+    volume.metadata.vcp_source_revision = metadata_text(&file, "vcp_source_revision");
+    volume.metadata.vcp_source_rda_build = metadata_text(&file, "vcp_source_rda_build");
+    volume.metadata.vcp_source_figure = metadata_text(&file, "vcp_source_figure");
+    volume.metadata.vcp_pulse_length = metadata_text(&file, "vcp_pulse_length");
+    volume.metadata.vcp_adaptations = metadata_text(&file, "vcp_adaptations");
     volume.metadata.polarization = metadata_text(&file, "polarization");
     volume.metadata.calibration = metadata_text(&file, "calibration");
     volume.metadata.forward_operator = metadata_text(&file, "forward_operator");
@@ -124,6 +136,24 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
 
     // Ray times (seconds offset from time_coverage_start).
     let ray_seconds = read_f64s(&file, "time").ok();
+    let source_row_indices = read_f64s(&file, "vcp_source_row_index").ok();
+    let vcp_azimuth_rates = read_f64s(&file, "vcp_azimuth_rate").ok();
+    let vcp_source_periods = read_f64s(&file, "vcp_source_period").ok();
+    let vcp_waveform_codes = read_f64s(&file, "vcp_waveform_code").ok();
+    let vcp_moment_coverage_codes = read_f64s(&file, "vcp_moment_coverage_code").ok();
+    let surveillance_prf_codes = read_f64s(&file, "vcp_surveillance_prf_code").ok();
+    let surveillance_pulse_counts = read_f64s(&file, "vcp_surveillance_pulse_count").ok();
+    let doppler_prf_codes = read_f64s(&file, "vcp_doppler_prf_code").ok();
+    let doppler_pulse_counts = read_f64s(&file, "vcp_doppler_pulse_count").ok();
+    let has_scan_leg_metadata = source_row_indices.is_some()
+        || vcp_azimuth_rates.is_some()
+        || vcp_source_periods.is_some()
+        || vcp_waveform_codes.is_some()
+        || vcp_moment_coverage_codes.is_some()
+        || surveillance_prf_codes.is_some()
+        || surveillance_pulse_counts.is_some()
+        || doppler_prf_codes.is_some()
+        || doppler_pulse_counts.is_some();
 
     // Field variables: anything shaped (time, range).
     let fields: Vec<&NcVar> = file
@@ -181,6 +211,22 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
             start_ray,
             end_ray,
             cut,
+            scan_leg: ScanLegMetadata {
+                source_row_index: numeric_u16_at(&source_row_indices, sweep),
+                elevation_deg: has_scan_leg_metadata.then_some(fixed),
+                azimuth_rate_deg_per_second: numeric_f32_at(&vcp_azimuth_rates, sweep),
+                source_period_seconds: numeric_f32_at(&vcp_source_periods, sweep),
+                waveform: numeric_u8_at(&vcp_waveform_codes, sweep)
+                    .and_then(waveform_from_code)
+                    .map(str::to_owned),
+                moment_coverage: numeric_u8_at(&vcp_moment_coverage_codes, sweep)
+                    .and_then(moment_coverage_from_code)
+                    .map(str::to_owned),
+                surveillance_prf_code: numeric_u8_at(&surveillance_prf_codes, sweep),
+                surveillance_pulse_count: numeric_u16_at(&surveillance_pulse_counts, sweep),
+                doppler_prf_code: numeric_u8_at(&doppler_prf_codes, sweep),
+                doppler_pulse_count: numeric_u16_at(&doppler_pulse_counts, sweep),
+            },
         });
     }
     if sweeps.is_empty() {
@@ -205,6 +251,9 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
             )));
         }
         for sweep in &mut sweeps {
+            if !scan_leg_allows_moment(&sweep.scan_leg, &moment) {
+                continue;
+            }
             let mut grid = MomentGrid {
                 moment: moment.clone(),
                 gate_range: gate_range.clone(),
@@ -223,10 +272,14 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
             sweep.cut.moments.insert(moment.clone(), grid);
         }
     }
+    sweeps.sort_by(|left, right| left.cut.elevation_deg.total_cmp(&right.cut.elevation_deg));
+    if sweeps
+        .iter()
+        .any(|sweep| sweep.scan_leg != ScanLegMetadata::default())
+    {
+        volume.metadata.scan_legs = sweeps.iter().map(|sweep| sweep.scan_leg.clone()).collect();
+    }
     volume.cuts = sweeps.into_iter().map(|sweep| sweep.cut).collect();
-    volume
-        .cuts
-        .sort_by(|left, right| left.elevation_deg.total_cmp(&right.elevation_deg));
     volume.metadata.decoded_radial_count = volume.cuts.iter().map(|cut| cut.radials.len()).sum();
     volume.metadata.message_count = sweep_count;
     Ok(volume)
@@ -236,6 +289,64 @@ struct DecodedSweep {
     start_ray: usize,
     end_ray: usize,
     cut: ElevationCut,
+    scan_leg: ScanLegMetadata,
+}
+
+fn numeric_at(values: &Option<Vec<f64>>, index: usize) -> Option<f64> {
+    values
+        .as_ref()?
+        .get(index)
+        .copied()
+        .filter(|value| value.is_finite() && *value != -9999.0)
+}
+
+fn numeric_f32_at(values: &Option<Vec<f64>>, index: usize) -> Option<f32> {
+    numeric_at(values, index)
+        .filter(|value| value.abs() <= f32::MAX as f64)
+        .map(|value| value as f32)
+}
+
+fn numeric_u8_at(values: &Option<Vec<f64>>, index: usize) -> Option<u8> {
+    let value = numeric_at(values, index)?;
+    (value.fract() == 0.0)
+        .then(|| u8::try_from(value as i64).ok())
+        .flatten()
+}
+
+fn numeric_u16_at(values: &Option<Vec<f64>>, index: usize) -> Option<u16> {
+    let value = numeric_at(values, index)?;
+    (value.fract() == 0.0)
+        .then(|| u16::try_from(value as i64).ok())
+        .flatten()
+}
+
+fn waveform_from_code(code: u8) -> Option<&'static str> {
+    Some(match code {
+        1 => "CS",
+        2 => "CD/W",
+        3 => "B",
+        4 => "CD/WO",
+        5 => "SZCS",
+        6 => "SZCD",
+        _ => return None,
+    })
+}
+
+fn moment_coverage_from_code(code: u8) -> Option<&'static str> {
+    Some(match code {
+        1 => "surveillance",
+        2 => "doppler",
+        3 => "all",
+        _ => return None,
+    })
+}
+
+fn scan_leg_allows_moment(scan_leg: &ScanLegMetadata, moment: &MomentType) -> bool {
+    match scan_leg.moment_coverage.as_deref() {
+        Some("surveillance") => !matches!(moment, MomentType::Velocity | MomentType::SpectrumWidth),
+        Some("doppler") => matches!(moment, MomentType::Velocity | MomentType::SpectrumWidth),
+        _ => true,
+    }
 }
 
 /// CfRadial's fixed angle is elevation for PPI sweeps and azimuth for RHI

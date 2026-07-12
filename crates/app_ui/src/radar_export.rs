@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use radar_core::{ElevationCut, GateRange, MomentType, RadarVolume};
+use radar_core::{ElevationCut, GateRange, MomentType, RadarVolume, ScanLegMetadata};
 use rw_store::netcdf3::{Nc3Attr, Nc3Dim, Nc3VarDef, Nc3Writer};
 
 /// Finite no-data sentinel written to field variables and flagged via the
@@ -154,6 +154,12 @@ pub(crate) fn export_volumes_cfradial(
     allow(dead_code)
 )]
 pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Result<(), String> {
+    let sweep_indices: Vec<usize> = volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, cut)| (!cut.radials.is_empty()).then_some(index))
+        .collect();
     let sweeps: Vec<&ElevationCut> = volume
         .cuts
         .iter()
@@ -307,6 +313,9 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
         ),
         Nc3Attr::text("instrument_name", volume.site.id.clone()),
     ];
+    if let Some(vcp) = &volume.vcp {
+        gattrs.push(Nc3Attr::floats("vcp_pattern", vec![vcp.pattern as f32]));
+    }
     if let Some(name) = volume.site.name.as_deref().filter(|name| !name.is_empty()) {
         gattrs.push(Nc3Attr::text("site_name", name));
     }
@@ -315,6 +324,30 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
     for (name, value) in [
         ("scan_name", volume.metadata.scan_name.as_deref()),
         ("scan_id", volume.metadata.scan_id.as_deref()),
+        (
+            "vcp_source_document",
+            volume.metadata.vcp_source_document.as_deref(),
+        ),
+        (
+            "vcp_source_revision",
+            volume.metadata.vcp_source_revision.as_deref(),
+        ),
+        (
+            "vcp_source_rda_build",
+            volume.metadata.vcp_source_rda_build.as_deref(),
+        ),
+        (
+            "vcp_source_figure",
+            volume.metadata.vcp_source_figure.as_deref(),
+        ),
+        (
+            "vcp_pulse_length",
+            volume.metadata.vcp_pulse_length.as_deref(),
+        ),
+        (
+            "vcp_adaptations",
+            volume.metadata.vcp_adaptations.as_deref(),
+        ),
         ("polarization", volume.metadata.polarization.as_deref()),
         ("calibration", volume.metadata.calibration.as_deref()),
         (
@@ -516,6 +549,109 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
     });
     payloads.push(sweep_end);
 
+    // BowEcho source-qualified VCP provenance. These are custom per-sweep
+    // variables because CfRadial has no standard representation for Appendix
+    // C waveform/PRF-code rows. Values are codes/counts exactly as published,
+    // never converted to Hz or PRT.
+    let leg_fields = [
+        (
+            "vcp_source_row_index",
+            "zero-based physical row in the qualified VCP source",
+            "1",
+            per_sweep_leg_values(volume, &sweep_indices, |leg| {
+                leg.source_row_index.map(f32::from)
+            }),
+        ),
+        (
+            "vcp_azimuth_rate",
+            "source-table antenna azimuth rate",
+            "degrees/second",
+            per_sweep_leg_values(volume, &sweep_indices, |leg| {
+                leg.azimuth_rate_deg_per_second
+            }),
+        ),
+        (
+            "vcp_source_period",
+            "source-table physical-row period",
+            "seconds",
+            per_sweep_leg_values(volume, &sweep_indices, |leg| leg.source_period_seconds),
+        ),
+        (
+            "vcp_waveform_code",
+            "BowEcho code for the source-table waveform abbreviation",
+            "1",
+            per_sweep_leg_values(volume, &sweep_indices, |leg| {
+                leg.waveform.as_deref().and_then(waveform_code)
+            }),
+        ),
+        (
+            "vcp_moment_coverage_code",
+            "BowEcho code for physical-row moment coverage",
+            "1",
+            per_sweep_leg_values(volume, &sweep_indices, |leg| {
+                leg.moment_coverage
+                    .as_deref()
+                    .and_then(moment_coverage_code)
+            }),
+        ),
+        (
+            "vcp_surveillance_prf_code",
+            "source-table surveillance PRF code (not Hz)",
+            "1",
+            per_sweep_leg_values(volume, &sweep_indices, |leg| {
+                leg.surveillance_prf_code.map(f32::from)
+            }),
+        ),
+        (
+            "vcp_surveillance_pulse_count",
+            "source-table surveillance pulse count",
+            "count",
+            per_sweep_leg_values(volume, &sweep_indices, |leg| {
+                leg.surveillance_pulse_count.map(f32::from)
+            }),
+        ),
+        (
+            "vcp_doppler_prf_code",
+            "source-table default Doppler PRF code (not Hz)",
+            "1",
+            per_sweep_leg_values(volume, &sweep_indices, |leg| {
+                leg.doppler_prf_code.map(f32::from)
+            }),
+        ),
+        (
+            "vcp_doppler_pulse_count",
+            "source-table default Doppler pulse count",
+            "count",
+            per_sweep_leg_values(volume, &sweep_indices, |leg| {
+                leg.doppler_pulse_count.map(f32::from)
+            }),
+        ),
+    ];
+    for (name, long_name, units, values) in leg_fields {
+        let Some(values) = values else { continue };
+        let mut attrs = vec![
+            Nc3Attr::text("long_name", long_name),
+            Nc3Attr::text("units", units),
+            Nc3Attr::floats("_FillValue", vec![CFRADIAL_FILL]),
+        ];
+        if name == "vcp_waveform_code" {
+            attrs.push(Nc3Attr::floats(
+                "flag_values",
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ));
+            attrs.push(Nc3Attr::text("flag_meanings", "CS CD/W B CD/WO SZCS SZCD"));
+        } else if name == "vcp_moment_coverage_code" {
+            attrs.push(Nc3Attr::floats("flag_values", vec![1.0, 2.0, 3.0]));
+            attrs.push(Nc3Attr::text("flag_meanings", "surveillance doppler all"));
+        }
+        vars.push(Nc3VarDef {
+            name: name.to_owned(),
+            dimids: vec![SWEEP],
+            attrs,
+        });
+        payloads.push(values);
+    }
+
     // Site scalars (0-dimensional variables), written only when known.
     let scalars = [
         ("latitude", "degrees_north", volume.site.latitude_deg),
@@ -599,11 +735,54 @@ fn check_geometry(expected: &GateRange, actual: &GateRange, what: &str) -> Resul
     Ok(())
 }
 
+fn per_sweep_leg_values(
+    volume: &RadarVolume,
+    sweep_indices: &[usize],
+    value: impl Fn(&ScanLegMetadata) -> Option<f32>,
+) -> Option<Vec<f32>> {
+    let mut any = false;
+    let values = sweep_indices
+        .iter()
+        .map(|&index| {
+            volume
+                .metadata
+                .scan_legs
+                .get(index)
+                .and_then(&value)
+                .filter(|value| value.is_finite())
+                .inspect(|_| any = true)
+                .unwrap_or(CFRADIAL_FILL)
+        })
+        .collect();
+    any.then_some(values)
+}
+
+fn waveform_code(waveform: &str) -> Option<f32> {
+    Some(match waveform {
+        "CS" => 1.0,
+        "CD/W" => 2.0,
+        "B" => 3.0,
+        "CD/WO" => 4.0,
+        "SZCS" => 5.0,
+        "SZCD" => 6.0,
+        _ => return None,
+    })
+}
+
+fn moment_coverage_code(coverage: &str) -> Option<f32> {
+    Some(match coverage {
+        "surveillance" => 1.0,
+        "doppler" => 2.0,
+        "all" => 3.0,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
-    use radar_core::{MomentGrid, MomentStorage, RadarSite, Radial};
+    use radar_core::{MomentGrid, MomentStorage, RadarSite, Radial, ScanLegMetadata, VcpInfo};
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -887,6 +1066,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn round_trip_vcp_physical_rows_without_inventing_prt() {
+        let mut volume = sample_volume();
+        volume.vcp = Some(VcpInfo { pattern: 212 });
+        volume.metadata.vcp_source_document = Some("2620002AA".to_owned());
+        volume.metadata.vcp_source_revision = Some("AA".to_owned());
+        volume.metadata.vcp_source_rda_build = Some("24.0".to_owned());
+        volume.metadata.vcp_source_figure = Some("Figure C-4".to_owned());
+        volume.metadata.vcp_pulse_length = Some("short".to_owned());
+        volume.metadata.vcp_adaptations = Some(
+            "Base pattern only: SAILS, MRLE, AVSET, Add-MPDA, and site-specific low-tilt adaptations are absent."
+                .to_owned(),
+        );
+        volume.metadata.prt_s = None;
+        volume.metadata.unambiguous_range_km = None;
+        volume.metadata.scan_legs = vec![
+            ScanLegMetadata {
+                source_row_index: Some(0),
+                elevation_deg: Some(0.5),
+                azimuth_rate_deg_per_second: Some(21.149),
+                source_period_seconds: Some(17.02),
+                waveform: Some("SZCS".to_owned()),
+                moment_coverage: Some("surveillance".to_owned()),
+                surveillance_prf_code: Some(1),
+                surveillance_pulse_count: Some(15),
+                ..ScanLegMetadata::default()
+            },
+            ScanLegMetadata {
+                source_row_index: Some(1),
+                elevation_deg: Some(0.5),
+                azimuth_rate_deg_per_second: Some(17.108),
+                source_period_seconds: Some(21.30),
+                waveform: Some("SZCD".to_owned()),
+                moment_coverage: Some("doppler".to_owned()),
+                doppler_prf_code: Some(6),
+                doppler_pulse_count: Some(64),
+                ..ScanLegMetadata::default()
+            },
+            ScanLegMetadata {
+                source_row_index: Some(2),
+                elevation_deg: Some(3.1),
+                azimuth_rate_deg_per_second: Some(28.227),
+                source_period_seconds: Some(12.75),
+                waveform: Some("B".to_owned()),
+                moment_coverage: Some("all".to_owned()),
+                surveillance_prf_code: Some(5),
+                surveillance_pulse_count: Some(3),
+                doppler_prf_code: Some(5),
+                doppler_pulse_count: Some(28),
+            },
+        ];
+
+        // Two distinct physical rotations at one fixed angle. Coverage is
+        // deliberately disjoint so the round trip proves duplicate order and
+        // split-cut moment ownership survive the union-of-fields export.
+        volume.cuts[0].elevation_deg = 0.5;
+        volume.cuts[1].elevation_deg = 0.5;
+        for radial in &mut volume.cuts[1].radials {
+            radial.elevation_deg = 0.5;
+        }
+        volume.cuts[0].moments.remove(&MomentType::Velocity);
+        volume.cuts[1].moments.remove(&MomentType::Reflectivity);
+
+        let expected_legs = volume.metadata.scan_legs.clone();
+        let path = tmp_dir("vcp-provenance").join("vcp212.nc");
+        export_volume_cfradial(&volume, &path).unwrap();
+        let decoded =
+            nexrad_io::decode_supported_volume_bytes(&std::fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(decoded.vcp, Some(VcpInfo { pattern: 212 }));
+        assert_eq!(
+            decoded.metadata.vcp_source_document.as_deref(),
+            Some("2620002AA")
+        );
+        assert_eq!(decoded.metadata.vcp_source_revision.as_deref(), Some("AA"));
+        assert_eq!(
+            decoded.metadata.vcp_source_rda_build.as_deref(),
+            Some("24.0")
+        );
+        assert_eq!(
+            decoded.metadata.vcp_source_figure.as_deref(),
+            Some("Figure C-4")
+        );
+        assert_eq!(decoded.metadata.vcp_pulse_length.as_deref(), Some("short"));
+        assert!(
+            decoded
+                .metadata
+                .vcp_adaptations
+                .as_deref()
+                .unwrap()
+                .contains("SAILS")
+        );
+        assert_eq!(decoded.metadata.prt_s, None);
+        assert_eq!(decoded.metadata.unambiguous_range_km, None);
+        assert_eq!(decoded.metadata.scan_legs, expected_legs);
+        assert_eq!(decoded.cuts[0].elevation_deg, 0.5);
+        assert_eq!(decoded.cuts[1].elevation_deg, 0.5);
+        assert_eq!(
+            decoded.metadata.scan_legs[0].waveform.as_deref(),
+            Some("SZCS")
+        );
+        assert_eq!(
+            decoded.metadata.scan_legs[1].waveform.as_deref(),
+            Some("SZCD")
+        );
+        assert!(
+            decoded.cuts[0]
+                .moments
+                .contains_key(&MomentType::Reflectivity)
+        );
+        assert!(!decoded.cuts[0].moments.contains_key(&MomentType::Velocity));
+        assert!(
+            !decoded.cuts[1]
+                .moments
+                .contains_key(&MomentType::Reflectivity)
+        );
+        assert!(decoded.cuts[1].moments.contains_key(&MomentType::Velocity));
     }
 
     #[test]

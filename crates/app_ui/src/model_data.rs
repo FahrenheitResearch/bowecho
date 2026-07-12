@@ -277,6 +277,10 @@ struct SyntheticRadarUiState {
     /// for settings written before these controls existed.
     #[serde(default)]
     simulation_mode: crate::wrf_radar::SimulationMode,
+    /// Physical scan pattern. Absent in older settings means the historical
+    /// custom fourteen-cut ladder, preserving serde/backward compatibility.
+    #[serde(default)]
+    scan_strategy: crate::wrf_radar::SyntheticScanStrategy,
     #[serde(default)]
     reflectivity_sampling: crate::wrf_radar::ReflectivitySampling,
     #[serde(default)]
@@ -399,6 +403,7 @@ impl Default for SyntheticRadarUiState {
             vel_gate_texture: false,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::default(),
             simulation_mode: crate::wrf_radar::SimulationMode::default(),
+            scan_strategy: crate::wrf_radar::SyntheticScanStrategy::default(),
             reflectivity_sampling: crate::wrf_radar::ReflectivitySampling::default(),
             beam_integration: crate::wrf_radar::BeamIntegration::default(),
             beam_width_deg: default_synth_beam_width_deg(),
@@ -585,6 +590,7 @@ impl SyntheticRadarUiState {
             vel_gate_texture: self.vel_gate_texture,
             reflectivity_operator: self.reflectivity_operator,
             simulation_mode: self.simulation_mode,
+            scan_strategy: self.scan_strategy,
             reflectivity_sampling: self.reflectivity_sampling,
             beam_integration: self.beam_integration,
             beam_width_deg: self.beam_width_deg,
@@ -604,7 +610,17 @@ impl SyntheticRadarUiState {
             prf_hz: self.prf_hz,
             instrument_noise: self.instrument_noise,
             sensitivity_dbz_at_1km: self.sensitivity_dbz_at_1km,
-            elevations_deg: crate::wrf_radar::elevation_ladder(self.include_low_tilt),
+            elevations_deg: self
+                .scan_strategy
+                .definition()
+                .map(|definition| {
+                    definition
+                        .elevation_ladder_deg()
+                        .into_iter()
+                        .map(f64::from)
+                        .collect()
+                })
+                .unwrap_or_else(|| crate::wrf_radar::elevation_ladder(self.include_low_tilt)),
             clutter_intensity: self.clutter_intensity.clamp(0.0, 1.0),
             fold_velocity: self.fold_velocity,
             // The folding Nyquist, clamped to the sane drag range. Inert when
@@ -3133,6 +3149,65 @@ impl ModelDataDock {
                     };
                     ui.label(egui::RichText::new(mode_summary).small().weak());
                     ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Scan pattern").strong());
+                        egui::ComboBox::from_id_salt("wrf_synth_scan_strategy")
+                            .selected_text(state.scan_strategy.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut state.scan_strategy,
+                                    crate::wrf_radar::SyntheticScanStrategy::CustomLegacy,
+                                    "Custom legacy ladder",
+                                );
+                                ui.separator();
+                                for strategy in
+                                    crate::wrf_radar::SyntheticScanStrategy::BUILD_24
+                                {
+                                    ui.selectable_value(
+                                        &mut state.scan_strategy,
+                                        strategy,
+                                        strategy.label(),
+                                    );
+                                }
+                            });
+                    });
+                    if let Some(definition) = state.scan_strategy.definition() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} rev {} · RDA Build {} · {} physical rows · ~{:.2} min base cadence",
+                                definition.source.document_number,
+                                definition.source.revision,
+                                definition.source.rda_build,
+                                definition.rows.len(),
+                                definition.nominal_cadence.minutes(),
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                crate::wrf_radar::BUILD_24_NO_ADAPTATIONS_CAVEAT,
+                            )
+                            .small()
+                            .color(crate::ui_theme::theme().warn),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Catalog PRF values remain source-table codes/pulse counts; no Hz or standard PRT is inferred.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "Legacy custom elevation ladder · custom rate, transition, PRF, and optional 0.1° tilt.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.selectable_value(
                             &mut state.placement,
@@ -3502,7 +3577,8 @@ impl ModelDataDock {
                                         .speed(0.05)
                                         .suffix(" us pulse"),
                                 );
-                                ui.add(
+                                ui.add_enabled(
+                                    !state.scan_strategy.is_named_vcp(),
                                     egui::DragValue::new(&mut state.prf_hz)
                                         .range(100.0..=5_000.0)
                                         .speed(25.0)
@@ -3531,25 +3607,34 @@ impl ModelDataDock {
                                 .on_hover_text(
                                     "Assign per-ray acquisition offsets while sampling the same WRF model time.",
                                 );
-                                let timed = matches!(
+                                let custom_timed = matches!(
                                     state.scan_timing,
                                     crate::wrf_radar::ScanTiming::TimedVolume
-                                );
+                                ) && !state.scan_strategy.is_named_vcp();
                                 ui.add_enabled(
-                                    timed,
+                                    custom_timed,
                                     egui::DragValue::new(&mut state.rotation_rate_deg_s)
                                         .range(1.0..=60.0)
                                         .speed(0.5)
                                         .suffix(" deg/s"),
                                 );
                                 ui.add_enabled(
-                                    timed,
+                                    custom_timed,
                                     egui::DragValue::new(&mut state.transition_delay_s)
                                         .range(0.0..=30.0)
                                         .speed(0.25)
-                                        .suffix(" s transition"),
+                                    .suffix(" s transition"),
                                 );
                             });
+                            if state.scan_strategy.is_named_vcp() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Named VCP owns each physical row's azimuth rate and period; custom transition and PRF-Hz controls are disabled.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
                             ui.add_enabled_ui(state.dual_pol, |ui| {
                                 ui.checkbox(
                                     &mut state.propagation,
@@ -3588,9 +3673,12 @@ impl ModelDataDock {
                             });
                         });
 
-                    ui.checkbox(
-                        &mut state.include_low_tilt,
-                        "Include 0.1° low tilt (community lowest tilt)",
+                    ui.add_enabled(
+                        !state.scan_strategy.is_named_vcp(),
+                        egui::Checkbox::new(
+                            &mut state.include_low_tilt,
+                            "Include 0.1° low tilt (community lowest tilt)",
+                        ),
                     )
                     .on_hover_text(
                         "Prepend a 0.1° tilt below the standard 0.5° lowest tilt, like the \
@@ -3604,7 +3692,7 @@ impl ModelDataDock {
                             "Restore Presentation mode: domain centre, 230 km / 250 m gates, \
                              linear-Z center sampling, model-native reflectivity, textured REF, \
                              clean unfolded velocity, and no dual-pol, propagation, blockage, \
-                             scan timing, instrument noise, clutter, or extra low tilt.",
+                             scan timing, instrument noise, clutter, extra low tilt, or named VCP.",
                         )
                         .clicked()
                     {
@@ -5602,6 +5690,11 @@ mod tests {
             crate::wrf_radar::SimulationMode::Presentation
         );
         assert_eq!(
+            empty.scan_strategy,
+            crate::wrf_radar::SyntheticScanStrategy::CustomLegacy,
+            "older settings restore the historical custom ladder"
+        );
+        assert_eq!(
             empty.reflectivity_sampling,
             crate::wrf_radar::ReflectivitySampling::LinearZ
         );
@@ -5668,6 +5761,7 @@ mod tests {
             vel_gate_texture: true,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::ClassicStoelinga,
             simulation_mode: crate::wrf_radar::SimulationMode::Instrument,
+            scan_strategy: crate::wrf_radar::SyntheticScanStrategy::Build24Vcp212,
             reflectivity_sampling: crate::wrf_radar::ReflectivitySampling::LegacyDbz,
             beam_integration: crate::wrf_radar::BeamIntegration::Reference,
             beam_width_deg: 1.25,
@@ -5730,6 +5824,7 @@ mod tests {
             "default operator is model native"
         );
         assert_eq!(config.simulation_mode, historical.simulation_mode);
+        assert_eq!(config.scan_strategy, historical.scan_strategy);
         assert_eq!(
             config.reflectivity_sampling,
             historical.reflectivity_sampling
@@ -6129,6 +6224,40 @@ mod tests {
             plain.elevations_deg,
             crate::wrf_radar::DEFAULT_ELEVATIONS_DEG
         );
+    }
+
+    #[test]
+    fn synth_radar_named_vcp_state_round_trips_and_owns_the_scan_ladder() {
+        use crate::wrf_radar::SyntheticScanStrategy;
+
+        let state = SyntheticRadarUiState {
+            scan_strategy: SyntheticScanStrategy::Build24Vcp112,
+            // These custom-only settings stay persisted for when the user
+            // returns to Custom, but they do not alter a named row plan.
+            include_low_tilt: true,
+            rotation_rate_deg_s: 3.0,
+            transition_delay_s: 29.0,
+            prf_hz: 4_900.0,
+            ..SyntheticRadarUiState::default()
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        let restored: SyntheticRadarUiState = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, state);
+
+        let config = restored.to_config().unwrap();
+        let definition = SyntheticScanStrategy::Build24Vcp112.definition().unwrap();
+        assert_eq!(config.scan_strategy, SyntheticScanStrategy::Build24Vcp112);
+        assert_eq!(config.physical_scan_legs().len(), definition.rows.len());
+        assert_eq!(
+            config.elevations_deg,
+            definition
+                .elevation_ladder_deg()
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(config.elevations_deg[0], crate::wrf_radar::LOW_TILT_DEG);
+        assert!(config.scan_strategy.is_named_vcp());
     }
 
     /// The ground-clutter slider flows from the UI state into the scan config

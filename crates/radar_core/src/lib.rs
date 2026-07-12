@@ -750,6 +750,38 @@ pub struct VcpInfo {
     pub pattern: u16,
 }
 
+/// Source-qualified provenance for one physical scan leg/sweep.
+///
+/// PRF values here are source-table *codes* and pulse counts. They are not
+/// frequencies or pulse-repetition times; keeping them separately typed and
+/// optional prevents downstream formats from inventing Hz/PRT metadata.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScanLegMetadata {
+    /// Zero-based row within the qualified source definition.
+    #[serde(default)]
+    pub source_row_index: Option<u16>,
+    #[serde(default)]
+    pub elevation_deg: Option<f32>,
+    #[serde(default)]
+    pub azimuth_rate_deg_per_second: Option<f32>,
+    #[serde(default)]
+    pub source_period_seconds: Option<f32>,
+    /// Source waveform abbreviation (for example `CS`, `CD/W`, or `SZCD`).
+    #[serde(default)]
+    pub waveform: Option<String>,
+    /// `surveillance`, `doppler`, or `all` for catalog-backed synthetic cuts.
+    #[serde(default)]
+    pub moment_coverage: Option<String>,
+    #[serde(default)]
+    pub surveillance_prf_code: Option<u8>,
+    #[serde(default)]
+    pub surveillance_pulse_count: Option<u16>,
+    #[serde(default)]
+    pub doppler_prf_code: Option<u8>,
+    #[serde(default)]
+    pub doppler_pulse_count: Option<u16>,
+}
+
 /// Antenna scanning strategy declared by the data source.
 ///
 /// NEXRAD Archive II is always PPI surveillance, but mobile/research formats
@@ -809,6 +841,26 @@ pub struct VolumeMetadata {
     /// Source-specific scan identifier.
     #[serde(default)]
     pub scan_id: Option<String>,
+    /// Primary document that qualifies `RadarVolume::vcp` (if known). A VCP
+    /// number alone is insufficient because patterns change between builds.
+    #[serde(default)]
+    pub vcp_source_document: Option<String>,
+    #[serde(default)]
+    pub vcp_source_revision: Option<String>,
+    #[serde(default)]
+    pub vcp_source_rda_build: Option<String>,
+    #[serde(default)]
+    pub vcp_source_figure: Option<String>,
+    /// Source-table categorical pulse length (`short`/`long`), never inferred
+    /// as a duration in microseconds.
+    #[serde(default)]
+    pub vcp_pulse_length: Option<String>,
+    /// Explicit statement of adaptations present/absent from the base pattern.
+    #[serde(default)]
+    pub vcp_adaptations: Option<String>,
+    /// Physical-row provenance aligned with `RadarVolume::cuts` when present.
+    #[serde(default)]
+    pub scan_legs: Vec<ScanLegMetadata>,
     /// Transmit/receive polarization description.
     #[serde(default)]
     pub polarization: Option<String>,
