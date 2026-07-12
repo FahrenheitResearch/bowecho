@@ -581,6 +581,20 @@ pub struct P3ParticleGeometry {
     pub shape_authority: P3ShapeAuthority,
 }
 
+impl P3ParticleGeometry {
+    /// True only where the pinned P3 particle law itself specifies a sphere.
+    /// Dense-unrimed and partially-rimed particles retain only maximum
+    /// dimension and projected area; treating them as spheroids would require
+    /// an additional, non-scheme-native shape closure.
+    #[must_use]
+    pub const fn is_exact_sphere(self) -> bool {
+        matches!(
+            self.region,
+            P3ParticleRegion::SmallDenseSphere | P3ParticleRegion::FullyRimedSphere
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct P3PsdProvenance {
     pub revision: String,
@@ -796,7 +810,22 @@ impl P3Psd {
     }
 
     pub fn quadrature(&self, config: P3QuadratureConfig) -> Result<P3Quadrature, P3PsdError> {
+        self.quadrature_with_dimension_breakpoints(config, &[])
+    }
+
+    /// Build the same exact P3 quadrature while forcing additional physical
+    /// maximum-dimension boundaries. This lets a downstream, fail-closed
+    /// scattering integrator align panels to its table envelope without
+    /// clipping or moving any particle onto a LUT edge.
+    pub fn quadrature_with_dimension_breakpoints(
+        &self,
+        config: P3QuadratureConfig,
+        additional_breakpoints_m: &[f64],
+    ) -> Result<P3Quadrature, P3PsdError> {
         config.validate()?;
+        for &breakpoint in additional_breakpoints_m {
+            positive("P3 additional quadrature breakpoint", breakpoint)?;
+        }
         let upper_m = self.tail_cutoff(config.maximum_tail_fraction, config.maximum_scaled_d)?;
         let required_base_nodes = usize::from(config.panels)
             .checked_mul(GL8_POINTS)
@@ -818,6 +847,11 @@ impl P3Psd {
         ] {
             if threshold > 0.0 && threshold < upper_m {
                 breakpoints.push(threshold);
+            }
+        }
+        for &breakpoint in additional_breakpoints_m {
+            if breakpoint < upper_m {
+                breakpoints.push(breakpoint);
             }
         }
         breakpoints.sort_by(f64::total_cmp);

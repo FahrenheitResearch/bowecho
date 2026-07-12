@@ -775,6 +775,21 @@ impl ResearchTMatrixLut {
         &self,
         node: &PsdParticleNode,
     ) -> Result<f64, EvaluationError> {
+        self.dry_particle_geometry_terminal_speed_m_s(
+            node.equivolume_diameter_m(),
+            node.bulk_density_kg_m3(),
+        )
+    }
+
+    /// Apply the table-bound terminal-speed law to explicit equivalent-volume
+    /// diameter and bulk density without requiring a scheme-specific PSD node
+    /// type. Shape/orientation remain separate query facts; this method does
+    /// not manufacture either one.
+    pub fn dry_particle_geometry_terminal_speed_m_s(
+        &self,
+        diameter_m: f64,
+        bulk_density_kg_m3: f64,
+    ) -> Result<f64, EvaluationError> {
         if self.descriptor.category
             != TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle
             || self.descriptor.population_role
@@ -787,8 +802,8 @@ impl ResearchTMatrixLut {
         }
         schiller_naumann_terminal_speed_m_s(
             &self.descriptor.terminal_speed,
-            node.equivolume_diameter_m(),
-            node.bulk_density_kg_m3(),
+            diameter_m,
+            bulk_density_kg_m3,
         )
     }
 

@@ -13,6 +13,7 @@ mod digest;
 mod lut;
 mod orientation;
 mod output;
+mod p3_integration;
 mod p3_psd;
 mod p3_table;
 mod particle;
@@ -44,6 +45,12 @@ pub use orientation::{
 pub use output::{
     AdditiveScattering, ComplexCovariance, FallSpeedMoments, LinearReflectivity, OutputError,
     PolarAccumulatorQuantities, SpecificAttenuation, SpecificDifferentialPhase,
+};
+pub use p3_integration::{
+    P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION, P3_SPHERICAL_INTEGRATION_REVISION,
+    P3TMatrixIntegrationAudit, P3TMatrixIntegrationConfig, P3TMatrixIntegrationConfigError,
+    P3TMatrixIntegrationError, P3TMatrixIntegrationResult, P3TMatrixOmissionAudit,
+    P3TMatrixParticleNode, P3TMatrixShapePolicy, integrate_p3_tmatrix_psd,
 };
 pub use p3_psd::{
     P3_MODULE_VERSION, P3_MU_RANGE, P3_MULTICATEGORY_DOI, P3_PART_I_DOI, P3_PSD_REVISION,

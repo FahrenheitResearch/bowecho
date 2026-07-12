@@ -7,18 +7,25 @@
 //! never substituted with the bulk Rayleigh operator when a lookup fails.
 
 use std::mem::size_of;
+use std::sync::Arc;
 
 use radar_scattering::{
     AdditiveScattering, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
     DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K, DiagnosticWetCategory,
     EvaluationError, FallMomentPolicy, ISHMAEL_PSD_REVISION, IshmaelPsd, IshmaelPsdInput,
-    MixtureTopology, OrientationDefinition, OrientationModel, OutputError, ParticleState,
-    PolarAccumulatorQuantities, PsdError, PsdFallSpeedProvenance, PsdIntegrationConfig,
-    PsdIntegrationError, PsdParticleNode, PsdParticleSupport, PsdSpheroidHabit,
-    RadarViewApplicability, RadarViewGeometry, ResearchTMatrixLut, SCHEME_PSD_REVISION,
-    Sha256Digest, SpheroidConvention, TMatrixEvaluationRequest, TMatrixMaterial,
-    TMatrixOdfConvention, TMatrixParticleCategory, TMatrixParticleNodeQuery, TMatrixPopulationRole,
-    integrate_ishmael_psd,
+    MixtureTopology, OrientationDefinition, OrientationModel, OutputError, P3_MODULE_VERSION,
+    P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION, P3_PSD_REVISION,
+    P3_SPHERICAL_INTEGRATION_REVISION, P3_TABLE_READER_REVISION, P3_WRF_SOURCE_COMMIT,
+    P3IceMomentInput, P3LookupTableV54, P3OfficialTableKind, P3OfficialTableV54, P3Psd, P3PsdError,
+    P3PsdInput, P3QuadratureNode, P3ReconstructionConfig, P3ShapeAuthority,
+    P3TMatrixIntegrationConfig, P3TMatrixIntegrationError, P3TMatrixParticleNode,
+    P3TMatrixShapePolicy, P3WrfScheme, ParticleState, PolarAccumulatorQuantities, PsdError,
+    PsdFallSpeedProvenance, PsdIntegrationConfig, PsdIntegrationError, PsdParticleNode,
+    PsdParticleSupport, PsdSpheroidHabit, RadarViewApplicability, RadarViewGeometry,
+    ResearchTMatrixLut, SCHEME_PSD_REVISION, Sha256Digest, SpheroidConvention,
+    TMatrixEvaluationRequest, TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory,
+    TMatrixParticleNodeQuery, TMatrixPopulationRole, integrate_ishmael_psd,
+    integrate_p3_tmatrix_psd,
 };
 use rayon::prelude::*;
 use thiserror::Error;
@@ -48,6 +55,13 @@ const PER_WORKER_ALLOCATION_GUARD_BYTES: usize = 16 * 1024;
 const ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION: f64 = 0.999;
 const ISHMAEL_PSD_MAXIMUM_OMITTED_MASS_FRACTION: f64 = 0.05;
 const ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION: f64 = 0.001;
+
+// P3 uses the same production omission gates. In strict mode nonspherical P3
+// particles count as omitted; projected-area research mode maps them through
+// its explicitly versioned equivalent-oblate assumption before this gate.
+const P3_MAXIMUM_OMITTED_NUMBER_FRACTION: f64 = 0.999;
+const P3_MAXIMUM_OMITTED_MASS_FRACTION: f64 = 0.05;
+const P3_MAXIMUM_OMITTED_D6_FRACTION: f64 = 0.001;
 
 // Exact coordinate contract for the versioned five-table research bundle.
 // Each frozen role keeps its own solver-complete diameter domain; no renderer
@@ -612,14 +626,48 @@ impl<'a> WrfTMatrixLutBundle<'a> {
     }
 }
 
+/// Exact official P3 table plus an explicit, versioned T-matrix shape policy.
+/// Loading/caching the external table remains an application-boundary choice;
+/// this constructor never downloads or substitutes an asset.
+#[derive(Clone)]
+pub struct WrfTMatrixP3Resources {
+    pub table: Arc<P3OfficialTableV54>,
+    pub integration: P3TMatrixIntegrationConfig,
+}
+
+impl WrfTMatrixP3Resources {
+    pub fn strict_shape_authoritative(
+        table: Arc<P3OfficialTableV54>,
+    ) -> Result<Self, radar_scattering::P3TMatrixIntegrationConfigError> {
+        Ok(Self {
+            table,
+            integration: production_p3_integration_config(
+                P3TMatrixShapePolicy::StrictShapeAuthoritativeSpheres,
+            )?,
+        })
+    }
+
+    pub fn projected_area_equivalent_oblate_research(
+        table: Arc<P3OfficialTableV54>,
+    ) -> Result<Self, radar_scattering::P3TMatrixIntegrationConfigError> {
+        Ok(Self {
+            table,
+            integration: production_p3_integration_config(
+                P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1,
+            )?,
+        })
+    }
+}
+
 /// Validated, reusable evaluator for one spatially/temporally blended raw
 /// property cell. Construction performs the complete five-table contract gate
 /// once; each call then performs exactly one nonlinear closure/PSD integration
 /// at the requested radar elevation.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WrfTMatrixRawEvaluator<'a> {
     tables: WrfTMatrixLutBundle<'a>,
     validated: ValidatedBundle<'a>,
+    p3: Option<WrfTMatrixP3Resources>,
 }
 
 impl<'a> WrfTMatrixRawEvaluator<'a> {
@@ -627,16 +675,32 @@ impl<'a> WrfTMatrixRawEvaluator<'a> {
         Ok(Self {
             tables,
             validated: validate_bundle(tables)?,
+            p3: None,
+        })
+    }
+
+    pub fn new_with_p3(
+        tables: WrfTMatrixLutBundle<'a>,
+        p3: WrfTMatrixP3Resources,
+    ) -> Result<Self, WrfTMatrixBundleError> {
+        Ok(Self {
+            tables,
+            validated: validate_bundle(tables)?,
+            p3: Some(p3),
         })
     }
 
     pub fn evaluate(
-        self,
+        &self,
         raw: &RawPropertyCell,
         elevation_deg: f64,
     ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
         match raw.microphysics_scheme_id() {
-            50..=53 => evaluate_characteristic_raw_cell(raw, self.tables, elevation_deg),
+            50..=53 => {
+                let p3 = self.p3.as_ref().ok_or_else(|| raw_p3_table_required(raw))?;
+                validate_raw_p3_table(raw.microphysics_scheme_id(), p3.table.as_ref())?;
+                evaluate_p3_psd_raw_cell(raw, self.tables, self.validated, p3, elevation_deg)
+            }
             55 => evaluate_ishmael_psd_raw_cell(raw, self.tables, self.validated, elevation_deg),
             scheme_id => Err(WrfTMatrixRawEvaluationError::UnsupportedScheme { scheme_id }),
         }
@@ -659,10 +723,10 @@ pub enum WrfTMatrixRainMode {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WrfTMatrixAuditCounts {
     pub source_cells: u64,
-    /// P3 populations evaluated through the legacy versioned
-    /// characteristic-particle closure.
+    /// Retained only for reading older audits. New P3 scenes never increment
+    /// the characteristic-particle count.
     pub characteristic_frozen_populations: u64,
-    /// ISHMAEL category distributions integrated from native Q/N/QVOLI/QAOLI.
+    /// P3 or ISHMAEL category distributions integrated from native moments.
     pub scheme_native_psd_populations: u64,
     pub dry_frozen_populations: u64,
     pub wet_frozen_populations: u64,
@@ -718,9 +782,24 @@ pub struct WrfTMatrixSceneProvenance {
 /// Frozen-particle representation used by this source scene.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WrfTMatrixFrozenScatteringAudit {
-    /// Exact P3 native PSD reconstruction is not implemented in this
-    /// revision; P3 remains explicit characteristic-particle science.
+    /// Legacy audit value retained for serialized/in-memory compatibility.
+    /// New P3 production dispatch never emits this variant.
     P3CharacteristicParticleV1,
+    /// Lambda/mu and PSD weights come from the exact pinned P3 table. Shape is
+    /// separately qualified: strict mode evaluates only scheme-native spheres;
+    /// research mode uses the named projected-area-equivalent oblate mapping.
+    P3SchemeNativePsdV1 {
+        p3_psd_revision: &'static str,
+        table_reader_revision: &'static str,
+        integration_revision: &'static str,
+        wrf_source_commit: &'static str,
+        p3_module_version: &'static str,
+        table_kind: P3OfficialTableKind,
+        table_sha256: Sha256Digest,
+        integration: P3TMatrixIntegrationConfig,
+        shape_authority: P3ShapeAuthority,
+        limitation: &'static str,
+    },
     /// Native ISHMAEL gamma PSD integrated through dry particle-node tables.
     /// Wet PSD allocation is deliberately unavailable rather than replaced by
     /// the old characteristic-particle coexistence approximation.
@@ -831,7 +910,7 @@ impl WrfTMatrixScene {
         source: &WrfPropertyScene,
         tables: WrfTMatrixLutBundle<'_>,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_with_rain_mode(source, tables, WrfTMatrixRainMode::FullProperty)
+        Self::build_internal(source, tables, WrfTMatrixRainMode::FullProperty, None)
     }
 
     pub fn build_with_rain_mode(
@@ -839,8 +918,35 @@ impl WrfTMatrixScene {
         tables: WrfTMatrixLutBundle<'_>,
         rain_mode: WrfTMatrixRainMode,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        Self::build_internal(source, tables, rain_mode, None)
+    }
+
+    pub fn build_with_p3(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        p3: WrfTMatrixP3Resources,
+    ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        Self::build_internal(source, tables, WrfTMatrixRainMode::FullProperty, Some(p3))
+    }
+
+    pub fn build_with_p3_and_rain_mode(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        p3: WrfTMatrixP3Resources,
+        rain_mode: WrfTMatrixRainMode,
+    ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        Self::build_internal(source, tables, rain_mode, Some(p3))
+    }
+
+    fn build_internal(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        rain_mode: WrfTMatrixRainMode,
+        p3: Option<WrfTMatrixP3Resources>,
+    ) -> Result<Self, WrfTMatrixSceneBuildError> {
         let validated = validate_bundle(tables)?;
         validate_source_shape(source)?;
+        let p3 = validate_scene_p3_resources(source.microphysics_scheme_id(), p3)?;
         let elevations = validated.radar_elevations_deg;
         let components_per_cell = elevations
             .len()
@@ -866,6 +972,7 @@ impl WrfTMatrixScene {
                                 cell_index as usize,
                                 tables,
                                 validated,
+                                p3.as_ref(),
                                 rain_mode,
                                 output,
                             )?;
@@ -895,6 +1002,7 @@ impl WrfTMatrixScene {
                             cell_index as usize,
                             tables,
                             validated,
+                            p3.as_ref(),
                             rain_mode,
                             output,
                         )
@@ -946,7 +1054,36 @@ impl WrfTMatrixScene {
                         fall_speed: validated.ishmael_fall_speed,
                     }
                 } else {
-                    WrfTMatrixFrozenScatteringAudit::P3CharacteristicParticleV1
+                    let p3 = p3
+                        .as_ref()
+                        .expect("P3 resources were validated before scene allocation");
+                    let integration_revision = match p3.integration.shape_policy() {
+                        P3TMatrixShapePolicy::StrictShapeAuthoritativeSpheres => {
+                            P3_SPHERICAL_INTEGRATION_REVISION
+                        }
+                        P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1 => {
+                            P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION
+                        }
+                    };
+                    WrfTMatrixFrozenScatteringAudit::P3SchemeNativePsdV1 {
+                        p3_psd_revision: P3_PSD_REVISION,
+                        table_reader_revision: P3_TABLE_READER_REVISION,
+                        integration_revision,
+                        wrf_source_commit: P3_WRF_SOURCE_COMMIT,
+                        p3_module_version: P3_MODULE_VERSION,
+                        table_kind: p3.table.kind(),
+                        table_sha256: p3.table.descriptor().table_sha256,
+                        integration: p3.integration,
+                        shape_authority: P3ShapeAuthority::MaximumDimensionAndProjectedAreaOnly,
+                        limitation: match p3.integration.shape_policy() {
+                            P3TMatrixShapePolicy::StrictShapeAuthoritativeSpheres => {
+                                "only P3 regions explicitly defined as spheres are evaluated; nonspherical mass/area-only nodes are omitted under strict budgets"
+                            }
+                            P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1 => {
+                                "lambda/mu and PSD weights are exact P3; oblate shape is projected-area-equivalent and Gaussian-20 canting is an external research assumption, not P3-predicted habit or orientation"
+                            }
+                        },
+                    }
                 },
                 fall_moment_policy: WrfTMatrixFallMomentAudit {
                     closed_category:
@@ -968,8 +1105,27 @@ impl WrfTMatrixScene {
         tables: WrfTMatrixLutBundle<'_>,
         rain_mode: WrfTMatrixRainMode,
     ) -> Result<WrfTMatrixBuildPeakEstimate, WrfTMatrixSceneBuildError> {
+        Self::estimate_build_peak_internal(source, tables, rain_mode, None)
+    }
+
+    pub fn estimate_build_peak_with_p3(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        rain_mode: WrfTMatrixRainMode,
+        p3: &WrfTMatrixP3Resources,
+    ) -> Result<WrfTMatrixBuildPeakEstimate, WrfTMatrixSceneBuildError> {
+        Self::estimate_build_peak_internal(source, tables, rain_mode, Some(p3))
+    }
+
+    fn estimate_build_peak_internal(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        rain_mode: WrfTMatrixRainMode,
+        p3: Option<&WrfTMatrixP3Resources>,
+    ) -> Result<WrfTMatrixBuildPeakEstimate, WrfTMatrixSceneBuildError> {
         let validated = validate_bundle(tables)?;
         validate_source_shape(source)?;
+        validate_scene_p3_resource_ref(source.microphysics_scheme_id(), p3)?;
         estimate_build_peak_from_shape(
             source,
             validated.radar_elevations_deg.len(),
@@ -1206,9 +1362,23 @@ impl WrfTMatrixScene {
 #[derive(Clone, Copy)]
 struct ValidatedBundle<'a> {
     radar_elevations_deg: &'a [f64],
+    p3_particle_support: PsdParticleSupport,
+    p3_fall_speed: PsdFallSpeedProvenance,
     ishmael_psd_config: PsdIntegrationConfig,
     ishmael_particle_support: PsdParticleSupport,
     ishmael_fall_speed: PsdFallSpeedProvenance,
+}
+
+fn production_p3_integration_config(
+    shape_policy: P3TMatrixShapePolicy,
+) -> Result<P3TMatrixIntegrationConfig, radar_scattering::P3TMatrixIntegrationConfigError> {
+    P3TMatrixIntegrationConfig::new(
+        shape_policy,
+        radar_scattering::P3QuadratureConfig::default(),
+        P3_MAXIMUM_OMITTED_NUMBER_FRACTION,
+        P3_MAXIMUM_OMITTED_MASS_FRACTION,
+        P3_MAXIMUM_OMITTED_D6_FRACTION,
+    )
 }
 
 fn production_ishmael_psd_config() -> PsdIntegrationConfig {
@@ -1238,23 +1408,233 @@ fn build_cell_into(
     cell_index: usize,
     tables: WrfTMatrixLutBundle<'_>,
     validated: ValidatedBundle<'_>,
+    p3: Option<&WrfTMatrixP3Resources>,
     rain_mode: WrfTMatrixRainMode,
     output: &mut [f32],
 ) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
     if source.microphysics_scheme_id() == 55 {
         build_ishmael_psd_cell_into(source, cell_index, tables, validated, rain_mode, output)
     } else {
-        build_characteristic_cell_into(
+        build_p3_psd_cell_into(
             source,
             cell_index,
             tables,
-            validated.radar_elevations_deg,
+            validated,
+            p3.expect("P3 resources validated before parallel scene build"),
             rain_mode,
             output,
         )
     }
 }
 
+fn build_p3_psd_cell_into(
+    source: &WrfPropertyScene,
+    cell_index: usize,
+    tables: WrfTMatrixLutBundle<'_>,
+    validated: ValidatedBundle<'_>,
+    p3: &WrfTMatrixP3Resources,
+    rain_mode: WrfTMatrixRainMode,
+    output: &mut [f32],
+) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
+    let elevations = validated.radar_elevations_deg;
+    let expected_components = elevations
+        .len()
+        .checked_mul(AdditiveScattering::COMPONENT_COUNT)
+        .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+    if output.len() != expected_components {
+        return Err(WrfTMatrixSceneBuildError::InternalRowLength {
+            cell_index,
+            expected: expected_components,
+            actual: output.len(),
+        });
+    }
+    let raw = source
+        .raw_cell(cell_index)
+        .map_err(|source| WrfTMatrixSceneBuildError::RawSourceCell { cell_index, source })?;
+    let scheme = P3WrfScheme::try_from(raw.microphysics_scheme_id()).map_err(|source| {
+        WrfTMatrixSceneBuildError::P3PsdReconstruction {
+            cell_index,
+            category: WrfPropertyCategory::P3(radar_scattering::P3Category::Category1),
+            source,
+        }
+    })?;
+    let mut frozen = Vec::with_capacity(raw.categories().len());
+    for category in raw.categories() {
+        if category.mixing_ratio_kgkg() == 0.0 {
+            continue;
+        }
+        let RawPropertyCategory::P3(value) = category else {
+            return Err(WrfTMatrixSceneBuildError::P3CategoryLayout {
+                cell_index,
+                category: category.category(),
+            });
+        };
+        let input = p3_psd_input(scheme, value, raw.dry_air_density_kg_m3()).ok_or(
+            WrfTMatrixSceneBuildError::MissingP3Qzi {
+                cell_index,
+                category: WrfPropertyCategory::P3(value.category),
+            },
+        )?;
+        let distribution =
+            P3Psd::reconstruct(input, p3.table.as_ref(), P3ReconstructionConfig::default())
+                .map_err(|source| WrfTMatrixSceneBuildError::P3PsdReconstruction {
+                    cell_index,
+                    category: WrfPropertyCategory::P3(value.category),
+                    source,
+                })?;
+        frozen.push((WrfPropertyCategory::P3(value.category), distribution));
+    }
+
+    if rain_mode == WrfTMatrixRainMode::FrozenOnly && frozen.is_empty() {
+        return Ok(CellBuildSummary {
+            retained: false,
+            counts: WrfTMatrixAuditCounts::default(),
+        });
+    }
+    let rain = if rain_mode == WrfTMatrixRainMode::FullProperty {
+        match close_raw_rain_state(&raw, OrientationDefinition::Gaussian20Research)
+            .map_err(|source| WrfTMatrixSceneBuildError::RawRainClosure { cell_index, source })?
+        {
+            ClosedRainState::Clear => None,
+            ClosedRainState::Closed(rain) => Some(rain),
+            ClosedRainState::Unavailable(reason) => {
+                return Err(WrfTMatrixSceneBuildError::RainUnavailable { cell_index, reason });
+            }
+        }
+    } else {
+        None
+    };
+    if frozen.is_empty() && rain.is_none() {
+        return Err(WrfTMatrixSceneBuildError::UnexpectedClearActiveCell { cell_index });
+    }
+
+    let counts = WrfTMatrixAuditCounts {
+        source_cells: 1,
+        scheme_native_psd_populations: usize_to_u64(frozen.len())?,
+        dry_frozen_populations: usize_to_u64(frozen.len())?,
+        standalone_rain_populations: u64::from(rain.is_some()),
+        ..WrfTMatrixAuditCounts::default()
+    };
+    for (elevation_index, &elevation_deg) in elevations.iter().enumerate() {
+        let oblate_request =
+            evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+        let prolate_request =
+            evaluation_request(elevation_deg, SpheroidConvention::ProlateMajorVertical)?;
+        let mut additive = AdditiveScattering::default();
+        for (category, distribution) in &frozen {
+            let p3_input = distribution.input();
+            let rime_fraction = p3_input.rime_mass_kgkg / p3_input.total_ice_kgkg;
+            let rime_density = if p3_input.rime_mass_kgkg > 0.0 {
+                Some(p3_input.rime_mass_kgkg / p3_input.rime_volume_m3_per_kg)
+            } else {
+                None
+            };
+            let integration = integrate_p3_tmatrix_psd(
+                distribution,
+                p3.integration,
+                validated.p3_particle_support,
+                |node: &P3TMatrixParticleNode| {
+                    let (table, request) = match node.habit() {
+                        PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
+                            (tables.dry_oblate, oblate_request)
+                        }
+                        PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
+                    };
+                    let positive_down_speed = table.dry_particle_geometry_terminal_speed_m_s(
+                        node.equivolume_diameter_m(),
+                        node.bulk_density_kg_m3(),
+                    )?;
+                    let query = TMatrixParticleNodeQuery::new(
+                        raw.environment().temperature_k(),
+                        node.equivolume_diameter_m(),
+                        node.bulk_density_kg_m3(),
+                        node.minor_to_major_axis_ratio(),
+                        node.habit(),
+                        Some(rime_fraction),
+                        rime_density,
+                        positive_down_speed,
+                        validated.p3_fall_speed,
+                        gaussian20_orientation(),
+                        request,
+                    )?;
+                    table.evaluate_dry_particle_node_per_m3(&query)
+                },
+            )
+            .map_err(|source| WrfTMatrixSceneBuildError::P3PsdIntegration {
+                cell_index,
+                elevation_deg,
+                category: *category,
+                source,
+            })?;
+            additive = additive
+                .checked_add(integration.additive())
+                .map_err(|source| WrfTMatrixSceneBuildError::Accumulation {
+                    cell_index,
+                    elevation_deg,
+                    contribution: WrfTMatrixContribution::P3SchemeNativePsd,
+                    source,
+                })?;
+        }
+        if let Some(rain) = rain.as_deref() {
+            let contribution = tables
+                .rain_standalone_and_residual
+                .evaluate(rain, oblate_request)
+                .map_err(|source| WrfTMatrixSceneBuildError::Evaluation {
+                    cell_index,
+                    elevation_deg,
+                    contribution: WrfTMatrixContribution::StandaloneRain,
+                    source,
+                })?;
+            additive = additive.checked_add(contribution).map_err(|source| {
+                WrfTMatrixSceneBuildError::Accumulation {
+                    cell_index,
+                    elevation_deg,
+                    contribution: WrfTMatrixContribution::StandaloneRain,
+                    source,
+                }
+            })?;
+        }
+        let compact =
+            compact_components(additive).map_err(|source| WrfTMatrixSceneBuildError::Compact {
+                cell_index,
+                elevation_deg,
+                source,
+            })?;
+        let start = elevation_index
+            .checked_mul(AdditiveScattering::COMPONENT_COUNT)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+        output[start..start + AdditiveScattering::COMPONENT_COUNT].copy_from_slice(&compact);
+    }
+    Ok(CellBuildSummary {
+        retained: true,
+        counts,
+    })
+}
+
+fn p3_psd_input(
+    scheme: P3WrfScheme,
+    value: &crate::wrf_property_reader::RawP3Category,
+    dry_air_density_kg_m3: f64,
+) -> Option<P3PsdInput> {
+    let moment = match scheme {
+        P3WrfScheme::Mp53OneIceTripleMoment => P3IceMomentInput::WrfAdvectedQzi {
+            qzi_sqrt_n_times_m6: value.qzi?,
+        },
+        _ => P3IceMomentInput::TwoMoment,
+    };
+    Some(P3PsdInput {
+        scheme,
+        category: value.category,
+        total_ice_kgkg: value.qice_kgkg,
+        total_number_per_kg: value.qnice_per_kg,
+        rime_mass_kgkg: value.qir_kgkg,
+        rime_volume_m3_per_kg: value.qib_m3_per_kg,
+        dry_air_density_kg_m3,
+        moment,
+    })
+}
+
+#[allow(dead_code)]
 fn build_characteristic_cell_into(
     source: &WrfPropertyScene,
     cell_index: usize,
@@ -1649,6 +2029,130 @@ fn gaussian20_orientation() -> OrientationModel {
     }
 }
 
+fn evaluate_p3_psd_raw_cell(
+    raw: &RawPropertyCell,
+    tables: WrfTMatrixLutBundle<'_>,
+    validated: ValidatedBundle<'_>,
+    p3: &WrfTMatrixP3Resources,
+    elevation_deg: f64,
+) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
+    let scheme = P3WrfScheme::try_from(raw.microphysics_scheme_id()).map_err(|source| {
+        WrfTMatrixRawEvaluationError::P3PsdReconstruction {
+            category: WrfPropertyCategory::P3(radar_scattering::P3Category::Category1),
+            source,
+        }
+    })?;
+    let mut frozen = Vec::with_capacity(raw.categories().len());
+    for category in raw.categories() {
+        if category.mixing_ratio_kgkg() == 0.0 {
+            continue;
+        }
+        let RawPropertyCategory::P3(value) = category else {
+            return Err(WrfTMatrixRawEvaluationError::P3CategoryLayout(
+                category.category(),
+            ));
+        };
+        let input = p3_psd_input(scheme, value, raw.dry_air_density_kg_m3()).ok_or(
+            WrfTMatrixRawEvaluationError::MissingP3Qzi(WrfPropertyCategory::P3(value.category)),
+        )?;
+        let distribution =
+            P3Psd::reconstruct(input, p3.table.as_ref(), P3ReconstructionConfig::default())
+                .map_err(|source| WrfTMatrixRawEvaluationError::P3PsdReconstruction {
+                    category: WrfPropertyCategory::P3(value.category),
+                    source,
+                })?;
+        frozen.push((WrfPropertyCategory::P3(value.category), distribution));
+    }
+    let rain = match close_raw_rain_state(raw, OrientationDefinition::Gaussian20Research)
+        .map_err(WrfTMatrixRawEvaluationError::Closure)?
+    {
+        ClosedRainState::Clear => None,
+        ClosedRainState::Closed(rain) => Some(rain),
+        ClosedRainState::Unavailable(reason) => {
+            return Err(WrfTMatrixRawEvaluationError::RainUnavailable(reason));
+        }
+    };
+    if frozen.is_empty() && rain.is_none() {
+        return Ok(None);
+    }
+
+    let oblate_request =
+        raw_evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+    let prolate_request =
+        raw_evaluation_request(elevation_deg, SpheroidConvention::ProlateMajorVertical)?;
+    let mut additive = AdditiveScattering::default();
+    for (category, distribution) in &frozen {
+        let p3_input = distribution.input();
+        let rime_fraction = p3_input.rime_mass_kgkg / p3_input.total_ice_kgkg;
+        let rime_density = if p3_input.rime_mass_kgkg > 0.0 {
+            Some(p3_input.rime_mass_kgkg / p3_input.rime_volume_m3_per_kg)
+        } else {
+            None
+        };
+        let integration = integrate_p3_tmatrix_psd(
+            distribution,
+            p3.integration,
+            validated.p3_particle_support,
+            |node: &P3TMatrixParticleNode| {
+                let (table, request) = match node.habit() {
+                    PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
+                        (tables.dry_oblate, oblate_request)
+                    }
+                    PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
+                };
+                let positive_down_speed = table.dry_particle_geometry_terminal_speed_m_s(
+                    node.equivolume_diameter_m(),
+                    node.bulk_density_kg_m3(),
+                )?;
+                let query = TMatrixParticleNodeQuery::new(
+                    raw.environment().temperature_k(),
+                    node.equivolume_diameter_m(),
+                    node.bulk_density_kg_m3(),
+                    node.minor_to_major_axis_ratio(),
+                    node.habit(),
+                    Some(rime_fraction),
+                    rime_density,
+                    positive_down_speed,
+                    validated.p3_fall_speed,
+                    gaussian20_orientation(),
+                    request,
+                )?;
+                table.evaluate_dry_particle_node_per_m3(&query)
+            },
+        )
+        .map_err(|source| WrfTMatrixRawEvaluationError::P3PsdIntegration {
+            category: *category,
+            source,
+        })?;
+        additive = additive
+            .checked_add(integration.additive())
+            .map_err(|source| WrfTMatrixRawEvaluationError::Accumulation {
+                contribution: WrfTMatrixContribution::P3SchemeNativePsd,
+                source,
+            })?;
+    }
+    if let Some(rain) = rain.as_deref() {
+        let contribution = tables
+            .rain_standalone_and_residual
+            .evaluate(rain, oblate_request)
+            .map_err(|source| WrfTMatrixRawEvaluationError::Evaluation {
+                contribution: WrfTMatrixContribution::StandaloneRain,
+                source,
+            })?;
+        additive = additive.checked_add(contribution).map_err(|source| {
+            WrfTMatrixRawEvaluationError::Accumulation {
+                contribution: WrfTMatrixContribution::StandaloneRain,
+                source,
+            }
+        })?;
+    }
+    additive
+        .to_polar_accumulator_quantities()
+        .map(Some)
+        .map_err(WrfTMatrixRawEvaluationError::Output)
+}
+
+#[allow(dead_code)]
 fn evaluate_characteristic_raw_cell(
     raw: &RawPropertyCell,
     tables: WrfTMatrixLutBundle<'_>,
@@ -1977,6 +2481,74 @@ fn compact_frozen_only_rows(
     Ok((retained_indices, counts))
 }
 
+fn required_p3_table_kind(scheme_id: i32) -> Option<P3OfficialTableKind> {
+    match scheme_id {
+        50..=52 => Some(P3OfficialTableKind::TwoMoment),
+        53 => Some(P3OfficialTableKind::ThreeMoment),
+        _ => None,
+    }
+}
+
+fn validate_scene_p3_resources(
+    scheme_id: i32,
+    p3: Option<WrfTMatrixP3Resources>,
+) -> Result<Option<WrfTMatrixP3Resources>, WrfTMatrixSceneBuildError> {
+    validate_scene_p3_resource_ref(scheme_id, p3.as_ref())?;
+    Ok(p3)
+}
+
+fn validate_scene_p3_resource_ref(
+    scheme_id: i32,
+    p3: Option<&WrfTMatrixP3Resources>,
+) -> Result<(), WrfTMatrixSceneBuildError> {
+    let Some(expected) = required_p3_table_kind(scheme_id) else {
+        return Ok(());
+    };
+    let resource = p3.ok_or_else(|| {
+        let spec = expected.asset_spec();
+        WrfTMatrixSceneBuildError::P3TableRequired {
+            scheme_id,
+            expected_file: spec.file_name,
+            source_url: spec.source_url,
+        }
+    })?;
+    if resource.table.kind() != expected {
+        return Err(WrfTMatrixSceneBuildError::WrongP3Table {
+            scheme_id,
+            expected_file: expected.asset_spec().file_name,
+            actual: resource.table.kind(),
+        });
+    }
+    Ok(())
+}
+
+fn raw_p3_table_required(raw: &RawPropertyCell) -> WrfTMatrixRawEvaluationError {
+    let expected = required_p3_table_kind(raw.microphysics_scheme_id())
+        .expect("raw P3 dispatcher only requests P3 table contracts");
+    let spec = expected.asset_spec();
+    WrfTMatrixRawEvaluationError::P3TableRequired {
+        scheme_id: raw.microphysics_scheme_id(),
+        expected_file: spec.file_name,
+        source_url: spec.source_url,
+    }
+}
+
+fn validate_raw_p3_table(
+    scheme_id: i32,
+    table: &P3OfficialTableV54,
+) -> Result<(), WrfTMatrixRawEvaluationError> {
+    let expected = required_p3_table_kind(scheme_id)
+        .expect("raw P3 dispatcher only validates P3 table contracts");
+    if table.kind() != expected {
+        return Err(WrfTMatrixRawEvaluationError::WrongP3Table {
+            scheme_id,
+            expected_file: expected.asset_spec().file_name,
+            actual: table.kind(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_source_shape(source: &WrfPropertyScene) -> Result<(), WrfTMatrixSceneBuildError> {
     if source.cell_count() > u32::MAX as usize {
         return Err(WrfTMatrixSceneBuildError::GridTooLarge {
@@ -2037,6 +2609,15 @@ fn estimate_build_peak_from_shape(
             required_contract_bytes,
         ])?,
     ])?;
+    let p3_quadrature_scratch_bytes = if (50..=53).contains(&source.microphysics_scheme_id()) {
+        checked_product(&[
+            MAX_PROPERTY_CATEGORIES_PER_CELL,
+            radar_scattering::P3QuadratureConfig::default().maximum_nodes as usize,
+            size_of::<P3QuadratureNode>(),
+        ])?
+    } else {
+        0
+    };
     let per_worker_scratch = checked_sum([
         checked_product(&[components_per_cell, size_of::<f32>()])?,
         size_of::<ClosedPropertyCell>(),
@@ -2049,6 +2630,7 @@ fn estimate_build_peak_from_shape(
             size_of::<DiagnosticWetCategory>(),
         ])?,
         closure_source_copy_bytes,
+        p3_quadrature_scratch_bytes,
         PER_WORKER_ALLOCATION_GUARD_BYTES,
     ])?;
     let worker_chunk_and_closure_scratch_bytes =
@@ -2411,6 +2993,12 @@ fn validate_bundle(
 
     Ok(ValidatedBundle {
         radar_elevations_deg: reference_elevations,
+        p3_particle_support: PsdParticleSupport::new(
+            Some(oblate_domain),
+            Some(prolate_domain),
+            Some(oblate_domain),
+        ),
+        p3_fall_speed: oblate_fall_speed,
         ishmael_psd_config: production_ishmael_psd_config(),
         ishmael_particle_support: PsdParticleSupport::new(
             Some(oblate_domain),
@@ -2633,6 +3221,7 @@ fn elevation_bracket(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WrfTMatrixContribution {
     DryFrozen,
+    P3SchemeNativePsd,
     IshmaelSchemeNativePsd,
     WetFrozen,
     ResidualRain,
@@ -2643,6 +3232,7 @@ impl std::fmt::Display for WrfTMatrixContribution {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::DryFrozen => "dry frozen",
+            Self::P3SchemeNativePsd => "P3 scheme-native PSD",
             Self::IshmaelSchemeNativePsd => "ISHMAEL scheme-native PSD",
             Self::WetFrozen => "wet frozen",
             Self::ResidualRain => "residual rain",
@@ -2655,6 +3245,38 @@ impl std::fmt::Display for WrfTMatrixContribution {
 pub enum WrfTMatrixRawEvaluationError {
     #[error("raw property T-matrix evaluation does not support WRF mp_physics={scheme_id}")]
     UnsupportedScheme { scheme_id: i32 },
+    #[error(
+        "WRF mp_physics={scheme_id} requires official P3 table {expected_file}; load/cache the hash-qualified external asset from {source_url} and construct the evaluator with new_with_p3"
+    )]
+    P3TableRequired {
+        scheme_id: i32,
+        expected_file: &'static str,
+        source_url: &'static str,
+    },
+    #[error(
+        "WRF mp_physics={scheme_id} requires official P3 table {expected_file}, but {actual:?} is loaded"
+    )]
+    WrongP3Table {
+        scheme_id: i32,
+        expected_file: &'static str,
+        actual: P3OfficialTableKind,
+    },
+    #[error("blended P3 state contains non-P3 category {0}")]
+    P3CategoryLayout(WrfPropertyCategory),
+    #[error("blended triple-moment P3 state is missing QZI for {0}")]
+    MissingP3Qzi(WrfPropertyCategory),
+    #[error("reconstruct blended exact native P3 PSD for {category}: {source}")]
+    P3PsdReconstruction {
+        category: WrfPropertyCategory,
+        #[source]
+        source: P3PsdError,
+    },
+    #[error("integrate blended native P3 PSD for {category}: {source}")]
+    P3PsdIntegration {
+        category: WrfPropertyCategory,
+        #[source]
+        source: P3TMatrixIntegrationError<EvaluationError>,
+    },
     #[error("close blended raw property state: {0}")]
     Closure(#[source] RawPropertyClosureError),
     #[error("full raw property T-matrix evaluation requires rain state: {0}")]
@@ -2723,6 +3345,22 @@ pub enum WrfTMatrixSceneBuildError {
         index: u32,
         cell_count: usize,
     },
+    #[error(
+        "WRF mp_physics={scheme_id} requires official P3 table {expected_file}; load/cache the hash-qualified external asset from {source_url} and call build_with_p3"
+    )]
+    P3TableRequired {
+        scheme_id: i32,
+        expected_file: &'static str,
+        source_url: &'static str,
+    },
+    #[error(
+        "WRF mp_physics={scheme_id} requires official P3 table {expected_file}, but {actual:?} is loaded"
+    )]
+    WrongP3Table {
+        scheme_id: i32,
+        expected_file: &'static str,
+        actual: P3OfficialTableKind,
+    },
     #[error("close property source cell {cell_index}: {source}")]
     SourceCell {
         cell_index: usize,
@@ -2734,6 +3372,33 @@ pub enum WrfTMatrixSceneBuildError {
         cell_index: usize,
         #[source]
         source: WrfPropertyReadError,
+    },
+    #[error("P3 source cell {cell_index} contains non-P3 category {category}")]
+    P3CategoryLayout {
+        cell_index: usize,
+        category: WrfPropertyCategory,
+    },
+    #[error("triple-moment P3 source cell {cell_index} is missing QZI for {category}")]
+    MissingP3Qzi {
+        cell_index: usize,
+        category: WrfPropertyCategory,
+    },
+    #[error("reconstruct exact native P3 PSD for {category} at cell {cell_index}: {source}")]
+    P3PsdReconstruction {
+        cell_index: usize,
+        category: WrfPropertyCategory,
+        #[source]
+        source: P3PsdError,
+    },
+    #[error(
+        "integrate native P3 PSD for {category} at cell {cell_index}, elevation {elevation_deg} degrees: {source}"
+    )]
+    P3PsdIntegration {
+        cell_index: usize,
+        elevation_deg: f64,
+        category: WrfPropertyCategory,
+        #[source]
+        source: P3TMatrixIntegrationError<EvaluationError>,
     },
     #[error("ISHMAEL source cell {cell_index} contains non-ISHMAEL category {category}")]
     IshmaelCategoryLayout {
