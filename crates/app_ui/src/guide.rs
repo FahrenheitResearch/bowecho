@@ -1264,9 +1264,19 @@ fn wrf(ui: &mut egui::Ui) {
         ui,
         "The multi-sample operator accumulates linear Z, Z-weighted radial velocity and \
          variance, polarimetric covariance, and terrain occultation. Terminal fall speed can \
-         make Doppler follow the scattering particles rather than air alone. Cumulative \
-         4/3-Earth terrain horizons remove blocked quadrature power instead of renormalizing it, \
-         so partial beam blockage remains visible.",
+         make Doppler follow the scattering particles rather than air alone. Cumulative terrain \
+         horizons remove blocked quadrature power instead of renormalizing it, so partial beam \
+         blockage remains visible.",
+    );
+    para(
+        ui,
+        "Standard 4/3 Earth is the default beam geometry. WRF refractivity (research) instead \
+         reads P, PB, T and QVAPOR at the actual virtual-radar site and ray-traces the gate \
+         ground range and height through that model profile. Sampling and terrain blockage use \
+         the same resolved path. Missing fields, incomplete vertical coverage or a mismatched \
+         site stop the build rather than falling back silently. BowEcho records the refractivity \
+         gradient and propagation regime and warns explicitly about ducting. Operational \
+         HRRR/RRFS forecast radar remains on standard 4/3 Earth.",
     );
     para(
         ui,

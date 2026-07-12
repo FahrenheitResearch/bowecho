@@ -216,9 +216,22 @@ terminal fall speed. Spectrum width combines pulse-volume velocity variance,
 terminal-speed diversity, optional WRF TKE/QKE, and a configured instrument
 floor.
 
+The default beam path uses standard 4/3-Earth geometry. An explicit **WRF
+refractivity (research)** choice instead reads `P`, `PB`, `T`, and `QVAPOR` at
+the actual virtual-radar site, derives the vertical refractivity profile, and
+ray-traces gate ground range and height through that model atmosphere. The
+same resolved path is used for model sampling and terrain blockage at every
+cut and quadrature point. Missing thermodynamic fields, incomplete vertical
+coverage, or a profile that does not match the selected site stop the build;
+BowEcho does not silently fall back to 4/3 Earth. The output records the local
+refractivity gradient, propagation regime, and a visible ducting warning when
+applicable. Operational HRRR/RRFS forecast radar remains on standard 4/3-Earth
+geometry because that ingest path does not yet carry this qualified site
+profile.
+
 Terrain blockage uses a cumulative apparent horizon for every azimuth and
-range under the same 4/3-Earth geometry as the beam. Blocked quadrature weights
-remove received power instead of being renormalized, which gives partial beam
+range under the selected beam geometry. Blocked quadrature weights remove
+received power instead of being renormalized, which gives partial beam
 blockage in the multi-sample rules.
 
 Timed volumes stamp a monotonic acquisition offset on every ray. The custom
