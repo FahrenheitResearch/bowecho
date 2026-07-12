@@ -2472,7 +2472,10 @@ impl ModelDataDock {
                     .as_deref()
                     .is_some_and(|value| value.starts_with("simulated-wrf"));
             !provenance_is_synthetic
-                && crate::wrf_radar_validation::ExactScanTemplate::from_volume(volume).is_ok()
+                && volume.site.latitude_deg.is_some()
+                && volume.site.longitude_deg.is_some()
+                && !volume.cuts.is_empty()
+                && volume.cuts.iter().all(|cut| !cut.radials.is_empty())
         });
     }
 
