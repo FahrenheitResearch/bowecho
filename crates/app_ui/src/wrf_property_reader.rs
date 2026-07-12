@@ -3,10 +3,10 @@
 //! This module is the file/normalization boundary in front of
 //! `radar_scattering`'s grid-point closures.  It deliberately does not modify
 //! the simulated-radar renderer or evaluate a LUT. A scene retains sparse
-//! positive-mass category tuples plus dense `f32` temperature, moist-air
-//! density, and dry-air density so clear corners and echo birth retain
-//! complete interpolation coverage. Full WRF source fields are read one at a
-//! time and discarded.
+//! positive-mass category tuples plus dense `f32` temperature, pressure,
+//! moist-air density, and dry-air density so clear corners and echo birth
+//! retain complete interpolation coverage. Full WRF source fields are read
+//! one at a time and discarded.
 //!
 //! [`blend_raw_property_cells`] performs weighted spatial/temporal blending
 //! before [`close_raw_property_cell`]. Closed particles, LUT coordinates, and
@@ -750,6 +750,7 @@ impl SparseRainStorage {
 #[derive(Clone, Debug, PartialEq)]
 struct DenseEnvironment {
     temperature_k: Vec<f32>,
+    pressure_pa: Vec<f32>,
     air_density_kg_m3: Vec<f32>,
     dry_air_density_kg_m3: Vec<f32>,
 }
@@ -767,6 +768,10 @@ impl DenseEnvironment {
         Some(f64::from(
             *self.dry_air_density_kg_m3.get(cell_index as usize)?,
         ))
+    }
+
+    fn pressure_at(&self, cell_index: u32) -> Option<f64> {
+        Some(f64::from(*self.pressure_pa.get(cell_index as usize)?))
     }
 }
 
@@ -842,6 +847,7 @@ pub struct RawPropertyCell {
     microphysics_scheme_id: i32,
     required_field_signature: Arc<RequiredFieldSignature>,
     environment: ParticleEnvironment,
+    pressure_pa: f64,
     dry_air_density_kg_m3: f64,
     categories: Vec<RawPropertyCategory>,
     rain: RawRainState,
@@ -866,6 +872,11 @@ impl RawPropertyCell {
     #[must_use]
     pub const fn environment(&self) -> ParticleEnvironment {
         self.environment
+    }
+
+    #[must_use]
+    pub const fn pressure_pa(&self) -> f64 {
+        self.pressure_pa
     }
 
     /// Dry-air density paired with WRF's per-kilogram-dry-air hydrometeor
@@ -929,6 +940,8 @@ pub enum RawPropertyBlendError {
     },
     #[error("blended raw dry-air density must be finite and positive, got {value}")]
     DryAirDensity { value: f64 },
+    #[error("blended raw pressure must be finite and positive, got {value}")]
+    Pressure { value: f64 },
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -1045,6 +1058,12 @@ impl WrfPropertyScene {
             WrfPropertyReadError::InvalidEnvironment {
                 cell_index,
                 reason: "dense dry-air-density coverage is unavailable",
+            },
+        )?;
+        let pressure_pa = self.environment.pressure_at(compact_index).ok_or(
+            WrfPropertyReadError::InvalidEnvironment {
+                cell_index,
+                reason: "dense pressure coverage is unavailable",
             },
         )?;
         let categories = if matches!(self.microphysics_scheme_id, 50..=53) {
@@ -1179,6 +1198,7 @@ impl WrfPropertyScene {
             microphysics_scheme_id: self.microphysics_scheme_id,
             required_field_signature: Arc::clone(&self.required_field_signature),
             environment,
+            pressure_pa,
             dry_air_density_kg_m3,
             categories,
             rain: self.rain.raw_at(compact_index),
@@ -1241,6 +1261,7 @@ impl WrfPropertyScene {
             + diagnostic_index_bytes
             + self.rain.index_bytes();
         let value_bytes = (self.environment.temperature_k.len()
+            + self.environment.pressure_pa.len()
             + self.environment.air_density_kg_m3.len()
             + self.environment.dry_air_density_kg_m3.len())
             * size_of::<f32>()
@@ -1359,6 +1380,14 @@ pub fn blend_raw_property_cells(
         .sum();
     let environment = ParticleEnvironment::new(temperature_k, air_density_kg_m3)
         .map_err(|source| RawPropertyBlendError::Environment { source })?;
+    let pressure_pa = raw_cells
+        .iter()
+        .zip(samples)
+        .map(|(cell, sample)| cell.pressure_pa * sample.weight)
+        .sum::<f64>();
+    if !pressure_pa.is_finite() || pressure_pa <= 0.0 {
+        return Err(RawPropertyBlendError::Pressure { value: pressure_pa });
+    }
     let dry_air_density_kg_m3 = raw_cells
         .iter()
         .zip(samples)
@@ -1481,6 +1510,7 @@ pub fn blend_raw_property_cells(
         microphysics_scheme_id: first.microphysics_scheme_id,
         required_field_signature: Arc::clone(&first.required_field_signature),
         environment,
+        pressure_pa,
         dry_air_density_kg_m3,
         categories,
         rain,
@@ -2466,6 +2496,7 @@ fn read_environment<P: PropertyFieldProvider + ?Sized>(
     for (pressure, base) in air_density_kg_m3.iter_mut().zip(base_pressure) {
         *pressure += base;
     }
+    let pressure_pa = air_density_kg_m3.clone();
     for cell_index in 0..cell_count {
         let pressure = f64::from(air_density_kg_m3[cell_index]);
         let theta = f64::from(temperature_k[cell_index]) + 300.0;
@@ -2526,6 +2557,7 @@ fn read_environment<P: PropertyFieldProvider + ?Sized>(
     Ok((
         DenseEnvironment {
             temperature_k,
+            pressure_pa,
             air_density_kg_m3,
             dry_air_density_kg_m3,
         },
@@ -3020,6 +3052,7 @@ mod tests {
         let expected_dry = 100_000.0
             / (280.0 * (DRY_AIR_GAS_CONSTANT_J_KG_K + qv * WATER_VAPOR_GAS_CONSTANT_J_KG_K));
         assert_close(raw.dry_air_density_kg_m3(), expected_dry, 2.0e-6);
+        assert_close(raw.pressure_pa(), 100_000.0, 1.0e-3);
         assert_close(
             raw.environment().air_density_kg_m3(),
             expected_dry * (1.0 + qv),
@@ -3245,8 +3278,8 @@ mod tests {
         let estimate = scene.memory_estimate();
         // One active-union index + one category index.
         assert_eq!(estimate.index_bytes, 2 * size_of::<u32>());
-        // Dense temperature+moist/dry density coverage plus four sparse P3 values.
-        assert_eq!(estimate.value_bytes, (3 * 1_024 + 4) * size_of::<f32>());
+        // Dense temperature/pressure/moist+dry density plus four sparse P3 values.
+        assert_eq!(estimate.value_bytes, (4 * 1_024 + 4) * size_of::<f32>());
         assert!(estimate.retained_bytes() < 1_024 * 6 * size_of::<f32>());
         assert_eq!(scene.active_cell_indices(), &[777]);
         assert_eq!(scene.identity().source_identity.0, "sha256:opaque-scene-id");

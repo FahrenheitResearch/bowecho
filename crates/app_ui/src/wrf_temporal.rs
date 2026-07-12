@@ -26,6 +26,9 @@ use crate::wrf_property_reader::{
 };
 use crate::wrf_scene_inventory::{WrfSceneGroup, WrfSceneLocator};
 
+pub const MAX_RAW_STATE_SPATIAL_WEIGHTS_PER_SCENE: usize = 8;
+const RAW_STATE_WEIGHT_SUM_TOLERANCE: f64 = 1.0e-9;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AtmosphereTimeMode {
@@ -526,8 +529,14 @@ pub fn interpolate_raw_gate(
 #[derive(Clone, Copy, Debug)]
 pub struct RawStateLinearEndpoint<'a> {
     pub property_scene: &'a WrfPropertyScene,
-    pub property_cell_index: usize,
+    property_coverage: RawPropertyCoverage<'a>,
     pub gate_state: &'a RawGateState,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RawPropertyCoverage<'a> {
+    Single(usize),
+    Weighted(&'a [(usize, f64)]),
 }
 
 impl<'a> RawStateLinearEndpoint<'a> {
@@ -539,7 +548,23 @@ impl<'a> RawStateLinearEndpoint<'a> {
     ) -> Self {
         Self {
             property_scene,
-            property_cell_index,
+            property_coverage: RawPropertyCoverage::Single(property_cell_index),
+            gate_state,
+        }
+    }
+
+    /// One endpoint sampled from its actual spatial interpolation stencil.
+    /// Weights must be normalized, positive-coverage contributions and may
+    /// contain at most the eight nodes of one trilinear WRF stencil.
+    #[must_use]
+    pub const fn with_spatial_weights(
+        property_scene: &'a WrfPropertyScene,
+        property_weights: &'a [(usize, f64)],
+        gate_state: &'a RawGateState,
+    ) -> Self {
+        Self {
+            property_scene,
+            property_coverage: RawPropertyCoverage::Weighted(property_weights),
             gate_state,
         }
     }
@@ -569,6 +594,16 @@ pub enum RawStateLinearError {
     PropertyCategoryLayoutMismatch,
     #[error("raw-state temporal rain availability differs between model times")]
     RainAvailabilityMismatch,
+    #[error("raw-state endpoint has {actual} spatial weights; maximum is {maximum}")]
+    TooManySpatialWeights { actual: usize, maximum: usize },
+    #[error("raw-state endpoint spatial coverage is empty")]
+    EmptySpatialWeights,
+    #[error(
+        "raw-state endpoint spatial weight {weight} at index {index} must be finite and nonnegative"
+    )]
+    InvalidSpatialWeight { index: usize, weight: f64 },
+    #[error("raw-state endpoint spatial weights sum to {sum}, expected 1")]
+    SpatialWeightSum { sum: f64 },
     #[error(transparent)]
     PropertyRead(#[from] WrfPropertyReadError),
     #[error("blend raw property state: {0}")]
@@ -597,12 +632,76 @@ fn exact_raw_state_endpoint(
     endpoint: RawStateLinearEndpoint<'_>,
 ) -> Result<RawStateLinearCell, RawStateLinearError> {
     validate_raw_gate_state(endpoint.gate_state).map_err(RawStateLinearError::Gate)?;
+    let property_cell = match endpoint.property_coverage {
+        RawPropertyCoverage::Single(cell_index) => endpoint.property_scene.raw_cell(cell_index)?,
+        RawPropertyCoverage::Weighted(weights) => {
+            let mut samples = Vec::with_capacity(weights.len());
+            append_endpoint_property_samples(endpoint, 1.0, &mut samples)?;
+            normalize_raw_property_sample_residual(&mut samples)?;
+            blend_raw_property_cells(&samples).map_err(map_raw_property_blend_error)?
+        }
+    };
     Ok(RawStateLinearCell {
-        property_cell: endpoint
-            .property_scene
-            .raw_cell(endpoint.property_cell_index)?,
+        property_cell,
         gate_state: endpoint.gate_state.clone(),
     })
+}
+
+fn append_endpoint_property_samples<'a>(
+    endpoint: RawStateLinearEndpoint<'a>,
+    temporal_weight: f64,
+    samples: &mut Vec<WeightedRawPropertyCell<'a>>,
+) -> Result<(), RawStateLinearError> {
+    match endpoint.property_coverage {
+        RawPropertyCoverage::Single(cell_index) => samples.push(WeightedRawPropertyCell::new(
+            endpoint.property_scene,
+            cell_index,
+            temporal_weight,
+        )),
+        RawPropertyCoverage::Weighted(weights) => {
+            if weights.is_empty() {
+                return Err(RawStateLinearError::EmptySpatialWeights);
+            }
+            if weights.len() > MAX_RAW_STATE_SPATIAL_WEIGHTS_PER_SCENE {
+                return Err(RawStateLinearError::TooManySpatialWeights {
+                    actual: weights.len(),
+                    maximum: MAX_RAW_STATE_SPATIAL_WEIGHTS_PER_SCENE,
+                });
+            }
+            let mut spatial_sum = 0.0;
+            for (index, &(cell_index, weight)) in weights.iter().enumerate() {
+                if !weight.is_finite() || weight < 0.0 {
+                    return Err(RawStateLinearError::InvalidSpatialWeight { index, weight });
+                }
+                spatial_sum += weight;
+                samples.push(WeightedRawPropertyCell::new(
+                    endpoint.property_scene,
+                    cell_index,
+                    temporal_weight * weight,
+                ));
+            }
+            if (spatial_sum - 1.0).abs() > RAW_STATE_WEIGHT_SUM_TOLERANCE {
+                return Err(RawStateLinearError::SpatialWeightSum { sum: spatial_sum });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_raw_property_sample_residual(
+    samples: &mut [WeightedRawPropertyCell<'_>],
+) -> Result<(), RawStateLinearError> {
+    let sum = samples.iter().map(|sample| sample.weight).sum::<f64>();
+    if !sum.is_finite() || (sum - 1.0).abs() > RAW_STATE_WEIGHT_SUM_TOLERANCE {
+        return Err(RawStateLinearError::SpatialWeightSum { sum });
+    }
+    if let Some(target) = samples
+        .iter_mut()
+        .max_by(|left, right| left.weight.total_cmp(&right.weight))
+    {
+        target.weight += 1.0 - sum;
+    }
+    Ok(())
 }
 
 /// Interpolate complete raw state across two adjacent model times.
@@ -645,11 +744,12 @@ pub fn interpolate_raw_state_linear(
         return Err(RawStateLinearError::PropertyInventoryMismatch);
     }
 
-    let property_cell = blend_raw_property_cells(&[
-        WeightedRawPropertyCell::new(left.property_scene, left.property_cell_index, 1.0 - alpha),
-        WeightedRawPropertyCell::new(right.property_scene, right.property_cell_index, alpha),
-    ])
-    .map_err(map_raw_property_blend_error)?;
+    let mut property_samples = Vec::with_capacity(2 * MAX_RAW_STATE_SPATIAL_WEIGHTS_PER_SCENE);
+    append_endpoint_property_samples(left, 1.0 - alpha, &mut property_samples)?;
+    append_endpoint_property_samples(right, alpha, &mut property_samples)?;
+    normalize_raw_property_sample_residual(&mut property_samples)?;
+    let property_cell =
+        blend_raw_property_cells(&property_samples).map_err(map_raw_property_blend_error)?;
     let gate_state = interpolate_raw_gate(Some(left.gate_state), Some(right.gate_state), alpha)
         .map_err(RawStateLinearError::Gate)?;
     Ok(RawStateLinearCell {
@@ -1012,7 +1112,10 @@ mod tests {
         }
 
         fn cell_count(&self) -> usize {
-            1
+            self.fields
+                .values()
+                .next()
+                .map_or(0, |field| field.values.len())
         }
 
         fn time_count(&self) -> usize {
@@ -1075,6 +1178,30 @@ mod tests {
     ) -> WrfPropertyScene {
         read_property_scene(
             &property_provider(name, 50, temperature_k, qice, qnice, qir, qib, rain),
+            0,
+        )
+        .unwrap()
+    }
+
+    fn two_cell_property_scene(name: &str, qice: [f64; 2]) -> WrfPropertyScene {
+        let fields = BTreeMap::from([
+            ("QICE", RawPropertyField::new(qice.to_vec(), "kg kg-1")),
+            ("QNICE", RawPropertyField::new(vec![1.0e6; 2], "kg-1")),
+            ("QIR", RawPropertyField::new(vec![4.0e-5; 2], "kg kg-1")),
+            ("QIB", RawPropertyField::new(vec![1.0e-7; 2], "m3 kg-1")),
+            ("T", RawPropertyField::new(vec![-30.0; 2], "K")),
+            ("P", RawPropertyField::new(vec![0.0; 2], "Pa")),
+            ("PB", RawPropertyField::new(vec![100_000.0; 2], "Pa")),
+            ("QVAPOR", RawPropertyField::new(vec![0.0; 2], "kg kg-1")),
+            ("QRAIN", RawPropertyField::new(vec![0.0; 2], "kg kg-1")),
+            ("QNRAIN", RawPropertyField::new(vec![0.0; 2], "kg-1")),
+        ]);
+        read_property_scene(
+            &TemporalPropertyProvider {
+                identity: WrfSourceIdentity(name.to_owned()),
+                scheme_id: 50,
+                fields,
+            },
             0,
         )
         .unwrap()
@@ -1148,6 +1275,32 @@ mod tests {
 
         let decay = interpolate_raw_state_linear(Some(echo), Some(clear), 0.75).unwrap();
         assert!((decay.property_cell.categories()[0].mixing_ratio_kgkg() - 2.5e-5).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn raw_state_linear_combines_full_spatial_stencils_before_temporal_blend() {
+        let left_scene = two_cell_property_scene("left-spatial", [1.0e-4, 3.0e-4]);
+        let right_scene = two_cell_property_scene("right-spatial", [5.0e-4, 9.0e-4]);
+        let left_gate = endpoint_gate(270.0, 0.0, 12.0);
+        let right_gate = endpoint_gate(270.0, 0.0, 28.0);
+        let left_weights = [(0, 0.25), (1, 0.75)];
+        let right_weights = [(0, 0.5), (1, 0.5)];
+        let left =
+            RawStateLinearEndpoint::with_spatial_weights(&left_scene, &left_weights, &left_gate);
+        let right =
+            RawStateLinearEndpoint::with_spatial_weights(&right_scene, &right_weights, &right_gate);
+
+        let exact_left = interpolate_raw_state_linear(Some(left), None, 0.0).unwrap();
+        assert!(
+            (exact_left.property_cell.categories()[0].mixing_ratio_kgkg() - 2.5e-4).abs() < 1.0e-10
+        );
+        let blended = interpolate_raw_state_linear(Some(left), Some(right), 0.4).unwrap();
+        // left spatial=2.5e-4, right spatial=7e-4, temporal=0.6/0.4.
+        assert!(
+            (blended.property_cell.categories()[0].mixing_ratio_kgkg() - 4.3e-4).abs() < 1.0e-10
+        );
+        assert!((blended.gate_state.wind_u_mps - 18.4).abs() < 1.0e-6);
+        assert_eq!(blended.property_cell.source_cell_index(), None);
     }
 
     #[test]

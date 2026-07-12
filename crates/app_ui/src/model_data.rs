@@ -209,7 +209,7 @@ impl SyntheticRadarRecipe {
                 "The full virtual instrument with 27-point pulse-volume integration. Best for one file or a short loop; source-model resolution still limits detail."
             }
             Self::PropertyTMatrixResearch => {
-                "Opt-in, fail-closed 2.8 GHz T-matrix dual-pol for exact supported P3/ISHMAEL property files. Research-only and substantially slower; no Rayleigh fallback."
+                "Opt-in, fail-closed 2.8 GHz T-matrix dual-pol for exact supported P3/ISHMAEL property files, with full-stencil raw-state interpolation before closure. Research-only and substantially slower; no Rayleigh fallback."
             }
         }
     }
@@ -649,7 +649,7 @@ impl SyntheticRadarUiState {
                 self.reflectivity_sampling = crate::wrf_radar::ReflectivitySampling::LinearZ;
                 self.beam_integration = crate::wrf_radar::BeamIntegration::Balanced;
                 self.atmosphere_time_mode =
-                    app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
+                    app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear;
                 self.missing_neighbor_policy =
                     app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
             }
@@ -733,10 +733,7 @@ impl SyntheticRadarUiState {
             // Adjacent-scene atmosphere/scattering interpolation is meaningful
             // only for a timed scan. Normalize stale/manually-edited settings
             // instead of emitting an internally contradictory configuration.
-            scan_timing: if matches!(
-                self.atmosphere_time_mode,
-                app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
-            ) {
+            scan_timing: if self.atmosphere_time_mode.uses_adjacent_scene() {
                 crate::wrf_radar::ScanTiming::TimedVolume
             } else {
                 self.scan_timing
@@ -4158,14 +4155,40 @@ impl ModelDataDock {
                                         app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
                                     state.scan_timing = crate::wrf_radar::ScanTiming::TimedVolume;
                                 }
+                                ui.add_enabled_ui(
+                                    matches!(
+                                        state.polarimetric_kernel,
+                                        crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
+                                    ),
+                                    |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                matches!(
+                                                    state.atmosphere_time_mode,
+                                                    app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
+                                                ),
+                                                "Raw-state pre-closure",
+                                            )
+                                            .on_hover_text(
+                                                "P3/ISHMAEL property T-matrix only. Blend each scene's real trilinear raw-state stencil and the timed-ray alpha before one nonlinear closure/scattering evaluation.",
+                                            )
+                                            .clicked()
+                                        {
+                                            state.atmosphere_time_mode =
+                                                app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear;
+                                            state.scan_timing =
+                                                crate::wrf_radar::ScanTiming::TimedVolume;
+                                        }
+                                    },
+                                );
                             });
-                            if matches!(
-                                state.atmosphere_time_mode,
-                                app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
-                            ) {
+                            if state.atmosphere_time_mode.uses_adjacent_scene() {
                                 ui.label(
                                     egui::RichText::new(
-                                        "Timed rays interpolate linear Z, winds, and additive polar scattering quantities; ratios such as ZDR and rhoHV are derived afterward. The renderer never extrapolates beyond the next compatible WRF scene.",
+                                        match state.atmosphere_time_mode {
+                                            app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear => "Timed rays blend raw winds, thermodynamics, and native P3/ISHMAEL state across the full spatial stencil and adjacent model times before one closure/T-matrix evaluation. No representative-cell or additive-time shortcut is used.",
+                                            _ => "Timed rays interpolate linear Z, winds, and additive polar scattering quantities; ratios such as ZDR and rhoHV are derived afterward. The renderer never extrapolates beyond the next compatible WRF scene.",
+                                        },
                                     )
                                     .small()
                                     .weak(),
@@ -6391,7 +6414,7 @@ mod tests {
             system_phidp_deg: 12.5,
             zdr_bias_db: -0.35,
             scan_timing: crate::wrf_radar::ScanTiming::TimedVolume,
-            atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent,
+            atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear,
             missing_neighbor_policy: app_ui::wrf_temporal::MissingNeighborPolicy::DropFrame,
             temporal_memory_budget_mib: 16_384,
             rotation_rate_deg_s: 24.0,
@@ -6652,6 +6675,33 @@ mod tests {
             AtmosphereTimeMode::FrozenAtVolumeStart
         );
         assert_eq!(high_budget.temporal_memory_budget_mib, 65_536);
+
+        let raw_state = SyntheticRadarUiState {
+            scan_timing: ScanTiming::InstantaneousTruth,
+            atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
+            dual_pol: true,
+            polarimetric_kernel: crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1,
+            radar_frequency_mhz: crate::wrf_radar::PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ,
+            reflectivity_sampling: crate::wrf_radar::ReflectivitySampling::LinearZ,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(raw_state.scan_timing, ScanTiming::TimedVolume);
+        assert!(raw_state.validate_science_contract().is_ok());
+
+        let invalid_raw_bulk = SyntheticRadarUiState {
+            atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert!(
+            invalid_raw_bulk
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("only with the P3/ISHMAEL property T-matrix")
+        );
     }
 
     #[test]
@@ -6775,6 +6825,10 @@ mod tests {
             crate::wrf_radar::PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ
         );
         assert_eq!(research.beam_integration, BeamIntegration::Balanced);
+        assert_eq!(
+            research.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
+        );
         assert!(research.dual_pol && research.propagation);
         assert!(research.validate_science_contract().is_ok());
     }

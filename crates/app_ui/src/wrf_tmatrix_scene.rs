@@ -25,9 +25,10 @@ use thiserror::Error;
 
 use crate::wrf_property_reader::{
     ClosedCellCategory, ClosedPropertyCell, ClosedRainState, CoexistenceUnavailable,
-    PropertySceneIdentity, RainUnavailableReason, RawPropertyCategory, RawPropertyClosureError,
-    RequiredFieldContract, RequiredFieldSignature, SourceFieldProvenance, WrfPropertyCategory,
-    WrfPropertyReadError, WrfPropertyScene, close_raw_rain_state,
+    PropertySceneIdentity, RainUnavailableReason, RawPropertyCategory, RawPropertyCell,
+    RawPropertyClosureError, RequiredFieldContract, RequiredFieldSignature, SourceFieldProvenance,
+    WrfPropertyCategory, WrfPropertyReadError, WrfPropertyScene, close_raw_property_cell,
+    close_raw_rain_state,
 };
 use crate::wrf_temporal::ScenePropertySignature;
 
@@ -607,6 +608,37 @@ impl<'a> WrfTMatrixLutBundle<'a> {
         match spheroid {
             SpheroidConvention::OblateMinorVertical => self.wet_oblate,
             SpheroidConvention::ProlateMajorVertical => self.wet_prolate,
+        }
+    }
+}
+
+/// Validated, reusable evaluator for one spatially/temporally blended raw
+/// property cell. Construction performs the complete five-table contract gate
+/// once; each call then performs exactly one nonlinear closure/PSD integration
+/// at the requested radar elevation.
+#[derive(Clone, Copy)]
+pub struct WrfTMatrixRawEvaluator<'a> {
+    tables: WrfTMatrixLutBundle<'a>,
+    validated: ValidatedBundle<'a>,
+}
+
+impl<'a> WrfTMatrixRawEvaluator<'a> {
+    pub fn new(tables: WrfTMatrixLutBundle<'a>) -> Result<Self, WrfTMatrixBundleError> {
+        Ok(Self {
+            tables,
+            validated: validate_bundle(tables)?,
+        })
+    }
+
+    pub fn evaluate(
+        self,
+        raw: &RawPropertyCell,
+        elevation_deg: f64,
+    ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
+        match raw.microphysics_scheme_id() {
+            50..=53 => evaluate_characteristic_raw_cell(raw, self.tables, elevation_deg),
+            55 => evaluate_ishmael_psd_raw_cell(raw, self.tables, self.validated, elevation_deg),
+            scheme_id => Err(WrfTMatrixRawEvaluationError::UnsupportedScheme { scheme_id }),
         }
     }
 }
@@ -1617,6 +1649,277 @@ fn gaussian20_orientation() -> OrientationModel {
     }
 }
 
+fn evaluate_characteristic_raw_cell(
+    raw: &RawPropertyCell,
+    tables: WrfTMatrixLutBundle<'_>,
+    elevation_deg: f64,
+) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
+    let closed = close_raw_property_cell(raw, OrientationDefinition::Gaussian20Research)
+        .map_err(WrfTMatrixRawEvaluationError::Closure)?;
+    let rain = match closed.rain() {
+        ClosedRainState::Clear => None,
+        ClosedRainState::Closed(rain) => Some(rain.as_ref()),
+        ClosedRainState::Unavailable(reason) => {
+            return Err(WrfTMatrixRawEvaluationError::RainUnavailable(
+                reason.clone(),
+            ));
+        }
+    };
+    let has_frozen = !closed.categories().is_empty();
+    if !has_frozen && rain.is_none() {
+        return Ok(None);
+    }
+    let coexistence = if should_diagnose_wet_coexistence(
+        WrfTMatrixRainMode::FullProperty,
+        has_frozen,
+        rain.is_some(),
+        closed.environment().temperature_k(),
+    ) {
+        Some(
+            closed
+                .diagnose_coexistence(MixtureTopology::HomogeneousMixedPhase)
+                .map_err(WrfTMatrixRawEvaluationError::Coexistence)?,
+        )
+    } else {
+        None
+    };
+    let mut additive = AdditiveScattering::default();
+    if let Some(partition) = &coexistence {
+        for wet in partition.diagnosis().wet_categories() {
+            let spheroid = spheroid_for_raw_particle(wet.source_category())?;
+            let request = raw_evaluation_request(elevation_deg, spheroid)?;
+            let contribution = tables
+                .wet(spheroid)
+                .evaluate_wet_category(wet, request)
+                .map_err(|source| WrfTMatrixRawEvaluationError::Evaluation {
+                    contribution: WrfTMatrixContribution::WetFrozen,
+                    source,
+                })?;
+            verify_raw_fall_moment_policy(
+                contribution.fall_moments(),
+                FallMomentPolicy::DiagnosticWetCategoryPositiveDownZeroWithinCategoryVariance,
+                WrfTMatrixContribution::WetFrozen,
+            )?;
+            additive = additive
+                .checked_add(contribution.additive())
+                .map_err(|source| WrfTMatrixRawEvaluationError::Accumulation {
+                    contribution: WrfTMatrixContribution::WetFrozen,
+                    source,
+                })?;
+        }
+        let unused_rain_mass = partition.diagnosis().unused_rain_mass_kgkg();
+        if unused_rain_mass > 0.0 {
+            let rain_source = rain.ok_or(WrfTMatrixRawEvaluationError::MissingRainSource)?;
+            let request =
+                raw_evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+            let contribution = tables
+                .rain_standalone_and_residual
+                .evaluate_unused_rain(rain_source, unused_rain_mass, request)
+                .map_err(|source| WrfTMatrixRawEvaluationError::Evaluation {
+                    contribution: WrfTMatrixContribution::ResidualRain,
+                    source,
+                })?;
+            verify_raw_fall_moment_policy(
+                contribution.fall_moments(),
+                FallMomentPolicy::ClosedCategoryPositiveDownZeroWithinCategoryVariance,
+                WrfTMatrixContribution::ResidualRain,
+            )?;
+            additive = additive
+                .checked_add(contribution.additive())
+                .map_err(|source| WrfTMatrixRawEvaluationError::Accumulation {
+                    contribution: WrfTMatrixContribution::ResidualRain,
+                    source,
+                })?;
+        }
+    } else {
+        for category in closed.categories() {
+            let spheroid = spheroid_for_characteristic_category(category.category())
+                .map_err(|_| WrfTMatrixRawEvaluationError::IshmaelCharacteristicForbidden)?;
+            let request = raw_evaluation_request(elevation_deg, spheroid)?;
+            let contribution = tables
+                .dry(spheroid)
+                .evaluate(category.closed(), request)
+                .map_err(|source| WrfTMatrixRawEvaluationError::Evaluation {
+                    contribution: WrfTMatrixContribution::DryFrozen,
+                    source,
+                })?;
+            additive = additive.checked_add(contribution).map_err(|source| {
+                WrfTMatrixRawEvaluationError::Accumulation {
+                    contribution: WrfTMatrixContribution::DryFrozen,
+                    source,
+                }
+            })?;
+        }
+        if let Some(rain) = rain {
+            let request =
+                raw_evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+            let contribution = tables
+                .rain_standalone_and_residual
+                .evaluate(rain, request)
+                .map_err(|source| WrfTMatrixRawEvaluationError::Evaluation {
+                    contribution: WrfTMatrixContribution::StandaloneRain,
+                    source,
+                })?;
+            additive = additive.checked_add(contribution).map_err(|source| {
+                WrfTMatrixRawEvaluationError::Accumulation {
+                    contribution: WrfTMatrixContribution::StandaloneRain,
+                    source,
+                }
+            })?;
+        }
+    }
+    additive
+        .to_polar_accumulator_quantities()
+        .map(Some)
+        .map_err(WrfTMatrixRawEvaluationError::Output)
+}
+
+fn evaluate_ishmael_psd_raw_cell(
+    raw: &RawPropertyCell,
+    tables: WrfTMatrixLutBundle<'_>,
+    validated: ValidatedBundle<'_>,
+    elevation_deg: f64,
+) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
+    let mut frozen = Vec::with_capacity(raw.categories().len());
+    for category in raw.categories() {
+        if category.mixing_ratio_kgkg() == 0.0 {
+            continue;
+        }
+        let RawPropertyCategory::Ishmael(value) = category else {
+            return Err(WrfTMatrixRawEvaluationError::IshmaelCategoryLayout(
+                category.category(),
+            ));
+        };
+        let ishmael_category = value.category.ishmael_category().ok_or(
+            WrfTMatrixRawEvaluationError::IshmaelCategoryLayout(value.category),
+        )?;
+        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
+            ishmael_category,
+            value.qice_kgkg,
+            value.qnice_per_kg,
+            value.qvoli_m3_per_kg,
+            value.qaoli_m3_per_kg,
+            raw.dry_air_density_kg_m3(),
+        ))
+        .map_err(
+            |source| WrfTMatrixRawEvaluationError::IshmaelPsdReconstruction {
+                category: value.category,
+                source,
+            },
+        )?;
+        frozen.push((value.category, distribution));
+    }
+    let rain = match close_raw_rain_state(raw, OrientationDefinition::Gaussian20Research)
+        .map_err(WrfTMatrixRawEvaluationError::Closure)?
+    {
+        ClosedRainState::Clear => None,
+        ClosedRainState::Closed(rain) => Some(rain),
+        ClosedRainState::Unavailable(reason) => {
+            return Err(WrfTMatrixRawEvaluationError::RainUnavailable(reason));
+        }
+    };
+    if frozen.is_empty() && rain.is_none() {
+        return Ok(None);
+    }
+    let oblate_request =
+        raw_evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+    let prolate_request =
+        raw_evaluation_request(elevation_deg, SpheroidConvention::ProlateMajorVertical)?;
+    let mut additive = AdditiveScattering::default();
+    for &(category, distribution) in &frozen {
+        let integration = integrate_ishmael_psd(
+            &distribution,
+            validated.ishmael_psd_config,
+            validated.ishmael_particle_support,
+            validated.ishmael_fall_speed,
+            |node: &PsdParticleNode| {
+                let (table, request) = match node.habit() {
+                    PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
+                        (tables.dry_oblate, oblate_request)
+                    }
+                    PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
+                };
+                let positive_down_speed = table.dry_particle_node_terminal_speed_m_s(node)?;
+                let query = TMatrixParticleNodeQuery::from_psd_node(
+                    node,
+                    raw.environment().temperature_k(),
+                    positive_down_speed,
+                    validated.ishmael_fall_speed,
+                    gaussian20_orientation(),
+                    request,
+                )?;
+                table.evaluate_dry_particle_node_per_m3(&query)
+            },
+        )
+        .map_err(
+            |source| WrfTMatrixRawEvaluationError::IshmaelPsdIntegration { category, source },
+        )?;
+        additive = additive
+            .checked_add(integration.additive())
+            .map_err(|source| WrfTMatrixRawEvaluationError::Accumulation {
+                contribution: WrfTMatrixContribution::IshmaelSchemeNativePsd,
+                source,
+            })?;
+    }
+    if let Some(rain) = rain.as_deref() {
+        let contribution = tables
+            .rain_standalone_and_residual
+            .evaluate(rain, oblate_request)
+            .map_err(|source| WrfTMatrixRawEvaluationError::Evaluation {
+                contribution: WrfTMatrixContribution::StandaloneRain,
+                source,
+            })?;
+        additive = additive.checked_add(contribution).map_err(|source| {
+            WrfTMatrixRawEvaluationError::Accumulation {
+                contribution: WrfTMatrixContribution::StandaloneRain,
+                source,
+            }
+        })?;
+    }
+    additive
+        .to_polar_accumulator_quantities()
+        .map(Some)
+        .map_err(WrfTMatrixRawEvaluationError::Output)
+}
+
+fn raw_evaluation_request(
+    elevation_deg: f64,
+    spheroid: SpheroidConvention,
+) -> Result<TMatrixEvaluationRequest, WrfTMatrixRawEvaluationError> {
+    let view = RadarViewGeometry::new(elevation_deg)
+        .map_err(WrfTMatrixRawEvaluationError::EvaluationRequest)?;
+    TMatrixEvaluationRequest::new(PROPERTY_TMATRIX_FREQUENCY_HZ, spheroid, view)
+        .map_err(WrfTMatrixRawEvaluationError::EvaluationRequest)
+}
+
+fn spheroid_for_raw_particle(
+    particle: &ClosedParticleCategory,
+) -> Result<SpheroidConvention, WrfTMatrixRawEvaluationError> {
+    match particle.record().state() {
+        ParticleState::P3(_) => Ok(SpheroidConvention::OblateMinorVertical),
+        ParticleState::Ishmael(_) => {
+            Err(WrfTMatrixRawEvaluationError::IshmaelCharacteristicForbidden)
+        }
+        ParticleState::Conventional(_) => Err(WrfTMatrixRawEvaluationError::WetSourceNotFrozen),
+    }
+}
+
+fn verify_raw_fall_moment_policy(
+    actual: FallMomentPolicy,
+    expected: FallMomentPolicy,
+    contribution: WrfTMatrixContribution,
+) -> Result<(), WrfTMatrixRawEvaluationError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(WrfTMatrixRawEvaluationError::FallMomentPolicy {
+            contribution,
+            expected,
+            actual,
+        })
+    }
+}
+
 fn compact_frozen_only_rows(
     components: &mut Vec<f32>,
     components_per_cell: usize,
@@ -2346,6 +2649,62 @@ impl std::fmt::Display for WrfTMatrixContribution {
             Self::StandaloneRain => "standalone rain",
         })
     }
+}
+
+#[derive(Debug, Error)]
+pub enum WrfTMatrixRawEvaluationError {
+    #[error("raw property T-matrix evaluation does not support WRF mp_physics={scheme_id}")]
+    UnsupportedScheme { scheme_id: i32 },
+    #[error("close blended raw property state: {0}")]
+    Closure(#[source] RawPropertyClosureError),
+    #[error("full raw property T-matrix evaluation requires rain state: {0}")]
+    RainUnavailable(RainUnavailableReason),
+    #[error("diagnose blended raw homogeneous mixed-phase coexistence: {0}")]
+    Coexistence(#[source] CoexistenceUnavailable),
+    #[error("diagnosed raw coexistence lost its closed rain source")]
+    MissingRainSource,
+    #[error("blended ISHMAEL state contains non-ISHMAEL category {0}")]
+    IshmaelCategoryLayout(WrfPropertyCategory),
+    #[error("reconstruct blended native ISHMAEL PSD for {category}: {source}")]
+    IshmaelPsdReconstruction {
+        category: WrfPropertyCategory,
+        #[source]
+        source: PsdError,
+    },
+    #[error("integrate blended native ISHMAEL PSD for {category}: {source}")]
+    IshmaelPsdIntegration {
+        category: WrfPropertyCategory,
+        #[source]
+        source: PsdIntegrationError<EvaluationError>,
+    },
+    #[error("construct raw T-matrix evaluation request: {0}")]
+    EvaluationRequest(#[source] EvaluationError),
+    #[error("evaluate raw {contribution}: {source}")]
+    Evaluation {
+        contribution: WrfTMatrixContribution,
+        #[source]
+        source: EvaluationError,
+    },
+    #[error("accumulate raw {contribution}: {source}")]
+    Accumulation {
+        contribution: WrfTMatrixContribution,
+        #[source]
+        source: OutputError,
+    },
+    #[error("convert raw integrated additive scattering: {0}")]
+    Output(#[source] OutputError),
+    #[error(
+        "runtime fall-moment policy for raw {contribution} must be {expected:?}, got {actual:?}"
+    )]
+    FallMomentPolicy {
+        contribution: WrfTMatrixContribution,
+        expected: FallMomentPolicy,
+        actual: FallMomentPolicy,
+    },
+    #[error("raw diagnosed wet category unexpectedly has a conventional source")]
+    WetSourceNotFrozen,
+    #[error("ISHMAEL characteristic-particle raw evaluation is forbidden; native PSD is required")]
+    IshmaelCharacteristicForbidden,
 }
 
 #[derive(Debug, Error)]

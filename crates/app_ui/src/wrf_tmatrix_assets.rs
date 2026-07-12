@@ -3,11 +3,12 @@
 
 use std::sync::OnceLock;
 
-use radar_scattering::{ResearchTMatrixLut, Sha256Digest};
+use radar_scattering::{PolarAccumulatorQuantities, ResearchTMatrixLut, Sha256Digest};
 
-use crate::wrf_property_reader::WrfPropertyScene;
+use crate::wrf_property_reader::{RawPropertyCell, WrfPropertyScene};
 use crate::wrf_tmatrix_scene::{
-    WrfTMatrixBuildPeakEstimate, WrfTMatrixLutBundle, WrfTMatrixRainMode, WrfTMatrixScene,
+    WrfTMatrixBuildPeakEstimate, WrfTMatrixLutBundle, WrfTMatrixRainMode, WrfTMatrixRawEvaluator,
+    WrfTMatrixScene,
 };
 
 const ASSET_ROOT: &str = "../../../research_only_assets/tmatrix/pytmatrix-0.3.3";
@@ -77,6 +78,7 @@ impl EmbeddedPropertyTMatrixLuts {
 }
 
 static PROPERTY_LUTS: OnceLock<Result<EmbeddedPropertyTMatrixLuts, String>> = OnceLock::new();
+static RAW_EVALUATOR: OnceLock<Result<WrfTMatrixRawEvaluator<'static>, String>> = OnceLock::new();
 
 pub struct EmbeddedPropertySceneBuild {
     pub scene: WrfTMatrixScene,
@@ -88,6 +90,28 @@ pub struct EmbeddedPropertySceneBuild {
 /// a failed embedded contract can never fall through to another kernel.
 pub fn preload_embedded_property_tmatrix_luts() -> Result<(), String> {
     embedded_luts().map(|_| ())
+}
+
+/// Evaluate one already spatially/temporally blended raw property cell through
+/// the validated embedded bundle. The reusable evaluator is cached, so the
+/// complete table contract is gated once rather than once per radar sample.
+pub fn evaluate_embedded_raw_property_cell(
+    raw: &RawPropertyCell,
+    elevation_deg: f64,
+) -> Result<Option<PolarAccumulatorQuantities>, String> {
+    embedded_raw_evaluator()?
+        .evaluate(raw, elevation_deg)
+        .map_err(|error| format!("evaluate embedded raw property cell: {error}"))
+}
+
+fn embedded_raw_evaluator() -> Result<WrfTMatrixRawEvaluator<'static>, String> {
+    match RAW_EVALUATOR.get_or_init(|| {
+        WrfTMatrixRawEvaluator::new(embedded_luts()?.bundle())
+            .map_err(|error| format!("validate embedded raw property evaluator: {error}"))
+    }) {
+        Ok(evaluator) => Ok(*evaluator),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 /// Build one compact scattering scene from the exact embedded research tables.

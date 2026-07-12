@@ -66,8 +66,9 @@ use app_ui::wrf_radar_validation::{
 use app_ui::wrf_scene_adapter::inventory_selected_wrf_paths;
 use app_ui::wrf_scene_inventory::{WrfScene, WrfSceneGroup, WrfSceneTime, WrfSourceIdentity};
 use app_ui::wrf_temporal::{
-    AtmosphereTimeMode, HoldReason, MissingNeighborPolicy, TemporalMemoryEstimate,
-    TemporalSamplingOutcome, TemporalScenePlan, TwoSceneCache, plan_for_scene,
+    AtmosphereTimeMode, HoldReason, MissingNeighborPolicy, RawGateState, RawStateLinearEndpoint,
+    TemporalMemoryEstimate, TemporalSamplingOutcome, TemporalScenePlan, TwoSceneCache,
+    interpolate_raw_state_linear, plan_for_scene,
 };
 
 /// Operational adaptations intentionally outside the checked base-pattern
@@ -632,10 +633,21 @@ impl SyntheticRadarConfig {
         if self.coupled_single_prf_estimator {
             validate_coupled_estimator_inputs(self)?;
         }
-        if !matches!(
+        let property_tmatrix = matches!(
             self.polarimetric_kernel,
             PolarimetricKernel::PropertyTMatrixResearchV1
-        ) {
+        );
+        if matches!(
+            self.atmosphere_time_mode,
+            AtmosphereTimeMode::RawStateLinear
+        ) && !property_tmatrix
+        {
+            return Err(
+                "RawStateLinear atmosphere timing is available only with the P3/ISHMAEL property T-matrix kernel"
+                    .to_string(),
+            );
+        }
+        if !property_tmatrix {
             return Ok(());
         }
         if !self.dual_pol {
@@ -1303,6 +1315,10 @@ pub struct WrfRadarFields {
     /// dropped after closure and LUT evaluation; gate sampling interpolates
     /// only additive scattering quantities.
     property_scattering: Option<Arc<app_ui::wrf_tmatrix_scene::WrfTMatrixScene>>,
+    /// Exact normalized P3/ISHMAEL source state retained only for
+    /// RawStateLinear. Spatial and temporal weights are applied before the
+    /// single per-quadrature closure/T-matrix evaluation.
+    raw_property_scene: Option<Arc<app_ui::wrf_property_reader::WrfPropertyScene>>,
     /// Compact scheme-aware polarimetric state. Seven one-byte planes and one
     /// signed two-byte KDP plane retain
     /// the ratios/propagation/fall moments while `dbz` remains the full-precision
@@ -1526,7 +1542,9 @@ impl WrfRadarFields {
     }
 
     fn has_polarimetric_input(&self) -> bool {
-        self.polarimetric.is_some() || self.property_scattering.is_some()
+        self.polarimetric.is_some()
+            || self.property_scattering.is_some()
+            || self.raw_property_scene.is_some()
     }
 
     fn base_retained_bytes_without_property_scattering(&self) -> usize {
@@ -1573,6 +1591,11 @@ impl WrfRadarFields {
                     .as_deref()
                     .map_or(0, |scene| scene.memory_estimate().retained_bytes()),
             )
+            .saturating_add(
+                self.raw_property_scene
+                    .as_deref()
+                    .map_or(0, |scene| scene.memory_estimate().retained_bytes()),
+            )
     }
 
     /// Domain-centre grid cell (used for the default antenna position).
@@ -1605,13 +1628,49 @@ fn remaining_property_tmatrix_build_budget_bytes(
     )
 }
 
+fn ensure_raw_property_retention_budget(
+    config: &SyntheticRadarConfig,
+    fields: &WrfRadarFields,
+    property_scene: &app_ui::wrf_property_reader::WrfPropertyScene,
+    expected_cells: usize,
+    reserved_memory_bytes: usize,
+) -> Result<(), String> {
+    let budget_bytes = config
+        .temporal_memory_budget_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "Raw-state temporal memory budget overflows address space".to_string())?;
+    let tke_bytes = if config.spectrum_width {
+        expected_cells
+    } else {
+        0
+    };
+    let required = fields
+        .base_retained_bytes_without_property_scattering()
+        .checked_add(property_scene.memory_estimate().retained_bytes())
+        .and_then(|value| {
+            value.checked_add(app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes())
+        })
+        .and_then(|value| value.checked_add(tke_bytes))
+        .and_then(|value| value.checked_add(reserved_memory_bytes))
+        .ok_or_else(|| "Raw-state temporal retained-memory estimate overflowed".to_string())?;
+    if required > budget_bytes {
+        return Err(format!(
+            "RawStateLinear needs {:.2} GiB for retained atmosphere, exact property state, embedded tables, TKE, outputs, and cache, above the configured {:.2} GiB budget",
+            required as f64 / 1024.0_f64.powi(3),
+            budget_bytes as f64 / 1024.0_f64.powi(3),
+        ));
+    }
+    Ok(())
+}
+
 fn minimum_property_tmatrix_owned_peak_bytes(expected_cells: usize) -> Result<usize, String> {
-    // The raw source always owns dense temperature and air-density f32 planes.
+    // The raw source owns dense temperature, pressure, moist-density, and
+    // dry-density f32 planes.
     // While that source is retained, the scattering scene must also allocate
     // one dense u32 full-cell -> sparse-row map. Sparse categories, additive
     // output rows, provenance, and worker scratch only increase this bound.
     let unavoidable_dense_bytes = expected_cells
-        .checked_mul(2 * std::mem::size_of::<f32>() + std::mem::size_of::<u32>())
+        .checked_mul(4 * std::mem::size_of::<f32>() + std::mem::size_of::<u32>())
         .ok_or_else(|| "Property T-matrix minimum source-memory estimate overflowed".to_string())?;
     unavoidable_dense_bytes
         .checked_add(std::mem::size_of::<
@@ -1796,6 +1855,7 @@ fn read_wrf_radar_fields_reporting_inner(
         w,
         terrain_m,
         property_scattering: None,
+        raw_property_scene: None,
         polarimetric: None,
         dual_pol_status: None,
         tke_tenths_m2s2: None,
@@ -1835,12 +1895,20 @@ fn read_wrf_radar_fields_for_config_reporting(
                 "Property T-matrix research mode requires S-band dual polarization".to_string(),
             );
         }
-        let maximum_owned_peak_bytes = remaining_property_tmatrix_build_budget_bytes(
-            config,
-            &fields,
-            expected,
-            reserved_memory_bytes,
-        )?;
+        let raw_state_linear = matches!(
+            config.atmosphere_time_mode,
+            AtmosphereTimeMode::RawStateLinear
+        );
+        let maximum_owned_peak_bytes = if raw_state_linear {
+            None
+        } else {
+            Some(remaining_property_tmatrix_build_budget_bytes(
+                config,
+                &fields,
+                expected,
+                reserved_memory_bytes,
+            )?)
+        };
         progress("validating embedded property T-matrix tables…");
         app_ui::wrf_tmatrix_assets::preload_embedded_property_tmatrix_luts()
             .map_err(|error| format!("preload embedded property T-matrix bundle: {error}"))?;
@@ -1863,20 +1931,40 @@ fn read_wrf_radar_fields_for_config_reporting(
             .map(app_ui::wrf_property_reader::SourceFieldProvenance::source_name)
             .collect::<Vec<_>>()
             .join(",");
-        progress("evaluating property T-matrix scene…");
-        let built = app_ui::wrf_tmatrix_assets::build_embedded_property_tmatrix_scene(
-            &property_scene,
-            maximum_owned_peak_bytes,
-        )
-        .map_err(|error| format!("build property T-matrix scene: {error}"))?;
-        let property_scattering = built.scene;
-        fields.dual_pol_status = Some(format!(
-            "property-aware T-matrix research input (mp_physics={}; raw fields={fields_read}; build peak {:.2} GiB)",
-            property_scattering.microphysics_scheme_id(),
-            built.peak.estimated_peak_bytes as f64 / 1024.0_f64.powi(3),
-        ));
+        if raw_state_linear {
+            progress("retaining raw property state for pre-closure interpolation…");
+        } else {
+            progress("evaluating property T-matrix scene…");
+        }
         fields.ref_source = PROPERTY_TMATRIX_S_BAND_SOURCE;
-        fields.property_scattering = Some(Arc::new(property_scattering));
+        if raw_state_linear {
+            ensure_raw_property_retention_budget(
+                config,
+                &fields,
+                &property_scene,
+                expected,
+                reserved_memory_bytes,
+            )?;
+            fields.dual_pol_status = Some(format!(
+                "property-aware T-matrix raw_state_linear input (mp_physics={}; raw fields={fields_read}; retained raw state {:.2} GiB)",
+                property_scene.microphysics_scheme_id(),
+                property_scene.memory_estimate().retained_bytes() as f64 / 1024.0_f64.powi(3),
+            ));
+            fields.raw_property_scene = Some(Arc::new(property_scene));
+        } else {
+            let built = app_ui::wrf_tmatrix_assets::build_embedded_property_tmatrix_scene(
+                &property_scene,
+                maximum_owned_peak_bytes.expect("non-raw property build has a budget"),
+            )
+            .map_err(|error| format!("build property T-matrix scene: {error}"))?;
+            let property_scattering = built.scene;
+            fields.dual_pol_status = Some(format!(
+                "property-aware T-matrix research input (mp_physics={}; raw fields={fields_read}; build peak {:.2} GiB)",
+                property_scattering.microphysics_scheme_id(),
+                built.peak.estimated_peak_bytes as f64 / 1024.0_f64.powi(3),
+            ));
+            fields.property_scattering = Some(Arc::new(property_scattering));
+        }
     } else if config.dual_pol || config.terminal_fall_speed {
         progress("deriving scheme-aware hydrometeor scattering…");
         match build_compact_polar_fields(file, timeidx, expected, progress) {
@@ -2454,6 +2542,16 @@ fn build_synthetic_volume_reporting_inner(
                 .join(",")
         })
         .or_else(|| {
+            fields.raw_property_scene.as_ref().map(|scene| {
+                scene
+                    .source_fields()
+                    .iter()
+                    .map(app_ui::wrf_property_reader::SourceFieldProvenance::source_name)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        })
+        .or_else(|| {
             fields
                 .polarimetric
                 .as_ref()
@@ -2551,7 +2649,7 @@ fn build_synthetic_volume_reporting_inner(
             "; tmatrix_status={}; tmatrix_frequency_hz={:.0}; tmatrix_orientation={:?}; \
              tmatrix_rain_mode={:?}; tmatrix_fall_policy_closed={:?}; \
              tmatrix_fall_policy_wet={:?}; tmatrix_tables={tables}; \
-             tmatrix_populations=source_cells:{},dry_frozen:{},wet_frozen:{},residual_rain:{},standalone_rain:{}; \
+             tmatrix_populations=source_cells:{},characteristic_frozen:{},scheme_native_psd:{},dry_frozen:{},wet_frozen:{},residual_rain:{},standalone_rain:{}; \
              tmatrix_interpolation=source_cell_closure_then_additive_space_beam_and_time",
             provenance.status,
             provenance.frequency_hz,
@@ -2560,10 +2658,25 @@ fn build_synthetic_volume_reporting_inner(
             provenance.fall_moment_policy.closed_category,
             provenance.fall_moment_policy.diagnostic_wet_category,
             counts.source_cells,
+            counts.characteristic_frozen_populations,
+            counts.scheme_native_psd_populations,
             counts.dry_frozen_populations,
             counts.wet_frozen_populations,
             counts.residual_rain_populations,
             counts.standalone_rain_populations,
+        );
+    }
+    if let Some(scene) = fields.raw_property_scene.as_deref() {
+        use std::fmt::Write as _;
+        let _ = write!(
+            forward_operator_config,
+            "; tmatrix_status=research_only_unvalidated; tmatrix_frequency_hz={:.0}; \
+             tmatrix_raw_mp_physics={}; tmatrix_raw_source={}:time{}; \
+             tmatrix_interpolation=raw_state_linear_spatial_and_temporal_preclosure_then_single_scattering_evaluation",
+            app_ui::wrf_tmatrix_scene::PROPERTY_TMATRIX_FREQUENCY_HZ,
+            scene.microphysics_scheme_id(),
+            scene.identity().source_identity.0.as_str(),
+            scene.identity().time_index,
         );
     }
     volume.metadata = VolumeMetadata {
@@ -2657,6 +2770,12 @@ fn build_synthetic_volume_reporting_inner(
             .property_scattering
             .as_ref()
             .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
+            .or_else(|| {
+                fields
+                    .raw_property_scene
+                    .as_ref()
+                    .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
+            })
             .or_else(|| {
                 fields
                     .polarimetric
@@ -2808,6 +2927,12 @@ fn build_exact_replay_volume(
             .property_scattering
             .as_ref()
             .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
+            .or_else(|| {
+                fields
+                    .raw_property_scene
+                    .as_ref()
+                    .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
+            })
             .or_else(|| {
                 fields
                     .polarimetric
@@ -3319,6 +3444,7 @@ fn sample_gate_with_quality_instrument(
                 lon as f32,
                 z_msl as f32,
                 elevation_deg,
+                config.atmosphere_time_mode,
                 config.reflectivity_sampling,
             )?
             else {
@@ -4319,12 +4445,25 @@ fn sample_column_temporal(
     lon: f32,
     z_msl: f32,
     beam_elevation_deg: f64,
+    atmosphere_time_mode: AtmosphereTimeMode,
     reflectivity_sampling: ReflectivitySampling,
 ) -> Result<Option<ColumnSample>, String> {
     if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
         return Err(format!(
             "temporal atmosphere weight {alpha} is outside the closed [0,1] interval"
         ));
+    }
+    if matches!(atmosphere_time_mode, AtmosphereTimeMode::RawStateLinear) {
+        return sample_column_raw_state_linear(
+            fields,
+            neighbor_fields,
+            alpha,
+            cells,
+            lat,
+            lon,
+            z_msl,
+            beam_elevation_deg,
+        );
     }
     if alpha <= 0.0 {
         return sample_column(
@@ -4411,6 +4550,208 @@ fn blend_column_samples(left: ColumnSample, right: ColumnSample, alpha: f32) -> 
         polar,
         tke_m2s2: beta * left.tke_m2s2 + alpha * right.tke_m2s2,
     }
+}
+
+struct RawSpatialEndpoint {
+    property_weights: [(usize, f64); 8],
+    property_weight_count: usize,
+    gate_state: RawGateState,
+    tke_m2s2: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_column_raw_state_linear(
+    fields: &WrfRadarFields,
+    neighbor_fields: Option<&WrfRadarFields>,
+    alpha: f64,
+    cells: usize,
+    lat: f32,
+    lon: f32,
+    z_msl: f32,
+    beam_elevation_deg: f64,
+) -> Result<Option<ColumnSample>, String> {
+    let left = if alpha < 1.0 {
+        raw_spatial_endpoint(fields, cells, lat, lon, z_msl)?
+    } else {
+        None
+    };
+    let right = if alpha > 0.0 {
+        let neighbor = neighbor_fields.ok_or_else(|| {
+            "RawStateLinear has a positive temporal weight but no adjacent WRF scene".to_string()
+        })?;
+        raw_spatial_endpoint(neighbor, cells, lat, lon, z_msl)?
+    } else {
+        None
+    };
+    if (alpha < 1.0 && left.is_none()) || (alpha > 0.0 && right.is_none()) {
+        return Ok(None);
+    }
+    let left_endpoint = left.as_ref().map(|endpoint| {
+        RawStateLinearEndpoint::with_spatial_weights(
+            fields
+                .raw_property_scene
+                .as_deref()
+                .expect("raw spatial endpoint requires a raw property scene"),
+            &endpoint.property_weights[..endpoint.property_weight_count],
+            &endpoint.gate_state,
+        )
+    });
+    let right_endpoint = right.as_ref().map(|endpoint| {
+        RawStateLinearEndpoint::with_spatial_weights(
+            neighbor_fields
+                .and_then(|neighbor| neighbor.raw_property_scene.as_deref())
+                .expect("raw adjacent endpoint requires a raw property scene"),
+            &endpoint.property_weights[..endpoint.property_weight_count],
+            &endpoint.gate_state,
+        )
+    });
+    let blended = interpolate_raw_state_linear(left_endpoint, right_endpoint, alpha)
+        .map_err(|error| format!("RawStateLinear pre-closure blend: {error}"))?;
+    let tke_m2s2 = match (left.as_ref(), right.as_ref()) {
+        (Some(left), Some(right)) => {
+            (f64::from(left.tke_m2s2)
+                + (f64::from(right.tke_m2s2) - f64::from(left.tke_m2s2)) * alpha) as f32
+        }
+        (Some(left), None) => left.tke_m2s2,
+        (None, Some(right)) => right.tke_m2s2,
+        (None, None) => return Ok(None),
+    };
+    let polar = app_ui::wrf_tmatrix_assets::evaluate_embedded_raw_property_cell(
+        &blended.property_cell,
+        beam_elevation_deg,
+    )?;
+    let polar = polar.map(|quantities| {
+        let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+        accumulator.add(1.0, tmatrix_as_contribution(quantities));
+        accumulator.finalize()
+    });
+    Ok(Some(ColumnSample {
+        z_linear: polar.map_or(0.0, |sample| sample.zh),
+        u: blended.gate_state.wind_u_mps,
+        v: blended.gate_state.wind_v_mps,
+        w: blended.gate_state.wind_w_mps,
+        polar,
+        tke_m2s2,
+    }))
+}
+
+fn raw_spatial_endpoint(
+    fields: &WrfRadarFields,
+    cells: usize,
+    lat: f32,
+    lon: f32,
+    z_msl: f32,
+) -> Result<Option<RawSpatialEndpoint>, String> {
+    let property_scene = fields.raw_property_scene.as_deref().ok_or_else(|| {
+        "RawStateLinear requires retained native P3/ISHMAEL property state".to_string()
+    })?;
+    if property_scene.cell_count() != fields.nx * fields.ny * fields.nz {
+        return Err(format!(
+            "RawStateLinear property coverage has {} cells, expected {}",
+            property_scene.cell_count(),
+            fields.nx * fields.ny * fields.nz
+        ));
+    }
+    let Some(stencil) = horizontal_stencil(fields, lat, lon) else {
+        return Ok(None);
+    };
+    let mut property_weights = [(0usize, 0.0f64); 8];
+    let mut property_weight_count = 0usize;
+    let mut wind_u = 0.0f64;
+    let mut wind_v = 0.0f64;
+    let mut wind_w = 0.0f64;
+    let mut tke = 0.0f64;
+    let mut weight_sum = 0.0f64;
+    for (column, horizontal_weight) in stencil {
+        if horizontal_weight <= 0.0 {
+            continue;
+        }
+        let Some((k, vertical_fraction)) = bracket_height(fields, cells, column, z_msl) else {
+            continue;
+        };
+        let lower = k * cells + column;
+        let upper = (k + 1) * cells + column;
+        let (Some(&u0), Some(&u1), Some(&v0), Some(&v1), Some(&w0), Some(&w1)) = (
+            fields.u.get(lower),
+            fields.u.get(upper),
+            fields.v.get(lower),
+            fields.v.get(upper),
+            fields.w.get(lower),
+            fields.w.get(upper),
+        ) else {
+            return Err("RawStateLinear wind coverage is internally inconsistent".to_string());
+        };
+        if [u0, u1, v0, v1, w0, w1]
+            .into_iter()
+            .any(|value| !value.is_finite())
+        {
+            continue;
+        }
+        let lower_weight = f64::from(horizontal_weight) * f64::from(1.0 - vertical_fraction);
+        let upper_weight = f64::from(horizontal_weight) * f64::from(vertical_fraction);
+        for (index, weight, u, v, w) in [
+            (lower, lower_weight, u0, v0, w0),
+            (upper, upper_weight, u1, v1, w1),
+        ] {
+            if weight <= 0.0 {
+                continue;
+            }
+            if property_weight_count >= property_weights.len() {
+                return Err("RawStateLinear spatial stencil exceeded eight cells".to_string());
+            }
+            property_weights[property_weight_count] = (index, weight);
+            property_weight_count += 1;
+            weight_sum += weight;
+            wind_u += weight * f64::from(u);
+            wind_v += weight * f64::from(v);
+            wind_w += weight * f64::from(w);
+            if let Some(tke_grid) = &fields.tke_tenths_m2s2 {
+                let value = tke_grid.get(index).copied().ok_or_else(|| {
+                    "RawStateLinear TKE coverage is internally inconsistent".to_string()
+                })?;
+                tke += weight * f64::from(value) * 0.1;
+            }
+        }
+    }
+    if property_weight_count == 0 || !weight_sum.is_finite() || weight_sum <= 0.0 {
+        return Ok(None);
+    }
+    for (_, weight) in &mut property_weights[..property_weight_count] {
+        *weight /= weight_sum;
+    }
+    let normalized_sum = property_weights[..property_weight_count]
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<f64>();
+    property_weights[property_weight_count - 1].1 += 1.0 - normalized_sum;
+
+    let endpoint_samples = property_weights[..property_weight_count]
+        .iter()
+        .map(|&(cell_index, weight)| {
+            app_ui::wrf_property_reader::WeightedRawPropertyCell::new(
+                property_scene,
+                cell_index,
+                weight,
+            )
+        })
+        .collect::<Vec<_>>();
+    let endpoint_property =
+        app_ui::wrf_property_reader::blend_raw_property_cells(&endpoint_samples)
+            .map_err(|error| format!("RawStateLinear spatial property blend: {error}"))?;
+    Ok(Some(RawSpatialEndpoint {
+        property_weights,
+        property_weight_count,
+        gate_state: RawGateState {
+            wind_u_mps: (wind_u / weight_sum) as f32,
+            wind_v_mps: (wind_v / weight_sum) as f32,
+            wind_w_mps: (wind_w / weight_sum) as f32,
+            temperature_k: endpoint_property.environment().temperature_k() as f32,
+            pressure_pa: endpoint_property.pressure_pa() as f32,
+            air_density_kgm3: endpoint_property.environment().air_density_kg_m3() as f32,
+            fields: Default::default(),
+        },
+        tke_m2s2: (tke / weight_sum) as f32,
+    }))
 }
 
 fn intrinsic_as_contribution(
@@ -5274,15 +5615,18 @@ fn build_synthetic_from_paths(
         config.polarimetric_kernel,
         PolarimetricKernel::PropertyTMatrixResearchV1
     ) {
-        notes.push(
-            "T-matrix output is research_only_unvalidated, characteristic-particle, and not operational calibration"
-                .to_string(),
-        );
+        notes.push(if matches!(
+            config.atmosphere_time_mode,
+            AtmosphereTimeMode::RawStateLinear
+        ) {
+            "T-matrix output is research_only_unvalidated; raw_state_linear blends full spatial/temporal P3/ISHMAEL state before one closure/scattering evaluation"
+                .to_string()
+        } else {
+            "T-matrix output is research_only_unvalidated; P3 is characteristic-particle and ISHMAEL is scheme-native PSD; not operational calibration"
+                .to_string()
+        });
     }
-    if matches!(
-        config.atmosphere_time_mode,
-        AtmosphereTimeMode::LinearAdjacent
-    ) {
+    if config.atmosphere_time_mode.uses_adjacent_scene() {
         return build_temporal_synthetic_from_scenes(
             &selected.group,
             config,
@@ -5667,7 +6011,7 @@ fn build_temporal_synthetic_from_scenes(
                                 build_synthetic_volume_reporting_temporal(
                                     &anchor, &neighbor, valid_time, config, &progress, &plan,
                                 )?,
-                                "linear_adjacent".to_string(),
+                                config.atmosphere_time_mode.provenance_name().to_string(),
                             )
                         }
                     }
@@ -5747,16 +6091,22 @@ fn temporal_memory_estimate(
         config.polarimetric_kernel,
         PolarimetricKernel::PropertyTMatrixResearchV1
     ) {
-        // The full-cell -> compact-scattering-row map is the only mandatory
-        // dense property allocation. Active-cell scattering is genuinely
-        // sparse and cannot be estimated from inventory metadata; it is added
-        // from WrfTMatrixScene::memory_estimate immediately after each scene
-        // is built, before rendering begins.
-        const PROPERTY_DENSE_LOOKUP_BYTES_PER_CELL: usize = std::mem::size_of::<u32>();
+        // RawStateLinear retains dense temperature, pressure, moist density,
+        // and dry density. LinearAdjacent retains the compact scene's dense
+        // full-cell -> sparse-row lookup. Sparse category/output bytes are
+        // added from exact runtime memory estimates after each scene read.
+        let property_dense_bytes_per_cell = if matches!(
+            config.atmosphere_time_mode,
+            AtmosphereTimeMode::RawStateLinear
+        ) {
+            4 * std::mem::size_of::<f32>()
+        } else {
+            std::mem::size_of::<u32>()
+        };
         compact_bytes_per_scene = compact_bytes_per_scene
             .checked_add(
                 cells_per_scene
-                    .checked_mul(PROPERTY_DENSE_LOOKUP_BYTES_PER_CELL)
+                    .checked_mul(property_dense_bytes_per_cell)
                     .ok_or_else(|| "WRF property memory estimate overflowed".to_string())?,
             )
             .ok_or_else(|| "WRF property memory estimate overflowed".to_string())?;
@@ -5865,7 +6215,7 @@ fn ensure_temporal_runtime_cache_budget(
     let cached_scene_count = cache.len();
     let has_property_scattering = cache
         .values()
-        .any(|fields| fields.property_scattering.is_some());
+        .any(|fields| fields.property_scattering.is_some() || fields.raw_property_scene.is_some());
     let required_bytes = temporal_runtime_reserved_bytes(cache, estimate)?
         .checked_add(if has_property_scattering {
             app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes()
@@ -6000,6 +6350,24 @@ fn validate_temporal_field_pair(
             );
         }
     }
+    match (&anchor.raw_property_scene, &neighbor.raw_property_scene) {
+        (None, None) => {}
+        (Some(left), Some(right))
+            if left.microphysics_scheme_id() == right.microphysics_scheme_id()
+                && left.required_field_signature() == right.required_field_signature() => {}
+        (Some(left), Some(right)) => {
+            return Err(format!(
+                "Adjacent RawStateLinear property inventories differ (mp_physics {} vs {})",
+                left.microphysics_scheme_id(),
+                right.microphysics_scheme_id(),
+            ));
+        }
+        _ => {
+            return Err(
+                "Adjacent WRF scene has incompatible RawStateLinear property coverage".to_string(),
+            );
+        }
+    }
     if anchor.tke_tenths_m2s2.is_some() != neighbor.tke_tenths_m2s2.is_some() {
         return Err("Adjacent WRF scene has incompatible TKE availability".to_string());
     }
@@ -6015,6 +6383,7 @@ fn property_scattering_contract_matches(
     left_provenance.status == right_provenance.status
         && left_provenance.frequency_hz == right_provenance.frequency_hz
         && left_provenance.orientation == right_provenance.orientation
+        && left_provenance.frozen_scattering == right_provenance.frozen_scattering
         && left_provenance.fall_moment_policy == right_provenance.fall_moment_policy
         && left_provenance.rain_mode == right_provenance.rain_mode
         && left_provenance.tables == right_provenance.tables
@@ -6048,13 +6417,18 @@ fn append_temporal_provenance(
         .as_deref()
         .unwrap_or("not_requested")
         .replace(';', ",");
-    let interpolation_space = if anchor.property_scattering.is_some() {
-        "source_cell_closure_then_additive_scattering_and_wind"
-    } else {
-        "derived_linear_z_wind_and_additive_polar"
+    let interpolation_space = match config.atmosphere_time_mode {
+        AtmosphereTimeMode::RawStateLinear => {
+            "raw_thermodynamics_winds_and_scheme_microphysics_spatial_plus_temporal_preclosure"
+        }
+        AtmosphereTimeMode::LinearAdjacent if anchor.property_scattering.is_some() => {
+            "source_cell_closure_then_additive_scattering_and_wind"
+        }
+        _ => "derived_linear_z_wind_and_additive_polar",
     };
     let provenance = format!(
-        "atmosphere_time_mode=linear_adjacent; temporal_interpolation_space={interpolation_space}; temporal_policy={policy}; temporal_outcome={runtime_outcome}; temporal_neighbor={neighbor}; temporal_neighbor_time={neighbor_time}; temporal_scan_duration_ms={}; temporal_reflectivity_source={}; temporal_polar_available={}; temporal_microphysics_status={physics_status}",
+        "atmosphere_time_mode={}; temporal_interpolation_space={interpolation_space}; temporal_policy={policy}; temporal_outcome={runtime_outcome}; temporal_neighbor={neighbor}; temporal_neighbor_time={neighbor_time}; temporal_scan_duration_ms={}; temporal_reflectivity_source={}; temporal_polar_available={}; temporal_microphysics_status={physics_status}",
+        config.atmosphere_time_mode.provenance_name(),
         plan.scan_duration_ms,
         anchor.ref_source,
         anchor.has_polarimetric_input(),
@@ -6512,6 +6886,7 @@ mod tests {
             w,
             terrain_m,
             property_scattering: None,
+            raw_property_scene: None,
             polarimetric: None,
             dual_pol_status: None,
             tke_tenths_m2s2: None,
@@ -6539,6 +6914,7 @@ mod tests {
             -95.0,
             1_000.0,
             0.5,
+            AtmosphereTimeMode::LinearAdjacent,
             ReflectivitySampling::LinearZ,
         )
         .expect("midpoint query")
@@ -6555,6 +6931,7 @@ mod tests {
             -95.0,
             1_000.0,
             0.5,
+            AtmosphereTimeMode::LinearAdjacent,
             ReflectivitySampling::LinearZ,
         )
         .expect("anchor query")
@@ -7426,6 +7803,23 @@ mod tests {
         assert!(
             supported_result.is_ok(),
             "the optional 0.1-degree cut and default one-degree beam fit the declared view axis: {supported_result:?}"
+        );
+        let raw_state = SyntheticRadarConfig {
+            atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
+            scan_timing: ScanTiming::TimedVolume,
+            ..supported.clone()
+        };
+        assert!(raw_state.validate_science_contract().is_ok());
+        let raw_with_bulk = SyntheticRadarConfig {
+            atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
+            scan_timing: ScanTiming::TimedVolume,
+            ..SyntheticRadarConfig::default()
+        };
+        assert!(
+            raw_with_bulk
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("only with the P3/ISHMAEL property T-matrix")
         );
 
         let wrong_frequency = SyntheticRadarConfig {
@@ -8858,6 +9252,7 @@ mod tests {
             w: vec![0.0f32; nz * cells],
             terrain_m: vec![0.0f32; cells],
             property_scattering: None,
+            raw_property_scene: None,
             polarimetric: None,
             dual_pol_status: None,
             tke_tenths_m2s2: None,
