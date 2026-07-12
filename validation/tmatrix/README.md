@@ -9,17 +9,16 @@ not an independent scientific validation package.
   mass accounting, elevation geometry, signed KDP, 12-worker deterministic
   ordering, the explicit Re=1000 drag-boundary policy, and every configured
   terminal-speed state without importing PyTMatrix.
-- `sanity_report.json` covers the historical conventional analytic/sphere and
-  resonance checks.
-- `property_sanity_report.json` covers the final five-table property configs,
-  dielectric formulas, oblate/prolate sphere identity, residual-rain mass
-  accounting, and retained extreme solver points.
+- Candidate-specific sanity reports cover the historical conventional
+  analytic/sphere and resonance checks and the five-table property contracts,
+  including dielectric formulas, oblate/prolate sphere identity, residual-rain
+  mass accounting, and retained extreme solver points.
 - `select_held_out_nodes.py` selects absent nodes only after grid/config bytes
   are frozen, using a public seed and axis bytes without evaluating scattering.
-- `held_out_nodes.json` and `held_out_interpolation_report.json` record direct
+- Candidate-specific held-out node and interpolation reports record direct
   PyTMatrix versus multilinear LUT interpolation for all eight tables.
-- `property_view_interpolation_report.json` holds all non-view coordinates at
-  exact LUT nodes and checks only radar-elevation interpolation at the union of
+- Candidate-specific property-view reports hold all non-view coordinates at
+  exact LUT nodes and check only radar-elevation interpolation at the union of
   19 optional/default/Build-24 cut centers, each at center and plus/minus the
   default 0.95-degree FWHM Gaussian beam sigma.
 - `initial_grid_design_failure_report.json`,
@@ -49,6 +48,25 @@ not an independent scientific validation package.
   output-aware gate. All 19,622,160 component comparisons passed with zero
   native-group failures (SHA-256
   `352e259f02b606ac71579b7d3b4591c3088b41f8e74becd949a27e5721030067`).
+
+Refined grid v9 was subsequently rejected by its one-time post-freeze held-out
+check and is development evidence, not validation. The public seed
+`bowecho-pytmatrix-0.3.3-post-grid-heldout-v4-refined-v9-final` selected 48
+nodes before any direct calculation. Forty-five passed, but one conventional
+wet-hail node, one property dry-oblate node, and one property-rain node failed
+the unchanged component thresholds. The exact request is
+`refined_grid_v9_post_freeze_held_out_nodes.json` (SHA-256
+`b49119bdd75aa443c71cc1fb9e0f5c9066242982ee99cd775319d196f3de2f3f`),
+and the exact failed report is
+`refined_grid_v9_post_freeze_held_out_failure_report.json` (SHA-256
+`162d1102503dbf4ddbe06cbb26c6713f1fb89778f826a6626cb9609fa714f451`).
+The passing conventional sanity, property sanity, and property-view reports
+are retained under the same `refined_grid_v9_post_freeze_*` prefix. The v9
+failure reproduction record contains every LUT/config/manifest hash and grid
+count; the rejected LUT payloads are deliberately not retained in the evidence
+bundle. A v10 candidate must use the v9 failures only to design a deterministic
+refinement and multi-axis cross-cell audit, then freeze and use a new public
+held-out seed exactly once.
 
 Every report retains `research_only_unvalidated`. Direct points share
 PyTMatrix, dielectric, orientation, geometry, and fall-speed implementations

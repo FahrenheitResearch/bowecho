@@ -1,0 +1,4458 @@
+{
+  "classification": "held_out_from_lut_interpolation_check_only",
+  "crate_table_validation_status_after_report": "research_only_unvalidated",
+  "environment_report_sha256": "ea4fd9324350cfb2819bb1fef53f251c61bb887a0fa63d7963666d22d03482c7",
+  "generator_source_sha256": "75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
+  "held_out_node_count": 48,
+  "independence_limit": "Held-out nodes are absent from the LUT and are recomputed in fresh PyTMatrix processes, but use the same PyTMatrix engine, generator, dielectric assumptions, orientation, geometry, and fall-speed closures. This tests generation and interpolation only; it is not independent scientific validation.",
+  "interpolation_check_passed": false,
+  "node_request_sha256": "b49119bdd75aa443c71cc1fb9e0f5c9066242982ee99cd775319d196f3de2f3f",
+  "production_validation": false,
+  "report_id": "pytmatrix-0.3.3-direct-node-interpolation-check-v1",
+  "schema": 1,
+  "scientifically_independent": false,
+  "selection_protocol": "Grid/config bytes were frozen before selection. This script uses only axis coordinates, a public fixed seed, fixed diameter quantiles, and SHA-256-derived within-cell fractions in [0.2,0.8]. It does not import PyTMatrix or inspect scattering outputs. No selected-node result may be used to alter these tables.",
+  "selection_seed": "bowecho-pytmatrix-0.3.3-post-grid-heldout-v4-refined-v9-final",
+  "selector_filename": "select_held_out_nodes.py",
+  "selector_source_sha256": "3a83b10c7d8311938b0bc184d025db620b74c786135c00376aa4e8b28deb3f51",
+  "tables": [
+    {
+      "asset_directory": "conventional_liquid_rain_sband_unvalidated",
+      "config_sha256": "a54a28224f3fe7b76250045268c9668d47ce68f19b4eb590fd47ff891dd0eabe",
+      "held_out_node_count": 6,
+      "lut_header_json_sha256": "4721edf1d68e17e8a65d619742728aa9bff1840836b6d2edd2871f31062d3af3",
+      "lut_sha256": "50896b109e489c205e87273155f561c0ca99eeb2dc03926cdb18a11d21193f56",
+      "nodes": [
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.000403792478883881,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.8603028802346322,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 2.6879588927549205e-07,
+            "av": 1.9051013399041398e-07,
+            "fall_speed_first_moment": 0.007698038397435615,
+            "fall_speed_second_moment": 0.012056272648707041,
+            "hh_vv_covariance_imaginary": 6.701899938359656e-06,
+            "hh_vv_covariance_real": 0.004133655379461349,
+            "kdp": 2.7401181828957653e-05,
+            "zh": 0.0049152666744599815,
+            "zv": 0.0034763427588574993
+          },
+          "errors": [
+            {
+              "absolute_error": 0.0009841883809076747,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.20023092257060562,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0006906796822273918,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.19867997206765187,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.000813863390197382,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.1968870927753623,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.3329362361485197e-06,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.19888930727228474,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.187475865549196e-06,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.043336666022713945,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.0761203539681267e-08,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.04003485160687105,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.3998992172707845e-09,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.03884254901444314,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.002377859084020247,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.3088915592850724,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.005431557323807247,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.4505171276455619,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 2.795570928151733e-07,
+            "av": 1.9791003320768477e-07,
+            "fall_speed_first_moment": 0.010075897481455862,
+            "fall_speed_second_moment": 0.017487829972514288,
+            "hh_vv_covariance_imaginary": 8.034836174508176e-06,
+            "hh_vv_covariance_real": 0.0049475187696587306,
+            "kdp": 2.858865769450685e-05,
+            "zh": 0.005899455055367656,
+            "zv": 0.004167022441084891
+          },
+          "node_index": 0,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.000676785225787806,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.9794384526054221,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 1.1611977994968777e-06,
+            "av": 1.1075041635351236e-06,
+            "fall_speed_first_moment": 0.2728964797760656,
+            "fall_speed_second_moment": 0.7606971527784174,
+            "hh_vv_covariance_imaginary": 2.2074538198556036e-05,
+            "hh_vv_covariance_real": 0.09557122977914533,
+            "kdp": 1.8314941471797638e-05,
+            "zh": 0.0979003121047064,
+            "zv": 0.09329756210597757
+          },
+          "errors": [
+            {
+              "absolute_error": 0.015473064044481288,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.15804917994472303,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.014698462801841075,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.15754391079527838,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.014950205014434656,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.1564299742609041,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.2816799035944552e-06,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.14866358127524135,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.0487858371928925e-06,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.05726394696962974,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.246570869291671e-08,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.03657060727407182,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.99988047746626e-08,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.036116166504500974,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.05910562017298632,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.21658623160506657,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.21656330796680257,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.2846905725567834,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.2036635081897944e-06,
+            "av": 1.1475029683097862e-06,
+            "fall_speed_first_moment": 0.33200209994905194,
+            "fall_speed_second_moment": 0.97726046074522,
+            "hh_vv_covariance_imaginary": 2.5356218102150492e-05,
+            "hh_vv_covariance_real": 0.11052143479357998,
+            "kdp": 1.936372730899053e-05,
+            "zh": 0.11337337614918769,
+            "zv": 0.10799602490781865
+          },
+          "node_index": 1,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.0012511871341814153,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.8566230167010805,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 8.792614308589654e-06,
+            "av": 6.274280725452754e-06,
+            "fall_speed_first_moment": 20.79462730509646,
+            "fall_speed_second_moment": 99.56652178745898,
+            "hh_vv_covariance_imaginary": 0.006137164589726285,
+            "hh_vv_covariance_real": 3.6336784031425196,
+            "kdp": 0.0008416385410549195,
+            "zh": 4.342991168064773,
+            "zv": 3.040221794449814
+          },
+          "errors": [
+            {
+              "absolute_error": 0.8849537506287328,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.20376595677560774,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.6145117876565953,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.20212728846903186,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.7277935123951829,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.20029111870928482,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.001249959223799048,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.20367047445517436,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.85703968093081e-05,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.04582774543685169,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.4406625880540626e-07,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.050504462406771373,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.15869649727338e-07,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.05034356343763129,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.520849061719147,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.2654940134640484,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 33.63812970872485,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.33784578495702533,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 9.23668056739506e-06,
+            "av": 6.590150375180092e-06,
+            "fall_speed_first_moment": 26.315476366815606,
+            "fall_speed_second_moment": 133.20465149618383,
+            "hh_vv_covariance_imaginary": 0.007387123813525333,
+            "hh_vv_covariance_real": 4.361471915537702,
+            "kdp": 0.0008802089378642276,
+            "zh": 5.227944918693506,
+            "zv": 3.6547335821064095
+          },
+          "node_index": 2,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.0019653373880228883,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.9452256295399922,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 3.631889724732393e-05,
+            "av": 3.236023827305103e-05,
+            "fall_speed_first_moment": 386.41287887497043,
+            "fall_speed_second_moment": 2504.922920311147,
+            "hh_vv_covariance_imaginary": 0.03628019183635837,
+            "hh_vv_covariance_real": 55.834769311515565,
+            "kdp": 0.0012194326439584403,
+            "zh": 59.60858585696342,
+            "zv": 52.29989498162696
+          },
+          "errors": [
+            {
+              "absolute_error": 11.948968331615056,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.20045716837315622,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 10.446352798410402,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.19973946031976206,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 11.048534241368053,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.197879106112638,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.007112600622153874,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.1960463895625256,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.55590773455748e-05,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.053761950420452356,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.2853484048702236e-06,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.06292449876182885,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.02937433221608e-06,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.06271197124979462,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 94.33365740896187,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.244126587301157,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 734.9385751896953,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.29339768071522354,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 3.8604245652194155e-05,
+            "av": 3.438961260526711e-05,
+            "fall_speed_first_moment": 480.7465362839323,
+            "fall_speed_second_moment": 3239.8614955008425,
+            "hh_vv_covariance_imaginary": 0.04339279245851224,
+            "hh_vv_covariance_real": 66.88330355288362,
+            "kdp": 0.001284991721304015,
+            "zh": 71.55755418857848,
+            "zv": 62.746247780037365
+          },
+          "node_index": 3,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.003724600788895241,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.8375185040839652,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 0.000462467870129781,
+            "av": 0.0003406105273113561,
+            "fall_speed_first_moment": 24987.86665955955,
+            "fall_speed_second_moment": 213589.214338296,
+            "hh_vv_covariance_imaginary": 5.100122880120637,
+            "hh_vv_covariance_real": 2378.364986325035,
+            "kdp": 0.02645634823976729,
+            "zh": 2923.338063348902,
+            "zv": 1934.9955074816644
+          },
+          "errors": [
+            {
+              "absolute_error": 523.097369866216,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.1789383774748819,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 342.62225754700466,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.17706617727134505,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 417.2542498843495,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.17543743381837956,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.8615957077608005,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.1689362644808316,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0011992635644305048,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.04532989789678749,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.7293601522849986e-05,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.1022635399721458,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.494178268592847e-05,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.10258573908958418,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4922.03022659825,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.1969768085310012,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 46209.114223607496,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.21634572872401037,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.000509761471652631,
+            "av": 0.0003755523099972846,
+            "fall_speed_first_moment": 29909.8968861578,
+            "fall_speed_second_moment": 259798.3285619035,
+            "hh_vv_covariance_imaginary": 5.961718587881437,
+            "hh_vv_covariance_real": 2795.6192362093843,
+            "kdp": 0.027655611804197795,
+            "zh": 3446.435433215118,
+            "zv": 2277.617765028669
+          },
+          "node_index": 4,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.0060828677202087915,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.9558673413935969,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 0.004581595948343976,
+            "av": 0.0042730861331427665,
+            "fall_speed_first_moment": 411492.58207098633,
+            "fall_speed_second_moment": 3860712.5235601813,
+            "hh_vv_covariance_imaginary": 27.097128544832778,
+            "hh_vv_covariance_real": 41545.63220495844,
+            "kdp": 0.032828469091037586,
+            "zh": 43858.78100638848,
+            "zv": 39354.49754776906
+          },
+          "errors": [
+            {
+              "absolute_error": 6590.986829534995,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.15027747416361048,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5922.899684935692,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.15050121470224312,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6155.192795005001,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.14815499171223068,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 9.389555243257117,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.34651476918382323,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.002543012636328737,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.07746363771264003,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0009193832383932845,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.2006687732307771,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0008346959307680814,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.19533796061213018,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 63846.088996955485,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.15515732671443744,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 618395.0246299282,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.1601763977131535,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.005500979186737261,
+            "av": 0.005107782063910848,
+            "fall_speed_first_moment": 475338.6710679418,
+            "fall_speed_second_moment": 4479107.548190109,
+            "hh_vv_covariance_imaginary": 17.70757330157566,
+            "hh_vv_covariance_real": 47700.82499996344,
+            "kdp": 0.03537148172736632,
+            "zh": 50449.76783592348,
+            "zv": 45277.39723270475
+          },
+          "node_index": 5,
+          "within_predeclared_interpolation_thresholds": true
+        }
+      ],
+      "payload_sha256": "e01cbf60e21504b1b1e2af216db139a54e2b21f2d5bcec41bf4c9e9081fd8399",
+      "table_id": "conventional-liquid-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_interpolation_thresholds": true
+    },
+    {
+      "asset_directory": "conventional_dry_ice_spheroids_sband_unvalidated",
+      "config_sha256": "8e5adb1ae3748274073549dd159c101fa766e84d15901e80a3e8b33ae75d7a45",
+      "held_out_node_count": 6,
+      "lut_header_json_sha256": "b0c5678ebdd26ce9eb687443437a1d1d4345513b81792ff068d59e30ce1469c2",
+      "lut_sha256": "6f6d3baec9d97379dce71d31132ef564af2c4ad7d6bfe94524ebbb6c3021b1f6",
+      "nodes": [
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.00017093846442795444,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.769635491323535,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 7.948045573401276e-11,
+            "av": 6.612096683558021e-11,
+            "fall_speed_first_moment": 2.7265307489257814e-06,
+            "fall_speed_second_moment": 1.4536405437805865e-06,
+            "hh_vv_covariance_imaginary": 3.8329845440779106e-11,
+            "hh_vv_covariance_real": 4.658193412030332e-06,
+            "kdp": 4.924526855058914e-07,
+            "zh": 5.1140358987949845e-06,
+            "zv": 4.248763884578716e-06
+          },
+          "errors": [
+            {
+              "absolute_error": 1.0412518613069862e-06,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.2036066781526378,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.523780246420844e-07,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.2006178850596687,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 9.375895964871465e-07,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.20127751545603734,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.176773010849e-12,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.2133265322836323,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.631057466277945e-08,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.05342761941840337,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.201584826089803e-12,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.04028141002115217,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.5078716301705457e-12,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.03792853840759389,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.997435879734563e-07,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.329995760483517,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.21915999393823e-07,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.49662621373801574,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 8.268204056010256e-11,
+            "av": 6.862883846575075e-11,
+            "fall_speed_first_moment": 3.6262743368992377e-06,
+            "fall_speed_second_moment": 2.1755565431744096e-06,
+            "hh_vv_covariance_imaginary": 4.6506618451628105e-11,
+            "hh_vv_covariance_real": 5.595783008517479e-06,
+            "kdp": 5.187632601686709e-07,
+            "zh": 6.155287760101971e-06,
+            "zv": 5.101141909220801e-06
+          },
+          "node_index": 0,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.000425834280296785,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.8837273948902152,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 1.1884682809548195e-09,
+            "av": 1.0889899812607425e-09,
+            "fall_speed_first_moment": 0.0019071691262401765,
+            "fall_speed_second_moment": 0.0030898720771828482,
+            "hh_vv_covariance_imaginary": 4.46524190899026e-09,
+            "hh_vv_covariance_real": 0.001126507711117284,
+            "kdp": 3.6174675023547e-06,
+            "zh": 0.0011771665574582541,
+            "zv": 0.0010783530969289631
+          },
+          "errors": [
+            {
+              "absolute_error": 0.00022941508102613368,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.19488752850869995,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00020844930381570793,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.1933033849574409,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00021818827151077612,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.1936855552407842,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 9.321056110677844e-10,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.2087469458689562,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.0195000662777937e-07,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.05582634992472636,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.7314912555622136e-11,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.039811674668851216,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.195215054509063e-11,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.03852390863736129,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0005297287693434472,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.2777565775657049,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.001167945322054738,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.37799148083813144,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.2357831935104416e-09,
+            "av": 1.130942131805833e-09,
+            "fall_speed_first_moment": 0.0024368978955836237,
+            "fall_speed_second_moment": 0.004257817399237586,
+            "hh_vv_covariance_imaginary": 5.397347520058044e-09,
+            "hh_vv_covariance_real": 0.0013446959826280602,
+            "kdp": 3.819417508982479e-06,
+            "zh": 0.0014065816384843878,
+            "zv": 0.001286802400744671
+          },
+          "node_index": 1,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.0013921101213873698,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.8133836811430959,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 5.028111115364227e-08,
+            "av": 4.346401586565195e-08,
+            "fall_speed_first_moment": 7.113630331021314,
+            "fall_speed_second_moment": 34.46096565132799,
+            "hh_vv_covariance_imaginary": 1.0605316031163662e-05,
+            "hh_vv_covariance_real": 1.364128844886563,
+            "kdp": 0.00021066934765100534,
+            "zh": 1.4684364042037905,
+            "zv": 1.2683032480861596
+          },
+          "errors": [
+            {
+              "absolute_error": 0.14372558603164087,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.09787661598431371,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.12161676490117745,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.09588934277720597,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.13140043305060356,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.09632552932456351,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.3222449053579142e-06,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.12467755807299895,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.533705025634604e-06,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.03576080293425,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.773333171011739e-09,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.035268376738792136,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.458026835337739e-09,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.03354560793104176,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.8989735823259135,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.1263733903075684,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.439483857062278,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.15784478914776615,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 5.205444432465401e-08,
+            "av": 4.492204270098969e-08,
+            "fall_speed_first_moment": 8.012603913347228,
+            "fall_speed_second_moment": 39.90044950839027,
+            "hh_vv_covariance_imaginary": 1.1927560936521576e-05,
+            "hh_vv_covariance_real": 1.4955292779371665,
+            "kdp": 0.00021820305267663994,
+            "zh": 1.6121619902354314,
+            "zv": 1.389920012987337
+          },
+          "node_index": 2,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.003800001696514634,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.8960558244252398,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 4.071451489245861e-06,
+            "av": 3.765639024246737e-06,
+            "fall_speed_first_moment": 5423.22343946881,
+            "fall_speed_second_moment": 49820.48616324153,
+            "hh_vv_covariance_imaginary": 0.009738946346952495,
+            "hh_vv_covariance_real": 567.609572563161,
+            "kdp": 0.0023045953141012363,
+            "zh": 590.3465569973532,
+            "zv": 545.8790867826467
+          },
+          "errors": [
+            {
+              "absolute_error": 113.44985981645004,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.1921750173211541,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 103.82285989212869,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.1901938770068104,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 108.2319125043042,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.1906802100175304,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.004686992065679336,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.4812627463694763,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00013732856481149178,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.05958901503062728,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.556294272047552e-07,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.16103088270522287,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.994998113836108e-07,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.1592026764975255,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1267.3811719153737,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.23369517890258826,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 13969.824390041787,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.28040321293269477,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 4.727080916450616e-06,
+            "av": 4.365138835630348e-06,
+            "fall_speed_first_moment": 6690.604611384184,
+            "fall_speed_second_moment": 63790.310553283314,
+            "hh_vv_covariance_imaginary": 0.01442593841263183,
+            "hh_vv_covariance_real": 675.8414850674652,
+            "kdp": 0.002441923878912728,
+            "zh": 703.7964168138033,
+            "zv": 649.7019466747754
+          },
+          "node_index": 3,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.012942670507429551,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.8138666455157919,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 0.005375561037177193,
+            "av": 0.004601724471585582,
+            "fall_speed_first_moment": 15363396.66569405,
+            "fall_speed_second_moment": 260470029.51275444,
+            "hh_vv_covariance_imaginary": 941.4766184448607,
+            "hh_vv_covariance_real": 837672.5224422137,
+            "kdp": 0.18679391013474594,
+            "zh": 906184.7059678748,
+            "zv": 775091.00353155
+          },
+          "errors": [
+            {
+              "absolute_error": 87910.16149028309,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.09701130565472112,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 73408.5649683117,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.0947096078187464,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 79775.03816818574,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.0952341589713407,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 217.71060737159758,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.23124377505116786,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.007584862779477286,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.040605514248327784,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0005547839118647153,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.10320483909081288,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00046362893790647536,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.10075112944489834,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1751837.147011578,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.11402668206330777,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 34424084.78339827,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.13216140393500675,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.005930344949041908,
+            "av": 0.005065353409492057,
+            "fall_speed_first_moment": 17115233.81270563,
+            "fall_speed_second_moment": 294894114.2961527,
+            "hh_vv_covariance_imaginary": 1159.1872258164583,
+            "hh_vv_covariance_real": 917447.5606103995,
+            "kdp": 0.19437877291422323,
+            "zh": 994094.8674581579,
+            "zv": 848499.5684998618
+          },
+          "node_index": 4,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.028664199287874125,
+            "frequency": 2700832954.954955,
+            "minor_to_major_axis_ratio": 0.906812400196737,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 0.6579011120146663,
+            "av": 0.6000980505816799,
+            "fall_speed_first_moment": 2035158868.2947786,
+            "fall_speed_second_moment": 51348385380.37795,
+            "hh_vv_covariance_imaginary": 651539.4247209002,
+            "hh_vv_covariance_real": 76898164.16645606,
+            "kdp": 1.2758995461867555,
+            "zh": 80662158.8686144,
+            "zv": 73342183.94416815
+          },
+          "errors": [
+            {
+              "absolute_error": 7507251.977380335,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.09307030809339523,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6670979.043670684,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.09095691844612887,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6990440.447731897,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.09090516689839541,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 273490.81993264146,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.41976096849365124,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.08625953615623172,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.06760683975006741,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.1253693801296274,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.19055961122441847,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.11206251032038106,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.1867403338700367,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 252831973.53607392,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.12423205749432087,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8198773596.674553,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.15966955019013307,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.7832704921442937,
+            "av": 0.7121605609020609,
+            "fall_speed_first_moment": 2287990841.8308525,
+            "fall_speed_second_moment": 59547158977.052505,
+            "hh_vv_covariance_imaginary": 925030.2446535417,
+            "hh_vv_covariance_real": 83888604.61418796,
+            "kdp": 1.3621590823429872,
+            "zh": 88169410.84599474,
+            "zv": 80013162.98783883
+          },
+          "node_index": 5,
+          "within_predeclared_interpolation_thresholds": true
+        }
+      ],
+      "payload_sha256": "cf357fcf104bd5d377d72a715c99d8f4f8a8ce2e7250a5b8f086bf57452749e1",
+      "table_id": "conventional-dry-ice-spheroids-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_interpolation_thresholds": true
+    },
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "config_sha256": "4e9240d544556f79e255dfa4dad44a0ef825c2803cd36f94154211a06c7fbcdb",
+      "held_out_node_count": 6,
+      "lut_header_json_sha256": "0d44e6203d9c1145b8668054c1e112db33c392b00800bad5a54cc841c16f57c9",
+      "lut_sha256": "e136be14494749a4a3647a08f4148a818381957fadcd7c1e57d5bdefa1981576",
+      "nodes": [
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.0029793395440569598,
+            "frequency": 2700832954.954955,
+            "liquid_mass_fraction": 0.1247898337730537,
+            "minor_to_major_axis_ratio": 0.7555267406091327,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 3.326104485162245e-05,
+            "av": 2.6101971712387515e-05,
+            "fall_speed_first_moment": 1846.7879603016722,
+            "fall_speed_second_moment": 15100.928781309758,
+            "hh_vv_covariance_imaginary": 0.133189868709058,
+            "hh_vv_covariance_real": 199.54814487081558,
+            "kdp": 0.004286651022386533,
+            "zh": 225.85536424332406,
+            "zv": 176.73006099391554
+          },
+          "errors": [
+            {
+              "absolute_error": 7.285554520619883,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.03225761117088558,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.416310307728963,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.030647362861010025,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.2240297637744675,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.031190617020287557,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0062329383174357655,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.04679739065627501,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.993743685809601e-05,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.009316698898400503,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.550748679390298e-08,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.001067539728601489,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.028736826535066e-07,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.003941222670342741,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 71.0441569447039,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.03846903839090377,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 683.512535156935,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.045262946740263446,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 3.3225537364828546e-05,
+            "av": 2.599909802973401e-05,
+            "fall_speed_first_moment": 1917.8321172463761,
+            "fall_speed_second_moment": 15784.441316466693,
+            "hh_vv_covariance_imaginary": 0.13942280702649376,
+            "hh_vv_covariance_real": 205.77217463459004,
+            "kdp": 0.0043265884592446294,
+            "zh": 233.14091876394394,
+            "zv": 182.1463713016445
+          },
+          "node_index": 0,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.006950720075773618,
+            "frequency": 2700832954.954955,
+            "liquid_mass_fraction": 0.21012865061404887,
+            "minor_to_major_axis_ratio": 0.8044617324802253,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 0.0008855549286373169,
+            "av": 0.0007154034285815716,
+            "fall_speed_first_moment": 559490.0602545359,
+            "fall_speed_second_moment": 7012916.191725678,
+            "hh_vv_covariance_imaginary": 44.21384850779979,
+            "hh_vv_covariance_real": 40007.6774348278,
+            "kdp": 0.05470910131222922,
+            "zh": 44636.085611996554,
+            "zv": 35926.68485130215
+          },
+          "errors": [
+            {
+              "absolute_error": 1229.0134918168987,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.027534078648836193,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 939.5628557265372,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.026152228061545824,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1060.9385805489364,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.026518374686388565,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.0156094558688267,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.04558774058117225,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0005468127638032297,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.009994914021389705,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.348227389702915e-06,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.009427114140225139,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.648417813094043e-06,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.00789543016909095,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 18252.064942192286,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.03262267954123911,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 267306.83811305184,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.038116359985656025,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.0008939031560270198,
+            "av": 0.0007210518463946656,
+            "fall_speed_first_moment": 577742.1251967282,
+            "fall_speed_second_moment": 7280223.02983873,
+            "hh_vv_covariance_imaginary": 46.229457963668615,
+            "hh_vv_covariance_real": 41068.616015376734,
+            "kdp": 0.05525591407603245,
+            "zh": 45865.09910381345,
+            "zv": 36866.247707028684
+          },
+          "node_index": 1,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.015951674244205846,
+            "frequency": 2700832954.954955,
+            "liquid_mass_fraction": 0.2755876052879439,
+            "minor_to_major_axis_ratio": 0.8997834152349,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 0.05646734993244174,
+            "av": 0.04987930749048553,
+            "fall_speed_first_moment": 133538101.95898345,
+            "fall_speed_second_moment": 2542773140.534138,
+            "hh_vv_covariance_imaginary": 21674.50222297729,
+            "hh_vv_covariance_real": 6576971.204643569,
+            "kdp": 0.45157489767833686,
+            "zh": 7012982.947846443,
+            "zv": 6172118.173693906
+          },
+          "errors": [
+            {
+              "absolute_error": 132133.0872745011,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.018841210403210337,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 111226.5669466462,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.018020809682598646,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 118939.87700752076,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.018084293409030755,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1092.0854312517586,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.05038572143511703,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.005798184901021464,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.0128399185402719,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0011417539514726044,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.020219719056031732,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0009613013476722845,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.01927254799709584,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3006855.9352101386,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.02251683894783604,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 67306625.89243507,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.026469772241772445,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.057609103883914346,
+            "av": 0.050840608838157816,
+            "fall_speed_first_moment": 136544957.8941936,
+            "fall_speed_second_moment": 2610079766.4265733,
+            "hh_vv_covariance_imaginary": 22766.58765422905,
+            "hh_vv_covariance_real": 6695911.08165109,
+            "kdp": 0.4573730825793583,
+            "zh": 7145116.0351209445,
+            "zv": 6283344.740640552
+          },
+          "node_index": 2,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.030035722589718327,
+            "frequency": 2700832954.954955,
+            "liquid_mass_fraction": 0.3533468563816531,
+            "minor_to_major_axis_ratio": 0.9562201892870834,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 3.5042389962690934,
+            "av": 3.2622528053496396,
+            "fall_speed_first_moment": 4960196940.340309,
+            "fall_speed_second_moment": 130035187391.89557,
+            "hh_vv_covariance_imaginary": 3192074.871308437,
+            "hh_vv_covariance_real": 182253326.0288076,
+            "kdp": 2.361488606540986,
+            "zh": 189206892.22996253,
+            "zv": 175656181.75635764
+          },
+          "errors": [
+            {
+              "absolute_error": 9768586.05764392,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.05162912377299214,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8268470.637476772,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.04707190236518679,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 9107881.078216404,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.04997374411030929,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 260132.32075718418,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.08149317645878258,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.100622914078635,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.042609951113007236,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.13251932774484843,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.03781686348617763,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.11646937814409375,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.035702131347117,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 256781858.49518204,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.051768480482463415,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6735591204.763992,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.05179821969621576,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 3.636758324013942,
+            "av": 3.3787221834937333,
+            "fall_speed_first_moment": 4703415081.845127,
+            "fall_speed_second_moment": 123299596187.13158,
+            "hh_vv_covariance_imaginary": 2931942.550551253,
+            "hh_vv_covariance_real": 173145444.9505912,
+            "kdp": 2.462111520619621,
+            "zh": 179438306.1723186,
+            "zv": 167387711.11888087
+          },
+          "node_index": 3,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.03989942749613881,
+            "frequency": 2700832954.954955,
+            "liquid_mass_fraction": 0.12803537440219864,
+            "minor_to_major_axis_ratio": 0.7376728292707024,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 9.70467214978895,
+            "av": 6.634151710856887,
+            "fall_speed_first_moment": 7607547277.916932,
+            "fall_speed_second_moment": 227674253087.8075,
+            "hh_vv_covariance_imaginary": 36027146.65596212,
+            "hh_vv_covariance_real": 213027981.6763245,
+            "kdp": 17.840741937432902,
+            "zh": 254199914.1353092,
+            "zv": 185623005.27838054
+          },
+          "errors": [
+            {
+              "absolute_error": 18561408.54261926,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.07301894104000022,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 9087515.275374442,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.048956837336761205,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 13219663.773669928,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.062055996914789975,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3171593.7705154195,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.08803344324773368,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.04383844115235647,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.0024572095323219705,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.3579020073991188,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.03687935067511809,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.16820303972488304,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.02535411414388011,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 558230670.293253,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.07337853448688726,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 16787731341.211334,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.07373574795362031,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 10.062574157188068,
+            "av": 6.80235475058177,
+            "fall_speed_first_moment": 7049316607.623679,
+            "fall_speed_second_moment": 210886521746.59616,
+            "hh_vv_covariance_imaginary": 32855552.885446697,
+            "hh_vv_covariance_real": 199808317.90265456,
+            "kdp": 17.88458037858526,
+            "zh": 235638505.59268993,
+            "zv": 176535490.0030061
+          },
+          "node_index": 4,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.04383348886232083,
+            "frequency": 2700832954.954955,
+            "liquid_mass_fraction": 0.21444688377603305,
+            "minor_to_major_axis_ratio": 0.8056225131519161,
+            "radar_elevation": 0.0
+          },
+          "direct_pytmatrix": {
+            "ah": 33.86272977377307,
+            "av": 26.657914853186025,
+            "fall_speed_first_moment": 10886245274.835764,
+            "fall_speed_second_moment": 342729893841.78217,
+            "hh_vv_covariance_imaginary": 133688646.99627493,
+            "hh_vv_covariance_real": 202999652.55676606,
+            "kdp": -20.86885058564642,
+            "zh": 345783482.308646,
+            "zv": 180105241.67535785
+          },
+          "errors": [
+            {
+              "absolute_error": 239852940.19317323,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.693650658475007,
+              "within_predeclared_threshold": false
+            },
+            {
+              "absolute_error": 258241828.09906617,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 1.433838491855504,
+              "within_predeclared_threshold": false
+            },
+            {
+              "absolute_error": 220548733.3087785,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 1.0864488216161112,
+              "within_predeclared_threshold": false
+            },
+            {
+              "absolute_error": 112052643.15245448,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.8381612475708329,
+              "within_predeclared_threshold": false
+            },
+            {
+              "absolute_error": 2.2331980318884703,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.10701107005023373,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.7047500636039814,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.05034296038721375,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.1548102176600139,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.0058072890739056336,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7631958316.724508,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.7010643361459306,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 242861600040.85687,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.7086093288173209,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 32.15797971016909,
+            "av": 26.81272507084604,
+            "fall_speed_first_moment": 18518203591.560272,
+            "fall_speed_second_moment": 585591493882.639,
+            "hh_vv_covariance_imaginary": 245741290.1487294,
+            "hh_vv_covariance_real": 423548385.86554456,
+            "kdp": -18.63565255375795,
+            "zh": 585636422.5018193,
+            "zv": 438347069.774424
+          },
+          "node_index": 5,
+          "within_predeclared_interpolation_thresholds": false
+        }
+      ],
+      "payload_sha256": "c2c3e0c22de7068445a99552194069bbdb56be5efda273c79143cc64ac18c97e",
+      "table_id": "conventional-wet-hail-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_interpolation_thresholds": false
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "config_sha256": "0dc4ca0c648c386f923de3155103aaa806e1c2234959cd44b19a55a129200bff",
+      "held_out_node_count": 6,
+      "lut_header_json_sha256": "280835f747e6c15ceba68c47f548ff1e1d0959c51b38fd3e017a2edfb8eec093",
+      "lut_sha256": "7683b4c70758c8688406b0f375567a3cc33dd1db6c39581a72437287ad66fda4",
+      "nodes": [
+        {
+          "coordinates": {
+            "bulk_density": 1.5598360294947913,
+            "equivolume_diameter": 9.000225023961165e-05,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.1659225599501833,
+            "radar_elevation": -0.10122367197461707,
+            "temperature": 209.2760520298129
+          },
+          "direct_pytmatrix": {
+            "ah": 5.679629365927683e-15,
+            "av": 5.668228905980137e-15,
+            "fall_speed_first_moment": 2.3571968640021364e-17,
+            "fall_speed_second_moment": 1.9450017283012853e-21,
+            "hh_vv_covariance_imaginary": 7.886698400339681e-21,
+            "hh_vv_covariance_real": 2.853877575002046e-13,
+            "kdp": 1.3669228231751574e-12,
+            "zh": 2.856746590407559e-13,
+            "zv": 2.8510118868144994e-13
+          },
+          "errors": [
+            {
+              "absolute_error": 1.1949872367650468e-14,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.011949872367650468,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.1904116941674568e-14,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.011904116941674567,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.1926963743513069e-14,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.01192696374351307,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.0407689344913172e-21,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 1.0407689344913172e-09,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.908267536277698e-14,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.043223124496185344,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.07116380370569e-16,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.000307116380370569,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.0606255250938273e-16,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.0003060625525093827,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.1579146799465462e-18,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 2.1579146799465463e-06,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.5949436543685206e-22,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 3.594943654368521e-10,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 5.986745746298252e-15,
+            "av": 5.97429145848952e-15,
+            "fall_speed_first_moment": 2.572988331996791e-17,
+            "fall_speed_second_moment": 2.3044960937381374e-21,
+            "hh_vv_covariance_imaginary": 8.927467334830998e-21,
+            "hh_vv_covariance_real": 2.973147212437177e-13,
+            "kdp": 1.4260054985379344e-12,
+            "zh": 2.976245314084064e-13,
+            "zv": 2.970053056231245e-13
+          },
+          "node_index": 0,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 1.704592461565481,
+            "equivolume_diameter": 0.00034910940834431497,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.5114078865080275,
+            "radar_elevation": 2.669367535852838,
+            "temperature": 240.00947160327232
+          },
+          "direct_pytmatrix": {
+            "ah": 5.491362027532107e-13,
+            "av": 5.486332617930276e-13,
+            "fall_speed_first_moment": 2.0639616106270027e-12,
+            "fall_speed_second_moment": 3.611942376904187e-15,
+            "hh_vv_covariance_imaginary": 2.2361930715977546e-17,
+            "hh_vv_covariance_real": 1.1788632515983516e-09,
+            "kdp": 4.0063966617665325e-11,
+            "zh": 1.1794035135724465e-09,
+            "zv": 1.1783232757511329e-09
+          },
+          "errors": [
+            {
+              "absolute_error": 5.7815281354722883e-11,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.049020781004457725,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.770369671898361e-11,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.04897102340798612,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.77594413400206e-11,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.04899587909090215,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.958995363910741e-18,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 5.958995363910741e-06,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.3972989581515153e-12,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.05983678503502145,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.543731318373894e-14,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.08543731318373894,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.532916118011996e-14,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.08532916118011996,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.1200739793247997e-13,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.10271867308039469,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.990370826622692e-16,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.0006990370826622693,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 6.345735159369497e-13,
+            "av": 6.339624229731475e-13,
+            "fall_speed_first_moment": 2.2759690085594827e-12,
+            "fall_speed_second_moment": 4.310979459566456e-15,
+            "hh_vv_covariance_imaginary": 2.832092607988829e-17,
+            "hh_vv_covariance_real": 1.2366226929383722e-09,
+            "kdp": 4.246126557581684e-11,
+            "zh": 1.2372187949271693e-09,
+            "zv": 1.2360269724701165e-09
+          },
+          "node_index": 1,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 1.7962263027055267,
+            "equivolume_diameter": 0.0012343300596439296,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.8882861775286773,
+            "radar_elevation": 8.60335507797426,
+            "temperature": 266.7317084184828
+          },
+          "direct_pytmatrix": {
+            "ah": 5.889797318129408e-11,
+            "av": 5.888837817799722e-11,
+            "fall_speed_first_moment": 5.591828816264809e-08,
+            "fall_speed_second_moment": 1.2078089601332666e-09,
+            "hh_vv_covariance_imaginary": 1.9976841602182195e-14,
+            "hh_vv_covariance_real": 2.58865450184251e-06,
+            "kdp": 3.3410073797253617e-10,
+            "zh": 2.588865502948364e-06,
+            "zv": 2.588443520836817e-06
+          },
+          "errors": [
+            {
+              "absolute_error": 9.140754141467495e-08,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.03530795296649218,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 9.13278656119911e-08,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.035282927704161665,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 9.136767658846358e-08,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.03529543109110598,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.3830307265572344e-15,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.005383030726557234,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.137683527615342e-11,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.153776479477207,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.315418036647057e-12,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.07326938099149442,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.313202731177781e-12,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.07324370044867946,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.81329455463193e-09,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.06819405028173069,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.5279821705492213e-10,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.12650859705334755,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 6.321339121794113e-11,
+            "av": 6.3201580909175e-11,
+            "fall_speed_first_moment": 5.973158271728002e-08,
+            "fall_speed_second_moment": 1.3606071771881887e-09,
+            "hh_vv_covariance_imaginary": 2.535987232873943e-14,
+            "hh_vv_covariance_real": 2.6800221784309737e-06,
+            "kdp": 3.854775732486896e-10,
+            "zh": 2.6802730443630388e-06,
+            "zv": 2.679771386448808e-06
+          },
+          "node_index": 2,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 2.103585351488715,
+            "equivolume_diameter": 0.0050135685430186495,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.32656046099615604,
+            "radar_elevation": 16.447272135561462,
+            "temperature": 218.366880534053
+          },
+          "direct_pytmatrix": {
+            "ah": 1.5590391679817594e-09,
+            "av": 1.5562894905489584e-09,
+            "fall_speed_first_moment": 0.0028158229932145947,
+            "fall_speed_second_moment": 0.0005244899547841568,
+            "hh_vv_covariance_imaginary": 4.4772364804600527e-10,
+            "hh_vv_covariance_real": 0.015104419303698324,
+            "kdp": 2.703001250114076e-07,
+            "zh": 0.015117275472661739,
+            "zv": 0.015091576352821781
+          },
+          "errors": [
+            {
+              "absolute_error": 0.0006032100466869389,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.03990203444911691,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0006010861636685967,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.03982924974939462,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0006021462143112333,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.03986556531596004,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.787819520426176e-11,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.15160734864129183,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.4282904977256102e-08,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.052840911474433525,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.695220484709011e-11,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.049358737373293785,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.666478039611861e-11,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.049261259464700384,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00019409266631863426,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.0689292852520728,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.976958471490973e-05,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.11395753945279406,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.6359913728288495e-09,
+            "av": 1.632954270945077e-09,
+            "fall_speed_first_moment": 0.003009915659533229,
+            "fall_speed_second_moment": 0.0005842595394990666,
+            "hh_vv_covariance_imaginary": 5.15601843250267e-10,
+            "hh_vv_covariance_real": 0.015706565518009558,
+            "kdp": 2.845830299886637e-07,
+            "zh": 0.015720485519348678,
+            "zv": 0.015692662516490378
+          },
+          "node_index": 3,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 2.4453304592905516,
+            "equivolume_diameter": 0.022192913136415665,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.5913862765743346,
+            "radar_elevation": 0.09544801326163133,
+            "temperature": 253.5305014967759
+          },
+          "direct_pytmatrix": {
+            "ah": 1.1149547091856178e-06,
+            "av": 1.1043245948289753e-06,
+            "fall_speed_first_moment": 82.22013479276949,
+            "fall_speed_second_moment": 66.64374443142049,
+            "hh_vv_covariance_imaginary": 0.0002557757824005553,
+            "hh_vv_covariance_real": 101.38047499045858,
+            "kdp": 1.725907080164167e-05,
+            "zh": 101.43713596851829,
+            "zv": 101.32385068311359
+          },
+          "errors": [
+            {
+              "absolute_error": 1.5936072710423304,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.015710294418573856,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.588775576825583,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.015680173681855192,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.5911854119472366,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.01569518600200868,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.801061669201836e-05,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.14860913076005056,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.2689325164066957e-06,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.07352264388914817,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.26134606678001e-08,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.05615785121310806,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.136147074643926e-08,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.055564705371741,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.598247484550427,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.0316011095226144,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.6358053009356297,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.05455583764020106,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.1775681698534179e-06,
+            "av": 1.1656860655754145e-06,
+            "fall_speed_first_moment": 84.81838227731991,
+            "fall_speed_second_moment": 70.27954973235612,
+            "hh_vv_covariance_imaginary": 0.00029378639909257364,
+            "hh_vv_covariance_real": 102.97166040240582,
+            "kdp": 1.8528003318048367e-05,
+            "zh": 103.03074323956062,
+            "zv": 102.91262625993917
+          },
+          "node_index": 4,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 2.8807687119410925,
+            "equivolume_diameter": 0.06996226759233486,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.8882163346763564,
+            "radar_elevation": 3.6180628896542406,
+            "temperature": 266.468564278848
+          },
+          "direct_pytmatrix": {
+            "ah": 0.000404408807990353,
+            "av": 0.00039542645477499196,
+            "fall_speed_first_moment": 741.0374513870171,
+            "fall_speed_second_moment": 1242.2449942335497,
+            "hh_vv_covariance_imaginary": 0.3359183805517586,
+            "hh_vv_covariance_real": 441.78270554642677,
+            "kdp": 0.00018751321341791137,
+            "zh": 442.0516942368331,
+            "zv": 441.5142682045658
+          },
+          "errors": [
+            {
+              "absolute_error": 229.1072971542476,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.5182816854707073,
+              "within_predeclared_threshold": false
+            },
+            {
+              "absolute_error": 229.6114860530585,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.520054509193513,
+              "within_predeclared_threshold": false
+            },
+            {
+              "absolute_error": 229.35917541007734,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.5191673927714993,
+              "within_predeclared_threshold": false
+            },
+            {
+              "absolute_error": 0.361269616374877,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 1.075468439034143,
+              "within_predeclared_threshold": false
+            },
+            {
+              "absolute_error": 2.786459478984051e-05,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.14860070008900433,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.166449468095802e-06,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.007829823202493988,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.86990578539511e-06,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.007257748566742105,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 395.42016265347354,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.5336034797072083,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 694.2212912316429,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.5588441043869685,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.0004075752574584488,
+            "av": 0.00039829636056038707,
+            "fall_speed_first_moment": 1136.4576140404906,
+            "fall_speed_second_moment": 1936.4662854651926,
+            "hh_vv_covariance_imaginary": -0.025351235823118403,
+            "hh_vv_covariance_real": 671.1418809565041,
+            "kdp": 0.00021537780820775188,
+            "zh": 671.1589913910807,
+            "zv": 671.1257542576243
+          },
+          "node_index": 5,
+          "within_predeclared_interpolation_thresholds": false
+        }
+      ],
+      "payload_sha256": "92e50b8709dcc13bad9675464c2b81d78343c51caa0d8d64815d4c1eab46e304",
+      "table_id": "property-p3-ishmael-dry-oblate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_interpolation_thresholds": false
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_prolate_sband_unvalidated",
+      "config_sha256": "c2b973ab36fa26edb8d9d82f7dbb2ae5df52feec4bf93c880e304cad5aa2ff49",
+      "held_out_node_count": 6,
+      "lut_header_json_sha256": "bbf8b36d931f38ae127618b654f8efb33fc1f8c938691f1e8f71f296e5bde70b",
+      "lut_sha256": "7a563e1103cb1a61ccb94ce72513d82b9fdd68a6faddb4aa8ae46112fb0109c0",
+      "nodes": [
+        {
+          "coordinates": {
+            "bulk_density": 1.5480014508378994,
+            "equivolume_diameter": 8.412663849533477e-05,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.3119042542726913,
+            "radar_elevation": 0.2702599094684618,
+            "temperature": 213.20491284386594
+          },
+          "direct_pytmatrix": {
+            "ah": 4.7933278127295105e-15,
+            "av": 4.798268783495565e-15,
+            "fall_speed_first_moment": 1.3063561419755784e-17,
+            "fall_speed_second_moment": 9.085985557348808e-22,
+            "hh_vv_covariance_imaginary": -2.773965756136364e-21,
+            "hh_vv_covariance_real": 1.8792080064167209e-13,
+            "kdp": -5.686967232674207e-13,
+            "zh": 1.8782402403193726e-13,
+            "zv": 1.8801763484378001e-13
+          },
+          "errors": [
+            {
+              "absolute_error": 7.605584056411473e-15,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.007605584056411474,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.612750142797483e-15,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.007612750142797483,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.609164579413543e-15,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.007609164579413543,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.4238570174954005e-22,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 2.4238570174954004e-10,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.004182468925739e-15,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.002004182468925739,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.6294745805225325e-16,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.0002629474580522533,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.6320031988900486e-16,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.0002632003198890049,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.1125401885123323e-18,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 1.1125401885123324e-06,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.543119884318881e-22,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 1.543119884318881e-10,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 5.056275270781764e-15,
+            "av": 5.06146910338457e-15,
+            "fall_speed_first_moment": 1.4176101608268116e-17,
+            "fall_speed_second_moment": 1.0629105441667689e-21,
+            "hh_vv_covariance_imaginary": -3.016351457885904e-21,
+            "hh_vv_covariance_real": 1.9552996522108563e-13,
+            "kdp": -5.707009057363465e-13,
+            "zh": 1.9542960808834874e-13,
+            "zv": 1.956303849865775e-13
+          },
+          "node_index": 0,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 1.6709224081304732,
+            "equivolume_diameter": 0.00022006886804454672,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.5453284589067977,
+            "radar_elevation": 3.127719054142997,
+            "temperature": 251.18941116831346
+          },
+          "direct_pytmatrix": {
+            "ah": 1.7560513023827126e-13,
+            "av": 1.757256828735455e-13,
+            "fall_speed_first_moment": 4.669722974163827e-14,
+            "fall_speed_second_moment": 3.051356456365881e-17,
+            "hh_vv_covariance_imaginary": -1.3199037727200111e-18,
+            "hh_vv_covariance_real": 7.148885242694633e-11,
+            "kdp": -7.389389626678282e-12,
+            "zh": 7.146432403838011e-11,
+            "zv": 7.151339055396177e-11
+          },
+          "errors": [
+            {
+              "absolute_error": 3.119238613734873e-12,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.043647493427065476,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.1223884921674303e-12,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.04366159215750474,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.120812382593291e-12,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.04365453181364766,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.7838168434486066e-19,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 2.783816843448607e-07,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.902700800652419e-13,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.02574909291266769,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.535530666376481e-14,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.02535530666376481,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.5375310167482756e-14,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.025375310167482755,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.569716891198354e-15,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.004569716891198354,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.081345704135084e-18,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 6.0813457041350834e-06,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 2.0096043690203607e-13,
+            "av": 2.0110099304102825e-13,
+            "fall_speed_first_moment": 5.1266946632836625e-14,
+            "fall_speed_second_moment": 3.6594910267793894e-17,
+            "hh_vv_covariance_imaginary": -1.5982854570648718e-18,
+            "hh_vv_covariance_real": 7.460966480953962e-11,
+            "kdp": -7.579659706743524e-12,
+            "zh": 7.458356265211499e-11,
+            "zv": 7.46357790461292e-11
+          },
+          "node_index": 1,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 1.8073515033638392,
+            "equivolume_diameter": 0.0006734897038333054,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.8745001178756941,
+            "radar_elevation": 8.650916945700045,
+            "temperature": 263.2555259409746
+          },
+          "direct_pytmatrix": {
+            "ah": 8.285506260867569e-12,
+            "av": 8.286987069262334e-12,
+            "fall_speed_first_moment": 5.182133476183721e-10,
+            "fall_speed_second_moment": 3.886617233768768e-12,
+            "hh_vv_covariance_imaginary": -5.039191217644856e-16,
+            "hh_vv_covariance_real": 6.910098489091946e-08,
+            "kdp": -5.98448137140708e-11,
+            "zh": 6.909480854368504e-08,
+            "zv": 6.91071618835462e-08
+          },
+          "errors": [
+            {
+              "absolute_error": 3.1752642842482215e-09,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.045955178850241224,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.1767296844575715e-09,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.04596816882468332,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.175996380894689e-09,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.04596166589967151,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 9.044091264751086e-17,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 9.044091264751086e-05,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.5148219677358306e-12,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.07544215927059188,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.096113871902442e-13,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.06150636679826529,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.098084707482934e-13,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.061519158469457345,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.096846164464852e-11,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.09835420465121486,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.485638161390316e-13,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.19260034397911768,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 8.795117648057813e-12,
+            "av": 8.796795540010627e-12,
+            "fall_speed_first_moment": 5.691818092630206e-10,
+            "fall_speed_second_moment": 4.6351810499078e-12,
+            "hh_vv_covariance_imaginary": -5.943600344119964e-16,
+            "hh_vv_covariance_real": 7.227698127181415e-08,
+            "kdp": -6.435963568180663e-11,
+            "zh": 7.227007282793326e-08,
+            "zv": 7.228389156800377e-08
+          },
+          "node_index": 2,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 2.1679405617721184,
+            "equivolume_diameter": 0.002103699911201437,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.2579064567250754,
+            "radar_elevation": 17.161934246819676,
+            "temperature": 198.89516825933262
+          },
+          "direct_pytmatrix": {
+            "ah": 9.134996529270912e-11,
+            "av": 9.148146498144332e-11,
+            "fall_speed_first_moment": 6.462205557314709e-06,
+            "fall_speed_second_moment": 4.686979659194559e-07,
+            "hh_vv_covariance_imaginary": -1.6106434633020308e-12,
+            "hh_vv_covariance_real": 8.916213183912291e-05,
+            "kdp": -1.7289218767337874e-08,
+            "zh": 8.909810517967007e-05,
+            "zv": 8.922621431068454e-05
+          },
+          "errors": [
+            {
+              "absolute_error": 4.1373434635358694e-06,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.04643581875498634,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.142162984946776e-06,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.04642316181345335,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.139750735589724e-06,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.046429472357829696,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.2378597277605416e-13,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.07685498100385087,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.796265768439101e-11,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.0021957416465866347,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.5954132061952412e-12,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.03935867074141298,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.5995184331230638e-12,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.03934696972608837,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.179124596558764e-07,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.08014484452133222,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.06144652059567e-08,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.12932521498583394,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 9.494537849890436e-11,
+            "av": 9.508098341456638e-11,
+            "fall_speed_first_moment": 6.980118016970585e-06,
+            "fall_speed_second_moment": 5.293124311254126e-07,
+            "hh_vv_covariance_imaginary": -1.734429436078085e-12,
+            "hh_vv_covariance_real": 9.330188257471263e-05,
+            "kdp": -1.7251256109653483e-08,
+            "zh": 9.323544864320594e-05,
+            "zv": 9.336837729563132e-05
+          },
+          "node_index": 3,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 2.390224425356007,
+            "equivolume_diameter": 0.007360918423093304,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.5778751582776808,
+            "radar_elevation": 0.48549223848702594,
+            "temperature": 248.48956436239564
+          },
+          "direct_pytmatrix": {
+            "ah": 9.999849440488251e-09,
+            "av": 1.0011204337054118e-08,
+            "fall_speed_first_moment": 0.0640143835790827,
+            "fall_speed_second_moment": 0.02065860733724071,
+            "hh_vv_covariance_imaginary": -7.82677695120492e-09,
+            "hh_vv_covariance_real": 0.19845056400613878,
+            "kdp": -5.226633194304801e-07,
+            "zh": 0.19835999775371432,
+            "zv": 0.19854117799491663
+          },
+          "errors": [
+            {
+              "absolute_error": 0.007446527396940017,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.037540469254217765,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.007459344361113895,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.037570767114642994,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0074529289305076685,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.037555594602780386,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.0825620106868465e-09,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.2660816864553984,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.641680815339899e-08,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.03140991063097284,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.474368291449279e-09,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.1474390489800506,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.4765784144455102e-09,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.1474925857801446,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.003997470812244705,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.06244644701305717,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.002085392740955743,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.1009454658251073,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.147421773193753e-08,
+            "av": 1.1487782751499628e-08,
+            "fall_speed_first_moment": 0.06801185439132741,
+            "fall_speed_second_moment": 0.022744000078196453,
+            "hh_vv_covariance_imaginary": -9.909338961891766e-09,
+            "hh_vv_covariance_real": 0.20590349293664645,
+            "kdp": -5.39080127583879e-07,
+            "zh": 0.20580652515065434,
+            "zv": 0.20600052235603053
+          },
+          "node_index": 4,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "bulk_density": 3.0397253917602622,
+            "equivolume_diameter": 0.020116155464265276,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.7964195522322107,
+            "radar_elevation": 3.299368032710018,
+            "temperature": 266.14836460703697
+          },
+          "direct_pytmatrix": {
+            "ah": 1.1839334834759898e-06,
+            "av": 1.1882849657301974e-06,
+            "fall_speed_first_moment": 101.1869440669318,
+            "fall_speed_second_moment": 95.22209959041606,
+            "hh_vv_covariance_imaginary": -0.00010859486222930659,
+            "hh_vv_covariance_real": 107.55525506178681,
+            "kdp": -7.951390006990288e-06,
+            "zh": 107.5254346800278,
+            "zv": 107.585084998667
+          },
+          "errors": [
+            {
+              "absolute_error": 3.1866347902746526,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.029636102376683075,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.192330341801636,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.029672610676853485,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.1894792068700895,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.029654331673871655,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.7270389945020936e-05,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.25112044331745054,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.9163465678397655e-07,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.049253609298459726,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.54714284663315e-08,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.046853500843197046,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.621546785315221e-08,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.04730806959137784,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.247328039880173,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.04197505991554312,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.546668279112737,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.058249800235144145,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.2394049119423213e-06,
+            "av": 1.2445004335833496e-06,
+            "fall_speed_first_moment": 105.43427210681197,
+            "fall_speed_second_moment": 100.7687678695288,
+            "hh_vv_covariance_imaginary": -0.00013586525217432752,
+            "hh_vv_covariance_real": 110.7447342686569,
+            "kdp": -8.343024663774264e-06,
+            "zh": 110.71206947030245,
+            "zv": 110.77741534046864
+          },
+          "node_index": 5,
+          "within_predeclared_interpolation_thresholds": true
+        }
+      ],
+      "payload_sha256": "35556bcec49bd36068455d7c1c344e009222f0c52649313446e0171f40354fc5",
+      "table_id": "property-p3-ishmael-dry-prolate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_interpolation_thresholds": true
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_oblate_sband_unvalidated",
+      "config_sha256": "61cd6f72beaf503485168a9b43e72db8ebc49ef993389e67ff8906e0c42e9bf8",
+      "held_out_node_count": 6,
+      "lut_header_json_sha256": "f21afc665a54888165a5f3784223887450dbea73e4b0900f6e34c69a9b3a1457",
+      "lut_sha256": "6c376422c512ebfc37dc5b2038defea799995d1821170da74b4af87276df1dd7",
+      "nodes": [
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0015471890781897275,
+            "equivolume_diameter": 8.420879470692733e-05,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.036948670076167534,
+            "minor_to_major_axis_ratio": 0.18139027777674377,
+            "radar_elevation": 0.10065101680344446,
+            "temperature": 271.1557869953515
+          },
+          "direct_pytmatrix": {
+            "ah": 1.4765412677576194e-13,
+            "av": 1.4737857797329524e-13,
+            "fall_speed_first_moment": 7.615532374671566e-18,
+            "fall_speed_second_moment": 3.2560255665834415e-22,
+            "hh_vv_covariance_imaginary": 1.5052446122653562e-19,
+            "hh_vv_covariance_real": 1.7795371220984735e-13,
+            "kdp": 1.0034587804836827e-12,
+            "zh": 1.7812001829741923e-13,
+            "zv": 1.7778758542835043e-13
+          },
+          "errors": [
+            {
+              "absolute_error": 7.088304312280725e-15,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.007088304312280725,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.060482186359237e-15,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.007060482186359237,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.074374295889908e-15,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.0070743742958899085,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.740116779549238e-20,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 1.740116779549238e-08,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.9797415294566864e-14,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.04962577064756336,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.9102992110862706e-15,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.0019102992110862707,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.8916170449158825e-15,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.0018916170449158826,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.948962651199973e-19,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 5.948962651199974e-07,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.745314361388076e-23,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 4.7453143613880757e-11,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.495644259868482e-13,
+            "av": 1.4927019501821113e-13,
+            "fall_speed_first_moment": 8.210428639791563e-18,
+            "fall_speed_second_moment": 3.730557002722249e-22,
+            "hh_vv_covariance_imaginary": 1.67925629022028e-19,
+            "hh_vv_covariance_real": 1.8502808650573726e-13,
+            "kdp": 1.0532561957782496e-12,
+            "zh": 1.8520832260969995e-13,
+            "zv": 1.8484806761470967e-13
+          },
+          "node_index": 0,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0015965243241500178,
+            "equivolume_diameter": 0.00020716008023355145,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.07721563042504868,
+            "minor_to_major_axis_ratio": 0.5100572013371949,
+            "radar_elevation": 3.1250999455277166,
+            "temperature": 273.9134718492939
+          },
+          "direct_pytmatrix": {
+            "ah": 4.101947343135566e-12,
+            "av": 4.098383771723196e-12,
+            "fall_speed_first_moment": 1.488945356153553e-14,
+            "fall_speed_second_moment": 4.815517276634501e-18,
+            "hh_vv_covariance_imaginary": 3.1306619539832895e-17,
+            "hh_vv_covariance_real": 4.6017798301140435e-11,
+            "kdp": 7.507622296895025e-12,
+            "zh": 4.6037801263182945e-11,
+            "zv": 4.5997805391555606e-11
+          },
+          "errors": [
+            {
+              "absolute_error": 1.586464949283404e-12,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.03446005034458763,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.5829647480853255e-12,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.03441391898179408,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.5847132819658983e-12,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.03443696440224141,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.289087248866061e-18,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 3.289087248866061e-06,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.2818197429481583e-13,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.05703296694506086,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.404639518397452e-14,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.008300056616024024,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.3810151269008474e-14,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.008249630379244047,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.0579223472866064e-15,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.0010579223472866064,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.958364679509593e-19,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 6.958364679509592e-07,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 4.135993738319541e-12,
+            "av": 4.132193922992204e-12,
+            "fall_speed_first_moment": 1.5947375908822138e-14,
+            "fall_speed_second_moment": 5.51135374458546e-18,
+            "hh_vv_covariance_imaginary": 3.4595706788698956e-17,
+            "hh_vv_covariance_real": 4.7602511583106333e-11,
+            "kdp": 7.93580427118984e-12,
+            "zh": 4.762426621246635e-11,
+            "zv": 4.758077013964093e-11
+          },
+          "node_index": 1,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0017510424427179439,
+            "equivolume_diameter": 0.0004921456699519925,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.1127727106722783,
+            "minor_to_major_axis_ratio": 0.9113362845279345,
+            "radar_elevation": 7.1840559868108445,
+            "temperature": 270.2923409657107
+          },
+          "direct_pytmatrix": {
+            "ah": 9.65952157960293e-11,
+            "av": 9.658264531031696e-11,
+            "fall_speed_first_moment": 3.0445041624527465e-11,
+            "fall_speed_second_moment": 8.629589297840476e-14,
+            "hh_vv_covariance_imaginary": 1.68647073996411e-15,
+            "hh_vv_covariance_real": 1.0740258787360141e-08,
+            "kdp": 1.7181572202092207e-11,
+            "zh": 1.0740957970632084e-08,
+            "zv": 1.0739559657090336e-08
+          },
+          "errors": [
+            {
+              "absolute_error": 5.245636487079758e-10,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.04883769679969302,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.242537547608108e-10,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.04881520020373411,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.244086002796646e-10,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.04882643990821003,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.978287665181597e-16,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.0003978287665181597,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.988923923289784e-12,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.17396102569273733,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.2235857350435797e-12,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.012667146348399971,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.2212899261778057e-12,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.012645024603062384,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.9714154287105602e-12,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.09759932225931649,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.5324950421145483e-14,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.015324950421145483,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 9.781880153107289e-11,
+            "av": 9.780393523649477e-11,
+            "fall_speed_first_moment": 3.3416457053238025e-11,
+            "fall_speed_second_moment": 1.0162084339955024e-13,
+            "hh_vv_covariance_imaginary": 2.0842995064822697e-15,
+            "hh_vv_covariance_real": 1.1264667387639806e-08,
+            "kdp": 2.017049612538199e-11,
+            "zh": 1.126552161934006e-08,
+            "zv": 1.1263813411851147e-08
+          },
+          "node_index": 2,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0018423122115162306,
+            "equivolume_diameter": 0.0015040956826237826,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.1741927010087505,
+            "minor_to_major_axis_ratio": 0.30988118107524476,
+            "radar_elevation": 12.782064197090634,
+            "temperature": 273.6251002145782
+          },
+          "direct_pytmatrix": {
+            "ah": 3.9896569536458386e-09,
+            "av": 3.982475811615379e-09,
+            "fall_speed_first_moment": 2.8594474418279197e-07,
+            "fall_speed_second_moment": 7.438445737041539e-09,
+            "hh_vv_covariance_imaginary": 3.077589758275507e-11,
+            "hh_vv_covariance_real": 1.0982235617377277e-05,
+            "kdp": 7.613754720680309e-09,
+            "zh": 1.0992134595886981e-05,
+            "zv": 1.09723472133585e-05
+          },
+          "errors": [
+            {
+              "absolute_error": 5.38543756392703e-07,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.04899355550051347,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.365215478799192e-07,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.048897609367184486,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.37530926107813e-07,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.04894549205056879,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.3676840567296017e-12,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.10942602234992639,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.45472534889044e-10,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.05850891593329918,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.104721074661421e-11,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.01028840605182968,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.059897966271881e-11,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.010194407093272708,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.614861666884211e-08,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.091446397252633,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.22728401218403e-09,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.16499199638877146,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 4.030704164392453e-09,
+            "av": 4.023074791278098e-09,
+            "fall_speed_first_moment": 3.120933608516341e-07,
+            "fall_speed_second_moment": 8.665729749225569e-09,
+            "hh_vv_covariance_imaginary": 3.414358163948467e-11,
+            "hh_vv_covariance_real": 1.151976654348509e-05,
+            "kdp": 8.059227255569353e-09,
+            "zh": 1.1530678352279684e-05,
+            "zv": 1.150886876123842e-05
+          },
+          "node_index": 3,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0020910211275013513,
+            "equivolume_diameter": 0.004019827350075121,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.27014330937002795,
+            "minor_to_major_axis_ratio": 0.6376801885531302,
+            "radar_elevation": 0.025012118689210494,
+            "temperature": 271.41072215242474
+          },
+          "direct_pytmatrix": {
+            "ah": 1.4375329440637135e-07,
+            "av": 1.4362050689346734e-07,
+            "fall_speed_first_moment": 0.0008064758707429701,
+            "fall_speed_second_moment": 0.00010577663746572663,
+            "hh_vv_covariance_imaginary": 1.3407417235202039e-08,
+            "hh_vv_covariance_real": 0.006145993069411464,
+            "kdp": 9.289212561516767e-08,
+            "zh": 0.0061488372638180445,
+            "zv": 0.006143150394467297
+          },
+          "errors": [
+            {
+              "absolute_error": 0.00030181863854932163,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.04908548162842597,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0003011960086392023,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.04902956777852424,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00030150697891715306,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.049057487620308225,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.6838655437367354e-09,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.12559208937838062,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.786341669785456e-09,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.06229098140952269,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.8272404877009287e-09,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.012710946870793542,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.8176433157739345e-09,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.012655875926703131,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.466381596823391e-05,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.08018071998690059,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.3674468009891154e-05,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.12927682650454744,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.4558053489407228e-07,
+            "av": 1.4543815020924128e-07,
+            "fall_speed_first_moment": 0.000871139686711204,
+            "fall_speed_second_moment": 0.00011945110547561779,
+            "hh_vv_covariance_imaginary": 1.5091282778938774e-08,
+            "hh_vv_covariance_real": 0.006447500048328617,
+            "kdp": 9.867846728495313e-08,
+            "zh": 0.006450655902367366,
+            "zv": 0.0064443464031065
+          },
+          "node_index": 4,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0024127164789878915,
+            "equivolume_diameter": 0.010360898895714534,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.37274708361682224,
+            "minor_to_major_axis_ratio": 0.8676604558755185,
+            "radar_elevation": 2.130813959467532,
+            "temperature": 273.8436738793218
+          },
+          "direct_pytmatrix": {
+            "ah": 3.6495564716122256e-06,
+            "av": 3.648223037383044e-06,
+            "fall_speed_first_moment": 1.1134564197034589,
+            "fall_speed_second_moment": 0.45803140677472676,
+            "hh_vv_covariance_imaginary": 2.7859016876398967e-06,
+            "hh_vv_covariance_real": 2.7062739458297127,
+            "kdp": 7.891445054779775e-07,
+            "zh": 2.706768968767698,
+            "zv": 2.7057790275440285
+          },
+          "errors": [
+            {
+              "absolute_error": 0.08153197152251757,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.03012151109432748,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.08136687022833966,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.030071513379344373,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.08144931397923338,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.030096477891583866,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.878742618252322e-07,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.175122569468178,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.1235398267363219e-07,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.14237440911481786,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.5456500919967328e-08,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.006975231406330776,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.526050612663194e-08,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.0069240575117775404,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.05533670215833064,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.04969813023581846,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.03657297363992762,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.07984817874708595,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 3.675012972532193e-06,
+            "av": 3.673483543509676e-06,
+            "fall_speed_first_moment": 1.1687931218617895,
+            "fall_speed_second_moment": 0.4946043804146544,
+            "hh_vv_covariance_imaginary": 3.273775949465129e-06,
+            "hh_vv_covariance_real": 2.787723259808946,
+            "kdp": 9.014984881516097e-07,
+            "zh": 2.7883009402902155,
+            "zv": 2.787145897772368
+          },
+          "node_index": 5,
+          "within_predeclared_interpolation_thresholds": true
+        }
+      ],
+      "payload_sha256": "7f7bddafcfd80c5c23bbadbd9f27d0e64350b98fdda1f4352a9bca8c7d8d1ff0",
+      "table_id": "property-p3-ishmael-wet-oblate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_interpolation_thresholds": true
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_prolate_sband_unvalidated",
+      "config_sha256": "0fa0bd759b64c8e6f62bcf629fd2d5c2733aa433fb0e2eb2793c2cbaa58e1758",
+      "held_out_node_count": 6,
+      "lut_header_json_sha256": "218328fa6adfdf7e02ac547fb52cae60bba63e47353e47212912e9f50b7e847f",
+      "lut_sha256": "9c55a51eb63a982005564eb1f35bbb24dfad5f22a65ed820ac7c1d5cf19f1040",
+      "nodes": [
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0015215682134971835,
+            "equivolume_diameter": 7.187795233687897e-05,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.020143769354317578,
+            "minor_to_major_axis_ratio": 0.1891798581293926,
+            "radar_elevation": 0.2967607741724527,
+            "temperature": 271.16295190485766
+          },
+          "direct_pytmatrix": {
+            "ah": 5.416248703009806e-14,
+            "av": 5.4225615356384436e-14,
+            "fall_speed_first_moment": 1.737818241895551e-18,
+            "fall_speed_second_moment": 4.7169586927046484e-23,
+            "hh_vv_covariance_imaginary": -2.0693849503000978e-20,
+            "hh_vv_covariance_real": 6.40618619815928e-14,
+            "kdp": -3.7540355929607446e-13,
+            "zh": 6.402456410177516e-14,
+            "zv": 6.409918495725576e-14
+          },
+          "errors": [
+            {
+              "absolute_error": 2.6100567687474926e-15,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.0026100567687474927,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.612522975622716e-15,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.0026125229756227162,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.6112890798471527e-15,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.002611289079847153,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.9729006093611525e-21,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 1.9729006093611524e-09,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.670253640038944e-16,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.0004670253640038944,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.402582676240056e-16,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.0007402582676240057,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.422690517091132e-16,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.0007422690517091132,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.5024238094830945e-19,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 1.5024238094830945e-07,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.463470330849864e-24,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 8.463470330849865e-12,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 5.4902745297722066e-14,
+            "av": 5.496788440809355e-14,
+            "fall_speed_first_moment": 1.8880606228438603e-18,
+            "fall_speed_second_moment": 5.563305725789635e-23,
+            "hh_vv_covariance_imaginary": -2.266675011236213e-20,
+            "hh_vv_covariance_real": 6.667315106143995e-14,
+            "kdp": -3.7493653393207057e-13,
+            "zh": 6.663462087052265e-14,
+            "zv": 6.671170793287847e-14
+          },
+          "node_index": 0,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0015929120987182115,
+            "equivolume_diameter": 0.00016382962644499182,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.06799927216162643,
+            "minor_to_major_axis_ratio": 0.5123240520814933,
+            "radar_elevation": 2.78686386094784,
+            "temperature": 273.74654812635936
+          },
+          "direct_pytmatrix": {
+            "ah": 1.8077320365571136e-12,
+            "av": 1.8090123065522815e-12,
+            "fall_speed_first_moment": 2.1842169055339365e-15,
+            "fall_speed_second_moment": 4.344983633815633e-19,
+            "hh_vv_covariance_imaginary": -5.4954093206565716e-18,
+            "hh_vv_covariance_real": 1.0983913567364797e-11,
+            "kdp": -2.987554024874617e-12,
+            "zh": 1.0980026376372495e-11,
+            "zv": 1.0987802349724942e-11
+          },
+          "errors": [
+            {
+              "absolute_error": 4.688492242442444e-13,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.042700191071775875,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.693135548520692e-13,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.042712231246480103,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.690812301919798e-13,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.04270620187559609,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.290043123615897e-19,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 4.290043123615897e-07,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.008776767583598e-14,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.023459916403947692,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.7662999573002807e-14,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.009770806300829066,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.770515990240909e-14,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.009787197045747351,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.9004719883812475e-16,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.00019004719883812475,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.455889361545579e-20,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 7.455889361545579e-08,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.8253950361301164e-12,
+            "av": 1.8267174664546906e-12,
+            "fall_speed_first_moment": 2.3742641043720613e-15,
+            "fall_speed_second_moment": 5.090572569970191e-19,
+            "hh_vv_covariance_imaginary": -5.924413633018161e-18,
+            "hh_vv_covariance_real": 1.1452994797556777e-11,
+            "kdp": -3.057641792550453e-12,
+            "zh": 1.144887560061674e-11,
+            "zv": 1.1457115904577011e-11
+          },
+          "node_index": 1,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0017387558672556324,
+            "equivolume_diameter": 0.00035005729316033154,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.11324026371114809,
+            "minor_to_major_axis_ratio": 0.9123615262820213,
+            "radar_elevation": 7.3671541369601545,
+            "temperature": 272.02642600078053
+          },
+          "direct_pytmatrix": {
+            "ah": 3.280981166167882e-11,
+            "av": 3.281389250470061e-11,
+            "fall_speed_first_moment": 1.9422812313906936e-12,
+            "fall_speed_second_moment": 2.7463220105473993e-15,
+            "hh_vv_covariance_imaginary": -1.959653818413177e-16,
+            "hh_vv_covariance_real": 1.3737248824246816e-09,
+            "kdp": -5.86725979592897e-12,
+            "zh": 1.3736394957780715e-09,
+            "zv": 1.3738102752551047e-09
+          },
+          "errors": [
+            {
+              "absolute_error": 6.796791104565154e-11,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.04948016656084313,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.799117626294769e-11,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.049490950451889955,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.797953368758728e-11,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.04948555169765913,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.901275614669117e-17,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 2.901275614669117e-05,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.328325582689875e-13,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.0908145500287368,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.1667230921457735e-13,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.012699625146012099,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.170733410747558e-13,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.012710267183785337,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.9909000132953381e-13,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.10250317930889097,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.334920915122313e-16,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.0005334920915122313,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 3.32264839708934e-11,
+            "av": 3.323096584577537e-11,
+            "fall_speed_first_moment": 2.1413712327202274e-12,
+            "fall_speed_second_moment": 3.2798141020596306e-15,
+            "hh_vv_covariance_imaginary": -2.249781379880089e-16,
+            "hh_vv_covariance_real": 1.4417044161122688e-09,
+            "kdp": -6.400092354197957e-12,
+            "zh": 1.441607406823723e-09,
+            "zv": 1.4418014515180524e-09
+          },
+          "node_index": 2,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0018841545104000587,
+            "equivolume_diameter": 0.000879582665706612,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.17147324870610897,
+            "minor_to_major_axis_ratio": 0.24029606434291648,
+            "radar_elevation": 16.115265460155154,
+            "temperature": 274.1308788270281
+          },
+          "direct_pytmatrix": {
+            "ah": 7.896573687724771e-10,
+            "av": 7.908103231428369e-10,
+            "fall_speed_first_moment": 5.1075139438712905e-09,
+            "fall_speed_second_moment": 5.698107414569967e-11,
+            "hh_vv_covariance_imaginary": -1.0105509577165649e-12,
+            "hh_vv_covariance_real": 4.5814753701833564e-07,
+            "kdp": -1.2579026878576938e-09,
+            "zh": 4.5781338940955034e-07,
+            "zv": 4.5848197876803483e-07
+          },
+          "errors": [
+            {
+              "absolute_error": 1.7786313654951943e-08,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.038850575510452526,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.7805105222191727e-08,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.038834907470158324,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.7795698362514563e-08,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.03884272406729616,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.580980632553023e-14,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.03543592339613023,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.0953141131590084e-12,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.005640590628868821,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.8801432322012996e-12,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.008712820907245488,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.878343211936869e-12,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.008697841961143059,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.024175655379178e-10,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.07878932293876449,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.489360330902037e-12,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.1489856142268375,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 7.965375120046784e-10,
+            "av": 7.976886663547738e-10,
+            "fall_speed_first_moment": 5.509931509409208e-09,
+            "fall_speed_second_moment": 6.547043447660171e-11,
+            "hh_vv_covariance_imaginary": -1.0463607640420951e-12,
+            "hh_vv_covariance_real": 4.759432353808502e-07,
+            "kdp": -1.2508073737445348e-09,
+            "zh": 4.755997030645023e-07,
+            "zv": 4.7628708399022656e-07
+          },
+          "node_index": 3,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0020952102901689606,
+            "equivolume_diameter": 0.0021057299910544752,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.2683494981198503,
+            "minor_to_major_axis_ratio": 0.6009215581353057,
+            "radar_elevation": 0.44297625595009127,
+            "temperature": 270.6990857789041
+          },
+          "direct_pytmatrix": {
+            "ah": 2.104752418605656e-08,
+            "av": 2.1066646597711372e-08,
+            "fall_speed_first_moment": 7.72787472392968e-06,
+            "fall_speed_second_moment": 4.6469272013356024e-07,
+            "hh_vv_covariance_imaginary": -2.805924140130651e-10,
+            "hh_vv_covariance_real": 0.00012857353214812314,
+            "kdp": -1.3128555475442743e-08,
+            "zh": 0.0001285151351878005,
+            "zv": 0.00012863195975635632
+          },
+          "errors": [
+            {
+              "absolute_error": 6.726395514892704e-06,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.05233932567602527,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.7360364916314104e-06,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.05236674077259054,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.731211299652282e-06,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.052353009108418905,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.7784355484491414e-11,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.09902033731816323,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.3121709761977165e-10,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.032845738316479134,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.8226156990122303e-10,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.01341067801638228,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.830812790152495e-10,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.013437415285924183,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.047351655528633e-07,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.0911939169213784,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.128038808040123e-08,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.1533925215353365,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 2.1329785755957782e-08,
+            "av": 2.1349727876726622e-08,
+            "fall_speed_first_moment": 8.432609889482543e-06,
+            "fall_speed_second_moment": 5.359731082139615e-07,
+            "hh_vv_covariance_imaginary": -3.083767694975565e-10,
+            "hh_vv_covariance_real": 0.00013530474344777542,
+            "kdp": -1.3559772573062515e-08,
+            "zh": 0.0001352415307026932,
+            "zv": 0.00013536799624798773
+          },
+          "node_index": 4,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "condensed_volume_fraction": 0.0023228322964092846,
+            "equivolume_diameter": 0.004710104624098612,
+            "frequency": 2800000000.0,
+            "liquid_mass_fraction": 0.33744640420983874,
+            "minor_to_major_axis_ratio": 0.847637484667385,
+            "radar_elevation": 3.0118237902252685,
+            "temperature": 273.94585799710853
+          },
+          "direct_pytmatrix": {
+            "ah": 2.958601193529549e-07,
+            "av": 2.9597072091703793e-07,
+            "fall_speed_first_moment": 0.00413911085095662,
+            "fall_speed_second_moment": 0.0007715494261715764,
+            "hh_vv_covariance_imaginary": -2.12494395930968e-08,
+            "hh_vv_covariance_real": 0.022209137388066652,
+            "kdp": -7.141268821477276e-08,
+            "zh": 0.022204978780837024,
+            "zv": 0.022213296896071724
+          },
+          "errors": [
+            {
+              "absolute_error": 0.0008834011251641627,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.03978392115945371,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0008843455190239366,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.03981153824943146,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0008838727080211842,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.03979770544785337,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.6619374016320183e-09,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.12527094608635178,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.973784920049225e-09,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.0696484762636386,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.4802133344652378e-09,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.008383060683844298,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.4886142725165117e-09,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.008408312365512947,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0002704393929912254,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.06533755744394287,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.171376587907606e-05,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.10590866003820296,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 2.983403326874201e-07,
+            "av": 2.9845933518955444e-07,
+            "fall_speed_first_moment": 0.004409550243947845,
+            "fall_speed_second_moment": 0.0008532631920506524,
+            "hh_vv_covariance_imaginary": -2.3911376994728817e-08,
+            "hh_vv_covariance_real": 0.023093010096087836,
+            "kdp": -7.638647313482198e-08,
+            "zh": 0.023088379906001186,
+            "zv": 0.02309764241509566
+          },
+          "node_index": 5,
+          "within_predeclared_interpolation_thresholds": true
+        }
+      ],
+      "payload_sha256": "62d49aa09b2c9bf8de0f9194dd79e092567f8ddd89a98baf6a2e7a4fb84c2e58",
+      "table_id": "property-p3-ishmael-wet-prolate-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_interpolation_thresholds": true
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "config_sha256": "b6ac330212174ce863ee14abe94bb3347c6ae208913a760cead418c6d67d879d",
+      "held_out_node_count": 6,
+      "lut_header_json_sha256": "3c79f03ef4b900f30fe95baa03aaa17632ac1a78d35fa6153eb3b83bfa997b74",
+      "lut_sha256": "66ac3a26ad5247ccc4198fbab529b46056576f6f70c6e9e5f3946f8da8af354b",
+      "nodes": [
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.00038802908327827124,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.5834827308232616,
+            "radar_elevation": 0.5642158432959417,
+            "temperature": 260.9410901985523
+          },
+          "direct_pytmatrix": {
+            "ah": 5.389147599450367e-07,
+            "av": 2.5424418739437656e-07,
+            "fall_speed_first_moment": 0.007656520447486586,
+            "fall_speed_second_moment": 0.011403074862330494,
+            "hh_vv_covariance_imaginary": 1.9327608831441032e-05,
+            "hh_vv_covariance_real": 0.0033938381803938537,
+            "kdp": 6.0898747843708176e-05,
+            "zh": 0.005140920854289586,
+            "zv": 0.002306776186032431
+          },
+          "errors": [
+            {
+              "absolute_error": 0.00038108802160929673,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.07412835801417109,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00012617604384729123,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.05469800001026944,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00018804189645971973,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.05540685397024366,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.1461061602146347e-06,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.11103836894316041,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.2893148032845394e-06,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.03759214900706801,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 4.2000096888187006e-08,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.07793458262763214,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.6504140625904255e-08,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.06491452487094027,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0007229029649793543,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.09441664394910125,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0013593321738588036,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.11920751115554733,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 5.809148568332237e-07,
+            "av": 2.707483280202808e-07,
+            "fall_speed_first_moment": 0.00837942341246594,
+            "fall_speed_second_moment": 0.012762407036189298,
+            "hh_vv_covariance_imaginary": 2.1473714991655667e-05,
+            "hh_vv_covariance_real": 0.0035818800768535734,
+            "kdp": 6.318806264699272e-05,
+            "zh": 0.005522008875898883,
+            "zv": 0.0024329522298797224
+          },
+          "node_index": 0,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.0007088801200989664,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.744210226122286,
+            "radar_elevation": 3.595311221480339,
+            "temperature": 284.9274096371036
+          },
+          "direct_pytmatrix": {
+            "ah": 1.2134092917593973e-06,
+            "av": 7.8309355787443e-07,
+            "fall_speed_first_moment": 0.44891479371231674,
+            "fall_speed_second_moment": 1.3101039699920707,
+            "hh_vv_covariance_imaginary": 0.00018366402929113275,
+            "hh_vv_covariance_real": 0.12190332624535867,
+            "kdp": 0.0002052260047736457,
+            "zh": 0.1538232816857975,
+            "zv": 0.09746255071471102
+          },
+          "errors": [
+            {
+              "absolute_error": 0.0051463546025026785,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.03345627882920041,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0029462032362313068,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.030229079935075065,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.003545429047420709,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.029083940173090208,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2.461884519226447e-05,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.1340428242115946,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.2221124789785956e-06,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.01570031284550137,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.3850478158694228e-07,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.11414514667686088,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 8.740981537328258e-08,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.11162116517794014,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.019199830425604192,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.042769431291917376,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.07009683642171827,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.05350478895361452,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 1.3519140733463395e-06,
+            "av": 8.705033732477126e-07,
+            "fall_speed_first_moment": 0.46811462413792093,
+            "fall_speed_second_moment": 1.380200806413789,
+            "hh_vv_covariance_imaginary": 0.00020828287448339722,
+            "hh_vv_covariance_real": 0.12544875529277938,
+            "kdp": 0.0002084481172526243,
+            "zh": 0.1589696362883002,
+            "zv": 0.10040875395094233
+          },
+          "node_index": 1,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.0012571315760401354,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.9633069743208726,
+            "radar_elevation": 7.183986771732499,
+            "temperature": 297.2508522075608
+          },
+          "direct_pytmatrix": {
+            "ah": 4.51284936527036e-06,
+            "av": 4.266377961907364e-06,
+            "fall_speed_first_moment": 19.184293273181382,
+            "fall_speed_second_moment": 92.18817807836697,
+            "hh_vv_covariance_imaginary": 0.0006063387959532756,
+            "hh_vv_covariance_real": 3.875414504930381,
+            "kdp": 0.00014956264503039802,
+            "zh": 3.9922375738738736,
+            "zv": 3.762557614502628
+          },
+          "errors": [
+            {
+              "absolute_error": 0.17267914727286948,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.04325372528000883,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.15796044928451058,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.041982200797579375,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.158279743581331,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.04084201661008501,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.0474526515424636e-05,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.05025989878729943,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.4527885529445115e-06,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.043144386431739075,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.7343787183759335e-07,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.038432009978512295,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.5932115031386823e-07,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.03734342145407125,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 1.0471674688282313,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.05458462576216532,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.225706123872541,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.0675325866466329,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 4.686287237107953e-06,
+            "av": 4.425699112221232e-06,
+            "fall_speed_first_moment": 20.231460742009613,
+            "fall_speed_second_moment": 98.41388420223952,
+            "hh_vv_covariance_imaginary": 0.0006368133224687003,
+            "hh_vv_covariance_real": 4.033694248511712,
+            "kdp": 0.00015601543358334253,
+            "zh": 4.164916721146743,
+            "zv": 3.9205180637871386
+          },
+          "node_index": 2,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.0022988962686365817,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.619619487279504,
+            "radar_elevation": 15.373551681045925,
+            "temperature": 264.98068010710716
+          },
+          "direct_pytmatrix": {
+            "ah": 0.00012253745315321044,
+            "av": 6.986812066873724e-05,
+            "fall_speed_first_moment": 1454.1666728143778,
+            "fall_speed_second_moment": 10262.089550352659,
+            "hh_vv_covariance_imaginary": 0.5572506497092417,
+            "hh_vv_covariance_real": 146.4708461974087,
+            "kdp": 0.01068363227322491,
+            "zh": 206.0594679035293,
+            "zv": 106.83985232746336
+          },
+          "errors": [
+            {
+              "absolute_error": 12.612258864014763,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.06120688844018288,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5.322621976126996,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.04981869461793338,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.97508648716493,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.047620988532858836,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.04269245272782296,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.07661265671040264,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.0003177215497597273,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.0297390944984127,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 7.314273550364372e-06,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.059690105858648985,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 3.397080148191613e-06,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.04862131850229728,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 96.11095624148379,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.06609349398406424,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 732.9501915881683,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.07142309448692935,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.0001298517267035748,
+            "av": 7.326520081692885e-05,
+            "fall_speed_first_moment": 1550.2776290558616,
+            "fall_speed_second_moment": 10995.039741940827,
+            "hh_vv_covariance_imaginary": 0.5999431024370646,
+            "hh_vv_covariance_real": 153.44593268457362,
+            "kdp": 0.011001353822984637,
+            "zh": 218.67172676754407,
+            "zv": 112.16247430359036
+          },
+          "node_index": 3,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.004462245487804529,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.7581867012475823,
+            "radar_elevation": 0.08874654784952962,
+            "temperature": 285.11000987488325
+          },
+          "direct_pytmatrix": {
+            "ah": 0.0008379297769083654,
+            "av": 0.0006070760105502873,
+            "fall_speed_first_moment": 76896.016903758,
+            "fall_speed_second_moment": 687598.3146105196,
+            "hh_vv_covariance_imaginary": 10.131942298954195,
+            "hh_vv_covariance_real": 6887.693891169983,
+            "kdp": 0.05219780207737479,
+            "zh": 8599.493759684929,
+            "zv": 5560.5422663835625
+          },
+          "errors": [
+            {
+              "absolute_error": 315.3683478506209,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.036672896877847784,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 184.0539528168747,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.033100000683310836,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 218.37624416829385,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.03170527721161534,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.5654309682428291,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.05580676947806859,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00100814686537299,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.019313971570653024,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 9.858174506879099e-05,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.11764917274156224,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 6.783666784702621e-05,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.11174328530217377,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 2956.6667577906046,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.038450193870134104,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 27723.355413637008,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.04031911484445757,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.0009365115219771564,
+            "av": 0.0006749126783973135,
+            "fall_speed_first_moment": 79852.68366154861,
+            "fall_speed_second_moment": 715321.6700241566,
+            "hh_vv_covariance_imaginary": 10.697373267197024,
+            "hh_vv_covariance_real": 7106.0701353382765,
+            "kdp": 0.05320594894274778,
+            "zh": 8914.86210753555,
+            "zv": 5744.596219200437
+          },
+          "node_index": 4,
+          "within_predeclared_interpolation_thresholds": true
+        },
+        {
+          "coordinates": {
+            "equivolume_diameter": 0.006909565718104732,
+            "frequency": 2800000000.0,
+            "minor_to_major_axis_ratio": 0.9094901277977521,
+            "radar_elevation": 2.7280097537085055,
+            "temperature": 301.80339493255894
+          },
+          "direct_pytmatrix": {
+            "ah": 0.005160502107998391,
+            "av": 0.004615010739733148,
+            "fall_speed_first_moment": 819004.6907530553,
+            "fall_speed_second_moment": 7769842.816962563,
+            "hh_vv_covariance_imaginary": 32.98085188596186,
+            "hh_vv_covariance_real": 79798.12672374952,
+            "kdp": 0.07683085099869401,
+            "zh": 86329.76229726728,
+            "zv": 73833.04324347762
+          },
+          "errors": [
+            {
+              "absolute_error": 612.8916104250966,
+              "component": "zh",
+              "relative_error_with_absolute_floor": 0.007099424278670779,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 580.8340767271293,
+              "component": "zv",
+              "relative_error_with_absolute_floor": 0.00786685813304113,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 402.16010370590084,
+              "component": "hh_vv_covariance_real",
+              "relative_error_with_absolute_floor": 0.0050397186026449655,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 17.2882005241592,
+              "component": "hh_vv_covariance_imaginary",
+              "relative_error_with_absolute_floor": 0.5241890228893038,
+              "within_predeclared_threshold": false
+            },
+            {
+              "absolute_error": 0.002003450718291569,
+              "component": "kdp",
+              "relative_error_with_absolute_floor": 0.02607612296687465,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00026416196802319346,
+              "component": "ah",
+              "relative_error_with_absolute_floor": 0.05118919874361882,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 0.00020830382352212632,
+              "component": "av",
+              "relative_error_with_absolute_floor": 0.04513615141319714,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 5818.2250558513915,
+              "component": "fall_speed_first_moment",
+              "relative_error_with_absolute_floor": 0.0071040192095867885,
+              "within_predeclared_threshold": true
+            },
+            {
+              "absolute_error": 55233.649481103756,
+              "component": "fall_speed_second_moment",
+              "relative_error_with_absolute_floor": 0.007108721602517056,
+              "within_predeclared_threshold": true
+            }
+          ],
+          "lut_multilinear_interpolation": {
+            "ah": 0.005424664076021584,
+            "av": 0.0048233145632552744,
+            "fall_speed_first_moment": 824822.9158089067,
+            "fall_speed_second_moment": 7825076.466443667,
+            "hh_vv_covariance_imaginary": 15.692651361802662,
+            "hh_vv_covariance_real": 80200.28682745542,
+            "kdp": 0.07883430171698558,
+            "zh": 86942.65390769238,
+            "zv": 74413.87732020475
+          },
+          "node_index": 5,
+          "within_predeclared_interpolation_thresholds": false
+        }
+      ],
+      "payload_sha256": "93f73611302f78a93b575bee575de11f5ec1110923fef65f316239ae2ca47439",
+      "table_id": "property-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
+      "within_predeclared_interpolation_thresholds": false
+    }
+  ],
+  "thresholds": {
+    "ah": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "av": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "fall_speed_first_moment": {
+      "absolute": 1e-12,
+      "relative": 0.75
+    },
+    "fall_speed_second_moment": {
+      "absolute": 1e-12,
+      "relative": 0.75
+    },
+    "hh_vv_covariance_imaginary": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "hh_vv_covariance_real": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "kdp": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "zh": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "zv": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    }
+  },
+  "unmet_production_gates": [
+    "independent Mie sphere comparison across the configured materials",
+    "independently coded PSD integration and terminal-moment comparison",
+    "independent covariance phase and radar H/V basis verification",
+    "independent KDP and attenuation convention/unit verification",
+    "reviewed wet-particle dielectric and morphology validation"
+  ],
+  "validation_source_sha256": "53c1e03a8c083e1df1af15d97af7cf611c84c6bbb15e0f980254fcc2d59562a7"
+}

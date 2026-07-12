@@ -1,0 +1,176 @@
+{
+  "schema": 1,
+  "report_id": "pytmatrix-0.3.3-refined-grid-v9-post-freeze-failure-reproduction-v1",
+  "classification": "grid_design_development_failure_not_validation",
+  "scientifically_independent": false,
+  "production_validation": false,
+  "production_activation": false,
+  "disposition": "rejected_after_one_time_post_freeze_held_out_interpolation_check",
+  "failure_policy": "The v9 held-out nodes and results are retained as development evidence. Thresholds were not loosened, the v9 selector seed will not be reused, and the failed LUT payloads are intentionally excluded from the final bundle.",
+  "execution": {
+    "frozen_attested_image_index_id": "sha256:8fa858ff203a6d4148d8e8fbea8ac556694216ebfaf5cbc5913f9e84362a135d",
+    "stable_linux_amd64_runtime_image_id": "sha256:5798717aaf97894751513c11e177394d5dc0592e21ea48baae42186d9f97ac9e",
+    "image_identity_note": "Docker BuildKit generated a fresh outer OCI attestation index per build. The runnable no-attestation linux/amd64 image identity was stable and was verified before the post-convergence sequence; the original attested index identity remains in the frozen environment record.",
+    "environment_report_sha256": "ea4fd9324350cfb2819bb1fef53f251c61bb887a0fa63d7963666d22d03482c7",
+    "generator_source_sha256": "75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
+    "validation_source_sha256": "53c1e03a8c083e1df1af15d97af7cf611c84c6bbb15e0f980254fcc2d59562a7",
+    "selector_source_sha256": "3a83b10c7d8311938b0bc184d025db620b74c786135c00376aa4e8b28deb3f51",
+    "generation_worker_limit": 12
+  },
+  "pre_freeze_evidence": {
+    "full_axis_budget_report_sha256": "66777866909cb858ebbc42dbcd048772250c949e6693cd1810d8b02662684c2a",
+    "full_axis_budget_check_passed": true,
+    "exhaustive_solver_convergence_report_sha256": "352e259f02b606ac71579b7d3b4591c3088b41f8e74becd949a27e5721030067",
+    "exhaustive_solver_convergence_check_passed": true,
+    "exhaustive_solver_grid_point_count": 2180240,
+    "exhaustive_solver_component_comparison_count": 19622160
+  },
+  "post_freeze_results": {
+    "runtime_loader_smoke_passed": true,
+    "solver_failure_count": 0,
+    "conventional_sanity_checks_passed": true,
+    "conventional_sanity_report_sha256": "985d4b80229f1df40fb57061ebc995582f562d4317c5d68f12c1a8516be5d6b1",
+    "property_sanity_checks_passed": true,
+    "property_sanity_report_sha256": "ec999274d3b8eb72e87feae96c2ee46c95f76cc7a17ee5ab44754b73e51afc49",
+    "property_view_interpolation_check_passed": true,
+    "property_view_interpolation_report_sha256": "1e5fa56944f7ccadfe033fc3181bfb1645e8d1d5af8e93265c2245b62435cb8d",
+    "property_view_sample_count": 285,
+    "generator_contract_test_count": 15,
+    "generator_contract_tests_passed": true,
+    "held_out_selection_seed": "bowecho-pytmatrix-0.3.3-post-grid-heldout-v4-refined-v9-final",
+    "held_out_nodes_sha256": "b49119bdd75aa443c71cc1fb9e0f5c9066242982ee99cd775319d196f3de2f3f",
+    "held_out_interpolation_report_sha256": "162d1102503dbf4ddbe06cbb26c6713f1fb89778f826a6626cb9609fa714f451",
+    "held_out_node_count": 48,
+    "held_out_passing_node_count": 45,
+    "held_out_failing_node_count": 3,
+    "held_out_interpolation_check_passed": false,
+    "overall_post_convergence_gate_passed": false
+  },
+  "failed_held_out_nodes": [
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "node_index": 5,
+      "coordinates": {
+        "equivolume_diameter": 0.04383348886232083,
+        "frequency": 2700832954.954955,
+        "liquid_mass_fraction": 0.21444688377603305,
+        "minor_to_major_axis_ratio": 0.8056225131519161,
+        "radar_elevation": 0.0
+      },
+      "failed_components": {
+        "zh": 0.693650658475007,
+        "zv": 1.433838491855504,
+        "hh_vv_covariance_real": 1.0864488216161112,
+        "hh_vv_covariance_imaginary": 0.8381612475708329
+      }
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "node_index": 5,
+      "coordinates": {
+        "bulk_density": 2.8807687119410925,
+        "equivolume_diameter": 0.06996226759233486,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.8882163346763564,
+        "radar_elevation": 3.6180628896542406,
+        "temperature": 266.468564278848
+      },
+      "failed_components": {
+        "zh": 0.5182816854707073,
+        "zv": 0.520054509193513,
+        "hh_vv_covariance_real": 0.5191673927714993,
+        "hh_vv_covariance_imaginary": 1.075468439034143
+      }
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "node_index": 5,
+      "coordinates": {
+        "equivolume_diameter": 0.006909565718104732,
+        "frequency": 2800000000.0,
+        "minor_to_major_axis_ratio": 0.9094901277977521,
+        "radar_elevation": 2.7280097537085055,
+        "temperature": 301.80339493255894
+      },
+      "failed_components": {
+        "hh_vv_covariance_imaginary": 0.5241890228893038
+      }
+    }
+  ],
+  "tables": [
+    {
+      "asset_directory": "conventional_liquid_rain_sband_unvalidated",
+      "config_sha256": "a54a28224f3fe7b76250045268c9668d47ce68f19b4eb590fd47ff891dd0eabe",
+      "grid_point_count": 48,
+      "lut_byte_length": 9108,
+      "lut_sha256": "50896b109e489c205e87273155f561c0ca99eeb2dc03926cdb18a11d21193f56",
+      "manifest_sha256": "2bbe27c5df31d460b2ef55ca7c4cef6b71ef67b835bfed5ffa320475d11ae32a",
+      "held_out_table_check_passed": true
+    },
+    {
+      "asset_directory": "conventional_dry_ice_spheroids_sband_unvalidated",
+      "config_sha256": "8e5adb1ae3748274073549dd159c101fa766e84d15901e80a3e8b33ae75d7a45",
+      "grid_point_count": 87,
+      "lut_byte_length": 12947,
+      "lut_sha256": "6f6d3baec9d97379dce71d31132ef564af2c4ad7d6bfe94524ebbb6c3021b1f6",
+      "manifest_sha256": "5424d56b62e5e6884a1439b8ef67dc3877dc11b1aa68ff1418034fc89362b751",
+      "held_out_table_check_passed": true
+    },
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "config_sha256": "4e9240d544556f79e255dfa4dad44a0ef825c2803cd36f94154211a06c7fbcdb",
+      "grid_point_count": 1400,
+      "lut_byte_length": 109146,
+      "lut_sha256": "e136be14494749a4a3647a08f4148a818381957fadcd7c1e57d5bdefa1981576",
+      "manifest_sha256": "2f5356d2f0ae4720981af8fe347a71f4855ec7e214b009646499e8ab81e99136",
+      "held_out_table_check_passed": false
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "config_sha256": "0dc4ca0c648c386f923de3155103aaa806e1c2234959cd44b19a55a129200bff",
+      "grid_point_count": 163520,
+      "lut_byte_length": 11785569,
+      "lut_sha256": "7683b4c70758c8688406b0f375567a3cc33dd1db6c39581a72437287ad66fda4",
+      "manifest_sha256": "2dc720f36186dce328d539c830f5d05afba4e7b04f85928c4c216b0cd4785bc0",
+      "held_out_table_check_passed": false
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_prolate_sband_unvalidated",
+      "config_sha256": "c2b973ab36fa26edb8d9d82f7dbb2ae5df52feec4bf93c880e304cad5aa2ff49",
+      "grid_point_count": 132160,
+      "lut_byte_length": 9527106,
+      "lut_sha256": "7a563e1103cb1a61ccb94ce72513d82b9fdd68a6faddb4aa8ae46112fb0109c0",
+      "manifest_sha256": "21055ca82d553ca4ce4020a0f8af7208af1311031299a2e6971e3a7a4782ca01",
+      "held_out_table_check_passed": true
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_oblate_sband_unvalidated",
+      "config_sha256": "61cd6f72beaf503485168a9b43e72db8ebc49ef993389e67ff8906e0c42e9bf8",
+      "grid_point_count": 1017600,
+      "lut_byte_length": 73279689,
+      "lut_sha256": "6c376422c512ebfc37dc5b2038defea799995d1821170da74b4af87276df1dd7",
+      "manifest_sha256": "ca6a589fb695a1b893fee7475d370033b830350fab6938f67f36ed78239ee649",
+      "held_out_table_check_passed": true
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_prolate_sband_unvalidated",
+      "config_sha256": "0fa0bd759b64c8e6f62bcf629fd2d5c2733aa433fb0e2eb2793c2cbaa58e1758",
+      "grid_point_count": 864000,
+      "lut_byte_length": 62220152,
+      "lut_sha256": "9c55a51eb63a982005564eb1f35bbb24dfad5f22a65ed820ac7c1d5cf19f1040",
+      "manifest_sha256": "a0f69ecefbb4ff212e849689288097f2916bede5d8f596d7b0a868a9d13285c9",
+      "held_out_table_check_passed": true
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "config_sha256": "b6ac330212174ce863ee14abe94bb3347c6ae208913a760cead418c6d67d879d",
+      "grid_point_count": 2960,
+      "lut_byte_length": 220684,
+      "lut_sha256": "66ac3a26ad5247ccc4198fbab529b46056576f6f70c6e9e5f3946f8da8af354b",
+      "manifest_sha256": "db25e4a45afadb9579971ac7263080ef8aefb50828f9e14b354baeee5386d30b",
+      "held_out_table_check_passed": false
+    }
+  ],
+  "total_grid_point_count": 2181775,
+  "table_validation_status": "research_only_unvalidated"
+}

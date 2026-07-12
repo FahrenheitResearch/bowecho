@@ -1,9 +1,9 @@
 {
   "classification": "analytic_and_solver_sanity_only",
   "crate_table_validation_status_after_report": "research_only_unvalidated",
-  "dry_config_sha256": "258503691739c401c700f7a20fba3db6a7231e58ed656f0568788c9e0fa3fff1",
-  "environment_report_sha256": "240027118e2489461d84a844bab7811748603582d78c999094fcb394c97a7b83",
-  "generator_source_sha256": "66998381079f3c69a04dcbf920fdcabaf906c10786f1a3c28c89a8274e6f253f",
+  "dry_config_sha256": "8e5adb1ae3748274073549dd159c101fa766e84d15901e80a3e8b33ae75d7a45",
+  "environment_report_sha256": "ea4fd9324350cfb2819bb1fef53f251c61bb887a0fa63d7963666d22d03482c7",
+  "generator_source_sha256": "75b152f220b290027cd66ec2f1211e54cbf3c06200ff5364fb08eb7633f0fc6c",
   "limitations": [
     "Rayleigh comparison is an analytic small-particle sanity check, not an independent Mie implementation.",
     "Wet-hail checks establish solver completion and finite schema-valid outputs, not laboratory or independent-model agreement.",
@@ -32,13 +32,14 @@
         "equivolume_diameter": 0.035,
         "frequency": 2700832954.954955,
         "liquid_mass_fraction": 0.4,
-        "minor_to_major_axis_ratio": 0.7
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 0.0
       },
       "direct_pytmatrix": {
         "ah": 26.512516559514047,
         "av": 13.10591842277938,
-        "fall_speed_first_moment": 17126726137.116997,
-        "fall_speed_second_moment": 485648509841.1607,
+        "fall_speed_first_moment": 17126726137.116304,
+        "fall_speed_second_moment": 485648509841.1214,
         "hh_vv_covariance_imaginary": 61825246.51701883,
         "hh_vv_covariance_real": 99932719.46520303,
         "kdp": -7.218586488797319,
@@ -53,13 +54,14 @@
         "equivolume_diameter": 0.05,
         "frequency": 2700832954.954955,
         "liquid_mass_fraction": 0.4,
-        "minor_to_major_axis_ratio": 0.7
+        "minor_to_major_axis_ratio": 0.7,
+        "radar_elevation": 0.0
       },
       "direct_pytmatrix": {
         "ah": 40.041961146984065,
         "av": 37.545042012632884,
-        "fall_speed_first_moment": 113535121822.93227,
-        "fall_speed_second_moment": 3847945546098.6826,
+        "fall_speed_first_moment": 113535121822.97017,
+        "fall_speed_second_moment": 3847945546101.2515,
         "hh_vv_covariance_imaginary": 2625029349.296512,
         "hh_vv_covariance_real": 1831897917.2386312,
         "kdp": -81.956847337403,
@@ -83,6 +85,6 @@
     "rayleigh_ratio_relative_error": 6.202112006303828e-06,
     "zh_zv_relative_difference": 9.677062102488892e-15
   },
-  "validation_source_sha256": "9dfb5456a7ea535a2057641f7a987b03766637a2ee78663fe5087cb9d30c7926",
-  "wet_config_sha256": "eed185ff2e5007aef4895acc15d7349b231ff463b14998b8f493ad261fc610f2"
+  "validation_source_sha256": "53c1e03a8c083e1df1af15d97af7cf611c84c6bbb15e0f980254fcc2d59562a7",
+  "wet_config_sha256": "4e9240d544556f79e255dfa4dad44a0ef825c2803cd36f94154211a06c7fbcdb"
 }

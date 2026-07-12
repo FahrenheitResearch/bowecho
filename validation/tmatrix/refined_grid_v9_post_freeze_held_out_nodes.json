@@ -1,0 +1,456 @@
+{
+  "asset_set": "all",
+  "classification": "held_out_from_lut_interpolation_check_only",
+  "schema": 1,
+  "selection_protocol": "Grid/config bytes were frozen before selection. This script uses only axis coordinates, a public fixed seed, fixed diameter quantiles, and SHA-256-derived within-cell fractions in [0.2,0.8]. It does not import PyTMatrix or inspect scattering outputs. No selected-node result may be used to alter these tables.",
+  "selection_seed": "bowecho-pytmatrix-0.3.3-post-grid-heldout-v4-refined-v9-final",
+  "selector_source_sha256": "3a83b10c7d8311938b0bc184d025db620b74c786135c00376aa4e8b28deb3f51",
+  "tables": [
+    {
+      "asset_directory": "conventional_liquid_rain_sband_unvalidated",
+      "config_sha256_at_selection": "a54a28224f3fe7b76250045268c9668d47ce68f19b4eb590fd47ff891dd0eabe",
+      "nodes": [
+        {
+          "equivolume_diameter": 0.000403792478883881,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8603028802346322,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.000676785225787806,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.9794384526054221,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.0012511871341814153,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8566230167010805,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.0019653373880228883,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.9452256295399922,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.003724600788895241,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8375185040839652,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.0060828677202087915,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.9558673413935969,
+          "radar_elevation": 0.0
+        }
+      ]
+    },
+    {
+      "asset_directory": "conventional_dry_ice_spheroids_sband_unvalidated",
+      "config_sha256_at_selection": "8e5adb1ae3748274073549dd159c101fa766e84d15901e80a3e8b33ae75d7a45",
+      "nodes": [
+        {
+          "equivolume_diameter": 0.00017093846442795444,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.769635491323535,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.000425834280296785,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8837273948902152,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.0013921101213873698,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8133836811430959,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.003800001696514634,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8960558244252398,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.012942670507429551,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.8138666455157919,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.028664199287874125,
+          "frequency": 2700832954.954955,
+          "minor_to_major_axis_ratio": 0.906812400196737,
+          "radar_elevation": 0.0
+        }
+      ]
+    },
+    {
+      "asset_directory": "conventional_wet_hail_sband_unvalidated",
+      "config_sha256_at_selection": "4e9240d544556f79e255dfa4dad44a0ef825c2803cd36f94154211a06c7fbcdb",
+      "nodes": [
+        {
+          "equivolume_diameter": 0.0029793395440569598,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.1247898337730537,
+          "minor_to_major_axis_ratio": 0.7555267406091327,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.006950720075773618,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.21012865061404887,
+          "minor_to_major_axis_ratio": 0.8044617324802253,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.015951674244205846,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.2755876052879439,
+          "minor_to_major_axis_ratio": 0.8997834152349,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.030035722589718327,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.3533468563816531,
+          "minor_to_major_axis_ratio": 0.9562201892870834,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.03989942749613881,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.12803537440219864,
+          "minor_to_major_axis_ratio": 0.7376728292707024,
+          "radar_elevation": 0.0
+        },
+        {
+          "equivolume_diameter": 0.04383348886232083,
+          "frequency": 2700832954.954955,
+          "liquid_mass_fraction": 0.21444688377603305,
+          "minor_to_major_axis_ratio": 0.8056225131519161,
+          "radar_elevation": 0.0
+        }
+      ]
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_oblate_sband_unvalidated",
+      "config_sha256_at_selection": "0dc4ca0c648c386f923de3155103aaa806e1c2234959cd44b19a55a129200bff",
+      "nodes": [
+        {
+          "bulk_density": 1.5598360294947913,
+          "equivolume_diameter": 9.000225023961165e-05,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.1659225599501833,
+          "radar_elevation": -0.10122367197461707,
+          "temperature": 209.2760520298129
+        },
+        {
+          "bulk_density": 1.704592461565481,
+          "equivolume_diameter": 0.00034910940834431497,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.5114078865080275,
+          "radar_elevation": 2.669367535852838,
+          "temperature": 240.00947160327232
+        },
+        {
+          "bulk_density": 1.7962263027055267,
+          "equivolume_diameter": 0.0012343300596439296,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.8882861775286773,
+          "radar_elevation": 8.60335507797426,
+          "temperature": 266.7317084184828
+        },
+        {
+          "bulk_density": 2.103585351488715,
+          "equivolume_diameter": 0.0050135685430186495,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.32656046099615604,
+          "radar_elevation": 16.447272135561462,
+          "temperature": 218.366880534053
+        },
+        {
+          "bulk_density": 2.4453304592905516,
+          "equivolume_diameter": 0.022192913136415665,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.5913862765743346,
+          "radar_elevation": 0.09544801326163133,
+          "temperature": 253.5305014967759
+        },
+        {
+          "bulk_density": 2.8807687119410925,
+          "equivolume_diameter": 0.06996226759233486,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.8882163346763564,
+          "radar_elevation": 3.6180628896542406,
+          "temperature": 266.468564278848
+        }
+      ]
+    },
+    {
+      "asset_directory": "property_p3_ishmael_dry_prolate_sband_unvalidated",
+      "config_sha256_at_selection": "c2b973ab36fa26edb8d9d82f7dbb2ae5df52feec4bf93c880e304cad5aa2ff49",
+      "nodes": [
+        {
+          "bulk_density": 1.5480014508378994,
+          "equivolume_diameter": 8.412663849533477e-05,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.3119042542726913,
+          "radar_elevation": 0.2702599094684618,
+          "temperature": 213.20491284386594
+        },
+        {
+          "bulk_density": 1.6709224081304732,
+          "equivolume_diameter": 0.00022006886804454672,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.5453284589067977,
+          "radar_elevation": 3.127719054142997,
+          "temperature": 251.18941116831346
+        },
+        {
+          "bulk_density": 1.8073515033638392,
+          "equivolume_diameter": 0.0006734897038333054,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.8745001178756941,
+          "radar_elevation": 8.650916945700045,
+          "temperature": 263.2555259409746
+        },
+        {
+          "bulk_density": 2.1679405617721184,
+          "equivolume_diameter": 0.002103699911201437,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.2579064567250754,
+          "radar_elevation": 17.161934246819676,
+          "temperature": 198.89516825933262
+        },
+        {
+          "bulk_density": 2.390224425356007,
+          "equivolume_diameter": 0.007360918423093304,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.5778751582776808,
+          "radar_elevation": 0.48549223848702594,
+          "temperature": 248.48956436239564
+        },
+        {
+          "bulk_density": 3.0397253917602622,
+          "equivolume_diameter": 0.020116155464265276,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.7964195522322107,
+          "radar_elevation": 3.299368032710018,
+          "temperature": 266.14836460703697
+        }
+      ]
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_oblate_sband_unvalidated",
+      "config_sha256_at_selection": "61cd6f72beaf503485168a9b43e72db8ebc49ef993389e67ff8906e0c42e9bf8",
+      "nodes": [
+        {
+          "condensed_volume_fraction": 0.0015471890781897275,
+          "equivolume_diameter": 8.420879470692733e-05,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.036948670076167534,
+          "minor_to_major_axis_ratio": 0.18139027777674377,
+          "radar_elevation": 0.10065101680344446,
+          "temperature": 271.1557869953515
+        },
+        {
+          "condensed_volume_fraction": 0.0015965243241500178,
+          "equivolume_diameter": 0.00020716008023355145,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.07721563042504868,
+          "minor_to_major_axis_ratio": 0.5100572013371949,
+          "radar_elevation": 3.1250999455277166,
+          "temperature": 273.9134718492939
+        },
+        {
+          "condensed_volume_fraction": 0.0017510424427179439,
+          "equivolume_diameter": 0.0004921456699519925,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.1127727106722783,
+          "minor_to_major_axis_ratio": 0.9113362845279345,
+          "radar_elevation": 7.1840559868108445,
+          "temperature": 270.2923409657107
+        },
+        {
+          "condensed_volume_fraction": 0.0018423122115162306,
+          "equivolume_diameter": 0.0015040956826237826,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.1741927010087505,
+          "minor_to_major_axis_ratio": 0.30988118107524476,
+          "radar_elevation": 12.782064197090634,
+          "temperature": 273.6251002145782
+        },
+        {
+          "condensed_volume_fraction": 0.0020910211275013513,
+          "equivolume_diameter": 0.004019827350075121,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.27014330937002795,
+          "minor_to_major_axis_ratio": 0.6376801885531302,
+          "radar_elevation": 0.025012118689210494,
+          "temperature": 271.41072215242474
+        },
+        {
+          "condensed_volume_fraction": 0.0024127164789878915,
+          "equivolume_diameter": 0.010360898895714534,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.37274708361682224,
+          "minor_to_major_axis_ratio": 0.8676604558755185,
+          "radar_elevation": 2.130813959467532,
+          "temperature": 273.8436738793218
+        }
+      ]
+    },
+    {
+      "asset_directory": "property_p3_ishmael_wet_prolate_sband_unvalidated",
+      "config_sha256_at_selection": "0fa0bd759b64c8e6f62bcf629fd2d5c2733aa433fb0e2eb2793c2cbaa58e1758",
+      "nodes": [
+        {
+          "condensed_volume_fraction": 0.0015215682134971835,
+          "equivolume_diameter": 7.187795233687897e-05,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.020143769354317578,
+          "minor_to_major_axis_ratio": 0.1891798581293926,
+          "radar_elevation": 0.2967607741724527,
+          "temperature": 271.16295190485766
+        },
+        {
+          "condensed_volume_fraction": 0.0015929120987182115,
+          "equivolume_diameter": 0.00016382962644499182,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.06799927216162643,
+          "minor_to_major_axis_ratio": 0.5123240520814933,
+          "radar_elevation": 2.78686386094784,
+          "temperature": 273.74654812635936
+        },
+        {
+          "condensed_volume_fraction": 0.0017387558672556324,
+          "equivolume_diameter": 0.00035005729316033154,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.11324026371114809,
+          "minor_to_major_axis_ratio": 0.9123615262820213,
+          "radar_elevation": 7.3671541369601545,
+          "temperature": 272.02642600078053
+        },
+        {
+          "condensed_volume_fraction": 0.0018841545104000587,
+          "equivolume_diameter": 0.000879582665706612,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.17147324870610897,
+          "minor_to_major_axis_ratio": 0.24029606434291648,
+          "radar_elevation": 16.115265460155154,
+          "temperature": 274.1308788270281
+        },
+        {
+          "condensed_volume_fraction": 0.0020952102901689606,
+          "equivolume_diameter": 0.0021057299910544752,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.2683494981198503,
+          "minor_to_major_axis_ratio": 0.6009215581353057,
+          "radar_elevation": 0.44297625595009127,
+          "temperature": 270.6990857789041
+        },
+        {
+          "condensed_volume_fraction": 0.0023228322964092846,
+          "equivolume_diameter": 0.004710104624098612,
+          "frequency": 2800000000.0,
+          "liquid_mass_fraction": 0.33744640420983874,
+          "minor_to_major_axis_ratio": 0.847637484667385,
+          "radar_elevation": 3.0118237902252685,
+          "temperature": 273.94585799710853
+        }
+      ]
+    },
+    {
+      "asset_directory": "property_rain_sband_unvalidated",
+      "config_sha256_at_selection": "b6ac330212174ce863ee14abe94bb3347c6ae208913a760cead418c6d67d879d",
+      "nodes": [
+        {
+          "equivolume_diameter": 0.00038802908327827124,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.5834827308232616,
+          "radar_elevation": 0.5642158432959417,
+          "temperature": 260.9410901985523
+        },
+        {
+          "equivolume_diameter": 0.0007088801200989664,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.744210226122286,
+          "radar_elevation": 3.595311221480339,
+          "temperature": 284.9274096371036
+        },
+        {
+          "equivolume_diameter": 0.0012571315760401354,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.9633069743208726,
+          "radar_elevation": 7.183986771732499,
+          "temperature": 297.2508522075608
+        },
+        {
+          "equivolume_diameter": 0.0022988962686365817,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.619619487279504,
+          "radar_elevation": 15.373551681045925,
+          "temperature": 264.98068010710716
+        },
+        {
+          "equivolume_diameter": 0.004462245487804529,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.7581867012475823,
+          "radar_elevation": 0.08874654784952962,
+          "temperature": 285.11000987488325
+        },
+        {
+          "equivolume_diameter": 0.006909565718104732,
+          "frequency": 2800000000.0,
+          "minor_to_major_axis_ratio": 0.9094901277977521,
+          "radar_elevation": 2.7280097537085055,
+          "temperature": 301.80339493255894
+        }
+      ]
+    }
+  ],
+  "thresholds": {
+    "ah": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "av": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "fall_speed_first_moment": {
+      "absolute": 1e-12,
+      "relative": 0.75
+    },
+    "fall_speed_second_moment": {
+      "absolute": 1e-12,
+      "relative": 0.75
+    },
+    "hh_vv_covariance_imaginary": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "hh_vv_covariance_real": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "kdp": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "zh": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    },
+    "zv": {
+      "absolute": 1e-12,
+      "relative": 0.5
+    }
+  }
+}
