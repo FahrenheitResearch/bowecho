@@ -29206,50 +29206,29 @@ impl ViewerApp {
         Some((direction, (speed_mps / KNOT_TO_MPS as f64) as f32))
     }
 
-    /// The model the one-click ingest targets: the Download panel's
-    /// (persisted) pick — except a primary radar outside HRRR's CONUS
-    /// coverage prefers GFS, so international radars get usable model
-    /// layers and soundings without manual switching ("the model follows
-    /// the radar"). Returns (model, auto-switched-for-coverage).
-    fn auto_model_for_radar(&self) -> (rustwx_core::ModelId, bool) {
-        let selected = self
-            .download_panel
-            .spec()
-            .model
-            .parse::<rustwx_core::ModelId>()
-            .ok()
-            .filter(|&model| rw_ingest::ingest_supported(model))
-            .unwrap_or(rustwx_core::ModelId::Hrrr);
-        if selected == rustwx_core::ModelId::Hrrr
-            && let Some((lat, lon)) = self.radar_location()
-            && !ingest_worker::hrrr_conus_covers(lat, lon)
-        {
-            return (rustwx_core::ModelId::Gfs, true);
-        }
-        (selected, false)
-    }
-
-    /// Kick a background model ingest for the freshest plausible init
-    /// (sounding-grade --no-heavy, four hours bracketing now), then prune
-    /// the store to the two newest runs and re-scan. The model comes from
-    /// [`Self::auto_model_for_radar`].
-    fn start_model_ingest(&mut self, ctx: &egui::Context) {
+    /// Fetch f00 (and optionally f01) from the newest published HRRR cycle
+    /// using the explicitly selected light or full-without-heavy processing
+    /// path, then prune the store to its configured run limit.
+    fn start_model_ingest(
+        &mut self,
+        processing: QuickHrrrProcessing,
+        include_f01: bool,
+        ctx: &egui::Context,
+    ) {
         if self.model_ingest_rx.is_some() {
             return;
         }
-        let (model, auto_switched) = self.auto_model_for_radar();
-        let label = model.as_str().to_uppercase();
+        let hours_label = if include_f01 { "f00–f01" } else { "f00" };
         let (sender, receiver) = mpsc::channel();
         let (progress_tx, progress_rx) = mpsc::channel();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.model_ingest_rx = Some(receiver);
         self.model_ingest_progress_rx = Some(progress_rx);
         self.model_ingest_cancel = Some(Arc::clone(&cancel));
-        self.status = if auto_switched {
-            format!("Fetching latest {label}… (radar outside HRRR coverage)")
-        } else {
-            format!("Fetching latest {label}…")
-        };
+        self.status = format!(
+            "Fetching latest HRRR {hours_label} · {}",
+            processing.label()
+        );
         let ctx = ctx.clone();
         let keep_runs = self.model_keep_runs as usize;
         thread::spawn(move || {
@@ -29258,8 +29237,16 @@ impl ViewerApp {
             // result: 0.2 ms frames at 99.8% system CPU).
             rw_ingest::throttle::set_current_thread_background_priority();
             let pool = rw_ingest::throttle::build_background_pool(None);
-            let result =
-                pool.install(|| run_model_ingest(model, &cancel, &progress_tx, &ctx, keep_runs));
+            let result = pool.install(|| {
+                run_model_ingest(
+                    processing,
+                    include_f01,
+                    &cancel,
+                    &progress_tx,
+                    &ctx,
+                    keep_runs,
+                )
+            });
             let _ = sender.send(result);
             ctx.request_repaint();
         });
@@ -29826,7 +29813,7 @@ impl ViewerApp {
                     ui.weak(if store_empty {
                         "Get a ready-to-use first run"
                     } else {
-                        "Latest run · quick presets · archive-time match · custom setup"
+                        "Latest HRRR · processing mode · archive-time match · custom setup"
                     });
                 })
                 .body(|ui| {
@@ -29875,18 +29862,6 @@ impl ViewerApp {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
     ) -> Vec<rw_ui::DownloadEvent> {
-        enum QuickChoice {
-            Preset {
-                profile: &'static str,
-                hours: &'static str,
-            },
-            DisplayedTime {
-                date: String,
-                cycle: u8,
-                hours: String,
-            },
-        }
-
         let mut events = Vec::new();
         let newest = self
             .model_dock
@@ -29896,9 +29871,11 @@ impl ViewerApp {
             .unwrap_or_else(|| "Model store is empty".to_owned());
         let fetching = self.model_ingest_rx.is_some();
         let running = self.download_panel.is_running();
-        let (auto_model, auto_switched) = self.auto_model_for_radar();
-        let auto_label = auto_model.as_str().to_uppercase();
-        let gfs_selected = self.download_panel.spec().model == "gfs";
+        let initial_processing =
+            QuickHrrrProcessing::from_profile_slug(&self.download_panel.spec().profile);
+        let initial_include_f01 = self.download_panel.spec().hours == "0-1";
+        let mut processing = initial_processing;
+        let mut include_f01 = initial_include_f01;
         let displayed_choice = self.displayed_timeline_time_utc().and_then(|displayed| {
             ingest_worker::spec_fields_for_displayed_time(
                 &self.download_panel.spec().model,
@@ -29906,7 +29883,7 @@ impl ViewerApp {
             )
         });
         let mut fetch_latest = false;
-        let mut quick_choice = None;
+        let mut match_displayed_time = false;
 
         let theme = ui_theme::theme();
         egui::Frame::new()
@@ -29917,7 +29894,7 @@ impl ViewerApp {
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        egui::RichText::new("QUICK ACQUIRE")
+                        egui::RichText::new("LATEST HRRR")
                             .size(11.0)
                             .strong()
                             .color(subhead_color()),
@@ -29926,94 +29903,52 @@ impl ViewerApp {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Fetch a ready-to-use recent run, or choose a focused preset.",
+                        "Fetch f00 from the newest published HRRR cycle; include f01 only when you need the next forecast hour.",
                     )
                     .small()
                     .weak(),
                 );
                 ui.add_space(3.0);
                 ui.horizontal_wrapped(|ui| {
+                    ui.label("Processing");
+                    egui::ComboBox::from_id_salt("quick_hrrr_processing")
+                        .selected_text(processing.label())
+                        .show_ui(ui, |ui| {
+                            for choice in QuickHrrrProcessing::ALL {
+                                ui.selectable_value(&mut processing, choice, choice.label())
+                                    .on_hover_text(choice.description());
+                            }
+                        });
+                    ui.checkbox(&mut include_f01, "Include f01")
+                        .on_hover_text("Fetch f00 and f01 instead of analysis hour f00 only");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let hour_label = if include_f01 { "f00–f01" } else { "f00" };
                     fetch_latest = ui
                         .add_enabled(
-                            !fetching,
+                            !fetching && !running,
                             egui::Button::new(
-                                egui::RichText::new(format!("Fetch latest {auto_label}"))
+                                egui::RichText::new(format!("Fetch latest HRRR {hour_label}"))
                                     .strong(),
                             ),
                         )
                         .on_hover_text(format!(
-                            "Fetch the freshest {auto_label} init with four hours bracketing now and prune to the two newest runs",
+                            "Fetch {hour_label} from the newest available HRRR cycle using {}. Heavy/eCAPE processing is always off.",
+                            processing.label(),
                         ))
+                        .on_disabled_hover_text("A model download is already running")
                         .clicked();
 
-                    ui.add_enabled_ui(!running, |ui| {
-                        ui.menu_button("Quick presets ⏷", |ui| {
-                            ui.set_min_width(240.0);
-                            ui.label(
-                                egui::RichText::new("FORECAST PACKS")
-                                    .size(10.0)
-                                    .strong()
-                                    .color(subhead_color()),
-                            );
-                            let presets: &[(&str, &str, &str, &str)] = if gfs_selected {
-                                &[
-                                    (
-                                        "Soundings · 0–12 hours",
-                                        "sounding",
-                                        "0-12",
-                                        "Hourly sounding-grade GFS for the next half day",
-                                    ),
-                                    (
-                                        "Full fields · 0–48 hours",
-                                        "full",
-                                        "0-48",
-                                        "GFS 2D maps and derived fields through two days",
-                                    ),
-                                ]
-                            } else {
-                                &[
-                                    (
-                                        "Soundings · 0–3 hours",
-                                        "sounding",
-                                        "0-3",
-                                        "Sounding-grade fields for the next three hours",
-                                    ),
-                                    (
-                                        "Full fields · 0–18 hours",
-                                        "full",
-                                        "0-18",
-                                        "2D maps and derived fields through the short range",
-                                    ),
-                                ]
-                            };
-                            for &(label, profile, hours, hover) in presets {
-                                if ui.button(label).on_hover_text(hover).clicked() {
-                                    quick_choice = Some(QuickChoice::Preset { profile, hours });
-                                    ui.close();
-                                }
-                            }
-                            ui.separator();
-                            let displayed = ui
-                                .add_enabled(
-                                    displayed_choice.is_some(),
-                                    egui::Button::new("Match displayed radar time"),
-                                )
-                                .on_hover_text(
-                                    "Use the model init and forecast hours covering the radar frame currently on screen",
-                                )
-                                .on_disabled_hover_text("No radar timeline frame is displayed");
-                            if displayed.clicked()
-                                && let Some((date, cycle, hours)) = displayed_choice.clone()
-                            {
-                                quick_choice = Some(QuickChoice::DisplayedTime {
-                                    date,
-                                    cycle,
-                                    hours,
-                                });
-                                ui.close();
-                            }
-                        });
-                    });
+                    match_displayed_time = ui
+                        .add_enabled(
+                            displayed_choice.is_some() && !running,
+                            egui::Button::new("Use displayed radar time in custom setup").small(),
+                        )
+                        .on_hover_text(
+                            "Set the custom run date, cycle, and forecast hours to the radar frame currently on screen",
+                        )
+                        .on_disabled_hover_text("No radar timeline frame is displayed")
+                        .clicked();
 
                     if fetching {
                         ui.spinner();
@@ -30024,33 +29959,42 @@ impl ViewerApp {
                         }
                     }
                 });
-                if auto_switched {
-                    ui.weak("Outside HRRR coverage · GFS selected automatically");
-                }
             });
 
-        if fetch_latest {
-            self.start_model_ingest(ctx);
-        }
-        if let Some(choice) = quick_choice {
+        let quick_controls_changed =
+            processing != initial_processing || include_f01 != initial_include_f01;
+        if quick_controls_changed || fetch_latest {
             let mut spec = self.download_panel.spec().clone();
-            match choice {
-                QuickChoice::Preset { profile, hours } => {
-                    spec.profile = profile.to_owned();
-                    spec.hours = hours.to_owned();
-                    spec.derived = profile != "sounding";
-                    spec.heavy = false;
-                }
-                QuickChoice::DisplayedTime { date, cycle, hours } => {
-                    spec.date = date;
-                    spec.cycle = cycle;
-                    spec.hours = hours;
-                }
-            }
+            spec.model = "hrrr".to_owned();
+            spec.profile = processing.profile_slug().to_owned();
+            spec.hours = quick_hrrr_hour_spec(include_f01).to_owned();
+            spec.derived = processing.derived();
+            spec.heavy = false;
             self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
             self.download_panel
                 .set_model_options(ingest_worker_model_options());
             events.push(rw_ui::DownloadEvent::SpecChanged(spec));
+        }
+        if fetch_latest {
+            self.start_model_ingest(processing, include_f01, ctx);
+        }
+
+        if match_displayed_time && let Some((date, cycle, hours)) = displayed_choice {
+            let mut spec = self.download_panel.spec().clone();
+            spec.date = date;
+            spec.cycle = cycle;
+            spec.hours = hours;
+            self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
+            self.download_panel
+                .set_model_options(ingest_worker_model_options());
+            events.push(rw_ui::DownloadEvent::SpecChanged(spec));
+
+            let custom_id = ui.make_persistent_id("model_window_custom_download");
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ctx, custom_id, false,
+            );
+            state.set_open(true);
+            state.store(ctx);
         }
         events
     }
@@ -40050,21 +39994,87 @@ fn draw_halo_text(
     painter.text(position, align, text, font, text_color);
 }
 
-/// Profile selector for the download window (0 sounding / 1 full / 2 view).
-/// In-process one-click model ingest via the rw-ingest LIBRARY (typed
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuickHrrrProcessing {
+    Sounding,
+    FullNoHeavy,
+}
+
+impl QuickHrrrProcessing {
+    const ALL: [Self; 2] = [Self::Sounding, Self::FullNoHeavy];
+
+    fn from_profile_slug(profile: &str) -> Self {
+        if profile == "full" {
+            Self::FullNoHeavy
+        } else {
+            Self::Sounding
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sounding => "Sounding processing",
+            Self::FullNoHeavy => "Full processing (no heavy)",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Sounding => {
+                "Sounding volumes plus the seven required surface fields; no derived or heavy stages"
+            }
+            Self::FullNoHeavy => {
+                "All model fields and normal derived diagnostics; eCAPE/heavy processing stays off"
+            }
+        }
+    }
+
+    fn profile_slug(self) -> &'static str {
+        match self {
+            Self::Sounding => "sounding",
+            Self::FullNoHeavy => "full",
+        }
+    }
+
+    fn derived(self) -> bool {
+        self == Self::FullNoHeavy
+    }
+
+    fn ingest_profile(self) -> rw_ingest::ingest_profile::IngestProfile {
+        match self {
+            Self::Sounding => rw_ingest::ingest_profile::IngestProfile::sounding(),
+            Self::FullNoHeavy => {
+                let mut profile = rw_ingest::ingest_profile::IngestProfile::full();
+                profile.heavy = false;
+                profile
+            }
+        }
+    }
+}
+
+fn quick_hrrr_hour_spec(include_f01: bool) -> &'static str {
+    if include_f01 { "0-1" } else { "0" }
+}
+
+fn quick_hrrr_hours(include_f01: bool) -> std::ops::RangeInclusive<u16> {
+    0..=if include_f01 { 1 } else { 0 }
+}
+
+/// In-process one-click HRRR ingest via the rw-ingest library (typed
 /// per-stage progress + cooperative cancel; atomic writes mean cancel never
-/// leaves a partial hour). Freshest plausible init first — cycle cadence
-/// from rustwx_models, publication lag per model (HRRR ~55 min, GFS
-/// ~3.5 h) — fall back one cycle; then prune the store to the newest runs.
-/// The four ingested hours start at the run's age so their valid times
-/// bracket now..now+3 h (the auto hail-env sampling window).
+/// leaves a partial hour). The quick path is deliberately narrow: the newest
+/// plausible HRRR cycle, f00 with optional f01, and either sounding processing
+/// or full derived processing with eCAPE/heavy disabled. Custom model/cycle/
+/// hour downloads remain in the detailed download panel.
 fn run_model_ingest(
-    model: rustwx_core::ModelId,
+    processing: QuickHrrrProcessing,
+    include_f01: bool,
     cancel: &std::sync::atomic::AtomicBool,
     progress: &mpsc::Sender<String>,
     ctx: &egui::Context,
     keep_runs: usize,
 ) -> std::result::Result<String, String> {
+    let model = rustwx_core::ModelId::Hrrr;
     let store_dir = settings::model_store_dir();
     let cache_dir = settings::model_cache_dir();
     let store_str = store_dir.to_string_lossy();
@@ -40091,7 +40101,7 @@ fn run_model_ingest(
         let Ok(cycle) = rustwx_core::CycleSpec::new(&date, cycle_hour) else {
             continue;
         };
-        let profile = rw_ingest::ingest_profile::IngestProfile::sounding();
+        let profile = processing.ingest_profile();
         let run_slug = format!("{date}_{cycle_hour:02}z");
         let progress_sink = std::sync::Mutex::new(progress.clone());
         let ctx_sink = ctx.clone();
@@ -40118,13 +40128,7 @@ fn run_model_ingest(
             progress: &on_event,
             cancel,
         };
-        let init = chrono::NaiveDate::parse_from_str(&date, "%Y%m%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(cycle_hour as u32, 0, 0))
-            .map(|naive| naive.and_utc());
-        let run_age_minutes = init.map(|init| (now - init).num_minutes()).unwrap_or(55);
-        let first = ingest_worker::first_live_hour(run_age_minutes);
-        for hour in first..=first + 3 {
+        for hour in quick_hrrr_hours(include_f01) {
             match rw_ingest::ingest_hour_serial(&config, hour) {
                 Ok(_) => {
                     report(format!("{label} {date} {cycle_hour:02}z f{hour:02} stored"));
@@ -40137,21 +40141,22 @@ fn run_model_ingest(
                     // This cycle likely isn't published yet — try the
                     // previous one (unless some hours already landed, in
                     // which case report the partial truthfully).
-                    if hour == first {
+                    if hour == 0 {
                         continue 'candidates;
                     }
                     prune_model_store(STORE, keep_runs);
                     return Ok(format!(
-                        "{label} {date} {cycle_hour:02}z: f{first:02}–f{:02} stored (f{hour:02} failed: {last_error})",
+                        "{label} {date} {cycle_hour:02}z: f00–f{:02} stored (f{hour:02} failed: {last_error})",
                         hour - 1
                     ));
                 }
             }
         }
         prune_model_store(STORE, keep_runs);
+        let hours = if include_f01 { "f00–f01" } else { "f00" };
         return Ok(format!(
-            "{label} {date} {cycle_hour:02}z ingested (f{first:02}–f{:02})",
-            first + 3
+            "{label} {date} {cycle_hour:02}z {hours} ingested · {}",
+            processing.label()
         ));
     }
     Err(last_error)
@@ -64560,6 +64565,30 @@ mod tests {
         assert!(app.spc_reports_enabled);
         assert!(app.event_explorer.failed_day_for_test().is_none());
         assert!(app.spc_data.fetched_at.is_none());
+    }
+
+    #[test]
+    fn quick_hrrr_modes_pin_f00_optional_f01_and_never_heavy() {
+        assert_eq!(quick_hrrr_hour_spec(false), "0");
+        assert_eq!(quick_hrrr_hours(false).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(quick_hrrr_hour_spec(true), "0-1");
+        assert_eq!(quick_hrrr_hours(true).collect::<Vec<_>>(), vec![0, 1]);
+
+        let sounding = QuickHrrrProcessing::Sounding.ingest_profile();
+        assert!(!sounding.derived);
+        assert!(!sounding.heavy);
+        assert_eq!(QuickHrrrProcessing::Sounding.profile_slug(), "sounding");
+
+        let full = QuickHrrrProcessing::FullNoHeavy.ingest_profile();
+        assert!(
+            full.derived,
+            "full quick processing keeps normal diagnostics"
+        );
+        assert!(
+            !full.heavy,
+            "quick processing must never enable eCAPE/heavy"
+        );
+        assert_eq!(QuickHrrrProcessing::FullNoHeavy.profile_slug(), "full");
     }
 
     #[test]

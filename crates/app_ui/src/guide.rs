@@ -732,18 +732,18 @@ fn model_data(ui: &mut egui::Ui) {
     subhead(ui, "GETTING DATA");
     action(
         ui,
-        "Fetch latest",
-        "(Custom row) — ingests the freshest init of the picked model (GFS automatically \
-         when the radar sits outside HRRR coverage), sounding-grade hours bracketing now, \
-         then prunes the store to the newest runs. About a minute, throttled below \
-         the UI so frames never stutter.",
+        "Latest HRRR f00 / f00–f01",
+        "— fetches f00 from the newest published HRRR cycle, with an Include f01 option. \
+         Processing is either Sounding (volumes plus the required surface fields) or Full \
+         (all normal fields and derived diagnostics). Full quick processing explicitly keeps \
+         eCAPE/heavy off. Work runs below UI priority.",
     );
     action(
         ui,
-        "Download…",
-        "— the full window: any init date/cycle, an hours spec (\"0-3\" or \"2,4,6\"), profile \
-         choice, with a live size estimate before you commit. Model support depends on the \
-         local rusty-weather ingest/catalog build.",
+        "Custom download setup",
+        "— any supported model, init date/cycle, hours spec (\"0-3\" or \"2,4,6\"), and \
+         profile, with a live size estimate before you commit. Use displayed radar time can \
+         seed this form from the radar frame currently on screen.",
     );
     action(
         ui,
@@ -752,10 +752,16 @@ fn model_data(ui: &mut egui::Ui) {
          \u{2248}1.5 GB on disk).",
     );
 
-    subhead(ui, "LOCAL WRF & NETCDF");
+    subhead(ui, "WRF WORKFLOWS");
+    para(
+        ui,
+        "WRF is a first-class section in the Model library rail. Open data, wrf-rust full \
+         diagnostics, and simulated radar each have their own visible workflow card; they are \
+         not hidden under generic model acquisition.",
+    );
     action(
         ui,
-        "\u{1f4c4} WRF/NetCDF file\u{2026} / \u{1f4e5} folder\u{2026}",
+        "Open WRF / NetCDF",
         "— import local model files into the store: 2-D surface fields plus skew-T sounding \
          volumes, one forecast hour per file. Handles raw wrfout, post-processed climate \
          wrfout, and plain NetCDF. Click a point in the field viewer afterwards to sound it.",
@@ -770,7 +776,7 @@ fn model_data(ui: &mut egui::Ui) {
     );
     action(
         ui,
-        "\u{1f6e0} Full model import (heavy)",
+        "WRF full diagnostics",
         "— the full-diagnostics ingest (~117 fields: CAPE, severe, precip, soil, …) via \
          wrf-core, minutes per file on large grids. A field selector narrows it to a \
          core-only set when you don't need everything. This is NOT the simulated-radar button.",
@@ -791,7 +797,7 @@ fn model_data(ui: &mut egui::Ui) {
     subhead(ui, "SIMULATED RADAR FROM WRF");
     para(
         ui,
-        "\u{1f329} Simulated radar from WRF (fast) forward-models a raw wrfout file's \
+        "WRF simulated radar forward-models a raw wrfout file's \
          hydrometeors and winds into a simulated NEXRAD-style volume — reflectivity and \
          radial velocity on a real 14-tilt polar ladder (720 radials, 250 m gates to 230 km, \
          4/3-Earth beam) — that renders and LOOPS in the radar view through the same pipeline \

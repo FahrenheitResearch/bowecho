@@ -572,6 +572,7 @@ fn find_latest(spec: &DownloadSpec) -> Result<(String, u8), String> {
 /// the test errs toward the GFS fallback when a radar is outside CONUS
 /// (Guam, Alaska, international feeds). The northernmost CONUS 88Ds sit
 /// ≈48.7 N, far from the edge either way.
+#[cfg(test)]
 pub fn hrrr_conus_covers(lat_deg: f32, lon_deg: f32) -> bool {
     (21.0..=52.5).contains(&lat_deg) && (-134.0..=-60.0).contains(&lon_deg)
 }
@@ -660,6 +661,7 @@ pub fn recent_cycle_candidates(
 /// path samples. A fresh HRRR run (age <2 h) starts at f00/f01; an older
 /// GFS cycle (age ~4-10 h) starts at f04-f10 instead of wasting the
 /// fetch on hours whose valid times are already hours in the past.
+#[cfg(test)]
 pub fn first_live_hour(age_minutes: i64) -> u16 {
     (age_minutes.max(0) / 60) as u16
 }

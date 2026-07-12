@@ -1601,21 +1601,31 @@ impl ModelDataDock {
         self.import_job = Some(ImportJob::SyntheticRadar(task));
     }
 
-    /// Acquisition, formula, and output controls rendered below the run
-    /// library. The dock's normal job is browsing fields, so these workflows
-    /// stay behind two explicit disclosures instead of permanently consuming
-    /// the whole left rail.
+    /// First-class WRF workflows plus secondary acquisition, formula, and
+    /// output controls rendered below the run library. Opening a raw wrfout,
+    /// running wrf-rust diagnostics, and building simulated radar are the
+    /// primary jobs of this workspace, so they remain directly visible instead
+    /// of being buried under a generic "Add data" disclosure.
     fn import_controls(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(model_section_heading("Add data"))
-            .id_salt("model_add_data")
+        ui.label(model_section_heading("WRF workflows"));
+        ui.label(
+            egui::RichText::new(
+                "Open raw wrfout or NetCDF data, compute the full wrf-rust suite, or build a simulated radar loop.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(4.0);
+        self.import_pickers(ui);
+
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(model_section_heading("Other model sources"))
+            .id_salt("model_other_sources")
             .default_open(false)
             .show(ui, |ui| {
-                self.import_pickers(ui);
-                ui.add_space(6.0);
-                model_subheading(ui, "Online catalog");
                 ui.label(
                     egui::RichText::new(
-                        "Browse and import regional climate WRF data without leaving BowEcho.",
+                        "Browse and import regional climate model data without leaving BowEcho.",
                     )
                     .small()
                     .weak(),
@@ -1817,15 +1827,15 @@ impl ModelDataDock {
         let busy = self.import_job.is_some() || self.formula_lab.busy();
         model_workflow_card(
             ui,
-            "Quick import",
-            "Surface fields and sounding volumes from WRF/NetCDF. Best for opening and browsing a run.",
+            "Open WRF / NetCDF",
+            "Quickly load surface fields and sounding volumes from raw wrfout, climate WRF, or NetCDF data.",
             |ui| {
                 ui.horizontal(|ui| {
                     let spacing = ui.spacing().item_spacing.x;
                     let width = ((ui.available_width() - spacing) * 0.5).max(82.0);
                     if ui
                         .add_enabled_ui(!busy, |ui| {
-                            ui.add_sized([width, 26.0], egui::Button::new("Choose file…"))
+                            ui.add_sized([width, 26.0], egui::Button::new("Open file…"))
                         })
                         .inner
                         .on_hover_text(
@@ -1841,7 +1851,7 @@ impl ModelDataDock {
                     }
                     if ui
                         .add_enabled_ui(!busy, |ui| {
-                            ui.add_sized([width, 26.0], egui::Button::new("Choose folder…"))
+                            ui.add_sized([width, 26.0], egui::Button::new("Open folder…"))
                         })
                         .inner
                         .on_hover_text(
@@ -1865,25 +1875,18 @@ impl ModelDataDock {
             },
         );
 
-        ui.add_space(4.0);
-        egui::CollapsingHeader::new(egui::RichText::new("Full diagnostics").strong())
-            .id_salt("model_full_diagnostics")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Compute the wrf-rust severe and thermodynamic suite: CAPE/CIN, \
-                         shear, SRH, STP/SCP/EHI, LCL/LFC/EL, precipitation, and more.",
-                    )
-                    .small()
-                    .weak(),
-                );
+        ui.add_space(6.0);
+        model_workflow_card(
+            ui,
+            "WRF full diagnostics",
+            "Run the wrf-rust severe and thermodynamic suite: CAPE/CIN, shear, SRH, STP/SCP/EHI, LCL/LFC/EL, precipitation, and more.",
+            |ui| {
                 ui.horizontal(|ui| {
                     let spacing = ui.spacing().item_spacing.x;
                     let width = ((ui.available_width() - spacing) * 0.5).max(82.0);
                     if ui
                         .add_enabled_ui(!busy, |ui| {
-                            ui.add_sized([width, 26.0], egui::Button::new("Choose files…"))
+                            ui.add_sized([width, 26.0], egui::Button::new("Process files…"))
                         })
                         .inner
                         .on_hover_text(
@@ -1905,7 +1908,7 @@ impl ModelDataDock {
                     }
                     if ui
                         .add_enabled_ui(!busy, |ui| {
-                            ui.add_sized([width, 26.0], egui::Button::new("Choose folder…"))
+                            ui.add_sized([width, 26.0], egui::Button::new("Process folder…"))
                         })
                         .inner
                         .on_hover_text(
@@ -1926,23 +1929,18 @@ impl ModelDataDock {
                     }
                 });
                 self.wrf_options_panel(ui);
-            });
+            },
+        );
 
         self.heavy_import_warning_ui(ui);
         self.light_import_warning_ui(ui);
 
-        egui::CollapsingHeader::new(egui::RichText::new("Simulated radar").strong())
-            .id_salt("model_simulated_radar")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Forward-model WRF hydrometeors and winds into a fast, loopable \
-                         NEXRAD-style reflectivity and radial-velocity scan.",
-                    )
-                    .small()
-                    .weak(),
-                );
+        ui.add_space(6.0);
+        model_workflow_card(
+            ui,
+            "WRF simulated radar",
+            "Forward-model WRF hydrometeors and winds into a fast, loopable NEXRAD-style reflectivity and radial-velocity scan.",
+            |ui| {
                 ui.horizontal(|ui| {
                     let spacing = ui.spacing().item_spacing.x;
                     let width = ((ui.available_width() - spacing) * 0.5).max(82.0);
@@ -2016,7 +2014,8 @@ impl ModelDataDock {
                     self.export_synthetic_radar_frames();
                 }
                 self.synthetic_radar_site_panel(ui);
-            });
+            },
+        );
     }
 
     /// Size-gate a wrf-rust severe/thermo import (park LARGE grids behind an
@@ -2938,7 +2937,7 @@ impl ModelDataDock {
                                 ui.label("No model runs yet.");
                                 ui.label(
                                     egui::RichText::new(
-                                        "Use Add data below to import WRF/NetCDF or browse GDEX.",
+                                        "Use the WRF workflows below to open wrfout/NetCDF data, or browse other model sources.",
                                     )
                                     .small()
                                     .weak(),
