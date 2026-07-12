@@ -3307,6 +3307,90 @@ fn display_name(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn fingerprint_scene(
+        path: &str,
+        source_identity: &str,
+        time_index: usize,
+    ) -> app_ui::wrf_scene_inventory::WrfScene {
+        use app_ui::wrf_scene_inventory::{
+            WrfDomainId, WrfGridSignature, WrfRunDomain, WrfRunId, WrfSceneTime, WrfSourceIdentity,
+        };
+        use chrono::TimeZone;
+
+        app_ui::wrf_scene_inventory::WrfScene {
+            path: PathBuf::from(path),
+            time_index,
+            run_domain: WrfRunDomain {
+                run: WrfRunId("2026-07-12_00:00:00".to_owned()),
+                domain: WrfDomainId(3),
+            },
+            grid_signature: WrfGridSignature::from_meters(
+                400,
+                300,
+                Some(50),
+                Some(3_000.0),
+                Some(3_000.0),
+                "lambert",
+                0x1234,
+            ),
+            source_identity: WrfSourceIdentity(source_identity.to_owned()),
+            time: WrfSceneTime::InternalTimes {
+                valid_time: Utc.with_ymd_and_hms(2026, 7, 12, 1, 0, 0).unwrap(),
+                raw: "2026-07-12_01:00:00".to_owned(),
+            },
+        }
+    }
+
+    fn fingerprint_group(
+        scene: app_ui::wrf_scene_inventory::WrfScene,
+    ) -> app_ui::wrf_scene_inventory::WrfSceneGroup {
+        app_ui::wrf_scene_inventory::WrfSceneInventory::from_scenes([scene])
+            .groups
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn scene_build_fingerprint_tracks_input_identity_without_private_paths() {
+        let config = SyntheticRadarConfig::default();
+        let first = fingerprint_group(fingerprint_scene(
+            "C:/private/a/wrfout_d03",
+            "sha256:source-a",
+            0,
+        ));
+        let moved = fingerprint_group(fingerprint_scene(
+            "D:/moved/wrfout_d03",
+            "sha256:source-a",
+            0,
+        ));
+        let changed_source = fingerprint_group(fingerprint_scene(
+            "C:/private/a/wrfout_d03",
+            "sha256:source-b",
+            0,
+        ));
+        let changed_time_index = fingerprint_group(fingerprint_scene(
+            "C:/private/a/wrfout_d03",
+            "sha256:source-a",
+            1,
+        ));
+
+        let first_fingerprint = scene_build_fingerprint(&config, &first);
+        assert_eq!(
+            first_fingerprint,
+            scene_build_fingerprint(&config, &moved),
+            "absolute paths are deliberately outside refresh/cache identity"
+        );
+        assert_ne!(
+            first_fingerprint,
+            scene_build_fingerprint(&config, &changed_source)
+        );
+        assert_ne!(
+            first_fingerprint,
+            scene_build_fingerprint(&config, &changed_time_index)
+        );
+    }
+
     /// REAL-data proof for the multi-frame loop path (project rule: prove on
     /// real data). Gated on `BOWECHO_WRF_RADAR_MULTI_FIXTURE` = a `;`-joined
     /// list of real wrfout paths (e.g. the five Enderlin tornado files).
