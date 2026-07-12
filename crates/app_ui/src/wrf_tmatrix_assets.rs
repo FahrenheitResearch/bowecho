@@ -1,17 +1,24 @@
-//! Embedded, fail-closed property T-matrix tables used by the WRF simulated
-//! radar research operator.
+//! Fail-closed embedded and validated-local property T-matrix table sources
+//! used by the WRF simulated radar research operator.
 
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use radar_scattering::{PolarAccumulatorQuantities, ResearchTMatrixLut, Sha256Digest};
 
 use crate::wrf_property_reader::{RawPropertyCell, WrfPropertyScene};
+use crate::wrf_tmatrix_band_assets::{
+    LocalDirectoryTMatrixBandPackProvider, OwnedTMatrixBandBundle, S_BAND_RESEARCH_FREQUENCY_HZ,
+    TMatrixBandPackCache, TMatrixBandPackDiscovery, TMatrixBandPackIdentity, TMatrixResearchBand,
+    discover_tmatrix_band_packs, legacy_embedded_s_research_v1_identity,
+};
 use crate::wrf_tmatrix_scene::{
     WrfTMatrixBuildPeakEstimate, WrfTMatrixLutBundle, WrfTMatrixRainMode, WrfTMatrixRawEvaluator,
     WrfTMatrixScene,
 };
 
 const ASSET_ROOT: &str = "../../../research_only_assets/tmatrix/pytmatrix-0.3.3";
+const TMATRIX_PACK_CACHE_FAMILY: &str = "bowecho-simradar/tmatrix-packs";
 
 macro_rules! embedded_table {
     ($prefix:ident, $directory:literal, $sha256:literal) => {
@@ -79,6 +86,162 @@ impl EmbeddedPropertyTMatrixLuts {
 
 static PROPERTY_LUTS: OnceLock<Result<EmbeddedPropertyTMatrixLuts, String>> = OnceLock::new();
 static RAW_EVALUATOR: OnceLock<Result<WrfTMatrixRawEvaluator<'static>, String>> = OnceLock::new();
+static EXTERNAL_PROPERTY_LUT_CACHE: OnceLock<TMatrixBandPackCache> = OnceLock::new();
+
+/// Explicit table source. Selection never changes this request to another
+/// source or another frequency: callers that request an external pack receive
+/// an error if that exact pack is unavailable or unvalidated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PropertyTMatrixTableSourceKind {
+    LegacyEmbeddedSResearchV1,
+    ExternalValidatedPack,
+}
+
+#[derive(Clone)]
+enum PropertyTMatrixTableStorage {
+    LegacyEmbeddedS(&'static EmbeddedPropertyTMatrixLuts),
+    ExternalValidated(Arc<OwnedTMatrixBandBundle>),
+}
+
+/// An ownership handle for one exact-frequency five-table source.
+///
+/// Keep this value alive for at least as long as anything borrowing the bundle
+/// returned by [`Self::borrowed_bundle`]. In particular, the external variant
+/// owns the `Arc` retained by the bounded process cache instead of manufacturing
+/// a `'static` reference.
+#[derive(Clone)]
+pub struct PropertyTMatrixTables {
+    storage: PropertyTMatrixTableStorage,
+}
+
+impl PropertyTMatrixTables {
+    #[must_use]
+    pub fn identity(&self) -> TMatrixBandPackIdentity {
+        match &self.storage {
+            PropertyTMatrixTableStorage::LegacyEmbeddedS(_) => {
+                legacy_embedded_s_research_v1_identity()
+            }
+            PropertyTMatrixTableStorage::ExternalValidated(bundle) => {
+                bundle.identity().clone().into()
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn source_kind(&self) -> PropertyTMatrixTableSourceKind {
+        match &self.storage {
+            PropertyTMatrixTableStorage::LegacyEmbeddedS(_) => {
+                PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+            }
+            PropertyTMatrixTableStorage::ExternalValidated(_) => {
+                PropertyTMatrixTableSourceKind::ExternalValidatedPack
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn exact_frequency_hz(&self) -> f64 {
+        match &self.storage {
+            PropertyTMatrixTableStorage::LegacyEmbeddedS(_) => S_BAND_RESEARCH_FREQUENCY_HZ,
+            PropertyTMatrixTableStorage::ExternalValidated(bundle) => {
+                bundle.identity().exact_frequency_hz()
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn borrowed_bundle(&self) -> WrfTMatrixLutBundle<'_> {
+        match &self.storage {
+            PropertyTMatrixTableStorage::LegacyEmbeddedS(tables) => tables.bundle(),
+            PropertyTMatrixTableStorage::ExternalValidated(bundle) => bundle.borrowed_bundle(),
+        }
+    }
+}
+
+/// Deterministic external-pack root below BowEcho's override-aware model cache.
+/// No downloader writes here: users or a separate pack installer provide the
+/// signed-off local manifests and role files.
+#[must_use]
+pub fn property_tmatrix_pack_cache_dir() -> PathBuf {
+    settings::model_cache_dir().join(TMATRIX_PACK_CACHE_FAMILY)
+}
+
+/// Inspect external packs without loading their large role files. Invalid and
+/// unvalidated manifests remain visible in the returned discovery report and
+/// can never satisfy exact selection.
+pub fn discover_cached_property_tmatrix_packs() -> Result<Vec<TMatrixBandPackDiscovery>, String> {
+    let root = property_tmatrix_pack_cache_dir();
+    std::fs::create_dir_all(&root).map_err(|error| {
+        format!(
+            "create simulated-radar T-matrix pack directory {}: {error}",
+            root.display()
+        )
+    })?;
+    discover_tmatrix_band_packs(&LocalDirectoryTMatrixBandPackProvider::new(root))
+        .map_err(|error| format!("discover local simulated-radar T-matrix packs: {error}"))
+}
+
+/// Resolve one explicitly requested source at one exact supported frequency.
+///
+/// Legacy embedded S is accepted only at 2.8 GHz. External S/C/X selection is
+/// delegated to the validated local manifests and therefore fails closed for
+/// a missing, invalid, unvalidated, or ambiguous pack. There is no cross-band
+/// substitution, nearest-frequency lookup, or implicit source fallback.
+pub fn load_property_tmatrix_tables_exact(
+    source: PropertyTMatrixTableSourceKind,
+    frequency_hz: f64,
+) -> Result<PropertyTMatrixTables, String> {
+    validate_table_source_frequency(source, frequency_hz)?;
+    match source {
+        PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1 => Ok(PropertyTMatrixTables {
+            storage: PropertyTMatrixTableStorage::LegacyEmbeddedS(embedded_luts()?),
+        }),
+        PropertyTMatrixTableSourceKind::ExternalValidatedPack => {
+            let root = property_tmatrix_pack_cache_dir();
+            std::fs::create_dir_all(&root).map_err(|error| {
+                format!(
+                    "create simulated-radar T-matrix pack directory {}: {error}",
+                    root.display()
+                )
+            })?;
+            let provider = LocalDirectoryTMatrixBandPackProvider::new(&root);
+            let discoveries = discover_tmatrix_band_packs(&provider).map_err(|error| {
+                format!(
+                    "discover simulated-radar T-matrix packs in {}: {error}",
+                    root.display()
+                )
+            })?;
+            let bundle = EXTERNAL_PROPERTY_LUT_CACHE
+                .get_or_init(TMatrixBandPackCache::default)
+                .load_exact_frequency(&provider, &discoveries, frequency_hz)
+                .map_err(|error| {
+                    format!(
+                        "load validated external T-matrix pack at exactly {frequency_hz} Hz from {}: {error}",
+                        root.display()
+                    )
+                })?;
+            Ok(PropertyTMatrixTables {
+                storage: PropertyTMatrixTableStorage::ExternalValidated(bundle),
+            })
+        }
+    }
+}
+
+fn validate_table_source_frequency(
+    source: PropertyTMatrixTableSourceKind,
+    frequency_hz: f64,
+) -> Result<TMatrixResearchBand, String> {
+    let band = TMatrixResearchBand::from_exact_frequency_hz(frequency_hz)
+        .map_err(|error| error.to_string())?;
+    if source == PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+        && frequency_hz.to_bits() != S_BAND_RESEARCH_FREQUENCY_HZ.to_bits()
+    {
+        return Err(format!(
+            "legacy embedded S research v1 exists only at exactly {S_BAND_RESEARCH_FREQUENCY_HZ} Hz; requested {frequency_hz} Hz ({band}-band); no fallback is allowed"
+        ));
+    }
+    Ok(band)
+}
 
 pub struct EmbeddedPropertySceneBuild {
     pub scene: WrfTMatrixScene,
@@ -109,7 +272,7 @@ fn embedded_raw_evaluator() -> Result<WrfTMatrixRawEvaluator<'static>, String> {
         WrfTMatrixRawEvaluator::new(embedded_luts()?.bundle())
             .map_err(|error| format!("validate embedded raw property evaluator: {error}"))
     }) {
-        Ok(evaluator) => Ok(*evaluator),
+        Ok(evaluator) => Ok(evaluator.clone()),
         Err(error) => Err(error.clone()),
     }
 }
@@ -230,6 +393,25 @@ mod tests {
             .bundle()
             .validate()
             .expect("embedded tables share the exact complete bundle contract");
+        let resolved = PropertyTMatrixTables {
+            storage: PropertyTMatrixTableStorage::LegacyEmbeddedS(tables),
+        };
+        assert_eq!(
+            resolved.identity(),
+            TMatrixBandPackIdentity::LegacyEmbeddedSResearchV1
+        );
+        assert_eq!(
+            resolved.source_kind(),
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+        );
+        assert_eq!(
+            resolved.exact_frequency_hz().to_bits(),
+            S_BAND_RESEARCH_FREQUENCY_HZ.to_bits()
+        );
+        resolved
+            .borrowed_bundle()
+            .validate()
+            .expect("resolved legacy handle borrows the embedded bundle");
         assert!(embedded_lut_memory_bytes() >= 2 * RAIN.0.len());
     }
 
@@ -244,5 +426,59 @@ mod tests {
             &tables.rain,
         );
         assert!(swapped.validate().is_err());
+    }
+
+    #[test]
+    fn source_routing_accepts_only_declared_exact_frequencies() {
+        assert_eq!(
+            validate_table_source_frequency(
+                PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+                S_BAND_RESEARCH_FREQUENCY_HZ,
+            )
+            .expect("legacy exact S"),
+            TMatrixResearchBand::S
+        );
+        for band in [
+            TMatrixResearchBand::S,
+            TMatrixResearchBand::C,
+            TMatrixResearchBand::X,
+        ] {
+            assert_eq!(
+                validate_table_source_frequency(
+                    PropertyTMatrixTableSourceKind::ExternalValidatedPack,
+                    band.exact_frequency_hz(),
+                )
+                .expect("declared external frequency"),
+                band
+            );
+        }
+        for band in [TMatrixResearchBand::C, TMatrixResearchBand::X] {
+            let error = validate_table_source_frequency(
+                PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+                band.exact_frequency_hz(),
+            )
+            .expect_err("legacy S cannot satisfy another band");
+            assert!(error.contains("no fallback"));
+        }
+        assert!(
+            validate_table_source_frequency(
+                PropertyTMatrixTableSourceKind::ExternalValidatedPack,
+                S_BAND_RESEARCH_FREQUENCY_HZ + 1.0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn external_pack_directory_is_scoped_below_the_model_cache() {
+        assert_eq!(
+            property_tmatrix_pack_cache_dir(),
+            settings::model_cache_dir().join(TMATRIX_PACK_CACHE_FAMILY)
+        );
+        assert!(
+            property_tmatrix_pack_cache_dir()
+                .ends_with(std::path::Path::new("bowecho-simradar").join("tmatrix-packs"))
+        );
+        assert!(!TMATRIX_PACK_CACHE_FAMILY.contains("simsat-cache"));
     }
 }
