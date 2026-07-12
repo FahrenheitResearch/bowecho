@@ -6,6 +6,7 @@
 //! products are derived only after interpolation.  These research tables are
 //! never substituted with the bulk Rayleigh operator when a lookup fails.
 
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -39,7 +40,11 @@ use crate::wrf_property_reader::{
 };
 use crate::wrf_temporal::ScenePropertySignature;
 
+/// Legacy embedded research bundle frequency. Production evaluation derives
+/// its exact frequency from the validated five-table bundle instead.
 pub const PROPERTY_TMATRIX_FREQUENCY_HZ: f64 = 2_800_000_000.0;
+const PROPERTY_TMATRIX_SUPPORTED_FREQUENCIES_HZ: [f64; 3] =
+    [2_800_000_000.0, 5_600_000_000.0, 9_400_000_000.0];
 pub const PROPERTY_TMATRIX_MIN_ELEVATION_DEG: f64 = -0.5;
 pub const PROPERTY_TMATRIX_MAX_ELEVATION_DEG: f64 = 20.0;
 pub const MAX_WEIGHTED_PROPERTY_CELLS: usize = 8;
@@ -485,7 +490,6 @@ const RAIN_DIAMETER_M: &[f64] = &[
 ];
 const RAIN_TEMPERATURE_K: &[f64] = &[250.0, 269.15, 293.15, 313.15];
 const RAIN_MINOR_TO_MAJOR: &[f64] = &[0.5, 0.6, 0.7, 0.775, 0.85, 0.925, 1.0];
-const PROPERTY_FREQUENCY_HZ: &[f64] = &[2800000000.0];
 const FROZEN_RADAR_ELEVATION_DEG: &[f64] = &[-0.5, 0.9, 4.5, 10.0, 20.0];
 const RAIN_RADAR_ELEVATION_DEG: &[f64] = &[-0.5, 0.2, 0.9, 2.7, 4.5, 7.25, 10.0, 15.0, 20.0];
 const PROPERTY_SOLVER_DDELT: f64 = 0.001;
@@ -541,7 +545,7 @@ pub enum WrfTMatrixTableRole {
 }
 
 impl WrfTMatrixTableRole {
-    const fn expected_id(self) -> &'static str {
+    const fn legacy_embedded_s_id(self) -> &'static str {
         match self {
             Self::DryOblate => DRY_OBLATE_TABLE_ID,
             Self::DryProlate => DRY_PROLATE_TABLE_ID,
@@ -760,10 +764,10 @@ impl WrfTMatrixAuditCounts {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WrfTMatrixTableAudit {
     pub role: WrfTMatrixTableRole,
-    pub table_id: &'static str,
+    pub table_id: String,
     pub file_sha256: Sha256Digest,
 }
 
@@ -1028,7 +1032,7 @@ impl WrfTMatrixScene {
 
         let table_audits = tables.entries().map(|(role, table)| WrfTMatrixTableAudit {
             role,
-            table_id: role.expected_id(),
+            table_id: table.descriptor().table_id().to_owned(),
             file_sha256: table.file_sha256(),
         });
         Ok(Self {
@@ -1043,7 +1047,7 @@ impl WrfTMatrixScene {
             additive_components,
             provenance: WrfTMatrixSceneProvenance {
                 status: "research_only_unvalidated",
-                frequency_hz: PROPERTY_TMATRIX_FREQUENCY_HZ,
+                frequency_hz: validated.frequency_hz,
                 orientation: OrientationDefinition::Gaussian20Research,
                 frozen_scattering: if source.microphysics_scheme_id() == 55 {
                     WrfTMatrixFrozenScatteringAudit::IshmaelSchemeNativePsdDryFrozenV1 {
@@ -1129,6 +1133,7 @@ impl WrfTMatrixScene {
         estimate_build_peak_from_shape(
             source,
             validated.radar_elevations_deg.len(),
+            validated.table_id_text_bytes,
             rain_mode,
             rayon::current_num_threads().max(1),
         )
@@ -1161,9 +1166,14 @@ impl WrfTMatrixScene {
         &self,
         reflectivity_source: impl Into<String>,
     ) -> ScenePropertySignature {
+        let reflectivity_source = reflectivity_source.into();
         ScenePropertySignature {
             microphysics_scheme_id: Some(self.microphysics_scheme_id),
-            reflectivity_source: reflectivity_source.into(),
+            reflectivity_source: format!(
+                "{reflectivity_source};tmatrix_frequency_hz={:.0};tmatrix_frequency_bits={:016x}",
+                self.provenance.frequency_hz,
+                self.provenance.frequency_hz.to_bits()
+            ),
             required_raw_fields: self.required_field_signature.field_names(),
         }
     }
@@ -1325,7 +1335,13 @@ impl WrfTMatrixScene {
             .source_fields
             .iter()
             .map(|field| field.source_units().len())
-            .sum();
+            .sum::<usize>()
+            + self
+                .provenance
+                .tables
+                .iter()
+                .map(|table| table.table_id.len())
+                .sum::<usize>();
         WrfTMatrixSceneMemoryEstimate {
             structure_bytes: size_of::<Self>(),
             source_index_bytes: self.source_cell_indices.len() * size_of::<u32>(),
@@ -1361,7 +1377,9 @@ impl WrfTMatrixScene {
 
 #[derive(Clone, Copy)]
 struct ValidatedBundle<'a> {
+    frequency_hz: f64,
     radar_elevations_deg: &'a [f64],
+    table_id_text_bytes: usize,
     p3_particle_support: PsdParticleSupport,
     p3_fall_speed: PsdFallSpeedProvenance,
     ishmael_psd_config: PsdIntegrationConfig,
@@ -1516,10 +1534,16 @@ fn build_p3_psd_cell_into(
         ..WrfTMatrixAuditCounts::default()
     };
     for (elevation_index, &elevation_deg) in elevations.iter().enumerate() {
-        let oblate_request =
-            evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
-        let prolate_request =
-            evaluation_request(elevation_deg, SpheroidConvention::ProlateMajorVertical)?;
+        let oblate_request = evaluation_request(
+            validated.frequency_hz,
+            elevation_deg,
+            SpheroidConvention::OblateMinorVertical,
+        )?;
+        let prolate_request = evaluation_request(
+            validated.frequency_hz,
+            elevation_deg,
+            SpheroidConvention::ProlateMajorVertical,
+        )?;
         let mut additive = AdditiveScattering::default();
         for (category, distribution) in &frozen {
             let p3_input = distribution.input();
@@ -1639,6 +1663,7 @@ fn build_characteristic_cell_into(
     source: &WrfPropertyScene,
     cell_index: usize,
     tables: WrfTMatrixLutBundle<'_>,
+    frequency_hz: f64,
     elevations: &[f64],
     rain_mode: WrfTMatrixRainMode,
     output: &mut [f32],
@@ -1732,7 +1757,7 @@ fn build_characteristic_cell_into(
         if let Some(partition) = &coexistence {
             for wet in partition.diagnosis().wet_categories() {
                 let spheroid = spheroid_for_particle(wet.source_category())?;
-                let request = evaluation_request(elevation_deg, spheroid)?;
+                let request = evaluation_request(frequency_hz, elevation_deg, spheroid)?;
                 let contribution = tables
                     .wet(spheroid)
                     .evaluate_wet_category(wet, request)
@@ -1762,8 +1787,11 @@ fn build_characteristic_cell_into(
                     rain.ok_or(WrfTMatrixSceneBuildError::CoexistenceMissingRainSource {
                         cell_index,
                     })?;
-                let request =
-                    evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+                let request = evaluation_request(
+                    frequency_hz,
+                    elevation_deg,
+                    SpheroidConvention::OblateMinorVertical,
+                )?;
                 let contribution = tables
                     .rain_standalone_and_residual
                     .evaluate_unused_rain(rain_source, unused_rain_mass, request)
@@ -1790,7 +1818,7 @@ fn build_characteristic_cell_into(
         } else {
             for category in closed.categories() {
                 let spheroid = spheroid_for_characteristic_category(category.category())?;
-                let request = evaluation_request(elevation_deg, spheroid)?;
+                let request = evaluation_request(frequency_hz, elevation_deg, spheroid)?;
                 let contribution = tables
                     .dry(spheroid)
                     .evaluate(category.closed(), request)
@@ -1812,8 +1840,11 @@ fn build_characteristic_cell_into(
             if rain_mode == WrfTMatrixRainMode::FullProperty
                 && let Some(rain) = rain
             {
-                let request =
-                    evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+                let request = evaluation_request(
+                    frequency_hz,
+                    elevation_deg,
+                    SpheroidConvention::OblateMinorVertical,
+                )?;
                 let contribution = tables
                     .rain_standalone_and_residual
                     .evaluate(rain, request)
@@ -1940,10 +1971,16 @@ fn build_ishmael_psd_cell_into(
         ..WrfTMatrixAuditCounts::default()
     };
     for (elevation_index, &elevation_deg) in elevations.iter().enumerate() {
-        let oblate_request =
-            evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
-        let prolate_request =
-            evaluation_request(elevation_deg, SpheroidConvention::ProlateMajorVertical)?;
+        let oblate_request = evaluation_request(
+            validated.frequency_hz,
+            elevation_deg,
+            SpheroidConvention::OblateMinorVertical,
+        )?;
+        let prolate_request = evaluation_request(
+            validated.frequency_hz,
+            elevation_deg,
+            SpheroidConvention::ProlateMajorVertical,
+        )?;
         let mut additive = AdditiveScattering::default();
         for &(category, distribution) in &frozen {
             let integration = integrate_ishmael_psd(
@@ -2076,10 +2113,16 @@ fn evaluate_p3_psd_raw_cell(
         return Ok(None);
     }
 
-    let oblate_request =
-        raw_evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
-    let prolate_request =
-        raw_evaluation_request(elevation_deg, SpheroidConvention::ProlateMajorVertical)?;
+    let oblate_request = raw_evaluation_request(
+        validated.frequency_hz,
+        elevation_deg,
+        SpheroidConvention::OblateMinorVertical,
+    )?;
+    let prolate_request = raw_evaluation_request(
+        validated.frequency_hz,
+        elevation_deg,
+        SpheroidConvention::ProlateMajorVertical,
+    )?;
     let mut additive = AdditiveScattering::default();
     for (category, distribution) in &frozen {
         let p3_input = distribution.input();
@@ -2156,6 +2199,7 @@ fn evaluate_p3_psd_raw_cell(
 fn evaluate_characteristic_raw_cell(
     raw: &RawPropertyCell,
     tables: WrfTMatrixLutBundle<'_>,
+    frequency_hz: f64,
     elevation_deg: f64,
 ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
     let closed = close_raw_property_cell(raw, OrientationDefinition::Gaussian20Research)
@@ -2191,7 +2235,7 @@ fn evaluate_characteristic_raw_cell(
     if let Some(partition) = &coexistence {
         for wet in partition.diagnosis().wet_categories() {
             let spheroid = spheroid_for_raw_particle(wet.source_category())?;
-            let request = raw_evaluation_request(elevation_deg, spheroid)?;
+            let request = raw_evaluation_request(frequency_hz, elevation_deg, spheroid)?;
             let contribution = tables
                 .wet(spheroid)
                 .evaluate_wet_category(wet, request)
@@ -2214,8 +2258,11 @@ fn evaluate_characteristic_raw_cell(
         let unused_rain_mass = partition.diagnosis().unused_rain_mass_kgkg();
         if unused_rain_mass > 0.0 {
             let rain_source = rain.ok_or(WrfTMatrixRawEvaluationError::MissingRainSource)?;
-            let request =
-                raw_evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+            let request = raw_evaluation_request(
+                frequency_hz,
+                elevation_deg,
+                SpheroidConvention::OblateMinorVertical,
+            )?;
             let contribution = tables
                 .rain_standalone_and_residual
                 .evaluate_unused_rain(rain_source, unused_rain_mass, request)
@@ -2239,7 +2286,7 @@ fn evaluate_characteristic_raw_cell(
         for category in closed.categories() {
             let spheroid = spheroid_for_characteristic_category(category.category())
                 .map_err(|_| WrfTMatrixRawEvaluationError::IshmaelCharacteristicForbidden)?;
-            let request = raw_evaluation_request(elevation_deg, spheroid)?;
+            let request = raw_evaluation_request(frequency_hz, elevation_deg, spheroid)?;
             let contribution = tables
                 .dry(spheroid)
                 .evaluate(category.closed(), request)
@@ -2255,8 +2302,11 @@ fn evaluate_characteristic_raw_cell(
             })?;
         }
         if let Some(rain) = rain {
-            let request =
-                raw_evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+            let request = raw_evaluation_request(
+                frequency_hz,
+                elevation_deg,
+                SpheroidConvention::OblateMinorVertical,
+            )?;
             let contribution = tables
                 .rain_standalone_and_residual
                 .evaluate(rain, request)
@@ -2325,10 +2375,16 @@ fn evaluate_ishmael_psd_raw_cell(
     if frozen.is_empty() && rain.is_none() {
         return Ok(None);
     }
-    let oblate_request =
-        raw_evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
-    let prolate_request =
-        raw_evaluation_request(elevation_deg, SpheroidConvention::ProlateMajorVertical)?;
+    let oblate_request = raw_evaluation_request(
+        validated.frequency_hz,
+        elevation_deg,
+        SpheroidConvention::OblateMinorVertical,
+    )?;
+    let prolate_request = raw_evaluation_request(
+        validated.frequency_hz,
+        elevation_deg,
+        SpheroidConvention::ProlateMajorVertical,
+    )?;
     let mut additive = AdditiveScattering::default();
     for &(category, distribution) in &frozen {
         let integration = integrate_ishmael_psd(
@@ -2387,12 +2443,13 @@ fn evaluate_ishmael_psd_raw_cell(
 }
 
 fn raw_evaluation_request(
+    frequency_hz: f64,
     elevation_deg: f64,
     spheroid: SpheroidConvention,
 ) -> Result<TMatrixEvaluationRequest, WrfTMatrixRawEvaluationError> {
     let view = RadarViewGeometry::new(elevation_deg)
         .map_err(WrfTMatrixRawEvaluationError::EvaluationRequest)?;
-    TMatrixEvaluationRequest::new(PROPERTY_TMATRIX_FREQUENCY_HZ, spheroid, view)
+    TMatrixEvaluationRequest::new(frequency_hz, spheroid, view)
         .map_err(WrfTMatrixRawEvaluationError::EvaluationRequest)
 }
 
@@ -2561,6 +2618,7 @@ fn validate_source_shape(source: &WrfPropertyScene) -> Result<(), WrfTMatrixScen
 fn estimate_build_peak_from_shape(
     source: &WrfPropertyScene,
     elevation_nodes: usize,
+    table_id_text_bytes: usize,
     rain_mode: WrfTMatrixRainMode,
     parallel_workers: usize,
 ) -> Result<WrfTMatrixBuildPeakEstimate, WrfTMatrixSceneBuildError> {
@@ -2598,6 +2656,7 @@ fn estimate_build_peak_from_shape(
         required_contract_bytes,
         source_field_structure_bytes,
         source_field_text_bytes,
+        table_id_text_bytes,
         elevation_axis_bytes,
     ])?;
 
@@ -2709,12 +2768,13 @@ fn verify_fall_moment_policy(
 }
 
 fn evaluation_request(
+    frequency_hz: f64,
     elevation_deg: f64,
     spheroid: SpheroidConvention,
 ) -> Result<TMatrixEvaluationRequest, WrfTMatrixSceneBuildError> {
     let view = RadarViewGeometry::new(elevation_deg)
         .map_err(WrfTMatrixSceneBuildError::EvaluationRequest)?;
-    TMatrixEvaluationRequest::new(PROPERTY_TMATRIX_FREQUENCY_HZ, spheroid, view)
+    TMatrixEvaluationRequest::new(frequency_hz, spheroid, view)
         .map_err(WrfTMatrixSceneBuildError::EvaluationRequest)
 }
 
@@ -2777,6 +2837,28 @@ fn decode_components(values: &[f32]) -> Result<AdditiveScattering, WrfTMatrixSce
 fn validate_bundle(
     tables: WrfTMatrixLutBundle<'_>,
 ) -> Result<ValidatedBundle<'_>, WrfTMatrixBundleError> {
+    let entries = tables.entries();
+    let legacy_id_matches = entries
+        .iter()
+        .filter(|(role, table)| table.descriptor().table_id() == role.legacy_embedded_s_id())
+        .count();
+    if legacy_id_matches != 0 && legacy_id_matches != entries.len() {
+        return Err(WrfTMatrixBundleError::MixedLegacyTableIds {
+            matching_roles: legacy_id_matches,
+        });
+    }
+    let unique_ids = entries
+        .iter()
+        .map(|(_, table)| table.descriptor().table_id())
+        .collect::<BTreeSet<_>>();
+    if unique_ids.len() != entries.len() {
+        return Err(WrfTMatrixBundleError::DuplicateTableIds);
+    }
+    let table_id_text_bytes = entries
+        .iter()
+        .map(|(_, table)| table.descriptor().table_id().len())
+        .sum();
+
     for (role, table) in tables.entries() {
         let expected_category = if role == WrfTMatrixTableRole::RainStandaloneAndResidual {
             TMatrixParticleCategory::Conventional(ConventionalHydrometeor::Rain)
@@ -2805,13 +2887,6 @@ fn validate_bundle(
             }
         };
         let descriptor = table.descriptor();
-        if descriptor.table_id() != role.expected_id() {
-            return Err(WrfTMatrixBundleError::TableId {
-                role,
-                expected: role.expected_id(),
-                actual: descriptor.table_id().to_owned(),
-            });
-        }
         if descriptor.category() != expected_category {
             return Err(WrfTMatrixBundleError::Category {
                 role,
@@ -2853,7 +2928,9 @@ fn validate_bundle(
             });
         }
         for axis in table.offline_lut().header().axes() {
-            validate_exact_axis_coordinates(role, axis.kind(), axis.coordinates())?;
+            if axis.kind() != AxisKind::Frequency {
+                validate_exact_axis_coordinates(role, axis.kind(), axis.coordinates())?;
+            }
         }
         validate_exact_solver(
             role,
@@ -2921,10 +2998,27 @@ fn validate_bundle(
         WrfTMatrixTableRole::DryOblate,
         AxisKind::Frequency,
     )?;
-    if reference_frequency != [PROPERTY_TMATRIX_FREQUENCY_HZ] {
-        return Err(WrfTMatrixBundleError::FrequencyAxis {
+    if reference_frequency.len() != 1 {
+        return Err(WrfTMatrixBundleError::FrequencyAxisNotSingleton {
             role: WrfTMatrixTableRole::DryOblate,
             actual: reference_frequency.to_vec(),
+        });
+    }
+    let frequency_hz = reference_frequency[0];
+    if !PROPERTY_TMATRIX_SUPPORTED_FREQUENCIES_HZ
+        .iter()
+        .any(|supported| supported.to_bits() == frequency_hz.to_bits())
+    {
+        return Err(WrfTMatrixBundleError::UnsupportedExactFrequency {
+            actual_hz: frequency_hz,
+        });
+    }
+    if legacy_id_matches == entries.len()
+        && frequency_hz.to_bits() != PROPERTY_TMATRIX_FREQUENCY_HZ.to_bits()
+    {
+        return Err(WrfTMatrixBundleError::LegacyTableFrequency {
+            expected_hz: PROPERTY_TMATRIX_FREQUENCY_HZ,
+            actual_hz: frequency_hz,
         });
     }
     let reference_elevations = axis_coordinates(
@@ -2942,8 +3036,18 @@ fn validate_bundle(
     }
     for (role, table) in tables.entries().into_iter().skip(1) {
         let frequency = axis_coordinates(table, role, AxisKind::Frequency)?;
-        if frequency != reference_frequency {
-            return Err(WrfTMatrixBundleError::SharedFrequencyAxis { role });
+        if frequency.len() != 1 {
+            return Err(WrfTMatrixBundleError::FrequencyAxisNotSingleton {
+                role,
+                actual: frequency.to_vec(),
+            });
+        }
+        if frequency[0].to_bits() != frequency_hz.to_bits() {
+            return Err(WrfTMatrixBundleError::SharedFrequencyAxis {
+                role,
+                expected_hz: frequency_hz,
+                actual: frequency.to_vec(),
+            });
         }
         let elevations = axis_coordinates(table, role, AxisKind::RadarElevation)?;
         if elevations.first() != reference_elevations.first()
@@ -2992,7 +3096,9 @@ fn validate_bundle(
     }
 
     Ok(ValidatedBundle {
+        frequency_hz,
         radar_elevations_deg: reference_elevations,
+        table_id_text_bytes,
         p3_particle_support: PsdParticleSupport::new(
             Some(oblate_domain),
             Some(prolate_domain),
@@ -3095,7 +3201,6 @@ fn exact_axis_coordinates(role: WrfTMatrixTableRole, kind: AxisKind) -> Option<&
         (WrfTMatrixTableRole::RainStandaloneAndResidual, AxisKind::MinorToMajorAxisRatio) => {
             Some(RAIN_MINOR_TO_MAJOR)
         }
-        (_, AxisKind::Frequency) => Some(PROPERTY_FREQUENCY_HZ),
         (WrfTMatrixTableRole::RainStandaloneAndResidual, AxisKind::RadarElevation) => {
             Some(RAIN_RADAR_ELEVATION_DEG)
         }
@@ -3513,12 +3618,12 @@ pub enum WrfTMatrixBundleError {
         oblate: PsdFallSpeedProvenance,
         prolate: PsdFallSpeedProvenance,
     },
-    #[error("{role} table id must be {expected:?}, got {actual:?}")]
-    TableId {
-        role: WrfTMatrixTableRole,
-        expected: &'static str,
-        actual: String,
-    },
+    #[error(
+        "bundle mixes {matching_roles} legacy embedded S-band table IDs with external IDs; all five IDs must come from one source family"
+    )]
+    MixedLegacyTableIds { matching_roles: usize },
+    #[error("the five typed table roles must have distinct table IDs")]
+    DuplicateTableIds,
     #[error("{role} table category must be {expected:?}, got {actual:?}")]
     Category {
         role: WrfTMatrixTableRole,
@@ -3584,13 +3689,27 @@ pub enum WrfTMatrixBundleError {
         expected: u32,
         actual: u32,
     },
-    #[error("dry-oblate frequency axis must be exactly [2.8e9], got {actual:?}")]
-    FrequencyAxis {
+    #[error("{role} frequency axis must contain exactly one coordinate, got {actual:?}")]
+    FrequencyAxisNotSingleton {
         role: WrfTMatrixTableRole,
         actual: Vec<f64>,
     },
-    #[error("{role} frequency axis differs from the exact dry-oblate axis")]
-    SharedFrequencyAxis { role: WrfTMatrixTableRole },
+    #[error(
+        "unsupported exact T-matrix frequency {actual_hz} Hz; allowed research bands are exactly 2.8, 5.6, or 9.4 GHz and interpolation is forbidden"
+    )]
+    UnsupportedExactFrequency { actual_hz: f64 },
+    #[error(
+        "legacy embedded S-band table IDs require exactly {expected_hz} Hz, got {actual_hz} Hz"
+    )]
+    LegacyTableFrequency { expected_hz: f64, actual_hz: f64 },
+    #[error(
+        "{role} frequency axis {actual:?} differs from exact shared bundle frequency {expected_hz} Hz"
+    )]
+    SharedFrequencyAxis {
+        role: WrfTMatrixTableRole,
+        expected_hz: f64,
+        actual: Vec<f64>,
+    },
     #[error("dry-oblate elevation axis must span exactly -0.5 through 20 degrees, got {actual:?}")]
     ElevationRange {
         role: WrfTMatrixTableRole,
@@ -3697,27 +3816,27 @@ mod tests {
                 tables: [
                     WrfTMatrixTableAudit {
                         role: WrfTMatrixTableRole::DryOblate,
-                        table_id: DRY_OBLATE_TABLE_ID,
+                        table_id: DRY_OBLATE_TABLE_ID.to_owned(),
                         file_sha256: Sha256Digest::compute(b"a"),
                     },
                     WrfTMatrixTableAudit {
                         role: WrfTMatrixTableRole::DryProlate,
-                        table_id: DRY_PROLATE_TABLE_ID,
+                        table_id: DRY_PROLATE_TABLE_ID.to_owned(),
                         file_sha256: Sha256Digest::compute(b"b"),
                     },
                     WrfTMatrixTableAudit {
                         role: WrfTMatrixTableRole::WetOblate,
-                        table_id: WET_OBLATE_TABLE_ID,
+                        table_id: WET_OBLATE_TABLE_ID.to_owned(),
                         file_sha256: Sha256Digest::compute(b"c"),
                     },
                     WrfTMatrixTableAudit {
                         role: WrfTMatrixTableRole::WetProlate,
-                        table_id: WET_PROLATE_TABLE_ID,
+                        table_id: WET_PROLATE_TABLE_ID.to_owned(),
                         file_sha256: Sha256Digest::compute(b"d"),
                     },
                     WrfTMatrixTableAudit {
                         role: WrfTMatrixTableRole::RainStandaloneAndResidual,
-                        table_id: RAIN_TABLE_ID,
+                        table_id: RAIN_TABLE_ID.to_owned(),
                         file_sha256: Sha256Digest::compute(b"e"),
                     },
                 ],
@@ -3791,6 +3910,9 @@ mod tests {
                 WrfTMatrixTableRole::RainStandaloneAndResidual => RAIN_AXIS_KINDS,
             };
             for &kind in kinds {
+                if kind == AxisKind::Frequency {
+                    continue;
+                }
                 let expected = exact_axis_coordinates(role, kind).unwrap();
                 validate_exact_axis_coordinates(role, kind, expected).unwrap();
                 let mut drifted = expected.to_vec();
@@ -3833,7 +3955,13 @@ mod tests {
             };
             let actual_counts = kinds
                 .iter()
-                .map(|&kind| exact_axis_coordinates(role, kind).unwrap().len())
+                .map(|&kind| {
+                    if kind == AxisKind::Frequency {
+                        1
+                    } else {
+                        exact_axis_coordinates(role, kind).unwrap().len()
+                    }
+                })
                 .collect::<Vec<_>>();
             assert_eq!(actual_counts, expected_counts, "{role} coordinate counts");
         }
@@ -4015,7 +4143,15 @@ mod tests {
         assert_eq!(estimate.source_identity_bytes, "fixture".len());
         assert_eq!(estimate.required_field_contract_bytes, 0);
         assert_eq!(estimate.source_field_provenance_bytes, 0);
-        assert_eq!(estimate.provenance_text_bytes, 0);
+        assert_eq!(
+            estimate.provenance_text_bytes,
+            scene
+                .provenance
+                .tables
+                .iter()
+                .map(|table| table.table_id.len())
+                .sum::<usize>()
+        );
         assert_eq!(
             estimate.retained_bytes(),
             estimate.structure_bytes
@@ -4037,7 +4173,10 @@ mod tests {
         assert_eq!(signature.microphysics_scheme_id, Some(50));
         assert_eq!(
             signature.reflectivity_source,
-            "property-tmatrix-research-v1"
+            format!(
+                "property-tmatrix-research-v1;tmatrix_frequency_hz=2800000000;tmatrix_frequency_bits={:016x}",
+                PROPERTY_TMATRIX_FREQUENCY_HZ.to_bits()
+            )
         );
         assert!(signature.required_raw_fields.is_empty());
         assert_eq!(scene.source_identity().time_index, 2);
