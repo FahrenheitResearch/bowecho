@@ -600,7 +600,7 @@ mod tests {
         let plan = plan_for_scene(
             &group(&[0]),
             0,
-            Duration::hours(1),
+            Duration::minutes(6),
             AtmosphereTimeMode::FrozenAtVolumeStart,
             MissingNeighborPolicy::Error,
         )
@@ -615,7 +615,7 @@ mod tests {
         let plan = plan_for_scene(
             &group(&[0, 1]),
             0,
-            Duration::minutes(6),
+            Duration::hours(1),
             AtmosphereTimeMode::LinearAdjacent,
             MissingNeighborPolicy::Error,
         )
