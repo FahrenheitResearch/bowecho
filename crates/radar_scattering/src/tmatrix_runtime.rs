@@ -14,8 +14,9 @@ use crate::{
     AdditiveScattering, AxisCoordinate, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
     DiagnosticWetCategory, EffectiveMediumRule, InterpolationError, KernelModel, LutError,
     MeltingModel, MicrophysicsFamily, MixtureTopology, OfflineLut, OrientationModel, OutputError,
-    ParticleState, PsdError, PsdFallSpeedProvenance, PsdParticleDomain, PsdParticleNode,
-    PsdSpheroidHabit, Sha256Digest, TMatrixImplementation, TableValidation, TemporalSampling, Unit,
+    ParticleState, PsdError, PsdFallSpeedAuthority, PsdFallSpeedProvenance, PsdParticleDomain,
+    PsdParticleNode, PsdSpheroidHabit, Sha256Digest, TMatrixImplementation, TableValidation,
+    TemporalSampling, Unit,
 };
 
 const PYTMATRIX_KERNEL: &str = "pytmatrix-0.3.3";
@@ -305,6 +306,7 @@ pub struct TMatrixTableDescriptor {
     odf: TMatrixOdfConvention,
     radar: RadarConventionDescriptor,
     terminal_speed: TerminalSpeedPolicy,
+    terminal_speed_sha256: Sha256Digest,
     execution: TMatrixExecutionDescriptor,
     normalization_number_concentration_m3: f64,
 }
@@ -738,6 +740,58 @@ impl ResearchTMatrixLut {
         .map_err(EvaluationError::ParticleNodeDomain)
     }
 
+    /// Exact identity of the terminal-speed policy bound to this dry particle
+    /// table. The digest covers only the versioned law and all of its numeric
+    /// parameters, so shape-specific tables with the same law produce the
+    /// same provenance token.
+    pub fn dry_particle_node_fall_speed_provenance(
+        &self,
+    ) -> Result<PsdFallSpeedProvenance, EvaluationError> {
+        if self.descriptor.category
+            != TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle
+            || self.descriptor.population_role
+                != TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle
+        {
+            return Err(EvaluationError::DryParticleNodeTableRequired {
+                actual_category: self.descriptor.category,
+                actual_role: self.descriptor.population_role,
+            });
+        }
+        if !matches!(
+            &self.descriptor.terminal_speed,
+            TerminalSpeedPolicy::SchillerNaumannGravityDrag { .. }
+        ) {
+            return Err(EvaluationError::DryParticleNodeTerminalSpeedPolicyRequired);
+        }
+        Ok(PsdFallSpeedProvenance::new(
+            PsdFallSpeedAuthority::TMatrixTableTerminalPolicyV1,
+            self.descriptor.terminal_speed_sha256,
+        ))
+    }
+
+    /// Reproduce the exact Schiller-Naumann terminal-speed solver declared by
+    /// the table generator for one PSD particle node.
+    pub fn dry_particle_node_terminal_speed_m_s(
+        &self,
+        node: &PsdParticleNode,
+    ) -> Result<f64, EvaluationError> {
+        if self.descriptor.category
+            != TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle
+            || self.descriptor.population_role
+                != TMatrixPopulationRole::PropertyAwareDryCharacteristicParticle
+        {
+            return Err(EvaluationError::DryParticleNodeTableRequired {
+                actual_category: self.descriptor.category,
+                actual_role: self.descriptor.population_role,
+            });
+        }
+        schiller_naumann_terminal_speed_m_s(
+            &self.descriptor.terminal_speed,
+            node.equivolume_diameter_m(),
+            node.bulk_density_kg_m3(),
+        )
+    }
+
     /// Interpolate a per-particle table node and scale every additive output
     /// by `number_per_kg * air_density_kg_m3`.
     pub fn evaluate(
@@ -948,6 +1002,24 @@ impl ResearchTMatrixLut {
             return Err(EvaluationError::ParticleNodeSpheroidMismatch {
                 habit: query.habit,
                 actual: request.spheroid,
+            });
+        }
+        let expected_fall_speed = self.dry_particle_node_fall_speed_provenance()?;
+        if query.fall_speed != expected_fall_speed {
+            return Err(EvaluationError::ParticleNodeFallSpeedProvenanceMismatch {
+                expected: expected_fall_speed,
+                actual: query.fall_speed,
+            });
+        }
+        let expected_positive_down_speed = schiller_naumann_terminal_speed_m_s(
+            &self.descriptor.terminal_speed,
+            query.equivolume_diameter_m,
+            query.bulk_density_kg_m3,
+        )?;
+        if query.positive_down_fall_speed_m_s != expected_positive_down_speed {
+            return Err(EvaluationError::ParticleNodeFallSpeedValueMismatch {
+                expected_m_s: expected_positive_down_speed,
+                actual_m_s: query.positive_down_fall_speed_m_s,
             });
         }
         let expected_orientation = self.descriptor.odf.orientation_model();
@@ -1266,6 +1338,134 @@ impl ResearchTMatrixLut {
     }
 }
 
+fn terminal_speed_policy_sha256(policy: &TerminalSpeedPolicy) -> Sha256Digest {
+    let mut canonical = Vec::with_capacity(96);
+    let push_f64 = |buffer: &mut Vec<u8>, value: f64| {
+        buffer.extend_from_slice(&value.to_bits().to_le_bytes());
+    };
+    match policy {
+        TerminalSpeedPolicy::AtlasRain1973Exponential {
+            a_m_s,
+            b_m_s,
+            c_per_mm,
+            valid_diameter_range_m,
+        } => {
+            canonical.extend_from_slice(b"atlas-rain-1973-exponential-v1\0");
+            push_f64(&mut canonical, *a_m_s);
+            push_f64(&mut canonical, *b_m_s);
+            push_f64(&mut canonical, *c_per_mm);
+            push_f64(&mut canonical, valid_diameter_range_m[0]);
+            push_f64(&mut canonical, valid_diameter_range_m[1]);
+        }
+        TerminalSpeedPolicy::SchillerNaumannGravityDrag {
+            gravity_m_s2,
+            air_density_kg_m3,
+            air_dynamic_viscosity_pa_s,
+            drag_transition_reynolds,
+            high_reynolds_drag_coefficient,
+            drag_transition_boundary_policy,
+            maximum_iterations,
+            relative_tolerance,
+        } => {
+            canonical.extend_from_slice(b"schiller-naumann-gravity-drag-v1\0");
+            push_f64(&mut canonical, *gravity_m_s2);
+            push_f64(&mut canonical, *air_density_kg_m3);
+            push_f64(&mut canonical, *air_dynamic_viscosity_pa_s);
+            push_f64(&mut canonical, *drag_transition_reynolds);
+            push_f64(&mut canonical, *high_reynolds_drag_coefficient);
+            canonical.extend_from_slice(match drag_transition_boundary_policy {
+                DragTransitionBoundaryPolicy::SelectExactTransitionReynoldsBoundaryWhenPiecewiseDragResidualJumpStraddlesZero => {
+                    b"exact-transition-on-residual-jump-v1\0"
+                }
+            });
+            canonical.extend_from_slice(&maximum_iterations.to_le_bytes());
+            push_f64(&mut canonical, *relative_tolerance);
+        }
+    }
+    Sha256Digest::compute(&canonical)
+}
+
+fn schiller_naumann_terminal_speed_m_s(
+    policy: &TerminalSpeedPolicy,
+    diameter_m: f64,
+    particle_density_kg_m3: f64,
+) -> Result<f64, EvaluationError> {
+    let TerminalSpeedPolicy::SchillerNaumannGravityDrag {
+        gravity_m_s2,
+        air_density_kg_m3,
+        air_dynamic_viscosity_pa_s,
+        drag_transition_reynolds,
+        high_reynolds_drag_coefficient,
+        drag_transition_boundary_policy:
+            DragTransitionBoundaryPolicy::SelectExactTransitionReynoldsBoundaryWhenPiecewiseDragResidualJumpStraddlesZero,
+        maximum_iterations,
+        relative_tolerance,
+    } = policy.clone()
+    else {
+        return Err(EvaluationError::DryParticleNodeTerminalSpeedPolicyRequired);
+    };
+    let density_difference = particle_density_kg_m3 - air_density_kg_m3;
+    if !density_difference.is_finite() || density_difference <= 0.0 {
+        return Err(EvaluationError::ParticleNodeDensityNotAboveAir {
+            particle_density_kg_m3,
+            air_density_kg_m3,
+        });
+    }
+    let force_scale =
+        (4.0 * gravity_m_s2 * diameter_m * density_difference) / (3.0 * air_density_kg_m3);
+    let transition_speed =
+        drag_transition_reynolds * air_dynamic_viscosity_pa_s / (air_density_kg_m3 * diameter_m);
+    let low_re_transition_drag =
+        (24.0 / drag_transition_reynolds) * (1.0 + 0.15 * drag_transition_reynolds.powf(0.687));
+    let residual_below_transition =
+        transition_speed * transition_speed * low_re_transition_drag - force_scale;
+    let residual_above_transition =
+        transition_speed * transition_speed * high_reynolds_drag_coefficient - force_scale;
+    if residual_below_transition <= 0.0 && residual_above_transition >= 0.0 {
+        return Ok(transition_speed);
+    }
+
+    let residual = |speed: f64| {
+        let reynolds =
+            (air_density_kg_m3 * speed * diameter_m / air_dynamic_viscosity_pa_s).max(1.0e-15);
+        let drag = if reynolds < drag_transition_reynolds {
+            (24.0 / reynolds) * (1.0 + 0.15 * reynolds.powf(0.687))
+        } else {
+            high_reynolds_drag_coefficient
+        };
+        speed * speed * drag - force_scale
+    };
+    let mut lower = 0.0;
+    let mut upper = 1.0;
+    let mut bracket_iterations = 0_u32;
+    while residual(upper) < 0.0 && bracket_iterations < maximum_iterations {
+        upper *= 2.0;
+        bracket_iterations += 1;
+    }
+    if residual(upper) < 0.0 {
+        return Err(EvaluationError::ParticleNodeTerminalSpeedNotBracketed {
+            diameter_m,
+            density_kg_m3: particle_density_kg_m3,
+        });
+    }
+    for _ in bracket_iterations..maximum_iterations {
+        let midpoint = 0.5 * (lower + upper);
+        if upper - lower <= relative_tolerance * midpoint.max(1.0) {
+            return Ok(midpoint);
+        }
+        if residual(midpoint) < 0.0 {
+            lower = midpoint;
+        } else {
+            upper = midpoint;
+        }
+    }
+    Err(EvaluationError::ParticleNodeTerminalSpeedDidNotConverge {
+        diameter_m,
+        density_kg_m3: particle_density_kg_m3,
+        maximum_iterations,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum TMatrixLoadError {
     #[error("whole LUT SHA-256 mismatch: expected {expected}, got {actual}")]
@@ -1331,6 +1531,38 @@ pub enum EvaluationError {
     },
     #[error("dry per-particle PSD evaluation requires a dry ice material table")]
     DryParticleNodeMaterialRequired,
+    #[error("dry per-particle PSD evaluation requires the table's Schiller-Naumann speed policy")]
+    DryParticleNodeTerminalSpeedPolicyRequired,
+    #[error(
+        "PSD particle-node terminal-speed provenance mismatch: expected {expected:?}, got {actual:?}"
+    )]
+    ParticleNodeFallSpeedProvenanceMismatch {
+        expected: PsdFallSpeedProvenance,
+        actual: PsdFallSpeedProvenance,
+    },
+    #[error(
+        "PSD particle-node terminal speed mismatch: exact table policy gives {expected_m_s} m s^-1, query supplied {actual_m_s} m s^-1"
+    )]
+    ParticleNodeFallSpeedValueMismatch { expected_m_s: f64, actual_m_s: f64 },
+    #[error(
+        "PSD particle density {particle_density_kg_m3} kg m^-3 must exceed terminal-policy air density {air_density_kg_m3} kg m^-3"
+    )]
+    ParticleNodeDensityNotAboveAir {
+        particle_density_kg_m3: f64,
+        air_density_kg_m3: f64,
+    },
+    #[error(
+        "could not bracket PSD particle terminal speed at D={diameter_m} m, density={density_kg_m3} kg m^-3"
+    )]
+    ParticleNodeTerminalSpeedNotBracketed { diameter_m: f64, density_kg_m3: f64 },
+    #[error(
+        "PSD particle terminal speed did not converge in {maximum_iterations} iterations at D={diameter_m} m, density={density_kg_m3} kg m^-3"
+    )]
+    ParticleNodeTerminalSpeedDidNotConverge {
+        diameter_m: f64,
+        density_kg_m3: f64,
+        maximum_iterations: u32,
+    },
     #[error("particle category has no number concentration; PSD integration is unsupported")]
     MissingNumberConcentration,
     #[error("wet-coexistence/mixed-material evaluation is not implemented")]
@@ -1696,6 +1928,7 @@ fn bind_descriptor(
     let radar = bind_radar(config.radar, lut, population_role)?;
     let terminal_speed = bind_terminal_speed(config.terminal_velocity, lut)?;
     verify_category_terminal(category, &terminal_speed)?;
+    let terminal_speed_sha256 = terminal_speed_policy_sha256(&terminal_speed);
     exact_text(
         "temporal.sampling",
         &config.temporal.sampling,
@@ -1727,6 +1960,7 @@ fn bind_descriptor(
         odf,
         radar,
         terminal_speed,
+        terminal_speed_sha256,
         execution,
         normalization_number_concentration_m3: 1.0,
     })
@@ -3395,6 +3629,7 @@ mod tests {
             odf: gaussian20_odf(),
             radar: test_radar_descriptor(),
             terminal_speed: test_drag_policy(),
+            terminal_speed_sha256: terminal_speed_policy_sha256(&test_drag_policy()),
             execution: TMatrixExecutionDescriptor::FreshProcessPerGridPoint,
             normalization_number_concentration_m3: 1.0,
         };
@@ -3500,6 +3735,9 @@ mod tests {
         assert_eq!(domain.equivolume_diameter_range_m(), [1.0e-6, 0.01]);
         assert_eq!(domain.bulk_density_range_kg_m3(), [50.0, 917.0]);
         assert_eq!(domain.minor_to_major_axis_ratio_range(), [0.1, 1.0]);
+        let exact_speed =
+            schiller_naumann_terminal_speed_m_s(table.descriptor().terminal_speed(), 1.0e-3, 400.0)
+                .unwrap();
         let query = TMatrixParticleNodeQuery::new(
             260.0,
             1.0e-3,
@@ -3508,17 +3746,17 @@ mod tests {
             PsdSpheroidHabit::Oblate,
             None,
             None,
-            3.0,
-            synthetic_speed_provenance(),
+            exact_speed,
+            table.dry_particle_node_fall_speed_provenance().unwrap(),
             gaussian20_odf().orientation_model(),
             request(FREQUENCY_HZ, 1.0),
         )
         .unwrap();
         let output = table.evaluate_dry_particle_node_per_m3(&query).unwrap();
-        assert_eq!(
-            output.components(),
-            [2.0, 1.0, 0.5, 0.0, 0.1, 0.01, 0.01, 6.0, 18.0]
-        );
+        let components = output.components();
+        assert_eq!(&components[..7], &[2.0, 1.0, 0.5, 0.0, 0.1, 0.01, 0.01]);
+        assert_eq!(components[7], 2.0 * exact_speed);
+        assert_eq!(components[8], 2.0 * exact_speed * exact_speed);
     }
 
     #[test]
@@ -3535,14 +3773,14 @@ mod tests {
             1.2,
         ))
         .unwrap();
-        let speed_provenance = synthetic_speed_provenance();
+        let speed_provenance = table.dry_particle_node_fall_speed_provenance().unwrap();
         let result = integrate_ishmael_psd(
             &distribution,
             PsdIntegrationConfig::default(),
             support,
             speed_provenance,
             |node| {
-                let positive_down_speed = 0.25 + 1_000.0 * node.equivolume_diameter_m();
+                let positive_down_speed = table.dry_particle_node_terminal_speed_m_s(node)?;
                 let query = TMatrixParticleNodeQuery::from_psd_node(
                     node,
                     260.0,
@@ -3561,12 +3799,19 @@ mod tests {
         assert!(result.additive().zh().get() > 0.0);
         assert!(result.accumulator().fall_speed_variance_m2s2 > 0.0);
         assert_eq!(result.audit().fall_speed, speed_provenance);
+        assert_eq!(
+            speed_provenance.authority(),
+            PsdFallSpeedAuthority::TMatrixTableTerminalPolicyV1
+        );
         assert!(result.audit().domain_omitted_number_fraction <= 1.0e-6);
     }
 
     #[test]
     fn particle_node_query_rejects_habit_frequency_and_wrong_table_role() {
         let table = dry_property_runtime(SpheroidConvention::OblateMinorVertical);
+        let exact_speed =
+            schiller_naumann_terminal_speed_m_s(table.descriptor().terminal_speed(), 1.0e-3, 400.0)
+                .unwrap();
         assert!(matches!(
             TMatrixParticleNodeQuery::new(
                 260.0,
@@ -3602,7 +3847,7 @@ mod tests {
             Err(EvaluationError::ParticleNodeSpheroidMismatch { .. })
         ));
 
-        let wrong_frequency = TMatrixParticleNodeQuery::new(
+        let wrong_provenance = TMatrixParticleNodeQuery::new(
             260.0,
             1.0e-3,
             400.0,
@@ -3612,6 +3857,44 @@ mod tests {
             None,
             3.0,
             synthetic_speed_provenance(),
+            gaussian20_odf().orientation_model(),
+            request(FREQUENCY_HZ, 1.0),
+        )
+        .unwrap();
+        assert!(matches!(
+            table.evaluate_dry_particle_node_per_m3(&wrong_provenance),
+            Err(EvaluationError::ParticleNodeFallSpeedProvenanceMismatch { .. })
+        ));
+
+        let wrong_speed = TMatrixParticleNodeQuery::new(
+            260.0,
+            1.0e-3,
+            400.0,
+            0.8,
+            PsdSpheroidHabit::Oblate,
+            None,
+            None,
+            exact_speed + 1.0e-9,
+            table.dry_particle_node_fall_speed_provenance().unwrap(),
+            gaussian20_odf().orientation_model(),
+            request(FREQUENCY_HZ, 1.0),
+        )
+        .unwrap();
+        assert!(matches!(
+            table.evaluate_dry_particle_node_per_m3(&wrong_speed),
+            Err(EvaluationError::ParticleNodeFallSpeedValueMismatch { .. })
+        ));
+
+        let wrong_frequency = TMatrixParticleNodeQuery::new(
+            260.0,
+            1.0e-3,
+            400.0,
+            0.8,
+            PsdSpheroidHabit::Oblate,
+            None,
+            None,
+            exact_speed,
+            table.dry_particle_node_fall_speed_provenance().unwrap(),
             gaussian20_odf().orientation_model(),
             request(FREQUENCY_HZ + 1.0, 1.0),
         )
@@ -3765,6 +4048,7 @@ mod tests {
             odf: gaussian20_odf(),
             radar: test_radar_descriptor(),
             terminal_speed: test_drag_policy(),
+            terminal_speed_sha256: terminal_speed_policy_sha256(&test_drag_policy()),
             execution: TMatrixExecutionDescriptor::FreshProcessPerGridPoint,
             normalization_number_concentration_m3: 1.0,
         };
@@ -3866,6 +4150,12 @@ mod tests {
             TableValidation::ResearchOnlyUnvalidated,
         )
         .unwrap();
+        let rain_terminal_speed = TerminalSpeedPolicy::AtlasRain1973Exponential {
+            a_m_s: 9.65,
+            b_m_s: 10.3,
+            c_per_mm: 0.6,
+            valid_diameter_range_m: [1.0e-4, 0.01],
+        };
         let descriptor = TMatrixTableDescriptor {
             table_id: "software-test-residual-rain".to_owned(),
             category: TMatrixParticleCategory::Conventional(ConventionalHydrometeor::Rain),
@@ -3879,12 +4169,8 @@ mod tests {
             },
             odf: gaussian20_odf(),
             radar: test_radar_descriptor(),
-            terminal_speed: TerminalSpeedPolicy::AtlasRain1973Exponential {
-                a_m_s: 9.65,
-                b_m_s: 10.3,
-                c_per_mm: 0.6,
-                valid_diameter_range_m: [1.0e-4, 0.01],
-            },
+            terminal_speed_sha256: terminal_speed_policy_sha256(&rain_terminal_speed),
+            terminal_speed: rain_terminal_speed,
             execution: TMatrixExecutionDescriptor::FreshProcessPerGridPoint,
             normalization_number_concentration_m3: 1.0,
         };

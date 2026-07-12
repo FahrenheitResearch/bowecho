@@ -11,19 +11,23 @@ use std::mem::size_of;
 use radar_scattering::{
     AdditiveScattering, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
     DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K, DiagnosticWetCategory,
-    EvaluationError, FallMomentPolicy, IshmaelIceCategory, MixtureTopology, OrientationDefinition,
-    OutputError, ParticleState, PolarAccumulatorQuantities, RadarViewApplicability,
-    RadarViewGeometry, ResearchTMatrixLut, Sha256Digest, SpheroidConvention,
-    TMatrixEvaluationRequest, TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory,
-    TMatrixPopulationRole,
+    EvaluationError, FallMomentPolicy, ISHMAEL_PSD_REVISION, IshmaelPsd, IshmaelPsdInput,
+    MixtureTopology, OrientationDefinition, OrientationModel, OutputError, ParticleState,
+    PolarAccumulatorQuantities, PsdError, PsdFallSpeedProvenance, PsdIntegrationConfig,
+    PsdIntegrationError, PsdParticleNode, PsdParticleSupport, PsdSpheroidHabit,
+    RadarViewApplicability, RadarViewGeometry, ResearchTMatrixLut, SCHEME_PSD_REVISION,
+    Sha256Digest, SpheroidConvention, TMatrixEvaluationRequest, TMatrixMaterial,
+    TMatrixOdfConvention, TMatrixParticleCategory, TMatrixParticleNodeQuery, TMatrixPopulationRole,
+    integrate_ishmael_psd,
 };
 use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::wrf_property_reader::{
     ClosedCellCategory, ClosedPropertyCell, ClosedRainState, CoexistenceUnavailable,
-    PropertySceneIdentity, RainUnavailableReason, RequiredFieldContract, RequiredFieldSignature,
-    SourceFieldProvenance, WrfPropertyCategory, WrfPropertyReadError, WrfPropertyScene,
+    PropertySceneIdentity, RainUnavailableReason, RawPropertyCategory, RawPropertyClosureError,
+    RequiredFieldContract, RequiredFieldSignature, SourceFieldProvenance, WrfPropertyCategory,
+    WrfPropertyReadError, WrfPropertyScene, close_raw_rain_state,
 };
 use crate::wrf_temporal::ScenePropertySignature;
 
@@ -35,6 +39,14 @@ pub const MAX_WEIGHTED_PROPERTY_CELLS: usize = 8;
 const WEIGHT_SUM_TOLERANCE: f64 = 1.0e-9;
 const MAX_PROPERTY_CATEGORIES_PER_CELL: usize = 3;
 const PER_WORKER_ALLOCATION_GUARD_BYTES: usize = 16 * 1024;
+
+// Production-v1 ISHMAEL PSD integration. The research dry tables start at
+// 50 micrometres, so omitted number may be large even while mass and D6 are
+// well represented. Those independently audited thresholds are explicit and
+// fail closed; no particle coordinate is clipped onto a table edge.
+const ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION: f64 = 0.999;
+const ISHMAEL_PSD_MAXIMUM_OMITTED_MASS_FRACTION: f64 = 0.05;
+const ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION: f64 = 0.001;
 
 // Exact coordinate contract for the versioned five-table research bundle.
 // Each frozen role keeps its own solver-complete diameter domain; no renderer
@@ -615,6 +627,11 @@ pub enum WrfTMatrixRainMode {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WrfTMatrixAuditCounts {
     pub source_cells: u64,
+    /// P3 populations evaluated through the legacy versioned
+    /// characteristic-particle closure.
+    pub characteristic_frozen_populations: u64,
+    /// ISHMAEL category distributions integrated from native Q/N/QVOLI/QAOLI.
+    pub scheme_native_psd_populations: u64,
     pub dry_frozen_populations: u64,
     pub wet_frozen_populations: u64,
     pub residual_rain_populations: u64,
@@ -625,6 +642,12 @@ impl WrfTMatrixAuditCounts {
     fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             source_cells: self.source_cells.checked_add(other.source_cells)?,
+            characteristic_frozen_populations: self
+                .characteristic_frozen_populations
+                .checked_add(other.characteristic_frozen_populations)?,
+            scheme_native_psd_populations: self
+                .scheme_native_psd_populations
+                .checked_add(other.scheme_native_psd_populations)?,
             dry_frozen_populations: self
                 .dry_frozen_populations
                 .checked_add(other.dry_frozen_populations)?,
@@ -653,10 +676,29 @@ pub struct WrfTMatrixSceneProvenance {
     pub status: &'static str,
     pub frequency_hz: f64,
     pub orientation: OrientationDefinition,
+    pub frozen_scattering: WrfTMatrixFrozenScatteringAudit,
     pub fall_moment_policy: WrfTMatrixFallMomentAudit,
     pub rain_mode: WrfTMatrixRainMode,
     pub tables: [WrfTMatrixTableAudit; 5],
     pub counts: WrfTMatrixAuditCounts,
+}
+
+/// Frozen-particle representation used by this source scene.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WrfTMatrixFrozenScatteringAudit {
+    /// Exact P3 native PSD reconstruction is not implemented in this
+    /// revision; P3 remains explicit characteristic-particle science.
+    P3CharacteristicParticleV1,
+    /// Native ISHMAEL gamma PSD integrated through dry particle-node tables.
+    /// Wet PSD allocation is deliberately unavailable rather than replaced by
+    /// the old characteristic-particle coexistence approximation.
+    IshmaelSchemeNativePsdDryFrozenV1 {
+        scheme_psd_revision: &'static str,
+        ishmael_reconstruction_revision: &'static str,
+        integration: PsdIntegrationConfig,
+        support: PsdParticleSupport,
+        fall_speed: PsdFallSpeedProvenance,
+    },
 }
 
 /// Runtime Doppler fall-moment policies retained with the scene audit.
@@ -791,7 +833,7 @@ impl WrfTMatrixScene {
                                 source,
                                 cell_index as usize,
                                 tables,
-                                elevations,
+                                validated,
                                 rain_mode,
                                 output,
                             )?;
@@ -820,7 +862,7 @@ impl WrfTMatrixScene {
                             source,
                             cell_index as usize,
                             tables,
-                            elevations,
+                            validated,
                             rain_mode,
                             output,
                         )
@@ -863,6 +905,17 @@ impl WrfTMatrixScene {
                 status: "research_only_unvalidated",
                 frequency_hz: PROPERTY_TMATRIX_FREQUENCY_HZ,
                 orientation: OrientationDefinition::Gaussian20Research,
+                frozen_scattering: if source.microphysics_scheme_id() == 55 {
+                    WrfTMatrixFrozenScatteringAudit::IshmaelSchemeNativePsdDryFrozenV1 {
+                        scheme_psd_revision: SCHEME_PSD_REVISION,
+                        ishmael_reconstruction_revision: ISHMAEL_PSD_REVISION,
+                        integration: validated.ishmael_psd_config,
+                        support: validated.ishmael_particle_support,
+                        fall_speed: validated.ishmael_fall_speed,
+                    }
+                } else {
+                    WrfTMatrixFrozenScatteringAudit::P3CharacteristicParticleV1
+                },
                 fall_moment_policy: WrfTMatrixFallMomentAudit {
                     closed_category:
                         FallMomentPolicy::ClosedCategoryPositiveDownZeroWithinCategoryVariance,
@@ -1118,8 +1171,28 @@ impl WrfTMatrixScene {
     }
 }
 
+#[derive(Clone, Copy)]
 struct ValidatedBundle<'a> {
     radar_elevations_deg: &'a [f64],
+    ishmael_psd_config: PsdIntegrationConfig,
+    ishmael_particle_support: PsdParticleSupport,
+    ishmael_fall_speed: PsdFallSpeedProvenance,
+}
+
+fn production_ishmael_psd_config() -> PsdIntegrationConfig {
+    PsdIntegrationConfig::new(
+        8,
+        256,
+        96.0,
+        1.0e-10,
+        5.0e-8,
+        5.0e-3,
+        radar_scattering::DEFAULT_ADDITIVE_ABSOLUTE_TOLERANCES,
+        ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION,
+        ISHMAEL_PSD_MAXIMUM_OMITTED_MASS_FRACTION,
+        ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION,
+    )
+    .expect("the versioned production ISHMAEL PSD config is valid")
 }
 
 #[derive(Debug)]
@@ -1129,6 +1202,28 @@ struct CellBuildSummary {
 }
 
 fn build_cell_into(
+    source: &WrfPropertyScene,
+    cell_index: usize,
+    tables: WrfTMatrixLutBundle<'_>,
+    validated: ValidatedBundle<'_>,
+    rain_mode: WrfTMatrixRainMode,
+    output: &mut [f32],
+) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
+    if source.microphysics_scheme_id() == 55 {
+        build_ishmael_psd_cell_into(source, cell_index, tables, validated, rain_mode, output)
+    } else {
+        build_characteristic_cell_into(
+            source,
+            cell_index,
+            tables,
+            validated.radar_elevations_deg,
+            rain_mode,
+            output,
+        )
+    }
+}
+
+fn build_characteristic_cell_into(
     source: &WrfPropertyScene,
     cell_index: usize,
     tables: WrfTMatrixLutBundle<'_>,
@@ -1199,6 +1294,9 @@ fn build_cell_into(
     let counts = if let Some(partition) = &coexistence {
         WrfTMatrixAuditCounts {
             source_cells: 1,
+            characteristic_frozen_populations: usize_to_u64(
+                partition.diagnosis().wet_categories().len(),
+            )?,
             wet_frozen_populations: usize_to_u64(partition.diagnosis().wet_categories().len())?,
             residual_rain_populations: u64::from(
                 partition.diagnosis().unused_rain_mass_kgkg() > 0.0,
@@ -1208,6 +1306,7 @@ fn build_cell_into(
     } else {
         WrfTMatrixAuditCounts {
             source_cells: 1,
+            characteristic_frozen_populations: usize_to_u64(closed.categories().len())?,
             dry_frozen_populations: usize_to_u64(closed.categories().len())?,
             standalone_rain_populations: u64::from(
                 rain_mode == WrfTMatrixRainMode::FullProperty && rain.is_some(),
@@ -1278,7 +1377,7 @@ fn build_cell_into(
             }
         } else {
             for category in closed.categories() {
-                let spheroid = spheroid_for_category(category.category());
+                let spheroid = spheroid_for_characteristic_category(category.category())?;
                 let request = evaluation_request(elevation_deg, spheroid)?;
                 let contribution = tables
                     .dry(spheroid)
@@ -1337,6 +1436,185 @@ fn build_cell_into(
         retained: true,
         counts,
     })
+}
+
+fn build_ishmael_psd_cell_into(
+    source: &WrfPropertyScene,
+    cell_index: usize,
+    tables: WrfTMatrixLutBundle<'_>,
+    validated: ValidatedBundle<'_>,
+    rain_mode: WrfTMatrixRainMode,
+    output: &mut [f32],
+) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
+    let elevations = validated.radar_elevations_deg;
+    let expected_components = elevations
+        .len()
+        .checked_mul(AdditiveScattering::COMPONENT_COUNT)
+        .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+    if output.len() != expected_components {
+        return Err(WrfTMatrixSceneBuildError::InternalRowLength {
+            cell_index,
+            expected: expected_components,
+            actual: output.len(),
+        });
+    }
+
+    let raw = source
+        .raw_cell(cell_index)
+        .map_err(|source| WrfTMatrixSceneBuildError::RawSourceCell { cell_index, source })?;
+    let mut frozen = Vec::with_capacity(raw.categories().len());
+    for category in raw.categories() {
+        if category.mixing_ratio_kgkg() == 0.0 {
+            continue;
+        }
+        let RawPropertyCategory::Ishmael(value) = category else {
+            return Err(WrfTMatrixSceneBuildError::IshmaelCategoryLayout {
+                cell_index,
+                category: category.category(),
+            });
+        };
+        let ishmael_category = value.category.ishmael_category().ok_or(
+            WrfTMatrixSceneBuildError::IshmaelCategoryLayout {
+                cell_index,
+                category: value.category,
+            },
+        )?;
+        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
+            ishmael_category,
+            value.qice_kgkg,
+            value.qnice_per_kg,
+            value.qvoli_m3_per_kg,
+            value.qaoli_m3_per_kg,
+            raw.dry_air_density_kg_m3(),
+        ))
+        .map_err(
+            |source| WrfTMatrixSceneBuildError::IshmaelPsdReconstruction {
+                cell_index,
+                category: value.category,
+                source,
+            },
+        )?;
+        frozen.push((value.category, distribution));
+    }
+
+    if rain_mode == WrfTMatrixRainMode::FrozenOnly && frozen.is_empty() {
+        return Ok(CellBuildSummary {
+            retained: false,
+            counts: WrfTMatrixAuditCounts::default(),
+        });
+    }
+    let rain = if rain_mode == WrfTMatrixRainMode::FullProperty {
+        match close_raw_rain_state(&raw, OrientationDefinition::Gaussian20Research)
+            .map_err(|source| WrfTMatrixSceneBuildError::RawRainClosure { cell_index, source })?
+        {
+            ClosedRainState::Clear => None,
+            ClosedRainState::Closed(rain) => Some(rain),
+            ClosedRainState::Unavailable(reason) => {
+                return Err(WrfTMatrixSceneBuildError::RainUnavailable { cell_index, reason });
+            }
+        }
+    } else {
+        None
+    };
+    if frozen.is_empty() && rain.is_none() {
+        return Err(WrfTMatrixSceneBuildError::UnexpectedClearActiveCell { cell_index });
+    }
+
+    let counts = WrfTMatrixAuditCounts {
+        source_cells: 1,
+        scheme_native_psd_populations: usize_to_u64(frozen.len())?,
+        dry_frozen_populations: usize_to_u64(frozen.len())?,
+        standalone_rain_populations: u64::from(rain.is_some()),
+        ..WrfTMatrixAuditCounts::default()
+    };
+    for (elevation_index, &elevation_deg) in elevations.iter().enumerate() {
+        let oblate_request =
+            evaluation_request(elevation_deg, SpheroidConvention::OblateMinorVertical)?;
+        let prolate_request =
+            evaluation_request(elevation_deg, SpheroidConvention::ProlateMajorVertical)?;
+        let mut additive = AdditiveScattering::default();
+        for &(category, distribution) in &frozen {
+            let integration = integrate_ishmael_psd(
+                &distribution,
+                validated.ishmael_psd_config,
+                validated.ishmael_particle_support,
+                validated.ishmael_fall_speed,
+                |node: &PsdParticleNode| {
+                    let (table, request) = match node.habit() {
+                        PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
+                            (tables.dry_oblate, oblate_request)
+                        }
+                        PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
+                    };
+                    let positive_down_speed = table.dry_particle_node_terminal_speed_m_s(node)?;
+                    let query = TMatrixParticleNodeQuery::from_psd_node(
+                        node,
+                        raw.environment().temperature_k(),
+                        positive_down_speed,
+                        validated.ishmael_fall_speed,
+                        gaussian20_orientation(),
+                        request,
+                    )?;
+                    table.evaluate_dry_particle_node_per_m3(&query)
+                },
+            )
+            .map_err(|source| WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
+                cell_index,
+                elevation_deg,
+                category,
+                source,
+            })?;
+            additive = additive
+                .checked_add(integration.additive())
+                .map_err(|source| WrfTMatrixSceneBuildError::Accumulation {
+                    cell_index,
+                    elevation_deg,
+                    contribution: WrfTMatrixContribution::IshmaelSchemeNativePsd,
+                    source,
+                })?;
+        }
+        if let Some(rain) = rain.as_deref() {
+            let contribution = tables
+                .rain_standalone_and_residual
+                .evaluate(rain, oblate_request)
+                .map_err(|source| WrfTMatrixSceneBuildError::Evaluation {
+                    cell_index,
+                    elevation_deg,
+                    contribution: WrfTMatrixContribution::StandaloneRain,
+                    source,
+                })?;
+            additive = additive.checked_add(contribution).map_err(|source| {
+                WrfTMatrixSceneBuildError::Accumulation {
+                    cell_index,
+                    elevation_deg,
+                    contribution: WrfTMatrixContribution::StandaloneRain,
+                    source,
+                }
+            })?;
+        }
+        let compact =
+            compact_components(additive).map_err(|source| WrfTMatrixSceneBuildError::Compact {
+                cell_index,
+                elevation_deg,
+                source,
+            })?;
+        let start = elevation_index
+            .checked_mul(AdditiveScattering::COMPONENT_COUNT)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+        output[start..start + AdditiveScattering::COMPONENT_COUNT].copy_from_slice(&compact);
+    }
+    Ok(CellBuildSummary {
+        retained: true,
+        counts,
+    })
+}
+
+fn gaussian20_orientation() -> OrientationModel {
+    OrientationModel::GaussianCanting {
+        mean_deg: 0.0,
+        standard_deviation_deg: 20.0,
+        quadrature_points: 50,
+    }
 }
 
 fn compact_frozen_only_rows(
@@ -1555,12 +1833,16 @@ fn evaluation_request(
         .map_err(WrfTMatrixSceneBuildError::EvaluationRequest)
 }
 
-fn spheroid_for_category(category: WrfPropertyCategory) -> SpheroidConvention {
+fn spheroid_for_characteristic_category(
+    category: WrfPropertyCategory,
+) -> Result<SpheroidConvention, WrfTMatrixSceneBuildError> {
     match category {
-        WrfPropertyCategory::IshmaelColumnar => SpheroidConvention::ProlateMajorVertical,
-        WrfPropertyCategory::P3(_)
-        | WrfPropertyCategory::IshmaelPlanar
-        | WrfPropertyCategory::IshmaelAggregate => SpheroidConvention::OblateMinorVertical,
+        WrfPropertyCategory::P3(_) => Ok(SpheroidConvention::OblateMinorVertical),
+        WrfPropertyCategory::IshmaelPlanar
+        | WrfPropertyCategory::IshmaelColumnar
+        | WrfPropertyCategory::IshmaelAggregate => {
+            Err(WrfTMatrixSceneBuildError::IshmaelCharacteristicForbidden)
+        }
     }
 }
 
@@ -1569,10 +1851,7 @@ fn spheroid_for_particle(
 ) -> Result<SpheroidConvention, WrfTMatrixSceneBuildError> {
     match particle.record().state() {
         ParticleState::P3(_) => Ok(SpheroidConvention::OblateMinorVertical),
-        ParticleState::Ishmael(state) if state.category() == IshmaelIceCategory::Columnar => {
-            Ok(SpheroidConvention::ProlateMajorVertical)
-        }
-        ParticleState::Ishmael(_) => Ok(SpheroidConvention::OblateMinorVertical),
+        ParticleState::Ishmael(_) => Err(WrfTMatrixSceneBuildError::IshmaelCharacteristicForbidden),
         ParticleState::Conventional(_) => Err(WrfTMatrixSceneBuildError::WetSourceNotFrozen),
     }
 }
@@ -1792,8 +2071,50 @@ fn validate_bundle(
         }
     }
 
+    let oblate_domain = tables
+        .dry_oblate
+        .dry_particle_node_domain()
+        .map_err(|source| WrfTMatrixBundleError::ParticleNodeBinding {
+            role: WrfTMatrixTableRole::DryOblate,
+            source,
+        })?;
+    let prolate_domain = tables
+        .dry_prolate
+        .dry_particle_node_domain()
+        .map_err(|source| WrfTMatrixBundleError::ParticleNodeBinding {
+            role: WrfTMatrixTableRole::DryProlate,
+            source,
+        })?;
+    let oblate_fall_speed = tables
+        .dry_oblate
+        .dry_particle_node_fall_speed_provenance()
+        .map_err(|source| WrfTMatrixBundleError::ParticleNodeBinding {
+            role: WrfTMatrixTableRole::DryOblate,
+            source,
+        })?;
+    let prolate_fall_speed = tables
+        .dry_prolate
+        .dry_particle_node_fall_speed_provenance()
+        .map_err(|source| WrfTMatrixBundleError::ParticleNodeBinding {
+            role: WrfTMatrixTableRole::DryProlate,
+            source,
+        })?;
+    if oblate_fall_speed != prolate_fall_speed {
+        return Err(WrfTMatrixBundleError::DryFallSpeedMismatch {
+            oblate: oblate_fall_speed,
+            prolate: prolate_fall_speed,
+        });
+    }
+
     Ok(ValidatedBundle {
         radar_elevations_deg: reference_elevations,
+        ishmael_psd_config: production_ishmael_psd_config(),
+        ishmael_particle_support: PsdParticleSupport::new(
+            Some(oblate_domain),
+            Some(prolate_domain),
+            Some(oblate_domain),
+        ),
+        ishmael_fall_speed: oblate_fall_speed,
     })
 }
 
@@ -2009,6 +2330,7 @@ fn elevation_bracket(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WrfTMatrixContribution {
     DryFrozen,
+    IshmaelSchemeNativePsd,
     WetFrozen,
     ResidualRain,
     StandaloneRain,
@@ -2018,6 +2340,7 @@ impl std::fmt::Display for WrfTMatrixContribution {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::DryFrozen => "dry frozen",
+            Self::IshmaelSchemeNativePsd => "ISHMAEL scheme-native PSD",
             Self::WetFrozen => "wet frozen",
             Self::ResidualRain => "residual rain",
             Self::StandaloneRain => "standalone rain",
@@ -2046,6 +2369,40 @@ pub enum WrfTMatrixSceneBuildError {
         cell_index: usize,
         #[source]
         source: WrfPropertyReadError,
+    },
+    #[error("read raw ISHMAEL source cell {cell_index}: {source}")]
+    RawSourceCell {
+        cell_index: usize,
+        #[source]
+        source: WrfPropertyReadError,
+    },
+    #[error("ISHMAEL source cell {cell_index} contains non-ISHMAEL category {category}")]
+    IshmaelCategoryLayout {
+        cell_index: usize,
+        category: WrfPropertyCategory,
+    },
+    #[error("reconstruct native ISHMAEL PSD for {category} at cell {cell_index}: {source}")]
+    IshmaelPsdReconstruction {
+        cell_index: usize,
+        category: WrfPropertyCategory,
+        #[source]
+        source: PsdError,
+    },
+    #[error(
+        "integrate native ISHMAEL PSD for {category} at cell {cell_index}, elevation {elevation_deg} degrees: {source}"
+    )]
+    IshmaelPsdIntegration {
+        cell_index: usize,
+        elevation_deg: f64,
+        category: WrfPropertyCategory,
+        #[source]
+        source: PsdIntegrationError<EvaluationError>,
+    },
+    #[error("close rain-only state at ISHMAEL cell {cell_index}: {source}")]
+    RawRainClosure {
+        cell_index: usize,
+        #[source]
+        source: RawPropertyClosureError,
     },
     #[error("property source marks cell {cell_index} active but closes it as clear")]
     UnexpectedClearActiveCell { cell_index: usize },
@@ -2099,6 +2456,8 @@ pub enum WrfTMatrixSceneBuildError {
     },
     #[error("diagnosed wet category unexpectedly has a conventional source")]
     WetSourceNotFrozen,
+    #[error("ISHMAEL characteristic-particle evaluation is forbidden; native PSD is required")]
+    IshmaelCharacteristicForbidden,
     #[error("scene storage size overflow")]
     SizeOverflow,
     #[error("scene audit-count overflow")]
@@ -2117,6 +2476,19 @@ pub enum WrfTMatrixSceneBuildError {
 
 #[derive(Debug, Error)]
 pub enum WrfTMatrixBundleError {
+    #[error("bind {role} for scheme-native particle nodes: {source}")]
+    ParticleNodeBinding {
+        role: WrfTMatrixTableRole,
+        #[source]
+        source: EvaluationError,
+    },
+    #[error(
+        "dry oblate/prolate particle tables use different terminal-speed laws: oblate={oblate:?}, prolate={prolate:?}"
+    )]
+    DryFallSpeedMismatch {
+        oblate: PsdFallSpeedProvenance,
+        prolate: PsdFallSpeedProvenance,
+    },
     #[error("{role} table id must be {expected:?}, got {actual:?}")]
     TableId {
         role: WrfTMatrixTableRole,
@@ -2289,6 +2661,8 @@ mod tests {
                 status: "research_only_unvalidated",
                 frequency_hz: PROPERTY_TMATRIX_FREQUENCY_HZ,
                 orientation: OrientationDefinition::Gaussian20Research,
+                frozen_scattering:
+                    WrfTMatrixFrozenScatteringAudit::P3CharacteristicParticleV1,
                 fall_moment_policy: WrfTMatrixFallMomentAudit {
                     closed_category:
                         FallMomentPolicy::ClosedCategoryPositiveDownZeroWithinCategoryVariance,
@@ -2333,21 +2707,49 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_is_prolate_only_for_ishmael_columnar() {
+    fn characteristic_dispatch_is_p3_only() {
         assert_eq!(
-            spheroid_for_category(WrfPropertyCategory::IshmaelColumnar),
-            SpheroidConvention::ProlateMajorVertical
+            spheroid_for_characteristic_category(WrfPropertyCategory::P3(
+                radar_scattering::P3Category::Category1
+            ))
+            .unwrap(),
+            SpheroidConvention::OblateMinorVertical
         );
         for category in [
-            WrfPropertyCategory::P3(radar_scattering::P3Category::Category1),
             WrfPropertyCategory::IshmaelPlanar,
+            WrfPropertyCategory::IshmaelColumnar,
             WrfPropertyCategory::IshmaelAggregate,
         ] {
-            assert_eq!(
-                spheroid_for_category(category),
-                SpheroidConvention::OblateMinorVertical
-            );
+            assert!(matches!(
+                spheroid_for_characteristic_category(category),
+                Err(WrfTMatrixSceneBuildError::IshmaelCharacteristicForbidden)
+            ));
         }
+    }
+
+    #[test]
+    fn production_ishmael_psd_omission_contract_is_independent_by_moment() {
+        let config = production_ishmael_psd_config();
+        assert_eq!(
+            config.maximum_domain_omitted_number_fraction(),
+            ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION
+        );
+        assert_eq!(
+            config.maximum_domain_omitted_mass_fraction(),
+            ISHMAEL_PSD_MAXIMUM_OMITTED_MASS_FRACTION
+        );
+        assert_eq!(
+            config.maximum_domain_omitted_d6_fraction(),
+            ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION
+        );
+        assert!(
+            config.maximum_domain_omitted_d6_fraction()
+                < config.maximum_domain_omitted_mass_fraction()
+        );
+        assert!(
+            config.maximum_domain_omitted_mass_fraction()
+                < config.maximum_domain_omitted_number_fraction()
+        );
     }
 
     #[test]

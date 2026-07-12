@@ -126,6 +126,7 @@ pub enum PsdSourceCategory {
 #[serde(rename_all = "snake_case")]
 pub enum PsdFallSpeedAuthority {
     WrfIshmaelMitchellHeymsfieldV1,
+    TMatrixTableTerminalPolicyV1,
     ExternalVersionedResearch,
     SyntheticTestOnly,
 }

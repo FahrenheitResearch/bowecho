@@ -3,9 +3,10 @@
 //! This module is the file/normalization boundary in front of
 //! `radar_scattering`'s grid-point closures.  It deliberately does not modify
 //! the simulated-radar renderer or evaluate a LUT. A scene retains sparse
-//! positive-mass category tuples plus dense `f32` temperature/air density so
-//! clear corners and echo birth retain complete interpolation coverage. Full
-//! WRF source fields are read one at a time and discarded.
+//! positive-mass category tuples plus dense `f32` temperature, moist-air
+//! density, and dry-air density so clear corners and echo birth retain
+//! complete interpolation coverage. Full WRF source fields are read one at a
+//! time and discarded.
 //!
 //! [`blend_raw_property_cells`] performs weighted spatial/temporal blending
 //! before [`close_raw_property_cell`]. Closed particles, LUT coordinates, and
@@ -40,6 +41,7 @@ use crate::wrf_temporal::ScenePropertySignature;
 const WRF_REFERENCE_PRESSURE_PA: f64 = 100_000.0;
 const WRF_KAPPA: f64 = 0.285_714_285_7;
 const DRY_AIR_GAS_CONSTANT_J_KG_K: f64 = 287.05;
+const WATER_VAPOR_GAS_CONSTANT_J_KG_K: f64 = 461.5;
 const WRF_FILL_MAGNITUDE: f64 = 1.0e30;
 
 /// One raw field returned by a [`PropertyFieldProvider`].
@@ -749,6 +751,7 @@ impl SparseRainStorage {
 struct DenseEnvironment {
     temperature_k: Vec<f32>,
     air_density_kg_m3: Vec<f32>,
+    dry_air_density_kg_m3: Vec<f32>,
 }
 
 impl DenseEnvironment {
@@ -758,6 +761,12 @@ impl DenseEnvironment {
             f64::from(*self.air_density_kg_m3.get(cell_index as usize)?),
         )
         .ok()
+    }
+
+    fn dry_air_density_at(&self, cell_index: u32) -> Option<f64> {
+        Some(f64::from(
+            *self.dry_air_density_kg_m3.get(cell_index as usize)?,
+        ))
     }
 }
 
@@ -833,6 +842,7 @@ pub struct RawPropertyCell {
     microphysics_scheme_id: i32,
     required_field_signature: Arc<RequiredFieldSignature>,
     environment: ParticleEnvironment,
+    dry_air_density_kg_m3: f64,
     categories: Vec<RawPropertyCategory>,
     rain: RawRainState,
 }
@@ -856,6 +866,14 @@ impl RawPropertyCell {
     #[must_use]
     pub const fn environment(&self) -> ParticleEnvironment {
         self.environment
+    }
+
+    /// Dry-air density paired with WRF's per-kilogram-dry-air hydrometeor
+    /// prognostics. This is intentionally distinct from the moist-air density
+    /// retained by [`ParticleEnvironment`].
+    #[must_use]
+    pub const fn dry_air_density_kg_m3(&self) -> f64 {
+        self.dry_air_density_kg_m3
     }
 
     #[must_use]
@@ -909,6 +927,8 @@ pub enum RawPropertyBlendError {
         #[source]
         source: radar_scattering::ParticleError,
     },
+    #[error("blended raw dry-air density must be finite and positive, got {value}")]
+    DryAirDensity { value: f64 },
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -1019,6 +1039,12 @@ impl WrfPropertyScene {
             WrfPropertyReadError::InvalidEnvironment {
                 cell_index,
                 reason: "dense temperature/air-density coverage is unavailable",
+            },
+        )?;
+        let dry_air_density_kg_m3 = self.environment.dry_air_density_at(compact_index).ok_or(
+            WrfPropertyReadError::InvalidEnvironment {
+                cell_index,
+                reason: "dense dry-air-density coverage is unavailable",
             },
         )?;
         let categories = if matches!(self.microphysics_scheme_id, 50..=53) {
@@ -1153,6 +1179,7 @@ impl WrfPropertyScene {
             microphysics_scheme_id: self.microphysics_scheme_id,
             required_field_signature: Arc::clone(&self.required_field_signature),
             environment,
+            dry_air_density_kg_m3,
             categories,
             rain: self.rain.raw_at(compact_index),
         })
@@ -1214,7 +1241,8 @@ impl WrfPropertyScene {
             + diagnostic_index_bytes
             + self.rain.index_bytes();
         let value_bytes = (self.environment.temperature_k.len()
-            + self.environment.air_density_kg_m3.len())
+            + self.environment.air_density_kg_m3.len()
+            + self.environment.dry_air_density_kg_m3.len())
             * size_of::<f32>()
             + self
                 .categories
@@ -1331,6 +1359,16 @@ pub fn blend_raw_property_cells(
         .sum();
     let environment = ParticleEnvironment::new(temperature_k, air_density_kg_m3)
         .map_err(|source| RawPropertyBlendError::Environment { source })?;
+    let dry_air_density_kg_m3 = raw_cells
+        .iter()
+        .zip(samples)
+        .map(|(cell, sample)| cell.dry_air_density_kg_m3 * sample.weight)
+        .sum::<f64>();
+    if !dry_air_density_kg_m3.is_finite() || dry_air_density_kg_m3 <= 0.0 {
+        return Err(RawPropertyBlendError::DryAirDensity {
+            value: dry_air_density_kg_m3,
+        });
+    }
 
     let mut categories = Vec::with_capacity(first.categories.len());
     for category_index in 0..first.categories.len() {
@@ -1443,6 +1481,7 @@ pub fn blend_raw_property_cells(
         microphysics_scheme_id: first.microphysics_scheme_id,
         required_field_signature: Arc::clone(&first.required_field_signature),
         environment,
+        dry_air_density_kg_m3,
         categories,
         rain,
     })
@@ -1563,6 +1602,34 @@ pub fn close_raw_property_cell(
             closed,
         });
     }
+    let rain = close_raw_rain_with_context(raw, &context)?;
+    Ok(ClosedPropertyCell {
+        source_cell_index: raw.source_cell_index,
+        environment: raw.environment,
+        categories,
+        rain,
+    })
+}
+
+/// Close only the conventional rain tuple from a raw property cell.
+///
+/// Scheme-native frozen PSD consumers use this seam so rain retains the
+/// established typed closure without evaluating or validating the legacy
+/// characteristic-particle closure for the frozen categories.
+pub fn close_raw_rain_state(
+    raw: &RawPropertyCell,
+    orientation: OrientationDefinition,
+) -> Result<ClosedRainState, RawPropertyClosureError> {
+    let context = ClosureContext::with_environment(raw.microphysics_scheme_id, raw.environment)
+        .map_err(|source| RawPropertyClosureError::Environment { source })?
+        .with_orientation(orientation);
+    close_raw_rain_with_context(raw, &context)
+}
+
+fn close_raw_rain_with_context(
+    raw: &RawPropertyCell,
+    context: &ClosureContext,
+) -> Result<ClosedRainState, RawPropertyClosureError> {
     let rain = match &raw.rain {
         RawRainState::Unavailable(reason) => ClosedRainState::Unavailable(reason.clone()),
         RawRainState::Available { qrain_kgkg, .. } if *qrain_kgkg == 0.0 => ClosedRainState::Clear,
@@ -1576,17 +1643,12 @@ pub fn close_raw_property_cell(
                 Some(*qnrain_per_kg),
             );
             ClosedRainState::Closed(Box::new(
-                close_conventional_category(&context, &input)
+                close_conventional_category(context, &input)
                     .map_err(|source| RawPropertyClosureError::Rain { source })?,
             ))
         }
     };
-    Ok(ClosedPropertyCell {
-        source_cell_index: raw.source_cell_index,
-        environment: raw.environment,
-        categories,
-        rain,
-    })
+    Ok(rain)
 }
 
 /// Retained byte estimate.  It excludes allocator slack and temporary raw
@@ -2430,24 +2492,42 @@ fn read_environment<P: PropertyFieldProvider + ?Sized>(
     }
     let (water_vapor, qv_provenance) =
         read_dense_environment_source(provider, time_index, cell_count, QVAPOR_FIELD)?;
+    let mut dry_air_density_kg_m3 = Vec::with_capacity(cell_count);
     for cell_index in 0..cell_count {
         let pressure = f64::from(air_density_kg_m3[cell_index]);
         let temperature = f64::from(temperature_k[cell_index]);
         let qv = f64::from(water_vapor[cell_index]);
-        let virtual_temperature = temperature * (1.0 + 0.61 * qv.max(0.0));
-        let density = pressure / (DRY_AIR_GAS_CONSTANT_J_KG_K * virtual_temperature);
-        if !density.is_finite() || density <= 0.0 {
+        if !qv.is_finite() || qv < 0.0 {
+            return Err(WrfPropertyReadError::InvalidEnvironment {
+                cell_index,
+                reason: "QVAPOR must be finite and nonnegative",
+            });
+        }
+        // WRF QVAPOR is water-vapor mixing ratio per kilogram of dry air.
+        // The ideal-gas mixture therefore gives p = rho_d * (Rd + qv*Rv) * T.
+        let dry_density = pressure
+            / (temperature * (DRY_AIR_GAS_CONSTANT_J_KG_K + qv * WATER_VAPOR_GAS_CONSTANT_J_KG_K));
+        let moist_density = dry_density * (1.0 + qv);
+        if !dry_density.is_finite() || dry_density <= 0.0 {
+            return Err(WrfPropertyReadError::InvalidEnvironment {
+                cell_index,
+                reason: "derived dry-air density must be finite and positive",
+            });
+        }
+        if !moist_density.is_finite() || moist_density <= 0.0 {
             return Err(WrfPropertyReadError::InvalidEnvironment {
                 cell_index,
                 reason: "derived moist-air density must be finite and positive",
             });
         }
-        air_density_kg_m3[cell_index] = narrow_f32("air_density", cell_index, density)?;
+        dry_air_density_kg_m3.push(narrow_f32("dry_air_density", cell_index, dry_density)?);
+        air_density_kg_m3[cell_index] = narrow_f32("air_density", cell_index, moist_density)?;
     }
     Ok((
         DenseEnvironment {
             temperature_k,
             air_density_kg_m3,
+            dry_air_density_kg_m3,
         },
         vec![t_provenance, p_provenance, pb_provenance, qv_provenance],
     ))
@@ -2929,6 +3009,25 @@ mod tests {
     }
 
     #[test]
+    fn dry_air_density_uses_exact_wrf_qvapor_mixing_ratio_basis() {
+        let qv = 0.02;
+        let provider = TinyProvider::new(50, 1)
+            .field("QICE", vec![0.0], "kg kg-1")
+            .environment(280.0)
+            .field("QVAPOR", vec![qv], "kg kg-1");
+        let scene = read_property_scene(&provider, 0).unwrap();
+        let raw = scene.raw_cell(0).unwrap();
+        let expected_dry = 100_000.0
+            / (280.0 * (DRY_AIR_GAS_CONSTANT_J_KG_K + qv * WATER_VAPOR_GAS_CONSTANT_J_KG_K));
+        assert_close(raw.dry_air_density_kg_m3(), expected_dry, 2.0e-6);
+        assert_close(
+            raw.environment().air_density_kg_m3(),
+            expected_dry * (1.0 + qv),
+            2.0e-6,
+        );
+    }
+
+    #[test]
     fn p3_52_retains_both_sparse_categories_and_sorted_union() {
         let scene = read_property_scene(&p3_52_provider(271.65), 0).unwrap();
         assert_eq!(scene.active_cell_indices(), &[1, 2, 3]);
@@ -3146,8 +3245,8 @@ mod tests {
         let estimate = scene.memory_estimate();
         // One active-union index + one category index.
         assert_eq!(estimate.index_bytes, 2 * size_of::<u32>());
-        // Dense temperature+density coverage plus four sparse P3 values.
-        assert_eq!(estimate.value_bytes, (2 * 1_024 + 4) * size_of::<f32>());
+        // Dense temperature+moist/dry density coverage plus four sparse P3 values.
+        assert_eq!(estimate.value_bytes, (3 * 1_024 + 4) * size_of::<f32>());
         assert!(estimate.retained_bytes() < 1_024 * 6 * size_of::<f32>());
         assert_eq!(scene.active_cell_indices(), &[777]);
         assert_eq!(scene.identity().source_identity.0, "sha256:opaque-scene-id");
@@ -3214,6 +3313,20 @@ mod tests {
                 },
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn rain_only_closure_does_not_evaluate_ishmael_characteristic_state() {
+        let provider =
+            ishmael_provider().field("rho_ice2", vec![f64::NAN, -1.0, f64::NAN], "kg m-3");
+        let scene = read_property_scene(&provider, 0).unwrap();
+        let raw = scene.raw_cell(1).unwrap();
+        assert!(matches!(
+            close_raw_rain_state(&raw, OrientationDefinition::Gaussian20Research).unwrap(),
+            ClosedRainState::Unavailable(RainUnavailableReason::MissingMassField {
+                field: "QRAIN"
+            })
         ));
     }
 
