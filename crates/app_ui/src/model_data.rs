@@ -785,6 +785,16 @@ pub struct ModelDataDock {
         allow(dead_code)
     )]
     synthetic_export_frames: Vec<std::sync::Arc<radar_core::RadarVolume>>,
+    /// Exact WRF source selection used by the most recent simulated-radar
+    /// launch. Kept only for this app session so tuning controls can rebuild
+    /// the current frame/loop without reopening a picker. A folder launch is
+    /// deliberately a snapshot: refresh reruns the same files rather than
+    /// silently adding later arrivals.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
+    synthetic_radar_source_files: Vec<PathBuf>,
     /// Last import status line shown under the import controls.
     import_message: Option<String>,
     tree: Option<StoreTree>,
@@ -923,6 +933,7 @@ impl ModelDataDock {
             import_job: None,
             synthetic_radar_result: None,
             synthetic_export_frames: Vec::new(),
+            synthetic_radar_source_files: Vec::new(),
             import_message: None,
             tree: None,
             browser: RunBrowserPanel::new(),
@@ -2637,6 +2648,29 @@ impl ModelDataDock {
                         }
                     }
                 });
+                let source_count = self.synthetic_radar_source_files.len();
+                let can_refresh = !busy && source_count > 0;
+                let refresh_hover = if source_count == 0 {
+                    "Build simulated radar from files or a folder first; BowEcho will remember that frame set for this session."
+                        .to_owned()
+                } else {
+                    format!(
+                        "Rebuild the current radar frame/loop from the same {source_count} WRF source file(s), using every control as it is set now."
+                    )
+                };
+                if ui
+                    .add_enabled_ui(can_refresh, |ui| {
+                        ui.add_sized(
+                            [ui.available_width().max(120.0), 26.0],
+                            egui::Button::new("Refresh current frame(s)"),
+                        )
+                    })
+                    .inner
+                    .on_hover_text(refresh_hover)
+                    .clicked()
+                {
+                    self.refresh_synthetic_radar();
+                }
                 let frame_count = self.synthetic_export_frames.len();
                 if ui
                     .add_enabled_ui(frame_count > 0, |ui| {
@@ -2814,13 +2848,23 @@ impl ModelDataDock {
         files: Vec<PathBuf>,
         config: crate::wrf_radar::SyntheticRadarConfig,
     ) {
-        self.stage_formula_raw_from_files(&files);
+        if self.import_job.is_some() {
+            self.import_message =
+                Some("Synthetic radar cannot start while another import is running".to_owned());
+            return;
+        }
         if self.formula_lab.busy() {
             self.import_message =
                 Some("Synthetic radar cannot start while Formula Lab is evaluating".to_owned());
             return;
         }
+        if files.is_empty() {
+            self.import_message = Some("No WRF files selected for simulated radar".to_owned());
+            return;
+        }
+        self.stage_formula_raw_from_files(&files);
         let count = files.len();
+        self.synthetic_radar_source_files = files.clone();
         let task = crate::wrf_radar::spawn_synthetic_radar(files, config);
         self.import_message = Some(if count == 1 {
             "Simulating radar from 1 WRF file…".to_string()
@@ -2828,6 +2872,43 @@ impl ModelDataDock {
             format!("Simulating radar loop from {count} WRF files…")
         });
         self.import_job = Some(ImportJob::SyntheticRadar(task));
+    }
+
+    /// Build a refresh request from the remembered source snapshot and the
+    /// controls as they exist NOW. The old config is intentionally not cached:
+    /// the entire point is fast experimentation with radar physics and
+    /// presentation settings.
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    fn synthetic_radar_refresh_request(
+        &self,
+    ) -> Result<(Vec<PathBuf>, crate::wrf_radar::SyntheticRadarConfig), String> {
+        if self.import_job.is_some() {
+            return Err(
+                "Synthetic radar cannot refresh while another import is running".to_owned(),
+            );
+        }
+        if self.formula_lab.busy() {
+            return Err(
+                "Synthetic radar cannot refresh while Formula Lab is evaluating".to_owned(),
+            );
+        }
+        if self.synthetic_radar_source_files.is_empty() {
+            return Err(
+                "Build simulated radar from files or a folder before refreshing".to_owned(),
+            );
+        }
+        Ok((
+            self.synthetic_radar_source_files.clone(),
+            self.synth_radar.to_config()?,
+        ))
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    fn refresh_synthetic_radar(&mut self) {
+        match self.synthetic_radar_refresh_request() {
+            Ok((files, config)) => self.launch_synthetic_radar(files, config),
+            Err(message) => self.import_message = Some(message),
+        }
     }
 
     /// Export the retained simulated-radar frames as CfRadial-1 NetCDF files:
@@ -5235,6 +5316,60 @@ mod tests {
         assert!(
             dock.import_in_flight(),
             "a running import job is reported so the app pauses live radar decode"
+        );
+    }
+
+    #[test]
+    fn synth_radar_refresh_reuses_sources_with_the_current_controls() {
+        let ctx = egui::Context::default();
+        let mut dock =
+            ModelDataDock::new_for_test(&ctx, tree_with_runs("wrf", &[("20260707_00z", &[0])]));
+        assert!(
+            dock.synthetic_radar_refresh_request().is_err(),
+            "refresh stays unavailable until a source frame set has been built"
+        );
+
+        let files = vec![
+            PathBuf::from("wrfout_d03_2026-07-07_01_00_00"),
+            PathBuf::from("wrfout_d03_2026-07-07_02_00_00"),
+        ];
+        dock.synthetic_radar_source_files = files.clone();
+        dock.synth_radar.max_range_km = 480.0;
+        dock.synth_radar.dual_pol = true;
+
+        let (refresh_files, config) = dock
+            .synthetic_radar_refresh_request()
+            .expect("remembered sources make refresh available");
+        assert_eq!(refresh_files, files, "the exact frame snapshot is reused");
+        assert_eq!(config.max_range_m, 480_000.0);
+        assert!(
+            config.dual_pol,
+            "refresh builds a fresh config from controls edited after the original run"
+        );
+        let persisted = dock.wrf_synth_radar_json().to_string();
+        assert!(
+            !persisted.contains("wrfout_d03"),
+            "source paths stay session-only instead of becoming stale settings"
+        );
+    }
+
+    #[test]
+    fn synth_radar_refresh_never_replaces_an_active_import() {
+        let ctx = egui::Context::default();
+        let mut dock =
+            ModelDataDock::new_for_test(&ctx, tree_with_runs("wrf", &[("20260707_00z", &[0])]));
+        let files = vec![PathBuf::from("wrfout_d02_2026-07-07_00_00_00")];
+        dock.synthetic_radar_source_files = files.clone();
+        dock.mark_import_in_flight_for_test();
+
+        let error = dock
+            .synthetic_radar_refresh_request()
+            .expect_err("an active import must own the single worker slot");
+        assert!(error.contains("another import"));
+        assert!(dock.import_job.is_some(), "the existing task is untouched");
+        assert_eq!(
+            dock.synthetic_radar_source_files, files,
+            "busy rejection keeps the current frame set available for later"
         );
     }
 
