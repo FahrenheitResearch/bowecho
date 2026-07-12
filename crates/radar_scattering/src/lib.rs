@@ -14,6 +14,7 @@ mod lut;
 mod orientation;
 mod output;
 mod p3_psd;
+mod p3_table;
 mod particle;
 mod scheme_psd;
 mod science;
@@ -54,6 +55,10 @@ pub use p3_psd::{
     P3ParticleGeometry, P3ParticleRegion, P3PiecewiseParticleLaw, P3Psd, P3PsdError, P3PsdInput,
     P3PsdProvenance, P3Quadrature, P3QuadratureAudit, P3QuadratureConfig, P3QuadratureNode,
     P3ReconstructionConfig, P3ShapeAuthority, P3WrfScheme,
+};
+pub use p3_table::{
+    P3_TABLE_READER_REVISION, P3_THREE_MOMENT_TABLE_ASSET, P3_TWO_MOMENT_TABLE_ASSET,
+    P3OfficialTableKind, P3OfficialTableV54, P3TableAssetSpec, P3TableLoadError,
 };
 pub use particle::{
     ClosureAssumption, ConventionalHydrometeor, ConventionalParticleState, ConventionalProvenance,
