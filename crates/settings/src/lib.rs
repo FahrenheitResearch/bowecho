@@ -675,6 +675,12 @@ pub struct AppSettings {
     /// state and one-session raw-file consent are deliberately never saved.
     #[serde(default)]
     pub formula_lab_state: Option<serde_json::Value>,
+    /// Last-used embedded SimSat source/product/view and rendering controls.
+    /// The app-ui crate owns the versioned schema; settings keeps the value
+    /// opaque so SimSat can evolve without coupling this crate to its types.
+    /// Active jobs, progress, errors, and rendered output are never saved.
+    #[serde(default)]
+    pub simsat_state: Option<serde_json::Value>,
     /// Data-folder override: where caches and stores live (Level II
     /// cache, model/sat/GLM stores, tiles, georefs). Empty = platform
     /// default. Read once at startup; Settings says "restart to apply".
@@ -1058,6 +1064,7 @@ impl Default for AppSettings {
             wrf_process_options: None,
             wrf_synth_radar: None,
             formula_lab_state: None,
+            simsat_state: None,
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
             sidebar_width_pt: None,
@@ -2484,6 +2491,24 @@ mod tests {
         assert_eq!(back, s);
         // Older configs simply restore the Formula Lab starter draft.
         assert_eq!(AppSettings::from_json("{}").formula_lab_state, None);
+    }
+
+    #[test]
+    fn simsat_state_round_trips_as_opaque_json() {
+        let s = AppSettings {
+            simsat_state: Some(serde_json::json!({
+                "version": 1,
+                "source_mode": "local",
+                "product": "visible",
+                "view": "geostationary",
+                "atmosphere": {"aerosol_optical_depth": 0.08}
+            })),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back, s);
+        // Older configs simply restore SimSat's shipped defaults.
+        assert_eq!(AppSettings::from_json("{}").simsat_state, None);
     }
 
     #[test]

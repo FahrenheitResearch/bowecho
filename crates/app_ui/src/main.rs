@@ -8082,6 +8082,7 @@ impl ViewerApp {
             sat_paint::SatelliteSource::parse(&app_settings.satellite_source);
         let restored_eumetsat_product = app_settings.eumetsat_product.clone();
         let restored_eumetsat_loop_frames = app_settings.eumetsat_loop_frames.clamp(2, 36);
+        let simsat = simsat_ui::SimSatPane::new(app_settings.simsat_state.as_ref());
         let restored_overlays = (
             app_settings.overlay_obs,
             app_settings.overlay_obs_metar,
@@ -8303,7 +8304,7 @@ impl ViewerApp {
             sat_player: rw_ui::SatPlayerPanel::new(),
             sat_run_listings: Vec::new(),
             show_satellite: false,
-            simsat: simsat_ui::SimSatPane::new(),
+            simsat,
             show_simsat: false,
             satellite_source: restored_satellite_source,
             himawari_band: 13,
@@ -19489,6 +19490,9 @@ impl eframe::App for ViewerApp {
             );
         }
 
+        // SimSat exposes only durable control changes through its dirty
+        // snapshot; runtime progress/output never reaches AppSettings.
+        self.persist_simsat_state();
         // Workspace layout persistence (debounced; on_exit flushes).
         self.maybe_persist_workspace_layout(&ctx);
         // Coalesce interactive settings/style edits; on_exit performs a final
@@ -19510,6 +19514,7 @@ impl eframe::App for ViewerApp {
         self.persist_wrf_process_options();
         self.persist_wrf_synth_radar();
         self.persist_formula_lab_state();
+        self.persist_simsat_state();
         if self.workspace.dirty {
             self.persist_workspace_layout();
         }
@@ -26161,6 +26166,19 @@ impl ViewerApp {
         let value = dock.formula_lab_state_json();
         if self.app_settings.formula_lab_state.as_ref() != Some(&value) {
             self.app_settings.formula_lab_state = Some(value);
+            self.mark_app_settings_dirty();
+        }
+    }
+
+    /// Persist the embedded SimSat pane's versioned, durable control state.
+    /// The pane deliberately excludes source paths, cache selections, active
+    /// jobs, progress/status, and rendered outputs from this snapshot.
+    fn persist_simsat_state(&mut self) {
+        let Some(value) = self.simsat.take_persisted_state_if_dirty() else {
+            return;
+        };
+        if self.app_settings.simsat_state.as_ref() != Some(&value) {
+            self.app_settings.simsat_state = Some(value);
             self.mark_app_settings_dirty();
         }
     }
@@ -63109,7 +63127,7 @@ mod tests {
             sat_player: rw_ui::SatPlayerPanel::new(),
             sat_run_listings: Vec::new(),
             show_satellite: false,
-            simsat: simsat_ui::SimSatPane::new(),
+            simsat: simsat_ui::SimSatPane::new(None),
             show_simsat: false,
             satellite_source: sat_paint::SatelliteSource::Goes,
             himawari_band: 13,
