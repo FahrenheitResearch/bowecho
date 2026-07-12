@@ -137,8 +137,8 @@ pub struct OperationalSpeciesProvenance {
     pub populated_cells: usize,
 }
 
-/// Audit trail carried with every operational-model scattering state.  It is
-/// deliberately detailed enough for a future Level-II export to explain the
+/// Audit trail carried with every operational-model scattering state. It is
+/// deliberately detailed enough for the normal radar/CfRadial output to explain the
 /// input inventory and every closure assumption without reopening the GRIB.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationalRadarProvenance {
@@ -154,7 +154,7 @@ pub struct OperationalRadarProvenance {
     pub notes: Vec<String>,
 }
 
-/// Builder-neutral native-model state for the future Level-II renderer.
+/// Builder-neutral native-model state consumed by BowEcho's polar-volume renderer.
 ///
 /// Geometry and winds use the same flattened `[level, row, column]` contract as
 /// `WrfRadarFields`.  `linear_scattering` is intentionally retained in
@@ -192,6 +192,9 @@ pub struct CachedOperationalHrrrInput {
     pub path: PathBuf,
     pub label: String,
     pub bytes: u64,
+    pub date: Option<String>,
+    pub cycle: Option<u8>,
+    pub forecast_hour: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -383,6 +386,9 @@ pub(crate) fn discover_cached_hrrr_inputs(root: &Path) -> Vec<CachedOperationalH
             label: input.label(),
             path: input.path,
             bytes: input.bytes,
+            date: input.spec.as_ref().map(|spec| spec.date.clone()),
+            cycle: input.spec.as_ref().map(|spec| spec.cycle),
+            forecast_hour: input.spec.as_ref().map(|spec| spec.forecast_hour),
         })
         .collect()
 }
@@ -438,6 +444,19 @@ pub fn read_operational_radar_state(
     reader.read_radar_state(progress)
 }
 
+/// Domain-centred counterpart used when the shared radar controls retain their
+/// historical "model domain centre" placement. The centre is chosen from the
+/// native projected grid before the radar crop is created; no full 3-D field
+/// is decoded merely to resolve the location.
+pub fn read_operational_radar_state_at_domain_center(
+    path: &Path,
+    maximum_range_km: f64,
+    progress: &dyn Fn(&str),
+) -> Result<OperationalRadarState, OperationalRadarGribError> {
+    let mut reader = OperationalRadarGribReader::open_for_domain_center(path, maximum_range_km)?;
+    reader.read_radar_state(progress)
+}
+
 impl OperationalRadarGribReader {
     pub fn probe(path: &Path) -> Result<OperationalRadarProbe, OperationalRadarGribError> {
         let catalog = build_catalog(path)?;
@@ -468,10 +487,34 @@ impl OperationalRadarGribReader {
         site_lon_deg: f64,
         maximum_range_km: f64,
     ) -> Result<Self, OperationalRadarGribError> {
+        Self::open_for_optional_radar(path, Some((site_lat_deg, site_lon_deg)), maximum_range_km)
+    }
+
+    pub fn open_for_domain_center(
+        path: &Path,
+        maximum_range_km: f64,
+    ) -> Result<Self, OperationalRadarGribError> {
+        Self::open_for_optional_radar(path, None, maximum_range_km)
+    }
+
+    fn open_for_optional_radar(
+        path: &Path,
+        site: Option<(f64, f64)>,
+        maximum_range_km: f64,
+    ) -> Result<Self, OperationalRadarGribError> {
         let catalog = build_catalog(path)?;
         let nx = catalog.grid.nx as usize;
         let ny = catalog.grid.ny as usize;
+        if nx == 0 || ny == 0 {
+            return Err(OperationalRadarGribError::Shape(
+                "native operational grid has zero horizontal cells".to_owned(),
+            ));
+        }
         let (lat_full, lon_full) = latlon_planes(&catalog.grid)?;
+        let (site_lat_deg, site_lon_deg) = site.unwrap_or_else(|| {
+            let center = (ny / 2) * nx + nx / 2;
+            (f64::from(lat_full[center]), f64::from(lon_full[center]))
+        });
         let crop = RadarCrop::around_radar(
             &lat_full,
             &lon_full,

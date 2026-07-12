@@ -1337,6 +1337,12 @@ pub struct WrfRadarFields {
     /// come from the same file) so [`build_synthetic_volume_reporting`] can size
     /// gates to the grid via [`effective_gate_spacing`] without re-opening it.
     pub dx_m: Option<f64>,
+    /// Optional source labels supplied by a non-WRF adapter that deliberately
+    /// reuses this renderer. Native wrfout readers leave these unset.
+    source_model_override: Option<String>,
+    source_microphysics_override: Option<String>,
+    source_scattering_override: Option<String>,
+    source_provenance_fragment: Option<String>,
     lut: InverseLut,
 }
 
@@ -1579,6 +1585,26 @@ impl WrfRadarFields {
             .saturating_add(self.lut.retained_bytes())
             .saturating_add(
                 self.dual_pol_status
+                    .as_ref()
+                    .map_or(0, std::string::String::len),
+            )
+            .saturating_add(
+                self.source_model_override
+                    .as_ref()
+                    .map_or(0, std::string::String::len),
+            )
+            .saturating_add(
+                self.source_microphysics_override
+                    .as_ref()
+                    .map_or(0, std::string::String::len),
+            )
+            .saturating_add(
+                self.source_scattering_override
+                    .as_ref()
+                    .map_or(0, std::string::String::len),
+            )
+            .saturating_add(
+                self.source_provenance_fragment
                     .as_ref()
                     .map_or(0, std::string::String::len),
             )
@@ -1861,6 +1887,10 @@ fn read_wrf_radar_fields_reporting_inner(
         tke_tenths_m2s2: None,
         ref_source,
         dx_m,
+        source_model_override: None,
+        source_microphysics_override: None,
+        source_scattering_override: None,
+        source_provenance_fragment: None,
         lut,
     })
 }
@@ -2326,6 +2356,162 @@ fn to_f32(values: &[f64]) -> Vec<f32> {
     values.iter().map(|value| *value as f32).collect()
 }
 
+const OPERATIONAL_BULK_S_BAND_SOURCE: &str =
+    "native HRRR/RRFS hydrometeors -> BowEcho category-bulk S-band scattering";
+
+/// Narrow operational-model adapter into the established WRF polar renderer.
+/// It owns no download or volume-building logic: native GRIB state is checked,
+/// compacted into the same additive polar representation, and then follows the
+/// normal `RadarVolume` path below.
+pub(crate) fn operational_radar_fields(
+    state: crate::operational_radar_grib::OperationalRadarState,
+) -> Result<WrfRadarFields, String> {
+    let cells = state
+        .nx
+        .checked_mul(state.ny)
+        .and_then(|value| value.checked_mul(state.nz))
+        .ok_or_else(|| "operational radar grid size overflowed".to_owned())?;
+    let horizontal_cells = state
+        .nx
+        .checked_mul(state.ny)
+        .ok_or_else(|| "operational radar horizontal grid size overflowed".to_owned())?;
+    for (name, actual, expected) in [
+        ("latitude", state.lat.len(), horizontal_cells),
+        ("longitude", state.lon.len(), horizontal_cells),
+        ("terrain", state.terrain_m.len(), horizontal_cells),
+        ("height", state.height_msl.len(), cells),
+        ("reflectivity", state.dbz.len(), cells),
+        ("u wind", state.u.len(), cells),
+        ("v wind", state.v.len(), cells),
+        ("w wind", state.w.len(), cells),
+        ("linear scattering", state.linear_scattering.len(), cells),
+    ] {
+        if actual != expected {
+            return Err(format!(
+                "operational radar {name} has {actual} values, expected {expected}"
+            ));
+        }
+    }
+    if let Some(tke) = state.tke_m2s2.as_ref()
+        && tke.len() != cells
+    {
+        return Err(format!(
+            "operational radar TKE has {} values, expected {cells}",
+            tke.len()
+        ));
+    }
+    let lut =
+        InverseLut::build_with_shape_domain_bounded(&state.lat, &state.lon, state.nx, state.ny)
+            .ok_or_else(|| {
+                "failed to build operational-model inverse geolocation LUT".to_owned()
+            })?;
+
+    let present_fields = state
+        .provenance
+        .species
+        .iter()
+        .flat_map(|species| {
+            std::iter::once(species.mass_field.to_owned())
+                .chain(species.number_field.map(str::to_owned))
+        })
+        .collect::<Vec<_>>();
+    let mut compact = CompactPolarFields::new(cells, state.scheme_profile.clone(), present_fields);
+    for (index, contribution) in state.linear_scattering.iter().copied().enumerate() {
+        if !contribution.zh.is_finite() || contribution.zh <= 0.0 {
+            continue;
+        }
+        let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+        accumulator.add(1.0, contribution);
+        compact.store(index, accumulator.finalize());
+    }
+    let compact_tke = state.tke_m2s2.as_ref().map(|values| {
+        values
+            .iter()
+            .map(|value| {
+                if value.is_finite() && *value > 0.0 {
+                    (value * 10.0).round().clamp(0.0, u8::MAX as f32) as u8
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    let provenance = &state.provenance;
+    let source_model = provenance.model.label().to_owned();
+    let source_microphysics = format!(
+        "{} ({})",
+        provenance.scheme_assumption.stable_id(),
+        provenance.scheme_assumption.description()
+    );
+    let source_scattering = format!(
+        "{} (operational GRIB category-bulk S-band assumptions; dual-pol-like, not T-matrix or observed calibration)",
+        provenance.scattering_kernel
+    );
+    let species = provenance
+        .species
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}:{}+{}:{:?}",
+                entry.kind.label(),
+                entry.mass_field,
+                entry.number_field.unwrap_or("bulk-default-number"),
+                entry.number_origin
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let source_provenance_fragment = format!(
+        "operational_model={}; operational_scheme={}; operational_scattering={}; operational_species={species}; operational_vertical_velocity={:?}; operational_grid_winds_rotated={}; operational_tke={:?}",
+        provenance.model.label(),
+        provenance.scheme_assumption.stable_id(),
+        provenance.scattering_kernel,
+        provenance.vertical_velocity_origin,
+        provenance.horizontal_winds_rotated_from_grid,
+        provenance.tke_origin,
+    );
+    let dual_pol_status = Some(format!(
+        "{} {} bulk-assumption polar fields; native category mass{}; not a T-matrix solution or observed dual-pol calibration",
+        provenance.model.label(),
+        provenance.scheme_assumption.stable_id(),
+        if provenance
+            .species
+            .iter()
+            .all(|entry| entry.number_field.is_some())
+        {
+            " and number"
+        } else {
+            ", with documented default number where absent"
+        }
+    ));
+
+    Ok(WrfRadarFields {
+        nx: state.nx,
+        ny: state.ny,
+        nz: state.nz,
+        lat: state.lat,
+        lon: state.lon,
+        height_msl: state.height_msl,
+        dbz: state.dbz,
+        u: state.u,
+        v: state.v,
+        w: state.w,
+        terrain_m: state.terrain_m,
+        property_scattering: None,
+        raw_property_scene: None,
+        polarimetric: Some(compact),
+        dual_pol_status,
+        tke_tenths_m2s2: compact_tke,
+        ref_source: OPERATIONAL_BULK_S_BAND_SOURCE,
+        dx_m: state.dx_m,
+        source_model_override: Some(source_model),
+        source_microphysics_override: Some(source_microphysics),
+        source_scattering_override: Some(source_scattering),
+        source_provenance_fragment: Some(source_provenance_fragment),
+        lut,
+    })
+}
+
 /// Build one synthetic [`RadarVolume`] from pre-read [`WrfRadarFields`].
 ///
 /// `valid_time` is the volume's scan time (the WRF forecast valid time), which
@@ -2679,6 +2865,10 @@ fn build_synthetic_volume_reporting_inner(
             scene.identity().time_index,
         );
     }
+    if let Some(source_provenance) = fields.source_provenance_fragment.as_deref() {
+        forward_operator_config.push_str("; ");
+        forward_operator_config.push_str(source_provenance);
+    }
     volume.metadata = VolumeMetadata {
         source_path: None,
         archive_version: Some("simulated-wrf".to_string()),
@@ -2765,25 +2955,29 @@ fn build_synthetic_volume_reporting_inner(
             "BowEcho WRF polar-volume forward operator v3".to_string()
         }),
         forward_operator_config: Some(forward_operator_config),
-        source_model: Some("WRF".to_string()),
-        microphysics_scheme: fields
-            .property_scattering
-            .as_ref()
-            .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
-            .or_else(|| {
-                fields
-                    .raw_property_scene
-                    .as_ref()
-                    .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
-            })
-            .or_else(|| {
-                fields
-                    .polarimetric
-                    .as_ref()
-                    .map(|polar| format!("{} ({:?})", polar.profile.name, polar.profile.capability))
-            }),
+        source_model: fields
+            .source_model_override
+            .clone()
+            .or_else(|| Some("WRF".to_string())),
+        microphysics_scheme: fields.source_microphysics_override.clone().or_else(|| {
+            fields
+                .property_scattering
+                .as_ref()
+                .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
+                .or_else(|| {
+                    fields
+                        .raw_property_scene
+                        .as_ref()
+                        .map(|scene| format!("WRF mp_physics={}", scene.microphysics_scheme_id()))
+                })
+                .or_else(|| {
+                    fields.polarimetric.as_ref().map(|polar| {
+                        format!("{} ({:?})", polar.profile.name, polar.profile.capability)
+                    })
+                })
+        }),
         scattering_model: if config.dual_pol && fields.has_polarimetric_input() {
-            Some(match config.polarimetric_kernel {
+            fields.source_scattering_override.clone().or_else(|| Some(match config.polarimetric_kernel {
                 PolarimetricKernel::BulkRayleighV1 => format!(
                     "{} (scheme-aware bulk S-band Rayleigh; not T-matrix)",
                     crate::wrf_radar_physics::bulk_sband_model_id()
@@ -2791,7 +2985,7 @@ fn build_synthetic_volume_reporting_inner(
                 PolarimetricKernel::PropertyTMatrixResearchV1 => {
                     "PyTMatrix 0.3.3 property-aware characteristic-particle LUT v1 (research_only_unvalidated; not PSD-integrated)".to_string()
                 }
-            })
+            }))
         } else {
             None
         },
@@ -5430,6 +5624,19 @@ pub struct SyntheticRadarTask {
     pub rx: Receiver<SyntheticRadarMessage>,
 }
 
+/// Source selection for operational HRRR/RRFS forecast radar. Files remain
+/// unrestricted so experimental RRFS/native layouts reach the strict GRIB
+/// inventory reader instead of being rejected by a filename filter.
+#[derive(Clone, Debug)]
+pub enum OperationalRadarSource {
+    Files(Vec<PathBuf>),
+    LatestHrrr {
+        forecast_hours: Vec<u16>,
+        input_root: PathBuf,
+        additional_cache_roots: Vec<PathBuf>,
+    },
+}
+
 pub enum SyntheticRadarReplayMessage {
     Progress(String),
     Done(Result<SyntheticRadarReplayOutput, String>),
@@ -5566,6 +5773,308 @@ pub fn spawn_synthetic_radar(
         })
         .expect("spawn WRF synthetic-radar worker");
     SyntheticRadarTask { label, rx }
+}
+
+/// Spawn native HRRR/RRFS GRIB -> ordinary synthetic `RadarVolume` frames.
+/// The worker reuses the same message/result contract as wrfout simulation so
+/// installation, looping, Refresh, and CfRadial export need no parallel path.
+pub fn spawn_operational_radar(
+    source: OperationalRadarSource,
+    config: SyntheticRadarConfig,
+) -> SyntheticRadarTask {
+    let label = match &source {
+        OperationalRadarSource::Files(paths) if paths.len() == 1 => format!(
+            "Operational forecast radar from {}",
+            display_name(&paths[0])
+        ),
+        OperationalRadarSource::Files(paths) => {
+            format!(
+                "Operational forecast radar from {} native files",
+                paths.len()
+            )
+        }
+        OperationalRadarSource::LatestHrrr { forecast_hours, .. } => format!(
+            "Latest HRRR operational radar ({})",
+            forecast_hours
+                .iter()
+                .map(|hour| format!("f{hour:02}"))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        ),
+    };
+    let (tx, rx) = channel();
+    let thread_label = label.clone();
+    std::thread::Builder::new()
+        .name("operational-forecast-radar".to_owned())
+        .spawn(move || {
+            let result = build_operational_radar(source, &config, &thread_label, &tx);
+            let _ = tx.send(SyntheticRadarMessage::Done(result));
+        })
+        .expect("spawn operational forecast-radar worker");
+    SyntheticRadarTask { label, rx }
+}
+
+fn resolve_operational_radar_paths(
+    source: OperationalRadarSource,
+    tx: &Sender<SyntheticRadarMessage>,
+) -> Result<Vec<PathBuf>, String> {
+    match source {
+        OperationalRadarSource::Files(paths) => {
+            let mut seen = std::collections::BTreeSet::new();
+            let paths = paths
+                .into_iter()
+                .filter(|path| seen.insert(path.clone()))
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                Err("No native HRRR/RRFS GRIB files selected".to_owned())
+            } else {
+                Ok(paths)
+            }
+        }
+        OperationalRadarSource::LatestHrrr {
+            mut forecast_hours,
+            input_root,
+            additional_cache_roots,
+        } => {
+            forecast_hours.sort_unstable();
+            forecast_hours.dedup();
+            if forecast_hours.is_empty()
+                || forecast_hours
+                    .iter()
+                    .any(|forecast_hour| !matches!(forecast_hour, 0 | 1))
+            {
+                return Err("Latest operational HRRR supports selected f00 and/or f01".to_owned());
+            }
+            let mut cached =
+                crate::operational_radar_grib::discover_cached_hrrr_inputs(&input_root);
+            for root in additional_cache_roots {
+                cached.extend(crate::operational_radar_grib::discover_cached_hrrr_inputs(
+                    &root,
+                ));
+            }
+            let candidates = crate::operational_radar_grib::latest_hrrr_native_specs(
+                Utc::now(),
+                forecast_hours[0],
+            );
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let mut last_error = None;
+            for candidate in candidates {
+                let mut cycle_paths = Vec::with_capacity(forecast_hours.len());
+                let mut cycle_failed = false;
+                for &forecast_hour in &forecast_hours {
+                    let specs = crate::operational_radar_grib::latest_hrrr_native_specs(
+                        Utc::now(),
+                        forecast_hour,
+                    );
+                    let Some(spec) = specs
+                        .into_iter()
+                        .find(|spec| spec.date == candidate.date && spec.cycle == candidate.cycle)
+                    else {
+                        cycle_failed = true;
+                        last_error = Some(format!(
+                            "HRRR {:02}z does not publish f{forecast_hour:02}",
+                            candidate.cycle
+                        ));
+                        break;
+                    };
+                    if let Some(hit) = cached.iter().find(|input| {
+                        input.date.as_deref() == Some(spec.date.as_str())
+                            && input.cycle == Some(spec.cycle)
+                            && input.forecast_hour == Some(spec.forecast_hour)
+                    }) {
+                        let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+                            "Reusing cached {}",
+                            hit.label
+                        )));
+                        cycle_paths.push(hit.path.clone());
+                        continue;
+                    }
+                    let progress = |message: &str| {
+                        let _ = tx.send(SyntheticRadarMessage::Progress(message.to_owned()));
+                    };
+                    match crate::operational_radar_grib::acquire_hrrr_native_input(
+                        &spec,
+                        &input_root,
+                        &cancel,
+                        &progress,
+                    ) {
+                        Ok(Some(path)) => cycle_paths.push(path),
+                        Ok(None) => return Err("Latest HRRR download was cancelled".to_owned()),
+                        Err(error) => {
+                            cycle_failed = true;
+                            last_error = Some(error.to_string());
+                            break;
+                        }
+                    }
+                }
+                if !cycle_failed && cycle_paths.len() == forecast_hours.len() {
+                    return Ok(cycle_paths);
+                }
+            }
+            Err(format!(
+                "No complete latest HRRR native cycle was available for {}{}",
+                forecast_hours
+                    .iter()
+                    .map(|hour| format!("f{hour:02}"))
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+                last_error
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            ))
+        }
+    }
+}
+
+fn build_operational_radar(
+    source: OperationalRadarSource,
+    config: &SyntheticRadarConfig,
+    label: &str,
+    tx: &Sender<SyntheticRadarMessage>,
+) -> Result<SyntheticRadarOutput, String> {
+    config.validate_science_contract()?;
+    if !matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::BulkRayleighV1
+    ) {
+        return Err(
+            "Operational HRRR/RRFS radar requires the versioned category-bulk S-band kernel"
+                .to_owned(),
+        );
+    }
+    if !matches!(
+        config.atmosphere_time_mode,
+        AtmosphereTimeMode::FrozenAtVolumeStart
+    ) {
+        return Err(
+            "Operational forecast frames are independent model instants; raw/adjacent WRF interpolation is unavailable"
+                .to_owned(),
+        );
+    }
+    let paths = resolve_operational_radar_paths(source, tx)?;
+    let site = match (config.site_lat_deg, config.site_lon_deg) {
+        (Some(lat), Some(lon)) => Some((lat, lon)),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "Operational radar site latitude/longitude must be supplied together".to_owned(),
+            );
+        }
+    };
+    let maximum_range_km = config.max_range_m / 1_000.0;
+    let mut frames = Vec::with_capacity(paths.len());
+    let mut notes = Vec::new();
+    let mut inventory_contract: Option<(String, Vec<(String, Option<String>)>)> = None;
+    for (index, path) in paths.iter().enumerate() {
+        let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+            "Reading operational source {}/{}: {}",
+            index + 1,
+            paths.len(),
+            display_name(path)
+        )));
+        let progress = |message: &str| {
+            let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+                "{}: {message}",
+                display_name(path)
+            )));
+        };
+        let state = match site {
+            Some((lat, lon)) => crate::operational_radar_grib::read_operational_radar_state(
+                path,
+                lat,
+                lon,
+                maximum_range_km,
+                &progress,
+            ),
+            None => crate::operational_radar_grib::read_operational_radar_state_at_domain_center(
+                path,
+                maximum_range_km,
+                &progress,
+            ),
+        }
+        .map_err(|error| format!("{}: {error}", display_name(path)))?;
+        let contract = (
+            state.provenance.scheme_assumption.stable_id().to_owned(),
+            state
+                .provenance
+                .species
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.mass_field.to_owned(),
+                        entry.number_field.map(str::to_owned),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        if let Some(expected) = inventory_contract.as_ref()
+            && expected != &contract
+        {
+            return Err(format!(
+                "{} has an incompatible operational microphysics inventory; mixed scheme/category loops fail closed",
+                display_name(path)
+            ));
+        }
+        inventory_contract.get_or_insert(contract);
+        let valid_time = state.provenance.valid_time.to_owned();
+        let model = state.provenance.model.label().to_owned();
+        let scheme = state.provenance.scheme_assumption.stable_id().to_owned();
+        let source_notes = state.provenance.notes.clone();
+        let mut volume = try_build_synthetic_volume_reporting(
+            &operational_radar_fields(state)?,
+            valid_time.to_owned(),
+            config,
+            &progress,
+        )?;
+        volume.metadata.source_path = Some(path.clone());
+        volume.metadata.archive_version = Some("simulated-operational-forecast".to_owned());
+        volume.metadata.forward_operator = Some(
+            "BowEcho operational HRRR/RRFS category-bulk polar-volume forward operator v1"
+                .to_owned(),
+        );
+        notes.push(format!(
+            "{} {} {}: {} radials; {}; {}",
+            model,
+            valid_time.to_rfc3339(),
+            scheme,
+            volume.metadata.decoded_radial_count,
+            OPERATIONAL_BULK_S_BAND_SOURCE,
+            source_notes.join("; ")
+        ));
+        frames.push((model, scheme, valid_time, Arc::new(volume)));
+    }
+    frames.sort_by_key(|(_, _, valid_time, _)| valid_time.to_owned());
+    let mut seen_times = std::collections::BTreeSet::new();
+    frames.retain(|(model, _, valid_time, _)| {
+        seen_times.insert((model.clone(), valid_time.to_owned()))
+    });
+    if frames.is_empty() {
+        return Err("Operational model input produced no radar frames".to_owned());
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.data_fingerprint().hash(&mut hasher);
+    for (model, scheme, valid_time, volume) in &frames {
+        model.hash(&mut hasher);
+        scheme.hash(&mut hasher);
+        valid_time.timestamp_millis().hash(&mut hasher);
+        volume.metadata.decoded_radial_count.hash(&mut hasher);
+    }
+    let config_fingerprint = hasher.finish();
+    let models = frames
+        .iter()
+        .map(|(model, _, _, _)| model.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("/");
+    let volumes = frames.into_iter().map(|(_, _, _, volume)| volume).collect();
+    Ok(SyntheticRadarOutput {
+        label: format!("{label} · {models}"),
+        volumes,
+        notes,
+        config_fingerprint,
+    })
 }
 
 fn build_synthetic_from_paths(
@@ -6538,6 +7047,105 @@ mod tests {
         assert_eq!(notes, vec!["bulk scene failed".to_string()]);
     }
 
+    #[test]
+    fn operational_state_adapter_compacts_additive_polar_state_and_stamps_provenance() {
+        use crate::operational_radar_grib::{
+            OperationalFieldOrigin, OperationalHydrometeor, OperationalModel,
+            OperationalRadarProvenance, OperationalRadarState, OperationalSchemeAssumption,
+            OperationalSpeciesProvenance,
+        };
+
+        let nx = 2;
+        let ny = 2;
+        let nz = 2;
+        let cells = nx * ny * nz;
+        let contribution = crate::wrf_radar_physics::BulkContribution {
+            zh: 100.0,
+            zv: 80.0,
+            cov_re: 85.0,
+            kdp_deg_km: 0.3,
+            ah_db_km: 0.02,
+            av_db_km: 0.01,
+            fall_speed_mps: 4.0,
+            ..Default::default()
+        };
+        let state = OperationalRadarState {
+            nx,
+            ny,
+            nz,
+            lat: vec![34.9, 34.9, 35.1, 35.1],
+            lon: vec![-97.1, -96.9, -97.1, -96.9],
+            height_msl: vec![
+                100.0, 100.0, 100.0, 100.0, 8_000.0, 8_000.0, 8_000.0, 8_000.0,
+            ],
+            dbz: vec![20.0; cells],
+            u: vec![10.0; cells],
+            v: vec![0.0; cells],
+            w: vec![0.0; cells],
+            terrain_m: vec![300.0; nx * ny],
+            dx_m: Some(3_000.0),
+            tke_m2s2: Some(vec![1.2; cells]),
+            linear_scattering: vec![contribution; cells],
+            scheme_profile: crate::wrf_radar_physics::detect_scheme(
+                Some(8),
+                ["QRAIN", "QNRAIN", "QSNOW"],
+            ),
+            provenance: OperationalRadarProvenance {
+                model: OperationalModel::Hrrr,
+                source_path: PathBuf::from("hrrr.t00z.wrfnatf00.grib2"),
+                valid_time: chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                scheme_assumption: OperationalSchemeAssumption::HrrrThompsonCategoryBulkV1,
+                scattering_kernel: crate::wrf_radar_physics::bulk_sband_model_id(),
+                species: vec![OperationalSpeciesProvenance {
+                    kind: OperationalHydrometeor::Rain,
+                    mass_field: "QRAIN",
+                    number_field: Some("QNRAIN"),
+                    number_origin: OperationalFieldOrigin::NativeGrib,
+                    populated_cells: cells,
+                }],
+                vertical_velocity_origin: OperationalFieldOrigin::DerivedFromNativeOmega,
+                horizontal_winds_rotated_from_grid: true,
+                tke_origin: Some(OperationalFieldOrigin::NativeGrib),
+                notes: vec!["test operational mapping".to_owned()],
+            },
+        };
+        let fields = operational_radar_fields(state).unwrap();
+        assert_eq!(fields.source_model_override.as_deref(), Some("HRRR"));
+        assert!(
+            fields
+                .source_microphysics_override
+                .as_deref()
+                .unwrap()
+                .contains("hrrr-thompson-category-bulk-rayleigh-sband-v1")
+        );
+        assert_eq!(fields.tke_tenths_m2s2.as_ref().unwrap()[0], 12);
+        assert!(fields.polarimetric.is_some());
+        assert_eq!(fields.ref_source, OPERATIONAL_BULK_S_BAND_SOURCE);
+    }
+
+    #[test]
+    fn operational_local_sources_are_extension_unrestricted_and_stably_deduplicated() {
+        let (tx, _rx) = channel();
+        let paths = resolve_operational_radar_paths(
+            OperationalRadarSource::Files(vec![
+                PathBuf::from("hrrr.wrfnat.grib2"),
+                PathBuf::from("experimental_rrfs_native"),
+                PathBuf::from("hrrr.wrfnat.grib2"),
+            ]),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("hrrr.wrfnat.grib2"),
+                PathBuf::from("experimental_rrfs_native")
+            ]
+        );
+    }
+
     fn fingerprint_scene(
         path: &str,
         source_identity: &str,
@@ -6892,6 +7500,10 @@ mod tests {
             tke_tenths_m2s2: None,
             ref_source: "test",
             dx_m: None,
+            source_model_override: None,
+            source_microphysics_override: None,
+            source_scattering_override: None,
+            source_provenance_fragment: None,
             lut,
         }
     }
@@ -9258,6 +9870,10 @@ mod tests {
             tke_tenths_m2s2: None,
             ref_source: "test",
             dx_m: None,
+            source_model_override: None,
+            source_microphysics_override: None,
+            source_scattering_override: None,
+            source_provenance_fragment: None,
             lut,
         }
     }

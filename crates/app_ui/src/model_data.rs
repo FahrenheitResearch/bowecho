@@ -391,6 +391,12 @@ struct SyntheticRadarUiState {
     /// An older config with no entry restores the default 25 m/s.
     #[serde(default = "default_fold_nyquist_mps")]
     fold_nyquist_mps: f32,
+    /// Operational forecast-radar quick selection. Both may be enabled to
+    /// build a two-frame f00/f01 loop from one latest HRRR cycle.
+    #[serde(default = "wrf_default_true")]
+    operational_f00: bool,
+    #[serde(default)]
+    operational_f01: bool,
 }
 
 fn default_synth_range_km() -> f64 {
@@ -499,6 +505,8 @@ impl Default for SyntheticRadarUiState {
             clutter_intensity: 0.0,
             fold_velocity: false,
             fold_nyquist_mps: default_fold_nyquist_mps(),
+            operational_f00: true,
+            operational_f01: false,
         }
     }
 }
@@ -515,6 +523,36 @@ impl SyntheticRadarUiState {
     /// Gate count of the classic default volume (230 km / 250 m); auto
     /// spacing preserves it as the range grows.
     const DEFAULT_GATE_COUNT: f64 = 920.0;
+
+    fn operational_forecast_hours(&self) -> Vec<u16> {
+        let mut hours = Vec::with_capacity(2);
+        if self.operational_f00 {
+            hours.push(0);
+        }
+        if self.operational_f01 {
+            hours.push(1);
+        }
+        hours
+    }
+
+    fn to_operational_config(&self) -> Result<crate::wrf_radar::SyntheticRadarConfig, String> {
+        let mut config = self.to_config()?;
+        config.reflectivity_sampling = crate::wrf_radar::ReflectivitySampling::LinearZ;
+        config.polarimetric_kernel = crate::wrf_radar::PolarimetricKernel::BulkRayleighV1;
+        config.dual_pol = true;
+        config.terminal_fall_speed = true;
+        config.atmosphere_time_mode = app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
+        config.site_name = Some(match (config.site_lat_deg, config.site_lon_deg) {
+            (Some(lat), Some(lon)) => {
+                format!("Operational forecast radar @ {lat:.3}, {lon:.3}")
+            }
+            _ => "Operational forecast radar at native model domain centre".to_owned(),
+        });
+        if !matches!(self.placement, SynthPlacement::NexradSite) {
+            config.site_id = "OPR".to_owned();
+        }
+        Ok(config)
+    }
 
     /// Apply only the controls owned by a named mode. This mirrors the
     /// backend preset exactly, but it runs solely in response to an explicit
@@ -963,6 +1001,12 @@ pub struct ModelDataDock {
         allow(dead_code)
     )]
     synthetic_radar_source_files: Vec<PathBuf>,
+    /// Latest operational HRRR/RRFS request. Local/cached requests retain the
+    /// exact file snapshot; latest-HRRR refresh deliberately re-resolves the
+    /// selected forecast hour(s) through the shared resumable cache.
+    operational_radar_source: Option<crate::wrf_radar::OperationalRadarSource>,
+    operational_cached_inputs: Vec<crate::operational_radar_grib::CachedOperationalHrrrInput>,
+    operational_cached_selected: usize,
     /// Last import status line shown under the import controls.
     import_message: Option<String>,
     tree: Option<StoreTree>,
@@ -1105,6 +1149,9 @@ impl ModelDataDock {
             synthetic_radar_replay_source: None,
             synthetic_export_frames: Vec::new(),
             synthetic_radar_source_files: Vec::new(),
+            operational_radar_source: None,
+            operational_cached_inputs: Vec::new(),
+            operational_cached_selected: 0,
             import_message: None,
             tree: None,
             browser: RunBrowserPanel::new(),
@@ -2210,8 +2257,9 @@ impl ModelDataDock {
                 match done {
                     Some(Ok(output)) => PollResult::FinishedSynthetic {
                         message: format!(
-                            "Simulated {} radar frame(s) from WRF — looping in the radar view",
-                            output.volumes.len()
+                            "Built {} radar frame(s) from {} — looping in the radar view",
+                            output.volumes.len(),
+                            output.label
                         ),
                         output,
                     },
@@ -2982,6 +3030,197 @@ impl ModelDataDock {
                 self.synthetic_radar_site_panel(ui);
             },
         );
+
+        ui.add_space(6.0);
+        model_workflow_card(
+            ui,
+            "Operational forecast radar",
+            "Turn native HRRR or RRFS hybrid-level GRIB into ordinary loopable radar volumes using the same radar controls and export path as WRF.",
+            |ui| self.operational_radar_ui(ui, busy),
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    fn operational_radar_ui(&mut self, ui: &mut egui::Ui, busy: bool) {
+        ui.label(
+            egui::RichText::new(
+                "Native category mass/number fields feed BowEcho's versioned bulk S-band operator. Polar products are dual-pol-like bulk assumptions — not T-matrix output or observed calibration.",
+            )
+            .small()
+            .weak(),
+        );
+        let placement = match self.synth_radar.placement {
+            SynthPlacement::DomainCenter => "native model domain centre".to_owned(),
+            SynthPlacement::LatLon => format!(
+                "lat {}, lon {}",
+                self.synth_radar.lat_text.trim(),
+                self.synth_radar.lon_text.trim()
+            ),
+            SynthPlacement::NexradSite => self.synth_radar.site_id_text.trim().to_uppercase(),
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "Radar: {placement} · {:.0} km range · scan/instrument controls shared with WRF above",
+                self.synth_radar.max_range_km
+            ))
+            .small(),
+        );
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Latest HRRR frames:");
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.toggle_value(&mut self.synth_radar.operational_f00, "f00");
+                ui.toggle_value(&mut self.synth_radar.operational_f01, "f01");
+            });
+        });
+        let forecast_hours = self.synth_radar.operational_forecast_hours();
+        ui.horizontal(|ui| {
+            let spacing = ui.spacing().item_spacing.x;
+            let width = ((ui.available_width() - spacing) * 0.5).max(90.0);
+            if ui
+                .add_enabled_ui(!busy && !forecast_hours.is_empty(), |ui| {
+                    ui.add_sized([width, 27.0], egui::Button::new("Latest HRRR · build"))
+                })
+                .inner
+                .on_hover_text(
+                    "Reuse a matching SimSat/model-cache native file when present; otherwise use SimSat's resumable NOMADS/AWS downloader. Selecting f00 + f01 builds a two-frame loop from one cycle.",
+                )
+                .clicked()
+            {
+                let source = crate::wrf_radar::OperationalRadarSource::LatestHrrr {
+                    forecast_hours,
+                    input_root: settings::simsat_input_dir(),
+                    additional_cache_roots: vec![settings::model_cache_dir()],
+                };
+                match self.synth_radar.to_operational_config() {
+                    Ok(config) => self.launch_operational_radar(source, config),
+                    Err(error) => self.import_message = Some(error),
+                }
+            }
+            if ui
+                .add_enabled_ui(!busy, |ui| {
+                    ui.add_sized([width, 27.0], egui::Button::new("Open local GRIB…"))
+                })
+                .inner
+                .on_hover_text(
+                    "Choose one or more native HRRR/RRFS GRIB files with no filename or extension restriction. Each compatible valid time becomes a frame.",
+                )
+                .clicked()
+                && let Some(paths) = rfd::FileDialog::new()
+                    .set_title("Choose native HRRR/RRFS GRIB file(s) for forecast radar")
+                    .pick_files()
+            {
+                match self.synth_radar.to_operational_config() {
+                    Ok(config) => self.launch_operational_radar(
+                        crate::wrf_radar::OperationalRadarSource::Files(paths),
+                        config,
+                    ),
+                    Err(error) => self.import_message = Some(error),
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Scan shared cache"))
+                .on_hover_text(
+                    "Discover complete native HRRR files in the same SimSat input and model-cache directories; no second cache is created.",
+                )
+                .clicked()
+            {
+                self.refresh_operational_cache();
+            }
+            let selected_label = self
+                .operational_cached_inputs
+                .get(self.operational_cached_selected)
+                .map(|input| input.label.as_str())
+                .unwrap_or("No cached native file scanned");
+            egui::ComboBox::from_id_salt("operational_radar_cached_hrrr")
+                .selected_text(selected_label)
+                .width(310.0)
+                .show_ui(ui, |ui| {
+                    for (index, input) in self.operational_cached_inputs.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.operational_cached_selected,
+                            index,
+                            &input.label,
+                        )
+                        .on_hover_text(input.path.display().to_string());
+                    }
+                });
+        });
+        let selected_cached = self
+            .operational_cached_inputs
+            .get(self.operational_cached_selected)
+            .map(|input| input.path.clone());
+        ui.horizontal(|ui| {
+            let spacing = ui.spacing().item_spacing.x;
+            let width = ((ui.available_width() - spacing) * 0.5).max(90.0);
+            if ui
+                .add_enabled_ui(!busy && selected_cached.is_some(), |ui| {
+                    ui.add_sized([width, 25.0], egui::Button::new("Build cached file"))
+                })
+                .inner
+                .clicked()
+                && let Some(path) = selected_cached
+            {
+                match self.synth_radar.to_operational_config() {
+                    Ok(config) => self.launch_operational_radar(
+                        crate::wrf_radar::OperationalRadarSource::Files(vec![path]),
+                        config,
+                    ),
+                    Err(error) => self.import_message = Some(error),
+                }
+            }
+            if ui
+                .add_enabled_ui(!busy && self.operational_radar_source.is_some(), |ui| {
+                    ui.add_sized([width, 25.0], egui::Button::new("Refresh operational frame(s)"))
+                })
+                .inner
+                .on_hover_text(
+                    "Rebuild local/cached files exactly, or re-resolve the selected latest-HRRR f00/f01 request, using the radar controls as tuned now.",
+                )
+                .clicked()
+            {
+                self.refresh_operational_radar();
+            }
+        });
+        if ui
+            .add_enabled_ui(!self.synthetic_export_frames.is_empty(), |ui| {
+                ui.add_sized(
+                    [ui.available_width().max(120.0), 24.0],
+                    egui::Button::new("Export latest operational loop as CfRadial…"),
+                )
+            })
+            .inner
+            .on_hover_text(
+                "Write the most recently built radar frame or loop through BowEcho's normal CfRadial-1 exporter.",
+            )
+            .clicked()
+        {
+            self.export_synthetic_radar_frames();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    fn refresh_operational_cache(&mut self) {
+        let mut inputs = crate::operational_radar_grib::discover_cached_hrrr_inputs(
+            &settings::simsat_input_dir(),
+        );
+        inputs.extend(crate::operational_radar_grib::discover_cached_hrrr_inputs(
+            &settings::model_cache_dir(),
+        ));
+        let mut seen = std::collections::HashSet::new();
+        inputs.retain(|input| seen.insert(input.path.clone()));
+        inputs.sort_by(|left, right| right.label.cmp(&left.label));
+        self.operational_cached_inputs = inputs;
+        self.operational_cached_selected = self
+            .operational_cached_selected
+            .min(self.operational_cached_inputs.len().saturating_sub(1));
+        self.import_message = Some(format!(
+            "Found {} complete cached HRRR native file(s)",
+            self.operational_cached_inputs.len()
+        ));
     }
 
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -3164,6 +3403,7 @@ impl ModelDataDock {
         self.stage_formula_raw_from_files(&files);
         let count = files.len();
         self.synthetic_radar_source_files = files.clone();
+        self.operational_radar_source = None;
         self.synthetic_radar_replay_source = None;
         let task = crate::wrf_radar::spawn_synthetic_radar(files, config);
         self.import_message = Some(if count == 1 {
@@ -3201,6 +3441,7 @@ impl ModelDataDock {
         };
         self.stage_formula_raw_from_files(std::slice::from_ref(&file));
         self.synthetic_radar_source_files = vec![file.clone()];
+        self.operational_radar_source = None;
         self.synthetic_radar_replay_source = Some(observed.clone());
         let task = crate::wrf_radar::spawn_synthetic_radar_replay(vec![file], config, observed);
         self.import_message = Some(
@@ -3255,6 +3496,60 @@ impl ModelDataDock {
                 }
             }
             Err(message) => self.import_message = Some(message),
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    fn launch_operational_radar(
+        &mut self,
+        source: crate::wrf_radar::OperationalRadarSource,
+        config: crate::wrf_radar::SyntheticRadarConfig,
+    ) {
+        if self.import_job.is_some() {
+            self.import_message = Some(
+                "Operational forecast radar cannot start while another import is running"
+                    .to_owned(),
+            );
+            return;
+        }
+        if self.formula_lab.busy() {
+            self.import_message = Some(
+                "Operational forecast radar cannot start while Formula Lab is evaluating"
+                    .to_owned(),
+            );
+            return;
+        }
+        if matches!(&source, crate::wrf_radar::OperationalRadarSource::Files(paths) if paths.is_empty())
+        {
+            self.import_message = Some("No native HRRR/RRFS GRIB files selected".to_owned());
+            return;
+        }
+        self.synthetic_radar_source_files.clear();
+        self.synthetic_radar_replay_source = None;
+        self.operational_radar_source = Some(source.clone());
+        self.import_message = Some("Building operational forecast radar…".to_owned());
+        self.import_job = Some(ImportJob::SyntheticRadar(
+            crate::wrf_radar::spawn_operational_radar(source, config),
+        ));
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    fn refresh_operational_radar(&mut self) {
+        if self.import_job.is_some() || self.formula_lab.busy() {
+            self.import_message = Some(
+                "Operational forecast radar cannot refresh while another model task is running"
+                    .to_owned(),
+            );
+            return;
+        }
+        let Some(source) = self.operational_radar_source.clone() else {
+            self.import_message =
+                Some("Build an operational forecast radar frame before refreshing".to_owned());
+            return;
+        };
+        match self.synth_radar.to_operational_config() {
+            Ok(config) => self.launch_operational_radar(source, config),
+            Err(error) => self.import_message = Some(error),
         }
     }
 
@@ -6385,6 +6680,8 @@ mod tests {
             crate::wrf_radar::DEFAULT_FOLD_NYQUIST_MPS,
             "folding Nyquist restores the default 25 m/s"
         );
+        assert!(empty.operational_f00);
+        assert!(!empty.operational_f01);
 
         // A non-default selection survives the round trip.
         let custom = SyntheticRadarUiState {
@@ -6549,6 +6846,33 @@ mod tests {
             config.nyquist_mps, historical.nyquist_mps,
             "default folding Nyquist matches the library default"
         );
+    }
+
+    #[test]
+    fn operational_radar_uses_selected_f00_f01_and_fixed_bulk_contract() {
+        let mut state = SyntheticRadarUiState {
+            polarimetric_kernel: crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1,
+            atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear,
+            dual_pol: false,
+            terminal_fall_speed: false,
+            operational_f00: true,
+            operational_f01: true,
+            ..SyntheticRadarUiState::default()
+        };
+        assert_eq!(state.operational_forecast_hours(), vec![0, 1]);
+        let config = state.to_operational_config().unwrap();
+        assert_eq!(
+            config.polarimetric_kernel,
+            crate::wrf_radar::PolarimetricKernel::BulkRayleighV1
+        );
+        assert_eq!(
+            config.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart
+        );
+        assert!(config.dual_pol && config.terminal_fall_speed);
+
+        state.operational_f00 = false;
+        assert_eq!(state.operational_forecast_hours(), vec![1]);
     }
 
     #[test]
