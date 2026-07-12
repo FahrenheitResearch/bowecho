@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
-GENERATOR_VERSION = "1.0.0"
+GENERATOR_VERSION = "1.1.0"
 MAGIC = b"BRSLUT01"
 SCHEMA_VERSION = 1
 POINT_COMPONENT_COUNT = 9
@@ -38,6 +38,11 @@ PROPERTY_SOLVER_NDGS = 14
 GENERATION_WORKERS = 12
 CONVENTIONAL_SOLVER_NDGS = 2
 CONVERGENCE_SOLVER_NDGS = (8, 10, 12, 14, 16, 18, 20)
+EXACT_PROPERTY_BAND_FREQUENCIES_HZ = {
+    "s": 2.8e9,
+    "c": 5.6e9,
+    "x": 9.4e9,
+}
 
 AXIS_UNITS = {
     "equivolume_diameter": "meter",
@@ -107,13 +112,16 @@ OUTPUTS = [
 TOOL_FILES = (
     "Dockerfile",
     "FAILURE_RECORD.md",
+    "PACK_FORMAT.md",
     "README.md",
+    "generate_band_pack.py",
     "generate_lut.py",
     "generator_config.example.json",
     "requirements-bootstrap-pinned.txt",
     "requirements-pytmatrix-pinned.txt",
     "run_all.ps1",
     "toolchain.json",
+    "test_generate_band_pack.py",
     "emitter/Cargo.toml",
     "emitter/Cargo.lock",
     "emitter/src/main.rs",
@@ -485,7 +493,6 @@ def validate_config(config: dict[str, Any]) -> None:
                 "liebe_hufford_manabe_1991_double_debye"
             ),
             "temperature_range_k": [250.0, 313.15],
-            "frequency_range_hz": [2.0e9, 4.0e9],
             "applicability": (
                 "pure_fresh_supercooled_or_liquid_water_250_to_313p15_k"
             ),
@@ -493,6 +500,15 @@ def validate_config(config: dict[str, Any]) -> None:
         for key, expected in exact_water_contract.items():
             if dielectric[key] != expected:
                 raise GeneratorError(f"dielectric.{key} must equal {expected!r}")
+        if dielectric["frequency_range_hz"] not in (
+            [2.0e9, 4.0e9],
+            [2.0e9, 10.0e9],
+        ):
+            raise GeneratorError(
+                "residual-rain dielectric.frequency_range_hz must be either "
+                "the legacy S-only [2, 4] GHz range or the exact-band-pack "
+                "[2, 10] GHz range"
+            )
         if (
             _number(
                 dielectric["mass_density_kg_m3"],
@@ -760,14 +776,47 @@ def validate_config(config: dict[str, Any]) -> None:
             raise GeneratorError("liquid mass fractions must lie in [0, 1]")
         if expected_kind == "minor_to_major_axis_ratio" and any(not (0.0 < v <= 1.0) for v in numeric):
             raise GeneratorError("minor-to-major ratios must lie in (0, 1]")
-        if expected_kind == "frequency" and any(not (2.0e9 <= v <= 4.0e9) for v in numeric):
-            raise GeneratorError("frequency nodes must remain in S band [2, 4] GHz")
+        if expected_kind == "frequency":
+            if _is_property_aware(config) or _is_residual_rain(config):
+                if (
+                    len(numeric) != 1
+                    or numeric[0] not in EXACT_PROPERTY_BAND_FREQUENCIES_HZ.values()
+                ):
+                    raise GeneratorError(
+                        "view-aware frequency must be a singleton exactly at "
+                        "2.8, 5.6, or 9.4 GHz; frequency interpolation is forbidden"
+                    )
+            elif any(not (2.0e9 <= v <= 4.0e9) for v in numeric):
+                raise GeneratorError(
+                    "legacy conventional frequency nodes must remain in S band [2, 4] GHz"
+                )
         if expected_kind == "radar_elevation" and any(not (-90.0 <= v <= 90.0) for v in numeric):
             raise GeneratorError("radar elevations must lie in [-90, 90] degrees")
 
     if _is_property_aware(config) or _is_residual_rain(config):
-        if axis_coordinates(config, "frequency") != [2.8e9]:
-            raise GeneratorError("view-aware frequency axis must be singleton exactly 2.8 GHz")
+        exact_frequency_hz = axis_coordinates(config, "frequency")[0]
+        band = next(
+            name
+            for name, frequency_hz in EXACT_PROPERTY_BAND_FREQUENCIES_HZ.items()
+            if frequency_hz == exact_frequency_hz
+        )
+        if f"-{band}band-" not in config["table_id"]:
+            raise GeneratorError(
+                f"table_id must contain '-{band}band-' for exact frequency "
+                f"{exact_frequency_hz} Hz"
+            )
+        if _is_residual_rain(config):
+            frequency_range_hz = dielectric["frequency_range_hz"]
+            if not (frequency_range_hz[0] <= exact_frequency_hz <= frequency_range_hz[1]):
+                raise GeneratorError(
+                    "residual-rain dielectric frequency range does not contain the "
+                    "exact configured pack frequency"
+                )
+            if band in ("c", "x") and frequency_range_hz != [2.0e9, 10.0e9]:
+                raise GeneratorError(
+                    "C/X residual-rain configs must declare the [2, 10] GHz "
+                    "Liebe-model applicability range"
+                )
         temperatures = axis_coordinates(config, "temperature")
         elevations = axis_coordinates(config, "radar_elevation")
         if elevations[0] != -0.5 or elevations[-1] != 20.0:

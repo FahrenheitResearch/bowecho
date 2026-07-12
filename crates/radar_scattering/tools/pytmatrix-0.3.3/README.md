@@ -17,6 +17,22 @@ The property tables are compatible with bounded, closure-derived P3/ISHMAEL-
 style characteristic-particle coordinates. They are not scheme-native PSD
 integrals and do not claim full P3 or ISHMAEL scientific validation.
 
+## Exact S/C/X pack generation
+
+`generate_band_pack.py` provides the reproducible five-role external-pack path
+for exact 2.8 GHz S, 5.6 GHz C, and 9.4 GHz X research frequencies. It reuses
+the property material, ODF, geometry, solver, and execution contracts, calls
+this locked generator for every real LUT node, and emits schema-1 `pack.json`
+with strict role-file sizes and SHA-256 identities. It never interpolates
+frequency. See [`PACK_FORMAT.md`](PACK_FORMAT.md) for the command, layout,
+manifest schema, and provenance-hash definitions.
+
+The pack generator always writes `unvalidated_research`. C/X generation does
+not reuse S-band convergence evidence and cannot be marked validated by a
+command-line switch; independent band-specific convergence and validation
+records are required before a separately reviewed manifest can activate a
+pack in BowEcho.
+
 ## Locked environment
 
 `Dockerfile` pins CPython 3.11.9 and Rust 1.85.1 image manifests, an immutable
@@ -82,8 +98,10 @@ turns beam elevation `e` into the declared backscatter and forward geometries.
 
 ## Property-coordinate physics and limits
 
-All five property tables use exactly 2.8 GHz, a radar-elevation axis spanning
--0.5 through 20 degrees, and mean-zero Gaussian canting with 20-degree standard
+The embedded five-table set uses exactly 2.8 GHz. External research packs may
+instead be generated directly at exactly 2.8, 5.6, or 9.4 GHz; one pack always
+contains only one of those frequencies. All use a radar-elevation axis spanning
+-0.5 through 20 degrees and mean-zero Gaussian canting with 20-degree standard
 deviation and deterministic 5-by-10 orientation quadrature. Oblate and prolate
 frozen states are separate tables. Frozen minor/major ratio covers 0.1 through
 1.0; rain covers 0.5 through 1.0.
