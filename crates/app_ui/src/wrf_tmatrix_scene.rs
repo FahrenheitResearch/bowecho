@@ -36,6 +36,154 @@ const WEIGHT_SUM_TOLERANCE: f64 = 1.0e-9;
 const MAX_PROPERTY_CATEGORIES_PER_CELL: usize = 3;
 const PER_WORKER_ALLOCATION_GUARD_BYTES: usize = 16 * 1024;
 
+// Exact coordinate contract for the versioned five-table research bundle.
+// Each frozen role keeps its own solver-complete diameter domain; no renderer
+// invariant requires the four phase/shape tables to share a size axis.
+const DRY_OBLATE_DIAMETER_M: &[f64] = &[
+    0.00005,
+    0.0000625,
+    0.000078125,
+    0.00009765625,
+    0.0001220703125,
+    0.000152587890625,
+    0.00019073486328125,
+    0.0002384185791015625,
+    0.0002980232238769531,
+    0.0003725290298461914,
+    0.00046566128730773926,
+    0.0005820766091346741,
+    0.0007275957614183426,
+    0.0009094947017729282,
+    0.0011368683772161603,
+    0.0014210854715202004,
+    0.0017763568394002505,
+    0.002220446049250313,
+    0.0027755575615628914,
+    0.003469446951953614,
+    0.004336808689942018,
+    0.005421010862427522,
+    0.006776263578034403,
+    0.008470329472543003,
+    0.010587911840678754,
+    0.013234889800848443,
+    0.016543612251060553,
+    0.02067951531382569,
+    0.025849394142282114,
+    0.03231174267785264,
+    0.0403896783473158,
+    0.05048709793414475,
+    0.06310887241768094,
+    0.07888609052210117,
+    0.089,
+];
+const DRY_PROLATE_DIAMETER_M: &[f64] = &[
+    0.00005,
+    0.0000625,
+    0.000078125,
+    0.00009765625,
+    0.0001220703125,
+    0.000152587890625,
+    0.00019073486328125,
+    0.0002384185791015625,
+    0.0002980232238769531,
+    0.0003725290298461914,
+    0.00046566128730773926,
+    0.0005820766091346741,
+    0.0007275957614183426,
+    0.0009094947017729282,
+    0.0011368683772161603,
+    0.0014210854715202004,
+    0.0017763568394002505,
+    0.002220446049250313,
+    0.0027755575615628914,
+    0.003469446951953614,
+    0.004336808689942018,
+    0.005421010862427522,
+    0.006776263578034403,
+    0.008470329472543003,
+    0.010587911840678754,
+    0.013234889800848443,
+    0.016543612251060553,
+    0.02067951531382569,
+    0.025849394142282114,
+    0.03231174267785264,
+    0.0403896783473158,
+    0.05,
+];
+const WET_OBLATE_DIAMETER_M: &[f64] = &[
+    0.00005,
+    0.0000625,
+    0.000078125,
+    0.00009765625,
+    0.0001220703125,
+    0.000152587890625,
+    0.00019073486328125,
+    0.0002384185791015625,
+    0.0002980232238769531,
+    0.0003725290298461914,
+    0.00046566128730773926,
+    0.0005820766091346741,
+    0.0007275957614183426,
+    0.0009094947017729282,
+    0.0011368683772161603,
+    0.0014210854715202004,
+    0.0017763568394002505,
+    0.002220446049250313,
+    0.0027755575615628914,
+    0.003469446951953614,
+    0.004336808689942018,
+    0.005421010862427522,
+    0.006776263578034403,
+    0.008470329472543003,
+    0.010587911840678754,
+    0.013234889800848443,
+    0.015,
+];
+const WET_PROLATE_DIAMETER_M: &[f64] = &[
+    0.00005,
+    0.0000625,
+    0.000078125,
+    0.00009765625,
+    0.0001220703125,
+    0.000152587890625,
+    0.00019073486328125,
+    0.0002384185791015625,
+    0.0002980232238769531,
+    0.0003725290298461914,
+    0.00046566128730773926,
+    0.0005820766091346741,
+    0.0007275957614183426,
+    0.0009094947017729282,
+    0.0011368683772161603,
+    0.0014210854715202004,
+    0.0017763568394002505,
+    0.002220446049250313,
+    0.0027755575615628914,
+    0.003469446951953614,
+    0.004336808689942018,
+    0.005421010862427522,
+    0.0063,
+];
+const DRY_TEMPERATURE_K: &[f64] = &[190.0, 230.0, 260.0, 273.15];
+const DRY_BULK_DENSITY_KG_M3: &[f64] = &[1.5, 20.0, 100.0, 400.0, 850.0, 917.0];
+const FROZEN_MINOR_TO_MAJOR: &[f64] = &[0.1, 0.4, 0.7, 1.0];
+const WET_TEMPERATURE_K: &[f64] = &[269.15, 273.15, 275.15];
+const WET_CONDENSED_VOLUME_FRACTION: &[f64] = &[0.0015, 0.05, 0.2, 0.5, 0.85, 1.0];
+const WET_LIQUID_MASS_FRACTION: &[f64] = &[0.0, 0.2, 0.6, 0.98];
+const RAIN_DIAMETER_M: &[f64] = &[
+    0.000_3, 0.000_5, 0.000_8, 0.001_2, 0.001_8, 0.002_6, 0.003_6, 0.004_8, 0.006, 0.007,
+];
+const RAIN_TEMPERATURE_K: &[f64] = &[250.0, 269.15, 293.15, 313.15];
+const RAIN_MINOR_TO_MAJOR: &[f64] = &[0.5, 0.7, 0.85, 1.0];
+const PROPERTY_FREQUENCY_HZ: &[f64] = &[PROPERTY_TMATRIX_FREQUENCY_HZ];
+const PROPERTY_RADAR_ELEVATION_DEG: &[f64] = &[-0.5, 0.9, 4.5, 10.0, 20.0];
+const PROPERTY_SOLVER_DDELT: f64 = 0.001;
+const DRY_OBLATE_SOLVER_NDGS: u32 = 14;
+const DRY_PROLATE_SOLVER_NDGS: u32 = 14;
+const WET_OBLATE_SOLVER_NDGS: u32 = 14;
+const WET_PROLATE_SOLVER_NDGS: u32 = 14;
+const RAIN_SOLVER_NDGS: u32 = 14;
+
 const DRY_OBLATE_TABLE_ID: &str =
     "property-p3-ishmael-dry-oblate-sband-pytmatrix-0.3.3-unvalidated-v1";
 const DRY_PROLATE_TABLE_ID: &str =
@@ -1250,6 +1398,14 @@ fn validate_bundle(
                 actual: actual_kinds,
             });
         }
+        for axis in table.offline_lut().header().axes() {
+            validate_exact_axis_coordinates(role, axis.kind(), axis.coordinates())?;
+        }
+        validate_exact_solver(
+            role,
+            descriptor.radar().solver_ddelt,
+            descriptor.radar().solver_ndgs,
+        )?;
         if !matches!(
             descriptor.odf(),
             TMatrixOdfConvention::GaussianCanting {
@@ -1356,6 +1512,114 @@ fn table_for_role(
         WrfTMatrixTableRole::WetOblate => tables.wet_oblate,
         WrfTMatrixTableRole::WetProlate => tables.wet_prolate,
         WrfTMatrixTableRole::RainStandaloneAndResidual => tables.rain_standalone_and_residual,
+    }
+}
+
+fn validate_exact_axis_coordinates(
+    role: WrfTMatrixTableRole,
+    kind: AxisKind,
+    actual: &[f64],
+) -> Result<(), WrfTMatrixBundleError> {
+    let expected = exact_axis_coordinates(role, kind)
+        .ok_or(WrfTMatrixBundleError::MissingCoordinateContract { role, kind })?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(WrfTMatrixBundleError::AxisCoordinates {
+            role,
+            kind,
+            expected: expected.to_vec(),
+            actual: actual.to_vec(),
+        })
+    }
+}
+
+fn exact_axis_coordinates(role: WrfTMatrixTableRole, kind: AxisKind) -> Option<&'static [f64]> {
+    match (role, kind) {
+        (WrfTMatrixTableRole::DryOblate, AxisKind::EquivolumeDiameter) => {
+            Some(DRY_OBLATE_DIAMETER_M)
+        }
+        (WrfTMatrixTableRole::DryProlate, AxisKind::EquivolumeDiameter) => {
+            Some(DRY_PROLATE_DIAMETER_M)
+        }
+        (WrfTMatrixTableRole::WetOblate, AxisKind::EquivolumeDiameter) => {
+            Some(WET_OBLATE_DIAMETER_M)
+        }
+        (WrfTMatrixTableRole::WetProlate, AxisKind::EquivolumeDiameter) => {
+            Some(WET_PROLATE_DIAMETER_M)
+        }
+        (
+            WrfTMatrixTableRole::DryOblate | WrfTMatrixTableRole::DryProlate,
+            AxisKind::Temperature,
+        ) => Some(DRY_TEMPERATURE_K),
+        (
+            WrfTMatrixTableRole::DryOblate | WrfTMatrixTableRole::DryProlate,
+            AxisKind::BulkDensity,
+        ) => Some(DRY_BULK_DENSITY_KG_M3),
+        (
+            WrfTMatrixTableRole::DryOblate
+            | WrfTMatrixTableRole::DryProlate
+            | WrfTMatrixTableRole::WetOblate
+            | WrfTMatrixTableRole::WetProlate,
+            AxisKind::MinorToMajorAxisRatio,
+        ) => Some(FROZEN_MINOR_TO_MAJOR),
+        (
+            WrfTMatrixTableRole::WetOblate | WrfTMatrixTableRole::WetProlate,
+            AxisKind::Temperature,
+        ) => Some(WET_TEMPERATURE_K),
+        (
+            WrfTMatrixTableRole::WetOblate | WrfTMatrixTableRole::WetProlate,
+            AxisKind::CondensedVolumeFraction,
+        ) => Some(WET_CONDENSED_VOLUME_FRACTION),
+        (
+            WrfTMatrixTableRole::WetOblate | WrfTMatrixTableRole::WetProlate,
+            AxisKind::LiquidMassFraction,
+        ) => Some(WET_LIQUID_MASS_FRACTION),
+        (WrfTMatrixTableRole::RainStandaloneAndResidual, AxisKind::EquivolumeDiameter) => {
+            Some(RAIN_DIAMETER_M)
+        }
+        (WrfTMatrixTableRole::RainStandaloneAndResidual, AxisKind::Temperature) => {
+            Some(RAIN_TEMPERATURE_K)
+        }
+        (WrfTMatrixTableRole::RainStandaloneAndResidual, AxisKind::MinorToMajorAxisRatio) => {
+            Some(RAIN_MINOR_TO_MAJOR)
+        }
+        (_, AxisKind::Frequency) => Some(PROPERTY_FREQUENCY_HZ),
+        (_, AxisKind::RadarElevation) => Some(PROPERTY_RADAR_ELEVATION_DEG),
+        _ => None,
+    }
+}
+
+fn validate_exact_solver(
+    role: WrfTMatrixTableRole,
+    actual_ddelt: f64,
+    actual_ndgs: u32,
+) -> Result<(), WrfTMatrixBundleError> {
+    if actual_ddelt != PROPERTY_SOLVER_DDELT {
+        return Err(WrfTMatrixBundleError::RadarSolverDdelt {
+            role,
+            expected: PROPERTY_SOLVER_DDELT,
+            actual: actual_ddelt,
+        });
+    }
+    let expected_ndgs = exact_solver_ndgs(role);
+    if actual_ndgs != expected_ndgs {
+        return Err(WrfTMatrixBundleError::RadarSolverNdgs {
+            role,
+            expected: expected_ndgs,
+            actual: actual_ndgs,
+        });
+    }
+    Ok(())
+}
+
+const fn exact_solver_ndgs(role: WrfTMatrixTableRole) -> u32 {
+    match role {
+        WrfTMatrixTableRole::DryOblate => DRY_OBLATE_SOLVER_NDGS,
+        WrfTMatrixTableRole::DryProlate => DRY_PROLATE_SOLVER_NDGS,
+        WrfTMatrixTableRole::WetOblate => WET_OBLATE_SOLVER_NDGS,
+        WrfTMatrixTableRole::WetProlate => WET_PROLATE_SOLVER_NDGS,
+        WrfTMatrixTableRole::RainStandaloneAndResidual => RAIN_SOLVER_NDGS,
     }
 }
 
@@ -1581,6 +1845,18 @@ pub enum WrfTMatrixBundleError {
         expected: Vec<AxisKind>,
         actual: Vec<AxisKind>,
     },
+    #[error("{role} table has no exact coordinate contract for axis {kind:?}")]
+    MissingCoordinateContract {
+        role: WrfTMatrixTableRole,
+        kind: AxisKind,
+    },
+    #[error("{role} {kind:?} coordinates must be exactly {expected:?}, got {actual:?}")]
+    AxisCoordinates {
+        role: WrfTMatrixTableRole,
+        kind: AxisKind,
+        expected: Vec<f64>,
+        actual: Vec<f64>,
+    },
     #[error("{role} table is missing required axis {kind:?}")]
     MissingAxis {
         role: WrfTMatrixTableRole,
@@ -1598,6 +1874,18 @@ pub enum WrfTMatrixBundleError {
     RadarApplicability,
     #[error("{role} radar convention/applicability differs from the dry-oblate reference")]
     RadarConventionMismatch { role: WrfTMatrixTableRole },
+    #[error("{role} radar solver ddelt must be exactly {expected}, got {actual}")]
+    RadarSolverDdelt {
+        role: WrfTMatrixTableRole,
+        expected: f64,
+        actual: f64,
+    },
+    #[error("{role} radar solver ndgs must be exactly {expected}, got {actual}")]
+    RadarSolverNdgs {
+        role: WrfTMatrixTableRole,
+        expected: u32,
+        actual: u32,
+    },
     #[error("dry-oblate frequency axis must be exactly [2.8e9], got {actual:?}")]
     FrequencyAxis {
         role: WrfTMatrixTableRole,
@@ -1757,6 +2045,60 @@ mod tests {
                 spheroid_for_category(category),
                 SpheroidConvention::OblateMinorVertical
             );
+        }
+    }
+
+    #[test]
+    fn every_role_rejects_one_coordinate_of_asset_drift() {
+        for role in [
+            WrfTMatrixTableRole::DryOblate,
+            WrfTMatrixTableRole::DryProlate,
+            WrfTMatrixTableRole::WetOblate,
+            WrfTMatrixTableRole::WetProlate,
+            WrfTMatrixTableRole::RainStandaloneAndResidual,
+        ] {
+            let kinds = match role {
+                WrfTMatrixTableRole::DryOblate | WrfTMatrixTableRole::DryProlate => DRY_AXIS_KINDS,
+                WrfTMatrixTableRole::WetOblate | WrfTMatrixTableRole::WetProlate => WET_AXIS_KINDS,
+                WrfTMatrixTableRole::RainStandaloneAndResidual => RAIN_AXIS_KINDS,
+            };
+            for &kind in kinds {
+                let expected = exact_axis_coordinates(role, kind).unwrap();
+                validate_exact_axis_coordinates(role, kind, expected).unwrap();
+                let mut drifted = expected.to_vec();
+                let last = drifted.last_mut().unwrap();
+                *last *= 1.0 + 1.0e-12;
+                assert!(matches!(
+                    validate_exact_axis_coordinates(role, kind, &drifted),
+                    Err(WrfTMatrixBundleError::AxisCoordinates {
+                        role: rejected_role,
+                        kind: rejected_kind,
+                        ..
+                    }) if rejected_role == role && rejected_kind == kind
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn every_role_requires_exact_solver_descriptor() {
+        for role in [
+            WrfTMatrixTableRole::DryOblate,
+            WrfTMatrixTableRole::DryProlate,
+            WrfTMatrixTableRole::WetOblate,
+            WrfTMatrixTableRole::WetProlate,
+            WrfTMatrixTableRole::RainStandaloneAndResidual,
+        ] {
+            let expected_ndgs = exact_solver_ndgs(role);
+            validate_exact_solver(role, PROPERTY_SOLVER_DDELT, expected_ndgs).unwrap();
+            assert!(matches!(
+                validate_exact_solver(role, PROPERTY_SOLVER_DDELT + 1.0e-12, expected_ndgs),
+                Err(WrfTMatrixBundleError::RadarSolverDdelt { .. })
+            ));
+            assert!(matches!(
+                validate_exact_solver(role, PROPERTY_SOLVER_DDELT, expected_ndgs - 1),
+                Err(WrfTMatrixBundleError::RadarSolverNdgs { .. })
+            ));
         }
     }
 
