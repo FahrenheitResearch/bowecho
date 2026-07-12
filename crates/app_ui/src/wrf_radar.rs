@@ -2073,6 +2073,59 @@ struct CutMomentRow {
     zdr_corrected: Vec<f32>,
 }
 
+/// Acquisition geometry and timing resolved before gate sampling begins.
+///
+/// Temporal WRF sampling needs one interpolation weight for the whole ray, so
+/// acquisition time cannot be invented after the parallel sampler has already
+/// read the atmosphere. Keeping this plan separate also makes the timestamp
+/// written to [`Radial`] exactly the timestamp used by the forward operator.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SyntheticRayPlan {
+    source_index: usize,
+    azimuth_deg: f32,
+    time_offset_ms: i32,
+    radial_status: radar_core::RadialStatus,
+}
+
+fn plan_synthetic_rays(
+    cut_index: usize,
+    cut_count: usize,
+    naz: usize,
+    scan_timing: ScanTiming,
+    azimuth_rate_deg_per_second: f32,
+    cut_start_ms: i32,
+) -> Vec<SyntheticRayPlan> {
+    (0..naz)
+        .map(|source_index| {
+            let azimuth_deg = source_index as f32 * 360.0 / naz as f32;
+            let time_offset_ms = match scan_timing {
+                ScanTiming::InstantaneousTruth => 0,
+                ScanTiming::TimedVolume => {
+                    let radial_ms = 1_000.0 * azimuth_deg / azimuth_rate_deg_per_second.max(0.1);
+                    cut_start_ms.saturating_add(radial_ms.round() as i32)
+                }
+            };
+            let radial_status = if source_index == 0 && cut_index == 0 {
+                radar_core::RadialStatus::StartVolume
+            } else if source_index == 0 {
+                radar_core::RadialStatus::StartElevation
+            } else if source_index + 1 == naz && cut_index + 1 == cut_count {
+                radar_core::RadialStatus::EndVolume
+            } else if source_index + 1 == naz {
+                radar_core::RadialStatus::EndElevation
+            } else {
+                radar_core::RadialStatus::Intermediate
+            };
+            SyntheticRayPlan {
+                source_index,
+                azimuth_deg,
+                time_offset_ms,
+                radial_status,
+            }
+        })
+        .collect()
+}
+
 impl CutMomentRow {
     fn blank(gates: usize) -> Self {
         let blank = || vec![f32::NAN; gates];
@@ -2135,12 +2188,22 @@ fn build_cut(
         Vec::new()
     };
 
+    let ray_plan = plan_synthetic_rays(
+        cut_index,
+        scan_leg_count,
+        naz,
+        config.scan_timing,
+        scan_leg.azimuth_rate_deg_per_second,
+        cut_start_ms,
+    );
+
     // One row per radial, sampled in parallel. Each row is `gate_count` REF and
     // `gate_count` VEL f32 values (NaN = no data / below floor / off-domain).
-    let rows: Vec<CutMomentRow> = (0..naz)
-        .into_par_iter()
-        .map(|iaz| {
-            let az_deg = iaz as f64 * 360.0 / naz as f64;
+    let rows: Vec<CutMomentRow> = ray_plan
+        .par_iter()
+        .map(|ray| {
+            let iaz = ray.source_index;
+            let az_deg = f64::from(ray.azimuth_deg);
             let mut row = CutMomentRow::blank(gate_count);
             let dr_km = (spacing / 1_000.0).max(0.0) as f32;
             let mut previous_kdp = 0.0f32;
@@ -2346,32 +2409,14 @@ fn build_cut(
     let mut adp_values = Vec::with_capacity(naz * gate_count);
     let mut pida_values = Vec::with_capacity(naz * gate_count);
     let mut zdrc_values = Vec::with_capacity(naz * gate_count);
-    for (iaz, row) in rows.into_iter().enumerate() {
-        let az_deg = iaz as f32 * 360.0 / naz as f32;
-        let time_offset_ms = match config.scan_timing {
-            ScanTiming::InstantaneousTruth => 0,
-            ScanTiming::TimedVolume => {
-                let radial_ms = 1_000.0 * az_deg / scan_leg.azimuth_rate_deg_per_second.max(0.1);
-                cut_start_ms.saturating_add(radial_ms.round() as i32)
-            }
-        };
+    for (ray, row) in ray_plan.into_iter().zip(rows) {
         cut.radials.push(Radial {
-            azimuth_deg: az_deg,
+            azimuth_deg: ray.azimuth_deg,
             elevation_deg: elevation_deg as f32,
-            time_offset_ms,
+            time_offset_ms: ray.time_offset_ms,
             gate_range: gate_range.clone(),
             nyquist_velocity_mps: Some(config.stamped_nyquist_mps()),
-            radial_status: Some(if iaz == 0 && cut_index == 0 {
-                radar_core::RadialStatus::StartVolume
-            } else if iaz == 0 {
-                radar_core::RadialStatus::StartElevation
-            } else if iaz + 1 == naz && cut_index + 1 == scan_leg_count {
-                radar_core::RadialStatus::EndVolume
-            } else if iaz + 1 == naz {
-                radar_core::RadialStatus::EndElevation
-            } else {
-                radar_core::RadialStatus::Intermediate
-            }),
+            radial_status: Some(ray.radial_status),
         });
         ref_values.extend(row.reflectivity);
         vel_values.extend(row.velocity);
@@ -3715,6 +3760,33 @@ mod tests {
         assert!(samples[0].spectrum_width_mps < 1.0e-4);
         assert!(samples[1].spectrum_width_mps >= 0.0);
         assert!(samples[2].spectrum_width_mps >= 0.0);
+    }
+
+    #[test]
+    fn ray_plan_resolves_sampling_time_and_status_before_rendering() {
+        let rays = plan_synthetic_rays(1, 2, 4, ScanTiming::TimedVolume, 10.0, 40_000);
+        assert_eq!(
+            rays.iter()
+                .map(|ray| (ray.azimuth_deg, ray.time_offset_ms))
+                .collect::<Vec<_>>(),
+            vec![
+                (0.0, 40_000),
+                (90.0, 49_000),
+                (180.0, 58_000),
+                (270.0, 67_000),
+            ]
+        );
+        assert_eq!(
+            rays.first().map(|ray| ray.radial_status),
+            Some(radar_core::RadialStatus::StartElevation)
+        );
+        assert_eq!(
+            rays.last().map(|ray| ray.radial_status),
+            Some(radar_core::RadialStatus::EndVolume)
+        );
+
+        let frozen = plan_synthetic_rays(0, 1, 3, ScanTiming::InstantaneousTruth, 18.0, 99);
+        assert!(frozen.iter().all(|ray| ray.time_offset_ms == 0));
     }
 
     #[test]
