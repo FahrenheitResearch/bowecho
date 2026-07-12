@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "status": "research_only_unvalidated",
+  "kernel": "pytmatrix-0.3.3",
+  "frequency_hz": [2800000000.0],
+  "equivolume_diameter_m": [0.0001, 0.001],
+  "temperature_k": [253.15, 273.15],
+  "minor_to_major_axis_ratio": [0.7, 1.0],
+  "orientation": {
+    "model": "fixed_euler",
+    "yaw_deg": 0.0,
+    "pitch_deg": 0.0,
+    "roll_deg": 0.0
+  },
+  "melting": {
+    "model": "dry"
+  },
+  "temporal": {
+    "sampling": "instantaneous"
+  },
+  "payload": {
+    "encoding": "f64_le_point_major_last_axis_fastest"
+  }
+}

@@ -1,0 +1,2 @@
+# Official PyPI 0.3.3 source distribution, pinned by artifact SHA-256.
+https://files.pythonhosted.org/packages/03/0e/9ab5caf01bd7c62107f2b997555b3f97b25b62db55573d09fd43bf48cad0/pytmatrix-0.3.3.tar.gz#sha256=34a1962a89c0f123ff815a05318abd09ad247613d3a2684747119a4cd67b9e5a

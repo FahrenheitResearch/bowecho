@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "status": "research_only_unvalidated",
+  "target": "linux-x86_64",
+  "os_family": "debian-12-bookworm",
+  "python": "CPython 3.11.9",
+  "fortran_compiler": "GNU Fortran 12.2.0 (Debian package 12.2.0-14+deb12u1)",
+  "native_runtime": "libgfortran5 12.2.0-14+deb12u1",
+  "pytmatrix": {
+    "version": "0.3.3",
+    "release_tag": "0.3.3",
+    "release_commit_short": "22432e7",
+    "sdist_sha256": "34a1962a89c0f123ff815a05318abd09ad247613d3a2684747119a4cd67b9e5a"
+  },
+  "output_lut_schema": 1
+}
