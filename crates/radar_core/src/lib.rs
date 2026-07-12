@@ -8,6 +8,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+mod refractivity;
+
+pub use refractivity::{
+    EARTH_DUCTING_GRADIENT_N_PER_KM, PropagationRegime, RefractedBeamError, RefractedBeamPoint,
+    RefractedBeamTrace, RefractivityLevel, RefractivityProfile, RefractivityProfileError,
+    STANDARD_REFRACTIVITY_GRADIENT_N_PER_KM, propagation_regime, radio_refractivity_n_units,
+    trace_refracted_beam,
+};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
