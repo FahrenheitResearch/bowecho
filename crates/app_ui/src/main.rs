@@ -2982,6 +2982,12 @@ struct ViewerApp {
     /// Model-data dock (rusty-weather rw-ui panels), created on first open.
     model_dock: Option<model_data::ModelDataDock>,
     model_dock_open: bool,
+    /// Dedicated raw-WRF workflows window/pane. Shares `model_dock` with the
+    /// Models viewer so processing jobs and stored results have one owner.
+    wrf_window_open: bool,
+    /// Deferred because the request can originate inside the dock tile-tree
+    /// pass, where mutating the live workspace tree is forbidden.
+    wrf_open_models_requested: bool,
     /// One-shot latch for the startup window sizing: the monitor size is only
     /// known once the event loop is running, so the per-monitor default
     /// (`adaptive_startup_inner_size`) is applied via a ViewportCommand on the
@@ -7601,7 +7607,7 @@ impl WorkflowPreset {
                 "Two-pane DVEL/SRV view with Vrot armed and velocity-focused inspection"
             }
             Self::ModelWrf => {
-                "Two-pane model plot and skew-T with the model dock, WRF import on the Data tab, and Vrot armed for synthetic radar"
+                "Two-pane model plot and skew-T plus the dedicated WRF workspace, with Vrot armed for synthetic radar"
             }
             Self::SatelliteTropical => {
                 "Satellite window following the player plus active tropical cyclones and the storm-cards panel"
@@ -7827,6 +7833,7 @@ struct WorkflowSnapshot {
     model_enabled: bool,
     model_download_open: bool,
     model_viewer_mode: dock::ViewerMode,
+    wrf_viewer_mode: dock::ViewerMode,
     satellite_viewer_mode: dock::ViewerMode,
     sounding_viewer_mode: dock::ViewerMode,
     sat_map_follow: bool,
@@ -8315,6 +8322,8 @@ impl ViewerApp {
             workspace: dock::Workspace::default(),
             model_dock: None,
             model_dock_open: false,
+            wrf_window_open: false,
+            wrf_open_models_requested: false,
             initial_viewport_sized: false,
             model_timeline_follow: false,
             model_timeline_last_key: None,
@@ -19425,6 +19434,11 @@ impl eframe::App for ViewerApp {
         }
 
         self.model_data_window(&ctx);
+        self.wrf_window(&ctx);
+        self.apply_wrf_window_requests();
+        if let Some(dock) = self.model_dock.as_mut() {
+            dock.auxiliary_windows(&ctx);
+        }
         self.vwp_window(&ctx);
         self.radar_overlays_window(&ctx);
         self.satellite_window(&ctx);
@@ -19873,7 +19887,7 @@ impl ViewerApp {
             }
             WorkflowPreset::ModelWrf => {
                 // Model + WRF desk: two-pane model plot with the skew-T docked
-                // beside it, WRF import/synthetic-radar tools on the Data tab,
+                // beside it, the separate WRF import/synthetic-radar workspace,
                 // model download picker open, obs adjusting soundings, and Vrot
                 // armed for the sim-supercell couplets. Folds together the old
                 // Model context, Simulated radar, and Upper air presets.
@@ -19881,6 +19895,7 @@ impl ViewerApp {
                 self.sidebar_tab = SidebarTab::Data;
                 self.model_enabled = true;
                 self.open_viewer(dock::WorkspacePane::Model);
+                self.open_viewer(dock::WorkspacePane::Wrf);
                 // Skew-T front door: docks beside the model plot; opens with
                 // instructions until an Alt-click launches a sounding.
                 self.open_viewer(dock::WorkspacePane::Sounding);
@@ -19964,6 +19979,7 @@ impl ViewerApp {
             model_enabled: self.model_enabled,
             model_download_open: self.model_download_open,
             model_viewer_mode: self.viewer_mode(dock::WorkspacePane::Model),
+            wrf_viewer_mode: self.viewer_mode(dock::WorkspacePane::Wrf),
             satellite_viewer_mode: self.viewer_mode(dock::WorkspacePane::Satellite),
             sounding_viewer_mode: self.viewer_mode(dock::WorkspacePane::Sounding),
             sat_map_follow: self.sat_map_follow,
@@ -20039,6 +20055,7 @@ impl ViewerApp {
         self.model_enabled = snapshot.model_enabled;
         self.model_download_open = snapshot.model_download_open;
         self.restore_viewer_mode(dock::WorkspacePane::Model, snapshot.model_viewer_mode);
+        self.restore_viewer_mode(dock::WorkspacePane::Wrf, snapshot.wrf_viewer_mode);
         self.restore_viewer_mode(
             dock::WorkspacePane::Satellite,
             snapshot.satellite_viewer_mode,
@@ -20152,9 +20169,14 @@ impl ViewerApp {
             let mut toggle: Option<dock::WorkspacePane> = None;
             for (pane, label, hover) in [
                 (
+                    dock::WorkspacePane::Wrf,
+                    "WRF",
+                    "Raw wrfout import, wrf-rust diagnostics, Formula Lab, and simulated radar",
+                ),
+                (
                     dock::WorkspacePane::Model,
-                    "Model data",
-                    "NWP model fields + skew-T soundings (rusty-weather store) — turns the model master switch on if needed",
+                    "Models",
+                    "Downloaded and processed NWP fields, native plots, maps, and skew-T soundings",
                 ),
                 (
                     dock::WorkspacePane::Vwp,
@@ -20251,8 +20273,8 @@ impl ViewerApp {
                 // §1.3.7): with the master switch off, poll_model_layer would
                 // tear the dock down next frame and the window flashed for
                 // one frame and died. Flip the switch on.
-                if pane == dock::WorkspacePane::Model
-                    && self.model_dock_open
+                if matches!(pane, dock::WorkspacePane::Model | dock::WorkspacePane::Wrf)
+                    && self.viewer_open(pane)
                     && !self.model_enabled
                 {
                     self.model_enabled = true;
@@ -20268,7 +20290,7 @@ impl ViewerApp {
             }
         });
         button.on_hover_text(
-            "Data windows: Model · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding",
+            "Data windows: WRF · Models · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding",
         );
     }
 
@@ -25985,6 +26007,7 @@ impl ViewerApp {
             dock::WorkspacePane::Farm => self.farm.open = open,
             dock::WorkspacePane::Satellite => self.show_satellite = open,
             dock::WorkspacePane::Simsat => self.show_simsat = open,
+            dock::WorkspacePane::Wrf => self.wrf_window_open = open,
             dock::WorkspacePane::Model => self.model_dock_open = open,
             dock::WorkspacePane::Vwp => self.vwp_open = open,
             dock::WorkspacePane::UnifiedPlayer => self.unified_player.open = open,
@@ -26002,6 +26025,7 @@ impl ViewerApp {
             dock::WorkspacePane::Farm => self.farm.open,
             dock::WorkspacePane::Satellite => self.show_satellite,
             dock::WorkspacePane::Simsat => self.show_simsat,
+            dock::WorkspacePane::Wrf => self.wrf_window_open,
             dock::WorkspacePane::Model => self.model_dock_open,
             dock::WorkspacePane::Vwp => self.vwp_open,
             dock::WorkspacePane::UnifiedPlayer => self.unified_player.open,
@@ -26154,10 +26178,9 @@ impl ViewerApp {
                 }
             }
         }
-        // A restored Model viewer implies the master switch (the top-bar
-        // intent rule) — otherwise poll_model_layer tears it down at the
-        // first frame.
-        if self.model_dock_open && !self.model_enabled {
+        // A restored Models or WRF viewer implies the shared backend switch —
+        // otherwise poll_model_layer would tear its worker down immediately.
+        if (self.model_dock_open || self.wrf_window_open) && !self.model_enabled {
             self.model_enabled = true;
         }
         // Restoring is not an edit; nothing to write back.
@@ -26258,6 +26281,7 @@ impl ViewerApp {
                 self.handle_satellite_events(panel_events, player_events);
             }
             dock::WorkspacePane::Simsat => self.simsat_pane_body(ui),
+            dock::WorkspacePane::Wrf => self.wrf_pane_body(ui),
             dock::WorkspacePane::Model => {
                 let events = self.model_pane_body(ui);
                 self.dispatch_download_events(events);
@@ -29698,6 +29722,13 @@ impl ViewerApp {
         dock
     }
 
+    fn ensure_model_data_dock(&mut self, ctx: &egui::Context) {
+        if self.model_dock.is_none() {
+            let store_root = settings::model_store_dir();
+            self.model_dock = Some(self.new_model_data_dock(ctx, store_root));
+        }
+    }
+
     fn vwp_window(&mut self, ctx: &egui::Context) {
         if !self.vwp_open || self.workspace.is_docked(dock::WorkspacePane::Vwp) {
             return;
@@ -29762,16 +29793,13 @@ impl ViewerApp {
         if !self.model_dock_open {
             return;
         }
-        if self.model_dock.is_none() {
-            let store_root = settings::model_store_dir();
-            self.model_dock = Some(self.new_model_data_dock(ctx, store_root));
-        }
+        self.ensure_model_data_dock(ctx);
         if self.workspace.is_docked(dock::WorkspacePane::Model) {
             return; // body renders as a workspace pane
         }
         let mut open = self.model_dock_open;
         let mut events = Vec::new();
-        egui::Window::new("Model data")
+        egui::Window::new("Models")
             .open(&mut open)
             // Wide by default: this window lays out Import | model plot | Sounding
             // side by side, and the old 1080x660 default clipped all three so the
@@ -29785,6 +29813,57 @@ impl ViewerApp {
             });
         self.set_viewer_open(dock::WorkspacePane::Model, open);
         self.dispatch_download_events(events);
+    }
+
+    fn wrf_window(&mut self, ctx: &egui::Context) {
+        if !self.wrf_window_open {
+            return;
+        }
+        // Opening WRF is explicit intent to keep the shared model/WRF worker
+        // alive even when no model raster is currently drawn on the map.
+        self.model_enabled = true;
+        self.ensure_model_data_dock(ctx);
+        if self.workspace.is_docked(dock::WorkspacePane::Wrf) {
+            return;
+        }
+        let mut open = self.wrf_window_open;
+        egui::Window::new("WRF")
+            .open(&mut open)
+            .default_size([900.0, 820.0])
+            .min_size([520.0, 420.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                self.dock_toggle_row(ui, dock::WorkspacePane::Wrf);
+                self.wrf_pane_body(ui);
+            });
+        self.set_viewer_open(dock::WorkspacePane::Wrf, open);
+    }
+
+    fn wrf_pane_body(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.ensure_model_data_dock(&ctx);
+        let mut open_models = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Processed fields and Formula Lab results are displayed in Models.");
+            open_models = ui.button("Open Models").clicked();
+        });
+        ui.separator();
+        if let Some(dock) = self.model_dock.as_mut() {
+            dock.wrf_ui(ui);
+        }
+        if open_models {
+            self.wrf_open_models_requested = true;
+        }
+        self.persist_wrf_process_options();
+        self.persist_wrf_synth_radar();
+    }
+
+    fn apply_wrf_window_requests(&mut self) {
+        if !std::mem::take(&mut self.wrf_open_models_requested) {
+            return;
+        }
+        self.model_enabled = true;
+        self.open_viewer(dock::WorkspacePane::Model);
     }
 
     /// Model data body (Download fold + store dock), window and pane
@@ -32288,6 +32367,9 @@ impl ViewerApp {
     }
 
     fn poll_model_layer(&mut self, ctx: &egui::Context) {
+        if self.wrf_window_open && !self.model_enabled {
+            self.model_enabled = true;
+        }
         if !self.model_enabled {
             if self.model_dock.is_some() {
                 // Tear down: drop the dock/layer/LUT so nothing model-side
@@ -32297,7 +32379,9 @@ impl ViewerApp {
                 self.model_layers.clear();
                 self.model_lut = None;
                 self.model_dock_open = false;
+                self.wrf_window_open = false;
                 self.workspace.undock(dock::WorkspacePane::Model);
+                self.workspace.undock(dock::WorkspacePane::Wrf);
             }
             return;
         }
@@ -62921,6 +63005,8 @@ mod tests {
             workspace: dock::Workspace::default(),
             model_dock: None,
             model_dock_open: false,
+            wrf_window_open: false,
+            wrf_open_models_requested: false,
             initial_viewport_sized: false,
             model_timeline_follow: false,
             model_timeline_last_key: None,
@@ -64825,6 +64911,22 @@ mod tests {
     }
 
     #[test]
+    fn wrf_open_models_request_restores_the_saved_dock_preference() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.workspace
+            .prefer_docked
+            .insert(dock::WorkspacePane::Model);
+        app.wrf_open_models_requested = true;
+
+        app.apply_wrf_window_requests();
+
+        assert!(app.model_enabled);
+        assert!(app.viewer_open(dock::WorkspacePane::Model));
+        assert!(app.workspace.is_docked(dock::WorkspacePane::Model));
+        assert!(!app.wrf_open_models_requested);
+    }
+
+    #[test]
     fn loading_a_site_remembers_startup_but_never_auto_favorites() {
         // Field feedback: "some actions make it automatically save radar;
         // only save radar by clicking the star". Loading/selecting a site
@@ -65504,7 +65606,7 @@ mod tests {
     }
 
     #[test]
-    fn model_wrf_workflow_opens_model_and_sounding_and_restores() {
+    fn model_wrf_workflow_opens_models_wrf_and_sounding_and_restores() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
         app.sidebar_tab = SidebarTab::Radar;
@@ -65524,6 +65626,7 @@ mod tests {
         assert!(app.model_enabled);
         assert!(app.model_download_open);
         assert!(app.viewer_open(dock::WorkspacePane::Model));
+        assert!(app.viewer_open(dock::WorkspacePane::Wrf));
         assert!(app.viewer_open(dock::WorkspacePane::Sounding));
         assert!(app.obs_enabled);
         assert!(app.obs_adjust_soundings);
@@ -65540,6 +65643,8 @@ mod tests {
         assert!(!app.model_download_open);
         assert!(!app.viewer_open(dock::WorkspacePane::Model));
         assert!(!app.workspace.is_docked(dock::WorkspacePane::Model));
+        assert!(!app.viewer_open(dock::WorkspacePane::Wrf));
+        assert!(!app.workspace.is_docked(dock::WorkspacePane::Wrf));
         assert!(!app.viewer_open(dock::WorkspacePane::Sounding));
         assert!(!app.obs_enabled);
         assert!(!app.obs_adjust_soundings);

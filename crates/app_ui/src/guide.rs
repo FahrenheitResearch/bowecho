@@ -726,7 +726,8 @@ fn model_data(ui: &mut egui::Ui) {
          worldwide, plus local WRF and NetCDF files you import yourself), layered straight \
          onto the radar map. Enable the \
          master switch first: \u{2699} Settings \u{25b8} Model \u{25b8} Model data (off = \
-         pure radar app). Windows \u{25be} \u{25b8} Model data opens the Model window.",
+         pure radar app). Windows \u{25be} \u{25b8} Models opens stored runs and plotting; \
+         Windows \u{25be} \u{25b8} WRF opens raw-WRF processing and simulated radar.",
     );
 
     subhead(ui, "GETTING DATA");
@@ -755,9 +756,10 @@ fn model_data(ui: &mut egui::Ui) {
     subhead(ui, "WRF WORKFLOWS");
     para(
         ui,
-        "WRF is a first-class section in the Model library rail. Open data, wrf-rust full \
-         diagnostics, and simulated radar each have their own visible workflow card; they are \
-         not hidden under generic model acquisition.",
+        "WRF is a separate first-class window and dockable workspace, not a section buried in \
+         Models. Open data, wrf-rust full diagnostics, Formula Lab, GDEX, and simulated radar \
+         live there. They share one backend with Models, so processed fields immediately appear \
+         in the Models run library for plotting, maps, and soundings.",
     );
     action(
         ui,
@@ -797,19 +799,35 @@ fn model_data(ui: &mut egui::Ui) {
     subhead(ui, "SIMULATED RADAR FROM WRF");
     para(
         ui,
-        "WRF simulated radar forward-models a raw wrfout file's \
-         hydrometeors and winds into a simulated NEXRAD-style volume — reflectivity and \
-         radial velocity on a real 14-tilt polar ladder (720 radials, 250 m gates to 230 km, \
-         4/3-Earth beam) — that renders and LOOPS in the radar view through the same pipeline \
+        "WRF simulated radar forward-models a raw wrfout file's hydrometeors and winds into a \
+         polar volume on a 14-tilt ladder (720 radials, 250 m gates to 230 km by default, \
+         4/3-Earth beam). It can emit REF, VEL, spectrum width, S-band dual-pol, phase, \
+         attenuation, and corrected fields, then renders and LOOPS through the same pipeline \
          as Level II: colormaps, tilts, cross-sections, and velocity dealiasing. Pick one or \
-         more files (each forecast time becomes a loop frame); it writes nothing to the model \
-         store and is labelled \u{201c}simulated\u{201d} so you always know. Runs in seconds \
-         per file, not the minutes the heavy import takes.",
+         more files; each forecast time becomes a loop frame and nothing is written to the \
+         model store.",
+    );
+    action(
+        ui,
+        "What do you want? presets",
+        "— Storm view (fast) is the readable loop default; Clean model truth removes every \
+         presentation/instrument effect; Clean dual-pol exposes polarimetric microphysics \
+         without noise or folding; Real radar (balanced) is the recommended complete virtual \
+         S-band scan; Maximum fidelity (slow) uses 27 pulse-volume samples. Each preset resets \
+         interacting physics and calibration values together while preserving your chosen \
+         radar location, range, and gate geometry.",
     );
     para(
         ui,
-        "The \u{1f4e1} Virtual radar site & range panel shapes the scan; every change rebuilds \
-         the volume on the next run.",
+        "Dual-pol presets use supported raw bulk hydrometeor fields when the WRF microphysics \
+         permits it. Unsupported P3/ISHMAEL or incomplete inputs fall back explicitly to \
+         scalar REF/VEL and report why instead of fabricating polarimetric products.",
+    );
+    para(
+        ui,
+        "Radar location & fine tuning (advanced) contains the antenna, geometry, physics, and \
+         instrument controls. You can ignore it when a preset already matches your goal; every \
+         advanced change is persisted and marks the setup as Custom tuning.",
     );
     action(
         ui,
@@ -1737,7 +1755,7 @@ fn sources(ui: &mut egui::Ui) {
     subhead(ui, "GDEX CLIMATE MODEL DATA");
     para(
         ui,
-        "The model dock's GDEX browser walks the NSF NCAR GDEX online catalog (a THREDDS \
+        "The WRF window's GDEX browser walks the NSF NCAR GDEX online catalog (a THREDDS \
          server) and imports whole files or NCSS subsets directly. A dataset picker offers \
          CONUS II — regional climate WRF downscaling for present and future periods — and \
          ERA-20C, ECMWF's 20th-century reanalysis (1900-2010, GRIB1). \

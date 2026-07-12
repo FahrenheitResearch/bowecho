@@ -152,6 +152,68 @@ enum SynthPlacement {
     NexradSite,
 }
 
+/// Outcome-oriented starting points for people who do not want to assemble a
+/// virtual instrument one checkbox at a time. Recipes deliberately preserve
+/// antenna placement, range, and gate geometry, but reset every interacting
+/// presentation/physics/instrument control to a known-compatible set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyntheticRadarRecipe {
+    StormView,
+    CleanTruth,
+    CleanDualPol,
+    RealRadar,
+    MaximumFidelity,
+}
+
+impl SyntheticRadarRecipe {
+    const ALL: [Self; 5] = [
+        Self::StormView,
+        Self::CleanTruth,
+        Self::CleanDualPol,
+        Self::RealRadar,
+        Self::MaximumFidelity,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::StormView => "Storm view (fast)",
+            Self::CleanTruth => "Clean model truth",
+            Self::CleanDualPol => "Clean dual-pol",
+            Self::RealRadar => "Real radar (balanced) - recommended",
+            Self::MaximumFidelity => "Maximum fidelity (slow)",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::StormView => {
+                "Sharp, readable reflectivity and clean winds for quickly browsing a run; no simulated hardware effects."
+            }
+            Self::CleanTruth => {
+                "Artifact-free model REF/VEL for diagnosis and comparisons: no texture, noise, folding, blockage, or scan-time effects."
+            }
+            Self::CleanDualPol => {
+                "All polarimetric products without noise, velocity folding, or terrain blockage, so the model microphysics is easiest to inspect."
+            }
+            Self::RealRadar => {
+                "A practical virtual S-band radar with beam averaging, fall speed, terrain blockage, dual-pol propagation, sensitivity, timed rays, and folded velocity."
+            }
+            Self::MaximumFidelity => {
+                "The full virtual instrument with 27-point pulse-volume integration. Best for one file or a short loop; source-model resolution still limits detail."
+            }
+        }
+    }
+
+    const fn products(self) -> &'static str {
+        match self {
+            Self::StormView | Self::CleanTruth => "REF / VEL",
+            Self::CleanDualPol | Self::RealRadar | Self::MaximumFidelity => {
+                "REF / VEL / SW / ZDR / CC / KDP / PHI + attenuation/corrected fields"
+            }
+        }
+    }
+}
+
 /// Editable + persisted state for the "Virtual radar site & range" popover
 /// next to the simulated-radar button: antenna placement plus the optional
 /// max-range / gate-spacing overrides (groundwork for the wide CONUS-style
@@ -413,6 +475,63 @@ impl SyntheticRadarUiState {
         self.vel_gate_texture = preset.vel_gate_texture;
         self.clutter_intensity = preset.clutter_intensity;
         self.fold_velocity = preset.fold_velocity;
+    }
+
+    /// Apply a complete, human-facing recipe while leaving the chosen virtual
+    /// radar location/range/gate geometry untouched.
+    fn apply_recipe(&mut self, recipe: SyntheticRadarRecipe) {
+        let defaults = crate::wrf_radar::SyntheticRadarConfig::default();
+
+        // Reset knobs that the lower-level mode presets intentionally leave
+        // editable. This prevents a stale custom PRF, bias, texture, or
+        // sensitivity value from leaking into a newly selected recipe.
+        self.reflectivity_operator = crate::wrf_radar::ReflectivityOperator::ModelNative;
+        self.reflectivity_sampling = crate::wrf_radar::ReflectivitySampling::LinearZ;
+        self.beam_width_deg = defaults.beam_width_deg;
+        self.pulse_width_us = defaults.pulse_width_us;
+        self.radar_frequency_mhz = defaults.radar_frequency_mhz;
+        self.spectrum_width_floor_mps = defaults.spectrum_width_floor_mps;
+        self.system_phidp_deg = 0.0;
+        self.zdr_bias_db = 0.0;
+        self.rotation_rate_deg_s = defaults.rotation_rate_deg_s;
+        self.transition_delay_s = defaults.transition_delay_s;
+        self.prf_hz = defaults.prf_hz;
+        self.sensitivity_dbz_at_1km = defaults.sensitivity_dbz_at_1km;
+        self.include_low_tilt = false;
+        self.vel_gate_texture = false;
+        self.clutter_intensity = 0.0;
+        self.fold_nyquist_mps = defaults.nyquist_mps;
+
+        match recipe {
+            SyntheticRadarRecipe::StormView => {
+                self.apply_mode_preset(crate::wrf_radar::SimulationMode::Presentation);
+            }
+            SyntheticRadarRecipe::CleanTruth => {
+                self.apply_mode_preset(crate::wrf_radar::SimulationMode::Truth);
+            }
+            SyntheticRadarRecipe::CleanDualPol => {
+                self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
+                self.terrain_blockage = false;
+                self.scan_timing = crate::wrf_radar::ScanTiming::InstantaneousTruth;
+                self.instrument_noise = false;
+                self.fold_velocity = false;
+            }
+            SyntheticRadarRecipe::RealRadar => {
+                self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
+            }
+            SyntheticRadarRecipe::MaximumFidelity => {
+                self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
+                self.beam_integration = crate::wrf_radar::BeamIntegration::Reference;
+            }
+        }
+    }
+
+    fn active_recipe(&self) -> Option<SyntheticRadarRecipe> {
+        SyntheticRadarRecipe::ALL.into_iter().find(|recipe| {
+            let mut expected = self.clone();
+            expected.apply_recipe(*recipe);
+            expected == *self
+        })
     }
 
     fn clamped_range_km(&self) -> f64 {
@@ -1180,6 +1299,15 @@ impl ModelDataDock {
         self.pump_formula_lab();
     }
 
+    /// Draw auxiliary windows that belong to the shared Models/WRF backend
+    /// exactly once per app frame, independent of which owner surface is open.
+    pub fn auxiliary_windows(&mut self, ctx: &egui::Context) {
+        if self.gdex.open {
+            let cache_dir = settings::gdex_cache_dir();
+            self.gdex.ui(ctx, &cache_dir);
+        }
+    }
+
     /// One-shot map request (the app installs it as a radar-map layer).
     pub fn take_map_request(&mut self) -> Option<std::sync::Arc<rw_ui::FieldData>> {
         self.map_request.take()
@@ -1756,73 +1884,91 @@ impl ModelDataDock {
         self.import_job = Some(ImportJob::SyntheticRadar(task));
     }
 
-    /// First-class WRF workflows plus secondary acquisition, formula, and
-    /// output controls rendered below the run library. Opening a raw wrfout,
-    /// running wrf-rust diagnostics, and building simulated radar are the
-    /// primary jobs of this workspace, so they remain directly visible instead
-    /// of being buried under a generic "Add data" disclosure.
-    fn import_controls(&mut self, ui: &mut egui::Ui) {
-        ui.label(model_section_heading("WRF workflows"));
+    /// The Models window now owns stored-run browsing and output. Raw WRF
+    /// workflows live in [`Self::wrf_ui`] so neither surface becomes another
+    /// wall of unrelated controls.
+    fn model_library_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(model_section_heading("Model output"));
         ui.label(
             egui::RichText::new(
-                "Open raw wrfout or NetCDF data, compute the full wrf-rust suite, or build a simulated radar loop.",
+                "Render the selected stored run. Raw wrfout processing and simulated radar now live in Windows > WRF.",
             )
             .small()
             .weak(),
         );
-        ui.add_space(4.0);
-        self.import_pickers(ui);
-
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(model_section_heading("Other model sources"))
-            .id_salt("model_other_sources")
-            .default_open(false)
+        model_subheading(ui, "Batch plots");
+        self.plot_controls(ui);
+    }
+
+    /// Dedicated first-class WRF workspace. It deliberately shares this
+    /// `ModelDataDock` with Models: one store worker, one selected run, one
+    /// Formula Lab, and one synthetic-radar result queue.
+    pub fn wrf_ui(&mut self, ui: &mut egui::Ui) {
+        self.handle_responses();
+        egui::ScrollArea::vertical()
+            .id_salt("wrf_workspace_scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.label(model_section_heading("WRF workspace"));
                 ui.label(
                     egui::RichText::new(
-                        "Browse and import regional climate model data without leaving BowEcho.",
+                        "Open raw wrfout data, compute wrf-rust diagnostics, build simulated radar, or create custom formulas. Finished fields remain available in Models for plotting.",
                     )
                     .small()
                     .weak(),
                 );
-                ui.horizontal(|ui| {
-                    let gdex_busy = self.gdex.busy();
-                    let reserved = if gdex_busy {
-                        ui.spacing().item_spacing.x + 18.0
-                    } else {
-                        0.0
-                    };
-                    let response = ui
-                        .add_sized(
-                            [(ui.available_width() - reserved).max(120.0), 26.0],
-                            egui::Button::new("Browse GDEX catalog…"),
-                        )
-                        .on_hover_text(
-                            "Browse the NSF NCAR GDEX online catalog — CONUS II regional \
-                             climate WRF (present + future). Download a whole file or an NCSS \
-                             subset; it imports into the model store like any other run.",
-                        );
-                    if response.clicked() {
-                        self.gdex.open = true;
-                    }
-                    if gdex_busy {
-                        ui.spinner();
-                    }
-                });
-            });
+                ui.add_space(6.0);
+                self.import_pickers(ui);
 
-        egui::CollapsingHeader::new(model_section_heading("Tools & output"))
-            .id_salt("model_tools_output")
-            .default_open(false)
-            .show(ui, |ui| {
-                self.formula_controls(ui);
+                ui.add_space(10.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| self.formula_controls(ui));
+
                 ui.add_space(8.0);
-                model_subheading(ui, "Batch plots");
-                self.plot_controls(ui);
-            });
+                egui::CollapsingHeader::new(model_section_heading("WRF archives (GDEX)"))
+                    .id_salt("wrf_gdex_source")
+                    .default_open(false)
+                    .show(ui, |ui| self.gdex_controls(ui));
 
+                self.import_status_ui(ui);
+            });
+    }
+
+    fn gdex_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Browse NSF NCAR CONUS II regional-climate WRF data and import it into the shared model store.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            let gdex_busy = self.gdex.busy();
+            let reserved = if gdex_busy {
+                ui.spacing().item_spacing.x + 18.0
+            } else {
+                0.0
+            };
+            let response = ui
+                .add_sized(
+                    [(ui.available_width() - reserved).max(120.0), 26.0],
+                    egui::Button::new("Browse GDEX catalog…"),
+                )
+                .on_hover_text(
+                    "Browse the NSF NCAR GDEX online catalog — CONUS II regional climate WRF (present + future). Download a whole file or an NCSS subset; it imports into the model store like any other run.",
+                );
+            if response.clicked() {
+                self.gdex.open = true;
+            }
+            if gdex_busy {
+                ui.spinner();
+            }
+        });
+    }
+
+    fn import_status_ui(&self, ui: &mut egui::Ui) {
         if let Some(message) = &self.import_message {
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if self.import_job.is_some() {
                     ui.spinner();
@@ -2096,6 +2242,8 @@ impl ModelDataDock {
             "WRF simulated radar",
             "Forward-model WRF hydrometeors and winds into a fast, loopable NEXRAD-style reflectivity and radial-velocity scan.",
             |ui| {
+                self.synthetic_radar_recipe_ui(ui, busy);
+                ui.add_space(5.0);
                 ui.horizontal(|ui| {
                     let spacing = ui.spacing().item_spacing.x;
                     let width = ((ui.available_width() - spacing) * 0.5).max(82.0);
@@ -2171,6 +2319,78 @@ impl ModelDataDock {
                 self.synthetic_radar_site_panel(ui);
             },
         );
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    fn synthetic_radar_recipe_ui(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let state = &mut self.synth_radar;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("WHAT DO YOU WANT?")
+                    .size(11.0)
+                    .strong()
+                    .color(crate::ui_theme::subhead_color()),
+            );
+
+            let current = state.active_recipe();
+            let selected_text = current
+                .map(SyntheticRadarRecipe::label)
+                .unwrap_or("Custom tuning");
+            let mut picked = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Preset:");
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_id_salt("wrf_synth_radar_recipe")
+                        .selected_text(selected_text)
+                        .width(245.0)
+                        .show_ui(ui, |ui| {
+                            for recipe in SyntheticRadarRecipe::ALL {
+                                if ui
+                                    .selectable_label(current == Some(recipe), recipe.label())
+                                    .on_hover_text(recipe.description())
+                                    .clicked()
+                                {
+                                    picked = Some(recipe);
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+            });
+            if let Some(recipe) = picked {
+                state.apply_recipe(recipe);
+            }
+
+            if let Some(recipe) = state.active_recipe() {
+                ui.label(egui::RichText::new(recipe.description()).small().weak());
+                ui.label(
+                    egui::RichText::new(format!("Expected products: {}", recipe.products()))
+                        .small(),
+                );
+                if matches!(
+                    recipe,
+                    SyntheticRadarRecipe::CleanDualPol
+                        | SyntheticRadarRecipe::RealRadar
+                        | SyntheticRadarRecipe::MaximumFidelity
+                ) {
+                    ui.label(
+                        egui::RichText::new(
+                            "Dual-pol uses supported raw bulk hydrometeors when present; unsupported inputs automatically fall back to REF/VEL with a status note.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "Custom tuning: one or more advanced controls differ from every safe preset.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+        });
     }
 
     /// Size-gate a wrf-rust severe/thermo import (park LARGE grids behind an
@@ -2436,7 +2656,7 @@ impl ModelDataDock {
     fn synthetic_radar_site_panel(&mut self, ui: &mut egui::Ui) {
         let busy = self.import_job.is_some() || self.formula_lab.busy();
         let state = &mut self.synth_radar;
-        egui::CollapsingHeader::new("Radar site & scan settings")
+        egui::CollapsingHeader::new("Radar location & fine tuning (advanced)")
             .id_salt("wrf_synth_radar_site")
             .default_open(false)
             .show(ui, |ui| {
@@ -2452,7 +2672,7 @@ impl ModelDataDock {
                 ui.add_enabled_ui(!busy, |ui| {
                     ui.separator();
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("Simulation mode").strong());
+                        ui.label(egui::RichText::new("Technical mode").strong());
                         for (mode, label, help) in [
                             (
                                 crate::wrf_radar::SimulationMode::Truth,
@@ -3045,10 +3265,14 @@ impl ModelDataDock {
                     });
                     if ui
                         .button("Reset to defaults")
-                        .on_hover_text("Everything but heavy eCAPE — the classic import.")
+                        .on_hover_text(
+                            "Everything but heavy eCAPE — the classic import. Does not change the separate Models > Automatically plot setting.",
+                        )
                         .clicked()
                     {
+                        let auto_plot = opts.auto_plot;
                         *opts = WrfProcessUiState::default();
+                        opts.auto_plot = auto_plot;
                     }
                 });
 
@@ -3338,7 +3562,7 @@ impl ModelDataDock {
                                 ui.label("No model runs yet.");
                                 ui.label(
                                     egui::RichText::new(
-                                        "Use the WRF workflows below to open wrfout/NetCDF data, or browse other model sources.",
+                                        "Use Acquire model data above, or open Windows > WRF for raw wrfout workflows.",
                                     )
                                     .small()
                                     .weak(),
@@ -3367,7 +3591,7 @@ impl ModelDataDock {
                     .id_salt("model_library_actions")
                     .max_height(actions_height)
                     .auto_shrink([false, true])
-                    .show(ui, |ui| self.import_controls(ui));
+                    .show(ui, |ui| self.model_library_controls(ui));
             });
 
         // The sounding is NOT rendered here. A model-sounding load feeds BOTH
@@ -3494,15 +3718,6 @@ impl ModelDataDock {
             if !open {
                 self.show_color_tables = false;
             }
-        }
-
-        // GDEX (NSF NCAR CONUS II) catalog browser, as a floating window.
-        // Rendered only while open so its download cache dir is not created
-        // every frame; its workers keep running (and completed downloads keep
-        // importing) via `poll_gdex` even after the window is closed.
-        if self.gdex.open {
-            let cache_dir = settings::gdex_cache_dir();
-            self.gdex.ui(ui, &cache_dir);
         }
     }
 }
@@ -5049,6 +5264,69 @@ mod tests {
         // Expert edits stay put until another mode button invokes the helper.
         state.dual_pol = false;
         assert!(!state.to_config().unwrap().dual_pol);
+    }
+
+    #[test]
+    fn synth_radar_recipes_reset_interacting_knobs_but_preserve_geometry() {
+        use crate::wrf_radar::{BeamIntegration, ScanTiming, SimulationMode};
+
+        let mut state = SyntheticRadarUiState {
+            placement: SynthPlacement::NexradSite,
+            site_id_text: "KTLX".to_owned(),
+            max_range_km: 310.0,
+            gate_spacing_m: 500.0,
+            auto_gate_spacing: false,
+            match_gate_to_grid: true,
+            beam_width_deg: 4.0,
+            prf_hz: 4_500.0,
+            system_phidp_deg: 82.0,
+            zdr_bias_db: 1.5,
+            clutter_intensity: 0.9,
+            include_low_tilt: true,
+            ..SyntheticRadarUiState::default()
+        };
+
+        state.apply_recipe(SyntheticRadarRecipe::RealRadar);
+        let real = state.to_config().unwrap();
+        let defaults = crate::wrf_radar::SyntheticRadarConfig::default();
+        assert_eq!(real.simulation_mode, SimulationMode::Instrument);
+        assert_eq!(real.beam_integration, BeamIntegration::Balanced);
+        assert!(real.dual_pol && real.propagation && real.spectrum_width);
+        assert!(real.terrain_blockage && real.instrument_noise && real.fold_velocity);
+        assert_eq!(real.scan_timing, ScanTiming::TimedVolume);
+        assert_eq!(real.beam_width_deg, defaults.beam_width_deg);
+        assert_eq!(real.prf_hz, defaults.prf_hz);
+        assert_eq!(real.system_phidp_deg, 0.0);
+        assert_eq!(real.zdr_bias_db, 0.0);
+        assert_eq!(real.clutter_intensity, 0.0);
+        assert_eq!(real.site_id, "KTLX");
+        assert_eq!(real.max_range_m, 310_000.0);
+        assert_eq!(real.gate_spacing_m, 500.0);
+        assert!(real.match_gate_to_grid);
+
+        state.apply_recipe(SyntheticRadarRecipe::CleanDualPol);
+        let clean = state.to_config().unwrap();
+        assert!(clean.dual_pol && clean.propagation && clean.spectrum_width);
+        assert!(!clean.terrain_blockage);
+        assert!(!clean.instrument_noise);
+        assert!(!clean.fold_velocity);
+        assert_eq!(clean.scan_timing, ScanTiming::InstantaneousTruth);
+
+        state.apply_recipe(SyntheticRadarRecipe::MaximumFidelity);
+        assert_eq!(
+            state.to_config().unwrap().beam_integration,
+            BeamIntegration::Reference
+        );
+    }
+
+    #[test]
+    fn synth_radar_recipe_detection_marks_manual_edits_custom() {
+        let mut state = SyntheticRadarUiState::default();
+        assert_eq!(state.active_recipe(), Some(SyntheticRadarRecipe::StormView));
+        state.apply_recipe(SyntheticRadarRecipe::RealRadar);
+        assert_eq!(state.active_recipe(), Some(SyntheticRadarRecipe::RealRadar));
+        state.zdr_bias_db = 0.25;
+        assert_eq!(state.active_recipe(), None);
     }
 
     /// The "Match gate size to grid resolution" checkbox flows from the UI state

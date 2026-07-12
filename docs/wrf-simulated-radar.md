@@ -20,6 +20,28 @@ Choosing a mode applies a preset once. Every control remains independently
 editable afterward, and the complete data-changing configuration participates
 in the loop fingerprint and export provenance.
 
+## User recipes
+
+BowEcho exposes the operator through **Windows > WRF**, separate from the
+Models run library and plotter. The `What do you want?` selector applies a
+complete compatible configuration while preserving the chosen radar location,
+range, and gate geometry:
+
+- **Storm view (fast)** produces readable textured REF/VEL loops without
+  virtual-instrument effects.
+- **Clean model truth** removes texture, noise, folding, blockage, and scan
+  timing for model diagnosis.
+- **Clean dual-pol** enables the polarimetric operator and propagation without
+  noise, folding, or terrain blockage.
+- **Real radar (balanced)** is the recommended practical S-band simulation.
+- **Maximum fidelity (slow)** uses the 27-point pulse-volume rule for one file
+  or a short loop.
+
+Changing an advanced control after applying a recipe labels the setup as
+`Custom tuning`. Selecting a recipe again resets all interacting physics,
+calibration, and instrument values together, so stale expert values cannot
+leak into a new run.
+
 ## Forward operator
 
 Reflectivity is interpolated and integrated in linear equivalent reflectivity
@@ -97,4 +119,3 @@ microphysics provenance, calibration settings, and the forward-operator
 configuration. The pinned NetCDF writer cannot yet emit the required character
 variables for strict `sweep_mode` and `prt_mode`; BowEcho does not fake them as
 numeric variables.
-

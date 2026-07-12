@@ -1,6 +1,6 @@
 //! Dockable workspace: the egui_tiles tile tree that hosts the radar map
 //! pane plus any DOCKED viewer panes (Sounding / Radar overlays / WoFS /
-//! FARM / Satellite / SimSat / Model / VWP / Unified Player / 3D). Crate evaluation + integration design:
+//! FARM / Satellite / SimSat / Model / WRF / VWP / Unified Player / 3D). Crate evaluation + integration design:
 //! docs/docking-spike.md.
 //!
 //! Division of labor:
@@ -61,6 +61,7 @@ pub enum WorkspacePane {
     Satellite,
     Simsat,
     Model,
+    Wrf,
     Vwp,
     UnifiedPlayer,
     Vol3d,
@@ -68,7 +69,7 @@ pub enum WorkspacePane {
 
 impl WorkspacePane {
     /// Every dockable viewer (everything but the map anchor).
-    pub const VIEWERS: [Self; 10] = [
+    pub const VIEWERS: [Self; 11] = [
         Self::Sounding,
         Self::RadarOverlays,
         Self::Wofs,
@@ -76,6 +77,7 @@ impl WorkspacePane {
         Self::Satellite,
         Self::Simsat,
         Self::Model,
+        Self::Wrf,
         Self::Vwp,
         Self::UnifiedPlayer,
         Self::Vol3d,
@@ -92,6 +94,7 @@ impl WorkspacePane {
             Self::Satellite => "Satellite",
             Self::Simsat => "SimSat",
             Self::Model => "Model",
+            Self::Wrf => "WRF",
             Self::Vwp => "VWP",
             Self::UnifiedPlayer => "Player",
             Self::Vol3d => "3D Volume",
@@ -520,12 +523,14 @@ mod tests {
     }
 
     #[test]
-    fn radar_overlays_is_a_first_class_viewer_pane() {
+    fn specialized_viewers_are_first_class_panes() {
         assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::RadarOverlays));
         assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::Simsat));
+        assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::Wrf));
         assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::Vwp));
         assert_eq!(WorkspacePane::RadarOverlays.tab_title(), "Radar overlays");
         assert_eq!(WorkspacePane::Simsat.tab_title(), "SimSat");
+        assert_eq!(WorkspacePane::Wrf.tab_title(), "WRF");
         assert_eq!(WorkspacePane::Vwp.tab_title(), "VWP");
     }
 

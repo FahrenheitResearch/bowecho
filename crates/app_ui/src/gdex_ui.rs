@@ -741,11 +741,11 @@ impl GdexBrowser {
 
     /// Draw the browser window(s). `cache_dir` is where downloads land (the
     /// dock passes `settings::gdex_cache_dir()`).
-    pub fn ui(&mut self, ui: &mut egui::Ui, cache_dir: &Path) {
+    pub fn ui(&mut self, ctx: &egui::Context, cache_dir: &Path) {
         if !self.open {
             return;
         }
-        let ctx = ui.ctx().clone();
+        let ctx = ctx.clone();
         if !self.initialized {
             self.initialized = true;
             let root = self.root_url.clone();
