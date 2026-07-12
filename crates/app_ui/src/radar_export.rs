@@ -7,7 +7,8 @@
 //! writer behind the model-hour export). Layout follows CfRadial 1.x
 //! (M. Dixon and W.-C. Lee, "CfRadial Data File Format", NCAR/EOL, v1.4,
 //! 2016): dimensions `time`/`range`/`sweep`, per-ray `azimuth`/`elevation`/
-//! `time`/`nyquist_velocity`, per-sweep `fixed_angle`/`sweep_number`/
+//! `time`/`nyquist_velocity` plus optional ray-local instrument parameters,
+//! per-sweep `fixed_angle`/`sweep_number`/
 //! `sweep_start_ray_index`/`sweep_end_ray_index`, scalar `latitude`/
 //! `longitude`/`altitude`, and one `(time, range)` float variable per
 //! moment, `_FillValue`-masked with a finite sentinel (py-ART and friends
@@ -371,17 +372,34 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
     let mut ray_seconds = Vec::with_capacity(n_rays);
     let mut nyquist = Vec::with_capacity(n_rays);
     let mut any_nyquist = false;
+    let mut ray_prt_s = Vec::with_capacity(n_rays);
+    let mut any_prt_s = false;
+    let mut ray_unambiguous_range_m = Vec::with_capacity(n_rays);
+    let mut any_unambiguous_range = false;
+    let mut ray_pulse_count = Vec::with_capacity(n_rays);
+    let mut any_pulse_count = false;
+    let mut ray_independent_samples = Vec::with_capacity(n_rays);
+    let mut any_independent_samples = false;
+    let legacy_prt_s = positive_finite(volume.metadata.prt_s);
+    let legacy_unambiguous_range_m =
+        positive_finite(volume.metadata.unambiguous_range_km).map(|value| value * 1_000.0);
     let mut sweep_number = Vec::with_capacity(n_sweeps);
     let mut fixed_angle = Vec::with_capacity(n_sweeps);
     let mut sweep_start = Vec::with_capacity(n_sweeps);
     let mut sweep_end = Vec::with_capacity(n_sweeps);
     let mut ray_base = 0usize;
     for (sweep_index, cut) in sweeps.iter().enumerate() {
+        let instrument_metadata = cut.aligned_ray_instrument_metadata().map_err(|error| {
+            format!(
+                "CfRadial export cut {} has invalid ray metadata: {error}",
+                sweep_indices[sweep_index]
+            )
+        })?;
         sweep_number.push(sweep_index as f32);
         fixed_angle.push(cut.elevation_deg);
         sweep_start.push(ray_base as f32);
         sweep_end.push((ray_base + cut.radials.len() - 1) as f32);
-        for radial in &cut.radials {
+        for (radial_index, radial) in cut.radials.iter().enumerate() {
             azimuth.push(radial.azimuth_deg.rem_euclid(360.0));
             elevation.push(radial.elevation_deg);
             ray_seconds.push(radial.time_offset_ms as f32 / 1000.0);
@@ -394,6 +412,35 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
                 // decodes back to None without any attribute masking.
                 _ => nyquist.push(CFRADIAL_FILL),
             }
+            let instrument = instrument_metadata.map(|values| &values[radial_index]);
+            push_ray_value(
+                &mut ray_prt_s,
+                &mut any_prt_s,
+                instrument
+                    .and_then(|metadata| positive_finite(metadata.prt_s))
+                    .or(legacy_prt_s),
+            );
+            push_ray_value(
+                &mut ray_unambiguous_range_m,
+                &mut any_unambiguous_range,
+                instrument
+                    .and_then(|metadata| positive_finite(metadata.unambiguous_range_km))
+                    .map(|value| value * 1_000.0)
+                    .or(legacy_unambiguous_range_m),
+            );
+            push_ray_value(
+                &mut ray_pulse_count,
+                &mut any_pulse_count,
+                instrument
+                    .and_then(|metadata| metadata.pulse_count)
+                    .filter(|value| *value > 0)
+                    .map(|value| value as f32),
+            );
+            push_ray_value(
+                &mut ray_independent_samples,
+                &mut any_independent_samples,
+                instrument.and_then(|metadata| positive_finite(metadata.independent_samples)),
+            );
         }
         ray_base += cut.radials.len();
     }
@@ -674,29 +721,12 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
         payloads.push(nyquist);
     }
 
-    for (name, long_name, units, value) in [
-        (
-            "pulse_width",
-            "transmitted pulse width",
-            "seconds",
-            volume.metadata.pulse_width_us.map(|value| value * 1.0e-6),
-        ),
-        (
-            "prt",
-            "pulse repetition time",
-            "seconds",
-            volume.metadata.prt_s,
-        ),
-        (
-            "unambiguous_range",
-            "unambiguous range",
-            "meters",
-            volume
-                .metadata
-                .unambiguous_range_km
-                .map(|value| value * 1000.0),
-        ),
-    ] {
+    for (name, long_name, units, value) in [(
+        "pulse_width",
+        "transmitted pulse width",
+        "seconds",
+        volume.metadata.pulse_width_us.map(|value| value * 1.0e-6),
+    )] {
         if let Some(value) = value.filter(|value| value.is_finite() && *value > 0.0) {
             vars.push(Nc3VarDef {
                 name: name.to_owned(),
@@ -708,6 +738,51 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
             });
             payloads.push(vec![value; n_rays]);
         }
+    }
+
+    for (name, long_name, units, values, any) in [
+        (
+            "prt",
+            "pulse repetition time",
+            "seconds",
+            ray_prt_s,
+            any_prt_s,
+        ),
+        (
+            "unambiguous_range",
+            "unambiguous range",
+            "meters",
+            ray_unambiguous_range_m,
+            any_unambiguous_range,
+        ),
+        (
+            "pulse_count",
+            "number of pulses contributing to the ray",
+            "count",
+            ray_pulse_count,
+            any_pulse_count,
+        ),
+        (
+            "independent_samples",
+            "effective number of independent samples",
+            "count",
+            ray_independent_samples,
+            any_independent_samples,
+        ),
+    ] {
+        if !any {
+            continue;
+        }
+        vars.push(Nc3VarDef {
+            name: name.to_owned(),
+            dimids: vec![TIME],
+            attrs: vec![
+                Nc3Attr::text("long_name", long_name),
+                Nc3Attr::text("units", units),
+                Nc3Attr::floats("_FillValue", vec![CFRADIAL_FILL]),
+            ],
+        });
+        payloads.push(values);
     }
 
     vars.push(Nc3VarDef {
@@ -938,6 +1013,19 @@ fn check_geometry(expected: &GateRange, actual: &GateRange, what: &str) -> Resul
     Ok(())
 }
 
+fn positive_finite(value: Option<f32>) -> Option<f32> {
+    value.filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn push_ray_value(values: &mut Vec<f32>, any: &mut bool, value: Option<f32>) {
+    if let Some(value) = value {
+        *any = true;
+        values.push(value);
+    } else {
+        values.push(CFRADIAL_FILL);
+    }
+}
+
 fn per_sweep_leg_values(
     volume: &RadarVolume,
     sweep_indices: &[usize],
@@ -985,7 +1073,10 @@ fn moment_coverage_code(coverage: &str) -> Option<f32> {
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
-    use radar_core::{MomentGrid, MomentStorage, RadarSite, Radial, ScanLegMetadata, VcpInfo};
+    use radar_core::{
+        MomentGrid, MomentStorage, RadarSite, Radial, RayInstrumentMetadata, ScanLegMetadata,
+        VcpInfo,
+    };
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1220,6 +1311,16 @@ mod tests {
             MomentType::Unknown("ZDRC".to_owned()),
         ];
         for cut in &mut volume.cuts {
+            cut.ray_instrument_metadata = (0..cut.radials.len())
+                .map(|ray| RayInstrumentMetadata {
+                    // Missing local values exercise the legacy volume-scalar
+                    // fallback independently for each physical field.
+                    prt_s: (ray == 0).then_some(0.000_8),
+                    unambiguous_range_km: (ray == 1).then_some(120.0),
+                    pulse_count: (ray % 2 == 0).then_some(60 + ray as u32),
+                    independent_samples: (ray % 2 == 1).then_some(15.0 + ray as f32 * 0.25),
+                })
+                .collect();
             let gate_range = cut.radials[0].gate_range.clone();
             for (moment_index, moment) in exported_moments.iter().enumerate() {
                 let rows = (0..cut.radials.len())
@@ -1247,8 +1348,8 @@ mod tests {
         assert_eq!(decoded.metadata.beam_width_h_deg, Some(0.95));
         assert_eq!(decoded.metadata.beam_width_v_deg, Some(1.05));
         assert!((decoded.metadata.pulse_width_us.unwrap() - 1.57).abs() < 1.0e-4);
-        assert!((decoded.metadata.prt_s.unwrap() - 0.001).abs() < 1.0e-7);
-        assert!((decoded.metadata.unambiguous_range_km.unwrap() - 149.896).abs() < 1.0e-3);
+        assert_eq!(decoded.metadata.prt_s, None);
+        assert_eq!(decoded.metadata.unambiguous_range_km, None);
         assert_eq!(
             decoded.metadata.scan_name.as_deref(),
             Some("Synthetic VCP 212")
@@ -1280,6 +1381,21 @@ mod tests {
             Some("S-band LUT v1")
         );
         for cut in &decoded.cuts {
+            let instrument = cut
+                .aligned_ray_instrument_metadata()
+                .unwrap()
+                .expect("ray-local instrument parameters");
+            assert!((instrument[0].prt_s.unwrap() - 0.000_8).abs() < 1.0e-7);
+            assert!(
+                (instrument[1].prt_s.unwrap() - 0.001).abs() < 1.0e-7,
+                "missing local PRT must use the legacy volume fallback"
+            );
+            assert!((instrument[0].unambiguous_range_km.unwrap() - 149.896).abs() < 1.0e-3);
+            assert_eq!(instrument[1].unambiguous_range_km, Some(120.0));
+            assert_eq!(instrument[0].pulse_count, Some(60));
+            assert_eq!(instrument[1].pulse_count, None);
+            assert_eq!(instrument[0].independent_samples, None);
+            assert_eq!(instrument[1].independent_samples, Some(15.25));
             for moment in &exported_moments {
                 assert!(
                     cut.moments.contains_key(moment),
@@ -1560,6 +1676,13 @@ mod tests {
         mixed.cuts[1].radials[3].gate_range.gate_spacing_m = 500;
         let error = export_volume_cfradial(&mixed, &dir.join("mixed.nc")).unwrap_err();
         assert!(error.contains("one gate geometry"), "got: {error}");
+
+        // A partial sidecar must fail closed instead of shifting metadata to
+        // the wrong rays or silently falling back to a volume scalar.
+        let mut misaligned = sample_volume();
+        misaligned.cuts[0].ray_instrument_metadata = vec![RayInstrumentMetadata::default()];
+        let error = export_volume_cfradial(&misaligned, &dir.join("misaligned.nc")).unwrap_err();
+        assert!(error.contains("invalid ray metadata"), "got: {error}");
     }
 
     #[test]

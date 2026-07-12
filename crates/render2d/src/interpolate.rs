@@ -414,6 +414,7 @@ mod tests {
                 .iter()
                 .map(|az| radial(*az, gate_range.clone()))
                 .collect(),
+            ray_instrument_metadata: Vec::new(),
             moments: BTreeMap::new(),
         };
         let grid = MomentGrid {

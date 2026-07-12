@@ -4,7 +4,8 @@
 //! by `tests/data/gen_cfradial_fixture.py` with the netCDF4 python library
 //! (1.7.4) in NETCDF3_CLASSIC (CDF-1) format following CfRadial 1.4
 //! (Dixon and Lee, NCAR/EOL, 2016). `time` is UNLIMITED, so every per-ray
-//! and field variable exercises the record-interleaved data path. Values
+//! and field variable exercises the record-interleaved data path. The fixture
+//! includes varying physical timing/sample metadata on every ray. Values
 //! are deterministic ramps: REF[t,r] = t + 0.5·r dBZ (float, one forced
 //! fill), VEL raw[t,r] = 10·t + r packed as shorts with scale 0.01,
 //! offset −0.5.
@@ -31,6 +32,10 @@ fn decodes_synthetic_cfradial1_volume() {
     );
     assert_eq!(volume.metadata.scan_mode, Some(ScanMode::Ppi));
     assert_eq!(volume.metadata.decoded_radial_count, 24);
+    // Per-time instrument variables must not be collapsed into a misleading
+    // volume-level value from the first ray.
+    assert_eq!(volume.metadata.prt_s, None);
+    assert_eq!(volume.metadata.unambiguous_range_km, None);
 
     assert_eq!(volume.cuts.len(), 2);
     assert_eq!(volume.cuts[0].elevation_deg, 0.5);
@@ -46,6 +51,16 @@ fn decodes_synthetic_cfradial1_volume() {
     assert_eq!(cut.radials[0].gate_range.gate_spacing_m, 250);
     assert_eq!(cut.radials[0].gate_range.gate_count, 20);
     assert_eq!(cut.radials[0].nyquist_velocity_mps, Some(26.4));
+    let rays = &cut.ray_instrument_metadata;
+    assert_eq!(rays.len(), cut.radials.len());
+    assert_eq!(rays[0].prt_s, Some(0.001));
+    assert!((rays[3].prt_s.unwrap() - 0.001_003).abs() < 1.0e-9);
+    assert_eq!(rays[0].unambiguous_range_km, Some(149.896));
+    assert!((rays[3].unambiguous_range_km.unwrap() - 149.596).abs() < 1.0e-3);
+    assert_eq!(rays[0].pulse_count, Some(60));
+    assert_eq!(rays[3].pulse_count, Some(63));
+    assert_eq!(rays[0].independent_samples, Some(15.0));
+    assert_eq!(rays[3].independent_samples, Some(15.75));
     // time(time) = 0.5 s steps from time_coverage_start.
     assert_eq!(cut.radials[2].time_offset_ms, 1000);
 
@@ -63,9 +78,7 @@ fn decodes_synthetic_cfradial1_volume() {
     // storage carries fill as NaN (same convention as DORADE float fields).
     let upper = &volume.cuts[1];
     let upper_ref = upper.moments.get(&MomentType::Reflectivity).expect("REF");
-    assert!(
-        upper_ref.scaled_value(2, 3).is_none_or(f32::is_nan) // global ray 14
-    );
+    assert!(upper_ref.scaled_value(2, 3).is_none_or(f32::is_nan)); // global ray 14
     assert_eq!(upper_ref.scaled_value(2, 4), Some(16.0)); // 14 + 0.5·4
     assert_eq!(upper.radials[0].elevation_deg, 1.5);
 }

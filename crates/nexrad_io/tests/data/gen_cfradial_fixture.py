@@ -7,7 +7,8 @@ CfRadial 1.4 (M. Dixon and W.-C. Lee, "CfRadial Data File Format",
 NCAR/EOL, 2016): dims time (UNLIMITED, exercising the record-variable
 interleave) and range; per-ray azimuth/elevation/time/nyquist; per-sweep
 fixed_angle/start/end indices/sweep_mode; scalar lat/lon/alt;
-time_coverage_start; fields REF (float, _FillValue) and VEL (short, CF
+time_coverage_start; aligned per-ray PRT, unambiguous range, pulse/sample
+counts; fields REF (float, _FillValue) and VEL (short, CF
 packed with scale_factor/add_offset).
 
 Volume: 2 PPI sweeps (0.5deg rays 0-11, 1.5deg rays 12-23), 24 rays x
@@ -61,6 +62,22 @@ def main() -> None:
         el[:] = np.where(np.arange(n_time) < 12, 0.5, 1.5)
         ny = nc.createVariable("nyquist_velocity", "f4", ("time",))
         ny[:] = np.full(n_time, 26.4)
+        prt = nc.createVariable("prt", "f4", ("time",))
+        prt.units = "seconds"
+        prt[:] = 0.001 + np.arange(n_time) * 0.000001
+        unambiguous_range = nc.createVariable(
+            "unambiguous_range", "f4", ("time",)
+        )
+        unambiguous_range.units = "meters"
+        unambiguous_range[:] = 149_896.0 - np.arange(n_time) * 100.0
+        pulse_count = nc.createVariable("pulse_count", "i4", ("time",))
+        pulse_count.units = "count"
+        pulse_count[:] = 60 + np.arange(n_time)
+        independent_samples = nc.createVariable(
+            "independent_samples", "f4", ("time",)
+        )
+        independent_samples.units = "count"
+        independent_samples[:] = 15.0 + np.arange(n_time) * 0.25
 
         fixed = nc.createVariable("fixed_angle", "f4", ("sweep",))
         fixed[:] = [0.5, 1.5]

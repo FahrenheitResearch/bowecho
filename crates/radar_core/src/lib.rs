@@ -254,6 +254,39 @@ fn merge_radial_metadata(existing: &mut ElevationCut, incoming: &ElevationCut) {
             base.nyquist_velocity_mps = other.nyquist_velocity_mps;
         }
     }
+
+    // Empty means absent. A malformed incoming sidecar is ignored rather
+    // than indexed partially; a valid incoming sidecar replaces a malformed
+    // existing one so bad alignment does not propagate into the merged cut.
+    if incoming.ray_instrument_metadata.is_empty()
+        || incoming.ray_instrument_metadata.len() != incoming.radials.len()
+    {
+        return;
+    }
+    if existing.ray_instrument_metadata.is_empty()
+        || existing.ray_instrument_metadata.len() != existing.radials.len()
+    {
+        existing.ray_instrument_metadata = incoming.ray_instrument_metadata.clone();
+        return;
+    }
+    for (base, other) in existing
+        .ray_instrument_metadata
+        .iter_mut()
+        .zip(&incoming.ray_instrument_metadata)
+    {
+        if base.prt_s.is_none() {
+            base.prt_s = other.prt_s;
+        }
+        if base.unambiguous_range_km.is_none() {
+            base.unambiguous_range_km = other.unambiguous_range_km;
+        }
+        if base.pulse_count.is_none() {
+            base.pulse_count = other.pulse_count;
+        }
+        if base.independent_samples.is_none() {
+            base.independent_samples = other.independent_samples;
+        }
+    }
 }
 
 /// Smallest absolute angular difference, wrap-aware (359.99° vs 0.01° is
@@ -269,6 +302,13 @@ pub struct ElevationCut {
     pub elevation_deg: f32,
     pub elevation_number: Option<u8>,
     pub radials: Vec<Radial>,
+    /// Physical instrument parameters aligned one-for-one with `radials`.
+    ///
+    /// An empty vector means the source did not supply ray-local metadata.
+    /// A non-empty vector must have exactly `radials.len()` entries; use
+    /// [`ElevationCut::aligned_ray_instrument_metadata`] before consuming it.
+    #[serde(default)]
+    pub ray_instrument_metadata: Vec<RayInstrumentMetadata>,
     pub moments: BTreeMap<MomentType, MomentGrid>,
 }
 
@@ -278,6 +318,7 @@ impl ElevationCut {
             elevation_deg,
             elevation_number,
             radials: Vec::new(),
+            ray_instrument_metadata: Vec::new(),
             moments: BTreeMap::new(),
         }
     }
@@ -285,7 +326,63 @@ impl ElevationCut {
     pub fn moments_available(&self) -> BTreeSet<MomentType> {
         self.moments.keys().cloned().collect()
     }
+
+    /// Return source-supplied ray instrument metadata after checking that it
+    /// is exactly aligned with this cut's radial geometry.
+    pub fn aligned_ray_instrument_metadata(
+        &self,
+    ) -> Result<Option<&[RayInstrumentMetadata]>, RayInstrumentMetadataAlignmentError> {
+        if self.ray_instrument_metadata.is_empty() {
+            return Ok(None);
+        }
+        if self.ray_instrument_metadata.len() != self.radials.len() {
+            return Err(RayInstrumentMetadataAlignmentError {
+                radial_count: self.radials.len(),
+                metadata_count: self.ray_instrument_metadata.len(),
+            });
+        }
+        Ok(Some(&self.ray_instrument_metadata))
+    }
 }
+
+/// Physical instrument parameters supplied for one radar ray.
+///
+/// These quantities are deliberately separate from source-table PRF *codes*
+/// in [`ScanLegMetadata`]. A numbered VCP code is not a frequency or PRT and
+/// must never be converted into one of these physical values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RayInstrumentMetadata {
+    /// Pulse repetition time in seconds.
+    #[serde(default)]
+    pub prt_s: Option<f32>,
+    /// Instrument unambiguous range in kilometres.
+    #[serde(default)]
+    pub unambiguous_range_km: Option<f32>,
+    /// Number of transmitted/received pulses contributing to the ray.
+    #[serde(default)]
+    pub pulse_count: Option<u32>,
+    /// Effective number of statistically independent samples.
+    #[serde(default)]
+    pub independent_samples: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RayInstrumentMetadataAlignmentError {
+    pub radial_count: usize,
+    pub metadata_count: usize,
+}
+
+impl fmt::Display for RayInstrumentMetadataAlignmentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ray instrument metadata has {} entries for {} radials",
+            self.metadata_count, self.radial_count
+        )
+    }
+}
+
+impl Error for RayInstrumentMetadataAlignmentError {}
 
 /// Geometry and timing for one radial.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -929,6 +1026,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ray_instrument_metadata_is_optional_but_must_align() {
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        cut.radials.push(Radial {
+            azimuth_deg: 0.0,
+            elevation_deg: 0.5,
+            time_offset_ms: 0,
+            gate_range: GateRange {
+                first_gate_m: 0,
+                gate_spacing_m: 250,
+                gate_count: 2,
+            },
+            nyquist_velocity_mps: None,
+            radial_status: None,
+        });
+
+        assert_eq!(cut.aligned_ray_instrument_metadata(), Ok(None));
+        cut.ray_instrument_metadata.push(RayInstrumentMetadata {
+            prt_s: Some(0.001),
+            ..RayInstrumentMetadata::default()
+        });
+        assert_eq!(
+            cut.aligned_ray_instrument_metadata().unwrap().unwrap()[0].prt_s,
+            Some(0.001)
+        );
+        cut.ray_instrument_metadata
+            .push(RayInstrumentMetadata::default());
+        assert_eq!(
+            cut.aligned_ray_instrument_metadata(),
+            Err(RayInstrumentMetadataAlignmentError {
+                radial_count: 1,
+                metadata_count: 2,
+            })
+        );
+    }
+
+    #[test]
     fn beam_height_matches_four_thirds_earth_reference() {
         // At 0° elevation, h ≈ r²/(2·aₑ): 100 km -> ~588 m.
         let h0 = beam_height_above_radar_m(100_000.0, 0.0);
@@ -1239,6 +1372,67 @@ mod tests {
                 moment_collisions: 0,
             }
         );
+    }
+
+    #[test]
+    fn merge_fills_aligned_ray_instrument_metadata_without_overwriting_source_values() {
+        let mut first_cut = merge_cut(0.5, MomentType::Reflectivity, 2.0);
+        first_cut.ray_instrument_metadata = vec![
+            RayInstrumentMetadata {
+                prt_s: Some(0.001),
+                ..RayInstrumentMetadata::default()
+            },
+            RayInstrumentMetadata::default(),
+            RayInstrumentMetadata {
+                pulse_count: Some(40),
+                ..RayInstrumentMetadata::default()
+            },
+        ];
+        let mut second_cut = merge_cut(0.5, MomentType::Velocity, 2.0);
+        second_cut.ray_instrument_metadata = vec![
+            RayInstrumentMetadata {
+                prt_s: Some(0.002),
+                unambiguous_range_km: Some(120.0),
+                ..RayInstrumentMetadata::default()
+            },
+            RayInstrumentMetadata {
+                pulse_count: Some(64),
+                independent_samples: Some(16.5),
+                ..RayInstrumentMetadata::default()
+            },
+            RayInstrumentMetadata {
+                pulse_count: Some(80),
+                ..RayInstrumentMetadata::default()
+            },
+        ];
+
+        let first = merge_volume("KTST", 1_000, vec![first_cut]);
+        let second = merge_volume("KTST", 1_000, vec![second_cut]);
+        let (merged, _) = merge_radar_volumes(vec![first, second]).unwrap();
+        let metadata = merged.cuts[0]
+            .aligned_ray_instrument_metadata()
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata[0].prt_s, Some(0.001), "first source wins");
+        assert_eq!(metadata[0].unambiguous_range_km, Some(120.0));
+        assert_eq!(metadata[1].pulse_count, Some(64));
+        assert_eq!(metadata[1].independent_samples, Some(16.5));
+        assert_eq!(metadata[2].pulse_count, Some(40), "first source wins");
+    }
+
+    #[test]
+    fn merge_ignores_malformed_incoming_ray_instrument_metadata() {
+        let first_cut = merge_cut(0.5, MomentType::Reflectivity, 2.0);
+        let mut malformed = merge_cut(0.5, MomentType::Velocity, 2.0);
+        malformed.ray_instrument_metadata = vec![RayInstrumentMetadata {
+            prt_s: Some(0.001),
+            ..RayInstrumentMetadata::default()
+        }];
+
+        let first = merge_volume("KTST", 1_000, vec![first_cut]);
+        let second = merge_volume("KTST", 1_000, vec![malformed]);
+        let (merged, _) = merge_radar_volumes(vec![first, second]).unwrap();
+        assert!(merged.cuts[0].ray_instrument_metadata.is_empty());
     }
 
     #[test]

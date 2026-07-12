@@ -6,7 +6,8 @@
 //! here). CfRadial 1 files are classic netCDF (`CDF\x01`/`CDF\x02`) with:
 //! - dimensions `time` (rays, usually unlimited) and `range` (gates),
 //! - per-ray `azimuth(time)`, `elevation(time)`, optional
-//!   `nyquist_velocity(time)`,
+//!   `nyquist_velocity(time)`, `prt(time)`, `unambiguous_range(time)`,
+//!   `pulse_count(time)`, and `independent_samples(time)`,
 //! - per-sweep `fixed_angle(sweep)`, `sweep_start_ray_index(sweep)`,
 //!   `sweep_end_ray_index(sweep)`, `sweep_mode(sweep, string_length)`,
 //! - scalar `latitude`/`longitude`/`altitude`, `time_coverage_start`,
@@ -27,7 +28,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentRow, MomentType, RadarSite, RadarVolume, Radial,
-    ScanLegMetadata, ScanMode, VcpInfo,
+    RayInstrumentMetadata, ScanLegMetadata, ScanMode, VcpInfo,
 };
 
 use crate::dorade::canonical_moment;
@@ -56,6 +57,25 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
         return Err(invalid("azimuth/elevation shorter than the time dimension"));
     }
     let nyquist = read_f64s(&file, "nyquist_velocity").ok();
+    // Keep physical timing/sample quantities aligned to their source rays.
+    // VCP Appendix-C PRF values elsewhere in the file are source-table CODES,
+    // not frequencies; they remain in ScanLegMetadata and never feed these
+    // physical variables.
+    let ray_prt_s = aligned_time_f32s(&file, "prt", time_dim, n_rays, time_units_scale);
+    let ray_unambiguous_range_km = aligned_time_f32s(
+        &file,
+        "unambiguous_range",
+        time_dim,
+        n_rays,
+        range_units_to_km_scale,
+    );
+    let ray_pulse_count = aligned_time_u32s(&file, "pulse_count", time_dim, n_rays);
+    let ray_independent_samples =
+        aligned_time_f32s(&file, "independent_samples", time_dim, n_rays, |_| 1.0);
+    let has_ray_instrument_metadata = ray_prt_s.is_some()
+        || ray_unambiguous_range_km.is_some()
+        || ray_pulse_count.is_some()
+        || ray_independent_samples.is_some();
 
     // Gate geometry: range(range) gate centers in metres (spec §5.5); the
     // start_range/gate spacing attributes are optional, so derive from the
@@ -205,6 +225,14 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
                     .filter(|value| *value > 0.0),
                 radial_status: None,
             });
+            if has_ray_instrument_metadata {
+                cut.ray_instrument_metadata.push(RayInstrumentMetadata {
+                    prt_s: aligned_at(&ray_prt_s, ray),
+                    unambiguous_range_km: aligned_at(&ray_unambiguous_range_km, ray),
+                    pulse_count: aligned_at(&ray_pulse_count, ray),
+                    independent_samples: aligned_at(&ray_independent_samples, ray),
+                });
+            }
         }
 
         sweeps.push(DecodedSweep {
@@ -582,8 +610,12 @@ fn cfradial_pulse_width_us(file: &Nc3File<'_>) -> Option<f32> {
 }
 
 fn cfradial_prt_s(file: &Nc3File<'_>) -> Option<f32> {
-    if let Some(seconds) = time_var_seconds(file, "prt") {
-        return positive_f32(seconds);
+    // A time-aligned `prt(time)` belongs to each ray, not to the volume.
+    // Only a true scalar variable participates in this legacy volume-level
+    // fallback.
+    if let Some(value) = numeric_scalar_var_first(file, "prt") {
+        let scale = time_units_scale(file.vars.get("prt").and_then(|var| var.attr_str("units")));
+        return positive_f32(value * scale);
     }
     file.gattr_f64("prt_s")
         .or_else(|| file.gattr_f64("prt"))
@@ -591,19 +623,14 @@ fn cfradial_prt_s(file: &Nc3File<'_>) -> Option<f32> {
 }
 
 fn cfradial_unambiguous_range_km(file: &Nc3File<'_>) -> Option<f32> {
-    if let Some(value) = numeric_var_first(file, "unambiguous_range") {
-        let units = file
-            .vars
-            .get("unambiguous_range")
-            .and_then(|var| var.attr_str("units"))
-            .unwrap_or("meters")
-            .to_ascii_lowercase();
-        let km = if units.contains("kilometer") || units.contains("kilometre") || units == "km" {
-            value
-        } else {
-            value / 1000.0
-        };
-        return positive_f32(km);
+    // As with PRT, do not collapse varying per-ray values to the first ray.
+    if let Some(value) = numeric_scalar_var_first(file, "unambiguous_range") {
+        let scale = range_units_to_km_scale(
+            file.vars
+                .get("unambiguous_range")
+                .and_then(|var| var.attr_str("units")),
+        );
+        return positive_f32(value * scale);
     }
     file.gattr_f64("unambiguous_range_km")
         .and_then(positive_f32)
@@ -620,6 +647,11 @@ fn numeric_var_first(file: &Nc3File<'_>, name: &str) -> Option<f64> {
             .get_f64(index)
             .filter(|value| value.is_finite() && *value > 0.0)
     })
+}
+
+fn numeric_scalar_var_first(file: &Nc3File<'_>, name: &str) -> Option<f64> {
+    file.vars.get(name)?.dim_ids.is_empty().then_some(())?;
+    numeric_var_first(file, name)
 }
 
 fn time_var_seconds(file: &Nc3File<'_>, name: &str) -> Option<f64> {
@@ -639,6 +671,85 @@ fn time_var_seconds(file: &Nc3File<'_>, name: &str) -> Option<f64> {
         value
     };
     seconds.is_finite().then_some(seconds)
+}
+
+/// Read a numeric variable only when it is exactly aligned to the CfRadial
+/// `time` dimension. A scalar, sweep-level value, or malformed short array is
+/// not silently broadcast across rays.
+fn aligned_time_values(
+    file: &Nc3File<'_>,
+    name: &str,
+    time_dim: usize,
+    n_rays: usize,
+) -> Option<Vec<f64>> {
+    let var = file.vars.get(name)?;
+    (var.dim_ids.as_slice() == [time_dim]).then_some(())?;
+    let values = read_f64s(file, name).ok()?;
+    (values.len() == n_rays).then_some(values)
+}
+
+fn aligned_time_f32s(
+    file: &Nc3File<'_>,
+    name: &str,
+    time_dim: usize,
+    n_rays: usize,
+    units_scale: impl FnOnce(Option<&str>) -> f64,
+) -> Option<Vec<Option<f32>>> {
+    let scale = units_scale(file.vars.get(name).and_then(|var| var.attr_str("units")));
+    aligned_time_values(file, name, time_dim, n_rays).map(|values| {
+        values
+            .into_iter()
+            .map(|value| positive_f32(value * scale))
+            .collect()
+    })
+}
+
+fn aligned_time_u32s(
+    file: &Nc3File<'_>,
+    name: &str,
+    time_dim: usize,
+    n_rays: usize,
+) -> Option<Vec<Option<u32>>> {
+    aligned_time_values(file, name, time_dim, n_rays).map(|values| {
+        values
+            .into_iter()
+            .map(|value| {
+                (value.is_finite()
+                    && value > 0.0
+                    && value.fract() == 0.0
+                    && value <= u32::MAX as f64)
+                    .then_some(value as u32)
+            })
+            .collect()
+    })
+}
+
+fn aligned_at<T: Copy>(values: &Option<Vec<Option<T>>>, ray: usize) -> Option<T> {
+    values
+        .as_ref()
+        .and_then(|values| values.get(ray))
+        .copied()
+        .flatten()
+}
+
+fn time_units_scale(units: Option<&str>) -> f64 {
+    let units = units.unwrap_or("seconds").trim().to_ascii_lowercase();
+    if units.contains("microsecond") || matches!(units.as_str(), "us" | "µs") {
+        1.0e-6
+    } else if units.contains("millisecond") || units == "ms" {
+        1.0e-3
+    } else {
+        1.0
+    }
+}
+
+fn range_units_to_km_scale(units: Option<&str>) -> f64 {
+    let units = units.unwrap_or("meters").trim().to_ascii_lowercase();
+    if units.contains("kilometer") || units.contains("kilometre") || units == "km" {
+        1.0
+    } else {
+        1.0e-3
+    }
 }
 
 fn positive_f32(value: f64) -> Option<f32> {
