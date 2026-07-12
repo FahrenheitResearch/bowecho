@@ -17,13 +17,16 @@ NetCDF**, **WRF full diagnostics**, or **Formula Lab** instead.
 2. Open **Radar location & fine tuning (advanced)** only when the recipe's
    antenna, geometry, moments, presentation, or instrument assumptions need
    changing.
-3. Choose **Build from files...** to multi-select WRF files, or **Build from
+3. Choose the custom ladder or a source-qualified **Build 24 VCP**. Choose
+   whether timed rays hold one WRF scene or interpolate a compatible adjacent
+   scene.
+4. Choose **Build from files...** to multi-select WRF files, or **Build from
    folder...**. Every selected WRF time becomes one radar-loop frame.
-4. Inspect the generated loop with the ordinary product, tilt, cross-section,
+5. Inspect the generated loop with the ordinary product, tilt, cross-section,
    readout, derived-product, and velocity workflows.
-5. Change controls and choose **Refresh current frame(s)** to rerun the same
+6. Change controls and choose **Refresh current frame(s)** to rerun the same
    source snapshot without another picker.
-6. Use **Export latest as CfRadial...** when a portable radar volume with
+7. Use **Export latest as CfRadial...** when a portable radar volume with
    model/operator provenance is needed.
 
 Extensionless **wrfout_*** names from every domain are valid. A folder build
@@ -119,14 +122,67 @@ range under the same 4/3-Earth geometry as the beam. Blocked quadrature weights
 remove received power instead of being renormalized, which gives partial beam
 blockage in the multi-sample rules.
 
-Timed volumes stamp a monotonic acquisition offset on every ray using the
-configured rotation rate and inter-sweep transition. The current timed mode
-samples one WRF scene; it does not claim temporal interpolation between model
-files or a numbered operational VCP.
+Timed volumes stamp a monotonic acquisition offset on every ray. The custom
+ladder uses its configured rotation rate and inter-sweep transition. A named
+Build 24 VCP instead uses each physical source row's azimuth rate and period.
+Atmosphere-time sampling is a separate choice described below.
 
-## S-band dual polarization
+## Named Build 24 VCP base patterns
 
-The first dual-pol operator is a scheme-aware bulk S-band Rayleigh model. It
+The scan selector includes the custom legacy ladder and source-qualified base
+patterns for **VCP 12, 34, 35, 112, 212, and 215**. BowEcho transcribes the
+WSR-88D Radar Operations Center's Build 24.0 interface control document
+2620002AA, revision AA, Appendix C. Across the six definitions, all **94
+physical rows** remain in source order:
+
+| VCP | Regime | Physical rows | Approximate base cadence |
+|---:|---|---:|---:|
+| 12 | Precipitation, short pulse | 17 | 236.23 s |
+| 34 | Clear air, long pulse | 10 | 524.52 s |
+| 35 | Clear air, short pulse | 12 | 403.49 s |
+| 112 | Precipitation, short pulse | 20 | 321.37 s |
+| 212 | Precipitation, short pulse | 17 | 258.38 s |
+| 215 | Precipitation, short pulse | 18 | 340.37 s |
+
+Equal-elevation rows are not collapsed. That preserves surveillance/Doppler
+split cuts and the two fixed MPDA Doppler cuts in VCP 112. Each row retains its
+elevation, azimuth rate, source period, waveform, moment coverage, surveillance
+PRF code and pulse count, and Doppler PRF policy. Appendix C gives numbered
+PRF **codes**, not frequencies, so BowEcho does not turn those codes into fake
+PRF-Hz, PRT, or unambiguous-range metadata.
+
+These are versioned **base-pattern simulations**, not claims that BowEcho has
+reproduced an actual site's live operational volume. SAILS, MRLE, AVSET,
+Add-MPDA, and site-specific low-tilt adaptations are outside this catalog.
+The source document, revision, RDA build, figure, physical-row metadata, and
+that adaptations caveat are retained in volume/CfRadial provenance. The source
+of record is the [ROC Build 24 interface control document](https://www.roc.noaa.gov/public-documents/icds/2620002AA.pdf).
+
+## Atmosphere time sampling
+
+**Frozen at volume start** remains available and makes every ray sample the
+anchor WRF scene, even when the ray carries an acquisition time. **Interpolate
+adjacent WRF scenes** instead requires the next chronologically later scene in
+the same compatible run/domain/grid group. For each ray, BowEcho derives one
+weight from its acquisition offset within the model-time bracket. The weight
+must remain between the two WRF times; the renderer never extrapolates.
+
+The compatibility renderer interpolates linear received power (`Z`), winds,
+and additive polarimetric scattering quantities. ZDR and rhoHV are derived
+afterward rather than interpolated as ratios. The property-aware research
+contract is stricter: raw mass/number/property state is blended before its
+nonlinear closure and T-matrix lookup.
+
+If there is no complete later scene, or the scan would cross beyond it, the
+explicit policy can **hold the anchor**, **drop the frame**, or **stop with an
+error**. A held frame records why it was held; it is not labeled interpolated.
+The worker keeps at most a rolling two-scene input cache and preflights the
+configured memory ceiling before reading the second scene. Provenance records
+the scene identities, bracket, interpolation space, outcome, and policy.
+
+## Default S-band dual polarization
+
+The default dual-pol operator is a scheme-aware bulk S-band Rayleigh model. It
 reads WRF mass mixing ratios and available number concentrations, closes a
 gamma or fixed-intercept particle-size distribution per species, and sums the
 species in additive linear scattering space. Rain shape follows the Brandes
@@ -169,19 +225,58 @@ Corrected fields are not generic post-processing guesses. They are the
 intrinsic values retained by the same radial propagation calculation that
 produces the observed moments.
 
-The operator recognizes common Lin/WSM/WDM, Thompson, Morrison,
+The bulk operator recognizes common Lin/WSM/WDM, Thompson, Morrison,
 Milbrandt-Yau, and NSSL bulk schemes and records whether the available fields
 provide full two-moment, partial two-moment, or assumption-heavy mass-only
 closure. P3 and ISHMAEL use property-based ice categories that cannot honestly
-be relabeled as snow/graupel/hail; BowEcho therefore falls back to scalar
-REF/VEL with an explicit note for those schemes.
+be relabeled as snow/graupel/hail. When the **bulk Rayleigh** kernel is selected,
+those schemes therefore fall back to scalar REF/VEL with an explicit note.
 
-This implementation is **not a T-matrix solver**. Frozen-particle orientation,
-full melting-layer coexistence, non-Rayleigh resonance, and scheme-native P3
-properties require an offline, versioned T-matrix lookup table. The scattering
-kernel has a stable additive-moment interface so that LUT can replace the
-current bulk kernel without changing sampling, propagation, the viewer, or
-CfRadial output.
+## Opt-in v0.33.1 property-aware T-matrix research contract
+
+The v0.33.1 branch defines a separate, opt-in research-mode contract for P3
+`mp_physics` 50-53 and ISHMAEL `mp_physics` 55. It is not the default bulk
+operator. A build may evaluate this mode only when its versioned property-aware
+tables and runtime descriptor match the request exactly; an absent or
+inapplicable asset is an error, never a silent fallback to Rayleigh.
+
+The intended data path preserves each scheme's native raw tuples. P3 category
+1/category 2 and ISHMAEL planar/columnar/aggregate mass, number, rime, bulk
+density, liquid fraction, aspect ratio, temperature, and air density are read
+as available. Spatial and adjacent-scene temporal weights apply to that raw
+state first. Nonlinear closure happens only after blending, so a derived radar
+moment is never used as a surrogate WRF property.
+
+The research tables use PyTMatrix at exactly **2.8 GHz**, with distinct oblate
+and prolate spheroids and a symmetric Bruggeman effective-medium mixture of
+air, ice, and liquid water. Their radar-view axis covers pulse-volume offsets
+around named cut centers from 0.1 degrees through 19.5 degrees (at least about
+-0.5 degrees through 20 degrees). A custom beam or quadrature sample outside
+the table's declared view axis fails closed. Frozen-particle orientation is a
+mean-zero Gaussian canting distribution with a fixed 20-degree standard
+deviation and deterministic 50-point orientation integration.
+
+Dielectric applicability is table-specific. Dry-ice nodes use the declared
+Mätzler parameterization over roughly 190-273.15 K; Warren and Brandt
+(2008) note the underlying fits over 190-258 K, so the warmer dry nodes remain
+part of the research uncertainty rather than evidence of validation. Wet
+coexistence nodes use Liebe-Hufford-Manabe liquid water with symmetric
+Bruggeman mixing only over 269.15-275.15 K (-4 to +2 degrees C).
+
+Lookup is bounded: there is no clamping or extrapolation across particle,
+material, temperature, frequency, orientation, or view axes. Signed KDP is
+preserved through per-particle lookup, accumulation, compact storage, and
+radial PhiDP integration. Within those declared bounds, a T-matrix table can
+represent nonspherical and non-Rayleigh/resonant scattering that the bulk
+Rayleigh kernel cannot.
+
+This remains **research-only and not independently validated**. It scales a
+single closure-derived characteristic particle by number concentration; it is
+not an integration over a scheme-native particle-size distribution. The
+reproducible generator checks table integrity and held-out interpolation, not
+agreement with an operational radar. No P3/ISHMAEL table, orientation model,
+VCP choice, or visually plausible output creates an operational-calibration
+claim.
 
 ## Geometry, instrument, and presentation controls
 
@@ -204,16 +299,22 @@ renders.
 
 Instrument controls include S-band frequency, beam width, pulse width, PRF,
 range-dependent sensitivity, calibration phase/ZDR bias, Nyquist folding,
-rotation rate, and inter-sweep transition. Reflectivity texture, velocity
-wobble, and ground clutter are deterministic virtual-instrument/presentation
-effects. They do not add model-resolved meteorological structure.
+rotation rate, and inter-sweep transition. Named Build 24 patterns own their
+physical rows, source rates, periods, waveforms, and PRF-code provenance, so
+the custom timing/PRF-Hz controls do not overwrite the source definition.
+Reflectivity texture, velocity wobble, and ground clutter are deterministic
+virtual-instrument/presentation effects. They do not add model-resolved
+meteorological structure.
 
 ## Memory and export
 
 Large convection-resolving WRF files make one f32 3-D field hundreds of MiB.
-BowEcho reads hydrometeor species sequentially and retains polarimetric ratios,
-phase, propagation coefficients, and fall moments in compact one-byte planes;
-it does not keep every raw mass/number field resident.
+The bulk path reads hydrometeor species sequentially and retains compact
+scattering fields rather than every raw mass/number field. Adjacent-scene mode
+uses a bounded two-input-scene cache and accounts for input, read/cut scratch,
+and retained output volumes in its memory preflight. A research property path
+must include its sparse raw-property state in that accounting; it may not
+silently exceed the configured ceiling.
 
 CfRadial export includes all native and attenuation moments, real ray times,
 frequency, beam width, pulse width, PRT, unambiguous range, scan name, model and
@@ -226,21 +327,28 @@ numeric variables.
 
 - Source-model resolution is the information ceiling. Smaller radar gates and
   more quadrature samples cannot recover unresolved storm structure.
-- Timed rays sample one WRF atmosphere. There is no interpolation between
-  forecast files and no claim to reproduce a numbered operational VCP.
-- The current dual-pol kernel is bulk S-band Rayleigh, not T-matrix.
-- Full melting-layer coexistence, frozen-particle orientation, non-Rayleigh
-  resonance, and scheme-native P3 properties are not implemented.
-- P3, ISHMAEL, missing hydrometeors, and unsupported closures fall back
-  explicitly to scalar REF/VEL with a diagnostic note.
+- Adjacent-scene mode is bounded linear interpolation between two compatible
+  WRF scenes, not model integration and never temporal extrapolation. Frozen,
+  held, dropped, and failed outcomes remain distinguishable in provenance.
+- Named Build 24 VCPs reproduce their checked Appendix C base rows, not SAILS,
+  MRLE, AVSET, Add-MPDA, site adaptations, or an observed operational volume.
+- The default dual-pol kernel remains bulk S-band Rayleigh. In that mode, P3,
+  ISHMAEL, missing hydrometeors, and unsupported closures fall back explicitly
+  to scalar REF/VEL with a diagnostic note.
+- The opt-in T-matrix contract is research-only, table-bounded, and not
+  independently validated. Its P3/ISHMAEL path is a characteristic-particle
+  approximation, not a scheme-native PSD integral or operational calibration.
+- Symmetric Bruggeman air/ice/water mixing represents a declared effective
+  medium; it is not a complete prognostic melting-layer microphysics model.
 - Deterministic clutter and texture are optional synthetic instrument effects,
   not observations and not additional WRF physics.
 - Strict CfRadial character variables for sweep/prt mode remain blocked by the
   pinned writer; numeric substitutes are not fabricated.
 
-## Clearly labeled future work
+## Remaining scientific boundary
 
-A versioned offline T-matrix scattering lookup table, true temporal
-interpolation between model outputs, and explicit operational-VCP emulation
-are possible future extensions. They are **not** features of the v0.33
-operator.
+Independent comparison against trusted polarimetric forward operators and
+observations is still required before any production-science claim. A true
+scheme-native PSD integral, richer frozen-particle orientation distributions,
+prognostic melting-state evolution, and operational VCP adaptations remain
+outside the characteristic-particle research contract.

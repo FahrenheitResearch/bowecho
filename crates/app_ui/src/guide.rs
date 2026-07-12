@@ -1022,6 +1022,32 @@ fn wrf(ui: &mut egui::Ui) {
          calibration, model/microphysics identity, and forward-operator provenance.",
     );
 
+    subhead(ui, "BUILD 24 VCP & ATMOSPHERE TIME");
+    para(
+        ui,
+        "The scan selector includes source-qualified Build 24 base patterns for VCP 12, 34, 35, \
+         112, 212 and 215. All 94 Appendix C physical rows remain in source order, including \
+         equal-elevation surveillance/Doppler split cuts and VCP 112's two fixed MPDA Doppler \
+         cuts. Row elevation, azimuth rate, period, waveform, moment coverage, PRF code and pulse \
+         count enter volume and CfRadial provenance.",
+    );
+    para(
+        ui,
+        "A numbered PRF code is not a PRF in Hz, so BowEcho does not invent PRT or unambiguous \
+         range from it. These are versioned Build 24 base-pattern simulations, not a claim to \
+         reproduce one site's live operational scan: SAILS, MRLE, AVSET, Add-MPDA and \
+         site-specific low-tilt adaptations are outside the catalog.",
+    );
+    para(
+        ui,
+        "Atmosphere time is independent of ray timing. Frozen samples the anchor scene. \
+         Interpolate adjacent WRF scenes uses every timed ray's acquisition offset within the \
+         next compatible model-time bracket. The compatibility renderer blends linear Z, winds \
+         and additive polar scattering, then derives ratios such as ZDR and rhoHV. It never \
+         extrapolates. A missing or too-short bracket follows the explicit hold, drop or error \
+         policy, and a rolling two-scene cache is checked against the memory budget before work.",
+    );
+
     subhead(ui, "START WITH A COMPLETE RECIPE");
     action(
         ui,
@@ -1116,11 +1142,29 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "Dual-pol is a scheme-aware bulk S-band Rayleigh operator. It closes available mass \
+        "The default dual-pol path is a scheme-aware bulk S-band Rayleigh operator. It closes available mass \
          mixing ratios and number concentrations into particle-size distributions, adds species \
          in linear scattering space, and then applies near-to-far phase and attenuation. Common \
          Lin/WSM/WDM, Thompson, Morrison, Milbrandt-Yau and NSSL bulk schemes are recognized; \
          the result records whether closure was full two-moment, partial, or assumption-heavy.",
+    );
+    para(
+        ui,
+        "The v0.33.1 branch also defines an opt-in property-aware T-matrix research contract for \
+         P3 50–53 and ISHMAEL 55 raw tuples. Its versioned PyTMatrix tables use exactly 2.8 GHz, \
+         symmetric Bruggeman air/ice/water mixing, separate oblate/prolate shapes, and a fixed \
+         mean-zero Gaussian canting distribution with 20\u{00b0} standard deviation and \
+         deterministic 50-point orientation integration. Raw spatial/temporal state is blended \
+         before nonlinear closure; signed KDP remains signed.",
+    );
+    para(
+        ui,
+        "A research lookup has no clamping or extrapolation. The view axis covers pulse-volume \
+         offsets around named 0.1\u{00b0}–19.5\u{00b0} cut centers (at least about \
+         -0.5\u{00b0}–20\u{00b0}); a wider custom beam fails closed. Missing or mismatched tables, \
+         properties, frequency, orientation, shape or view coordinates are errors, never silent \
+         Rayleigh fallback. This characteristic-particle approximation is not PSD-integrated, \
+         is research-only and not independently validated, and makes no operational claim.",
     );
     cite(
         ui,
@@ -1139,8 +1183,9 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "Timed rays receive real acquisition offsets from rotation rate and inter-sweep delay, \
-         but sample one WRF model instant. Sensitivity can rise with range, and velocity may be \
+        "Timed rays receive real acquisition offsets from custom rotation/inter-sweep controls \
+         or from each selected Build 24 physical row. They can sample the frozen anchor or a \
+         bounded adjacent-scene bracket. Sensitivity can rise with range, and velocity may be \
          folded into a chosen Nyquist interval for dealiasing practice. Reflectivity texture, \
          velocity wobble and ground clutter are deterministic presentation/instrument effects; \
          they are not additional model-resolved weather.",
@@ -1149,16 +1194,19 @@ fn wrf(ui: &mut egui::Ui) {
     subhead(ui, "HONEST LIMITS");
     para(
         ui,
-        "This is not a T-matrix solver. Frozen-particle orientation, non-Rayleigh resonance, a \
-         complete melting-layer scattering treatment, and scheme-native P3 properties are not \
-         present. P3, ISHMAEL, incomplete hydrometeor inputs, or unsupported closures fall back \
-         explicitly to scalar REF/VEL with a note rather than fabricating dual-pol fields.",
+        "Bulk Rayleigh remains the default. In that mode P3, ISHMAEL, incomplete hydrometeor \
+         inputs, or unsupported closures fall back explicitly to scalar REF/VEL with a note. \
+         The opt-in T-matrix contract is table-bounded research: it can represent nonspherical \
+         and non-Rayleigh/resonant scattering within its declared axes, but it is a \
+         characteristic-particle approximation rather than scheme-native PSD integration or a \
+         complete prognostic melting-layer model.",
     );
     para(
         ui,
-        "Timed scans do not interpolate the atmosphere between forecast files and do not claim \
-         to reproduce a numbered operational VCP. A fine radar gate cannot recover structure \
-         absent from the WRF grid. The pinned NetCDF writer also cannot yet emit strict character \
+        "Adjacent-scene sampling is bounded interpolation between two compatible WRF times, not \
+         atmosphere integration. Build 24 selections reproduce checked base rows, not operational \
+         adaptations or an observed volume. A fine radar gate cannot recover structure absent \
+         from the WRF grid. The pinned NetCDF writer also cannot yet emit strict character \
          variables for CfRadial sweep_mode/prt_mode, so BowEcho does not fake numeric substitutes.",
     );
     cite(ui, "Deeper reference: docs/wrf-simulated-radar.md.");
@@ -2514,12 +2562,12 @@ mod tests {
     }
 
     #[test]
-    fn guide_documents_the_v033_science_workspaces_honestly() {
+    fn guide_documents_the_v0331_science_workspaces_honestly() {
         let guide_src = include_str!("guide.rs");
 
         // Simulated radar includes the fast experimentation path, the full
-        // released recipe set, and the boundaries that must not be promoted
-        // into future capabilities by documentation.
+        // recipe set, checked Build 24 base patterns, bounded adjacent-scene
+        // sampling, and the research-only T-matrix boundary.
         assert!(guide_src.contains("Refresh current frame(s)"));
         for recipe in [
             "Storm view (fast)",
@@ -2530,9 +2578,27 @@ mod tests {
         ] {
             assert!(guide_src.contains(recipe), "missing recipe {recipe}");
         }
-        assert!(guide_src.contains("This is not a T-matrix solver"));
-        assert!(guide_src.contains("do not claim to reproduce a numbered operational VCP"));
-        assert!(guide_src.contains("P3, ISHMAEL"));
+        for vcp in [
+            "VCP 12", "VCP 34", "VCP 35", "VCP 112", "VCP 212", "VCP 215",
+        ] {
+            assert!(guide_src.contains(vcp), "missing checked {vcp} guide copy");
+        }
+        assert!(guide_src.contains("All 94 Appendix C physical rows"));
+        assert!(guide_src.contains("SAILS, MRLE, AVSET, Add-MPDA"));
+        assert!(guide_src.contains("Interpolate adjacent WRF scenes"));
+        assert!(guide_src.contains("It never extrapolates"));
+        assert!(guide_src.contains("hold, drop or error"));
+
+        assert!(guide_src.contains("property-aware T-matrix research contract"));
+        assert!(guide_src.contains("P3 50–53 and ISHMAEL 55"));
+        assert!(guide_src.contains("symmetric Bruggeman air/ice/water"));
+        assert!(guide_src.contains("exactly 2.8 GHz"));
+        assert!(guide_src.contains("deterministic 50-point orientation integration"));
+        assert!(guide_src.contains("signed KDP remains signed"));
+        assert!(guide_src.contains("never silent Rayleigh fallback"));
+        assert!(guide_src.contains("not PSD-integrated"));
+        assert!(guide_src.contains("research-only and not independently validated"));
+        assert!(guide_src.contains("makes no operational claim"));
 
         // Formula Lab must retain the explicit capability boundary rather
         // than implying every stored model has raw-WRF grid geometry.
