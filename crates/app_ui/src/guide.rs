@@ -1065,13 +1065,23 @@ fn wrf(ui: &mut egui::Ui) {
         ui,
         "Find this at WRF simulated radar \u{2192} Radar location & fine tuning (advanced) \
          \u{2192} Instrument & propagation \u{2192} Atmosphere time. Ray timing and atmosphere \
-         sampling are separate concepts, but selecting Interpolate adjacent WRF scenes also \
-         enables Timed volume because instantaneous rays have no acquisition offsets. Frozen \
-         samples the anchor scene. Interpolate uses every timed ray's acquisition offset within the \
-         next compatible model-time bracket. The compatibility renderer blends linear Z, winds \
-         and additive polar scattering, then derives ratios such as ZDR and rhoHV. It never \
-         extrapolates. A missing or too-short bracket follows the explicit hold, drop or error \
-         policy, and a rolling two-scene cache is checked against the memory budget before work.",
+         sampling are separate concepts, but either adjacent-scene choice also enables Timed \
+         volume because instantaneous rays have no acquisition offsets. Frozen samples the \
+         anchor scene. Linear adjacent is the fast path: every timed ray blends linear Z, winds \
+         and additive polar scattering within the next compatible model-time bracket, then \
+         derives ratios such as ZDR and rhoHV.",
+    );
+    para(
+        ui,
+        "Raw-state pre-closure is the slower P3/ISHMAEL research reference. At each \
+         pulse-volume sample it combines the actual up-to-eight spatial/vertical contributors \
+         from each scene with the ray's temporal weight, blends raw winds, TKE, pressure, \
+         temperature, density and native property tuples, then performs one nonlinear closure \
+         and one validated T-matrix/PSD evaluation. Endpoints are exact. Scheme, inventory, \
+         category, rain, coverage or table mismatch stops the run instead of substituting the \
+         additive-time path. Both adjacent modes never extrapolate; a missing or too-short \
+         bracket follows the explicit hold, drop or error policy and the retained two-scene \
+         state is checked against the configured memory budget.",
     );
     para(
         ui,
@@ -2854,7 +2864,8 @@ mod tests {
         }
         assert!(guide_src.contains("All 94 Appendix C physical rows"));
         assert!(guide_src.contains("SAILS, MRLE, AVSET, Add-MPDA"));
-        assert!(guide_src.contains("Interpolate adjacent WRF scenes"));
+        assert!(guide_src.contains("Linear adjacent is the fast path"));
+        assert!(guide_src.contains("Raw-state pre-closure is the slower"));
         assert!(guide_src.contains("It never extrapolates"));
         assert!(guide_src.contains("hold, drop or error"));
         assert!(guide_src.contains("does not create extra loop frames"));
