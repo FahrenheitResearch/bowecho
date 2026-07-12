@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde::de::{Error as _, Visitor};
+use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
