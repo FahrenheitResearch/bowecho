@@ -2,7 +2,12 @@
 //! radar research operator.
 
 use crate::wrf_property_reader::WrfPropertyScene;
-use crate::wrf_tmatrix_scene::WrfTMatrixScene;
+use crate::wrf_tmatrix_scene::{WrfTMatrixBuildPeakEstimate, WrfTMatrixScene};
+
+pub struct EmbeddedPropertySceneBuild {
+    pub scene: WrfTMatrixScene,
+    pub peak: WrfTMatrixBuildPeakEstimate,
+}
 
 /// Build one compact scattering scene from the exact embedded research tables.
 ///
@@ -10,7 +15,8 @@ use crate::wrf_tmatrix_scene::WrfTMatrixScene;
 /// digests are connected here once the reproducible PyTMatrix build completes.
 pub fn build_embedded_property_tmatrix_scene(
     _source: &WrfPropertyScene,
-) -> Result<WrfTMatrixScene, String> {
+    _maximum_owned_peak_bytes: usize,
+) -> Result<EmbeddedPropertySceneBuild, String> {
     Err(
         "embedded property T-matrix research tables are not present in this build; no bulk-kernel fallback was used"
             .to_string(),

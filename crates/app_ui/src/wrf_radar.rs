@@ -1149,6 +1149,52 @@ impl WrfRadarFields {
         self.polarimetric.is_some() || self.property_scattering.is_some()
     }
 
+    fn base_retained_bytes_without_property_scattering(&self) -> usize {
+        let f32_values = self
+            .lat
+            .len()
+            .saturating_add(self.lon.len())
+            .saturating_add(self.height_msl.len())
+            .saturating_add(self.dbz.len())
+            .saturating_add(self.u.len())
+            .saturating_add(self.v.len())
+            .saturating_add(self.w.len())
+            .saturating_add(self.terrain_m.len());
+        let compact_polar_bytes = self.polarimetric.as_ref().map_or(0, |polar| {
+            polar.zdr.len()
+                + polar.rho.len()
+                + polar.covariance_phase.len()
+                + polar.kdp.len() * std::mem::size_of::<i16>()
+                + polar.ah.len()
+                + polar.adp.len()
+                + polar.fall_speed.len()
+                + polar.fall_speed_std.len()
+        });
+        std::mem::size_of::<Self>()
+            .saturating_add(f32_values.saturating_mul(std::mem::size_of::<f32>()))
+            .saturating_add(compact_polar_bytes)
+            .saturating_add(
+                self.tke_tenths_m2s2
+                    .as_ref()
+                    .map_or(0, |values| values.len()),
+            )
+            .saturating_add(self.lut.retained_bytes())
+            .saturating_add(
+                self.dual_pol_status
+                    .as_ref()
+                    .map_or(0, std::string::String::len),
+            )
+    }
+
+    fn retained_bytes_estimate(&self) -> usize {
+        self.base_retained_bytes_without_property_scattering()
+            .saturating_add(
+                self.property_scattering
+                    .as_deref()
+                    .map_or(0, |scene| scene.memory_estimate().retained_bytes()),
+            )
+    }
+
     /// Domain-centre grid cell (used for the default antenna position).
     fn center_cell(&self) -> usize {
         (self.ny / 2) * self.nx + (self.nx / 2)
@@ -1318,6 +1364,7 @@ fn read_wrf_radar_fields_for_config_reporting(
     timeidx: usize,
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
+    reserved_memory_bytes: usize,
 ) -> Result<WrfRadarFields, String> {
     let property_tmatrix = matches!(
         config.polarimetric_kernel,
@@ -1357,13 +1404,36 @@ fn read_wrf_radar_fields_for_config_reporting(
             .map(app_ui::wrf_property_reader::SourceFieldProvenance::source_name)
             .collect::<Vec<_>>()
             .join(",");
+        let budget_bytes = config
+            .temporal_memory_budget_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| "Simulated-radar memory budget overflows address space".to_string())?;
+        let current_base_bytes = fields
+            .base_retained_bytes_without_property_scattering()
+            .checked_add(if config.spectrum_width { expected } else { 0 })
+            .and_then(|value| {
+                value.checked_add(app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes())
+            })
+            .and_then(|value| value.checked_add(reserved_memory_bytes))
+            .ok_or_else(|| "Property T-matrix build-memory reservation overflowed".to_string())?;
+        let maximum_owned_peak_bytes = budget_bytes.checked_sub(current_base_bytes).ok_or_else(|| {
+            format!(
+                "Property T-matrix build has no memory remaining inside the configured {:.2} GiB budget after {:.2} GiB of retained fields, tables, outputs, and cache",
+                budget_bytes as f64 / 1024.0_f64.powi(3),
+                current_base_bytes as f64 / 1024.0_f64.powi(3),
+            )
+        })?;
         progress("evaluating property T-matrix scene…");
-        let property_scattering =
-            app_ui::wrf_tmatrix_assets::build_embedded_property_tmatrix_scene(&property_scene)
-                .map_err(|error| format!("build property T-matrix scene: {error}"))?;
+        let built = app_ui::wrf_tmatrix_assets::build_embedded_property_tmatrix_scene(
+            &property_scene,
+            maximum_owned_peak_bytes,
+        )
+        .map_err(|error| format!("build property T-matrix scene: {error}"))?;
+        let property_scattering = built.scene;
         fields.dual_pol_status = Some(format!(
-            "property-aware T-matrix research input (mp_physics={}; raw fields={fields_read})",
+            "property-aware T-matrix research input (mp_physics={}; raw fields={fields_read}; build peak {:.2} GiB)",
             property_scattering.microphysics_scheme_id(),
+            built.peak.estimated_peak_bytes as f64 / 1024.0_f64.powi(3),
         ));
         fields.ref_source = PROPERTY_TMATRIX_S_BAND_SOURCE;
         fields.property_scattering = Some(Arc::new(property_scattering));
@@ -3064,6 +3134,8 @@ fn sample_column(
     let mut tke = 0.0f32;
     let mut polar_accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
     let property_scattering = fields.property_scattering.as_deref();
+    let mut property_weights = [(0usize, 0.0f64); 8];
+    let mut property_weight_count = 0usize;
     for (col, weight) in stencil {
         if weight <= 0.0 {
             continue;
@@ -3081,23 +3153,17 @@ fn sample_column(
             continue;
         };
 
-        let d = if let Some(property) = property_scattering {
-            let mut vertical = crate::wrf_radar_physics::PolarAccumulator::default();
-            if let Some(lower) = property
-                .polar_at(i0, beam_elevation_deg)
-                .map_err(|error| format!("query lower property T-matrix cell {i0}: {error}"))?
-            {
-                vertical.add(1.0 - t, tmatrix_as_contribution(lower));
+        if property_scattering.is_some() {
+            let lower_weight = f64::from(weight) * f64::from(1.0 - t);
+            if lower_weight > 0.0 {
+                property_weights[property_weight_count] = (i0, lower_weight);
+                property_weight_count += 1;
             }
-            if let Some(upper) = property
-                .polar_at(i1, beam_elevation_deg)
-                .map_err(|error| format!("query upper property T-matrix cell {i1}: {error}"))?
-            {
-                vertical.add(t, tmatrix_as_contribution(upper));
+            let upper_weight = f64::from(weight) * f64::from(t);
+            if upper_weight > 0.0 {
+                property_weights[property_weight_count] = (i1, upper_weight);
+                property_weight_count += 1;
             }
-            let sample = vertical.finalize();
-            polar_accumulator.add(weight, intrinsic_as_contribution(sample));
-            sample.zh
         } else {
             let Some(d) = (match reflectivity_sampling {
                 ReflectivitySampling::LegacyDbz => lerp(fields.dbz[i0], fields.dbz[i1], t),
@@ -3107,8 +3173,8 @@ fn sample_column(
             }) else {
                 continue;
             };
-            d
-        };
+            reflectivity += weight * d;
+        }
 
         if property_scattering.is_none()
             && let Some(polar) = &fields.polarimetric
@@ -3124,7 +3190,6 @@ fn sample_column(
             tke += weight * (t0 + t * (t1 - t0));
         }
         wsum += weight;
-        reflectivity += weight * d;
         u += weight * su;
         v += weight * sv;
         w += weight * sw;
@@ -3132,17 +3197,43 @@ fn sample_column(
     if wsum <= 0.0 {
         return Ok(None);
     }
-    let reflectivity = reflectivity / wsum;
-    let z_linear = match reflectivity_sampling {
-        ReflectivitySampling::LegacyDbz => dbz_to_z(reflectivity),
-        ReflectivitySampling::LinearZ => reflectivity,
-    };
-    let polar = (fields.polarimetric.is_some() || property_scattering.is_some())
-        .then(|| {
+    let (z_linear, polar) = if let Some(property) = property_scattering {
+        if property_weight_count == 0 {
+            return Ok(None);
+        }
+        let weights = &mut property_weights[..property_weight_count];
+        let weight_sum = weights.iter().map(|(_, weight)| *weight).sum::<f64>();
+        if !weight_sum.is_finite() || weight_sum <= 0.0 {
+            return Err(format!(
+                "property T-matrix trilinear weights have invalid sum {weight_sum}"
+            ));
+        }
+        for (_, weight) in weights.iter_mut() {
+            *weight /= weight_sum;
+        }
+        let normalized_sum = weights.iter().map(|(_, weight)| *weight).sum::<f64>();
+        if let Some((_, last_weight)) = weights.last_mut() {
+            *last_weight += 1.0 - normalized_sum;
+        }
+        let quantities = property
+            .weighted_polar_at(weights, beam_elevation_deg)
+            .map_err(|error| format!("query weighted property T-matrix column: {error}"))?;
+        let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+        accumulator.add(1.0, tmatrix_as_contribution(quantities));
+        let sample = accumulator.finalize();
+        (sample.zh, (sample.zh > 0.0).then_some(sample))
+    } else {
+        let reflectivity = reflectivity / wsum;
+        let z_linear = match reflectivity_sampling {
+            ReflectivitySampling::LegacyDbz => dbz_to_z(reflectivity),
+            ReflectivitySampling::LinearZ => reflectivity,
+        };
+        let polar = fields.polarimetric.as_ref().and_then(|_| {
             let sample = normalize_intrinsic(polar_accumulator.finalize(), wsum);
-            sample
-        })
-        .filter(|sample| sample.zh > 0.0);
+            (sample.zh > 0.0).then_some(sample)
+        });
+        (z_linear, polar)
+    };
     Ok(Some(ColumnSample {
         z_linear: polar.map_or(z_linear, |sample| sample.zh),
         u: u / wsum,
@@ -3707,6 +3798,18 @@ fn build_synthetic_from_paths(
     let selected = inventory_selected_wrf_paths(&files)?;
     let scenes = selected.group.scenes.clone();
     let config_fingerprint = scene_build_fingerprint(config, &selected.group);
+    let property_build_reservation_bytes = if matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        let estimate = temporal_memory_estimate(&selected.group, config, scenes.len())?;
+        estimate
+            .shared_static_bytes
+            .checked_add(estimate.output_bytes)
+            .ok_or_else(|| "Property T-matrix output-memory reservation overflowed".to_string())?
+    } else {
+        0
+    };
 
     let mut notes = selected
         .notes
@@ -3788,6 +3891,7 @@ fn build_synthetic_from_paths(
             timeidx,
             config,
             &progress,
+            property_build_reservation_bytes,
         ) {
             Ok(fields) => fields,
             Err(error) => {
@@ -4260,35 +4364,14 @@ fn ensure_temporal_runtime_cache_budget(
     budget_bytes: usize,
 ) -> Result<(), String> {
     let cached_scene_count = cache.len();
-    let base_scene_bytes = estimate
-        .scene_bytes()
-        .ok_or_else(|| "Temporal runtime scene-memory estimate overflowed".to_string())?;
-    let property_dense_lookup_bytes = estimate
-        .cells_per_scene
-        .checked_mul(std::mem::size_of::<u32>())
-        .ok_or_else(|| "Temporal runtime property-memory estimate overflowed".to_string())?;
     let has_property_scattering = cache
         .values()
         .any(|fields| fields.property_scattering.is_some());
-    let property_extra_bytes = cache.values().try_fold(0usize, |total, fields| {
-        let retained = fields
-            .property_scattering
-            .as_deref()
-            .map(|scene| scene.memory_estimate().retained_bytes())
-            .unwrap_or(0);
-        total.checked_add(retained.saturating_sub(property_dense_lookup_bytes))
-    });
-    let required_bytes = base_scene_bytes
-        .checked_mul(cached_scene_count)
-        .and_then(|value| value.checked_add(property_extra_bytes?))
-        .and_then(|value| value.checked_add(estimate.shared_static_bytes))
-        .and_then(|value| value.checked_add(estimate.output_bytes))
-        .and_then(|value| {
-            value.checked_add(if has_property_scattering {
-                app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes()
-            } else {
-                0
-            })
+    let required_bytes = temporal_runtime_reserved_bytes(cache, estimate)?
+        .checked_add(if has_property_scattering {
+            app_ui::wrf_tmatrix_assets::embedded_lut_memory_bytes()
+        } else {
+            0
         })
         .ok_or_else(|| "Temporal runtime memory estimate overflowed".to_string())?;
     if required_bytes > budget_bytes {
@@ -4299,6 +4382,22 @@ fn ensure_temporal_runtime_cache_budget(
         ));
     }
     Ok(())
+}
+
+fn temporal_runtime_reserved_bytes(
+    cache: &TwoSceneCache<(String, usize), Arc<WrfRadarFields>>,
+    estimate: TemporalMemoryEstimate,
+) -> Result<usize, String> {
+    let shared_and_output = estimate
+        .shared_static_bytes
+        .checked_add(estimate.output_bytes)
+        .ok_or_else(|| "Temporal runtime retained-memory estimate overflowed".to_string())?;
+    cache
+        .values()
+        .try_fold(shared_and_output, |total, fields| {
+            total.checked_add(fields.retained_bytes_estimate())
+        })
+        .ok_or_else(|| "Temporal runtime retained-memory estimate overflowed".to_string())
 }
 
 fn cached_temporal_fields(
@@ -4327,12 +4426,14 @@ fn cached_temporal_fields(
             display_name(&scene.path)
         )
     })?;
+    let reserved_memory_bytes = temporal_runtime_reserved_bytes(cache, estimate)?;
     let fields = Arc::new(read_wrf_radar_fields_for_config_reporting(
         &file,
         &scene.source_identity,
         scene.time_index,
         config,
         progress,
+        reserved_memory_bytes,
     )?);
     let evicted = cache.insert(key.clone(), Arc::clone(&fields));
     if let Err(error) = ensure_temporal_runtime_cache_budget(cache, estimate, budget_bytes) {

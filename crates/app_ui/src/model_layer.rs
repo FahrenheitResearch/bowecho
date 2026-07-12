@@ -43,6 +43,12 @@ const MAX_LUT_BINS: f32 = 16_000_000.0;
 const HOLE_FILL_PASSES: usize = 3;
 
 impl InverseLut {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.index.len().saturating_mul(std::mem::size_of::<u32>()))
+    }
+
     /// Build from the grid's lat/lon arrays (~a second for CONUS HRRR;
     /// run on a background thread).
     pub fn build(lat: &[f32], lon: &[f32]) -> Option<Self> {
