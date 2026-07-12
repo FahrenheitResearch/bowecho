@@ -61,7 +61,7 @@ closure, or assumption.
 ### `DiagnosticCoexistenceV1`
 
 Melting is deliberately diagnostic, never scheme-native. It is available only
-when positive rain and frozen mass coexist from 268.15 through 275.15 K. Let
+when positive rain and frozen mass coexist from 269.15 through 275.15 K. Let
 `t` be temperature's bounded linear position in that envelope, `F` total
 frozen mass, and `R` rain mass. The liquid needed to reach the temperature
 limit is `F*t/(1-t)` (unbounded at the warm edge), paired liquid is the lesser
@@ -96,6 +96,46 @@ A decoded `OfflineLut` has passed all of the following checks:
 Queries name every axis in declared order and never extrapolate. The payload
 layout is point-major little-endian f64 with the last declared axis varying
 fastest.
+
+## Research T-matrix runtime boundary
+
+`ResearchTMatrixLut::load` requires the expected SHA-256 of the complete LUT
+and the exact external generator-config bytes. It then binds the already
+validated `OfflineLut` to typed population, category, spheroid, dielectric,
+ODF, radar-basis/view, and terminal-speed descriptors. A table is never chosen
+from matching axes alone. PyTMatrix 0.3.3, research-only validation status,
+exact 1 m^-3 node normalization, H/V covariance convention, and every
+generator/header science field are fail-closed requirements.
+
+Radar elevation is a genuine degree-valued LUT axis. Current legacy tables
+declare a singleton horizontal 0-degree node; view-aware tables declare the
+-0.5 through 20-degree PPI range. Queries outside the declared nodes fail and
+cannot silently reuse horizontal scattering for an elevated VCP cut.
+
+Property-aware dispatch is phase explicit. Dry P3/ISHMAEL characteristic
+particles require exactly zero liquid fraction and the separate Matzler/air
+table spanning 190 through 273.15 K. Wet diagnosed categories require positive
+liquid fraction and the Bruggeman air/ice/water table spanning 269.15 through
+275.15 K. Its independent filling coordinate is condensed volume fraction,
+`rho_b * ((1-w)/917 + w/999.84)`, rather than a Cartesian bulk-density/liquid
+fraction grid containing impossible negative-air states. The view-aware Liebe
+liquid-rain table spans 250 through 313.15 K.
+None of these tables may be relabeled as a conventional frozen category.
+
+All nodes are additive quantities normalized to one particle per cubic metre.
+Ordinary closed categories scale by `number_per_kg * air_density`. A wet
+category preserves its frozen source number while its paired liquid changes
+mass-derived diameter, density, aspect, and liquid fraction. Residual rain
+preserves PSD shape and scales number by `q_residual / q_original`; paired
+liquid is therefore removed exactly once and never scattered again at the
+original full rain number.
+
+The generator's terminal-speed law remains in the descriptor for exact LUT
+reproduction, but application evaluation does not silently consume its fixed
+1.225 kg m^-3 fall moments aloft. The runtime replaces them before scaling
+with `ZH*v` and `ZH*v^2` from the closed category or diagnosed wet category's
+positive-down fall speed, explicitly declaring zero within-category speed
+variance in `FallMomentPolicy`.
 
 ## Evidence status
 

@@ -22,9 +22,11 @@ pub enum AxisKind {
     EquivolumeDiameter,
     Temperature,
     BulkDensity,
+    CondensedVolumeFraction,
     LiquidMassFraction,
     MinorToMajorAxisRatio,
     Frequency,
+    RadarElevation,
     CantingAngle,
     RimeMassFraction,
     RimeDensity,
@@ -169,10 +171,11 @@ fn axis_unit(kind: AxisKind) -> Unit {
         AxisKind::Temperature => Unit::Kelvin,
         AxisKind::BulkDensity | AxisKind::RimeDensity => Unit::KilogramPerCubicMeter,
         AxisKind::LiquidMassFraction
+        | AxisKind::CondensedVolumeFraction
         | AxisKind::MinorToMajorAxisRatio
         | AxisKind::RimeMassFraction => Unit::UnitlessFraction,
         AxisKind::Frequency => Unit::Hertz,
-        AxisKind::CantingAngle => Unit::Degree,
+        AxisKind::RadarElevation | AxisKind::CantingAngle => Unit::Degree,
         AxisKind::TimeOffset => Unit::Second,
     }
 }

@@ -14,6 +14,7 @@ mod orientation;
 mod output;
 mod particle;
 mod science;
+mod tmatrix_runtime;
 
 pub use closure::{
     ClosedOrientation, ClosedParticleCategory, ClosureContext, ClosureError,
@@ -49,4 +50,11 @@ pub use particle::{
 pub use science::{
     EffectiveMediumRule, KernelModel, MeltingModel, OrientationModel, ScienceError,
     ScienceMetadata, TMatrixImplementation, TableValidation, TemporalSampling,
+};
+pub use tmatrix_runtime::{
+    ComplexRefractiveIndex, EvaluationError, FallMomentPolicy, HomogeneousMaterial,
+    NumberScalingPolicy, RadarConventionDescriptor, RadarHvConvention, RadarViewApplicability,
+    RadarViewGeometry, ResearchTMatrixLut, ScaledScatteringContribution, SpheroidConvention,
+    TMatrixEvaluationRequest, TMatrixLoadError, TMatrixMaterial, TMatrixOdfConvention,
+    TMatrixParticleCategory, TMatrixPopulationRole, TMatrixTableDescriptor, TerminalSpeedPolicy,
 };

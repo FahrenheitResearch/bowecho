@@ -19,8 +19,8 @@ use crate::{
 /// Versioned implementation identifier carried by all analytic properties.
 pub const PROPERTY_CLOSURE_REVISION: &str = "wrf-property-closure-v1";
 
-/// Cold edge (-5 C) of the explicitly diagnostic coexistence envelope.
-pub const DIAGNOSTIC_COEXISTENCE_COLD_K: f64 = 268.15;
+/// Cold edge (-4 C) of the explicitly diagnostic coexistence envelope.
+pub const DIAGNOSTIC_COEXISTENCE_COLD_K: f64 = 269.15;
 
 /// Warm edge (+2 C) of the explicitly diagnostic coexistence envelope.
 pub const DIAGNOSTIC_COEXISTENCE_WARM_K: f64 = 275.15;
@@ -112,6 +112,13 @@ pub enum OrientationDefinition {
     SchemeDefault,
     /// A zero-width, zero-mean Gaussian canting override.
     Aligned,
+    /// Exact fixed-Euler vertical ODF used by aligned research tables. This is
+    /// intentionally distinct from the degenerate Gaussian `Aligned` model.
+    FixedAlignedVerticalResearch,
+    /// Exact ODF used by the view-aware research PyTMatrix tables:
+    /// zero mean, 20-degree standard deviation, 5x10 quadrature.
+    /// This is opt-in and is never treated as a scheme-native prediction.
+    Gaussian20Research,
     /// A true isotropic distribution, not a very broad Gaussian surrogate.
     Isotropic,
 }
@@ -1777,6 +1784,32 @@ fn close_orientation(
                 "explicit aligned Gaussian canting override",
             ),
         },
+        OrientationDefinition::FixedAlignedVerticalResearch => ClosedOrientation {
+            definition,
+            model: OrientationModel::FixedEuler {
+                yaw_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            provenance: PropertyProvenance::new(
+                PropertySourceKind::Assumed,
+                vec![],
+                "explicit research-table fixed-Euler aligned vertical ODF",
+            ),
+        },
+        OrientationDefinition::Gaussian20Research => ClosedOrientation {
+            definition,
+            model: OrientationModel::GaussianCanting {
+                mean_deg: 0.0,
+                standard_deviation_deg: 20.0,
+                quadrature_points: 50,
+            },
+            provenance: PropertyProvenance::new(
+                PropertySourceKind::Assumed,
+                vec![],
+                "explicit research-table Gaussian canting ODF: mean=0, sigma=20 degrees, 5x10 quadrature",
+            ),
+        },
         OrientationDefinition::Isotropic => ClosedOrientation {
             definition,
             model: OrientationModel::Isotropic {
@@ -2486,7 +2519,7 @@ mod tests {
     #[test]
     fn diagnostic_coexistence_conserves_mass_without_double_counting_rain() {
         let (rain, frozen) = coexistence_categories();
-        let input = DiagnosticCoexistenceInput::new(271.65, rain, frozen).unwrap();
+        let input = DiagnosticCoexistenceInput::new(272.15, rain, frozen).unwrap();
         let result = input.diagnose().unwrap();
         assert_eq!(result.model_identifier(), "DiagnosticCoexistenceV1");
         assert!(!result.is_scheme_native());
@@ -2522,7 +2555,7 @@ mod tests {
     #[test]
     fn diagnostic_coexistence_preserves_frozen_category_fractions_and_bounds() {
         let (rain, frozen) = coexistence_categories();
-        let input = DiagnosticCoexistenceInput::new(271.65, rain, frozen).unwrap();
+        let input = DiagnosticCoexistenceInput::new(272.15, rain, frozen).unwrap();
         let result = diagnose_coexistence(&input).unwrap();
         assert_eq!(result.wet_categories().len(), 2);
         assert_close(result.wet_categories()[0].frozen_category_fraction(), 0.25);
@@ -2592,7 +2625,7 @@ mod tests {
         assert_eq!(MixtureMetadata::SUPPORTED_TOPOLOGIES.len(), 2);
         for topology in MixtureMetadata::SUPPORTED_TOPOLOGIES {
             let (rain, frozen) = coexistence_categories();
-            let result = DiagnosticCoexistenceInput::new(271.65, rain, frozen)
+            let result = DiagnosticCoexistenceInput::new(272.15, rain, frozen)
                 .unwrap()
                 .with_topology(topology)
                 .diagnose()
@@ -2613,15 +2646,15 @@ mod tests {
     fn coexistence_rejects_wrong_phase_roles() {
         let (rain, frozen) = coexistence_categories();
         assert_eq!(
-            DiagnosticCoexistenceInput::new(271.65, rain.clone(), vec![]).unwrap_err(),
+            DiagnosticCoexistenceInput::new(272.15, rain.clone(), vec![]).unwrap_err(),
             ClosureError::NoFrozenCategories
         );
         assert_eq!(
-            DiagnosticCoexistenceInput::new(271.65, frozen[0].clone(), frozen.clone()).unwrap_err(),
+            DiagnosticCoexistenceInput::new(272.15, frozen[0].clone(), frozen.clone()).unwrap_err(),
             ClosureError::RainCategoryRequired
         );
         assert!(matches!(
-            DiagnosticCoexistenceInput::new(271.65, rain.clone(), vec![rain]),
+            DiagnosticCoexistenceInput::new(272.15, rain.clone(), vec![rain]),
             Err(ClosureError::FrozenCategoryRequired { index: 0 })
         ));
     }
