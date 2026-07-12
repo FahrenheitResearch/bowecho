@@ -2498,13 +2498,10 @@ impl ModelDataDock {
         }
     }
 
-    /// One-shot: take finished synthetic-radar volumes for the app to install
-    /// into the loop engine. Returns `(status label, one volume per WRF time)`.
-    pub fn take_synthetic_radar(
-        &mut self,
-    ) -> Option<(String, u64, Vec<std::sync::Arc<radar_core::RadarVolume>>)> {
-        let output = self.synthetic_radar_result.take()?;
-        Some((output.label, output.config_fingerprint, output.volumes))
+    /// One-shot: take finished synthetic-radar volumes and their private,
+    /// session-only source descriptors for installation into the loop engine.
+    pub fn take_synthetic_radar(&mut self) -> Option<crate::wrf_radar::SyntheticRadarOutput> {
+        self.synthetic_radar_result.take()
     }
 
     /// One-shot: take a completed exact observed-geometry replay. The app

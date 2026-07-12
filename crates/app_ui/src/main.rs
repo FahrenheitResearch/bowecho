@@ -2897,6 +2897,10 @@ struct ViewerApp {
     simradar_truth_lab: simradar_truth_lab::AlgorithmTruthLabState,
     /// Exact selected-gate quality/stage report and optional spectrum view.
     simradar_gate_inspector: simradar_gate_inspector::SimradarGateInspectorState,
+    /// Private session-only WRF source descriptors keyed by installed Arc
+    /// identity. Absolute paths never enter RadarVolume provenance.
+    simradar_gate_sources: HashMap<usize, wrf_radar::SyntheticFrameSourceDescriptor>,
+    simradar_gate_explanation_task: Option<(u64, wrf_radar::GateExplanationTask)>,
     /// The last-clicked pane (0 = main). The sidebar product picker and tilt
     /// list drive this pane: the main pane edits the whole bunch, an extra
     /// pane edits itself independently.
@@ -8416,6 +8420,8 @@ impl ViewerApp {
             simradar_comparison: None,
             simradar_truth_lab: simradar_truth_lab::AlgorithmTruthLabState::default(),
             simradar_gate_inspector: simradar_gate_inspector::SimradarGateInspectorState::default(),
+            simradar_gate_sources: HashMap::new(),
+            simradar_gate_explanation_task: None,
             active_pane: 0,
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
@@ -9428,6 +9434,8 @@ impl ViewerApp {
     fn clear_frame_history(&mut self) {
         self.remember_current_primary_product_cut();
         self.primary.clear_history();
+        self.simradar_gate_sources.clear();
+        self.simradar_gate_explanation_task = None;
         self.clear_primary_loop_side_state();
     }
 
@@ -9667,6 +9675,37 @@ impl ViewerApp {
         volumes: Vec<Arc<RadarVolume>>,
         ctx: &egui::Context,
     ) {
+        self.install_synthetic_radar_volumes_with_sources(
+            label,
+            config_fingerprint,
+            volumes,
+            Vec::new(),
+            ctx,
+        );
+    }
+
+    fn install_synthetic_radar_output(
+        &mut self,
+        output: wrf_radar::SyntheticRadarOutput,
+        ctx: &egui::Context,
+    ) {
+        self.install_synthetic_radar_volumes_with_sources(
+            output.label,
+            output.config_fingerprint,
+            output.volumes,
+            output.frame_sources,
+            ctx,
+        );
+    }
+
+    fn install_synthetic_radar_volumes_with_sources(
+        &mut self,
+        label: String,
+        config_fingerprint: u64,
+        volumes: Vec<Arc<RadarVolume>>,
+        frame_sources: Vec<wrf_radar::SyntheticFrameSourceDescriptor>,
+        ctx: &egui::Context,
+    ) {
         if volumes.is_empty() {
             self.status = "Simulated radar produced no frames".to_owned();
             return;
@@ -9690,10 +9729,17 @@ impl ViewerApp {
         self.clear_frame_history();
 
         let frame_count = volumes.len();
+        let mut frame_sources = frame_sources.into_iter();
         let frames: Vec<DecodedLoad> = volumes
             .into_iter()
             .enumerate()
             .map(|(index, volume)| {
+                if let Some(source) = frame_sources.next()
+                    && source.matches_volume(&volume)
+                {
+                    self.simradar_gate_sources
+                        .insert(Arc::as_ptr(&volume) as usize, source);
+                }
                 let stamp = volume.volume_time.format("%Y%m%d_%H%M%S").to_string();
                 DecodedLoad {
                     // Stable dedupe/refresh key per forecast frame, keyed on the
@@ -9849,6 +9895,17 @@ impl ViewerApp {
         difference: Arc<RadarVolume>,
         ctx: &egui::Context,
     ) -> Result<(), String> {
+        self.install_simradar_comparison_with_source(observed, synthetic, difference, None, ctx)
+    }
+
+    fn install_simradar_comparison_with_source(
+        &mut self,
+        observed: Arc<RadarVolume>,
+        synthetic: Arc<RadarVolume>,
+        difference: Arc<RadarVolume>,
+        source_descriptor: Option<wrf_radar::SyntheticFrameSourceDescriptor>,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
         let synchronized_cut = simradar_comparison_synchronized_cut(
             observed.as_ref(),
             synthetic.as_ref(),
@@ -9867,6 +9924,12 @@ impl ViewerApp {
         self.pending_local_autoplay = false;
         self.load_receiver = None;
         self.clear_frame_history();
+        if let Some(source_descriptor) = source_descriptor
+            && source_descriptor.matches_volume(&synthetic)
+        {
+            self.simradar_gate_sources
+                .insert(Arc::as_ptr(&synthetic) as usize, source_descriptor);
+        }
         self.primary.feed = FeedSource::LocalFiles {
             label: "simradar observed/simulated/difference comparison".to_owned(),
         };
@@ -19818,26 +19881,70 @@ impl eframe::App for ViewerApp {
             self.simradar_truth_lab.set_volume(truth_lab_volume);
         }
         self.simradar_truth_lab.show_window(&ctx);
+        let explanation_result =
+            self.simradar_gate_explanation_task
+                .as_ref()
+                .and_then(|(generation, task)| match task.rx.try_recv() {
+                    Ok(result) => Some((*generation, result)),
+                    Err(mpsc::TryRecvError::Disconnected) => Some((
+                        *generation,
+                        wrf_radar_estimator::WhyThisGate::Unavailable(
+                            wrf_radar_estimator::WhyThisGateUnavailable::WorkerFailed(
+                                "selected-gate worker disconnected".to_owned(),
+                            ),
+                        ),
+                    )),
+                    Err(mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(Duration::from_millis(50));
+                        None
+                    }
+                });
+        if let Some((generation, result)) = explanation_result {
+            self.simradar_gate_explanation_task = None;
+            self.simradar_gate_inspector
+                .supply_explanation(generation, result);
+        }
         if let Some(request) = self.simradar_gate_inspector.take_explanation_request() {
-            // The fast gate report is fully embedded in RadarVolume. Detailed
-            // hydrometeor spectra require a retained/reopened source-state
-            // sidecar; do not reverse-engineer them from displayed moments.
-            let unavailable = if request
+            let is_synthetic = request
                 .volume
                 .metadata
                 .forward_operator
                 .as_deref()
-                .is_some_and(|operator| operator.contains("BowEcho"))
-            {
-                wrf_radar_estimator::WhyThisGateUnavailable::SourceSnapshotExpired
+                .is_some_and(|operator| operator.contains("BowEcho"));
+            let source = self
+                .simradar_gate_sources
+                .get(&(Arc::as_ptr(&request.volume) as usize))
+                .cloned();
+            if !is_synthetic {
+                self.simradar_gate_inspector.supply_explanation(
+                    request.generation,
+                    wrf_radar_estimator::WhyThisGate::Unavailable(
+                        wrf_radar_estimator::WhyThisGateUnavailable::NotSyntheticRadar,
+                    ),
+                );
+            } else if let Some(source) = source {
+                if source.matches_volume(&request.volume) {
+                    self.simradar_gate_explanation_task = Some((
+                        request.generation,
+                        wrf_radar::spawn_gate_explanation(source, request.volume, request.identity),
+                    ));
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                } else {
+                    self.simradar_gate_inspector.supply_explanation(
+                        request.generation,
+                        wrf_radar_estimator::WhyThisGate::Unavailable(
+                            wrf_radar_estimator::WhyThisGateUnavailable::StaleFrameWitness,
+                        ),
+                    );
+                }
             } else {
-                wrf_radar_estimator::WhyThisGateUnavailable::NotSyntheticRadar
-            };
-            let _identity = request.identity;
-            self.simradar_gate_inspector.supply_explanation(
-                request.generation,
-                wrf_radar_estimator::WhyThisGate::Unavailable(unavailable),
-            );
+                self.simradar_gate_inspector.supply_explanation(
+                    request.generation,
+                    wrf_radar_estimator::WhyThisGate::Unavailable(
+                        wrf_radar_estimator::WhyThisGateUnavailable::SourceSnapshotExpired,
+                    ),
+                );
+            }
         }
         self.simradar_gate_inspector.show_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
@@ -33136,8 +33243,8 @@ impl ViewerApp {
             .model_dock
             .as_mut()
             .and_then(|dock| dock.take_synthetic_radar());
-        if let Some((label, config_fingerprint, volumes)) = synthetic_radar {
-            self.install_synthetic_radar_volumes(label, config_fingerprint, volumes, ctx);
+        if let Some(output) = synthetic_radar {
+            self.install_synthetic_radar_output(output, ctx);
         }
         let synthetic_replay = self
             .model_dock
@@ -33148,10 +33255,11 @@ impl ViewerApp {
             let notes = replay.notes;
             if let Some(frame) = replay.frames.into_iter().next() {
                 let unavailable_count = frame.unavailable_observed_moments.len();
-                match self.install_simradar_comparison_volumes(
+                match self.install_simradar_comparison_with_source(
                     frame.observed,
                     frame.simulated,
                     frame.difference,
+                    Some(frame.source_descriptor),
                     ctx,
                 ) {
                     Ok(()) => {
@@ -63757,6 +63865,8 @@ mod tests {
             simradar_comparison: None,
             simradar_truth_lab: simradar_truth_lab::AlgorithmTruthLabState::default(),
             simradar_gate_inspector: simradar_gate_inspector::SimradarGateInspectorState::default(),
+            simradar_gate_sources: HashMap::new(),
+            simradar_gate_explanation_task: None,
             active_pane: 0,
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),

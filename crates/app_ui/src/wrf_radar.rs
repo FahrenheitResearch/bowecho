@@ -30,6 +30,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -47,10 +48,14 @@ use crate::model_layer::{
     InverseLut, neighboring_cell_starts, solve_bilinear_coords, unwrap_lon_near,
 };
 use crate::wrf_radar_estimator::{
-    CustomSinglePrf, IdealMoments, MatchedFilterRangeResponse, MeasuredMoments,
+    CustomSinglePrf, DopplerSpectrumConfig, GateCoverageExplanation, GateExplanation, GateIdentity,
+    GatePropagationExplanation, GateTimeExplanation, GateVelocityExplanation,
+    HydrometeorGateContribution, IdealMoments, MatchedFilterRangeResponse, MeasuredMoments,
     MomentEstimatorConfig, NoiseKey, PresentationConfig, PresentedMoments, PrfSpecification,
     RadarInstrument, RadarMomentValues, ResolvedEstimatorSampling, ResolvedSinglePrf,
-    estimate_measured_moments, present_measured_moments, resolve_estimator_sampling, resolve_prf,
+    SpeciesDopplerMode, WhyThisGate, WhyThisGateUnavailable, estimate_measured_moments,
+    present_measured_moments, resolve_estimator_sampling, resolve_prf,
+    synthesize_selected_gate_spectrum,
 };
 use ui_core::geo::aeqd_inverse_km;
 
@@ -2033,9 +2038,6 @@ fn read_wrf_radar_fields_for_config_reporting(
                 reserved_memory_bytes,
             )?)
         };
-        progress("validating embedded property T-matrix tables…");
-        app_ui::wrf_tmatrix_assets::preload_embedded_property_tmatrix_luts()
-            .map_err(|error| format!("preload embedded property T-matrix bundle: {error}"))?;
         progress("reading native P3/ISHMAEL property state…");
         let property_scene = app_ui::wrf_property_reader::read_wrf_property_scene(
             file,
@@ -2049,6 +2051,11 @@ fn read_wrf_radar_fields_for_config_reporting(
                 property_scene.cell_count()
             ));
         }
+        app_ui::wrf_tmatrix_assets::preload_embedded_property_tmatrix_for_scheme(
+            property_scene.microphysics_scheme_id(),
+            progress,
+        )
+        .map_err(|error| format!("preload property T-matrix scheme assets: {error}"))?;
         let fields_read = property_scene
             .source_fields()
             .iter()
@@ -3465,6 +3472,46 @@ struct TerrainHorizon {
 
 impl TerrainHorizon {
     #[allow(clippy::too_many_arguments)]
+    fn build_row(
+        fields: &WrfRadarFields,
+        site_lat: f64,
+        site_lon: f64,
+        antenna_msl: f64,
+        azimuth_deg: f64,
+        gate_count: usize,
+        first_gate_m: i32,
+        spacing_m: f64,
+    ) -> Vec<f32> {
+        let azimuth = azimuth_deg.to_radians();
+        let mut horizon = f32::NEG_INFINITY;
+        let mut row = Vec::with_capacity(gate_count);
+        for gate in 0..gate_count {
+            let slant_m = f64::from(first_gate_m) + gate as f64 * spacing_m;
+            let ground_m = beam_ground_range_m(slant_m, 0.0);
+            if ground_m < spacing_m.max(1.0) {
+                row.push(horizon);
+                continue;
+            }
+            let east_km = ground_m * azimuth.sin() / 1_000.0;
+            let north_km = ground_m * azimuth.cos() / 1_000.0;
+            let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
+            if let Some(terrain_m) = sample_terrain(fields, lat as f32, lon as f32) {
+                let ae = radar_core::EFFECTIVE_EARTH_RADIUS_M;
+                let phi = ground_m / ae;
+                let terrain_radius = ae + f64::from(terrain_m);
+                let horizontal = terrain_radius * phi.sin();
+                let vertical = terrain_radius * phi.cos() - (ae + antenna_msl);
+                let apparent = vertical.atan2(horizontal).to_degrees() as f32;
+                if apparent.is_finite() {
+                    horizon = horizon.max(apparent);
+                }
+            }
+            row.push(horizon);
+        }
+        row
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn build(
         fields: &WrfRadarFields,
         site_lat: f64,
@@ -3479,39 +3526,62 @@ impl TerrainHorizon {
             .into_par_iter()
             .map(|iaz| {
                 let azimuth_deg = iaz as f64 * 360.0 / azimuth_count as f64;
-                let azimuth = azimuth_deg.to_radians();
-                let mut horizon = f32::NEG_INFINITY;
-                let mut row = Vec::with_capacity(gate_count);
-                for gate in 0..gate_count {
-                    let slant_m = f64::from(first_gate_m) + gate as f64 * spacing_m;
-                    let ground_m = beam_ground_range_m(slant_m, 0.0);
-                    if ground_m < spacing_m.max(1.0) {
-                        row.push(horizon);
-                        continue;
-                    }
-                    let east_km = ground_m * azimuth.sin() / 1_000.0;
-                    let north_km = ground_m * azimuth.cos() / 1_000.0;
-                    let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
-                    if let Some(terrain_m) = sample_terrain(fields, lat as f32, lon as f32) {
-                        let ae = radar_core::EFFECTIVE_EARTH_RADIUS_M;
-                        let phi = ground_m / ae;
-                        let terrain_radius = ae + f64::from(terrain_m);
-                        let horizontal = terrain_radius * phi.sin();
-                        let vertical = terrain_radius * phi.cos() - (ae + antenna_msl);
-                        let apparent = vertical.atan2(horizontal).to_degrees() as f32;
-                        if apparent.is_finite() {
-                            horizon = horizon.max(apparent);
-                        }
-                    }
-                    row.push(horizon);
-                }
-                row
+                Self::build_row(
+                    fields,
+                    site_lat,
+                    site_lon,
+                    antenna_msl,
+                    azimuth_deg,
+                    gate_count,
+                    first_gate_m,
+                    spacing_m,
+                )
             })
             .collect();
         Self {
             azimuth_count,
             gate_count,
             elevation_deg: rows.into_iter().flatten().collect(),
+        }
+    }
+
+    /// Exact lookup support for one requested radial. Only the two azimuth
+    /// rows needed by interpolation are traced; all other rows remain empty.
+    #[allow(clippy::too_many_arguments)]
+    fn build_selected_azimuth(
+        fields: &WrfRadarFields,
+        site_lat: f64,
+        site_lon: f64,
+        antenna_msl: f64,
+        azimuth_count: usize,
+        selected_azimuth_deg: f64,
+        gate_count: usize,
+        first_gate_m: i32,
+        spacing_m: f64,
+    ) -> Self {
+        let azimuth_count = azimuth_count.max(1);
+        let az = selected_azimuth_deg.rem_euclid(360.0) * azimuth_count as f64 / 360.0;
+        let lo = az.floor() as usize % azimuth_count;
+        let hi = (lo + 1) % azimuth_count;
+        let mut elevation_deg = vec![f32::NEG_INFINITY; azimuth_count * gate_count];
+        for index in [lo, hi] {
+            let azimuth_deg = index as f64 * 360.0 / azimuth_count as f64;
+            let row = Self::build_row(
+                fields,
+                site_lat,
+                site_lon,
+                antenna_msl,
+                azimuth_deg,
+                gate_count,
+                first_gate_m,
+                spacing_m,
+            );
+            elevation_deg[index * gate_count..(index + 1) * gate_count].copy_from_slice(&row);
+        }
+        Self {
+            azimuth_count,
+            gate_count,
+            elevation_deg,
         }
     }
 
@@ -3809,11 +3879,17 @@ fn refractivity_run_note(fields: &WrfRadarFields) -> Option<String> {
     ))
 }
 
+#[derive(Clone, Copy)]
 struct GatePhysicalSample {
     z_linear: f32,
     velocity_mps: f32,
     spectrum_width_mps: f32,
     polar: Option<crate::wrf_radar_physics::IntrinsicPolarSample>,
+    air_velocity_mps: f32,
+    terminal_fall_correction_mps: f32,
+    pulse_volume_variance_m2s2: f32,
+    terminal_variance_m2s2: f32,
+    turbulence_variance_m2s2: f32,
 }
 
 struct GateSampleResult {
@@ -3860,7 +3936,9 @@ fn sample_gate_with_quality_instrument(
     let mut sum_z = 0.0f64;
     let mut sum_z_vr = 0.0f64;
     let mut sum_z_vr2 = 0.0f64;
-    let mut sum_z_subgrid_variance = 0.0f64;
+    let mut sum_z_air_velocity = 0.0f64;
+    let mut sum_z_terminal_variance = 0.0f64;
+    let mut sum_z_turbulence_variance = 0.0f64;
     let mut polar_accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
     let mut any_polar = false;
 
@@ -3933,9 +4011,10 @@ fn sample_gate_with_quality_instrument(
         } else {
             0.0
         };
-        let vr = f64::from(sample.u) * azimuth.sin() * el.cos()
+        let air_velocity = f64::from(sample.u) * azimuth.sin() * el.cos()
             + f64::from(sample.v) * azimuth.cos() * el.cos()
-            + f64::from(sample.w - fall_speed) * el.sin();
+            + f64::from(sample.w) * el.sin();
+        let vr = air_velocity - f64::from(fall_speed) * el.sin();
         let z = f64::from(sample.z_linear);
         if !z.is_finite() || z <= 0.0 || !vr.is_finite() {
             return Ok(());
@@ -3944,6 +4023,7 @@ fn sample_gate_with_quality_instrument(
         sum_z += weight * z;
         sum_z_vr += weight * z * vr;
         sum_z_vr2 += weight * z * vr * vr;
+        sum_z_air_velocity += weight * z * air_velocity;
         let terminal_variance = if config.terminal_fall_speed {
             sample
                 .polar
@@ -3958,7 +4038,8 @@ fn sample_gate_with_quality_instrument(
         } else {
             0.0
         };
-        sum_z_subgrid_variance += weight * z * (terminal_variance + turbulent_variance);
+        sum_z_terminal_variance += weight * z * terminal_variance;
+        sum_z_turbulence_variance += weight * z * turbulent_variance;
         if let Some(polar) = sample.polar {
             any_polar = true;
             polar_accumulator.add(weight as f32, intrinsic_as_contribution(polar));
@@ -4012,8 +4093,10 @@ fn sample_gate_with_quality_instrument(
         .filter(|sample| sample.zh > 0.0)
         .map_or((sum_z / valid_weight) as f32, |sample| sample.zh);
     let velocity = sum_z_vr / sum_z;
-    let variance =
-        (sum_z_vr2 / sum_z - velocity * velocity).max(0.0) + sum_z_subgrid_variance / sum_z;
+    let pulse_volume_variance = (sum_z_vr2 / sum_z - velocity * velocity).max(0.0);
+    let terminal_variance = sum_z_terminal_variance / sum_z;
+    let turbulence_variance = sum_z_turbulence_variance / sum_z;
+    let variance = pulse_volume_variance + terminal_variance + turbulence_variance;
     let floor = if config.spectrum_width {
         f64::from(config.spectrum_width_floor_mps.max(0.0))
     } else {
@@ -4025,6 +4108,11 @@ fn sample_gate_with_quality_instrument(
             velocity_mps: velocity as f32,
             spectrum_width_mps: (variance + floor * floor).sqrt() as f32,
             polar: polar.take(),
+            air_velocity_mps: (sum_z_air_velocity / sum_z) as f32,
+            terminal_fall_correction_mps: (velocity - sum_z_air_velocity / sum_z) as f32,
+            pulse_volume_variance_m2s2: pulse_volume_variance as f32,
+            terminal_variance_m2s2: terminal_variance as f32,
+            turbulence_variance_m2s2: turbulence_variance as f32,
         }),
         quality,
     })
@@ -5895,6 +5983,1264 @@ pub enum SyntheticRadarMessage {
     Done(Result<SyntheticRadarOutput, String>),
 }
 
+/// Private, session-only source contract for reopening one installed WRF
+/// synthetic frame. Paths intentionally live only in this sidecar and are
+/// never copied into RadarVolume metadata or exported provenance.
+#[derive(Clone)]
+pub(crate) struct SyntheticFrameSourceDescriptor {
+    source: SyntheticFrameSource,
+    config: SyntheticRadarConfig,
+    config_fingerprint: u64,
+    witness: SyntheticFrameWitness,
+}
+
+#[derive(Clone)]
+enum SyntheticFrameSource {
+    Wrf {
+        anchor: WrfScene,
+        neighbor: Option<WrfScene>,
+        temporal_plan: Option<TemporalScenePlan>,
+    },
+    OperationalForecast,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SyntheticFrameWitness {
+    frame_ordinal: usize,
+    site_id: String,
+    volume_time_unix_ms: i64,
+    cut_count: usize,
+    decoded_radial_count: usize,
+    geometry_digest: u64,
+}
+
+impl SyntheticFrameWitness {
+    fn from_volume(frame_ordinal: usize, config_fingerprint: u64, volume: &RadarVolume) -> Self {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        volume.site.id.hash(&mut hasher);
+        volume.volume_time.timestamp_millis().hash(&mut hasher);
+        config_fingerprint.hash(&mut hasher);
+        volume.metadata.archive_version.hash(&mut hasher);
+        volume.metadata.forward_operator.hash(&mut hasher);
+        volume.metadata.forward_operator_config.hash(&mut hasher);
+        volume.cuts.len().hash(&mut hasher);
+        for cut in &volume.cuts {
+            cut.elevation_deg.to_bits().hash(&mut hasher);
+            cut.radials.len().hash(&mut hasher);
+            for radial in &cut.radials {
+                radial.azimuth_deg.to_bits().hash(&mut hasher);
+                radial.elevation_deg.to_bits().hash(&mut hasher);
+                radial.time_offset_ms.hash(&mut hasher);
+                radial.gate_range.first_gate_m.hash(&mut hasher);
+                radial.gate_range.gate_spacing_m.hash(&mut hasher);
+                radial.gate_range.gate_count.hash(&mut hasher);
+                radial
+                    .nyquist_velocity_mps
+                    .map(f32::to_bits)
+                    .hash(&mut hasher);
+            }
+        }
+        Self {
+            frame_ordinal,
+            site_id: volume.site.id.clone(),
+            volume_time_unix_ms: volume.volume_time.timestamp_millis(),
+            cut_count: volume.cuts.len(),
+            decoded_radial_count: volume.metadata.decoded_radial_count,
+            geometry_digest: hasher.finish(),
+        }
+    }
+
+    fn matches(&self, config_fingerprint: u64, volume: &RadarVolume) -> bool {
+        Self::from_volume(self.frame_ordinal, config_fingerprint, volume) == *self
+    }
+}
+
+impl SyntheticFrameSourceDescriptor {
+    fn wrf(
+        frame_ordinal: usize,
+        volume: &RadarVolume,
+        anchor: WrfScene,
+        neighbor: Option<WrfScene>,
+        temporal_plan: Option<TemporalScenePlan>,
+        config: &SyntheticRadarConfig,
+        config_fingerprint: u64,
+    ) -> Self {
+        Self {
+            source: SyntheticFrameSource::Wrf {
+                anchor,
+                neighbor,
+                temporal_plan,
+            },
+            config: config.clone(),
+            config_fingerprint,
+            witness: SyntheticFrameWitness::from_volume(frame_ordinal, config_fingerprint, volume),
+        }
+    }
+
+    fn operational(
+        frame_ordinal: usize,
+        volume: &RadarVolume,
+        config: &SyntheticRadarConfig,
+        config_fingerprint: u64,
+    ) -> Self {
+        Self {
+            source: SyntheticFrameSource::OperationalForecast,
+            config: config.clone(),
+            config_fingerprint,
+            witness: SyntheticFrameWitness::from_volume(frame_ordinal, config_fingerprint, volume),
+        }
+    }
+
+    pub(crate) fn matches_volume(&self, volume: &RadarVolume) -> bool {
+        self.witness.matches(self.config_fingerprint, volume)
+    }
+}
+
+pub(crate) struct GateExplanationTask {
+    pub(crate) rx: Receiver<WhyThisGate>,
+}
+
+pub(crate) fn spawn_gate_explanation(
+    descriptor: SyntheticFrameSourceDescriptor,
+    volume: Arc<RadarVolume>,
+    identity: GateIdentity,
+) -> GateExplanationTask {
+    let (tx, rx) = channel();
+    std::thread::Builder::new()
+        .name("wrf-selected-gate-explanation".to_owned())
+        .spawn(move || {
+            let result = explain_selected_gate(&descriptor, &volume, identity)
+                .map(|explanation| WhyThisGate::Available(Box::new(explanation)))
+                .unwrap_or_else(WhyThisGate::Unavailable);
+            let _ = tx.send(result);
+        })
+        .expect("spawn selected-gate explanation worker");
+    GateExplanationTask { rx }
+}
+
+fn explain_selected_gate(
+    descriptor: &SyntheticFrameSourceDescriptor,
+    volume: &RadarVolume,
+    identity: GateIdentity,
+) -> Result<GateExplanation, WhyThisGateUnavailable> {
+    if !descriptor.matches_volume(volume) {
+        return Err(WhyThisGateUnavailable::StaleFrameWitness);
+    }
+    if identity.frame_index != descriptor.witness.frame_ordinal {
+        return Err(WhyThisGateUnavailable::StaleFrameWitness);
+    }
+    let SyntheticFrameSource::Wrf {
+        anchor,
+        neighbor,
+        temporal_plan,
+    } = &descriptor.source
+    else {
+        return Err(WhyThisGateUnavailable::UnsupportedSourceContract);
+    };
+    let cut = volume
+        .cuts
+        .get(identity.cut_index)
+        .ok_or(WhyThisGateUnavailable::StaleFrameWitness)?;
+    let radial = cut
+        .radials
+        .get(identity.radial_index)
+        .ok_or(WhyThisGateUnavailable::StaleFrameWitness)?;
+    if identity.gate_index >= radial.gate_range.gate_count
+        || (f64::from(radial.azimuth_deg) - identity.azimuth_deg).abs() > 1.0e-5
+        || (f64::from(radial.elevation_deg) - identity.elevation_deg).abs() > 1.0e-5
+    {
+        return Err(WhyThisGateUnavailable::StaleFrameWitness);
+    }
+    let expected_slant_m = f64::from(radial.gate_range.first_gate_m)
+        + identity.gate_index as f64 * f64::from(radial.gate_range.gate_spacing_m);
+    if (expected_slant_m - identity.slant_range_m).abs() > 0.51 {
+        return Err(WhyThisGateUnavailable::StaleFrameWitness);
+    }
+
+    let mut config = inspector_render_config(&descriptor.config, volume);
+    let anchor_file = reopen_wrf_scene(anchor)?;
+    let progress = |_: &str| {};
+    let anchor_fields = read_wrf_radar_fields_for_config_reporting(
+        &anchor_file,
+        &anchor.source_identity,
+        anchor.time_index,
+        &config,
+        &progress,
+        0,
+    )
+    .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+    let neighbor_pair = if let Some(neighbor) = neighbor {
+        let file = reopen_wrf_scene(neighbor)?;
+        let fields = read_wrf_radar_fields_for_config_reporting(
+            &file,
+            &neighbor.source_identity,
+            neighbor.time_index,
+            &config,
+            &progress,
+            0,
+        )
+        .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+        validate_temporal_field_pair(&anchor_fields, &fields)
+            .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+        Some((file, fields))
+    } else {
+        None
+    };
+    let neighbor_fields = neighbor_pair.as_ref().map(|(_, fields)| fields);
+    let ray_offset_ms = i64::from(radial.time_offset_ms);
+    let temporal_alpha = if neighbor_fields.is_some() {
+        temporal_plan
+            .as_ref()
+            .map(|plan| plan.ray_alpha(ray_offset_ms))
+            .transpose()
+            .map_err(|error| WhyThisGateUnavailable::WorkerFailed(error.to_string()))?
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
+    let (site_lat, site_lon, antenna_msl) = resolve_radar_site(&anchor_fields, &config)
+        .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+    let beam_geometry =
+        BeamPropagationGeometry::resolve(&anchor_fields, &config, site_lat, site_lon, antenna_msl)
+            .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+    let coupled =
+        resolve_coupled_instrument(&config).map_err(WhyThisGateUnavailable::WorkerFailed)?;
+    let spacing_m = f64::from(radial.gate_range.gate_spacing_m);
+    let prefix_gate_count = identity.gate_index + 1;
+    let horizon_azimuth_count = if descriptor.config.exact_replay_template.is_some() {
+        720
+    } else {
+        config.azimuth_count.max(1)
+    };
+    let terrain_horizon =
+        (config.terrain_blockage && !beam_geometry.is_wrf_refractivity()).then(|| {
+            TerrainHorizon::build_selected_azimuth(
+                &anchor_fields,
+                site_lat,
+                site_lon,
+                antenna_msl,
+                horizon_azimuth_count,
+                identity.azimuth_deg,
+                prefix_gate_count,
+                radial.gate_range.first_gate_m,
+                spacing_m,
+            )
+        });
+    let quadrature_count = coupled
+        .as_ref()
+        .and_then(|instrument| instrument.quadrature(config.beam_integration))
+        .map_or_else(
+            || quadrature_points(config.beam_integration).len(),
+            |points| points.len(),
+        );
+    let mut refracted_terrain_blockage = (config.terrain_blockage
+        && beam_geometry.is_wrf_refractivity())
+    .then(|| vec![false; quadrature_count]);
+
+    let mut previous_kdp = 0.0f32;
+    let mut previous_ah = 0.0f32;
+    let mut previous_adp = 0.0f32;
+    let mut phi_path = 0.0f32;
+    let mut tau_h = 0.0f32;
+    let mut tau_dp = 0.0f32;
+    let dr_km = (spacing_m / 1_000.0).max(0.0) as f32;
+    let mut selected_quality = GateQualityFractions::default();
+    let mut selected_physical = None;
+    let mut selected_polar = None;
+    let mut selected_pia = f32::NAN;
+    let mut selected_pida = f32::NAN;
+    let mut selected_phi_dp = f32::NAN;
+    let mut selected_intrinsic_dbz = f32::NAN;
+    let mut selected_geometry = None;
+    for gate in 0..prefix_gate_count {
+        let slant_m = f64::from(radial.gate_range.first_gate_m) + gate as f64 * spacing_m;
+        let center_geometry = beam_geometry
+            .point(
+                identity.elevation_deg,
+                &radial.gate_range,
+                gate,
+                0.0,
+                slant_m,
+            )
+            .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+        let sampled = sample_gate_with_quality_instrument(
+            &anchor_fields,
+            neighbor_fields,
+            temporal_alpha,
+            anchor_fields.cells(),
+            site_lat,
+            site_lon,
+            antenna_msl,
+            identity.azimuth_deg,
+            identity.elevation_deg,
+            slant_m,
+            gate,
+            spacing_m,
+            &radial.gate_range,
+            beam_geometry,
+            &config,
+            terrain_horizon.as_ref(),
+            refracted_terrain_blockage.as_deref_mut(),
+            coupled.as_ref(),
+        )
+        .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+        if gate == identity.gate_index {
+            selected_geometry = Some(center_geometry);
+            selected_quality = sampled.quality;
+        }
+        if sampled.quality.model_coverage_fraction
+            < config.clamped_minimum_model_coverage_fraction()
+        {
+            continue;
+        }
+        let Some(physical) = sampled.physical else {
+            continue;
+        };
+        let intrinsic_dbz = z_to_dbz(physical.z_linear);
+        let mut pia = f32::NAN;
+        let mut pida = f32::NAN;
+        let mut phi_dp = f32::NAN;
+        if let Some(polar) = physical.polar {
+            let kdp = polar.kdp_deg_km;
+            let ah = polar.ah_db_km;
+            let adp = polar.ah_db_km - polar.av_db_km;
+            if config.propagation && gate > 0 {
+                phi_path += (previous_kdp + kdp) * dr_km;
+                tau_h += 0.5 * (previous_ah + ah) * dr_km;
+                tau_dp += 0.5 * (previous_adp + adp) * dr_km;
+            }
+            previous_kdp = kdp;
+            previous_ah = ah;
+            previous_adp = adp;
+            pia = if config.propagation { 2.0 * tau_h } else { 0.0 };
+            pida = if config.propagation {
+                2.0 * tau_dp
+            } else {
+                0.0
+            };
+            phi_dp = config.system_phidp_deg + if config.propagation { phi_path } else { 0.0 };
+        }
+        if gate == identity.gate_index {
+            selected_intrinsic_dbz = intrinsic_dbz;
+            selected_polar = physical.polar;
+            selected_pia = pia;
+            selected_pida = pida;
+            selected_phi_dp = phi_dp;
+            selected_physical = Some(physical);
+        }
+    }
+
+    let coverage = selected_quality;
+    let physical = selected_physical;
+    let observed_dbz = selected_intrinsic_dbz
+        - if selected_pia.is_finite() {
+            selected_pia
+        } else {
+            0.0
+        };
+    let ideal = IdealMoments {
+        values: RadarMomentValues {
+            reflectivity_dbz: observed_dbz.is_finite().then_some(f64::from(observed_dbz)),
+            velocity_mps: physical
+                .filter(|sample| sample.velocity_mps.is_finite())
+                .map(|sample| f64::from(sample.velocity_mps)),
+            spectrum_width_mps: physical
+                .filter(|sample| config.spectrum_width && sample.spectrum_width_mps.is_finite())
+                .map(|sample| f64::from(sample.spectrum_width_mps.max(0.0))),
+            zdr_db: selected_polar
+                .filter(|_| config.dual_pol)
+                .map(|polar| f64::from(polar.zdr_db - selected_pida.max(0.0))),
+            rho_hv: selected_polar
+                .filter(|_| config.dual_pol)
+                .map(|polar| f64::from(polar.rho_hv.clamp(0.0, 1.0))),
+            kdp_deg_km: selected_polar
+                .filter(|_| config.dual_pol)
+                .map(|polar| f64::from(polar.kdp_deg_km)),
+        },
+    };
+    let frame_seed = clutter_frame_seed(&volume.site.id, volume.volume_time);
+    let noise_key = NoiseKey {
+        seed: u64::from(frame_seed),
+        frame: 0,
+        cut: u16::try_from(identity.cut_index).unwrap_or(u16::MAX),
+        ray: u32::try_from(identity.radial_index).unwrap_or(u32::MAX),
+        gate: u32::try_from(identity.gate_index).unwrap_or(u32::MAX),
+    };
+    let (instrument, timing, measured, presented) = explain_instrument_stages(
+        &config,
+        coupled.as_ref(),
+        ideal,
+        identity,
+        selected_geometry,
+        frame_seed,
+        cut.radials.len(),
+        radial.gate_range.gate_count,
+        noise_key,
+    )?;
+
+    let hydrometeor_details = if physical.is_some()
+        && matches!(
+            config.polarimetric_kernel,
+            PolarimetricKernel::BulkRayleighV1
+        ) {
+        bulk_species_gate_contributions(
+            &anchor_file,
+            anchor.time_index,
+            neighbor_pair.as_ref().map(|(file, _)| file),
+            neighbor.as_ref().map(|scene| scene.time_index),
+            &anchor_fields,
+            neighbor_fields,
+            temporal_alpha,
+            site_lat,
+            site_lon,
+            antenna_msl,
+            identity,
+            &radial.gate_range,
+            beam_geometry,
+            &config,
+            terrain_horizon.as_ref(),
+            coupled.as_ref(),
+            coverage.model_coverage_fraction as f64,
+        )?
+    } else {
+        Vec::new()
+    };
+    let hydrometeors = hydrometeor_details
+        .iter()
+        .map(|detail| HydrometeorGateContribution {
+            name: detail.name.clone(),
+            zh_linear: f64::from(detail.contribution.zh),
+            zv_linear: f64::from(detail.contribution.zv),
+            kdp_deg_km: f64::from(detail.contribution.kdp_deg_km),
+            ah_db_km: f64::from(detail.contribution.ah_db_km),
+            fall_speed_mps: f64::from(detail.contribution.fall_speed_mps),
+        })
+        .collect::<Vec<_>>();
+    let spectrum = physical.and_then(|physical| {
+        let el = identity.elevation_deg.to_radians();
+        let modes = hydrometeor_details
+            .iter()
+            .filter(|detail| detail.contribution.zh.is_finite() && detail.contribution.zh > 0.0)
+            .map(|detail| SpeciesDopplerMode {
+                name: detail.name.clone(),
+                power_linear: f64::from(detail.contribution.zh),
+                air_velocity_mps: f64::from(physical.air_velocity_mps),
+                fall_velocity_projection_mps: -f64::from(detail.contribution.fall_speed_mps)
+                    * el.sin(),
+                intrinsic_width_mps: f64::from(
+                    detail.contribution.fall_speed_variance_m2s2.max(0.0).sqrt(),
+                ) * el.sin().abs(),
+                beam_shear_width_mps: f64::from(
+                    physical.pulse_volume_variance_m2s2.max(0.0).sqrt(),
+                ),
+                turbulence_width_mps: f64::from(physical.turbulence_variance_m2s2.max(0.0).sqrt()),
+            })
+            .collect::<Vec<_>>();
+        if modes.is_empty() {
+            return None;
+        }
+        let nyquist = timing
+            .map(|value| value.nyquist_velocity_mps)
+            .or_else(|| radial.nyquist_velocity_mps.map(f64::from));
+        let extent = nyquist.unwrap_or(75.0).max(20.0);
+        synthesize_selected_gate_spectrum(
+            &modes,
+            DopplerSpectrumConfig {
+                true_min_velocity_mps: -extent * 2.0,
+                true_max_velocity_mps: extent * 2.0,
+                true_bin_count: 512,
+                output_bin_count: 256,
+                nyquist_velocity_mps: nyquist,
+                white_noise_power_per_bin: measured
+                    .snr_db
+                    .map(|snr| f64::from(physical.z_linear) / 10.0f64.powf(snr / 10.0) / 256.0)
+                    .unwrap_or(0.0),
+                noise_key,
+            },
+        )
+        .ok()
+    });
+
+    let anchor_time = anchor
+        .time
+        .valid_time()
+        .ok_or(WhyThisGateUnavailable::StaleFrameWitness)?;
+    let neighbor_time = neighbor
+        .as_ref()
+        .and_then(|scene| scene.time.valid_time())
+        .map(|time| time.timestamp_millis());
+    let mut provenance = vec![
+        format!("config_fingerprint={:016x}", descriptor.config_fingerprint),
+        format!(
+            "frame_geometry_witness={:016x}",
+            descriptor.witness.geometry_digest
+        ),
+        format!("anchor_source_identity={}", anchor.source_identity.0),
+        format!("anchor_time_index={}", anchor.time_index),
+        format!(
+            "atmosphere_mode={}",
+            config.atmosphere_time_mode.provenance_name()
+        ),
+        "source_paths=session_private_not_exported".to_owned(),
+    ];
+    if let Some(neighbor) = neighbor {
+        provenance.push(format!(
+            "neighbor_source_identity={}",
+            neighbor.source_identity.0
+        ));
+        provenance.push(format!("neighbor_time_index={}", neighbor.time_index));
+    }
+    if matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        provenance.push(
+            "hydrometeor_decomposition=unavailable_without_qualified_property_category_seam"
+                .to_owned(),
+        );
+        provenance.push("doppler_spectrum=unavailable_without_species_modes".to_owned());
+    }
+    Ok(GateExplanation {
+        identity,
+        time: GateTimeExplanation {
+            ray_offset_ms,
+            anchor_unix_ms: anchor_time.timestamp_millis(),
+            neighbor_unix_ms: neighbor_time,
+            temporal_alpha,
+            held_anchor: neighbor.is_none() && temporal_plan.is_some(),
+        },
+        coverage: GateCoverageExplanation {
+            model_coverage_fraction: f64::from(coverage.model_coverage_fraction),
+            terrain_unblocked_fraction: f64::from(coverage.terrain_unblocked_fraction),
+            meteorological_signal_fraction: f64::from(coverage.meteorological_signal_fraction),
+            unblocked_power_fraction: f64::from(coverage.terrain_unblocked_fraction),
+        },
+        hydrometeors,
+        velocity: GateVelocityExplanation {
+            air_velocity_mps: physical.map_or(0.0, |value| f64::from(value.air_velocity_mps)),
+            terminal_fall_correction_mps: physical
+                .map_or(0.0, |value| f64::from(value.terminal_fall_correction_mps)),
+            scatterer_velocity_mps: physical.map_or(0.0, |value| f64::from(value.velocity_mps)),
+            pulse_volume_variance_m2s2: physical
+                .map_or(0.0, |value| f64::from(value.pulse_volume_variance_m2s2)),
+            terminal_variance_m2s2: physical
+                .map_or(0.0, |value| f64::from(value.terminal_variance_m2s2)),
+            turbulence_variance_m2s2: physical
+                .map_or(0.0, |value| f64::from(value.turbulence_variance_m2s2)),
+            instrument_variance_m2s2: measured.uncertainty.velocity_sigma_mps.powi(2),
+        },
+        propagation: GatePropagationExplanation {
+            intrinsic_reflectivity_dbz: selected_intrinsic_dbz
+                .is_finite()
+                .then_some(f64::from(selected_intrinsic_dbz)),
+            observed_reflectivity_dbz: observed_dbz.is_finite().then_some(f64::from(observed_dbz)),
+            intrinsic_zdr_db: selected_polar.map(|value| f64::from(value.zdr_db)),
+            observed_zdr_db: selected_polar.map(|value| {
+                f64::from(
+                    value.zdr_db
+                        - if selected_pida.is_finite() {
+                            selected_pida
+                        } else {
+                            0.0
+                        },
+                )
+            }),
+            phi_dp_deg: selected_phi_dp
+                .is_finite()
+                .then_some(f64::from(selected_phi_dp)),
+            pia_db: selected_pia.is_finite().then_some(f64::from(selected_pia)),
+            pida_db: selected_pida
+                .is_finite()
+                .then_some(f64::from(selected_pida)),
+        },
+        instrument,
+        timing,
+        ideal,
+        measured,
+        presented,
+        spectrum,
+        provenance,
+    })
+}
+
+fn reopen_wrf_scene(scene: &WrfScene) -> Result<WrfFile, WhyThisGateUnavailable> {
+    if !scene.path.is_file() {
+        return Err(WhyThisGateUnavailable::SourceFileUnavailable);
+    }
+    let selected =
+        inventory_selected_wrf_paths(std::slice::from_ref(&scene.path)).map_err(|error| {
+            if scene.path.is_file() {
+                WhyThisGateUnavailable::WorkerFailed(error)
+            } else {
+                WhyThisGateUnavailable::SourceFileUnavailable
+            }
+        })?;
+    let current = selected
+        .group
+        .scenes
+        .iter()
+        .find(|candidate| candidate.time_index == scene.time_index)
+        .ok_or(WhyThisGateUnavailable::StaleFrameWitness)?;
+    if current.source_identity != scene.source_identity
+        || current.run_domain != scene.run_domain
+        || current.grid_signature != scene.grid_signature
+        || current.time.valid_time() != scene.time.valid_time()
+    {
+        return Err(WhyThisGateUnavailable::StaleFrameWitness);
+    }
+    WrfFile::open(&scene.path).map_err(|error| {
+        if scene.path.is_file() {
+            WhyThisGateUnavailable::WorkerFailed(format!("reopen retained WRF source: {error}"))
+        } else {
+            WhyThisGateUnavailable::SourceFileUnavailable
+        }
+    })
+}
+
+fn inspector_render_config(
+    source: &SyntheticRadarConfig,
+    volume: &RadarVolume,
+) -> SyntheticRadarConfig {
+    let mut config = source.clone();
+    if source.exact_replay_template.is_some() {
+        config.exact_replay_template = None;
+        config.scan_strategy = SyntheticScanStrategy::CustomLegacy;
+        config.site_id = volume.site.id.clone();
+        config.site_name = volume.site.name.clone();
+        config.site_lat_deg = volume.site.latitude_deg.map(f64::from);
+        config.site_lon_deg = volume.site.longitude_deg.map(f64::from);
+        config.antenna_msl_m = volume.site.elevation_m.map(f64::from);
+        config.fold_velocity = false;
+        config.coupled_single_prf_estimator = false;
+        config.emit_stage_diagnostics = false;
+        config.emit_quality_fields = true;
+        config.spectrum_width = volume
+            .cuts
+            .iter()
+            .any(|cut| cut.moments.contains_key(&MomentType::SpectrumWidth));
+        config.dual_pol = volume
+            .cuts
+            .iter()
+            .flat_map(|cut| cut.moments.keys())
+            .any(is_dual_pol_replay_moment);
+    }
+    config
+}
+
+#[allow(clippy::too_many_arguments)]
+fn explain_instrument_stages(
+    config: &SyntheticRadarConfig,
+    coupled: Option<&CoupledInstrumentContext>,
+    ideal: IdealMoments,
+    identity: GateIdentity,
+    geometry: Option<BeamGeometryPoint>,
+    frame_seed: u32,
+    radial_count: usize,
+    gate_count: usize,
+    noise_key: NoiseKey,
+) -> Result<
+    (
+        RadarInstrument,
+        Option<ResolvedSinglePrf>,
+        MeasuredMoments,
+        PresentedMoments,
+    ),
+    WhyThisGateUnavailable,
+> {
+    let instrument = coupled.map_or_else(
+        || {
+            RadarInstrument::new(
+                "BowEcho virtual radar",
+                f64::from(config.radar_frequency_mhz) * 1.0e6,
+                f64::from(config.pulse_width_us) * 1.0e-6,
+            )
+            .map_err(|error| WhyThisGateUnavailable::WorkerFailed(error.to_string()))
+        },
+        |context| Ok(context.instrument.clone()),
+    )?;
+    let timing = if let Some(coupled) = coupled {
+        Some(coupled.timing)
+    } else {
+        let prf = CustomSinglePrf::new(f64::from(config.prf_hz))
+            .map_err(|error| WhyThisGateUnavailable::WorkerFailed(error.to_string()))?;
+        resolve_prf(&instrument, PrfSpecification::CustomSinglePrf(prf)).ok()
+    };
+    let clutter_amount = config.clutter_intensity.clamp(0.0, 1.0);
+    let clutter_on = clutter_amount > 0.0 && identity.cut_index < CLUTTER_TILT_LIMIT;
+    let clutter_reflectivity = if clutter_on {
+        let geometry = geometry.unwrap_or(BeamGeometryPoint {
+            ground_range_m: identity.slant_range_m,
+            height_above_radar_m: 0.0,
+        });
+        let hotspots = clutter_hotspots(frame_seed, identity.cut_index, radial_count, gate_count);
+        ground_clutter_dbz(
+            frame_seed,
+            identity.cut_index,
+            identity.radial_index,
+            identity.gate_index,
+            identity.azimuth_deg as f32,
+            (geometry.ground_range_m / 1_000.0) as f32,
+            geometry.height_above_radar_m as f32,
+            in_clutter_hotspot(&hotspots, identity.radial_index, identity.gate_index),
+            clutter_amount,
+        )
+    } else {
+        None
+    };
+
+    if let Some(coupled) = coupled {
+        let measured = estimate_measured_moments(
+            ideal,
+            &instrument,
+            &coupled.timing,
+            &coupled.estimator_config,
+            identity.slant_range_m,
+            noise_key,
+        )
+        .map_err(|error| WhyThisGateUnavailable::WorkerFailed(error.to_string()))?;
+        let presentation = PresentationConfig {
+            reflectivity_texture_sigma_db: if config.ref_gate_texture {
+                f64::from(REF_TEXTURE_CORRELATED_DB.hypot(REF_TEXTURE_JITTER_DB))
+            } else {
+                0.0
+            },
+            velocity_texture_sigma_mps: if config.vel_gate_texture {
+                f64::from(VEL_TEXTURE_MPS)
+            } else {
+                0.0
+            },
+            zdr_display_bias_db: 0.0,
+            reflectivity_display_floor_dbz: None,
+            clutter_reflectivity_dbz: clutter_reflectivity.map(f64::from),
+            clutter_velocity_mps: if clutter_reflectivity.is_some() {
+                f64::from(clutter_velocity_mps(
+                    frame_seed,
+                    identity.cut_index,
+                    identity.radial_index,
+                    identity.gate_index,
+                ))
+            } else {
+                0.0
+            },
+        };
+        let mut presented = present_measured_moments(measured, &presentation, noise_key);
+        if let Some(value) = presented.values.velocity_mps.as_mut() {
+            *value = f64::from(fold_velocity_mps(
+                *value as f32,
+                coupled.stamped_nyquist_mps(),
+            ));
+        }
+        if presented.adjustment.clutter_replaced
+            && let Some(width) = presented.values.spectrum_width_mps.as_mut()
+        {
+            *width = (*width).max(f64::from(config.spectrum_width_floor_mps.max(0.0)));
+        }
+        return Ok((instrument, timing, measured, presented));
+    }
+
+    let mut measured = MeasuredMoments {
+        values: ideal.values,
+        ..MeasuredMoments::default()
+    };
+    if let Some(dbz) = measured.values.reflectivity_dbz.as_mut() {
+        if config.ref_gate_texture {
+            *dbz += f64::from(ref_gate_texture_db(
+                identity.cut_index,
+                identity.radial_index,
+                identity.gate_index,
+            ));
+        }
+        let range_km = (identity.slant_range_m / 1_000.0).max(1.0);
+        let sensitivity = f64::from(config.sensitivity_dbz_at_1km) + 20.0 * range_km.log10();
+        measured.sensitivity_dbz = Some(sensitivity);
+        measured.snr_db = Some(*dbz - sensitivity);
+        if config.instrument_noise {
+            let snr = *dbz - sensitivity;
+            if !snr.is_finite() || snr < 0.0 {
+                measured.censored = true;
+                measured.values = RadarMomentValues::default();
+            } else {
+                let sigma_db = (1.5 / (1.0 + snr / 6.0)).clamp(0.12, 1.5);
+                measured.uncertainty.reflectivity_sigma_db = sigma_db;
+                *dbz += sigma_db
+                    * f64::from(clutter_signed(
+                        frame_seed,
+                        identity.cut_index,
+                        identity.radial_index,
+                        identity.gate_index,
+                        0x534e_525a,
+                    ));
+            }
+        } else if *dbz < f64::from(config.ref_floor_dbz) {
+            measured.censored = true;
+            measured.values = RadarMomentValues::default();
+        }
+    }
+    if !measured.censored
+        && let Some(velocity) = measured.values.velocity_mps.as_mut()
+    {
+        if config.instrument_noise {
+            let snr = measured.snr_db.unwrap_or(0.0).max(0.0);
+            let sigma = (1.2 / (1.0 + snr / 8.0)).clamp(0.08, 1.2);
+            measured.uncertainty.velocity_sigma_mps = sigma;
+            *velocity += sigma
+                * f64::from(clutter_signed(
+                    frame_seed,
+                    identity.cut_index,
+                    identity.radial_index,
+                    identity.gate_index,
+                    0x534e_5256,
+                ));
+        }
+        if config.vel_gate_texture {
+            *velocity += f64::from(vel_gate_texture_mps(
+                identity.cut_index,
+                identity.radial_index,
+                identity.gate_index,
+            ));
+        }
+    }
+    let mut presented = PresentedMoments {
+        values: measured.values,
+        ..PresentedMoments::default()
+    };
+    if let (Some(clutter), Some(reflectivity)) = (
+        clutter_reflectivity.map(f64::from),
+        presented.values.reflectivity_dbz.as_mut(),
+    ) && *reflectivity < clutter
+    {
+        presented.adjustment.clutter_replaced = true;
+        presented.adjustment.reflectivity_db = clutter - *reflectivity;
+        *reflectivity = clutter;
+        if let Some(velocity) = presented.values.velocity_mps.as_mut() {
+            let clutter_velocity = f64::from(clutter_velocity_mps(
+                frame_seed,
+                identity.cut_index,
+                identity.radial_index,
+                identity.gate_index,
+            ));
+            presented.adjustment.velocity_mps = clutter_velocity - *velocity;
+            *velocity = clutter_velocity;
+        }
+        presented.values.zdr_db = None;
+        presented.values.rho_hv = None;
+        presented.values.kdp_deg_km = None;
+    }
+    if !presented.adjustment.clutter_replaced
+        && let Some(zdr) = presented.values.zdr_db.as_mut()
+    {
+        *zdr += f64::from(config.zdr_bias_db);
+        presented.adjustment.zdr_db = f64::from(config.zdr_bias_db);
+    }
+    if config.fold_velocity
+        && let Some(velocity) = presented.values.velocity_mps.as_mut()
+    {
+        *velocity = f64::from(fold_velocity_mps(*velocity as f32, config.nyquist_mps));
+    }
+    Ok((instrument, timing, measured, presented))
+}
+
+#[derive(Clone)]
+struct BulkHydrometeorDetail {
+    name: String,
+    contribution: crate::wrf_radar_physics::BulkContribution,
+}
+
+#[derive(Clone)]
+struct InspectorSpatialTarget {
+    latitude_deg: f32,
+    longitude_deg: f32,
+    height_msl_m: f32,
+    elevation_deg: f64,
+    point_weight: f64,
+    blocked: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bulk_species_gate_contributions(
+    anchor_file: &WrfFile,
+    anchor_time_index: usize,
+    neighbor_file: Option<&WrfFile>,
+    neighbor_time_index: Option<usize>,
+    anchor_fields: &WrfRadarFields,
+    neighbor_fields: Option<&WrfRadarFields>,
+    temporal_alpha: f64,
+    site_lat: f64,
+    site_lon: f64,
+    antenna_msl: f64,
+    identity: GateIdentity,
+    gate_range: &GateRange,
+    beam_geometry: BeamPropagationGeometry<'_>,
+    config: &SyntheticRadarConfig,
+    terrain_horizon: Option<&TerrainHorizon>,
+    coupled: Option<&CoupledInstrumentContext>,
+    _model_coverage_fraction: f64,
+) -> Result<Vec<BulkHydrometeorDetail>, WhyThisGateUnavailable> {
+    let targets = inspector_spatial_targets(
+        anchor_fields,
+        neighbor_fields,
+        temporal_alpha,
+        site_lat,
+        site_lon,
+        antenna_msl,
+        identity,
+        gate_range,
+        beam_geometry,
+        config,
+        terrain_horizon,
+        coupled,
+    )?;
+    let valid_weight = targets
+        .iter()
+        .map(|target| target.point_weight)
+        .sum::<f64>();
+    if valid_weight <= 0.0 {
+        return Ok(Vec::new());
+    }
+    let anchor =
+        read_bulk_species_targets(anchor_file, anchor_time_index, anchor_fields, &targets)?;
+    let neighbor = match (neighbor_file, neighbor_fields, neighbor_time_index) {
+        (Some(file), Some(fields), Some(time_index)) => Some(read_bulk_species_targets(
+            file, time_index, fields, &targets,
+        )?),
+        _ => None,
+    };
+    let mut output = Vec::new();
+    for (species_index, spec) in SPECIES_READ_SPECS.iter().enumerate() {
+        let mut gate = crate::wrf_radar_physics::PolarAccumulator::default();
+        for (target_index, target) in targets.iter().enumerate() {
+            if target.blocked {
+                continue;
+            }
+            let mut temporal = crate::wrf_radar_physics::PolarAccumulator::default();
+            temporal.add(
+                (1.0 - temporal_alpha) as f32,
+                anchor[species_index][target_index],
+            );
+            if let Some(neighbor) = &neighbor {
+                temporal.add(temporal_alpha as f32, neighbor[species_index][target_index]);
+            }
+            gate.add(
+                target.point_weight as f32,
+                intrinsic_as_contribution(temporal.finalize()),
+            );
+        }
+        let contribution =
+            intrinsic_as_contribution(normalize_intrinsic(gate.finalize(), valid_weight as f32));
+        if contribution.zh > 0.0 {
+            output.push(BulkHydrometeorDetail {
+                name: hydrometeor_name(spec.kind).to_owned(),
+                contribution,
+            });
+        }
+    }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspector_spatial_targets(
+    fields: &WrfRadarFields,
+    neighbor_fields: Option<&WrfRadarFields>,
+    temporal_alpha: f64,
+    site_lat: f64,
+    site_lon: f64,
+    antenna_msl: f64,
+    identity: GateIdentity,
+    gate_range: &GateRange,
+    beam_geometry: BeamPropagationGeometry<'_>,
+    config: &SyntheticRadarConfig,
+    terrain_horizon: Option<&TerrainHorizon>,
+    coupled: Option<&CoupledInstrumentContext>,
+) -> Result<Vec<InspectorSpatialTarget>, WhyThisGateUnavailable> {
+    let beam_sigma_deg = gaussian_beam_sigma_deg(f64::from(config.beam_width_deg.max(0.05)));
+    let physical_points =
+        coupled.and_then(|instrument| instrument.quadrature(config.beam_integration));
+    let points = physical_points
+        .map(|points| {
+            points
+                .iter()
+                .map(|point| {
+                    (
+                        point.az_sigma,
+                        point.el_sigma,
+                        point.range_offset_m,
+                        point.weight,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            quadrature_points(config.beam_integration)
+                .iter()
+                .map(|point| {
+                    (
+                        point.az_sigma,
+                        point.el_sigma,
+                        point.range_gate * f64::from(gate_range.gate_spacing_m),
+                        point.weight,
+                    )
+                })
+                .collect()
+        });
+    let mut targets = Vec::new();
+    for (az_sigma, el_sigma, range_offset_m, point_weight) in points {
+        let azimuth_deg = identity.azimuth_deg + az_sigma * beam_sigma_deg;
+        let elevation_deg = identity.elevation_deg + el_sigma * beam_sigma_deg;
+        let center_slant_m = f64::from(gate_range.first_gate_m)
+            + identity.gate_index as f64 * f64::from(gate_range.gate_spacing_m);
+        let geometry = beam_geometry
+            .point(
+                elevation_deg,
+                gate_range,
+                identity.gate_index,
+                range_offset_m,
+                center_slant_m,
+            )
+            .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+        let z_msl = antenna_msl + geometry.height_above_radar_m;
+        let azimuth = azimuth_deg.to_radians();
+        let east_km = geometry.ground_range_m * azimuth.sin() / 1_000.0;
+        let north_km = geometry.ground_range_m * azimuth.cos() / 1_000.0;
+        let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
+        if sample_column_temporal(
+            fields,
+            neighbor_fields,
+            temporal_alpha,
+            fields.cells(),
+            lat as f32,
+            lon as f32,
+            z_msl as f32,
+            elevation_deg,
+            config.atmosphere_time_mode,
+            config.reflectivity_sampling,
+        )
+        .map_err(WhyThisGateUnavailable::WorkerFailed)?
+        .is_none()
+        {
+            continue;
+        }
+        let blocked = if beam_geometry.is_wrf_refractivity() && config.terrain_blockage {
+            let mut blocked = false;
+            for gate in 0..=identity.gate_index {
+                let slant_m = f64::from(gate_range.first_gate_m)
+                    + gate as f64 * f64::from(gate_range.gate_spacing_m);
+                let point = beam_geometry
+                    .point(elevation_deg, gate_range, gate, range_offset_m, slant_m)
+                    .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+                let ground_m = point.ground_range_m;
+                let east_km = ground_m * azimuth.sin() / 1_000.0;
+                let north_km = ground_m * azimuth.cos() / 1_000.0;
+                let (gate_lat, gate_lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
+                if sample_terrain(fields, gate_lat as f32, gate_lon as f32).is_some_and(|terrain| {
+                    f64::from(terrain) >= antenna_msl + point.height_above_radar_m
+                }) {
+                    blocked = true;
+                    break;
+                }
+            }
+            blocked
+        } else {
+            terrain_horizon.is_some_and(|horizon| {
+                let horizon_deg = horizon.at(azimuth_deg, identity.gate_index);
+                horizon_deg.is_finite() && elevation_deg as f32 <= horizon_deg
+            })
+        };
+        targets.push(InspectorSpatialTarget {
+            latitude_deg: lat as f32,
+            longitude_deg: lon as f32,
+            height_msl_m: z_msl as f32,
+            elevation_deg,
+            point_weight,
+            blocked,
+        });
+    }
+    Ok(targets)
+}
+
+fn read_bulk_species_targets(
+    file: &WrfFile,
+    time_index: usize,
+    fields: &WrfRadarFields,
+    targets: &[InspectorSpatialTarget],
+) -> Result<Vec<Vec<crate::wrf_radar_physics::BulkContribution>>, WhyThisGateUnavailable> {
+    let target_weights = targets
+        .iter()
+        .map(|target| inspector_cell_weights(fields, target))
+        .collect::<Vec<_>>();
+    let needed_indices = target_weights
+        .iter()
+        .flatten()
+        .map(|(index, _)| *index)
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = fields.cells() * fields.nz;
+    let temperature = file.temperature(time_index).map_err(|error| {
+        WhyThisGateUnavailable::WorkerFailed(format!("read species temperature: {error}"))
+    })?;
+    if temperature.len() != expected {
+        return Err(WhyThisGateUnavailable::StaleFrameWitness);
+    }
+    let temperature = needed_indices
+        .iter()
+        .map(|&index| (index, temperature[index] as f32))
+        .collect::<HashMap<_, _>>();
+    file.clear_cache();
+    let pressure = file.full_pressure(time_index).map_err(|error| {
+        WhyThisGateUnavailable::WorkerFailed(format!("read species pressure: {error}"))
+    })?;
+    if pressure.len() != expected {
+        return Err(WhyThisGateUnavailable::StaleFrameWitness);
+    }
+    let qv = if file.has_var("QVAPOR") {
+        file.read_var("QVAPOR", time_index).map_err(|error| {
+            WhyThisGateUnavailable::WorkerFailed(format!("read species QVAPOR: {error}"))
+        })?
+    } else {
+        vec![0.0; expected]
+    };
+    if qv.len() != expected {
+        return Err(WhyThisGateUnavailable::StaleFrameWitness);
+    }
+    let air_density = needed_indices
+        .iter()
+        .map(|&index| {
+            (
+                index,
+                crate::wrf_radar_physics::air_density(
+                    pressure[index] as f32,
+                    temperature[&index],
+                    qv[index] as f32,
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    drop(pressure);
+    drop(qv);
+    file.clear_cache();
+
+    let present_fields = MICROPHYSICS_FIELD_NAMES
+        .iter()
+        .filter(|name| file.has_var(name))
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let profile = crate::wrf_radar_physics::detect_scheme(
+        file.global_attr_i32("MP_PHYSICS").ok(),
+        &present_fields,
+    );
+    if profile.capability == crate::wrf_radar_physics::MicrophysicsCapability::Unsupported {
+        return Err(WhyThisGateUnavailable::UnsupportedSourceContract);
+    }
+    let mut output = Vec::with_capacity(SPECIES_READ_SPECS.len());
+    for spec in SPECIES_READ_SPECS {
+        let Some(mass_name) = first_existing_var(file, spec.mass) else {
+            output.push(vec![
+                crate::wrf_radar_physics::BulkContribution::default();
+                targets.len()
+            ]);
+            continue;
+        };
+        let number = read_optional_first_var_f32(file, time_index, spec.number, expected)
+            .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+        let volume = read_optional_first_var_f32(file, time_index, spec.volume, expected)
+            .map_err(WhyThisGateUnavailable::WorkerFailed)?;
+        let mass = file.read_var(mass_name, time_index).map_err(|error| {
+            WhyThisGateUnavailable::WorkerFailed(format!("read species {mass_name}: {error}"))
+        })?;
+        if mass.len() != expected {
+            return Err(WhyThisGateUnavailable::StaleFrameWitness);
+        }
+        let contributions = needed_indices
+            .iter()
+            .map(|&index| {
+                let q = mass[index] as f32;
+                let contribution = if q.is_finite() && q > 0.0 {
+                    crate::wrf_radar_physics::bulk_sband_contribution(
+                        crate::wrf_radar_physics::BulkSpeciesInput {
+                            kind: spec.kind,
+                            q_kgkg: q,
+                            number_per_kg: number.as_ref().map(|values| values[index]),
+                            volume_m3_per_kg: volume.as_ref().map(|values| values[index]),
+                            temperature_k: temperature[&index],
+                            air_density_kgm3: air_density[&index],
+                        },
+                        &profile,
+                    )
+                } else {
+                    crate::wrf_radar_physics::BulkContribution::default()
+                };
+                (index, contribution)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut sampled = Vec::with_capacity(targets.len());
+        for weights in &target_weights {
+            let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
+            for &(index, weight) in weights {
+                accumulator.add(weight, contributions[&index]);
+            }
+            sampled.push(intrinsic_as_contribution(accumulator.finalize()));
+        }
+        output.push(sampled);
+        drop(mass);
+        drop(number);
+        drop(volume);
+        file.clear_cache();
+    }
+    Ok(output)
+}
+
+fn inspector_cell_weights(
+    fields: &WrfRadarFields,
+    target: &InspectorSpatialTarget,
+) -> Vec<(usize, f32)> {
+    let Some(stencil) = horizontal_stencil(fields, target.latitude_deg, target.longitude_deg)
+    else {
+        return Vec::new();
+    };
+    let cells = fields.cells();
+    let mut weights = Vec::with_capacity(8);
+    for (column, horizontal_weight) in stencil {
+        if horizontal_weight <= 0.0 {
+            continue;
+        }
+        let Some((k, vertical_fraction)) =
+            bracket_height(fields, cells, column, target.height_msl_m)
+        else {
+            continue;
+        };
+        let lower = k * cells + column;
+        let upper = (k + 1) * cells + column;
+        if lerp(fields.u[lower], fields.u[upper], vertical_fraction).is_none()
+            || lerp(fields.v[lower], fields.v[upper], vertical_fraction).is_none()
+            || lerp(fields.w[lower], fields.w[upper], vertical_fraction).is_none()
+        {
+            continue;
+        }
+        weights.push((lower, horizontal_weight * (1.0 - vertical_fraction)));
+        weights.push((upper, horizontal_weight * vertical_fraction));
+    }
+    let sum = weights.iter().map(|(_, weight)| *weight).sum::<f32>();
+    if sum > 0.0 {
+        for (_, weight) in &mut weights {
+            *weight /= sum;
+        }
+    }
+    weights
+}
+
+fn hydrometeor_name(kind: crate::wrf_radar_physics::HydrometeorKind) -> &'static str {
+    use crate::wrf_radar_physics::HydrometeorKind;
+    match kind {
+        HydrometeorKind::CloudWater => "Cloud water",
+        HydrometeorKind::Rain => "Rain",
+        HydrometeorKind::CloudIce => "Cloud ice",
+        HydrometeorKind::Snow => "Snow",
+        HydrometeorKind::Graupel => "Graupel",
+        HydrometeorKind::Hail => "Hail",
+    }
+}
+
 /// Result of a finished synthetic-radar job: one volume per WRF forecast time,
 /// ready to feed the loop engine as a looping sequence.
 pub struct SyntheticRadarOutput {
@@ -5907,6 +7253,9 @@ pub struct SyntheticRadarOutput {
     /// history key so either changed settings OR changed WRF input replaces a
     /// stale result without exposing private absolute paths.
     pub config_fingerprint: u64,
+    /// Aligned one-for-one with `volumes`; contains private paths and therefore
+    /// must never be serialized or copied into volume provenance.
+    pub(crate) frame_sources: Vec<SyntheticFrameSourceDescriptor>,
 }
 
 impl std::fmt::Debug for SyntheticRadarOutput {
@@ -5916,6 +7265,7 @@ impl std::fmt::Debug for SyntheticRadarOutput {
             .field("volumes", &self.volumes.len())
             .field("notes", &self.notes)
             .field("config_fingerprint", &self.config_fingerprint)
+            .field("frame_sources", &self.frame_sources.len())
             .finish()
     }
 }
@@ -5948,6 +7298,7 @@ pub struct SyntheticRadarReplayFrame {
     pub simulated: Arc<RadarVolume>,
     pub difference: Arc<RadarVolume>,
     pub unavailable_observed_moments: Vec<UnavailableObservedMoment>,
+    pub(crate) source_descriptor: SyntheticFrameSourceDescriptor,
 }
 
 pub struct SyntheticRadarReplayOutput {
@@ -6009,7 +7360,9 @@ pub fn spawn_synthetic_radar_replay(
                                 "Exact replay uses observed radial Nyquist/PRT; custom coupled PRF, stage diagnostics, and manual folding were disabled"
                                     .to_string(),
                             );
-                            for simulated in output.volumes {
+                            for (simulated, source_descriptor) in
+                                output.volumes.into_iter().zip(output.frame_sources)
+                            {
                                 let overlap = build_difference_volume_overlap(&observed, &simulated)
                                     .map_err(|error| {
                                         format!(
@@ -6036,6 +7389,7 @@ pub fn spawn_synthetic_radar_replay(
                                     difference: Arc::new(overlap.volume),
                                     unavailable_observed_moments: overlap
                                         .unavailable_observed_moments,
+                                    source_descriptor,
                                 });
                             }
                             Ok(SyntheticRadarReplayOutput {
@@ -6386,12 +7740,23 @@ fn build_operational_radar(
         .into_iter()
         .collect::<Vec<_>>()
         .join("/");
-    let volumes = frames.into_iter().map(|(_, _, _, volume)| volume).collect();
+    let volumes = frames
+        .into_iter()
+        .map(|(_, _, _, volume)| volume)
+        .collect::<Vec<_>>();
+    let frame_sources = volumes
+        .iter()
+        .enumerate()
+        .map(|(index, volume)| {
+            SyntheticFrameSourceDescriptor::operational(index, volume, config, config_fingerprint)
+        })
+        .collect();
     Ok(SyntheticRadarOutput {
         label: format!("{label} · {models}"),
         volumes,
         notes,
         config_fingerprint,
+        frame_sources,
     })
 }
 
@@ -6465,6 +7830,7 @@ fn build_synthetic_from_paths(
     }
 
     let mut volumes = Vec::new();
+    let mut frame_sources = Vec::new();
     let one_scene_per_file = {
         let mut identities = std::collections::BTreeSet::new();
         scenes
@@ -6572,7 +7938,17 @@ fn build_synthetic_from_paths(
             volume.metadata.decoded_radial_count,
             fields.ref_source,
         ));
-        volumes.push(Arc::new(volume));
+        let volume = Arc::new(volume);
+        frame_sources.push(SyntheticFrameSourceDescriptor::wrf(
+            volumes.len(),
+            &volume,
+            scene.clone(),
+            None,
+            None,
+            config,
+            config_fingerprint,
+        ));
+        volumes.push(volume);
     }
 
     if volumes.is_empty() {
@@ -6592,6 +7968,7 @@ fn build_synthetic_from_paths(
         volumes,
         notes,
         config_fingerprint,
+        frame_sources,
     })
 }
 
@@ -6683,6 +8060,7 @@ fn build_temporal_synthetic_from_scenes(
 
     let mut cache: TwoSceneCache<(String, usize), Arc<WrfRadarFields>> = TwoSceneCache::default();
     let mut volumes = Vec::new();
+    let mut frame_sources = Vec::new();
     for (frame_index, (scene, plan)) in group.scenes.iter().zip(plans).enumerate() {
         let Some(plan) = plan else {
             notes.push(format!(
@@ -6876,7 +8254,30 @@ fn build_temporal_synthetic_from_scenes(
             scene.time_index,
             volume.metadata.decoded_radial_count,
         ));
-        volumes.push(Arc::new(volume));
+        let neighbor_scene = if runtime_outcome.starts_with("held_anchor") {
+            None
+        } else {
+            plan.neighbor
+                .as_ref()
+                .and_then(|locator| {
+                    group.scenes.iter().find(|candidate| {
+                        candidate.source_identity == locator.source_identity
+                            && candidate.time_index == locator.time_index
+                    })
+                })
+                .cloned()
+        };
+        let volume = Arc::new(volume);
+        frame_sources.push(SyntheticFrameSourceDescriptor::wrf(
+            volumes.len(),
+            &volume,
+            scene.clone(),
+            neighbor_scene,
+            Some(plan.clone()),
+            config,
+            config_fingerprint,
+        ));
+        volumes.push(volume);
     }
 
     if volumes.is_empty() {
@@ -6894,6 +8295,7 @@ fn build_temporal_synthetic_from_scenes(
         volumes,
         notes,
         config_fingerprint,
+        frame_sources,
     })
 }
 
@@ -10935,5 +12337,29 @@ mod tests {
             "[equiv] parallel read == serial read: {} elems x 5 fields bit-identical",
             par.dbz.len()
         );
+    }
+
+    #[test]
+    fn selected_gate_witness_rejects_stale_geometry_config_and_operator() {
+        let mut volume = irregular_observed_replay_volume();
+        volume.metadata.forward_operator = Some("BowEcho WRF fixture".to_owned());
+        volume.metadata.forward_operator_config = Some("config=v1".to_owned());
+        let witness = SyntheticFrameWitness::from_volume(3, 0x1234, &volume);
+        assert!(witness.matches(0x1234, &volume));
+        assert!(!witness.matches(0x1235, &volume));
+
+        let mut stale_geometry = volume.clone();
+        stale_geometry.cuts[0].radials[0].azimuth_deg += 0.25;
+        assert!(!witness.matches(0x1234, &stale_geometry));
+
+        let mut stale_operator = volume.clone();
+        stale_operator.metadata.forward_operator_config = Some("config=v2".to_owned());
+        assert!(!witness.matches(0x1234, &stale_operator));
+
+        // Source paths are deliberately outside the export-safe witness. The
+        // retained descriptor owns them privately for this session.
+        let mut moved_source = volume;
+        moved_source.metadata.source_path = Some(PathBuf::from("private/moved/wrfout"));
+        assert!(witness.matches(0x1234, &moved_source));
     }
 }
