@@ -101,6 +101,7 @@ mod sat_worker;
 mod self_update;
 mod settings_persistence;
 mod settings_ui;
+mod simradar_gate_inspector;
 mod simradar_truth_lab;
 mod simsat_hrrr;
 mod simsat_store;
@@ -2893,6 +2894,8 @@ struct ViewerApp {
     /// Exact-gate Ideal -> Measured -> Presented audit for synthetic radar.
     /// Session-only: it follows the active pane and never mutates loop data.
     simradar_truth_lab: simradar_truth_lab::AlgorithmTruthLabState,
+    /// Exact selected-gate quality/stage report and optional spectrum view.
+    simradar_gate_inspector: simradar_gate_inspector::SimradarGateInspectorState,
     /// The last-clicked pane (0 = main). The sidebar product picker and tilt
     /// list drive this pane: the main pane edits the whole bunch, an extra
     /// pane edits itself independently.
@@ -2909,6 +2912,9 @@ struct ViewerApp {
     cross_section_armed: bool,
     /// Last right-click location (for the context menu's best-radar list).
     context_menu_lonlat: Option<(f32, f32)>,
+    /// Exact gate captured with the right-click, stable while the pointer moves
+    /// from the radar map into its context menu.
+    context_menu_gate: Option<CursorReadout>,
     radar_operational_status_cache: BTreeMap<String, RadarOperationalStatusCacheEntry>,
     radar_operational_status_rx: WorkerSlot<RadarOperationalStatusLoad>,
     /// SPC storm reports for the archive date (tornado events browser).
@@ -8408,12 +8414,14 @@ impl ViewerApp {
             extra_panes: Vec::new(),
             simradar_comparison: None,
             simradar_truth_lab: simradar_truth_lab::AlgorithmTruthLabState::default(),
+            simradar_gate_inspector: simradar_gate_inspector::SimradarGateInspectorState::default(),
             active_pane: 0,
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
             context_menu_lonlat: None,
+            context_menu_gate: None,
             radar_operational_status_cache: BTreeMap::new(),
             radar_operational_status_rx: WorkerSlot::idle("radar-operational-status"),
             spc_reports: None,
@@ -19809,6 +19817,28 @@ impl eframe::App for ViewerApp {
             self.simradar_truth_lab.set_volume(truth_lab_volume);
         }
         self.simradar_truth_lab.show_window(&ctx);
+        if let Some(request) = self.simradar_gate_inspector.take_explanation_request() {
+            // The fast gate report is fully embedded in RadarVolume. Detailed
+            // hydrometeor spectra require a retained/reopened source-state
+            // sidecar; do not reverse-engineer them from displayed moments.
+            let unavailable = if request
+                .volume
+                .metadata
+                .forward_operator
+                .as_deref()
+                .is_some_and(|operator| operator.contains("BowEcho"))
+            {
+                wrf_radar_estimator::WhyThisGateUnavailable::SourceSnapshotExpired
+            } else {
+                wrf_radar_estimator::WhyThisGateUnavailable::NotSyntheticRadar
+            };
+            let _identity = request.identity;
+            self.simradar_gate_inspector.supply_explanation(
+                request.generation,
+                wrf_radar_estimator::WhyThisGate::Unavailable(unavailable),
+            );
+        }
+        self.simradar_gate_inspector.show_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
 
         self.sounding_window(&ctx);
@@ -27381,6 +27411,7 @@ impl ViewerApp {
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 self.context_menu_lonlat = Some(self.screen_to_lon_lat(rect, pointer));
+                self.context_menu_gate = self.cursor_readout_at(rect, pointer);
             }
             response.context_menu(|ui| self.best_radar_context_menu(ui));
         }
@@ -28039,6 +28070,7 @@ impl ViewerApp {
                     // eager nearest-site load here raced the menu pick —
                     // see the single-pane handler).
                     self.context_menu_lonlat = Some(self.screen_to_lon_lat(cell, pointer));
+                    self.context_menu_gate = self.cursor_readout_at(cell, pointer);
                 }
             }
             if !armed
@@ -29527,6 +29559,32 @@ impl ViewerApp {
         let operational_site = self.nearest_operational_status_site(lat, lon);
         let nearest_ob = self.nearest_surface_ob_to_lonlat(lon, lat, 35.0);
         ui.label(format!("{lat:.3}, {lon:.3}"));
+        if let (Some(volume), Some(readout)) = (self.volume.clone(), self.context_menu_gate.clone())
+            && volume
+                .metadata
+                .forward_operator
+                .as_deref()
+                .is_some_and(|operator| operator.contains("BowEcho"))
+        {
+            if ui
+                .button("Why this synthetic gate?")
+                .on_hover_text(
+                    "Open exact gate quality, Ideal/Measured/Presented stages, propagation, hydrometeor contributions when retained, and the on-demand Doppler spectrum",
+                )
+                .clicked()
+            {
+                let mut selection = simradar_gate_inspector::GateSelection::new(
+                    readout.cut,
+                    readout.row,
+                    readout.gate,
+                )
+                .with_anchor(readout.product.base_moment());
+                selection.frame_index = self.primary.cursor.index;
+                self.simradar_gate_inspector
+                    .open_with_gate(volume, selection);
+                ui.close();
+            }
+        }
         ui.separator();
         if let Some((site, distance_km)) = operational_site.as_ref() {
             self.radar_operational_status_menu(ui, site, *distance_km);
@@ -63697,12 +63755,14 @@ mod tests {
             extra_panes: Vec::new(),
             simradar_comparison: None,
             simradar_truth_lab: simradar_truth_lab::AlgorithmTruthLabState::default(),
+            simradar_gate_inspector: simradar_gate_inspector::SimradarGateInspectorState::default(),
             active_pane: 0,
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
             context_menu_lonlat: None,
+            context_menu_gate: None,
             radar_operational_status_cache: BTreeMap::new(),
             radar_operational_status_rx: WorkerSlot::idle("radar-operational-status"),
             spc_reports: None,
