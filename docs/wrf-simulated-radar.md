@@ -210,8 +210,21 @@ For an ordinary build, the first completed tilt of the first forecast frame is
 installed immediately as a clearly marked partial preview; the finished
 volume replaces it while the same worker continues. The preview is not a
 complete scan or export result. Exact observed-scan replay waits for its
-aligned comparison result instead of installing this preview. Simulated-radar
-builds do not currently expose a mid-build **Cancel** button.
+aligned comparison result instead of installing this preview.
+
+The live job-status row provides **Cancel** for ordinary builds and exact
+observed-scan replay. After a click it changes to `Cancelling...` while the
+worker stops cooperatively. Cancellation checks occur between bounded work
+units throughout the field-read stages, static property-scene cells, PSD
+nodes, tilts and rays, and regular groups of gates. One library file
+decompression/read or CUDA driver call that is already in progress may still
+finish before the next check, so cancellation is responsive but not an
+instantaneous process kill.
+
+Cancellation removes an installed partial-tilt preview and does not install a
+finished volume or export result. A stop detected around CUDA work remains a
+normal cancellation: it is not reported as a CUDA failure, does not disable
+the accelerator, and does not launch the category-level CPU replay path.
 
 Completed-volume and CfRadial provenance records the requested compute choice,
 actual CPU/CUDA backend, CUDA device and kernel identity when used, submitted
