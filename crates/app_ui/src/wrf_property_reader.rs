@@ -3895,9 +3895,9 @@ mod tests {
             .iter()
             .copied()
             .enumerate()
-            .filter_map(|(cell_index, value)| {
-                (value < 0.0 && value >= -WRF_P3_QSMALL_KGKG)
-                    .then(|| u32::try_from(cell_index).expect("WRF property grid index fits u32"))
+            .filter(|&(_, value)| (-WRF_P3_QSMALL_KGKG..0.0).contains(&value))
+            .map(|(cell_index, _)| {
+                u32::try_from(cell_index).expect("WRF property grid index fits u32")
             })
             .collect::<Vec<_>>();
         assert!(
@@ -3910,9 +3910,9 @@ mod tests {
             .expect("read fixture QIR")
             .into_iter()
             .enumerate()
-            .filter_map(|(cell_index, value)| {
-                (active_qice[cell_index] && value < 0.0)
-                    .then(|| u32::try_from(cell_index).expect("WRF property grid index fits u32"))
+            .filter(|&(cell_index, value)| active_qice[cell_index] && value < 0.0)
+            .map(|(cell_index, _)| {
+                u32::try_from(cell_index).expect("WRF property grid index fits u32")
             })
             .collect::<Vec<_>>();
         assert!(
