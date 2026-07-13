@@ -3487,10 +3487,57 @@ enum RawBatchNodeLocation {
     },
 }
 
-#[derive(Default)]
 struct RawBatchRoleSweep {
     locations: Vec<RawBatchNodeLocation>,
     nodes: Vec<CudaPreparedTMatrixNode>,
+}
+
+impl RawBatchRoleSweep {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            locations: Vec::with_capacity(capacity),
+            nodes: Vec::with_capacity(capacity),
+        }
+    }
+}
+
+fn raw_batch_role_node_counts(prepared: &[PreparedRawBatchEvaluation<'_>]) -> (usize, usize) {
+    let mut oblate = 0_usize;
+    let mut prolate = 0_usize;
+    for request in prepared {
+        match request {
+            PreparedRawBatchEvaluation::Clear => {}
+            PreparedRawBatchEvaluation::P3(request) => {
+                for category in &request.categories {
+                    for (_, _, node, _, _) in category.integration.table_nodes() {
+                        match node.habit() {
+                            PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
+                                oblate = oblate.saturating_add(1);
+                            }
+                            PsdSpheroidHabit::Prolate => {
+                                prolate = prolate.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+            PreparedRawBatchEvaluation::Ishmael(request) => {
+                for category in &request.categories {
+                    for evaluation in &category.integration.evaluations {
+                        match evaluation.role {
+                            WrfTMatrixCudaTableRole::DryOblate => {
+                                oblate = oblate.saturating_add(1);
+                            }
+                            WrfTMatrixCudaTableRole::DryProlate => {
+                                prolate = prolate.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (oblate, prolate)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3702,8 +3749,9 @@ fn finish_raw_batch(
         return finish_raw_batch_ordered(prepared, false, cancel);
     }
 
-    let mut oblate = RawBatchRoleSweep::default();
-    let mut prolate = RawBatchRoleSweep::default();
+    let (oblate_node_count, prolate_node_count) = raw_batch_role_node_counts(&prepared);
+    let mut oblate = RawBatchRoleSweep::with_capacity(oblate_node_count);
+    let mut prolate = RawBatchRoleSweep::with_capacity(prolate_node_count);
     let staging_failure = 'staging: {
         for (request_index, request) in prepared.iter().enumerate() {
             check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
@@ -3785,6 +3833,10 @@ fn finish_raw_batch(
         cuda.disable_for_cpu_fallback(detail, 0);
         return finish_raw_batch_ordered(prepared, false, cancel);
     }
+    debug_assert_eq!(oblate.locations.len(), oblate_node_count);
+    debug_assert_eq!(oblate.nodes.len(), oblate_node_count);
+    debug_assert_eq!(prolate.locations.len(), prolate_node_count);
+    debug_assert_eq!(prolate.nodes.len(), prolate_node_count);
 
     let RawBatchRoleSweep {
         locations: oblate_locations,
@@ -5703,6 +5755,10 @@ mod tests {
             assert!(
                 prolate_nodes > 0,
                 "fixture must exercise the prolate role sweep"
+            );
+            assert_eq!(
+                raw_batch_role_node_counts(&prepared),
+                (oblate_nodes, prolate_nodes)
             );
             let actual = finish_raw_batch(prepared, Some(&service), None).unwrap();
             assert_raw_batch_bitwise_eq(&actual, &expected);
