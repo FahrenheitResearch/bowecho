@@ -5452,7 +5452,7 @@ mod tests {
             SpheroidConvention::ProlateMajorVertical,
         )
         .unwrap();
-        let integration = qice_candidates_kgkg
+        let (integration, expected) = qice_candidates_kgkg
             .iter()
             .find_map(|&qice_kgkg| {
                 let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
@@ -5464,7 +5464,7 @@ mod tests {
                     1.2,
                 ))
                 .ok()?;
-                prepare_ishmael_particle_integration(
+                let integration = prepare_ishmael_particle_integration(
                     &distribution,
                     validated.ishmael_psd_config,
                     validated.ishmael_particle_support,
@@ -5474,9 +5474,17 @@ mod tests {
                     oblate_request,
                     prolate_request,
                 )
-                .ok()
+                .ok()?;
+                let expected = integration
+                    .finish_cpu()
+                    .ok()?
+                    .additive()
+                    .to_polar_accumulator_quantities()
+                    .map(Some)
+                    .ok()?;
+                Some((integration, expected))
             })
-            .expect("construct an embedded-table ISHMAEL batch case");
+            .expect("construct a converged embedded-table ISHMAEL batch case");
         let oblate_nodes = integration
             .evaluations
             .iter()
@@ -5487,13 +5495,6 @@ mod tests {
             .iter()
             .filter(|evaluation| evaluation.role == WrfTMatrixCudaTableRole::DryProlate)
             .count();
-        let expected = integration
-            .finish_cpu()
-            .expect("finish scalar ISHMAEL batch case")
-            .additive()
-            .to_polar_accumulator_quantities()
-            .map(Some)
-            .expect("convert scalar ISHMAEL batch case");
         let cuda_outputs = (0..integration.evaluations.len()).map(|_| None).collect();
         (
             PreparedRawBatchEvaluation::Ishmael(PreparedIshmaelRawBatchEvaluation {
@@ -5542,9 +5543,12 @@ mod tests {
             validated,
             WrfPropertyCategory::IshmaelColumnar,
             radar_scattering::IshmaelIceCategory::Columnar,
-            2.5e-8,
-            5.0e-8,
-            &[4.0e-3, 2.0e-3, 8.0e-3, 1.0e-3, 5.0e-4],
+            // Physical near-spherical prolate case: a_n=50 um,
+            // c(a_n)=50.5 um. Density candidates retain the unchanged
+            // production support and additive-convergence gates.
+            1.262_5e-8,
+            1.275_125e-8,
+            &[2.54e-3, 1.27e-3, 3.81e-3, 5.08e-3, 6.35e-4],
             1.3,
         );
         let oblate_nodes = oblate.2.saturating_add(prolate.2);
