@@ -416,8 +416,17 @@ where
                 }
             }
             P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1 => {
+                let Ok(table_node) = projected_area_equivalent_oblate(*node) else {
+                    // A source mass/area tuple that cannot define the named
+                    // equivalent spheroid is an in-source shape omission. It
+                    // is gated together with table omissions instead of being
+                    // clamped into an invented particle or aborting before the
+                    // declared omission policy can evaluate it.
+                    non_spherical.add(node);
+                    continue;
+                };
                 projected_area_equivalent_nodes += 1;
-                projected_area_equivalent_oblate(index, *node)?
+                table_node
             }
         };
         let inside_table = table_support
@@ -527,17 +536,13 @@ where
     })
 }
 
-fn projected_area_equivalent_oblate<E: Error + 'static>(
-    node_index: usize,
+fn projected_area_equivalent_oblate(
     node: P3QuadratureNode,
-) -> Result<P3TMatrixParticleNode, P3TMatrixIntegrationError<E>> {
+) -> Result<P3TMatrixParticleNode, &'static str> {
     let maximum_dimension = node.particle.maximum_dimension_m;
     let raw_ratio = 4.0 * node.particle.projected_area_m2 / (PI * maximum_dimension.powi(2));
     if !raw_ratio.is_finite() || raw_ratio <= 0.0 || raw_ratio > 1.0 + 1.0e-10 {
-        return Err(P3TMatrixIntegrationError::InvalidEquivalentGeometry {
-            node_index,
-            message: format!("4A/(pi Dmax^2) must be within (0, 1], got {raw_ratio}"),
-        });
+        return Err("4A/(pi Dmax^2) is outside the equivalent-oblate domain");
     }
     // Only absorb roundoff at the analytic spherical boundary; values above
     // the tolerance fail instead of silently becoming spheres.
@@ -550,12 +555,7 @@ fn projected_area_equivalent_oblate<E: Error + 'static>(
         || !density.is_finite()
         || density <= 0.0
     {
-        return Err(P3TMatrixIntegrationError::InvalidEquivalentGeometry {
-            node_index,
-            message: format!(
-                "derived Deq and density must be finite and positive, got {equivolume_diameter} m and {density} kg m-3"
-            ),
-        });
+        return Err("derived equivalent diameter or density is nonpositive or nonfinite");
     }
     Ok(P3TMatrixParticleNode {
         source: node,
@@ -693,5 +693,12 @@ mod tests {
                 sixth_moment: 0.2,
             }
         );
+    }
+
+    #[test]
+    fn projected_area_above_circumscribing_circle_is_not_clamped() {
+        let mut invalid = node(0.01, 1.0e-6, 1.0);
+        invalid.particle.projected_area_m2 *= 1.001;
+        assert!(projected_area_equivalent_oblate(invalid).is_err());
     }
 }
