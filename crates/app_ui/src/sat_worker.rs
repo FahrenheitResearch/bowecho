@@ -49,7 +49,7 @@ use rw_sat::s3::{
 };
 use rw_sat::store::{
     SatelliteGridField, SatelliteGridScene, SatelliteProjection, WrittenFrame, downsample_field,
-    frame_file_name, run_day, sector_slug, selector_band,
+    frame_file_name, frame_time, run_day, sector_slug, selector_band,
 };
 use rw_sat::window::WindowConfig;
 use rw_store::format::RwsWriterInfo;
@@ -512,10 +512,14 @@ pub enum SatResponse {
     },
     FrameWritten {
         id: String,
+        model: String,
         run: String,
         hhmm: u16,
         bytes: u64,
         encode_ms: u64,
+        /// True only for rw-sat's live-follow/load-loop event stream. One-shot
+        /// product ingests already publish their own final SelectFrame.
+        select_live_run: bool,
     },
     Evicted {
         frames: usize,
@@ -1092,6 +1096,23 @@ fn simsat_run_title(run: &str) -> String {
 
 /// Enumerate the sat store into player-ready run listings, newest run
 /// first.
+fn latest_run_frame_time(listing: &SatRunListing) -> Option<DateTime<Utc>> {
+    listing
+        .frames
+        .iter()
+        .filter_map(|&hhmm| frame_time(&listing.key.run, hhmm))
+        .max()
+}
+
+fn sort_run_listings_newest_first(listings: &mut [SatRunListing]) {
+    listings.sort_by(|a, b| {
+        latest_run_frame_time(b)
+            .cmp(&latest_run_frame_time(a))
+            .then_with(|| b.key.run.cmp(&a.key.run))
+            .then_with(|| a.key.model.cmp(&b.key.model))
+    });
+}
+
 fn scan_runs(store_root: &Path) -> Vec<SatRunListing> {
     let tree = StoreView::new(store_root).enumerate();
     let mut listings = Vec::new();
@@ -1114,12 +1135,7 @@ fn scan_runs(store_root: &Path) -> Vec<SatRunListing> {
             });
         }
     }
-    listings.sort_by(|a, b| {
-        b.key
-            .run
-            .cmp(&a.key.run)
-            .then_with(|| a.key.model.cmp(&b.key.model))
-    });
+    sort_run_listings_newest_first(&mut listings);
     listings
 }
 
@@ -2059,6 +2075,7 @@ fn map_event(event: SatEvent, current_key: &mut Option<String>) -> Vec<SatRespon
             cache_hit,
         }],
         SatEvent::FrameWritten {
+            model,
             run,
             hhmm,
             bytes,
@@ -2066,10 +2083,12 @@ fn map_event(event: SatEvent, current_key: &mut Option<String>) -> Vec<SatRespon
             ..
         } => vec![SatResponse::FrameWritten {
             id: current_key.take().unwrap_or_default(),
+            model,
             run,
             hhmm,
             bytes,
             encode_ms,
+            select_live_run: true,
         }],
         SatEvent::Evicted { frames, bytes, .. } => vec![SatResponse::Evicted { frames, bytes }],
         SatEvent::Sleeping { ms } => vec![SatResponse::Sleeping { ms }],
@@ -2584,10 +2603,12 @@ fn ingest_latest_himawari(
     for id in row_ids {
         send(SatResponse::FrameWritten {
             id,
+            model: frame.model.clone(),
             run: frame.run.clone(),
             hhmm: frame.hhmm,
             bytes: frame.bytes,
             encode_ms: frame.encode_ms,
+            select_live_run: false,
         });
     }
     send(SatResponse::Runs(scan_runs(store_root)));
@@ -4287,10 +4308,12 @@ fn ingest_latest_himawari_composite(
         for object in objects {
             send(SatResponse::FrameWritten {
                 id: object.key.clone(),
+                model: frame.model.clone(),
                 run: frame.run.clone(),
                 hhmm: frame.hhmm,
                 bytes: frame.bytes,
                 encode_ms: frame.encode_ms,
+                select_live_run: false,
             });
         }
     }
@@ -4407,10 +4430,12 @@ fn ingest_latest_himawari_ir_window(
     for object in objects {
         send(SatResponse::FrameWritten {
             id: object.key.clone(),
+            model: frame.model.clone(),
             run: frame.run.clone(),
             hhmm: frame.hhmm,
             bytes: frame.bytes,
             encode_ms: frame.encode_ms,
+            select_live_run: false,
         });
     }
     send(SatResponse::Runs(scan_runs(store_root)));
@@ -4674,10 +4699,12 @@ fn ingest_latest_goes_composite(
     for object in objects.values() {
         send(SatResponse::FrameWritten {
             id: object.key.clone(),
+            model: frame.model.clone(),
             run: frame.run.clone(),
             hhmm: frame.hhmm,
             bytes: frame.bytes,
             encode_ms: frame.encode_ms,
+            select_live_run: false,
         });
     }
     send(SatResponse::Runs(scan_runs(store_root)));
@@ -4854,10 +4881,12 @@ fn ingest_latest_goes_ir_window(
 
     send(SatResponse::FrameWritten {
         id: object.key.clone(),
+        model: frame.model.clone(),
         run: frame.run.clone(),
         hhmm: frame.hhmm,
         bytes: frame.bytes,
         encode_ms: frame.encode_ms,
+        select_live_run: false,
     });
     send(SatResponse::Runs(scan_runs(store_root)));
     send(SatResponse::SelectFrame {
@@ -5256,10 +5285,12 @@ fn ingest_meteosat_wms(
         )?;
         send(SatResponse::FrameWritten {
             id: format!("{}@{}", product.layer(), time.to_rfc3339()),
+            model: frame.model.clone(),
             run: frame.run.clone(),
             hhmm: frame.hhmm,
             bytes: frame.bytes,
             encode_ms: frame.encode_ms,
+            select_live_run: false,
         });
         newest = Some(frame);
     }
@@ -7402,10 +7433,48 @@ mod tests {
             },
             &mut current,
         );
-        assert!(
-            matches!(&written[0], SatResponse::FrameWritten { id, hhmm: 1921, .. } if id == &key)
-        );
+        assert!(matches!(
+            &written[0],
+            SatResponse::FrameWritten {
+                id,
+                model,
+                hhmm: 1921,
+                select_live_run: true,
+                ..
+            } if id == &key && model == "g19"
+        ));
         assert!(current.is_none(), "id consumed by the frame");
+    }
+
+    #[test]
+    fn run_listings_sort_by_frame_time_not_product_prefix() {
+        let mut listings = vec![
+            SatRunListing {
+                key: SatRunKey {
+                    model: "simsat".to_owned(),
+                    run: "wrfout_d02_1974_04_03_23_12_00_visible_geo_rgb_goese_19740403".to_owned(),
+                },
+                title: "old SimSat".to_owned(),
+                nx: 10,
+                ny: 10,
+                frames: vec![2312],
+            },
+            SatRunListing {
+                key: SatRunKey {
+                    model: "g18".to_owned(),
+                    run: "conus_c01_20260713".to_owned(),
+                },
+                title: "live GOES".to_owned(),
+                nx: 10,
+                ny: 10,
+                frames: vec![1851],
+            },
+        ];
+
+        sort_run_listings_newest_first(&mut listings);
+
+        assert_eq!(listings[0].key.model, "g18");
+        assert_eq!(listings[0].key.run, "conus_c01_20260713");
     }
 
     /// A Follow over an invalid spec responds FollowFinished(Err) without

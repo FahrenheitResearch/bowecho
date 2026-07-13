@@ -3030,7 +3030,9 @@ struct ViewerApp {
     /// GOES satellite frame as a map layer (under everything weather).
     sat_layer: Option<SatMapLayer>,
     sat_layer_build_rx: Option<mpsc::Receiver<Option<SatMapLayer>>>,
-    sat_layer_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
+    /// GPU map raster plus its generation/view and whether the rendered
+    /// viewport contained at least one non-transparent satellite pixel.
+    sat_layer_texture: Option<(egui::TextureHandle, u64, ModelLayerView, bool)>,
     sat_layer_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
     sat_layer_generation: u64,
     /// Content-addressed satellite InverseLut cache, most-recent first (see

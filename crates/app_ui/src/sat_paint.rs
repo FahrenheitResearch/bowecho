@@ -628,6 +628,28 @@ impl ViewerApp {
         &mut self,
         ui: &mut egui::Ui,
     ) -> (Vec<rw_ui::SatelliteEvent>, Vec<rw_ui::SatPlayerEvent>) {
+        // The provider controls are intentionally information-dense. In a
+        // short floating window or a shallow dock they can consume the
+        // parent's whole clip rect before rw-ui's player measures its image
+        // area. The player then clamps its native-frame scale to 0.01, which
+        // turns a healthy 5000x3000 ABI frame into a misleading 50x30 dark
+        // thumbnail beside the "texture cache" footer. Give the pane a real
+        // scrolling content surface and reserve a finite player rectangle;
+        // the controls remain reachable while the preview never collapses.
+        let mut events = (Vec::new(), Vec::new());
+        egui::ScrollArea::vertical()
+            .id_salt("bowecho-satellite-pane-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                events = self.satellite_pane_contents(ui);
+            });
+        events
+    }
+
+    fn satellite_pane_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> (Vec<rw_ui::SatelliteEvent>, Vec<rw_ui::SatPlayerEvent>) {
         let panel_events = self.satellite_provider_controls(ui);
         if self.satellite_source != SatelliteSource::Goes
             && let Some(activity) = satellite_activity_status(&self.status)
@@ -759,7 +781,14 @@ impl ViewerApp {
             }
         }
         panel_kit::subgroup(ui, "Saved loop", |_ui| {});
-        let player_events = self.sat_player.ui(ui);
+        let player_height = satellite_player_panel_height(ui.available_width());
+        let player_events = ui
+            .allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), player_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| self.sat_player.ui(ui),
+            )
+            .inner;
         (panel_events, player_events)
     }
 
@@ -994,19 +1023,26 @@ impl ViewerApp {
                 }
                 sat_worker::SatResponse::FrameWritten {
                     id,
+                    model,
                     run,
                     hhmm,
                     bytes,
                     encode_ms,
+                    select_live_run,
                 } => {
                     self.status = format!(
                         "Satellite: stored {run}/t{hhmm:04} · {} in {encode_ms} ms",
                         rw_ui::format_bytes(bytes)
                     );
                     self.sat_panel
-                        .apply_frame_written(&id, run, hhmm, bytes, encode_ms);
+                        .apply_frame_written(&id, run.clone(), hhmm, bytes, encode_ms);
                     if let Some(sat) = &self.sat {
-                        sat.send(sat_worker::SatRequest::Scan);
+                        sat.send(satellite_frame_written_refresh_request(
+                            model,
+                            run,
+                            hhmm,
+                            select_live_run,
+                        ));
                     }
                 }
                 sat_worker::SatResponse::Evicted { frames, bytes } => {
@@ -1316,15 +1352,21 @@ impl ViewerApp {
             match receiver.try_recv() {
                 Ok((generation, key, image, _ms)) => {
                     self.sat_layer_render_rx = None;
-                    if self
+                    if let Some(layer) = self
                         .sat_layer
                         .as_ref()
-                        .map(|l| l.generation == generation)
-                        .unwrap_or(false)
+                        .filter(|layer| layer.generation == generation)
                     {
+                        let has_visible_pixels = satellite_render_has_visible_pixels(&image);
                         let texture =
                             ctx.load_texture("sat-layer", image, egui::TextureOptions::LINEAR);
-                        self.sat_layer_texture = Some((texture, generation, key));
+                        self.sat_layer_texture =
+                            Some((texture, generation, key, has_visible_pixels));
+                        self.status = if has_visible_pixels {
+                            format!("Satellite map: {:04}Z", layer.hhmm)
+                        } else {
+                            "Satellite map: no visible pixels in this view (outside the selected sector or transparent IR)".to_owned()
+                        };
                     }
                     ctx.request_repaint();
                 }
@@ -1347,9 +1389,9 @@ impl ViewerApp {
         let current = self
             .sat_layer_texture
             .as_ref()
-            .filter(|(_, generation, _)| *generation == layer.generation);
+            .filter(|(_, generation, _, _)| *generation == layer.generation);
         let needs_render = current
-            .map(|(_, _, have)| model_layer_view_needs_rerender(have, &view))
+            .map(|(_, _, have, _)| model_layer_view_needs_rerender(have, &view))
             .unwrap_or(true);
         let defer_render = map_layer_rerender_deferred(painter.ctx());
         if needs_render && !defer_render && self.sat_layer_render_rx.is_none() {
@@ -1404,7 +1446,7 @@ impl ViewerApp {
                 ));
             });
         }
-        if let Some((texture, _, rendered)) = &self.sat_layer_texture {
+        if let Some((texture, _, rendered, has_visible_pixels)) = &self.sat_layer_texture {
             let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
             let tint = egui::Color32::from_white_alpha((layer.opacity * 255.0) as u8);
             if model_layer_view_needs_rerender(rendered, &view) {
@@ -1420,6 +1462,9 @@ impl ViewerApp {
                 }
             } else {
                 painter.image(texture.id(), rect, uv, tint);
+            }
+            if !has_visible_pixels && !model_layer_view_needs_rerender(rendered, &view) {
+                draw_satellite_no_visible_notice(painter, rect);
             }
         }
         if layer.key.model == "mtg_i1" {
@@ -1452,6 +1497,55 @@ impl ViewerApp {
             );
         }
     }
+}
+
+/// Player panel height reserved inside the satellite pane's scroll surface.
+/// About 112 points belong to transport/run chrome; the remainder is a
+/// practical preview that grows with pane width without making wide panes
+/// absurdly tall.
+fn satellite_player_panel_height(available_width: f32) -> f32 {
+    112.0 + (available_width * 0.40).clamp(240.0, 420.0)
+}
+
+fn satellite_render_has_visible_pixels(image: &egui::ColorImage) -> bool {
+    image.pixels.iter().any(|pixel| pixel.a() > 0)
+}
+
+fn satellite_frame_written_refresh_request(
+    model: String,
+    run: String,
+    hhmm: u16,
+    select_live_run: bool,
+) -> sat_worker::SatRequest {
+    if select_live_run && matches!(model.as_str(), "g16" | "g17" | "g18" | "g19") {
+        sat_worker::SatRequest::ScanAndSelect {
+            key: rw_ui::SatRunKey { model, run },
+            hhmm,
+        }
+    } else {
+        sat_worker::SatRequest::Scan
+    }
+}
+
+fn draw_satellite_no_visible_notice(painter: &egui::Painter, rect: egui::Rect) {
+    let text = "No visible satellite pixels in this map view\nTry the matching satellite/sector, or an IR layer at night";
+    let style = painter.ctx().global_style();
+    let visuals = &style.visuals;
+    let galley = painter.layout(
+        text.to_owned(),
+        egui::FontId::proportional(12.0),
+        visuals.text_color(),
+        (rect.width() - 32.0).max(120.0),
+    );
+    let size = galley.size() + egui::vec2(20.0, 14.0);
+    let card = egui::Rect::from_center_size(rect.center(), size);
+    painter.rect_filled(card, 5.0, visuals.window_fill());
+    painter.rect_stroke(card, 5.0, visuals.window_stroke(), egui::StrokeKind::Inside);
+    painter.galley(
+        card.min + egui::vec2(10.0, 7.0),
+        galley,
+        visuals.text_color(),
+    );
 }
 
 fn satellite_activity_status(status: &str) -> Option<&str> {
@@ -1808,6 +1902,65 @@ mod tests {
     fn satellite_source_tabs_split_the_row_three_ways() {
         assert_eq!(satellite_source_tab_width(520.0, 4.0), 170.0);
         assert_eq!(satellite_source_tab_width(320.0, 4.0), 104.0);
+    }
+
+    #[test]
+    fn satellite_player_layout_reserves_a_practical_preview_at_any_pane_width() {
+        let narrow = satellite_player_panel_height(320.0);
+        let normal = satellite_player_panel_height(900.0);
+        let wide = satellite_player_panel_height(2_000.0);
+
+        assert_eq!(narrow, 352.0);
+        assert_eq!(normal, 472.0);
+        assert_eq!(wide, 532.0);
+        assert!(
+            narrow >= 300.0,
+            "the native-frame preview must never collapse to a thumbnail"
+        );
+    }
+
+    #[test]
+    fn satellite_render_visibility_distinguishes_empty_and_covered_views() {
+        let empty = egui::ColorImage::new([2, 2], vec![egui::Color32::TRANSPARENT; 4]);
+        let covered = egui::ColorImage::new(
+            [2, 2],
+            vec![
+                egui::Color32::TRANSPARENT,
+                egui::Color32::TRANSPARENT,
+                egui::Color32::from_rgb(3, 5, 8),
+                egui::Color32::TRANSPARENT,
+            ],
+        );
+
+        assert!(!satellite_render_has_visible_pixels(&empty));
+        assert!(satellite_render_has_visible_pixels(&covered));
+    }
+
+    #[test]
+    fn live_goes_frame_refresh_scans_and_selects_the_just_written_run() {
+        match satellite_frame_written_refresh_request(
+            "g18".to_owned(),
+            "conus_c01_20260713".to_owned(),
+            1851,
+            true,
+        ) {
+            sat_worker::SatRequest::ScanAndSelect { key, hhmm } => {
+                assert_eq!(key.model, "g18");
+                assert_eq!(key.run, "conus_c01_20260713");
+                assert_eq!(hhmm, 1851);
+            }
+            other => panic!("expected live GOES scan-and-select, got {other:?}"),
+        }
+
+        assert!(matches!(
+            satellite_frame_written_refresh_request(
+                "g18".to_owned(),
+                "conus_rgb_natural_color_20260713".to_owned(),
+                1851,
+                false,
+            ),
+            sat_worker::SatRequest::Scan
+        ));
     }
 
     #[test]
