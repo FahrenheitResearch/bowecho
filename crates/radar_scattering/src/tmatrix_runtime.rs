@@ -14,9 +14,10 @@ use crate::{
     AdditiveScattering, AxisCoordinate, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
     DiagnosticWetCategory, EffectiveMediumRule, InterpolationError, KernelModel,
     LIQUID_WATER_DENSITY_KG_M3, LutError, MeltingModel, MicrophysicsFamily, MixtureTopology,
-    OfflineLut, OrientationModel, OutputError, ParticleState, PreparedInterpolationPlan, PsdError,
-    PsdFallSpeedAuthority, PsdFallSpeedProvenance, PsdParticleDomain, PsdParticleNode,
-    PsdSpheroidHabit, Sha256Digest, TMatrixImplementation, TableValidation, TemporalSampling, Unit,
+    OfflineLut, OrientationModel, OutputError, PREPARED_INTERPOLATION_AXIS_SLOTS, ParticleState,
+    PreparedInterpolationPlan, PsdError, PsdFallSpeedAuthority, PsdFallSpeedProvenance,
+    PsdParticleDomain, PsdParticleNode, PsdSpheroidHabit, Sha256Digest, TMatrixImplementation,
+    TableValidation, TemporalSampling, Unit,
 };
 
 const PYTMATRIX_KERNEL: &str = "pytmatrix-0.3.3";
@@ -1093,9 +1094,7 @@ impl ResearchTMatrixLut {
         orientation: OrientationModel,
         request: TMatrixEvaluationRequest,
     ) -> Result<PreparedTMatrixParticleNode, EvaluationError> {
-        let positive_down_fall_speed_m_s = self
-            .dry_particle_geometry_terminal_speed_m_s(equivolume_diameter_m, bulk_density_kg_m3)?;
-        let query = TMatrixParticleNodeQuery::new(
+        let query = self.dry_particle_geometry_query(
             temperature_k,
             equivolume_diameter_m,
             bulk_density_kg_m3,
@@ -1103,7 +1102,6 @@ impl ResearchTMatrixLut {
             habit,
             rime_mass_fraction,
             rime_density_kg_m3,
-            positive_down_fall_speed_m_s,
             fall_speed,
             orientation,
             request,
@@ -1111,9 +1109,74 @@ impl ResearchTMatrixLut {
         self.prepare_dry_particle_node_query(
             &query,
             ParticleNodeTerminalSpeedValidation::AlreadySolvedByOwningTable(
-                positive_down_fall_speed_m_s,
+                query.positive_down_fall_speed_m_s,
             ),
         )
+    }
+
+    /// Validate, solve terminal speed, and bracket one dry particle directly
+    /// into the fixed-size LUT execution token used by batched backends.
+    ///
+    /// This is science-identical to
+    /// [`Self::prepare_dry_particle_geometry_per_m3`] followed by
+    /// [`Self::prepare_dry_particle_lut_interpolation`], but it avoids the
+    /// short-lived heap allocation for a per-node coordinate vector. This is
+    /// material for native P3/ISHMAEL integrations, which prepare hundreds of
+    /// particles for every sampled atmosphere point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_dry_particle_geometry_lut_interpolation_per_m3(
+        &self,
+        temperature_k: f64,
+        equivolume_diameter_m: f64,
+        bulk_density_kg_m3: f64,
+        minor_to_major_axis_ratio: f64,
+        habit: PsdSpheroidHabit,
+        rime_mass_fraction: Option<f64>,
+        rime_density_kg_m3: Option<f64>,
+        fall_speed: PsdFallSpeedProvenance,
+        orientation: OrientationModel,
+        request: TMatrixEvaluationRequest,
+    ) -> Result<PreparedTMatrixLutInterpolation, EvaluationError> {
+        let query = self.dry_particle_geometry_query(
+            temperature_k,
+            equivolume_diameter_m,
+            bulk_density_kg_m3,
+            minor_to_major_axis_ratio,
+            habit,
+            rime_mass_fraction,
+            rime_density_kg_m3,
+            fall_speed,
+            orientation,
+            request,
+        )?;
+        let axis_count = self.lut.header().axes().len();
+        if axis_count > PREPARED_INTERPOLATION_AXIS_SLOTS {
+            return Err(EvaluationError::PreparedParticleNodeAxisCapacity {
+                actual: axis_count,
+                maximum: PREPARED_INTERPOLATION_AXIS_SLOTS,
+            });
+        }
+        let placeholder = AxisCoordinate::new(AxisKind::TimeOffset, 0.0)?;
+        let mut coordinates = [placeholder; PREPARED_INTERPOLATION_AXIS_SLOTS];
+        let mut coordinate_count = 0_usize;
+        self.visit_dry_particle_node_query(
+            &query,
+            ParticleNodeTerminalSpeedValidation::AlreadySolvedByOwningTable(
+                query.positive_down_fall_speed_m_s,
+            ),
+            |coordinate| {
+                coordinates[coordinate_count] = coordinate;
+                coordinate_count += 1;
+            },
+        )?;
+        debug_assert_eq!(coordinate_count, axis_count);
+        Ok(PreparedTMatrixLutInterpolation {
+            table_file_sha256: self.file_sha256,
+            plan: self
+                .lut
+                .prepare_interpolation(&coordinates[..coordinate_count])?,
+            positive_down_fall_speed_m_s: query.positive_down_fall_speed_m_s,
+        })
     }
 
     /// Interpolate a table-owned prepared node without repeating its terminal
@@ -1123,6 +1186,21 @@ impl ResearchTMatrixLut {
         prepared: &PreparedTMatrixParticleNode,
     ) -> Result<AdditiveScattering, EvaluationError> {
         let interpolation = self.prepare_dry_particle_lut_interpolation(prepared)?;
+        self.evaluate_prepared_dry_particle_lut_interpolation_per_m3(&interpolation)
+    }
+
+    /// Interpolate an already validated and bracketed dry particle without
+    /// rebuilding its typed coordinate vector or repeating LUT bracketing.
+    pub fn evaluate_prepared_dry_particle_lut_interpolation_per_m3(
+        &self,
+        interpolation: &PreparedTMatrixLutInterpolation,
+    ) -> Result<AdditiveScattering, EvaluationError> {
+        if interpolation.table_file_sha256 != self.file_sha256 {
+            return Err(EvaluationError::PreparedParticleNodeTableMismatch {
+                expected: self.file_sha256,
+                actual: interpolation.table_file_sha256,
+            });
+        }
         replace_fall_moments(
             self.lut
                 .interpolate_prepared(interpolation.interpolation_plan())?,
@@ -1154,11 +1232,59 @@ impl ResearchTMatrixLut {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn dry_particle_geometry_query(
+        &self,
+        temperature_k: f64,
+        equivolume_diameter_m: f64,
+        bulk_density_kg_m3: f64,
+        minor_to_major_axis_ratio: f64,
+        habit: PsdSpheroidHabit,
+        rime_mass_fraction: Option<f64>,
+        rime_density_kg_m3: Option<f64>,
+        fall_speed: PsdFallSpeedProvenance,
+        orientation: OrientationModel,
+        request: TMatrixEvaluationRequest,
+    ) -> Result<TMatrixParticleNodeQuery, EvaluationError> {
+        let positive_down_fall_speed_m_s = self
+            .dry_particle_geometry_terminal_speed_m_s(equivolume_diameter_m, bulk_density_kg_m3)?;
+        TMatrixParticleNodeQuery::new(
+            temperature_k,
+            equivolume_diameter_m,
+            bulk_density_kg_m3,
+            minor_to_major_axis_ratio,
+            habit,
+            rime_mass_fraction,
+            rime_density_kg_m3,
+            positive_down_fall_speed_m_s,
+            fall_speed,
+            orientation,
+            request,
+        )
+    }
+
     fn prepare_dry_particle_node_query(
         &self,
         query: &TMatrixParticleNodeQuery,
         terminal_speed_validation: ParticleNodeTerminalSpeedValidation,
     ) -> Result<PreparedTMatrixParticleNode, EvaluationError> {
+        let mut coordinates = Vec::with_capacity(self.lut.header().axes().len());
+        self.visit_dry_particle_node_query(query, terminal_speed_validation, |coordinate| {
+            coordinates.push(coordinate);
+        })?;
+        Ok(PreparedTMatrixParticleNode {
+            table_file_sha256: self.file_sha256,
+            coordinates,
+            positive_down_fall_speed_m_s: query.positive_down_fall_speed_m_s,
+        })
+    }
+
+    fn visit_dry_particle_node_query(
+        &self,
+        query: &TMatrixParticleNodeQuery,
+        terminal_speed_validation: ParticleNodeTerminalSpeedValidation,
+        mut visit_coordinate: impl FnMut(AxisCoordinate),
+    ) -> Result<(), EvaluationError> {
         if self.descriptor.category
             != TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle
             || self.descriptor.population_role
@@ -1279,7 +1405,6 @@ impl ResearchTMatrixLut {
             });
         }
 
-        let mut coordinates = Vec::with_capacity(self.lut.header().axes().len());
         for axis in self.lut.header().axes() {
             let value = match axis.kind() {
                 AxisKind::EquivolumeDiameter => query.equivolume_diameter_m,
@@ -1302,13 +1427,9 @@ impl ResearchTMatrixLut {
                     return Err(EvaluationError::UnsupportedAxis(axis.kind()));
                 }
             };
-            coordinates.push(AxisCoordinate::new(axis.kind(), value)?);
+            visit_coordinate(AxisCoordinate::new(axis.kind(), value)?);
         }
-        Ok(PreparedTMatrixParticleNode {
-            table_file_sha256: self.file_sha256,
-            coordinates,
-            positive_down_fall_speed_m_s: query.positive_down_fall_speed_m_s,
-        })
+        Ok(())
     }
 
     /// Add a category contribution without exposing any nonlinear derived
@@ -1775,6 +1896,10 @@ pub enum EvaluationError {
         expected: Sha256Digest,
         actual: Sha256Digest,
     },
+    #[error(
+        "dry particle-node table has {actual} axes; fixed prepared interpolation supports at most {maximum}"
+    )]
+    PreparedParticleNodeAxisCapacity { actual: usize, maximum: usize },
     #[error(
         "PSD particle density {particle_density_kg_m3} kg m^-3 must exceed terminal-policy air density {air_density_kg_m3} kg m^-3"
     )]
@@ -4121,7 +4246,7 @@ mod tests {
                 None,
                 None,
                 speed_provenance,
-                orientation,
+                orientation.clone(),
                 evaluation_request,
             )
             .unwrap();
@@ -4144,6 +4269,21 @@ mod tests {
         let interpolation = table
             .prepare_dry_particle_lut_interpolation(&prepared)
             .unwrap();
+        let direct_interpolation = table
+            .prepare_dry_particle_geometry_lut_interpolation_per_m3(
+                260.0,
+                1.0e-3,
+                400.0,
+                0.8,
+                PsdSpheroidHabit::Oblate,
+                None,
+                None,
+                speed_provenance,
+                orientation,
+                evaluation_request,
+            )
+            .unwrap();
+        assert_eq!(direct_interpolation, interpolation);
         assert_eq!(interpolation.table_file_sha256(), table.file_sha256());
         assert_eq!(interpolation.positive_down_fall_speed_m_s(), exact_speed);
         assert!(!std::mem::needs_drop::<PreparedTMatrixLutInterpolation>());
@@ -4175,7 +4315,11 @@ mod tests {
         let prepared_output = table
             .evaluate_prepared_dry_particle_node_per_m3(&prepared)
             .unwrap();
+        let direct_output = table
+            .evaluate_prepared_dry_particle_lut_interpolation_per_m3(&direct_interpolation)
+            .unwrap();
         assert_eq!(prepared_output.components(), external.components());
+        assert_eq!(direct_output.components(), external.components());
 
         let (other_table, _, _) = fixture();
         assert!(matches!(
@@ -4184,6 +4328,11 @@ mod tests {
         ));
         assert!(matches!(
             other_table.prepare_dry_particle_lut_interpolation(&prepared),
+            Err(EvaluationError::PreparedParticleNodeTableMismatch { .. })
+        ));
+        assert!(matches!(
+            other_table
+                .evaluate_prepared_dry_particle_lut_interpolation_per_m3(&direct_interpolation),
             Err(EvaluationError::PreparedParticleNodeTableMismatch { .. })
         ));
     }
@@ -4228,6 +4377,104 @@ mod tests {
             ),
             Err(EvaluationError::ParticleNodeFallSpeedProvenanceMismatch { .. })
         ));
+    }
+
+    /// Manual bounded hot-path measurement for the native-PSD caller. Run in
+    /// release mode with:
+    /// `cargo test -p radar_scattering prepared_interpolation_hot_path_benchmark --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual bounded performance measurement"]
+    fn prepared_interpolation_hot_path_benchmark() {
+        const NODE_COUNT: usize = 24_000;
+        const ROUNDS: usize = 7;
+
+        let table = dry_property_runtime(SpheroidConvention::OblateMinorVertical);
+        let speed_provenance = table.dry_particle_node_fall_speed_provenance().unwrap();
+        let orientation = gaussian20_odf().orientation_model();
+        let evaluation_request = request(FREQUENCY_HZ, 1.0);
+        let geometry = |index: usize| {
+            let fraction = (index % 1_024) as f64 / 1_023.0;
+            (
+                1.0e-5 + fraction * 9.8e-3,
+                55.0 + fraction * 850.0,
+                0.12 + fraction * 0.86,
+            )
+        };
+
+        let legacy_once = |index: usize| {
+            let (diameter, density, aspect) = geometry(index);
+            let prepared = table
+                .prepare_dry_particle_geometry_per_m3(
+                    260.0,
+                    diameter,
+                    density,
+                    aspect,
+                    PsdSpheroidHabit::Oblate,
+                    None,
+                    None,
+                    speed_provenance,
+                    orientation.clone(),
+                    evaluation_request,
+                )
+                .unwrap();
+            table
+                .prepare_dry_particle_lut_interpolation(&prepared)
+                .unwrap()
+        };
+        let direct_once = |index: usize| {
+            let (diameter, density, aspect) = geometry(index);
+            table
+                .prepare_dry_particle_geometry_lut_interpolation_per_m3(
+                    260.0,
+                    diameter,
+                    density,
+                    aspect,
+                    PsdSpheroidHabit::Oblate,
+                    None,
+                    None,
+                    speed_provenance,
+                    orientation.clone(),
+                    evaluation_request,
+                )
+                .unwrap()
+        };
+
+        for index in [0, 31, 1_023, 9_817] {
+            assert_eq!(direct_once(index), legacy_once(index));
+        }
+        for index in 0..1_024 {
+            std::hint::black_box(legacy_once(index));
+            std::hint::black_box(direct_once(index));
+        }
+
+        let measure = |prepare: &dyn Fn(usize) -> PreparedTMatrixLutInterpolation| {
+            let started = std::time::Instant::now();
+            for index in 0..NODE_COUNT {
+                std::hint::black_box(prepare(index));
+            }
+            started.elapsed()
+        };
+        let mut legacy = Vec::with_capacity(ROUNDS);
+        let mut direct = Vec::with_capacity(ROUNDS);
+        for round in 0..ROUNDS {
+            if round % 2 == 0 {
+                legacy.push(measure(&legacy_once));
+                direct.push(measure(&direct_once));
+            } else {
+                direct.push(measure(&direct_once));
+                legacy.push(measure(&legacy_once));
+            }
+        }
+        legacy.sort_unstable();
+        direct.sort_unstable();
+        let legacy_median = legacy[ROUNDS / 2];
+        let direct_median = direct[ROUNDS / 2];
+        eprintln!(
+            "[prepared-interpolation benchmark] {NODE_COUNT} nodes: legacy median {:.3} ms; direct fixed-size median {:.3} ms; speedup {:.3}x",
+            legacy_median.as_secs_f64() * 1_000.0,
+            direct_median.as_secs_f64() * 1_000.0,
+            legacy_median.as_secs_f64() / direct_median.as_secs_f64(),
+        );
     }
 
     #[test]

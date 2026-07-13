@@ -28,7 +28,7 @@ use radar_scattering::{
     P3TMatrixIntegrationConfig, P3TMatrixIntegrationError, P3TMatrixIntegrationResult,
     P3TMatrixParticleNode, P3TMatrixShapePolicy, P3WrfScheme, ParticleState,
     PolarAccumulatorQuantities, PreparedIshmaelPsdIntegration, PreparedP3TMatrixIntegration,
-    PreparedTMatrixParticleNode, PsdError, PsdFallSpeedProvenance, PsdIntegrationConfig,
+    PreparedTMatrixLutInterpolation, PsdError, PsdFallSpeedProvenance, PsdIntegrationConfig,
     PsdIntegrationError, PsdIntegrationResult, PsdParticleNode, PsdParticleSupport,
     PsdQuadratureLevel, PsdSpheroidHabit, RadarViewApplicability, RadarViewGeometry,
     ResearchTMatrixLut, SCHEME_PSD_REVISION, Sha256Digest, SpheroidConvention,
@@ -2337,7 +2337,7 @@ fn floor_anchored_rayleigh_sphere(
 enum PreparedP3ParticleEvaluation<'table> {
     TMatrixTable {
         table: &'table ResearchTMatrixLut,
-        prepared: PreparedTMatrixParticleNode,
+        prepared: PreparedTMatrixLutInterpolation,
     },
     CpuRayleighBridge {
         table: &'table ResearchTMatrixLut,
@@ -2354,7 +2354,7 @@ impl<'table> PreparedP3ParticleEvaluation<'table> {
     fn evaluate_cpu(&self) -> Result<AdditiveScattering, EvaluationError> {
         match self {
             Self::TMatrixTable { table, prepared } => {
-                table.evaluate_prepared_dry_particle_node_per_m3(prepared)
+                table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(prepared)
             }
             Self::CpuRayleighBridge {
                 table,
@@ -2376,7 +2376,9 @@ impl<'table> PreparedP3ParticleEvaluation<'table> {
         }
     }
 
-    fn table_binding(&self) -> Option<(&'table ResearchTMatrixLut, &PreparedTMatrixParticleNode)> {
+    fn table_binding(
+        &self,
+    ) -> Option<(&'table ResearchTMatrixLut, &PreparedTMatrixLutInterpolation)> {
         match self {
             Self::TMatrixTable { table, prepared } => Some((*table, prepared)),
             Self::CpuRayleighBridge { .. } => None,
@@ -2396,7 +2398,7 @@ fn prepare_p3_particle_node<'table>(
 ) -> Result<PreparedP3ParticleEvaluation<'table>, EvaluationError> {
     match node.scattering_route() {
         P3ParticleScatteringRoute::TMatrixTable => {
-            let prepared = table.prepare_dry_particle_geometry_per_m3(
+            let prepared = table.prepare_dry_particle_geometry_lut_interpolation_per_m3(
                 temperature_k,
                 node.equivolume_diameter_m(),
                 node.bulk_density_kg_m3(),
@@ -2462,7 +2464,7 @@ fn evaluate_p3_rayleigh_bridge_node(
             value: target_diameter,
         });
     }
-    let anchor = table.prepare_dry_particle_geometry_per_m3(
+    let anchor = table.prepare_dry_particle_geometry_lut_interpolation_per_m3(
         temperature_k,
         anchor_diameter,
         target_density,
@@ -2474,7 +2476,7 @@ fn evaluate_p3_rayleigh_bridge_node(
         gaussian20_orientation(),
         request,
     )?;
-    let anchor = table.evaluate_prepared_dry_particle_node_per_m3(&anchor)?;
+    let anchor = table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(&anchor)?;
     let diameter_ratio = target_diameter / anchor_diameter;
     let reference_water_factor_squared = table
         .descriptor()
@@ -2508,19 +2510,24 @@ impl<'table> PreparedP3ParticleIntegration<'table> {
     ) -> impl Iterator<
         Item = (
             usize,
+            usize,
             P3TMatrixParticleNode,
             &'table ResearchTMatrixLut,
-            &PreparedTMatrixParticleNode,
+            &PreparedTMatrixLutInterpolation,
         ),
     > + '_ {
-        self.integration.nodes().zip(&self.evaluations).filter_map(
-            |((node_index, node), (prepared_index, evaluation))| {
-                debug_assert_eq!(node_index, *prepared_index);
-                evaluation
-                    .table_binding()
-                    .map(|(table, prepared)| (node_index, node, table, prepared))
-            },
-        )
+        self.integration
+            .nodes()
+            .zip(&self.evaluations)
+            .enumerate()
+            .filter_map(
+                |(position, ((node_index, node), (prepared_index, evaluation)))| {
+                    debug_assert_eq!(node_index, *prepared_index);
+                    evaluation
+                        .table_binding()
+                        .map(|(table, prepared)| (position, node_index, node, table, prepared))
+                },
+            )
     }
 
     /// Finish through a caller-selected table evaluator while retaining the
@@ -2532,22 +2539,24 @@ impl<'table> PreparedP3ParticleIntegration<'table> {
     where
         F: FnMut(
             usize,
+            usize,
             &P3TMatrixParticleNode,
             &'table ResearchTMatrixLut,
-            &PreparedTMatrixParticleNode,
+            &PreparedTMatrixLutInterpolation,
         ) -> Result<AdditiveScattering, EvaluationError>,
     {
         let mut cursor = 0_usize;
         let result = self.integration.finish(|node_index, node| {
+            let position = cursor;
             let (prepared_index, evaluation) = self
                 .evaluations
-                .get(cursor)
+                .get(position)
                 .expect("prepared P3 workload matches its admitted integration");
             cursor += 1;
             debug_assert_eq!(node_index, *prepared_index);
             match evaluation {
                 PreparedP3ParticleEvaluation::TMatrixTable { table, prepared } => {
-                    evaluate_table(node_index, node, table, prepared)
+                    evaluate_table(position, node_index, node, table, prepared)
                 }
                 PreparedP3ParticleEvaluation::CpuRayleighBridge { .. } => evaluation.evaluate_cpu(),
             }
@@ -2559,8 +2568,8 @@ impl<'table> PreparedP3ParticleIntegration<'table> {
     fn finish_cpu(
         &self,
     ) -> Result<P3TMatrixIntegrationResult, P3TMatrixIntegrationError<EvaluationError>> {
-        self.finish_with_table_evaluator(|_, _, table, prepared| {
-            table.evaluate_prepared_dry_particle_node_per_m3(prepared)
+        self.finish_with_table_evaluator(|_, _, _, table, prepared| {
+            table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(prepared)
         })
     }
 }
@@ -2750,20 +2759,9 @@ fn finish_p3_particle_integration(
     let mut oblate_indices = Vec::new();
     let mut prolate_nodes = Vec::new();
     let mut prolate_indices = Vec::new();
-    for (node_index, node, table, admitted) in prepared.table_nodes() {
+    for (position, node_index, node, _table, admitted) in prepared.table_nodes() {
         check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
-        let interpolation = match table.prepare_dry_particle_lut_interpolation(admitted) {
-            Ok(interpolation) => interpolation,
-            Err(error) => {
-                check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
-                cuda.disable_for_cpu_fallback(
-                    format!("prepare admitted P3 node {node_index} for CUDA: {error}"),
-                    0,
-                );
-                return finish_p3_cpu_cancellable(prepared, cancel);
-            }
-        };
-        let cuda_node = match CudaPreparedTMatrixNode::new(&interpolation, 1.0) {
+        let cuda_node = match CudaPreparedTMatrixNode::new(admitted, 1.0) {
             Ok(cuda_node) => cuda_node,
             Err(error) => {
                 check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
@@ -2776,19 +2774,17 @@ fn finish_p3_particle_integration(
         };
         match node.habit() {
             PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
-                oblate_indices.push(node_index);
+                oblate_indices.push(position);
                 oblate_nodes.push(cuda_node);
             }
             PsdSpheroidHabit::Prolate => {
-                prolate_indices.push(node_index);
+                prolate_indices.push(position);
                 prolate_nodes.push(cuda_node);
             }
         }
     }
 
-    let mut outputs = std::collections::HashMap::with_capacity(
-        oblate_indices.len().saturating_add(prolate_indices.len()),
-    );
+    let mut outputs = vec![None; prepared.evaluations.len()];
     for (role, indices, nodes) in [
         (
             WrfTMatrixCudaTableRole::DryOblate,
@@ -2814,13 +2810,14 @@ fn finish_p3_particle_integration(
         };
         check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         debug_assert_eq!(indices.len(), evaluated.len());
-        outputs.extend(indices.into_iter().zip(evaluated));
+        for (position, output) in indices.into_iter().zip(evaluated) {
+            outputs[position] = Some(output);
+        }
     }
 
     prepared
-        .finish_with_table_evaluator(|node_index, _, _, _| {
-            Ok(*outputs
-                .get(&node_index)
+        .finish_with_table_evaluator(|position, _, _, _, _| {
+            Ok(outputs[position]
                 .expect("CUDA returned one ordered answer for every admitted P3 table node"))
         })
         .map_err(ParticleFinishError::Science)
@@ -2836,7 +2833,7 @@ fn finish_p3_cpu_cancellable(
     let Some(_) = cancel else {
         return prepared.finish_cpu().map_err(ParticleFinishError::Science);
     };
-    let mut outputs = std::collections::HashMap::with_capacity(prepared.evaluations.len());
+    let mut outputs = Vec::with_capacity(prepared.evaluations.len());
     for (node_index, evaluation) in &prepared.evaluations {
         check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         let output = evaluation.evaluate_cpu().map_err(|source| {
@@ -2845,15 +2842,11 @@ fn finish_p3_cpu_cancellable(
                 source,
             })
         })?;
-        outputs.insert(*node_index, output);
+        outputs.push(output);
     }
     check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
     prepared
-        .finish_with_table_evaluator(|node_index, _, _, _| {
-            Ok(*outputs
-                .get(&node_index)
-                .expect("cancellable CPU pass evaluated every admitted P3 node"))
-        })
+        .finish_with_table_evaluator(|position, _, _, _, _| Ok(outputs[position]))
         .map_err(ParticleFinishError::Science)
 }
 
@@ -2995,7 +2988,7 @@ struct PreparedIshmaelParticleEvaluation<'table> {
     node_index: usize,
     role: WrfTMatrixCudaTableRole,
     table: &'table ResearchTMatrixLut,
-    prepared: PreparedTMatrixParticleNode,
+    prepared: PreparedTMatrixLutInterpolation,
 }
 
 struct PreparedIshmaelParticleIntegration<'table> {
@@ -3015,7 +3008,7 @@ impl<'table> PreparedIshmaelParticleIntegration<'table> {
             usize,
             &PsdParticleNode,
             &'table ResearchTMatrixLut,
-            &PreparedTMatrixParticleNode,
+            &PreparedTMatrixLutInterpolation,
         ) -> Result<AdditiveScattering, EvaluationError>,
     {
         let mut cursor = 0_usize;
@@ -3045,7 +3038,7 @@ impl<'table> PreparedIshmaelParticleIntegration<'table> {
 
     fn finish_cpu(&self) -> Result<PsdIntegrationResult, PsdIntegrationError<EvaluationError>> {
         self.finish_with_table_evaluator(|_, _, _, _, table, prepared| {
-            table.evaluate_prepared_dry_particle_node_per_m3(prepared)
+            table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(prepared)
         })
     }
 }
@@ -3081,7 +3074,7 @@ fn prepare_ishmael_particle_integration<'table>(
             ),
         };
         let prepared = table
-            .prepare_dry_particle_geometry_per_m3(
+            .prepare_dry_particle_geometry_lut_interpolation_per_m3(
                 temperature_k,
                 node.equivolume_diameter_m(),
                 node.bulk_density_kg_m3(),
@@ -3128,24 +3121,7 @@ fn finish_ishmael_particle_integration(
     let mut prolate_nodes = Vec::new();
     for (position, evaluation) in prepared.evaluations.iter().enumerate() {
         check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
-        let interpolation = match evaluation
-            .table
-            .prepare_dry_particle_lut_interpolation(&evaluation.prepared)
-        {
-            Ok(interpolation) => interpolation,
-            Err(error) => {
-                check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
-                cuda.disable_for_cpu_fallback(
-                    format!(
-                        "prepare admitted ISHMAEL {:?} node {} for CUDA: {error}",
-                        evaluation.level, evaluation.node_index
-                    ),
-                    0,
-                );
-                return finish_ishmael_cpu_cancellable(prepared, cancel);
-            }
-        };
-        let cuda_node = match CudaPreparedTMatrixNode::new(&interpolation, 1.0) {
+        let cuda_node = match CudaPreparedTMatrixNode::new(&evaluation.prepared, 1.0) {
             Ok(cuda_node) => cuda_node,
             Err(error) => {
                 check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
@@ -3230,7 +3206,7 @@ fn finish_ishmael_cpu_cancellable(
         outputs.push(
             evaluation
                 .table
-                .evaluate_prepared_dry_particle_node_per_m3(&evaluation.prepared)
+                .evaluate_prepared_dry_particle_lut_interpolation_per_m3(&evaluation.prepared)
                 .map_err(|source| {
                     ParticleFinishError::Science(PsdIntegrationError::NodeEvaluation {
                         level: evaluation.level,
@@ -4776,7 +4752,9 @@ mod tests {
                 .map(|evaluation| {
                     evaluation
                         .table
-                        .evaluate_prepared_dry_particle_node_per_m3(&evaluation.prepared)
+                        .evaluate_prepared_dry_particle_lut_interpolation_per_m3(
+                            &evaluation.prepared,
+                        )
                         .unwrap()
                 })
                 .collect::<Vec<_>>();
@@ -4797,11 +4775,7 @@ mod tests {
                     .iter()
                     .map(|&position| {
                         let evaluation = &prepared.evaluations[position];
-                        let interpolation = evaluation
-                            .table
-                            .prepare_dry_particle_lut_interpolation(&evaluation.prepared)
-                            .unwrap();
-                        CudaPreparedTMatrixNode::new(&interpolation, 1.0).unwrap()
+                        CudaPreparedTMatrixNode::new(&evaluation.prepared, 1.0).unwrap()
                     })
                     .collect::<Vec<_>>();
                 if staged.is_empty() {
