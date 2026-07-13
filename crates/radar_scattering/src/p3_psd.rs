@@ -1595,18 +1595,49 @@ mod tests {
     }
 
     #[test]
-    fn piecewise_boundaries_retain_official_one_percent_iteration_tolerance() {
+    fn piecewise_boundaries_match_official_mass_and_area_semantics() {
         let law = P3PiecewiseParticleLaw::reconstruct(0.5, 400.0).unwrap();
-        for threshold in [
-            law.small_sphere_limit_m,
-            law.dense_unrimed_to_graupel_m,
-            law.graupel_to_partially_rimed_m,
+        let boundary = |threshold: f64| {
+            (
+                law.particle(threshold * (1.0 - 1.0e-9)).unwrap(),
+                law.particle(threshold * (1.0 + 1.0e-9)).unwrap(),
+            )
+        };
+        let (small_sphere, dense_unrimed) = boundary(law.small_sphere_limit_m);
+        let (dense_unrimed_large, fully_rimed) = boundary(law.dense_unrimed_to_graupel_m);
+        let (fully_rimed_large, partially_rimed) = boundary(law.graupel_to_partially_rimed_m);
+
+        for (below, above) in [
+            (small_sphere, dense_unrimed),
+            (dense_unrimed_large, fully_rimed),
+            (fully_rimed_large, partially_rimed),
         ] {
-            let below = law.particle(threshold * (1.0 - 1.0e-9)).unwrap();
-            let above = law.particle(threshold * (1.0 + 1.0e-9)).unwrap();
             assert!(relative_error(below.mass_kg, above.mass_kg) < 0.011);
-            assert!(relative_error(below.projected_area_m2, above.projected_area_m2) < 0.03);
         }
+
+        assert_eq!(small_sphere.region, P3ParticleRegion::SmallDenseSphere);
+        assert_eq!(dense_unrimed.region, P3ParticleRegion::DenseUnrimed);
+        assert_eq!(dense_unrimed_large.region, P3ParticleRegion::DenseUnrimed);
+        assert_eq!(fully_rimed.region, P3ParticleRegion::FullyRimedSphere);
+        assert_eq!(fully_rimed_large.region, P3ParticleRegion::FullyRimedSphere);
+        assert_eq!(partially_rimed.region, P3ParticleRegion::PartiallyRimed);
+
+        // The pinned WRF generator defines the first two breakpoints by mass.
+        // It deliberately switches area laws without matching their
+        // coefficients: solid sphere -> empirical unrimed area is a downward
+        // jump, and empirical unrimed -> fully rimed sphere is an upward jump.
+        assert!(small_sphere.projected_area_m2 > dense_unrimed.projected_area_m2);
+        assert!(dense_unrimed_large.projected_area_m2 < fully_rimed.projected_area_m2);
+
+        // The partially-rimed area is instead mass-interpolated from the
+        // unrimed and graupel laws. Its boundary mismatch is therefore bounded
+        // by the source's one-percent graupel-density fixed-point tolerance.
+        assert!(
+            relative_error(
+                fully_rimed_large.projected_area_m2,
+                partially_rimed.projected_area_m2,
+            ) < 0.011
+        );
     }
 
     #[test]

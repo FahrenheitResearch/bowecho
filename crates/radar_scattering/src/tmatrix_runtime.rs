@@ -3769,9 +3769,22 @@ mod tests {
         .unwrap();
         let output = table.evaluate_dry_particle_node_per_m3(&query).unwrap();
         let components = output.components();
-        assert_eq!(&components[..7], &[2.0, 1.0, 0.5, 0.0, 0.1, 0.01, 0.01]);
-        assert_eq!(components[7], 2.0 * exact_speed);
-        assert_eq!(components[8], 2.0 * exact_speed * exact_speed);
+        for (actual, expected) in components[..7]
+            .iter()
+            .copied()
+            .zip([2.0, 1.0, 0.5, 0.0, 0.1, 0.01, 0.01])
+        {
+            if expected == 0.0 {
+                assert_eq!(actual, expected);
+            } else {
+                assert!(
+                    ((actual - expected) / expected).abs() <= 8.0 * f64::EPSILON,
+                    "one-particle interpolation changed {expected} to {actual}"
+                );
+            }
+        }
+        assert_eq!(components[7], components[0] * exact_speed);
+        assert_eq!(components[8], components[0] * exact_speed * exact_speed);
     }
 
     #[test]

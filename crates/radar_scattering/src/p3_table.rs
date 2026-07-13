@@ -1193,19 +1193,22 @@ mod tests {
 
     #[test]
     fn compute_mu_piecewise_vectors_match_pinned_fortran_real_semantics() {
-        for (g, expected) in [
-            (20.0, 0.0),
-            (15.0, 0.269_755_13),
-            (10.0, 0.780_600_1),
-            (5.0, 2.366_599_3),
-            (3.5, 3.883_775_2),
-            (2.0, 9.745_399),
-            (1.6, 15.665_112),
-            (1.3, 30.872_152),
-            (1.2, 20.0),
+        // WRF declares G, g2, mu, and the moment arguments as default REAL.
+        // Pin the IEEE-754 binary32 results of the same statement sequence;
+        // decimal tolerances would hide accidental wider-intermediate math.
+        for (g, expected_bits) in [
+            (20.0, 0x0000_0000),
+            (15.0, 0x3e8a_1d58),
+            (10.0, 0x3f47_d568),
+            (5.0, 0x4017_765c),
+            (3.5, 0x4078_8fc8),
+            (2.0, 0x411b_ed28),
+            (1.6, 0x417a_a450),
+            (1.3, 0x41f6_fa20),
+            (1.2, 0x41a0_0000),
         ] {
             let actual = compute_mu_3moment(g, 1.0, 1.0).unwrap();
-            assert!((actual - expected).abs() <= 2.0e-5, "G={g}");
+            assert_eq!(actual.to_bits(), expected_bits, "G={g}, actual={actual}");
         }
     }
 }
