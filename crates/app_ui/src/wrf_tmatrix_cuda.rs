@@ -1569,4 +1569,195 @@ mod tests {
             NODE_COUNT as f64 / burst_elapsed.as_secs_f64(),
         );
     }
+
+    /// Representative RawStateLinear launch-shape referee for the cut-wide
+    /// pipeline. The legacy leg deliberately blocks after every category-sized
+    /// request, matching v0.33.2's gate/category call boundary. The pipeline
+    /// leg publishes the same descriptors in stable order to two table-role
+    /// sweeps and scatters their answers back to the original work positions.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "manual cut-wide CUDA pipeline benchmark; requires a supported NVIDIA GPU"]
+    fn manual_cut_pipeline_launch_shape_and_parity() {
+        const GATES: usize = 1_024;
+        const POPULATIONS_PER_GATE: usize = 3;
+        const NODES_PER_POPULATION: usize = 32;
+        const POPULATIONS: usize = GATES * POPULATIONS_PER_GATE;
+        const NODE_COUNT: usize = POPULATIONS * NODES_PER_POPULATION;
+
+        let availability = probe_cuda_cached();
+        let Some(device) = availability.preferred_device() else {
+            eprintln!("skipping cut-wide CUDA pipeline benchmark: {availability:?}");
+            return;
+        };
+        let service = WrfTMatrixCudaBatchService::open_with_config(
+            device.ordinal,
+            WrfTMatrixCudaBatchConfig::default(),
+        )
+        .unwrap();
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .unwrap();
+        let tables = owner.borrowed_bundle();
+        let orientation = OrientationModel::GaussianCanting {
+            mean_deg: 0.0,
+            standard_deviation_deg: 20.0,
+            quadrature_points: 50,
+        };
+        let prepare = |role| {
+            let (table, convention, habit) = match role {
+                WrfTMatrixCudaTableRole::DryOblate => (
+                    tables.dry_oblate,
+                    SpheroidConvention::OblateMinorVertical,
+                    PsdSpheroidHabit::Oblate,
+                ),
+                WrfTMatrixCudaTableRole::DryProlate => (
+                    tables.dry_prolate,
+                    SpheroidConvention::ProlateMajorVertical,
+                    PsdSpheroidHabit::Prolate,
+                ),
+            };
+            let request = TMatrixEvaluationRequest::new(
+                S_BAND_RESEARCH_FREQUENCY_HZ,
+                convention,
+                RadarViewGeometry::horizontal(),
+            )
+            .unwrap();
+            let prepared = table
+                .prepare_dry_particle_geometry_per_m3(
+                    260.0,
+                    1.0e-3,
+                    400.0,
+                    0.8,
+                    habit,
+                    None,
+                    None,
+                    table.dry_particle_node_fall_speed_provenance().unwrap(),
+                    orientation,
+                    request,
+                )
+                .unwrap();
+            let interpolation = table
+                .prepare_dry_particle_lut_interpolation(&prepared)
+                .unwrap();
+            let cuda = CudaPreparedTMatrixNode::new(&interpolation, 1.0).unwrap();
+            let cpu = table
+                .evaluate_prepared_dry_particle_node_per_m3(&prepared)
+                .unwrap();
+            (cuda, cpu)
+        };
+        let (oblate_node, oblate_cpu) = prepare(WrfTMatrixCudaTableRole::DryOblate);
+        let (prolate_node, prolate_cpu) = prepare(WrfTMatrixCudaTableRole::DryProlate);
+
+        let role_for_population = |population: usize| {
+            if population % 3 == 1 {
+                WrfTMatrixCudaTableRole::DryProlate
+            } else {
+                WrfTMatrixCudaTableRole::DryOblate
+            }
+        };
+        let node_for_role = |role| match role {
+            WrfTMatrixCudaTableRole::DryOblate => oblate_node,
+            WrfTMatrixCudaTableRole::DryProlate => prolate_node,
+        };
+
+        let legacy_before = service.report();
+        let legacy_started = std::time::Instant::now();
+        let mut legacy = Vec::with_capacity(NODE_COUNT);
+        for population in 0..POPULATIONS {
+            let role = role_for_population(population);
+            legacy.extend(
+                service
+                    .evaluate_particles(role, vec![node_for_role(role); NODES_PER_POPULATION])
+                    .unwrap(),
+            );
+        }
+        let legacy_elapsed = legacy_started.elapsed();
+        let legacy_after = service.report();
+
+        let mut oblate_positions = Vec::with_capacity(NODE_COUNT * 2 / 3);
+        let mut oblate_nodes = Vec::with_capacity(NODE_COUNT * 2 / 3);
+        let mut prolate_positions = Vec::with_capacity(NODE_COUNT / 3);
+        let mut prolate_nodes = Vec::with_capacity(NODE_COUNT / 3);
+        for population in 0..POPULATIONS {
+            let role = role_for_population(population);
+            for within_population in 0..NODES_PER_POPULATION {
+                let position = population * NODES_PER_POPULATION + within_population;
+                match role {
+                    WrfTMatrixCudaTableRole::DryOblate => {
+                        oblate_positions.push(position);
+                        oblate_nodes.push(oblate_node);
+                    }
+                    WrfTMatrixCudaTableRole::DryProlate => {
+                        prolate_positions.push(position);
+                        prolate_nodes.push(prolate_node);
+                    }
+                }
+            }
+        }
+
+        let pipeline_before = service.report();
+        let pipeline_started = std::time::Instant::now();
+        let oblate = service
+            .evaluate_particles(WrfTMatrixCudaTableRole::DryOblate, oblate_nodes)
+            .unwrap();
+        let prolate = service
+            .evaluate_particles(WrfTMatrixCudaTableRole::DryProlate, prolate_nodes)
+            .unwrap();
+        let mut pipeline = vec![None; NODE_COUNT];
+        for (position, output) in oblate_positions.into_iter().zip(oblate) {
+            pipeline[position] = Some(output);
+        }
+        for (position, output) in prolate_positions.into_iter().zip(prolate) {
+            pipeline[position] = Some(output);
+        }
+        let pipeline_elapsed = pipeline_started.elapsed();
+        let pipeline_after = service.report();
+
+        assert_eq!(legacy.len(), NODE_COUNT);
+        for (position, (legacy_output, pipeline_output)) in legacy.iter().zip(&pipeline).enumerate()
+        {
+            let population = position / NODES_PER_POPULATION;
+            let cpu = match role_for_population(population) {
+                WrfTMatrixCudaTableRole::DryOblate => oblate_cpu,
+                WrfTMatrixCudaTableRole::DryProlate => prolate_cpu,
+            };
+            let pipeline_output = pipeline_output
+                .as_ref()
+                .expect("each role sweep returned every staged descriptor");
+            assert_eq!(
+                pipeline_output.components().map(f64::to_bits),
+                legacy_output.components().map(f64::to_bits),
+                "pipeline changed particle bits at ordered position {position}"
+            );
+            assert_eq!(
+                pipeline_output.components().map(f64::to_bits),
+                cpu.components().map(f64::to_bits),
+                "CUDA changed scalar-oracle bits at ordered position {position}"
+            );
+        }
+
+        let legacy_requests = legacy_after.requests_submitted - legacy_before.requests_submitted;
+        let legacy_batches = legacy_after.batches_completed - legacy_before.batches_completed;
+        let pipeline_requests =
+            pipeline_after.requests_submitted - pipeline_before.requests_submitted;
+        let pipeline_batches = pipeline_after.batches_completed - pipeline_before.batches_completed;
+        assert_eq!(legacy_requests, POPULATIONS as u64);
+        assert_eq!(pipeline_requests, 2);
+        assert_eq!(
+            pipeline_after.nodes_completed - pipeline_before.nodes_completed,
+            NODE_COUNT as u64
+        );
+        assert_eq!(pipeline_after.fallback_reason, None);
+        eprintln!(
+            "cut-wide CUDA pipeline ({}; artifact={}): {GATES} gates, {POPULATIONS} populations, {NODE_COUNT} nodes; legacy {legacy_requests} requests/{legacy_batches} batches/{:.6}s; role sweeps {pipeline_requests} requests/{pipeline_batches} batches/{:.6}s; speedup {:.3}x; exact_bits=true",
+            pipeline_after.device.name,
+            pipeline_after.device.kernel_artifact,
+            legacy_elapsed.as_secs_f64(),
+            pipeline_elapsed.as_secs_f64(),
+            legacy_elapsed.as_secs_f64() / pipeline_elapsed.as_secs_f64(),
+        );
+    }
 }
