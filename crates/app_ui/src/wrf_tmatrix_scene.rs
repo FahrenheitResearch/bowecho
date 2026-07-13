@@ -3766,6 +3766,7 @@ pub enum WrfTMatrixSceneQueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrf_property_reader::read_wrf_property_scene;
     use crate::wrf_scene_inventory::WrfSourceIdentity;
 
     fn additive(values: [f64; 9]) -> AdditiveScattering {
@@ -4229,5 +4230,134 @@ mod tests {
         assert_eq!(components, vec![3.0, 4.0, 5.0, 6.0]);
         assert_eq!(counts.source_cells, 2);
         assert_eq!(counts.dry_frozen_populations, 3);
+    }
+
+    #[test]
+    fn real_p3_fixture_reconstructs_reader_normalized_property_cells() {
+        let (Some(wrf_path), Some(table_path)) = (
+            std::env::var_os("BOWECHO_WRF_PROPERTY_FIXTURE"),
+            std::env::var_os("BOWECHO_P3_TABLE_FIXTURE"),
+        ) else {
+            return;
+        };
+
+        let file = wrf_core::WrfFile::open(&wrf_path).expect("open BOWECHO_WRF_PROPERTY_FIXTURE");
+        assert_eq!(
+            file.global_attr_i32("MP_PHYSICS")
+                .expect("fixture has MP_PHYSICS"),
+            50,
+            "this regression fixture must use two-moment P3 mp_physics=50"
+        );
+
+        let qsmall = f64::from(radar_scattering::P3_WRF_QSMALL_KGKG);
+        let bsmall = f64::from(1.0e-15_f32);
+        let qice = file.read_var("QICE", 0).expect("read fixture QICE");
+        let qnice = file.read_var("QNICE", 0).expect("read fixture QNICE");
+        let negative_number_index = qice
+            .iter()
+            .zip(&qnice)
+            .position(|(&mass, &number)| mass >= qsmall && number <= 0.0)
+            .expect("fixture has active P3 ice with nonpositive QNICE");
+        drop(qnice);
+
+        let qir = file.read_var("QIR", 0).expect("read fixture QIR");
+        let qib = file.read_var("QIB", 0).expect("read fixture QIB");
+        let small_volume_index = qice
+            .iter()
+            .zip(&qir)
+            .zip(&qib)
+            .position(|((&mass, &rime_mass), &rime_volume)| {
+                mass >= qsmall && rime_mass >= qsmall && rime_volume < bsmall
+            })
+            .expect("fixture has active P3 rime below the BIRIM activity floor");
+        let low_density_index = qice
+            .iter()
+            .zip(&qir)
+            .zip(&qib)
+            .position(|((&mass, &rime_mass), &rime_volume)| {
+                mass >= qsmall && rime_volume >= bsmall && rime_mass / rime_volume < 50.0
+            })
+            .expect("fixture has active P3 rime below the density floor");
+        let high_density_index = qice
+            .iter()
+            .zip(&qir)
+            .zip(&qib)
+            .position(|((&mass, &rime_mass), &rime_volume)| {
+                mass >= qsmall && rime_volume >= bsmall && rime_mass / rime_volume > 900.0
+            })
+            .expect("fixture has active P3 rime above the density ceiling");
+
+        const NEGATIVE_QICE_INDEX: usize = 6_480_117;
+        assert!(
+            qice[NEGATIVE_QICE_INDEX] < 0.0 && qice[NEGATIVE_QICE_INDEX] >= -qsmall,
+            "fixture no longer contains the original QICE residue"
+        );
+        drop((qice, qir, qib));
+        file.clear_cache();
+
+        let scene = read_wrf_property_scene(
+            &file,
+            WrfSourceIdentity("fixture:p3-production-seam".to_owned()),
+            0,
+        )
+        .expect("read normalized P3 property scene");
+        let table = P3OfficialTableV54::load_path(P3OfficialTableKind::TwoMoment, table_path)
+            .expect("load BOWECHO_P3_TABLE_FIXTURE");
+
+        let inactive = scene
+            .raw_cell(NEGATIVE_QICE_INDEX)
+            .expect("read original negative-QICE cell");
+        assert!(
+            inactive
+                .categories()
+                .iter()
+                .all(|category| category.mixing_ratio_kgkg() == 0.0),
+            "negative QICE residue must be inactive"
+        );
+
+        let reconstruct = |cell_index: usize| {
+            let raw = scene.raw_cell(cell_index).expect("read selected P3 cell");
+            let value = raw
+                .categories()
+                .iter()
+                .find_map(|category| match category {
+                    RawPropertyCategory::P3(value) if value.qice_kgkg > 0.0 => Some(value),
+                    _ => None,
+                })
+                .expect("selected source cell retains active P3 ice");
+            let input = p3_psd_input(
+                P3WrfScheme::Mp50OneIceFixedCloudNumber,
+                value,
+                raw.dry_air_density_kg_m3(),
+            )
+            .expect("mp50 maps to a two-moment P3 input");
+            let psd = P3Psd::reconstruct(input, &table, P3ReconstructionConfig::default())
+                .expect("production P3 input reconstructs");
+            (input, psd)
+        };
+
+        let (negative_number, negative_number_psd) = reconstruct(negative_number_index);
+        assert!(negative_number.total_number_per_kg <= 0.0);
+        assert!(
+            negative_number_psd
+                .number_limiter_audit()
+                .repaired_total_number_per_kg
+                > 0.0
+        );
+
+        let (small_volume, _) = reconstruct(small_volume_index);
+        assert_eq!(small_volume.rime_mass_kgkg, 0.0);
+        assert_eq!(small_volume.rime_volume_m3_per_kg, 0.0);
+
+        let (low_density, _) = reconstruct(low_density_index);
+        assert!(
+            (low_density.rime_mass_kgkg / low_density.rime_volume_m3_per_kg - 50.0).abs() < 1.0e-3
+        );
+
+        let (high_density, _) = reconstruct(high_density_index);
+        assert!(
+            (high_density.rime_mass_kgkg / high_density.rime_volume_m3_per_kg - 900.0).abs()
+                < 1.0e-3
+        );
     }
 }

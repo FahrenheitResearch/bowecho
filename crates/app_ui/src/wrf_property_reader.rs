@@ -43,6 +43,16 @@ const WRF_KAPPA: f64 = 0.285_714_285_7;
 const DRY_AIR_GAS_CONSTANT_J_KG_K: f64 = 287.05;
 const WATER_VAPOR_GAS_CONSTANT_J_KG_K: f64 = 461.5;
 const WRF_FILL_MAGNITUDE: f64 = 1.0e30;
+// WRF P3's source-level hydrometeor activity threshold (`qsmall`). Keep this
+// distinct from ISHMAEL, whose source code does not establish the same floor.
+const WRF_P3_QSMALL_KGKG: f64 = 1.0e-14_f32 as f64;
+const WRF_P3_NSMALL_PER_KG: f64 = 1.0e-16;
+const WRF_P3_RIME_VOLUME_MIN_M3_PER_KG: f32 = 1.0e-15_f32;
+const WRF_P3_RIME_DENSITY_MIN_KG_M3: f32 = 50.0;
+const WRF_P3_RIME_DENSITY_MAX_KG_M3: f32 = 900.0;
+const WRF_P3_RAIN_LAMBDA_MIN_M_INV: f64 = 500.0;
+const WRF_P3_RAIN_LAMBDA_MAX_M_INV: f64 = 100_000.0;
+const WRF_P3_RAIN_WATER_DENSITY_KG_M3: f64 = 1_000.0;
 
 /// One raw field returned by a [`PropertyFieldProvider`].
 #[derive(Clone, Debug, PartialEq)]
@@ -2020,7 +2030,7 @@ pub fn read_property_scene<P: PropertyFieldProvider + ?Sized>(
                 category,
                 &active_cell_indices,
             )?;
-            let (qir_kgkg, qir_provenance) = read_required_category_field(
+            let (mut qir_kgkg, qir_provenance) = read_p3_rime_mass_field(
                 provider,
                 time_index,
                 cell_count,
@@ -2028,7 +2038,7 @@ pub fn read_property_scene<P: PropertyFieldProvider + ?Sized>(
                 category,
                 &active_cell_indices,
             )?;
-            let (qib_m3_per_kg, qib_provenance) = read_required_category_field(
+            let (mut qib_m3_per_kg, qib_provenance) = read_required_category_field(
                 provider,
                 time_index,
                 cell_count,
@@ -2036,6 +2046,7 @@ pub fn read_property_scene<P: PropertyFieldProvider + ?Sized>(
                 category,
                 &active_cell_indices,
             )?;
+            normalize_p3_rime_tuples(&qice_kgkg, &mut qir_kgkg, &mut qib_m3_per_kg);
             source_fields.extend([qnice_provenance, qir_provenance, qib_provenance]);
             let (qzi, qzi_name) = if let Some(qzi_spec) = spec.qzi {
                 let (values, provenance) = read_required_category_field(
@@ -2170,7 +2181,7 @@ pub fn read_property_scene<P: PropertyFieldProvider + ?Sized>(
     }
 
     let active_cell_indices = union_active_cells(&categories);
-    let (rain, rain_provenance) = read_rain(provider, time_index, cell_count);
+    let (rain, rain_provenance) = read_rain(provider, time_index, cell_count, scheme_id);
     source_fields.extend(rain_provenance);
     let (environment, environment_provenance) = read_environment(provider, time_index, cell_count)?;
     source_fields.extend(environment_provenance);
@@ -2279,6 +2290,8 @@ fn read_mass_field<P: PropertyFieldProvider + ?Sized>(
     let normalized = read_normalized_field(provider, time_index, cell_count, spec)?;
     let mut indices = Vec::new();
     let mut values = Vec::new();
+    let p3_qsmall = matches!(category, WrfPropertyCategory::P3(_));
+    let negative_limit = if p3_qsmall { -WRF_P3_QSMALL_KGKG } else { 0.0 };
     for (cell_index, value) in normalized.values.iter().copied().enumerate() {
         if is_missing(value) {
             return Err(WrfPropertyReadError::MissingMassValue {
@@ -2286,14 +2299,19 @@ fn read_mass_field<P: PropertyFieldProvider + ?Sized>(
                 cell_index,
             });
         }
-        if value < 0.0 {
+        if value < negative_limit {
             return Err(WrfPropertyReadError::NegativeMassValue {
                 field: spec.name,
                 cell_index,
                 value,
             });
         }
-        if value == 0.0 {
+        let inactive = if p3_qsmall {
+            value < WRF_P3_QSMALL_KGKG
+        } else {
+            value == 0.0
+        };
+        if inactive {
             continue;
         }
         indices.push(u32::try_from(cell_index).expect("grid size checked before reads"));
@@ -2328,6 +2346,88 @@ fn read_required_category_field<P: PropertyFieldProvider + ?Sized>(
         },
     )?;
     Ok((values, normalized.provenance))
+}
+
+fn read_p3_rime_mass_field<P: PropertyFieldProvider + ?Sized>(
+    provider: &P,
+    time_index: usize,
+    cell_count: usize,
+    spec: FieldSpec,
+    category: WrfPropertyCategory,
+    active_cell_indices: &[u32],
+) -> Result<(Vec<f32>, SourceFieldProvenance), WrfPropertyReadError> {
+    if !provider.has_field(spec.name) {
+        return Err(WrfPropertyReadError::MissingRequiredField {
+            category,
+            field: spec.name,
+        });
+    }
+    let normalized = read_normalized_field(provider, time_index, cell_count, spec)?;
+    let mut values = Vec::with_capacity(active_cell_indices.len());
+    for &cell_index in active_cell_indices {
+        let position = cell_index as usize;
+        let source_value = normalized.values[position];
+        if is_missing(source_value) {
+            return Err(WrfPropertyReadError::MissingRequiredValue {
+                category,
+                field: spec.name,
+                cell_index: position,
+            });
+        }
+        if source_value < -WRF_P3_QSMALL_KGKG {
+            return Err(WrfPropertyReadError::NegativeMassValue {
+                field: spec.name,
+                cell_index: position,
+                value: source_value,
+            });
+        }
+        // P3's rime-consistency path clears qirim below qsmall. Preserve the
+        // reader's fail-closed policy outside the source-level residue band.
+        let value = if source_value < WRF_P3_QSMALL_KGKG {
+            0.0
+        } else {
+            source_value
+        };
+        values.push(narrow_f32(spec.name, position, value)?);
+    }
+    Ok((values, normalized.provenance))
+}
+
+fn normalize_p3_rime_tuples(qice_kgkg: &[f32], qir_kgkg: &mut [f32], qib_m3_per_kg: &mut [f32]) {
+    debug_assert_eq!(qice_kgkg.len(), qir_kgkg.len());
+    debug_assert_eq!(qice_kgkg.len(), qib_m3_per_kg.len());
+    for ((&qice, qir), qib) in qice_kgkg
+        .iter()
+        .zip(qir_kgkg.iter_mut())
+        .zip(qib_m3_per_kg.iter_mut())
+    {
+        // Preserve WRF default-REAL ordering from calc_bulkRhoRime.
+        let rime_density = if *qib >= WRF_P3_RIME_VOLUME_MIN_M3_PER_KG {
+            let density = *qir / *qib;
+            if density < WRF_P3_RIME_DENSITY_MIN_KG_M3 {
+                *qib = *qir / WRF_P3_RIME_DENSITY_MIN_KG_M3;
+                WRF_P3_RIME_DENSITY_MIN_KG_M3
+            } else if density > WRF_P3_RIME_DENSITY_MAX_KG_M3 {
+                *qib = *qir / WRF_P3_RIME_DENSITY_MAX_KG_M3;
+                WRF_P3_RIME_DENSITY_MAX_KG_M3
+            } else {
+                density
+            }
+        } else {
+            *qir = 0.0;
+            *qib = 0.0;
+            0.0
+        };
+
+        if *qir > qice && rime_density > 0.0 {
+            *qir = qice;
+            *qib = *qir / rime_density;
+        }
+        if *qir < WRF_P3_QSMALL_KGKG as f32 {
+            *qir = 0.0;
+            *qib = 0.0;
+        }
+    }
 }
 
 struct OptionalDiagnosticRead {
@@ -2373,6 +2473,7 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
     provider: &P,
     time_index: usize,
     cell_count: usize,
+    scheme_id: i32,
 ) -> (SparseRainStorage, Vec<SourceFieldProvenance>) {
     if !provider.has_field(QRAIN_FIELD.name) {
         return (
@@ -2397,8 +2498,11 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
     let mut provenance = vec![mass.provenance];
     let mut active_cell_indices = Vec::new();
     let mut qrain_kgkg = Vec::new();
+    let mut qrain_normalization_kgkg = Vec::new();
+    let p3_rain = matches!(scheme_id, 50..=53);
+    let negative_limit = if p3_rain { -WRF_P3_QSMALL_KGKG } else { 0.0 };
     for (cell_index, value) in mass.values.into_iter().enumerate() {
-        if is_missing(value) || value < 0.0 {
+        if is_missing(value) || value < negative_limit {
             return (
                 SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
                     field: QRAIN_FIELD.name,
@@ -2406,6 +2510,11 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
                 }),
                 provenance,
             );
+        }
+        // P3's `get_rain_dsd2` clears the complete rain tuple below qsmall.
+        // ISHMAEL retains the reader's independent exact-zero behavior.
+        if p3_rain && value < WRF_P3_QSMALL_KGKG {
+            continue;
         }
         if value > 0.0 {
             let compact = match narrow_f32(QRAIN_FIELD.name, cell_index, value) {
@@ -2423,6 +2532,7 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
             active_cell_indices
                 .push(u32::try_from(cell_index).expect("grid size checked before rain read"));
             qrain_kgkg.push(compact);
+            qrain_normalization_kgkg.push(value);
         }
     }
     if !provider.has_field(QNRAIN_FIELD.name) {
@@ -2447,18 +2557,23 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
     };
     provenance.push(number.provenance);
     let mut qnrain_per_kg = Vec::with_capacity(active_cell_indices.len());
-    for &cell_index in &active_cell_indices {
+    for (rain_position, &cell_index) in active_cell_indices.iter().enumerate() {
         let position = cell_index as usize;
-        let value = number.values[position];
-        if is_missing(value) || value <= 0.0 {
+        let source_value = number.values[position];
+        if is_missing(source_value) || !p3_rain && source_value <= 0.0 {
             return (
                 SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
                     field: QNRAIN_FIELD.name,
-                    message: format!("invalid number {value} at rainy cell {position}"),
+                    message: format!("invalid number {source_value} at rainy cell {position}"),
                 }),
                 provenance,
             );
         }
+        let value = if p3_rain {
+            normalize_p3_rain_number(qrain_normalization_kgkg[rain_position], source_value)
+        } else {
+            source_value
+        };
         match narrow_f32(QNRAIN_FIELD.name, position, value) {
             Ok(value) => qnrain_per_kg.push(value),
             Err(error) => {
@@ -2480,6 +2595,20 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
         },
         provenance,
     )
+}
+
+fn normalize_p3_rain_number(qrain_kgkg: f64, qnrain_per_kg: f64) -> f64 {
+    let number = qnrain_per_kg.max(WRF_P3_NSMALL_PER_KG);
+    // P3 get_rain_dsd2 uses mu=0 for iSPF=1.
+    let lambda =
+        (std::f64::consts::PI * WRF_P3_RAIN_WATER_DENSITY_KG_M3 * number / qrain_kgkg).cbrt();
+    let bounded_lambda = lambda.clamp(WRF_P3_RAIN_LAMBDA_MIN_M_INV, WRF_P3_RAIN_LAMBDA_MAX_M_INV);
+    if bounded_lambda == lambda {
+        number
+    } else {
+        bounded_lambda.powi(3) * qrain_kgkg
+            / (std::f64::consts::PI * WRF_P3_RAIN_WATER_DENSITY_KG_M3)
+    }
 }
 
 fn read_environment<P: PropertyFieldProvider + ?Sized>(
@@ -3272,6 +3401,269 @@ mod tests {
     }
 
     #[test]
+    fn p3_qsmall_deactivates_qice_and_qice2_before_tuple_reads() {
+        let qsmall_f32 = WRF_P3_QSMALL_KGKG as f32;
+        let below_qsmall = f64::from(f32::from_bits(qsmall_f32.to_bits() - 1));
+        let provider = TinyProvider::new(52, 4)
+            .field(
+                "QICE",
+                vec![
+                    -WRF_P3_QSMALL_KGKG,
+                    -0.5 * WRF_P3_QSMALL_KGKG,
+                    0.0,
+                    below_qsmall,
+                ],
+                "kg kg-1",
+            )
+            .field(
+                "QICE2",
+                vec![
+                    below_qsmall,
+                    0.0,
+                    -0.5 * WRF_P3_QSMALL_KGKG,
+                    -WRF_P3_QSMALL_KGKG,
+                ],
+                "kg kg-1",
+            )
+            .environment(270.0);
+
+        let scene = read_property_scene(&provider, 0).unwrap();
+        assert!(scene.categories().is_empty());
+        assert_eq!(
+            scene.skipped_zero_mass_categories(),
+            &[
+                WrfPropertyCategory::P3(P3Category::Category1),
+                WrfPropertyCategory::P3(P3Category::Category2),
+            ]
+        );
+        assert!(
+            provider.reads.borrow().iter().all(|field| !matches!(
+                *field,
+                "QNICE" | "QIR" | "QIB" | "QNICE2" | "QIR2" | "QIB2"
+            ))
+        );
+    }
+
+    #[test]
+    fn p3_qsmall_boundary_is_active_and_larger_negative_mass_is_typed() {
+        let exact = TinyProvider::new(50, 1)
+            .field("QICE", vec![WRF_P3_QSMALL_KGKG], "kg kg-1")
+            .environment(270.0);
+        assert_eq!(
+            read_property_scene(&exact, 0).unwrap_err(),
+            WrfPropertyReadError::MissingRequiredField {
+                category: WrfPropertyCategory::P3(P3Category::Category1),
+                field: "QNICE",
+            }
+        );
+
+        for (provider, field, category) in [
+            (
+                TinyProvider::new(50, 1).field("QICE", vec![-1.01 * WRF_P3_QSMALL_KGKG], "kg kg-1"),
+                "QICE",
+                WrfPropertyCategory::P3(P3Category::Category1),
+            ),
+            (
+                TinyProvider::new(52, 1)
+                    .field("QICE", vec![0.0], "kg kg-1")
+                    .field("QICE2", vec![-1.01 * WRF_P3_QSMALL_KGKG], "kg kg-1"),
+                "QICE2",
+                WrfPropertyCategory::P3(P3Category::Category2),
+            ),
+        ] {
+            assert_eq!(
+                read_property_scene(&provider, 0).unwrap_err(),
+                WrfPropertyReadError::NegativeMassValue {
+                    field,
+                    cell_index: 0,
+                    value: -1.01 * WRF_P3_QSMALL_KGKG,
+                },
+                "{category} must retain typed gross-negative mass"
+            );
+        }
+    }
+
+    #[test]
+    fn p3_qir_qsmall_normalizes_both_categories_and_rejects_material_negative() {
+        let qsmall_f32 = WRF_P3_QSMALL_KGKG as f32;
+        let below_qsmall = f64::from(f32::from_bits(qsmall_f32.to_bits() - 1));
+        let provider = p3_52_provider(271.65)
+            .field(
+                "QIR",
+                vec![f64::NAN, -WRF_P3_QSMALL_KGKG, f64::NAN, WRF_P3_QSMALL_KGKG],
+                "kg kg-1",
+            )
+            .field(
+                "QIR2",
+                vec![f64::NAN, f64::NAN, below_qsmall, -0.5 * WRF_P3_QSMALL_KGKG],
+                "kg kg-1",
+            );
+        let scene = read_property_scene(&provider, 0).unwrap();
+        let cell_one = scene.raw_cell(1).unwrap();
+        let RawPropertyCategory::P3(first_zero) = &cell_one.categories()[0] else {
+            panic!("expected first P3 category")
+        };
+        assert_eq!(first_zero.qir_kgkg, 0.0);
+        let cell_three = scene.raw_cell(3).unwrap();
+        let RawPropertyCategory::P3(first_boundary) = &cell_three.categories()[0] else {
+            panic!("expected first P3 category")
+        };
+        assert_close(first_boundary.qir_kgkg, WRF_P3_QSMALL_KGKG, 1.0e-21);
+        for cell_index in [2, 3] {
+            let cell = scene.raw_cell(cell_index).unwrap();
+            let RawPropertyCategory::P3(second_zero) = &cell.categories()[1] else {
+                panic!("expected second P3 category")
+            };
+            assert_eq!(second_zero.qir_kgkg, 0.0);
+        }
+
+        let materially_negative =
+            p3_50_provider(50, 1, 0).field("QIR", vec![-1.01 * WRF_P3_QSMALL_KGKG], "kg kg-1");
+        assert_eq!(
+            read_property_scene(&materially_negative, 0).unwrap_err(),
+            WrfPropertyReadError::NegativeMassValue {
+                field: "QIR",
+                cell_index: 0,
+                value: -1.01 * WRF_P3_QSMALL_KGKG,
+            }
+        );
+    }
+
+    #[test]
+    fn p3_calc_bulk_rho_rime_normalizes_volume_density_and_total_mass_bound() {
+        let below_volume_min = f32::from_bits(WRF_P3_RIME_VOLUME_MIN_M3_PER_KG.to_bits() - 1);
+        let below_qsmall = f32::from_bits((WRF_P3_QSMALL_KGKG as f32).to_bits() - 1);
+        let qice = vec![1.0e-4, 1.0e-4, 1.0e-4, 5.0e-6, 1.0e-4];
+        let mut qir = vec![1.0e-5, 1.0e-5, 1.0e-5, 1.0e-5, below_qsmall];
+        let mut qib = vec![below_volume_min, 1.0e-6, 1.0e-9, 1.0e-7, 1.0e-7];
+
+        normalize_p3_rime_tuples(&qice, &mut qir, &mut qib);
+
+        assert_eq!((qir[0], qib[0]), (0.0, 0.0));
+        assert_close(
+            f64::from(qir[1] / qib[1]),
+            f64::from(WRF_P3_RIME_DENSITY_MIN_KG_M3),
+            1.0e-4,
+        );
+        assert_close(
+            f64::from(qir[2] / qib[2]),
+            f64::from(WRF_P3_RIME_DENSITY_MAX_KG_M3),
+            1.0e-3,
+        );
+        assert_eq!(qir[3], qice[3]);
+        assert_close(f64::from(qib[3]), f64::from(qice[3] / 100.0), 1.0e-14);
+        assert_eq!((qir[4], qib[4]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn ishmael_mass_keeps_exact_negative_validation_without_p3_qsmall() {
+        let provider =
+            TinyProvider::new(55, 1).field("QICE", vec![-0.5 * WRF_P3_QSMALL_KGKG], "kg kg-1");
+        assert_eq!(
+            read_property_scene(&provider, 0).unwrap_err(),
+            WrfPropertyReadError::NegativeMassValue {
+                field: "QICE",
+                cell_index: 0,
+                value: -0.5 * WRF_P3_QSMALL_KGKG,
+            }
+        );
+    }
+
+    #[test]
+    fn p3_rain_qsmall_clears_tuple_and_retains_exact_boundary() {
+        let qsmall_f32 = WRF_P3_QSMALL_KGKG as f32;
+        let below_qsmall = f64::from(f32::from_bits(qsmall_f32.to_bits() - 1));
+        let provider = TinyProvider::new(50, 4)
+            .field(
+                "QRAIN",
+                vec![-WRF_P3_QSMALL_KGKG, 0.0, below_qsmall, WRF_P3_QSMALL_KGKG],
+                "kg kg-1",
+            )
+            .field("QNRAIN", vec![f64::NAN, f64::NAN, f64::NAN, 1.0e6], "kg-1");
+        let (rain, _) = read_rain(&provider, 0, 4, 50);
+        let SparseRainStorage::Available {
+            active_cell_indices,
+            qrain_kgkg,
+            qnrain_per_kg,
+        } = rain
+        else {
+            panic!("P3 rain tuple should be available")
+        };
+        assert_eq!(active_cell_indices, vec![3]);
+        assert_eq!(qrain_kgkg, vec![WRF_P3_QSMALL_KGKG as f32]);
+        let expected_number = WRF_P3_RAIN_LAMBDA_MAX_M_INV.powi(3) * WRF_P3_QSMALL_KGKG
+            / (std::f64::consts::PI * WRF_P3_RAIN_WATER_DENSITY_KG_M3);
+        assert_close(f64::from(qnrain_per_kg[0]), expected_number, 1.0e-9);
+
+        let materially_negative = TinyProvider::new(50, 1)
+            .field("QRAIN", vec![-1.01 * WRF_P3_QSMALL_KGKG], "kg kg-1")
+            .field("QNRAIN", vec![1.0e6], "kg-1");
+        let (rain, _) = read_rain(&materially_negative, 0, 1, 50);
+        assert!(matches!(
+            rain,
+            SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
+                field: "QRAIN",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn p3_rain_number_matches_get_rain_dsd2_lambda_limits() {
+        let unclamped_q = 8.0e-4;
+        let unclamped_n = 1.0e6;
+        assert_eq!(
+            normalize_p3_rain_number(unclamped_q, unclamped_n),
+            unclamped_n
+        );
+
+        let lower_q = 1.0e-4;
+        let expected_lower = WRF_P3_RAIN_LAMBDA_MIN_M_INV.powi(3) * lower_q
+            / (std::f64::consts::PI * WRF_P3_RAIN_WATER_DENSITY_KG_M3);
+        assert_close(
+            normalize_p3_rain_number(lower_q, -1.0),
+            expected_lower,
+            1.0e-14,
+        );
+
+        let upper_q = WRF_P3_QSMALL_KGKG;
+        let expected_upper = WRF_P3_RAIN_LAMBDA_MAX_M_INV.powi(3) * upper_q
+            / (std::f64::consts::PI * WRF_P3_RAIN_WATER_DENSITY_KG_M3);
+        assert_close(
+            normalize_p3_rain_number(upper_q, 1.0e6),
+            expected_upper,
+            1.0e-12,
+        );
+    }
+
+    #[test]
+    fn ishmael_rain_does_not_inherit_p3_qsmall_or_number_limiter() {
+        let tiny_positive = TinyProvider::new(55, 1)
+            .field("QRAIN", vec![0.5 * WRF_P3_QSMALL_KGKG], "kg kg-1")
+            .field("QNRAIN", vec![2.0], "kg-1");
+        let (rain, _) = read_rain(&tiny_positive, 0, 1, 55);
+        assert!(matches!(
+            rain.raw_at(0),
+            RawRainState::Available {
+                qrain_kgkg,
+                qnrain_per_kg: 2.0,
+            } if qrain_kgkg > 0.0
+        ));
+
+        let negative = TinyProvider::new(55, 1)
+            .field("QRAIN", vec![-0.5 * WRF_P3_QSMALL_KGKG], "kg kg-1")
+            .field("QNRAIN", vec![2.0], "kg-1");
+        let (rain, _) = read_rain(&negative, 0, 1, 55);
+        assert!(matches!(
+            rain,
+            SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
+                field: "QRAIN",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn sparse_memory_accounting_and_identity_exclude_dense_fields_and_private_path() {
         let provider = p3_50_provider(50, 1_024, 777);
         let scene = read_property_scene(&provider, 0).unwrap();
@@ -3479,5 +3871,121 @@ mod tests {
             temporal.required_raw_fields,
             p3_53.required_field_signature().field_names()
         );
+    }
+
+    #[test]
+    fn real_p3_fixture_reads_qsmall_boundary_residue() {
+        let Some(path) = std::env::var_os("BOWECHO_WRF_PROPERTY_FIXTURE") else {
+            return;
+        };
+        let file = WrfFile::open(&path).expect("open BOWECHO_WRF_PROPERTY_FIXTURE");
+        let scheme_id = file
+            .global_attr_i32("MP_PHYSICS")
+            .expect("fixture has MP_PHYSICS");
+        assert!(
+            matches!(scheme_id, 50..=53),
+            "property fixture must use P3 mp_physics 50-53, got {scheme_id}"
+        );
+        let source_qice = file.read_var("QICE", 0).expect("read fixture QICE");
+        let active_qice = source_qice
+            .iter()
+            .map(|&value| value >= WRF_P3_QSMALL_KGKG)
+            .collect::<Vec<_>>();
+        let tiny_negative_indices = source_qice
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(cell_index, value)| {
+                (value < 0.0 && value >= -WRF_P3_QSMALL_KGKG)
+                    .then(|| u32::try_from(cell_index).expect("WRF property grid index fits u32"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !tiny_negative_indices.is_empty(),
+            "property fixture must exercise a negative QICE qsmall residue"
+        );
+        drop(source_qice);
+        let active_negative_qir_indices = file
+            .read_var("QIR", 0)
+            .expect("read fixture QIR")
+            .into_iter()
+            .enumerate()
+            .filter_map(|(cell_index, value)| {
+                (active_qice[cell_index] && value < 0.0)
+                    .then(|| u32::try_from(cell_index).expect("WRF property grid index fits u32"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !active_negative_qir_indices.is_empty(),
+            "property fixture must exercise negative QIR at active P3 ice mass"
+        );
+
+        let scene = read_wrf_property_scene(
+            &file,
+            WrfSourceIdentity("fixture:p3-qsmall-regression".to_owned()),
+            0,
+        )
+        .expect("P3 property reader accepts qsmall residue");
+        let category_one = scene
+            .categories()
+            .iter()
+            .find(|category| category.category() == WrfPropertyCategory::P3(P3Category::Category1));
+        for cell_index in tiny_negative_indices {
+            assert!(
+                category_one.is_none_or(|category| {
+                    category
+                        .active_cell_indices()
+                        .binary_search(&cell_index)
+                        .is_err()
+                }),
+                "qsmall residue cell {cell_index} remained active"
+            );
+        }
+        let category_one = category_one.expect("fixture retains active P3 category 1");
+        let SparseCategoryValues::P3 { qir_kgkg, .. } = &category_one.values else {
+            panic!("P3 category has P3 storage")
+        };
+        for cell_index in active_negative_qir_indices {
+            let position = category_one
+                .position(cell_index)
+                .expect("source-active QIR cell remains active after QICE ingest");
+            assert_eq!(
+                qir_kgkg[position], 0.0,
+                "negative QIR residue cell {cell_index} was not normalized"
+            );
+        }
+        for category in scene.categories() {
+            let SparseCategoryValues::P3 {
+                qice_kgkg,
+                qir_kgkg,
+                qib_m3_per_kg,
+                ..
+            } = &category.values
+            else {
+                panic!("P3 scene category has P3 storage")
+            };
+            for ((&qice, &qir), &qib) in qice_kgkg.iter().zip(qir_kgkg).zip(qib_m3_per_kg) {
+                assert!(qir >= 0.0, "{} retained negative QIR", category.category());
+                assert!(qib >= 0.0, "{} retained negative QIB", category.category());
+                assert!(
+                    qir <= qice,
+                    "{} retained QIR {qir} above QICE {qice}",
+                    category.category()
+                );
+                if qir == 0.0 {
+                    assert_eq!(qib, 0.0, "clear rime mass must have clear rime volume");
+                } else {
+                    assert!(qib > 0.0, "positive rime mass must have positive volume");
+                    let density = qir / qib;
+                    assert!(
+                        (WRF_P3_RIME_DENSITY_MIN_KG_M3 - 1.0e-4
+                            ..=WRF_P3_RIME_DENSITY_MAX_KG_M3 + 1.0e-3)
+                            .contains(&density),
+                        "{} retained invalid rime density {density}",
+                        category.category()
+                    );
+                }
+            }
+        }
     }
 }

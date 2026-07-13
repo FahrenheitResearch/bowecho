@@ -17,12 +17,12 @@ use thiserror::Error;
 use crate::{
     P3_MODULE_VERSION, P3_TABLE_GENERATOR_VERSION, P3_THREE_MOMENT_TABLE_SHA256,
     P3_THREE_MOMENT_TABLE_VERSION, P3_TWO_MOMENT_TABLE_SHA256, P3_TWO_MOMENT_TABLE_VERSION,
-    P3_WRF_SOURCE_COMMIT, P3Category, P3IceMomentOrder, P3LookupAxisClamps, P3LookupFailure,
-    P3LookupQuery, P3LookupSolution, P3LookupTableDescriptor, P3LookupTableV54, P3WrfScheme,
-    Sha256Digest,
+    P3_WRF_NSMALL_PER_KG, P3_WRF_QSMALL_KGKG, P3_WRF_SOURCE_COMMIT, P3Category, P3IceMomentOrder,
+    P3LookupAxisClamps, P3LookupFailure, P3LookupQuery, P3LookupSolution, P3LookupTableDescriptor,
+    P3LookupTableV54, P3NumberLimiterAudit, P3WrfScheme, Sha256Digest,
 };
 
-pub const P3_TABLE_READER_REVISION: &str = "wrf-p3-v5.4-exact-table-reader-v1";
+pub const P3_TABLE_READER_REVISION: &str = "wrf-p3-v5.4-exact-table-reader-v2";
 
 const MASS_AXIS_SIZE: usize = 50;
 const RIME_AXIS_SIZE: usize = 4;
@@ -32,8 +32,6 @@ const RAIN_COLLISION_AXIS_SIZE: usize = 30;
 const TWO_MOMENT_MAIN_FIELDS: usize = 14;
 const THREE_MOMENT_MAIN_FIELDS: usize = 15;
 const COLLISION_FIELDS: usize = 2;
-const WRF_QSMALL: f32 = 1.0e-14;
-const WRF_NSMALL: f32 = 1.0e-16;
 const WRF_ZSMALL: f32 = 1.0e-35;
 // Preserve the decimal `REAL` literal from the pinned WRF Fortran source.
 // Replacing it with Rust's PI spelling would obscure source-parity intent.
@@ -185,18 +183,33 @@ impl P3LookupTableV54 for P3OfficialTableV54 {
 
     fn lookup_psd(&self, query: P3LookupQuery) -> Result<P3LookupSolution, P3LookupFailure> {
         self.validate_query(query)?;
-        let mass = mass_axis(f32_checked(
-            "mean particle mass",
-            query.mean_particle_mass_kg,
-        )?)?;
+        let total_ice = f32_checked("total ice mass", query.total_ice_kgkg)?;
+        let number_after_nsmall =
+            f32_checked("total ice number", query.total_number_per_kg)?.max(P3_WRF_NSMALL_PER_KG);
+        let mass = mass_axis(total_ice / number_after_nsmall)?;
         let rime = rime_axis(f32_checked("rime mass fraction", query.rime_mass_fraction)?)?;
         let density = density_axis(f32_checked("rime density", query.rime_density_kg_m3)?)?;
 
         match &self.payload {
-            TablePayload::TwoMoment { lambda, mu } => {
+            TablePayload::TwoMoment {
+                inverse_qmin,
+                inverse_qmax,
+                lambda,
+                mu,
+            } => {
+                let inverse_qmin =
+                    interpolate_three_axes(inverse_qmin, self.layout, mass, rime, density);
+                let inverse_qmax =
+                    interpolate_three_axes(inverse_qmax, self.layout, mass, rime, density);
                 let slope = interpolate_three_axes(lambda, self.layout, mass, rime, density);
                 let shape = interpolate_three_axes(mu, self.layout, mass, rime, density);
                 validate_solution(slope, shape)?;
+                P3NumberLimiterAudit::from_wrf_real(
+                    query.total_number_per_kg,
+                    query.total_ice_kgkg,
+                    f64::from(inverse_qmin),
+                    f64::from(inverse_qmax),
+                )?;
                 Ok(P3LookupSolution {
                     slope_lambda_m_inv: f64::from(slope),
                     shape_mu: f64::from(shape),
@@ -206,15 +219,18 @@ impl P3LookupTableV54 for P3OfficialTableV54 {
                         rime_density: density.clamped,
                         shape: false,
                     },
+                    inverse_qmin_per_kg: f64::from(inverse_qmin),
+                    inverse_qmax_per_kg: f64::from(inverse_qmax),
                 })
             }
             TablePayload::ThreeMoment {
+                inverse_qmin,
+                inverse_qmax,
                 mean_density,
                 lambda,
                 mu,
             } => {
-                let number = f32_checked("total ice number", query.total_number_per_kg)?;
-                let total_ice = f32_checked("total ice mass", query.total_ice_kgkg)?;
+                let number = number_after_nsmall;
                 let sixth = f32_checked(
                     "sixth ice moment",
                     query
@@ -262,7 +278,29 @@ impl P3LookupTableV54 for P3OfficialTableV54 {
                 );
                 let shape =
                     interpolate_four_axes(mu, self.layout, shape_axis_value, mass, rime, density);
+                let inverse_qmin = interpolate_four_axes(
+                    inverse_qmin,
+                    self.layout,
+                    shape_axis_value,
+                    mass,
+                    rime,
+                    density,
+                );
+                let inverse_qmax = interpolate_four_axes(
+                    inverse_qmax,
+                    self.layout,
+                    shape_axis_value,
+                    mass,
+                    rime,
+                    density,
+                );
                 validate_solution(slope, shape)?;
+                P3NumberLimiterAudit::from_wrf_real(
+                    query.total_number_per_kg,
+                    query.total_ice_kgkg,
+                    f64::from(inverse_qmin),
+                    f64::from(inverse_qmax),
+                )?;
                 Ok(P3LookupSolution {
                     slope_lambda_m_inv: f64::from(slope),
                     shape_mu: f64::from(shape),
@@ -272,6 +310,8 @@ impl P3LookupTableV54 for P3OfficialTableV54 {
                         rime_density: density.clamped,
                         shape: any_shape_clamp,
                     },
+                    inverse_qmin_per_kg: f64::from(inverse_qmin),
+                    inverse_qmax_per_kg: f64::from(inverse_qmax),
                 })
             }
         }
@@ -296,16 +336,17 @@ impl P3OfficialTableV54 {
                 query.scheme.mp_physics()
             )));
         }
-        for (name, value) in [
-            ("mean particle mass", query.mean_particle_mass_kg),
-            ("total ice number", query.total_number_per_kg),
-            ("total ice mass", query.total_ice_kgkg),
-        ] {
-            if !value.is_finite() || value <= 0.0 {
-                return Err(P3LookupFailure::OutsideDomain(format!(
-                    "{name} must be finite and positive, got {value}"
-                )));
-            }
+        if !query.total_number_per_kg.is_finite() {
+            return Err(P3LookupFailure::OutsideDomain(format!(
+                "total ice number must be finite before P3 repair, got {}",
+                query.total_number_per_kg
+            )));
+        }
+        if !query.total_ice_kgkg.is_finite() || query.total_ice_kgkg <= 0.0 {
+            return Err(P3LookupFailure::OutsideDomain(format!(
+                "total ice mass must be finite and positive, got {}",
+                query.total_ice_kgkg
+            )));
         }
         if !query.rime_mass_fraction.is_finite() || !(0.0..=1.0).contains(&query.rime_mass_fraction)
         {
@@ -321,15 +362,10 @@ impl P3OfficialTableV54 {
             )));
         }
         let total_ice = f32_checked("total ice mass", query.total_ice_kgkg)?;
-        let number = f32_checked("total ice number", query.total_number_per_kg)?;
-        if total_ice < WRF_QSMALL {
+        f32_checked("total ice number", query.total_number_per_kg)?;
+        if total_ice < P3_WRF_QSMALL_KGKG {
             return Err(P3LookupFailure::OutsideDomain(format!(
-                "total ice mass {total_ice} is below WRF qsmall={WRF_QSMALL}"
-            )));
-        }
-        if number < WRF_NSMALL {
-            return Err(P3LookupFailure::OutsideDomain(format!(
-                "total ice number {number} is below WRF nsmall={WRF_NSMALL}"
+                "total ice mass {total_ice} is below WRF qsmall={P3_WRF_QSMALL_KGKG}"
             )));
         }
         match (self.kind, query.sixth_moment_per_kg) {
@@ -411,6 +447,18 @@ pub enum P3TableLoadError {
         position: usize,
         token: String,
     },
+    #[error("P3 table line {line} has invalid {field} value {value}; it must be positive")]
+    InvalidNumberLimiter {
+        line: usize,
+        field: &'static str,
+        value: f32,
+    },
+    #[error("P3 table line {line} has inv_Qmin={inverse_qmin} below inv_Qmax={inverse_qmax}")]
+    InvalidNumberLimiterOrdering {
+        line: usize,
+        inverse_qmin: f32,
+        inverse_qmax: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -425,10 +473,14 @@ struct TableLayout {
 #[derive(Clone, Debug)]
 enum TablePayload {
     TwoMoment {
+        inverse_qmin: Vec<f32>,
+        inverse_qmax: Vec<f32>,
         lambda: Vec<f32>,
         mu: Vec<f32>,
     },
     ThreeMoment {
+        inverse_qmin: Vec<f32>,
+        inverse_qmax: Vec<f32>,
         mean_density: Vec<f32>,
         lambda: Vec<f32>,
         mu: Vec<f32>,
@@ -485,6 +537,8 @@ fn parse_two_moment_payload(
     layout: TableLayout,
 ) -> Result<TablePayload, P3TableLoadError> {
     let retained = layout.densities * layout.rimes * layout.masses;
+    let mut inverse_qmin = Vec::with_capacity(retained);
+    let mut inverse_qmax = Vec::with_capacity(retained);
     let mut lambda = Vec::with_capacity(retained);
     let mut mu = Vec::with_capacity(retained);
     for density in 1..=layout.densities {
@@ -497,13 +551,21 @@ fn parse_two_moment_payload(
                     "two-moment main record",
                     &[density, rime, mass],
                 )?;
+                validate_number_limiter_record(line_number, values[6], values[7])?;
+                inverse_qmin.push(values[6]);
+                inverse_qmax.push(values[7]);
                 lambda.push(values[12]);
                 mu.push(values[13]);
             }
             parse_collision_block(reader, layout, rime)?;
         }
     }
-    Ok(TablePayload::TwoMoment { lambda, mu })
+    Ok(TablePayload::TwoMoment {
+        inverse_qmin,
+        inverse_qmax,
+        lambda,
+        mu,
+    })
 }
 
 fn parse_three_moment_payload(
@@ -511,6 +573,8 @@ fn parse_three_moment_payload(
     layout: TableLayout,
 ) -> Result<TablePayload, P3TableLoadError> {
     let retained = layout.shapes * layout.densities * layout.rimes * layout.masses;
+    let mut inverse_qmin = Vec::with_capacity(retained);
+    let mut inverse_qmax = Vec::with_capacity(retained);
     let mut mean_density = Vec::with_capacity(retained);
     let mut lambda = Vec::with_capacity(retained);
     let mut mu = Vec::with_capacity(retained);
@@ -525,6 +589,9 @@ fn parse_three_moment_payload(
                         "three-moment main record",
                         &[shape, density, rime, mass],
                     )?;
+                    validate_number_limiter_record(line_number, values[6], values[7])?;
+                    inverse_qmin.push(values[6]);
+                    inverse_qmax.push(values[7]);
                     mean_density.push(values[11]);
                     lambda.push(values[13]);
                     mu.push(values[14]);
@@ -534,10 +601,41 @@ fn parse_three_moment_payload(
         }
     }
     Ok(TablePayload::ThreeMoment {
+        inverse_qmin,
+        inverse_qmax,
         mean_density,
         lambda,
         mu,
     })
+}
+
+fn validate_number_limiter_record(
+    line: usize,
+    inverse_qmin: f32,
+    inverse_qmax: f32,
+) -> Result<(), P3TableLoadError> {
+    if inverse_qmin <= 0.0 {
+        return Err(P3TableLoadError::InvalidNumberLimiter {
+            line,
+            field: "i_qsmall/inv_Qmin (field 7)",
+            value: inverse_qmin,
+        });
+    }
+    if inverse_qmax <= 0.0 {
+        return Err(P3TableLoadError::InvalidNumberLimiter {
+            line,
+            field: "i_qlarge/inv_Qmax (field 8)",
+            value: inverse_qmax,
+        });
+    }
+    if inverse_qmin < inverse_qmax {
+        return Err(P3TableLoadError::InvalidNumberLimiterOrdering {
+            line,
+            inverse_qmin,
+            inverse_qmax,
+        });
+    }
+    Ok(())
 }
 
 fn parse_collision_block(
@@ -893,12 +991,12 @@ mod tests {
                         for mass in 1..=layout.masses {
                             write!(output, "{density} {rime} {mass}").unwrap();
                             for field in 0..TWO_MOMENT_MAIN_FIELDS {
-                                let value = if field == 12 {
-                                    100_000.0 + (density * 100 + rime * 10 + mass) as f32
-                                } else if field == 13 {
-                                    (density + rime + mass) as f32
-                                } else {
-                                    101.25 + field as f32
+                                let value = match field {
+                                    6 => 2.0e15 + (density * 100 + rime * 10 + mass) as f32 * 1.0e9,
+                                    7 => 2.0e5 + (density * 100 + rime * 10 + mass) as f32 * 100.0,
+                                    12 => 100_000.0 + (density * 100 + rime * 10 + mass) as f32,
+                                    13 => (density + rime + mass) as f32,
+                                    _ => 101.25 + field as f32,
                                 };
                                 write!(output, " {value}").unwrap();
                             }
@@ -916,6 +1014,18 @@ mod tests {
                                 write!(output, "{shape} {density} {rime} {mass}").unwrap();
                                 for field in 0..THREE_MOMENT_MAIN_FIELDS {
                                     let value = match field {
+                                        6 => {
+                                            2.0e15
+                                                + (shape * 1_000 + density * 100 + rime * 10 + mass)
+                                                    as f32
+                                                    * 1.0e9
+                                        }
+                                        7 => {
+                                            2.0e5
+                                                + (shape * 1_000 + density * 100 + rime * 10 + mass)
+                                                    as f32
+                                                    * 100.0
+                                        }
                                         11 => 200.0 + shape as f32,
                                         13 => {
                                             100_000.0
@@ -1012,9 +1122,17 @@ mod tests {
         };
         let two_text = synthetic_table(P3OfficialTableKind::TwoMoment, two_layout);
         let two = parse_synthetic(P3OfficialTableKind::TwoMoment, &two_text, two_layout).unwrap();
-        let TablePayload::TwoMoment { lambda, mu } = two.payload else {
+        let TablePayload::TwoMoment {
+            inverse_qmin,
+            inverse_qmax,
+            lambda,
+            mu,
+        } = two.payload
+        else {
             panic!("wrong payload")
         };
+        assert_eq!(inverse_qmin.len(), 8);
+        assert!(inverse_qmin[0] > inverse_qmax[0]);
         assert_eq!(lambda.len(), 8);
         assert_eq!(lambda[0], 100_111.0);
         assert_eq!(mu[7], 6.0);
@@ -1027,6 +1145,8 @@ mod tests {
         let three =
             parse_synthetic(P3OfficialTableKind::ThreeMoment, &three_text, three_layout).unwrap();
         let TablePayload::ThreeMoment {
+            inverse_qmin,
+            inverse_qmax,
             mean_density,
             lambda,
             mu,
@@ -1035,6 +1155,8 @@ mod tests {
             panic!("wrong payload")
         };
         assert_eq!(mean_density.len(), 16);
+        assert_eq!(inverse_qmin.len(), 16);
+        assert!(inverse_qmin[15] > inverse_qmax[15]);
         assert_eq!(mean_density[0], 201.0);
         assert_eq!(lambda[15], 102_222.0);
         assert_eq!(mu[15], 8.0);
@@ -1068,6 +1190,20 @@ mod tests {
             Err(P3TableLoadError::NonFinite { .. })
         ));
 
+        let mut invalid_limiter_lines = exact.lines().map(str::to_owned).collect::<Vec<_>>();
+        let mut main_tokens = invalid_limiter_lines[2]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        // Three integer axes precede table field 7 (`i_qsmall`/`inv_Qmin`).
+        main_tokens[3 + 6] = "0".to_owned();
+        invalid_limiter_lines[2] = main_tokens.join(" ");
+        let invalid_limiter = invalid_limiter_lines.join("\n") + "\n";
+        assert!(matches!(
+            parse_synthetic(P3OfficialTableKind::TwoMoment, &invalid_limiter, layout),
+            Err(P3TableLoadError::InvalidNumberLimiter { .. })
+        ));
+
         let wrong_index = exact.replacen("\n1 1 1 ", "\n1 1 2 ", 1);
         assert!(matches!(
             parse_synthetic(P3OfficialTableKind::TwoMoment, &wrong_index, layout),
@@ -1094,6 +1230,56 @@ mod tests {
         let shape = shape_axis(6.0).unwrap();
         assert_eq!(shape.lower, 3);
         assert_eq!(shape.coordinate, 4.0);
+    }
+
+    #[test]
+    fn official_lookup_interpolates_number_limits_on_the_lambda_axis_and_repairs_negative_ni() {
+        let retained = OFFICIAL_LAYOUT.densities * OFFICIAL_LAYOUT.rimes * OFFICIAL_LAYOUT.masses;
+        let inverse_qmin = 2.0e15_f32;
+        let inverse_qmax = 4.0e13_f32;
+        let table = P3OfficialTableV54 {
+            kind: P3OfficialTableKind::TwoMoment,
+            descriptor: test_descriptor(P3OfficialTableKind::TwoMoment, b"limiter fixture"),
+            layout: OFFICIAL_LAYOUT,
+            payload: TablePayload::TwoMoment {
+                inverse_qmin: vec![inverse_qmin; retained],
+                inverse_qmax: vec![inverse_qmax; retained],
+                lambda: vec![2.0e5; retained],
+                mu: vec![2.0; retained],
+            },
+        };
+        let query = P3LookupQuery {
+            scheme: P3WrfScheme::Mp50OneIceFixedCloudNumber,
+            category: P3Category::Category1,
+            rime_mass_fraction: 0.0,
+            rime_density_kg_m3: 0.0,
+            total_number_per_kg: -3.0e-7,
+            total_ice_kgkg: 2.33e-9,
+            sixth_moment_per_kg: None,
+        };
+        let solution = table.lookup_psd(query).unwrap();
+        let expected = P3NumberLimiterAudit::from_wrf_real(
+            query.total_number_per_kg,
+            query.total_ice_kgkg,
+            f64::from(inverse_qmin),
+            f64::from(inverse_qmax),
+        )
+        .unwrap();
+        assert_eq!(solution.inverse_qmin_per_kg, f64::from(inverse_qmin));
+        assert_eq!(solution.inverse_qmax_per_kg, f64::from(inverse_qmax));
+        assert_eq!(
+            P3NumberLimiterAudit::from_wrf_real(
+                query.total_number_per_kg,
+                query.total_ice_kgkg,
+                solution.inverse_qmin_per_kg,
+                solution.inverse_qmax_per_kg,
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(solution.slope_lambda_m_inv, 2.0e5);
+        assert_eq!(solution.shape_mu, 2.0);
+        assert!(solution.axis_clamps.normalized_mass);
     }
 
     #[test]

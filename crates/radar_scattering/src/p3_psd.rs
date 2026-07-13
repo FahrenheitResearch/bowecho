@@ -30,7 +30,7 @@ use thiserror::Error;
 
 use crate::{P3Category, Sha256Digest};
 
-pub const P3_PSD_REVISION: &str = "wrf-p3-v4.5.2-table-v5.4-psd-v1";
+pub const P3_PSD_REVISION: &str = "wrf-p3-v4.5.2-table-v5.4-psd-v2";
 pub const P3_WRF_SOURCE_COMMIT: &str = "f52c197ed39d12e087d02c50f412d90d418f6186";
 pub const P3_WRF_RELEASE: &str = "v4.7.1";
 pub const P3_MODULE_VERSION: &str = "4.5.2";
@@ -49,6 +49,10 @@ pub const P3_TRIPLE_MOMENT_CONTEXT_DOI: &str = "10.1029/2024MS004644";
 
 pub const P3_RIME_DENSITY_RANGE_KG_M3: [f64; 2] = [50.0, 900.0];
 pub const P3_MU_RANGE: [f64; 2] = [0.0, 20.0];
+/// P3's default-`REAL` minimum ice mass mixing ratio.
+pub const P3_WRF_QSMALL_KGKG: f32 = 1.0e-14;
+/// P3's default-`REAL` minimum ice number mixing ratio.
+pub const P3_WRF_NSMALL_PER_KG: f32 = 1.0e-16;
 
 const SOLID_ICE_DENSITY_KG_M3: f64 = 900.0;
 const UNRIMED_MASS_COEFFICIENT: f64 = 0.0121;
@@ -292,12 +296,90 @@ impl P3LookupTableDescriptor {
 pub struct P3LookupQuery {
     pub scheme: P3WrfScheme,
     pub category: P3Category,
-    pub mean_particle_mass_kg: f64,
     pub rime_mass_fraction: f64,
     pub rime_density_kg_m3: f64,
+    /// Unmodified WRF history-field value. Negative finite leading-edge values
+    /// are repaired by the exact P3 number-limiter sequence during lookup.
     pub total_number_per_kg: f64,
     pub total_ice_kgkg: f64,
     pub sixth_moment_per_kg: Option<f64>,
+}
+
+/// Exact default-`REAL` P3 number repair and mean-size limiter audit.
+///
+/// WRF first applies `Ni=max(Ni,nsmall)`, then interpolates the table fields
+/// `i_qsmall` (`inv_Qmin`, field 7) and `i_qlarge` (`inv_Qmax`, field 8) at the
+/// same coordinates as lambda/mu, and finally applies the upper and lower Ni
+/// bounds in that order.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct P3NumberLimiterAudit {
+    pub original_total_number_per_kg: f64,
+    pub wrf_real_original_total_number_per_kg: f64,
+    pub after_nsmall_total_number_per_kg: f64,
+    pub inverse_qmin_per_kg: f64,
+    pub inverse_qmax_per_kg: f64,
+    pub maximum_total_number_per_kg: f64,
+    pub minimum_total_number_per_kg: f64,
+    pub repaired_total_number_per_kg: f64,
+    pub nsmall_applied: bool,
+    pub maximum_applied: bool,
+    pub minimum_applied: bool,
+}
+
+impl P3NumberLimiterAudit {
+    /// Apply the pinned WRF statement sequence using binary32 after validating
+    /// that every input can be represented as default `REAL`.
+    pub fn from_wrf_real(
+        original_total_number_per_kg: f64,
+        total_ice_kgkg: f64,
+        inverse_qmin_per_kg: f64,
+        inverse_qmax_per_kg: f64,
+    ) -> Result<Self, P3LookupFailure> {
+        let original = wrf_real("total ice number", original_total_number_per_kg)?;
+        let total_ice = wrf_real("total ice mass", total_ice_kgkg)?;
+        let inverse_qmin = wrf_real("P3 table inv_Qmin", inverse_qmin_per_kg)?;
+        let inverse_qmax = wrf_real("P3 table inv_Qmax", inverse_qmax_per_kg)?;
+        if total_ice <= 0.0 {
+            return Err(P3LookupFailure::OutsideDomain(format!(
+                "total ice mass must be positive, got {total_ice}"
+            )));
+        }
+        if inverse_qmin <= 0.0 || inverse_qmax <= 0.0 {
+            return Err(P3LookupFailure::Corrupt(format!(
+                "P3 number-limit multipliers must be positive, got inv_Qmin={inverse_qmin}, inv_Qmax={inverse_qmax}"
+            )));
+        }
+
+        let after_nsmall = original.max(P3_WRF_NSMALL_PER_KG);
+        let maximum = inverse_qmin * total_ice;
+        let minimum = inverse_qmax * total_ice;
+        if !maximum.is_finite() || !minimum.is_finite() || maximum < minimum {
+            return Err(P3LookupFailure::Corrupt(format!(
+                "P3 number limits are invalid: minimum={minimum}, maximum={maximum}"
+            )));
+        }
+        let after_maximum = after_nsmall.min(maximum);
+        let repaired = after_maximum.max(minimum);
+        Ok(Self {
+            original_total_number_per_kg,
+            wrf_real_original_total_number_per_kg: f64::from(original),
+            after_nsmall_total_number_per_kg: f64::from(after_nsmall),
+            inverse_qmin_per_kg: f64::from(inverse_qmin),
+            inverse_qmax_per_kg: f64::from(inverse_qmax),
+            maximum_total_number_per_kg: f64::from(maximum),
+            minimum_total_number_per_kg: f64::from(minimum),
+            repaired_total_number_per_kg: f64::from(repaired),
+            nsmall_applied: after_nsmall.to_bits() != original.to_bits(),
+            maximum_applied: after_maximum.to_bits() != after_nsmall.to_bits(),
+            minimum_applied: repaired.to_bits() != after_maximum.to_bits(),
+        })
+    }
+
+    pub(crate) fn number_after_nsmall_wrf_real(
+        original_total_number_per_kg: f64,
+    ) -> Result<f32, P3LookupFailure> {
+        Ok(wrf_real("total ice number", original_total_number_per_kg)?.max(P3_WRF_NSMALL_PER_KG))
+    }
 }
 
 /// PSD parameters returned by exact interpolation of the required official
@@ -307,6 +389,10 @@ pub struct P3LookupSolution {
     pub slope_lambda_m_inv: f64,
     pub shape_mu: f64,
     pub axis_clamps: P3LookupAxisClamps,
+    /// Interpolated table field 7 (`i_qsmall`/`inv_Qmin`).
+    pub inverse_qmin_per_kg: f64,
+    /// Interpolated table field 8 (`i_qlarge`/`inv_Qmax`).
+    pub inverse_qmax_per_kg: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -595,6 +681,7 @@ pub struct P3PsdProvenance {
     pub wrf_source_commit: String,
     pub p3_module_version: String,
     pub table: P3LookupTableDescriptor,
+    pub number_limiter: P3NumberLimiterAudit,
     pub primary_source_dois: Vec<String>,
 }
 
@@ -645,22 +732,25 @@ impl P3Psd {
 
         let rime_fraction = input.rime_mass_kgkg / input.total_ice_kgkg;
         let rime_density = if input.rime_mass_kgkg > 0.0 {
-            input.rime_mass_kgkg / input.rime_volume_m3_per_kg
+            wrf_real_rime_density_kg_m3(input.rime_mass_kgkg, input.rime_volume_m3_per_kg)
+                .map_err(P3PsdError::Lookup)?
         } else {
             // `calc_bulkRhoRime` returns zero for unrimed state; WRF's table
             // indexer then applies the documented lower density-axis clamp.
             0.0
         };
+        let number_after_nsmall =
+            P3NumberLimiterAudit::number_after_nsmall_wrf_real(input.total_number_per_kg)
+                .map_err(P3PsdError::Lookup)?;
         let sixth_moment_per_kg = match input.moment {
             P3IceMomentInput::TwoMoment => None,
             P3IceMomentInput::WrfAdvectedQzi {
                 qzi_sqrt_n_times_m6,
-            } => Some(qzi_sqrt_n_times_m6.powi(2) / input.total_number_per_kg),
+            } => Some(qzi_sqrt_n_times_m6.powi(2) / f64::from(number_after_nsmall)),
         };
         let query = P3LookupQuery {
             scheme: input.scheme,
             category: input.category,
-            mean_particle_mass_kg: input.total_ice_kgkg / input.total_number_per_kg,
             rime_mass_fraction: rime_fraction,
             rime_density_kg_m3: rime_density,
             total_number_per_kg: input.total_number_per_kg,
@@ -670,9 +760,27 @@ impl P3Psd {
         let solution = table.lookup_psd(query).map_err(P3PsdError::Lookup)?;
         positive("P3 lambda", solution.slope_lambda_m_inv)?;
         in_range("P3 mu", solution.shape_mu, P3_MU_RANGE)?;
+        let number_limiter = P3NumberLimiterAudit::from_wrf_real(
+            input.total_number_per_kg,
+            input.total_ice_kgkg,
+            solution.inverse_qmin_per_kg,
+            solution.inverse_qmax_per_kg,
+        )
+        .map_err(P3PsdError::Lookup)?;
+        if input.scheme == P3WrfScheme::Mp53OneIceTripleMoment
+            && (number_limiter.nsmall_applied
+                || number_limiter.maximum_applied
+                || number_limiter.minimum_applied)
+        {
+            return Err(P3PsdError::TripleMomentNumberRepairRequiresZiLimiter {
+                original_number_per_kg: number_limiter.original_total_number_per_kg,
+                repaired_number_per_kg: number_limiter.repaired_total_number_per_kg,
+            });
+        }
 
         let law = P3PiecewiseParticleLaw::reconstruct(rime_fraction, rime_density)?;
-        let number_density = input.total_number_per_kg * input.dry_air_density_kg_m3;
+        let repaired_number_per_kg = number_limiter.repaired_total_number_per_kg;
+        let number_density = repaired_number_per_kg * input.dry_air_density_kg_m3;
         let log_n0 = number_density.ln()
             + (solution.shape_mu + 1.0) * solution.slope_lambda_m_inv.ln()
             - ln_gamma(solution.shape_mu + 1.0)?;
@@ -768,6 +876,7 @@ impl P3Psd {
                 wrf_source_commit: P3_WRF_SOURCE_COMMIT.to_owned(),
                 p3_module_version: P3_MODULE_VERSION.to_owned(),
                 table: table.descriptor().clone(),
+                number_limiter,
                 primary_source_dois,
             },
         })
@@ -807,6 +916,11 @@ impl P3Psd {
     #[must_use]
     pub fn provenance(&self) -> &P3PsdProvenance {
         &self.provenance
+    }
+
+    #[must_use]
+    pub const fn number_limiter_audit(&self) -> P3NumberLimiterAudit {
+        self.provenance.number_limiter
     }
 
     pub fn quadrature(&self, config: P3QuadratureConfig) -> Result<P3Quadrature, P3PsdError> {
@@ -1153,6 +1267,13 @@ pub enum P3PsdError {
     LookupDigestMismatch { expected: String, actual: String },
     #[error("P3 official-table lookup failed: {0}")]
     Lookup(#[source] P3LookupFailure),
+    #[error(
+        "P3 triple-moment number repair from {original_number_per_kg} to {repaired_number_per_kg} kg-1 requires the coupled WRF Zi limiter"
+    )]
+    TripleMomentNumberRepairRequiresZiLimiter {
+        original_number_per_kg: f64,
+        repaired_number_per_kg: f64,
+    },
     #[error("{field} produced invalid value {value}")]
     InvalidComputation { field: &'static str, value: f64 },
     #[error("{operation} did not converge")]
@@ -1186,7 +1307,21 @@ pub enum P3PsdError {
 
 fn validate_input(input: P3PsdInput) -> Result<(), P3PsdError> {
     positive("P3 total ice mixing ratio", input.total_ice_kgkg)?;
-    positive("P3 total number mixing ratio", input.total_number_per_kg)?;
+    let total_ice_wrf_real = input.total_ice_kgkg as f32;
+    if !total_ice_wrf_real.is_finite() || total_ice_wrf_real < P3_WRF_QSMALL_KGKG {
+        return Err(P3PsdError::InvalidInput {
+            field: "P3 total ice mixing ratio",
+            value: input.total_ice_kgkg,
+            requirement: "representable as WRF REAL and at least P3 qsmall=1e-14 kg kg-1",
+        });
+    }
+    if !input.total_number_per_kg.is_finite() {
+        return Err(P3PsdError::InvalidInput {
+            field: "P3 total number mixing ratio",
+            value: input.total_number_per_kg,
+            requirement: "finite; P3 repairs finite leading-edge values",
+        });
+    }
     nonnegative("P3 rime mass mixing ratio", input.rime_mass_kgkg)?;
     nonnegative("P3 rime volume mixing ratio", input.rime_volume_m3_per_kg)?;
     positive("P3 dry-air density", input.dry_air_density_kg_m3)?;
@@ -1430,6 +1565,38 @@ fn positive(field: &'static str, value: f64) -> Result<(), P3PsdError> {
     }
 }
 
+fn wrf_real(field: &str, value: f64) -> Result<f32, P3LookupFailure> {
+    let narrowed = value as f32;
+    if value.is_finite() && narrowed.is_finite() {
+        Ok(narrowed)
+    } else {
+        Err(P3LookupFailure::OutsideDomain(format!(
+            "{field} cannot be represented as finite WRF REAL: {value}"
+        )))
+    }
+}
+
+fn wrf_real_rime_density_kg_m3(
+    rime_mass_kgkg: f64,
+    rime_volume_m3_per_kg: f64,
+) -> Result<f64, P3LookupFailure> {
+    let mass = wrf_real("P3 rime mass", rime_mass_kgkg)?;
+    let volume = wrf_real("P3 rime volume", rime_volume_m3_per_kg)?;
+    if mass <= 0.0 || volume <= 0.0 {
+        return Err(P3LookupFailure::OutsideDomain(format!(
+            "positive P3 rime mass requires positive rime volume, got mass={mass}, volume={volume}"
+        )));
+    }
+    // `calc_bulkRhoRime` performs this division and bound in default REAL.
+    // Widening the independently stored f32 tuple before division can move an
+    // exact 50/900 kg m-3 boundary a few ulps outside the accepted interval.
+    let density = (mass / volume).clamp(
+        P3_RIME_DENSITY_RANGE_KG_M3[0] as f32,
+        P3_RIME_DENSITY_RANGE_KG_M3[1] as f32,
+    );
+    Ok(f64::from(density))
+}
+
 fn nonnegative(field: &'static str, value: f64) -> Result<(), P3PsdError> {
     if value.is_finite() && value >= 0.0 {
         Ok(())
@@ -1490,7 +1657,10 @@ mod tests {
     #[derive(Clone)]
     struct ExactFixtureTable {
         descriptor: P3LookupTableDescriptor,
-        solution: P3LookupSolution,
+        lambda: f64,
+        mu: f64,
+        inverse_qmin: f64,
+        inverse_qmax: f64,
     }
 
     impl P3LookupTableV54 for ExactFixtureTable {
@@ -1499,7 +1669,13 @@ mod tests {
         }
 
         fn lookup_psd(&self, _query: P3LookupQuery) -> Result<P3LookupSolution, P3LookupFailure> {
-            Ok(self.solution)
+            Ok(P3LookupSolution {
+                slope_lambda_m_inv: self.lambda,
+                shape_mu: self.mu,
+                axis_clamps: P3LookupAxisClamps::default(),
+                inverse_qmin_per_kg: self.inverse_qmin,
+                inverse_qmax_per_kg: self.inverse_qmax,
+            })
         }
     }
 
@@ -1512,11 +1688,10 @@ mod tests {
                 table_version: scheme.required_table_version().to_owned(),
                 table_sha256: Sha256Digest::from_hex(scheme.required_table_sha256()).unwrap(),
             },
-            solution: P3LookupSolution {
-                slope_lambda_m_inv: lambda,
-                shape_mu: mu,
-                axis_clamps: P3LookupAxisClamps::default(),
-            },
+            lambda,
+            mu,
+            inverse_qmin: 1.0e30,
+            inverse_qmax: 1.0e-30,
         }
     }
 
@@ -1657,6 +1832,132 @@ mod tests {
         assert!(psd.closure.number_relative_error < 1.0e-12);
         assert!(psd.closure.mass_relative_error < 1.0e-12);
         assert!(psd.closure.expected_sixth_moment_m3.is_none());
+        assert_eq!(
+            psd.number_limiter_audit().original_total_number_per_kg,
+            input.total_number_per_kg
+        );
+        assert_eq!(
+            psd.number_limiter_audit().repaired_total_number_per_kg,
+            f64::from(input.total_number_per_kg as f32)
+        );
+        assert!(!psd.number_limiter_audit().nsmall_applied);
+        assert!(!psd.number_limiter_audit().maximum_applied);
+        assert!(!psd.number_limiter_audit().minimum_applied);
+    }
+
+    #[test]
+    fn wrf_real_number_limiter_repairs_negative_leading_edge_and_preserves_valid_number() {
+        let qice = 2.33e-9_f64;
+        let inverse_qmin = 2.0e15_f64;
+        let inverse_qmax = 4.0e13_f64;
+        let repaired =
+            P3NumberLimiterAudit::from_wrf_real(-3.0e-7, qice, inverse_qmin, inverse_qmax).unwrap();
+        let qice_real = qice as f32;
+        let expected_minimum = (inverse_qmax as f32) * qice_real;
+        assert!(repaired.nsmall_applied);
+        assert!(!repaired.maximum_applied);
+        assert!(repaired.minimum_applied);
+        assert_eq!(
+            (repaired.repaired_total_number_per_kg as f32).to_bits(),
+            expected_minimum.to_bits()
+        );
+
+        let unchanged = P3NumberLimiterAudit::from_wrf_real(1.0e6, 1.0e-4, 1.0e12, 1.0e3).unwrap();
+        assert_eq!(
+            unchanged.repaired_total_number_per_kg,
+            unchanged.wrf_real_original_total_number_per_kg
+        );
+        assert!(!unchanged.nsmall_applied);
+        assert!(!unchanged.maximum_applied);
+        assert!(!unchanged.minimum_applied);
+
+        let upper_limited =
+            P3NumberLimiterAudit::from_wrf_real(1.0e9, 1.0e-4, 1.0e12, 1.0e3).unwrap();
+        assert!(!upper_limited.nsmall_applied);
+        assert!(upper_limited.maximum_applied);
+        assert!(!upper_limited.minimum_applied);
+        assert_eq!(
+            upper_limited.repaired_total_number_per_kg,
+            upper_limited.maximum_total_number_per_kg
+        );
+
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                P3NumberLimiterAudit::from_wrf_real(invalid, 1.0e-4, 1.0e12, 1.0e3),
+                Err(P3LookupFailure::OutsideDomain(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn wrf_real_rime_density_clamps_f32_boundary_roundoff_before_widening() {
+        let mass = 4.999_999_912_258_35e-14_f64;
+        let low_volume = 1.000_000_003_627_493_7e-15_f64;
+        let high_volume = 5.555_555_428_653_967e-17_f64;
+        assert!(mass / low_volume < P3_RIME_DENSITY_RANGE_KG_M3[0]);
+        assert!(mass / high_volume > P3_RIME_DENSITY_RANGE_KG_M3[1]);
+        assert_eq!(
+            wrf_real_rime_density_kg_m3(mass, low_volume).unwrap(),
+            P3_RIME_DENSITY_RANGE_KG_M3[0]
+        );
+        assert_eq!(
+            wrf_real_rime_density_kg_m3(mass, high_volume).unwrap(),
+            P3_RIME_DENSITY_RANGE_KG_M3[1]
+        );
+
+        let middle_volume = f64::from((mass as f32) / 400.0_f32);
+        assert_eq!(
+            wrf_real_rime_density_kg_m3(mass, middle_volume).unwrap(),
+            400.0
+        );
+    }
+
+    #[test]
+    fn reconstruction_uses_repaired_negative_leading_edge_number_and_audits_source() {
+        let scheme = P3WrfScheme::Mp50OneIceFixedCloudNumber;
+        let lambda = 2.0e5;
+        let mu = 2.0;
+        let target_number = 2.0e5;
+        let mut input = state_from_exact_distribution(scheme, lambda, mu, target_number, 0.9);
+        input.total_number_per_kg = -4.0e-8;
+        let mut table = fixture_table(scheme, lambda, mu);
+        table.inverse_qmax = target_number / input.total_ice_kgkg;
+        table.inverse_qmin = 10.0 * table.inverse_qmax;
+        let psd = P3Psd::reconstruct(
+            input,
+            &table,
+            P3ReconstructionConfig {
+                maximum_moment_relative_error: 2.0e-6,
+            },
+        )
+        .unwrap();
+        let audit = psd.number_limiter_audit();
+        assert_eq!(audit.original_total_number_per_kg, -4.0e-8);
+        assert!(audit.nsmall_applied);
+        assert!(audit.minimum_applied);
+        assert!((audit.repaired_total_number_per_kg - target_number).abs() < 0.1);
+
+        let mut invalid = input;
+        invalid.total_number_per_kg = f64::NAN;
+        assert!(matches!(
+            P3Psd::reconstruct(invalid, &table, P3ReconstructionConfig::default()),
+            Err(P3PsdError::InvalidInput {
+                field: "P3 total number mixing ratio",
+                ..
+            })
+        ));
+
+        let triple_scheme = P3WrfScheme::Mp53OneIceTripleMoment;
+        let mut triple =
+            state_from_exact_distribution(triple_scheme, lambda, mu, target_number, 0.9);
+        triple.total_number_per_kg = -4.0e-8;
+        let mut triple_table = fixture_table(triple_scheme, lambda, mu);
+        triple_table.inverse_qmax = target_number / triple.total_ice_kgkg;
+        triple_table.inverse_qmin = 10.0 * triple_table.inverse_qmax;
+        assert!(matches!(
+            P3Psd::reconstruct(triple, &triple_table, P3ReconstructionConfig::default()),
+            Err(P3PsdError::TripleMomentNumberRepairRequiresZiLimiter { .. })
+        ));
     }
 
     #[test]
