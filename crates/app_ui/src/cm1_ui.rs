@@ -39,10 +39,122 @@ pub struct Cm1ImportSummary {
     pub store_root: PathBuf,
     pub model: String,
     pub run: String,
-    pub variable: String,
     pub hours_written: usize,
     pub hour: rw_ui::HourKey,
-    pub provenance_path: PathBuf,
+    native_variable: String,
+    native_long_name: Option<String>,
+    native_units: Option<String>,
+    native_level_index: Option<usize>,
+    native_nominal_level_m: Option<f64>,
+    plane_statistics: Cm1PlaneStatistics,
+}
+
+#[derive(Debug, Clone)]
+struct Cm1PlaneStatistics {
+    total_values: usize,
+    finite_values: usize,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct Cm1CompletionPlane {
+    variable: String,
+    long_name: Option<String>,
+    units: Option<String>,
+    level_index: Option<usize>,
+    nominal_level_m: Option<f64>,
+    statistics: Cm1PlaneStatistics,
+}
+
+impl Cm1CompletionPlane {
+    fn from_plane(plane: &cm1::Cm1NativePlane) -> Self {
+        Self {
+            variable: plane.variable.clone(),
+            long_name: plane.long_name.clone(),
+            units: plane.units.clone(),
+            level_index: plane.level_index,
+            nominal_level_m: plane.nominal_level_m,
+            statistics: Cm1PlaneStatistics::from_values(&plane.values),
+        }
+    }
+}
+
+impl Cm1ImportSummary {
+    /// Human-facing completion text. Store slugs and provenance paths are
+    /// intentionally omitted: after an import, the useful facts are what was
+    /// opened in Models and whether the plane actually contains variation.
+    pub fn completion_message(&self) -> String {
+        let field = match self.native_long_name.as_deref() {
+            Some(long_name) if !long_name.eq_ignore_ascii_case(&self.native_variable) => {
+                format!("{long_name} ({})", self.native_variable)
+            }
+            _ => self.native_variable.clone(),
+        };
+        let level = self.native_level_index.map_or_else(String::new, |level| {
+            self.native_nominal_level_m.map_or_else(
+                || format!(", native level k={level}"),
+                |height| format!(", native level k={level} ({height:.1} m nominal)"),
+            )
+        });
+        let frames = if self.hours_written == 1 {
+            "1 frame".to_owned()
+        } else {
+            format!("{} frames", self.hours_written)
+        };
+        format!(
+            "Opened CM1 {field}{level} in Models ({frames}) — {}",
+            self.plane_statistics.describe(self.native_units.as_deref())
+        )
+    }
+}
+
+impl Cm1PlaneStatistics {
+    fn from_values(values: &[f64]) -> Self {
+        let mut minimum: Option<f64> = None;
+        let mut maximum: Option<f64> = None;
+        let mut finite_values = 0usize;
+        for &value in values.iter().filter(|value| value.is_finite()) {
+            finite_values += 1;
+            minimum = Some(minimum.map_or(value, |current| current.min(value)));
+            maximum = Some(maximum.map_or(value, |current| current.max(value)));
+        }
+        Self {
+            total_values: values.len(),
+            finite_values,
+            minimum,
+            maximum,
+        }
+    }
+
+    fn describe(&self, units: Option<&str>) -> String {
+        let suffix = units
+            .filter(|units| !units.trim().is_empty())
+            .map(|units| format!(" {units}"))
+            .unwrap_or_default();
+        match (self.minimum, self.maximum) {
+            (None, None) => format!(
+                "no finite values in {} cells, so the plot is blank",
+                self.total_values
+            ),
+            (Some(minimum), Some(maximum)) if minimum == maximum => format!(
+                "constant {}{suffix}, so the plot is correctly a single color",
+                format_plot_value(minimum)
+            ),
+            (Some(minimum), Some(maximum)) => {
+                let missing = self.total_values.saturating_sub(self.finite_values);
+                let missing_note = (missing > 0)
+                    .then(|| format!("; {missing} missing cell(s)"))
+                    .unwrap_or_default();
+                format!(
+                    "range {} to {}{suffix}{missing_note}",
+                    format_plot_value(minimum),
+                    format_plot_value(maximum)
+                )
+            }
+            _ => "value range unavailable".to_owned(),
+        }
+    }
 }
 
 /// Immutable snapshot of every scientific and placement choice made in the
@@ -121,6 +233,10 @@ pub struct Cm1ImportPanel {
 impl Cm1ImportPanel {
     pub fn open(&mut self) {
         self.open = true;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
     }
 
     pub fn is_open(&self) -> bool {
@@ -204,10 +320,15 @@ impl Cm1ImportPanel {
                 self.placement_ui(ui, &inventory);
                 ui.add_space(8.0);
 
-                self.radar_ui(ui, &inventory, import_busy);
-                ui.add_space(8.0);
                 ui.separator();
-                ui.strong("Model-store import");
+                ui.strong("Plot in Models");
+                ui.label(
+                    egui::RichText::new(
+                        "Store exactly the selected field, output time, and native level, then open the resulting field in Models.",
+                    )
+                    .small()
+                    .weak(),
+                );
 
                 let validation = self.build_request(&inventory);
                 if let Err(reason) = &validation {
@@ -217,9 +338,9 @@ impl Cm1ImportPanel {
                     ui.label(egui::RichText::new(status).small().weak());
                 }
                 let import_label = if self.import_all_times {
-                    "Store exact-time loop and open in Models"
+                    "Build exact-time loop and open in Models"
                 } else {
-                    "Store selected plane and open in Models"
+                    "Plot selected field in Models"
                 };
                 if ui
                     .add_enabled(
@@ -234,6 +355,9 @@ impl Cm1ImportPanel {
                     request = validation.ok();
                     self.message = Some("CM1 import queued…".to_owned());
                 }
+
+                ui.add_space(8.0);
+                self.radar_ui(ui, &inventory, import_busy);
             });
         self.open = open;
         request
@@ -295,10 +419,7 @@ impl Cm1ImportPanel {
                         .variable(selected)
                         .is_none_or(|variable| !variable.role.is_horizontal_plane_compatible())
                 }) {
-                    self.selected_variable = result
-                        .inventory
-                        .horizontal_plane_variables()
-                        .next()
+                    self.selected_variable = preferred_horizontal_variable(&result.inventory)
                         .map(|variable| variable.name.clone());
                 }
                 self.message = Some(format!(
@@ -535,6 +656,27 @@ impl Cm1ImportPanel {
         if let Some(note) = &self.diagnostic_note {
             ui.label(egui::RichText::new(note).small().weak());
         }
+
+        let plane_count = inventory.horizontal_plane_variables().count();
+        let radar_missing = cm1_radar_missing_fields(inventory);
+        let sounding_ready = cm1::thermodynamic_readiness(inventory).can_derive_native_profile();
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("File capabilities:");
+            ui.label(format!("{plane_count} plottable native field(s)"));
+            if radar_missing.is_empty() {
+                ui.label("· native REF/VEL ready");
+            } else {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("· radar unavailable (missing {})", radar_missing.join(", ")),
+                );
+            }
+            if sounding_ready {
+                ui.label("· sounding data ready");
+            } else {
+                ui.weak("· sounding unavailable");
+            }
+        });
     }
 
     fn selection_ui(&mut self, ui: &mut egui::Ui, inventory: &Cm1Inventory, ctx: &egui::Context) {
@@ -543,16 +685,15 @@ impl Cm1ImportPanel {
         let selected_label = self
             .selected_variable
             .as_deref()
-            .unwrap_or("Choose a native scalar");
+            .and_then(|name| inventory.variable(name))
+            .map(variable_display_label)
+            .unwrap_or_else(|| "Choose a native scalar".to_owned());
         egui::ComboBox::from_id_salt("cm1_native_scalar")
             .selected_text(selected_label)
             .width(360.0)
             .show_ui(ui, |ui| {
                 for variable in &plottable {
-                    let label = match &variable.long_name {
-                        Some(long_name) => format!("{} — {}", variable.name, long_name),
-                        None => variable.name.clone(),
-                    };
+                    let label = variable_display_label(variable);
                     if ui
                         .selectable_value(
                             &mut self.selected_variable,
@@ -571,6 +712,13 @@ impl Cm1ImportPanel {
             .as_deref()
             .and_then(|name| inventory.variable(name));
         if let Some(variable) = selected {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Selected plot field: {}. Change this before using Plot in Models below.",
+                    variable_display_label(variable)
+                ))
+                .small(),
+            );
             ui.label(
                 egui::RichText::new(format!(
                     "{} · units {} · dims {:?} · shape {:?}",
@@ -1122,6 +1270,23 @@ impl Cm1ImportPanel {
     fn radar_ui(&mut self, ui: &mut egui::Ui, inventory: &Cm1Inventory, import_busy: bool) {
         ui.separator();
         ui.strong("Native simulated radar");
+        let missing = cm1_radar_missing_fields(inventory);
+        if !missing.is_empty() {
+            ui.label(
+                egui::RichText::new("Radar is unavailable for this particular CM1 file.")
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "Missing required native output: {}. This does not prevent plotting the available horizontal fields above.",
+                    missing.join(", ")
+                ))
+                .small()
+                .weak(),
+            );
+            return;
+        }
         ui.label(
             egui::RichText::new(
                 "Build REF and radial velocity from this output record using native 3-D dbz, physical zhval model heights, and earth-relative winds. The first completed tilt appears while the rest processes.",
@@ -1214,16 +1379,12 @@ impl Cm1ImportPanel {
             .source_path
             .clone()
             .ok_or_else(|| "Choose a CM1 output file.".to_owned())?;
-        let dbz = inventory
-            .variable("dbz")
-            .ok_or_else(|| "Native radar requires the file's 3-D dbz field.".to_owned())?;
-        if dbz.role != Cm1VariableRole::NativeScalar3D {
-            return Err("CM1 dbz is not a native 3-D scalar field.".to_owned());
-        }
-        if inventory.physical_height_variable.available().is_none() {
-            return Err(
-                "Native radar requires official 3-D zhval physical model-level heights.".to_owned(),
-            );
+        let missing = cm1_radar_missing_fields(inventory);
+        if !missing.is_empty() {
+            return Err(format!(
+                "Native radar is unavailable for this file; missing {}.",
+                missing.join(", ")
+            ));
         }
         exact_time(inventory, self.time_index)?;
         let placement = self.build_placement(inventory)?;
@@ -1319,6 +1480,69 @@ impl Cm1ImportPanel {
             placement,
         })
     }
+}
+
+fn preferred_horizontal_variable(inventory: &Cm1Inventory) -> Option<&cm1::Cm1Variable> {
+    // NetCDF variable iteration order is not a scientific preference and can
+    // differ between classic/HDF5 writers. Pick a useful, already-centred
+    // diagnostic deterministically before falling back to file order.
+    const PREFERRED: &[&str] = &[
+        "cref", "dbz", "winterp", "zvort", "thpert", "th", "prspert", "uinterp", "vinterp", "w",
+    ];
+    PREFERRED
+        .iter()
+        .find_map(|name| {
+            inventory
+                .variable(name)
+                .filter(|variable| variable.role.is_horizontal_plane_compatible())
+        })
+        .or_else(|| inventory.horizontal_plane_variables().next())
+}
+
+fn variable_display_label(variable: &cm1::Cm1Variable) -> String {
+    match variable.long_name.as_deref() {
+        Some(long_name) if !long_name.eq_ignore_ascii_case(&variable.name) => {
+            format!("{long_name} ({})", variable.name)
+        }
+        _ => variable.name.clone(),
+    }
+}
+
+fn cm1_radar_missing_fields(inventory: &Cm1Inventory) -> Vec<&'static str> {
+    let has_role = |name: &str, role: &Cm1VariableRole| {
+        inventory
+            .variable(name)
+            .is_some_and(|variable| &variable.role == role)
+    };
+    let mut missing = Vec::new();
+    if !has_role("dbz", &Cm1VariableRole::NativeScalar3D) {
+        missing.push("3-D dbz");
+    }
+    if inventory.physical_height_variable.available().is_none() {
+        missing.push("3-D zhval heights");
+    }
+    if !has_role("uinterp", &Cm1VariableRole::NativeScalar3D)
+        && !has_role("u", &Cm1VariableRole::NativeXStaggered3D)
+    {
+        missing.push("3-D u wind");
+    }
+    if !has_role("vinterp", &Cm1VariableRole::NativeScalar3D)
+        && !has_role("v", &Cm1VariableRole::NativeYStaggered3D)
+    {
+        missing.push("3-D v wind");
+    }
+    if !has_role("winterp", &Cm1VariableRole::NativeScalar3D)
+        && !has_role("w", &Cm1VariableRole::NativeZStaggered3D)
+    {
+        missing.push("3-D w wind");
+    }
+    if matches!(
+        &inventory.motion.domain_motion,
+        Cm1DomainMotion::Unresolved { .. }
+    ) {
+        missing.push("moving-domain wind correction");
+    }
+    missing
 }
 
 pub fn spawn_import(request: Cm1ImportRequest, store_root: PathBuf) -> Cm1ImportTask {
@@ -1426,6 +1650,7 @@ fn import_selected_plane(
     let run = run_name(request);
     let projection = GridProjection::Geographic;
     let mut representative_plane = None;
+    let mut display_plane = None;
     let mut hours_written = 0usize;
     for (slot, &(time_index, exact)) in exact_times.iter().enumerate() {
         progress(format!(
@@ -1479,6 +1704,9 @@ fn import_selected_plane(
         match result {
             Ok(plane) => {
                 hours_written += 1;
+                if time_index == request.display_time_index {
+                    display_plane = Some(Cm1CompletionPlane::from_plane(&plane));
+                }
                 representative_plane.get_or_insert(plane);
             }
             Err(error) => {
@@ -1490,6 +1718,8 @@ fn import_selected_plane(
     }
     let representative_plane = representative_plane
         .ok_or_else(|| "CM1 import produced no representative field plane.".to_owned())?;
+    let display_plane = display_plane
+        .ok_or_else(|| "CM1 import did not read the requested display plane.".to_owned())?;
 
     let provenance_path = store_root
         .join("cm1")
@@ -1523,10 +1753,14 @@ fn import_selected_plane(
         store_root: store_root.to_path_buf(),
         model: "cm1".to_owned(),
         run,
-        variable: field_name,
         hours_written,
         hour,
-        provenance_path,
+        native_variable: display_plane.variable,
+        native_long_name: display_plane.long_name,
+        native_units: display_plane.units,
+        native_level_index: display_plane.level_index,
+        native_nominal_level_m: display_plane.nominal_level_m,
+        plane_statistics: display_plane.statistics,
     })
 }
 
@@ -1808,6 +2042,15 @@ fn format_profile_value(value: f64) -> String {
     }
 }
 
+fn format_plot_value(value: f64) -> String {
+    let value = if value == 0.0 { 0.0 } else { value };
+    if value != 0.0 && !(1.0e-3..1.0e5).contains(&value.abs()) {
+        format!("{value:.4e}")
+    } else {
+        format!("{value:.4}")
+    }
+}
+
 fn cm1_time_label(inventory: &Cm1Inventory, index: usize) -> String {
     let elapsed = inventory
         .time
@@ -1955,6 +2198,27 @@ mod tests {
     }
 
     #[test]
+    fn default_field_is_scientific_not_backend_iteration_order() {
+        let inventory = cm1::inspect_path(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc"),
+        )
+        .expect("fixture inventory");
+        assert_eq!(
+            preferred_horizontal_variable(&inventory).map(|variable| variable.name.as_str()),
+            Some("cref")
+        );
+    }
+
+    #[test]
+    fn constant_plane_status_explains_single_color_plot() {
+        let statistics = Cm1PlaneStatistics::from_values(&[0.0, -0.0, 0.0]);
+        assert_eq!(
+            statistics.describe(Some("m/s")),
+            "constant 0.0000 m/s, so the plot is correctly a single color"
+        );
+    }
+
+    #[test]
     fn exact_fixture_time_uses_official_start_and_elapsed_seconds() {
         let inventory = cm1::inspect_path(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc"),
@@ -1998,7 +2262,13 @@ mod tests {
             import_selected_plane(&request, &store_root, &mut |message| progress.push(message))
                 .expect("import fixture plane");
         assert_eq!(summary.model, "cm1");
-        assert_eq!(summary.variable, "cm1_u_k001");
+        let completion = summary.completion_message();
+        assert!(
+            completion.contains("Opened CM1 u velocity (u)"),
+            "{completion}"
+        );
+        assert!(completion.contains("in Models"), "{completion}");
+        assert!(completion.contains("range"), "{completion}");
         assert_eq!(
             summary.hour.exact_time.map(|time| time.lead_seconds),
             Some(60)
@@ -2010,8 +2280,13 @@ mod tests {
                 .join("f000.rws")
                 .is_file()
         );
-        let provenance =
-            std::fs::read_to_string(&summary.provenance_path).expect("read CM1 provenance sidecar");
+        let provenance = std::fs::read_to_string(
+            store_root
+                .join("cm1")
+                .join(&summary.run)
+                .join("cm1-provenance.json"),
+        )
+        .expect("read CM1 provenance sidecar");
         assert!(provenance.contains("bowecho-cm1-provenance-v1"));
         assert!(provenance.contains("\"name\": \"u\""));
         assert!(provenance.contains("DestaggeredX"));
@@ -2050,7 +2325,7 @@ mod tests {
         );
         assert!(run_dir.join("f000.rws").is_file());
         assert!(run_dir.join("f001.rws").is_file());
-        let provenance = std::fs::read_to_string(&summary.provenance_path)
+        let provenance = std::fs::read_to_string(run_dir.join("cm1-provenance.json"))
             .expect("read loop provenance sidecar");
         assert!(provenance.contains("\"time_indices\": ["));
         assert!(provenance.contains("\"storage_slot\": 1"));

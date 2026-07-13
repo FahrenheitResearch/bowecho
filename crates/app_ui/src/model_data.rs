@@ -2457,13 +2457,7 @@ impl ModelDataDock {
                 }
                 match done {
                     Some(Ok(summary)) => PollResult::FinishedCm1 {
-                        message: format!(
-                            "Imported {} CM1 frame(s) of {} -> run “{}”; provenance {}",
-                            summary.hours_written,
-                            summary.variable,
-                            summary.run,
-                            summary.provenance_path.display()
-                        ),
+                        message: summary.completion_message(),
                         summary,
                     },
                     Some(Err(error)) => PollResult::Finished {
@@ -2701,6 +2695,10 @@ impl ModelDataDock {
                 self.import_job = None;
                 self.select_hour_key(summary.hour.clone());
                 self.rescan();
+                // The button promises an open-in-Models handoff. Leaving the
+                // floating CM1 workspace above the newly opened Models pane
+                // made a successful import look as though nothing happened.
+                self.cm1.close();
                 self.cm1_open_models_requested = true;
                 if self.wrf_options.auto_plot {
                     self.start_plot_job(summary.store_root, summary.model, summary.run);
