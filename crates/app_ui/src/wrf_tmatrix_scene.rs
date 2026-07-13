@@ -4542,4 +4542,116 @@ mod tests {
             "P3 full-fixture sweep: reconstructed={reconstructed_categories}, negative_rain_cleared={negative_rain_cells}, active_positive_rain={active_positive_rain_cells}, audited_nonmass_residuals_over_default={audited_nonmass_residuals_over_default}, worst={worst_error} ({worst_moment}) at cell {worst_cell}, category {worst_category:?}, input {worst_input:#?}"
         );
     }
+
+    #[test]
+    fn diagnose_reported_p3_particle_support_omission() {
+        let (Some(wrf_path), Some(table_path)) = (
+            std::env::var_os("BOWECHO_WRF_PROPERTY_FIXTURE"),
+            std::env::var_os("BOWECHO_P3_TABLE_FIXTURE"),
+        ) else {
+            return;
+        };
+        const CELL: usize = 5_779_317;
+
+        let file = wrf_core::WrfFile::open(&wrf_path).expect("open WRF fixture");
+        let scheme_id = file.global_attr_i32("MP_PHYSICS").expect("MP_PHYSICS");
+        let scheme = P3WrfScheme::try_from(scheme_id).expect("P3 fixture");
+        let table_kind = required_p3_table_kind(scheme_id).expect("P3 table kind");
+        let scene = read_wrf_property_scene(
+            &file,
+            WrfSourceIdentity("fixture:p3-support-diagnostic".to_owned()),
+            0,
+        )
+        .expect("read P3 scene");
+        let table = P3OfficialTableV54::load_path(table_kind, table_path).expect("load P3 table");
+        let raw = scene.raw_cell(CELL).expect("read reported cell");
+
+        for value in raw
+            .categories()
+            .iter()
+            .filter_map(|category| match category {
+                RawPropertyCategory::P3(value) if value.qice_kgkg > 0.0 => Some(value),
+                _ => None,
+            })
+        {
+            let input =
+                p3_psd_input(scheme, value, raw.dry_air_density_kg_m3()).expect("map P3 input");
+            let psd = P3Psd::reconstruct(input, &table, P3ReconstructionConfig::default())
+                .expect("reconstruct P3 PSD");
+            eprintln!("cell={CELL} category={:?} input={input:#?}", value.category);
+            for minimum_diameter_m in [
+                50e-6, 45e-6, 40e-6, 35e-6, 30e-6, 25e-6, 20e-6, 15e-6, 10e-6, 5e-6, 1e-6,
+            ] {
+                let quadrature = psd
+                    .quadrature_with_dimension_breakpoints(
+                        radar_scattering::P3QuadratureConfig::default(),
+                        &[minimum_diameter_m, 0.089],
+                    )
+                    .expect("quadrature");
+                let closure = psd.closure_audit();
+                let mut omitted = [0.0_f64; 3];
+                let mut by_diameter = [0.0_f64; 3];
+                let mut by_density = [0.0_f64; 3];
+                let mut by_ratio = [0.0_f64; 3];
+                let mut minimum_coordinates = [f64::INFINITY; 3];
+                let mut maximum_coordinates = [f64::NEG_INFINITY; 3];
+                for node in &quadrature.nodes {
+                    let ratio = (4.0 * node.particle.projected_area_m2
+                        / (std::f64::consts::PI * node.particle.maximum_dimension_m.powi(2)))
+                    .min(1.0);
+                    let equivolume_diameter_m = node.particle.maximum_dimension_m * ratio.cbrt();
+                    let density_kg_m3 = node.particle.mass_kg
+                        / (std::f64::consts::PI / 6.0 * equivolume_diameter_m.powi(3));
+                    let coordinates = [equivolume_diameter_m, density_kg_m3, ratio];
+                    for axis in 0..3 {
+                        minimum_coordinates[axis] =
+                            minimum_coordinates[axis].min(coordinates[axis]);
+                        maximum_coordinates[axis] =
+                            maximum_coordinates[axis].max(coordinates[axis]);
+                    }
+                    let moments = [
+                        node.number_concentration_m3,
+                        node.number_concentration_m3 * node.particle.mass_kg,
+                        node.number_concentration_m3 * node.particle.maximum_dimension_m.powi(6),
+                    ];
+                    let diameter_outside =
+                        !(minimum_diameter_m..=0.089).contains(&equivolume_diameter_m);
+                    let density_outside = !(1.5..=917.0).contains(&density_kg_m3);
+                    let ratio_outside = !(0.1..=1.0).contains(&ratio);
+                    for moment in 0..3 {
+                        if diameter_outside || density_outside || ratio_outside {
+                            omitted[moment] += moments[moment];
+                        }
+                        if diameter_outside {
+                            by_diameter[moment] += moments[moment];
+                        }
+                        if density_outside {
+                            by_density[moment] += moments[moment];
+                        }
+                        if ratio_outside {
+                            by_ratio[moment] += moments[moment];
+                        }
+                    }
+                }
+                let totals = [
+                    closure.reconstructed_number_density_m3,
+                    closure.reconstructed_mass_concentration_kg_m3,
+                    closure.reconstructed_sixth_moment_m3,
+                ];
+                for values in [
+                    &mut omitted,
+                    &mut by_diameter,
+                    &mut by_density,
+                    &mut by_ratio,
+                ] {
+                    for moment in 0..3 {
+                        values[moment] /= totals[moment];
+                    }
+                }
+                eprintln!(
+                    "minD={minimum_diameter_m:.9e} omitted={omitted:?} diameter={by_diameter:?} density={by_density:?} ratio={by_ratio:?} coords_min={minimum_coordinates:?} coords_max={maximum_coordinates:?}"
+                );
+            }
+        }
+    }
 }
