@@ -73,7 +73,12 @@ const NUMERICAL_EPSILON: f64 = 2.0e-14;
 const NUMERICAL_FLOOR: f64 = 1.0e-300;
 const RECONSTRUCTION_RELATIVE_TOLERANCE: f64 = 2.0e-12;
 const SPHERICAL_LOG_AXIS_TOLERANCE: f64 = 1.0e-12;
-const SOURCE_BOUND_RELATIVE_TOLERANCE: f64 = 8.0 * f32::EPSILON as f64;
+// Native ISHMAEL prognostics are WRF REAL values. Reconstructing a bounded
+// diagnostic from several transported f32 fields (ratios, roots, and a gamma
+// moment) can accumulate slightly more than eight single-precision epsilons.
+// Sixteen epsilons is still a narrowly bounded ~1.9 ppm transport allowance;
+// values admitted by it are canonicalized to the exact source bound below.
+const SOURCE_BOUND_RELATIVE_TOLERANCE: f64 = 16.0 * f32::EPSILON as f64;
 
 /// The native distribution revision selected by a PSD integration config.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1742,7 +1747,7 @@ fn source_bounded(
     let tolerance = SOURCE_BOUND_RELATIVE_TOLERANCE * range[0].abs().max(range[1].abs()).max(1.0);
     if value.is_finite() && range[0] - tolerance <= value && value <= range[1] + tolerance {
         let canonical = value.clamp(range[0], range[1]);
-        Ok((value, value - canonical))
+        Ok((canonical, value - canonical))
     } else {
         Err(PsdError::OutsideReconstructionBound {
             field,
@@ -2257,8 +2262,12 @@ mod tests {
             400.0,
         ))
         .unwrap();
-        assert_relative(delta_boundary.aspect_power_delta(), raw_delta, 2.0e-14);
-        assert!(delta_boundary.reconstruction_audit().delta_bound_excursion < 0.0);
+        assert_eq!(delta_boundary.aspect_power_delta(), ISHMAEL_DELTA_RANGE[0]);
+        assert_relative(
+            delta_boundary.reconstruction_audit().delta_bound_excursion,
+            raw_delta - ISHMAEL_DELTA_RANGE[0],
+            2.0e-12,
+        );
 
         let density_excursion =
             0.25 * SOURCE_BOUND_RELATIVE_TOLERANCE * ISHMAEL_DENSITY_RANGE_KG_M3[1];
@@ -2269,12 +2278,42 @@ mod tests {
             ISHMAEL_DENSITY_RANGE_KG_M3[1] + density_excursion,
         ))
         .unwrap();
-        assert!(density_boundary.bulk_density_kg_m3() > ISHMAEL_DENSITY_RANGE_KG_M3[1]);
+        assert_eq!(
+            density_boundary.bulk_density_kg_m3(),
+            ISHMAEL_DENSITY_RANGE_KG_M3[1]
+        );
         assert!(
             density_boundary
                 .reconstruction_audit()
                 .density_bound_excursion_kg_m3
                 > 0.0
+        );
+    }
+
+    #[test]
+    fn exact_wrf_upper_density_transport_residue_is_canonicalized() {
+        // Actual MP55 cell 1,951,079 reconstructed this value from native WRF
+        // REAL QICE/QNICE/QVOLI/QAOLI. It is a ~1 ppm arithmetic excursion,
+        // not a physically distinct density above ISHMAEL's 920 kg m^-3 cap.
+        let transported_density = 920.000_932_689_841_8;
+        let distribution = IshmaelPsd::reconstruct(input_from_scales(
+            IshmaelIceCategory::Planar,
+            50.0e-6,
+            25.0e-6,
+            transported_density,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            distribution.bulk_density_kg_m3(),
+            ISHMAEL_DENSITY_RANGE_KG_M3[1]
+        );
+        assert_relative(
+            distribution
+                .reconstruction_audit()
+                .density_bound_excursion_kg_m3,
+            transported_density - ISHMAEL_DENSITY_RANGE_KG_M3[1],
+            2.0e-12,
         );
     }
 
