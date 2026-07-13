@@ -14,6 +14,7 @@ use crate::{
 
 pub(crate) const CUDA_LUT_COMPONENT_COUNT: usize = AdditiveScattering::COMPONENT_COUNT;
 const KERNEL_NAME: &str = "bowecho_p3_lut_segments_v1";
+const CUDA_SEGMENT_THREADS_PER_BLOCK: u32 = 128;
 const KERNEL_PTX: &str = include_str!("../kernels/p3_lut_segments.ptx");
 #[cfg(test)]
 const KERNEL_MANIFEST: &str = include_str!("../kernels/p3_lut_segments.manifest.json");
@@ -223,8 +224,8 @@ impl CudaLutExecutor {
     }
 
     /// Evaluate ordered PSD reduction segments against a previously uploaded
-    /// table. One CUDA warp owns one segment; lanes 0..8 independently
-    /// accumulate the nine components in node order.
+    /// table. One CUDA thread owns one segment and accumulates all nine
+    /// components in node order.
     pub(crate) fn evaluate_preloaded_segments(
         &mut self,
         table_file_sha256: Sha256Digest,
@@ -329,10 +330,11 @@ impl CudaLutExecutor {
             .arg(&mut device.outputs)
             .arg(&mut device.error_codes)
             .arg(&mut device.error_nodes);
+        let grid_blocks = segment_count.div_ceil(CUDA_SEGMENT_THREADS_PER_BLOCK);
         unsafe {
             launch.launch(LaunchConfig {
-                grid_dim: (segment_count, 1, 1),
-                block_dim: (32, 1, 1),
+                grid_dim: (grid_blocks, 1, 1),
+                block_dim: (CUDA_SEGMENT_THREADS_PER_BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             })
         }
@@ -723,6 +725,21 @@ mod tests {
         }
     }
 
+    fn five_axis_node(scale: f64, speed: f64) -> CudaLutNodePlan {
+        let mut offsets = [0; CUDA_MAX_ACTIVE_AXES];
+        offsets[..5].copy_from_slice(&[16, 8, 4, 2, 1]);
+        let mut fractions = [0.0; CUDA_MAX_ACTIVE_AXES];
+        fractions[..5].copy_from_slice(&[0.25, 0.75, 0.375, 0.625, 0.5]);
+        CudaLutNodePlan {
+            base_point_index: 0,
+            upper_point_offsets: offsets,
+            upper_fractions: fractions,
+            active_axis_count: 5,
+            number_concentration_m3: scale,
+            positive_down_fall_speed_m_s: speed,
+        }
+    }
+
     #[test]
     fn input_validation_rejects_out_of_bounds_plan_before_launch() {
         let mut node = interior_node(1.0, 2.0);
@@ -869,6 +886,59 @@ mod tests {
             executor.device_batch.as_ref().unwrap().segment_capacity,
             large_segments.len(),
             "smaller follow-up must reuse the existing output/error buffers"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual low-level CUDA launch benchmark"]
+    fn manual_gpu_65k_one_node_segment_throughput() {
+        const NODE_COUNT: usize = 65_536;
+        const SAMPLES: usize = 5;
+
+        let availability = crate::probe_cuda();
+        let Some(device) = availability.preferred_device() else {
+            eprintln!("skipping CUDA launch benchmark: {availability:?}");
+            return;
+        };
+        let mut executor = CudaLutExecutor::open(device.ordinal).unwrap();
+        let table = (0..32)
+            .map(|point| valid_point(10.0 + f64::from(point)))
+            .collect::<Vec<_>>();
+        let nodes = vec![five_axis_node(1.25, 2.5); NODE_COUNT];
+        let segments = (0..NODE_COUNT)
+            .map(|node| CudaLutSegment {
+                first_node: node as u32,
+                node_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let digest = Sha256Digest::compute(b"manual CUDA launch benchmark LUT");
+        let point_count = executor.preload_lut(digest, &table).unwrap();
+        let expected = ordered_cpu_segments(&table, &nodes, &segments);
+        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut actual = Vec::new();
+        for _ in 0..SAMPLES {
+            let started = std::time::Instant::now();
+            actual = executor
+                .evaluate_preloaded_segments(digest, point_count, &nodes, &segments)
+                .unwrap();
+            samples.push(started.elapsed());
+        }
+        assert_eq!(actual, expected);
+        let steady = samples
+            .iter()
+            .skip(1)
+            .map(|sample| sample.as_secs_f64())
+            .sum::<f64>()
+            / (SAMPLES - 1) as f64;
+        eprintln!(
+            "CUDA low-level 65k one-node segments: cold {:.6} s; steady {:.6} s ({:.0} nodes/s); samples {:?}",
+            samples[0].as_secs_f64(),
+            steady,
+            NODE_COUNT as f64 / steady,
+            samples
+                .iter()
+                .map(std::time::Duration::as_secs_f64)
+                .collect::<Vec<_>>()
         );
     }
 }
