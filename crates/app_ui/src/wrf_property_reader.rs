@@ -2500,9 +2500,8 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
     let mut qrain_kgkg = Vec::new();
     let mut qrain_normalization_kgkg = Vec::new();
     let p3_rain = matches!(scheme_id, 50..=53);
-    let negative_limit = if p3_rain { -WRF_P3_QSMALL_KGKG } else { 0.0 };
     for (cell_index, value) in mass.values.into_iter().enumerate() {
-        if is_missing(value) || value < negative_limit {
+        if is_missing(value) {
             return (
                 SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
                     field: QRAIN_FIELD.name,
@@ -2515,6 +2514,15 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
         // ISHMAEL retains the reader's independent exact-zero behavior.
         if p3_rain && value < WRF_P3_QSMALL_KGKG {
             continue;
+        }
+        if value < 0.0 {
+            return (
+                SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
+                    field: QRAIN_FIELD.name,
+                    message: format!("invalid mass {value} at cell {cell_index}"),
+                }),
+                provenance,
+            );
         }
         if value > 0.0 {
             let compact = match narrow_f32(QRAIN_FIELD.name, cell_index, value) {
@@ -3595,16 +3603,16 @@ mod tests {
             / (std::f64::consts::PI * WRF_P3_RAIN_WATER_DENSITY_KG_M3);
         assert_close(f64::from(qnrain_per_kg[0]), expected_number, 1.0e-9);
 
-        let materially_negative = TinyProvider::new(50, 1)
-            .field("QRAIN", vec![-1.01 * WRF_P3_QSMALL_KGKG], "kg kg-1")
-            .field("QNRAIN", vec![1.0e6], "kg-1");
-        let (rain, _) = read_rain(&materially_negative, 0, 1, 50);
+        let reported_residue = TinyProvider::new(50, 1)
+            .field("QRAIN", vec![-1.079_097_951_945_35e-14], "kg kg-1")
+            .field("QNRAIN", vec![f64::NAN], "kg-1");
+        let (rain, _) = read_rain(&reported_residue, 0, 1, 50);
         assert!(matches!(
-            rain,
-            SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
-                field: "QRAIN",
-                ..
-            })
+            rain.raw_at(0),
+            RawRainState::Available {
+                qrain_kgkg: 0.0,
+                qnrain_per_kg: 0.0
+            }
         ));
     }
 

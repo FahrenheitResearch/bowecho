@@ -1428,10 +1428,9 @@ mod tests {
             1.0e6,
             4.0e-5,
             1.0e-7,
-            // P3 repairs nonpositive QNRAIN at active rain mass. Use a
-            // materially negative mass to preserve this availability-mismatch
-            // contract without contradicting the native scheme behavior.
-            Some((-1.0, 0.0)),
+            // P3 repairs finite nonpositive QNRAIN and clears all QRAIN below
+            // qsmall. A nonfinite number remains genuinely unavailable.
+            Some((1.0e-4, f64::NAN)),
         );
         assert_eq!(
             interpolate_raw_state_linear(
