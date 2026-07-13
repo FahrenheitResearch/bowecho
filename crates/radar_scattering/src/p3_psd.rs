@@ -431,15 +431,21 @@ pub trait P3LookupTableV54: Send + Sync {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct P3ReconstructionConfig {
+    /// Maximum numerical relative error allowed after mass-normalizing the
+    /// reconstructed PSD. Number and sixth-moment residuals remain audited,
+    /// but are not hard gates: WRF linearly interpolates its coarse table and
+    /// applies the number limiters after lookup, so those moments are not
+    /// algebraically guaranteed to close between table nodes.
     pub maximum_moment_relative_error: f64,
 }
 
 impl Default for P3ReconstructionConfig {
     fn default() -> Self {
         Self {
-            // The official table is discretized and WRF linearly interpolates
-            // lambda/mu. Retain a strict, visible closure gate without claiming
-            // bitwise inversion of the offline generator.
+            // The official generator mass-normalizes N0 after selecting
+            // lambda/mu. Retain a strict numerical check on that authoritative
+            // mass closure without rejecting expected interpolation residuals
+            // in number or the optional sixth moment.
             maximum_moment_relative_error: 0.03,
         }
     }
@@ -781,10 +787,23 @@ impl P3Psd {
         let law = P3PiecewiseParticleLaw::reconstruct(rime_fraction, rime_density)?;
         let repaired_number_per_kg = number_limiter.repaired_total_number_per_kg;
         let number_density = repaired_number_per_kg * input.dry_air_density_kg_m3;
-        let log_n0 = number_density.ln()
-            + (solution.shape_mu + 1.0) * solution.slope_lambda_m_inv.ln()
-            - ln_gamma(solution.shape_mu + 1.0)?;
-        let n0_intercept_si = log_n0.exp();
+        let expected_mass = input.total_ice_kgkg * input.dry_air_density_kg_m3;
+        // The pinned lookup-table generator deliberately derives final N0
+        // from Q and the piecewise mass integral, rather than from N, because
+        // WRF may subsequently adjust N to enforce its mean-size bounds. Do
+        // the same here. Interpolated lambda/mu plus repaired Ni need not close
+        // number exactly between the coarse table nodes, but QICE remains the
+        // authoritative total condensed mass for the scattering population.
+        let unit_intercept_mass = integrate_piecewise_mass(
+            1.0,
+            solution.slope_lambda_m_inv,
+            solution.shape_mu,
+            law,
+            0.0,
+            f64::INFINITY,
+        )?;
+        positive("P3 unit-intercept mass integral", unit_intercept_mass)?;
+        let n0_intercept_si = expected_mass / unit_intercept_mass;
         positive("P3 gamma intercept N0", n0_intercept_si)?;
 
         let reconstructed_number = gamma_raw_moment(
@@ -807,25 +826,16 @@ impl P3Psd {
             solution.shape_mu,
             6.0,
         )?;
-        let expected_mass = input.total_ice_kgkg * input.dry_air_density_kg_m3;
         let expected_m6 = sixth_moment_per_kg.map(|moment| moment * input.dry_air_density_kg_m3);
         let number_error = relative_error(reconstructed_number, number_density);
         let mass_error = relative_error(reconstructed_mass, expected_mass);
         let sixth_error = expected_m6.map(|expected| relative_error(reconstructed_m6, expected));
-        for (moment, error) in [
-            ("number", Some(number_error)),
-            ("mass", Some(mass_error)),
-            ("sixth", sixth_error),
-        ] {
-            if let Some(relative_error) = error
-                && relative_error > config.maximum_moment_relative_error
-            {
-                return Err(P3PsdError::MomentClosure {
-                    moment,
-                    relative_error,
-                    maximum: config.maximum_moment_relative_error,
-                });
-            }
+        if mass_error > config.maximum_moment_relative_error {
+            return Err(P3PsdError::MomentClosure {
+                moment: "mass",
+                relative_error: mass_error,
+                maximum: config.maximum_moment_relative_error,
+            });
         }
         let expected_rime_mass = input.rime_mass_kgkg * input.dry_air_density_kg_m3;
         let reconstructed_rime_mass = reconstructed_mass * rime_fraction;
@@ -1843,6 +1853,30 @@ mod tests {
         assert!(!psd.number_limiter_audit().nsmall_applied);
         assert!(!psd.number_limiter_audit().maximum_applied);
         assert!(!psd.number_limiter_audit().minimum_applied);
+    }
+
+    #[test]
+    fn table_interpolation_number_residual_is_audited_while_mass_remains_exact() {
+        let scheme = P3WrfScheme::Mp50OneIceFixedCloudNumber;
+        let input = state_from_exact_distribution(scheme, 2.0e5, 2.0, 3.0e5, 0.9);
+        // Mimic an interpolated official-table solution that does not exactly
+        // invert the supplied Q/N tuple. The pinned generator normalizes N0
+        // from Q in this situation; the repaired Ni remains an audit target.
+        let psd = P3Psd::reconstruct(
+            input,
+            &fixture_table(scheme, 1.6e5, 2.0),
+            P3ReconstructionConfig {
+                maximum_moment_relative_error: 1.0e-10,
+            },
+        )
+        .unwrap();
+
+        assert!(psd.closure.mass_relative_error < 1.0e-12);
+        assert!(psd.closure.number_relative_error > 0.03);
+        assert_eq!(
+            psd.closure.expected_number_density_m3,
+            psd.number_limiter_audit().repaired_total_number_per_kg * input.dry_air_density_kg_m3
+        );
     }
 
     #[test]

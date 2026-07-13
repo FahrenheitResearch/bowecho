@@ -4412,12 +4412,10 @@ mod tests {
             "fixture must contain active positive rain"
         );
 
-        let default_tolerance = P3ReconstructionConfig::default().maximum_moment_relative_error;
-        let diagnostic_config = P3ReconstructionConfig {
-            maximum_moment_relative_error: 0.999,
-        };
+        let reconstruction_config = P3ReconstructionConfig::default();
+        let default_tolerance = reconstruction_config.maximum_moment_relative_error;
         let mut reconstructed_categories = 0_usize;
-        let mut closures_over_default = 0_usize;
+        let mut audited_nonmass_residuals_over_default = 0_usize;
         let mut worst_closure: Option<(f64, usize, P3Category, &'static str, P3PsdInput)> = None;
 
         for sparse_category in scene.categories() {
@@ -4445,7 +4443,7 @@ mod tests {
                             "production p3_psd_input rejected cell {cell_index}, category {category:?}, raw {value:#?}"
                         )
                     });
-                let psd = P3Psd::reconstruct(input, &table, diagnostic_config).unwrap_or_else(
+                let psd = P3Psd::reconstruct(input, &table, reconstruction_config).unwrap_or_else(
                     |error| {
                         panic!(
                             "production P3 reconstruction failed at cell {cell_index}, category {category:?}, input {input:#?}: {error}"
@@ -4462,8 +4460,8 @@ mod tests {
                     let Some(error) = error else {
                         continue;
                     };
-                    if error > default_tolerance {
-                        closures_over_default += 1;
+                    if moment != "mass" && error > default_tolerance {
+                        audited_nonmass_residuals_over_default += 1;
                     }
                     if worst_closure
                         .as_ref()
@@ -4478,7 +4476,7 @@ mod tests {
         let (worst_error, worst_cell, worst_category, worst_moment, worst_input) =
             worst_closure.expect("fixture contains an active P3 category");
         eprintln!(
-            "P3 full-fixture sweep: reconstructed={reconstructed_categories}, negative_rain_cleared={negative_rain_cells}, active_positive_rain={active_positive_rain_cells}, closures_over_default={closures_over_default}, worst={worst_error} ({worst_moment}) at cell {worst_cell}, category {worst_category:?}, input {worst_input:#?}"
+            "P3 full-fixture sweep: reconstructed={reconstructed_categories}, negative_rain_cleared={negative_rain_cells}, active_positive_rain={active_positive_rain_cells}, audited_nonmass_residuals_over_default={audited_nonmass_residuals_over_default}, worst={worst_error} ({worst_moment}) at cell {worst_cell}, category {worst_category:?}, input {worst_input:#?}"
         );
     }
 }
