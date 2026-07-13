@@ -7045,6 +7045,28 @@ mod tests {
             0,
         )
         .expect("read normalized ISHMAEL property scene");
+        if cell == 3_216_000 {
+            let audit = source.ishmael_source_state_normalization_audit();
+            assert_eq!(
+                audit.revision(),
+                crate::wrf_property_reader::ISHMAEL_SOURCE_STATE_NORMALIZATION_REVISION
+            );
+            assert!(audit.positive_sub_qsmall_ice_tuples_cleared() > 0);
+            let raw = source.raw_cell(cell).unwrap();
+            let RawPropertyCategory::Ishmael(columnar) = &raw.categories()[1] else {
+                panic!("exact fixture cell retains the columnar tuple slot")
+            };
+            assert_eq!(columnar.category, WrfPropertyCategory::IshmaelColumnar);
+            assert_eq!(
+                (
+                    columnar.qice_kgkg.to_bits(),
+                    columnar.qnice_per_kg.to_bits(),
+                    columnar.qvoli_m3_per_kg.to_bits(),
+                    columnar.qaoli_m3_per_kg.to_bits(),
+                ),
+                (0, 0, 0, 0)
+            );
+        }
 
         let owner = load_property_tmatrix_tables_exact(
             PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,

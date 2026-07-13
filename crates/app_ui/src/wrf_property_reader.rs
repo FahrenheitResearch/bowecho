@@ -47,8 +47,7 @@ const WRF_FILL_MAGNITUDE: f64 = 1.0e30;
 // Thermodynamic paths already require physical nonnegative vapor, so clamp a
 // bounded residue (at most 0.01 g/kg) to dry air and reject anything larger.
 const WRF_NEGATIVE_WATER_VAPOR_RESIDUE_LIMIT_KGKG: f64 = 1.0e-5_f32 as f64;
-// WRF P3's source-level hydrometeor activity threshold (`qsmall`). Keep this
-// distinct from ISHMAEL, whose source code does not establish the same floor.
+// WRF P3's source-level hydrometeor activity threshold (`qsmall`).
 const WRF_P3_QSMALL_KGKG: f64 = 1.0e-14_f32 as f64;
 // WRF output can retain sparse default-REAL transport undershoots at lateral
 // boundaries even though hydrometeor mass is physically nonnegative. Keep the
@@ -56,11 +55,10 @@ const WRF_P3_QSMALL_KGKG: f64 = 1.0e-14_f32 as f64;
 // negligible absolute band become inactive zero, while a larger negative mass
 // remains a typed file error. 1e-10 kg/kg is 0.1 microgram per kilogram.
 const WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG: f64 = 1.0e-10_f32 as f64;
-// ISHMAEL's source-level QSMALL clears rain at and below 1e-12 kg/kg. Its WRF
-// transport fields can also contain isolated negative default-REAL residues
-// around zero. Use the same source threshold for rain activity while keeping
-// this negative-mass bound explicit for the frozen tuples; a larger negative
-// mass remains a typed file error.
+// ISHMAEL's source-level QSMALL clears each complete ice or rain tuple at and
+// below 1e-12 kg/kg. Its WRF transport fields can also contain isolated
+// negative default-REAL residues around zero. Keep the negative-mass bound
+// explicit; a larger negative mass remains a typed file error.
 const WRF_ISHMAEL_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG: f64 = 1.0e-12_f32 as f64;
 const WRF_ISHMAEL_QSMALL_KGKG: f64 = 1.0e-12_f32 as f64;
 const WRF_ISHMAEL_QNSMALL_PER_KG: f64 = 1.25e-7_f32 as f64;
@@ -74,6 +72,10 @@ const WRF_P3_RIME_DENSITY_MAX_KG_M3: f32 = 900.0;
 const WRF_P3_RAIN_LAMBDA_MIN_M_INV: f64 = 500.0;
 const WRF_P3_RAIN_LAMBDA_MAX_M_INV: f64 = 100_000.0;
 const WRF_P3_RAIN_WATER_DENSITY_KG_M3: f64 = 1_000.0;
+
+/// Versioned reproduction of WRF ISHMAEL's complete-tuple `QSMALL` cleanup.
+pub const ISHMAEL_SOURCE_STATE_NORMALIZATION_REVISION: &str =
+    "wrf-v4.5.2-ishmael-qsmall-complete-tuple-v1";
 
 /// One raw field returned by a [`PropertyFieldProvider`].
 #[derive(Clone, Debug, PartialEq)]
@@ -823,6 +825,35 @@ pub struct PropertySceneIdentity {
     pub time_index: usize,
 }
 
+/// Source-state repairs applied before sparse ISHMAEL tuples are exposed to
+/// closure, interpolation, CPU scattering, or CUDA scattering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IshmaelSourceStateNormalizationAudit {
+    revision: &'static str,
+    positive_sub_qsmall_ice_tuples_cleared: u64,
+}
+
+impl Default for IshmaelSourceStateNormalizationAudit {
+    fn default() -> Self {
+        Self {
+            revision: ISHMAEL_SOURCE_STATE_NORMALIZATION_REVISION,
+            positive_sub_qsmall_ice_tuples_cleared: 0,
+        }
+    }
+}
+
+impl IshmaelSourceStateNormalizationAudit {
+    #[must_use]
+    pub const fn revision(self) -> &'static str {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn positive_sub_qsmall_ice_tuples_cleared(self) -> u64 {
+        self.positive_sub_qsmall_ice_tuples_cleared
+    }
+}
+
 /// Unit-normalized P3 state before nonlinear closure or LUT lookup.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawP3Category {
@@ -1066,6 +1097,7 @@ pub struct WrfPropertyScene {
     categories: Vec<SparsePropertyCategory>,
     rain: SparseRainStorage,
     skipped_zero_mass_categories: Vec<WrfPropertyCategory>,
+    ishmael_source_state_normalization: IshmaelSourceStateNormalizationAudit,
     ishmael_source_names: Vec<(WrfPropertyCategory, IshmaelSourceFields)>,
     source_fields: Vec<SourceFieldProvenance>,
     required_field_signature: Arc<RequiredFieldSignature>,
@@ -1100,6 +1132,13 @@ impl WrfPropertyScene {
     #[must_use]
     pub fn skipped_zero_mass_categories(&self) -> &[WrfPropertyCategory] {
         &self.skipped_zero_mass_categories
+    }
+
+    #[must_use]
+    pub const fn ishmael_source_state_normalization_audit(
+        &self,
+    ) -> IshmaelSourceStateNormalizationAudit {
+        self.ishmael_source_state_normalization
     }
 
     #[must_use]
@@ -2191,6 +2230,7 @@ pub fn read_property_scene<P: PropertyFieldProvider + ?Sized>(
     let required_field_signature = inventory_field_signature(provider, scheme_id);
     let mut categories = Vec::new();
     let mut skipped_zero_mass_categories = Vec::new();
+    let mut ishmael_source_state_normalization = IshmaelSourceStateNormalizationAudit::default();
     let mut source_fields = Vec::new();
     let mut ishmael_source_names = Vec::new();
 
@@ -2206,7 +2246,7 @@ pub fn read_property_scene<P: PropertyFieldProvider + ?Sized>(
         };
         for &spec in specs {
             let category = WrfPropertyCategory::P3(spec.category);
-            let (active_cell_indices, qice_kgkg, mass_provenance) =
+            let (active_cell_indices, qice_kgkg, mass_provenance, _) =
                 read_mass_field(provider, time_index, cell_count, spec.qice, category)?;
             source_fields.push(mass_provenance);
             if active_cell_indices.is_empty() {
@@ -2280,8 +2320,10 @@ pub fn read_property_scene<P: PropertyFieldProvider + ?Sized>(
             let category = spec.category;
             let tuple_source_names = resolved_ishmael_source_names(provider, spec);
             ishmael_source_names.push((category, tuple_source_names));
-            let (active_cell_indices, qice_kgkg, mass_provenance) =
+            let (active_cell_indices, qice_kgkg, mass_provenance, positive_sub_qsmall_clears) =
                 read_mass_field(provider, time_index, cell_count, spec.qice, category)?;
+            ishmael_source_state_normalization.positive_sub_qsmall_ice_tuples_cleared +=
+                positive_sub_qsmall_clears;
             source_fields.push(mass_provenance);
             if active_cell_indices.is_empty() {
                 skipped_zero_mass_categories.push(category);
@@ -2395,6 +2437,7 @@ pub fn read_property_scene<P: PropertyFieldProvider + ?Sized>(
         categories,
         rain,
         skipped_zero_mass_categories,
+        ishmael_source_state_normalization,
         ishmael_source_names,
         source_fields,
         required_field_signature: Arc::new(required_field_signature),
@@ -2477,7 +2520,7 @@ fn read_mass_field<P: PropertyFieldProvider + ?Sized>(
     cell_count: usize,
     spec: FieldSpec,
     category: WrfPropertyCategory,
-) -> Result<(Vec<u32>, Vec<f32>, SourceFieldProvenance), WrfPropertyReadError> {
+) -> Result<(Vec<u32>, Vec<f32>, SourceFieldProvenance, u64), WrfPropertyReadError> {
     if !provider.has_field(spec.name) {
         return Err(WrfPropertyReadError::MissingRequiredField {
             category,
@@ -2487,6 +2530,7 @@ fn read_mass_field<P: PropertyFieldProvider + ?Sized>(
     let normalized = read_normalized_field(provider, time_index, cell_count, spec)?;
     let mut indices = Vec::new();
     let mut values = Vec::new();
+    let mut positive_sub_qsmall_clears = 0_u64;
     let p3_qsmall = matches!(category, WrfPropertyCategory::P3(_));
     let negative_limit = -if p3_qsmall {
         WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG
@@ -2510,15 +2554,23 @@ fn read_mass_field<P: PropertyFieldProvider + ?Sized>(
         let inactive = if p3_qsmall {
             value < WRF_P3_QSMALL_KGKG
         } else {
-            value <= 0.0
+            value <= WRF_ISHMAEL_QSMALL_KGKG
         };
         if inactive {
+            if !p3_qsmall && value > 0.0 {
+                positive_sub_qsmall_clears += 1;
+            }
             continue;
         }
         indices.push(u32::try_from(cell_index).expect("grid size checked before reads"));
         values.push(narrow_f32(spec.name, cell_index, value)?);
     }
-    Ok((indices, values, normalized.provenance))
+    Ok((
+        indices,
+        values,
+        normalized.provenance,
+        positive_sub_qsmall_clears,
+    ))
 }
 
 fn read_required_category_field<P: PropertyFieldProvider + ?Sized>(
@@ -3954,6 +4006,67 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn ishmael_qsmall_clears_complete_exact_boundary_tuple_and_audits_positive_residue() {
+        // Exact QICE2 bits from MP55 fixture cell 3,216,000. QNICE2,
+        // QVOLI2, and QAOLI2 are all zero there. WRF v4.5.2's final
+        // ISHMAEL check takes the `qi <= QSMALL` branch and clears the whole
+        // tuple before any number/axis reconstruction.
+        let reported_residue = f64::from(f32::from_bits(0x1f40_bcb9));
+        assert_eq!(reported_residue, 4.081_368_919_060_592_6e-20);
+        let provider = ishmael_provider().field(
+            "QICE2",
+            vec![reported_residue, WRF_ISHMAEL_QSMALL_KGKG, 0.0],
+            "kg kg-1",
+        );
+        let scene = read_property_scene(&provider, 0).unwrap();
+        let audit = scene.ishmael_source_state_normalization_audit();
+
+        assert_eq!(
+            audit.revision(),
+            ISHMAEL_SOURCE_STATE_NORMALIZATION_REVISION
+        );
+        assert_eq!(audit.positive_sub_qsmall_ice_tuples_cleared(), 2);
+        assert!(
+            scene
+                .skipped_zero_mass_categories()
+                .contains(&WrfPropertyCategory::IshmaelColumnar)
+        );
+        assert!(!provider.reads.borrow().iter().any(|field| matches!(
+            *field,
+            "QNICE2" | "QVOLI2" | "QAOLI2" | "rho_ice2" | "phi_ice2" | "v_ice2"
+        )));
+        let raw = scene.raw_cell(0).unwrap();
+        let RawPropertyCategory::Ishmael(columnar) = &raw.categories()[1] else {
+            panic!("expected explicit columnar clear tuple")
+        };
+        assert_eq!(
+            (
+                columnar.qice_kgkg.to_bits(),
+                columnar.qnice_per_kg.to_bits(),
+                columnar.qvoli_m3_per_kg.to_bits(),
+                columnar.qaoli_m3_per_kg.to_bits(),
+            ),
+            (0, 0, 0, 0)
+        );
+
+        let first_active = f64::from(f32::from_bits(
+            (WRF_ISHMAEL_QSMALL_KGKG as f32).to_bits() + 1,
+        ));
+        let active = ishmael_provider().field("QICE2", vec![0.0, first_active, 0.0], "kg kg-1");
+        let scene = read_property_scene(&active, 0).unwrap();
+        assert!(scene.categories().iter().any(|category| {
+            category.category() == WrfPropertyCategory::IshmaelColumnar
+                && category.active_cell_indices() == [1]
+        }));
+        assert_eq!(
+            scene
+                .ishmael_source_state_normalization_audit()
+                .positive_sub_qsmall_ice_tuples_cleared(),
+            0
+        );
     }
 
     #[test]
