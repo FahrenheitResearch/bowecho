@@ -715,6 +715,16 @@ enum SparseRainStorage {
 }
 
 impl SparseRainStorage {
+    fn active_cell_indices(&self) -> &[u32] {
+        match self {
+            Self::Available {
+                active_cell_indices,
+                ..
+            } => active_cell_indices,
+            Self::Unavailable(_) => &[],
+        }
+    }
+
     fn raw_at(&self, cell_index: u32) -> RawRainState {
         match self {
             Self::Unavailable(reason) => RawRainState::Unavailable(reason.clone()),
@@ -2180,8 +2190,13 @@ pub fn read_property_scene<P: PropertyFieldProvider + ?Sized>(
         }
     }
 
-    let active_cell_indices = union_active_cells(&categories);
+    let frozen_active_cell_indices = union_active_cells(&categories);
     let (rain, rain_provenance) = read_rain(provider, time_index, cell_count, scheme_id);
+    // Full-property T-matrix scenes evaluate standalone rain even where every
+    // frozen category is clear. Keep those cells in the scene-wide sparse
+    // union; FrozenOnly scene construction explicitly filters them back out.
+    let active_cell_indices =
+        merge_sorted_unique(&frozen_active_cell_indices, rain.active_cell_indices());
     source_fields.extend(rain_provenance);
     let (environment, environment_provenance) = read_environment(provider, time_index, cell_count)?;
     source_fields.extend(environment_provenance);
@@ -3227,6 +3242,40 @@ mod tests {
         assert_eq!(
             both.categories()[1].source_fields(),
             &["QICE2", "QNICE2", "QIR2", "QIB2"]
+        );
+    }
+
+    #[test]
+    fn scene_active_union_includes_rain_only_cells() {
+        let provider = p3_50_provider(50, 4, 1)
+            .field("QRAIN", vec![0.0, 0.0, 1.0e-4, 0.0], "kg kg-1")
+            .field("QNRAIN", vec![0.0, 0.0, 1.0e6, 0.0], "# kg-1");
+        let scene = read_property_scene(&provider, 0).unwrap();
+
+        assert_eq!(scene.categories()[0].active_cell_indices(), &[1]);
+        assert_eq!(scene.active_cell_indices(), &[1, 2]);
+        // Scene union (2) + frozen category (1) + rain storage (1).
+        assert_eq!(scene.memory_estimate().index_bytes, 4 * size_of::<u32>());
+
+        let rain_only = scene.raw_cell(2).unwrap();
+        assert!(
+            rain_only
+                .categories()
+                .iter()
+                .all(|category| category.mixing_ratio_kgkg() == 0.0)
+        );
+        assert!(matches!(
+            rain_only.rain(),
+            RawRainState::Available {
+                qrain_kgkg,
+                qnrain_per_kg,
+            } if *qrain_kgkg > 0.0 && *qnrain_per_kg > 0.0
+        ));
+        assert!(
+            scene
+                .close_cell(2, OrientationDefinition::Gaussian20Research)
+                .unwrap()
+                .is_some()
         );
     }
 

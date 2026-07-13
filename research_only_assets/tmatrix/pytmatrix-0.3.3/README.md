@@ -28,14 +28,19 @@ Gaussian20 orientation with deterministic 5-by-10 quadrature, temperature-
 dependent dielectric formulas, porous/wet symmetric Bruggeman mixing, and a
 radar-elevation axis spanning -0.5 through 20 degrees. Property configs use
 exactly `ddelt=0.001` and `ndgs=14`. The final property bundle contains
-2,180,240 Cartesian points: 163,520 dry-oblate, 132,160 dry-prolate, 1,017,600
-wet-oblate, 864,000 wet-prolate, and 2,960 rain points. Role-specific dense
+2,204,496 Cartesian points: 163,520 dry-oblate, 132,160 dry-prolate, 1,017,600
+wet-oblate, 864,000 wet-prolate, and 27,216 rain points. Role-specific dense
 diameter grids preserve solver-complete domains at shape ratio 0.1: 89 mm dry
 oblate, exactly 32.31174267785264 mm dry prolate, 15 mm wet oblate, and 6.3 mm
 wet prolate. The dry-prolate cap prevents interpolation across an unresolved
 large/slender-particle KDP resonance; rejected domains, order/ddelt probes,
 node-removal failures, and lower-order convergence failures are retained under
 `validation/tmatrix`.
+
+The v2 rain table spans 18 micrometres through 7 mm and 225 through 313.15 K,
+covering the audited supercooled rain and complete WRF-P3 `get_rain_dsd2`
+lambda-limited size state without a clamp, omission, or Rayleigh substitution.
+Its stored normalized fall moments use the same positive Schiller-Naumann law.
 
 Frozen Schiller-Naumann terminal speeds use bracketed force balance and an
 explicit Re=1000 boundary selection when the piecewise drag-coefficient jump

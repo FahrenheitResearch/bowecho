@@ -443,6 +443,34 @@ const WET_CONDENSED_VOLUME_FRACTION: &[f64] = &[
 ];
 const WET_LIQUID_MASS_FRACTION: &[f64] = &[0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.98];
 const RAIN_DIAMETER_M: &[f64] = &[
+    0.000018,
+    0.00002,
+    0.000022,
+    0.0000245,
+    0.000027,
+    0.00003,
+    0.0000332,
+    0.0000368,
+    0.0000408,
+    0.0000451,
+    0.00005,
+    0.0000549,
+    0.0000603,
+    0.0000663,
+    0.0000728,
+    0.00008,
+    0.0000885,
+    0.000098,
+    0.0001084,
+    0.00012,
+    0.0001328,
+    0.000147,
+    0.0001626,
+    0.00018,
+    0.0002,
+    0.0002213,
+    0.0002449,
+    0.0002711,
     0.0003,
     0.000332269902974487,
     0.0003680109614089166,
@@ -488,7 +516,7 @@ const RAIN_DIAMETER_M: &[f64] = &[
     0.006966360627778315,
     0.007,
 ];
-const RAIN_TEMPERATURE_K: &[f64] = &[250.0, 269.15, 293.15, 313.15];
+const RAIN_TEMPERATURE_K: &[f64] = &[225.0, 237.5, 250.0, 269.15, 293.15, 313.15];
 const RAIN_MINOR_TO_MAJOR: &[f64] = &[0.5, 0.6, 0.7, 0.775, 0.85, 0.925, 1.0];
 const FROZEN_RADAR_ELEVATION_DEG: &[f64] = &[-0.5, 0.9, 4.5, 10.0, 20.0];
 const RAIN_RADAR_ELEVATION_DEG: &[f64] = &[-0.5, 0.2, 0.9, 2.7, 4.5, 7.25, 10.0, 15.0, 20.0];
@@ -507,7 +535,7 @@ const WET_OBLATE_TABLE_ID: &str =
     "property-p3-ishmael-wet-oblate-sband-pytmatrix-0.3.3-unvalidated-v1";
 const WET_PROLATE_TABLE_ID: &str =
     "property-p3-ishmael-wet-prolate-sband-pytmatrix-0.3.3-unvalidated-v1";
-const RAIN_TABLE_ID: &str = "property-rain-sband-pytmatrix-0.3.3-unvalidated-v1";
+const RAIN_TABLE_ID: &str = "property-rain-sband-pytmatrix-0.3.3-unvalidated-v2";
 
 const DRY_AXIS_KINDS: &[AxisKind] = &[
     AxisKind::EquivolumeDiameter,
@@ -4201,9 +4229,11 @@ mod tests {
     }
 
     #[test]
-    fn frozen_only_compaction_is_in_place_and_preserves_order() {
+    fn frozen_only_compaction_drops_rain_only_rows_and_preserves_order() {
         let mut components = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let summaries = vec![
+            // FullProperty keeps this scene-union row for standalone rain;
+            // FrozenOnly reports it unretained and compacts it away.
             CellBuildSummary {
                 retained: false,
                 counts: WrfTMatrixAuditCounts::default(),

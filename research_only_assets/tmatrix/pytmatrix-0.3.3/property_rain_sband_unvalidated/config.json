@@ -2,7 +2,7 @@
   "schema": 1,
   "status": "research_only_unvalidated",
   "kernel": "pytmatrix-0.3.3",
-  "table_id": "property-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
+  "table_id": "property-rain-sband-pytmatrix-0.3.3-unvalidated-v2",
   "particle_population": {
     "microphysics_family": "conventional",
     "category": "rain",
@@ -17,8 +17,8 @@
     }
   },
   "axes": [
-    {"kind": "equivolume_diameter", "unit": "meter", "coordinates": [0.0003, 0.000332269902974487, 0.0003680109614089166, 0.0004075965548029613, 0.0004514402257237171, 0.0005, 0.000549280271653059, 0.0006034176336545163, 0.0006628908034679974, 0.0007282256812104322, 0.0008, 0.0008853455357602572, 0.0009797958971132711, 0.0010843224043318137, 0.0012, 0.0013280183036403859, 0.0014696938456699065, 0.0016264836064977205, 0.0018, 0.0019733209007916346, 0.0021633307652783934, 0.0023716365635830087, 0.0026, 0.0028978978026935596, 0.0032299275672523706, 0.0036, 0.003962312698673552, 0.004361089422797134, 0.0048, 0.005366563145999495, 0.006, 0.006480740698407861, 0.00673536820737033, 0.006866409356540893, 0.0068747185511922075, 0.0068830277458435223, 0.006891336940494837, 0.006899646135146152, 0.0069079553297974666, 0.0069162645244487814, 0.0069245737191000961, 0.006932882913751411, 0.006966360627778315, 0.007]},
-    {"kind": "temperature", "unit": "kelvin", "coordinates": [250.0, 269.15, 293.15, 313.15]},
+    {"kind": "equivolume_diameter", "unit": "meter", "coordinates": [0.000018, 0.00002, 0.000022, 0.0000245, 0.000027, 0.00003, 0.0000332, 0.0000368, 0.0000408, 0.0000451, 0.00005, 0.0000549, 0.0000603, 0.0000663, 0.0000728, 0.00008, 0.0000885, 0.000098, 0.0001084, 0.00012, 0.0001328, 0.000147, 0.0001626, 0.00018, 0.0002, 0.0002213, 0.0002449, 0.0002711, 0.0003, 0.000332269902974487, 0.0003680109614089166, 0.0004075965548029613, 0.0004514402257237171, 0.0005, 0.000549280271653059, 0.0006034176336545163, 0.0006628908034679974, 0.0007282256812104322, 0.0008, 0.0008853455357602572, 0.0009797958971132711, 0.0010843224043318137, 0.0012, 0.0013280183036403859, 0.0014696938456699065, 0.0016264836064977205, 0.0018, 0.0019733209007916346, 0.0021633307652783934, 0.0023716365635830087, 0.0026, 0.0028978978026935596, 0.0032299275672523706, 0.0036, 0.003962312698673552, 0.004361089422797134, 0.0048, 0.005366563145999495, 0.006, 0.006480740698407861, 0.00673536820737033, 0.006866409356540893, 0.0068747185511922075, 0.0068830277458435223, 0.006891336940494837, 0.006899646135146152, 0.0069079553297974666, 0.0069162645244487814, 0.0069245737191000961, 0.006932882913751411, 0.006966360627778315, 0.007]},
+    {"kind": "temperature", "unit": "kelvin", "coordinates": [225.0, 237.5, 250.0, 269.15, 293.15, 313.15]},
     {"kind": "minor_to_major_axis_ratio", "unit": "unitless_fraction", "coordinates": [0.5, 0.6, 0.7, 0.775, 0.85, 0.925, 1.0]},
     {"kind": "frequency", "unit": "hertz", "coordinates": [2800000000.0]},
     {"kind": "radar_elevation", "unit": "degree", "coordinates": [-0.5, 0.2, 0.9, 2.7, 4.5, 7.25, 10.0, 15.0, 20.0]}
@@ -27,9 +27,9 @@
     "model": "temperature_dependent_liquid_water_liebe_1991",
     "liquid_water_permittivity_model": "liebe_hufford_manabe_1991_double_debye",
     "mass_density_kg_m3": 999.84,
-    "temperature_range_k": [250.0, 313.15],
+    "temperature_range_k": [225.0, 313.15],
     "frequency_range_hz": [2000000000.0, 4000000000.0],
-    "applicability": "pure_fresh_supercooled_or_liquid_water_250_to_313p15_k"
+    "applicability": "pure_fresh_supercooled_or_liquid_water_225_to_313p15_k"
   },
   "orientation": {
     "model": "gaussian_canting",
@@ -53,11 +53,15 @@
     "solver": {"shape": "spheroid", "ddelt": 0.001, "ndgs": 14}
   },
   "terminal_velocity": {
-    "law": "atlas_rain_1973_exponential",
-    "a_m_s": 9.65,
-    "b_m_s": 10.3,
-    "c_per_mm": 0.6,
-    "valid_diameter_range_m": [0.0003, 0.007]
+    "law": "schiller_naumann_gravity_drag",
+    "gravity_m_s2": 9.80665,
+    "air_density_kg_m3": 1.225,
+    "air_dynamic_viscosity_pa_s": 0.000017894,
+    "drag_transition_reynolds": 1000.0,
+    "high_reynolds_drag_coefficient": 0.44,
+    "drag_transition_boundary_policy": "select_exact_transition_reynolds_boundary_when_piecewise_drag_residual_jump_straddles_zero",
+    "maximum_iterations": 200,
+    "relative_tolerance": 1e-12
   },
   "temporal": {"sampling": "instantaneous"},
   "execution": {
@@ -72,7 +76,7 @@
       "tmatrix_state_axis_kinds": ["equivolume_diameter", "minor_to_major_axis_ratio"],
       "geometry_axis_kind": "radar_elevation",
       "partial_group_policy": "reject_entire_lut",
-      "maximum_points_per_process": 4096,
+      "maximum_points_per_process": 8192,
       "group_timeout_seconds": 3600
     }
   },

@@ -488,18 +488,30 @@ def validate_config(config: dict[str, Any]) -> None:
                 f"dielectric.model {TEMPERATURE_WATER_DIELECTRIC_MODEL} requires "
                 "the residual-rain coexistence descriptor"
             )
-        exact_water_contract = {
-            "liquid_water_permittivity_model": (
-                "liebe_hufford_manabe_1991_double_debye"
+        expected_water_model = "liebe_hufford_manabe_1991_double_debye"
+        if dielectric["liquid_water_permittivity_model"] != expected_water_model:
+            raise GeneratorError(
+                "dielectric.liquid_water_permittivity_model must equal "
+                f"{expected_water_model!r}"
+            )
+        water_temperature_contract = (
+            dielectric["temperature_range_k"],
+            dielectric["applicability"],
+        )
+        if water_temperature_contract not in (
+            (
+                [250.0, 313.15],
+                "pure_fresh_supercooled_or_liquid_water_250_to_313p15_k",
             ),
-            "temperature_range_k": [250.0, 313.15],
-            "applicability": (
-                "pure_fresh_supercooled_or_liquid_water_250_to_313p15_k"
+            (
+                [225.0, 313.15],
+                "pure_fresh_supercooled_or_liquid_water_225_to_313p15_k",
             ),
-        }
-        for key, expected in exact_water_contract.items():
-            if dielectric[key] != expected:
-                raise GeneratorError(f"dielectric.{key} must equal {expected!r}")
+        ):
+            raise GeneratorError(
+                "dielectric temperature range and applicability must declare "
+                "one exact supported Liebe-1991 water contract"
+            )
         if dielectric["frequency_range_hz"] not in (
             [2.0e9, 4.0e9],
             [2.0e9, 10.0e9],
@@ -852,9 +864,12 @@ def validate_config(config: dict[str, Any]) -> None:
                     raise GeneratorError(
                         "wet condensed-volume axis must cover exactly 0.0015 through 1"
                     )
-        elif temperatures[0] != 250.0 or temperatures[-1] != 313.15:
+        elif (
+            temperatures[0] != dielectric["temperature_range_k"][0]
+            or temperatures[-1] != dielectric["temperature_range_k"][1]
+        ):
             raise GeneratorError(
-                "view-aware liquid-rain temperature axis must cover exactly 250 through 313.15 K"
+                "view-aware liquid-rain temperature axis must cover its complete declared dielectric range"
             )
     elif axis_coordinates(config, "radar_elevation") != [0.0]:
         raise GeneratorError(
@@ -1205,9 +1220,9 @@ def _water_permittivity_liebe_1991(
     temperature_k = _number(temperature_k, "temperature_k", positive=True)
     frequency_hz = _number(frequency_hz, "frequency_hz", positive=True)
     frequency_ghz = frequency_hz * 1.0e-9
-    if not 250.0 <= temperature_k <= 313.15:
+    if not 225.0 <= temperature_k <= 313.15:
         raise GeneratorError(
-            "this research use of Liebe-Hufford-Manabe water is restricted to [250, 313.15] K"
+            "this research use of Liebe-Hufford-Manabe water is restricted to [225, 313.15] K"
         )
     theta = 1.0 - 300.0 / temperature_k
     epsilon_0 = 77.66 - 103.3 * theta

@@ -112,8 +112,16 @@ air/ice mixture. Wet states span 269.15 through 275.15 K, condensed volume
 fraction 0.0015 through 1.0, and liquid mass fraction 0 through 0.98. They use
 temperature-dependent Liebe-Hufford-Manabe water, ice temperature capped at
 273.15 K for phase equilibrium, and a symmetric air/ice/water Bruggeman root
-followed continuously from vacuum. Rain spans 250 through 313.15 K using the
-same temperature-dependent liquid-water model.
+followed continuously from vacuum. The v2 property-rain asset spans 225 through
+313.15 K using the same temperature-dependent liquid-water model and extends
+equivalent-volume diameter down to 18 micrometres. Those bounds contain the
+audited supercooled rain and the complete WRF-P3 `get_rain_dsd2` lambda-limited
+size state; no query is clamped, drizzle omitted, or Rayleigh result substituted.
+The v2 asset uses the declared Schiller-Naumann law for its normalized stored
+fall moments because the previous Atlas exponential becomes nonpositive for
+small drops. Runtime category evaluation replaces those stored moments with the
+closed category's audited positive-downward fall speed before population
+scaling.
 
 Native PyTMatrix is resolution-sensitive at the joint extreme of large
 diameter and minor/major ratio 0.1. The initial `ndgs=2` probes, failed all-grid
@@ -122,7 +130,7 @@ sweep are retained. Final property configs use exactly `ddelt=0.001` and
 `ndgs=14`. Rule-based interpolation refinement preserves the original anchors,
 adds diameter midpoints, spaces dry density and wet condensed fraction by
 density excess over 1.225 kg/m3 air, and resolves wet liquid-fraction curvature.
-The final five-table Cartesian grid contains 2,180,240 points.
+The final five-table Cartesian grid contains 2,204,496 points.
 
 Runtime dispatch is phase/shape-specific, so solver-complete domains are
 retained separately: dry oblate through 89 mm, dry prolate through

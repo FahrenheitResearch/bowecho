@@ -2584,10 +2584,20 @@ fn bind_material(raw: RawDielectric) -> Result<TMatrixMaterial, TMatrixLoadError
                     "must exactly equal 999.84 kg m^-3",
                 );
             }
-            if temperature_range_k != [250.0, 313.15] {
+            let valid_temperature_contract = matches!(
+                (temperature_range_k, applicability.as_str()),
+                (
+                    [250.0, 313.15],
+                    "pure_fresh_supercooled_or_liquid_water_250_to_313p15_k"
+                ) | (
+                    [225.0, 313.15],
+                    "pure_fresh_supercooled_or_liquid_water_225_to_313p15_k"
+                )
+            );
+            if !valid_temperature_contract {
                 return invalid(
-                    "dielectric.temperature_range_k",
-                    "must exactly equal [250.0, 313.15] K",
+                    "dielectric temperature contract",
+                    "range/applicability must exactly identify supported Liebe-1991 water bounds",
                 );
             }
             if frequency_range_hz != [2.0e9, 4.0e9] {
@@ -2596,11 +2606,6 @@ fn bind_material(raw: RawDielectric) -> Result<TMatrixMaterial, TMatrixLoadError
                     "must exactly equal [2e9, 4e9] Hz",
                 );
             }
-            exact_text(
-                "dielectric.applicability",
-                &applicability,
-                "pure_fresh_supercooled_or_liquid_water_250_to_313p15_k",
-            )?;
             Ok(TMatrixMaterial::TemperatureDependentLiquidWaterLiebe1991 {
                 mass_density_kg_m3,
                 temperature_range_k,
@@ -3077,6 +3082,7 @@ fn verify_category_terminal(
         (
             TMatrixParticleCategory::Conventional(ConventionalHydrometeor::Rain),
             TerminalSpeedPolicy::AtlasRain1973Exponential { .. }
+                | TerminalSpeedPolicy::SchillerNaumannGravityDrag { .. }
         ) | (
             TMatrixParticleCategory::Conventional(ConventionalHydrometeor::Hail),
             TerminalSpeedPolicy::SchillerNaumannGravityDrag { .. }

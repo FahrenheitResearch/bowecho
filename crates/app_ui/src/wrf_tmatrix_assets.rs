@@ -63,7 +63,7 @@ embedded_table!(
 embedded_table!(
     RAIN,
     "property_rain_sband_unvalidated",
-    "e6f37ab31fb6fb634d11cdb1cdb615e0d19217ebc7d11056c2e52cdd975a76ea"
+    "9a2ed9a7678fd6e8dcbaa4d26bad24fe47fe7cf95ae5eb17ad80d63a34c06b56"
 );
 
 struct EmbeddedPropertyTMatrixLuts {
@@ -483,6 +483,8 @@ pub const fn embedded_lut_memory_bytes() -> usize {
 mod tests {
     use std::collections::BTreeSet;
 
+    use radar_scattering::AxisKind;
+
     use super::*;
 
     #[test]
@@ -512,7 +514,7 @@ mod tests {
             ),
             (
                 &tables.rain,
-                "property-rain-sband-pytmatrix-0.3.3-unvalidated-v1",
+                "property-rain-sband-pytmatrix-0.3.3-unvalidated-v2",
                 RAIN.2,
             ),
         ] {
@@ -657,8 +659,27 @@ mod tests {
             "fixture must contain active P3 rain"
         );
 
+        let rain_lut = &embedded_luts().expect("load embedded T-matrix tables").rain;
+        let axis_bounds = |kind| {
+            let coordinates = rain_lut
+                .offline_lut()
+                .header()
+                .axes()
+                .iter()
+                .find(|axis| axis.kind() == kind)
+                .unwrap_or_else(|| panic!("embedded rain table is missing {kind:?}"))
+                .coordinates();
+            (*coordinates.first().unwrap(), *coordinates.last().unwrap())
+        };
+        let diameter_bounds = axis_bounds(AxisKind::EquivolumeDiameter);
+        let temperature_bounds = axis_bounds(AxisKind::Temperature);
+        let axis_ratio_bounds = axis_bounds(AxisKind::MinorToMajorAxisRatio);
+
         let mut rain_only_indices = Vec::new();
         let mut combined_indices = Vec::new();
+        let mut diameter_extrema = [(f64::INFINITY, 0_usize), (f64::NEG_INFINITY, 0_usize)];
+        let mut temperature_extrema = [(f64::INFINITY, 0_usize), (f64::NEG_INFINITY, 0_usize)];
+        let mut axis_ratio_extrema = [(f64::INFINITY, 0_usize), (f64::NEG_INFINITY, 0_usize)];
         for &cell_index in &active_rain_indices {
             let raw = scene
                 .raw_cell(cell_index)
@@ -676,6 +697,31 @@ mod tests {
                 radar_scattering::LIQUID_WATER_DENSITY_KG_M3.to_bits(),
                 "active rain at cell {cell_index} does not use the T-matrix material density"
             );
+            let diameter_m = rain.characteristic_diameter_m().value();
+            let temperature_k = raw.environment().temperature_k();
+            let axis_ratio = rain.minor_to_major_axis_ratio().value();
+            for (label, value, (minimum, maximum)) in [
+                ("diameter", diameter_m, diameter_bounds),
+                ("temperature", temperature_k, temperature_bounds),
+                ("axis ratio", axis_ratio, axis_ratio_bounds),
+            ] {
+                assert!(
+                    value.is_finite() && minimum <= value && value <= maximum,
+                    "active rain {label} {value} at cell {cell_index} is outside embedded LUT [{minimum}, {maximum}]"
+                );
+            }
+            for (value, extrema) in [
+                (diameter_m, &mut diameter_extrema),
+                (temperature_k, &mut temperature_extrema),
+                (axis_ratio, &mut axis_ratio_extrema),
+            ] {
+                if value < extrema[0].0 {
+                    extrema[0] = (value, cell_index);
+                }
+                if value > extrema[1].0 {
+                    extrema[1] = (value, cell_index);
+                }
+            }
             if raw
                 .categories()
                 .iter()
@@ -739,6 +785,13 @@ mod tests {
             &mut evaluator_indices,
             &combined_indices,
             STRATIFIED_SAMPLES_PER_CLASS,
+        );
+        evaluator_indices.extend(
+            diameter_extrema
+                .into_iter()
+                .chain(temperature_extrema)
+                .chain(axis_ratio_extrema)
+                .map(|(_, cell_index)| cell_index),
         );
         const REPORTED_RAIN_FAILURE_CELL: usize = 4_680_030;
         if REPORTED_RAIN_FAILURE_CELL < scene.cell_count() {
