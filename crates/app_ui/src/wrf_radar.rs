@@ -14469,6 +14469,151 @@ mod tests {
         );
     }
 
+    /// CUDA-primary acceptance gate for a complete real MP50--53 or MP55
+    /// wrfout. The fixture is intentionally external because these files are
+    /// multi-GB; CI skips the body unless
+    /// `BOWECHO_NATIVE_TMATRIX_CUDA_ACCEPTANCE_FIXTURE` is set.
+    ///
+    /// Unlike the parity test below, this gate never pays for a CPU reference
+    /// volume. It requires the normal runtime selector to retain CUDA, builds
+    /// the *entire* frozen property-scattering scene, and then renders one
+    /// complete (small) tilt through the production sampler. Run it once with
+    /// a representative MP50 file and once with MP55 before cutting an RC.
+    #[test]
+    fn actual_native_tmatrix_cuda_primary_scene_and_tilt_complete() {
+        let Some(path) = std::env::var_os("BOWECHO_NATIVE_TMATRIX_CUDA_ACCEPTANCE_FIXTURE") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let selected = inventory_selected_wrf_paths(std::slice::from_ref(&path))
+            .expect("inventory CUDA-primary native T-matrix WRF fixture");
+        let scene = selected
+            .group
+            .scenes
+            .first()
+            .expect("fixture inventory has one timed scene");
+        let file = WrfFile::open(&scene.path).expect("open native T-matrix WRF fixture");
+        let requested = SyntheticRadarConfig {
+            compute_preference: SyntheticRadarComputePreference::NvidiaCuda,
+            dual_pol: true,
+            polarimetric_kernel: PolarimetricKernel::PropertyTMatrixResearchV1,
+            property_tmatrix_table_source:
+                app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            property_tmatrix_rain_sensitivity: PropertyTMatrixRainSensitivity::FullProperty,
+            radar_frequency_mhz: PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ,
+            reflectivity_sampling: ReflectivitySampling::LinearZ,
+            atmosphere_time_mode: AtmosphereTimeMode::FrozenAtVolumeStart,
+            scan_timing: ScanTiming::InstantaneousTruth,
+            elevations_deg: vec![0.5],
+            azimuth_count: 8,
+            gate_spacing_m: 1_000.0,
+            max_range_m: 2_000.0,
+            beam_integration: BeamIntegration::Center,
+            ref_floor_dbz: -100.0,
+            ref_gate_texture: false,
+            vel_gate_texture: false,
+            propagation: true,
+            terminal_fall_speed: true,
+            emit_quality_fields: false,
+            ..SyntheticRadarConfig::default()
+        };
+        requested
+            .validate_science_contract()
+            .expect("CUDA-primary acceptance configuration is valid");
+
+        let (tx, _rx) = channel();
+        let cancel = AtomicBool::new(false);
+        let (mut config, runtime) = resolve_tmatrix_execution_runtime(&requested, &tx, &cancel)
+            .expect("resolve CUDA-primary T-matrix runtime");
+        let service = match &runtime {
+            TMatrixExecutionRuntime::NvidiaCuda { service } => Arc::clone(service),
+            TMatrixExecutionRuntime::CpuReference { reason } => {
+                panic!("CUDA-primary acceptance cannot use CPU fallback: {reason}")
+            }
+            TMatrixExecutionRuntime::NotApplicable => {
+                panic!("property T-matrix acceptance unexpectedly bypassed runtime selection")
+            }
+        };
+
+        let field_read_started = std::time::Instant::now();
+        let fields = read_wrf_radar_fields_for_config_reporting(
+            &file,
+            &scene.source_identity,
+            scene.time_index,
+            &config,
+            &|stage| eprintln!("[cuda-acceptance] {stage}"),
+            0,
+            Some(&cancel),
+        )
+        .expect("build complete frozen native property scene with CUDA primary");
+        let field_read_elapsed = field_read_started.elapsed();
+        assert!(
+            fields.raw_property_scene.is_none(),
+            "frozen acceptance must not retain the raw-state-only path"
+        );
+        let property = fields
+            .property_scattering
+            .as_deref()
+            .expect("frozen acceptance built a complete compact property scene");
+        assert!(
+            !property.active_cell_indices().is_empty(),
+            "fixture property scene has no active cells"
+        );
+
+        // Put the tiny acceptance tilt at a real active column. The antenna
+        // altitude is deliberately the active model level: this gate proves
+        // execution and data plumbing, not an operational siting choice.
+        let active_cell = property.active_cell_indices()[0] as usize;
+        let horizontal = active_cell % (fields.nx * fields.ny);
+        config.site_lat_deg = Some(f64::from(fields.lat[horizontal]));
+        config.site_lon_deg = Some(f64::from(fields.lon[horizontal]));
+        config.antenna_msl_m = Some(f64::from(fields.height_msl[active_cell]));
+        let valid_time = scene
+            .time
+            .valid_time()
+            .cloned()
+            .expect("fixture scene has a valid time");
+
+        let volume_started = std::time::Instant::now();
+        let volume = try_build_synthetic_volume_reporting(&fields, valid_time, &config, &|stage| {
+            eprintln!("[cuda-acceptance tilt] {stage}")
+        })
+        .expect("render one complete tilt from the CUDA-built property scene");
+        let volume_elapsed = volume_started.elapsed();
+        assert_eq!(volume.cuts.len(), 1, "acceptance volume must have one cut");
+        let cut = &volume.cuts[0];
+        assert_eq!(cut.radials.len(), 8, "acceptance cut must be complete");
+        for moment in [
+            MomentType::Reflectivity,
+            MomentType::DifferentialReflectivity,
+            MomentType::CorrelationCoefficient,
+            MomentType::DifferentialPhase,
+            MomentType::SpecificDifferentialPhase,
+        ] {
+            assert!(
+                cut.moments.contains_key(&moment),
+                "acceptance cut omitted {moment:?}"
+            );
+        }
+
+        let report = service.report();
+        assert!(
+            report.nodes_completed > 0,
+            "fixture submitted no native particle nodes to CUDA"
+        );
+        assert_eq!(report.fallback_reason, None, "CUDA unexpectedly fell back");
+        eprintln!(
+            "[cuda-acceptance complete] mp_physics={} active_cells={} scene={:.3}s tilt={:.3}s; {} CUDA nodes in {} batches / {} requests",
+            property.microphysics_scheme_id(),
+            property.active_cell_indices().len(),
+            field_read_elapsed.as_secs_f64(),
+            volume_elapsed.as_secs_f64(),
+            report.nodes_completed,
+            report.batches_completed,
+            report.requests_submitted,
+        );
+    }
+
     /// End-to-end native-property parity on a real P3/ISHMAEL wrfout. The
     /// fixture is intentionally external because these files are multi-GB;
     /// CI skips the body unless `BOWECHO_NATIVE_TMATRIX_WRF_FIXTURE` is set.
