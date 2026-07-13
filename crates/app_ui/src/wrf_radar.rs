@@ -4488,15 +4488,12 @@ struct RawGateColumnBatch {
     first_gate: usize,
     gate_count: usize,
     points: Vec<ResolvedBeamSamplePoint>,
+    locations: Vec<BeamColumnPoint>,
     samples: Vec<Option<ColumnSample>>,
 }
 
 impl RawGateColumnBatch {
-    fn sample(
-        &self,
-        gate_index: usize,
-        point_index: usize,
-    ) -> Result<Option<ColumnSample>, String> {
+    fn position(&self, gate_index: usize, point_index: usize) -> Result<usize, String> {
         let local_gate = gate_index.checked_sub(self.first_gate).ok_or_else(|| {
             format!(
                 "raw T-matrix gate batch starts at {}, queried gate {gate_index}",
@@ -4512,6 +4509,23 @@ impl RawGateColumnBatch {
             .checked_mul(self.points.len())
             .and_then(|offset| offset.checked_add(point_index))
             .ok_or_else(|| "raw T-matrix gate-batch lookup overflowed".to_owned())?;
+        Ok(position)
+    }
+
+    fn location(&self, gate_index: usize, point_index: usize) -> Result<BeamColumnPoint, String> {
+        let position = self.position(gate_index, point_index)?;
+        self.locations
+            .get(position)
+            .copied()
+            .ok_or_else(|| "raw T-matrix gate-batch geometry is incomplete".to_owned())
+    }
+
+    fn sample(
+        &self,
+        gate_index: usize,
+        point_index: usize,
+    ) -> Result<Option<ColumnSample>, String> {
+        let position = self.position(gate_index, point_index)?;
         self.samples
             .get(position)
             .copied()
@@ -4554,44 +4568,51 @@ fn build_raw_gate_column_batch(
     let beam_sigma_deg = gaussian_beam_sigma_deg(f64::from(config.beam_width_deg.max(0.05)));
     let prepared = (0..work_count)
         .into_par_iter()
-        .map(|position| {
-            let local_gate = position / points.len();
-            let point_index = position % points.len();
-            let gate_index = first_gate + local_gate;
-            let center_slant_m = f64::from(gate_range.first_gate_m) + gate_index as f64 * spacing_m;
-            let location = beam_column_point(
-                site_lat,
-                site_lon,
-                antenna_msl,
-                center_azimuth_deg,
-                center_elevation_deg,
-                center_slant_m,
-                gate_index,
-                gate_range,
-                beam_geometry,
-                beam_sigma_deg,
-                points[point_index],
-            )?;
-            prepare_column_raw_state_linear(
-                fields,
-                neighbor_fields,
-                atmosphere_alpha,
-                cells,
-                location.latitude,
-                location.longitude,
-                location.z_msl as f32,
-                cancel,
-            )
-        })
+        .map(
+            |position| -> Result<(BeamColumnPoint, Option<PreparedRawColumnSample>), String> {
+                let local_gate = position / points.len();
+                let point_index = position % points.len();
+                let gate_index = first_gate + local_gate;
+                let center_slant_m =
+                    f64::from(gate_range.first_gate_m) + gate_index as f64 * spacing_m;
+                let location = beam_column_point(
+                    site_lat,
+                    site_lon,
+                    antenna_msl,
+                    center_azimuth_deg,
+                    center_elevation_deg,
+                    center_slant_m,
+                    gate_index,
+                    gate_range,
+                    beam_geometry,
+                    beam_sigma_deg,
+                    points[point_index],
+                )?;
+                let prepared = prepare_column_raw_state_linear(
+                    fields,
+                    neighbor_fields,
+                    atmosphere_alpha,
+                    cells,
+                    location.latitude,
+                    location.longitude,
+                    location.z_msl as f32,
+                    cancel,
+                )?;
+                Ok((location, prepared))
+            },
+        )
         .collect::<Vec<_>>();
     if let Some(cancel) = cancel {
         check_synthetic_radar_cancel(cancel)?;
     }
     // Indexed Rayon collection preserves work position. Selecting errors in
     // this serial pass makes (gate, beam point) ordering deterministic.
+    let mut locations = Vec::with_capacity(prepared.len());
     let mut ordered = Vec::with_capacity(prepared.len());
     for result in prepared {
-        ordered.push(result?);
+        let (location, prepared) = result?;
+        locations.push(location);
+        ordered.push(prepared);
     }
     let evaluated = {
         let requests = ordered
@@ -4599,12 +4620,9 @@ fn build_raw_gate_column_batch(
             .enumerate()
             .filter_map(|(position, prepared)| {
                 prepared.as_ref().map(|prepared| {
-                    let point_index = position % points.len();
-                    let center_elevation =
-                        center_elevation_deg + points[point_index].el_sigma * beam_sigma_deg;
                     app_ui::wrf_tmatrix_scene::WrfTMatrixRawBatchRequest::new(
                         &prepared.property_cell,
-                        center_elevation,
+                        locations[position].elevation_deg,
                     )
                 })
             })
@@ -4647,6 +4665,7 @@ fn build_raw_gate_column_batch(
         first_gate,
         gate_count,
         points,
+        locations,
         samples,
     })
 }
@@ -4700,19 +4719,23 @@ fn sample_gate_with_quality_instrument(
 
     let mut accumulate_point =
         |point_index: usize, point: ResolvedBeamSamplePoint| -> Result<(), String> {
-            let location = beam_column_point(
-                site_lat,
-                site_lon,
-                antenna_msl,
-                center_azimuth_deg,
-                center_elevation_deg,
-                center_slant_m,
-                gate_index,
-                gate_range,
-                beam_geometry,
-                beam_sigma_deg,
-                point,
-            )?;
+            let location = if let Some(raw_batch) = raw_batch {
+                raw_batch.location(gate_index, point_index)?
+            } else {
+                beam_column_point(
+                    site_lat,
+                    site_lon,
+                    antenna_msl,
+                    center_azimuth_deg,
+                    center_elevation_deg,
+                    center_slant_m,
+                    gate_index,
+                    gate_range,
+                    beam_geometry,
+                    beam_sigma_deg,
+                    point,
+                )?
+            };
             let azimuth_deg = location.azimuth_deg;
             let elevation_deg = location.elevation_deg;
             let z_msl = location.z_msl;
