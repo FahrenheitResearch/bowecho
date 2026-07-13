@@ -4667,7 +4667,7 @@ mod tests {
                     }
                 }
                 eprintln!(
-                    "minRho={minimum_density_kg_m3:.9e} omitted(number,mass,mass2-radar)={omitted:?} diameter={by_diameter:?} density={by_density:?} ratio={by_ratio:?} coords_min={minimum_coordinates:?} coords_max={maximum_coordinates:?}"
+                    "minRho={minimum_density_kg_m3:.9e} totals(number,mass,mass2-radar)={totals:?} omitted(number,mass,mass2-radar)={omitted:?} diameter={by_diameter:?} density={by_density:?} ratio={by_ratio:?} coords_min={minimum_coordinates:?} coords_max={maximum_coordinates:?}"
                 );
                 assert!(
                     omitted[2] < P3_MAXIMUM_OMITTED_RADAR_WEIGHT_FRACTION,
