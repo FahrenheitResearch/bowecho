@@ -481,6 +481,8 @@ pub const fn embedded_lut_memory_bytes() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -611,5 +613,152 @@ mod tests {
                 .ends_with(std::path::Path::new("bowecho-simradar").join("tmatrix-packs"))
         );
         assert!(!TMATRIX_PACK_CACHE_FAMILY.contains("simsat-cache"));
+    }
+
+    #[test]
+    fn real_p3_fixture_closes_and_evaluates_embedded_rain() {
+        let (Some(wrf_path), Some(table_path)) = (
+            std::env::var_os("BOWECHO_WRF_PROPERTY_FIXTURE"),
+            std::env::var_os("BOWECHO_P3_TABLE_FIXTURE"),
+        ) else {
+            return;
+        };
+
+        let file = wrf_core::WrfFile::open(&wrf_path).expect("open BOWECHO_WRF_PROPERTY_FIXTURE");
+        let scheme_id = file
+            .global_attr_i32("MP_PHYSICS")
+            .expect("fixture has MP_PHYSICS");
+        let table_kind = match scheme_id {
+            50..=52 => P3OfficialTableKind::TwoMoment,
+            53 => P3OfficialTableKind::ThreeMoment,
+            other => panic!("property fixture must use P3 mp_physics 50-53, got {other}"),
+        };
+        let scene = crate::wrf_property_reader::read_wrf_property_scene(
+            &file,
+            crate::wrf_scene_inventory::WrfSourceIdentity(
+                "fixture:p3-embedded-rain-evaluator".to_owned(),
+            ),
+            0,
+        )
+        .expect("read normalized P3 property scene");
+
+        let source_qrain = file.read_var("QRAIN", 0).expect("read fixture QRAIN");
+        let qsmall = f64::from(radar_scattering::P3_WRF_QSMALL_KGKG);
+        let active_rain_indices = source_qrain
+            .iter()
+            .enumerate()
+            .filter(|&(_, &mass)| mass >= qsmall)
+            .map(|(cell_index, _)| cell_index)
+            .collect::<Vec<_>>();
+        drop(source_qrain);
+        file.clear_cache();
+        assert!(
+            !active_rain_indices.is_empty(),
+            "fixture must contain active P3 rain"
+        );
+
+        let mut rain_only_indices = Vec::new();
+        let mut combined_indices = Vec::new();
+        for &cell_index in &active_rain_indices {
+            let raw = scene
+                .raw_cell(cell_index)
+                .unwrap_or_else(|error| panic!("read active-rain cell {cell_index}: {error}"));
+            let closed = crate::wrf_property_reader::close_raw_rain_state(
+                &raw,
+                radar_scattering::OrientationDefinition::Gaussian20Research,
+            )
+            .unwrap_or_else(|error| panic!("close active rain at cell {cell_index}: {error}"));
+            let crate::wrf_property_reader::ClosedRainState::Closed(rain) = closed else {
+                panic!("source-active rain at cell {cell_index} did not close as rain")
+            };
+            assert_eq!(
+                rain.shape().bulk_density_kg_m3().to_bits(),
+                radar_scattering::LIQUID_WATER_DENSITY_KG_M3.to_bits(),
+                "active rain at cell {cell_index} does not use the T-matrix material density"
+            );
+            if raw
+                .categories()
+                .iter()
+                .any(|category| category.mixing_ratio_kgkg() > 0.0)
+            {
+                combined_indices.push(cell_index);
+            } else {
+                rain_only_indices.push(cell_index);
+            }
+        }
+        assert!(
+            !rain_only_indices.is_empty(),
+            "fixture must contain a rain-only evaluator cell"
+        );
+        assert!(
+            !combined_indices.is_empty(),
+            "fixture must contain a combined frozen-and-rain evaluator cell"
+        );
+
+        let official_table =
+            radar_scattering::P3OfficialTableV54::load_path(table_kind, table_path)
+                .expect("load BOWECHO_P3_TABLE_FIXTURE");
+        let p3 = WrfTMatrixP3Resources::projected_area_equivalent_oblate_research(Arc::new(
+            official_table,
+        ))
+        .expect("configure production P3 integration");
+        let evaluator = WrfTMatrixRawEvaluator::new_with_p3(
+            embedded_luts()
+                .expect("load embedded T-matrix tables")
+                .bundle(),
+            p3,
+        )
+        .expect("construct embedded P3 raw evaluator");
+
+        const STRATIFIED_SAMPLES_PER_CLASS: usize = 128;
+        fn add_stratified_samples(
+            output: &mut BTreeSet<usize>,
+            indices: &[usize],
+            maximum_samples: usize,
+        ) {
+            let stride = indices.len().div_ceil(maximum_samples).max(1);
+            output.extend(
+                indices
+                    .iter()
+                    .step_by(stride)
+                    .take(maximum_samples)
+                    .copied(),
+            );
+            if let Some(&last) = indices.last() {
+                output.insert(last);
+            }
+        }
+
+        let mut evaluator_indices = BTreeSet::new();
+        add_stratified_samples(
+            &mut evaluator_indices,
+            &rain_only_indices,
+            STRATIFIED_SAMPLES_PER_CLASS,
+        );
+        add_stratified_samples(
+            &mut evaluator_indices,
+            &combined_indices,
+            STRATIFIED_SAMPLES_PER_CLASS,
+        );
+        const REPORTED_RAIN_FAILURE_CELL: usize = 4_680_030;
+        if REPORTED_RAIN_FAILURE_CELL < scene.cell_count() {
+            evaluator_indices.insert(REPORTED_RAIN_FAILURE_CELL);
+        }
+
+        for cell_index in evaluator_indices.iter().copied() {
+            let raw = scene
+                .raw_cell(cell_index)
+                .unwrap_or_else(|error| panic!("read evaluator sample cell {cell_index}: {error}"));
+            evaluator.evaluate(&raw, 0.5).unwrap_or_else(|error| {
+                panic!("evaluate embedded raw property cell {cell_index}: {error}")
+            });
+        }
+        eprintln!(
+            "embedded P3 rain fixture: active_rain={}, rain_only={}, combined={}, evaluated={}",
+            active_rain_indices.len(),
+            rain_only_indices.len(),
+            combined_indices.len(),
+            evaluator_indices.len()
+        );
     }
 }

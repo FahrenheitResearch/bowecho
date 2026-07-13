@@ -26,7 +26,12 @@ pub const DIAGNOSTIC_COEXISTENCE_COLD_K: f64 = 269.15;
 pub const DIAGNOSTIC_COEXISTENCE_WARM_K: f64 = 275.15;
 
 const ICE_MATERIAL_DENSITY_KG_M3: f64 = 917.0;
-const WATER_DENSITY_KG_M3: f64 = 1_000.0;
+/// Liquid-water material density used by the versioned T-matrix assets.
+///
+/// Keep conventional liquid closure on the same exact reference as the LUT
+/// dielectric/material contract; otherwise an otherwise valid rain particle
+/// cannot be evaluated by the fail-closed runtime binding.
+pub const LIQUID_WATER_DENSITY_KG_M3: f64 = 999.84;
 const REFERENCE_AIR_DENSITY_KG_M3: f64 = 1.225;
 const DEFAULT_GAUSSIAN_QUADRATURE_POINTS: u16 = 16;
 const ISOTROPIC_QUADRATURE_POINTS: u16 = 64;
@@ -692,7 +697,7 @@ pub fn close_conventional_category(
     }
 
     let (density, density_source) = if let Some(value) = input.bulk_density_kg_m3 {
-        physical_density("RHO_HYDROMETEOR", value, WATER_DENSITY_KG_M3)?;
+        physical_density("RHO_HYDROMETEOR", value, LIQUID_WATER_DENSITY_KG_M3)?;
         (
             value,
             PropertyProvenance::new(
@@ -1677,7 +1682,7 @@ pub fn diagnose_coexistence(
         physical_density(
             "diagnostic wet-particle density",
             density,
-            WATER_DENSITY_KG_M3,
+            LIQUID_WATER_DENSITY_KG_M3,
         )?;
         axis_ratio_value("diagnostic wet-particle axis ratio", axis_ratio)?;
         positive("diagnostic wet-particle fall speed", fall_speed)?;
@@ -1861,7 +1866,9 @@ fn analytic_fall_speed(
 
 fn conventional_default_density(category: ConventionalHydrometeor) -> f64 {
     match category {
-        ConventionalHydrometeor::CloudWater | ConventionalHydrometeor::Rain => WATER_DENSITY_KG_M3,
+        ConventionalHydrometeor::CloudWater | ConventionalHydrometeor::Rain => {
+            LIQUID_WATER_DENSITY_KG_M3
+        }
         ConventionalHydrometeor::CloudIce => ICE_MATERIAL_DENSITY_KG_M3,
         ConventionalHydrometeor::Snow => 100.0,
         ConventionalHydrometeor::Graupel => 400.0,
@@ -2494,6 +2501,25 @@ mod tests {
             closed.characteristic_diameter_m().provenance().kind(),
             PropertySourceKind::WrfDiagnostic
         );
+    }
+
+    #[test]
+    fn conventional_liquid_closure_matches_tmatrix_material_density() {
+        for category in [
+            ConventionalHydrometeor::CloudWater,
+            ConventionalHydrometeor::Rain,
+        ] {
+            let input = ConventionalCategoryInput::new(category, 1.0e-4, Some(1.0e6));
+            let closed = close_conventional_category(&context(10), &input).unwrap();
+            assert_eq!(
+                closed.shape().bulk_density_kg_m3(),
+                LIQUID_WATER_DENSITY_KG_M3
+            );
+            assert_eq!(
+                closed.effective_density_kg_m3().value(),
+                LIQUID_WATER_DENSITY_KG_M3
+            );
+        }
     }
 
     fn coexistence_categories() -> (ClosedParticleCategory, Vec<ClosedParticleCategory>) {

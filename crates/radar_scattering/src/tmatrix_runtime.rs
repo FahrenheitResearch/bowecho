@@ -12,11 +12,11 @@ use thiserror::Error;
 
 use crate::{
     AdditiveScattering, AxisCoordinate, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
-    DiagnosticWetCategory, EffectiveMediumRule, InterpolationError, KernelModel, LutError,
-    MeltingModel, MicrophysicsFamily, MixtureTopology, OfflineLut, OrientationModel, OutputError,
-    ParticleState, PsdError, PsdFallSpeedAuthority, PsdFallSpeedProvenance, PsdParticleDomain,
-    PsdParticleNode, PsdSpheroidHabit, Sha256Digest, TMatrixImplementation, TableValidation,
-    TemporalSampling, Unit,
+    DiagnosticWetCategory, EffectiveMediumRule, InterpolationError, KernelModel,
+    LIQUID_WATER_DENSITY_KG_M3, LutError, MeltingModel, MicrophysicsFamily, MixtureTopology,
+    OfflineLut, OrientationModel, OutputError, ParticleState, PsdError, PsdFallSpeedAuthority,
+    PsdFallSpeedProvenance, PsdParticleDomain, PsdParticleNode, PsdSpheroidHabit, Sha256Digest,
+    TMatrixImplementation, TableValidation, TemporalSampling, Unit,
 };
 
 const PYTMATRIX_KERNEL: &str = "pytmatrix-0.3.3";
@@ -2490,7 +2490,7 @@ fn bind_material(raw: RawDielectric) -> Result<TMatrixMaterial, TMatrixLoadError
                     "must exactly equal property-closure-v1 density 917 kg m^-3",
                 );
             }
-            if liquid_water_density_kg_m3 != 999.84 {
+            if liquid_water_density_kg_m3 != LIQUID_WATER_DENSITY_KG_M3 {
                 return invalid(
                     "dielectric.liquid_water_density_kg_m3",
                     "must exactly equal 999.84 kg m^-3",
@@ -2578,7 +2578,7 @@ fn bind_material(raw: RawDielectric) -> Result<TMatrixMaterial, TMatrixLoadError
                 &liquid_water_permittivity_model,
                 "liebe_hufford_manabe_1991_double_debye",
             )?;
-            if mass_density_kg_m3 != 999.84 {
+            if mass_density_kg_m3 != LIQUID_WATER_DENSITY_KG_M3 {
                 return invalid(
                     "dielectric.mass_density_kg_m3",
                     "must exactly equal 999.84 kg m^-3",
@@ -3278,8 +3278,9 @@ fn condensed_volume_fraction(
     bulk_density_kg_m3: f64,
     liquid_mass_fraction: f64,
 ) -> Result<f64, EvaluationError> {
-    let value =
-        bulk_density_kg_m3 * ((1.0 - liquid_mass_fraction) / 917.0 + liquid_mass_fraction / 999.84);
+    let value = bulk_density_kg_m3
+        * ((1.0 - liquid_mass_fraction) / 917.0
+            + liquid_mass_fraction / LIQUID_WATER_DENSITY_KG_M3);
     if value.is_finite() && 0.0 < value && value <= 1.0 {
         Ok(value)
     } else {
@@ -4210,11 +4211,14 @@ mod tests {
             &context,
             &ConventionalCategoryInput::new(ConventionalHydrometeor::Rain, 1.0e-4, Some(2.0))
                 .with_characteristic_diameter_m(1.0e-3)
-                .with_bulk_density_kg_m3(999.84)
                 .with_minor_to_major_axis_ratio(0.9)
                 .with_fall_speed_m_s(2.0),
         )
         .unwrap();
+        assert_eq!(
+            rain.shape().bulk_density_kg_m3(),
+            LIQUID_WATER_DENSITY_KG_M3
+        );
         let contribution = table
             .evaluate_unused_rain(&rain, 2.5e-5, request(FREQUENCY_HZ, 1.0))
             .unwrap();
