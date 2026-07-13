@@ -1017,6 +1017,9 @@ pub struct ModelDataDock {
     /// Finished synthetic-radar volumes waiting for the app to install them in
     /// the loop engine (one-shot, drained by [`Self::take_synthetic_radar`]).
     synthetic_radar_result: Option<crate::wrf_radar::SyntheticRadarOutput>,
+    /// First completed tilt from the active synthetic-radar build. This lets
+    /// the radar view become useful while the remaining cuts keep processing.
+    synthetic_radar_preview: Option<crate::wrf_radar::SyntheticRadarPreview>,
     /// Finished exact observed-geometry replay waiting for the app to install
     /// its Observed / Simulated / Difference workspace.
     synthetic_radar_replay_result: Option<crate::wrf_radar::SyntheticRadarReplayOutput>,
@@ -1191,6 +1194,7 @@ impl ModelDataDock {
             store_root,
             import_job: None,
             synthetic_radar_result: None,
+            synthetic_radar_preview: None,
             synthetic_radar_replay_result: None,
             displayed_replay_source: None,
             synthetic_radar_replay_source: None,
@@ -2183,6 +2187,11 @@ impl ModelDataDock {
                 message: String,
                 output: crate::wrf_radar::SyntheticRadarOutput,
             },
+            /// The first cut is displayable while the same worker continues.
+            SyntheticPreview {
+                message: String,
+                preview: crate::wrf_radar::SyntheticRadarPreview,
+            },
             /// An exact observed-geometry replay finished. Unlike an ordinary
             /// synthetic loop this is consumed as a three-volume comparison.
             FinishedReplay {
@@ -2282,11 +2291,15 @@ impl ModelDataDock {
             }
             Some(ImportJob::SyntheticRadar(task)) => {
                 let mut latest = None;
+                let mut preview = None;
                 let mut done = None;
                 loop {
                     match task.rx.try_recv() {
                         Ok(crate::wrf_radar::SyntheticRadarMessage::Progress(message)) => {
                             latest = Some(message);
+                        }
+                        Ok(crate::wrf_radar::SyntheticRadarMessage::Preview(update)) => {
+                            preview = Some(update);
                         }
                         Ok(crate::wrf_radar::SyntheticRadarMessage::Done(outcome)) => {
                             done = Some(outcome);
@@ -2322,9 +2335,18 @@ impl ModelDataDock {
                         message: format!("Synthetic radar failed: {error}"),
                         plot: None,
                     },
-                    None => match latest {
-                        Some(message) => PollResult::Progress(message),
-                        None => PollResult::Progress(String::new()),
+                    None => match preview {
+                        Some(preview) => PollResult::SyntheticPreview {
+                            message: format!(
+                                "Showing tilt {}/{} now; the remaining tilts are still processing",
+                                preview.completed_cuts, preview.total_cuts
+                            ),
+                            preview,
+                        },
+                        None => match latest {
+                            Some(message) => PollResult::Progress(message),
+                            None => PollResult::Progress(String::new()),
+                        },
                     },
                 }
             }
@@ -2395,6 +2417,7 @@ impl ModelDataDock {
             PollResult::FinishedSynthetic { message, output } => {
                 self.import_message = Some(message);
                 self.import_job = None;
+                self.synthetic_radar_preview = None;
                 // Retain Arc handles for the CfRadial export control — the
                 // one-shot result below is drained away by the app.
                 self.synthetic_export_frames = output.volumes.clone();
@@ -2402,6 +2425,12 @@ impl ModelDataDock {
                 // `poll_model_layer`); nothing was written to the store, so no
                 // rescan.
                 self.synthetic_radar_result = Some(output);
+                self.repaint.request_repaint();
+            }
+            PollResult::SyntheticPreview { message, preview } => {
+                self.import_message = Some(message);
+                self.synthetic_radar_preview = Some(preview);
+                // Keep `import_job`: later cuts continue on the same worker.
                 self.repaint.request_repaint();
             }
             PollResult::FinishedReplay { message, output } => {
@@ -2539,6 +2568,13 @@ impl ModelDataDock {
     /// session-only source descriptors for installation into the loop engine.
     pub fn take_synthetic_radar(&mut self) -> Option<crate::wrf_radar::SyntheticRadarOutput> {
         self.synthetic_radar_result.take()
+    }
+
+    /// One-shot: take the first completed tilt while its worker continues.
+    pub fn take_synthetic_radar_preview(
+        &mut self,
+    ) -> Option<crate::wrf_radar::SyntheticRadarPreview> {
+        self.synthetic_radar_preview.take()
     }
 
     /// One-shot: take a completed exact observed-geometry replay. The app
@@ -3457,6 +3493,7 @@ impl ModelDataDock {
         self.synthetic_radar_source_files = files.clone();
         self.operational_radar_source = None;
         self.synthetic_radar_replay_source = None;
+        self.synthetic_radar_preview = None;
         let task = crate::wrf_radar::spawn_synthetic_radar(files, config);
         self.import_message = Some(if count == 1 {
             "Simulating radar from 1 WRF file…".to_string()

@@ -9669,6 +9669,55 @@ impl ViewerApp {
     /// local-deployment autoplay contract (grow history to fit, pause live/poll
     /// so a tick can't stomp the loop, roll it) — no new file format, no store
     /// write; the frames are handed straight to `install_decoded_load_batch`.
+    fn install_synthetic_radar_preview(
+        &mut self,
+        preview: wrf_radar::SyntheticRadarPreview,
+        ctx: &egui::Context,
+    ) {
+        self.poll_active = false;
+        self.primary.live.enabled = false;
+        self.primary.cursor.playing = false;
+        self.pending_local_autoplay = false;
+        self.primary_load_is_auto_refresh = false;
+        self.load_receiver = None;
+        self.clear_frame_history();
+
+        let stamp = preview
+            .volume
+            .volume_time
+            .format("%Y%m%d_%H%M%S")
+            .to_string();
+        let path = crate::wrf_radar::synthetic_frame_path(
+            &preview.volume.site.id,
+            preview.config_fingerprint,
+            0,
+            &stamp,
+        );
+        self.primary.feed = FeedSource::LocalFiles {
+            label: preview.label.clone(),
+        };
+        self.install_decoded_load_batch(
+            DecodedLoadBatch::single(DecodedLoad {
+                path,
+                volume: preview.volume,
+                timings: LoadTimings::default(),
+                status: FrameStatus::Preview,
+                source_label: format!(
+                    "simulated WRF partial tilt {}/{}",
+                    preview.completed_cuts, preview.total_cuts
+                ),
+            }),
+            false,
+            true,
+            ctx,
+        );
+        self.status = format!(
+            "Simulated WRF radar · tilt {}/{} ready · remaining tilts processing",
+            preview.completed_cuts, preview.total_cuts
+        );
+        ctx.request_repaint();
+    }
+
     fn install_synthetic_radar_output(
         &mut self,
         output: wrf_radar::SyntheticRadarOutput,
@@ -9711,7 +9760,24 @@ impl ViewerApp {
         // playing/browsing) the synthetic anchor is never selected — display stuck
         // on the stale real volume until the site is toggled. The clear also
         // resets the cursor so the anchor lands in a fresh single-source loop.
-        self.clear_frame_history();
+        // A first-cut preview uses the final frame's exact identity/path and a
+        // lower completeness priority. Preserve that one-entry history so the
+        // final Local frame replaces it atomically instead of flashing blank.
+        let replacing_matching_preview = volumes.first().is_some_and(|volume| {
+            let stamp = volume.volume_time.format("%Y%m%d_%H%M%S").to_string();
+            let expected_path = crate::wrf_radar::synthetic_frame_path(
+                &volume.site.id,
+                config_fingerprint,
+                0,
+                &stamp,
+            );
+            self.primary.history.len() == 1
+                && self.primary.history[0].status == FrameStatus::Preview
+                && self.primary.history[0].path == expected_path
+        });
+        if !replacing_matching_preview {
+            self.clear_frame_history();
+        }
 
         let frame_count = volumes.len();
         let mut frame_sources = frame_sources.into_iter();
@@ -33212,6 +33278,13 @@ impl ViewerApp {
         // Simulated-radar-from-WRF: finished synthetic volumes are installed
         // into the loop engine so the model forecast plays like a real scan
         // sequence (no store write — these are radar frames, not model fields).
+        let synthetic_preview = self
+            .model_dock
+            .as_mut()
+            .and_then(|dock| dock.take_synthetic_radar_preview());
+        if let Some(preview) = synthetic_preview {
+            self.install_synthetic_radar_preview(preview, ctx);
+        }
         let synthetic_radar = self
             .model_dock
             .as_mut()

@@ -2875,7 +2875,24 @@ fn try_build_synthetic_volume_reporting(
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
 ) -> Result<RadarVolume, String> {
-    build_synthetic_volume_reporting_inner(fields, valid_time, config, progress, None)
+    build_synthetic_volume_reporting_inner(fields, valid_time, config, progress, None, None)
+}
+
+fn try_build_synthetic_volume_reporting_previewing(
+    fields: &WrfRadarFields,
+    valid_time: DateTime<Utc>,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+    cut_completed: &dyn Fn(&RadarVolume, usize, usize),
+) -> Result<RadarVolume, String> {
+    build_synthetic_volume_reporting_inner(
+        fields,
+        valid_time,
+        config,
+        progress,
+        None,
+        Some(cut_completed),
+    )
 }
 
 struct TemporalRenderContext<'a> {
@@ -2897,6 +2914,26 @@ fn build_synthetic_volume_reporting_temporal(
         config,
         progress,
         Some(TemporalRenderContext { neighbor, plan }),
+        None,
+    )
+}
+
+fn build_synthetic_volume_reporting_temporal_previewing(
+    fields: &WrfRadarFields,
+    neighbor: &WrfRadarFields,
+    valid_time: DateTime<Utc>,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+    plan: &TemporalScenePlan,
+    cut_completed: &dyn Fn(&RadarVolume, usize, usize),
+) -> Result<RadarVolume, String> {
+    build_synthetic_volume_reporting_inner(
+        fields,
+        valid_time,
+        config,
+        progress,
+        Some(TemporalRenderContext { neighbor, plan }),
+        Some(cut_completed),
     )
 }
 
@@ -2906,6 +2943,7 @@ fn build_synthetic_volume_reporting_inner(
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
     temporal: Option<TemporalRenderContext<'_>>,
+    cut_completed: Option<&dyn Fn(&RadarVolume, usize, usize)>,
 ) -> Result<RadarVolume, String> {
     config.validate_science_contract()?;
     if let Some(template) = config.exact_replay_template.as_deref() {
@@ -3305,6 +3343,10 @@ fn build_synthetic_volume_reporting_inner(
         )?;
         decoded_radials += cut.radials.len();
         volume.cuts.push(cut);
+        volume.metadata.decoded_radial_count = decoded_radials;
+        if let Some(cut_completed) = cut_completed {
+            cut_completed(&volume, cut_index + 1, tilt_total);
+        }
         if matches!(config.scan_timing, ScanTiming::TimedVolume) {
             cut_start_ms = advance_cut_start_ms(config, leg, cut_start_ms);
         }
@@ -6172,7 +6214,20 @@ pub fn synthetic_frame_path(
 #[derive(Debug)]
 pub enum SyntheticRadarMessage {
     Progress(String),
+    /// One-cut preview of the first forecast frame. This is intentionally sent
+    /// only once: cloning every growing volume would make an already expensive
+    /// raw P3 render progressively slower and consume quadratic memory traffic.
+    Preview(SyntheticRadarPreview),
     Done(Result<SyntheticRadarOutput, String>),
+}
+
+#[derive(Debug)]
+pub struct SyntheticRadarPreview {
+    pub label: String,
+    pub volume: Arc<RadarVolume>,
+    pub config_fingerprint: u64,
+    pub completed_cuts: usize,
+    pub total_cuts: usize,
 }
 
 /// Private, session-only source contract for reopening one installed WRF
@@ -7547,6 +7602,9 @@ pub fn spawn_synthetic_radar_replay(
                     SyntheticRadarMessage::Progress(progress) => {
                         let _ = tx.send(SyntheticRadarReplayMessage::Progress(progress));
                     }
+                    // Exact replay remains all-or-nothing because its observed,
+                    // simulated, and difference panes must stay aligned.
+                    SyntheticRadarMessage::Preview(_) => {}
                     SyntheticRadarMessage::Done(result) => {
                         let replay_result = result.and_then(|output| {
                             let mut frames = Vec::with_capacity(output.volumes.len());
@@ -8100,18 +8158,37 @@ fn build_synthetic_from_paths(
             .valid_time()
             .cloned()
             .expect("scene adapter rejects untimed scenes");
-        let mut volume =
-            match try_build_synthetic_volume_reporting(&fields, valid_time, config, &progress) {
-                Ok(volume) => volume,
-                Err(error) => {
-                    record_or_propagate_scene_failure(
-                        config,
-                        &mut notes,
-                        format!("{name} time {timeidx}: {error}"),
-                    )?;
-                    continue;
+        let first_cut_preview =
+            |partial: &RadarVolume, completed_cuts: usize, total_cuts: usize| {
+                if frame_index == 0 && completed_cuts == 1 {
+                    send_first_cut_preview(
+                        tx,
+                        label,
+                        config_fingerprint,
+                        scene,
+                        partial,
+                        completed_cuts,
+                        total_cuts,
+                    );
                 }
             };
+        let mut volume = match try_build_synthetic_volume_reporting_previewing(
+            &fields,
+            valid_time,
+            config,
+            &progress,
+            &first_cut_preview,
+        ) {
+            Ok(volume) => volume,
+            Err(error) => {
+                record_or_propagate_scene_failure(
+                    config,
+                    &mut notes,
+                    format!("{name} time {timeidx}: {error}"),
+                )?;
+                continue;
+            }
+        };
         append_scene_provenance(&mut volume, scene);
         // Self-document the gate spacing when grid-matching is on: record the
         // effective size and whether it came from the grid DX or fell back.
@@ -8171,6 +8248,46 @@ fn build_synthetic_from_paths(
         config_fingerprint,
         frame_sources,
     })
+}
+
+fn send_first_cut_preview(
+    tx: &Sender<SyntheticRadarMessage>,
+    label: &str,
+    config_fingerprint: u64,
+    scene: &WrfScene,
+    partial: &RadarVolume,
+    completed_cuts: usize,
+    total_cuts: usize,
+) {
+    debug_assert_eq!(completed_cuts, 1);
+    let mut volume = partial.clone();
+    append_scene_provenance(&mut volume, scene);
+    volume.metadata.archive_version = Some("simulated-wrf-partial-preview".to_owned());
+    let preview_fragment = format!(
+        "build_complete=false; completed_tilts={completed_cuts}; planned_tilts={total_cuts}"
+    );
+    match volume.metadata.forward_operator_config.as_mut() {
+        Some(config) => {
+            config.push_str("; ");
+            config.push_str(&preview_fragment);
+        }
+        None => volume.metadata.forward_operator_config = Some(preview_fragment),
+    }
+    volume.metadata.scan_name = Some(format!(
+        "{} (processing: tilt {completed_cuts}/{total_cuts})",
+        volume
+            .metadata
+            .scan_name
+            .as_deref()
+            .unwrap_or("BowEcho synthetic radar")
+    ));
+    let _ = tx.send(SyntheticRadarMessage::Preview(SyntheticRadarPreview {
+        label: format!("{label} · tilt {completed_cuts}/{total_cuts} preview"),
+        volume: Arc::new(volume),
+        config_fingerprint,
+        completed_cuts,
+        total_cuts,
+    }));
 }
 
 fn record_or_propagate_scene_failure(
@@ -8332,6 +8449,20 @@ fn build_temporal_synthetic_from_scenes(
             .valid_time()
             .cloned()
             .expect("scene adapter rejects untimed scenes");
+        let first_cut_preview =
+            |partial: &RadarVolume, completed_cuts: usize, total_cuts: usize| {
+                if frame_index == 0 && completed_cuts == 1 {
+                    send_first_cut_preview(
+                        tx,
+                        label,
+                        config_fingerprint,
+                        scene,
+                        partial,
+                        completed_cuts,
+                        total_cuts,
+                    );
+                }
+            };
 
         let (mut volume, runtime_outcome) = match plan.outcome {
             TemporalSamplingOutcome::LinearAdjacent => {
@@ -8363,8 +8494,12 @@ fn build_temporal_synthetic_from_scenes(
                                 display_name(&scene.path),
                                 scene.time_index
                             ));
-                            let volume = try_build_synthetic_volume_reporting(
-                                &anchor, valid_time, config, &progress,
+                            let volume = try_build_synthetic_volume_reporting_previewing(
+                                &anchor,
+                                valid_time,
+                                config,
+                                &progress,
+                                &first_cut_preview,
                             )?;
                             TemporalNeighborResolution::Held(
                                 volume,
@@ -8406,8 +8541,12 @@ fn build_temporal_synthetic_from_scenes(
                                         scene.time_index
                                     ));
                                     (
-                                        try_build_synthetic_volume_reporting(
-                                            &anchor, valid_time, config, &progress,
+                                        try_build_synthetic_volume_reporting_previewing(
+                                            &anchor,
+                                            valid_time,
+                                            config,
+                                            &progress,
+                                            &first_cut_preview,
                                         )?,
                                         "held_anchor_property_mismatch".to_string(),
                                     )
@@ -8424,8 +8563,14 @@ fn build_temporal_synthetic_from_scenes(
                             }
                         } else {
                             (
-                                build_synthetic_volume_reporting_temporal(
-                                    &anchor, &neighbor, valid_time, config, &progress, &plan,
+                                build_synthetic_volume_reporting_temporal_previewing(
+                                    &anchor,
+                                    &neighbor,
+                                    valid_time,
+                                    config,
+                                    &progress,
+                                    &plan,
+                                    &first_cut_preview,
                                 )?,
                                 config.atmosphere_time_mode.provenance_name().to_string(),
                             )
@@ -8434,11 +8579,23 @@ fn build_temporal_synthetic_from_scenes(
                 }
             }
             TemporalSamplingOutcome::Frozen => (
-                try_build_synthetic_volume_reporting(&anchor, valid_time, config, &progress)?,
+                try_build_synthetic_volume_reporting_previewing(
+                    &anchor,
+                    valid_time,
+                    config,
+                    &progress,
+                    &first_cut_preview,
+                )?,
                 "frozen".to_string(),
             ),
             TemporalSamplingOutcome::HeldAnchor(reason) => (
-                try_build_synthetic_volume_reporting(&anchor, valid_time, config, &progress)?,
+                try_build_synthetic_volume_reporting_previewing(
+                    &anchor,
+                    valid_time,
+                    config,
+                    &progress,
+                    &first_cut_preview,
+                )?,
                 match reason {
                     HoldReason::NoLaterScene => "held_anchor_no_later_scene".to_string(),
                     HoldReason::ScanCrossesNeighbor => {
@@ -9311,11 +9468,13 @@ mod tests {
         }
 
         // Per-file progress streamed in sorted order.
-        let progress: Vec<String> = std::iter::from_fn(|| match rx.try_recv() {
-            Ok(SyntheticRadarMessage::Progress(message)) => Some(message),
-            _ => None,
-        })
-        .collect();
+        let progress: Vec<String> = rx
+            .try_iter()
+            .filter_map(|message| match message {
+                SyntheticRadarMessage::Progress(message) => Some(message),
+                SyntheticRadarMessage::Preview(_) | SyntheticRadarMessage::Done(_) => None,
+            })
+            .collect();
         let marker = format!("file 2/{expected_frames}");
         assert!(
             progress
@@ -9874,6 +10033,43 @@ mod tests {
             i64::from(*offsets.last().expect("last timed ray")),
             "temporal planner duration must be the exact latest sampled ray"
         );
+    }
+
+    #[test]
+    fn cut_completion_callback_exposes_first_tilt_before_volume_finishes() {
+        let fields = uniform_box_fields();
+        let config = SyntheticRadarConfig {
+            site_lat_deg: Some(39.0),
+            site_lon_deg: Some(-95.0),
+            antenna_msl_m: Some(200.0),
+            elevations_deg: vec![0.5, 1.5],
+            azimuth_count: 4,
+            gate_spacing_m: 1_000.0,
+            max_range_m: 2_000.0,
+            ref_gate_texture: false,
+            ..SyntheticRadarConfig::default()
+        };
+        let updates = std::cell::RefCell::new(Vec::new());
+        let volume = build_synthetic_volume_reporting_inner(
+            &fields,
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            &config,
+            &|_| {},
+            None,
+            Some(&|partial, completed, total| {
+                updates.borrow_mut().push((
+                    completed,
+                    total,
+                    partial.cuts.len(),
+                    partial.metadata.decoded_radial_count,
+                ));
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(updates.into_inner(), vec![(1, 2, 1, 4), (2, 2, 2, 8)]);
+        assert_eq!(volume.cuts.len(), 2);
+        assert_eq!(volume.metadata.decoded_radial_count, 8);
     }
 
     #[test]
