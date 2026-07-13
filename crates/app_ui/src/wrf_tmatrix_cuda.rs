@@ -39,10 +39,13 @@ pub const DEFAULT_CUDA_TMATRIX_BATCH_NODES: usize = 16_384;
 pub const DEFAULT_CUDA_TMATRIX_BATCH_REQUESTS: usize = 256;
 
 /// Give sibling Rayon tasks a bounded opportunity to reach the dedicated GPU
-/// worker before its first launch. Without this short linger, the worker often
-/// wakes on one request and submits a tiny kernel while the other CPU workers
-/// are still enqueuing their already-prepared nodes.
-const CUDA_TMATRIX_COALESCE_WAIT: Duration = Duration::from_micros(250);
+/// worker before its first launch. The worker stops waiting as soon as this
+/// many same-table nodes are queued, so a full millisecond is paid only by a
+/// sparse burst instead of every launch.
+const CUDA_TMATRIX_COALESCE_TARGET_NODES: usize = 12_288;
+
+/// Hard latency ceiling for coalescing work that wakes an empty worker queue.
+const CUDA_TMATRIX_COALESCE_WAIT: Duration = Duration::from_millis(1);
 
 /// Exact preloaded dry LUT selected for one request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -611,26 +614,19 @@ fn run_worker<N, O, B>(
             }
         }
 
-        while !shutdown && pending.len() < config.max_requests {
-            match receiver.try_recv() {
-                Ok(WorkerCommand::Request(request)) => pending.push_back(request.into()),
-                Ok(WorkerCommand::Shutdown) => shutdown = true,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    shutdown = true;
-                    break;
-                }
-            }
-        }
-
-        if woke_from_empty && !shutdown {
-            linger_for_peer_requests(
+        if !shutdown {
+            collect_peer_requests(
                 &receiver,
                 &mut pending,
                 config,
                 &mut shutdown,
                 &state,
-                CUDA_TMATRIX_COALESCE_WAIT,
+                CUDA_TMATRIX_COALESCE_TARGET_NODES,
+                if woke_from_empty {
+                    CUDA_TMATRIX_COALESCE_WAIT
+                } else {
+                    Duration::ZERO
+                },
             );
         }
 
@@ -659,12 +655,13 @@ fn run_worker<N, O, B>(
     }
 }
 
-fn linger_for_peer_requests<N, O>(
+fn collect_peer_requests<N, O>(
     receiver: &Receiver<WorkerCommand<N, O>>,
     pending: &mut VecDeque<PendingRequest<N, O>>,
     config: WrfTMatrixCudaBatchConfig,
     shutdown: &mut bool,
     state: &ServiceState,
+    target_nodes: usize,
     coalesce_wait: Duration,
 ) {
     let Some(role) = pending.front().map(|request| request.role) else {
@@ -674,20 +671,31 @@ fn linger_for_peer_requests<N, O>(
     loop {
         let queued_nodes = pending
             .iter()
-            .filter(|request| request.role == role)
+            .take_while(|request| request.role == role)
             .map(|request| request.nodes.len().saturating_sub(request.next_node))
             .fold(0_usize, usize::saturating_add);
+        let role_boundary_queued = pending.iter().any(|request| request.role != role);
         if pending.len() >= config.max_requests
             || queued_nodes >= config.max_nodes
+            || queued_nodes >= target_nodes
+            || role_boundary_queued
             || state.fallback().is_some()
         {
             break;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match receiver.recv_timeout(remaining) {
+
+        let command = match receiver.try_recv() {
+            Ok(command) => Ok(command),
+            Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+            Err(TryRecvError::Empty) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                receiver.recv_timeout(remaining)
+            }
+        };
+        match command {
             Ok(WorkerCommand::Request(request)) => {
                 let role_changed = request.role != role;
                 pending.push_back(request.into());
@@ -962,34 +970,108 @@ mod tests {
     }
 
     #[test]
-    fn bounded_linger_collects_a_late_peer_and_stops_at_role_boundary() {
+    fn empty_queue_coalescing_stops_at_target_nodes() {
         let config = WrfTMatrixCudaBatchConfig::new(8, 8).unwrap();
         let state = ServiceState::default();
         let (first, _first_reply) = pending(WrfTMatrixCudaTableRole::DryOblate, vec![1]);
         let mut queue = VecDeque::from([first]);
         let (commands, receiver) = mpsc::channel();
-        let sender = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5));
-            for (role, nodes) in [
-                (WrfTMatrixCudaTableRole::DryOblate, vec![2, 3]),
-                (WrfTMatrixCudaTableRole::DryProlate, vec![4]),
-            ] {
-                let (reply, _response) = mpsc::sync_channel(1);
-                commands
-                    .send(WorkerCommand::Request(WorkerRequest { role, nodes, reply }))
-                    .unwrap();
-            }
-        });
+        for nodes in [vec![2, 3, 4], vec![5]] {
+            let (reply, _response) = mpsc::sync_channel(1);
+            commands
+                .send(WorkerCommand::Request(WorkerRequest {
+                    role: WrfTMatrixCudaTableRole::DryOblate,
+                    nodes,
+                    reply,
+                }))
+                .unwrap();
+        }
         let mut shutdown = false;
-        linger_for_peer_requests(
+        collect_peer_requests(
             &receiver,
             &mut queue,
             config,
             &mut shutdown,
             &state,
+            4,
             Duration::from_millis(100),
         );
-        sender.join().unwrap();
+
+        assert!(!shutdown);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].nodes, vec![1]);
+        assert_eq!(queue[1].nodes, vec![2, 3, 4]);
+        let WorkerCommand::Request(waiting) = receiver.try_recv().unwrap() else {
+            panic!("target must stop before receiving shutdown");
+        };
+        assert_eq!(waiting.nodes, vec![5]);
+    }
+
+    #[test]
+    fn empty_queue_coalescing_stops_at_full_batch() {
+        let config = WrfTMatrixCudaBatchConfig::new(4, 8).unwrap();
+        let state = ServiceState::default();
+        let (first, _first_reply) = pending(WrfTMatrixCudaTableRole::DryOblate, vec![1, 2]);
+        let mut queue = VecDeque::from([first]);
+        let (commands, receiver) = mpsc::channel();
+        for nodes in [vec![3, 4], vec![5]] {
+            let (reply, _response) = mpsc::sync_channel(1);
+            commands
+                .send(WorkerCommand::Request(WorkerRequest {
+                    role: WrfTMatrixCudaTableRole::DryOblate,
+                    nodes,
+                    reply,
+                }))
+                .unwrap();
+        }
+        let mut shutdown = false;
+        collect_peer_requests(
+            &receiver,
+            &mut queue,
+            config,
+            &mut shutdown,
+            &state,
+            8,
+            Duration::from_millis(100),
+        );
+
+        assert!(!shutdown);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].nodes, vec![1, 2]);
+        assert_eq!(queue[1].nodes, vec![3, 4]);
+        let WorkerCommand::Request(waiting) = receiver.try_recv().unwrap() else {
+            panic!("full batch must stop before receiving shutdown");
+        };
+        assert_eq!(waiting.nodes, vec![5]);
+    }
+
+    #[test]
+    fn empty_queue_coalescing_stops_at_role_boundary() {
+        let config = WrfTMatrixCudaBatchConfig::new(8, 8).unwrap();
+        let state = ServiceState::default();
+        let (first, _first_reply) = pending(WrfTMatrixCudaTableRole::DryOblate, vec![1]);
+        let mut queue = VecDeque::from([first]);
+        let (commands, receiver) = mpsc::channel();
+        for (role, nodes) in [
+            (WrfTMatrixCudaTableRole::DryOblate, vec![2, 3]),
+            (WrfTMatrixCudaTableRole::DryProlate, vec![4]),
+            (WrfTMatrixCudaTableRole::DryOblate, vec![5]),
+        ] {
+            let (reply, _response) = mpsc::sync_channel(1);
+            commands
+                .send(WorkerCommand::Request(WorkerRequest { role, nodes, reply }))
+                .unwrap();
+        }
+        let mut shutdown = false;
+        collect_peer_requests(
+            &receiver,
+            &mut queue,
+            config,
+            &mut shutdown,
+            &state,
+            8,
+            Duration::from_millis(100),
+        );
 
         assert!(!shutdown);
         assert_eq!(queue.len(), 3);
@@ -997,6 +1079,68 @@ mod tests {
         assert_eq!(queue[1].nodes, vec![2, 3]);
         assert_eq!(queue[2].nodes, vec![4]);
         assert_eq!(queue[2].role, WrfTMatrixCudaTableRole::DryProlate);
+        let WorkerCommand::Request(waiting) = receiver.try_recv().unwrap() else {
+            panic!("role boundary must stop before receiving shutdown");
+        };
+        assert_eq!(waiting.nodes, vec![5]);
+    }
+
+    #[test]
+    fn concurrent_burst_reaches_target_in_two_batches_and_preserves_replies() {
+        const REQUESTS: usize = 24;
+        const NODES_PER_REQUEST: usize = 1_024;
+
+        let (backend, control) = mock();
+        let state = Arc::new(ServiceState::default());
+        let (commands, receiver) = mpsc::channel();
+        let replies = (0..REQUESTS)
+            .into_par_iter()
+            .map(|request_index| {
+                let commands = commands.clone();
+                let start = request_index * NODES_PER_REQUEST;
+                let nodes = (start..start + NODES_PER_REQUEST)
+                    .map(|node| u32::try_from(node).unwrap())
+                    .collect::<Vec<_>>();
+                let (reply, response) = mpsc::sync_channel(1);
+                commands
+                    .send(WorkerCommand::Request(WorkerRequest {
+                        role: WrfTMatrixCudaTableRole::DryOblate,
+                        nodes,
+                        reply,
+                    }))
+                    .unwrap();
+                (request_index, response)
+            })
+            .collect::<Vec<_>>();
+        commands.send(WorkerCommand::Shutdown).unwrap();
+
+        run_worker(
+            receiver,
+            backend,
+            Arc::clone(&state),
+            WrfTMatrixCudaBatchConfig::default(),
+        );
+
+        for (request_index, response) in replies {
+            let output = response.recv().unwrap().unwrap();
+            let start = request_index * NODES_PER_REQUEST;
+            assert_eq!(output.len(), NODES_PER_REQUEST);
+            assert_eq!(output[0], u32::try_from(start * 2).unwrap());
+            assert_eq!(
+                output[NODES_PER_REQUEST - 1],
+                u32::try_from((start + NODES_PER_REQUEST - 1) * 2).unwrap()
+            );
+        }
+        let batch_sizes = control
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, nodes)| nodes.len())
+            .collect::<Vec<_>>();
+        assert_eq!(batch_sizes, vec![12_288, 12_288]);
+        assert_eq!(state.batches_completed.load(Ordering::Relaxed), 2);
+        assert_eq!(state.nodes_completed.load(Ordering::Relaxed), 24_576);
     }
 
     #[test]
