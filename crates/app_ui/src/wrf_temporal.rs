@@ -1428,7 +1428,10 @@ mod tests {
             1.0e6,
             4.0e-5,
             1.0e-7,
-            Some((1.0e-4, 0.0)),
+            // P3 repairs nonpositive QNRAIN at active rain mass. Use a
+            // materially negative mass to preserve this availability-mismatch
+            // contract without contradicting the native scheme behavior.
+            Some((-1.0, 0.0)),
         );
         assert_eq!(
             interpolate_raw_state_linear(
