@@ -89,6 +89,7 @@ pub const SYNTHETIC_RADAR_CANCELLED: &str = "Synthetic radar cancelled";
 pub fn is_synthetic_radar_cancelled(error: &str) -> bool {
     error == SYNTHETIC_RADAR_CANCELLED
         || error.ends_with("synthetic-radar T-matrix evaluation cancelled")
+        || error.ends_with("synthetic-radar T-matrix raw batch cancelled")
         || error.ends_with("synthetic-radar T-matrix scene build cancelled")
 }
 
@@ -4229,6 +4230,44 @@ fn quadrature_points(mode: BeamIntegration) -> &'static [QuadraturePoint] {
 }
 
 #[derive(Clone, Copy)]
+struct ResolvedBeamSamplePoint {
+    az_sigma: f64,
+    el_sigma: f64,
+    range_offset_m: f64,
+    weight: f64,
+}
+
+fn resolved_beam_sample_points(
+    config: &SyntheticRadarConfig,
+    coupled_instrument: Option<&CoupledInstrumentContext>,
+    spacing_m: f64,
+) -> Vec<ResolvedBeamSamplePoint> {
+    if let Some(points) =
+        coupled_instrument.and_then(|instrument| instrument.quadrature(config.beam_integration))
+    {
+        points
+            .iter()
+            .map(|point| ResolvedBeamSamplePoint {
+                az_sigma: point.az_sigma,
+                el_sigma: point.el_sigma,
+                range_offset_m: point.range_offset_m,
+                weight: point.weight,
+            })
+            .collect()
+    } else {
+        quadrature_points(config.beam_integration)
+            .iter()
+            .map(|point| ResolvedBeamSamplePoint {
+                az_sigma: point.az_sigma,
+                el_sigma: point.el_sigma,
+                range_offset_m: point.range_gate * spacing_m,
+                weight: point.weight,
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy)]
 enum BeamPropagationGeometry<'a> {
     StandardFourThirdsEarth,
     WrfRefractivity(&'a crate::wrf_refractivity::WrfRefractivityModel),
@@ -4238,6 +4277,52 @@ enum BeamPropagationGeometry<'a> {
 struct BeamGeometryPoint {
     ground_range_m: f64,
     height_above_radar_m: f64,
+}
+
+#[derive(Clone, Copy)]
+struct BeamColumnPoint {
+    azimuth_deg: f64,
+    elevation_deg: f64,
+    latitude: f32,
+    longitude: f32,
+    z_msl: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn beam_column_point(
+    site_lat: f64,
+    site_lon: f64,
+    antenna_msl: f64,
+    center_azimuth_deg: f64,
+    center_elevation_deg: f64,
+    center_slant_m: f64,
+    gate_index: usize,
+    gate_range: &GateRange,
+    beam_geometry: BeamPropagationGeometry<'_>,
+    beam_sigma_deg: f64,
+    point: ResolvedBeamSamplePoint,
+) -> Result<BeamColumnPoint, String> {
+    let azimuth_deg = center_azimuth_deg + point.az_sigma * beam_sigma_deg;
+    let elevation_deg = center_elevation_deg + point.el_sigma * beam_sigma_deg;
+    let geometry = beam_geometry.point(
+        elevation_deg,
+        gate_range,
+        gate_index,
+        point.range_offset_m,
+        center_slant_m,
+    )?;
+    let z_msl = antenna_msl + geometry.height_above_radar_m;
+    let azimuth = azimuth_deg.to_radians();
+    let east_km = geometry.ground_range_m * azimuth.sin() / 1_000.0;
+    let north_km = geometry.ground_range_m * azimuth.cos() / 1_000.0;
+    let (latitude, longitude) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
+    Ok(BeamColumnPoint {
+        azimuth_deg,
+        elevation_deg,
+        latitude: latitude as f32,
+        longitude: longitude as f32,
+        z_msl,
+    })
 }
 
 impl<'a> BeamPropagationGeometry<'a> {
@@ -4394,6 +4479,178 @@ struct GateSampleResult {
     quality: GateQualityFractions,
 }
 
+/// Gate count in one bounded RawStateLinear prepare/evaluate/finish chunk.
+/// Even Center sampling now exposes several category integrations to each role
+/// sweep, while Reference sampling exposes 216 ordered beam points per chunk.
+const RAW_TMATRIX_PIPELINE_GATE_CHUNK: usize = 8;
+
+struct RawGateColumnBatch {
+    first_gate: usize,
+    gate_count: usize,
+    points: Vec<ResolvedBeamSamplePoint>,
+    samples: Vec<Option<ColumnSample>>,
+}
+
+impl RawGateColumnBatch {
+    fn sample(
+        &self,
+        gate_index: usize,
+        point_index: usize,
+    ) -> Result<Option<ColumnSample>, String> {
+        let local_gate = gate_index.checked_sub(self.first_gate).ok_or_else(|| {
+            format!(
+                "raw T-matrix gate batch starts at {}, queried gate {gate_index}",
+                self.first_gate
+            )
+        })?;
+        if local_gate >= self.gate_count || point_index >= self.points.len() {
+            return Err(format!(
+                "raw T-matrix gate batch does not contain gate {gate_index}, point {point_index}"
+            ));
+        }
+        let position = local_gate
+            .checked_mul(self.points.len())
+            .and_then(|offset| offset.checked_add(point_index))
+            .ok_or_else(|| "raw T-matrix gate-batch lookup overflowed".to_owned())?;
+        self.samples
+            .get(position)
+            .copied()
+            .ok_or_else(|| "raw T-matrix gate-batch storage is incomplete".to_owned())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_raw_gate_column_batch(
+    fields: &WrfRadarFields,
+    neighbor_fields: Option<&WrfRadarFields>,
+    atmosphere_alpha: f64,
+    cells: usize,
+    site_lat: f64,
+    site_lon: f64,
+    antenna_msl: f64,
+    center_azimuth_deg: f64,
+    center_elevation_deg: f64,
+    spacing_m: f64,
+    gate_range: &GateRange,
+    beam_geometry: BeamPropagationGeometry<'_>,
+    config: &SyntheticRadarConfig,
+    coupled_instrument: Option<&CoupledInstrumentContext>,
+    first_gate: usize,
+    end_gate: usize,
+    cuda: &app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService,
+    cancel: Option<&AtomicBool>,
+) -> Result<RawGateColumnBatch, String> {
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
+    let gate_count = end_gate.saturating_sub(first_gate);
+    let points = resolved_beam_sample_points(config, coupled_instrument, spacing_m);
+    if points.is_empty() {
+        return Err("raw T-matrix gate batch requires at least one beam sample point".to_owned());
+    }
+    let work_count = gate_count
+        .checked_mul(points.len())
+        .ok_or_else(|| "raw T-matrix gate-batch work size overflowed".to_owned())?;
+    let beam_sigma_deg = gaussian_beam_sigma_deg(f64::from(config.beam_width_deg.max(0.05)));
+    let prepared = (0..work_count)
+        .into_par_iter()
+        .map(|position| {
+            let local_gate = position / points.len();
+            let point_index = position % points.len();
+            let gate_index = first_gate + local_gate;
+            let center_slant_m = f64::from(gate_range.first_gate_m) + gate_index as f64 * spacing_m;
+            let location = beam_column_point(
+                site_lat,
+                site_lon,
+                antenna_msl,
+                center_azimuth_deg,
+                center_elevation_deg,
+                center_slant_m,
+                gate_index,
+                gate_range,
+                beam_geometry,
+                beam_sigma_deg,
+                points[point_index],
+            )?;
+            prepare_column_raw_state_linear(
+                fields,
+                neighbor_fields,
+                atmosphere_alpha,
+                cells,
+                location.latitude,
+                location.longitude,
+                location.z_msl as f32,
+                cancel,
+            )
+        })
+        .collect::<Vec<_>>();
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
+    // Indexed Rayon collection preserves work position. Selecting errors in
+    // this serial pass makes (gate, beam point) ordering deterministic.
+    let mut ordered = Vec::with_capacity(prepared.len());
+    for result in prepared {
+        ordered.push(result?);
+    }
+    let evaluated = {
+        let requests = ordered
+            .iter()
+            .enumerate()
+            .filter_map(|(position, prepared)| {
+                prepared.as_ref().map(|prepared| {
+                    let point_index = position % points.len();
+                    let center_elevation =
+                        center_elevation_deg + points[point_index].el_sigma * beam_sigma_deg;
+                    app_ui::wrf_tmatrix_scene::WrfTMatrixRawBatchRequest::new(
+                        &prepared.property_cell,
+                        center_elevation,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        app_ui::wrf_tmatrix_assets::evaluate_embedded_raw_property_batch_with_cuda_and_cancel(
+            &requests,
+            Some(cuda),
+            cancel,
+        )
+        .map_err(|error| {
+            format!("ordered raw T-matrix gate batch {first_gate}..{end_gate} failed: {error}")
+        })?
+    };
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
+    let expected_evaluated = ordered.iter().filter(|prepared| prepared.is_some()).count();
+    if evaluated.len() != expected_evaluated {
+        return Err(format!(
+            "raw T-matrix batch returned {} covered samples, expected {expected_evaluated}",
+            evaluated.len()
+        ));
+    }
+    let mut evaluated = evaluated.into_iter();
+    let mut samples = Vec::with_capacity(ordered.len());
+    for prepared in ordered {
+        samples.push(match prepared {
+            Some(prepared) => Some(finish_prepared_raw_column(
+                prepared,
+                evaluated
+                    .next()
+                    .expect("covered raw columns and batch answers have equal length"),
+                cancel,
+            )?),
+            None => None,
+        });
+    }
+    debug_assert!(evaluated.next().is_none());
+    Ok(RawGateColumnBatch {
+        first_gate,
+        gate_count,
+        points,
+        samples,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sample_gate_with_quality_instrument(
     fields: &WrfRadarFields,
@@ -4414,23 +4671,21 @@ fn sample_gate_with_quality_instrument(
     terrain_horizon: Option<&TerrainHorizon>,
     mut refracted_terrain_blockage: Option<&mut [bool]>,
     coupled_instrument: Option<&CoupledInstrumentContext>,
+    raw_batch: Option<&RawGateColumnBatch>,
     cancel: Option<&AtomicBool>,
 ) -> Result<GateSampleResult, String> {
     if let Some(cancel) = cancel {
         check_synthetic_radar_cancel(cancel)?;
     }
     let beam_sigma_deg = gaussian_beam_sigma_deg(f64::from(config.beam_width_deg.max(0.05)));
-    let physical_points =
-        coupled_instrument.and_then(|instrument| instrument.quadrature(config.beam_integration));
-    let total_weight = physical_points.map_or_else(
-        || {
-            quadrature_points(config.beam_integration)
-                .iter()
-                .map(|point| point.weight)
-                .sum::<f64>()
-        },
-        |points| points.iter().map(|point| point.weight).sum::<f64>(),
-    );
+    let owned_points;
+    let points = if let Some(raw_batch) = raw_batch {
+        raw_batch.points.as_slice()
+    } else {
+        owned_points = resolved_beam_sample_points(config, coupled_instrument, spacing_m);
+        owned_points.as_slice()
+    };
+    let total_weight = points.iter().map(|point| point.weight).sum::<f64>();
     let mut valid_weight = 0.0f64;
     let mut terrain_unblocked_weight = 0.0f64;
     let mut signal_weight = 0.0f64;
@@ -4443,135 +4698,116 @@ fn sample_gate_with_quality_instrument(
     let mut polar_accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
     let mut any_polar = false;
 
-    let mut accumulate_point = |point_index: usize,
-                                az_sigma: f64,
-                                el_sigma: f64,
-                                range_offset_m: f64,
-                                weight: f64|
-     -> Result<(), String> {
-        let azimuth_deg = center_azimuth_deg + az_sigma * beam_sigma_deg;
-        let elevation_deg = center_elevation_deg + el_sigma * beam_sigma_deg;
-        let geometry = beam_geometry.point(
-            elevation_deg,
-            gate_range,
-            gate_index,
-            range_offset_m,
-            center_slant_m,
-        )?;
-        let z_msl = antenna_msl + geometry.height_above_radar_m;
-        let ground_m = geometry.ground_range_m;
-        let azimuth = azimuth_deg.to_radians();
-        let east_km = ground_m * azimuth.sin() / 1_000.0;
-        let north_km = ground_m * azimuth.cos() / 1_000.0;
-        let (lat, lon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
-        let refracted_blocked =
-            if let Some(blocked_by_point) = refracted_terrain_blockage.as_deref_mut() {
-                let blocked = blocked_by_point.get_mut(point_index).ok_or_else(|| {
-                    "WRF refractivity terrain state does not match beam quadrature".to_owned()
-                })?;
-                if sample_terrain(fields, lat as f32, lon as f32)
-                    .is_some_and(|terrain_m| f64::from(terrain_m) >= z_msl)
-                {
-                    *blocked = true;
-                }
-                Some(*blocked)
+    let mut accumulate_point =
+        |point_index: usize, point: ResolvedBeamSamplePoint| -> Result<(), String> {
+            let location = beam_column_point(
+                site_lat,
+                site_lon,
+                antenna_msl,
+                center_azimuth_deg,
+                center_elevation_deg,
+                center_slant_m,
+                gate_index,
+                gate_range,
+                beam_geometry,
+                beam_sigma_deg,
+                point,
+            )?;
+            let azimuth_deg = location.azimuth_deg;
+            let elevation_deg = location.elevation_deg;
+            let z_msl = location.z_msl;
+            let azimuth = azimuth_deg.to_radians();
+            let refracted_blocked =
+                if let Some(blocked_by_point) = refracted_terrain_blockage.as_deref_mut() {
+                    let blocked = blocked_by_point.get_mut(point_index).ok_or_else(|| {
+                        "WRF refractivity terrain state does not match beam quadrature".to_owned()
+                    })?;
+                    if sample_terrain(fields, location.latitude, location.longitude)
+                        .is_some_and(|terrain_m| f64::from(terrain_m) >= z_msl)
+                    {
+                        *blocked = true;
+                    }
+                    Some(*blocked)
+                } else {
+                    None
+                };
+            let sampled_column = if let Some(raw_batch) = raw_batch {
+                raw_batch.sample(gate_index, point_index)?
             } else {
-                None
+                sample_column_temporal(
+                    fields,
+                    neighbor_fields,
+                    atmosphere_alpha,
+                    cells,
+                    location.latitude,
+                    location.longitude,
+                    location.z_msl as f32,
+                    elevation_deg,
+                    config.atmosphere_time_mode,
+                    config.reflectivity_sampling,
+                    config.runtime_cuda_service.as_deref(),
+                    cancel,
+                )?
             };
-        let Some(sample) = sample_column_temporal(
-            fields,
-            neighbor_fields,
-            atmosphere_alpha,
-            cells,
-            lat as f32,
-            lon as f32,
-            z_msl as f32,
-            elevation_deg,
-            config.atmosphere_time_mode,
-            config.reflectivity_sampling,
-            config.runtime_cuda_service.as_deref(),
-            cancel,
-        )?
-        else {
-            return Ok(());
-        };
-        valid_weight += weight;
+            let Some(sample) = sampled_column else {
+                return Ok(());
+            };
+            valid_weight += point.weight;
 
-        let blocked = refracted_blocked.unwrap_or_else(|| {
-            terrain_horizon.is_some_and(|horizon| {
-                let horizon_deg = horizon.at(azimuth_deg, gate_index);
-                horizon_deg.is_finite() && elevation_deg as f32 <= horizon_deg
-            })
-        });
-        if blocked {
-            return Ok(());
-        }
-        terrain_unblocked_weight += weight;
+            let blocked = refracted_blocked.unwrap_or_else(|| {
+                terrain_horizon.is_some_and(|horizon| {
+                    let horizon_deg = horizon.at(azimuth_deg, gate_index);
+                    horizon_deg.is_finite() && elevation_deg as f32 <= horizon_deg
+                })
+            });
+            if blocked {
+                return Ok(());
+            }
+            terrain_unblocked_weight += point.weight;
 
-        let el = elevation_deg.to_radians();
-        let fall_speed = if config.terminal_fall_speed {
-            sample.polar.map_or(0.0, |polar| polar.fall_speed_mps)
-        } else {
-            0.0
+            let el = elevation_deg.to_radians();
+            let fall_speed = if config.terminal_fall_speed {
+                sample.polar.map_or(0.0, |polar| polar.fall_speed_mps)
+            } else {
+                0.0
+            };
+            let air_velocity = f64::from(sample.u) * azimuth.sin() * el.cos()
+                + f64::from(sample.v) * azimuth.cos() * el.cos()
+                + f64::from(sample.w) * el.sin();
+            let vr = air_velocity - f64::from(fall_speed) * el.sin();
+            let z = f64::from(sample.z_linear);
+            if !z.is_finite() || z <= 0.0 || !vr.is_finite() {
+                return Ok(());
+            }
+            signal_weight += point.weight;
+            sum_z += point.weight * z;
+            sum_z_vr += point.weight * z * vr;
+            sum_z_vr2 += point.weight * z * vr * vr;
+            sum_z_air_velocity += point.weight * z * air_velocity;
+            let terminal_variance = if config.terminal_fall_speed {
+                sample
+                    .polar
+                    .map_or(0.0, |polar| f64::from(polar.fall_speed_variance_m2s2))
+                    * el.sin().powi(2)
+            } else {
+                0.0
+            };
+            let turbulent_variance = if config.spectrum_width {
+                // Isotropic one-dimensional variance from TKE = 1/2(u'^2+v'^2+w'^2).
+                f64::from((2.0 / 3.0) * sample.tke_m2s2.max(0.0))
+            } else {
+                0.0
+            };
+            sum_z_terminal_variance += point.weight * z * terminal_variance;
+            sum_z_turbulence_variance += point.weight * z * turbulent_variance;
+            if let Some(polar) = sample.polar {
+                any_polar = true;
+                polar_accumulator.add(point.weight as f32, intrinsic_as_contribution(polar));
+            }
+            Ok(())
         };
-        let air_velocity = f64::from(sample.u) * azimuth.sin() * el.cos()
-            + f64::from(sample.v) * azimuth.cos() * el.cos()
-            + f64::from(sample.w) * el.sin();
-        let vr = air_velocity - f64::from(fall_speed) * el.sin();
-        let z = f64::from(sample.z_linear);
-        if !z.is_finite() || z <= 0.0 || !vr.is_finite() {
-            return Ok(());
-        }
-        signal_weight += weight;
-        sum_z += weight * z;
-        sum_z_vr += weight * z * vr;
-        sum_z_vr2 += weight * z * vr * vr;
-        sum_z_air_velocity += weight * z * air_velocity;
-        let terminal_variance = if config.terminal_fall_speed {
-            sample
-                .polar
-                .map_or(0.0, |polar| f64::from(polar.fall_speed_variance_m2s2))
-                * el.sin().powi(2)
-        } else {
-            0.0
-        };
-        let turbulent_variance = if config.spectrum_width {
-            // Isotropic one-dimensional variance from TKE = 1/2(u'^2+v'^2+w'^2).
-            f64::from((2.0 / 3.0) * sample.tke_m2s2.max(0.0))
-        } else {
-            0.0
-        };
-        sum_z_terminal_variance += weight * z * terminal_variance;
-        sum_z_turbulence_variance += weight * z * turbulent_variance;
-        if let Some(polar) = sample.polar {
-            any_polar = true;
-            polar_accumulator.add(weight as f32, intrinsic_as_contribution(polar));
-        }
-        Ok(())
-    };
-    if let Some(points) = physical_points {
-        for (point_index, point) in points.iter().enumerate() {
-            accumulate_point(
-                point_index,
-                point.az_sigma,
-                point.el_sigma,
-                point.range_offset_m,
-                point.weight,
-            )?;
-        }
-    } else {
-        for (point_index, point) in quadrature_points(config.beam_integration)
-            .iter()
-            .enumerate()
-        {
-            accumulate_point(
-                point_index,
-                point.az_sigma,
-                point.el_sigma,
-                point.range_gate * spacing_m,
-                point.weight,
-            )?;
-        }
+    for (point_index, &point) in points.iter().enumerate() {
+        accumulate_point(point_index, point)?;
     }
 
     let quality = GateQuality {
@@ -4662,6 +4898,7 @@ fn sample_gate_with_quality(
         BeamPropagationGeometry::StandardFourThirdsEarth,
         config,
         terrain_horizon,
+        None,
         None,
         None,
         None,
@@ -4982,7 +5219,7 @@ fn build_cut(
 
     // One row per radial, sampled in parallel. Each row is `gate_count` REF and
     // `gate_count` VEL f32 values (NaN = no data / below floor / off-domain).
-    let rows: Vec<CutMomentRow> = ray_plan
+    let row_results: Vec<Result<CutMomentRow, String>> = ray_plan
         .par_iter()
         .map(|ray| -> Result<CutMomentRow, String> {
             if let Some(cancel) = cancel {
@@ -5008,7 +5245,52 @@ fn build_cut(
             let mut refracted_terrain_blockage = (config.terrain_blockage
                 && beam_geometry.is_wrf_refractivity())
             .then(|| vec![false; quadrature_count]);
+            let raw_cuda = matches!(
+                config.atmosphere_time_mode,
+                AtmosphereTimeMode::RawStateLinear
+            )
+            .then(|| config.runtime_cuda_service.as_deref())
+            .flatten();
+            let mut raw_batch = None;
             for gate in 0..gate_count {
+                if let Some(cuda) = raw_cuda
+                    && gate % RAW_TMATRIX_PIPELINE_GATE_CHUNK == 0
+                {
+                    let end_gate = gate
+                        .saturating_add(RAW_TMATRIX_PIPELINE_GATE_CHUNK)
+                        .min(gate_count);
+                    raw_batch = Some(
+                        build_raw_gate_column_batch(
+                            fields,
+                            temporal.map(|context| context.neighbor),
+                            ray.atmosphere_alpha,
+                            cells,
+                            site_lat,
+                            site_lon,
+                            antenna_msl,
+                            az_deg,
+                            ray_elevation_deg,
+                            spacing,
+                            &gate_range,
+                            beam_geometry,
+                            config,
+                            coupled_instrument,
+                            gate,
+                            end_gate,
+                            cuda,
+                            cancel,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "prepare raw T-matrix cut {} ray {} gates {}..{}: {error}",
+                                cut_index + 1,
+                                iaz + 1,
+                                gate + 1,
+                                end_gate
+                            )
+                        })?,
+                    );
+                }
                 if gate % 8 == 0
                     && let Some(cancel) = cancel
                 {
@@ -5038,6 +5320,7 @@ fn build_cut(
                     terrain_horizon,
                     refracted_terrain_blockage.as_deref_mut(),
                     coupled_instrument,
+                    raw_batch.as_ref(),
                     cancel,
                 )?;
                 if config.emit_quality_fields {
@@ -5349,7 +5632,13 @@ fn build_cut(
             }
             Ok(row)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
+    // Rayon completion order must not select the externally visible failure.
+    // Resolve indexed radial slots serially so the first ray in cut order wins.
+    let rows = row_results.into_iter().collect::<Result<Vec<_>, _>>()?;
 
     let mut cut = ElevationCut::new(elevation_deg as f32, u8::try_from(cut_index + 1).ok());
     let mut ref_values = Vec::with_capacity(rendered_ray_count * gate_count);
@@ -5529,6 +5818,7 @@ fn f32_grid(
 }
 
 /// One trilinearly-sampled model column value at a gate.
+#[derive(Clone, Copy)]
 struct ColumnSample {
     /// Equivalent reflectivity factor in linear mm^6 m^-3. Keeping received
     /// power linear through every interpolation and pulse-volume average is the
@@ -5674,6 +5964,12 @@ struct RawSpatialEndpoint {
     tke_m2s2: f32,
 }
 
+struct PreparedRawColumnSample {
+    property_cell: app_ui::wrf_property_reader::RawPropertyCell,
+    gate_state: RawGateState,
+    tke_m2s2: f32,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sample_column_raw_state_linear(
     fields: &WrfRadarFields,
@@ -5687,6 +5983,40 @@ fn sample_column_raw_state_linear(
     cuda: Option<&app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
     cancel: Option<&AtomicBool>,
 ) -> Result<Option<ColumnSample>, String> {
+    let Some(prepared) = prepare_column_raw_state_linear(
+        fields,
+        neighbor_fields,
+        alpha,
+        cells,
+        lat,
+        lon,
+        z_msl,
+        cancel,
+    )?
+    else {
+        return Ok(None);
+    };
+    let polar =
+        app_ui::wrf_tmatrix_assets::evaluate_embedded_raw_property_cell_with_cuda_and_cancel(
+            &prepared.property_cell,
+            beam_elevation_deg,
+            cuda,
+            cancel,
+        )?;
+    finish_prepared_raw_column(prepared, polar, cancel).map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_column_raw_state_linear(
+    fields: &WrfRadarFields,
+    neighbor_fields: Option<&WrfRadarFields>,
+    alpha: f64,
+    cells: usize,
+    lat: f32,
+    lon: f32,
+    z_msl: f32,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<PreparedRawColumnSample>, String> {
     if let Some(cancel) = cancel {
         check_synthetic_radar_cancel(cancel)?;
     }
@@ -5736,13 +6066,18 @@ fn sample_column_raw_state_linear(
         (None, Some(right)) => right.tke_m2s2,
         (None, None) => return Ok(None),
     };
-    let polar =
-        app_ui::wrf_tmatrix_assets::evaluate_embedded_raw_property_cell_with_cuda_and_cancel(
-            &blended.property_cell,
-            beam_elevation_deg,
-            cuda,
-            cancel,
-        )?;
+    Ok(Some(PreparedRawColumnSample {
+        property_cell: blended.property_cell,
+        gate_state: blended.gate_state,
+        tke_m2s2,
+    }))
+}
+
+fn finish_prepared_raw_column(
+    prepared: PreparedRawColumnSample,
+    polar: Option<radar_scattering::PolarAccumulatorQuantities>,
+    cancel: Option<&AtomicBool>,
+) -> Result<ColumnSample, String> {
     if let Some(cancel) = cancel {
         check_synthetic_radar_cancel(cancel)?;
     }
@@ -5751,14 +6086,14 @@ fn sample_column_raw_state_linear(
         accumulator.add(1.0, tmatrix_as_contribution(quantities));
         accumulator.finalize()
     });
-    Ok(Some(ColumnSample {
+    Ok(ColumnSample {
         z_linear: polar.map_or(0.0, |sample| sample.zh),
-        u: blended.gate_state.wind_u_mps,
-        v: blended.gate_state.wind_v_mps,
-        w: blended.gate_state.wind_w_mps,
+        u: prepared.gate_state.wind_u_mps,
+        v: prepared.gate_state.wind_v_mps,
+        w: prepared.gate_state.wind_w_mps,
         polar,
-        tke_m2s2,
-    }))
+        tke_m2s2: prepared.tke_m2s2,
+    })
 }
 
 fn raw_spatial_endpoint(
@@ -6859,6 +7194,7 @@ fn explain_selected_gate(
             terrain_horizon.as_ref(),
             refracted_terrain_blockage.as_deref_mut(),
             coupled.as_ref(),
+            None,
             None,
         )
         .map_err(WhyThisGateUnavailable::WorkerFailed)?;

@@ -47,7 +47,8 @@ One bounded cut-work chunk is transformed as follows.
    lists, dry-oblate then dry-prolate. A back-reference identifies the prepared
    item and particle position. Each list is submitted in bulk; the job-scoped
    service may split it only at its configured node bound. No reduction runs
-   on the GPU.
+   on the GPU. Independent radial chunks can still rendezvous at that service,
+   so compatible roles from several Rayon workers remain coalescible.
 3. **Ordered finish.** Visit indexed work in `(ray, gate, beam sample,
    category)` order. Feed particle answers back to the existing prepared
    integration's `finish` callback in source order, evaluate CPU-only bridges
@@ -66,18 +67,21 @@ One bounded cut-work chunk is transformed as follows.
   role submissions, before replay, and during ordered finish. Cancellation
   wins over accelerator fallback and does not install a misleading failure.
 - Preparation and finish errors are selected by the stable work key, not by
-  Rayon completion or CUDA role order. The first scalar-order error is the
-  externally visible error.
+  Rayon completion or CUDA role order. Preparation is a distinct first phase;
+  within each phase the lowest input position is the externally visible
+  error.
 - Successful CUDA and scalar execution must remain bit-identical at each
   particle's nine `f64` additive components and at the finished gate output.
 
 ## Boundedness and benchmark gate
 
-The pipeline is chunked by prepared CUDA-node count rather than gate count,
-because PSD support can vary substantially by gate. The first implementation
-uses the existing service's `DEFAULT_CUDA_TMATRIX_BATCH_NODES` as the device
-submission bound and a separate host preparation bound; no unbounded whole-
-volume staging is allowed.
+The first cut integration uses a fixed host bound of eight consecutive gates
+per radial. That is 8, 72, or 216 ordered raw columns for Center, Balanced, or
+Reference beam integration respectively. The reusable evaluator accepts any
+bounded request slice, while the existing service independently splits each
+role sweep at `DEFAULT_CUDA_TMATRIX_BATCH_NODES`. No unbounded whole-volume
+staging is allowed. A future adaptive host bound may use admitted-node counts,
+but changing the bound cannot change ordering or replay semantics.
 
 The ignored `manual_cut_pipeline_launch_shape_and_parity` test in
 `wrf_tmatrix_cuda.rs` is the representative GPU harness. It models 1,024 gates

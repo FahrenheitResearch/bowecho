@@ -743,6 +743,34 @@ pub struct WrfTMatrixRawEvaluator<'a> {
     p3: Option<WrfTMatrixP3Resources>,
 }
 
+/// One stable-position input to the cut-wide raw-property evaluator.
+///
+/// Callers retain ownership of the blended raw cell. The batch preserves this
+/// slice order through parallel preparation, CUDA role sweeps, CPU replay, and
+/// final error selection.
+#[derive(Clone, Copy)]
+pub struct WrfTMatrixRawBatchRequest<'raw> {
+    raw: &'raw RawPropertyCell,
+    elevation_deg: f64,
+}
+
+impl<'raw> WrfTMatrixRawBatchRequest<'raw> {
+    #[must_use]
+    pub const fn new(raw: &'raw RawPropertyCell, elevation_deg: f64) -> Self {
+        Self { raw, elevation_deg }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> &'raw RawPropertyCell {
+        self.raw
+    }
+
+    #[must_use]
+    pub const fn elevation_deg(self) -> f64 {
+        self.elevation_deg
+    }
+}
+
 impl<'a> WrfTMatrixRawEvaluator<'a> {
     pub fn new(tables: WrfTMatrixLutBundle<'a>) -> Result<Self, WrfTMatrixBundleError> {
         Ok(Self {
@@ -816,6 +844,80 @@ impl<'a> WrfTMatrixRawEvaluator<'a> {
                 self.validated,
                 elevation_deg,
                 cuda,
+                cancel,
+            ),
+            scheme_id => Err(WrfTMatrixRawEvaluationError::UnsupportedScheme { scheme_id }),
+        }
+    }
+
+    /// Prepare many already-blended raw gate samples, evaluate all compatible
+    /// dry LUT nodes in two cut-wide CUDA role sweeps, and then finish every
+    /// request in the input order on the CPU.
+    ///
+    /// CUDA answers are not installed until both role sweeps succeed. Any
+    /// descriptor or execution failure discards the complete chunk and replays
+    /// every retained preparation on the scalar path. Preparation and finish
+    /// failures are reported by the first input position, never by Rayon or GPU
+    /// completion order.
+    pub fn evaluate_batch_with_cuda_and_cancel(
+        &self,
+        requests: &[WrfTMatrixRawBatchRequest<'_>],
+        cuda: Option<&WrfTMatrixCudaBatchService>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Option<PolarAccumulatorQuantities>>, WrfTMatrixRawBatchError> {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+        let prepared = requests
+            .par_iter()
+            .map(|request| self.prepare_batch_request(*request, cancel))
+            .collect::<Vec<_>>();
+        // Cancellation is deliberately checked before selecting a science
+        // error from the indexed preparation slots.
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+        let mut ordered = Vec::with_capacity(prepared.len());
+        for (request_index, prepared) in prepared.into_iter().enumerate() {
+            match prepared {
+                Ok(prepared) => ordered.push(prepared),
+                Err(WrfTMatrixRawEvaluationError::Cancelled) => {
+                    return Err(WrfTMatrixRawBatchError::Cancelled);
+                }
+                Err(source) => {
+                    return Err(WrfTMatrixRawBatchError::Request {
+                        request_index,
+                        source,
+                    });
+                }
+            }
+        }
+        finish_raw_batch(ordered, cuda, cancel)
+    }
+
+    fn prepare_batch_request<'table>(
+        &'table self,
+        request: WrfTMatrixRawBatchRequest<'_>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PreparedRawBatchEvaluation<'table>, WrfTMatrixRawEvaluationError> {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
+        match request.raw.microphysics_scheme_id() {
+            50..=53 => {
+                let p3 = self
+                    .p3
+                    .as_ref()
+                    .ok_or_else(|| raw_p3_table_required(request.raw))?;
+                validate_raw_p3_table(request.raw.microphysics_scheme_id(), p3.table.as_ref())?;
+                prepare_p3_raw_batch_evaluation(
+                    request.raw,
+                    self.tables,
+                    self.validated,
+                    p3,
+                    request.elevation_deg,
+                    cancel,
+                )
+            }
+            55 => prepare_ishmael_raw_batch_evaluation(
+                request.raw,
+                self.tables,
+                self.validated,
+                request.elevation_deg,
                 cancel,
             ),
             scheme_id => Err(WrfTMatrixRawEvaluationError::UnsupportedScheme { scheme_id }),
@@ -2754,6 +2856,9 @@ fn finish_p3_particle_integration(
     let Some(cuda) = cuda else {
         return finish_p3_cpu_cancellable(prepared, cancel);
     };
+    if cuda.is_disabled() {
+        return finish_p3_cpu_cancellable(prepared, cancel);
+    }
 
     let mut oblate_nodes = Vec::new();
     let mut oblate_indices = Vec::new();
@@ -3114,6 +3219,9 @@ fn finish_ishmael_particle_integration(
     let Some(cuda) = cuda else {
         return finish_ishmael_cpu_cancellable(prepared, cancel);
     };
+    if cuda.is_disabled() {
+        return finish_ishmael_cpu_cancellable(prepared, cancel);
+    }
 
     let mut oblate_positions = Vec::new();
     let mut oblate_nodes = Vec::new();
@@ -3316,6 +3424,584 @@ fn evaluate_ishmael_psd_raw_cell(
         let contribution = tables
             .rain_standalone_and_residual
             .evaluate(rain, oblate_request)
+            .map_err(|source| WrfTMatrixRawEvaluationError::Evaluation {
+                contribution: WrfTMatrixContribution::StandaloneRain,
+                source,
+            })?;
+        additive = additive.checked_add(contribution).map_err(|source| {
+            WrfTMatrixRawEvaluationError::Accumulation {
+                contribution: WrfTMatrixContribution::StandaloneRain,
+                source,
+            }
+        })?;
+    }
+    additive
+        .to_polar_accumulator_quantities()
+        .map(Some)
+        .map_err(WrfTMatrixRawEvaluationError::Output)
+}
+
+struct PreparedP3RawBatchCategory<'table> {
+    category: WrfPropertyCategory,
+    integration: PreparedP3ParticleIntegration<'table>,
+    cuda_outputs: Vec<Option<AdditiveScattering>>,
+}
+
+struct PreparedP3RawBatchEvaluation<'table> {
+    categories: Vec<PreparedP3RawBatchCategory<'table>>,
+    rain: Option<Box<ClosedParticleCategory>>,
+    rain_request: TMatrixEvaluationRequest,
+    rain_table: &'table ResearchTMatrixLut,
+}
+
+struct PreparedIshmaelRawBatchCategory<'table> {
+    category: WrfPropertyCategory,
+    integration: PreparedIshmaelParticleIntegration<'table>,
+    cuda_outputs: Vec<Option<AdditiveScattering>>,
+}
+
+struct PreparedIshmaelRawBatchEvaluation<'table> {
+    categories: Vec<PreparedIshmaelRawBatchCategory<'table>>,
+    rain: Option<Box<ClosedParticleCategory>>,
+    rain_request: TMatrixEvaluationRequest,
+    rain_table: &'table ResearchTMatrixLut,
+}
+
+enum PreparedRawBatchEvaluation<'table> {
+    Clear,
+    P3(PreparedP3RawBatchEvaluation<'table>),
+    Ishmael(PreparedIshmaelRawBatchEvaluation<'table>),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RawBatchNodeLocation {
+    P3 {
+        request_index: usize,
+        category_index: usize,
+        particle_position: usize,
+    },
+    Ishmael {
+        request_index: usize,
+        category_index: usize,
+        particle_position: usize,
+    },
+}
+
+#[derive(Default)]
+struct RawBatchRoleSweep {
+    locations: Vec<RawBatchNodeLocation>,
+    nodes: Vec<CudaPreparedTMatrixNode>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_p3_raw_batch_evaluation<'table>(
+    raw: &RawPropertyCell,
+    tables: WrfTMatrixLutBundle<'table>,
+    validated: ValidatedBundle<'table>,
+    p3: &WrfTMatrixP3Resources,
+    elevation_deg: f64,
+    cancel: Option<&AtomicBool>,
+) -> Result<PreparedRawBatchEvaluation<'table>, WrfTMatrixRawEvaluationError> {
+    let scheme = P3WrfScheme::try_from(raw.microphysics_scheme_id()).map_err(|source| {
+        WrfTMatrixRawEvaluationError::P3PsdReconstruction {
+            category: WrfPropertyCategory::P3(radar_scattering::P3Category::Category1),
+            source,
+        }
+    })?;
+    let mut frozen = Vec::with_capacity(raw.categories().len());
+    for category in raw.categories() {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
+        if category.mixing_ratio_kgkg() == 0.0 {
+            continue;
+        }
+        let RawPropertyCategory::P3(value) = category else {
+            return Err(WrfTMatrixRawEvaluationError::P3CategoryLayout(
+                category.category(),
+            ));
+        };
+        let input = p3_psd_input(scheme, value, raw.dry_air_density_kg_m3()).ok_or(
+            WrfTMatrixRawEvaluationError::MissingP3Qzi(WrfPropertyCategory::P3(value.category)),
+        )?;
+        let distribution =
+            P3Psd::reconstruct(input, p3.table.as_ref(), P3ReconstructionConfig::default())
+                .map_err(|source| WrfTMatrixRawEvaluationError::P3PsdReconstruction {
+                    category: WrfPropertyCategory::P3(value.category),
+                    source,
+                })?;
+        frozen.push((WrfPropertyCategory::P3(value.category), distribution));
+    }
+    let rain = match close_raw_rain_state(raw, OrientationDefinition::Gaussian20Research)
+        .map_err(WrfTMatrixRawEvaluationError::Closure)?
+    {
+        ClosedRainState::Clear => None,
+        ClosedRainState::Closed(rain) => Some(rain),
+        ClosedRainState::Unavailable(reason) => {
+            return Err(WrfTMatrixRawEvaluationError::RainUnavailable(reason));
+        }
+    };
+    if frozen.is_empty() && rain.is_none() {
+        return Ok(PreparedRawBatchEvaluation::Clear);
+    }
+
+    let oblate_request = raw_evaluation_request(
+        validated.frequency_hz,
+        elevation_deg,
+        SpheroidConvention::OblateMinorVertical,
+    )?;
+    let prolate_request = raw_evaluation_request(
+        validated.frequency_hz,
+        elevation_deg,
+        SpheroidConvention::ProlateMajorVertical,
+    )?;
+    let mut categories = Vec::with_capacity(frozen.len());
+    for (category, distribution) in &frozen {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
+        let p3_input = distribution.input();
+        let rime_fraction = p3_input.rime_mass_kgkg / p3_input.total_ice_kgkg;
+        let rime_density = if p3_input.rime_mass_kgkg > 0.0 {
+            Some(p3_input.rime_mass_kgkg / p3_input.rime_volume_m3_per_kg)
+        } else {
+            None
+        };
+        let integration = prepare_p3_particle_integration(
+            distribution,
+            p3.integration,
+            validated.p3_particle_support,
+            tables,
+            dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
+            rime_fraction,
+            rime_density,
+            validated.p3_fall_speed,
+            oblate_request,
+            prolate_request,
+        )
+        .map_err(|source| WrfTMatrixRawEvaluationError::P3PsdIntegration {
+            category: *category,
+            source,
+        })?;
+        let cuda_outputs = (0..integration.evaluations.len()).map(|_| None).collect();
+        categories.push(PreparedP3RawBatchCategory {
+            category: *category,
+            integration,
+            cuda_outputs,
+        });
+    }
+    Ok(PreparedRawBatchEvaluation::P3(
+        PreparedP3RawBatchEvaluation {
+            categories,
+            rain,
+            rain_request: oblate_request,
+            rain_table: tables.rain_standalone_and_residual,
+        },
+    ))
+}
+
+fn prepare_ishmael_raw_batch_evaluation<'table>(
+    raw: &RawPropertyCell,
+    tables: WrfTMatrixLutBundle<'table>,
+    validated: ValidatedBundle<'table>,
+    elevation_deg: f64,
+    cancel: Option<&AtomicBool>,
+) -> Result<PreparedRawBatchEvaluation<'table>, WrfTMatrixRawEvaluationError> {
+    let mut frozen = Vec::with_capacity(raw.categories().len());
+    for category in raw.categories() {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
+        if category.mixing_ratio_kgkg() == 0.0 {
+            continue;
+        }
+        let RawPropertyCategory::Ishmael(value) = category else {
+            return Err(WrfTMatrixRawEvaluationError::IshmaelCategoryLayout(
+                category.category(),
+            ));
+        };
+        let ishmael_category = value.category.ishmael_category().ok_or(
+            WrfTMatrixRawEvaluationError::IshmaelCategoryLayout(value.category),
+        )?;
+        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
+            ishmael_category,
+            value.qice_kgkg,
+            value.qnice_per_kg,
+            value.qvoli_m3_per_kg,
+            value.qaoli_m3_per_kg,
+            raw.dry_air_density_kg_m3(),
+        ))
+        .map_err(
+            |source| WrfTMatrixRawEvaluationError::IshmaelPsdReconstruction {
+                category: value.category,
+                source,
+            },
+        )?;
+        frozen.push((value.category, distribution));
+    }
+    let rain = match close_raw_rain_state(raw, OrientationDefinition::Gaussian20Research)
+        .map_err(WrfTMatrixRawEvaluationError::Closure)?
+    {
+        ClosedRainState::Clear => None,
+        ClosedRainState::Closed(rain) => Some(rain),
+        ClosedRainState::Unavailable(reason) => {
+            return Err(WrfTMatrixRawEvaluationError::RainUnavailable(reason));
+        }
+    };
+    if frozen.is_empty() && rain.is_none() {
+        return Ok(PreparedRawBatchEvaluation::Clear);
+    }
+
+    let oblate_request = raw_evaluation_request(
+        validated.frequency_hz,
+        elevation_deg,
+        SpheroidConvention::OblateMinorVertical,
+    )?;
+    let prolate_request = raw_evaluation_request(
+        validated.frequency_hz,
+        elevation_deg,
+        SpheroidConvention::ProlateMajorVertical,
+    )?;
+    let mut categories = Vec::with_capacity(frozen.len());
+    for &(category, distribution) in &frozen {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
+        let integration = prepare_ishmael_particle_integration(
+            &distribution,
+            validated.ishmael_psd_config,
+            validated.ishmael_particle_support,
+            validated.ishmael_fall_speed,
+            tables,
+            dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
+            oblate_request,
+            prolate_request,
+        )
+        .map_err(
+            |source| WrfTMatrixRawEvaluationError::IshmaelPsdIntegration { category, source },
+        )?;
+        let cuda_outputs = (0..integration.evaluations.len()).map(|_| None).collect();
+        categories.push(PreparedIshmaelRawBatchCategory {
+            category,
+            integration,
+            cuda_outputs,
+        });
+    }
+    Ok(PreparedRawBatchEvaluation::Ishmael(
+        PreparedIshmaelRawBatchEvaluation {
+            categories,
+            rain,
+            rain_request: oblate_request,
+            rain_table: tables.rain_standalone_and_residual,
+        },
+    ))
+}
+
+fn finish_raw_batch(
+    mut prepared: Vec<PreparedRawBatchEvaluation<'_>>,
+    cuda: Option<&WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<Option<PolarAccumulatorQuantities>>, WrfTMatrixRawBatchError> {
+    check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+    let Some(cuda) = cuda else {
+        return finish_raw_batch_ordered(prepared, false, cancel);
+    };
+    if cuda.is_disabled() {
+        return finish_raw_batch_ordered(prepared, false, cancel);
+    }
+
+    let mut oblate = RawBatchRoleSweep::default();
+    let mut prolate = RawBatchRoleSweep::default();
+    for (request_index, request) in prepared.iter().enumerate() {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+        match request {
+            PreparedRawBatchEvaluation::Clear => {}
+            PreparedRawBatchEvaluation::P3(request) => {
+                for (category_index, category) in request.categories.iter().enumerate() {
+                    for (particle_position, node_index, node, _table, admitted) in
+                        category.integration.table_nodes()
+                    {
+                        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                        let cuda_node = match CudaPreparedTMatrixNode::new(admitted, 1.0) {
+                            Ok(cuda_node) => cuda_node,
+                            Err(error) => {
+                                check_cancel(cancel)
+                                    .map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                                cuda.disable_for_cpu_fallback(
+                                    format!(
+                                        "stage ordered raw batch request {request_index}, P3 category {}, node {node_index} for CUDA: {error}",
+                                        category.category
+                                    ),
+                                    0,
+                                );
+                                return finish_raw_batch_ordered(prepared, false, cancel);
+                            }
+                        };
+                        let sweep = match node.habit() {
+                            PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => &mut oblate,
+                            PsdSpheroidHabit::Prolate => &mut prolate,
+                        };
+                        sweep.locations.push(RawBatchNodeLocation::P3 {
+                            request_index,
+                            category_index,
+                            particle_position,
+                        });
+                        sweep.nodes.push(cuda_node);
+                    }
+                }
+            }
+            PreparedRawBatchEvaluation::Ishmael(request) => {
+                for (category_index, category) in request.categories.iter().enumerate() {
+                    for (particle_position, evaluation) in
+                        category.integration.evaluations.iter().enumerate()
+                    {
+                        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                        let cuda_node = match CudaPreparedTMatrixNode::new(
+                            &evaluation.prepared,
+                            1.0,
+                        ) {
+                            Ok(cuda_node) => cuda_node,
+                            Err(error) => {
+                                check_cancel(cancel)
+                                    .map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                                cuda.disable_for_cpu_fallback(
+                                    format!(
+                                        "stage ordered raw batch request {request_index}, ISHMAEL category {}, {:?} node {} for CUDA: {error}",
+                                        category.category, evaluation.level, evaluation.node_index
+                                    ),
+                                    0,
+                                );
+                                return finish_raw_batch_ordered(prepared, false, cancel);
+                            }
+                        };
+                        let sweep = match evaluation.role {
+                            WrfTMatrixCudaTableRole::DryOblate => &mut oblate,
+                            WrfTMatrixCudaTableRole::DryProlate => &mut prolate,
+                        };
+                        sweep.locations.push(RawBatchNodeLocation::Ishmael {
+                            request_index,
+                            category_index,
+                            particle_position,
+                        });
+                        sweep.nodes.push(cuda_node);
+                    }
+                }
+            }
+        }
+    }
+
+    let RawBatchRoleSweep {
+        locations: oblate_locations,
+        nodes: oblate_nodes,
+    } = oblate;
+    let RawBatchRoleSweep {
+        locations: prolate_locations,
+        nodes: prolate_nodes,
+    } = prolate;
+    check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+    let oblate_outputs = if oblate_nodes.is_empty() {
+        Vec::new()
+    } else {
+        match cuda.evaluate_particles(WrfTMatrixCudaTableRole::DryOblate, oblate_nodes) {
+            Ok(outputs) => outputs,
+            Err(_) => {
+                check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                return finish_raw_batch_ordered(prepared, false, cancel);
+            }
+        }
+    };
+    check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+    let prolate_outputs = if prolate_nodes.is_empty() {
+        Vec::new()
+    } else {
+        match cuda.evaluate_particles(WrfTMatrixCudaTableRole::DryProlate, prolate_nodes) {
+            Ok(outputs) => outputs,
+            Err(_) => {
+                check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                return finish_raw_batch_ordered(prepared, false, cancel);
+            }
+        }
+    };
+    check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+    if oblate_locations.len() != oblate_outputs.len()
+        || prolate_locations.len() != prolate_outputs.len()
+    {
+        cuda.disable_for_cpu_fallback(
+            "CUDA omitted an ordered raw-batch particle output".to_owned(),
+            oblate_outputs.len().saturating_add(prolate_outputs.len()),
+        );
+        return finish_raw_batch_ordered(prepared, false, cancel);
+    }
+
+    install_raw_batch_outputs(&mut prepared, oblate_locations, oblate_outputs);
+    install_raw_batch_outputs(&mut prepared, prolate_locations, prolate_outputs);
+    finish_raw_batch_ordered(prepared, true, cancel)
+}
+
+fn install_raw_batch_outputs(
+    prepared: &mut [PreparedRawBatchEvaluation<'_>],
+    locations: Vec<RawBatchNodeLocation>,
+    outputs: Vec<AdditiveScattering>,
+) {
+    for (location, output) in locations.into_iter().zip(outputs) {
+        match location {
+            RawBatchNodeLocation::P3 {
+                request_index,
+                category_index,
+                particle_position,
+            } => {
+                let PreparedRawBatchEvaluation::P3(request) = &mut prepared[request_index] else {
+                    unreachable!("P3 batch location points at a P3 prepared request")
+                };
+                request.categories[category_index].cuda_outputs[particle_position] = Some(output);
+            }
+            RawBatchNodeLocation::Ishmael {
+                request_index,
+                category_index,
+                particle_position,
+            } => {
+                let PreparedRawBatchEvaluation::Ishmael(request) = &mut prepared[request_index]
+                else {
+                    unreachable!("ISHMAEL batch location points at an ISHMAEL prepared request")
+                };
+                request.categories[category_index].cuda_outputs[particle_position] = Some(output);
+            }
+        }
+    }
+}
+
+fn finish_raw_batch_ordered(
+    prepared: Vec<PreparedRawBatchEvaluation<'_>>,
+    use_cuda_outputs: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<Option<PolarAccumulatorQuantities>>, WrfTMatrixRawBatchError> {
+    let mut outputs = Vec::with_capacity(prepared.len());
+    for (request_index, request) in prepared.into_iter().enumerate() {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+        let result = match request {
+            PreparedRawBatchEvaluation::Clear => Ok(None),
+            PreparedRawBatchEvaluation::P3(request) => {
+                finish_prepared_p3_raw_batch(request, use_cuda_outputs, cancel)
+            }
+            PreparedRawBatchEvaluation::Ishmael(request) => {
+                finish_prepared_ishmael_raw_batch(request, use_cuda_outputs, cancel)
+            }
+        };
+        match result {
+            Ok(output) => outputs.push(output),
+            Err(WrfTMatrixRawEvaluationError::Cancelled) => {
+                return Err(WrfTMatrixRawBatchError::Cancelled);
+            }
+            Err(source) => {
+                return Err(WrfTMatrixRawBatchError::Request {
+                    request_index,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(outputs)
+}
+
+fn finish_prepared_p3_raw_batch(
+    request: PreparedP3RawBatchEvaluation<'_>,
+    use_cuda_outputs: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
+    let mut additive = AdditiveScattering::default();
+    for category in &request.categories {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
+        let integration = if use_cuda_outputs {
+            category
+                .integration
+                .finish_with_table_evaluator(|position, _, _, _, _| {
+                    Ok(category.cuda_outputs[position]
+                        .expect("both CUDA role sweeps populated every P3 table-node output"))
+                })
+                .map_err(|source| WrfTMatrixRawEvaluationError::P3PsdIntegration {
+                    category: category.category,
+                    source,
+                })?
+        } else {
+            finish_p3_cpu_cancellable(&category.integration, cancel).map_err(
+                |error| match error {
+                    ParticleFinishError::Cancelled => WrfTMatrixRawEvaluationError::Cancelled,
+                    ParticleFinishError::Science(source) => {
+                        WrfTMatrixRawEvaluationError::P3PsdIntegration {
+                            category: category.category,
+                            source,
+                        }
+                    }
+                },
+            )?
+        };
+        additive = additive
+            .checked_add(integration.additive())
+            .map_err(|source| WrfTMatrixRawEvaluationError::Accumulation {
+                contribution: WrfTMatrixContribution::P3SchemeNativePsd,
+                source,
+            })?;
+    }
+    if let Some(rain) = request.rain.as_deref() {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
+        let contribution = request
+            .rain_table
+            .evaluate(rain, request.rain_request)
+            .map_err(|source| WrfTMatrixRawEvaluationError::Evaluation {
+                contribution: WrfTMatrixContribution::StandaloneRain,
+                source,
+            })?;
+        additive = additive.checked_add(contribution).map_err(|source| {
+            WrfTMatrixRawEvaluationError::Accumulation {
+                contribution: WrfTMatrixContribution::StandaloneRain,
+                source,
+            }
+        })?;
+    }
+    additive
+        .to_polar_accumulator_quantities()
+        .map(Some)
+        .map_err(WrfTMatrixRawEvaluationError::Output)
+}
+
+fn finish_prepared_ishmael_raw_batch(
+    request: PreparedIshmaelRawBatchEvaluation<'_>,
+    use_cuda_outputs: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
+    let mut additive = AdditiveScattering::default();
+    for category in &request.categories {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
+        let integration = if use_cuda_outputs {
+            category
+                .integration
+                .finish_with_table_evaluator(|position, _, _, _, _, _| {
+                    Ok(category.cuda_outputs[position]
+                        .expect("both CUDA role sweeps populated every ISHMAEL particle output"))
+                })
+                .map_err(
+                    |source| WrfTMatrixRawEvaluationError::IshmaelPsdIntegration {
+                        category: category.category,
+                        source,
+                    },
+                )?
+        } else {
+            finish_ishmael_cpu_cancellable(&category.integration, cancel).map_err(|error| {
+                match error {
+                    ParticleFinishError::Cancelled => WrfTMatrixRawEvaluationError::Cancelled,
+                    ParticleFinishError::Science(source) => {
+                        WrfTMatrixRawEvaluationError::IshmaelPsdIntegration {
+                            category: category.category,
+                            source,
+                        }
+                    }
+                }
+            })?
+        };
+        additive = additive
+            .checked_add(integration.additive())
+            .map_err(|source| WrfTMatrixRawEvaluationError::Accumulation {
+                contribution: WrfTMatrixContribution::IshmaelSchemeNativePsd,
+                source,
+            })?;
+    }
+    if let Some(rain) = request.rain.as_deref() {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
+        let contribution = request
+            .rain_table
+            .evaluate(rain, request.rain_request)
             .map_err(|source| WrfTMatrixRawEvaluationError::Evaluation {
                 contribution: WrfTMatrixContribution::StandaloneRain,
                 source,
@@ -4327,6 +5013,19 @@ pub enum WrfTMatrixRawEvaluationError {
     IshmaelCharacteristicForbidden,
 }
 
+/// Stable-position failure from a cut-wide raw-property batch.
+#[derive(Debug, Error)]
+pub enum WrfTMatrixRawBatchError {
+    #[error("synthetic-radar T-matrix raw batch cancelled")]
+    Cancelled,
+    #[error("raw property batch request {request_index}: {source}")]
+    Request {
+        request_index: usize,
+        #[source]
+        source: WrfTMatrixRawEvaluationError,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum WrfTMatrixSceneBuildError {
     #[error("synthetic-radar T-matrix scene build cancelled")]
@@ -4721,6 +5420,139 @@ mod tests {
         test(&prepared);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn embedded_ishmael_raw_batch_case<'table>(
+        tables: WrfTMatrixLutBundle<'table>,
+        validated: ValidatedBundle<'table>,
+        category: WrfPropertyCategory,
+        ishmael_category: radar_scattering::IshmaelIceCategory,
+        qvoli_m3_per_kg: f64,
+        qaoli_m3_per_kg: f64,
+        qice_candidates_kgkg: &[f64],
+        elevation_deg: f64,
+    ) -> (
+        PreparedRawBatchEvaluation<'table>,
+        Option<PolarAccumulatorQuantities>,
+        usize,
+        usize,
+    ) {
+        let oblate_request = evaluation_request(
+            validated.frequency_hz,
+            elevation_deg,
+            SpheroidConvention::OblateMinorVertical,
+        )
+        .unwrap();
+        let prolate_request = evaluation_request(
+            validated.frequency_hz,
+            elevation_deg,
+            SpheroidConvention::ProlateMajorVertical,
+        )
+        .unwrap();
+        let integration = qice_candidates_kgkg
+            .iter()
+            .find_map(|&qice_kgkg| {
+                let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
+                    ishmael_category,
+                    qice_kgkg,
+                    100_000.0,
+                    qvoli_m3_per_kg,
+                    qaoli_m3_per_kg,
+                    1.2,
+                ))
+                .ok()?;
+                prepare_ishmael_particle_integration(
+                    &distribution,
+                    validated.ishmael_psd_config,
+                    validated.ishmael_particle_support,
+                    validated.ishmael_fall_speed,
+                    tables,
+                    260.0,
+                    oblate_request,
+                    prolate_request,
+                )
+                .ok()
+            })
+            .expect("construct an embedded-table ISHMAEL batch case");
+        let oblate_nodes = integration
+            .evaluations
+            .iter()
+            .filter(|evaluation| evaluation.role == WrfTMatrixCudaTableRole::DryOblate)
+            .count();
+        let prolate_nodes = integration
+            .evaluations
+            .iter()
+            .filter(|evaluation| evaluation.role == WrfTMatrixCudaTableRole::DryProlate)
+            .count();
+        let expected = integration
+            .finish_cpu()
+            .expect("finish scalar ISHMAEL batch case")
+            .additive()
+            .to_polar_accumulator_quantities()
+            .map(Some)
+            .expect("convert scalar ISHMAEL batch case");
+        let cuda_outputs = (0..integration.evaluations.len()).map(|_| None).collect();
+        (
+            PreparedRawBatchEvaluation::Ishmael(PreparedIshmaelRawBatchEvaluation {
+                categories: vec![PreparedIshmaelRawBatchCategory {
+                    category,
+                    integration,
+                    cuda_outputs,
+                }],
+                rain: None,
+                rain_request: oblate_request,
+                rain_table: tables.rain_standalone_and_residual,
+            }),
+            expected,
+            oblate_nodes,
+            prolate_nodes,
+        )
+    }
+
+    fn with_embedded_ishmael_raw_batch(
+        test: impl for<'table> FnOnce(
+            Vec<PreparedRawBatchEvaluation<'table>>,
+            Vec<Option<PolarAccumulatorQuantities>>,
+            usize,
+            usize,
+        ),
+    ) {
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let tables = owner.borrowed_bundle();
+        let validated = validate_bundle(tables).expect("validate embedded table bundle");
+        let oblate = embedded_ishmael_raw_batch_case(
+            tables,
+            validated,
+            WrfPropertyCategory::IshmaelPlanar,
+            radar_scattering::IshmaelIceCategory::Planar,
+            6.250_000_000_000_000_5e-9,
+            3.125_000_000_000_000_3e-9,
+            &[1.020_730_388_452_175_2e-3],
+            0.9,
+        );
+        let prolate = embedded_ishmael_raw_batch_case(
+            tables,
+            validated,
+            WrfPropertyCategory::IshmaelColumnar,
+            radar_scattering::IshmaelIceCategory::Columnar,
+            2.5e-8,
+            5.0e-8,
+            &[4.0e-3, 2.0e-3, 8.0e-3, 1.0e-3, 5.0e-4],
+            1.3,
+        );
+        let oblate_nodes = oblate.2.saturating_add(prolate.2);
+        let prolate_nodes = oblate.3.saturating_add(prolate.3);
+        test(
+            vec![oblate.0, prolate.0],
+            vec![oblate.1, prolate.1],
+            oblate_nodes,
+            prolate_nodes,
+        );
+    }
+
     fn assert_psd_result_bitwise_eq(actual: PsdIntegrationResult, expected: PsdIntegrationResult) {
         assert_eq!(
             actual.additive().components().map(f64::to_bits),
@@ -4729,6 +5561,38 @@ mod tests {
         );
         assert_eq!(actual.accumulator(), expected.accumulator());
         assert_eq!(actual.audit(), expected.audit());
+    }
+
+    fn polar_accumulator_bits(value: PolarAccumulatorQuantities) -> [u32; 9] {
+        [
+            value.zh.to_bits(),
+            value.zv.to_bits(),
+            value.cov_re.to_bits(),
+            value.cov_im.to_bits(),
+            value.kdp_deg_km.to_bits(),
+            value.ah_db_km.to_bits(),
+            value.av_db_km.to_bits(),
+            value.fall_speed_mps.to_bits(),
+            value.fall_speed_variance_m2s2.to_bits(),
+        ]
+    }
+
+    fn assert_raw_batch_bitwise_eq(
+        actual: &[Option<PolarAccumulatorQuantities>],
+        expected: &[Option<PolarAccumulatorQuantities>],
+    ) {
+        assert_eq!(actual.len(), expected.len());
+        for (request_index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            match (actual, expected) {
+                (Some(actual), Some(expected)) => assert_eq!(
+                    polar_accumulator_bits(*actual),
+                    polar_accumulator_bits(*expected),
+                    "raw batch request {request_index} differs at the float-bit level"
+                ),
+                (None, None) => {}
+                _ => panic!("raw batch request {request_index} changed clear/echo state"),
+            }
+        }
     }
 
     #[cfg(any(windows, target_os = "linux"))]
@@ -4806,6 +5670,124 @@ mod tests {
         assert!(report.nodes_completed > 0);
         assert_eq!(report.nodes_completed, report.nodes_submitted);
         assert_eq!(report.batches_completed, report.batches_submitted);
+        assert_eq!(report.fallback_reason, None);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn embedded_ishmael_raw_batch_is_bitwise_equal_on_gpu_and_cpu() {
+        let availability = simradar_cuda::probe_cuda_cached();
+        let Some(device) = availability.preferred_device() else {
+            eprintln!("skipping ordered raw-batch CUDA parity test: {availability:?}");
+            return;
+        };
+        let service = WrfTMatrixCudaBatchService::open_with_config(
+            device.ordinal,
+            crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchConfig::new(512, 8).unwrap(),
+        )
+        .expect("open CUDA service for ordered raw-batch parity");
+
+        with_embedded_ishmael_raw_batch(|prepared, expected, oblate_nodes, prolate_nodes| {
+            assert!(
+                oblate_nodes > 0,
+                "fixture must exercise the oblate role sweep"
+            );
+            assert!(
+                prolate_nodes > 0,
+                "fixture must exercise the prolate role sweep"
+            );
+            let actual = finish_raw_batch(prepared, Some(&service), None).unwrap();
+            assert_raw_batch_bitwise_eq(&actual, &expected);
+        });
+
+        let report = service.report();
+        assert_eq!(report.requests_submitted, 2);
+        assert_eq!(report.nodes_completed, report.nodes_submitted);
+        assert_eq!(report.batches_completed, report.batches_submitted);
+        assert_eq!(report.fallback_reason, None);
+    }
+
+    #[test]
+    fn failed_second_role_discards_first_role_and_replays_whole_raw_batch() {
+        let service = WrfTMatrixCudaBatchService::fail_after_successful_calls_for_test(
+            1,
+            "injected failure after one successful ordered role sweep",
+        );
+        let mut expected_oblate_nodes = 0_usize;
+        let mut expected_prolate_nodes = 0_usize;
+        with_embedded_ishmael_raw_batch(|prepared, expected, oblate_nodes, prolate_nodes| {
+            assert!(
+                oblate_nodes > 0,
+                "fixture must exercise the oblate role sweep"
+            );
+            assert!(
+                prolate_nodes > 0,
+                "fixture must exercise the prolate role sweep"
+            );
+            expected_oblate_nodes = oblate_nodes;
+            expected_prolate_nodes = prolate_nodes;
+            let replayed = finish_raw_batch(prepared, Some(&service), None).unwrap();
+            assert_raw_batch_bitwise_eq(&replayed, &expected);
+        });
+
+        let report = service.report();
+        assert_eq!(report.requests_submitted, 2);
+        assert_eq!(report.batches_submitted, 2);
+        assert_eq!(report.batches_completed, 1);
+        assert_eq!(report.nodes_completed, expected_oblate_nodes as u64);
+        let reason = report
+            .fallback_reason
+            .expect("second role failure permanently disables this job service");
+        assert_eq!(reason.failed_batch_sequence, Some(2));
+        assert_eq!(reason.discarded_node_count, expected_prolate_nodes);
+        assert_eq!(
+            reason.detail,
+            "injected failure after one successful ordered role sweep"
+        );
+    }
+
+    #[test]
+    fn raw_batch_preparation_errors_are_selected_by_input_position() {
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let evaluator = WrfTMatrixRawEvaluator::new(owner.borrowed_bundle()).unwrap();
+        let first = RawPropertyCell::unsupported_for_batch_test(54);
+        let second = RawPropertyCell::unsupported_for_batch_test(56);
+        let requests = [
+            WrfTMatrixRawBatchRequest::new(&first, 0.5),
+            WrfTMatrixRawBatchRequest::new(&second, 0.5),
+        ];
+
+        for _ in 0..16 {
+            let error = evaluator
+                .evaluate_batch_with_cuda_and_cancel(&requests, None, None)
+                .expect_err("unsupported raw schemes must fail");
+            assert!(matches!(
+                error,
+                WrfTMatrixRawBatchError::Request {
+                    request_index: 0,
+                    source: WrfTMatrixRawEvaluationError::UnsupportedScheme { scheme_id: 54 },
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn cancelled_raw_batch_does_not_submit_disable_or_replay() {
+        let service = WrfTMatrixCudaBatchService::failing_for_test(
+            "a pre-cancelled raw batch must never reach this backend",
+        );
+        let cancel = AtomicBool::new(true);
+        let error = finish_raw_batch(Vec::new(), Some(&service), Some(&cancel))
+            .expect_err("pre-cancelled raw batch stops before CUDA or CPU evaluation");
+        assert!(matches!(error, WrfTMatrixRawBatchError::Cancelled));
+        let report = service.report();
+        assert_eq!(report.requests_submitted, 0);
+        assert_eq!(report.batches_submitted, 0);
+        assert_eq!(report.nodes_submitted, 0);
         assert_eq!(report.fallback_reason, None);
     }
 

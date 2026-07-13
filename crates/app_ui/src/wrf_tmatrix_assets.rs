@@ -17,7 +17,7 @@ use crate::wrf_tmatrix_band_assets::{
 };
 use crate::wrf_tmatrix_scene::{
     WrfTMatrixBuildPeakEstimate, WrfTMatrixLutBundle, WrfTMatrixP3Resources, WrfTMatrixRainMode,
-    WrfTMatrixRawEvaluator, WrfTMatrixScene,
+    WrfTMatrixRawBatchRequest, WrfTMatrixRawEvaluator, WrfTMatrixScene,
 };
 
 const ASSET_ROOT: &str = "../../../research_only_assets/tmatrix/pytmatrix-0.3.3";
@@ -339,6 +339,27 @@ pub fn evaluate_embedded_raw_property_cell_with_cuda_and_cancel(
     evaluator
         .evaluate_with_cuda_and_cancel(raw, elevation_deg, cuda, cancel)
         .map_err(|error| format!("evaluate embedded raw property cell: {error}"))
+}
+
+/// Cut-wide form of [`evaluate_embedded_raw_property_cell_with_cuda_and_cancel`].
+/// The input slice order is the public error and output order; CUDA failure
+/// replays this entire slice through the retained CPU preparations.
+pub fn evaluate_embedded_raw_property_batch_with_cuda_and_cancel(
+    requests: &[WrfTMatrixRawBatchRequest<'_>],
+    cuda: Option<&crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<Option<PolarAccumulatorQuantities>>, String> {
+    let Some(first) = requests.first() else {
+        return Ok(Vec::new());
+    };
+    let evaluator = match first.raw().microphysics_scheme_id() {
+        50..=52 => embedded_p3_raw_evaluator(P3OfficialTableKind::TwoMoment, &|_| {})?,
+        53 => embedded_p3_raw_evaluator(P3OfficialTableKind::ThreeMoment, &|_| {})?,
+        _ => embedded_raw_evaluator()?,
+    };
+    evaluator
+        .evaluate_batch_with_cuda_and_cancel(requests, cuda, cancel)
+        .map_err(|error| format!("evaluate embedded raw property batch: {error}"))
 }
 
 fn embedded_raw_evaluator() -> Result<WrfTMatrixRawEvaluator<'static>, String> {

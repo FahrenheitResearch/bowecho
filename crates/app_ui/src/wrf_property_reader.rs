@@ -926,6 +926,27 @@ impl RawPropertyCell {
     pub const fn rain(&self) -> &RawRainState {
         &self.rain
     }
+
+    #[cfg(test)]
+    pub(crate) fn unsupported_for_batch_test(microphysics_scheme_id: i32) -> Self {
+        Self {
+            source_cell_index: None,
+            microphysics_scheme_id,
+            required_field_signature: Arc::new(RequiredFieldSignature {
+                microphysics_scheme_id,
+                fields: BTreeSet::new(),
+            }),
+            environment: ParticleEnvironment::new(270.0, 1.2)
+                .expect("fixed test environment is physical"),
+            pressure_pa: 90_000.0,
+            dry_air_density_kg_m3: 1.2,
+            categories: Vec::new(),
+            rain: RawRainState::Available {
+                qrain_kgkg: 0.0,
+                qnrain_per_kg: 0.0,
+            },
+        }
+    }
 }
 
 /// One spatial or temporal contributor to a raw gate sample.

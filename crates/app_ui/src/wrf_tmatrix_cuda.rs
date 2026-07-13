@@ -310,6 +310,14 @@ impl WrfTMatrixCudaBatchService {
         })
     }
 
+    /// Whether this job-scoped service has permanently selected CPU replay.
+    /// Callers can use this before descriptor staging to avoid rebuilding GPU
+    /// work after the immutable first fallback reason has already been set.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.state.fallback.get().is_some()
+    }
+
     #[must_use]
     pub fn report(&self) -> WrfTMatrixCudaServiceReport {
         WrfTMatrixCudaServiceReport {
@@ -330,10 +338,41 @@ impl WrfTMatrixCudaBatchService {
     /// CUDA driver, context, module, or table upload.
     #[cfg(test)]
     pub(crate) fn failing_for_test(detail: impl Into<String>) -> Self {
+        Self::with_test_backend(
+            "bowecho-cuda-tmatrix-failure-test",
+            FailingPreparedNodeBackend {
+                detail: detail.into(),
+            },
+        )
+    }
+
+    /// Return placeholder outputs for `successful_calls`, then fail the next
+    /// worker batch. This proves that a caller discards an earlier successful
+    /// role sweep before whole-chunk CPU replay.
+    #[cfg(test)]
+    pub(crate) fn fail_after_successful_calls_for_test(
+        successful_calls: usize,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::with_test_backend(
+            "bowecho-cuda-tmatrix-partial-success-test",
+            FailAfterPreparedNodeBackend {
+                successful_calls,
+                calls: 0,
+                detail: detail.into(),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn with_test_backend(
+        worker_name: &'static str,
+        backend: impl BatchBackend<CudaPreparedTMatrixNode, AdditiveScattering>,
+    ) -> Self {
         let config = WrfTMatrixCudaBatchConfig::default();
         let device = WrfTMatrixCudaDeviceReport {
             ordinal: usize::MAX,
-            name: "test-only failing CUDA backend".to_owned(),
+            name: "test-only CUDA backend".to_owned(),
             compute_capability_major: 0,
             compute_capability_minor: 0,
             total_memory_bytes: 0,
@@ -343,13 +382,10 @@ impl WrfTMatrixCudaBatchService {
         let state = Arc::new(ServiceState::default());
         let (commands, receiver) = mpsc::channel();
         let worker_state = Arc::clone(&state);
-        let backend = FailingPreparedNodeBackend {
-            detail: detail.into(),
-        };
         let worker = thread::Builder::new()
-            .name("bowecho-cuda-tmatrix-failure-test".to_owned())
+            .name(worker_name.to_owned())
             .spawn(move || run_worker(receiver, backend, worker_state, config))
-            .expect("spawn deterministic failing CUDA test worker");
+            .expect("spawn deterministic CUDA test worker");
         Self {
             commands,
             worker: Some(worker),
@@ -517,6 +553,32 @@ impl BatchBackend<CudaPreparedTMatrixNode, AdditiveScattering> for FailingPrepar
         _nodes: &[CudaPreparedTMatrixNode],
     ) -> Result<Vec<AdditiveScattering>, String> {
         Err(self.detail.clone())
+    }
+}
+
+#[cfg(test)]
+struct FailAfterPreparedNodeBackend {
+    successful_calls: usize,
+    calls: usize,
+    detail: String,
+}
+
+#[cfg(test)]
+impl BatchBackend<CudaPreparedTMatrixNode, AdditiveScattering> for FailAfterPreparedNodeBackend {
+    fn evaluate(
+        &mut self,
+        _role: WrfTMatrixCudaTableRole,
+        nodes: &[CudaPreparedTMatrixNode],
+    ) -> Result<Vec<AdditiveScattering>, String> {
+        let call = self.calls;
+        self.calls = self.calls.saturating_add(1);
+        if call >= self.successful_calls {
+            Err(self.detail.clone())
+        } else {
+            Ok((0..nodes.len())
+                .map(|_| AdditiveScattering::default())
+                .collect())
+        }
     }
 }
 
