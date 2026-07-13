@@ -18,8 +18,8 @@ mod kernel;
 
 #[cfg(any(windows, target_os = "linux"))]
 pub use adapter::{
-    CudaLutNodePreparationError, CudaPreparedTMatrixNode, CudaSegmentLayoutError,
-    CudaTMatrixExecutionError, CudaTMatrixExecutor, CudaTMatrixSegment,
+    CudaLutNodePreparationError, CudaPreloadedTMatrixTable, CudaPreparedTMatrixNode,
+    CudaSegmentLayoutError, CudaTMatrixExecutionError, CudaTMatrixExecutor, CudaTMatrixSegment,
 };
 
 /// Minimum architecture supported by the first deterministic f64 P3 kernel.

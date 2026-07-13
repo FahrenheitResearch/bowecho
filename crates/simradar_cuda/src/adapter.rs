@@ -71,6 +71,27 @@ impl CudaTMatrixSegment {
     }
 }
 
+/// Opaque handle proving that an exact validated LUT payload was uploaded by
+/// this API. It carries no host table allocation and can move with a dedicated
+/// batching worker after preload completes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CudaPreloadedTMatrixTable {
+    table_file_sha256: Sha256Digest,
+    point_count: usize,
+}
+
+impl CudaPreloadedTMatrixTable {
+    #[must_use]
+    pub const fn table_file_sha256(self) -> Sha256Digest {
+        self.table_file_sha256
+    }
+
+    #[must_use]
+    pub const fn point_count(self) -> usize {
+        self.point_count
+    }
+}
+
 /// Identity-safe, persistent-LUT CUDA executor. Only table-owned prepared
 /// descriptors enter this API; the raw plan, terminal speed, and table payload
 /// cannot be replaced independently by callers.
@@ -105,22 +126,37 @@ impl CudaTMatrixExecutor {
         self.inner.kernel_artifact()
     }
 
+    pub fn preload_table(
+        &mut self,
+        table: &ResearchTMatrixLut,
+    ) -> Result<CudaPreloadedTMatrixTable, CudaTMatrixExecutionError> {
+        let table_file_sha256 = table.file_sha256();
+        let point_count = self
+            .inner
+            .preload_lut(table_file_sha256, table.offline_lut().values())?;
+        Ok(CudaPreloadedTMatrixTable {
+            table_file_sha256,
+            point_count,
+        })
+    }
+
     pub fn evaluate_segments(
         &mut self,
         table: &ResearchTMatrixLut,
         nodes: &[CudaPreparedTMatrixNode],
         segments: &[CudaTMatrixSegment],
     ) -> Result<Vec<AdditiveScattering>, CudaTMatrixExecutionError> {
-        let expected = table.file_sha256();
-        if let Some((node, actual)) = nodes.iter().enumerate().find_map(|(node, prepared)| {
-            (prepared.table_file_sha256 != expected).then_some((node, prepared.table_file_sha256))
-        }) {
-            return Err(CudaTMatrixExecutionError::TableIdentity {
-                node,
-                expected,
-                actual,
-            });
-        }
+        let preloaded = self.preload_table(table)?;
+        self.evaluate_preloaded_segments(preloaded, nodes, segments)
+    }
+
+    pub fn evaluate_preloaded_segments(
+        &mut self,
+        table: CudaPreloadedTMatrixTable,
+        nodes: &[CudaPreparedTMatrixNode],
+        segments: &[CudaTMatrixSegment],
+    ) -> Result<Vec<AdditiveScattering>, CudaTMatrixExecutionError> {
+        validate_node_table_identity(table.table_file_sha256, nodes)?;
         let plans = nodes.iter().map(|node| node.plan).collect::<Vec<_>>();
         let segments = segments
             .iter()
@@ -130,8 +166,30 @@ impl CudaTMatrixExecutor {
             })
             .collect::<Vec<_>>();
         self.inner
-            .evaluate_segments(expected, table.offline_lut().values(), &plans, &segments)
+            .evaluate_preloaded_segments(
+                table.table_file_sha256,
+                table.point_count,
+                &plans,
+                &segments,
+            )
             .map_err(Into::into)
+    }
+}
+
+fn validate_node_table_identity(
+    expected: Sha256Digest,
+    nodes: &[CudaPreparedTMatrixNode],
+) -> Result<(), CudaTMatrixExecutionError> {
+    if let Some((node, actual)) = nodes.iter().enumerate().find_map(|(node, prepared)| {
+        (prepared.table_file_sha256 != expected).then_some((node, prepared.table_file_sha256))
+    }) {
+        Err(CudaTMatrixExecutionError::TableIdentity {
+            node,
+            expected,
+            actual,
+        })
+    } else {
+        Ok(())
     }
 }
 

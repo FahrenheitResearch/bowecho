@@ -172,20 +172,11 @@ impl CudaLutExecutor {
         self.kernel_artifact
     }
 
-    /// Evaluate ordered PSD reduction segments. One CUDA warp owns one segment;
-    /// lanes 0..8 independently accumulate the nine components in node order.
-    pub(crate) fn evaluate_segments(
+    pub(crate) fn preload_lut(
         &mut self,
         table_file_sha256: Sha256Digest,
         table_values: &[AdditiveScattering],
-        nodes: &[CudaLutNodePlan],
-        segments: &[CudaLutSegment],
-    ) -> Result<Vec<AdditiveScattering>, CudaSegmentExecutionError> {
-        validate_batch(table_values, nodes, segments)?;
-        if segments.is_empty() {
-            return Ok(Vec::new());
-        }
-
+    ) -> Result<usize, CudaSegmentExecutionError> {
         if let Some(uploaded) = self.uploaded_luts.get(&table_file_sha256) {
             if uploaded.point_count != table_values.len() {
                 return Err(CudaSegmentExecutionError::InvalidInput(format!(
@@ -194,19 +185,47 @@ impl CudaLutExecutor {
                     table_values.len()
                 )));
             }
-        } else {
-            let table_flat = table_values
-                .iter()
-                .flat_map(|point| point.components())
-                .collect::<Vec<_>>();
-            let values = self.copy_to_device("upload persistent LUT payload", &table_flat)?;
-            self.uploaded_luts.insert(
-                table_file_sha256,
-                UploadedLut {
-                    point_count: table_values.len(),
-                    values,
-                },
-            );
+            return Ok(uploaded.point_count);
+        }
+        let table_flat = table_values
+            .iter()
+            .flat_map(|point| point.components())
+            .collect::<Vec<_>>();
+        let values = self.copy_to_device("upload persistent LUT payload", &table_flat)?;
+        self.uploaded_luts.insert(
+            table_file_sha256,
+            UploadedLut {
+                point_count: table_values.len(),
+                values,
+            },
+        );
+        Ok(table_values.len())
+    }
+
+    /// Evaluate ordered PSD reduction segments against a previously uploaded
+    /// table. One CUDA warp owns one segment; lanes 0..8 independently
+    /// accumulate the nine components in node order.
+    pub(crate) fn evaluate_preloaded_segments(
+        &mut self,
+        table_file_sha256: Sha256Digest,
+        table_point_count: usize,
+        nodes: &[CudaLutNodePlan],
+        segments: &[CudaLutSegment],
+    ) -> Result<Vec<AdditiveScattering>, CudaSegmentExecutionError> {
+        let uploaded = self.uploaded_luts.get(&table_file_sha256).ok_or_else(|| {
+            CudaSegmentExecutionError::InvalidInput(format!(
+                "LUT {table_file_sha256} was not preloaded"
+            ))
+        })?;
+        if uploaded.point_count != table_point_count {
+            return Err(CudaSegmentExecutionError::InvalidInput(format!(
+                "preloaded LUT {table_file_sha256} has {} points, token declares {table_point_count}",
+                uploaded.point_count
+            )));
+        }
+        validate_batch(table_point_count, nodes, segments)?;
+        if segments.is_empty() {
+            return Ok(Vec::new());
         }
         let base_indices = nodes
             .iter()
@@ -266,7 +285,7 @@ impl CudaLutExecutor {
             .alloc_zeros::<u32>(segments.len())
             .map_err(|error| driver_error("allocate CUDA error nodes", error))?;
 
-        let table_point_count = table_values.len() as u64;
+        let table_point_count = table_point_count as u64;
         let node_count = nodes.len() as u32;
         let segment_count = segments.len() as u32;
         let mut launch = self.stream.launch_builder(&self.function);
@@ -345,11 +364,11 @@ impl CudaLutExecutor {
 }
 
 fn validate_batch(
-    table_values: &[AdditiveScattering],
+    table_point_count: usize,
     nodes: &[CudaLutNodePlan],
     segments: &[CudaLutSegment],
 ) -> Result<(), CudaSegmentExecutionError> {
-    if table_values.is_empty() && !nodes.is_empty() {
+    if table_point_count == 0 && !nodes.is_empty() {
         return Err(CudaSegmentExecutionError::InvalidInput(
             "nonempty node batch requires a LUT payload".to_owned(),
         ));
@@ -396,10 +415,10 @@ fn validate_batch(
                 )));
             }
         }
-        if maximum_point >= table_values.len() as u64 {
+        if maximum_point >= table_point_count as u64 {
             return Err(CudaSegmentExecutionError::InvalidInput(format!(
                 "node {index} addresses LUT point {maximum_point}, but payload has {} points",
-                table_values.len()
+                table_point_count
             )));
         }
     }
@@ -580,7 +599,7 @@ mod tests {
         let mut node = interior_node(1.0, 2.0);
         node.base_point_index = 3;
         let error = validate_batch(
-            &[valid_point(1.0); 4],
+            4,
             &[node],
             &[CudaLutSegment {
                 first_node: 0,
@@ -644,6 +663,7 @@ mod tests {
             node_count: 2,
         }];
         let table_digest = Sha256Digest::compute(b"deterministic synthetic CUDA LUT");
+        let table_point_count = executor.preload_lut(table_digest, &table).unwrap();
 
         // Fractions are exact binary values. Use the literal scalar operation
         // sequence owned by OfflineLut + checked_scale + checked_add as the
@@ -651,7 +671,7 @@ mod tests {
         let expected = ordered_cpu_segments(&table, &nodes, &segments);
         assert_eq!(expected[0].components()[0], 56.25);
         let first = executor
-            .evaluate_segments(table_digest, &table, &nodes, &segments)
+            .evaluate_preloaded_segments(table_digest, table_point_count, &nodes, &segments)
             .unwrap();
         assert_eq!(
             first[0].components().map(f64::to_bits),
@@ -660,7 +680,7 @@ mod tests {
         let expected_bits = first[0].components().map(f64::to_bits);
         for _ in 0..20 {
             let repeated = executor
-                .evaluate_segments(table_digest, &table, &nodes, &segments)
+                .evaluate_preloaded_segments(table_digest, table_point_count, &nodes, &segments)
                 .unwrap();
             assert_eq!(repeated[0].components().map(f64::to_bits), expected_bits);
         }
