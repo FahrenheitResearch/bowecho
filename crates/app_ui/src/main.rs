@@ -34085,7 +34085,7 @@ impl ViewerApp {
     /// WoFS viewer window: run/product/minute browser over the public
     /// CB-WoFS imagery, with sync-to-radar-frame.
     fn wofs_window(&mut self, ctx: &egui::Context) {
-        if !self.wofs.open {
+        if !self.wofs.open && !self.wofs.drape_on_map {
             return;
         }
         if self.wofs.catalog.is_none() && self.wofs.catalog_rx.is_none() {
@@ -34100,16 +34100,7 @@ impl ViewerApp {
             && !self.wofs.init.is_empty()
         {
             let frame = volume.volume_time.with_timezone(&Utc);
-            if let (Ok(rd), Ok(init_h), Ok(init_m)) = (
-                chrono::NaiveDate::parse_from_str(&run.rundate, "%Y%m%d"),
-                self.wofs.init[..2].parse::<u32>(),
-                self.wofs.init[2..].parse::<u32>(),
-            ) {
-                let mut init_time = rd.and_hms_opt(init_h, init_m, 0).unwrap().and_utc();
-                // Inits 00z-03z belong to the NEXT calendar day.
-                if init_h < 12 {
-                    init_time += chrono::Duration::days(1);
-                }
+            if let Some(init_time) = wofs::init_time_utc(run, &self.wofs.init) {
                 let delta_min = (frame - init_time).num_minutes();
                 if delta_min >= 0 {
                     let snapped = self.wofs.snap_minute(delta_min.min(600) as u32);
@@ -34120,6 +34111,9 @@ impl ViewerApp {
             }
         }
         self.wofs.pump(ctx);
+        if !self.wofs.open {
+            return;
+        }
         if self.workspace.is_docked(dock::WorkspacePane::Wofs) {
             // Body renders as a workspace pane; the WoFS sounding picker
             // stays its own floating sub-window either way.
@@ -34179,14 +34173,14 @@ impl ViewerApp {
                         });
                     if let Some(run) = catalog.runs.get(self.wofs.run_index) {
                         egui::ComboBox::from_id_salt("wofs_init")
-                            .selected_text(format!("{}z", self.wofs.init))
+                            .selected_text(format!("{}z", wofs::init_hhmm(&self.wofs.init)))
                             .width(76.0)
                             .show_ui(ui, |ui| {
                                 for init in run.inits.iter().rev() {
                                     ui.selectable_value(
                                         &mut self.wofs.init,
                                         init.clone(),
-                                        format!("{init}z"),
+                                        format!("{}z", wofs::init_hhmm(init)),
                                     );
                                 }
                             });
@@ -34252,7 +34246,7 @@ impl ViewerApp {
                     if self.wofs.sync_to_radar {
                         ui.weak(format!(
                             "-> {}z + {} min",
-                            self.wofs.init, self.wofs.minute
+                            wofs::init_hhmm(&self.wofs.init), self.wofs.minute
                         ));
                     }
                     self.wofs.soundings_toggle_ui(ui);
@@ -34286,7 +34280,19 @@ impl ViewerApp {
                     );
                 } else {
                     ui.painter()
-                        .rect_filled(rect, 4.0, egui::Color32::from_rgb(14, 16, 20));
+                        .rect_filled(rect, 4.0, egui::Color32::from_rgb(24, 27, 33));
+                    let unavailable = self.wofs.missing.contains_key(&base_url);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if unavailable {
+                            "Frame unavailable at the WoFS source"
+                        } else {
+                            "Loading WoFS frame..."
+                        },
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::from_gray(190),
+                    );
                 }
                 for overlay in self.wofs.overlays.clone() {
                     let url = wofs::image_url(run, &self.wofs.init, &overlay, self.wofs.minute);

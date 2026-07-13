@@ -56,8 +56,35 @@ pub struct WofsRun {
     pub id: String,
     pub name: String,
     pub rundate: String,
-    /// Init times as "HHMM", newest first.
+    /// Exact init cycles as `YYYYMMDDHHMM`, newest first. Keeping the date is
+    /// essential: many WoFS runs cross midnight, and the imagery/sounding
+    /// services key their paths by the init's actual UTC date rather than the
+    /// run's nominal `rundate`.
     pub inits: Vec<String>,
+}
+
+fn canonical_init_token(rundate: &str, init: &str) -> String {
+    let trimmed = init.trim();
+    if trimmed.len() == 12 && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        trimmed.to_owned()
+    } else {
+        format!("{rundate}{}", init_hhmm(trimmed))
+    }
+}
+
+pub fn init_hhmm(init: &str) -> &str {
+    init.get(init.len().saturating_sub(4)..).unwrap_or(init)
+}
+
+fn init_date_and_hhmm(rundate: &str, init: &str) -> (String, String) {
+    let token = canonical_init_token(rundate, init);
+    (token[..8].to_owned(), token[8..].to_owned())
+}
+
+pub fn init_time_utc(run: &WofsRun, init: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::NaiveDateTime::parse_from_str(&canonical_init_token(&run.rundate, init), "%Y%m%d%H%M")
+        .ok()
+        .map(|time| time.and_utc())
 }
 
 #[derive(Clone)]
@@ -89,7 +116,10 @@ pub fn fetch_catalog() -> Result<WofsCatalog, String> {
                         .map(|t| {
                             t.iter()
                                 .filter_map(|v| v.as_str())
-                                .map(|rt| rt[rt.len().saturating_sub(4)..].to_owned())
+                                .filter(|rt| {
+                                    rt.len() == 12 && rt.bytes().all(|byte| byte.is_ascii_digit())
+                                })
+                                .map(ToOwned::to_owned)
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -112,9 +142,10 @@ pub fn fetch_catalog() -> Result<WofsCatalog, String> {
     if let Some(newest) = runs.first_mut() {
         let mut keep = newest.inits.clone();
         while keep.len() > 1 {
+            let (init_date, init_hhmm) = init_date_and_hhmm(&newest.rundate, &keep[0]);
             let probe = format!(
                 "{CDN}/{}/{}/{}/img/comp_dz__paintballs_thresh_40_f000.png",
-                newest.id, newest.rundate, keep[0]
+                newest.id, init_date, init_hhmm
             );
             if data_source::fetch_bytes(&probe).is_ok() {
                 break;
@@ -125,10 +156,14 @@ pub fn fetch_catalog() -> Result<WofsCatalog, String> {
     }
     // Menu tree + per-product time grids for the newest run.
     let newest = &runs[0];
-    let init = newest.inits.first().cloned().unwrap_or("1700".to_owned());
+    let init = newest
+        .inits
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("{}1700", newest.rundate));
     let query = format!(
-        "model={}&rd={}&rt={}{}&product=t_2__ens_mean&sector=wofs",
-        newest.id, newest.rundate, newest.rundate, init
+        "model={}&rd={}&rt={}&product=t_2__ens_mean&sector=wofs",
+        newest.id, newest.rundate, init
     );
     let hierarchy_text =
         data_source::fetch_text(&format!("{API}/hierarchy?{query}&type=hierarchy"))
@@ -197,9 +232,10 @@ fn collect_slugs(node: &serde_json::Value, out: &mut Vec<String>) {
 
 /// Product image URL: forecast minute as f{MMM}.
 pub fn image_url(run: &WofsRun, init: &str, product: &str, minute: u32) -> String {
+    let (init_date, init_hhmm) = init_date_and_hhmm(&run.rundate, init);
     format!(
         "{CDN}/{}/{}/{}/img/{}_f{minute:03}.png",
-        run.id, run.rundate, init, product
+        run.id, init_date, init_hhmm, product
     )
 }
 
@@ -319,8 +355,9 @@ impl WofsStation {
 /// thread). The lattice JSON carries no lat/lon — only image fractions;
 /// each sounding PNG's title states the station's lat/lon.
 pub fn fetch_stations(run_id: &str, rundate: &str, init: &str) -> Result<Vec<WofsStation>, String> {
+    let init = canonical_init_token(rundate, init);
     let url = format!(
-        "{API}/stations?model={run_id}&rd={rundate}&rt={rundate}{init}&product={SND_REF_PRODUCT}&sector=wofs&type=stations"
+        "{API}/stations?model={run_id}&rd={rundate}&rt={init}&product={SND_REF_PRODUCT}&sector=wofs&type=stations"
     );
     let text = data_source::fetch_text(&url).map_err(|e| format!("stations: {e}"))?;
     let root: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -350,10 +387,8 @@ pub fn fetch_stations(run_id: &str, rundate: &str, init: &str) -> Result<Vec<Wof
 /// (frame 0 = analysis, frame 36 = +180 min — verified live 2026-06-11:
 /// frames 0..=72 exist for a 0..=360 min run, 73 returns HTTP 500).
 pub fn sounding_url(run: &WofsRun, init: &str, frame: u32, station: &str) -> String {
-    format!(
-        "{SND_CDN}/{}/{}{init}/{frame}/wofs_snd_{station}.png",
-        run.id, run.rundate
-    )
+    let init = canonical_init_token(&run.rundate, init);
+    format!("{SND_CDN}/{}/{init}/{frame}/wofs_snd_{station}.png", run.id)
 }
 
 /// Fetch + decode one product PNG into an egui image (palette -> RGBA).
@@ -759,7 +794,7 @@ impl WofsState {
             self.georef_progress = Arc::new(AtomicUsize::new(0));
             let progress = Arc::clone(&self.georef_progress);
             let run_id = run.id.clone();
-            let rd_init = format!("{}{}", run.rundate, self.init);
+            let rd_init = canonical_init_token(&run.rundate, &self.init);
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
                 let result = wofs_georef::build_georef(&run_id, &rd_init, Some(&progress));
@@ -838,16 +873,16 @@ impl WofsState {
     /// as a textured mesh: vertices at `project(lonlat_of(u, v))`, UVs into
     /// the axes-box subrect of the already-fetched window texture.
     ///
-    /// Gated on the window being OPEN: pump + radar-time sync only run
-    /// while the window shows, so a drape that outlived the window would
-    /// silently freeze at a stale forecast minute as the user scrubs.
+    /// The owner keeps pumping radar-time sync while a drape is enabled, so
+    /// closing the WoFS window does not remove or silently freeze the map
+    /// layer.
     pub fn draw_drape(
         &self,
         painter: &egui::Painter,
         rect: egui::Rect,
         project: &dyn Fn(f32, f32) -> egui::Pos2,
     ) {
-        if !self.drape_on_map || !self.open {
+        if !self.drape_on_map {
             return;
         }
         let Some(catalog) = &self.catalog else {
@@ -1109,6 +1144,31 @@ mod tests {
         assert_eq!(
             sounding_url(&run, "1700", 36, "10_10"),
             "https://ep-wofs-sounding-etb5awe5cdfqawe8.a01.azurefd.net/api/sounding/WOFSRun20260611-144912d1/202606111700/36/wofs_snd_10_10.png"
+        );
+    }
+
+    #[test]
+    fn midnight_crossing_init_uses_its_own_utc_date() {
+        let run = WofsRun {
+            id: "WOFSRun20260711-130130d1".to_owned(),
+            name: String::new(),
+            rundate: "20260711".to_owned(),
+            inits: vec!["202607120300".to_owned()],
+        };
+
+        assert_eq!(init_hhmm(&run.inits[0]), "0300");
+        assert_eq!(
+            init_time_utc(&run, &run.inits[0]).unwrap().to_rfc3339(),
+            "2026-07-12T03:00:00+00:00"
+        );
+        assert!(
+            image_url(&run, &run.inits[0], "comp_dz__paintballs_thresh_40", 60).ends_with(
+                "/WOFSRun20260711-130130d1/20260712/0300/img/comp_dz__paintballs_thresh_40_f060.png"
+            )
+        );
+        assert_eq!(
+            sounding_url(&run, &run.inits[0], 12, "10_10"),
+            "https://ep-wofs-sounding-etb5awe5cdfqawe8.a01.azurefd.net/api/sounding/WOFSRun20260711-130130d1/202607120300/12/wofs_snd_10_10.png"
         );
     }
 
