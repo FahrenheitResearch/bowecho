@@ -28,7 +28,7 @@ use crate::{
 /// Version stamped on the first scheme-native PSD implementation.
 pub const SCHEME_PSD_REVISION: &str = "scheme-psd-v1";
 /// Version stamped on the ISHMAEL reconstruction equations.
-pub const ISHMAEL_PSD_REVISION: &str = "wrf-jensen-ishmael-gamma-v1";
+pub const ISHMAEL_PSD_REVISION: &str = "wrf-jensen-ishmael-gamma-var-check-v2";
 /// Mass- and shape-preserving binding from ISHMAEL's source density ceiling
 /// to the authenticated solid-ice constituent endpoint of the dry LUTs.
 pub const ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION: &str =
@@ -89,6 +89,7 @@ const SOURCE_BOUND_RELATIVE_TOLERANCE: f64 = 16.0 * f32::EPSILON as f64;
 #[serde(rename_all = "snake_case")]
 pub enum SchemePsdRevision {
     IshmaelGammaV1,
+    IshmaelGammaVarCheckV2,
 }
 
 /// Deterministic bounded quadrature implemented by this revision.
@@ -254,6 +255,16 @@ pub struct IshmaelReconstructionAudit {
     pub delta_bound_excursion: f64,
     /// Signed raw excursion beyond the nearest WRF bound; zero when inside.
     pub density_bound_excursion_kg_m3: f64,
+    /// Whether WRF ISHMAEL's `var_check` density branch was reproduced by
+    /// retaining mass, number, and habit while re-diagnosing both axes.
+    #[serde(default)]
+    pub source_density_state_projected: bool,
+    /// Signed change from source QVOLI to the projected `a^2 c` moment.
+    #[serde(default)]
+    pub qvoli_source_projection_relative_change: f64,
+    /// Signed change from source QAOLI to the projected `c^2 a` moment.
+    #[serde(default)]
+    pub qaoli_source_projection_relative_change: f64,
 }
 
 /// A reconstructed native ISHMAEL gamma distribution.
@@ -290,37 +301,83 @@ impl IshmaelPsd {
             input.qaoli_m3_per_kg * input.qaoli_m3_per_kg
                 / (input.qvoli_m3_per_kg * input.qnice_per_kg),
         )?;
-        let a_scale_m = a_cubed.cbrt();
+        let source_a_scale_m = a_cubed.cbrt();
         let raw_c_at_a_scale_m = c_cubed.cbrt();
-        if a_scale_m <= ISHMAEL_MONOMER_SEMI_AXIS_M {
+        if source_a_scale_m <= ISHMAEL_MONOMER_SEMI_AXIS_M {
             return Err(PsdError::OutsideReconstructionBound {
                 field: "ISHMAEL a_n",
-                value: a_scale_m,
+                value: source_a_scale_m,
                 minimum: ISHMAEL_MONOMER_SEMI_AXIS_M,
                 maximum: f64::MAX,
             });
         }
 
-        let denominator = (a_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M).ln();
+        let denominator = (source_a_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M).ln();
         let raw_aspect_power_delta =
             (raw_c_at_a_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M).ln() / denominator;
         let (aspect_power_delta, delta_bound_excursion) =
             source_bounded("ISHMAEL delta", raw_aspect_power_delta, ISHMAEL_DELTA_RANGE)?;
-        let c_at_a_scale_m = ISHMAEL_MONOMER_SEMI_AXIS_M.powf(1.0 - aspect_power_delta)
-            * a_scale_m.powf(aspect_power_delta);
-
-        let mean_volume_m3 =
-            mean_particle_volume(a_scale_m, aspect_power_delta, ISHMAEL_GAMMA_SHAPE)?;
+        let source_mean_volume_m3 =
+            mean_particle_volume(source_a_scale_m, aspect_power_delta, ISHMAEL_GAMMA_SHAPE)?;
         let mean_particle_mass_kg = input.qice_kgkg / input.qnice_per_kg;
         let raw_bulk_density_kg_m3 = checked_positive_computation(
             "ISHMAEL bulk density",
-            mean_particle_mass_kg / mean_volume_m3,
+            mean_particle_mass_kg / source_mean_volume_m3,
         )?;
-        let (bulk_density_kg_m3, density_bound_excursion_kg_m3) = source_bounded(
-            "ISHMAEL bulk density",
-            raw_bulk_density_kg_m3,
-            ISHMAEL_DENSITY_RANGE_KG_M3,
+        let density_tolerance = SOURCE_BOUND_RELATIVE_TOLERANCE
+            * ISHMAEL_DENSITY_RANGE_KG_M3[0]
+                .abs()
+                .max(ISHMAEL_DENSITY_RANGE_KG_M3[1].abs())
+                .max(1.0);
+        let source_density_state_projected = raw_bulk_density_kg_m3
+            < ISHMAEL_DENSITY_RANGE_KG_M3[0] - density_tolerance
+            || raw_bulk_density_kg_m3 > ISHMAEL_DENSITY_RANGE_KG_M3[1] + density_tolerance;
+        let (bulk_density_kg_m3, density_bound_excursion_kg_m3) = if source_density_state_projected
+        {
+            let bounded = raw_bulk_density_kg_m3.clamp(
+                ISHMAEL_DENSITY_RANGE_KG_M3[0],
+                ISHMAEL_DENSITY_RANGE_KG_M3[1],
+            );
+            (bounded, raw_bulk_density_kg_m3 - bounded)
+        } else {
+            source_bounded(
+                "ISHMAEL bulk density",
+                raw_bulk_density_kg_m3,
+                ISHMAEL_DENSITY_RANGE_KG_M3,
+            )?
+        };
+
+        // WRF's `module_mp_jensen_ishmael.F:var_check` retains qidum,
+        // nidum, and the bounded deltastr when density lies outside
+        // [50, RHOI]. It sets rbdum to the bound, re-diagnoses ani from the
+        // mass moment, derives cni from deltastr, and rewrites aidum/cidum.
+        // The ratio form below is algebraically the same update while using
+        // this reconstruction's analytic gamma moment consistently.
+        let density_projection_scale = if source_density_state_projected {
+            checked_positive_computation(
+                "ISHMAEL source density projection scale",
+                (raw_bulk_density_kg_m3 / bulk_density_kg_m3)
+                    .powf(1.0 / (2.0 + aspect_power_delta)),
+            )?
+        } else {
+            1.0
+        };
+        let a_scale_m = checked_positive_computation(
+            "ISHMAEL source-checked a_n",
+            source_a_scale_m * density_projection_scale,
         )?;
+        let c_at_a_scale_m = checked_positive_computation(
+            "ISHMAEL source-checked c_n",
+            ISHMAEL_MONOMER_SEMI_AXIS_M.powf(1.0 - aspect_power_delta)
+                * a_scale_m.powf(aspect_power_delta),
+        )?;
+        let mean_volume_m3 =
+            mean_particle_volume(a_scale_m, aspect_power_delta, ISHMAEL_GAMMA_SHAPE)?;
+        let mass_preserving_bulk_density_kg_m3 = if source_density_state_projected {
+            bulk_density_kg_m3
+        } else {
+            raw_bulk_density_kg_m3
+        };
 
         let mean_equivolume_diameter_sixth_m6 = checked_positive_computation(
             "ISHMAEL mean equivalent-volume diameter sixth moment",
@@ -333,16 +390,34 @@ impl IshmaelPsd {
                 )?,
         )?;
 
-        let reconstructed_qvoli = input.qnice_per_kg * a_scale_m * a_scale_m * raw_c_at_a_scale_m;
+        let reconstructed_qvoli =
+            input.qnice_per_kg * source_a_scale_m * source_a_scale_m * raw_c_at_a_scale_m;
         let reconstructed_qaoli =
-            input.qnice_per_kg * a_scale_m * raw_c_at_a_scale_m * raw_c_at_a_scale_m;
-        let reconstructed_qice = input.qnice_per_kg * raw_bulk_density_kg_m3 * mean_volume_m3;
+            input.qnice_per_kg * source_a_scale_m * raw_c_at_a_scale_m * raw_c_at_a_scale_m;
+        let reconstructed_qice = if source_density_state_projected {
+            input.qnice_per_kg * mass_preserving_bulk_density_kg_m3 * mean_volume_m3
+        } else {
+            input.qnice_per_kg * raw_bulk_density_kg_m3 * source_mean_volume_m3
+        };
+        let projected_qvoli = input.qnice_per_kg * a_scale_m * a_scale_m * c_at_a_scale_m;
+        let projected_qaoli = input.qnice_per_kg * a_scale_m * c_at_a_scale_m * c_at_a_scale_m;
         let reconstruction = IshmaelReconstructionAudit {
             qvoli_relative_error: relative_error(reconstructed_qvoli, input.qvoli_m3_per_kg, 0.0),
             qaoli_relative_error: relative_error(reconstructed_qaoli, input.qaoli_m3_per_kg, 0.0),
             mass_relative_error: relative_error(reconstructed_qice, input.qice_kgkg, 0.0),
             delta_bound_excursion,
             density_bound_excursion_kg_m3,
+            source_density_state_projected,
+            qvoli_source_projection_relative_change: if source_density_state_projected {
+                (projected_qvoli - input.qvoli_m3_per_kg) / input.qvoli_m3_per_kg
+            } else {
+                0.0
+            },
+            qaoli_source_projection_relative_change: if source_density_state_projected {
+                (projected_qaoli - input.qaoli_m3_per_kg) / input.qaoli_m3_per_kg
+            } else {
+                0.0
+            },
         };
         for (moment, error) in [
             ("QVOLI", reconstruction.qvoli_relative_error),
@@ -364,7 +439,7 @@ impl IshmaelPsd {
             c_at_a_scale_m,
             aspect_power_delta,
             bulk_density_kg_m3,
-            mass_preserving_bulk_density_kg_m3: raw_bulk_density_kg_m3,
+            mass_preserving_bulk_density_kg_m3,
             mean_particle_mass_kg,
             mean_equivolume_diameter_sixth_m6,
             reconstruction,
@@ -401,10 +476,10 @@ impl IshmaelPsd {
         self.bulk_density_kg_m3
     }
 
-    /// Native mean mass divided by native mean volume before an accepted
-    /// source-bound roundoff excursion is canonicalized. Particle mass and
-    /// any mass-preserving table geometry use this value; the bounded density
-    /// remains the authoritative scheme material state.
+    /// Density used for particle mass and mass-preserving table geometry.
+    /// This retains the raw reconstructed density for a narrowly accepted
+    /// transport-roundoff excursion. When the source `var_check` projection
+    /// is required, both geometry and this density use the exact source bound.
     #[must_use]
     pub const fn mass_preserving_bulk_density_kg_m3(self) -> f64 {
         self.mass_preserving_bulk_density_kg_m3
@@ -1187,7 +1262,7 @@ impl PsdIntegrationConfig {
             });
         }
         Ok(Self {
-            revision: SchemePsdRevision::IshmaelGammaV1,
+            revision: SchemePsdRevision::IshmaelGammaVarCheckV2,
             quadrature: PsdQuadratureRule::CompositeGaussLegendre8AdaptiveRefinedV2,
             coarse_panels,
             maximum_refined_nodes,
@@ -2720,7 +2795,7 @@ mod tests {
         )
         .unwrap();
         let audit = result.audit();
-        assert_eq!(audit.revision, SchemePsdRevision::IshmaelGammaV1);
+        assert_eq!(audit.revision, SchemePsdRevision::IshmaelGammaVarCheckV2);
         assert_eq!(
             audit.quadrature,
             PsdQuadratureRule::CompositeGaussLegendre8AdaptiveRefinedV2
@@ -2828,15 +2903,6 @@ mod tests {
                 ..
             })
         ));
-        let excessive_density =
-            input_from_scales(IshmaelIceCategory::Aggregate, 50.0e-6, 25.0e-6, 921.0);
-        assert!(matches!(
-            IshmaelPsd::reconstruct(excessive_density),
-            Err(PsdError::OutsideReconstructionBound {
-                field: "ISHMAEL bulk density",
-                ..
-            })
-        ));
         let mut invalid_raw =
             input_from_scales(IshmaelIceCategory::Planar, 50.0e-6, 25.0e-6, 400.0);
         invalid_raw.qvoli_m3_per_kg = 0.0;
@@ -2911,6 +2977,64 @@ mod tests {
             transported_density - ISHMAEL_DENSITY_RANGE_KG_M3[1],
             2.0e-12,
         );
+        assert!(
+            !distribution
+                .reconstruction_audit()
+                .source_density_state_projected
+        );
+    }
+
+    #[test]
+    fn exact_wrf_lateral_boundary_density_state_uses_source_var_check_projection() {
+        // MP55 planar cell 187,000 (z/y/x 0/374/0) from the exact full-gate
+        // fixture. This lateral-boundary state was not passed through the
+        // interior microphysics call: every optional ice diagnostic is zero,
+        // while the four prognostics imply rho=922.005... kg m^-3. Reproduce
+        // WRF `var_check`: retain QICE/QNICE and delta, clamp density, and
+        // rewrite both axes/moments.
+        let input = IshmaelPsdInput::new(
+            IshmaelIceCategory::Planar,
+            f64::from(f32::from_bits(0x31c3_bab2)),
+            f64::from(f32::from_bits(0x3c91_041c)),
+            f64::from(f32::from_bits(0x285d_6c44)),
+            f64::from(f32::from_bits(0x285d_6c44)),
+            1.0,
+        );
+        let distribution = IshmaelPsd::reconstruct(input).unwrap();
+        let audit = distribution.reconstruction_audit();
+        let projected_qvoli =
+            input.qnice_per_kg() * distribution.a_scale_m().powi(2) * distribution.c_at_a_scale_m();
+        let projected_qaoli =
+            input.qnice_per_kg() * distribution.a_scale_m() * distribution.c_at_a_scale_m().powi(2);
+
+        assert_eq!(distribution.aspect_power_delta(), 1.0);
+        assert_eq!(distribution.bulk_density_kg_m3(), 920.0);
+        assert_eq!(distribution.mass_preserving_bulk_density_kg_m3(), 920.0);
+        assert!(audit.source_density_state_projected);
+        assert_eq!(distribution.a_scale_m().to_bits(), 0x3f17_3ada_948b_74d9);
+        assert_eq!(
+            distribution.c_at_a_scale_m().to_bits(),
+            0x3f17_3ada_948b_74d9
+        );
+        assert_eq!(
+            audit.density_bound_excursion_kg_m3.to_bits(),
+            0x4000_0a56_28b3_1b00
+        );
+        assert_eq!(projected_qvoli.to_bits(), 0x3d0b_bcf9_b450_64ec);
+        assert_eq!(projected_qaoli.to_bits(), 0x3d0b_bcf9_b450_64ec);
+        assert_eq!(
+            audit.qvoli_source_projection_relative_change.to_bits(),
+            0x3f61_da87_f7df_d5fc
+        );
+        assert_eq!(
+            audit.qvoli_source_projection_relative_change.to_bits(),
+            audit.qaoli_source_projection_relative_change.to_bits()
+        );
+        assert_eq!(
+            distribution.mean_equivolume_diameter_sixth_m6().to_bits(),
+            0x3c41_4988_c604_49e4
+        );
+        assert!(audit.mass_relative_error <= RECONSTRUCTION_RELATIVE_TOLERANCE);
     }
 
     #[derive(Debug)]
