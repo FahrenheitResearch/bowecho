@@ -4694,6 +4694,18 @@ impl ModelDataDock {
                                     .small()
                                     .weak(),
                                 );
+                                if matches!(
+                                    state.atmosphere_time_mode,
+                                    app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
+                                ) {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "⚠ CPU-intensive: raw-state P3/ISHMAEL T-matrix reconstructs and integrates the native PSD at every sampled gate and intentionally uses all available CPU cores. Progress advances only after a complete tilt, so a busy first tilt can appear stationary for several minutes; dense scans and multi-sample pulse volumes can take much longer.",
+                                        )
+                                        .small()
+                                        .color(crate::ui_theme::theme().warn),
+                                    );
+                                }
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label("Final-frame policy:");
                                     ui.selectable_value(
