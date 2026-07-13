@@ -947,6 +947,35 @@ impl<'a> WeightedRawPropertyCell<'a> {
     }
 }
 
+/// Thermodynamic projection of one normalized spatial/temporal raw-state
+/// stencil. This is the exact linear environment used by
+/// [`blend_raw_property_cells`], without materializing every hydrometeor
+/// category. Gate sampling needs this projection once while assembling winds;
+/// the complete raw tuple is blended later exactly once before closure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlendedRawEnvironment {
+    environment: ParticleEnvironment,
+    pressure_pa: f64,
+    dry_air_density_kg_m3: f64,
+}
+
+impl BlendedRawEnvironment {
+    #[must_use]
+    pub const fn environment(self) -> ParticleEnvironment {
+        self.environment
+    }
+
+    #[must_use]
+    pub const fn pressure_pa(self) -> f64 {
+        self.pressure_pa
+    }
+
+    #[must_use]
+    pub const fn dry_air_density_kg_m3(self) -> f64 {
+        self.dry_air_density_kg_m3
+    }
+}
+
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum RawPropertyBlendError {
     #[error("raw property interpolation requires at least one weighted cell")]
@@ -1358,6 +1387,75 @@ impl WrfPropertyScene {
 /// product weights for all contributing corners/scenes. Required-field
 /// signatures and category layouts must match exactly. No closed particle or
 /// radar quantity is ever interpolated here.
+pub fn blend_raw_property_environment(
+    samples: &[WeightedRawPropertyCell<'_>],
+) -> Result<BlendedRawEnvironment, RawPropertyBlendError> {
+    let Some(first_sample) = samples.first() else {
+        return Err(RawPropertyBlendError::NoSamples);
+    };
+    let mut weight_sum = 0.0;
+    let mut temperature_k = 0.0;
+    let mut air_density_kg_m3 = 0.0;
+    let mut pressure_pa = 0.0;
+    let mut dry_air_density_kg_m3 = 0.0;
+    for (sample_index, sample) in samples.iter().enumerate() {
+        if !sample.weight.is_finite() || sample.weight < 0.0 {
+            return Err(RawPropertyBlendError::InvalidWeight {
+                sample_index,
+                weight: sample.weight,
+            });
+        }
+        if sample.scene.required_field_signature() != first_sample.scene.required_field_signature()
+        {
+            return Err(RawPropertyBlendError::FieldSignatureMismatch { sample_index });
+        }
+        weight_sum += sample.weight;
+        let cell_index = sample.scene.checked_cell_index(sample.cell_index)?;
+        let environment = sample.scene.environment.environment_at(cell_index).ok_or(
+            WrfPropertyReadError::InvalidEnvironment {
+                cell_index: sample.cell_index,
+                reason: "dense temperature/air-density coverage is unavailable",
+            },
+        )?;
+        let pressure = sample.scene.environment.pressure_at(cell_index).ok_or(
+            WrfPropertyReadError::InvalidEnvironment {
+                cell_index: sample.cell_index,
+                reason: "dense pressure coverage is unavailable",
+            },
+        )?;
+        let dry_density = sample
+            .scene
+            .environment
+            .dry_air_density_at(cell_index)
+            .ok_or(WrfPropertyReadError::InvalidEnvironment {
+                cell_index: sample.cell_index,
+                reason: "dense dry-air-density coverage is unavailable",
+            })?;
+        temperature_k += environment.temperature_k() * sample.weight;
+        air_density_kg_m3 += environment.air_density_kg_m3() * sample.weight;
+        pressure_pa += pressure * sample.weight;
+        dry_air_density_kg_m3 += dry_density * sample.weight;
+    }
+    if (weight_sum - 1.0).abs() > 1.0e-9 {
+        return Err(RawPropertyBlendError::WeightSum { sum: weight_sum });
+    }
+    let environment = ParticleEnvironment::new(temperature_k, air_density_kg_m3)
+        .map_err(|source| RawPropertyBlendError::Environment { source })?;
+    if !pressure_pa.is_finite() || pressure_pa <= 0.0 {
+        return Err(RawPropertyBlendError::Pressure { value: pressure_pa });
+    }
+    if !dry_air_density_kg_m3.is_finite() || dry_air_density_kg_m3 <= 0.0 {
+        return Err(RawPropertyBlendError::DryAirDensity {
+            value: dry_air_density_kg_m3,
+        });
+    }
+    Ok(BlendedRawEnvironment {
+        environment,
+        pressure_pa,
+        dry_air_density_kg_m3,
+    })
+}
+
 pub fn blend_raw_property_cells(
     samples: &[WeightedRawPropertyCell<'_>],
 ) -> Result<RawPropertyCell, RawPropertyBlendError> {
@@ -3995,6 +4093,101 @@ mod tests {
             closed.categories()[0].closed().mixing_ratio_kgkg(),
             5.0e-5,
             1.0e-10,
+        );
+    }
+
+    #[test]
+    fn environment_projection_is_bit_identical_to_complete_raw_blend() {
+        let scene = read_property_scene(
+            &p3_50_provider(50, 8, 4)
+                .field(
+                    "T",
+                    vec![-31.0, -30.5, -30.0, -29.5, -29.0, -28.5, -28.0, -27.5],
+                    "K",
+                )
+                .field(
+                    "P",
+                    vec![0.0, 200.0, 400.0, 600.0, 800.0, 1_000.0, 1_200.0, 1_400.0],
+                    "Pa",
+                ),
+            0,
+        )
+        .unwrap();
+        let weights = [0.05, 0.1, 0.15, 0.2, 0.2, 0.15, 0.1, 0.05];
+        let samples = weights
+            .into_iter()
+            .enumerate()
+            .map(|(cell_index, weight)| WeightedRawPropertyCell::new(&scene, cell_index, weight))
+            .collect::<Vec<_>>();
+        let complete = blend_raw_property_cells(&samples).unwrap();
+        let projected = blend_raw_property_environment(&samples).unwrap();
+        assert_eq!(
+            projected.environment().temperature_k().to_bits(),
+            complete.environment().temperature_k().to_bits()
+        );
+        assert_eq!(
+            projected.environment().air_density_kg_m3().to_bits(),
+            complete.environment().air_density_kg_m3().to_bits()
+        );
+        assert_eq!(
+            projected.pressure_pa().to_bits(),
+            complete.pressure_pa().to_bits()
+        );
+        assert_eq!(
+            projected.dry_air_density_kg_m3().to_bits(),
+            complete.dry_air_density_kg_m3().to_bits()
+        );
+    }
+
+    /// Manual bounded measurement of the gate-only thermodynamic projection.
+    /// Run with `cargo test -p app_ui --lib raw_environment_projection_hot_path_benchmark --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual bounded performance measurement"]
+    fn raw_environment_projection_hot_path_benchmark() {
+        const SAMPLE_COUNT: usize = 40_000;
+        const ROUNDS: usize = 7;
+
+        let scene = read_property_scene(&p3_50_provider(50, 8, 4), 0).unwrap();
+        let weights = [0.05, 0.1, 0.15, 0.2, 0.2, 0.15, 0.1, 0.05];
+        let samples = weights
+            .into_iter()
+            .enumerate()
+            .map(|(cell_index, weight)| WeightedRawPropertyCell::new(&scene, cell_index, weight))
+            .collect::<Vec<_>>();
+        let measure_complete = || {
+            let started = std::time::Instant::now();
+            for _ in 0..SAMPLE_COUNT {
+                std::hint::black_box(blend_raw_property_cells(&samples).unwrap());
+            }
+            started.elapsed()
+        };
+        let measure_projection = || {
+            let started = std::time::Instant::now();
+            for _ in 0..SAMPLE_COUNT {
+                std::hint::black_box(blend_raw_property_environment(&samples).unwrap());
+            }
+            started.elapsed()
+        };
+        let mut complete = Vec::with_capacity(ROUNDS);
+        let mut projection = Vec::with_capacity(ROUNDS);
+        for round in 0..ROUNDS {
+            if round % 2 == 0 {
+                complete.push(measure_complete());
+                projection.push(measure_projection());
+            } else {
+                projection.push(measure_projection());
+                complete.push(measure_complete());
+            }
+        }
+        complete.sort_unstable();
+        projection.sort_unstable();
+        let complete_median = complete[ROUNDS / 2];
+        let projection_median = projection[ROUNDS / 2];
+        eprintln!(
+            "[raw-environment benchmark] {SAMPLE_COUNT} eight-cell stencils: complete median {:.3} ms; projection median {:.3} ms; speedup {:.3}x",
+            complete_median.as_secs_f64() * 1_000.0,
+            projection_median.as_secs_f64() * 1_000.0,
+            complete_median.as_secs_f64() / projection_median.as_secs_f64(),
         );
     }
 

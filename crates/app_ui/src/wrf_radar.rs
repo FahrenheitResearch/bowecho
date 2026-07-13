@@ -5851,19 +5851,26 @@ fn raw_spatial_endpoint(
         .sum::<f64>();
     property_weights[property_weight_count - 1].1 += 1.0 - normalized_sum;
 
-    let endpoint_samples = property_weights[..property_weight_count]
-        .iter()
-        .map(|&(cell_index, weight)| {
-            app_ui::wrf_property_reader::WeightedRawPropertyCell::new(
-                property_scene,
-                cell_index,
-                weight,
-            )
-        })
-        .collect::<Vec<_>>();
-    let endpoint_property =
-        app_ui::wrf_property_reader::blend_raw_property_cells(&endpoint_samples)
-            .map_err(|error| format!("RawStateLinear spatial property blend: {error}"))?;
+    let (first_cell_index, first_weight) = property_weights[0];
+    let mut endpoint_samples = [app_ui::wrf_property_reader::WeightedRawPropertyCell::new(
+        property_scene,
+        first_cell_index,
+        first_weight,
+    ); 8];
+    for (sample, &(cell_index, weight)) in endpoint_samples
+        .iter_mut()
+        .zip(&property_weights[..property_weight_count])
+    {
+        *sample = app_ui::wrf_property_reader::WeightedRawPropertyCell::new(
+            property_scene,
+            cell_index,
+            weight,
+        );
+    }
+    let endpoint_environment = app_ui::wrf_property_reader::blend_raw_property_environment(
+        &endpoint_samples[..property_weight_count],
+    )
+    .map_err(|error| format!("RawStateLinear spatial environment blend: {error}"))?;
     Ok(Some(RawSpatialEndpoint {
         property_weights,
         property_weight_count,
@@ -5871,9 +5878,9 @@ fn raw_spatial_endpoint(
             wind_u_mps: (wind_u / weight_sum) as f32,
             wind_v_mps: (wind_v / weight_sum) as f32,
             wind_w_mps: (wind_w / weight_sum) as f32,
-            temperature_k: endpoint_property.environment().temperature_k() as f32,
-            pressure_pa: endpoint_property.pressure_pa() as f32,
-            air_density_kgm3: endpoint_property.environment().air_density_kg_m3() as f32,
+            temperature_k: endpoint_environment.environment().temperature_k() as f32,
+            pressure_pa: endpoint_environment.pressure_pa() as f32,
+            air_density_kgm3: endpoint_environment.environment().air_density_kg_m3() as f32,
             fields: Default::default(),
         },
         tke_m2s2: (tke / weight_sum) as f32,
