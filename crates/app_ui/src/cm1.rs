@@ -80,11 +80,42 @@ pub enum Cm1AxisGrid {
     StaggeredZ,
 }
 
+/// Native NetCDF topology family emitted by an official CM1 release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cm1SchemaFamily {
+    /// cm1r20.3 and newer: coordinate names are also dimension names
+    /// (`xh/yh/zh`, `xf/yf/zf`).
+    ModernR20Plus,
+    /// cm1r18/r19 native topology: data dimensions are
+    /// `ni/nj/nk` and `nip1/njp1/nkp1`, while coordinate variables are
+    /// `xh/xf/yh/yf/z/zf`.
+    LegacyR18R19,
+    /// Optional legacy COARDS writer. Its degree labels are compatibility
+    /// labels, not real geographic coordinates.
+    LegacyCoards,
+}
+
+/// Logical CM1 grid axes mapped to the file's concrete dimension names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cm1GridTopology {
+    pub family: Cm1SchemaFamily,
+    pub scalar_x_dimension: String,
+    pub staggered_x_dimension: String,
+    pub scalar_y_dimension: String,
+    pub staggered_y_dimension: String,
+    pub scalar_z_dimension: String,
+    pub staggered_z_dimension: String,
+    pub coards_labels_are_non_geographic: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cm1Axis {
     pub name: String,
     pub grid: Cm1AxisGrid,
     pub source_units: Cm1Availability<String>,
+    /// Values exactly as stored, retained even when CM1's legacy COARDS
+    /// compatibility labels prevent a defensible conversion to metres.
+    pub raw_values: Vec<f64>,
     /// Coordinates converted to metres. The raw values are not reinterpreted
     /// when the file omits or uses an unknown unit.
     pub values_m: Cm1Availability<Vec<f64>>,
@@ -132,13 +163,14 @@ impl Cm1VariableRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Cm1Variable {
     pub name: String,
     pub dimensions: Vec<String>,
     pub shape: Vec<usize>,
     pub units: Option<String>,
     pub long_name: Option<String>,
+    pub missing_value: Option<f64>,
     pub role: Cm1VariableRole,
 }
 
@@ -176,6 +208,33 @@ pub struct Cm1MotionMetadata {
     pub domain_motion: Cm1DomainMotion,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cm1FileLayout {
+    CompleteDomain {
+        nx: usize,
+        ny: usize,
+    },
+    /// `output_filetype=3`: one output time and one file per MPI process.
+    /// These files must be assembled before plotting or 3-D processing.
+    MpiTile {
+        local_nx: usize,
+        local_ny: usize,
+        global_nx: usize,
+        global_ny: usize,
+        process_index: Option<u32>,
+        output_index: Option<u32>,
+    },
+    Unresolved {
+        reason: String,
+    },
+}
+
+impl Cm1FileLayout {
+    pub fn requires_tile_assembly(&self) -> bool {
+        matches!(self, Self::MpiTile { .. })
+    }
+}
+
 /// How a user explicitly chooses to place a local Cartesian CM1 domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cm1PlacementMode {
@@ -198,12 +257,17 @@ pub struct Cm1Inventory {
     pub source_path: PathBuf,
     pub detection: Cm1Detection,
     pub version: Option<String>,
+    pub topology: Cm1GridTopology,
     pub dimensions: BTreeMap<String, usize>,
     pub axes: Cm1Axes,
     pub time: Cm1TimeAxis,
     pub variables: Vec<Cm1Variable>,
     pub motion: Cm1MotionMetadata,
+    pub file_layout: Cm1FileLayout,
     pub geographic_hints: Cm1GeographicHints,
+    /// Official CM1 global sentinel (normally -999999.9), preserved so reads
+    /// can normalize it to NaN without inventing per-field fill semantics.
+    pub missing_value: Option<f64>,
     /// Actual 3-D model-level height when terrain-following output includes
     /// the official `zhval` field. The 1-D `zh` coordinate remains nominal.
     pub physical_height_variable: Cm1Availability<String>,
@@ -320,6 +384,166 @@ pub fn inspect_path(path: impl AsRef<Path>) -> Result<Cm1Inventory, Cm1Error> {
     inspect_file(&nc, path)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TopologySpec {
+    family: Cm1SchemaFamily,
+    xh_variable: &'static str,
+    xh_dimension: &'static str,
+    xf_variable: &'static str,
+    xf_dimension: &'static str,
+    yh_variable: &'static str,
+    yh_dimension: &'static str,
+    yf_variable: &'static str,
+    yf_dimension: &'static str,
+    zh_variable: &'static str,
+    zh_dimension: &'static str,
+    zf_variable: &'static str,
+    zf_dimension: &'static str,
+    coards_labels_are_non_geographic: bool,
+}
+
+impl TopologySpec {
+    fn public(self) -> Cm1GridTopology {
+        Cm1GridTopology {
+            family: self.family,
+            scalar_x_dimension: self.xh_dimension.to_string(),
+            staggered_x_dimension: self.xf_dimension.to_string(),
+            scalar_y_dimension: self.yh_dimension.to_string(),
+            staggered_y_dimension: self.yf_dimension.to_string(),
+            scalar_z_dimension: self.zh_dimension.to_string(),
+            staggered_z_dimension: self.zf_dimension.to_string(),
+            coards_labels_are_non_geographic: self.coards_labels_are_non_geographic,
+        }
+    }
+
+    fn axes(self) -> [(&'static str, &'static str, &'static str); 6] {
+        [
+            (
+                self.xh_variable,
+                self.xh_dimension,
+                "west-east location of scalar grid points",
+            ),
+            (
+                self.xf_variable,
+                self.xf_dimension,
+                "west-east location of staggered u grid points",
+            ),
+            (
+                self.yh_variable,
+                self.yh_dimension,
+                "south-north location of scalar grid points",
+            ),
+            (
+                self.yf_variable,
+                self.yf_dimension,
+                "south-north location of staggered v grid points",
+            ),
+            (
+                self.zh_variable,
+                self.zh_dimension,
+                "nominal height of scalar grid points",
+            ),
+            (
+                self.zf_variable,
+                self.zf_dimension,
+                "nominal height of staggered w grid points",
+            ),
+        ]
+    }
+}
+
+const MODERN_TOPOLOGY: TopologySpec = TopologySpec {
+    family: Cm1SchemaFamily::ModernR20Plus,
+    xh_variable: "xh",
+    xh_dimension: "xh",
+    xf_variable: "xf",
+    xf_dimension: "xf",
+    yh_variable: "yh",
+    yh_dimension: "yh",
+    yf_variable: "yf",
+    yf_dimension: "yf",
+    zh_variable: "zh",
+    zh_dimension: "zh",
+    zf_variable: "zf",
+    zf_dimension: "zf",
+    coards_labels_are_non_geographic: false,
+};
+
+const LEGACY_TOPOLOGY: TopologySpec = TopologySpec {
+    family: Cm1SchemaFamily::LegacyR18R19,
+    xh_variable: "xh",
+    xh_dimension: "ni",
+    xf_variable: "xf",
+    xf_dimension: "nip1",
+    yh_variable: "yh",
+    yh_dimension: "nj",
+    yf_variable: "yf",
+    yf_dimension: "njp1",
+    zh_variable: "z",
+    zh_dimension: "nk",
+    zf_variable: "zf",
+    zf_dimension: "nkp1",
+    coards_labels_are_non_geographic: false,
+};
+
+const LEGACY_COARDS_TOPOLOGY: TopologySpec = TopologySpec {
+    family: Cm1SchemaFamily::LegacyCoards,
+    xh_variable: "ni",
+    xh_dimension: "ni",
+    xf_variable: "nip1",
+    xf_dimension: "nip1",
+    yh_variable: "nj",
+    yh_dimension: "nj",
+    yf_variable: "njp1",
+    yf_dimension: "njp1",
+    zh_variable: "nk",
+    zh_dimension: "nk",
+    zf_variable: "nkp1",
+    zf_dimension: "nkp1",
+    coards_labels_are_non_geographic: true,
+};
+
+fn topology_score(variables: &[NcVariable], topology: TopologySpec) -> (usize, usize) {
+    let mut axes = 0usize;
+    let mut described = 0usize;
+    for (variable_name, dimension_name, official_long_name) in topology.axes() {
+        let Some(variable) = variable_ci(variables, variable_name) else {
+            continue;
+        };
+        let dimensions = variable_dimension_names(variable);
+        if dimensions.len() != 1 || !dimensions[0].eq_ignore_ascii_case(dimension_name) {
+            continue;
+        }
+        axes += 1;
+        if variable_attr_string_ci(variable, "long_name").is_some_and(|value| {
+            value.eq_ignore_ascii_case(official_long_name)
+                || (matches!(topology.family, Cm1SchemaFamily::LegacyR18R19)
+                    && variable_name == "z"
+                    && value.to_ascii_lowercase().contains("height"))
+        }) {
+            described += 1;
+        }
+    }
+    (axes, described)
+}
+
+fn select_topology(variables: &[NcVariable]) -> Option<(TopologySpec, usize, usize)> {
+    [MODERN_TOPOLOGY, LEGACY_TOPOLOGY, LEGACY_COARDS_TOPOLOGY]
+        .into_iter()
+        .map(|topology| {
+            let (axes, described) = topology_score(variables, topology);
+            (topology, axes, described)
+        })
+        .max_by_key(|(topology, axes, described)| {
+            (
+                *axes,
+                *described,
+                matches!(topology.family, Cm1SchemaFamily::ModernR20Plus),
+            )
+        })
+        .filter(|(_, axes, _)| *axes >= 3)
+}
+
 /// Detect native CM1 evidence without interpreting any meteorological field.
 pub fn detect_file(nc: &NcFile) -> Result<Cm1Detection, Cm1Error> {
     let variables = nc.variables()?;
@@ -336,28 +560,12 @@ pub fn detect_file(nc: &NcFile) -> Result<Cm1Detection, Cm1Error> {
         missing.push("global CM1 version attribute".to_string());
     }
 
-    let official_axes = [
-        ("xh", "west-east location of scalar grid points"),
-        ("xf", "west-east location of staggered u grid points"),
-        ("yh", "south-north location of scalar grid points"),
-        ("yf", "south-north location of staggered v grid points"),
-        ("zh", "nominal height of scalar grid points"),
-        ("zf", "nominal height of staggered w grid points"),
-    ];
-    let mut axis_count = 0usize;
-    let mut described_axis_count = 0usize;
-    for (name, official_long_name) in official_axes {
-        if let Some(variable) = variable_ci(&variables, name) {
-            let dimensions = variable_dimension_names(variable);
-            if dimensions.len() == 1 && dimensions[0].eq_ignore_ascii_case(name) {
-                axis_count += 1;
-                if variable_attr_string_ci(variable, "long_name")
-                    .is_some_and(|value| value.eq_ignore_ascii_case(official_long_name))
-                {
-                    described_axis_count += 1;
-                }
-            }
-        }
+    let selected_topology = select_topology(&variables);
+    let (axis_count, described_axis_count) = selected_topology
+        .map(|(_, axes, described)| (axes, described))
+        .unwrap_or_default();
+    if let Some((topology, _, _)) = selected_topology {
+        evidence.push(format!("{:?} native coordinate topology", topology.family));
     }
     if axis_count > 0 {
         evidence.push(format!("{axis_count}/6 native CM1 coordinate axes"));
@@ -422,6 +630,12 @@ pub fn inspect_file(nc: &NcFile, source_path: &Path) -> Result<Cm1Inventory, Cm1
         });
     }
     let variables = nc.variables()?;
+    let topology_spec = select_topology(&variables)
+        .map(|(topology, _, _)| topology)
+        .ok_or_else(|| Cm1Error::NotCm1 {
+            evidence: "no supported CM1 coordinate topology".to_string(),
+        })?;
+    let topology = topology_spec.public();
     let dimensions = nc
         .dimensions()?
         .into_iter()
@@ -429,18 +643,70 @@ pub fn inspect_file(nc: &NcFile, source_path: &Path) -> Result<Cm1Inventory, Cm1
         .collect::<BTreeMap<_, _>>();
 
     let axes = Cm1Axes {
-        xh: read_axis(nc, &variables, "xh", Cm1AxisGrid::ScalarX, "x_units")?,
-        xf: read_axis(nc, &variables, "xf", Cm1AxisGrid::StaggeredX, "x_units")?,
-        yh: read_axis(nc, &variables, "yh", Cm1AxisGrid::ScalarY, "y_units")?,
-        yf: read_axis(nc, &variables, "yf", Cm1AxisGrid::StaggeredY, "y_units")?,
-        zh: read_axis(nc, &variables, "zh", Cm1AxisGrid::ScalarZ, "z_units")?,
-        zf: read_axis(nc, &variables, "zf", Cm1AxisGrid::StaggeredZ, "z_units")?,
+        xh: read_axis(
+            nc,
+            &variables,
+            topology_spec.xh_variable,
+            topology_spec.xh_dimension,
+            Cm1AxisGrid::ScalarX,
+            "x_units",
+        )?,
+        xf: read_axis(
+            nc,
+            &variables,
+            topology_spec.xf_variable,
+            topology_spec.xf_dimension,
+            Cm1AxisGrid::StaggeredX,
+            "x_units",
+        )?,
+        yh: read_axis(
+            nc,
+            &variables,
+            topology_spec.yh_variable,
+            topology_spec.yh_dimension,
+            Cm1AxisGrid::ScalarY,
+            "y_units",
+        )?,
+        yf: read_axis(
+            nc,
+            &variables,
+            topology_spec.yf_variable,
+            topology_spec.yf_dimension,
+            Cm1AxisGrid::StaggeredY,
+            "y_units",
+        )?,
+        zh: read_axis(
+            nc,
+            &variables,
+            topology_spec.zh_variable,
+            topology_spec.zh_dimension,
+            Cm1AxisGrid::ScalarZ,
+            "z_units",
+        )?,
+        zf: read_axis(
+            nc,
+            &variables,
+            topology_spec.zf_variable,
+            topology_spec.zf_dimension,
+            Cm1AxisGrid::StaggeredZ,
+            "z_units",
+        )?,
     };
     let time = read_time_axis(nc, &variables)?;
-    let inventoried_variables = variables.iter().map(inventory_variable).collect();
+    let missing_value = global_attr_f64_ci(nc, "missing_value");
+    let inventoried_variables = variables
+        .iter()
+        .map(|variable| inventory_variable(variable, &topology, missing_value))
+        .collect();
     let motion = read_motion(nc, &variables, time.record_count);
+    let file_layout = classify_file_layout(nc, source_path, &dimensions, &topology);
     let physical_height_variable = variable_ci(&variables, "zhval")
-        .filter(|variable| matches!(classify_variable(variable), Cm1VariableRole::NativeScalar3D))
+        .filter(|variable| {
+            matches!(
+                classify_variable(variable, &topology),
+                Cm1VariableRole::NativeScalar3D
+            )
+        })
         .map(|variable| Cm1Availability::Available(variable.name().to_string()))
         .unwrap_or_else(|| Cm1Availability::Unavailable {
             reason:
@@ -452,17 +718,20 @@ pub fn inspect_file(nc: &NcFile, source_path: &Path) -> Result<Cm1Inventory, Cm1
         source_path: source_path.to_path_buf(),
         detection,
         version: global_attr_string_ci(nc, "CM1 version"),
+        topology,
         dimensions,
         axes,
         time,
         variables: inventoried_variables,
         motion,
+        file_layout,
         geographic_hints: Cm1GeographicHints {
             control_latitude_deg: global_attr_f64_ci(nc, "ctrlat"),
             control_longitude_deg: global_attr_f64_ci(nc, "ctrlon"),
             interpretation: "CM1 documents ctrlat/ctrlon as applying to the entire domain; they are not a map projection or a cell geolocation. World placement requires an explicit user anchor."
                 .to_string(),
         },
+        missing_value,
         physical_height_variable,
     })
 }
@@ -503,7 +772,9 @@ pub fn read_native_scalar_plane(
             .dimensions
             .iter()
             .zip(metadata.shape.iter())
-            .find(|(dimension, _)| dimension.eq_ignore_ascii_case("zh"))
+            .find(|(dimension, _)| {
+                dimension.eq_ignore_ascii_case(&inventory.topology.scalar_z_dimension)
+            })
             .map(|(_, &length)| length)
             .unwrap_or(0)
     } else {
@@ -528,9 +799,9 @@ pub fn read_native_scalar_plane(
     for dimension in &metadata.dimensions {
         if dimension.eq_ignore_ascii_case("time") {
             selection.push(NcSliceInfoElem::Index(time_index as u64));
-        } else if dimension.eq_ignore_ascii_case("zh") {
+        } else if dimension.eq_ignore_ascii_case(&inventory.topology.scalar_z_dimension) {
             selection.push(NcSliceInfoElem::Index(
-                selected_level.expect("3-D role has zh") as u64,
+                selected_level.expect("3-D role has a scalar-z dimension") as u64,
             ));
         } else {
             selection.push(NcSliceInfoElem::Slice {
@@ -544,10 +815,10 @@ pub fn read_native_scalar_plane(
     if remaining_dimensions.len() != 2
         || !remaining_dimensions
             .iter()
-            .any(|dimension| dimension.eq_ignore_ascii_case("xh"))
+            .any(|dimension| dimension.eq_ignore_ascii_case(&inventory.topology.scalar_x_dimension))
         || !remaining_dimensions
             .iter()
-            .any(|dimension| dimension.eq_ignore_ascii_case("yh"))
+            .any(|dimension| dimension.eq_ignore_ascii_case(&inventory.topology.scalar_y_dimension))
     {
         return Err(Cm1Error::PlaneShape {
             name: metadata.name.clone(),
@@ -564,30 +835,38 @@ pub fn read_native_scalar_plane(
     let y_m = required_axis_values(&inventory.axes.yh)?;
     let nx = x_m.len();
     let ny = y_m.len();
-    let values = if remaining_dimensions[0].eq_ignore_ascii_case("yh") {
-        if array.shape() != [ny, nx] {
-            return Err(Cm1Error::PlaneShape {
-                name: metadata.name.clone(),
-                dimensions: remaining_dimensions,
-            });
-        }
-        array.into_values()
-    } else {
-        if array.shape() != [nx, ny] {
-            return Err(Cm1Error::PlaneShape {
-                name: metadata.name.clone(),
-                dimensions: remaining_dimensions,
-            });
-        }
-        let source = array.into_values();
-        let mut transposed = vec![0.0; nx * ny];
-        for x in 0..nx {
-            for y in 0..ny {
-                transposed[y * nx + x] = source[x * ny + y];
+    let mut values =
+        if remaining_dimensions[0].eq_ignore_ascii_case(&inventory.topology.scalar_y_dimension) {
+            if array.shape() != [ny, nx] {
+                return Err(Cm1Error::PlaneShape {
+                    name: metadata.name.clone(),
+                    dimensions: remaining_dimensions,
+                });
+            }
+            array.into_values()
+        } else {
+            if array.shape() != [nx, ny] {
+                return Err(Cm1Error::PlaneShape {
+                    name: metadata.name.clone(),
+                    dimensions: remaining_dimensions,
+                });
+            }
+            let source = array.into_values();
+            let mut transposed = vec![0.0; nx * ny];
+            for x in 0..nx {
+                for y in 0..ny {
+                    transposed[y * nx + x] = source[x * ny + y];
+                }
+            }
+            transposed
+        };
+    if let Some(missing) = metadata.missing_value {
+        for value in &mut values {
+            if value.to_bits() == missing.to_bits() || *value == missing {
+                *value = f64::NAN;
             }
         }
-        transposed
-    };
+    }
     let nominal_level_m = selected_level.and_then(|level| {
         inventory
             .axes
@@ -625,12 +904,17 @@ fn read_axis(
     nc: &NcFile,
     variables: &[NcVariable],
     name: &'static str,
+    expected_dimension: &'static str,
     grid: Cm1AxisGrid,
     global_unit_name: &str,
 ) -> Result<Cm1Axis, Cm1Error> {
     let variable = variable_ci(variables, name).ok_or(Cm1Error::MissingAxis(name))?;
     let shape = variable.shape();
-    if shape.len() != 1 {
+    let dimension_names = variable_dimension_names(variable);
+    if shape.len() != 1
+        || dimension_names.len() != 1
+        || !dimension_names[0].eq_ignore_ascii_case(expected_dimension)
+    {
         return Err(Cm1Error::InvalidAxisShape {
             name: variable.name().to_string(),
             shape,
@@ -652,7 +936,7 @@ fn read_axis(
         .or_else(|| global_attr_string_ci(nc, global_unit_name));
     let values_m = match units.as_deref().and_then(length_scale_to_metres) {
         Some(scale) => {
-            Cm1Availability::Available(values.into_iter().map(|value| value * scale).collect())
+            Cm1Availability::Available(values.iter().map(|value| value * scale).collect())
         }
         None => Cm1Availability::Unavailable {
             reason: match &units {
@@ -670,6 +954,7 @@ fn read_axis(
             .unwrap_or_else(|| Cm1Availability::Unavailable {
                 reason: "no variable or matching global units attribute".to_string(),
             }),
+        raw_values: values,
         values_m,
         long_name: variable_attr_string_ci(variable, "long_name").map(ToOwned::to_owned),
     })
@@ -735,20 +1020,30 @@ fn simulation_start(nc: &NcFile) -> Cm1Availability<String> {
     Cm1Availability::Available(datetime.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
-fn inventory_variable(variable: &NcVariable) -> Cm1Variable {
+fn inventory_variable(
+    variable: &NcVariable,
+    topology: &Cm1GridTopology,
+    global_missing_value: Option<f64>,
+) -> Cm1Variable {
     Cm1Variable {
         name: variable.name().to_string(),
         dimensions: variable_dimension_names(variable),
         shape: variable.shape(),
         units: variable_attr_string_ci(variable, "units").map(ToOwned::to_owned),
         long_name: variable_attr_string_ci(variable, "long_name").map(ToOwned::to_owned),
-        role: classify_variable(variable),
+        missing_value: variable_attr_f64_ci(variable, "_FillValue").or(global_missing_value),
+        role: classify_variable(variable, topology),
     }
 }
 
-fn classify_variable(variable: &NcVariable) -> Cm1VariableRole {
+fn classify_variable(variable: &NcVariable, topology: &Cm1GridTopology) -> Cm1VariableRole {
     let name = variable.name().to_ascii_lowercase();
-    if matches!(name.as_str(), "xh" | "xf" | "yh" | "yf" | "zh" | "zf") {
+    let coordinate_names: &[&str] = match topology.family {
+        Cm1SchemaFamily::ModernR20Plus => &["xh", "xf", "yh", "yf", "zh", "zf"],
+        Cm1SchemaFamily::LegacyR18R19 => &["xh", "xf", "yh", "yf", "z", "zf"],
+        Cm1SchemaFamily::LegacyCoards => &["ni", "nip1", "nj", "njp1", "nk", "nkp1"],
+    };
+    if coordinate_names.contains(&name.as_str()) {
         return Cm1VariableRole::Coordinate;
     }
     if name == "time" {
@@ -765,15 +1060,49 @@ fn classify_variable(variable: &NcVariable) -> Cm1VariableRole {
         .iter()
         .map(|dimension| dimension.to_ascii_lowercase())
         .collect::<Vec<_>>();
-    if same_dimensions(&lower, &["yh", "xh"]) {
+    if same_dimensions(
+        &lower,
+        &[
+            topology.scalar_y_dimension.as_str(),
+            topology.scalar_x_dimension.as_str(),
+        ],
+    ) {
         Cm1VariableRole::NativeScalar2D
-    } else if same_dimensions(&lower, &["zh", "yh", "xh"]) {
+    } else if same_dimensions(
+        &lower,
+        &[
+            topology.scalar_z_dimension.as_str(),
+            topology.scalar_y_dimension.as_str(),
+            topology.scalar_x_dimension.as_str(),
+        ],
+    ) {
         Cm1VariableRole::NativeScalar3D
-    } else if same_dimensions(&lower, &["zh", "yh", "xf"]) {
+    } else if same_dimensions(
+        &lower,
+        &[
+            topology.scalar_z_dimension.as_str(),
+            topology.scalar_y_dimension.as_str(),
+            topology.staggered_x_dimension.as_str(),
+        ],
+    ) {
         Cm1VariableRole::NativeXStaggered3D
-    } else if same_dimensions(&lower, &["zh", "yf", "xh"]) {
+    } else if same_dimensions(
+        &lower,
+        &[
+            topology.scalar_z_dimension.as_str(),
+            topology.staggered_y_dimension.as_str(),
+            topology.scalar_x_dimension.as_str(),
+        ],
+    ) {
         Cm1VariableRole::NativeYStaggered3D
-    } else if same_dimensions(&lower, &["zf", "yh", "xh"]) {
+    } else if same_dimensions(
+        &lower,
+        &[
+            topology.staggered_z_dimension.as_str(),
+            topology.scalar_y_dimension.as_str(),
+            topology.scalar_x_dimension.as_str(),
+        ],
+    ) {
         Cm1VariableRole::NativeZStaggered3D
     } else if lower.len() <= 1 {
         Cm1VariableRole::Metadata
@@ -784,6 +1113,84 @@ fn classify_variable(variable: &NcVariable) -> Cm1VariableRole {
                 variable_dimension_names(variable)
             ),
         }
+    }
+}
+
+fn classify_file_layout(
+    nc: &NcFile,
+    source_path: &Path,
+    dimensions: &BTreeMap<String, usize>,
+    topology: &Cm1GridTopology,
+) -> Cm1FileLayout {
+    let local_nx = dimensions
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&topology.scalar_x_dimension))
+        .map(|(_, &length)| length);
+    let local_ny = dimensions
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&topology.scalar_y_dimension))
+        .map(|(_, &length)| length);
+    let global_nx = global_attr_integer_ci(nc, "nx").and_then(|value| usize::try_from(value).ok());
+    let global_ny = global_attr_integer_ci(nc, "ny").and_then(|value| usize::try_from(value).ok());
+    let file_indices = parse_cm1_output_filename(source_path);
+    match (local_nx, local_ny, global_nx, global_ny) {
+        (Some(local_nx), Some(local_ny), Some(global_nx), Some(global_ny))
+            if local_nx < global_nx
+                || local_ny < global_ny
+                || file_indices.as_ref().is_some_and(|indices| indices.is_tile) =>
+        {
+            Cm1FileLayout::MpiTile {
+                local_nx,
+                local_ny,
+                global_nx,
+                global_ny,
+                process_index: file_indices.as_ref().and_then(|indices| indices.process_index),
+                output_index: file_indices.as_ref().and_then(|indices| indices.output_index),
+            }
+        }
+        (Some(nx), Some(ny), Some(global_nx), Some(global_ny))
+            if nx == global_nx && ny == global_ny =>
+        {
+            Cm1FileLayout::CompleteDomain { nx, ny }
+        }
+        (Some(nx), Some(ny), None, None) if !file_indices.as_ref().is_some_and(|value| value.is_tile) => {
+            Cm1FileLayout::CompleteDomain { nx, ny }
+        }
+        _ => Cm1FileLayout::Unresolved {
+            reason: "cannot prove whether this CM1 file is a complete domain or one output_filetype=3 MPI tile"
+                .to_string(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedOutputFilename {
+    is_tile: bool,
+    process_index: Option<u32>,
+    output_index: Option<u32>,
+}
+
+fn parse_cm1_output_filename(path: &Path) -> Option<ParsedOutputFilename> {
+    let mut stem = path.file_stem()?.to_str()?;
+    if let Some(without_interpolated) = stem.strip_suffix("_i") {
+        stem = without_interpolated;
+    }
+    let suffix = stem.strip_prefix("cm1out_")?;
+    let numbers = suffix.split('_').collect::<Vec<_>>();
+    match numbers.as_slice() {
+        [output] if output.len() == 6 => Some(ParsedOutputFilename {
+            is_tile: false,
+            process_index: None,
+            output_index: output.parse().ok(),
+        }),
+        [process, output] if process.len() == 6 && output.len() == 6 => {
+            Some(ParsedOutputFilename {
+                is_tile: true,
+                process_index: process.parse().ok(),
+                output_index: output.parse().ok(),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -979,6 +1386,14 @@ fn variable_attr_string_ci<'a>(variable: &'a NcVariable, name: &str) -> Option<&
         .and_then(|attribute| attribute.as_string())
 }
 
+fn variable_attr_f64_ci(variable: &NcVariable, name: &str) -> Option<f64> {
+    variable
+        .attributes()
+        .iter()
+        .find(|attribute| attribute.name().eq_ignore_ascii_case(name))
+        .and_then(|attribute| attribute.as_f64())
+}
+
 fn global_attr_string_ci(nc: &NcFile, name: &str) -> Option<String> {
     nc.attributes().ok()?.into_iter().find_map(|attribute| {
         attribute
@@ -1019,6 +1434,10 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc")
     }
 
+    fn legacy_fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_legacy_r19.nc")
+    }
+
     #[test]
     fn official_schema_fixture_is_detected_and_inventoried() {
         let inventory = inspect_path(fixture_path()).expect("inspect fixture");
@@ -1027,6 +1446,7 @@ mod tests {
             Cm1DetectionConfidence::Confirmed
         );
         assert_eq!(inventory.version.as_deref(), Some("cm1r21.1"));
+        assert_eq!(inventory.topology.family, Cm1SchemaFamily::ModernR20Plus);
         assert_eq!(inventory.time.record_count, 2);
         assert_eq!(
             inventory.time.offsets_seconds.available(),
@@ -1060,6 +1480,10 @@ mod tests {
             inventory.motion.domain_motion,
             Cm1DomainMotion::Unresolved { .. }
         ));
+        assert_eq!(
+            inventory.file_layout,
+            Cm1FileLayout::CompleteDomain { nx: 3, ny: 2 }
+        );
         assert!(
             inventory
                 .placement_offset_m(Cm1PlacementMode::FixedWorld, 1)
@@ -1083,5 +1507,43 @@ mod tests {
         assert_eq!((plane.nx, plane.ny), (3, 2));
         assert_eq!(plane.nominal_level_m, Some(1_500.0));
         assert_eq!(plane.values, vec![110.0, 111.0, 112.0, 113.0, 114.0, 115.0]);
+    }
+
+    #[test]
+    fn legacy_r19_topology_and_minutes_are_supported() {
+        let path = legacy_fixture_path();
+        let nc = netcrust::open(&path).expect("open legacy fixture");
+        let inventory = inspect_file(&nc, &path).expect("inspect legacy fixture");
+        assert_eq!(inventory.topology.family, Cm1SchemaFamily::LegacyR18R19);
+        assert_eq!(inventory.topology.scalar_x_dimension, "ni");
+        assert_eq!(inventory.topology.scalar_z_dimension, "nk");
+        assert_eq!(
+            inventory.time.offsets_seconds.available(),
+            Some(&vec![0.0, 60.0])
+        );
+        assert_eq!(
+            inventory
+                .variable("custom_legacy")
+                .map(|variable| &variable.role),
+            Some(&Cm1VariableRole::NativeScalar3D)
+        );
+        assert_eq!(
+            inventory.variable("u").map(|variable| &variable.role),
+            Some(&Cm1VariableRole::NativeXStaggered3D)
+        );
+
+        let plane = read_native_scalar_plane(&nc, &inventory, "custom_legacy", 1, Some(1))
+            .expect("read legacy scalar plane");
+        assert_eq!(&plane.values[..5], &[110.0, 111.0, 112.0, 113.0, 114.0]);
+        assert!(plane.values[5].is_nan(), "global CM1 sentinel -> NaN");
+    }
+
+    #[test]
+    fn output_filetype_three_filename_is_a_tile() {
+        let parsed = parse_cm1_output_filename(Path::new("cm1out_000017_000042_i.nc"))
+            .expect("parse CM1 tile name");
+        assert!(parsed.is_tile);
+        assert_eq!(parsed.process_index, Some(17));
+        assert_eq!(parsed.output_index, Some(42));
     }
 }

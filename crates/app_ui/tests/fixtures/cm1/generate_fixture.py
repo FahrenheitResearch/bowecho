@@ -7,6 +7,7 @@ import numpy as np
 
 
 OUT = Path(__file__).with_name("cm1out_schema.nc")
+LEGACY_OUT = Path(__file__).with_name("cm1out_legacy_r19.nc")
 
 
 with netCDF4.Dataset(OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
@@ -114,4 +115,78 @@ with netCDF4.Dataset(OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
     ):
         nc.setncattr(name, np.int32(value))
 
+with netCDF4.Dataset(LEGACY_OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
+    for name, length in (
+        ("ni", 3),
+        ("nj", 2),
+        ("nk", 2),
+        ("nip1", 4),
+        ("njp1", 3),
+        ("nkp1", 3),
+        ("one", 1),
+    ):
+        nc.createDimension(name, length)
+    nc.createDimension("time", None)
+
+    axes = {
+        "xh": ("ni", [-1.0, 0.0, 1.0], "west-east location of scalar grid points"),
+        "xf": (
+            "nip1",
+            [-1.5, -0.5, 0.5, 1.5],
+            "west-east location of staggered u grid points",
+        ),
+        "yh": ("nj", [-0.5, 0.5], "south-north location of scalar grid points"),
+        "yf": (
+            "njp1",
+            [-1.0, 0.0, 1.0],
+            "south-north location of staggered v grid points",
+        ),
+        "z": ("nk", [0.5, 1.5], "height of scalar grid points"),
+        "zf": ("nkp1", [0.0, 1.0, 2.0], "height of staggered w grid points"),
+    }
+    for name, (dimension, values, long_name) in axes.items():
+        var = nc.createVariable(name, "f4", (dimension,))
+        var.long_name = long_name
+        var.units = "km"
+        var[:] = values
+
+    time = nc.createVariable("time", "f4", ("time",))
+    time.long_name = "time since beginning of simulation"
+    time.units = "minutes"
+    time[:] = [0.0, 1.0]
+
+    scalar = nc.createVariable(
+        "custom_legacy", "f4", ("time", "nk", "nj", "ni")
+    )
+    scalar.long_name = "fixture arbitrary legacy scalar"
+    scalar.units = "K"
+    scalar[:] = np.array(
+        [
+            [[[0, 1, 2], [3, 4, 5]], [[10, 11, 12], [13, 14, 15]]],
+            [[[100, 101, 102], [103, 104, 105]], [[110, 111, 112], [113, 114, 115]]],
+        ],
+        dtype=np.float32,
+    )
+    scalar[1, 1, 1, 2] = np.float32(-999999.9)
+
+    u = nc.createVariable("u", "f4", ("time", "nk", "nj", "nip1"))
+    u.units = "m/s"
+    u[:] = 0.0
+    v = nc.createVariable("v", "f4", ("time", "nk", "njp1", "ni"))
+    v.units = "m/s"
+    v[:] = 0.0
+    w = nc.createVariable("w", "f4", ("time", "nkp1", "nj", "ni"))
+    w.units = "m/s"
+    w[:] = 0.0
+
+    nc.setncattr("cm1 version", "cm1r19.9")
+    nc.setncattr("missing_value", np.float32(-999999.9))
+    nc.setncattr("nx", np.int32(3))
+    nc.setncattr("ny", np.int32(2))
+    nc.setncattr("nz", np.int32(2))
+    nc.setncattr("imoist", np.int32(1))
+    nc.setncattr("ptype", np.int32(5))
+    nc.setncattr("iorigin", np.int32(1))
+
 print(OUT)
+print(LEGACY_OUT)
