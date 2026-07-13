@@ -14,7 +14,11 @@ DIAGNOSTIC_OUTPUTS = (
 )
 
 
-with netCDF4.Dataset(OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
+# Current CM1 writes modern self-named coordinate variables as NetCDF-4/HDF5
+# dimension scales. This deliberately exercises BowEcho's guarded raw-HDF5
+# coordinate fallback for readers that omit dimension-scale datasets from the
+# normal NetCDF variable index.
+with netCDF4.Dataset(OUT, "w", format="NETCDF4_CLASSIC") as nc:
     for name, length in (
         ("xh", 3),
         ("yh", 2),

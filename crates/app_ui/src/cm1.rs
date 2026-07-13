@@ -788,35 +788,45 @@ const LEGACY_COARDS_TOPOLOGY: TopologySpec = TopologySpec {
     coards_labels_are_non_geographic: true,
 };
 
-fn topology_score(variables: &[NcVariable], topology: TopologySpec) -> (usize, usize) {
+fn topology_score(nc: &NcFile, variables: &[NcVariable], topology: TopologySpec) -> (usize, usize) {
     let mut axes = 0usize;
     let mut described = 0usize;
     for (variable_name, dimension_name, official_long_name) in topology.axes() {
-        let Some(variable) = variable_ci(variables, variable_name) else {
-            continue;
-        };
-        let dimensions = variable_dimension_names(variable);
-        if dimensions.len() != 1 || !dimensions[0].eq_ignore_ascii_case(dimension_name) {
-            continue;
+        if let Some(variable) = variable_ci(variables, variable_name) {
+            let dimensions = variable_dimension_names(variable);
+            if dimensions.len() == 1 && dimensions[0].eq_ignore_ascii_case(dimension_name) {
+                axes += 1;
+                if variable_attr_string_ci(variable, "long_name").is_some_and(|value| {
+                    value.eq_ignore_ascii_case(official_long_name)
+                        || (matches!(topology.family, Cm1SchemaFamily::LegacyR18R19)
+                            && variable_name == "z"
+                            && value.to_ascii_lowercase().contains("height"))
+                }) {
+                    described += 1;
+                }
+                continue;
+            }
         }
-        axes += 1;
-        if variable_attr_string_ci(variable, "long_name").is_some_and(|value| {
-            value.eq_ignore_ascii_case(official_long_name)
-                || (matches!(topology.family, Cm1SchemaFamily::LegacyR18R19)
-                    && variable_name == "z"
-                    && value.to_ascii_lowercase().contains("height"))
-        }) {
+
+        // NetCDF-4 represents a coordinate whose variable and dimension have
+        // the same name as an HDF5 dimension-scale dataset. `netcdf-reader`
+        // currently omits those datasets from its variable index for files
+        // written by current CM1, even though the data variables retain the
+        // correct named dimensions. Accept only an exact official CM1 axis
+        // recovered from netcrust's guarded raw-HDF5 metadata surface.
+        if hdf5_axis_metadata(nc, variable_name, dimension_name, official_long_name).is_some() {
+            axes += 1;
             described += 1;
         }
     }
     (axes, described)
 }
 
-fn select_topology(variables: &[NcVariable]) -> Option<(TopologySpec, usize, usize)> {
+fn select_topology(nc: &NcFile, variables: &[NcVariable]) -> Option<(TopologySpec, usize, usize)> {
     [MODERN_TOPOLOGY, LEGACY_TOPOLOGY, LEGACY_COARDS_TOPOLOGY]
         .into_iter()
         .map(|topology| {
-            let (axes, described) = topology_score(variables, topology);
+            let (axes, described) = topology_score(nc, variables, topology);
             (topology, axes, described)
         })
         .max_by_key(|(topology, axes, described)| {
@@ -845,7 +855,7 @@ pub fn detect_file(nc: &NcFile) -> Result<Cm1Detection, Cm1Error> {
         missing.push("global CM1 version attribute".to_string());
     }
 
-    let selected_topology = select_topology(&variables);
+    let selected_topology = select_topology(nc, &variables);
     let (axis_count, described_axis_count) = selected_topology
         .map(|(_, axes, described)| (axes, described))
         .unwrap_or_default();
@@ -917,7 +927,7 @@ pub fn inspect_file(nc: &NcFile, source_path: &Path) -> Result<Cm1Inventory, Cm1
         });
     }
     let variables = nc.variables()?;
-    let topology_spec = select_topology(&variables)
+    let topology_spec = select_topology(nc, &variables)
         .map(|(topology, _, _)| topology)
         .ok_or_else(|| Cm1Error::NotCm1 {
             evidence: "no supported CM1 coordinate topology".to_string(),
@@ -2966,32 +2976,64 @@ fn read_axis(
     grid: Cm1AxisGrid,
     global_unit_name: &str,
 ) -> Result<Cm1Axis, Cm1Error> {
-    let variable = variable_ci(variables, name).ok_or(Cm1Error::MissingAxis(name))?;
-    let shape = variable.shape();
-    let dimension_names = variable_dimension_names(variable);
-    if shape.len() != 1
-        || dimension_names.len() != 1
-        || !dimension_names[0].eq_ignore_ascii_case(expected_dimension)
-    {
+    let official_long_name = match grid {
+        Cm1AxisGrid::ScalarX => "west-east location of scalar grid points",
+        Cm1AxisGrid::StaggeredX => "west-east location of staggered u grid points",
+        Cm1AxisGrid::ScalarY => "south-north location of scalar grid points",
+        Cm1AxisGrid::StaggeredY => "south-north location of staggered v grid points",
+        Cm1AxisGrid::ScalarZ => "nominal height of scalar grid points",
+        Cm1AxisGrid::StaggeredZ => "nominal height of staggered w grid points",
+    };
+    let (source_name, shape, values, variable_units, long_name) =
+        if let Some(variable) = variable_ci(variables, name) {
+            let dimensions = variable_dimension_names(variable);
+            let shape = variable.shape();
+            if shape.len() != 1
+                || dimensions.len() != 1
+                || !dimensions[0].eq_ignore_ascii_case(expected_dimension)
+            {
+                return Err(Cm1Error::InvalidAxisShape {
+                    name: variable.name().to_string(),
+                    shape,
+                });
+            }
+            (
+                variable.name().to_string(),
+                shape,
+                variable.array_f64()?.into_values(),
+                variable_attr_string_ci(variable, "units").map(ToOwned::to_owned),
+                variable_attr_string_ci(variable, "long_name").map(ToOwned::to_owned),
+            )
+        } else if let Some(metadata) =
+            hdf5_axis_metadata(nc, name, expected_dimension, official_long_name)
+        {
+            (
+                metadata.name.clone(),
+                vec![metadata.len],
+                nc.read_f64(&metadata.name)?,
+                Some(metadata.units),
+                Some(metadata.long_name),
+            )
+        } else {
+            return Err(Cm1Error::MissingAxis(name));
+        };
+    if shape.len() != 1 || values.len() != shape[0] {
         return Err(Cm1Error::InvalidAxisShape {
-            name: variable.name().to_string(),
+            name: source_name,
             shape,
         });
     }
-    let values = variable.array_f64()?.into_values();
     if let Some((index, _)) = values
         .iter()
         .enumerate()
         .find(|(_, value)| !value.is_finite())
     {
         return Err(Cm1Error::NonFiniteCoordinate {
-            name: variable.name().to_string(),
+            name: source_name,
             index,
         });
     }
-    let units = variable_attr_string_ci(variable, "units")
-        .map(ToOwned::to_owned)
-        .or_else(|| global_attr_string_ci(nc, global_unit_name));
+    let units = variable_units.or_else(|| global_attr_string_ci(nc, global_unit_name));
     let values_m = match units.as_deref().and_then(length_scale_to_metres) {
         Some(scale) => {
             Cm1Availability::Available(values.iter().map(|value| value * scale).collect())
@@ -3004,7 +3046,7 @@ fn read_axis(
         },
     };
     Ok(Cm1Axis {
-        name: variable.name().to_string(),
+        name: source_name,
         grid,
         source_units: units
             .clone()
@@ -3014,7 +3056,53 @@ fn read_axis(
             }),
         raw_values: values,
         values_m,
-        long_name: variable_attr_string_ci(variable, "long_name").map(ToOwned::to_owned),
+        long_name,
+    })
+}
+
+#[derive(Debug)]
+struct Hdf5AxisMetadata {
+    name: String,
+    len: usize,
+    units: String,
+    long_name: String,
+}
+
+/// Recover an official one-dimensional CM1 coordinate dataset that the
+/// NetCDF-4 variable index omitted because it is encoded as an HDF5
+/// dimension scale. Exact name, rank, and upstream long-name semantics are
+/// required so arbitrary HDF5 datasets cannot become grid coordinates.
+fn hdf5_axis_metadata(
+    nc: &NcFile,
+    expected_name: &str,
+    expected_dimension: &str,
+    official_long_name: &str,
+) -> Option<Hdf5AxisMetadata> {
+    // This fallback is specifically for self-named NetCDF-4 coordinate
+    // variables. Coordinates whose variable and dimension names differ must
+    // remain visible through the normal NetCDF variable index.
+    if !expected_name.eq_ignore_ascii_case(expected_dimension) {
+        return None;
+    }
+    let dataset = nc.hdf5_root_datasets().ok()?.into_iter().find(|dataset| {
+        dataset.name().eq_ignore_ascii_case(expected_name) && dataset.shape().len() == 1
+    })?;
+    let dimension = nc.dimension(expected_dimension)?;
+    let len = usize::try_from(dataset.shape()[0]).ok()?;
+    if dimension.len() != len {
+        return None;
+    }
+    let long_name = nc.hdf5_dataset_attribute_string(dataset.name(), "long_name")?;
+    if !long_name.trim().eq_ignore_ascii_case(official_long_name) {
+        return None;
+    }
+    let units = nc.hdf5_dataset_attribute_string(dataset.name(), "units")?;
+    length_scale_to_metres(&units)?;
+    Some(Hdf5AxisMetadata {
+        name: dataset.name().to_string(),
+        len,
+        units,
+        long_name,
     })
 }
 
@@ -3549,7 +3637,14 @@ mod tests {
 
     #[test]
     fn official_schema_fixture_is_detected_and_inventoried() {
-        let inventory = inspect_path(fixture_path()).expect("inspect fixture");
+        let path = fixture_path();
+        let nc = netcrust::open(&path).expect("open fixture");
+        assert!(
+            nc.variable("xh").is_none(),
+            "modern NetCDF-4 fixture must exercise the dimension-scale fallback"
+        );
+        assert!(nc.has_hdf5_dataset("xh"));
+        let inventory = inspect_file(&nc, &path).expect("inspect fixture");
         assert_eq!(
             inventory.detection.confidence,
             Cm1DetectionConfidence::Confirmed
@@ -3604,6 +3699,36 @@ mod tests {
                 .expect("follow domain"),
             (0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn optional_real_modern_hdf5_output_inspects_and_builds_radar_scene() {
+        let Some(path) = std::env::var_os("BOWECHO_CM1_R21_FIXTURE").map(PathBuf::from) else {
+            return;
+        };
+        let nc = netcrust::open(&path).expect("open real modern CM1 output");
+        let inventory = inspect_file(&nc, &path).expect("inspect real modern CM1 output");
+        assert_eq!(inventory.topology.family, Cm1SchemaFamily::ModernR20Plus);
+        for field in [
+            "dbz", "zhval", "th", "prs", "qv", "uinterp", "vinterp", "winterp",
+        ] {
+            assert!(inventory.variable(field).is_some(), "missing `{field}`");
+        }
+        let scene = read_radar_scene(
+            &nc,
+            &inventory,
+            &Cm1Placement {
+                mode: Cm1PlacementMode::FollowDomain,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+            0,
+            Cm1TerrainPolicy::RequireNative,
+        )
+        .expect("build radar-ready scene from real modern CM1 output");
+        assert_eq!(scene.nx, inventory.axes.xh.raw_values.len());
+        assert_eq!(scene.ny, inventory.axes.yh.raw_values.len());
+        assert_eq!(scene.nz, inventory.axes.zh.raw_values.len());
     }
 
     #[test]
