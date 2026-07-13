@@ -1134,19 +1134,38 @@ impl P3Psd {
             analytic_domain.mass_squared_radar_weight_kg2_m3,
         );
         let m6_error = relative_error(integrated_m6, analytic_domain.sixth_moment_m3);
-        for (moment, error) in [
+        let errors = [
             ("number", number_error),
             ("mass", mass_error),
             ("mass-squared radar weight", mass_squared_error),
             ("sixth", m6_error),
-        ] {
-            if error > config.maximum_quadrature_relative_error {
-                return Err(P3PsdError::QuadratureClosure {
-                    moment,
-                    relative_error: error,
-                    maximum: config.maximum_quadrature_relative_error,
-                });
+        ];
+        if let Some(&(moment, error)) = errors
+            .iter()
+            .find(|(_, error)| *error > config.maximum_quadrature_relative_error)
+        {
+            let next_panels = config.panels.checked_mul(2);
+            let conservative_next_nodes = required_nodes
+                .saturating_add(usize::from(config.panels).saturating_mul(GL8_POINTS));
+            if let Some(next_panels) = next_panels
+                && conservative_next_nodes <= config.maximum_nodes as usize
+            {
+                let refined = P3QuadratureConfig {
+                    panels: next_panels,
+                    ..config
+                };
+                return self.quadrature_bounded_internal(
+                    refined,
+                    upper_m,
+                    panel_upper_m,
+                    additional_breakpoints_m,
+                );
             }
+            return Err(P3PsdError::QuadratureClosure {
+                moment,
+                relative_error: error,
+                maximum: config.maximum_quadrature_relative_error,
+            });
         }
         Ok(P3Quadrature {
             nodes,
@@ -2340,6 +2359,24 @@ mod tests {
                     .represented_mass_squared_radar_weight_kg2_m3,
                 represented.mass_squared_radar_weight_kg2_m3,
             ) <= P3QuadratureConfig::default().maximum_quadrature_relative_error
+        );
+
+        let adaptive = psd
+            .quadrature_bounded_with_dimension_breakpoints(
+                P3QuadratureConfig {
+                    panels: 1,
+                    ..P3QuadratureConfig::default()
+                },
+                source_edge,
+                &[],
+            )
+            .unwrap();
+        assert!(adaptive.audit.config.panels > 1);
+        assert!(
+            adaptive
+                .audit
+                .mass_squared_radar_weight_quadrature_relative_error
+                <= adaptive.audit.config.maximum_quadrature_relative_error
         );
     }
 }
