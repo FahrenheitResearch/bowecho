@@ -23,6 +23,7 @@ radar_core = { path = "../radar_core" }
 radar_scattering = { path = "../radar_scattering" }
 render2d = { path = "../render2d" }
 settings = { path = "../settings" }
+simradar_cuda = { path = "../simradar_cuda" }
 styles = { path = "../styles" }
 ui_core = { path = "../ui_core" }
 serde.workspace = true

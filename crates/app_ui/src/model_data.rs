@@ -290,6 +290,11 @@ struct SyntheticRadarUiState {
     /// for settings written before these controls existed.
     #[serde(default)]
     simulation_mode: crate::wrf_radar::SimulationMode,
+    /// Preferred native P3/ISHMAEL property-T-matrix execution backend.
+    /// `Auto` is backward-compatible and may use CUDA only when the cached
+    /// runtime probe reports a qualified NVIDIA device.
+    #[serde(default)]
+    compute_preference: crate::wrf_radar::SyntheticRadarComputePreference,
     /// Physical scan pattern. Absent in older settings means the historical
     /// custom fourteen-cut ladder, preserving serde/backward compatibility.
     #[serde(default)]
@@ -470,6 +475,69 @@ fn default_synth_sensitivity_dbz_at_1km() -> f32 {
     crate::wrf_radar::SyntheticRadarConfig::default().sensitivity_dbz_at_1km
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SyntheticRadarWorkEstimate {
+    tilt_count: usize,
+    rays_per_tilt: usize,
+    gates_per_ray: usize,
+    samples_per_gate: usize,
+    total_samples: u64,
+}
+
+impl SyntheticRadarWorkEstimate {
+    fn from_state(state: &SyntheticRadarUiState) -> Self {
+        let tilt_count = state
+            .scan_strategy
+            .definition()
+            .map_or_else(
+                || crate::wrf_radar::elevation_ladder(state.include_low_tilt).len(),
+                |definition| definition.rows.len(),
+            )
+            .max(1);
+        let rays_per_tilt = crate::wrf_radar::SyntheticRadarConfig::default()
+            .azimuth_count
+            .max(1);
+        let gates_per_ray = ((state.clamped_range_km() * 1000.0 / state.effective_gate_spacing_m())
+            .floor() as usize)
+            .max(1);
+        let samples_per_gate = state.beam_integration.pulse_volume_sample_count();
+        let total_samples = (tilt_count as u64)
+            .saturating_mul(rays_per_tilt as u64)
+            .saturating_mul(gates_per_ray as u64)
+            .saturating_mul(samples_per_gate as u64);
+        Self {
+            tilt_count,
+            rays_per_tilt,
+            gates_per_ray,
+            samples_per_gate,
+            total_samples,
+        }
+    }
+
+    fn summary(self) -> String {
+        format!(
+            "Pulse-volume estimate: {} samples ({} per gate × {} gates × {} rays × {} tilts)",
+            compact_sample_count(self.total_samples),
+            self.samples_per_gate,
+            self.gates_per_ray,
+            self.rays_per_tilt,
+            self.tilt_count,
+        )
+    }
+}
+
+fn compact_sample_count(samples: u64) -> String {
+    if samples >= 1_000_000_000 {
+        format!("{:.2} billion", samples as f64 / 1_000_000_000.0)
+    } else if samples >= 1_000_000 {
+        format!("{:.1} million", samples as f64 / 1_000_000.0)
+    } else if samples >= 1_000 {
+        format!("{:.1} thousand", samples as f64 / 1_000.0)
+    } else {
+        samples.to_string()
+    }
+}
+
 impl Default for SyntheticRadarUiState {
     fn default() -> Self {
         Self {
@@ -485,6 +553,7 @@ impl Default for SyntheticRadarUiState {
             vel_gate_texture: false,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::default(),
             simulation_mode: crate::wrf_radar::SimulationMode::default(),
+            compute_preference: crate::wrf_radar::SyntheticRadarComputePreference::default(),
             scan_strategy: crate::wrf_radar::SyntheticScanStrategy::default(),
             reflectivity_sampling: crate::wrf_radar::ReflectivitySampling::default(),
             beam_integration: crate::wrf_radar::BeamIntegration::default(),
@@ -559,6 +628,10 @@ impl SyntheticRadarUiState {
 
     fn to_operational_config(&self) -> Result<crate::wrf_radar::SyntheticRadarConfig, String> {
         let mut config = self.to_config()?;
+        // Operational HRRR/RRFS uses the portable bulk-Rayleigh path. Keep it
+        // on the CPU contract even when the WRF property-T-matrix preference
+        // is Auto/CUDA so that preference cannot leak across workflows.
+        config.compute_preference = crate::wrf_radar::SyntheticRadarComputePreference::Cpu;
         config.reflectivity_sampling = crate::wrf_radar::ReflectivitySampling::LinearZ;
         config.polarimetric_kernel = crate::wrf_radar::PolarimetricKernel::BulkRayleighV1;
         config.dual_pol = true;
@@ -795,6 +868,7 @@ impl SyntheticRadarUiState {
             vel_gate_texture: self.vel_gate_texture,
             reflectivity_operator: self.reflectivity_operator,
             simulation_mode: self.simulation_mode,
+            compute_preference: self.compute_preference,
             scan_strategy: self.scan_strategy,
             reflectivity_sampling: self.reflectivity_sampling,
             beam_integration: self.beam_integration,
@@ -3351,6 +3425,72 @@ impl ModelDataDock {
                 state.apply_recipe(recipe);
             }
 
+            ui.add_space(3.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Compute:");
+                ui.add_enabled_ui(!busy, |ui| {
+                    for preference in [
+                        crate::wrf_radar::SyntheticRadarComputePreference::Auto,
+                        crate::wrf_radar::SyntheticRadarComputePreference::Cpu,
+                        crate::wrf_radar::SyntheticRadarComputePreference::NvidiaCuda,
+                    ] {
+                        ui.selectable_value(
+                            &mut state.compute_preference,
+                            preference,
+                            preference.label(),
+                        )
+                        .on_hover_text(match preference {
+                            crate::wrf_radar::SyntheticRadarComputePreference::Auto => {
+                                "Use a qualified NVIDIA CUDA device when available; otherwise use the CPU reference path."
+                            }
+                            crate::wrf_radar::SyntheticRadarComputePreference::Cpu => {
+                                "Always use the portable CPU reference implementation."
+                            }
+                            crate::wrf_radar::SyntheticRadarComputePreference::NvidiaCuda => {
+                                "Prefer NVIDIA CUDA for supported native P3/ISHMAEL work; fall back to CPU if it is unavailable."
+                            }
+                        });
+                    }
+                });
+            });
+            let cuda = simradar_cuda::probe_cuda_cached();
+            if let Some(device) = cuda.preferred_device() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "CUDA ready: {} · compute {} · {:.1} GiB",
+                        device.name,
+                        device.compute_capability_label(),
+                        device.total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    ))
+                    .small()
+                    .weak(),
+                );
+            } else if let Some(reason) = cuda.fallback_reason() {
+                ui.label(
+                    egui::RichText::new(format!("CUDA unavailable: {reason}; CPU fallback is ready"))
+                        .small()
+                        .weak(),
+                );
+            }
+            let work = SyntheticRadarWorkEstimate::from_state(state);
+            let mut work_text = work.summary();
+            if state.match_gate_to_grid {
+                work_text.push_str(" · fallback spacing shown; source DX sets the final gate count");
+            }
+            ui.label(egui::RichText::new(work_text).small().weak());
+            if !matches!(
+                state.polarimetric_kernel,
+                crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
+            ) {
+                ui.label(
+                    egui::RichText::new(
+                        "CUDA applies to native P3/ISHMAEL property T-matrix processing; this preset uses CPU.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+
             if let Some(recipe) = state.active_recipe() {
                 ui.label(egui::RichText::new(recipe.description()).small().weak());
                 ui.label(
@@ -4737,7 +4877,7 @@ impl ModelDataDock {
                                 ) {
                                     ui.label(
                                         egui::RichText::new(
-                                            "⚠ CPU-intensive: raw-state P3/ISHMAEL T-matrix reconstructs and integrates the native PSD at every sampled gate and intentionally uses all available CPU cores. Progress advances only after a complete tilt, so a busy first tilt can appear stationary for several minutes; dense scans and multi-sample pulse volumes can take much longer.",
+                                            "⚠ CPU-intensive: raw-state P3/ISHMAEL T-matrix reconstructs and integrates the native PSD at every sampled gate and intentionally uses all available CPU cores. Tilt 1 appears as a preview as soon as it completes while the remaining tilts continue; the first tilt can still take several minutes on dense, multi-sample volumes.",
                                         )
                                         .small()
                                         .color(crate::ui_theme::theme().warn),
@@ -6880,6 +7020,11 @@ mod tests {
             crate::wrf_radar::SimulationMode::Presentation
         );
         assert_eq!(
+            empty.compute_preference,
+            crate::wrf_radar::SyntheticRadarComputePreference::Auto,
+            "older settings restore automatic CPU/CUDA selection"
+        );
+        assert_eq!(
             empty.scan_strategy,
             crate::wrf_radar::SyntheticScanStrategy::CustomLegacy,
             "older settings restore the historical custom ladder"
@@ -6995,6 +7140,7 @@ mod tests {
             vel_gate_texture: true,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::ClassicStoelinga,
             simulation_mode: crate::wrf_radar::SimulationMode::Instrument,
+            compute_preference: crate::wrf_radar::SyntheticRadarComputePreference::NvidiaCuda,
             scan_strategy: crate::wrf_radar::SyntheticScanStrategy::Build24Vcp212,
             reflectivity_sampling: crate::wrf_radar::ReflectivitySampling::LegacyDbz,
             beam_integration: crate::wrf_radar::BeamIntegration::Reference,
@@ -7075,6 +7221,7 @@ mod tests {
             "default operator is model native"
         );
         assert_eq!(config.simulation_mode, historical.simulation_mode);
+        assert_eq!(config.compute_preference, historical.compute_preference);
         assert_eq!(config.scan_strategy, historical.scan_strategy);
         assert_eq!(
             config.reflectivity_sampling,
@@ -7173,6 +7320,7 @@ mod tests {
         let mut state = SyntheticRadarUiState {
             polarimetric_kernel: crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1,
             atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear,
+            compute_preference: crate::wrf_radar::SyntheticRadarComputePreference::NvidiaCuda,
             dual_pol: false,
             terminal_fall_speed: false,
             operational_f00: true,
@@ -7194,6 +7342,11 @@ mod tests {
             crate::wrf_radar::PropagationGeometry::StandardFourThirdsEarth
         );
         assert!(config.dual_pol && config.terminal_fall_speed);
+        assert_eq!(
+            config.compute_preference,
+            crate::wrf_radar::SyntheticRadarComputePreference::Cpu,
+            "operational bulk-radar builds stay on the fixed CPU contract"
+        );
 
         state.operational_f00 = false;
         assert_eq!(state.operational_forecast_hours(), vec![1]);
@@ -7207,6 +7360,7 @@ mod tests {
 
         let state = SyntheticRadarUiState {
             simulation_mode: SimulationMode::Instrument,
+            compute_preference: crate::wrf_radar::SyntheticRadarComputePreference::NvidiaCuda,
             reflectivity_sampling: ReflectivitySampling::LegacyDbz,
             beam_integration: BeamIntegration::Reference,
             beam_width_deg: 1.2,
@@ -7247,6 +7401,10 @@ mod tests {
         let config = state.to_config().unwrap();
 
         assert_eq!(config.simulation_mode, SimulationMode::Instrument);
+        assert_eq!(
+            config.compute_preference,
+            crate::wrf_radar::SyntheticRadarComputePreference::NvidiaCuda
+        );
         assert_eq!(
             config.reflectivity_sampling,
             ReflectivitySampling::LegacyDbz
@@ -7421,6 +7579,7 @@ mod tests {
             zdr_bias_db: 1.5,
             clutter_intensity: 0.9,
             include_low_tilt: true,
+            compute_preference: crate::wrf_radar::SyntheticRadarComputePreference::NvidiaCuda,
             ..SyntheticRadarUiState::default()
         };
 
@@ -7502,6 +7661,11 @@ mod tests {
             app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
         );
         assert!(research.dual_pol && research.propagation);
+        assert_eq!(
+            research.compute_preference,
+            crate::wrf_radar::SyntheticRadarComputePreference::NvidiaCuda,
+            "recipes preserve the user's execution preference"
+        );
         assert!(research.emit_quality_fields);
         assert_eq!(research.minimum_model_coverage_fraction, 0.0);
         assert!(research.validate_science_contract().is_ok());
@@ -7509,7 +7673,10 @@ mod tests {
 
     #[test]
     fn synth_radar_recipe_detection_marks_manual_edits_custom() {
-        let mut state = SyntheticRadarUiState::default();
+        let mut state = SyntheticRadarUiState {
+            compute_preference: crate::wrf_radar::SyntheticRadarComputePreference::Cpu,
+            ..SyntheticRadarUiState::default()
+        };
         assert_eq!(state.active_recipe(), Some(SyntheticRadarRecipe::StormView));
         state.apply_recipe(SyntheticRadarRecipe::RealRadar);
         assert_eq!(state.active_recipe(), Some(SyntheticRadarRecipe::RealRadar));
@@ -7520,6 +7687,37 @@ mod tests {
         );
         state.zdr_bias_db = 0.25;
         assert_eq!(state.active_recipe(), None);
+    }
+
+    #[test]
+    fn synth_radar_work_estimate_tracks_geometry_and_pulse_volume_rule() {
+        let default = SyntheticRadarWorkEstimate::from_state(&SyntheticRadarUiState::default());
+        assert_eq!(
+            default,
+            SyntheticRadarWorkEstimate {
+                tilt_count: 14,
+                rays_per_tilt: 720,
+                gates_per_ray: 920,
+                samples_per_gate: 1,
+                total_samples: 9_273_600,
+            }
+        );
+        assert!(default.summary().contains("9.3 million"));
+
+        let maximum = SyntheticRadarUiState {
+            max_range_km: 1_000.0,
+            auto_gate_spacing: false,
+            gate_spacing_m: 100.0,
+            include_low_tilt: true,
+            beam_integration: crate::wrf_radar::BeamIntegration::Reference,
+            ..SyntheticRadarUiState::default()
+        };
+        let maximum = SyntheticRadarWorkEstimate::from_state(&maximum);
+        assert_eq!(maximum.tilt_count, 15);
+        assert_eq!(maximum.gates_per_ray, 10_000);
+        assert_eq!(maximum.samples_per_gate, 27);
+        assert_eq!(maximum.total_samples, 2_916_000_000);
+        assert!(maximum.summary().contains("2.92 billion"));
     }
 
     /// The "Match gate size to grid resolution" checkbox flows from the UI state

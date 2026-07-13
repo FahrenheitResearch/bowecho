@@ -204,6 +204,47 @@ pub enum BeamIntegration {
     Reference,
 }
 
+impl BeamIntegration {
+    /// Number of deterministic antenna/range quadrature points evaluated for
+    /// every rendered radar gate. This is exposed for the WRF UI workload
+    /// estimate; the execution path uses the same rules in
+    /// [`quadrature_points`].
+    pub const fn pulse_volume_sample_count(self) -> usize {
+        match self {
+            Self::Center => 1,
+            Self::Balanced => 9,
+            Self::Reference => 27,
+        }
+    }
+}
+
+/// User preference for the native P3/ISHMAEL T-matrix execution backend.
+///
+/// This is a preference rather than output provenance: `Auto` may choose a
+/// qualified NVIDIA device, and every CUDA selection must retain a normal CPU
+/// fallback when the runtime or a requested operation is unavailable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntheticRadarComputePreference {
+    /// Prefer CUDA when a supported runtime/device is available, otherwise CPU.
+    #[default]
+    Auto,
+    /// Always run the portable CPU reference implementation.
+    Cpu,
+    /// Prefer the optional NVIDIA CUDA path, with automatic CPU fallback.
+    NvidiaCuda,
+}
+
+impl SyntheticRadarComputePreference {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Cpu => "CPU",
+            Self::NvidiaCuda => "NVIDIA CUDA",
+        }
+    }
+}
+
 /// User intent for a synthetic volume. Fine-grained controls remain editable,
 /// but named modes make it explicit whether a volume is model truth, a virtual
 /// instrument measurement, or a display-oriented presentation.
@@ -391,6 +432,10 @@ fn gaussian_beam_sigma_deg(fwhm_deg: f64) -> f64 {
 pub struct SyntheticRadarConfig {
     /// Named operating intent. This is also stamped in export provenance.
     pub simulation_mode: SimulationMode,
+    /// Preferred execution backend for the native P3/ISHMAEL property
+    /// T-matrix workload. It is intentionally excluded from the scientific
+    /// data fingerprint: parity-capable backends compute the same product.
+    pub compute_preference: SyntheticRadarComputePreference,
     /// Physical scan definition. The historical custom ladder remains the
     /// default; a Build 24 selection owns its rows, rates, periods, waveform,
     /// moment coverage and PRF-code provenance.
@@ -568,6 +613,7 @@ impl Default for SyntheticRadarConfig {
     fn default() -> Self {
         Self {
             simulation_mode: SimulationMode::Presentation,
+            compute_preference: SyntheticRadarComputePreference::Auto,
             scan_strategy: SyntheticScanStrategy::CustomLegacy,
             exact_replay_template: None,
             site_id: "WRF".to_string(),
@@ -3950,11 +3996,13 @@ const fn make_reference_quadrature() -> [QuadraturePoint; 27] {
 const REFERENCE_QUADRATURE: [QuadraturePoint; 27] = make_reference_quadrature();
 
 fn quadrature_points(mode: BeamIntegration) -> &'static [QuadraturePoint] {
-    match mode {
+    let points: &'static [QuadraturePoint] = match mode {
         BeamIntegration::Center => &CENTER_QUADRATURE,
         BeamIntegration::Balanced => &BALANCED_QUADRATURE,
         BeamIntegration::Reference => &REFERENCE_QUADRATURE,
-    }
+    };
+    debug_assert_eq!(points.len(), mode.pulse_volume_sample_count());
+    points
 }
 
 #[derive(Clone, Copy)]
@@ -9821,6 +9869,20 @@ mod tests {
     }
 
     #[test]
+    fn pulse_volume_sample_counts_match_the_execution_quadratures() {
+        for mode in [
+            BeamIntegration::Center,
+            BeamIntegration::Balanced,
+            BeamIntegration::Reference,
+        ] {
+            assert_eq!(
+                mode.pulse_volume_sample_count(),
+                quadrature_points(mode).len()
+            );
+        }
+    }
+
+    #[test]
     fn quadrature_tiers_leave_a_uniform_scene_invariant() {
         let fields = uniform_box_fields();
         let mut config = SyntheticRadarConfig {
@@ -10731,6 +10793,15 @@ mod tests {
             larger_memory_budget.data_fingerprint(),
             fingerprint,
             "memory budget gates execution but does not alter a successful sample"
+        );
+        let forced_cpu = SyntheticRadarConfig {
+            compute_preference: SyntheticRadarComputePreference::Cpu,
+            ..base.clone()
+        };
+        assert_eq!(
+            forced_cpu.data_fingerprint(),
+            fingerprint,
+            "execution preference does not alter the deterministic scientific product"
         );
 
         // Every data-affecting field must move the fingerprint. `differs`
