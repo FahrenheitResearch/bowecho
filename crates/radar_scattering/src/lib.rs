@@ -88,11 +88,12 @@ pub use particle::{
 pub use scheme_psd::{
     DEFAULT_ADDITIVE_ABSOLUTE_TOLERANCES, ISHMAEL_DELTA_RANGE, ISHMAEL_DENSITY_RANGE_KG_M3,
     ISHMAEL_GAMMA_SHAPE, ISHMAEL_MONOMER_SEMI_AXIS_M, ISHMAEL_PSD_REVISION, IshmaelPsd,
-    IshmaelPsdInput, IshmaelReconstructionAudit, PsdError, PsdFallSpeedAuthority,
-    PsdFallSpeedProvenance, PsdIntegrationAudit, PsdIntegrationConfig, PsdIntegrationError,
-    PsdIntegrationResult, PsdParticleDomain, PsdParticleNode, PsdParticleSupport,
-    PsdQuadratureLevel, PsdQuadratureRule, PsdSourceCategory, PsdSpheroidHabit,
+    IshmaelPsdInput, IshmaelReconstructionAudit, PreparedIshmaelPsdIntegration, PsdError,
+    PsdFallSpeedAuthority, PsdFallSpeedProvenance, PsdIntegrationAudit, PsdIntegrationConfig,
+    PsdIntegrationError, PsdIntegrationResult, PsdParticleDomain, PsdParticleNode,
+    PsdParticleSupport, PsdQuadratureLevel, PsdQuadratureRule, PsdSourceCategory, PsdSpheroidHabit,
     SCHEME_PSD_REVISION, SchemePsdRevision, analytic_gamma_moment, integrate_ishmael_psd,
+    prepare_ishmael_psd,
 };
 pub use science::{
     EffectiveMediumRule, KernelModel, MeltingModel, OrientationModel, ScienceError,

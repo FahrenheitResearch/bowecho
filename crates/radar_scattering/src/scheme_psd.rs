@@ -1067,25 +1067,230 @@ impl PsdIntegrationResult {
     }
 }
 
-/// Integrate an ISHMAEL PSD through a caller-supplied per-particle operator.
+/// Opaque, fully constructed ISHMAEL coarse/refined scattering workload.
 ///
-/// `evaluate_particle` must return all nine additive quantities normalized to
-/// exactly one particle per cubic metre. It is called for both the coarse and
-/// refined rules so the returned science carries an actual scattering-space
-/// convergence audit, not only a gamma-moment check. The callback must be
-/// deterministic and scientifically side-effect-free because those two rules
-/// use different node grids.
-pub fn integrate_ishmael_psd<F, E>(
+/// Preparation fixes both quadrature grids, their original per-rule node
+/// indices, support admission, and every analytic closure/audit quantity. It
+/// does not evaluate scattering. A backend may therefore stage the exposed
+/// ordered nodes while [`Self::finish`] remains the sole owner of population
+/// scaling, serial reduction, convergence gates, and final output validation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedIshmaelPsdIntegration {
+    distribution: IshmaelPsd,
+    config: PsdIntegrationConfig,
+    support: PsdParticleSupport,
+    fall_speed: PsdFallSpeedProvenance,
+    coarse: PreparedPsdRule,
+    refined: PreparedPsdRule,
+    upper_scaled_a: f64,
+    represented: MomentFractions,
+    omitted: MomentFractions,
+    tails: MomentFractions,
+    number_closure: f64,
+    mass_closure: f64,
+    d6_closure: f64,
+}
+
+impl PreparedIshmaelPsdIntegration {
+    /// Ordered supported nodes in the coarse convergence pass.
+    pub fn coarse_nodes(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (usize, PsdParticleNode)> + DoubleEndedIterator + '_ {
+        self.coarse
+            .nodes
+            .iter()
+            .copied()
+            .map(|node| (node.index(), node))
+    }
+
+    /// Ordered supported nodes in the refined convergence pass.
+    pub fn refined_nodes(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (usize, PsdParticleNode)> + DoubleEndedIterator + '_ {
+        self.refined
+            .nodes
+            .iter()
+            .copied()
+            .map(|node| (node.index(), node))
+    }
+
+    /// Complete callback order: every coarse node, followed by every refined
+    /// node. Level and original per-grid index remain explicit even when table
+    /// support excludes intervening quadrature nodes.
+    pub fn nodes(&self) -> impl Iterator<Item = (PsdQuadratureLevel, usize, PsdParticleNode)> + '_ {
+        self.coarse_nodes()
+            .map(|(index, node)| (PsdQuadratureLevel::Coarse, index, node))
+            .chain(
+                self.refined_nodes()
+                    .map(|(index, node)| (PsdQuadratureLevel::Refined, index, node)),
+            )
+    }
+
+    #[must_use]
+    pub fn node_count(&self, level: PsdQuadratureLevel) -> usize {
+        match level {
+            PsdQuadratureLevel::Coarse => self.coarse.nodes.len(),
+            PsdQuadratureLevel::Refined => self.refined.nodes.len(),
+        }
+    }
+
+    #[must_use]
+    pub const fn upper_scaled_a(&self) -> f64 {
+        self.upper_scaled_a
+    }
+
+    /// Analytic/quadrature closure errors already fixed by preparation. The
+    /// configured fail-closed limits are deliberately enforced only in
+    /// [`Self::finish`], matching the original post-evaluation ordering.
+    #[must_use]
+    pub const fn closure_relative_errors(&self) -> [f64; 3] {
+        [self.number_closure, self.mass_closure, self.d6_closure]
+    }
+
+    /// Consume one per-particle response for every exposed node and finish in
+    /// the exact scalar CPU order used before workload preparation existed.
+    pub fn finish<F, E>(
+        &self,
+        mut evaluate_particle: F,
+    ) -> Result<PsdIntegrationResult, PsdIntegrationError<E>>
+    where
+        F: FnMut(PsdQuadratureLevel, usize, &PsdParticleNode) -> Result<AdditiveScattering, E>,
+        E: Error + 'static,
+    {
+        let coarse = finish_prepared_rule(
+            &self.coarse,
+            PsdQuadratureLevel::Coarse,
+            &mut evaluate_particle,
+        )?;
+        let refined = finish_prepared_rule(
+            &self.refined,
+            PsdQuadratureLevel::Refined,
+            &mut evaluate_particle,
+        )?;
+
+        for (moment, error) in [
+            ("number", self.number_closure),
+            ("mass", self.mass_closure),
+            ("equivalent-volume D6", self.d6_closure),
+        ] {
+            if error > self.config.maximum_quadrature_closure_error {
+                return Err(PsdError::QuadratureClosure {
+                    moment,
+                    relative_error: error,
+                    maximum: self.config.maximum_quadrature_closure_error,
+                }
+                .into());
+            }
+        }
+
+        for (moment, omitted, maximum) in [
+            (
+                "number",
+                self.omitted.number,
+                self.config.maximum_domain_omitted_number_fraction,
+            ),
+            (
+                "mass",
+                self.omitted.mass,
+                self.config.maximum_domain_omitted_mass_fraction,
+            ),
+            (
+                "equivalent-volume D6",
+                self.omitted.d6,
+                self.config.maximum_domain_omitted_d6_fraction,
+            ),
+        ] {
+            if omitted > maximum {
+                return Err(PsdError::DomainOmission {
+                    moment,
+                    fraction: omitted,
+                    maximum,
+                }
+                .into());
+            }
+        }
+
+        let coarse_components = coarse.additive.components();
+        let refined_components = refined.additive.components();
+        let mut maximum_additive_convergence_error = 0.0_f64;
+        let mut maximum_additive_convergence_component = 0;
+        for index in 0..AdditiveScattering::COMPONENT_COUNT {
+            let absolute_error = (coarse_components[index] - refined_components[index]).abs();
+            let magnitude = coarse_components[index]
+                .abs()
+                .max(refined_components[index].abs());
+            let allowed = self.config.additive_absolute_tolerances[index]
+                + self.config.maximum_additive_convergence_error * magnitude;
+            let error = relative_error(
+                coarse_components[index],
+                refined_components[index],
+                self.config.additive_absolute_tolerances[index],
+            );
+            if error > maximum_additive_convergence_error {
+                maximum_additive_convergence_error = error;
+                maximum_additive_convergence_component = index;
+            }
+            if absolute_error > allowed {
+                return Err(PsdError::AdditiveConvergence {
+                    component: index,
+                    absolute_error,
+                    absolute_tolerance: self.config.additive_absolute_tolerances[index],
+                    relative_tolerance: self.config.maximum_additive_convergence_error,
+                }
+                .into());
+            }
+        }
+
+        let accumulator = refined
+            .additive
+            .to_polar_accumulator_quantities()
+            .map_err(PsdIntegrationError::Output)?;
+        let audit = PsdIntegrationAudit {
+            config: self.config,
+            support: self.support,
+            revision: self.config.revision,
+            quadrature: self.config.quadrature,
+            fall_speed: self.fall_speed,
+            reconstruction: self.distribution.reconstruction,
+            coarse_nodes_evaluated: coarse.nodes_evaluated,
+            refined_nodes_evaluated: refined.nodes_evaluated,
+            upper_scaled_a: self.upper_scaled_a,
+            expected_number_density_m3: self.distribution.number_density_m3(),
+            expected_mass_concentration_kg_m3: self.distribution.mass_concentration_kg_m3(),
+            expected_d6_concentration_m3: self.distribution.number_density_m3()
+                * self.distribution.mean_equivolume_diameter_sixth_m6,
+            represented_number_fraction: self.represented.number,
+            represented_mass_fraction: self.represented.mass,
+            represented_d6_fraction: self.represented.d6,
+            domain_omitted_number_fraction: self.omitted.number,
+            domain_omitted_mass_fraction: self.omitted.mass,
+            domain_omitted_d6_fraction: self.omitted.d6,
+            truncation_tail_number_fraction: self.tails.number,
+            truncation_tail_mass_fraction: self.tails.mass,
+            truncation_tail_d6_fraction: self.tails.d6,
+            number_closure_relative_error: self.number_closure,
+            mass_closure_relative_error: self.mass_closure,
+            d6_closure_relative_error: self.d6_closure,
+            maximum_additive_convergence_error,
+            maximum_additive_convergence_component,
+        };
+        Ok(PsdIntegrationResult {
+            additive: refined.additive,
+            accumulator,
+            audit,
+        })
+    }
+}
+
+/// Construct both ordered ISHMAEL convergence grids without evaluating any
+/// scattering. Analytic support/tail facts and quadrature closure are frozen
+/// into the returned opaque workload for backend-independent finishing.
+pub fn prepare_ishmael_psd(
     distribution: &IshmaelPsd,
     config: PsdIntegrationConfig,
     support: PsdParticleSupport,
     fall_speed: PsdFallSpeedProvenance,
-    mut evaluate_particle: F,
-) -> Result<PsdIntegrationResult, PsdIntegrationError<E>>
-where
-    F: FnMut(&PsdParticleNode) -> Result<AdditiveScattering, E>,
-    E: Error + 'static,
-{
+) -> Result<PreparedIshmaelPsdIntegration, PsdError> {
     let upper_scaled_a = tail_cutoff(*distribution, config)?;
     let support_intervals = distribution.support_intervals(support, upper_scaled_a);
     let tails = MomentFractions {
@@ -1106,141 +1311,65 @@ where
         d6: (1.0 - tails.d6 - represented.d6).max(0.0),
     };
 
-    let coarse = integrate_rule(
+    let coarse = prepare_rule(
         *distribution,
         usize::from(config.coarse_panels),
         upper_scaled_a,
         support,
         &support_intervals,
         config.maximum_refined_nodes as usize,
-        PsdQuadratureLevel::Coarse,
-        &mut evaluate_particle,
     )?;
-    let refined = integrate_rule(
+    let refined = prepare_rule(
         *distribution,
         usize::from(config.coarse_panels) * REFINEMENT_FACTOR,
         upper_scaled_a,
         support,
         &support_intervals,
         config.maximum_refined_nodes as usize,
-        PsdQuadratureLevel::Refined,
-        &mut evaluate_particle,
     )?;
 
     let number_closure = (refined.all.number + tails.number - 1.0).abs();
     let mass_closure = (refined.all.mass + tails.mass - 1.0).abs();
     let d6_closure = (refined.all.d6 + tails.d6 - 1.0).abs();
-    for (moment, error) in [
-        ("number", number_closure),
-        ("mass", mass_closure),
-        ("equivalent-volume D6", d6_closure),
-    ] {
-        if error > config.maximum_quadrature_closure_error {
-            return Err(PsdError::QuadratureClosure {
-                moment,
-                relative_error: error,
-                maximum: config.maximum_quadrature_closure_error,
-            }
-            .into());
-        }
-    }
-
-    for (moment, omitted, maximum) in [
-        (
-            "number",
-            omitted.number,
-            config.maximum_domain_omitted_number_fraction,
-        ),
-        (
-            "mass",
-            omitted.mass,
-            config.maximum_domain_omitted_mass_fraction,
-        ),
-        (
-            "equivalent-volume D6",
-            omitted.d6,
-            config.maximum_domain_omitted_d6_fraction,
-        ),
-    ] {
-        if omitted > maximum {
-            return Err(PsdError::DomainOmission {
-                moment,
-                fraction: omitted,
-                maximum,
-            }
-            .into());
-        }
-    }
-
-    let coarse_components = coarse.additive.components();
-    let refined_components = refined.additive.components();
-    let mut maximum_additive_convergence_error = 0.0_f64;
-    let mut maximum_additive_convergence_component = 0;
-    for index in 0..AdditiveScattering::COMPONENT_COUNT {
-        let absolute_error = (coarse_components[index] - refined_components[index]).abs();
-        let magnitude = coarse_components[index]
-            .abs()
-            .max(refined_components[index].abs());
-        let allowed = config.additive_absolute_tolerances[index]
-            + config.maximum_additive_convergence_error * magnitude;
-        let error = relative_error(
-            coarse_components[index],
-            refined_components[index],
-            config.additive_absolute_tolerances[index],
-        );
-        if error > maximum_additive_convergence_error {
-            maximum_additive_convergence_error = error;
-            maximum_additive_convergence_component = index;
-        }
-        if absolute_error > allowed {
-            return Err(PsdError::AdditiveConvergence {
-                component: index,
-                absolute_error,
-                absolute_tolerance: config.additive_absolute_tolerances[index],
-                relative_tolerance: config.maximum_additive_convergence_error,
-            }
-            .into());
-        }
-    }
-
-    let accumulator = refined
-        .additive
-        .to_polar_accumulator_quantities()
-        .map_err(PsdIntegrationError::Output)?;
-    let audit = PsdIntegrationAudit {
+    Ok(PreparedIshmaelPsdIntegration {
+        distribution: *distribution,
         config,
         support,
-        revision: config.revision,
-        quadrature: config.quadrature,
         fall_speed,
-        reconstruction: distribution.reconstruction,
-        coarse_nodes_evaluated: coarse.nodes_evaluated,
-        refined_nodes_evaluated: refined.nodes_evaluated,
+        coarse,
+        refined,
         upper_scaled_a,
-        expected_number_density_m3: distribution.number_density_m3(),
-        expected_mass_concentration_kg_m3: distribution.mass_concentration_kg_m3(),
-        expected_d6_concentration_m3: distribution.number_density_m3()
-            * distribution.mean_equivolume_diameter_sixth_m6,
-        represented_number_fraction: represented.number,
-        represented_mass_fraction: represented.mass,
-        represented_d6_fraction: represented.d6,
-        domain_omitted_number_fraction: omitted.number,
-        domain_omitted_mass_fraction: omitted.mass,
-        domain_omitted_d6_fraction: omitted.d6,
-        truncation_tail_number_fraction: tails.number,
-        truncation_tail_mass_fraction: tails.mass,
-        truncation_tail_d6_fraction: tails.d6,
-        number_closure_relative_error: number_closure,
-        mass_closure_relative_error: mass_closure,
-        d6_closure_relative_error: d6_closure,
-        maximum_additive_convergence_error,
-        maximum_additive_convergence_component,
-    };
-    Ok(PsdIntegrationResult {
-        additive: refined.additive,
-        accumulator,
-        audit,
+        represented,
+        omitted,
+        tails,
+        number_closure,
+        mass_closure,
+        d6_closure,
     })
+}
+
+/// Integrate an ISHMAEL PSD through a caller-supplied per-particle operator.
+///
+/// `evaluate_particle` must return all nine additive quantities normalized to
+/// exactly one particle per cubic metre. It is called for both the coarse and
+/// refined rules so the returned science carries an actual scattering-space
+/// convergence audit, not only a gamma-moment check. The callback must be
+/// deterministic and scientifically side-effect-free because those two rules
+/// use different node grids.
+pub fn integrate_ishmael_psd<F, E>(
+    distribution: &IshmaelPsd,
+    config: PsdIntegrationConfig,
+    support: PsdParticleSupport,
+    fall_speed: PsdFallSpeedProvenance,
+    mut evaluate_particle: F,
+) -> Result<PsdIntegrationResult, PsdIntegrationError<E>>
+where
+    F: FnMut(&PsdParticleNode) -> Result<AdditiveScattering, E>,
+    E: Error + 'static,
+{
+    let prepared = prepare_ishmael_psd(distribution, config, support, fall_speed)
+        .map_err(PsdIntegrationError::Psd)?;
+    prepared.finish(|_, _, node| evaluate_particle(node))
 }
 
 /// Analytic raw moment of a gamma number distribution.
@@ -1269,37 +1398,39 @@ pub fn analytic_gamma_moment(
     )
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct MomentFractions {
     number: f64,
     mass: f64,
     d6: f64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PreparedPsdRule {
+    /// Only nodes admitted by the explicit table-support contract require a
+    /// scattering result. Their `PsdParticleNode::index` values still refer to
+    /// the complete quadrature grid, including unsupported intervening nodes.
+    nodes: Vec<PsdParticleNode>,
+    all: MomentFractions,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RuleAccumulation {
     additive: AdditiveScattering,
     nodes_evaluated: usize,
-    all: MomentFractions,
 }
 
-// Each argument is an independent part of the quadrature rule or its audit
-// context; bundling them would only obscure the coarse/refined call sites.
+// Each argument is an independent part of quadrature construction or its
+// audit context; bundling them would obscure the coarse/refined call sites.
 #[allow(clippy::too_many_arguments)]
-fn integrate_rule<F, E>(
+fn prepare_rule(
     distribution: IshmaelPsd,
     panels: usize,
     upper_scaled_a: f64,
     support: PsdParticleSupport,
     support_intervals: &[SupportInterval],
     maximum_nodes: usize,
-    level: PsdQuadratureLevel,
-    evaluate_particle: &mut F,
-) -> Result<RuleAccumulation, PsdIntegrationError<E>>
-where
-    F: FnMut(&PsdParticleNode) -> Result<AdditiveScattering, E>,
-    E: Error + 'static,
-{
+) -> Result<PreparedPsdRule, PsdError> {
     let gamma_normalization = ln_gamma(ISHMAEL_GAMMA_SHAPE)?.exp();
     let panel_width = upper_scaled_a / panels as f64;
     let mut breakpoints = Vec::with_capacity(panels + 1 + 2 * support_intervals.len());
@@ -1323,12 +1454,10 @@ where
         return Err(PsdError::NodeBudgetExceeded {
             required: required_nodes,
             maximum: maximum_nodes,
-        }
-        .into());
+        });
     }
-    let mut additive = AdditiveScattering::default();
+    let mut nodes = Vec::with_capacity(required_nodes);
     let mut all = MomentFractions::default();
-    let mut nodes_evaluated = 0;
     let mut index = 0;
 
     for segment in breakpoints.windows(2) {
@@ -1356,29 +1485,44 @@ where
             add_fractions(&mut all, fractions);
 
             if support.contains(node) {
-                let per_particle = evaluate_particle(&node).map_err(|source| {
-                    PsdIntegrationError::NodeEvaluation {
-                        level,
-                        node_index: index,
-                        source,
-                    }
-                })?;
-                let contribution = per_particle
-                    .checked_scale(node.number_density_m3)
-                    .map_err(PsdIntegrationError::Output)?;
-                additive = additive
-                    .checked_add(contribution)
-                    .map_err(PsdIntegrationError::Output)?;
-                nodes_evaluated += 1;
+                nodes.push(node);
             }
             index += 1;
         }
     }
 
+    Ok(PreparedPsdRule { nodes, all })
+}
+
+fn finish_prepared_rule<F, E>(
+    prepared: &PreparedPsdRule,
+    level: PsdQuadratureLevel,
+    evaluate_particle: &mut F,
+) -> Result<RuleAccumulation, PsdIntegrationError<E>>
+where
+    F: FnMut(PsdQuadratureLevel, usize, &PsdParticleNode) -> Result<AdditiveScattering, E>,
+    E: Error + 'static,
+{
+    let mut additive = AdditiveScattering::default();
+    for node in &prepared.nodes {
+        let node_index = node.index();
+        let per_particle = evaluate_particle(level, node_index, node).map_err(|source| {
+            PsdIntegrationError::NodeEvaluation {
+                level,
+                node_index,
+                source,
+            }
+        })?;
+        let contribution = per_particle
+            .checked_scale(node.number_density_m3)
+            .map_err(PsdIntegrationError::Output)?;
+        additive = additive
+            .checked_add(contribution)
+            .map_err(PsdIntegrationError::Output)?;
+    }
     Ok(RuleAccumulation {
         additive,
-        nodes_evaluated,
-        all,
+        nodes_evaluated: prepared.nodes.len(),
     })
 }
 
@@ -2207,5 +2351,99 @@ mod tests {
             error,
             PsdIntegrationError::Psd(PsdError::TailToleranceUnreachable { .. })
         ));
+    }
+
+    #[test]
+    fn prepared_workload_preserves_level_index_and_callback_order() {
+        let prepared = prepare_ishmael_psd(
+            &oblate_distribution(),
+            PsdIntegrationConfig::default(),
+            PsdParticleSupport::default(),
+            synthetic_fall_speed_provenance(),
+        )
+        .unwrap();
+        assert_eq!(prepared.node_count(PsdQuadratureLevel::Coarse), 72);
+        assert_eq!(prepared.node_count(PsdQuadratureLevel::Refined), 136);
+
+        let expected = prepared
+            .nodes()
+            .map(|(level, index, node)| {
+                assert_eq!(node.index(), index);
+                (level, index, node.scaled_a().to_bits())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            expected[..72]
+                .iter()
+                .all(|(level, ..)| *level == PsdQuadratureLevel::Coarse)
+        );
+        assert!(
+            expected[72..]
+                .iter()
+                .all(|(level, ..)| *level == PsdQuadratureLevel::Refined)
+        );
+
+        let mut callback_order = Vec::new();
+        prepared
+            .finish(|level, index, node| {
+                callback_order.push((level, index, node.scaled_a().to_bits()));
+                Ok::<_, Infallible>(synthetic_per_particle(node))
+            })
+            .unwrap();
+        assert_eq!(callback_order, expected);
+    }
+
+    #[test]
+    fn prepared_cpu_finish_is_bit_identical_to_frozen_pre_refactor_result() {
+        const EXPECTED_COMPONENT_BITS: [u64; AdditiveScattering::COMPONENT_COUNT] = [
+            4_624_366_135_188_360_613,
+            4_622_730_831_761_640_179,
+            4_621_913_180_048_279_949,
+            0,
+            4_570_454_029_199_748_885,
+            4_533_201_175_231_653_355,
+            4_531_784_465_286_792_376,
+            4_621_728_900_563_117_324,
+            4_619_695_587_033_046_629,
+        ];
+        const EXPECTED_CLOSURE_BITS: [u64; 3] = [
+            4_409_129_588_311_982_080,
+            4_447_716_880_169_304_064,
+            4_422_341_320_031_338_496,
+        ];
+        const EXPECTED_CONVERGENCE_BITS: u64 = 4_497_224_872_953_735_180;
+
+        let distribution = oblate_distribution();
+        let config = PsdIntegrationConfig::default();
+        let support = PsdParticleSupport::default();
+        let fall_speed = synthetic_fall_speed_provenance();
+        let prepared = prepare_ishmael_psd(&distribution, config, support, fall_speed).unwrap();
+        let direct = prepared
+            .finish(|_, _, node| Ok::<_, Infallible>(synthetic_per_particle(node)))
+            .unwrap();
+        assert_eq!(
+            direct.additive().components().map(f64::to_bits),
+            EXPECTED_COMPONENT_BITS
+        );
+        let audit = direct.audit();
+        assert_eq!(
+            [
+                audit.number_closure_relative_error.to_bits(),
+                audit.mass_closure_relative_error.to_bits(),
+                audit.d6_closure_relative_error.to_bits(),
+            ],
+            EXPECTED_CLOSURE_BITS
+        );
+        assert_eq!(
+            audit.maximum_additive_convergence_error.to_bits(),
+            EXPECTED_CONVERGENCE_BITS
+        );
+        assert_eq!(audit.maximum_additive_convergence_component, 4);
+
+        let delegated = integrate_ishmael_psd(&distribution, config, support, fall_speed, |node| {
+            Ok::<_, Infallible>(synthetic_per_particle(node))
+        })
+        .unwrap();
+        assert_eq!(delegated, direct);
     }
 }
