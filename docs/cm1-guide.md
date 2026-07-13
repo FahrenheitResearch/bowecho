@@ -11,36 +11,41 @@ cell. BowEcho therefore never treats `ctrlat`/`ctrlon` as geolocation. Every
 map or radar action requires a user-supplied domain-center latitude and
 longitude, and provenance records that choice.
 
-## Try the public compatibility file
+## Try the public compatibility files
 
-The development sample is:
-
-`C:\Users\drew\Downloads\CM1-Wang2020-old-dx25-nopert-cm1out_000001.nc`
-
-The checked file is 30,532,830 bytes with SHA-256
-`898A72062E37761586F5B3FD24768B30BDF503436166A033D4F488B60F411166`.
-It is a real CM1 r19.1 native-output file from the Penn State Data Commons
+The Penn State Data Commons hosts real CM1 r19.1 native output from the
 [Wang et al. idealized-tornado simulation
-collection](https://www.datacommons.psu.edu/download/meteorology/wang-et-al-idealized-tornado-simulations-turbulence-memory-study-2020/old-dx25-nopert/run/).
+collection](https://www.datacommons.psu.edu/download/meteorology/wang-et-al-idealized-tornado-simulations-turbulence-memory-study-2020/).
 It is not bundled with BowEcho.
 
-This particular file is a useful compatibility sample, not a radar-ready
-sample. It contains one 320 × 320 × 152 output record with native scalar and
-staggered dynamical fields, but it does not contain 3-D `dbz`, physical
-`zhval`, terrain `zs`, total pressure `prs`, or water-vapor mixing ratio `qv`.
-Consequently:
+Two small time-zero files are useful for schema compatibility, with an
+important limitation:
 
-- native field import and native column browsing work;
-- the meteorological-readiness panel explains why a thermodynamic profile is
-  unavailable;
-- **Build native REF/VEL in Radar** remains unavailable for this file.
+- [`old-dx25-nopert/run/cm1out_000001.nc`](https://www.datacommons.psu.edu/download/meteorology/wang-et-al-idealized-tornado-simulations-turbulence-memory-study-2020/old-dx25-nopert/run/cm1out_000001.nc)
+  is 30,532,830 bytes with SHA-256
+  `898A72062E37761586F5B3FD24768B30BDF503436166A033D4F488B60F411166`.
+  It is an unperturbed initial condition: useful meteorological planes are
+  spatially constant or zero. It verifies legacy-file reading but deliberately
+  produces a flat plot.
+- [`old-dx25/run/cm1out_000001.nc`](https://www.datacommons.psu.edu/download/meteorology/wang-et-al-idealized-tornado-simulations-turbulence-memory-study-2020/old-dx25/run/cm1out_000001.nc)
+  is 113,631,372 bytes with SHA-256
+  `28139E66B8B9C0F9D55A62E54DBA2C907B66689B40866D1A9D4BB78E1314F451`.
+  It contains a visible `thpert` perturbation field and is the better quick
+  horizontal-plot check. It is still a single time-zero record, not an evolved
+  storm.
+
+Both files are dry (`imoist=0`) and omit 3-D `dbz`, physical `zhval`, terrain
+`zs`, total pressure `prs`, and water-vapor mixing ratio `qv`. They cannot
+exercise thermodynamic soundings or native simulated radar. Those features
+require an evolved moist output written with the fields listed later in this
+guide.
 
 To exercise the supported path:
 
-1. Open **Windows > CM1**, choose **Open cm1out file…**, and select the file
-   above.
-2. Under **Native horizontal plane**, choose `th`, `uinterp`, or another
-   available field. Select the output record and, for a 3-D field, a native
+1. Open **Windows > CM1**, choose **Open cm1out file…**, and select the
+   perturbed compatibility file above.
+2. Under **Native horizontal plane**, choose `thpert` for an immediately
+   visible field. Select the output record and, for a 3-D field, a native
    level.
 3. Expand **Native 3-D column / profile**, choose a scalar `x`/`y` cell, and
    select **Read native column**. This preserves native levels; it does not
@@ -52,10 +57,10 @@ To exercise the supported path:
    Models**. The imported field enters the normal Models/map/native-plot
    workflow with a CM1 provenance sidecar.
 
-Because this sample contains one output record, it cannot demonstrate a loop.
-A multi-record CM1 file exposes **All N records (loop)** and writes an ordered
-exact-time run when every record has a valid whole-second time and shares the
-same placed grid.
+Because these samples contain one output record, they cannot demonstrate a
+loop. A multi-record CM1 file exposes **All N records (loop)** and writes an
+ordered exact-time run when every record has a valid whole-second time and
+shares the same placed grid.
 
 ## Placement and moving domains
 
