@@ -4286,6 +4286,7 @@ struct BeamColumnPoint {
     latitude: f32,
     longitude: f32,
     z_msl: f64,
+    geometry: BeamGeometryPoint,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4322,6 +4323,7 @@ fn beam_column_point(
         latitude: latitude as f32,
         longitude: longitude as f32,
         z_msl,
+        geometry,
     })
 }
 
@@ -4504,6 +4506,7 @@ struct RawGateColumnBatch {
     first_gate: usize,
     gate_count: usize,
     points: Vec<ResolvedBeamSamplePoint>,
+    center_point_index: Option<usize>,
     locations: Vec<BeamColumnPoint>,
     samples: Vec<Option<ColumnSample>>,
 }
@@ -4547,6 +4550,21 @@ impl RawGateColumnBatch {
             .copied()
             .ok_or_else(|| "raw T-matrix gate-batch storage is incomplete".to_owned())
     }
+
+    fn center_geometry(&self, gate_index: usize) -> Result<Option<BeamGeometryPoint>, String> {
+        self.center_point_index
+            .map(|point_index| {
+                self.location(gate_index, point_index)
+                    .map(|location| location.geometry)
+            })
+            .transpose()
+    }
+}
+
+fn exact_center_point_index(points: &[ResolvedBeamSamplePoint]) -> Option<usize> {
+    points.iter().position(|point| {
+        point.az_sigma == 0.0 && point.el_sigma == 0.0 && point.range_offset_m == 0.0
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4578,6 +4596,7 @@ fn build_raw_gate_column_batch(
     if points.is_empty() {
         return Err("raw T-matrix gate batch requires at least one beam sample point".to_owned());
     }
+    let center_point_index = exact_center_point_index(&points);
     let work_count = gate_count
         .checked_mul(points.len())
         .ok_or_else(|| "raw T-matrix gate-batch work size overflowed".to_owned())?;
@@ -4681,6 +4700,7 @@ fn build_raw_gate_column_batch(
         first_gate,
         gate_count,
         points,
+        center_point_index,
         locations,
         samples,
     })
@@ -5335,8 +5355,16 @@ fn build_cut(
                     check_synthetic_radar_cancel(cancel)?;
                 }
                 let slant_m = f64::from(gate_range.first_gate_m) + gate as f64 * spacing;
-                let center_geometry =
-                    beam_geometry.point(ray_elevation_deg, &gate_range, gate, 0.0, slant_m)?;
+                let cached_center_geometry = match raw_batch.as_ref() {
+                    Some(batch) => batch.center_geometry(gate)?,
+                    None => None,
+                };
+                let center_geometry = match cached_center_geometry {
+                    Some(geometry) => geometry,
+                    None => {
+                        beam_geometry.point(ray_elevation_deg, &gate_range, gate, 0.0, slant_m)?
+                    }
+                };
                 let beam_height_m = center_geometry.height_above_radar_m;
                 let ground_m = center_geometry.ground_range_m;
                 let sampled = sample_gate_with_quality_instrument(
@@ -10877,6 +10905,48 @@ mod tests {
             assert!((1..=RAW_TMATRIX_PIPELINE_MAX_GATE_CHUNK).contains(&gates));
             assert!(gates.saturating_mul(point_count) <= RAW_TMATRIX_PIPELINE_TARGET_COLUMNS);
         }
+    }
+
+    #[test]
+    fn raw_tmatrix_batches_identify_exact_center_geometry() {
+        for (mode, expected_index) in [
+            (BeamIntegration::Center, 0),
+            (BeamIntegration::Balanced, 0),
+            (BeamIntegration::Reference, 13),
+        ] {
+            let config = SyntheticRadarConfig {
+                beam_integration: mode,
+                ..SyntheticRadarConfig::default()
+            };
+            let points = resolved_beam_sample_points(&config, None, 250.0);
+            assert_eq!(exact_center_point_index(&points), Some(expected_index));
+        }
+
+        let geometry = BeamGeometryPoint {
+            ground_range_m: 1_234.5,
+            height_above_radar_m: 67.25,
+        };
+        let batch = RawGateColumnBatch {
+            first_gate: 7,
+            gate_count: 1,
+            points: vec![ResolvedBeamSamplePoint {
+                az_sigma: 0.0,
+                el_sigma: 0.0,
+                range_offset_m: 0.0,
+                weight: 1.0,
+            }],
+            center_point_index: Some(0),
+            locations: vec![BeamColumnPoint {
+                azimuth_deg: 90.0,
+                elevation_deg: 0.5,
+                latitude: 39.0,
+                longitude: -95.0,
+                z_msl: 500.0,
+                geometry,
+            }],
+            samples: vec![None],
+        };
+        assert_eq!(batch.center_geometry(7).unwrap(), Some(geometry));
     }
 
     #[test]
