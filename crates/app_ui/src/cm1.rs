@@ -546,6 +546,50 @@ pub struct Cm1ThermodynamicColumn {
     pub provenance: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cm1TerrainPolicy {
+    /// Require CM1's official `zs` surface-height field.
+    RequireNative,
+    /// Explicit user choice for an idealized flat domain when `zs` was not
+    /// written. All terrain values become zero in the CM1 model-z datum.
+    AssumeFlatModelZero,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cm1RadarFieldSources {
+    pub reflectivity: String,
+    pub model_height: String,
+    pub terrain: String,
+    pub u: String,
+    pub v: String,
+    pub w: String,
+}
+
+/// A validated CM1 scalar-grid atmosphere ready for BowEcho's polar radar
+/// sampler. Heights and terrain deliberately retain the name `model_z`: CM1
+/// does not declare an MSL datum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cm1RadarScene {
+    pub nx: usize,
+    pub ny: usize,
+    pub nz: usize,
+    pub lat_deg: Vec<f32>,
+    pub lon_deg: Vec<f32>,
+    pub model_z_m: Vec<f32>,
+    pub dbz: Vec<f32>,
+    pub u_east_mps: Vec<f32>,
+    pub v_north_mps: Vec<f32>,
+    pub w_mps: Vec<f32>,
+    pub terrain_model_z_m: Vec<f32>,
+    pub dx_m: Option<f64>,
+    pub valid_time_utc: DateTime<Utc>,
+    pub time_index: usize,
+    pub placement: Cm1Placement,
+    pub flat_terrain_assumed: bool,
+    pub field_sources: Cm1RadarFieldSources,
+    pub provenance: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Cm1Error {
     #[error("NetCDF read error: {0}")]
@@ -613,6 +657,9 @@ pub enum Cm1Error {
 
     #[error("CM1 thermodynamic profile unavailable: {0}")]
     Thermodynamic(String),
+
+    #[error("CM1 radar scene unavailable: {0}")]
+    RadarScene(String),
 }
 
 /// Inspect a file from disk and return its native CM1 inventory.
@@ -1716,33 +1763,7 @@ pub fn thermodynamic_readiness(inventory: &Cm1Inventory) -> Cm1ThermodynamicRead
             reason: reason.clone(),
         },
     };
-    let wind_frame_correction = match &inventory.motion.domain_motion {
-        Cm1DomainMotion::Static => Cm1Availability::Available(
-            Cm1WindFrameCorrection::StationaryDomain,
-        ),
-        Cm1DomainMotion::ExplicitDisplacement { .. } | Cm1DomainMotion::Unresolved { .. } => {
-            match (
-                inventory.motion.east_velocity_mps.available(),
-                inventory.motion.north_velocity_mps.available(),
-            ) {
-                (Some(east_mps), Some(north_mps))
-                    if east_mps.len() == inventory.time.record_count
-                        && north_mps.len() == inventory.time.record_count =>
-                {
-                    Cm1Availability::Available(Cm1WindFrameCorrection::AddDomainVelocity {
-                        east_mps: east_mps.clone(),
-                        north_mps: north_mps.clone(),
-                        provenance: "official CM1 umove/vmove added to grid-relative u/v"
-                            .to_string(),
-                    })
-                }
-                _ => Cm1Availability::Unavailable {
-                    reason: "moving-domain u/v cannot be converted to east/north winds because complete unit-bearing umove/vmove records are unavailable"
-                        .to_string(),
-                },
-            }
-        }
-    };
+    let wind_frame_correction = wind_frame_correction(inventory);
     let core_ready = potential_temperature.available().is_some()
         && pressure.available().is_some()
         && water_vapor_mixing_ratio.available().is_some()
@@ -1768,6 +1789,36 @@ pub fn thermodynamic_readiness(inventory: &Cm1Inventory) -> Cm1ThermodynamicRead
         model_level_height,
         wind_frame_correction,
         sounding_viewer,
+    }
+}
+
+fn wind_frame_correction(inventory: &Cm1Inventory) -> Cm1Availability<Cm1WindFrameCorrection> {
+    match &inventory.motion.domain_motion {
+        Cm1DomainMotion::Static => {
+            Cm1Availability::Available(Cm1WindFrameCorrection::StationaryDomain)
+        }
+        Cm1DomainMotion::ExplicitDisplacement { .. } | Cm1DomainMotion::Unresolved { .. } => {
+            match (
+                inventory.motion.east_velocity_mps.available(),
+                inventory.motion.north_velocity_mps.available(),
+            ) {
+                (Some(east_mps), Some(north_mps))
+                    if east_mps.len() == inventory.time.record_count
+                        && north_mps.len() == inventory.time.record_count =>
+                {
+                    Cm1Availability::Available(Cm1WindFrameCorrection::AddDomainVelocity {
+                        east_mps: east_mps.clone(),
+                        north_mps: north_mps.clone(),
+                        provenance: "official CM1 umove/vmove added to grid-relative u/v"
+                            .to_string(),
+                    })
+                }
+                _ => Cm1Availability::Unavailable {
+                    reason: "moving-domain u/v cannot be converted to east/north winds because complete unit-bearing umove/vmove records are unavailable"
+                        .to_string(),
+                },
+            }
+        }
     }
 }
 
@@ -2038,6 +2089,519 @@ pub fn read_thermodynamic_column(
         ),
         constants,
     })
+}
+
+pub fn read_radar_scene(
+    nc: &NcFile,
+    inventory: &Cm1Inventory,
+    placement: &Cm1Placement,
+    time_index: usize,
+    terrain_policy: Cm1TerrainPolicy,
+) -> Result<Cm1RadarScene, Cm1Error> {
+    read_radar_scene_reporting(
+        nc,
+        inventory,
+        placement,
+        time_index,
+        terrain_policy,
+        &|_| {},
+    )
+}
+
+/// Build a scalar-grid CM1 atmosphere for the existing polar radar sampler.
+/// This first practical adapter is deliberately limited to native 3-D `dbz`;
+/// it does not extrude 2-D `cref` and does not synthesize dual-pol fields.
+pub fn read_radar_scene_reporting(
+    nc: &NcFile,
+    inventory: &Cm1Inventory,
+    placement: &Cm1Placement,
+    time_index: usize,
+    terrain_policy: Cm1TerrainPolicy,
+    progress: &dyn Fn(&str),
+) -> Result<Cm1RadarScene, Cm1Error> {
+    match &inventory.file_layout {
+        Cm1FileLayout::CompleteDomain { .. } => {}
+        Cm1FileLayout::MpiTile { .. } => {
+            return Err(Cm1Error::RadarScene(
+                "one output_filetype=3 MPI tile cannot become a radar scene; assemble the complete domain first"
+                    .to_string(),
+            ));
+        }
+        Cm1FileLayout::Unresolved { reason } => {
+            return Err(Cm1Error::RadarScene(format!(
+                "file layout is unresolved: {reason}"
+            )));
+        }
+    }
+    let nx = inventory.axes.xh.raw_values.len();
+    let ny = inventory.axes.yh.raw_values.len();
+    let nz = inventory.axes.zh.raw_values.len();
+    if nx == 0 || ny == 0 || nz < 2 {
+        return Err(Cm1Error::RadarScene(format!(
+            "radar sampling requires a nonempty horizontal grid and at least two model levels, got {nx}x{ny}x{nz}"
+        )));
+    }
+    let reflectivity = radar_field(
+        inventory,
+        "dbz",
+        &[Cm1VariableRole::NativeScalar3D],
+        "dBZ",
+        "official native 3-D reflectivity",
+    )?;
+    let model_height_name = inventory
+        .physical_height_variable
+        .available()
+        .ok_or_else(|| {
+            Cm1Error::RadarScene(
+                inventory
+                    .physical_height_variable
+                    .unavailable_reason()
+                    .unwrap_or("official zhval is unavailable")
+                    .to_string(),
+            )
+        })?;
+    let model_height = bind_length_field(
+        inventory,
+        model_height_name,
+        "official physical height on model levels; vertical datum is undeclared",
+    );
+    let model_height = available_radar_field("model height", model_height)?;
+    let grid_u = available_radar_field(
+        "u wind",
+        bind_first_thermodynamic_field(
+            inventory,
+            &[
+                (
+                    "uinterp",
+                    &[Cm1VariableRole::NativeScalar3D][..],
+                    "official scalar-grid u (grid-relative)",
+                ),
+                (
+                    "u",
+                    &[Cm1VariableRole::NativeXStaggered3D][..],
+                    "official x-staggered u, adjacent-face averaged (grid-relative)",
+                ),
+            ],
+            "m/s",
+        ),
+    )?;
+    let grid_v = available_radar_field(
+        "v wind",
+        bind_first_thermodynamic_field(
+            inventory,
+            &[
+                (
+                    "vinterp",
+                    &[Cm1VariableRole::NativeScalar3D][..],
+                    "official scalar-grid v (grid-relative)",
+                ),
+                (
+                    "v",
+                    &[Cm1VariableRole::NativeYStaggered3D][..],
+                    "official y-staggered v, adjacent-face averaged (grid-relative)",
+                ),
+            ],
+            "m/s",
+        ),
+    )?;
+    let vertical_wind = available_radar_field(
+        "w wind",
+        bind_first_thermodynamic_field(
+            inventory,
+            &[
+                (
+                    "winterp",
+                    &[Cm1VariableRole::NativeScalar3D][..],
+                    "official scalar-grid vertical velocity",
+                ),
+                (
+                    "w",
+                    &[Cm1VariableRole::NativeZStaggered3D][..],
+                    "official z-staggered w, adjacent-face averaged",
+                ),
+            ],
+            "m/s",
+        ),
+    )?;
+    let correction =
+        available_radar_field("wind-frame correction", wind_frame_correction(inventory))?;
+    let (domain_u, domain_v) = correction.offset_at(time_index).ok_or_else(|| {
+        Cm1Error::RadarScene(format!(
+            "wind-frame correction has no record for output time {time_index}"
+        ))
+    })?;
+    let georeferenced = georeference_scalar_grid(inventory, placement, time_index)?;
+    let valid_time_utc = radar_valid_time(inventory, time_index)?;
+
+    progress("CM1 radar: reading native 3-D dbz");
+    let dbz = read_radar_volume(nc, inventory, &reflectivity, time_index, nz, 1.0)?;
+    progress("CM1 radar: reading physical model-level heights");
+    let height_scale = length_scale_to_metres(&model_height.units).ok_or_else(|| {
+        Cm1Error::RadarScene(format!(
+            "model-height units `{}` cannot be converted to metres",
+            model_height.units
+        ))
+    })?;
+    let model_z_m = read_radar_volume(nc, inventory, &model_height, time_index, nz, height_scale)?;
+    progress("CM1 radar: reading and centering horizontal winds");
+    let mut u_east_mps = read_radar_volume(nc, inventory, &grid_u, time_index, nz, 1.0)?;
+    let mut v_north_mps = read_radar_volume(nc, inventory, &grid_v, time_index, nz, 1.0)?;
+    for value in &mut u_east_mps {
+        if value.is_finite() {
+            *value += domain_u as f32;
+        }
+    }
+    for value in &mut v_north_mps {
+        if value.is_finite() {
+            *value += domain_v as f32;
+        }
+    }
+    progress("CM1 radar: reading vertical velocity");
+    let w_mps = read_radar_volume(nc, inventory, &vertical_wind, time_index, nz, 1.0)?;
+    progress("CM1 radar: resolving terrain in the model-z datum");
+    let (terrain_model_z_m, terrain_source, flat_terrain_assumed) =
+        read_radar_terrain(nc, inventory, time_index, terrain_policy, nx, ny)?;
+
+    validate_radar_scene_arrays(
+        nx,
+        ny,
+        nz,
+        &georeferenced.lat_deg,
+        &georeferenced.lon_deg,
+        &model_z_m,
+        &dbz,
+        &u_east_mps,
+        &v_north_mps,
+        &w_mps,
+        &terrain_model_z_m,
+    )?;
+    let field_sources = Cm1RadarFieldSources {
+        reflectivity: format!(
+            "{} ({})",
+            reflectivity.variable, reflectivity.interpretation
+        ),
+        model_height: format!(
+            "{} ({})",
+            model_height.variable, model_height.interpretation
+        ),
+        terrain: terrain_source,
+        u: format!("{} ({})", grid_u.variable, grid_u.interpretation),
+        v: format!("{} ({})", grid_v.variable, grid_v.interpretation),
+        w: format!(
+            "{} ({})",
+            vertical_wind.variable, vertical_wind.interpretation
+        ),
+    };
+    let wind_provenance = match correction {
+        Cm1WindFrameCorrection::StationaryDomain => {
+            "stationary CM1 frame; grid x/y aligned with placed east/north".to_string()
+        }
+        Cm1WindFrameCorrection::AddDomainVelocity { provenance, .. } => provenance,
+    };
+    let provenance = format!(
+        "CM1 native scalar radar scene; source={}; time_index={time_index}; placement={:?}; {}; model_z and terrain share CM1's undeclared vertical datum and are not labeled MSL; wind_frame={wind_provenance}; native 3-D dbz only; no cref extrusion; no dual-pol synthesis",
+        inventory.source_path.display(),
+        placement.mode,
+        georeferenced.provenance,
+    );
+    Ok(Cm1RadarScene {
+        nx,
+        ny,
+        nz,
+        lat_deg: georeferenced.lat_deg,
+        lon_deg: georeferenced.lon_deg,
+        model_z_m,
+        dbz,
+        u_east_mps,
+        v_north_mps,
+        w_mps,
+        terrain_model_z_m,
+        dx_m: radar_grid_spacing_m(inventory),
+        valid_time_utc,
+        time_index,
+        placement: placement.clone(),
+        flat_terrain_assumed,
+        field_sources,
+        provenance,
+    })
+}
+
+fn radar_field(
+    inventory: &Cm1Inventory,
+    name: &str,
+    roles: &[Cm1VariableRole],
+    units: &str,
+    interpretation: &str,
+) -> Result<Cm1ThermodynamicField, Cm1Error> {
+    available_radar_field(
+        name,
+        bind_exact_thermodynamic_field(inventory, name, roles, units, interpretation),
+    )
+}
+
+fn available_radar_field<T>(label: &str, value: Cm1Availability<T>) -> Result<T, Cm1Error> {
+    match value {
+        Cm1Availability::Available(value) => Ok(value),
+        Cm1Availability::Unavailable { reason } => {
+            Err(Cm1Error::RadarScene(format!("{label}: {reason}")))
+        }
+    }
+}
+
+fn read_radar_volume(
+    nc: &NcFile,
+    inventory: &Cm1Inventory,
+    field: &Cm1ThermodynamicField,
+    time_index: usize,
+    nz: usize,
+    scale: f64,
+) -> Result<Vec<f32>, Cm1Error> {
+    let horizontal_cells = inventory
+        .axes
+        .xh
+        .raw_values
+        .len()
+        .checked_mul(inventory.axes.yh.raw_values.len())
+        .ok_or_else(|| Cm1Error::RadarScene("horizontal grid size overflowed".to_string()))?;
+    let capacity = horizontal_cells
+        .checked_mul(nz)
+        .ok_or_else(|| Cm1Error::RadarScene("3-D radar grid size overflowed".to_string()))?;
+    let mut values = Vec::with_capacity(capacity);
+    for level in 0..nz {
+        let plane = read_horizontal_mass_grid_plane(
+            nc,
+            inventory,
+            &field.variable,
+            time_index,
+            Some(level),
+        )?;
+        if plane.values.len() != horizontal_cells || plane.transform != field.transform {
+            return Err(Cm1Error::RadarScene(format!(
+                "{} level {level} has {} cells and transform {:?}, expected {horizontal_cells} and {:?}",
+                field.variable,
+                plane.values.len(),
+                plane.transform,
+                field.transform
+            )));
+        }
+        values.extend(
+            plane
+                .values
+                .into_iter()
+                .enumerate()
+                .map(|(cell, value)| radar_f32(&field.variable, level, cell, value * scale))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    Ok(values)
+}
+
+fn radar_f32(name: &str, level: usize, cell: usize, value: f64) -> Result<f32, Cm1Error> {
+    if value.is_nan() {
+        Ok(f32::NAN)
+    } else if value.is_finite() && value >= f64::from(f32::MIN) && value <= f64::from(f32::MAX) {
+        Ok(value as f32)
+    } else {
+        Err(Cm1Error::RadarScene(format!(
+            "{name} level {level} cell {cell} cannot be represented as f32: {value}"
+        )))
+    }
+}
+
+fn read_radar_terrain(
+    nc: &NcFile,
+    inventory: &Cm1Inventory,
+    time_index: usize,
+    policy: Cm1TerrainPolicy,
+    nx: usize,
+    ny: usize,
+) -> Result<(Vec<f32>, String, bool), Cm1Error> {
+    let Some(metadata) = inventory.variable("zs") else {
+        return match policy {
+            Cm1TerrainPolicy::RequireNative => Err(Cm1Error::RadarScene(
+                "official CM1 surface-height field `zs` is absent; explicitly choose flat model-z=0 only for a known idealized flat domain"
+                    .to_string(),
+            )),
+            Cm1TerrainPolicy::AssumeFlatModelZero => Ok((
+                vec![0.0; nx * ny],
+                "explicit user flat-domain assumption: model-z=0".to_string(),
+                true,
+            )),
+        };
+    };
+    if metadata.role != Cm1VariableRole::NativeScalar2D {
+        return Err(Cm1Error::RadarScene(format!(
+            "CM1 zs has role {:?}, expected NativeScalar2D",
+            metadata.role
+        )));
+    }
+    let units = metadata
+        .units
+        .as_deref()
+        .ok_or_else(|| Cm1Error::RadarScene("CM1 zs has no length units".to_string()))?;
+    let scale = length_scale_to_metres(units).ok_or_else(|| {
+        Cm1Error::RadarScene(format!("CM1 zs uses unsupported length units `{units}`"))
+    })?;
+    let plane = read_native_scalar_plane(nc, inventory, &metadata.name, time_index, None)?;
+    let values = plane
+        .values
+        .into_iter()
+        .enumerate()
+        .map(|(cell, value)| radar_f32(&metadata.name, 0, cell, value * scale))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        values,
+        format!("{} native CM1 surface height", metadata.name),
+        false,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_radar_scene_arrays(
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    lat: &[f32],
+    lon: &[f32],
+    height: &[f32],
+    dbz: &[f32],
+    u: &[f32],
+    v: &[f32],
+    w: &[f32],
+    terrain: &[f32],
+) -> Result<(), Cm1Error> {
+    let horizontal = nx
+        .checked_mul(ny)
+        .ok_or_else(|| Cm1Error::RadarScene("horizontal grid size overflowed".to_string()))?;
+    let volume = horizontal
+        .checked_mul(nz)
+        .ok_or_else(|| Cm1Error::RadarScene("3-D grid size overflowed".to_string()))?;
+    for (name, actual, expected) in [
+        ("latitude", lat.len(), horizontal),
+        ("longitude", lon.len(), horizontal),
+        ("terrain", terrain.len(), horizontal),
+        ("model height", height.len(), volume),
+        ("dbz", dbz.len(), volume),
+        ("u", u.len(), volume),
+        ("v", v.len(), volume),
+        ("w", w.len(), volume),
+    ] {
+        if actual != expected {
+            return Err(Cm1Error::RadarScene(format!(
+                "{name} has {actual} values, expected {expected}"
+            )));
+        }
+    }
+    if lat.iter().any(|value| !value.is_finite())
+        || lon.iter().any(|value| !value.is_finite())
+        || terrain.iter().any(|value| !value.is_finite())
+    {
+        return Err(Cm1Error::RadarScene(
+            "geolocation and terrain must be finite at every horizontal cell".to_string(),
+        ));
+    }
+    if !dbz.iter().any(|value| value.is_finite()) {
+        return Err(Cm1Error::RadarScene(
+            "native 3-D dbz contains no finite samples".to_string(),
+        ));
+    }
+    for (name, values) in [("u", u), ("v", v), ("w", w)] {
+        if !values.iter().any(|value| value.is_finite()) {
+            return Err(Cm1Error::RadarScene(format!(
+                "{name} wind contains no finite samples"
+            )));
+        }
+    }
+    for cell in 0..horizontal {
+        let mut previous = None;
+        for level in 0..nz {
+            let value = height[level * horizontal + cell];
+            if !value.is_finite() {
+                return Err(Cm1Error::RadarScene(format!(
+                    "model height is missing at level {level}, horizontal cell {cell}"
+                )));
+            }
+            if previous.is_some_and(|previous| value <= previous) {
+                return Err(Cm1Error::RadarScene(format!(
+                    "model height is not strictly increasing at level {level}, horizontal cell {cell}"
+                )));
+            }
+            previous = Some(value);
+        }
+    }
+    Ok(())
+}
+
+fn radar_valid_time(
+    inventory: &Cm1Inventory,
+    time_index: usize,
+) -> Result<DateTime<Utc>, Cm1Error> {
+    let offsets = inventory.time.offsets_seconds.available().ok_or_else(|| {
+        Cm1Error::RadarScene(
+            inventory
+                .time
+                .offsets_seconds
+                .unavailable_reason()
+                .unwrap_or("elapsed time cannot be converted to seconds")
+                .to_string(),
+        )
+    })?;
+    let offset = *offsets.get(time_index).ok_or(Cm1Error::TimeIndex {
+        index: time_index,
+        count: inventory.time.record_count,
+    })?;
+    let rounded = offset.round();
+    if !offset.is_finite()
+        || offset < 0.0
+        || (offset - rounded).abs() > 1.0e-6
+        || rounded > i64::MAX as f64
+    {
+        return Err(Cm1Error::RadarScene(format!(
+            "elapsed time {offset} s is not a finite nonnegative whole second"
+        )));
+    }
+    let start_text = inventory
+        .time
+        .simulation_start_utc
+        .available()
+        .ok_or_else(|| {
+            Cm1Error::RadarScene(
+                inventory
+                    .time
+                    .simulation_start_utc
+                    .unavailable_reason()
+                    .unwrap_or("simulation start UTC is unavailable")
+                    .to_string(),
+            )
+        })?;
+    let start = DateTime::parse_from_rfc3339(start_text)
+        .map_err(|error| {
+            Cm1Error::RadarScene(format!("invalid simulation start `{start_text}`: {error}"))
+        })?
+        .with_timezone(&Utc);
+    start
+        .checked_add_signed(chrono::TimeDelta::seconds(rounded as i64))
+        .ok_or_else(|| Cm1Error::RadarScene("valid UTC overflows chrono range".to_string()))
+}
+
+fn radar_grid_spacing_m(inventory: &Cm1Inventory) -> Option<f64> {
+    fn uniform_spacing(values: &[f64]) -> Option<f64> {
+        let mut differences = values.windows(2).map(|pair| pair[1] - pair[0]);
+        let first = differences.next()?;
+        if !first.is_finite() || first <= 0.0 {
+            return None;
+        }
+        differences
+            .all(|difference| {
+                difference.is_finite()
+                    && difference > 0.0
+                    && (difference - first).abs() <= first.abs().max(1.0) * 1.0e-6
+            })
+            .then_some(first)
+    }
+    let dx = uniform_spacing(inventory.axes.xh.values_m.available()?)?;
+    let dy = uniform_spacing(inventory.axes.yh.values_m.available()?)?;
+    ((dx - dy).abs() <= dx.abs().max(dy.abs()).max(1.0) * 1.0e-6).then_some(0.5 * (dx + dy))
 }
 
 fn read_model_height_column(
@@ -3190,6 +3754,75 @@ mod tests {
         assert!(column.dewpoint_c.iter().all(|value| value.is_finite()));
         assert!(column.provenance.contains("testcase 4/5 overrides"));
         assert!(column.provenance.contains("not labeled MSL"));
+    }
+
+    #[test]
+    fn native_dbz_scene_has_physical_heights_and_earth_relative_winds() {
+        let path = fixture_path();
+        let nc = netcrust::open(&path).expect("open fixture");
+        let inventory = inspect_file(&nc, &path).expect("inspect fixture");
+        let placement = Cm1Placement {
+            mode: Cm1PlacementMode::FollowDomain,
+            anchor_latitude_deg: 35.0,
+            anchor_longitude_deg: -97.0,
+        };
+        let scene = read_radar_scene(
+            &nc,
+            &inventory,
+            &placement,
+            0,
+            Cm1TerrainPolicy::RequireNative,
+        )
+        .expect("build focused CM1 radar scene");
+
+        assert_eq!((scene.nx, scene.ny, scene.nz), (3, 2, 2));
+        assert_eq!(scene.model_z_m, [vec![500.0; 6], vec![1_500.0; 6]].concat());
+        assert_eq!(scene.terrain_model_z_m, vec![100.0; 6]);
+        assert_eq!(scene.u_east_mps, [vec![14.5; 6], vec![15.5; 6]].concat());
+        assert_eq!(scene.v_north_mps, [vec![7.0; 6], vec![8.0; 6]].concat());
+        assert_eq!(scene.w_mps, [vec![5.0; 6], vec![15.0; 6]].concat());
+        assert_eq!(scene.dx_m, Some(1_000.0));
+        assert_eq!(
+            scene.valid_time_utc.to_rfc3339(),
+            "2026-05-20T18:30:00+00:00"
+        );
+        assert!(!scene.flat_terrain_assumed);
+        assert!(scene.field_sources.reflectivity.starts_with("dbz"));
+        assert!(scene.provenance.contains("no cref extrusion"));
+        assert!(scene.provenance.contains("not labeled MSL"));
+    }
+
+    #[test]
+    fn flat_radar_terrain_requires_explicit_policy() {
+        let path = fixture_path();
+        let nc = netcrust::open(&path).expect("open fixture");
+        let mut inventory = inspect_file(&nc, &path).expect("inspect fixture");
+        inventory
+            .variables
+            .retain(|variable| !variable.name.eq_ignore_ascii_case("zs"));
+        assert!(matches!(
+            read_radar_terrain(
+                &nc,
+                &inventory,
+                0,
+                Cm1TerrainPolicy::RequireNative,
+                3,
+                2
+            ),
+            Err(Cm1Error::RadarScene(reason)) if reason.contains("explicitly choose flat")
+        ));
+        let (terrain, source, assumed) = read_radar_terrain(
+            &nc,
+            &inventory,
+            0,
+            Cm1TerrainPolicy::AssumeFlatModelZero,
+            3,
+            2,
+        )
+        .expect("explicit flat terrain");
+        assert_eq!(terrain, vec![0.0; 6]);
+        assert!(source.contains("explicit user"));
+        assert!(assumed);
     }
 
     #[test]

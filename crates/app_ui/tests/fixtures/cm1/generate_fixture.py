@@ -59,6 +59,11 @@ with netCDF4.Dataset(OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
     cref.units = "dBZ"
     cref[:] = np.arange(12, dtype=np.float32).reshape(2, 2, 3)
 
+    zs = nc.createVariable("zs", "f4", ("time", "yh", "xh"))
+    zs.long_name = "terrain height"
+    zs.units = "m"
+    zs[:] = np.float32(100.0)
+
     scalar = nc.createVariable(
         "custom_scalar", "f4", ("time", "zh", "yh", "xh")
     )
