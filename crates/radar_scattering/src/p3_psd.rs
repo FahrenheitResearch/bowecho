@@ -2071,8 +2071,11 @@ mod tests {
         assert!(dense_unrimed_large.projected_area_m2 < fully_rimed.projected_area_m2);
 
         // The partially-rimed area is instead mass-interpolated from the
-        // unrimed and graupel laws. Its boundary mismatch is therefore bounded
-        // by the source's one-percent graupel-density fixed-point tolerance.
+        // unrimed and graupel laws. This mid-rime fixture happens to remain
+        // within 1.1% at the boundary. That is not a general area bound: the
+        // source's one-percent coefficient residual is amplified at low rime
+        // fraction and is typed separately by `particle()` when A exceeds the
+        // Dmax circle.
         assert!(
             relative_error(
                 fully_rimed_large.projected_area_m2,

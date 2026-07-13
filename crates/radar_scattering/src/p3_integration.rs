@@ -275,8 +275,16 @@ pub struct P3TMatrixIntegrationAudit {
     pub outside_table_nodes: usize,
     pub projected_area_equivalent_nodes: usize,
     pub solid_ice_constrained_nodes: usize,
+    /// Source quadrature nodes carrying the typed final-coefficient area
+    /// artifact. These are counted after shape mapping and before table-support
+    /// filtering, so a subsequently omitted table node remains visible here.
     pub fixed_point_area_closure_nodes: usize,
+    /// Largest original `4A/(pi Dmax^2)` among those source closure nodes,
+    /// before their scattering geometry is closed to the Dmax sphere.
     pub maximum_fixed_point_raw_area_ratio: Option<f64>,
+    /// Source closure-node `N*m^2` weight divided by the full in-source
+    /// analytic `N*m^2` population. Like the count, this precedes table-support
+    /// filtering and is independent of the omission audit below.
     pub fixed_point_area_closure_radar_weight_fraction: f64,
     pub small_sphere_rayleigh_bridge_nodes: usize,
     pub source_domain: P3TMatrixSourceDomainAudit,
