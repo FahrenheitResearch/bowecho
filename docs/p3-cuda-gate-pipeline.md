@@ -75,22 +75,24 @@ One bounded cut-work chunk is transformed as follows.
 
 ## Boundedness and benchmark gate
 
-The first cut integration uses a fixed host bound of eight consecutive gates
-per radial. That is 8, 72, or 216 ordered raw columns for Center, Balanced, or
-Reference beam integration respectively. The reusable evaluator accepts any
-bounded request slice, while the existing service independently splits each
-role sweep at `DEFAULT_CUDA_TMATRIX_BATCH_NODES`. No unbounded whole-volume
-staging is allowed. A future adaptive host bound may use admitted-node counts,
-but changing the bound cannot change ordering or replay semantics.
+The cut integration targets 216 ordered raw columns per radial chunk, capped
+at 64 consecutive gates to bound cancellation latency and retained state. That
+selects 64 Center gates, 24 Balanced gates, or 8 Reference gates (64, 216, or
+216 raw columns). Custom quadratures use the same ceiling calculation and at
+least one gate. The reusable evaluator accepts any bounded request slice,
+while the existing service independently splits each role sweep at
+`DEFAULT_CUDA_TMATRIX_BATCH_NODES`. No unbounded whole-volume staging is
+allowed. Changing the host bound cannot change ordering or replay semantics.
 
 The ignored `manual_cut_pipeline_launch_shape_and_parity` test in
 `wrf_tmatrix_cuda.rs` is the representative GPU harness. It models 1,024 gates
-with three alternating oblate/prolate category populations per gate and 32
-admitted nodes per population. It compares the v0.33.2 synchronous
-category-call shape with two cut-wide role sweeps, prints time and service
-counter deltas, and requires exact component-bit parity. Node-side validation
-should record GPU model/driver/artifact, elapsed times, request and launch
-counts, completed nodes, and the parity result.
+in the default Center mode, with three alternating oblate/prolate category
+populations per gate and 32 admitted nodes per population. It compares the
+v0.33.2 synchronous category-call shape with the actual bounded 64-gate host
+chunks (two role sweeps per chunk), prints time and service counter deltas, and
+requires exact component-bit parity. Node-side validation should record GPU
+model/driver/artifact, elapsed times, request and launch counts, completed
+nodes, request reduction, and the parity result.
 
 ## Milestones
 

@@ -4479,10 +4479,26 @@ struct GateSampleResult {
     quality: GateQualityFractions,
 }
 
-/// Gate count in one bounded RawStateLinear prepare/evaluate/finish chunk.
-/// Even Center sampling now exposes several category integrations to each role
-/// sweep, while Reference sampling exposes 216 ordered beam points per chunk.
-const RAW_TMATRIX_PIPELINE_GATE_CHUNK: usize = 8;
+/// Keep the host-side prepare/evaluate/finish footprint near the original
+/// eight-gate Reference bound while widening sparse Center/Balanced work.
+/// The 64-gate cap also bounds cancellation latency and retained preparations.
+pub(crate) const RAW_TMATRIX_PIPELINE_TARGET_COLUMNS: usize = 8 * 27;
+pub(crate) const RAW_TMATRIX_PIPELINE_MAX_GATE_CHUNK: usize = 64;
+
+pub(crate) const fn raw_tmatrix_pipeline_gate_chunk(point_count: usize) -> usize {
+    if point_count == 0 {
+        return 1;
+    }
+    let gates = RAW_TMATRIX_PIPELINE_TARGET_COLUMNS.saturating_add(point_count.saturating_sub(1))
+        / point_count;
+    if gates == 0 {
+        1
+    } else if gates > RAW_TMATRIX_PIPELINE_MAX_GATE_CHUNK {
+        RAW_TMATRIX_PIPELINE_MAX_GATE_CHUNK
+    } else {
+        gates
+    }
+}
 
 struct RawGateColumnBatch {
     first_gate: usize,
@@ -5274,14 +5290,13 @@ fn build_cut(
             )
             .then(|| config.runtime_cuda_service.as_deref())
             .flatten();
+            let raw_gate_chunk = raw_tmatrix_pipeline_gate_chunk(quadrature_count);
             let mut raw_batch = None;
             for gate in 0..gate_count {
                 if let Some(cuda) = raw_cuda
-                    && gate % RAW_TMATRIX_PIPELINE_GATE_CHUNK == 0
+                    && gate % raw_gate_chunk == 0
                 {
-                    let end_gate = gate
-                        .saturating_add(RAW_TMATRIX_PIPELINE_GATE_CHUNK)
-                        .min(gate_count);
+                    let end_gate = gate.saturating_add(raw_gate_chunk).min(gate_count);
                     raw_batch = Some(
                         build_raw_gate_column_batch(
                             fields,
@@ -10834,6 +10849,33 @@ mod tests {
                 mode.pulse_volume_sample_count(),
                 quadrature_points(mode).len()
             );
+        }
+    }
+
+    #[test]
+    fn raw_tmatrix_gate_chunks_reuse_one_bounded_column_budget() {
+        assert_eq!(raw_tmatrix_pipeline_gate_chunk(0), 1);
+        assert_eq!(raw_tmatrix_pipeline_gate_chunk(CENTER_QUADRATURE.len()), 64);
+        assert_eq!(
+            raw_tmatrix_pipeline_gate_chunk(BALANCED_QUADRATURE.len()),
+            24
+        );
+        assert_eq!(
+            raw_tmatrix_pipeline_gate_chunk(REFERENCE_QUADRATURE.len()),
+            8
+        );
+        assert_eq!(
+            raw_tmatrix_pipeline_gate_chunk(RAW_TMATRIX_PIPELINE_TARGET_COLUMNS),
+            1
+        );
+        assert_eq!(
+            raw_tmatrix_pipeline_gate_chunk(RAW_TMATRIX_PIPELINE_TARGET_COLUMNS + 1),
+            1
+        );
+        for point_count in [1, 9, 27, RAW_TMATRIX_PIPELINE_TARGET_COLUMNS] {
+            let gates = raw_tmatrix_pipeline_gate_chunk(point_count);
+            assert!((1..=RAW_TMATRIX_PIPELINE_MAX_GATE_CHUNK).contains(&gates));
+            assert!(gates.saturating_mul(point_count) <= RAW_TMATRIX_PIPELINE_TARGET_COLUMNS);
         }
     }
 

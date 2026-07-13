@@ -1632,11 +1632,12 @@ mod tests {
         );
     }
 
-    /// Representative RawStateLinear launch-shape referee for the cut-wide
-    /// pipeline. The legacy leg deliberately blocks after every category-sized
-    /// request, matching v0.33.2's gate/category call boundary. The pipeline
-    /// leg publishes the same descriptors in stable order to two table-role
-    /// sweeps and scatters their answers back to the original work positions.
+    /// Representative RawStateLinear launch-shape referee for the bounded
+    /// gate pipeline. The legacy leg deliberately blocks after every
+    /// category-sized request, matching v0.33.2's gate/category call boundary.
+    /// The pipeline leg uses the Center-mode runtime host bound, publishes each
+    /// chunk in two stable table-role sweeps, and scatters answers back to the
+    /// original work positions.
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     #[ignore = "manual cut-wide CUDA pipeline benchmark; requires a supported NVIDIA GPU"]
@@ -1644,6 +1645,10 @@ mod tests {
         const GATES: usize = 1_024;
         const POPULATIONS_PER_GATE: usize = 3;
         const NODES_PER_POPULATION: usize = 32;
+        const CENTER_BEAM_SAMPLE_POINTS: usize = 1;
+        const GATES_PER_CHUNK: usize =
+            crate::wrf_radar::raw_tmatrix_pipeline_gate_chunk(CENTER_BEAM_SAMPLE_POINTS);
+        const HOST_CHUNKS: usize = (GATES + GATES_PER_CHUNK - 1) / GATES_PER_CHUNK;
         const POPULATIONS: usize = GATES * POPULATIONS_PER_GATE;
         const NODE_COUNT: usize = POPULATIONS * NODES_PER_POPULATION;
 
@@ -1739,41 +1744,46 @@ mod tests {
         let legacy_elapsed = legacy_started.elapsed();
         let legacy_after = service.report();
 
-        let mut oblate_positions = Vec::with_capacity(NODE_COUNT * 2 / 3);
-        let mut oblate_nodes = Vec::with_capacity(NODE_COUNT * 2 / 3);
-        let mut prolate_positions = Vec::with_capacity(NODE_COUNT / 3);
-        let mut prolate_nodes = Vec::with_capacity(NODE_COUNT / 3);
-        for population in 0..POPULATIONS {
-            let role = role_for_population(population);
-            for within_population in 0..NODES_PER_POPULATION {
-                let position = population * NODES_PER_POPULATION + within_population;
-                match role {
-                    WrfTMatrixCudaTableRole::DryOblate => {
-                        oblate_positions.push(position);
-                        oblate_nodes.push(oblate_node);
-                    }
-                    WrfTMatrixCudaTableRole::DryProlate => {
-                        prolate_positions.push(position);
-                        prolate_nodes.push(prolate_node);
+        let pipeline_before = service.report();
+        let pipeline_started = std::time::Instant::now();
+        let mut pipeline = vec![None; NODE_COUNT];
+        for first_gate in (0..GATES).step_by(GATES_PER_CHUNK) {
+            let end_gate = first_gate.saturating_add(GATES_PER_CHUNK).min(GATES);
+            let first_population = first_gate * POPULATIONS_PER_GATE;
+            let end_population = end_gate * POPULATIONS_PER_GATE;
+            let chunk_nodes = (end_population - first_population) * NODES_PER_POPULATION;
+            let mut oblate_positions = Vec::with_capacity(chunk_nodes * 2 / 3);
+            let mut oblate_nodes = Vec::with_capacity(chunk_nodes * 2 / 3);
+            let mut prolate_positions = Vec::with_capacity(chunk_nodes / 3);
+            let mut prolate_nodes = Vec::with_capacity(chunk_nodes / 3);
+            for population in first_population..end_population {
+                let role = role_for_population(population);
+                for within_population in 0..NODES_PER_POPULATION {
+                    let position = population * NODES_PER_POPULATION + within_population;
+                    match role {
+                        WrfTMatrixCudaTableRole::DryOblate => {
+                            oblate_positions.push(position);
+                            oblate_nodes.push(oblate_node);
+                        }
+                        WrfTMatrixCudaTableRole::DryProlate => {
+                            prolate_positions.push(position);
+                            prolate_nodes.push(prolate_node);
+                        }
                     }
                 }
             }
-        }
-
-        let pipeline_before = service.report();
-        let pipeline_started = std::time::Instant::now();
-        let oblate = service
-            .evaluate_particles(WrfTMatrixCudaTableRole::DryOblate, oblate_nodes)
-            .unwrap();
-        let prolate = service
-            .evaluate_particles(WrfTMatrixCudaTableRole::DryProlate, prolate_nodes)
-            .unwrap();
-        let mut pipeline = vec![None; NODE_COUNT];
-        for (position, output) in oblate_positions.into_iter().zip(oblate) {
-            pipeline[position] = Some(output);
-        }
-        for (position, output) in prolate_positions.into_iter().zip(prolate) {
-            pipeline[position] = Some(output);
+            let oblate = service
+                .evaluate_particles(WrfTMatrixCudaTableRole::DryOblate, oblate_nodes)
+                .unwrap();
+            let prolate = service
+                .evaluate_particles(WrfTMatrixCudaTableRole::DryProlate, prolate_nodes)
+                .unwrap();
+            for (position, output) in oblate_positions.into_iter().zip(oblate) {
+                pipeline[position] = Some(output);
+            }
+            for (position, output) in prolate_positions.into_iter().zip(prolate) {
+                pipeline[position] = Some(output);
+            }
         }
         let pipeline_elapsed = pipeline_started.elapsed();
         let pipeline_after = service.report();
@@ -1807,18 +1817,20 @@ mod tests {
             pipeline_after.requests_submitted - pipeline_before.requests_submitted;
         let pipeline_batches = pipeline_after.batches_completed - pipeline_before.batches_completed;
         assert_eq!(legacy_requests, POPULATIONS as u64);
-        assert_eq!(pipeline_requests, 2);
+        assert_eq!(pipeline_requests, (HOST_CHUNKS * 2) as u64);
+        assert_eq!(pipeline_batches, pipeline_requests);
         assert_eq!(
             pipeline_after.nodes_completed - pipeline_before.nodes_completed,
             NODE_COUNT as u64
         );
         assert_eq!(pipeline_after.fallback_reason, None);
         eprintln!(
-            "cut-wide CUDA pipeline ({}; artifact={}): {GATES} gates, {POPULATIONS} populations, {NODE_COUNT} nodes; legacy {legacy_requests} requests/{legacy_batches} batches/{:.6}s; role sweeps {pipeline_requests} requests/{pipeline_batches} batches/{:.6}s; speedup {:.3}x; exact_bits=true",
+            "bounded CUDA gate pipeline ({}; artifact={}): {GATES} Center gates in {HOST_CHUNKS} x {GATES_PER_CHUNK}-gate host chunks, {POPULATIONS} populations, {NODE_COUNT} nodes; legacy {legacy_requests} requests/{legacy_batches} batches/{:.6}s; role sweeps {pipeline_requests} requests/{pipeline_batches} batches/{:.6}s; request_reduction={:.3}x; speedup {:.3}x; exact_bits=true",
             pipeline_after.device.name,
             pipeline_after.device.kernel_artifact,
             legacy_elapsed.as_secs_f64(),
             pipeline_elapsed.as_secs_f64(),
+            legacy_requests as f64 / pipeline_requests as f64,
             legacy_elapsed.as_secs_f64() / pipeline_elapsed.as_secs_f64(),
         );
     }
