@@ -418,6 +418,134 @@ pub struct Cm1NativeColumnProfile {
     pub provenance: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cm1ThermodynamicField {
+    pub variable: String,
+    pub units: String,
+    pub transform: Cm1PlaneTransform,
+    pub interpretation: String,
+}
+
+/// Conversion from CM1's grid-relative horizontal velocities into the
+/// east/north frame established by BowEcho's explicit local-tangent
+/// placement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cm1WindFrameCorrection {
+    StationaryDomain,
+    AddDomainVelocity {
+        east_mps: Vec<f64>,
+        north_mps: Vec<f64>,
+        provenance: String,
+    },
+}
+
+impl Cm1WindFrameCorrection {
+    pub fn offset_at(&self, time_index: usize) -> Option<(f64, f64)> {
+        match self {
+            Self::StationaryDomain => Some((0.0, 0.0)),
+            Self::AddDomainVelocity {
+                east_mps,
+                north_mps,
+                ..
+            } => Some((*east_mps.get(time_index)?, *north_mps.get(time_index)?)),
+        }
+    }
+}
+
+/// Evidence-only readiness report. No approximate alias or unproven unit is
+/// silently accepted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cm1ThermodynamicReadiness {
+    pub potential_temperature: Cm1Availability<Cm1ThermodynamicField>,
+    pub pressure: Cm1Availability<Cm1ThermodynamicField>,
+    pub water_vapor_mixing_ratio: Cm1Availability<Cm1ThermodynamicField>,
+    pub grid_relative_u: Cm1Availability<Cm1ThermodynamicField>,
+    pub grid_relative_v: Cm1Availability<Cm1ThermodynamicField>,
+    pub model_level_height: Cm1Availability<Cm1ThermodynamicField>,
+    pub wind_frame_correction: Cm1Availability<Cm1WindFrameCorrection>,
+    pub sounding_viewer: Cm1Availability<String>,
+}
+
+impl Cm1ThermodynamicReadiness {
+    pub fn can_derive_native_profile(&self) -> bool {
+        self.potential_temperature.available().is_some()
+            && self.pressure.available().is_some()
+            && self.water_vapor_mixing_ratio.available().is_some()
+            && self.grid_relative_u.available().is_some()
+            && self.grid_relative_v.available().is_some()
+            && self.model_level_height.available().is_some()
+            && self.wind_frame_correction.available().is_some()
+    }
+}
+
+/// Thermodynamic constants selected for converting native CM1 potential
+/// temperature and water-vapor mixing ratio. Official native output does not
+/// record `testcase`; callers must explicitly opt into these defaults rather
+/// than receiving them as an invisible assumption.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cm1ThermodynamicConstants {
+    pub dry_air_gas_constant_j_kg_k: f64,
+    pub dry_air_cp_j_kg_k: f64,
+    pub water_vapor_gas_constant_j_kg_k: f64,
+    pub reference_pressure_pa: f64,
+    pub provenance: String,
+}
+
+impl Cm1ThermodynamicConstants {
+    pub fn official_defaults() -> Self {
+        Self {
+            dry_air_gas_constant_j_kg_k: 287.04,
+            dry_air_cp_j_kg_k: 1005.7,
+            water_vapor_gas_constant_j_kg_k: 461.5,
+            reference_pressure_pa: 100_000.0,
+            provenance: format!(
+                "NCAR CM1 default constants Rd=287.04, Cp=1005.7, Rv=461.5 from constants.F at {}; testcase 4/5 overrides are not identifiable because native output does not store testcase",
+                CM1_SCHEMA_SOURCE
+            ),
+        }
+    }
+
+    fn validate(&self) -> Result<(), Cm1Error> {
+        let values = [
+            self.dry_air_gas_constant_j_kg_k,
+            self.dry_air_cp_j_kg_k,
+            self.water_vapor_gas_constant_j_kg_k,
+            self.reference_pressure_pa,
+        ];
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+            || self.dry_air_gas_constant_j_kg_k >= self.dry_air_cp_j_kg_k
+        {
+            return Err(Cm1Error::Thermodynamic(
+                "thermodynamic constants must be finite and positive, with Rd < Cp".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cm1ThermodynamicColumn {
+    pub time_index: usize,
+    pub x_index: usize,
+    pub y_index: usize,
+    pub local_x_m: f64,
+    pub local_y_m: f64,
+    pub pressure_hpa: Vec<f64>,
+    pub model_level_height_m: Vec<f64>,
+    pub temperature_c: Vec<f64>,
+    pub dewpoint_c: Vec<f64>,
+    pub water_vapor_mixing_ratio_kg_kg: Vec<f64>,
+    pub u_grid_relative_mps: Vec<f64>,
+    pub v_grid_relative_mps: Vec<f64>,
+    pub u_east_mps: Vec<f64>,
+    pub v_north_mps: Vec<f64>,
+    pub invalid_levels: Vec<(usize, String)>,
+    pub constants: Cm1ThermodynamicConstants,
+    pub provenance: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Cm1Error {
     #[error("NetCDF read error: {0}")]
@@ -482,6 +610,9 @@ pub enum Cm1Error {
 
     #[error("invalid CM1 geographic anchor: {0}")]
     InvalidAnchor(String),
+
+    #[error("CM1 thermodynamic profile unavailable: {0}")]
+    Thermodynamic(String),
 }
 
 /// Inspect a file from disk and return its native CM1 inventory.
@@ -1513,6 +1644,397 @@ pub fn read_native_column_profile(
         provenance: format!(
             "native CM1 scalar-grid column; transform={transform:?}; vertical order and nominal zh preserved; no pressure interpolation; no MSL datum inferred"
         ),
+    })
+}
+
+/// Report whether one CM1 file contains the exact, unit-bearing fields needed
+/// for a meteorological column. This never substitutes perturbation fields or
+/// 2-D products for the official total 3-D quantities.
+pub fn thermodynamic_readiness(inventory: &Cm1Inventory) -> Cm1ThermodynamicReadiness {
+    let potential_temperature = bind_exact_thermodynamic_field(
+        inventory,
+        "th",
+        &[Cm1VariableRole::NativeScalar3D],
+        "K",
+        "official total potential temperature",
+    );
+    let pressure = bind_exact_thermodynamic_field(
+        inventory,
+        "prs",
+        &[Cm1VariableRole::NativeScalar3D],
+        "Pa",
+        "official total pressure",
+    );
+    let water_vapor_mixing_ratio = bind_exact_thermodynamic_field(
+        inventory,
+        "qv",
+        &[Cm1VariableRole::NativeScalar3D],
+        "kg/kg",
+        "official water-vapor mixing ratio",
+    );
+    let grid_relative_u = bind_first_thermodynamic_field(
+        inventory,
+        &[
+            (
+                "uinterp",
+                &[Cm1VariableRole::NativeScalar3D][..],
+                "official scalar-grid u (grid-relative)",
+            ),
+            (
+                "u",
+                &[Cm1VariableRole::NativeXStaggered3D][..],
+                "official x-staggered u, adjacent-face averaged (grid-relative)",
+            ),
+        ],
+        "m/s",
+    );
+    let grid_relative_v = bind_first_thermodynamic_field(
+        inventory,
+        &[
+            (
+                "vinterp",
+                &[Cm1VariableRole::NativeScalar3D][..],
+                "official scalar-grid v (grid-relative)",
+            ),
+            (
+                "v",
+                &[Cm1VariableRole::NativeYStaggered3D][..],
+                "official y-staggered v, adjacent-face averaged (grid-relative)",
+            ),
+        ],
+        "m/s",
+    );
+    let model_level_height = match &inventory.physical_height_variable {
+        Cm1Availability::Available(name) => bind_length_field(
+            inventory,
+            name,
+            "official physical height on model levels; vertical datum is undeclared",
+        ),
+        Cm1Availability::Unavailable { reason } => Cm1Availability::Unavailable {
+            reason: reason.clone(),
+        },
+    };
+    let wind_frame_correction = match &inventory.motion.domain_motion {
+        Cm1DomainMotion::Static => Cm1Availability::Available(
+            Cm1WindFrameCorrection::StationaryDomain,
+        ),
+        Cm1DomainMotion::ExplicitDisplacement { .. } | Cm1DomainMotion::Unresolved { .. } => {
+            match (
+                inventory.motion.east_velocity_mps.available(),
+                inventory.motion.north_velocity_mps.available(),
+            ) {
+                (Some(east_mps), Some(north_mps))
+                    if east_mps.len() == inventory.time.record_count
+                        && north_mps.len() == inventory.time.record_count =>
+                {
+                    Cm1Availability::Available(Cm1WindFrameCorrection::AddDomainVelocity {
+                        east_mps: east_mps.clone(),
+                        north_mps: north_mps.clone(),
+                        provenance: "official CM1 umove/vmove added to grid-relative u/v"
+                            .to_string(),
+                    })
+                }
+                _ => Cm1Availability::Unavailable {
+                    reason: "moving-domain u/v cannot be converted to east/north winds because complete unit-bearing umove/vmove records are unavailable"
+                        .to_string(),
+                },
+            }
+        }
+    };
+    let core_ready = potential_temperature.available().is_some()
+        && pressure.available().is_some()
+        && water_vapor_mixing_ratio.available().is_some()
+        && grid_relative_u.available().is_some()
+        && grid_relative_v.available().is_some()
+        && model_level_height.available().is_some()
+        && wind_frame_correction.available().is_some();
+    let sounding_viewer = Cm1Availability::Unavailable {
+        reason: if core_ready {
+            "native thermodynamic profile is derivable, but CM1 zhval does not declare an MSL datum and the current Sounding viewer labels its height input MSL; BowEcho will not silently mislabel model-z"
+                .to_string()
+        } else {
+            "one or more required native thermodynamic fields, units, heights, or wind-frame corrections are unavailable"
+                .to_string()
+        },
+    };
+    Cm1ThermodynamicReadiness {
+        potential_temperature,
+        pressure,
+        water_vapor_mixing_ratio,
+        grid_relative_u,
+        grid_relative_v,
+        model_level_height,
+        wind_frame_correction,
+        sounding_viewer,
+    }
+}
+
+fn bind_first_thermodynamic_field(
+    inventory: &Cm1Inventory,
+    candidates: &[(&str, &[Cm1VariableRole], &str)],
+    expected_units: &str,
+) -> Cm1Availability<Cm1ThermodynamicField> {
+    let mut reasons = Vec::new();
+    for &(name, roles, interpretation) in candidates {
+        match bind_exact_thermodynamic_field(inventory, name, roles, expected_units, interpretation)
+        {
+            Cm1Availability::Available(field) => return Cm1Availability::Available(field),
+            Cm1Availability::Unavailable { reason } => reasons.push(reason),
+        }
+    }
+    Cm1Availability::Unavailable {
+        reason: reasons.join("; "),
+    }
+}
+
+fn bind_exact_thermodynamic_field(
+    inventory: &Cm1Inventory,
+    name: &str,
+    expected_roles: &[Cm1VariableRole],
+    expected_units: &str,
+    interpretation: &str,
+) -> Cm1Availability<Cm1ThermodynamicField> {
+    let Some(variable) = inventory.variable(name) else {
+        return Cm1Availability::Unavailable {
+            reason: format!("required CM1 field `{name}` is absent"),
+        };
+    };
+    if !expected_roles.contains(&variable.role) {
+        return Cm1Availability::Unavailable {
+            reason: format!(
+                "CM1 field `{}` has role {:?}, expected one of {:?}",
+                variable.name, variable.role, expected_roles
+            ),
+        };
+    }
+    let Some(units) = variable.units.as_deref() else {
+        return Cm1Availability::Unavailable {
+            reason: format!("CM1 field `{}` has no units", variable.name),
+        };
+    };
+    if !units.trim().eq_ignore_ascii_case(expected_units) {
+        return Cm1Availability::Unavailable {
+            reason: format!(
+                "CM1 field `{}` uses units `{units}`, expected official `{expected_units}`",
+                variable.name
+            ),
+        };
+    }
+    let transform = match variable.role {
+        Cm1VariableRole::NativeScalar3D => Cm1PlaneTransform::NativeScalar,
+        Cm1VariableRole::NativeXStaggered3D => Cm1PlaneTransform::DestaggeredX,
+        Cm1VariableRole::NativeYStaggered3D => Cm1PlaneTransform::DestaggeredY,
+        Cm1VariableRole::NativeZStaggered3D => Cm1PlaneTransform::DestaggeredZ,
+        _ => unreachable!("role validated above"),
+    };
+    Cm1Availability::Available(Cm1ThermodynamicField {
+        variable: variable.name.clone(),
+        units: units.to_string(),
+        transform,
+        interpretation: interpretation.to_string(),
+    })
+}
+
+fn bind_length_field(
+    inventory: &Cm1Inventory,
+    name: &str,
+    interpretation: &str,
+) -> Cm1Availability<Cm1ThermodynamicField> {
+    let Some(variable) = inventory.variable(name) else {
+        return Cm1Availability::Unavailable {
+            reason: format!("required CM1 model-height field `{name}` is absent"),
+        };
+    };
+    if variable.role != Cm1VariableRole::NativeScalar3D {
+        return Cm1Availability::Unavailable {
+            reason: format!(
+                "CM1 model-height field `{}` has role {:?}, expected NativeScalar3D",
+                variable.name, variable.role
+            ),
+        };
+    }
+    let Some(units) = variable.units.as_deref() else {
+        return Cm1Availability::Unavailable {
+            reason: format!("CM1 model-height field `{}` has no units", variable.name),
+        };
+    };
+    if length_scale_to_metres(units).is_none() {
+        return Cm1Availability::Unavailable {
+            reason: format!(
+                "CM1 model-height field `{}` uses unsupported length units `{units}`",
+                variable.name
+            ),
+        };
+    }
+    Cm1Availability::Available(Cm1ThermodynamicField {
+        variable: variable.name.clone(),
+        units: units.to_string(),
+        transform: Cm1PlaneTransform::NativeScalar,
+        interpretation: interpretation.to_string(),
+    })
+}
+
+/// Derive a native CM1 thermodynamic column using an explicit constants
+/// choice. Invalid levels are preserved as NaNs with per-level reasons; the
+/// function never pressure-interpolates or calls the MSL-labeled sounding
+/// bridge.
+pub fn read_thermodynamic_column(
+    nc: &NcFile,
+    inventory: &Cm1Inventory,
+    time_index: usize,
+    x_index: usize,
+    y_index: usize,
+    constants: Cm1ThermodynamicConstants,
+) -> Result<Cm1ThermodynamicColumn, Cm1Error> {
+    constants.validate()?;
+    let readiness = thermodynamic_readiness(inventory);
+    if !readiness.can_derive_native_profile() {
+        let unavailable = [
+            ("th", readiness.potential_temperature.unavailable_reason()),
+            ("prs", readiness.pressure.unavailable_reason()),
+            (
+                "qv",
+                readiness.water_vapor_mixing_ratio.unavailable_reason(),
+            ),
+            ("u", readiness.grid_relative_u.unavailable_reason()),
+            ("v", readiness.grid_relative_v.unavailable_reason()),
+            ("zhval", readiness.model_level_height.unavailable_reason()),
+            (
+                "wind frame",
+                readiness.wind_frame_correction.unavailable_reason(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, reason)| reason.map(|reason| format!("{name}: {reason}")))
+        .collect::<Vec<_>>();
+        return Err(Cm1Error::Thermodynamic(unavailable.join("; ")));
+    }
+    let read_bound = |binding: &Cm1Availability<Cm1ThermodynamicField>| {
+        let field = binding.available().expect("readiness checked");
+        read_native_column_profile(nc, inventory, &field.variable, time_index, x_index, y_index)
+    };
+    let theta = read_bound(&readiness.potential_temperature)?;
+    let pressure = read_bound(&readiness.pressure)?;
+    let qv = read_bound(&readiness.water_vapor_mixing_ratio)?;
+    let u = read_bound(&readiness.grid_relative_u)?;
+    let v = read_bound(&readiness.grid_relative_v)?;
+    let height = theta
+        .model_level_height_m
+        .available()
+        .ok_or_else(|| {
+            Cm1Error::Thermodynamic(
+                theta
+                    .model_level_height_m
+                    .unavailable_reason()
+                    .unwrap_or("physical model-level height read failed")
+                    .to_string(),
+            )
+        })?
+        .values_m
+        .clone();
+    let nz = theta.values.len();
+    for (name, len) in [
+        ("prs", pressure.values.len()),
+        ("qv", qv.values.len()),
+        ("u", u.values.len()),
+        ("v", v.values.len()),
+        ("zhval", height.len()),
+    ] {
+        if len != nz {
+            return Err(Cm1Error::Thermodynamic(format!(
+                "{name} column has {len} levels while th has {nz}"
+            )));
+        }
+    }
+    let (domain_u, domain_v) = readiness
+        .wind_frame_correction
+        .available()
+        .and_then(|correction| correction.offset_at(time_index))
+        .ok_or_else(|| {
+            Cm1Error::Thermodynamic(format!(
+                "no wind-frame correction for output time {time_index}"
+            ))
+        })?;
+    let kappa = constants.dry_air_gas_constant_j_kg_k / constants.dry_air_cp_j_kg_k;
+    let epsilon = constants.dry_air_gas_constant_j_kg_k / constants.water_vapor_gas_constant_j_kg_k;
+    let mut pressure_hpa = vec![f64::NAN; nz];
+    let mut temperature_c = vec![f64::NAN; nz];
+    let mut dewpoint_c = vec![f64::NAN; nz];
+    let mut qv_output = vec![f64::NAN; nz];
+    let mut u_grid = vec![f64::NAN; nz];
+    let mut v_grid = vec![f64::NAN; nz];
+    let mut u_east = vec![f64::NAN; nz];
+    let mut v_north = vec![f64::NAN; nz];
+    let mut invalid_levels = Vec::new();
+    for level in 0..nz {
+        let mut reasons = Vec::new();
+        let pressure_pa = pressure.values[level];
+        let theta_k = theta.values[level];
+        let mixing_ratio = qv.values[level];
+        if pressure_pa.is_finite() && pressure_pa > 0.0 {
+            pressure_hpa[level] = pressure_pa / 100.0;
+        } else {
+            reasons.push("pressure is not finite and positive");
+        }
+        if theta_k.is_finite() && theta_k > 0.0 && pressure_hpa[level].is_finite() {
+            temperature_c[level] =
+                theta_k * (pressure_pa / constants.reference_pressure_pa).powf(kappa) - 273.15;
+        } else {
+            reasons.push("potential temperature/pressure cannot produce temperature");
+        }
+        if mixing_ratio.is_finite() && mixing_ratio > 0.0 && pressure_hpa[level].is_finite() {
+            qv_output[level] = mixing_ratio;
+            let vapor_pressure_hpa = pressure_hpa[level] * mixing_ratio / (epsilon + mixing_ratio);
+            let logarithm = (vapor_pressure_hpa / 6.112).ln();
+            let derived = 243.5 * logarithm / (17.67 - logarithm);
+            if derived.is_finite() {
+                dewpoint_c[level] = derived;
+            } else {
+                reasons.push("mixing ratio/pressure cannot produce finite dewpoint");
+            }
+        } else {
+            reasons.push("water-vapor mixing ratio is not finite and positive");
+        }
+        if u.values[level].is_finite() {
+            u_grid[level] = u.values[level];
+            u_east[level] = u.values[level] + domain_u;
+        } else {
+            reasons.push("u wind is missing");
+        }
+        if v.values[level].is_finite() {
+            v_grid[level] = v.values[level];
+            v_north[level] = v.values[level] + domain_v;
+        } else {
+            reasons.push("v wind is missing");
+        }
+        if !height[level].is_finite() {
+            reasons.push("physical model-level height is missing");
+        }
+        if !reasons.is_empty() {
+            invalid_levels.push((level, reasons.join("; ")));
+        }
+    }
+    Ok(Cm1ThermodynamicColumn {
+        time_index,
+        x_index,
+        y_index,
+        local_x_m: theta.local_x_m,
+        local_y_m: theta.local_y_m,
+        pressure_hpa,
+        model_level_height_m: height,
+        temperature_c,
+        dewpoint_c,
+        water_vapor_mixing_ratio_kg_kg: qv_output,
+        u_grid_relative_mps: u_grid,
+        v_grid_relative_mps: v_grid,
+        u_east_mps: u_east,
+        v_north_mps: v_north,
+        invalid_levels,
+        provenance: format!(
+            "native CM1 th/prs/qv column; T=theta*(p/p0)^(Rd/Cp); dewpoint from qv and pressure using epsilon=Rd/Rv and Bolton inversion; {}; model height is zhval with undeclared datum (not labeled MSL); no pressure interpolation",
+            constants.provenance
+        ),
+        constants,
     })
 }
 
@@ -2557,6 +3079,64 @@ mod tests {
                 ny: 2
             })
         ));
+    }
+
+    #[test]
+    fn thermodynamic_readiness_requires_exact_native_fields_and_units() {
+        let ready = inspect_path(fixture_path()).expect("inspect modern fixture");
+        let readiness = thermodynamic_readiness(&ready);
+        assert!(readiness.can_derive_native_profile());
+        assert_eq!(
+            readiness
+                .grid_relative_u
+                .available()
+                .map(|field| field.variable.as_str()),
+            Some("uinterp")
+        );
+        assert!(readiness.sounding_viewer.available().is_none());
+        assert!(
+            readiness
+                .sounding_viewer
+                .unavailable_reason()
+                .expect("explicit viewer reason")
+                .contains("MSL datum")
+        );
+
+        let incomplete = inspect_path(legacy_fixture_path()).expect("inspect legacy fixture");
+        let readiness = thermodynamic_readiness(&incomplete);
+        assert!(!readiness.can_derive_native_profile());
+        assert!(
+            readiness
+                .potential_temperature
+                .unavailable_reason()
+                .expect("missing th reason")
+                .contains("`th` is absent")
+        );
+    }
+
+    #[test]
+    fn thermodynamic_column_uses_explicit_defaults_and_motion_correction() {
+        let path = fixture_path();
+        let nc = netcrust::open(&path).expect("open fixture");
+        let inventory = inspect_file(&nc, &path).expect("inspect fixture");
+        let constants = Cm1ThermodynamicConstants::official_defaults();
+        let column = read_thermodynamic_column(&nc, &inventory, 0, 1, 0, constants.clone())
+            .expect("derive thermodynamic column");
+
+        assert_eq!(column.pressure_hpa, vec![950.0, 800.0]);
+        assert_eq!(column.model_level_height_m, vec![500.0, 1_500.0]);
+        assert_eq!(column.u_grid_relative_mps, vec![2.0, 3.0]);
+        assert_eq!(column.v_grid_relative_mps, vec![4.0, 5.0]);
+        assert_eq!(column.u_east_mps, vec![14.5, 15.5]);
+        assert_eq!(column.v_north_mps, vec![7.0, 8.0]);
+        assert!(column.invalid_levels.is_empty());
+        let expected_temperature = 300.0
+            * (0.95_f64).powf(constants.dry_air_gas_constant_j_kg_k / constants.dry_air_cp_j_kg_k)
+            - 273.15;
+        assert!((column.temperature_c[0] - expected_temperature).abs() < 1.0e-10);
+        assert!(column.dewpoint_c.iter().all(|value| value.is_finite()));
+        assert!(column.provenance.contains("testcase 4/5 overrides"));
+        assert!(column.provenance.contains("not labeled MSL"));
     }
 
     #[test]

@@ -19,12 +19,14 @@ science. Regenerate it with `generate_fixture.py`; the generated binary is
 committed so Rust tests do not require Python or libnetcdf.
 
 Generated fixture SHA-256:
-`8239CAE702233F1059FD1274E8274A47B3450AFC9614E50802234B94EA5DBFA8`.
+`733C8571B19D264F2542DA8038673FB1C846A4A9D1DCA92AD9CF7481015706E1`.
 Its `u`, `v`, and `w` faces contain simple nonzero sequences so tests can
 verify the exact adjacent-face averages used to destagger `xf/yf/zf` fields
 onto the `xh/yh/zh` scalar grid. Its `zhval` contains populated physical
 model-level heights for every time and horizontal cell so column tests do not
-mistake NetCDF's default fill value for vertical-coordinate data.
+mistake NetCDF's default fill value for vertical-coordinate data. Exact
+official-name `th/prs/qv/uinterp/vinterp` fields provide small, clearly
+synthetic inputs for unit-gating and thermodynamic-column tests.
 
 `cm1out_legacy_r19.nc` reproduces the official r18/r19 topology, whose data
 dimensions are `ni/nj/nk` and `nip1/njp1/nkp1` while coordinate variables are

@@ -77,6 +77,31 @@ with netCDF4.Dataset(OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
     dbz.units = "dBZ"
     dbz[:] = scalar[:]
 
+    for name, long_name, units, level_values in (
+        ("th", "potential temperature", "K", [300.0, 310.0]),
+        ("prs", "pressure", "Pa", [95000.0, 80000.0]),
+        ("qv", "water vapor mixing ratio", "kg/kg", [0.010, 0.004]),
+        (
+            "uinterp",
+            "u interpolated to scalar points (grid-relative)",
+            "m/s",
+            [2.0, 3.0],
+        ),
+        (
+            "vinterp",
+            "v interpolated to scalar points (grid-relative)",
+            "m/s",
+            [4.0, 5.0],
+        ),
+    ):
+        var = nc.createVariable(name, "f4", ("time", "zh", "yh", "xh"))
+        var.long_name = long_name
+        var.units = units
+        var[:] = np.broadcast_to(
+            np.asarray(level_values, dtype=np.float32)[None, :, None, None],
+            (2, 2, 2, 3),
+        )
+
     zhval = nc.createVariable("zhval", "f4", ("time", "zh", "yh", "xh"))
     zhval.long_name = "height on model levels"
     zhval.units = "m"
