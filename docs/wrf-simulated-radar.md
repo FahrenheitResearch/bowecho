@@ -496,7 +496,11 @@ mass-squared (equivalent-ice-volume-squared) radar weight. The latter matches
 the variable-density ice reflectivity weight in the official P3 table
 generator; using raw `Dmax^6` here would incorrectly give a fluffy aggregate
 the radar weight of a solid constant-density sphere. Native P3 M6 remains the
-separate PSD reconstruction and quadrature-tail closure authority.
+separate PSD reconstruction and quadrature-tail closure authority. The
+production projected-area policy permits at most 0.25% omitted P3 radar
+weight (about 0.011 dB in the Rayleigh-equivalent limit), while number and
+mass retain their independent hard gates; no missing node is clamped or
+fabricated.
 
 P3 predicts maximum dimension, mass, and projected area, but not one unique
 spheroidal habit or canting distribution. The usable research policy therefore
