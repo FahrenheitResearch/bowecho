@@ -5664,8 +5664,8 @@ dependencies = [
 
 [[package]]
 name = "simsat"
-version = "0.1.9"
-source = "git+https://github.com/FahrenheitResearch/simsat.git?rev=39f928a44232de6a6304e67f97b94c1ed86f4339#39f928a44232de6a6304e67f97b94c1ed86f4339"
+version = "0.2.0"
+source = "git+https://github.com/FahrenheitResearch/simsat.git?rev=bda8661d1486970a9540f735bc334d9edfd8268a#bda8661d1486970a9540f735bc334d9edfd8268a"
 dependencies = [
  "chrono",
  "eframe",

@@ -1775,12 +1775,16 @@ fn enhanced_anchors_for_band(band: u8) -> Option<rw_sat::palette::Anchors> {
 }
 
 /// User-selectable IR enhancement for Kelvin brightness-temperature bands
-/// (GOES ABI and Himawari AHI bands 7-16). `Cimss` keeps the established
-/// per-band behavior ([`ENHANCED_IR`] on the longwave window, production
-/// palettes elsewhere); the others are the classic NOAA absolute-temperature
-/// enhancement curves, applied to every IR band on both satellites.
+/// (GOES ABI and Himawari AHI bands 7-16). [`Natural`](Self::Natural) is NOAA's
+/// continuous heritage longwave-window display, while `Cimss` keeps BowEcho's
+/// established persisted default and per-band behavior ([`ENHANCED_IR`] on the
+/// longwave window, production palettes elsewhere). The other choices are the
+/// classic NOAA absolute-temperature analysis curves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IrEnhancement {
+    /// NOAA heritage continuous bi-linear longwave-IR grayscale (recommended).
+    /// Water-vapor bands retain their band-scaled grayscale ranges.
+    Natural,
     /// CIMSS-style rainbow on 13-15, production palettes elsewhere (default).
     #[default]
     Cimss,
@@ -1797,7 +1801,8 @@ pub enum IrEnhancement {
 }
 
 impl IrEnhancement {
-    pub const ALL: [IrEnhancement; 6] = [
+    pub const ALL: [IrEnhancement; 7] = [
+        Self::Natural,
         Self::Cimss,
         Self::Bd,
         Self::Avn,
@@ -1809,6 +1814,7 @@ impl IrEnhancement {
     /// Stable settings key (persisted in `AppSettings::sat_ir_enhancement`).
     pub fn slug(self) -> &'static str {
         match self {
+            Self::Natural => "natural",
             Self::Cimss => "cimss",
             Self::Bd => "bd",
             Self::Avn => "avn",
@@ -1820,22 +1826,34 @@ impl IrEnhancement {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Cimss => "CIMSS ramp (default)",
-            Self::Bd => "BD curve (Dvorak)",
-            Self::Avn => "AVN",
-            Self::Funktop => "Funktop",
-            Self::Rainbow => "Rainbow",
-            Self::Grayscale => "Grayscale",
+            Self::Natural => "Natural (NOAA heritage) — Recommended",
+            Self::Cimss => "CIMSS-style false color (isotherm bands)",
+            Self::Bd => "BD stepped thresholds (Dvorak)",
+            Self::Avn => "AVN stepped analysis palette",
+            Self::Funktop => "Funktop stepped analysis palette",
+            Self::Rainbow => "Rainbow analysis palette",
+            Self::Grayscale => "Legacy linear grayscale",
         }
     }
 
-    /// Parse a settings slug; unknown values keep the default enhancement.
+    /// Parse a settings slug or public SimSat alias; unknown values keep BowEcho's
+    /// persisted CIMSS default rather than silently changing existing users.
     pub fn parse(value: &str) -> Self {
-        let normalized = value.trim().to_ascii_lowercase();
-        Self::ALL
-            .into_iter()
-            .find(|enhancement| enhancement.slug() == normalized)
-            .unwrap_or_default()
+        match value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_', ' '], "")
+            .as_str()
+        {
+            "natural" | "noaa" | "noaaheritage" | "heritage" => Self::Natural,
+            "cimss" => Self::Cimss,
+            "bd" | "bdcurve" => Self::Bd,
+            "avn" => Self::Avn,
+            "funktop" => Self::Funktop,
+            "rainbow" | "rb" => Self::Rainbow,
+            "gray" | "grayscale" | "grey" | "greyscale" => Self::Grayscale,
+            _ => Self::default(),
+        }
     }
 }
 
@@ -1847,6 +1865,9 @@ impl IrEnhancement {
 /// the warm anchor simply clamp dark).
 fn ir_enhancement_anchors(band: u8, enhancement: IrEnhancement) -> rw_sat::palette::Anchors {
     match enhancement {
+        // NOAA's heritage transfer is a longwave-window display. Preserve useful
+        // contrast on WV 8/9/10 with SimSat's exact band-scaled grayscale fallback.
+        IrEnhancement::Natural => wv_grayscale_for_band(band).unwrap_or(NATURAL_IR),
         IrEnhancement::Cimss => {
             enhanced_anchors_for_band(band).unwrap_or_else(|| band_anchors(band))
         }
@@ -1971,6 +1992,33 @@ const GRAYSCALE_IR: rw_sat::palette::Anchors = &[
     (173.15, [255, 255, 255]), // -100 C
     (330.0, [0, 0, 0]),        //  +57 C
 ];
+
+/// NOAA/NESDIS heritage 8-bit longwave-IR display mapping. The GOES-R Cloud and
+/// Moisture Imagery ATBD defines `418 - BT` below 242 K and `660 - 2*BT` at and
+/// above 242 K, clamped to 0..255. These exact anchors express the same continuous
+/// bi-linear transfer; the canonical brightness-temperature plane remains Kelvin.
+///
+/// Source: NOAA/NESDIS GOES-R ABI Cloud and Moisture Imagery Product ATBD v4,
+/// section 3.4.2.1, <https://www.star.nesdis.noaa.gov/goesr/documents/ATBDs/Enterprise/ATBD_Enterprise_Cloud_and_Moisture_Imagery_Product_v4_2021-01-13.pdf>.
+const NATURAL_IR: rw_sat::palette::Anchors = &[
+    (163.0, [255, 255, 255]),
+    (242.0, [176, 176, 176]),
+    (330.0, [0, 0, 0]),
+];
+
+/// WV-scaled inverted grayscale fallbacks used by SimSat's Natural display.
+const WV_GRAYSCALE_C08: rw_sat::palette::Anchors = &[(184.0, [255, 255, 255]), (268.0, [0, 0, 0])];
+const WV_GRAYSCALE_C09: rw_sat::palette::Anchors = &[(188.0, [255, 255, 255]), (276.0, [0, 0, 0])];
+const WV_GRAYSCALE_C10: rw_sat::palette::Anchors = &[(196.0, [255, 255, 255]), (286.0, [0, 0, 0])];
+
+fn wv_grayscale_for_band(band: u8) -> Option<rw_sat::palette::Anchors> {
+    match band {
+        8 => Some(WV_GRAYSCALE_C08),
+        9 => Some(WV_GRAYSCALE_C09),
+        10 => Some(WV_GRAYSCALE_C10),
+        _ => None,
+    }
+}
 
 /// Radar-map-overlay alpha from brightness temperature: warm (> +5 C) fully
 /// transparent so radar/basemap shows through; cold storm tops (< -40 C)
@@ -7007,9 +7055,79 @@ mod tests {
         for enhancement in IrEnhancement::ALL {
             assert_eq!(IrEnhancement::parse(enhancement.slug()), enhancement);
         }
+        assert_eq!(IrEnhancement::default(), IrEnhancement::Cimss);
         assert_eq!(IrEnhancement::parse(" BD "), IrEnhancement::Bd);
+        assert_eq!(
+            IrEnhancement::parse("NOAA heritage"),
+            IrEnhancement::Natural
+        );
+        assert_eq!(IrEnhancement::parse("grayscale"), IrEnhancement::Grayscale);
         assert_eq!(IrEnhancement::parse("no-such"), IrEnhancement::Cimss);
         assert_eq!(IrEnhancement::parse(""), IrEnhancement::Cimss);
+    }
+
+    #[test]
+    fn natural_ir_uses_exact_noaa_longwave_transfer() {
+        assert_eq!(
+            ir_enhancement_anchors(13, IrEnhancement::Natural),
+            NATURAL_IR
+        );
+        for (bt, expected) in [
+            (150.0, 255),
+            (163.0, 255),
+            (200.0, 218),
+            (242.0, 176),
+            (260.0, 140),
+            (300.0, 60),
+            (330.0, 0),
+            (350.0, 0),
+        ] {
+            let [r, g, b, a] = anchor_color(bt, ir_enhancement_anchors(13, IrEnhancement::Natural));
+            assert_eq!([r, g, b, a], [expected, expected, expected, 255], "{bt} K");
+        }
+    }
+
+    #[test]
+    fn natural_ir_uses_simsat_wv_grayscale_fallbacks() {
+        for (band, expected) in [
+            (8, WV_GRAYSCALE_C08),
+            (9, WV_GRAYSCALE_C09),
+            (10, WV_GRAYSCALE_C10),
+        ] {
+            assert_eq!(
+                ir_enhancement_anchors(band, IrEnhancement::Natural),
+                expected
+            );
+            let (cold_k, _) = expected[0];
+            let (warm_k, _) = expected[1];
+            assert_eq!(
+                anchor_color(cold_k, expected),
+                [255, 255, 255, 255],
+                "band {band} cold end"
+            );
+            assert_eq!(
+                anchor_color(warm_k, expected),
+                [0, 0, 0, 255],
+                "band {band} warm end"
+            );
+        }
+        assert_eq!(
+            ir_enhancement_anchors(14, IrEnhancement::Natural),
+            NATURAL_IR
+        );
+    }
+
+    #[test]
+    fn natural_ir_labels_match_simsat_without_changing_bowecho_default() {
+        assert_eq!(
+            IrEnhancement::Natural.label(),
+            "Natural (NOAA heritage) — Recommended"
+        );
+        assert_eq!(
+            IrEnhancement::Cimss.label(),
+            "CIMSS-style false color (isotherm bands)"
+        );
+        assert_eq!(IrEnhancement::parse("unknown"), IrEnhancement::Cimss);
     }
 
     #[test]

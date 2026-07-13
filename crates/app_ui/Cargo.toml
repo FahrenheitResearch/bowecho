@@ -29,8 +29,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 quick-xml.workspace = true
-# SimSat v0.1.9 engine, pinned to the exact public release-tag commit.
-simsat = { git = "https://github.com/FahrenheitResearch/simsat.git", rev = "39f928a44232de6a6304e67f97b94c1ed86f4339" }
+# SimSat v0.2.0 engine, pinned to the exact public release commit.
+simsat = { git = "https://github.com/FahrenheitResearch/simsat.git", rev = "bda8661d1486970a9540f735bc334d9edfd8268a" }
 # In-app updater (Settings > security): streaming release-asset download with
 # progress, hashing the streamed bytes for the SHA-256 gate that runs before
 # the Authenticode gate (docs/SIGNING.md).
