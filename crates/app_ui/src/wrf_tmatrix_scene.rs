@@ -3,10 +3,13 @@
 //! The cache retains only sparse source-cell indices and nine additive f32
 //! components at every validated radar-elevation LUT node.  Query-time
 //! elevation interpolation happens component by component; nonlinear radar
-//! products are derived only after interpolation.  These research tables are
-//! never substituted with the bulk Rayleigh operator when a lookup fails.
+//! products are derived only after interpolation. These research tables are
+//! never substituted with the bulk Rayleigh operator when a lookup fails;
+//! the separately versioned sub-floor exact-sphere Rayleigh limit is selected
+//! before lookup and cannot handle any other miss.
 
 use std::collections::BTreeSet;
+use std::f64::consts::PI;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -16,10 +19,12 @@ use radar_scattering::{
     EvaluationError, FallMomentPolicy, ISHMAEL_PSD_REVISION, IshmaelPsd, IshmaelPsdInput,
     MixtureTopology, OrientationDefinition, OrientationModel, OutputError, P3_MODULE_VERSION,
     P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION, P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION,
-    P3_PSD_REVISION, P3_SPHERICAL_INTEGRATION_REVISION, P3_TABLE_READER_REVISION,
-    P3_WRF_SOURCE_COMMIT, P3IceMomentInput, P3LookupTableV54, P3OfficialTableKind,
-    P3OfficialTableV54, P3Psd, P3PsdError, P3PsdInput, P3QuadratureNode, P3ReconstructionConfig,
-    P3ShapeAuthority, P3TMatrixIntegrationConfig, P3TMatrixIntegrationError, P3TMatrixParticleNode,
+    P3_PSD_REVISION, P3_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION, P3_SOLID_ICE_DENSITY_KG_M3,
+    P3_SPHERICAL_INTEGRATION_REVISION, P3_TABLE_READER_REVISION, P3_WRF_SOURCE_COMMIT,
+    P3IceMomentInput, P3LookupTableV54, P3OfficialTableKind, P3OfficialTableV54, P3ParticleRegion,
+    P3ParticleScatteringRoute, P3Psd, P3PsdError, P3PsdInput, P3QuadratureNode,
+    P3ReconstructionConfig, P3ShapeAuthority, P3SmallSphereScatteringPolicy,
+    P3TMatrixIntegrationConfig, P3TMatrixIntegrationError, P3TMatrixParticleNode,
     P3TMatrixShapePolicy, P3WrfScheme, ParticleState, PolarAccumulatorQuantities, PsdError,
     PsdFallSpeedProvenance, PsdIntegrationConfig, PsdIntegrationError, PsdParticleNode,
     PsdParticleSupport, PsdSpheroidHabit, RadarViewApplicability, RadarViewGeometry,
@@ -836,11 +841,13 @@ pub enum WrfTMatrixFrozenScatteringAudit {
     P3CharacteristicParticleV1,
     /// Lambda/mu and PSD weights come from the exact pinned P3 table. Shape is
     /// separately qualified: strict mode evaluates only scheme-native spheres;
-    /// research mode uses the named projected-area-equivalent oblate mapping.
+    /// research mode uses the named area/mass spheroid mapping and the declared
+    /// exact-small-sphere Rayleigh-limit bridge below the table floor.
     P3SchemeNativePsdV1 {
         p3_psd_revision: &'static str,
         table_reader_revision: &'static str,
         integration_revision: &'static str,
+        small_sphere_scattering_revision: &'static str,
         wrf_source_commit: &'static str,
         p3_module_version: &'static str,
         table_kind: P3OfficialTableKind,
@@ -1121,6 +1128,8 @@ impl WrfTMatrixScene {
                         p3_psd_revision: P3_PSD_REVISION,
                         table_reader_revision: P3_TABLE_READER_REVISION,
                         integration_revision,
+                        small_sphere_scattering_revision:
+                            P3_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION,
                         wrf_source_commit: P3_WRF_SOURCE_COMMIT,
                         p3_module_version: P3_MODULE_VERSION,
                         table_kind: p3.table.kind(),
@@ -1135,7 +1144,7 @@ impl WrfTMatrixScene {
                                 "lambda/mu and analytic closure are exact P3; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately and without renormalization; oblate shape is projected-area-equivalent and Gaussian-20 canting is an external research assumption, not P3-predicted habit or orientation"
                             }
                             P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1 => {
-                                "lambda/mu and analytic closure are exact P3; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately and without renormalization; source mass and projected area map continuously to an equivalent oblate or, only for the pinned one-percent rime-iteration overshoot, prolate spheroid without clamping; Gaussian-20 canting and spheroidal habit remain external research assumptions"
+                                "lambda/mu and analytic closure are exact P3; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately and without renormalization; the area-equivalent spheroid preserves mass, uses a continuous 900 kg/m3 source-solid-ice construction where the empirical area-law transition cannot define a physical homogeneous volume, and maps only the pinned one-percent rime-iteration area overshoot to prolate; exact P3 small dense spheres below the 50 um T-matrix floor use the separately versioned Rayleigh-limit bridge; Gaussian-20 canting and spheroidal habit remain external research assumptions"
                             }
                         },
                     }
@@ -1443,6 +1452,7 @@ fn production_p3_integration_config(
 ) -> Result<P3TMatrixIntegrationConfig, radar_scattering::P3TMatrixIntegrationConfigError> {
     P3TMatrixIntegrationConfig::new(
         shape_policy,
+        P3SmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1,
         radar_scattering::P3QuadratureConfig::default(),
         P3_MAXIMUM_OMITTED_NUMBER_FRACTION,
         P3_MAXIMUM_OMITTED_MASS_FRACTION,
@@ -1615,24 +1625,15 @@ fn build_p3_psd_cell_into(
                         }
                         PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
                     };
-                    let positive_down_speed = table.dry_particle_geometry_terminal_speed_m_s(
-                        node.equivolume_diameter_m(),
-                        node.bulk_density_kg_m3(),
-                    )?;
-                    let query = TMatrixParticleNodeQuery::new(
+                    evaluate_p3_particle_node(
+                        table,
+                        node,
                         dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
-                        node.equivolume_diameter_m(),
-                        node.bulk_density_kg_m3(),
-                        node.minor_to_major_axis_ratio(),
-                        node.habit(),
-                        Some(rime_fraction),
+                        rime_fraction,
                         rime_density,
-                        positive_down_speed,
                         validated.p3_fall_speed,
-                        gaussian20_orientation(),
                         request,
-                    )?;
-                    table.evaluate_dry_particle_node_per_m3(&query)
+                    )
                 },
             )
             .map_err(|source| WrfTMatrixSceneBuildError::P3PsdIntegration {
@@ -2125,6 +2126,142 @@ fn gaussian20_orientation() -> OrientationModel {
     }
 }
 
+fn floor_anchored_rayleigh_sphere(
+    anchor_components: [f64; AdditiveScattering::COMPONENT_COUNT],
+    diameter_ratio: f64,
+    target_speed: f64,
+    frequency_hz: f64,
+    reference_water_factor_squared: f64,
+) -> Result<AdditiveScattering, EvaluationError> {
+    if !diameter_ratio.is_finite() || diameter_ratio <= 0.0 || diameter_ratio > 1.0 {
+        return Err(EvaluationError::InvalidQuery {
+            field: "P3 Rayleigh bridge diameter ratio",
+            value: diameter_ratio,
+        });
+    }
+    let backscatter_scale = diameter_ratio.powi(6);
+    let anchor_reflectivity = 0.5 * (anchor_components[0] + anchor_components[1]);
+    let reflectivity = anchor_reflectivity * backscatter_scale;
+    let anchor_attenuation = 0.5 * (anchor_components[5] + anchor_components[6]);
+    let wavelength_mm = 299_792_458.0 / frequency_hz * 1_000.0;
+    let backscatter_cross_section_mm2 =
+        anchor_reflectivity * PI.powi(5) * reference_water_factor_squared / wavelength_mm.powi(4);
+    let scattering_cross_section_mm2 = (2.0 / 3.0) * backscatter_cross_section_mm2;
+    let extinction_cross_section_mm2 = anchor_attenuation / 4.343e-3;
+    let absorption_cross_section_mm2 = extinction_cross_section_mm2 - scattering_cross_section_mm2;
+    let negative_tolerance = 1.0e-10
+        * extinction_cross_section_mm2
+            .abs()
+            .max(scattering_cross_section_mm2.abs())
+            .max(f64::MIN_POSITIVE);
+    if absorption_cross_section_mm2 < -negative_tolerance {
+        return Err(EvaluationError::InvalidQuery {
+            field: "P3 Rayleigh bridge anchor absorption cross section",
+            value: absorption_cross_section_mm2,
+        });
+    }
+    let target_extinction_cross_section_mm2 = absorption_cross_section_mm2.max(0.0)
+        * diameter_ratio.powi(3)
+        + scattering_cross_section_mm2 * backscatter_scale;
+    let attenuation = 4.343e-3 * target_extinction_cross_section_mm2;
+    AdditiveScattering::from_components([
+        reflectivity,
+        reflectivity,
+        reflectivity,
+        0.0,
+        0.0,
+        attenuation,
+        attenuation,
+        reflectivity * target_speed,
+        reflectivity * target_speed * target_speed,
+    ])
+    .map_err(EvaluationError::Output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_p3_particle_node(
+    table: &ResearchTMatrixLut,
+    node: &P3TMatrixParticleNode,
+    temperature_k: f64,
+    rime_fraction: f64,
+    rime_density: Option<f64>,
+    fall_speed: PsdFallSpeedProvenance,
+    request: TMatrixEvaluationRequest,
+) -> Result<AdditiveScattering, EvaluationError> {
+    let target_diameter = node.equivolume_diameter_m();
+    let target_density = node.bulk_density_kg_m3();
+    let target_speed =
+        table.dry_particle_geometry_terminal_speed_m_s(target_diameter, target_density)?;
+    if node.scattering_route() == P3ParticleScatteringRoute::TMatrixTable {
+        let query = TMatrixParticleNodeQuery::new(
+            temperature_k,
+            target_diameter,
+            target_density,
+            node.minor_to_major_axis_ratio(),
+            node.habit(),
+            Some(rime_fraction),
+            rime_density,
+            target_speed,
+            fall_speed,
+            gaussian20_orientation(),
+            request,
+        )?;
+        return table.evaluate_dry_particle_node_per_m3(&query);
+    }
+
+    // This route is selected only for P3's exact spherical 900 kg/m3 ice law
+    // below the LUT diameter floor. Anchor the same table material,
+    // temperature, frequency and view at its first diameter, then apply the
+    // analytic Rayleigh sphere limits: D^6 backscatter/covariance and D^3
+    // absorption. No other failed lookup can enter this path.
+    if node.habit() != PsdSpheroidHabit::Spherical
+        || node.source().particle.region != P3ParticleRegion::SmallDenseSphere
+        || target_density.to_bits() != P3_SOLID_ICE_DENSITY_KG_M3.to_bits()
+        || node.minor_to_major_axis_ratio().to_bits() != 1.0_f64.to_bits()
+    {
+        return Err(EvaluationError::InvalidQuery {
+            field: "P3 Rayleigh bridge exact small-dense-sphere contract",
+            value: node.minor_to_major_axis_ratio(),
+        });
+    }
+    let domain = table.dry_particle_node_domain()?;
+    let anchor_diameter = domain.equivolume_diameter_range_m()[0];
+    if target_diameter >= anchor_diameter {
+        return Err(EvaluationError::InvalidQuery {
+            field: "P3 Rayleigh bridge diameter below table floor",
+            value: target_diameter,
+        });
+    }
+    let anchor_speed =
+        table.dry_particle_geometry_terminal_speed_m_s(anchor_diameter, target_density)?;
+    let anchor_query = TMatrixParticleNodeQuery::new(
+        temperature_k,
+        anchor_diameter,
+        target_density,
+        1.0,
+        PsdSpheroidHabit::Spherical,
+        Some(rime_fraction),
+        rime_density,
+        anchor_speed,
+        fall_speed,
+        gaussian20_orientation(),
+        request,
+    )?;
+    let anchor = table.evaluate_dry_particle_node_per_m3(&anchor_query)?;
+    let diameter_ratio = target_diameter / anchor_diameter;
+    let reference_water_factor_squared = table
+        .descriptor()
+        .radar()
+        .reference_water_dielectric_factor_squared;
+    floor_anchored_rayleigh_sphere(
+        anchor.components(),
+        diameter_ratio,
+        target_speed,
+        request.frequency_hz(),
+        reference_water_factor_squared,
+    )
+}
+
 fn evaluate_p3_psd_raw_cell(
     raw: &RawPropertyCell,
     tables: WrfTMatrixLutBundle<'_>,
@@ -2202,24 +2339,15 @@ fn evaluate_p3_psd_raw_cell(
                     }
                     PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
                 };
-                let positive_down_speed = table.dry_particle_geometry_terminal_speed_m_s(
-                    node.equivolume_diameter_m(),
-                    node.bulk_density_kg_m3(),
-                )?;
-                let query = TMatrixParticleNodeQuery::new(
+                evaluate_p3_particle_node(
+                    table,
+                    node,
                     dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
-                    node.equivolume_diameter_m(),
-                    node.bulk_density_kg_m3(),
-                    node.minor_to_major_axis_ratio(),
-                    node.habit(),
-                    Some(rime_fraction),
+                    rime_fraction,
                     rime_density,
-                    positive_down_speed,
                     validated.p3_fall_speed,
-                    gaussian20_orientation(),
                     request,
-                )?;
-                table.evaluate_dry_particle_node_per_m3(&query)
+                )
             },
         )
         .map_err(|source| WrfTMatrixRawEvaluationError::P3PsdIntegration {
@@ -3831,6 +3959,38 @@ mod tests {
 
     fn additive(values: [f64; 9]) -> AdditiveScattering {
         AdditiveScattering::from_components(values).unwrap()
+    }
+
+    #[test]
+    fn floor_anchored_rayleigh_sphere_has_exact_floor_and_sphere_limits() {
+        let anchor = [64.0, 64.0, 64.0, 0.0, 0.0, 1.0e-6, 1.0e-6, 0.0, 0.0];
+        let at_floor =
+            floor_anchored_rayleigh_sphere(anchor, 1.0, 2.0, PROPERTY_TMATRIX_FREQUENCY_HZ, 0.93)
+                .unwrap();
+        let floor_components = at_floor.components();
+        assert_eq!(floor_components[0], 64.0);
+        assert_eq!(floor_components[1], 64.0);
+        assert_eq!(floor_components[2], 64.0);
+        assert_eq!(floor_components[3], 0.0);
+        assert_eq!(floor_components[4], 0.0);
+        assert!((floor_components[5] - 1.0e-6).abs() <= 1.0e-18);
+        assert!((floor_components[6] - 1.0e-6).abs() <= 1.0e-18);
+        assert_eq!(floor_components[7], 128.0);
+        assert_eq!(floor_components[8], 256.0);
+
+        let half_diameter =
+            floor_anchored_rayleigh_sphere(anchor, 0.5, 2.0, PROPERTY_TMATRIX_FREQUENCY_HZ, 0.93)
+                .unwrap();
+        let half_components = half_diameter.components();
+        assert_eq!(half_components[0], 1.0);
+        assert_eq!(half_components[1], 1.0);
+        assert_eq!(half_components[2], 1.0);
+        assert_eq!(half_components[3], 0.0);
+        assert_eq!(half_components[4], 0.0);
+        assert!(half_components[5] > 0.0 && half_components[5] < 1.0e-6);
+        assert_eq!(half_components[5], half_components[6]);
+        assert_eq!(half_components[7], 2.0);
+        assert_eq!(half_components[8], 4.0);
     }
 
     fn synthetic_scene() -> WrfTMatrixScene {

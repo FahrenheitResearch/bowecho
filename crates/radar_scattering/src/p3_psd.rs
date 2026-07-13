@@ -54,7 +54,8 @@ pub const P3_WRF_QSMALL_KGKG: f32 = 1.0e-14;
 /// P3's default-`REAL` minimum ice number mixing ratio.
 pub const P3_WRF_NSMALL_PER_KG: f32 = 1.0e-16;
 
-const SOLID_ICE_DENSITY_KG_M3: f64 = 900.0;
+/// Solid-ice density used by the pinned P3 particle law.
+pub const P3_SOLID_ICE_DENSITY_KG_M3: f64 = 900.0;
 const UNRIMED_MASS_COEFFICIENT: f64 = 0.0121;
 const UNRIMED_MASS_EXPONENT: f64 = 1.9;
 const RIMED_MASS_EXPONENT: f64 = 3.0;
@@ -480,7 +481,7 @@ impl P3PiecewiseParticleLaw {
         }
 
         let small_sphere_limit_m = (PI / (6.0 * UNRIMED_MASS_COEFFICIENT)
-            * SOLID_ICE_DENSITY_KG_M3)
+            * P3_SOLID_ICE_DENSITY_KG_M3)
             .powf(1.0 / (UNRIMED_MASS_EXPONENT - RIMED_MASS_EXPONENT));
         let effective_rime_density = if rime_mass_fraction > 0.0 {
             rime_density_kg_m3
@@ -593,7 +594,7 @@ impl P3PiecewiseParticleLaw {
             if maximum_dimension_m <= self.small_sphere_limit_m {
                 (
                     P3ParticleRegion::SmallDenseSphere,
-                    PI / 6.0 * SOLID_ICE_DENSITY_KG_M3 * maximum_dimension_m.powi(3),
+                    PI / 6.0 * P3_SOLID_ICE_DENSITY_KG_M3 * maximum_dimension_m.powi(3),
                     PI / 4.0 * maximum_dimension_m.powi(2),
                 )
             } else if maximum_dimension_m <= self.dense_unrimed_to_graupel_m {
@@ -1531,7 +1532,7 @@ fn integrate_piecewise_mass(
         (
             0.0,
             law.small_sphere_limit_m,
-            PI / 6.0 * SOLID_ICE_DENSITY_KG_M3,
+            PI / 6.0 * P3_SOLID_ICE_DENSITY_KG_M3,
             3.0,
         ),
         (
@@ -1583,7 +1584,7 @@ fn integrate_piecewise_mass_squared(
         (
             0.0,
             law.small_sphere_limit_m,
-            PI / 6.0 * SOLID_ICE_DENSITY_KG_M3,
+            PI / 6.0 * P3_SOLID_ICE_DENSITY_KG_M3,
             3.0,
         ),
         (

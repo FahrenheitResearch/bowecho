@@ -4,9 +4,12 @@
 //! predict a unique spheroidal axis ratio or canting distribution for its
 //! dense-unrimed and partially-rimed regions. Strict mode therefore evaluates
 //! only exact spheres and audits every other particle as omitted. A separate,
-//! unmistakably research-only mode derives one projected-area-equivalent
-//! oblate from the native mass/area law; it never labels that shape as P3
-//! truth. Both modes reject table-domain omissions above declared budgets.
+//! unmistakably research-only mode derives one spheroid from the native
+//! mass/area law; it never labels that shape as P3 truth. Production research
+//! mode also has one narrow, declared Rayleigh-limit bridge for P3's exact
+//! small dense spheres below the T-matrix table's diameter floor. It is not a
+//! fallback for any other table miss. All remaining shape/table omissions are
+//! rejected above declared budgets.
 
 use std::error::Error;
 use std::f64::consts::PI;
@@ -14,8 +17,9 @@ use std::f64::consts::PI;
 use thiserror::Error;
 
 use crate::{
-    AdditiveScattering, OutputError, P3PopulationMoments, P3Psd, P3PsdError, P3QuadratureAudit,
-    P3QuadratureConfig, P3QuadratureNode, PsdParticleDomain, PsdSpheroidHabit,
+    AdditiveScattering, OutputError, P3_SOLID_ICE_DENSITY_KG_M3, P3ParticleRegion,
+    P3PopulationMoments, P3Psd, P3PsdError, P3QuadratureAudit, P3QuadratureConfig,
+    P3QuadratureNode, PsdParticleDomain, PsdSpheroidHabit,
 };
 
 pub const P3_SPHERICAL_INTEGRATION_REVISION: &str =
@@ -23,7 +27,9 @@ pub const P3_SPHERICAL_INTEGRATION_REVISION: &str =
 pub const P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION: &str =
     "wrf-p3-v5.4-projected-area-equivalent-oblate-gaussian20-research-v4";
 pub const P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION: &str =
-    "wrf-p3-v5.4-projected-area-equivalent-spheroid-gaussian20-research-v1";
+    "wrf-p3-v5.4-area-spheroid-solid-ice-constrained-gaussian20-research-v2";
+pub const P3_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION: &str =
+    "wrf-p3-v5.4-exact-small-dense-sphere-rayleigh-table-floor-bridge-v1";
 /// The source P3 rime-density fixed point exits below one-percent relative
 /// change. A small area overshoot created by that final coefficient update is
 /// eligible for the explicit prolate side of the equivalent-spheroid policy;
@@ -101,15 +107,36 @@ pub enum P3TMatrixShapePolicy {
     /// maps to an oblate with horizontal major diameter Dmax. A source-law
     /// area up to one percent above the Dmax circle, caused by the pinned
     /// rime-density fixed-point tolerance, maps continuously to a prolate that
-    /// preserves source area and mass without clamping either value. Larger
+    /// preserves source area and mass without clamping either value. Where the
+    /// empirical P3 area-law transition would otherwise imply a homogeneous
+    /// density above P3's own 900 kg/m3 solid-ice density, the mapping instead
+    /// preserves particle mass at that physical density bound and retains the
+    /// native normalized area as its aspect-ratio proxy. Larger source-area
     /// overshoots remain shape omissions.
     ProjectedAreaEquivalentSpheroidGaussian20ResearchV1,
+}
+
+/// Explicit treatment of exact P3 small dense spheres below a particle LUT's
+/// diameter floor. No policy applies to nonspherical particles or to any
+/// upper-size, density, aspect-ratio, temperature, frequency, or view miss.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum P3SmallSphereScatteringPolicy {
+    Disabled,
+    RayleighLimitBelowTableDiameterFloorV1,
+}
+
+/// Per-node scattering route selected before the application evaluator runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum P3ParticleScatteringRoute {
+    TMatrixTable,
+    TableFloorAnchoredSmallDenseSphereRayleighV1,
 }
 
 /// Explicit omission gates for the only shape-authoritative P3/T-matrix seam.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct P3TMatrixIntegrationConfig {
     shape_policy: P3TMatrixShapePolicy,
+    small_sphere_policy: P3SmallSphereScatteringPolicy,
     quadrature: P3QuadratureConfig,
     maximum_omitted_number_fraction: f64,
     maximum_omitted_mass_fraction: f64,
@@ -119,6 +146,7 @@ pub struct P3TMatrixIntegrationConfig {
 impl P3TMatrixIntegrationConfig {
     pub fn new(
         shape_policy: P3TMatrixShapePolicy,
+        small_sphere_policy: P3SmallSphereScatteringPolicy,
         quadrature: P3QuadratureConfig,
         maximum_omitted_number_fraction: f64,
         maximum_omitted_mass_fraction: f64,
@@ -144,6 +172,7 @@ impl P3TMatrixIntegrationConfig {
         }
         Ok(Self {
             shape_policy,
+            small_sphere_policy,
             quadrature,
             maximum_omitted_number_fraction,
             maximum_omitted_mass_fraction,
@@ -154,6 +183,11 @@ impl P3TMatrixIntegrationConfig {
     #[must_use]
     pub const fn shape_policy(self) -> P3TMatrixShapePolicy {
         self.shape_policy
+    }
+
+    #[must_use]
+    pub const fn small_sphere_policy(self) -> P3SmallSphereScatteringPolicy {
+        self.small_sphere_policy
     }
 
     #[must_use]
@@ -181,6 +215,7 @@ impl Default for P3TMatrixIntegrationConfig {
     fn default() -> Self {
         Self::new(
             P3TMatrixShapePolicy::StrictShapeAuthoritativeSpheres,
+            P3SmallSphereScatteringPolicy::Disabled,
             P3QuadratureConfig::default(),
             0.999,
             0.05,
@@ -244,6 +279,8 @@ pub struct P3TMatrixIntegrationAudit {
     pub non_spherical_nodes: usize,
     pub outside_table_nodes: usize,
     pub projected_area_equivalent_nodes: usize,
+    pub solid_ice_constrained_nodes: usize,
+    pub small_sphere_rayleigh_bridge_nodes: usize,
     pub source_domain: P3TMatrixSourceDomainAudit,
     pub in_source_shape_table_omission: P3TMatrixInSourceOmissionAudit,
 }
@@ -307,6 +344,8 @@ pub struct P3TMatrixParticleNode {
     minor_to_major_axis_ratio: f64,
     habit: PsdSpheroidHabit,
     shape_policy: P3TMatrixShapePolicy,
+    scattering_route: P3ParticleScatteringRoute,
+    solid_ice_constrained: bool,
 }
 
 impl P3TMatrixParticleNode {
@@ -338,6 +377,16 @@ impl P3TMatrixParticleNode {
     #[must_use]
     pub const fn shape_policy(self) -> P3TMatrixShapePolicy {
         self.shape_policy
+    }
+
+    #[must_use]
+    pub const fn scattering_route(self) -> P3ParticleScatteringRoute {
+        self.scattering_route
+    }
+
+    #[must_use]
+    pub const fn solid_ice_constrained(self) -> bool {
+        self.solid_ice_constrained
     }
 }
 
@@ -413,20 +462,29 @@ where
     let mut outside_table = OmittedWeights::default();
     let mut supported = Vec::new();
     let mut projected_area_equivalent_nodes = 0;
+    let mut solid_ice_constrained_nodes = 0;
+    let mut small_sphere_rayleigh_bridge_nodes = 0;
     for (index, node) in quadrature.nodes.iter().enumerate() {
-        let table_node = match config.shape_policy {
+        let mut table_node = match config.shape_policy {
             P3TMatrixShapePolicy::StrictShapeAuthoritativeSpheres => {
                 if !node.particle.is_exact_sphere() {
                     non_spherical.add(node);
                     continue;
                 }
+                let density = if node.particle.region == P3ParticleRegion::SmallDenseSphere {
+                    P3_SOLID_ICE_DENSITY_KG_M3
+                } else {
+                    node.particle.effective_spherical_density_kg_m3
+                };
                 P3TMatrixParticleNode {
                     source: *node,
                     equivolume_diameter_m: node.particle.maximum_dimension_m,
-                    bulk_density_kg_m3: node.particle.effective_spherical_density_kg_m3,
+                    bulk_density_kg_m3: density,
                     minor_to_major_axis_ratio: 1.0,
                     habit: PsdSpheroidHabit::Spherical,
                     shape_policy: config.shape_policy,
+                    scattering_route: P3ParticleScatteringRoute::TMatrixTable,
+                    solid_ice_constrained: false,
                 }
             }
             P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1 => {
@@ -451,6 +509,14 @@ where
                 table_node
             }
         };
+        solid_ice_constrained_nodes += usize::from(table_node.solid_ice_constrained);
+        if small_sphere_bridge_applies(config, *node, table_node, table_support) {
+            table_node.scattering_route =
+                P3ParticleScatteringRoute::TableFloorAnchoredSmallDenseSphereRayleighV1;
+            small_sphere_rayleigh_bridge_nodes += 1;
+            supported.push((index, table_node));
+            continue;
+        }
         let inside_table = table_support
             .domain_for(table_node.habit)
             .is_some_and(|domain| table_node_in_domain(table_node, domain));
@@ -527,6 +593,8 @@ where
             non_spherical_nodes: non_spherical.nodes,
             outside_table_nodes: outside_table.nodes,
             projected_area_equivalent_nodes,
+            solid_ice_constrained_nodes,
+            small_sphere_rayleigh_bridge_nodes,
             source_domain: P3TMatrixSourceDomainAudit {
                 provenance: P3_TMATRIX_SOURCE_DOMAIN_PROVENANCE,
                 in_source_nodes: quadrature.nodes.len(),
@@ -559,6 +627,33 @@ where
             },
         },
     })
+}
+
+fn small_sphere_bridge_applies(
+    config: P3TMatrixIntegrationConfig,
+    source: P3QuadratureNode,
+    mapped: P3TMatrixParticleNode,
+    table_support: crate::PsdParticleSupport,
+) -> bool {
+    if config.small_sphere_policy
+        != P3SmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1
+        || source.particle.region != P3ParticleRegion::SmallDenseSphere
+        || !source.particle.is_exact_sphere()
+        || mapped.habit != PsdSpheroidHabit::Spherical
+        || mapped.bulk_density_kg_m3.to_bits() != P3_SOLID_ICE_DENSITY_KG_M3.to_bits()
+        || mapped.minor_to_major_axis_ratio.to_bits() != 1.0_f64.to_bits()
+    {
+        return false;
+    }
+    let Some(domain) = table_support.spherical() else {
+        return false;
+    };
+    mapped.equivolume_diameter_m < domain.equivolume_diameter_range_m()[0]
+        && contains(domain.bulk_density_range_kg_m3(), mapped.bulk_density_kg_m3)
+        && contains(
+            domain.minor_to_major_axis_ratio_range(),
+            mapped.minor_to_major_axis_ratio,
+        )
 }
 
 fn projected_area_equivalent_oblate(
@@ -611,9 +706,30 @@ fn projected_area_equivalent_spheroid_impl(
         // mapping, not a claim that P3 predicts a prolate habit.
         (PsdSpheroidHabit::Prolate, raw_ratio.recip())
     };
-    let equivolume_diameter = maximum_dimension * volume_ratio.cbrt();
-    let volume = PI / 6.0 * equivolume_diameter.powi(3);
-    let density = node.particle.mass_kg / volume;
+    let area_equivalent_diameter = maximum_dimension * volume_ratio.cbrt();
+    let area_equivalent_volume = PI / 6.0 * area_equivalent_diameter.powi(3);
+    let area_equivalent_density = node.particle.mass_kg / area_equivalent_volume;
+    // P3's empirical unrimed area law changes at the exact small-sphere
+    // boundary. Treating that projected-area fill factor as the volume of a
+    // homogeneous spheroid can then demand more than P3's own solid-ice
+    // density. Preserve mass and the normalized-area aspect proxy, but expand
+    // the equivalent volume just enough to remain at the source's physical
+    // solid-ice density. This is continuous where the two constructions meet
+    // and is not a clamp to an EM-table coordinate.
+    let exact_small_dense_sphere = node.particle.region == P3ParticleRegion::SmallDenseSphere
+        && node.particle.is_exact_sphere();
+    let solid_ice_constrained = !exact_small_dense_sphere
+        && area_equivalent_density > P3_SOLID_ICE_DENSITY_KG_M3 * (1.0 + 1.0e-10);
+    let (equivolume_diameter, density) = if exact_small_dense_sphere {
+        (maximum_dimension, P3_SOLID_ICE_DENSITY_KG_M3)
+    } else if solid_ice_constrained {
+        (
+            (6.0 * node.particle.mass_kg / (PI * P3_SOLID_ICE_DENSITY_KG_M3)).cbrt(),
+            P3_SOLID_ICE_DENSITY_KG_M3,
+        )
+    } else {
+        (area_equivalent_diameter, area_equivalent_density)
+    };
     if !equivolume_diameter.is_finite()
         || equivolume_diameter <= 0.0
         || !density.is_finite()
@@ -628,6 +744,8 @@ fn projected_area_equivalent_spheroid_impl(
         minor_to_major_axis_ratio: axis_ratio,
         habit,
         shape_policy,
+        scattering_route: P3ParticleScatteringRoute::TMatrixTable,
+        solid_ice_constrained,
     })
 }
 
@@ -757,7 +875,7 @@ mod tests {
 
     #[test]
     fn projected_area_above_circumscribing_circle_is_not_clamped() {
-        let mut invalid = node(0.01, 1.0e-6, 1.0);
+        let mut invalid = node(0.01, 1.0e-9, 1.0);
         invalid.particle.projected_area_m2 *= 1.001;
         assert!(projected_area_equivalent_oblate(invalid).is_err());
 
@@ -773,5 +891,104 @@ mod tests {
         let mut excessive = invalid;
         excessive.particle.projected_area_m2 = PI / 4.0 * 0.01_f64.powi(2) * 1.011;
         assert!(projected_area_equivalent_spheroid(excessive).is_err());
+    }
+
+    #[test]
+    fn dense_unrimed_area_discontinuity_uses_mass_preserving_solid_ice_volume() {
+        let law = crate::P3PiecewiseParticleLaw::reconstruct(0.0, 50.0).unwrap();
+        let diameter = law.small_sphere_limit_m * (1.0 + 1.0e-8);
+        let particle = law.particle(diameter).unwrap();
+        assert_eq!(particle.region, P3ParticleRegion::DenseUnrimed);
+        let source = P3QuadratureNode {
+            maximum_dimension_m: diameter,
+            number_concentration_m3: 1.0,
+            particle,
+        };
+        let mapped = projected_area_equivalent_spheroid(source).unwrap();
+
+        assert!(mapped.solid_ice_constrained());
+        assert_eq!(
+            mapped.bulk_density_kg_m3().to_bits(),
+            P3_SOLID_ICE_DENSITY_KG_M3.to_bits()
+        );
+        let reconstructed_mass =
+            mapped.bulk_density_kg_m3() * PI / 6.0 * mapped.equivolume_diameter_m().powi(3);
+        assert!((reconstructed_mass - particle.mass_kg).abs() / particle.mass_kg < 1.0e-12);
+        let raw_ratio = 4.0 * particle.projected_area_m2 / (PI * diameter.powi(2));
+        assert!((mapped.minor_to_major_axis_ratio() - raw_ratio).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn rayleigh_bridge_is_only_below_floor_for_exact_small_dense_spheres() {
+        let law = crate::P3PiecewiseParticleLaw::reconstruct(0.0, 50.0).unwrap();
+        let domain = PsdParticleDomain::new([50.0e-6, 0.089], [1.5, 917.0], [0.1, 1.0]).unwrap();
+        let support = crate::PsdParticleSupport::uniform(domain);
+        let config = P3TMatrixIntegrationConfig::new(
+            P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1,
+            P3SmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1,
+            P3QuadratureConfig::default(),
+            0.999,
+            0.05,
+            0.0025,
+        )
+        .unwrap();
+        let make = |diameter| {
+            let particle = law.particle(diameter).unwrap();
+            let source = P3QuadratureNode {
+                maximum_dimension_m: diameter,
+                number_concentration_m3: 1.0,
+                particle,
+            };
+            let mapped = projected_area_equivalent_spheroid(source).unwrap();
+            (source, mapped)
+        };
+        let (below_source, below_mapped) = make(25.0e-6);
+        assert_eq!(
+            below_mapped.bulk_density_kg_m3().to_bits(),
+            P3_SOLID_ICE_DENSITY_KG_M3.to_bits()
+        );
+        assert!(small_sphere_bridge_applies(
+            config,
+            below_source,
+            below_mapped,
+            support
+        ));
+        let disabled = P3TMatrixIntegrationConfig::new(
+            P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1,
+            P3SmallSphereScatteringPolicy::Disabled,
+            P3QuadratureConfig::default(),
+            0.999,
+            0.05,
+            0.0025,
+        )
+        .unwrap();
+        assert!(!small_sphere_bridge_applies(
+            disabled,
+            below_source,
+            below_mapped,
+            support
+        ));
+        let mut wrong_density = below_mapped;
+        wrong_density.bulk_density_kg_m3 = 1_000.0;
+        assert!(!small_sphere_bridge_applies(
+            config,
+            below_source,
+            wrong_density,
+            support
+        ));
+        let (floor_source, floor_mapped) = make(50.0e-6);
+        assert!(!small_sphere_bridge_applies(
+            config,
+            floor_source,
+            floor_mapped,
+            support
+        ));
+        let (nonspherical_source, nonspherical_mapped) = make(law.small_sphere_limit_m * 1.01);
+        assert!(!small_sphere_bridge_applies(
+            config,
+            nonspherical_source,
+            nonspherical_mapped,
+            support
+        ));
     }
 }
