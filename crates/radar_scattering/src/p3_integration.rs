@@ -19,9 +19,9 @@ use crate::{
 };
 
 pub const P3_SPHERICAL_INTEGRATION_REVISION: &str =
-    "wrf-p3-v5.4-shape-authoritative-spherical-integration-v1";
+    "wrf-p3-v5.4-shape-authoritative-spherical-integration-v3";
 pub const P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION: &str =
-    "wrf-p3-v5.4-projected-area-equivalent-oblate-gaussian20-research-v1";
+    "wrf-p3-v5.4-projected-area-equivalent-oblate-gaussian20-research-v3";
 
 /// Shape contract applied after exact native P3 lambda/mu reconstruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,7 +43,7 @@ pub struct P3TMatrixIntegrationConfig {
     quadrature: P3QuadratureConfig,
     maximum_omitted_number_fraction: f64,
     maximum_omitted_mass_fraction: f64,
-    maximum_omitted_sixth_moment_fraction: f64,
+    maximum_omitted_radar_weight_fraction: f64,
 }
 
 impl P3TMatrixIntegrationConfig {
@@ -52,7 +52,7 @@ impl P3TMatrixIntegrationConfig {
         quadrature: P3QuadratureConfig,
         maximum_omitted_number_fraction: f64,
         maximum_omitted_mass_fraction: f64,
-        maximum_omitted_sixth_moment_fraction: f64,
+        maximum_omitted_radar_weight_fraction: f64,
     ) -> Result<Self, P3TMatrixIntegrationConfigError> {
         for (field, value) in [
             (
@@ -64,8 +64,8 @@ impl P3TMatrixIntegrationConfig {
                 maximum_omitted_mass_fraction,
             ),
             (
-                "maximum omitted P3 sixth-moment fraction",
-                maximum_omitted_sixth_moment_fraction,
+                "maximum omitted P3 mass-squared radar-weight fraction",
+                maximum_omitted_radar_weight_fraction,
             ),
         ] {
             if !value.is_finite() || !(0.0..1.0).contains(&value) {
@@ -77,7 +77,7 @@ impl P3TMatrixIntegrationConfig {
             quadrature,
             maximum_omitted_number_fraction,
             maximum_omitted_mass_fraction,
-            maximum_omitted_sixth_moment_fraction,
+            maximum_omitted_radar_weight_fraction,
         })
     }
 
@@ -102,8 +102,8 @@ impl P3TMatrixIntegrationConfig {
     }
 
     #[must_use]
-    pub const fn maximum_omitted_sixth_moment_fraction(self) -> f64 {
-        self.maximum_omitted_sixth_moment_fraction
+    pub const fn maximum_omitted_radar_weight_fraction(self) -> f64 {
+        self.maximum_omitted_radar_weight_fraction
     }
 }
 
@@ -130,13 +130,13 @@ pub enum P3TMatrixIntegrationConfigError {
 pub struct P3TMatrixOmissionAudit {
     pub non_spherical_number_fraction: f64,
     pub non_spherical_mass_fraction: f64,
-    pub non_spherical_sixth_moment_fraction: f64,
+    pub non_spherical_radar_weight_fraction: f64,
     pub outside_table_number_fraction: f64,
     pub outside_table_mass_fraction: f64,
-    pub outside_table_sixth_moment_fraction: f64,
+    pub outside_table_radar_weight_fraction: f64,
     pub total_omitted_number_fraction: f64,
     pub total_omitted_mass_fraction: f64,
-    pub total_omitted_sixth_moment_fraction: f64,
+    pub total_omitted_radar_weight_fraction: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,15 +174,15 @@ pub enum P3TMatrixIntegrationError<E: Error + 'static> {
     #[error("construct exact P3 quadrature: {0}")]
     Psd(#[source] P3PsdError),
     #[error(
-        "P3 cannot be represented by the existing spheroidal tables without an invented shape: omitted number={number_fraction}, mass={mass_fraction}, D6={sixth_moment_fraction}; limits are {maximum_number}, {maximum_mass}, {maximum_sixth_moment}"
+        "P3 cannot be represented by the existing spheroidal tables without an invented shape: omitted number={number_fraction}, mass={mass_fraction}, equivalent-ice-volume-squared radar weight={radar_weight_fraction}; limits are {maximum_number}, {maximum_mass}, {maximum_radar_weight}"
     )]
     ShapeOrTableOmission {
         number_fraction: f64,
         mass_fraction: f64,
-        sixth_moment_fraction: f64,
+        radar_weight_fraction: f64,
         maximum_number: f64,
         maximum_mass: f64,
-        maximum_sixth_moment: f64,
+        maximum_radar_weight: f64,
     },
     #[error("P3 projected-area equivalent geometry is invalid at node {node_index}: {message}")]
     InvalidEquivalentGeometry { node_index: usize, message: String },
@@ -245,20 +245,30 @@ impl P3TMatrixParticleNode {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct OmittedMoments {
+struct OmittedWeights {
     number: f64,
     mass: f64,
-    sixth: f64,
+    radar_weight: f64,
     nodes: usize,
 }
 
-impl OmittedMoments {
+impl OmittedWeights {
     fn add(&mut self, node: &P3QuadratureNode) {
         self.number += node.number_concentration_m3;
         self.mass += node.number_concentration_m3 * node.particle.mass_kg;
-        self.sixth += node.number_concentration_m3 * node.particle.maximum_dimension_m.powi(6);
+        self.radar_weight += p3_radar_weight(node);
         self.nodes += 1;
     }
+}
+
+/// P3's official lookup-table generator weights its Rayleigh-equivalent ice
+/// reflectivity by `(m / rho_ice)^2`, not by maximum-dimension sixth moment.
+/// The constant ice-density factor cancels in an omitted fraction, leaving
+/// `N m^2`. This matters for large, fluffy P3 particles: `Dmax^6` would assign
+/// them the reflectivity of solid constant-density spheres and can overstate
+/// an unsupported tail by orders of magnitude.
+fn p3_radar_weight(node: &P3QuadratureNode) -> f64 {
+    node.number_concentration_m3 * node.particle.mass_kg.powi(2)
 }
 
 /// Integrate exact native P3 PSD weights through an explicit shape policy.
@@ -288,8 +298,8 @@ where
         .quadrature_with_dimension_breakpoints(config.quadrature, &diameter_breakpoints)
         .map_err(P3TMatrixIntegrationError::Psd)?;
 
-    let mut non_spherical = OmittedMoments::default();
-    let mut outside_table = OmittedMoments::default();
+    let mut non_spherical = OmittedWeights::default();
+    let mut outside_table = OmittedWeights::default();
     let mut supported = Vec::new();
     let mut projected_area_equivalent_nodes = 0;
     for (index, node) in quadrature.nodes.iter().enumerate() {
@@ -326,9 +336,16 @@ where
     let closure = distribution.closure_audit();
     let total_number = closure.reconstructed_number_density_m3;
     let total_mass = closure.reconstructed_mass_concentration_kg_m3;
-    let total_sixth = closure.reconstructed_sixth_moment_m3;
-    let non_spherical_fractions = fractions(non_spherical, total_number, total_mass, total_sixth);
-    let outside_table_fractions = fractions(outside_table, total_number, total_mass, total_sixth);
+    // P3's native M6 remains the quadrature/tail-closure authority. Table
+    // support, however, needs a radar omission weight that remains meaningful
+    // for variable-density particles. Sum the same scheme-native mass-squared
+    // weight over every represented node; the quadrature's independently
+    // audited number/mass/M6 tail is at most 1e-10 by production policy.
+    let total_radar_weight: f64 = quadrature.nodes.iter().map(p3_radar_weight).sum();
+    let non_spherical_fractions =
+        fractions(non_spherical, total_number, total_mass, total_radar_weight);
+    let outside_table_fractions =
+        fractions(outside_table, total_number, total_mass, total_radar_weight);
     let total_fractions = [
         non_spherical_fractions[0] + outside_table_fractions[0],
         non_spherical_fractions[1] + outside_table_fractions[1],
@@ -336,15 +353,15 @@ where
     ];
     if total_fractions[0] > config.maximum_omitted_number_fraction
         || total_fractions[1] > config.maximum_omitted_mass_fraction
-        || total_fractions[2] > config.maximum_omitted_sixth_moment_fraction
+        || total_fractions[2] > config.maximum_omitted_radar_weight_fraction
     {
         return Err(P3TMatrixIntegrationError::ShapeOrTableOmission {
             number_fraction: total_fractions[0],
             mass_fraction: total_fractions[1],
-            sixth_moment_fraction: total_fractions[2],
+            radar_weight_fraction: total_fractions[2],
             maximum_number: config.maximum_omitted_number_fraction,
             maximum_mass: config.maximum_omitted_mass_fraction,
-            maximum_sixth_moment: config.maximum_omitted_sixth_moment_fraction,
+            maximum_radar_weight: config.maximum_omitted_radar_weight_fraction,
         });
     }
 
@@ -380,13 +397,13 @@ where
             omission: P3TMatrixOmissionAudit {
                 non_spherical_number_fraction: non_spherical_fractions[0],
                 non_spherical_mass_fraction: non_spherical_fractions[1],
-                non_spherical_sixth_moment_fraction: non_spherical_fractions[2],
+                non_spherical_radar_weight_fraction: non_spherical_fractions[2],
                 outside_table_number_fraction: outside_table_fractions[0],
                 outside_table_mass_fraction: outside_table_fractions[1],
-                outside_table_sixth_moment_fraction: outside_table_fractions[2],
+                outside_table_radar_weight_fraction: outside_table_fractions[2],
                 total_omitted_number_fraction: total_fractions[0],
                 total_omitted_mass_fraction: total_fractions[1],
-                total_omitted_sixth_moment_fraction: total_fractions[2],
+                total_omitted_radar_weight_fraction: total_fractions[2],
             },
         },
     })
@@ -448,18 +465,56 @@ fn table_node_in_domain(node: P3TMatrixParticleNode, domain: PsdParticleDomain) 
 }
 
 fn fractions(
-    omitted: OmittedMoments,
+    omitted: OmittedWeights,
     total_number: f64,
     total_mass: f64,
-    total_sixth: f64,
+    total_radar_weight: f64,
 ) -> [f64; 3] {
     [
         omitted.number / total_number,
         omitted.mass / total_mass,
-        omitted.sixth / total_sixth,
+        omitted.radar_weight / total_radar_weight,
     ]
 }
 
 fn contains(range: [f64; 2], value: f64) -> bool {
     value >= range[0] && value <= range[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{P3ParticleGeometry, P3ParticleRegion, P3ShapeAuthority};
+
+    fn node(maximum_dimension_m: f64, mass_kg: f64, number_m3: f64) -> P3QuadratureNode {
+        P3QuadratureNode {
+            maximum_dimension_m,
+            number_concentration_m3: number_m3,
+            particle: P3ParticleGeometry {
+                maximum_dimension_m,
+                mass_kg,
+                projected_area_m2: PI / 4.0 * maximum_dimension_m.powi(2),
+                effective_spherical_density_kg_m3: mass_kg
+                    / (PI / 6.0 * maximum_dimension_m.powi(3)),
+                region: P3ParticleRegion::DenseUnrimed,
+                shape_authority: P3ShapeAuthority::MaximumDimensionAndProjectedAreaOnly,
+            },
+        }
+    }
+
+    #[test]
+    fn radar_omission_weight_is_scheme_mass_squared_not_dmax_sixth() {
+        let fluffy = node(0.1, 1.0e-9, 10.0);
+        let compact = node(0.001, 1.0e-6, 1.0);
+        let mut omitted = OmittedWeights::default();
+        omitted.add(&fluffy);
+        let total_radar_weight = p3_radar_weight(&fluffy) + p3_radar_weight(&compact);
+        let omitted_fraction = fractions(omitted, 11.0, 1.01e-6, total_radar_weight)[2];
+        let dmax_sixth_fraction =
+            10.0 * 0.1_f64.powi(6) / (10.0 * 0.1_f64.powi(6) + 0.001_f64.powi(6));
+
+        assert!(omitted_fraction < 1.0e-4);
+        assert!(dmax_sixth_fraction > 0.999);
+        assert_eq!(p3_radar_weight(&fluffy), 10.0 * 1.0e-9_f64.powi(2));
+    }
 }

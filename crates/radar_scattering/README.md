@@ -122,6 +122,15 @@ fraction grid containing impossible negative-air states. The view-aware Liebe
 liquid-rain table spans 250 through 313.15 K.
 None of these tables may be relabeled as a conventional frozen category.
 
+P3 table-support omissions are gated independently by number, mass, and
+`N*m^2`, equivalently the squared ice-volume radar weight because the constant
+solid-ice density cancels in the fraction. This follows the variable-density
+ice reflectivity weighting in WRF's official P3 table generator. Raw
+maximum-dimension `D^6` is retained for native P3 M6 reconstruction and
+quadrature-tail closure, but is not used as the table-support radar proxy: it
+would assign a porous aggregate the reflectivity of a solid sphere with the
+same maximum dimension.
+
 All nodes are additive quantities normalized to one particle per cubic metre.
 Ordinary closed categories scale by `number_per_kg * air_density`. A wet
 category preserves its frozen source number while its paired liquid changes

@@ -1355,8 +1355,10 @@ fn wrf(ui: &mut egui::Ui) {
          uses the exact triple-moment table and WRF M3/M6 iteration. BowEcho lazily downloads only \
          the required 1.6 or 17.9 MB file and accepts it only after pinned size, SHA-256, header, \
          layout, source-revision and scheme checks. Production P3 and dry ISHMAEL integrate their \
-         reconstructed scheme-native PSDs per particle through the dry T-matrix tables and audit \
-         omitted number, mass and sixth-moment tails. \
+         reconstructed scheme-native PSDs per particle through the dry T-matrix tables. ISHMAEL \
+         audits omitted number, mass and equivalent-volume sixth-moment tails. P3 audits omitted \
+         number, mass and its scheme-consistent mass-squared (equivalent-ice-volume-squared) radar \
+         weight; native P3 M6 remains the separate PSD/quadrature closure authority. \
          Wet ISHMAEL PSD allocation remains unavailable rather than replaced by a characteristic \
          particle.",
     );

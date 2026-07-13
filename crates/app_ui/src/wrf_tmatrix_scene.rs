@@ -61,12 +61,14 @@ const ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION: f64 = 0.999;
 const ISHMAEL_PSD_MAXIMUM_OMITTED_MASS_FRACTION: f64 = 0.05;
 const ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION: f64 = 0.001;
 
-// P3 uses the same production omission gates. In strict mode nonspherical P3
-// particles count as omitted; projected-area research mode maps them through
-// its explicitly versioned equivalent-oblate assumption before this gate.
+// P3 independently gates omitted number, mass, and the official P3
+// mass-squared/equivalent-ice-volume-squared radar weight. In strict mode
+// nonspherical P3 particles count as omitted; projected-area research mode
+// maps them through its explicitly versioned equivalent-oblate assumption
+// before this gate.
 const P3_MAXIMUM_OMITTED_NUMBER_FRACTION: f64 = 0.999;
 const P3_MAXIMUM_OMITTED_MASS_FRACTION: f64 = 0.05;
-const P3_MAXIMUM_OMITTED_D6_FRACTION: f64 = 0.001;
+const P3_MAXIMUM_OMITTED_RADAR_WEIGHT_FRACTION: f64 = 0.001;
 
 // P3 retains an ice category while it melts above freezing, but WRF P3 v4.5.2
 // does not predict liquid fraction within that category (the source calls
@@ -1433,7 +1435,7 @@ fn production_p3_integration_config(
         radar_scattering::P3QuadratureConfig::default(),
         P3_MAXIMUM_OMITTED_NUMBER_FRACTION,
         P3_MAXIMUM_OMITTED_MASS_FRACTION,
-        P3_MAXIMUM_OMITTED_D6_FRACTION,
+        P3_MAXIMUM_OMITTED_RADAR_WEIGHT_FRACTION,
     )
 }
 
@@ -4544,7 +4546,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnose_reported_p3_particle_support_omission() {
+    fn reported_p3_low_density_tail_passes_mass_squared_radar_gate() {
         let (Some(wrf_path), Some(table_path)) = (
             std::env::var_os("BOWECHO_WRF_PROPERTY_FIXTURE"),
             std::env::var_os("BOWECHO_P3_TABLE_FIXTURE"),
@@ -4579,7 +4581,8 @@ mod tests {
             let psd = P3Psd::reconstruct(input, &table, P3ReconstructionConfig::default())
                 .expect("reconstruct P3 PSD");
             eprintln!("cell={CELL} category={:?} input={input:#?}", value.category);
-            for minimum_density_kg_m3 in [1.5, 1.4, 1.3, 1.2, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5] {
+            {
+                let minimum_density_kg_m3 = 1.5;
                 let minimum_diameter_m = 50e-6;
                 let quadrature = psd
                     .quadrature_with_dimension_breakpoints(
@@ -4608,10 +4611,10 @@ mod tests {
                         maximum_coordinates[axis] =
                             maximum_coordinates[axis].max(coordinates[axis]);
                     }
-                    let moments = [
+                    let weights = [
                         node.number_concentration_m3,
                         node.number_concentration_m3 * node.particle.mass_kg,
-                        node.number_concentration_m3 * node.particle.maximum_dimension_m.powi(6),
+                        node.number_concentration_m3 * node.particle.mass_kg.powi(2),
                     ];
                     let diameter_outside =
                         !(minimum_diameter_m..=0.089).contains(&equivolume_diameter_m);
@@ -4619,23 +4622,27 @@ mod tests {
                     let ratio_outside = !(0.1..=1.0).contains(&ratio);
                     for moment in 0..3 {
                         if diameter_outside || density_outside || ratio_outside {
-                            omitted[moment] += moments[moment];
+                            omitted[moment] += weights[moment];
                         }
                         if diameter_outside {
-                            by_diameter[moment] += moments[moment];
+                            by_diameter[moment] += weights[moment];
                         }
                         if density_outside {
-                            by_density[moment] += moments[moment];
+                            by_density[moment] += weights[moment];
                         }
                         if ratio_outside {
-                            by_ratio[moment] += moments[moment];
+                            by_ratio[moment] += weights[moment];
                         }
                     }
                 }
                 let totals = [
                     closure.reconstructed_number_density_m3,
                     closure.reconstructed_mass_concentration_kg_m3,
-                    closure.reconstructed_sixth_moment_m3,
+                    quadrature
+                        .nodes
+                        .iter()
+                        .map(|node| node.number_concentration_m3 * node.particle.mass_kg.powi(2))
+                        .sum(),
                 ];
                 for values in [
                     &mut omitted,
@@ -4648,7 +4655,13 @@ mod tests {
                     }
                 }
                 eprintln!(
-                    "minRho={minimum_density_kg_m3:.9e} omitted={omitted:?} diameter={by_diameter:?} density={by_density:?} ratio={by_ratio:?} coords_min={minimum_coordinates:?} coords_max={maximum_coordinates:?}"
+                    "minRho={minimum_density_kg_m3:.9e} omitted(number,mass,mass2-radar)={omitted:?} diameter={by_diameter:?} density={by_density:?} ratio={by_ratio:?} coords_min={minimum_coordinates:?} coords_max={maximum_coordinates:?}"
+                );
+                assert!(
+                    omitted[2] < P3_MAXIMUM_OMITTED_RADAR_WEIGHT_FRACTION,
+                    "reported cell {CELL} mass-squared radar-weight omission {} must remain below {}",
+                    omitted[2],
+                    P3_MAXIMUM_OMITTED_RADAR_WEIGHT_FRACTION
                 );
             }
         }

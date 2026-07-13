@@ -490,8 +490,13 @@ solve. BowEcho downloads that 1.6 or 17.9 MB asset only when required, caches
 it outside the executable, and accepts it only after the pinned byte length,
 SHA-256, header, record layout, source commit, and scheme/table-kind checks all
 pass. PSD quadrature then integrates additive scattering through the dry
-T-matrix node tables; convergence and omitted number, mass, and sixth-moment
-fractions remain fail-closed.
+T-matrix node tables. Table-support omissions remain fail-closed and are
+audited independently by number, mass, and P3's scheme-consistent
+mass-squared (equivalent-ice-volume-squared) radar weight. The latter matches
+the variable-density ice reflectivity weight in the official P3 table
+generator; using raw `Dmax^6` here would incorrectly give a fluffy aggregate
+the radar weight of a solid constant-density sphere. Native P3 M6 remains the
+separate PSD reconstruction and quadrature-tail closure authority.
 
 P3 predicts maximum dimension, mass, and projected area, but not one unique
 spheroidal habit or canting distribution. The usable research policy therefore
