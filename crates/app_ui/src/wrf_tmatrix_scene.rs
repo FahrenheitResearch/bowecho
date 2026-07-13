@@ -2190,10 +2190,8 @@ fn evaluate_p3_particle_node(
 ) -> Result<AdditiveScattering, EvaluationError> {
     let target_diameter = node.equivolume_diameter_m();
     let target_density = node.bulk_density_kg_m3();
-    let target_speed =
-        table.dry_particle_geometry_terminal_speed_m_s(target_diameter, target_density)?;
     if node.scattering_route() == P3ParticleScatteringRoute::TMatrixTable {
-        let query = TMatrixParticleNodeQuery::new(
+        let prepared = table.prepare_dry_particle_geometry_per_m3(
             temperature_k,
             target_diameter,
             target_density,
@@ -2201,13 +2199,15 @@ fn evaluate_p3_particle_node(
             node.habit(),
             Some(rime_fraction),
             rime_density,
-            target_speed,
             fall_speed,
             gaussian20_orientation(),
             request,
         )?;
-        return table.evaluate_dry_particle_node_per_m3(&query);
+        return table.evaluate_prepared_dry_particle_node_per_m3(&prepared);
     }
+
+    let target_speed =
+        table.dry_particle_geometry_terminal_speed_m_s(target_diameter, target_density)?;
 
     // This route is selected only for P3's exact spherical 900 kg/m3 ice law
     // below the LUT diameter floor. Anchor the same table material,
@@ -2232,9 +2232,7 @@ fn evaluate_p3_particle_node(
             value: target_diameter,
         });
     }
-    let anchor_speed =
-        table.dry_particle_geometry_terminal_speed_m_s(anchor_diameter, target_density)?;
-    let anchor_query = TMatrixParticleNodeQuery::new(
+    let anchor = table.prepare_dry_particle_geometry_per_m3(
         temperature_k,
         anchor_diameter,
         target_density,
@@ -2242,12 +2240,11 @@ fn evaluate_p3_particle_node(
         PsdSpheroidHabit::Spherical,
         Some(rime_fraction),
         rime_density,
-        anchor_speed,
         fall_speed,
         gaussian20_orientation(),
         request,
     )?;
-    let anchor = table.evaluate_dry_particle_node_per_m3(&anchor_query)?;
+    let anchor = table.evaluate_prepared_dry_particle_node_per_m3(&anchor)?;
     let diameter_ratio = target_diameter / anchor_diameter;
     let reference_water_factor_squared = table
         .descriptor()

@@ -398,6 +398,42 @@ pub struct TMatrixParticleNodeQuery {
     request: TMatrixEvaluationRequest,
 }
 
+/// One dry particle-node evaluation after the owning table has validated and
+/// bound every query fact.
+///
+/// The fields are deliberately opaque: callers cannot manufacture a prepared
+/// node or substitute a terminal speed. A prepared node is also bound to the
+/// exact LUT file that created it, so it cannot be evaluated by a different
+/// table. This is the narrow science-identical seam used by batched execution
+/// backends after the fail-closed CPU runtime has admitted a node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedTMatrixParticleNode {
+    table_file_sha256: Sha256Digest,
+    coordinates: Vec<AxisCoordinate>,
+    positive_down_fall_speed_m_s: f64,
+}
+
+impl PreparedTMatrixParticleNode {
+    /// Validated coordinates in the exact axis order declared by the owning
+    /// table. The slice is read-only; only the table runtime can construct or
+    /// rebind a prepared node.
+    #[must_use]
+    pub fn coordinates(&self) -> &[AxisCoordinate] {
+        &self.coordinates
+    }
+
+    #[must_use]
+    pub const fn positive_down_fall_speed_m_s(&self) -> f64 {
+        self.positive_down_fall_speed_m_s
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ParticleNodeTerminalSpeedValidation {
+    RecomputeFromExternalQuery,
+    AlreadySolvedByOwningTable(f64),
+}
+
 impl TMatrixParticleNodeQuery {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -984,6 +1020,82 @@ impl ResearchTMatrixLut {
         &self,
         query: &TMatrixParticleNodeQuery,
     ) -> Result<AdditiveScattering, EvaluationError> {
+        let prepared = self.prepare_dry_particle_node_query(
+            query,
+            ParticleNodeTerminalSpeedValidation::RecomputeFromExternalQuery,
+        )?;
+        self.evaluate_prepared_dry_particle_node_per_m3(&prepared)
+    }
+
+    /// Validate and bind an explicit dry particle geometry while deriving its
+    /// positive-down terminal speed exactly once from this table's declared
+    /// Schiller-Naumann policy.
+    ///
+    /// This differs from [`Self::evaluate_dry_particle_node_per_m3`] only in
+    /// authority: the latter authenticates an externally supplied speed by
+    /// independently solving the table law, while this constructor owns the
+    /// solve and returns an opaque prepared node. Both paths share every other
+    /// fail-closed validation and produce bit-identical additive output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_dry_particle_geometry_per_m3(
+        &self,
+        temperature_k: f64,
+        equivolume_diameter_m: f64,
+        bulk_density_kg_m3: f64,
+        minor_to_major_axis_ratio: f64,
+        habit: PsdSpheroidHabit,
+        rime_mass_fraction: Option<f64>,
+        rime_density_kg_m3: Option<f64>,
+        fall_speed: PsdFallSpeedProvenance,
+        orientation: OrientationModel,
+        request: TMatrixEvaluationRequest,
+    ) -> Result<PreparedTMatrixParticleNode, EvaluationError> {
+        let positive_down_fall_speed_m_s = self
+            .dry_particle_geometry_terminal_speed_m_s(equivolume_diameter_m, bulk_density_kg_m3)?;
+        let query = TMatrixParticleNodeQuery::new(
+            temperature_k,
+            equivolume_diameter_m,
+            bulk_density_kg_m3,
+            minor_to_major_axis_ratio,
+            habit,
+            rime_mass_fraction,
+            rime_density_kg_m3,
+            positive_down_fall_speed_m_s,
+            fall_speed,
+            orientation,
+            request,
+        )?;
+        self.prepare_dry_particle_node_query(
+            &query,
+            ParticleNodeTerminalSpeedValidation::AlreadySolvedByOwningTable(
+                positive_down_fall_speed_m_s,
+            ),
+        )
+    }
+
+    /// Interpolate a table-owned prepared node without repeating its terminal
+    /// speed solve or any externally forgeable validation shortcut.
+    pub fn evaluate_prepared_dry_particle_node_per_m3(
+        &self,
+        prepared: &PreparedTMatrixParticleNode,
+    ) -> Result<AdditiveScattering, EvaluationError> {
+        if prepared.table_file_sha256 != self.file_sha256 {
+            return Err(EvaluationError::PreparedParticleNodeTableMismatch {
+                expected: self.file_sha256,
+                actual: prepared.table_file_sha256,
+            });
+        }
+        replace_fall_moments(
+            self.lut.interpolate(&prepared.coordinates)?,
+            prepared.positive_down_fall_speed_m_s,
+        )
+    }
+
+    fn prepare_dry_particle_node_query(
+        &self,
+        query: &TMatrixParticleNodeQuery,
+        terminal_speed_validation: ParticleNodeTerminalSpeedValidation,
+    ) -> Result<PreparedTMatrixParticleNode, EvaluationError> {
         if self.descriptor.category
             != TMatrixParticleCategory::PropertyAwareFrozenCharacteristicParticle
             || self.descriptor.population_role
@@ -1026,11 +1138,16 @@ impl ResearchTMatrixLut {
                 actual: query.fall_speed,
             });
         }
-        let expected_positive_down_speed = schiller_naumann_terminal_speed_m_s(
-            &self.descriptor.terminal_speed,
-            query.equivolume_diameter_m,
-            query.bulk_density_kg_m3,
-        )?;
+        let expected_positive_down_speed = match terminal_speed_validation {
+            ParticleNodeTerminalSpeedValidation::RecomputeFromExternalQuery => {
+                schiller_naumann_terminal_speed_m_s(
+                    &self.descriptor.terminal_speed,
+                    query.equivolume_diameter_m,
+                    query.bulk_density_kg_m3,
+                )?
+            }
+            ParticleNodeTerminalSpeedValidation::AlreadySolvedByOwningTable(speed) => speed,
+        };
         if query.positive_down_fall_speed_m_s != expected_positive_down_speed {
             return Err(EvaluationError::ParticleNodeFallSpeedValueMismatch {
                 expected_m_s: expected_positive_down_speed,
@@ -1124,10 +1241,11 @@ impl ResearchTMatrixLut {
             };
             coordinates.push(AxisCoordinate::new(axis.kind(), value)?);
         }
-        replace_fall_moments(
-            self.lut.interpolate(&coordinates)?,
-            query.positive_down_fall_speed_m_s,
-        )
+        Ok(PreparedTMatrixParticleNode {
+            table_file_sha256: self.file_sha256,
+            coordinates,
+            positive_down_fall_speed_m_s: query.positive_down_fall_speed_m_s,
+        })
     }
 
     /// Add a category contribution without exposing any nonlinear derived
@@ -1559,6 +1677,13 @@ pub enum EvaluationError {
         "PSD particle-node terminal speed mismatch: exact table policy gives {expected_m_s} m s^-1, query supplied {actual_m_s} m s^-1"
     )]
     ParticleNodeFallSpeedValueMismatch { expected_m_s: f64, actual_m_s: f64 },
+    #[error(
+        "prepared dry particle node belongs to LUT {actual}, not the evaluating LUT {expected}"
+    )]
+    PreparedParticleNodeTableMismatch {
+        expected: Sha256Digest,
+        actual: Sha256Digest,
+    },
     #[error(
         "PSD particle density {particle_density_kg_m3} kg m^-3 must exceed terminal-policy air density {air_density_kg_m3} kg m^-3"
     )]
@@ -3792,6 +3917,117 @@ mod tests {
         }
         assert_eq!(components[7], components[0] * exact_speed);
         assert_eq!(components[8], components[0] * exact_speed * exact_speed);
+    }
+
+    #[test]
+    fn prepared_dry_particle_node_is_bit_identical_and_table_bound() {
+        let table = dry_property_runtime(SpheroidConvention::OblateMinorVertical);
+        let exact_speed = table
+            .dry_particle_geometry_terminal_speed_m_s(1.0e-3, 400.0)
+            .unwrap();
+        let speed_provenance = table.dry_particle_node_fall_speed_provenance().unwrap();
+        let orientation = gaussian20_odf().orientation_model();
+        let evaluation_request = request(FREQUENCY_HZ, 1.0);
+        let external_query = TMatrixParticleNodeQuery::new(
+            260.0,
+            1.0e-3,
+            400.0,
+            0.8,
+            PsdSpheroidHabit::Oblate,
+            None,
+            None,
+            exact_speed,
+            speed_provenance,
+            orientation.clone(),
+            evaluation_request,
+        )
+        .unwrap();
+        let external = table
+            .evaluate_dry_particle_node_per_m3(&external_query)
+            .unwrap();
+
+        let prepared = table
+            .prepare_dry_particle_geometry_per_m3(
+                260.0,
+                1.0e-3,
+                400.0,
+                0.8,
+                PsdSpheroidHabit::Oblate,
+                None,
+                None,
+                speed_provenance,
+                orientation,
+                evaluation_request,
+            )
+            .unwrap();
+        assert_eq!(
+            prepared
+                .coordinates()
+                .iter()
+                .copied()
+                .map(AxisCoordinate::kind)
+                .collect::<Vec<_>>(),
+            table
+                .offline_lut()
+                .header()
+                .axes()
+                .iter()
+                .map(Axis::kind)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(prepared.positive_down_fall_speed_m_s(), exact_speed);
+        let prepared_output = table
+            .evaluate_prepared_dry_particle_node_per_m3(&prepared)
+            .unwrap();
+        assert_eq!(prepared_output.components(), external.components());
+
+        let (other_table, _, _) = fixture();
+        assert!(matches!(
+            other_table.evaluate_prepared_dry_particle_node_per_m3(&prepared),
+            Err(EvaluationError::PreparedParticleNodeTableMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_external_particle_node_still_fails_closed_after_preparation_seam() {
+        let table = dry_property_runtime(SpheroidConvention::OblateMinorVertical);
+        let exact_speed = table
+            .dry_particle_geometry_terminal_speed_m_s(1.0e-3, 400.0)
+            .unwrap();
+        let wrong_speed = TMatrixParticleNodeQuery::new(
+            260.0,
+            1.0e-3,
+            400.0,
+            0.8,
+            PsdSpheroidHabit::Oblate,
+            None,
+            None,
+            exact_speed + 1.0e-9,
+            table.dry_particle_node_fall_speed_provenance().unwrap(),
+            gaussian20_odf().orientation_model(),
+            request(FREQUENCY_HZ, 1.0),
+        )
+        .unwrap();
+        assert!(matches!(
+            table.evaluate_dry_particle_node_per_m3(&wrong_speed),
+            Err(EvaluationError::ParticleNodeFallSpeedValueMismatch { .. })
+        ));
+
+        assert!(matches!(
+            table.prepare_dry_particle_geometry_per_m3(
+                260.0,
+                1.0e-3,
+                400.0,
+                0.8,
+                PsdSpheroidHabit::Oblate,
+                None,
+                None,
+                synthetic_speed_provenance(),
+                gaussian20_odf().orientation_model(),
+                request(FREQUENCY_HZ, 1.0),
+            ),
+            Err(EvaluationError::ParticleNodeFallSpeedProvenanceMismatch { .. })
+        ));
     }
 
     #[test]
