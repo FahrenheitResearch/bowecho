@@ -12,7 +12,7 @@ use rw_ui::{
     PlotViewerPanel, RunBrowserPanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree,
     StoreView, StoreWorker, StyleOverrideSettings,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::formula_lab::{
     FormulaLabPanel, FormulaLabSources, FormulaResultSource, FormulaSourceKind,
@@ -1122,6 +1122,12 @@ fn light_import_size_warning(files: &[PathBuf]) -> Option<String> {
          heavily loaded while it runs; save other work first.",
         wrf_import_size_description(files)?
     ))
+}
+
+/// Return the staged raw-WRF source only while it still names a real file.
+/// A stale session path must fall through to the unrestricted source picker.
+fn retained_namelist_source(path: Option<&Path>) -> Option<PathBuf> {
+    path.filter(|path| path.is_file()).map(Path::to_path_buf)
 }
 
 pub struct ModelDataDock {
@@ -3216,6 +3222,52 @@ impl ModelDataDock {
                         }
                     }
                 });
+                let retained_source = retained_namelist_source(self.formula_raw_path.as_deref());
+                let source_hint = retained_source.as_ref().map_or_else(
+                    || {
+                        "Choose a raw wrfout, reconstruct the subset of namelist.input metadata it actually stores, then save the annotated result."
+                            .to_owned()
+                    },
+                    |path| {
+                        format!(
+                            "Reconstruct from the retained raw WRF source {} and save the annotated result. The output is explicitly marked partial and non-reproducible.",
+                            path.file_name()
+                                .map(|name| name.to_string_lossy())
+                                .unwrap_or_else(|| path.as_os_str().to_string_lossy())
+                        )
+                    },
+                );
+                if let Some(path) = retained_source.as_ref() {
+                    let file_name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| path.as_os_str().to_string_lossy());
+                    ui.label(
+                        egui::RichText::new(format!("Namelist source: {file_name}"))
+                            .small()
+                            .weak(),
+                    )
+                    .on_hover_text(path.display().to_string());
+                } else {
+                    ui.label(
+                        egui::RichText::new("No retained wrfout — asks on click")
+                            .small()
+                            .weak(),
+                    );
+                }
+                if ui
+                    .add_enabled_ui(!busy, |ui| {
+                        ui.add_sized(
+                            [ui.available_width().max(120.0), 24.0],
+                            egui::Button::new("Extract namelist…"),
+                        )
+                    })
+                    .inner
+                    .on_hover_text(source_hint)
+                    .clicked()
+                {
+                    self.extract_wrf_namelist_dialog();
+                }
             },
         );
 
@@ -3827,6 +3879,74 @@ impl ModelDataDock {
         let task = crate::local_import::spawn_import_paths(files, self.store_root.clone());
         self.import_message = Some(message);
         self.import_job = Some(ImportJob::Local(task));
+    }
+
+    /// Reconstruct the exact subset of `namelist.input` metadata retained by
+    /// one wrfout, keeping inferred and unavailable values commented. Prefer
+    /// the session's staged Formula Lab/raw-import source; only prompt for an
+    /// input when that source is absent or no longer exists.
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    fn extract_wrf_namelist_dialog(&mut self) {
+        let retained = retained_namelist_source(self.formula_raw_path.as_deref());
+        let retained_attempt = retained.as_ref().map(|source| {
+            (
+                source.clone(),
+                crate::wrf_namelist::reconstruct_namelist_from_wrfout(source),
+            )
+        });
+        let (source, reconstructed) = match retained_attempt {
+            Some((source, Ok(reconstructed))) => (source, reconstructed),
+            retained_failure => {
+                let title = if retained_failure.is_some() {
+                    "Retained source is not a readable wrfout; choose another raw WRF file"
+                } else {
+                    "Choose a raw wrfout for partial namelist reconstruction"
+                };
+                let Some(source) = rfd::FileDialog::new()
+                    // Raw wrfout names are ordinarily extensionless.
+                    .set_title(title)
+                    .pick_file()
+                else {
+                    if let Some((_, Err(error))) = retained_failure {
+                        self.import_message = Some(format!(
+                            "Retained source could not reconstruct a namelist: {error}"
+                        ));
+                    }
+                    return;
+                };
+                match crate::wrf_namelist::reconstruct_namelist_from_wrfout(&source) {
+                    Ok(reconstructed) => (source, reconstructed),
+                    Err(error) => {
+                        self.import_message =
+                            Some(format!("Namelist reconstruction failed: {error}"));
+                        return;
+                    }
+                }
+            }
+        };
+        // A newly selected, successfully decoded wrfout becomes the same
+        // session-private raw source used by Formula Lab and later WRF tools.
+        self.formula_raw_path = Some(source.clone());
+
+        let Some(destination) = rfd::FileDialog::new()
+            .set_title("Save partial reconstructed WRF namelist")
+            .set_file_name("namelist.reconstructed.input")
+            .save_file()
+        else {
+            return;
+        };
+        self.import_message = Some(
+            match rw_store::atomic::atomic_write_bytes(&destination, reconstructed.as_bytes()) {
+                Ok(()) => format!(
+                    "Saved partial reconstructed namelist to {} — not the original and not sufficient to reproduce the run",
+                    destination.display()
+                ),
+                Err(error) => format!(
+                    "Could not save reconstructed namelist to {}: {error}",
+                    destination.display()
+                ),
+            },
+        );
     }
 
     /// Spawn the fast simulated-radar job over the picked file set.
@@ -5394,6 +5514,8 @@ impl ModelDataDock {
                 .small()
                 .weak(),
         );
+        ui.add_enabled(false, egui::Button::new("Extract namelist…"))
+            .on_hover_text("Raw-WRF open/save dialogs are unavailable on this platform.");
     }
 
     /// Step the selected forecast hour within the current run; the viewer
@@ -6804,6 +6926,27 @@ mod tests {
         let source = dock.formula_raw_source().expect("staged raw WRF source");
         assert_eq!(source.path, path);
         assert_eq!(source.display_hour.run, "wrfout_d37_2026-07-10_20:00:00");
+    }
+
+    #[test]
+    fn namelist_extraction_prefers_only_an_existing_retained_raw_source() {
+        let path = std::env::temp_dir().join(format!(
+            "bowecho-namelist-source-{}-wrfout_d37_2026-07-10_20_00_00",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"fixture marker").unwrap();
+        assert_eq!(
+            retained_namelist_source(Some(&path)),
+            Some(path.clone()),
+            "an existing staged source bypasses the open dialog"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            retained_namelist_source(Some(&path)),
+            None,
+            "a stale staged source falls through to the open dialog"
+        );
+        assert_eq!(retained_namelist_source(None), None);
     }
 
     #[test]
