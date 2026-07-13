@@ -15,11 +15,9 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use radar_scattering::AdditiveScattering;
+use simradar_cuda::{CudaAvailability, CudaPreparedTMatrixNode, probe_cuda_cached};
 #[cfg(any(windows, target_os = "linux"))]
-use simradar_cuda::{
-    CudaAvailability, CudaPreloadedTMatrixTable, CudaTMatrixExecutor, CudaTMatrixSegment,
-};
-use simradar_cuda::{CudaPreparedTMatrixNode, probe_cuda_cached};
+use simradar_cuda::{CudaPreloadedTMatrixTable, CudaTMatrixExecutor, CudaTMatrixSegment};
 use thiserror::Error;
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -203,23 +201,7 @@ impl std::fmt::Debug for WrfTMatrixCudaBatchService {
 impl WrfTMatrixCudaBatchService {
     /// Open the best supported device reported by the cached runtime probe.
     pub fn open_preferred() -> Result<Self, WrfTMatrixCudaServiceOpenError> {
-        let availability = probe_cuda_cached();
-        if matches!(
-            availability,
-            simradar_cuda::CudaAvailability::UnsupportedPlatform
-        ) {
-            return Err(WrfTMatrixCudaServiceOpenError::UnsupportedPlatform);
-        }
-        let ordinal = availability
-            .preferred_device()
-            .map(|device| device.ordinal)
-            .ok_or_else(|| {
-                WrfTMatrixCudaServiceOpenError::Unavailable(
-                    availability
-                        .fallback_reason()
-                        .unwrap_or_else(|| "no supported NVIDIA CUDA device".to_owned()),
-                )
-            })?;
+        let ordinal = preferred_device_ordinal(probe_cuda_cached())?;
         Self::open(ordinal)
     }
 
@@ -332,6 +314,58 @@ impl WrfTMatrixCudaBatchService {
             fallback_reason: self.state.fallback(),
         }
     }
+
+    /// Deterministic worker failure used to prove whole-category CPU replay.
+    /// This constructor is absent from production builds and never opens a
+    /// CUDA driver, context, module, or table upload.
+    #[cfg(test)]
+    pub(crate) fn failing_for_test(detail: impl Into<String>) -> Self {
+        let config = WrfTMatrixCudaBatchConfig::default();
+        let device = WrfTMatrixCudaDeviceReport {
+            ordinal: usize::MAX,
+            name: "test-only failing CUDA backend".to_owned(),
+            compute_capability_major: 0,
+            compute_capability_minor: 0,
+            total_memory_bytes: 0,
+            driver_api_version: None,
+            kernel_artifact: "test-only/no-kernel".to_owned(),
+        };
+        let state = Arc::new(ServiceState::default());
+        let (commands, receiver) = mpsc::channel();
+        let worker_state = Arc::clone(&state);
+        let backend = FailingPreparedNodeBackend {
+            detail: detail.into(),
+        };
+        let worker = thread::Builder::new()
+            .name("bowecho-cuda-tmatrix-failure-test".to_owned())
+            .spawn(move || run_worker(receiver, backend, worker_state, config))
+            .expect("spawn deterministic failing CUDA test worker");
+        Self {
+            commands,
+            worker: Some(worker),
+            state,
+            device,
+            config,
+        }
+    }
+}
+
+fn preferred_device_ordinal(
+    availability: &CudaAvailability,
+) -> Result<usize, WrfTMatrixCudaServiceOpenError> {
+    if matches!(availability, CudaAvailability::UnsupportedPlatform) {
+        return Err(WrfTMatrixCudaServiceOpenError::UnsupportedPlatform);
+    }
+    availability
+        .preferred_device()
+        .map(|device| device.ordinal)
+        .ok_or_else(|| {
+            WrfTMatrixCudaServiceOpenError::Unavailable(
+                availability
+                    .fallback_reason()
+                    .unwrap_or_else(|| "no supported NVIDIA CUDA device".to_owned()),
+            )
+        })
 }
 
 impl Drop for WrfTMatrixCudaBatchService {
@@ -453,6 +487,22 @@ fn driver_api_version_for_ordinal(ordinal: usize) -> Option<i32> {
 
 trait BatchBackend<N, O>: Send + 'static {
     fn evaluate(&mut self, role: WrfTMatrixCudaTableRole, nodes: &[N]) -> Result<Vec<O>, String>;
+}
+
+#[cfg(test)]
+struct FailingPreparedNodeBackend {
+    detail: String,
+}
+
+#[cfg(test)]
+impl BatchBackend<CudaPreparedTMatrixNode, AdditiveScattering> for FailingPreparedNodeBackend {
+    fn evaluate(
+        &mut self,
+        _role: WrfTMatrixCudaTableRole,
+        _nodes: &[CudaPreparedTMatrixNode],
+    ) -> Result<Vec<AdditiveScattering>, String> {
+        Err(self.detail.clone())
+    }
 }
 
 enum WorkerCommand<N, O> {
@@ -978,6 +1028,58 @@ mod tests {
         worker.join().unwrap();
 
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn preferred_device_resolution_distinguishes_unsupported_and_unavailable() {
+        assert_eq!(
+            preferred_device_ordinal(&CudaAvailability::UnsupportedPlatform),
+            Err(WrfTMatrixCudaServiceOpenError::UnsupportedPlatform)
+        );
+        assert_eq!(
+            preferred_device_ordinal(&CudaAvailability::DriverUnavailable),
+            Err(WrfTMatrixCudaServiceOpenError::Unavailable(
+                "NVIDIA CUDA driver not found".to_owned()
+            ))
+        );
+
+        let old_only = CudaAvailability::Available {
+            driver_api_version: 12_000,
+            devices: vec![simradar_cuda::CudaDeviceInfo {
+                ordinal: 4,
+                name: "old test device".to_owned(),
+                compute_capability_major: 7,
+                compute_capability_minor: 4,
+                total_memory_bytes: 64,
+            }],
+        };
+        assert_eq!(
+            preferred_device_ordinal(&old_only),
+            Err(WrfTMatrixCudaServiceOpenError::Unavailable(
+                "CUDA devices are older than compute capability 7.5".to_owned()
+            ))
+        );
+
+        let supported = CudaAvailability::Available {
+            driver_api_version: 13_000,
+            devices: vec![
+                simradar_cuda::CudaDeviceInfo {
+                    ordinal: 2,
+                    name: "small".to_owned(),
+                    compute_capability_major: 8,
+                    compute_capability_minor: 6,
+                    total_memory_bytes: 16,
+                },
+                simradar_cuda::CudaDeviceInfo {
+                    ordinal: 7,
+                    name: "large".to_owned(),
+                    compute_capability_major: 12,
+                    compute_capability_minor: 0,
+                    total_memory_bytes: 32,
+                },
+            ],
+        };
+        assert_eq!(preferred_device_ordinal(&supported), Ok(7));
     }
 
     #[cfg(any(windows, target_os = "linux"))]

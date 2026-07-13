@@ -4482,11 +4482,204 @@ mod tests {
     use super::*;
     use crate::wrf_property_reader::{RawRainState, read_wrf_property_scene};
     use crate::wrf_scene_inventory::WrfSourceIdentity;
+    use crate::wrf_tmatrix_assets::{
+        PropertyTMatrixTableSourceKind, load_property_tmatrix_tables_exact,
+    };
+    use crate::wrf_tmatrix_band_assets::S_BAND_RESEARCH_FREQUENCY_HZ;
     use radar_scattering::P3Category;
     use radar_scattering::P3ProjectedAreaConsistency;
 
     fn additive(values: [f64; 9]) -> AdditiveScattering {
         AdditiveScattering::from_components(values).unwrap()
+    }
+
+    fn with_embedded_ishmael_prepared(
+        test: impl for<'table> FnOnce(&PreparedIshmaelParticleIntegration<'table>),
+    ) {
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let tables = owner.borrowed_bundle();
+        let validated = validate_bundle(tables).expect("validate embedded table bundle");
+        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
+            radar_scattering::IshmaelIceCategory::Planar,
+            1.020_730_388_452_175_2e-3,
+            100_000.0,
+            6.250_000_000_000_000_5e-9,
+            3.125_000_000_000_000_3e-9,
+            1.2,
+        ))
+        .expect("reconstruct fixed ISHMAEL category");
+        let oblate_request = evaluation_request(
+            validated.frequency_hz,
+            0.9,
+            SpheroidConvention::OblateMinorVertical,
+        )
+        .unwrap();
+        let prolate_request = evaluation_request(
+            validated.frequency_hz,
+            0.9,
+            SpheroidConvention::ProlateMajorVertical,
+        )
+        .unwrap();
+        let prepared = prepare_ishmael_particle_integration(
+            &distribution,
+            validated.ishmael_psd_config,
+            validated.ishmael_particle_support,
+            validated.ishmael_fall_speed,
+            tables,
+            260.0,
+            oblate_request,
+            prolate_request,
+        )
+        .expect("prepare embedded-table ISHMAEL category");
+        assert!(prepared.integration.node_count(PsdQuadratureLevel::Coarse) > 0);
+        assert!(prepared.integration.node_count(PsdQuadratureLevel::Refined) > 0);
+        test(&prepared);
+    }
+
+    fn assert_psd_result_bitwise_eq(actual: PsdIntegrationResult, expected: PsdIntegrationResult) {
+        assert_eq!(
+            actual.additive().components().map(f64::to_bits),
+            expected.additive().components().map(f64::to_bits),
+            "integrated additive components differ at the bit level"
+        );
+        assert_eq!(actual.accumulator(), expected.accumulator());
+        assert_eq!(actual.audit(), expected.audit());
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn embedded_ishmael_prepared_nodes_are_bitwise_equal_on_gpu_and_cpu() {
+        let availability = simradar_cuda::probe_cuda_cached();
+        let Some(device) = availability.preferred_device() else {
+            eprintln!("skipping ISHMAEL CUDA parity test: {availability:?}");
+            return;
+        };
+        let service = WrfTMatrixCudaBatchService::open_with_config(
+            device.ordinal,
+            crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchConfig::new(512, 8).unwrap(),
+        )
+        .expect("open CUDA service for ISHMAEL parity");
+
+        with_embedded_ishmael_prepared(|prepared| {
+            let cpu_nodes = prepared
+                .evaluations
+                .iter()
+                .map(|evaluation| {
+                    evaluation
+                        .table
+                        .evaluate_prepared_dry_particle_node_per_m3(&evaluation.prepared)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut gpu_nodes = vec![None; prepared.evaluations.len()];
+            for role in [
+                WrfTMatrixCudaTableRole::DryOblate,
+                WrfTMatrixCudaTableRole::DryProlate,
+            ] {
+                let positions = prepared
+                    .evaluations
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, evaluation)| {
+                        (evaluation.role == role).then_some(position)
+                    })
+                    .collect::<Vec<_>>();
+                let staged = positions
+                    .iter()
+                    .map(|&position| {
+                        let evaluation = &prepared.evaluations[position];
+                        let interpolation = evaluation
+                            .table
+                            .prepare_dry_particle_lut_interpolation(&evaluation.prepared)
+                            .unwrap();
+                        CudaPreparedTMatrixNode::new(&interpolation, 1.0).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                if staged.is_empty() {
+                    continue;
+                }
+                let evaluated = service.evaluate_particles(role, staged).unwrap();
+                for (position, output) in positions.into_iter().zip(evaluated) {
+                    assert_eq!(
+                        output.components().map(f64::to_bits),
+                        cpu_nodes[position].components().map(f64::to_bits),
+                        "ISHMAEL particle {position} differs between CUDA and scalar CPU"
+                    );
+                    gpu_nodes[position] = Some(output);
+                }
+            }
+            assert!(gpu_nodes.iter().all(Option::is_some));
+
+            let cpu_category = prepared.finish_cpu().unwrap();
+            let gpu_category = prepared
+                .finish_with_table_evaluator(|position, _, _, _, _, _| {
+                    Ok(gpu_nodes[position].expect("every prepared node has a GPU result"))
+                })
+                .unwrap();
+            assert_psd_result_bitwise_eq(gpu_category, cpu_category);
+        });
+
+        let report = service.report();
+        assert!(report.nodes_completed > 0);
+        assert_eq!(report.nodes_completed, report.nodes_submitted);
+        assert_eq!(report.batches_completed, report.batches_submitted);
+        assert_eq!(report.fallback_reason, None);
+    }
+
+    #[test]
+    fn failed_and_disabled_cuda_replay_the_whole_ishmael_category_on_cpu() {
+        let service = WrfTMatrixCudaBatchService::failing_for_test(
+            "injected deterministic ISHMAEL CUDA launch failure",
+        );
+        with_embedded_ishmael_prepared(|prepared| {
+            let expected = prepared.finish_cpu().unwrap();
+            let replayed = finish_ishmael_particle_integration(prepared, Some(&service)).unwrap();
+            assert_psd_result_bitwise_eq(replayed, expected);
+
+            let failed_report = service.report();
+            let reason = failed_report
+                .fallback_reason
+                .as_ref()
+                .expect("failed batch permanently disables this job service");
+            assert_eq!(reason.failed_batch_sequence, Some(1));
+            assert_eq!(
+                reason.discarded_node_count,
+                prepared.evaluations.len(),
+                "the failed category batch must be discarded in full"
+            );
+            assert_eq!(
+                reason.detail,
+                "injected deterministic ISHMAEL CUDA launch failure"
+            );
+            assert_eq!(failed_report.batches_submitted, 1);
+            assert_eq!(failed_report.batches_completed, 0);
+            assert_eq!(failed_report.nodes_completed, 0);
+
+            let replayed_while_disabled =
+                finish_ishmael_particle_integration(prepared, Some(&service)).unwrap();
+            assert_psd_result_bitwise_eq(replayed_while_disabled, expected);
+            let disabled_report = service.report();
+            assert_eq!(
+                disabled_report.requests_submitted,
+                failed_report.requests_submitted
+            );
+            assert_eq!(
+                disabled_report.batches_submitted,
+                failed_report.batches_submitted
+            );
+            assert_eq!(
+                disabled_report.nodes_submitted,
+                failed_report.nodes_submitted
+            );
+            assert_eq!(
+                disabled_report.fallback_reason,
+                failed_report.fallback_reason
+            );
+        });
     }
 
     #[test]
