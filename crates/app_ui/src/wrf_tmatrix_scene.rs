@@ -3704,82 +3704,86 @@ fn finish_raw_batch(
 
     let mut oblate = RawBatchRoleSweep::default();
     let mut prolate = RawBatchRoleSweep::default();
-    for (request_index, request) in prepared.iter().enumerate() {
-        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
-        match request {
-            PreparedRawBatchEvaluation::Clear => {}
-            PreparedRawBatchEvaluation::P3(request) => {
-                for (category_index, category) in request.categories.iter().enumerate() {
-                    for (particle_position, node_index, node, _table, admitted) in
-                        category.integration.table_nodes()
-                    {
-                        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
-                        let cuda_node = match CudaPreparedTMatrixNode::new(admitted, 1.0) {
-                            Ok(cuda_node) => cuda_node,
-                            Err(error) => {
-                                check_cancel(cancel)
-                                    .map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
-                                cuda.disable_for_cpu_fallback(
-                                    format!(
+    let staging_failure = 'staging: {
+        for (request_index, request) in prepared.iter().enumerate() {
+            check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+            match request {
+                PreparedRawBatchEvaluation::Clear => {}
+                PreparedRawBatchEvaluation::P3(request) => {
+                    for (category_index, category) in request.categories.iter().enumerate() {
+                        for (particle_position, node_index, node, _table, admitted) in
+                            category.integration.table_nodes()
+                        {
+                            check_cancel(cancel)
+                                .map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                            let cuda_node = match CudaPreparedTMatrixNode::new(admitted, 1.0) {
+                                Ok(cuda_node) => cuda_node,
+                                Err(error) => {
+                                    check_cancel(cancel)
+                                        .map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                                    break 'staging Some(format!(
                                         "stage ordered raw batch request {request_index}, P3 category {}, node {node_index} for CUDA: {error}",
                                         category.category
-                                    ),
-                                    0,
-                                );
-                                return finish_raw_batch_ordered(prepared, false, cancel);
-                            }
-                        };
-                        let sweep = match node.habit() {
-                            PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => &mut oblate,
-                            PsdSpheroidHabit::Prolate => &mut prolate,
-                        };
-                        sweep.locations.push(RawBatchNodeLocation::P3 {
-                            request_index,
-                            category_index,
-                            particle_position,
-                        });
-                        sweep.nodes.push(cuda_node);
+                                    ));
+                                }
+                            };
+                            let sweep = match node.habit() {
+                                PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
+                                    &mut oblate
+                                }
+                                PsdSpheroidHabit::Prolate => &mut prolate,
+                            };
+                            sweep.locations.push(RawBatchNodeLocation::P3 {
+                                request_index,
+                                category_index,
+                                particle_position,
+                            });
+                            sweep.nodes.push(cuda_node);
+                        }
                     }
                 }
-            }
-            PreparedRawBatchEvaluation::Ishmael(request) => {
-                for (category_index, category) in request.categories.iter().enumerate() {
-                    for (particle_position, evaluation) in
-                        category.integration.evaluations.iter().enumerate()
-                    {
-                        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
-                        let cuda_node = match CudaPreparedTMatrixNode::new(
-                            &evaluation.prepared,
-                            1.0,
-                        ) {
-                            Ok(cuda_node) => cuda_node,
-                            Err(error) => {
-                                check_cancel(cancel)
-                                    .map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
-                                cuda.disable_for_cpu_fallback(
-                                    format!(
+                PreparedRawBatchEvaluation::Ishmael(request) => {
+                    for (category_index, category) in request.categories.iter().enumerate() {
+                        for (particle_position, evaluation) in
+                            category.integration.evaluations.iter().enumerate()
+                        {
+                            check_cancel(cancel)
+                                .map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                            let cuda_node = match CudaPreparedTMatrixNode::new(
+                                &evaluation.prepared,
+                                1.0,
+                            ) {
+                                Ok(cuda_node) => cuda_node,
+                                Err(error) => {
+                                    check_cancel(cancel)
+                                        .map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+                                    break 'staging Some(format!(
                                         "stage ordered raw batch request {request_index}, ISHMAEL category {}, {:?} node {} for CUDA: {error}",
                                         category.category, evaluation.level, evaluation.node_index
-                                    ),
-                                    0,
-                                );
-                                return finish_raw_batch_ordered(prepared, false, cancel);
-                            }
-                        };
-                        let sweep = match evaluation.role {
-                            WrfTMatrixCudaTableRole::DryOblate => &mut oblate,
-                            WrfTMatrixCudaTableRole::DryProlate => &mut prolate,
-                        };
-                        sweep.locations.push(RawBatchNodeLocation::Ishmael {
-                            request_index,
-                            category_index,
-                            particle_position,
-                        });
-                        sweep.nodes.push(cuda_node);
+                                    ));
+                                }
+                            };
+                            let sweep = match evaluation.role {
+                                WrfTMatrixCudaTableRole::DryOblate => &mut oblate,
+                                WrfTMatrixCudaTableRole::DryProlate => &mut prolate,
+                            };
+                            sweep.locations.push(RawBatchNodeLocation::Ishmael {
+                                request_index,
+                                category_index,
+                                particle_position,
+                            });
+                            sweep.nodes.push(cuda_node);
+                        }
                     }
                 }
             }
         }
+        None
+    };
+    if let Some(detail) = staging_failure {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
+        cuda.disable_for_cpu_fallback(detail, 0);
+        return finish_raw_batch_ordered(prepared, false, cancel);
     }
 
     let RawBatchRoleSweep {

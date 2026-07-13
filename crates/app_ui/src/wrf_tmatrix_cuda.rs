@@ -1697,7 +1697,7 @@ mod tests {
                     None,
                     None,
                     table.dry_particle_node_fall_speed_provenance().unwrap(),
-                    orientation,
+                    orientation.clone(),
                     request,
                 )
                 .unwrap();
