@@ -771,9 +771,14 @@ mod tests {
 
     use super::*;
 
+    type MockCall = (WrfTMatrixCudaTableRole, Vec<u32>);
+    type MockCallLog = Arc<Mutex<Vec<MockCall>>>;
+    type MockPendingReply = Receiver<Result<Vec<u32>, WrfTMatrixCudaRequestError>>;
+    type MockPendingRequest = (PendingRequest<u32, u32>, MockPendingReply);
+
     #[derive(Clone)]
     struct MockControl {
-        calls: Arc<Mutex<Vec<(WrfTMatrixCudaTableRole, Vec<u32>)>>>,
+        calls: MockCallLog,
         fail_call: Option<usize>,
     }
 
@@ -849,13 +854,7 @@ mod tests {
         )
     }
 
-    fn pending(
-        role: WrfTMatrixCudaTableRole,
-        nodes: Vec<u32>,
-    ) -> (
-        PendingRequest<u32, u32>,
-        Receiver<Result<Vec<u32>, WrfTMatrixCudaRequestError>>,
-    ) {
+    fn pending(role: WrfTMatrixCudaTableRole, nodes: Vec<u32>) -> MockPendingRequest {
         let (reply, response) = mpsc::sync_channel(1);
         (
             PendingRequest::from(WorkerRequest { role, nodes, reply }),
