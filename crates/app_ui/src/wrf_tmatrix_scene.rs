@@ -2239,14 +2239,17 @@ fn build_ishmael_psd_cell_into(
                 category: value.category,
             },
         )?;
-        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
-            ishmael_category,
-            value.qice_kgkg,
-            value.qnice_per_kg,
-            value.qvoli_m3_per_kg,
-            value.qaoli_m3_per_kg,
-            raw.dry_air_density_kg_m3(),
-        ))
+        let distribution = IshmaelPsd::reconstruct_wrf_source_checked(
+            IshmaelPsdInput::new(
+                ishmael_category,
+                value.qice_kgkg,
+                value.qnice_per_kg,
+                value.qvoli_m3_per_kg,
+                value.qaoli_m3_per_kg,
+                raw.dry_air_density_kg_m3(),
+            ),
+            raw.environment().temperature_k(),
+        )
         .map_err(
             |source| WrfTMatrixSceneBuildError::IshmaelPsdReconstruction {
                 cell_index,
@@ -3379,14 +3382,17 @@ fn evaluate_ishmael_psd_raw_cell(
         let ishmael_category = value.category.ishmael_category().ok_or(
             WrfTMatrixRawEvaluationError::IshmaelCategoryLayout(value.category),
         )?;
-        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
-            ishmael_category,
-            value.qice_kgkg,
-            value.qnice_per_kg,
-            value.qvoli_m3_per_kg,
-            value.qaoli_m3_per_kg,
-            raw.dry_air_density_kg_m3(),
-        ))
+        let distribution = IshmaelPsd::reconstruct_wrf_source_checked(
+            IshmaelPsdInput::new(
+                ishmael_category,
+                value.qice_kgkg,
+                value.qnice_per_kg,
+                value.qvoli_m3_per_kg,
+                value.qaoli_m3_per_kg,
+                raw.dry_air_density_kg_m3(),
+            ),
+            raw.environment().temperature_k(),
+        )
         .map_err(
             |source| WrfTMatrixRawEvaluationError::IshmaelPsdReconstruction {
                 category: value.category,
@@ -3693,14 +3699,17 @@ fn prepare_ishmael_raw_batch_evaluation<'table>(
         let ishmael_category = value.category.ishmael_category().ok_or(
             WrfTMatrixRawEvaluationError::IshmaelCategoryLayout(value.category),
         )?;
-        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
-            ishmael_category,
-            value.qice_kgkg,
-            value.qnice_per_kg,
-            value.qvoli_m3_per_kg,
-            value.qaoli_m3_per_kg,
-            raw.dry_air_density_kg_m3(),
-        ))
+        let distribution = IshmaelPsd::reconstruct_wrf_source_checked(
+            IshmaelPsdInput::new(
+                ishmael_category,
+                value.qice_kgkg,
+                value.qnice_per_kg,
+                value.qvoli_m3_per_kg,
+                value.qaoli_m3_per_kg,
+                raw.dry_air_density_kg_m3(),
+            ),
+            raw.environment().temperature_k(),
+        )
         .map_err(
             |source| WrfTMatrixRawEvaluationError::IshmaelPsdReconstruction {
                 category: value.category,
@@ -7065,6 +7074,69 @@ mod tests {
                     columnar.qaoli_m3_per_kg.to_bits(),
                 ),
                 (0, 0, 0, 0)
+            );
+        }
+        if cell == 5_554_071 {
+            let raw = source.raw_cell(cell).expect("read exact aggregate cell");
+            assert_eq!(raw.environment().temperature_k(), 244.504_241_943_359_38);
+            let aggregate = raw
+                .categories()
+                .iter()
+                .find_map(|category| match category {
+                    RawPropertyCategory::Ishmael(value)
+                        if value.category == WrfPropertyCategory::IshmaelAggregate =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .expect("exact fixture cell retains the aggregate tuple");
+            assert_eq!(
+                (
+                    aggregate.qice_kgkg,
+                    aggregate.qnice_per_kg,
+                    aggregate.qvoli_m3_per_kg,
+                    aggregate.qaoli_m3_per_kg,
+                ),
+                (
+                    f64::from(f32::from_bits(0x2ed0_f2c7)),
+                    f64::from(f32::from_bits(0x3d4b_5185)),
+                    f64::from(f32::from_bits(0x27e5_0322)),
+                    f64::from(f32::from_bits(0x2685_5dbd)),
+                )
+            );
+            let checked = IshmaelPsd::reconstruct_wrf_source_checked(
+                IshmaelPsdInput::new(
+                    radar_scattering::IshmaelIceCategory::Aggregate,
+                    aggregate.qice_kgkg,
+                    aggregate.qnice_per_kg,
+                    aggregate.qvoli_m3_per_kg,
+                    aggregate.qaoli_m3_per_kg,
+                    raw.dry_air_density_kg_m3(),
+                ),
+                raw.environment().temperature_k(),
+            )
+            .expect("replay exact WRF cold-aggregate final check");
+            let audit = checked.reconstruction_audit();
+            assert!(audit.source_aggregate_final_check_applied);
+            assert!(audit.source_cold_aggregate_reset_applied);
+            assert!(!audit.source_aggregate_size_cap_applied);
+            assert!(!audit.source_var_check_small_ice_applied);
+            assert!(!audit.source_var_check_large_ice_applied);
+            assert_eq!(checked.a_scale_m().to_bits(), 0x3f12_abe1_2cdc_d7cc);
+            assert_eq!(checked.c_at_a_scale_m().to_bits(), 0x3ef6_312b_b658_2af7);
+            assert_eq!(
+                checked.aspect_power_delta().to_bits(),
+                0x3fea_167c_939e_a245
+            );
+            assert_eq!(checked.bulk_density_kg_m3().to_bits(), 50.0_f64.to_bits());
+            assert_eq!(
+                checked.input().qice_kgkg().to_bits(),
+                aggregate.qice_kgkg.to_bits()
+            );
+            assert_eq!(
+                checked.input().qnice_per_kg().to_bits(),
+                aggregate.qnice_per_kg.to_bits()
             );
         }
 

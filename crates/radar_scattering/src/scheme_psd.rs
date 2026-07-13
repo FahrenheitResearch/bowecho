@@ -28,7 +28,7 @@ use crate::{
 /// Version stamped on the first scheme-native PSD implementation.
 pub const SCHEME_PSD_REVISION: &str = "scheme-psd-v1";
 /// Version stamped on the ISHMAEL reconstruction equations.
-pub const ISHMAEL_PSD_REVISION: &str = "wrf-jensen-ishmael-gamma-var-check-v2";
+pub const ISHMAEL_PSD_REVISION: &str = "wrf-jensen-ishmael-gamma-final-check-v3";
 /// Mass- and shape-preserving binding from ISHMAEL's source density ceiling
 /// to the authenticated solid-ice constituent endpoint of the dry LUTs.
 pub const ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION: &str =
@@ -42,6 +42,18 @@ pub const ISHMAEL_MONOMER_SEMI_AXIS_M: f64 = 0.1e-6;
 pub const ISHMAEL_DELTA_RANGE: [f64; 2] = [0.55, 1.30];
 /// Bounds applied by WRF's ISHMAEL state checks.
 pub const ISHMAEL_DENSITY_RANGE_KG_M3: [f64; 2] = [50.0, 920.0];
+/// Temperature threshold used by ISHMAEL's final cold-aggregate reset.
+pub const ISHMAEL_MELTING_TEMPERATURE_K: f64 = 273.15;
+/// Fixed number-weighted aspect ratio assigned to cold aggregates.
+pub const ISHMAEL_COLD_AGGREGATE_NUMBER_WEIGHTED_ASPECT_RATIO: f64 = 0.2;
+/// Density assigned to cold aggregates by the source final check.
+pub const ISHMAEL_COLD_AGGREGATE_DENSITY_KG_M3: f64 = 50.0;
+/// Characteristic aggregate a-axis cap used for implicit breakup.
+pub const ISHMAEL_AGGREGATE_MAXIMUM_A_SCALE_M: f64 = 0.5e-3;
+const ISHMAEL_MINIMUM_AXIS_SCALE_M: f64 = 2.0e-6;
+const ISHMAEL_MINIMUM_NUMBER_PER_KG: f64 = 1.25e-7;
+const ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG: f64 = 1.0e-24;
+const ISHMAEL_VAR_CHECK_MAXIMUM_AXIS_SCALE_M: f64 = 1.0e-3;
 /// Absolute coarse/refined convergence tolerances in
 /// [`AdditiveScattering::components`] order. Each entry therefore retains
 /// the component's native unit instead of sharing a dimensionally invalid
@@ -90,6 +102,7 @@ const SOURCE_BOUND_RELATIVE_TOLERANCE: f64 = 16.0 * f32::EPSILON as f64;
 pub enum SchemePsdRevision {
     IshmaelGammaV1,
     IshmaelGammaVarCheckV2,
+    IshmaelGammaFinalCheckV3,
 }
 
 /// Deterministic bounded quadrature implemented by this revision.
@@ -265,6 +278,33 @@ pub struct IshmaelReconstructionAudit {
     /// Signed change from source QAOLI to the projected `c^2 a` moment.
     #[serde(default)]
     pub qaoli_source_projection_relative_change: f64,
+    /// Whether WRF's aggregate-only final state check was reproduced.
+    #[serde(default)]
+    pub source_aggregate_final_check_applied: bool,
+    /// Whether the cold aggregate density/number-weighted-shape reset ran.
+    #[serde(default)]
+    pub source_cold_aggregate_reset_applied: bool,
+    /// Whether the 0.5 mm aggregate a-scale cap changed source number.
+    #[serde(default)]
+    pub source_aggregate_size_cap_applied: bool,
+    /// Signed change from source QNICE to the source-checked number.
+    #[serde(default)]
+    pub qnice_source_projection_relative_change: f64,
+    /// Whether the source QNICE floor changed the incoming number.
+    #[serde(default)]
+    pub source_number_floor_applied: bool,
+    /// Whether the source QVOLI/QAOLI floor changed either incoming moment.
+    #[serde(default)]
+    pub source_moment_floor_applied: bool,
+    /// Whether the source 2 um a/c-axis floor changed either incoming axis.
+    #[serde(default)]
+    pub source_axis_floor_applied: bool,
+    /// Whether `var_check` re-diagnosed number at its 2 um radius floor.
+    #[serde(default)]
+    pub source_var_check_small_ice_applied: bool,
+    /// Whether `var_check` re-diagnosed number at its 1 mm axis cap.
+    #[serde(default)]
+    pub source_var_check_large_ice_applied: bool,
 }
 
 /// A reconstructed native ISHMAEL gamma distribution.
@@ -418,6 +458,15 @@ impl IshmaelPsd {
             } else {
                 0.0
             },
+            source_aggregate_final_check_applied: false,
+            source_cold_aggregate_reset_applied: false,
+            source_aggregate_size_cap_applied: false,
+            qnice_source_projection_relative_change: 0.0,
+            source_number_floor_applied: false,
+            source_moment_floor_applied: false,
+            source_axis_floor_applied: false,
+            source_var_check_small_ice_applied: false,
+            source_var_check_large_ice_applied: false,
         };
         for (moment, error) in [
             ("QVOLI", reconstruction.qvoli_relative_error),
@@ -444,6 +493,297 @@ impl IshmaelPsd {
             mean_equivolume_diameter_sixth_m6,
             reconstruction,
         })
+    }
+
+    /// Apply the source's pre-`var_check` floors and the complete shared
+    /// `var_check` projection. This deliberately does not reproduce the
+    /// sedimentation-only `ai/ci < 1e-12` sphericalization: wrfout tuples are
+    /// reconstructed at the raw-state boundary, while that source branch is
+    /// tied to the in-step sedimentation update.
+    fn reconstruct_wrf_var_checked(input: IshmaelPsdInput) -> Result<Self, PsdError> {
+        positive("QICE", input.qice_kgkg)?;
+        positive("QNICE", input.qnice_per_kg)?;
+        positive("QVOLI", input.qvoli_m3_per_kg)?;
+        positive("QAOLI", input.qaoli_m3_per_kg)?;
+        positive("dry-air density", input.dry_air_density_kg_m3)?;
+
+        let raw_a_scale_m = checked_positive_computation(
+            "ISHMAEL raw a_n",
+            (input.qvoli_m3_per_kg * input.qvoli_m3_per_kg
+                / (input.qaoli_m3_per_kg * input.qnice_per_kg))
+                .cbrt(),
+        )?;
+        let raw_c_at_a_scale_m = checked_positive_computation(
+            "ISHMAEL raw c_n",
+            (input.qaoli_m3_per_kg * input.qaoli_m3_per_kg
+                / (input.qvoli_m3_per_kg * input.qnice_per_kg))
+                .cbrt(),
+        )?;
+        let source_number_floor_applied = input.qnice_per_kg < ISHMAEL_MINIMUM_NUMBER_PER_KG;
+        let source_moment_floor_applied = input.qvoli_m3_per_kg
+            < ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG
+            || input.qaoli_m3_per_kg < ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG;
+        let qnice_per_kg = input.qnice_per_kg.max(ISHMAEL_MINIMUM_NUMBER_PER_KG);
+        let qvoli_m3_per_kg = input
+            .qvoli_m3_per_kg
+            .max(ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG);
+        let qaoli_m3_per_kg = input
+            .qaoli_m3_per_kg
+            .max(ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG);
+        let mut a_scale_m = checked_positive_computation(
+            "ISHMAEL source incoming a_n",
+            (qvoli_m3_per_kg * qvoli_m3_per_kg / (qaoli_m3_per_kg * qnice_per_kg)).cbrt(),
+        )?;
+        let mut c_at_a_scale_m = checked_positive_computation(
+            "ISHMAEL source incoming c_n",
+            (qaoli_m3_per_kg * qaoli_m3_per_kg / (qvoli_m3_per_kg * qnice_per_kg)).cbrt(),
+        )?;
+        let source_axis_floor_applied = a_scale_m < ISHMAEL_MINIMUM_AXIS_SCALE_M
+            || c_at_a_scale_m < ISHMAEL_MINIMUM_AXIS_SCALE_M;
+        a_scale_m = a_scale_m.max(ISHMAEL_MINIMUM_AXIS_SCALE_M);
+        c_at_a_scale_m = c_at_a_scale_m.max(ISHMAEL_MINIMUM_AXIS_SCALE_M);
+        let aspect_power_delta = (c_at_a_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M).ln()
+            / (a_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M).ln();
+        let source_state = ishmael_source_var_check(
+            input.qice_kgkg,
+            qnice_per_kg,
+            a_scale_m,
+            c_at_a_scale_m,
+            aspect_power_delta,
+        )?;
+        let source_projection_applied = source_number_floor_applied
+            || source_moment_floor_applied
+            || source_axis_floor_applied
+            || source_state.delta_bound_excursion != 0.0
+            || source_state.source_density_state_projected
+            || source_state.small_ice_applied
+            || source_state.large_ice_applied;
+        if !source_projection_applied {
+            return Self::reconstruct(input);
+        }
+
+        let projected_qvoli = source_state.qnice_per_kg
+            * source_state.a_scale_m
+            * source_state.a_scale_m
+            * source_state.c_at_a_scale_m;
+        let projected_qaoli = source_state.qnice_per_kg
+            * source_state.a_scale_m
+            * source_state.c_at_a_scale_m
+            * source_state.c_at_a_scale_m;
+        let projected_input = IshmaelPsdInput::new(
+            input.category,
+            input.qice_kgkg,
+            source_state.qnice_per_kg,
+            projected_qvoli,
+            projected_qaoli,
+            input.dry_air_density_kg_m3,
+        );
+        let mut checked = Self::reconstruct(projected_input)?;
+        checked.a_scale_m = source_state.a_scale_m;
+        checked.c_at_a_scale_m = source_state.c_at_a_scale_m;
+        checked.aspect_power_delta = source_state.aspect_power_delta;
+        checked.bulk_density_kg_m3 = source_state.bulk_density_kg_m3;
+        checked.mass_preserving_bulk_density_kg_m3 =
+            source_state.mass_preserving_bulk_density_kg_m3;
+        checked.mean_particle_mass_kg = input.qice_kgkg / source_state.qnice_per_kg;
+        checked.mean_equivolume_diameter_sixth_m6 = checked_positive_computation(
+            "ISHMAEL source-checked mean equivalent-volume diameter sixth moment",
+            64.0 * ISHMAEL_MONOMER_SEMI_AXIS_M.powf(2.0 * (1.0 - source_state.aspect_power_delta))
+                * analytic_gamma_moment(
+                    1.0,
+                    source_state.a_scale_m,
+                    ISHMAEL_GAMMA_SHAPE,
+                    4.0 + 2.0 * source_state.aspect_power_delta,
+                )?,
+        )?;
+        let audit = &mut checked.reconstruction;
+        audit.qvoli_relative_error = relative_error(
+            input.qnice_per_kg * raw_a_scale_m * raw_a_scale_m * raw_c_at_a_scale_m,
+            input.qvoli_m3_per_kg,
+            0.0,
+        );
+        audit.qaoli_relative_error = relative_error(
+            input.qnice_per_kg * raw_a_scale_m * raw_c_at_a_scale_m * raw_c_at_a_scale_m,
+            input.qaoli_m3_per_kg,
+            0.0,
+        );
+        audit.delta_bound_excursion = source_state.delta_bound_excursion;
+        audit.density_bound_excursion_kg_m3 = source_state.density_bound_excursion_kg_m3;
+        audit.source_density_state_projected = source_state.source_density_state_projected;
+        audit.qvoli_source_projection_relative_change =
+            (projected_qvoli - input.qvoli_m3_per_kg) / input.qvoli_m3_per_kg;
+        audit.qaoli_source_projection_relative_change =
+            (projected_qaoli - input.qaoli_m3_per_kg) / input.qaoli_m3_per_kg;
+        audit.qnice_source_projection_relative_change =
+            (source_state.qnice_per_kg - input.qnice_per_kg) / input.qnice_per_kg;
+        audit.source_number_floor_applied = source_number_floor_applied;
+        audit.source_moment_floor_applied = source_moment_floor_applied;
+        audit.source_axis_floor_applied = source_axis_floor_applied;
+        audit.source_var_check_small_ice_applied = source_state.small_ice_applied;
+        audit.source_var_check_large_ice_applied = source_state.large_ice_applied;
+        Ok(checked)
+    }
+
+    /// Reproduce the final source checks that depend on WRF temperature and
+    /// category identity before exposing a PSD to scattering.
+    ///
+    /// In `module_mp_jensen_ishmael.F`, cold aggregates are assigned
+    /// `rhobar=50` and number-weighted `phiagg3=0.2`. The source then derives
+    /// a new power-law delta, keeps aggregates spherical or oblate, solves
+    /// the a-axis from conserved mass and number, and applies its 0.5 mm
+    /// implicit-breakup cap. This entry point preserves that order at every
+    /// raw-state boundary, including post-transport wrfout states.
+    pub fn reconstruct_wrf_source_checked(
+        input: IshmaelPsdInput,
+        temperature_k: f64,
+    ) -> Result<Self, PsdError> {
+        positive("ISHMAEL source temperature", temperature_k)?;
+        let incoming = Self::reconstruct_wrf_var_checked(input)?;
+        if input.category != IshmaelIceCategory::Aggregate {
+            return Ok(incoming);
+        }
+
+        let cold = temperature_k <= ISHMAEL_MELTING_TEMPERATURE_K;
+        let incoming_delta = incoming.aspect_power_delta;
+        let c_after_shape_check = if cold {
+            let gamma_ratio = checked_positive_computation(
+                "ISHMAEL cold aggregate gamma ratio",
+                (ln_gamma(ISHMAEL_GAMMA_SHAPE)?
+                    - ln_gamma(ISHMAEL_GAMMA_SHAPE - 1.0 + incoming_delta)?)
+                .exp(),
+            )?;
+            checked_positive_computation(
+                "ISHMAEL cold aggregate c_n",
+                ISHMAEL_COLD_AGGREGATE_NUMBER_WEIGHTED_ASPECT_RATIO
+                    * incoming.a_scale_m
+                    * gamma_ratio,
+            )?
+        } else {
+            incoming.c_at_a_scale_m
+        };
+        let aggregate_delta = if incoming.a_scale_m > 1.1 * ISHMAEL_MONOMER_SEMI_AXIS_M
+            && c_after_shape_check > 1.1 * ISHMAEL_MONOMER_SEMI_AXIS_M
+        {
+            (c_after_shape_check / ISHMAEL_MONOMER_SEMI_AXIS_M).ln()
+                / (incoming.a_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M).ln()
+        } else {
+            1.0
+        }
+        .min(1.0);
+        let aggregate_density_kg_m3 = if cold {
+            ISHMAEL_COLD_AGGREGATE_DENSITY_KG_M3
+        } else {
+            incoming.bulk_density_kg_m3
+        };
+        let mean_particle_mass_kg = input.qice_kgkg / incoming.input.qnice_per_kg;
+        let mut a_scale_m = ishmael_a_scale_for_mean_mass(
+            mean_particle_mass_kg,
+            aggregate_density_kg_m3,
+            aggregate_delta,
+        )?
+        .max(ISHMAEL_MINIMUM_AXIS_SCALE_M);
+        let source_aggregate_size_cap_applied = a_scale_m > ISHMAEL_AGGREGATE_MAXIMUM_A_SCALE_M;
+        let qnice_per_kg = if source_aggregate_size_cap_applied {
+            a_scale_m = ISHMAEL_AGGREGATE_MAXIMUM_A_SCALE_M;
+            let mean_volume_m3 =
+                mean_particle_volume(a_scale_m, aggregate_delta, ISHMAEL_GAMMA_SHAPE)?;
+            (input.qice_kgkg / (aggregate_density_kg_m3 * mean_volume_m3))
+                .max(ISHMAEL_MINIMUM_NUMBER_PER_KG)
+        } else {
+            incoming.input.qnice_per_kg
+        };
+        let c_at_a_scale_m = ishmael_c_scale_for_a(a_scale_m, aggregate_delta)?;
+
+        // The source calls var_check again after rewriting the aggregate
+        // moments. Reproduce its order, including the branches that can
+        // re-diagnose number, rather than widening a downstream LUT domain.
+        let final_state = ishmael_source_var_check(
+            input.qice_kgkg,
+            qnice_per_kg,
+            a_scale_m,
+            c_at_a_scale_m,
+            aggregate_delta,
+        )?;
+
+        let checked_input = IshmaelPsdInput::new(
+            input.category,
+            input.qice_kgkg,
+            final_state.qnice_per_kg,
+            final_state.qnice_per_kg
+                * final_state.a_scale_m
+                * final_state.a_scale_m
+                * final_state.c_at_a_scale_m,
+            final_state.qnice_per_kg
+                * final_state.a_scale_m
+                * final_state.c_at_a_scale_m
+                * final_state.c_at_a_scale_m,
+            input.dry_air_density_kg_m3,
+        );
+        let mut checked = Self::reconstruct(checked_input)?;
+        checked.a_scale_m = final_state.a_scale_m;
+        checked.c_at_a_scale_m = final_state.c_at_a_scale_m;
+        checked.aspect_power_delta = final_state.aspect_power_delta;
+        checked.bulk_density_kg_m3 = final_state.bulk_density_kg_m3;
+        checked.mass_preserving_bulk_density_kg_m3 = final_state.mass_preserving_bulk_density_kg_m3;
+        checked.mean_particle_mass_kg = input.qice_kgkg / final_state.qnice_per_kg;
+        checked.mean_equivolume_diameter_sixth_m6 = checked_positive_computation(
+            "ISHMAEL final aggregate mean equivalent-volume diameter sixth moment",
+            64.0 * ISHMAEL_MONOMER_SEMI_AXIS_M.powf(2.0 * (1.0 - final_state.aspect_power_delta))
+                * analytic_gamma_moment(
+                    1.0,
+                    final_state.a_scale_m,
+                    ISHMAEL_GAMMA_SHAPE,
+                    4.0 + 2.0 * final_state.aspect_power_delta,
+                )?,
+        )?;
+        if cold
+            && relative_error(
+                checked.bulk_density_kg_m3,
+                ISHMAEL_COLD_AGGREGATE_DENSITY_KG_M3,
+                f64::MIN_POSITIVE,
+            ) <= 64.0 * f64::EPSILON
+        {
+            checked.bulk_density_kg_m3 = ISHMAEL_COLD_AGGREGATE_DENSITY_KG_M3;
+            checked.mass_preserving_bulk_density_kg_m3 = ISHMAEL_COLD_AGGREGATE_DENSITY_KG_M3;
+        }
+        let checked_audit = &mut checked.reconstruction;
+        let incoming_audit = incoming.reconstruction;
+        checked_audit.qvoli_relative_error = incoming_audit.qvoli_relative_error;
+        checked_audit.qaoli_relative_error = incoming_audit.qaoli_relative_error;
+        checked_audit.mass_relative_error = checked_audit
+            .mass_relative_error
+            .max(incoming_audit.mass_relative_error);
+        checked_audit.delta_bound_excursion = if final_state.delta_bound_excursion != 0.0 {
+            final_state.delta_bound_excursion
+        } else {
+            incoming_audit.delta_bound_excursion
+        };
+        checked_audit.density_bound_excursion_kg_m3 =
+            if final_state.density_bound_excursion_kg_m3 != 0.0 {
+                final_state.density_bound_excursion_kg_m3
+            } else {
+                incoming_audit.density_bound_excursion_kg_m3
+            };
+        checked_audit.source_density_state_projected = incoming_audit
+            .source_density_state_projected
+            || final_state.source_density_state_projected;
+        checked_audit.source_aggregate_final_check_applied = true;
+        checked_audit.source_cold_aggregate_reset_applied = cold;
+        checked_audit.source_aggregate_size_cap_applied = source_aggregate_size_cap_applied;
+        checked_audit.qnice_source_projection_relative_change =
+            (final_state.qnice_per_kg - input.qnice_per_kg) / input.qnice_per_kg;
+        checked_audit.source_number_floor_applied = incoming_audit.source_number_floor_applied;
+        checked_audit.source_moment_floor_applied = incoming_audit.source_moment_floor_applied;
+        checked_audit.source_axis_floor_applied = incoming_audit.source_axis_floor_applied;
+        checked_audit.source_var_check_small_ice_applied =
+            incoming_audit.source_var_check_small_ice_applied || final_state.small_ice_applied;
+        checked_audit.source_var_check_large_ice_applied =
+            incoming_audit.source_var_check_large_ice_applied || final_state.large_ice_applied;
+        checked_audit.qvoli_source_projection_relative_change =
+            (checked_input.qvoli_m3_per_kg - input.qvoli_m3_per_kg) / input.qvoli_m3_per_kg;
+        checked_audit.qaoli_source_projection_relative_change =
+            (checked_input.qaoli_m3_per_kg - input.qaoli_m3_per_kg) / input.qaoli_m3_per_kg;
+        Ok(checked)
     }
 
     #[must_use]
@@ -1262,7 +1602,7 @@ impl PsdIntegrationConfig {
             });
         }
         Ok(Self {
-            revision: SchemePsdRevision::IshmaelGammaVarCheckV2,
+            revision: SchemePsdRevision::IshmaelGammaFinalCheckV3,
             quadrature: PsdQuadratureRule::CompositeGaussLegendre8AdaptiveRefinedV2,
             coarse_panels,
             maximum_refined_nodes,
@@ -2134,6 +2474,200 @@ fn mean_particle_volume(a_scale_m: f64, delta: f64, gamma_shape: f64) -> Result<
     )
 }
 
+fn ishmael_a_scale_for_mean_mass(
+    mean_particle_mass_kg: f64,
+    bulk_density_kg_m3: f64,
+    delta: f64,
+) -> Result<f64, PsdError> {
+    positive("ISHMAEL mean particle mass", mean_particle_mass_kg)?;
+    positive("ISHMAEL aggregate bulk density", bulk_density_kg_m3)?;
+    let log_volume_coefficient = ((4.0 / 3.0) * PI).ln()
+        + (1.0 - delta) * ISHMAEL_MONOMER_SEMI_AXIS_M.ln()
+        + ln_gamma(ISHMAEL_GAMMA_SHAPE + 2.0 + delta)?
+        - ln_gamma(ISHMAEL_GAMMA_SHAPE)?;
+    checked_positive_computation(
+        "ISHMAEL aggregate mass-conserving a_n",
+        ((mean_particle_mass_kg.ln() - bulk_density_kg_m3.ln() - log_volume_coefficient)
+            / (2.0 + delta))
+            .exp(),
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IshmaelSourceVarCheckState {
+    qnice_per_kg: f64,
+    a_scale_m: f64,
+    c_at_a_scale_m: f64,
+    aspect_power_delta: f64,
+    bulk_density_kg_m3: f64,
+    mass_preserving_bulk_density_kg_m3: f64,
+    delta_bound_excursion: f64,
+    density_bound_excursion_kg_m3: f64,
+    source_density_state_projected: bool,
+    small_ice_applied: bool,
+    large_ice_applied: bool,
+}
+
+fn ishmael_c_scale_for_a(a_scale_m: f64, delta: f64) -> Result<f64, PsdError> {
+    checked_positive_computation(
+        "ISHMAEL c_n from a_n and delta",
+        ISHMAEL_MONOMER_SEMI_AXIS_M.powf(1.0 - delta) * a_scale_m.powf(delta),
+    )
+}
+
+/// Reproduce WRF v4.5.2 `var_check` using this module's analytic gamma
+/// moments. The caller supplies the state immediately before the source call;
+/// this routine applies the delta, density, small-radius, and large-axis
+/// branches in source order and returns the moments' defining tuple.
+fn ishmael_source_var_check(
+    qice_kgkg: f64,
+    mut qnice_per_kg: f64,
+    mut a_scale_m: f64,
+    mut c_at_a_scale_m: f64,
+    mut aspect_power_delta: f64,
+) -> Result<IshmaelSourceVarCheckState, PsdError> {
+    positive("ISHMAEL var_check QICE", qice_kgkg)?;
+    positive("ISHMAEL var_check QNICE", qnice_per_kg)?;
+    positive("ISHMAEL var_check a_n", a_scale_m)?;
+    positive("ISHMAEL var_check c_n", c_at_a_scale_m)?;
+    if !aspect_power_delta.is_finite() {
+        return Err(PsdError::InvalidComputation {
+            field: "ISHMAEL var_check delta",
+            value: aspect_power_delta,
+        });
+    }
+
+    let delta_bound_excursion = if aspect_power_delta < ISHMAEL_DELTA_RANGE[0] {
+        let excursion = aspect_power_delta - ISHMAEL_DELTA_RANGE[0];
+        aspect_power_delta = ISHMAEL_DELTA_RANGE[0];
+        a_scale_m = checked_positive_computation(
+            "ISHMAEL var_check a_n after delta floor",
+            (c_at_a_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M.powf(1.0 - aspect_power_delta))
+                .powf(1.0 / aspect_power_delta),
+        )?;
+        excursion
+    } else if aspect_power_delta > ISHMAEL_DELTA_RANGE[1] {
+        let excursion = aspect_power_delta - ISHMAEL_DELTA_RANGE[1];
+        aspect_power_delta = ISHMAEL_DELTA_RANGE[1];
+        c_at_a_scale_m = ishmael_c_scale_for_a(a_scale_m, aspect_power_delta)?;
+        excursion
+    } else {
+        0.0
+    };
+
+    let mean_particle_mass_kg = qice_kgkg / qnice_per_kg;
+    let raw_bulk_density_kg_m3 = if a_scale_m > ISHMAEL_MINIMUM_AXIS_SCALE_M {
+        checked_positive_computation(
+            "ISHMAEL var_check density",
+            mean_particle_mass_kg
+                / mean_particle_volume(a_scale_m, aspect_power_delta, ISHMAEL_GAMMA_SHAPE)?,
+        )?
+    } else {
+        ISHMAEL_DENSITY_RANGE_KG_M3[1]
+    };
+    let density_tolerance = SOURCE_BOUND_RELATIVE_TOLERANCE
+        * ISHMAEL_DENSITY_RANGE_KG_M3[0]
+            .abs()
+            .max(ISHMAEL_DENSITY_RANGE_KG_M3[1].abs())
+            .max(1.0);
+    let source_density_state_projected = raw_bulk_density_kg_m3
+        < ISHMAEL_DENSITY_RANGE_KG_M3[0] - density_tolerance
+        || raw_bulk_density_kg_m3 > ISHMAEL_DENSITY_RANGE_KG_M3[1] + density_tolerance;
+    let (bulk_density_kg_m3, density_bound_excursion_kg_m3) = if source_density_state_projected {
+        let bounded = raw_bulk_density_kg_m3.clamp(
+            ISHMAEL_DENSITY_RANGE_KG_M3[0],
+            ISHMAEL_DENSITY_RANGE_KG_M3[1],
+        );
+        (bounded, raw_bulk_density_kg_m3 - bounded)
+    } else {
+        source_bounded(
+            "ISHMAEL var_check density",
+            raw_bulk_density_kg_m3,
+            ISHMAEL_DENSITY_RANGE_KG_M3,
+        )?
+    };
+    if source_density_state_projected {
+        a_scale_m = ishmael_a_scale_for_mean_mass(
+            mean_particle_mass_kg,
+            bulk_density_kg_m3,
+            aspect_power_delta,
+        )?;
+        c_at_a_scale_m = ishmael_c_scale_for_a(a_scale_m, aspect_power_delta)?;
+    }
+    let mut mass_preserving_bulk_density_kg_m3 = if source_density_state_projected {
+        bulk_density_kg_m3
+    } else {
+        raw_bulk_density_kg_m3
+    };
+
+    let gamma_mass_ratio = checked_positive_computation(
+        "ISHMAEL var_check gamma mass ratio",
+        (ln_gamma(ISHMAEL_GAMMA_SHAPE + 2.0 + aspect_power_delta)?
+            - ln_gamma(ISHMAEL_GAMMA_SHAPE)?)
+        .exp(),
+    )?;
+    let equivalent_radius_scale_m = checked_positive_computation(
+        "ISHMAEL var_check r_n",
+        (qice_kgkg / (qnice_per_kg * bulk_density_kg_m3 * (4.0 / 3.0) * PI * gamma_mass_ratio))
+            .cbrt(),
+    )?;
+    let small_ice_applied = equivalent_radius_scale_m < ISHMAEL_MINIMUM_AXIS_SCALE_M;
+    if small_ice_applied {
+        qnice_per_kg = checked_positive_computation(
+            "ISHMAEL var_check number after radius floor",
+            qice_kgkg
+                / (bulk_density_kg_m3
+                    * (4.0 / 3.0)
+                    * PI
+                    * ISHMAEL_MINIMUM_AXIS_SCALE_M.powi(3)
+                    * gamma_mass_ratio),
+        )?;
+        a_scale_m = ishmael_a_scale_for_mean_mass(
+            qice_kgkg / qnice_per_kg,
+            bulk_density_kg_m3,
+            aspect_power_delta,
+        )?;
+        c_at_a_scale_m = ishmael_c_scale_for_a(a_scale_m, aspect_power_delta)?;
+        mass_preserving_bulk_density_kg_m3 = bulk_density_kg_m3;
+    }
+
+    let large_ice_applied = a_scale_m.max(c_at_a_scale_m) > ISHMAEL_VAR_CHECK_MAXIMUM_AXIS_SCALE_M;
+    if large_ice_applied {
+        if a_scale_m >= c_at_a_scale_m {
+            a_scale_m = ISHMAEL_VAR_CHECK_MAXIMUM_AXIS_SCALE_M;
+            c_at_a_scale_m = ishmael_c_scale_for_a(a_scale_m, aspect_power_delta)?;
+        } else {
+            c_at_a_scale_m = ISHMAEL_VAR_CHECK_MAXIMUM_AXIS_SCALE_M;
+            a_scale_m = checked_positive_computation(
+                "ISHMAEL var_check a_n after large-c cap",
+                (c_at_a_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M.powf(1.0 - aspect_power_delta))
+                    .powf(1.0 / aspect_power_delta),
+            )?;
+        }
+        qnice_per_kg = checked_positive_computation(
+            "ISHMAEL var_check number after large-axis cap",
+            qice_kgkg
+                / (bulk_density_kg_m3
+                    * mean_particle_volume(a_scale_m, aspect_power_delta, ISHMAEL_GAMMA_SHAPE)?),
+        )?;
+        mass_preserving_bulk_density_kg_m3 = bulk_density_kg_m3;
+    }
+
+    Ok(IshmaelSourceVarCheckState {
+        qnice_per_kg,
+        a_scale_m,
+        c_at_a_scale_m,
+        aspect_power_delta,
+        bulk_density_kg_m3,
+        mass_preserving_bulk_density_kg_m3,
+        delta_bound_excursion,
+        density_bound_excursion_kg_m3,
+        source_density_state_projected,
+        small_ice_applied,
+        large_ice_applied,
+    })
+}
+
 fn regularized_gamma_q(shape: f64, x: f64) -> Result<f64, PsdError> {
     positive("regularized-gamma shape", shape)?;
     if !x.is_finite() || x < 0.0 {
@@ -2795,7 +3329,7 @@ mod tests {
         )
         .unwrap();
         let audit = result.audit();
-        assert_eq!(audit.revision, SchemePsdRevision::IshmaelGammaVarCheckV2);
+        assert_eq!(audit.revision, SchemePsdRevision::IshmaelGammaFinalCheckV3);
         assert_eq!(
             audit.quadrature,
             PsdQuadratureRule::CompositeGaussLegendre8AdaptiveRefinedV2
@@ -3035,6 +3569,98 @@ mod tests {
             0x3c41_4988_c604_49e4
         );
         assert!(audit.mass_relative_error <= RECONSTRUCTION_RELATIVE_TOLERANCE);
+    }
+
+    #[test]
+    fn exact_wrf_cold_aggregate_replays_source_final_check() {
+        let input = IshmaelPsdInput::new(
+            IshmaelIceCategory::Aggregate,
+            f64::from(f32::from_bits(0x2ed0_f2c7)),
+            f64::from(f32::from_bits(0x3d4b_5185)),
+            f64::from(f32::from_bits(0x27e5_0322)),
+            f64::from(f32::from_bits(0x2685_5dbd)),
+            1.0,
+        );
+        let incoming = IshmaelPsd::reconstruct(input).unwrap();
+        let checked =
+            IshmaelPsd::reconstruct_wrf_source_checked(input, 244.504_241_943_359_38).unwrap();
+        let audit = checked.reconstruction_audit();
+
+        assert!(audit.source_aggregate_final_check_applied);
+        assert!(audit.source_cold_aggregate_reset_applied);
+        assert!(!audit.source_aggregate_size_cap_applied);
+        assert!(!audit.source_number_floor_applied);
+        assert!(!audit.source_moment_floor_applied);
+        assert!(!audit.source_axis_floor_applied);
+        assert!(!audit.source_var_check_small_ice_applied);
+        assert!(!audit.source_var_check_large_ice_applied);
+        assert_eq!(checked.a_scale_m().to_bits(), 0x3f12_abe1_2cdc_d7cc);
+        assert_eq!(checked.c_at_a_scale_m().to_bits(), 0x3ef6_312b_b658_2af7);
+        assert_eq!(
+            checked.aspect_power_delta().to_bits(),
+            0x3fea_167c_939e_a245
+        );
+        assert_eq!(checked.bulk_density_kg_m3().to_bits(), 50.0_f64.to_bits());
+        assert_eq!(
+            audit.qvoli_source_projection_relative_change.to_bits(),
+            0xbfc4_ad7e_02a2_1f1c
+        );
+        assert_eq!(
+            audit.qaoli_source_projection_relative_change.to_bits(),
+            0x3fe6_c292_f813_1077
+        );
+        assert_eq!(
+            checked.mean_equivolume_diameter_sixth_m6().to_bits(),
+            0x3bd7_1749_cab5_af82
+        );
+        assert_eq!(
+            checked.input().qice_kgkg().to_bits(),
+            input.qice_kgkg().to_bits()
+        );
+        assert_eq!(
+            checked.input().qnice_per_kg().to_bits(),
+            input.qnice_per_kg().to_bits()
+        );
+        assert!(checked.aspect_power_delta() > incoming.aspect_power_delta());
+        assert!(checked.c_at_a_scale_m() > incoming.c_at_a_scale_m());
+    }
+
+    #[test]
+    fn wrf_source_checked_centralizes_shared_var_check_branches() {
+        let low_delta = input_from_scales(
+            IshmaelIceCategory::Planar,
+            50.0e-6,
+            ISHMAEL_MONOMER_SEMI_AXIS_M * (50.0e-6 / ISHMAEL_MONOMER_SEMI_AXIS_M).powf(0.4),
+            400.0,
+        );
+        let low_delta = IshmaelPsd::reconstruct_wrf_source_checked(low_delta, 260.0).unwrap();
+        assert_eq!(low_delta.aspect_power_delta(), ISHMAEL_DELTA_RANGE[0]);
+        assert!(low_delta.reconstruction_audit().delta_bound_excursion < 0.0);
+        assert!(
+            !low_delta
+                .reconstruction_audit()
+                .source_aggregate_final_check_applied
+        );
+
+        let small = input_from_scales(IshmaelIceCategory::Columnar, 0.5e-6, 0.5e-6, 400.0);
+        let small = IshmaelPsd::reconstruct_wrf_source_checked(small, 260.0).unwrap();
+        assert!(small.reconstruction_audit().source_axis_floor_applied);
+        assert!(
+            small
+                .reconstruction_audit()
+                .source_var_check_small_ice_applied
+        );
+
+        let large = input_from_scales(IshmaelIceCategory::Planar, 2.0e-3, 2.0e-3, 400.0);
+        let large = IshmaelPsd::reconstruct_wrf_source_checked(large, 260.0).unwrap();
+        assert!(
+            large
+                .reconstruction_audit()
+                .source_var_check_large_ice_applied
+        );
+        assert!(
+            large.a_scale_m().max(large.c_at_a_scale_m()) <= ISHMAEL_VAR_CHECK_MAXIMUM_AXIS_SCALE_M
+        );
     }
 
     #[derive(Debug)]
