@@ -56,6 +56,13 @@ const WRF_P3_QSMALL_KGKG: f64 = 1.0e-14_f32 as f64;
 // negligible absolute band become inactive zero, while a larger negative mass
 // remains a typed file error. 1e-10 kg/kg is 0.1 microgram per kilogram.
 const WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG: f64 = 1.0e-10_f32 as f64;
+// ISHMAEL has no P3-style qsmall activity threshold, so retain every positive
+// mass. Its WRF transport fields can nevertheless contain isolated negative
+// default-REAL residues around zero. Clamp only the negative side of this much
+// tighter band to inactive zero; 1e-12 kg/kg is 0.001 microgram per kilogram
+// and covers the observed QICE/QRAIN residues while preserving a typed error
+// for materially negative source data.
+const WRF_ISHMAEL_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG: f64 = 1.0e-12_f32 as f64;
 const WRF_P3_NSMALL_PER_KG: f64 = 1.0e-16;
 const WRF_P3_RIME_VOLUME_MIN_M3_PER_KG: f32 = 1.0e-15_f32;
 const WRF_P3_RIME_DENSITY_MIN_KG_M3: f32 = 50.0;
@@ -2477,10 +2484,10 @@ fn read_mass_field<P: PropertyFieldProvider + ?Sized>(
     let mut indices = Vec::new();
     let mut values = Vec::new();
     let p3_qsmall = matches!(category, WrfPropertyCategory::P3(_));
-    let negative_limit = if p3_qsmall {
-        -WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG
+    let negative_limit = -if p3_qsmall {
+        WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG
     } else {
-        0.0
+        WRF_ISHMAEL_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG
     };
     for (cell_index, value) in normalized.values.iter().copied().enumerate() {
         if is_missing(value) {
@@ -2499,7 +2506,7 @@ fn read_mass_field<P: PropertyFieldProvider + ?Sized>(
         let inactive = if p3_qsmall {
             value < WRF_P3_QSMALL_KGKG
         } else {
-            value == 0.0
+            value <= 0.0
         };
         if inactive {
             continue;
@@ -2703,12 +2710,13 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
         }
         // P3's `get_rain_dsd2` clears the complete rain tuple below qsmall,
         // but only after the same bounded negative-residue check used by its
-        // ice masses. ISHMAEL retains exact-negative validation.
+        // ice masses. ISHMAEL retains every positive rain mass while applying
+        // its tighter negative transport-residue bound.
         if value
             < if p3_rain {
                 -WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG
             } else {
-                0.0
+                -WRF_ISHMAEL_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG
             }
         {
             return (
@@ -3867,17 +3875,59 @@ mod tests {
     }
 
     #[test]
-    fn ishmael_mass_keeps_exact_negative_validation_without_p3_qsmall() {
+    fn ishmael_mass_clamps_observed_transport_residues_and_rejects_beyond_limit() {
+        let reported_qice = -4.998_571_258_404_468e-21;
+        let worst_observed_qice = -5.614_400_342_746_940_5e-15;
+        let worst_observed_qrain = -4.239_170_863_298_835_6e-14;
+        let provider = ishmael_provider()
+            .field(
+                "QICE",
+                vec![reported_qice, worst_observed_qice, 0.0],
+                "kg kg-1",
+            )
+            .field("QRAIN", vec![0.0, worst_observed_qrain, 0.0], "kg kg-1")
+            .field("QNRAIN", vec![0.0; 3], "kg-1");
+        let scene = read_property_scene(&provider, 0).unwrap();
+        assert!(
+            scene
+                .skipped_zero_mass_categories()
+                .contains(&WrfPropertyCategory::IshmaelPlanar)
+        );
+        for cell_index in 0..3 {
+            assert!(matches!(
+                scene.rain.raw_at(cell_index),
+                RawRainState::Available {
+                    qrain_kgkg: 0.0,
+                    qnrain_per_kg: 0.0
+                }
+            ));
+        }
+
+        let first_rejected_negative = -f64::from(f32::from_bits(
+            (WRF_ISHMAEL_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG as f32).to_bits() + 1,
+        ));
         let provider =
-            TinyProvider::new(55, 1).field("QICE", vec![-0.5 * WRF_P3_QSMALL_KGKG], "kg kg-1");
+            TinyProvider::new(55, 1).field("QICE", vec![first_rejected_negative], "kg kg-1");
         assert_eq!(
             read_property_scene(&provider, 0).unwrap_err(),
             WrfPropertyReadError::NegativeMassValue {
                 field: "QICE",
                 cell_index: 0,
-                value: -0.5 * WRF_P3_QSMALL_KGKG,
+                value: first_rejected_negative,
             }
         );
+
+        let rain_provider = TinyProvider::new(55, 1)
+            .field("QRAIN", vec![first_rejected_negative], "kg kg-1")
+            .field("QNRAIN", vec![0.0], "kg-1");
+        let (rain, _) = read_rain(&rain_provider, 0, 1, 55);
+        assert!(matches!(
+            rain,
+            SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
+                field: "QRAIN",
+                ..
+            })
+        ));
     }
 
     #[test]
