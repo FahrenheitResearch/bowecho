@@ -672,6 +672,31 @@ impl SyntheticRadarUiState {
         Ok(config)
     }
 
+    fn to_cm1_config(&self) -> Result<crate::wrf_radar::SyntheticRadarConfig, String> {
+        let mut config = self.to_config()?;
+        // CM1's first-class adapter samples a scalar native-dbz scene. Keep
+        // every WRF-only or polarimetric branch impossible even when those
+        // controls remain selected in the shared simulated-radar workspace.
+        config.compute_preference = crate::wrf_radar::SyntheticRadarComputePreference::Cpu;
+        config.reflectivity_operator = crate::wrf_radar::ReflectivityOperator::ModelNative;
+        config.polarimetric_kernel = crate::wrf_radar::PolarimetricKernel::BulkRayleighV1;
+        config.dual_pol = false;
+        config.terminal_fall_speed = false;
+        config.propagation = false;
+        config.propagation_geometry =
+            crate::wrf_radar::PropagationGeometry::StandardFourThirdsEarth;
+        config.atmosphere_time_mode = app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
+        config.exact_replay_template = None;
+        config.site_name = Some(match (config.site_lat_deg, config.site_lon_deg) {
+            (Some(lat), Some(lon)) => format!("Simulated CM1 radar @ {lat:.3}, {lon:.3}"),
+            _ => "Simulated CM1 radar at placed domain centre".to_owned(),
+        });
+        if !matches!(self.placement, SynthPlacement::NexradSite) {
+            config.site_id = "CM1".to_owned();
+        }
+        Ok(config)
+    }
+
     /// Apply only the controls owned by a named mode. This mirrors the
     /// backend preset exactly, but it runs solely in response to an explicit
     /// mode-button click; expert edits are otherwise left untouched.
@@ -2024,6 +2049,32 @@ impl ModelDataDock {
                 self.store_root.clone(),
             )));
             self.repaint.request_repaint();
+        }
+
+        if let Some(request) = self.cm1.take_radar_request()
+            && self.import_job.is_none()
+            && !self.formula_lab.busy()
+        {
+            match self.synth_radar.to_cm1_config() {
+                Ok(config) => {
+                    self.synthetic_radar_source_files.clear();
+                    self.operational_radar_source = None;
+                    self.synthetic_radar_replay_source = None;
+                    self.synthetic_radar_preview = None;
+                    self.import_message = Some(format!(
+                        "Building CM1 native REF/VEL from {} time {}...",
+                        request.source_path.display(),
+                        request.time_index
+                    ));
+                    self.import_job = Some(ImportJob::SyntheticRadar(
+                        crate::wrf_radar::spawn_cm1_radar(request, config),
+                    ));
+                    self.repaint.request_repaint();
+                }
+                Err(error) => {
+                    self.import_message = Some(format!("CM1 radar setup failed: {error}"))
+                }
+            }
         }
 
         if self.gdex.open {

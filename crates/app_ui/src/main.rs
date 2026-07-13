@@ -9689,6 +9689,13 @@ impl ViewerApp {
             .volume_time
             .format("%Y%m%d_%H%M%S")
             .to_string();
+        let source_model = preview
+            .volume
+            .metadata
+            .source_model
+            .as_deref()
+            .unwrap_or("WRF")
+            .to_owned();
         let path = crate::wrf_radar::synthetic_frame_path(
             &preview.volume.site.id,
             preview.config_fingerprint,
@@ -9705,7 +9712,7 @@ impl ViewerApp {
                 timings: LoadTimings::default(),
                 status: FrameStatus::Preview,
                 source_label: format!(
-                    "simulated WRF partial tilt {}/{}",
+                    "simulated {source_model} partial tilt {}/{}",
                     preview.completed_cuts, preview.total_cuts
                 ),
             }),
@@ -9714,7 +9721,7 @@ impl ViewerApp {
             ctx,
         );
         self.status = format!(
-            "Simulated WRF radar · tilt {}/{} ready · remaining tilts processing",
+            "Simulated {source_model} radar · tilt {}/{} ready · remaining tilts processing",
             preview.completed_cuts, preview.total_cuts
         );
         ctx.request_repaint();
@@ -9782,6 +9789,11 @@ impl ViewerApp {
         }
 
         let frame_count = volumes.len();
+        let source_model = volumes
+            .first()
+            .and_then(|volume| volume.metadata.source_model.as_deref())
+            .unwrap_or("WRF")
+            .to_owned();
         let mut frame_sources = frame_sources.into_iter();
         let frames: Vec<DecodedLoad> = volumes
             .into_iter()
@@ -9794,6 +9806,12 @@ impl ViewerApp {
                         .insert(Arc::as_ptr(&volume) as usize, source);
                 }
                 let stamp = volume.volume_time.format("%Y%m%d_%H%M%S").to_string();
+                let frame_model = volume
+                    .metadata
+                    .source_model
+                    .as_deref()
+                    .unwrap_or("WRF")
+                    .to_owned();
                 DecodedLoad {
                     // Stable dedupe/refresh key per forecast frame, keyed on the
                     // config fingerprint (see `synthetic_frame_path`): a re-import
@@ -9810,7 +9828,7 @@ impl ViewerApp {
                     volume,
                     timings: LoadTimings::default(),
                     status: FrameStatus::Local,
-                    source_label: format!("simulated WRF {stamp}"),
+                    source_label: format!("simulated {frame_model} {stamp}"),
                 }
             })
             .collect();
@@ -9827,7 +9845,7 @@ impl ViewerApp {
             self.primary.cursor.playing = true;
             self.primary.cursor.last_step = None;
         }
-        self.status = format!("Simulated WRF radar loop — {frame_count} frame(s)");
+        self.status = format!("Simulated {source_model} radar loop — {frame_count} frame(s)");
         ctx.request_repaint();
     }
 

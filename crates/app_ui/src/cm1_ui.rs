@@ -104,6 +104,8 @@ pub struct Cm1ImportPanel {
     anchor_latitude: String,
     anchor_longitude: String,
     placement_mode: Option<Cm1PlacementMode>,
+    assume_flat_radar_terrain: bool,
+    pending_radar_request: Option<crate::wrf_radar::Cm1RadarRequest>,
     profile_x_index: usize,
     profile_y_index: usize,
     profile_task: Option<ProfileTask>,
@@ -123,6 +125,10 @@ impl Cm1ImportPanel {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub fn take_radar_request(&mut self) -> Option<crate::wrf_radar::Cm1RadarRequest> {
+        self.pending_radar_request.take()
     }
 
     pub fn show_window(
@@ -198,6 +204,11 @@ impl Cm1ImportPanel {
                 self.placement_ui(ui, &inventory);
                 ui.add_space(8.0);
 
+                self.radar_ui(ui, &inventory, import_busy);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.strong("Model-store import");
+
                 let validation = self.build_request(&inventory);
                 if let Err(reason) = &validation {
                     ui.label(egui::RichText::new(reason).small().color(ui.visuals().warn_fg_color));
@@ -239,6 +250,8 @@ impl Cm1ImportPanel {
             self.anchor_latitude.clear();
             self.anchor_longitude.clear();
             self.placement_mode = None;
+            self.assume_flat_radar_terrain = false;
+            self.pending_radar_request = None;
             self.diagnostic_files.clear();
             self.profile_x_index = 0;
             self.profile_y_index = 0;
@@ -1106,6 +1119,133 @@ impl Cm1ImportPanel {
         }
     }
 
+    fn radar_ui(&mut self, ui: &mut egui::Ui, inventory: &Cm1Inventory, import_busy: bool) {
+        ui.separator();
+        ui.strong("Native simulated radar");
+        ui.label(
+            egui::RichText::new(
+                "Build REF and radial velocity from this output record using native 3-D dbz, physical zhval model heights, and earth-relative winds. The first completed tilt appears while the rest processes.",
+            )
+            .small(),
+        );
+
+        let native_terrain = inventory.variable("zs").is_some();
+        if native_terrain {
+            self.assume_flat_radar_terrain = false;
+            ui.label(
+                egui::RichText::new("Terrain: native CM1 zs in the same model-z datum as zhval.")
+                    .small()
+                    .weak(),
+            );
+        } else {
+            ui.checkbox(
+                &mut self.assume_flat_radar_terrain,
+                "This is a flat idealized domain; explicitly use model-z = 0 terrain",
+            )
+            .on_hover_text(
+                "Required only when the file has no native zs field. BowEcho never assumes flat terrain silently.",
+            );
+        }
+        ui.label(
+            egui::RichText::new(
+                "Fixed for CM1: scalar native reflectivity, CPU sampling, frozen single-time atmosphere, standard 4/3-Earth beam geometry. Dual-pol, T-matrix, WRF refractivity, Stoelinga recomputation, and adjacent-WRF interpolation are unavailable.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Scan, range, gate, virtual-site, blockage, noise, and presentation controls come from the WRF simulated-radar control panel; incompatible WRF-only controls are ignored and revalidated by the CM1 worker.",
+            )
+            .small()
+            .weak(),
+        );
+
+        let validation = self.build_radar_request(inventory);
+        if let Err(reason) = &validation {
+            ui.label(
+                egui::RichText::new(reason)
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+            );
+        }
+        if ui
+            .add_enabled(
+                !import_busy && validation.is_ok(),
+                egui::Button::new("Build native REF/VEL in Radar"),
+            )
+            .clicked()
+        {
+            self.pending_radar_request = validation.ok();
+            self.message = Some("CM1 native radar queued...".to_owned());
+        }
+    }
+
+    fn build_placement(&self, inventory: &Cm1Inventory) -> Result<Cm1Placement, String> {
+        let latitude = parse_coordinate(&self.anchor_latitude, "latitude", -90.0, 90.0)?;
+        let longitude = parse_coordinate(&self.anchor_longitude, "longitude", -180.0, 180.0)?;
+        let mode = self
+            .placement_mode
+            .ok_or_else(|| "Choose Follow domain or Fixed world.".to_owned())?;
+        let placement = Cm1Placement {
+            mode,
+            anchor_latitude_deg: latitude,
+            anchor_longitude_deg: longitude,
+        };
+        cm1::georeference_scalar_grid(inventory, &placement, self.time_index)
+            .map_err(|error| error.to_string())?;
+        Ok(placement)
+    }
+
+    fn build_radar_request(
+        &self,
+        inventory: &Cm1Inventory,
+    ) -> Result<crate::wrf_radar::Cm1RadarRequest, String> {
+        if inventory.file_layout.requires_tile_assembly() {
+            return Err(
+                "This is one CM1 MPI tile; assemble the complete domain before radar sampling."
+                    .to_owned(),
+            );
+        }
+        if let Cm1FileLayout::Unresolved { reason } = &inventory.file_layout {
+            return Err(format!("CM1 file layout is unresolved: {reason}"));
+        }
+        let source_path = self
+            .source_path
+            .clone()
+            .ok_or_else(|| "Choose a CM1 output file.".to_owned())?;
+        let dbz = inventory
+            .variable("dbz")
+            .ok_or_else(|| "Native radar requires the file's 3-D dbz field.".to_owned())?;
+        if dbz.role != Cm1VariableRole::NativeScalar3D {
+            return Err("CM1 dbz is not a native 3-D scalar field.".to_owned());
+        }
+        if inventory.physical_height_variable.available().is_none() {
+            return Err(
+                "Native radar requires official 3-D zhval physical model-level heights.".to_owned(),
+            );
+        }
+        exact_time(inventory, self.time_index)?;
+        let placement = self.build_placement(inventory)?;
+        let terrain_policy = if inventory.variable("zs").is_some() {
+            cm1::Cm1TerrainPolicy::RequireNative
+        } else if self.assume_flat_radar_terrain {
+            cm1::Cm1TerrainPolicy::AssumeFlatModelZero
+        } else {
+            return Err(
+                "No native zs terrain field: explicitly confirm flat model-z = 0 terrain to continue."
+                    .to_owned(),
+            );
+        };
+        Ok(crate::wrf_radar::Cm1RadarRequest {
+            source_path,
+            inventory: inventory.clone(),
+            placement,
+            time_index: self.time_index,
+            terrain_policy,
+        })
+    }
+
     fn build_request(&self, inventory: &Cm1Inventory) -> Result<Cm1ImportRequest, String> {
         if inventory.file_layout.requires_tile_assembly() {
             return Err(
@@ -1135,16 +1275,8 @@ impl Cm1ImportPanel {
             | Cm1VariableRole::NativeZStaggered3D => Some(self.level_index),
             _ => return Err("Choose a native scalar field.".to_owned()),
         };
-        let latitude = parse_coordinate(&self.anchor_latitude, "latitude", -90.0, 90.0)?;
-        let longitude = parse_coordinate(&self.anchor_longitude, "longitude", -180.0, 180.0)?;
-        let mode = self
-            .placement_mode
-            .ok_or_else(|| "Choose Follow domain or Fixed world.".to_owned())?;
-        let placement = Cm1Placement {
-            mode,
-            anchor_latitude_deg: latitude,
-            anchor_longitude_deg: longitude,
-        };
+        let placement = self.build_placement(inventory)?;
+        let mode = placement.mode;
         let time_indices = if self.import_all_times {
             (0..inventory.time.record_count).collect::<Vec<_>>()
         } else {
@@ -1157,8 +1289,6 @@ impl Cm1ImportPanel {
                 usize::from(u16::MAX) + 1
             ));
         }
-        cm1::georeference_scalar_grid(inventory, &placement, self.time_index)
-            .map_err(|error| error.to_string())?;
         for &time_index in &time_indices {
             exact_time(inventory, time_index)?;
         }

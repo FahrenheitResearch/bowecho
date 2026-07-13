@@ -2681,6 +2681,101 @@ fn to_f32(values: &[f64]) -> Vec<f32> {
     values.iter().map(|value| *value as f32).collect()
 }
 
+const CM1_NATIVE_DBZ_SOURCE: &str = "CM1 native 3-D dbz";
+
+/// Narrow CM1 adapter into the established scalar REF/VEL polar renderer.
+/// The renderer's legacy private field name is `height_msl`; this adapter
+/// supplies CM1 model-z and stamps the undeclared-datum limitation in every
+/// source/provenance label instead of claiming it is MSL.
+pub(crate) fn cm1_radar_fields(
+    scene: app_ui::cm1::Cm1RadarScene,
+) -> Result<WrfRadarFields, String> {
+    let volume_cells = scene
+        .nx
+        .checked_mul(scene.ny)
+        .and_then(|value| value.checked_mul(scene.nz))
+        .ok_or_else(|| "CM1 radar grid size overflowed".to_owned())?;
+    let horizontal_cells = scene
+        .nx
+        .checked_mul(scene.ny)
+        .ok_or_else(|| "CM1 radar horizontal grid size overflowed".to_owned())?;
+    for (name, actual, expected) in [
+        ("latitude", scene.lat_deg.len(), horizontal_cells),
+        ("longitude", scene.lon_deg.len(), horizontal_cells),
+        (
+            "terrain model-z",
+            scene.terrain_model_z_m.len(),
+            horizontal_cells,
+        ),
+        ("physical model-z", scene.model_z_m.len(), volume_cells),
+        ("native dbz", scene.dbz.len(), volume_cells),
+        ("east wind", scene.u_east_mps.len(), volume_cells),
+        ("north wind", scene.v_north_mps.len(), volume_cells),
+        ("vertical wind", scene.w_mps.len(), volume_cells),
+    ] {
+        if actual != expected {
+            return Err(format!(
+                "CM1 radar {name} has {actual} values, expected {expected}"
+            ));
+        }
+    }
+    let lut = InverseLut::build_with_shape_domain_bounded(
+        &scene.lat_deg,
+        &scene.lon_deg,
+        scene.nx,
+        scene.ny,
+    )
+    .ok_or_else(|| "failed to build CM1 inverse geolocation LUT".to_owned())?;
+    let field_sources = &scene.field_sources;
+    let source_provenance_fragment = format!(
+        "{}; cm1_ref={}; cm1_height={}; cm1_terrain={}; cm1_u={}; cm1_v={}; cm1_w={}; cm1_flat_terrain_assumed={}",
+        scene.provenance,
+        field_sources.reflectivity,
+        field_sources.model_height,
+        field_sources.terrain,
+        field_sources.u,
+        field_sources.v,
+        field_sources.w,
+        scene.flat_terrain_assumed,
+    );
+    Ok(WrfRadarFields {
+        nx: scene.nx,
+        ny: scene.ny,
+        nz: scene.nz,
+        lat: scene.lat_deg,
+        lon: scene.lon_deg,
+        height_msl: scene.model_z_m,
+        dbz: scene.dbz,
+        u: scene.u_east_mps,
+        v: scene.v_north_mps,
+        w: scene.w_mps,
+        terrain_m: scene.terrain_model_z_m,
+        property_scattering: None,
+        property_table_identity: None,
+        property_table_resident_bytes: 0,
+        raw_property_scene: None,
+        refractivity_model: None,
+        polarimetric: None,
+        dual_pol_status: Some(
+            "CM1 scalar scene uses native 3-D dbz only; dual-pol and T-matrix products are unavailable"
+                .to_owned(),
+        ),
+        tke_tenths_m2s2: None,
+        ref_source: CM1_NATIVE_DBZ_SOURCE,
+        dx_m: scene.dx_m,
+        source_model_override: Some("CM1".to_owned()),
+        source_microphysics_override: Some(
+            "not evaluated; source is native CM1 scalar dbz".to_owned(),
+        ),
+        source_scattering_override: Some(
+            "native CM1 dbz sampled directly; no BowEcho scattering or dual-pol synthesis"
+                .to_owned(),
+        ),
+        source_provenance_fragment: Some(source_provenance_fragment),
+        lut,
+    })
+}
+
 const OPERATIONAL_BULK_S_BAND_SOURCE: &str =
     "native HRRR/RRFS hydrometeors -> BowEcho category-bulk S-band scattering";
 
@@ -3387,9 +3482,14 @@ fn build_synthetic_volume_reporting_inner(
         fields,
         config.propagation_geometry,
     );
+    let source_model_label = fields.source_model_override.as_deref().unwrap_or("WRF");
+    let archive_version = fields.source_model_override.as_ref().map_or_else(
+        || "simulated-wrf".to_string(),
+        |source| format!("simulated-{}", source.to_ascii_lowercase()),
+    );
     volume.metadata = VolumeMetadata {
         source_path: None,
-        archive_version: Some("simulated-wrf".to_string()),
+        archive_version: Some(archive_version),
         compression: None,
         message_count: 0,
         decoded_radial_count: 0,
@@ -3467,10 +3567,11 @@ fn build_synthetic_volume_reporting_inner(
             config.zdr_bias_db, config.system_phidp_deg
         )),
         forward_operator: Some(if coupled_instrument.is_some() {
-            "BowEcho WRF polar-volume forward operator v4 (coupled single-PRF estimator)"
-                .to_string()
+            format!(
+                "BowEcho {source_model_label} polar-volume forward operator v4 (coupled single-PRF estimator)"
+            )
         } else {
-            "BowEcho WRF polar-volume forward operator v3".to_string()
+            format!("BowEcho {source_model_label} polar-volume forward operator v3")
         }),
         forward_operator_config: Some(forward_operator_config),
         source_model: fields
@@ -8266,6 +8367,15 @@ impl SyntheticRadarTask {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Cm1RadarRequest {
+    pub source_path: PathBuf,
+    pub inventory: app_ui::cm1::Cm1Inventory,
+    pub placement: app_ui::cm1::Cm1Placement,
+    pub time_index: usize,
+    pub terrain_policy: app_ui::cm1::Cm1TerrainPolicy,
+}
+
 /// Source selection for operational HRRR/RRFS forecast radar. Files remain
 /// unrestricted so experimental RRFS/native layouts reach the strict GRIB
 /// inventory reader instead of being rejected by a filename filter.
@@ -8500,6 +8610,237 @@ pub fn spawn_operational_radar(
         })
         .expect("spawn operational forecast-radar worker");
     SyntheticRadarTask { label, rx, cancel }
+}
+
+/// Spawn one scalar CM1 native-dbz scene through the ordinary polar-volume
+/// renderer. WRF-only science is rejected before any large 3-D read.
+pub fn spawn_cm1_radar(
+    request: Cm1RadarRequest,
+    config: SyntheticRadarConfig,
+) -> SyntheticRadarTask {
+    let label = format!(
+        "CM1 native REF/VEL from {} time {}",
+        display_name(&request.source_path),
+        request.time_index
+    );
+    let (tx, rx) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let thread_label = label.clone();
+    std::thread::Builder::new()
+        .name("cm1-native-radar".to_owned())
+        .spawn(move || {
+            let result = build_cm1_radar(request, &config, &thread_label, &tx, &worker_cancel);
+            let result = normalize_synthetic_radar_cancel(result, &worker_cancel);
+            let _ = tx.send(SyntheticRadarMessage::Done(result));
+        })
+        .expect("spawn CM1 native radar worker");
+    SyntheticRadarTask { label, rx, cancel }
+}
+
+fn validate_cm1_scalar_radar_config(config: &SyntheticRadarConfig) -> Result<(), String> {
+    let mut unavailable = Vec::new();
+    if config.dual_pol {
+        unavailable.push("dual-pol");
+    }
+    if matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        unavailable.push("property T-matrix");
+    }
+    if config.terminal_fall_speed {
+        unavailable.push("hydrometeor terminal-fall-speed correction");
+    }
+    if config.propagation {
+        unavailable.push("polarimetric KDP/attenuation propagation");
+    }
+    if matches!(
+        config.propagation_geometry,
+        PropagationGeometry::WrfRefractivityResearch
+    ) {
+        unavailable.push("WRF refractivity beam geometry");
+    }
+    if !matches!(
+        config.atmosphere_time_mode,
+        AtmosphereTimeMode::FrozenAtVolumeStart
+    ) {
+        unavailable.push("adjacent-WRF atmosphere interpolation");
+    }
+    if !matches!(
+        config.reflectivity_operator,
+        ReflectivityOperator::ModelNative
+    ) {
+        unavailable.push("WRF Stoelinga reflectivity recomputation");
+    }
+    if config.exact_replay_template.is_some() {
+        unavailable.push("observed Level-II exact replay");
+    }
+    if unavailable.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "CM1 native scalar REF/VEL does not support {}; disable those WRF/polarimetric options",
+            unavailable.join(", ")
+        ))
+    }
+}
+
+fn build_cm1_radar(
+    request: Cm1RadarRequest,
+    config: &SyntheticRadarConfig,
+    label: &str,
+    tx: &Sender<SyntheticRadarMessage>,
+    cancel: &AtomicBool,
+) -> Result<SyntheticRadarOutput, String> {
+    check_synthetic_radar_cancel(cancel)?;
+    validate_cm1_scalar_radar_config(config)?;
+    if request.inventory.source_path != request.source_path {
+        return Err(format!(
+            "CM1 radar inventory source {} does not match selected file {}",
+            request.inventory.source_path.display(),
+            request.source_path.display()
+        ));
+    }
+    let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+        "CM1 radar: opening {}",
+        display_name(&request.source_path)
+    )));
+    let nc = netcrust::open(&request.source_path)
+        .map_err(|error| format!("open CM1 radar source: {error}"))?;
+    let progress = |message: &str| {
+        let _ = tx.send(SyntheticRadarMessage::Progress(message.to_owned()));
+    };
+    let scene = app_ui::cm1::read_radar_scene_reporting(
+        &nc,
+        &request.inventory,
+        &request.placement,
+        request.time_index,
+        request.terrain_policy,
+        &progress,
+    )
+    .map_err(|error| error.to_string())?;
+    check_synthetic_radar_cancel(cancel)?;
+    let valid_time = scene.valid_time_utc;
+    let config_fingerprint = cm1_radar_fingerprint(config, &request, &scene);
+    let fields = cm1_radar_fields(scene)?;
+    let preview_sent = AtomicBool::new(false);
+    let cut_completed = |partial: &RadarVolume, completed_cuts: usize, total_cuts: usize| {
+        if completed_cuts == 1 && !preview_sent.swap(true, Ordering::AcqRel) {
+            send_cm1_first_cut_preview(
+                tx,
+                label,
+                config_fingerprint,
+                &request.source_path,
+                partial,
+                completed_cuts,
+                total_cuts,
+            );
+        }
+    };
+    let mut volume = try_build_synthetic_volume_reporting_previewing_cancellable(
+        &fields,
+        valid_time,
+        config,
+        &progress,
+        &cut_completed,
+        cancel,
+    )?;
+    volume.metadata.source_path = Some(request.source_path.display().to_string());
+    volume.metadata.archive_version = Some("simulated-cm1-native-dbz-v1".to_owned());
+    volume.metadata.scan_name = Some(format!(
+        "CM1 native scalar REF/VEL (time {})",
+        request.time_index
+    ));
+    let notes = vec![format!(
+        "CM1 {} time {}: {} radials; native 3-D dbz; model-z datum undeclared; dual-pol/T-matrix/WRF interpolation disabled",
+        request
+            .inventory
+            .version
+            .as_deref()
+            .unwrap_or("version undeclared"),
+        request.time_index,
+        volume.metadata.decoded_radial_count,
+    )];
+    Ok(SyntheticRadarOutput {
+        label: label.to_owned(),
+        volumes: vec![Arc::new(volume)],
+        notes,
+        config_fingerprint,
+        frame_sources: Vec::new(),
+    })
+}
+
+fn cm1_radar_fingerprint(
+    config: &SyntheticRadarConfig,
+    request: &Cm1RadarRequest,
+    scene: &app_ui::cm1::Cm1RadarScene,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.data_fingerprint().hash(&mut hasher);
+    request.source_path.hash(&mut hasher);
+    request.time_index.hash(&mut hasher);
+    scene.valid_time_utc.timestamp_millis().hash(&mut hasher);
+    scene.nx.hash(&mut hasher);
+    scene.ny.hash(&mut hasher);
+    scene.nz.hash(&mut hasher);
+    request
+        .placement
+        .anchor_latitude_deg
+        .to_bits()
+        .hash(&mut hasher);
+    request
+        .placement
+        .anchor_longitude_deg
+        .to_bits()
+        .hash(&mut hasher);
+    match request.placement.mode {
+        app_ui::cm1::Cm1PlacementMode::FixedWorld => 0u8,
+        app_ui::cm1::Cm1PlacementMode::FollowDomain => 1u8,
+    }
+    .hash(&mut hasher);
+    match request.terrain_policy {
+        app_ui::cm1::Cm1TerrainPolicy::RequireNative => 0u8,
+        app_ui::cm1::Cm1TerrainPolicy::AssumeFlatModelZero => 1u8,
+    }
+    .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn send_cm1_first_cut_preview(
+    tx: &Sender<SyntheticRadarMessage>,
+    label: &str,
+    config_fingerprint: u64,
+    source_path: &Path,
+    partial: &RadarVolume,
+    completed_cuts: usize,
+    total_cuts: usize,
+) {
+    let mut volume = partial.clone();
+    volume.metadata.source_path = Some(source_path.display().to_string());
+    volume.metadata.archive_version = Some("simulated-cm1-partial-preview".to_owned());
+    volume.metadata.scan_name = Some(format!(
+        "CM1 native scalar REF/VEL (processing: tilt {completed_cuts}/{total_cuts})"
+    ));
+    let preview_fragment = format!(
+        "build_complete=false; completed_tilts={completed_cuts}; planned_tilts={total_cuts}"
+    );
+    match volume.metadata.forward_operator_config.as_mut() {
+        Some(config) => {
+            config.push_str("; ");
+            config.push_str(&preview_fragment);
+        }
+        None => volume.metadata.forward_operator_config = Some(preview_fragment),
+    }
+    let _ = tx.send(SyntheticRadarMessage::Preview(SyntheticRadarPreview {
+        label: format!("{label} - tilt {completed_cuts}/{total_cuts} preview"),
+        volume: Arc::new(volume),
+        config_fingerprint,
+        completed_cuts,
+        total_cuts,
+    }));
 }
 
 fn resolve_operational_radar_paths(
@@ -10249,6 +10590,85 @@ mod tests {
         assert_eq!(fields.tke_tenths_m2s2.as_ref().unwrap()[0], 12);
         assert!(fields.polarimetric.is_some());
         assert_eq!(fields.ref_source, OPERATIONAL_BULK_S_BAND_SOURCE);
+    }
+
+    #[test]
+    fn cm1_adapter_preserves_native_scalar_fields_and_model_z_provenance() {
+        let scene = app_ui::cm1::Cm1RadarScene {
+            nx: 2,
+            ny: 2,
+            nz: 2,
+            lat_deg: vec![34.9, 34.9, 35.1, 35.1],
+            lon_deg: vec![-97.1, -96.9, -97.1, -96.9],
+            model_z_m: [vec![500.0; 4], vec![1_500.0; 4]].concat(),
+            dbz: vec![35.0; 8],
+            u_east_mps: vec![12.0; 8],
+            v_north_mps: vec![-3.0; 8],
+            w_mps: vec![2.0; 8],
+            terrain_model_z_m: vec![100.0; 4],
+            dx_m: Some(1_000.0),
+            valid_time_utc: chrono::DateTime::parse_from_rfc3339("2026-07-13T18:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            time_index: 0,
+            placement: app_ui::cm1::Cm1Placement {
+                mode: app_ui::cm1::Cm1PlacementMode::FollowDomain,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+            flat_terrain_assumed: false,
+            field_sources: app_ui::cm1::Cm1RadarFieldSources {
+                reflectivity: "dbz [dBZ]".to_owned(),
+                model_height: "zhval [m]".to_owned(),
+                terrain: "zs [m]".to_owned(),
+                u: "uinterp + umove [m s-1]".to_owned(),
+                v: "vinterp + vmove [m s-1]".to_owned(),
+                w: "winterp [m s-1]".to_owned(),
+            },
+            provenance: "focused CM1 scene; model-z datum undeclared".to_owned(),
+        };
+
+        let expected_height = scene.model_z_m.clone();
+        let fields = cm1_radar_fields(scene).expect("adapt CM1 scalar scene");
+        assert_eq!(fields.source_model_override.as_deref(), Some("CM1"));
+        assert_eq!(fields.ref_source, CM1_NATIVE_DBZ_SOURCE);
+        assert_eq!(fields.height_msl, expected_height);
+        assert!(fields.polarimetric.is_none());
+        assert!(fields.raw_property_scene.is_none());
+        assert!(
+            fields
+                .source_provenance_fragment
+                .as_deref()
+                .unwrap()
+                .contains("model-z datum undeclared")
+        );
+    }
+
+    #[test]
+    fn cm1_scalar_config_rejects_wrf_only_and_polarimetric_branches() {
+        validate_cm1_scalar_radar_config(&SyntheticRadarConfig::default())
+            .expect("portable scalar default");
+
+        let unsupported = SyntheticRadarConfig {
+            dual_pol: true,
+            terminal_fall_speed: true,
+            propagation: true,
+            propagation_geometry: PropagationGeometry::WrfRefractivityResearch,
+            atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent,
+            reflectivity_operator: ReflectivityOperator::ClassicStoelinga,
+            ..SyntheticRadarConfig::default()
+        };
+        let error = validate_cm1_scalar_radar_config(&unsupported).unwrap_err();
+        for expected in [
+            "dual-pol",
+            "terminal-fall-speed",
+            "propagation",
+            "WRF refractivity",
+            "adjacent-WRF",
+            "Stoelinga",
+        ] {
+            assert!(error.contains(expected), "missing {expected} in {error}");
+        }
     }
 
     #[test]
