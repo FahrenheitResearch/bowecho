@@ -20,7 +20,7 @@ const GUIDE_TOP_BAR_TEXT: &str = "The top bar leads with LIVE plus one Timeline 
     warnings by default. Reload, Screenshot, Annotate, and Workflows remain one click \
     away. View contains Reset map view and Map only. \
     On the right, the Windows menu opens every data workspace (Models, WRF, \
-    Formula Lab, Algorithm Truth Lab, Radar overlays, Satellite, SimSat, WoFS, \
+    CM1, Formula Lab, Algorithm Truth Lab, Radar overlays, Satellite, SimSat, WoFS, \
     FARM, 3D Volume, Sounding) beside this Guide. Status chips appear \
     beside the menus. Map Only hides chrome for a clean capture; Tab or Esc \
     brings it back.";
@@ -58,6 +58,7 @@ enum GuideSection {
     Layers,
     ModelData,
     Wrf,
+    Cm1,
     FormulaLab,
     Satellite,
     SimSat,
@@ -71,12 +72,13 @@ enum GuideSection {
 }
 
 impl GuideSection {
-    const ALL: [GuideSection; 15] = [
+    const ALL: [GuideSection; 16] = [
         Self::GettingStarted,
         Self::Products,
         Self::Layers,
         Self::ModelData,
         Self::Wrf,
+        Self::Cm1,
         Self::FormulaLab,
         Self::Satellite,
         Self::SimSat,
@@ -96,6 +98,7 @@ impl GuideSection {
             Self::Layers => "Map & layers",
             Self::ModelData => "Models & soundings",
             Self::Wrf => "WRF & simulated radar",
+            Self::Cm1 => "CM1",
             Self::FormulaLab => "Formula Lab",
             Self::Satellite => "Satellite",
             Self::SimSat => "SimSat",
@@ -163,6 +166,7 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
                             GuideSection::Layers => layers(ui),
                             GuideSection::ModelData => model_data(ui),
                             GuideSection::Wrf => wrf(ui),
+                            GuideSection::Cm1 => cm1(ui),
                             GuideSection::FormulaLab => formula_lab(ui),
                             GuideSection::Satellite => satellite(ui),
                             GuideSection::SimSat => simsat(ui),
@@ -811,6 +815,12 @@ fn model_data(ui: &mut egui::Ui) {
     );
     action(
         ui,
+        "Windows \u{25be} \u{25b8} CM1",
+        "— native NCAR CM1 inventory, explicit local-Cartesian placement, exact-time field \
+         loops, native columns and scalar REF/VEL. CM1 does not pass through the WRF reader.",
+    );
+    action(
+        ui,
         "Windows \u{25be} \u{25b8} Formula Lab",
         "— safe custom diagnostics over the selected stored run or a raw WRF file. Results \
          return here for maps, native plots, PNG output, and color-table work.",
@@ -920,6 +930,14 @@ fn wrf(ui: &mut egui::Ui) {
         "— the lighter store import. Use it for common 2-D surface fields and the isobaric \
          temperature/dewpoint/wind/height volumes that drive soundings. It accepts raw wrfout, \
          post-processed climate wrfout, and compatible NetCDF.",
+    );
+    action(
+        ui,
+        "Extract namelist…",
+        "— reads one raw wrfout and saves an annotated partial reconstruction. Only exact \
+         stored values that safely map to the represented domain become active assignments; \
+         exact context, inferred values and unavailable settings remain comments. The result \
+         is not the original namelist.input and cannot reproduce the run.",
     );
     action(
         ui,
@@ -1481,7 +1499,100 @@ fn wrf(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Formula Lab
+// 6. CM1
+
+fn cm1(ui: &mut egui::Ui) {
+    ui.heading("CM1");
+    para(
+        ui,
+        "Windows \u{25be} \u{25b8} CM1 opens the native NCAR CM1 workspace. It inventories \
+         complete local-Cartesian cm1out files directly; CM1 data never passes through the \
+         WRF reader. Modern r20.3+, legacy r18/r19 and legacy COARDS topologies are recognized, \
+         while one-file MPI tiles are identified as needing assembly.",
+    );
+
+    subhead(ui, "NORMAL WORKFLOW");
+    action(
+        ui,
+        "1. Open cm1out file…",
+        "— inspect native axes, output records, variables, units, staggering and complete-domain \
+         status. Unsupported shapes stay listed with a reason.",
+    );
+    action(
+        ui,
+        "2. Choose a native plane",
+        "— select one 2-D field or one native level of a 3-D field. Official staggered u/v/w \
+         are averaged from adjacent Arakawa-C faces onto the scalar grid, with the transform \
+         retained in provenance.",
+    );
+    action(
+        ui,
+        "3. Place the domain",
+        "— enter an explicit domain-center latitude/longitude, then choose Follow domain or an \
+         available Fixed world placement. BowEcho never treats CM1 ctrlat/ctrlon as a map \
+         projection or silently invents cell locations.",
+    );
+    action(
+        ui,
+        "4. Store in Models",
+        "— store the selected plane, or choose All records (loop) for a strictly ordered \
+         multi-record file. Exact elapsed seconds plus the official simulation start become \
+         the model time axis; every loop frame must share the same placed grid.",
+    );
+
+    subhead(ui, "MOVING DOMAINS");
+    para(
+        ui,
+        "Follow domain pins a storm-following computational grid to the chosen anchor. Fixed \
+         world preserves exact source displacement. If a moving run has matching official \
+         cm1out_diag_XXXXXX.nc files beside it, Attach exact diagnostic positions matches them \
+         by elapsed time. BowEcho does not integrate umove/vmove into purported geolocation. \
+         Moving Fixed-world records cannot share one stored loop grid.",
+    );
+
+    subhead(ui, "NATIVE AND METEOROLOGICAL COLUMNS");
+    action(
+        ui,
+        "Read native column",
+        "— shows any compatible 3-D field at one scalar x/y cell in native model-level order. \
+         It preserves nominal height and an available zhval column without inventing pressure \
+         levels or calling the undeclared vertical datum MSL.",
+    );
+    para(
+        ui,
+        "Meteorological profile readiness is stricter: exact unit-bearing th, prs, qv, zhval, \
+         horizontal winds and a defensible wind-frame correction must all be present. Derivation \
+         of pressure, temperature, dewpoint and earth-relative wind also requires an explicit \
+         opt-in to CM1's default Rd/Cp/Rv constants because cm1out does not record testcase. \
+         The result remains a native table; the MSL-labelled Sounding viewer is not enabled.",
+    );
+
+    subhead(ui, "SCALAR NATIVE REF/VEL");
+    para(
+        ui,
+        "Build native REF/VEL in Radar requires an assembled complete domain with native 3-D \
+         dbz, physical zhval, horizontal and vertical winds, exact time and explicit placement. \
+         Native zs supplies terrain; when it is absent, only an explicit flat-idealized-domain \
+         choice may use model-z = 0. The compatible scan, range, gate, virtual-site, blockage, \
+         noise and presentation controls come from the WRF simulated-radar panel. The first \
+         completed tilt opens while the remaining tilts process.",
+    );
+    para(
+        ui,
+        "This release samples one frozen CM1 record on CPU with standard 4/3-Earth geometry and \
+         the file's native scalar dbz. It does not extrude 2-D cref, assemble MPI tiles, \
+         synthesize dual-pol, run T-matrix or WRF refractivity, recompute reflectivity, or use \
+         adjacent-WRF interpolation.",
+    );
+    cite(
+        ui,
+        "Schema reference: NCAR CM1 writeout_nc.F at commit \
+         a33cd28c206adb010995f3ffb65aada150d9b1b9. Practical walkthrough: docs/cm1-guide.md.",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Formula Lab
 
 fn formula_lab(ui: &mut egui::Ui) {
     ui.heading("Formula Lab");
@@ -1694,7 +1805,7 @@ fn formula_lab(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Satellite
+// 8. Satellite
 
 fn satellite(ui: &mut egui::Ui) {
     ui.heading("Satellite");
@@ -1870,7 +1981,7 @@ fn satellite(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. SimSat
+// 9. SimSat
 
 fn simsat(ui: &mut egui::Ui) {
     ui.heading("SimSat");
@@ -2260,7 +2371,7 @@ fn simsat(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Archive & events
+// 10. Archive & events
 
 fn archive(ui: &mut egui::Ui) {
     ui.heading("Archive & events");
@@ -2372,7 +2483,7 @@ fn archive(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Unified Player
+// 11. Unified Player
 
 fn unified_player(ui: &mut egui::Ui) {
     ui.heading("Unified Player");
@@ -2449,7 +2560,7 @@ fn unified_player(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 11. Tools & inspector
+// 12. Tools & inspector
 
 fn tools(ui: &mut egui::Ui) {
     ui.heading("Tools & inspector");
@@ -2593,7 +2704,7 @@ fn tools(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 12. 3D Volume
+// 13. 3D Volume
 
 fn volume_3d(ui: &mut egui::Ui) {
     ui.heading("3D Volume");
@@ -2642,7 +2753,7 @@ fn volume_3d(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 13. Capture & brand
+// 14. Capture & brand
 
 fn capture_brand(ui: &mut egui::Ui) {
     ui.heading("Capture & brand");
@@ -2689,7 +2800,7 @@ fn capture_brand(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 14. Keyboard shortcuts
+// 15. Keyboard shortcuts
 
 fn shortcuts(ui: &mut egui::Ui) {
     ui.heading("Keyboard shortcuts");
@@ -2789,7 +2900,7 @@ fn shortcuts(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 15. Data sources & credits
+// 16. Data sources & credits
 
 fn sources(ui: &mut egui::Ui) {
     ui.heading("Data sources & credits");
@@ -2857,6 +2968,13 @@ fn sources(ui: &mut egui::Ui) {
          rusty-weather's rw-formula supplies the deliberately narrower, store-backed adapter. \
          BowEcho's simulated-radar operator records its own versioned scattering/configuration \
          provenance in generated volumes and CfRadial output.",
+    );
+    para(
+        ui,
+        "Native CM1 schema handling follows NCAR CM1's official writeout_nc.F at commit \
+         a33cd28c206adb010995f3ffb65aada150d9b1b9. The real r19.1 compatibility file used by \
+         the v0.33.3 reader check is from the Wang et al. idealized-tornado simulation \
+         collection distributed by Penn State Data Commons; that file is not bundled.",
     );
 
     para(
@@ -2951,7 +3069,7 @@ fn sources(ui: &mut egui::Ui) {
     para(
         ui,
         "Deeper write-ups live in the repo: docs/products-guide.md, docs/formula-lab.md, \
-         docs/wrf-simulated-radar.md, docs/simsat-guide.md, and \
+         docs/wrf-simulated-radar.md, docs/cm1-guide.md, docs/simsat-guide.md, and \
          docs/hail-wind-algo-spec.md.",
     );
 }
@@ -2962,10 +3080,11 @@ mod tests {
 
     #[test]
     fn guide_copy_mentions_current_navigation_and_repro_surfaces() {
-        assert_eq!(GuideSection::ALL.len(), 15);
+        assert_eq!(GuideSection::ALL.len(), 16);
         assert_eq!(GuideSection::Layers.label(), "Map & layers");
         assert_eq!(GuideSection::ModelData.label(), "Models & soundings");
         assert_eq!(GuideSection::Wrf.label(), "WRF & simulated radar");
+        assert_eq!(GuideSection::Cm1.label(), "CM1");
         assert_eq!(GuideSection::FormulaLab.label(), "Formula Lab");
         assert_eq!(GuideSection::SimSat.label(), "SimSat");
         assert_eq!(GuideSection::Player.label(), "Unified Player");
@@ -2977,6 +3096,7 @@ mod tests {
         assert!(GUIDE_TOP_BAR_TEXT.contains("Formula Lab"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Algorithm Truth Lab"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("SimSat"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("CM1"));
         // The consolidated source/timeline front stays documented with its
         // sync default and full-player path.
         assert!(GUIDE_TOP_BAR_TEXT.contains("LIVE plus one Timeline"));
@@ -3152,6 +3272,21 @@ mod tests {
         assert!(guide_src.contains("Source paths, active jobs, progress, errors"));
         assert!(guide_src.contains("Resolution is not a separate run key"));
         assert!(guide_src.contains("not currently embedded into Satellite"));
+    }
+
+    #[test]
+    fn guide_documents_cm1_and_partial_namelist_boundaries() {
+        let guide_src = include_str!("guide.rs");
+        assert!(guide_src.contains("Extract namelist…"));
+        assert!(guide_src.contains("not the original namelist.input"));
+        assert!(guide_src.contains("cannot reproduce the run"));
+        assert!(guide_src.contains("complete local-Cartesian cm1out files"));
+        assert!(guide_src.contains("does not integrate umove/vmove"));
+        assert!(guide_src.contains("Meteorological profile readiness"));
+        assert!(guide_src.contains("Build native REF/VEL in Radar"));
+        assert!(guide_src.contains("native 3-D dbz"));
+        assert!(guide_src.contains("does not extrude 2-D cref"));
+        assert!(guide_src.contains("docs/cm1-guide.md"));
     }
 
     /// International radars are not second-class: the guide's gesture and
