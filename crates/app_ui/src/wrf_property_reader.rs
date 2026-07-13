@@ -56,13 +56,17 @@ const WRF_P3_QSMALL_KGKG: f64 = 1.0e-14_f32 as f64;
 // negligible absolute band become inactive zero, while a larger negative mass
 // remains a typed file error. 1e-10 kg/kg is 0.1 microgram per kilogram.
 const WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG: f64 = 1.0e-10_f32 as f64;
-// ISHMAEL has no P3-style qsmall activity threshold, so retain every positive
-// mass. Its WRF transport fields can nevertheless contain isolated negative
-// default-REAL residues around zero. Clamp only the negative side of this much
-// tighter band to inactive zero; 1e-12 kg/kg is 0.001 microgram per kilogram
-// and covers the observed QICE/QRAIN residues while preserving a typed error
-// for materially negative source data.
+// ISHMAEL's source-level QSMALL clears rain at and below 1e-12 kg/kg. Its WRF
+// transport fields can also contain isolated negative default-REAL residues
+// around zero. Use the same source threshold for rain activity while keeping
+// this negative-mass bound explicit for the frozen tuples; a larger negative
+// mass remains a typed file error.
 const WRF_ISHMAEL_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG: f64 = 1.0e-12_f32 as f64;
+const WRF_ISHMAEL_QSMALL_KGKG: f64 = 1.0e-12_f32 as f64;
+const WRF_ISHMAEL_QNSMALL_PER_KG: f64 = 1.25e-7_f32 as f64;
+const WRF_ISHMAEL_RAIN_LAMBDA_MIN_M_INV: f64 = 1.0 / 2_800.0e-6;
+const WRF_ISHMAEL_RAIN_LAMBDA_MAX_M_INV: f64 = 1.0 / 20.0e-6;
+const WRF_ISHMAEL_RAIN_WATER_DENSITY_KG_M3: f64 = 1_000.0;
 const WRF_P3_NSMALL_PER_KG: f64 = 1.0e-16;
 const WRF_P3_RIME_VOLUME_MIN_M3_PER_KG: f32 = 1.0e-15_f32;
 const WRF_P3_RIME_DENSITY_MIN_KG_M3: f32 = 50.0;
@@ -2710,8 +2714,8 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
         }
         // P3's `get_rain_dsd2` clears the complete rain tuple below qsmall,
         // but only after the same bounded negative-residue check used by its
-        // ice masses. ISHMAEL retains every positive rain mass while applying
-        // its tighter negative transport-residue bound.
+        // ice masses. ISHMAEL's final rain check clears the tuple when QRAIN
+        // is at or below its QSMALL threshold.
         if value
             < if p3_rain {
                 -WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG
@@ -2728,6 +2732,9 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
             );
         }
         if p3_rain && value < WRF_P3_QSMALL_KGKG {
+            continue;
+        }
+        if !p3_rain && value <= WRF_ISHMAEL_QSMALL_KGKG {
             continue;
         }
         if value > 0.0 {
@@ -2774,7 +2781,7 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
     for (rain_position, &cell_index) in active_cell_indices.iter().enumerate() {
         let position = cell_index as usize;
         let source_value = number.values[position];
-        if is_missing(source_value) || !p3_rain && source_value <= 0.0 {
+        if is_missing(source_value) {
             return (
                 SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
                     field: QNRAIN_FIELD.name,
@@ -2786,7 +2793,7 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
         let value = if p3_rain {
             normalize_p3_rain_number(qrain_normalization_kgkg[rain_position], source_value)
         } else {
-            source_value
+            normalize_ishmael_rain_number(qrain_normalization_kgkg[rain_position], source_value)
         };
         match narrow_f32(QNRAIN_FIELD.name, position, value) {
             Ok(value) => qnrain_per_kg.push(value),
@@ -2822,6 +2829,25 @@ fn normalize_p3_rain_number(qrain_kgkg: f64, qnrain_per_kg: f64) -> f64 {
     } else {
         bounded_lambda.powi(3) * qrain_kgkg
             / (std::f64::consts::PI * WRF_P3_RAIN_WATER_DENSITY_KG_M3)
+    }
+}
+
+fn normalize_ishmael_rain_number(qrain_kgkg: f64, qnrain_per_kg: f64) -> f64 {
+    // WRF's ISHMAEL final rain check applies the number floor before bounding
+    // the exponential-rain slope, then re-diagnoses number if either slope
+    // bound is active (`module_mp_jensen_ishmael.F`).
+    let number = qnrain_per_kg.max(WRF_ISHMAEL_QNSMALL_PER_KG);
+    let lambda =
+        (std::f64::consts::PI * WRF_ISHMAEL_RAIN_WATER_DENSITY_KG_M3 * number / qrain_kgkg).cbrt();
+    let bounded_lambda = lambda.clamp(
+        WRF_ISHMAEL_RAIN_LAMBDA_MIN_M_INV,
+        WRF_ISHMAEL_RAIN_LAMBDA_MAX_M_INV,
+    );
+    if bounded_lambda == lambda {
+        number
+    } else {
+        bounded_lambda.powi(3) * qrain_kgkg
+            / (std::f64::consts::PI * WRF_ISHMAEL_RAIN_WATER_DENSITY_KG_M3)
     }
 }
 
@@ -4023,27 +4049,53 @@ mod tests {
     }
 
     #[test]
-    fn ishmael_rain_does_not_inherit_p3_qsmall_or_number_limiter() {
-        let tiny_positive = TinyProvider::new(55, 1)
-            .field("QRAIN", vec![0.5 * WRF_P3_QSMALL_KGKG], "kg kg-1")
-            .field("QNRAIN", vec![2.0], "kg-1");
-        let (rain, _) = read_rain(&tiny_positive, 0, 1, 55);
-        assert!(matches!(
-            rain.raw_at(0),
-            RawRainState::Available {
-                qrain_kgkg,
-                qnrain_per_kg: 2.0,
-            } if qrain_kgkg > 0.0
-        ));
+    fn ishmael_rain_matches_native_qsmall_and_repairs_reported_zero_number() {
+        // Exact first failing tuple from wrfout_d02_1974-04-03_13_15_00,
+        // source cell 282 (WRF v4.6.1, mp_physics=55).
+        let reported_qrain = 1.055_216_677_925_408e-10;
+        let provider = TinyProvider::new(55, 3)
+            .field(
+                "QRAIN",
+                vec![
+                    reported_qrain,
+                    WRF_ISHMAEL_QSMALL_KGKG,
+                    0.5 * WRF_ISHMAEL_QSMALL_KGKG,
+                ],
+                "kg kg-1",
+            )
+            .field("QNRAIN", vec![0.0, f64::NAN, f64::NAN], "kg-1");
+        let (rain, _) = read_rain(&provider, 0, 3, 55);
+        let SparseRainStorage::Available {
+            active_cell_indices,
+            qrain_kgkg,
+            qnrain_per_kg,
+        } = &rain
+        else {
+            panic!("ISHMAEL native rain normalization should repair the reported tuple")
+        };
+        assert_eq!(active_cell_indices, &[0]);
+        assert_eq!(qrain_kgkg, &[reported_qrain as f32]);
+        let expected_number = WRF_ISHMAEL_RAIN_LAMBDA_MIN_M_INV.powi(3) * reported_qrain
+            / (std::f64::consts::PI * WRF_ISHMAEL_RAIN_WATER_DENSITY_KG_M3);
+        assert_close(f64::from(qnrain_per_kg[0]), expected_number, 1.0e-13);
+        for cell_index in 1..3 {
+            assert!(matches!(
+                rain.raw_at(cell_index),
+                RawRainState::Available {
+                    qrain_kgkg: 0.0,
+                    qnrain_per_kg: 0.0,
+                }
+            ));
+        }
 
-        let negative = TinyProvider::new(55, 1)
-            .field("QRAIN", vec![-0.5 * WRF_P3_QSMALL_KGKG], "kg kg-1")
-            .field("QNRAIN", vec![2.0], "kg-1");
-        let (rain, _) = read_rain(&negative, 0, 1, 55);
+        let nonfinite = TinyProvider::new(55, 1)
+            .field("QRAIN", vec![1.0e-4], "kg kg-1")
+            .field("QNRAIN", vec![f64::NAN], "kg-1");
+        let (rain, _) = read_rain(&nonfinite, 0, 1, 55);
         assert!(matches!(
             rain,
             SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
-                field: "QRAIN",
+                field: "QNRAIN",
                 ..
             })
         ));
