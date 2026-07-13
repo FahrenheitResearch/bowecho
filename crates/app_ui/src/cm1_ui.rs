@@ -79,6 +79,11 @@ struct InspectTask {
     rx: Receiver<Result<Cm1Inspection, String>>,
 }
 
+#[derive(Debug)]
+struct ProfileTask {
+    rx: Receiver<Result<cm1::Cm1NativeColumnProfile, String>>,
+}
+
 #[derive(Debug, Default)]
 pub struct Cm1ImportPanel {
     pub open: bool,
@@ -94,6 +99,11 @@ pub struct Cm1ImportPanel {
     anchor_latitude: String,
     anchor_longitude: String,
     placement_mode: Option<Cm1PlacementMode>,
+    profile_x_index: usize,
+    profile_y_index: usize,
+    profile_task: Option<ProfileTask>,
+    profile: Option<cm1::Cm1NativeColumnProfile>,
+    profile_message: Option<String>,
     message: Option<String>,
 }
 
@@ -113,6 +123,7 @@ impl Cm1ImportPanel {
         shared_import_message: Option<&str>,
     ) -> Option<Cm1ImportRequest> {
         self.poll_inspection(ctx);
+        self.poll_profile(ctx);
         if !self.open {
             return None;
         }
@@ -172,7 +183,7 @@ impl Cm1ImportPanel {
                 ui.separator();
                 self.inventory_summary(ui, &inventory, ctx);
                 ui.add_space(8.0);
-                self.selection_ui(ui, &inventory);
+                self.selection_ui(ui, &inventory, ctx);
                 ui.add_space(8.0);
                 self.placement_ui(ui, &inventory);
                 ui.add_space(8.0);
@@ -219,6 +230,11 @@ impl Cm1ImportPanel {
             self.anchor_longitude.clear();
             self.placement_mode = None;
             self.diagnostic_files.clear();
+            self.profile_x_index = 0;
+            self.profile_y_index = 0;
+            self.profile_task = None;
+            self.profile = None;
+            self.profile_message = None;
         }
         self.message = Some(match mode {
             InspectMode::Inventory => "Inspecting native CM1 metadata…".to_owned(),
@@ -278,6 +294,72 @@ impl Cm1ImportPanel {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.message = Some("CM1 inspection worker stopped unexpectedly".to_owned());
                 self.inspect_task = None;
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn begin_profile(
+        &mut self,
+        inventory: Cm1Inventory,
+        variable: String,
+        time_index: usize,
+        x_index: usize,
+        y_index: usize,
+        ctx: &egui::Context,
+    ) {
+        self.profile = None;
+        self.profile_message = Some(format!(
+            "Reading native {variable} column at x={x_index}, y={y_index}..."
+        ));
+        let (tx, rx) = channel();
+        std::thread::Builder::new()
+            .name("bowecho-cm1-profile".to_owned())
+            .spawn(move || {
+                crate::wrf_process::lower_import_thread_priority();
+                let result = (|| {
+                    let nc = netcrust::open(&inventory.source_path)
+                        .map_err(|error| error.to_string())?;
+                    cm1::read_native_column_profile(
+                        &nc, &inventory, &variable, time_index, x_index, y_index,
+                    )
+                    .map_err(|error| error.to_string())
+                })();
+                let _ = tx.send(result);
+            })
+            .expect("spawn CM1 profile worker");
+        self.profile_task = Some(ProfileTask { rx });
+        ctx.request_repaint();
+    }
+
+    fn poll_profile(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.profile_task.as_ref() else {
+            return;
+        };
+        match task.rx.try_recv() {
+            Ok(Ok(profile)) => {
+                self.profile_message = Some(format!(
+                    "Loaded {} native model level(s) from {}.",
+                    profile.values.len(),
+                    profile.variable
+                ));
+                self.profile = Some(profile);
+                self.profile_task = None;
+                ctx.request_repaint();
+            }
+            Ok(Err(error)) => {
+                self.profile_message = Some(format!("CM1 column read failed: {error}"));
+                self.profile = None;
+                self.profile_task = None;
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.profile_message = Some("CM1 column worker stopped unexpectedly".to_owned());
+                self.profile = None;
+                self.profile_task = None;
                 ctx.request_repaint();
             }
         }
@@ -356,7 +438,7 @@ impl Cm1ImportPanel {
         }
     }
 
-    fn selection_ui(&mut self, ui: &mut egui::Ui, inventory: &Cm1Inventory) {
+    fn selection_ui(&mut self, ui: &mut egui::Ui, inventory: &Cm1Inventory, ctx: &egui::Context) {
         ui.strong("Native horizontal plane");
         let plottable = inventory.horizontal_plane_variables().collect::<Vec<_>>();
         let selected_label = self
@@ -381,6 +463,7 @@ impl Cm1ImportPanel {
                         .clicked()
                     {
                         self.level_index = 0;
+                        self.profile = None;
                     }
                 }
             });
@@ -420,11 +503,16 @@ impl Cm1ImportPanel {
                 .selected_text(time_label)
                 .show_ui(ui, |ui| {
                     for index in 0..inventory.time.record_count {
-                        ui.selectable_value(
-                            &mut self.time_index,
-                            index,
-                            cm1_time_label(inventory, index),
-                        );
+                        if ui
+                            .selectable_value(
+                                &mut self.time_index,
+                                index,
+                                cm1_time_label(inventory, index),
+                            )
+                            .clicked()
+                        {
+                            self.profile = None;
+                        }
                     }
                 });
         });
@@ -479,6 +567,8 @@ impl Cm1ImportPanel {
                 ),
             };
             ui.label(egui::RichText::new(height_note).small().weak());
+
+            self.column_profile_ui(ui, inventory, variable, ctx);
         }
 
         let unavailable = inventory
@@ -507,6 +597,146 @@ impl Cm1ImportPanel {
                 );
             }
         });
+    }
+
+    fn column_profile_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        inventory: &Cm1Inventory,
+        variable: &cm1::Cm1Variable,
+        ctx: &egui::Context,
+    ) {
+        egui::CollapsingHeader::new("Native 3-D column / profile")
+            .default_open(false)
+            .show(ui, |ui| {
+                let nx = inventory.axes.xh.raw_values.len();
+                let ny = inventory.axes.yh.raw_values.len();
+                self.profile_x_index = self.profile_x_index.min(nx.saturating_sub(1));
+                self.profile_y_index = self.profile_y_index.min(ny.saturating_sub(1));
+                ui.label(
+                    egui::RichText::new(
+                        "Browse the exact native model column. This preserves CM1 levels and does not invent pressure coordinates or an MSL vertical datum.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Scalar cell");
+                    let x_changed = ui
+                        .add(
+                        egui::DragValue::new(&mut self.profile_x_index)
+                            .range(0..=nx.saturating_sub(1))
+                            .prefix("x "),
+                        )
+                        .changed();
+                    let y_changed = ui
+                        .add(
+                        egui::DragValue::new(&mut self.profile_y_index)
+                            .range(0..=ny.saturating_sub(1))
+                            .prefix("y "),
+                        )
+                        .changed();
+                    if x_changed || y_changed {
+                        self.profile = None;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.profile_task.is_none() && nx > 0 && ny > 0,
+                            egui::Button::new("Read native column"),
+                        )
+                        .clicked()
+                    {
+                        self.begin_profile(
+                            inventory.clone(),
+                            variable.name.clone(),
+                            self.time_index,
+                            self.profile_x_index,
+                            self.profile_y_index,
+                            ctx,
+                        );
+                    }
+                    if self.profile_task.is_some() {
+                        ui.spinner();
+                    }
+                });
+                if let Some(message) = &self.profile_message {
+                    ui.label(egui::RichText::new(message).small());
+                }
+                let Some(profile) = &self.profile else {
+                    return;
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} at local x={:.3} km, y={:.3} km - units {} - {:?}",
+                        profile.variable,
+                        profile.local_x_m / 1_000.0,
+                        profile.local_y_m / 1_000.0,
+                        profile.units.as_deref().unwrap_or("not declared"),
+                        profile.transform
+                    ))
+                    .small(),
+                );
+                match &profile.model_level_height_m {
+                    Cm1Availability::Available(height) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Physical model-level height: {} ({})",
+                                height.variable, height.interpretation
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    Cm1Availability::Unavailable { reason } => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Physical model-level height unavailable: {reason}"
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("cm1_native_column_rows")
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("cm1_native_column_grid")
+                            .striped(true)
+                            .min_col_width(100.0)
+                            .show(ui, |ui| {
+                                ui.strong("k");
+                                ui.strong("nominal zh");
+                                ui.strong("model height");
+                                ui.strong("value");
+                                ui.end_row();
+                                for (level, value) in profile.values.iter().enumerate() {
+                                    ui.monospace(level.to_string());
+                                    ui.monospace(format_profile_height(
+                                        profile
+                                            .nominal_level_m
+                                            .available()
+                                            .map(Vec::as_slice),
+                                        level,
+                                    ));
+                                    ui.monospace(format_profile_height(
+                                        profile
+                                            .model_level_height_m
+                                            .available()
+                                            .map(|height| height.values_m.as_slice()),
+                                        level,
+                                    ));
+                                    ui.monospace(format_profile_value(*value));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                ui.label(
+                    egui::RichText::new(&profile.provenance)
+                        .small()
+                        .weak(),
+                );
+            });
     }
 
     fn placement_ui(&mut self, ui: &mut egui::Ui, inventory: &Cm1Inventory) {
@@ -1106,6 +1336,24 @@ fn exact_time(inventory: &Cm1Inventory, time_index: usize) -> Result<RwsExactTim
         )
         .ok_or_else(|| "CM1 valid UTC overflows the signed timestamp range".to_owned())?;
     Ok(RwsExactTime::new(lead_seconds, valid_unix))
+}
+
+fn format_profile_height(levels_m: Option<&[f64]>, index: usize) -> String {
+    levels_m
+        .and_then(|levels| levels.get(index))
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.1} m"))
+        .unwrap_or_else(|| "unavailable".to_owned())
+}
+
+fn format_profile_value(value: f64) -> String {
+    if !value.is_finite() {
+        "missing".to_owned()
+    } else if value != 0.0 && !(1.0e-3..1.0e5).contains(&value.abs()) {
+        format!("{value:.6e}")
+    } else {
+        format!("{value:.6}")
+    }
 }
 
 fn cm1_time_label(inventory: &Cm1Inventory, index: usize) -> String {
