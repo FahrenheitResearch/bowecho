@@ -1057,12 +1057,15 @@ struct SupportInterval {
 
 fn push_clipped_interval(
     intervals: &mut Vec<SupportInterval>,
-    first: f64,
-    second: f64,
+    lower_bound: f64,
+    upper_bound: f64,
     upper_scaled_a: f64,
 ) {
-    let lower = first.min(second).max(0.0);
-    let upper = first.max(second).min(upper_scaled_a);
+    // Callers have already intersected independently ordered diameter and
+    // aspect-ratio bounds. Reordering a reversed result here would turn an
+    // empty intersection into a fabricated support interval.
+    let lower = lower_bound.max(0.0);
+    let upper = upper_bound.min(upper_scaled_a);
     if lower.is_finite() && upper.is_finite() && upper > lower {
         intervals.push(SupportInterval { lower, upper });
     }
@@ -3179,6 +3182,18 @@ mod tests {
             PsdFallSpeedAuthority::SyntheticTestOnly,
             Sha256Digest::compute(b"scheme-psd-test-size-speed-v1"),
         )
+    }
+
+    #[test]
+    fn clipped_support_interval_rejects_a_disjoint_intersection() {
+        let mut intervals = Vec::new();
+        push_clipped_interval(&mut intervals, 2.0, 1.0, 4.0);
+        assert!(intervals.is_empty());
+
+        push_clipped_interval(&mut intervals, -1.0, 2.0, 1.5);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].lower.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(intervals[0].upper.to_bits(), 1.5_f64.to_bits());
     }
 
     #[test]
