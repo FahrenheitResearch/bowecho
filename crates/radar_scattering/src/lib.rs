@@ -35,7 +35,7 @@ pub use digest::{DigestError, Sha256Digest};
 pub use lut::{
     Axis, AxisCoordinate, AxisKind, GeneratorMetadata, InterpolationError, LUT_MAGIC,
     LUT_SCHEMA_VERSION, LutError, LutHeader, OfflineLut, OutputDescriptor, OutputKind,
-    PayloadEncoding, Unit,
+    PREPARED_INTERPOLATION_AXIS_SLOTS, PayloadEncoding, PreparedInterpolationPlan, Unit,
 };
 pub use orientation::{
     BodyFrameScattering, BodyOrientation, Complex64, OrientationError, RadarGeometry,

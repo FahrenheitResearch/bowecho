@@ -16,6 +16,14 @@ const PREFIX_BYTES: usize = 8 + 2 + 4;
 const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AXES: usize = 16;
 
+/// Fixed number of axis slots carried by [`PreparedInterpolationPlan`].
+///
+/// Only the prefix reported by
+/// [`PreparedInterpolationPlan::active_axis_count`] is active. Remaining
+/// offsets and fractions are deterministically zero-filled so plans can be
+/// staged as fixed-size host records for a batched accelerator backend.
+pub const PREPARED_INTERPOLATION_AXIS_SLOTS: usize = MAX_AXES;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AxisKind {
@@ -565,6 +573,67 @@ struct Bracket {
     fraction: f64,
 }
 
+/// A validated, fixed-size multilinear-interpolation record prepared on the
+/// CPU.
+///
+/// `base_point_index` is the all-lower-corner point in the LUT's
+/// last-axis-fastest payload. The active prefixes of `upper_point_offsets` and
+/// `upper_fractions` contain one entry per non-degenerate bracket, compacted in
+/// the LUT header's exact axis order. Corner bit `n` selects the upper point of
+/// active entry `n`. Inactive array tails are zero-filled.
+///
+/// The fixed-width integer fields, fixed arrays, and C field order make this a
+/// stable host-side staging layout. Serde serialization remains the portable
+/// representation; consumers must not infer native endianness from `repr(C)`.
+/// A plan is tied to the [`OfflineLut`] whose axes prepared it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedInterpolationPlan {
+    base_point_index: u64,
+    upper_point_offsets: [u64; PREPARED_INTERPOLATION_AXIS_SLOTS],
+    upper_fractions: [f64; PREPARED_INTERPOLATION_AXIS_SLOTS],
+    corner_count: u32,
+    active_axis_count: u32,
+}
+
+impl PreparedInterpolationPlan {
+    /// All-lower-corner index in the LUT's point-major payload.
+    #[must_use]
+    pub const fn base_point_index(&self) -> u64 {
+        self.base_point_index
+    }
+
+    /// Number of active entries in the offset and fraction arrays.
+    #[must_use]
+    pub const fn active_axis_count(&self) -> u32 {
+        self.active_axis_count
+    }
+
+    /// Fixed host array of upper-corner point offsets.
+    ///
+    /// Only `[..active_axis_count()]` is active; the tail is zero-filled.
+    #[must_use]
+    pub const fn upper_point_offsets(&self) -> &[u64; PREPARED_INTERPOLATION_AXIS_SLOTS] {
+        &self.upper_point_offsets
+    }
+
+    /// Fixed host array of upper interpolation fractions.
+    ///
+    /// Entries correspond one-for-one with [`Self::upper_point_offsets`] in
+    /// exact LUT axis order. Only `[..active_axis_count()]` is active.
+    #[must_use]
+    pub const fn upper_fractions(&self) -> &[f64; PREPARED_INTERPOLATION_AXIS_SLOTS] {
+        &self.upper_fractions
+    }
+
+    /// Number of corners evaluated by this plan (`2^active_axis_count`).
+    #[must_use]
+    pub const fn corner_count(&self) -> u32 {
+        self.corner_count
+    }
+}
+
 /// Validated, immutable additive-scattering lookup table.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OfflineLut {
@@ -725,18 +794,27 @@ impl OfflineLut {
         }
     }
 
-    /// Deterministic multilinear interpolation with no extrapolation.
-    pub fn interpolate(
+    /// Validate and pre-bracket a query for deterministic multilinear
+    /// interpolation with no extrapolation.
+    ///
+    /// Bracketing and typed-axis validation happen entirely on the CPU. The
+    /// returned fixed-size plan can be copied into a larger batch without
+    /// carrying query-axis metadata into an accelerator kernel.
+    pub fn prepare_interpolation(
         &self,
         coordinates: &[AxisCoordinate],
-    ) -> Result<AdditiveScattering, InterpolationError> {
+    ) -> Result<PreparedInterpolationPlan, InterpolationError> {
         if coordinates.len() != self.header.axes.len() {
             return Err(InterpolationError::CoordinateCount {
                 expected: self.header.axes.len(),
                 actual: coordinates.len(),
             });
         }
-        let mut brackets = Vec::with_capacity(coordinates.len());
+        let strides = last_axis_fastest_strides(&self.header.axes)?;
+        let mut base_point_index = 0_usize;
+        let mut upper_point_offsets = [0_u64; PREPARED_INTERPOLATION_AXIS_SLOTS];
+        let mut upper_fractions = [0.0_f64; PREPARED_INTERPOLATION_AXIS_SLOTS];
+        let mut active_axis_count = 0_usize;
         for (index, (axis, coordinate)) in
             self.header.axes.iter().zip(coordinates.iter()).enumerate()
         {
@@ -753,48 +831,114 @@ impl OfflineLut {
                     value: coordinate.value,
                 });
             }
-            brackets.push(axis.locate(coordinate.value)?);
+            let bracket = axis.locate(coordinate.value)?;
+            base_point_index = base_point_index
+                .checked_add(
+                    bracket
+                        .lower
+                        .checked_mul(strides[index])
+                        .ok_or(InterpolationError::DimensionOverflow)?,
+                )
+                .ok_or(InterpolationError::DimensionOverflow)?;
+            if bracket.lower != bracket.upper {
+                let upper_delta = bracket
+                    .upper
+                    .checked_sub(bracket.lower)
+                    .and_then(|delta| delta.checked_mul(strides[index]))
+                    .ok_or(InterpolationError::DimensionOverflow)?;
+                upper_point_offsets[active_axis_count] = u64::try_from(upper_delta)
+                    .map_err(|_| InterpolationError::DimensionOverflow)?;
+                upper_fractions[active_axis_count] = bracket.fraction;
+                active_axis_count += 1;
+            }
+        }
+        let active_axis_count =
+            u32::try_from(active_axis_count).map_err(|_| InterpolationError::DimensionOverflow)?;
+        let corner_count = 1_u32
+            .checked_shl(active_axis_count)
+            .ok_or(InterpolationError::DimensionOverflow)?;
+        Ok(PreparedInterpolationPlan {
+            base_point_index: u64::try_from(base_point_index)
+                .map_err(|_| InterpolationError::DimensionOverflow)?,
+            upper_point_offsets,
+            upper_fractions,
+            corner_count,
+            active_axis_count,
+        })
+    }
+
+    /// Execute a plan returned by [`Self::prepare_interpolation`].
+    ///
+    /// Corner masks, active axes, weight multiplication, and component
+    /// accumulation retain the same ascending order as direct interpolation.
+    /// The plan must have been prepared for this table.
+    pub fn interpolate_prepared(
+        &self,
+        plan: &PreparedInterpolationPlan,
+    ) -> Result<AdditiveScattering, InterpolationError> {
+        let active_axis_count = usize::try_from(plan.active_axis_count)
+            .map_err(|_| InterpolationError::DimensionOverflow)?;
+        if active_axis_count > PREPARED_INTERPOLATION_AXIS_SLOTS {
+            return Err(InterpolationError::InvalidPreparedPlan {
+                reason: "active axis count exceeds the fixed host layout",
+            });
+        }
+        let expected_corner_count = 1_u32
+            .checked_shl(plan.active_axis_count)
+            .ok_or(InterpolationError::DimensionOverflow)?;
+        if plan.corner_count != expected_corner_count {
+            return Err(InterpolationError::InvalidPreparedPlan {
+                reason: "corner count does not equal 2^active_axis_count",
+            });
+        }
+        let base_point_index = usize::try_from(plan.base_point_index)
+            .map_err(|_| InterpolationError::DimensionOverflow)?;
+        let mut maximum_point_index = base_point_index;
+        for active_axis in 0..active_axis_count {
+            let fraction = plan.upper_fractions[active_axis];
+            if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+                return Err(InterpolationError::InvalidPreparedPlan {
+                    reason: "active upper fraction is not finite and within [0, 1]",
+                });
+            }
+            let offset = usize::try_from(plan.upper_point_offsets[active_axis])
+                .map_err(|_| InterpolationError::DimensionOverflow)?;
+            if offset == 0 {
+                return Err(InterpolationError::InvalidPreparedPlan {
+                    reason: "active upper point offset is zero",
+                });
+            }
+            maximum_point_index = maximum_point_index
+                .checked_add(offset)
+                .ok_or(InterpolationError::DimensionOverflow)?;
+        }
+        if maximum_point_index >= self.values.len() {
+            return Err(InterpolationError::InvalidPreparedPlan {
+                reason: "prepared point index is outside the LUT payload",
+            });
         }
 
-        let strides = last_axis_fastest_strides(&self.header.axes)?;
-        let active_axes: Vec<usize> = brackets
-            .iter()
-            .enumerate()
-            .filter_map(|(index, bracket)| (bracket.lower != bracket.upper).then_some(index))
-            .collect();
-        let corner_count = 1_usize
-            .checked_shl(active_axes.len() as u32)
-            .ok_or(InterpolationError::DimensionOverflow)?;
         let mut accumulated = [0.0; AdditiveScattering::COMPONENT_COUNT];
 
         // Ascending corner masks and fixed axis order make evaluation stable
         // and reproducible across calls/platforms using IEEE-754 f64.
-        for corner in 0..corner_count {
-            let mut point_index = 0_usize;
+        for corner in 0..plan.corner_count {
+            let mut point_index = base_point_index;
             let mut weight = 1.0;
-            let mut active_bit = 0_usize;
-            for axis_index in 0..brackets.len() {
-                let bracket = brackets[axis_index];
-                let coordinate_index = if bracket.lower == bracket.upper {
-                    bracket.lower
+            for active_axis in 0..active_axis_count {
+                let upper = ((corner >> active_axis) & 1) == 1;
+                let fraction = plan.upper_fractions[active_axis];
+                if upper {
+                    weight *= fraction;
+                    point_index = point_index
+                        .checked_add(
+                            usize::try_from(plan.upper_point_offsets[active_axis])
+                                .map_err(|_| InterpolationError::DimensionOverflow)?,
+                        )
+                        .ok_or(InterpolationError::DimensionOverflow)?;
                 } else {
-                    let upper = ((corner >> active_bit) & 1) == 1;
-                    active_bit += 1;
-                    if upper {
-                        weight *= bracket.fraction;
-                        bracket.upper
-                    } else {
-                        weight *= 1.0 - bracket.fraction;
-                        bracket.lower
-                    }
-                };
-                point_index = point_index
-                    .checked_add(
-                        coordinate_index
-                            .checked_mul(strides[axis_index])
-                            .ok_or(InterpolationError::DimensionOverflow)?,
-                    )
-                    .ok_or(InterpolationError::DimensionOverflow)?;
+                    weight *= 1.0 - fraction;
+                }
             }
             let components = self
                 .values
@@ -809,6 +953,15 @@ impl OfflineLut {
         AdditiveScattering::from_components(accumulated)
             .map_err(InterpolationError::InvalidInterpolatedOutput)
     }
+
+    /// Deterministic multilinear interpolation with no extrapolation.
+    pub fn interpolate(
+        &self,
+        coordinates: &[AxisCoordinate],
+    ) -> Result<AdditiveScattering, InterpolationError> {
+        let plan = self.prepare_interpolation(coordinates)?;
+        self.interpolate_prepared(&plan)
+    }
 }
 
 fn grid_point_count(axes: &[Axis]) -> Result<usize, LutError> {
@@ -819,8 +972,10 @@ fn grid_point_count(axes: &[Axis]) -> Result<usize, LutError> {
     })
 }
 
-fn last_axis_fastest_strides(axes: &[Axis]) -> Result<Vec<usize>, InterpolationError> {
-    let mut strides = vec![1_usize; axes.len()];
+fn last_axis_fastest_strides(
+    axes: &[Axis],
+) -> Result<[usize; PREPARED_INTERPOLATION_AXIS_SLOTS], InterpolationError> {
+    let mut strides = [1_usize; PREPARED_INTERPOLATION_AXIS_SLOTS];
     for index in (0..axes.len().saturating_sub(1)).rev() {
         strides[index] = strides[index + 1]
             .checked_mul(axes[index + 1].coordinates.len())
@@ -1003,6 +1158,8 @@ pub enum InterpolationError {
     },
     #[error("interpolation dimensions overflow addressable table size")]
     DimensionOverflow,
+    #[error("invalid prepared interpolation plan: {reason}")]
+    InvalidPreparedPlan { reason: &'static str },
     #[error("interpolation produced an invalid additive output: {0}")]
     InvalidInterpolatedOutput(OutputError),
 }
@@ -1074,6 +1231,160 @@ mod tests {
         .unwrap()
     }
 
+    fn singleton_axis_fixture() -> OfflineLut {
+        let axes = vec![
+            Axis::new(AxisKind::EquivolumeDiameter, Unit::Meter, vec![1.0, 2.0]).unwrap(),
+            Axis::new(AxisKind::Temperature, Unit::Kelvin, vec![270.0]).unwrap(),
+            Axis::new(
+                AxisKind::BulkDensity,
+                Unit::KilogramPerCubicMeter,
+                vec![100.0, 200.0, 300.0],
+            )
+            .unwrap(),
+        ];
+        let generator = GeneratorMetadata::new(
+            "synthetic-unit-test-generator",
+            "1",
+            "internal-test",
+            "singleton-axis-fixture-v1",
+            None,
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let science = ScienceMetadata::new(
+            KernelModel::SyntheticFixtureOnly,
+            OrientationModel::FixedEuler {
+                yaw_deg: 0.0,
+                pitch_deg: 0.0,
+                roll_deg: 0.0,
+            },
+            MeltingModel::Dry,
+            TemporalSampling::Instantaneous,
+            TableValidation::SyntheticFixtureOnly,
+        )
+        .unwrap();
+        let mut values = Vec::new();
+        for diameter in [1.0, 2.0] {
+            for temperature in [270.0] {
+                for density in [100.0, 200.0, 300.0] {
+                    let components = synthetic_node(diameter, temperature).components();
+                    let scale = 1.0 + density / 1_000.0;
+                    values.push(
+                        AdditiveScattering::from_components(
+                            components.map(|component| component * scale),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+        OfflineLut::new(
+            axes,
+            generator,
+            r#"{"fixture":"singleton-axis-v1","physical":false}"#,
+            science,
+            values,
+        )
+        .unwrap()
+    }
+
+    // Frozen copy of the pre-plan implementation. Comparing component bits
+    // against it protects corner/axis/arithmetic order while the prepared
+    // layout becomes the common CPU/CUDA boundary.
+    fn legacy_interpolate(
+        table: &OfflineLut,
+        coordinates: &[AxisCoordinate],
+    ) -> Result<AdditiveScattering, InterpolationError> {
+        if coordinates.len() != table.header.axes.len() {
+            return Err(InterpolationError::CoordinateCount {
+                expected: table.header.axes.len(),
+                actual: coordinates.len(),
+            });
+        }
+        let mut brackets = Vec::with_capacity(coordinates.len());
+        for (index, (axis, coordinate)) in
+            table.header.axes.iter().zip(coordinates.iter()).enumerate()
+        {
+            if axis.kind != coordinate.kind {
+                return Err(InterpolationError::AxisOrder {
+                    index,
+                    expected: axis.kind,
+                    actual: coordinate.kind,
+                });
+            }
+            if !coordinate.value.is_finite() {
+                return Err(InterpolationError::NonFiniteCoordinate {
+                    kind: coordinate.kind,
+                    value: coordinate.value,
+                });
+            }
+            brackets.push(axis.locate(coordinate.value)?);
+        }
+
+        let strides = last_axis_fastest_strides(&table.header.axes)?;
+        let active_axis_count = brackets
+            .iter()
+            .filter(|bracket| bracket.lower != bracket.upper)
+            .count();
+        let corner_count = 1_usize
+            .checked_shl(active_axis_count as u32)
+            .ok_or(InterpolationError::DimensionOverflow)?;
+        let mut accumulated = [0.0; AdditiveScattering::COMPONENT_COUNT];
+        for corner in 0..corner_count {
+            let mut point_index = 0_usize;
+            let mut weight = 1.0;
+            let mut active_bit = 0_usize;
+            for axis_index in 0..brackets.len() {
+                let bracket = brackets[axis_index];
+                let coordinate_index = if bracket.lower == bracket.upper {
+                    bracket.lower
+                } else {
+                    let upper = ((corner >> active_bit) & 1) == 1;
+                    active_bit += 1;
+                    if upper {
+                        weight *= bracket.fraction;
+                        bracket.upper
+                    } else {
+                        weight *= 1.0 - bracket.fraction;
+                        bracket.lower
+                    }
+                };
+                point_index = point_index
+                    .checked_add(
+                        coordinate_index
+                            .checked_mul(strides[axis_index])
+                            .ok_or(InterpolationError::DimensionOverflow)?,
+                    )
+                    .ok_or(InterpolationError::DimensionOverflow)?;
+            }
+            let components = table
+                .values
+                .get(point_index)
+                .ok_or(InterpolationError::DimensionOverflow)?
+                .components();
+            for component in 0..AdditiveScattering::COMPONENT_COUNT {
+                accumulated[component] += weight * components[component];
+            }
+        }
+        AdditiveScattering::from_components(accumulated)
+            .map_err(InterpolationError::InvalidInterpolatedOutput)
+    }
+
+    fn assert_bit_identical(actual: AdditiveScattering, expected: AdditiveScattering) {
+        for (index, (actual, expected)) in actual
+            .components()
+            .into_iter()
+            .zip(expected.components())
+            .enumerate()
+        {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "component {index}: {actual:.17e} != {expected:.17e}"
+            );
+        }
+    }
+
     #[test]
     fn synthetic_fixture_round_trip_is_byte_deterministic() {
         let table = synthetic_fixture();
@@ -1116,6 +1427,128 @@ mod tests {
         assert!(matches!(
             order_error,
             InterpolationError::AxisOrder { index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn prepared_plan_has_fixed_serializable_axis_ordered_layout() {
+        let table = singleton_axis_fixture();
+        let coordinates = [
+            AxisCoordinate::new(AxisKind::EquivolumeDiameter, 1.25).unwrap(),
+            AxisCoordinate::new(AxisKind::Temperature, 270.0).unwrap(),
+            AxisCoordinate::new(AxisKind::BulkDensity, 250.0).unwrap(),
+        ];
+        let plan = table.prepare_interpolation(&coordinates).unwrap();
+
+        // Last-axis-fastest dimensions [2, 1, 3]: all-lower base is
+        // [0, 0, 1], then active diameter and density offsets retain header
+        // order while the singleton temperature axis is omitted.
+        assert_eq!(plan.base_point_index(), 1);
+        assert_eq!(plan.active_axis_count(), 2);
+        assert_eq!(plan.corner_count(), 4);
+        assert_eq!(&plan.upper_point_offsets()[..2], &[3, 1]);
+        assert_eq!(&plan.upper_fractions()[..2], &[0.25, 0.5]);
+        assert!(
+            plan.upper_point_offsets()[2..]
+                .iter()
+                .all(|value| *value == 0)
+        );
+        assert!(
+            plan.upper_fractions()[2..]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert_eq!(size_of::<PreparedInterpolationPlan>(), 272);
+
+        let encoded = serde_json::to_vec(&plan).unwrap();
+        let decoded: PreparedInterpolationPlan = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, plan);
+        assert_bit_identical(
+            table.interpolate_prepared(&decoded).unwrap(),
+            legacy_interpolate(&table, &coordinates).unwrap(),
+        );
+    }
+
+    #[test]
+    fn prepared_execution_is_bit_identical_to_legacy_corner_order() {
+        let table = synthetic_fixture();
+        for (diameter, temperature) in [
+            (1.0, 260.0),
+            (1.0, 267.3),
+            (1.37, 260.0),
+            (1.37, 267.3),
+            (2.0, 267.3),
+            (2.0, 280.0),
+        ] {
+            let coordinates = [
+                AxisCoordinate::new(AxisKind::EquivolumeDiameter, diameter).unwrap(),
+                AxisCoordinate::new(AxisKind::Temperature, temperature).unwrap(),
+            ];
+            let expected = legacy_interpolate(&table, &coordinates).unwrap();
+            let plan = table.prepare_interpolation(&coordinates).unwrap();
+            assert_bit_identical(table.interpolate_prepared(&plan).unwrap(), expected);
+            assert_bit_identical(table.interpolate(&coordinates).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn prepared_plan_handles_singletons_and_exact_boundaries() {
+        let table = singleton_axis_fixture();
+        let lower = [
+            AxisCoordinate::new(AxisKind::EquivolumeDiameter, 1.0).unwrap(),
+            AxisCoordinate::new(AxisKind::Temperature, 270.0).unwrap(),
+            AxisCoordinate::new(AxisKind::BulkDensity, 100.0).unwrap(),
+        ];
+        let upper = [
+            AxisCoordinate::new(AxisKind::EquivolumeDiameter, 2.0).unwrap(),
+            AxisCoordinate::new(AxisKind::Temperature, 270.0).unwrap(),
+            AxisCoordinate::new(AxisKind::BulkDensity, 300.0).unwrap(),
+        ];
+        for (coordinates, expected_base) in [(&lower[..], 0), (&upper[..], 5)] {
+            let plan = table.prepare_interpolation(coordinates).unwrap();
+            assert_eq!(plan.base_point_index(), expected_base);
+            assert_eq!(plan.active_axis_count(), 0);
+            assert_eq!(plan.corner_count(), 1);
+            assert_bit_identical(
+                table.interpolate_prepared(&plan).unwrap(),
+                legacy_interpolate(&table, coordinates).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn plan_preparation_preserves_outside_axis_failures() {
+        let table = singleton_axis_fixture();
+        let outside_density = [
+            AxisCoordinate::new(AxisKind::EquivolumeDiameter, 1.5).unwrap(),
+            AxisCoordinate::new(AxisKind::Temperature, 270.0).unwrap(),
+            AxisCoordinate::new(AxisKind::BulkDensity, 301.0).unwrap(),
+        ];
+        let expected = InterpolationError::OutsideAxis {
+            kind: AxisKind::BulkDensity,
+            value: 301.0,
+            minimum: 100.0,
+            maximum: 300.0,
+        };
+        assert_eq!(
+            table.prepare_interpolation(&outside_density).unwrap_err(),
+            expected
+        );
+        assert_eq!(table.interpolate(&outside_density).unwrap_err(), expected);
+
+        let outside_singleton = [
+            AxisCoordinate::new(AxisKind::EquivolumeDiameter, 1.5).unwrap(),
+            AxisCoordinate::new(AxisKind::Temperature, 269.0).unwrap(),
+            AxisCoordinate::new(AxisKind::BulkDensity, 200.0).unwrap(),
+        ];
+        assert!(matches!(
+            table.prepare_interpolation(&outside_singleton),
+            Err(InterpolationError::OutsideAxis {
+                kind: AxisKind::Temperature,
+                minimum: 270.0,
+                maximum: 270.0,
+                ..
+            })
         ));
     }
 
