@@ -4457,11 +4457,25 @@ fn compact_components(additive: AdditiveScattering) -> Result<[f32; 9], CompactS
         }
         compact[index] = converted;
     }
-    // Independent nearest-f32 rounding can put an otherwise-valid fall-moment
-    // triple just outside S*ZH >= F^2. Keep nearest-f32 ZH and F, then move S
-    // to the smallest representable f32 on the valid side of that boundary.
-    // This is a directed quantization of a valid source tuple, not a repair of
-    // invalid evaluator output: `additive` was validated before reaching here.
+    // Independent nearest-f32 rounding can put an otherwise-valid covariance
+    // just outside |C| <= sqrt(ZH*ZV). Keep nearest-f32 ZH/ZV and project along
+    // the complex covariance direction before rounding both components inward.
+    // `additive` was already validated, so this is directed quantization of a
+    // valid source tuple, never repair of invalid evaluator output.
+    // Covariance is validated before fall moments, so repair it first in case
+    // it masks an independently rounded fall-moment boundary.
+    if matches!(
+        decode_components(&compact),
+        Err(WrfTMatrixSceneQueryError::Output(
+            OutputError::CovarianceBound { .. }
+        ))
+    ) {
+        project_compact_covariance(&mut compact);
+    }
+
+    // The same independent rounding can put a valid fall-moment triple just
+    // outside S*ZH >= F^2. Keep nearest-f32 ZH and F, then move S to the
+    // smallest representable f32 on the valid side of that boundary.
     if matches!(
         decode_components(&compact),
         Err(WrfTMatrixSceneQueryError::Output(
@@ -4478,6 +4492,34 @@ fn compact_components(additive: AdditiveScattering) -> Result<[f32; 9], CompactS
         _ => unreachable!("decoding a fixed nine-component array cannot be a storage error"),
     })?;
     Ok(compact)
+}
+
+fn project_compact_covariance(compact: &mut [f32; AdditiveScattering::COMPONENT_COUNT]) {
+    let zh = f64::from(compact[0]);
+    let zv = f64::from(compact[1]);
+    let re = f64::from(compact[2]);
+    let im = f64::from(compact[3]);
+    let maximum = zh.sqrt() * zv.sqrt();
+    let magnitude = re.hypot(im);
+    debug_assert!(magnitude > maximum);
+    if maximum == 0.0 {
+        compact[2] = 0.0;
+        compact[3] = 0.0;
+        return;
+    }
+
+    let scale = maximum / magnitude;
+    compact[2] = round_f32_toward_zero(re * scale);
+    compact[3] = round_f32_toward_zero(im * scale);
+}
+
+fn round_f32_toward_zero(value: f64) -> f32 {
+    let nearest = value as f32;
+    if f64::from(nearest).abs() > value.abs() {
+        f32::from_bits(nearest.to_bits() - 1)
+    } else {
+        nearest
+    }
 }
 
 fn project_compact_second_fall_moment(
@@ -6187,6 +6229,43 @@ mod tests {
         assert_eq!(compact[0], nearest[0]);
         assert_eq!(compact[7], nearest[7]);
         assert_eq!(compact[8], f32::from_bits(nearest[8].to_bits() + 1));
+        decode_components(&compact).expect("projected tuple remains physically valid");
+    }
+
+    #[test]
+    fn compact_quantization_projects_reported_covariance_roundoff() {
+        // Exact valid f64 tuple captured from the real mp_physics=50 d02
+        // all-active-cell build. Nearest-f32 rounding puts covariance real on
+        // the upper ZH lattice point while ZV lands one ULP below it.
+        let source = additive([
+            129.068_162_268_768_28,
+            129.068_149_944_855_15,
+            129.068_155_884_295_3,
+            4.147_305_158_180_616e-8,
+            1.328_771_757_781_215e-5,
+            3.618_100_524_704_311_6e-6,
+            3.590_836_876_778_43e-6,
+            2_810.176_756_199_691,
+            61_731.010_819_663_155,
+        ]);
+        let nearest = source.components().map(|value| value as f32);
+        assert_eq!(nearest[0].to_bits(), 0x4301_1173);
+        assert_eq!(nearest[1].to_bits(), 0x4301_1172);
+        assert_eq!(nearest[2].to_bits(), 0x4301_1173);
+        assert_eq!(nearest[3].to_bits(), 0x3332_201a);
+        assert!(matches!(
+            decode_components(&nearest),
+            Err(WrfTMatrixSceneQueryError::Output(
+                OutputError::CovarianceBound { .. }
+            ))
+        ));
+
+        let compact = compact_components(source).expect("directed compact quantization");
+        assert_eq!(compact[0], nearest[0]);
+        assert_eq!(compact[1], nearest[1]);
+        assert_eq!(compact[2].to_bits(), 0x4301_1172);
+        assert_eq!(compact[3].to_bits(), 0x3332_2019);
+        assert_eq!(compact[4..], nearest[4..]);
         decode_components(&compact).expect("projected tuple remains physically valid");
     }
 

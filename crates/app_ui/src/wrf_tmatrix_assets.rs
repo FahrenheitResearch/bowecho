@@ -744,6 +744,101 @@ mod tests {
         assert!(!TMATRIX_PACK_CACHE_FAMILY.contains("simsat-cache"));
     }
 
+    /// Full, all-active-cell acceptance probe for a real P3 wrfout. The
+    /// multi-GB fixture stays external and normal CI returns immediately.
+    /// Unlike the tiny gate-level CUDA parity probe in `wrf_radar`, this calls
+    /// the production compact-scene builder and requires every retained P3
+    /// source cell to finish without selecting CPU fallback.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn real_p3_fixture_builds_all_active_cells_on_cuda() {
+        let Some(wrf_path) = std::env::var_os("BOWECHO_P3_CUDA_SCENE_FIXTURE") else {
+            return;
+        };
+        let total_started = std::time::Instant::now();
+        let file = wrf_core::WrfFile::open(&wrf_path)
+            .expect("open BOWECHO_P3_CUDA_SCENE_FIXTURE for full CUDA scene build");
+        assert_eq!(
+            file.global_attr_i32("MP_PHYSICS")
+                .expect("P3 fixture has MP_PHYSICS"),
+            50,
+            "full CUDA acceptance fixture must use two-moment P3 mp_physics=50"
+        );
+
+        let read_started = std::time::Instant::now();
+        let source = crate::wrf_property_reader::read_wrf_property_scene(
+            &file,
+            crate::wrf_scene_inventory::WrfSourceIdentity("fixture:p3-full-cuda-scene".to_owned()),
+            0,
+        )
+        .expect("read complete native P3 property scene");
+        let read_elapsed = read_started.elapsed();
+        assert!(
+            !source.active_cell_indices().is_empty(),
+            "P3 fixture has no active property cells"
+        );
+
+        let service_started = std::time::Instant::now();
+        let service = crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService::open_preferred()
+            .expect("open preferred NVIDIA CUDA T-matrix service");
+        let service_elapsed = service_started.elapsed();
+        let table_owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load exact embedded S-band property tables");
+
+        let build_started = std::time::Instant::now();
+        let result = build_property_tmatrix_scene_with_cuda(
+            &source,
+            usize::MAX,
+            table_owner,
+            WrfTMatrixRainMode::FullProperty,
+            &|stage| eprintln!("[p3-cuda-scene] {stage}"),
+            &service,
+        );
+        let build_elapsed = build_started.elapsed();
+        let report = service.report();
+        eprintln!(
+            "[p3-cuda-scene timing] read={:.3}s service={:.3}s build={:.3}s total={:.3}s; device={} cc={}.{} artifact={}; requests={} batches={}/{} nodes={}/{} fallback={:?}",
+            read_elapsed.as_secs_f64(),
+            service_elapsed.as_secs_f64(),
+            build_elapsed.as_secs_f64(),
+            total_started.elapsed().as_secs_f64(),
+            report.device.name,
+            report.device.compute_capability_major,
+            report.device.compute_capability_minor,
+            report.device.kernel_artifact,
+            report.requests_submitted,
+            report.batches_completed,
+            report.batches_submitted,
+            report.nodes_completed,
+            report.nodes_submitted,
+            report.fallback_reason,
+        );
+        let built = result.unwrap_or_else(|error| {
+            panic!("build every active P3 property cell through CUDA: {error}")
+        });
+        assert_eq!(
+            built.scene.active_cell_indices(),
+            source.active_cell_indices(),
+            "full-property CUDA build did not retain the exact source active-cell set"
+        );
+        assert!(
+            report.nodes_completed > 0,
+            "P3 scene submitted no CUDA nodes"
+        );
+        assert_eq!(report.nodes_completed, report.nodes_submitted);
+        assert_eq!(report.batches_completed, report.batches_submitted);
+        assert_eq!(report.fallback_reason, None, "CUDA unexpectedly fell back");
+        eprintln!(
+            "[p3-cuda-scene complete] source_cells={} active_cells={} estimated_peak_bytes={}",
+            built.scene.source_cell_count(),
+            built.scene.active_cell_indices().len(),
+            built.peak.estimated_peak_bytes,
+        );
+    }
+
     /// Exact regression for a real P3 cell that previously reached the same
     /// embedded raw evaluator used by synthetic-radar gate sampling and failed
     /// inside the scheme-native PSD/T-matrix seam. The real fixture remains
