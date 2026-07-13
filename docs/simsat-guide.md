@@ -1,7 +1,7 @@
 # SimSat in BowEcho
 
-BowEcho embeds SimSat v0.2.1 at public release commit
-`22dd23b2b956360c53ca6b7b2b445fe76202c392` as a first-class
+BowEcho embeds SimSat v0.2.1 plus its MTG-I1 camera integration at pinned commit
+`fd2b8f48e904342bc81bd003503ad0f4e27c5596` as a first-class
 simulated-satellite workspace.
 Open **Windows > SimSat** to render WRF or HRRR native-level atmospheres into
 visible, thermal, water-vapor, and derived satellite products.
@@ -16,7 +16,8 @@ and does not enter saved loops.
 1. Choose **Local WRF / GRIB**, **Downloaded HRRR**, or **Download HRRR**.
 2. Choose a product.
 3. Choose **Geostationary (from space)** or **Top-down map**.
-4. For geostationary output, choose GOES-East, GOES-West, or Himawari.
+4. For geostationary output, choose GOES-East, GOES-West, Himawari, or
+   **MTG-I1 / Meteosat-12 (0°)**. European WRF domains should use MTG-I1.
 5. Choose Model native, ABI 1 km, or ABI 2 km output resolution.
 6. Start with **Recommended** Quick mode, or select **High Quality** / **Sensor
    QA** for their explicitly described use cases.
@@ -150,6 +151,8 @@ The output uses the selected satellite's fixed-grid viewpoint:
 - GOES-East
 - GOES-West
 - Himawari
+- MTG-I1 / Meteosat-12 at the operational EUMETSAT 0° service longitude
+  ([EUMETSAT service reference](https://user.eumetsat.int/resources/user-guides/mtg-in-operations))
 
 **Earth margin** controls how much real surrounding ground is visible around
 the finite model domain. Weather outside the model domain is clear, not
@@ -157,8 +160,16 @@ extrapolated.
 
 **Navigation** selects either the shipped WRF/model sphere or the opt-in exact
 GOES-R ellipsoid/sweep-x fixed grid. Exact GOES-R navigation is CPU-only and is
-not available for Himawari. It improves registration geometry; it does not by
-itself make the radiometry sensor-exact.
+available only for GOES-East/West. Himawari and MTG-I1 use the model-sphere
+geostationary camera. It improves registration geometry; it does not by itself
+make the radiometry sensor-exact.
+
+The MTG-I1 choice is an honest **camera/viewpoint preset** for Meteosat-12 at
+0°. It renders the existing SimSat visible, generic 10.3 micrometer IR, and
+water-vapor physics from the European/African geostationary viewpoint. It does
+not apply Flexible Combined Imager (FCI) spectral-response functions, its
+instrument point-spread function, or claim FCI-equivalent radiometry. Do not
+enable the explicitly GOES-19 FM4 response and interpret it as FCI.
 
 ### Top-down map
 

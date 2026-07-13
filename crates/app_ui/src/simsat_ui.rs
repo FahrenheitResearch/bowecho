@@ -236,16 +236,18 @@ enum SatelliteChoice {
     GoesEast,
     GoesWest,
     Himawari,
+    MtgI1,
 }
 
 impl SatelliteChoice {
-    const ALL: [Self; 3] = [Self::GoesEast, Self::GoesWest, Self::Himawari];
+    const ALL: [Self; 4] = [Self::GoesEast, Self::GoesWest, Self::Himawari, Self::MtgI1];
 
     fn label(self) -> &'static str {
         match self {
             Self::GoesEast => "GOES-East",
             Self::GoesWest => "GOES-West",
             Self::Himawari => "Himawari",
+            Self::MtgI1 => "MTG-I1 / Meteosat-12 (0°)",
         }
     }
 
@@ -254,6 +256,7 @@ impl SatelliteChoice {
             Self::GoesEast => "goes-east",
             Self::GoesWest => "goes-west",
             Self::Himawari => "himawari",
+            Self::MtgI1 => "mtg-i1",
         }
     }
 
@@ -262,7 +265,12 @@ impl SatelliteChoice {
             Self::GoesEast => SatellitePreset::GoesEast,
             Self::GoesWest => SatellitePreset::GoesWest,
             Self::Himawari => SatellitePreset::Himawari,
+            Self::MtgI1 => SatellitePreset::MtgI1,
         }
+    }
+
+    fn is_goes(self) -> bool {
+        matches!(self, Self::GoesEast | Self::GoesWest)
     }
 }
 
@@ -1086,13 +1094,11 @@ impl SimSatPane {
         if !self.product.has_band13_component() {
             self.instrument_footprint = InstrumentFootprint::Off;
         }
-        if self.satellite == SatelliteChoice::Himawari
-            && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
-        {
+        if !self.satellite.is_goes() && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid {
             self.geo_navigation = GeoNavigation::ModelSphere;
         }
         if self.instrument_footprint != InstrumentFootprint::Off {
-            if self.satellite == SatelliteChoice::Himawari {
+            if !self.satellite.is_goes() {
                 self.satellite = SatelliteChoice::GoesEast;
             }
             self.view = OutputView::Geostationary;
@@ -1234,9 +1240,9 @@ impl SimSatPane {
                         self.product.label()
                     ));
                 }
-                if self.satellite == SatelliteChoice::Himawari {
+                if !self.satellite.is_goes() {
                     return Err(
-                        "GOES-R Sensor QA is incompatible with Himawari. Select a GOES satellite first; the preset will not relabel the platform.".to_owned(),
+                        "GOES-R Sensor QA is available only for GOES-East/West. Select a GOES satellite first; the preset will not relabel Himawari or MTG-I1.".to_owned(),
                     );
                 }
                 if self.product == SimSatProduct::Ir13
@@ -1418,7 +1424,7 @@ impl SimSatPane {
 
     fn sensor_qa_core_matches(&self) -> bool {
         let common = self.product.supports_sensor_qa()
-            && self.satellite != SatelliteChoice::Himawari
+            && self.satellite.is_goes()
             && self.storage_profile == StorageProfile::CompactU8
             && self.instrument_footprint == InstrumentFootprint::Off
             && self.view == OutputView::Geostationary
@@ -1697,8 +1703,7 @@ impl SimSatPane {
 
                     ui.label("Navigation");
                     ui.add_enabled_ui(
-                        self.view == OutputView::Geostationary
-                            && self.satellite != SatelliteChoice::Himawari,
+                        self.view == OutputView::Geostationary && self.satellite.is_goes(),
                         |ui| {
                             egui::ComboBox::from_id_salt("simsat-geo-navigation")
                                 .selected_text(self.geo_navigation.label())
@@ -1747,12 +1752,17 @@ impl SimSatPane {
                     "Top-down is map-registered; satellite choice is ignored, while Native / ABI \
                      resolution remains active.",
                 );
+            } else if self.satellite == SatelliteChoice::MtgI1 {
+                ui.small(
+                    "MTG-I1 / Meteosat-12 camera at 0°. Visible, IR, and water-vapor use \
+                     SimSat's existing generic physics; this does not claim FCI spectral response.",
+                );
             }
         });
         if product_changed || satellite_changed {
             let previous_footprint = self.instrument_footprint;
             let previous_optics = self.cloud_optics;
-            if satellite_changed && self.satellite == SatelliteChoice::Himawari {
+            if satellite_changed && !self.satellite.is_goes() {
                 self.instrument_footprint = InstrumentFootprint::Off;
             }
             self.normalize_incompatible_controls();
@@ -2018,7 +2028,7 @@ impl SimSatPane {
                     .changed()
                 {
                     self.instrument_footprint = if footprint_on {
-                        if self.satellite == SatelliteChoice::Himawari {
+                        if !self.satellite.is_goes() {
                             self.satellite = SatelliteChoice::GoesEast;
                         }
                         self.view = OutputView::Geostationary;
@@ -2032,7 +2042,7 @@ impl SimSatPane {
                 }
                 if self.instrument_footprint != InstrumentFootprint::Off {
                     let compatible = self.view == OutputView::Geostationary
-                        && self.satellite != SatelliteChoice::Himawari
+                        && self.satellite.is_goes()
                         && self.geo_navigation == GeoNavigation::GoesRAbiFixedGrid
                         && self.resolution == ResolutionMode::Abi2km
                         && self.thermal_sensor == ThermalSensor::GoesRAbiBand13Fm4;
@@ -3511,6 +3521,41 @@ mod tests {
     }
 
     #[test]
+    fn mtg_i1_is_a_persisted_zero_degree_engine_camera_without_goes_controls() {
+        assert_eq!(
+            SatelliteChoice::MtgI1.api_satellite(),
+            SatellitePreset::MtgI1
+        );
+        assert_eq!(SatelliteChoice::MtgI1.api_satellite().sub_lon_deg(), 0.0);
+
+        let mut pane = SimSatPane {
+            product: SimSatProduct::Ir13,
+            satellite: SatelliteChoice::MtgI1,
+            geo_navigation: GeoNavigation::GoesRAbiFixedGrid,
+            instrument_footprint: InstrumentFootprint::GoesRAbiBand13Mtf,
+            ..SimSatPane::default()
+        };
+        pane.normalize_incompatible_controls();
+        // A GOES-only footprint intentionally relabels an incompatible platform;
+        // selecting MTG without that control restores the honest camera.
+        assert_eq!(pane.satellite, SatelliteChoice::GoesEast);
+
+        pane.satellite = SatelliteChoice::MtgI1;
+        pane.geo_navigation = GeoNavigation::GoesRAbiFixedGrid;
+        pane.instrument_footprint = InstrumentFootprint::Off;
+        pane.thermal_sensor = ThermalSensor::FastGray;
+        pane.normalize_incompatible_controls();
+        assert_eq!(pane.geo_navigation, GeoNavigation::ModelSphere);
+        pane.persisted_state_dirty = true;
+        let saved = pane.take_persisted_state_if_dirty().unwrap();
+        assert_eq!(saved["satellite"], "mtg-i1");
+        let restored = SimSatPane::new(Some(&saved));
+        assert_eq!(restored.satellite, SatelliteChoice::MtgI1);
+        assert_eq!(restored.geo_navigation, GeoNavigation::ModelSphere);
+        assert_eq!(restored.thermal_sensor, ThermalSensor::FastGray);
+    }
+
+    #[test]
     fn render_controls_map_to_the_released_simsat_api() {
         let job = RenderJob {
             source: JobSource::Local(PathBuf::from("wrfout")),
@@ -3873,6 +3918,12 @@ mod tests {
         assert!(near_f32(pane.cloud_softclip, 0.45));
 
         pane.product = SimSatProduct::Ir13;
+        pane.satellite = SatelliteChoice::MtgI1;
+        assert!(
+            pane.apply_quick_mode(SimSatQuickMode::SensorQa)
+                .unwrap_err()
+                .contains("MTG-I1")
+        );
         pane.satellite = SatelliteChoice::GoesWest;
         assert!(
             pane.apply_quick_mode(SimSatQuickMode::SensorQa)
