@@ -76,7 +76,7 @@
       "tmatrix_state_axis_kinds": ["equivolume_diameter", "minor_to_major_axis_ratio"],
       "geometry_axis_kind": "radar_elevation",
       "partial_group_policy": "reject_entire_lut",
-      "maximum_points_per_process": 8192,
+      "maximum_points_per_process": 4096,
       "group_timeout_seconds": 3600
     }
   },

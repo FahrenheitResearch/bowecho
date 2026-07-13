@@ -63,7 +63,7 @@ embedded_table!(
 embedded_table!(
     RAIN,
     "property_rain_sband_unvalidated",
-    "9a2ed9a7678fd6e8dcbaa4d26bad24fe47fe7cf95ae5eb17ad80d63a34c06b56"
+    "396ca95c58d70a9a413d90799bd790dc389179dc9a38f48152e464bf852d5e11"
 );
 
 struct EmbeddedPropertyTMatrixLuts {

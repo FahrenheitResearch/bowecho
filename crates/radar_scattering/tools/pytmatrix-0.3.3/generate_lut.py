@@ -1156,15 +1156,10 @@ def validate_config(config: dict[str, Any]) -> None:
             grouping["group_timeout_seconds"],
             "execution.grouping.group_timeout_seconds",
         )
-        in_process_points = (
-            len(axis_coordinates(config, "equivolume_diameter"))
-            * len(axis_coordinates(config, "minor_to_major_axis_ratio"))
-            * len(axis_coordinates(config, "radar_elevation"))
-        )
-        if in_process_points > maximum_points:
-            raise GeneratorError(
-                "property-aware material-state group exceeds maximum_points_per_process"
-            )
+        # One material state may span more nodes than the declared process
+        # cap. Generation partitions that state into deterministic contiguous
+        # chunks; every chunk still runs in a fresh isolated process and any
+        # partial/failing chunk rejects the complete LUT.
     payload = _require_object(config["payload"], "payload")
     _keys(payload, required=("encoding",), allowed=("encoding",), path="payload")
     if payload["encoding"] != "f64_le_point_major_last_axis_fastest":
@@ -2539,7 +2534,12 @@ def _compute_isolated_grid(
         for flat_index, point in enumerate(coordinates):
             key = tuple(point[kind] for kind in material_axes)
             grouped.setdefault(key, []).append((flat_index, point))
-        group_items = list(grouped.values())
+        maximum_points = int(grouping["maximum_points_per_process"])
+        group_items = [
+            entries[start : start + maximum_points]
+            for entries in grouped.values()
+            for start in range(0, len(entries), maximum_points)
+        ]
         collected: list[list[float] | None] = [None] * len(coordinates)
         group_timeout = int(grouping["group_timeout_seconds"])
 
@@ -2574,8 +2574,8 @@ def _compute_isolated_grid(
         values = [point for point in collected if point is not None]
         return (
             values,
-            len(grouped),
-            max(len(entries) for entries in grouped.values()),
+            len(group_items),
+            max(len(entries) for entries in group_items),
         )
 
     collected = [None] * len(coordinates)
