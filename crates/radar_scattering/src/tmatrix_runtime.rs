@@ -26,6 +26,12 @@ const CONSTANT_S_BAND_DIELECTRIC: &str = "constant_over_configured_s_band_nodes"
 const SPEED_OF_LIGHT_M_S: f64 = 299_792_458.0;
 const BACKSCATTER_GEOMETRY_DEG: [f64; 6] = [90.0, 90.0, 0.0, 180.0, 0.0, 0.0];
 const FORWARD_GEOMETRY_DEG: [f64; 6] = [90.0, 90.0, 0.0, 0.0, 0.0, 0.0];
+// The embedded liquid-water table starts at 225 K. WRF state interpolation
+// can put a supercooled-rain query a few hundredths of a kelvin across that
+// finite support edge. Treat at most one tenth kelvin as the boundary node;
+// this is deliberately much smaller than a table interval and is not a
+// general extrapolation policy.
+const RAIN_LUT_TEMPERATURE_EDGE_TOLERANCE_K: f64 = 0.1;
 
 /// Microphysics family and exact native category represented by a table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1005,7 +1011,10 @@ impl ResearchTMatrixLut {
         for axis in self.lut.header().axes() {
             let value = match axis.kind() {
                 AxisKind::EquivolumeDiameter => particle.characteristic_diameter_m().value(),
-                AxisKind::Temperature => environment.temperature_k(),
+                AxisKind::Temperature => self.rain_lut_temperature_coordinate(
+                    axis.coordinates(),
+                    environment.temperature_k(),
+                ),
                 AxisKind::BulkDensity => particle.effective_density_kg_m3().value(),
                 AxisKind::CondensedVolumeFraction => condensed_volume_fraction(
                     particle.effective_density_kg_m3().value(),
@@ -1480,6 +1489,34 @@ impl ResearchTMatrixLut {
             })
         } else {
             Ok(())
+        }
+    }
+
+    fn rain_lut_temperature_coordinate(&self, axis: &[f64], temperature_k: f64) -> f64 {
+        let is_standalone_or_residual_rain = self.descriptor.category
+            == TMatrixParticleCategory::Conventional(ConventionalHydrometeor::Rain)
+            && self.descriptor.population_role
+                == TMatrixPopulationRole::ConventionalRainStandaloneAndResidual
+            && matches!(
+                &self.descriptor.material,
+                TMatrixMaterial::TemperatureDependentLiquidWaterLiebe1991 { .. }
+            );
+        if !is_standalone_or_residual_rain || !temperature_k.is_finite() {
+            return temperature_k;
+        }
+
+        let minimum = axis[0];
+        let maximum = axis[axis.len() - 1];
+        if temperature_k < minimum
+            && temperature_k >= minimum - RAIN_LUT_TEMPERATURE_EDGE_TOLERANCE_K
+        {
+            minimum
+        } else if temperature_k > maximum
+            && temperature_k <= maximum + RAIN_LUT_TEMPERATURE_EDGE_TOLERANCE_K
+        {
+            maximum
+        } else {
+            temperature_k
         }
     }
 
@@ -3837,6 +3874,80 @@ mod tests {
         constant_runtime(axes, science, descriptor)
     }
 
+    fn rain_runtime(temperature_range_k: [f64; 2]) -> ResearchTMatrixLut {
+        let axes = vec![
+            Axis::new(
+                AxisKind::EquivolumeDiameter,
+                Unit::Meter,
+                vec![1.0e-4, 0.01],
+            )
+            .unwrap(),
+            Axis::new(
+                AxisKind::Temperature,
+                Unit::Kelvin,
+                temperature_range_k.to_vec(),
+            )
+            .unwrap(),
+            Axis::new(
+                AxisKind::MinorToMajorAxisRatio,
+                Unit::UnitlessFraction,
+                vec![0.5, 1.0],
+            )
+            .unwrap(),
+            Axis::new(AxisKind::Frequency, Unit::Hertz, vec![FREQUENCY_HZ]).unwrap(),
+            Axis::new(AxisKind::RadarElevation, Unit::Degree, vec![-0.5, 20.0]).unwrap(),
+        ];
+        let science = ScienceMetadata::new(
+            KernelModel::TMatrix {
+                implementation: TMatrixImplementation::PyTMatrix033,
+            },
+            gaussian20_odf().orientation_model(),
+            MeltingModel::Dry,
+            TemporalSampling::Instantaneous,
+            TableValidation::ResearchOnlyUnvalidated,
+        )
+        .unwrap();
+        let rain_terminal_speed = TerminalSpeedPolicy::AtlasRain1973Exponential {
+            a_m_s: 9.65,
+            b_m_s: 10.3,
+            c_per_mm: 0.6,
+            valid_diameter_range_m: [1.0e-4, 0.01],
+        };
+        let descriptor = TMatrixTableDescriptor {
+            table_id: "software-test-residual-rain".to_owned(),
+            category: TMatrixParticleCategory::Conventional(ConventionalHydrometeor::Rain),
+            population_role: TMatrixPopulationRole::ConventionalRainStandaloneAndResidual,
+            density_applicability: DensityApplicability::ConventionalCategory,
+            spheroid: SpheroidConvention::OblateMinorVertical,
+            material: TMatrixMaterial::TemperatureDependentLiquidWaterLiebe1991 {
+                mass_density_kg_m3: 999.84,
+                temperature_range_k,
+                frequency_range_hz: [2.0e9, 4.0e9],
+            },
+            odf: gaussian20_odf(),
+            radar: test_radar_descriptor(),
+            terminal_speed_sha256: terminal_speed_policy_sha256(&rain_terminal_speed),
+            terminal_speed: rain_terminal_speed,
+            execution: TMatrixExecutionDescriptor::FreshProcessPerGridPoint,
+            normalization_number_concentration_m3: 1.0,
+        };
+        constant_runtime(axes, science, descriptor)
+    }
+
+    fn closed_rain(temperature_k: f64) -> ClosedParticleCategory {
+        let context = ClosureContext::new(6, temperature_k, 1.5)
+            .unwrap()
+            .with_orientation(OrientationDefinition::Gaussian20Research);
+        close_conventional_category(
+            &context,
+            &ConventionalCategoryInput::new(ConventionalHydrometeor::Rain, 1.0e-4, Some(2.0))
+                .with_characteristic_diameter_m(1.0e-3)
+                .with_minor_to_major_axis_ratio(0.9)
+                .with_fall_speed_m_s(2.0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn loader_binds_complete_digest_config_and_descriptor() {
         let (table, _, _) = fixture();
@@ -4483,69 +4594,8 @@ mod tests {
 
     #[test]
     fn residual_rain_scales_number_by_unpaired_mass_fraction_exactly_once() {
-        let axes = vec![
-            Axis::new(
-                AxisKind::EquivolumeDiameter,
-                Unit::Meter,
-                vec![1.0e-4, 0.01],
-            )
-            .unwrap(),
-            Axis::new(AxisKind::Temperature, Unit::Kelvin, vec![250.0, 313.15]).unwrap(),
-            Axis::new(
-                AxisKind::MinorToMajorAxisRatio,
-                Unit::UnitlessFraction,
-                vec![0.5, 1.0],
-            )
-            .unwrap(),
-            Axis::new(AxisKind::Frequency, Unit::Hertz, vec![FREQUENCY_HZ]).unwrap(),
-            Axis::new(AxisKind::RadarElevation, Unit::Degree, vec![-0.5, 20.0]).unwrap(),
-        ];
-        let science = ScienceMetadata::new(
-            KernelModel::TMatrix {
-                implementation: TMatrixImplementation::PyTMatrix033,
-            },
-            gaussian20_odf().orientation_model(),
-            MeltingModel::Dry,
-            TemporalSampling::Instantaneous,
-            TableValidation::ResearchOnlyUnvalidated,
-        )
-        .unwrap();
-        let rain_terminal_speed = TerminalSpeedPolicy::AtlasRain1973Exponential {
-            a_m_s: 9.65,
-            b_m_s: 10.3,
-            c_per_mm: 0.6,
-            valid_diameter_range_m: [1.0e-4, 0.01],
-        };
-        let descriptor = TMatrixTableDescriptor {
-            table_id: "software-test-residual-rain".to_owned(),
-            category: TMatrixParticleCategory::Conventional(ConventionalHydrometeor::Rain),
-            population_role: TMatrixPopulationRole::ConventionalRainStandaloneAndResidual,
-            density_applicability: DensityApplicability::ConventionalCategory,
-            spheroid: SpheroidConvention::OblateMinorVertical,
-            material: TMatrixMaterial::TemperatureDependentLiquidWaterLiebe1991 {
-                mass_density_kg_m3: 999.84,
-                temperature_range_k: [250.0, 313.15],
-                frequency_range_hz: [2.0e9, 4.0e9],
-            },
-            odf: gaussian20_odf(),
-            radar: test_radar_descriptor(),
-            terminal_speed_sha256: terminal_speed_policy_sha256(&rain_terminal_speed),
-            terminal_speed: rain_terminal_speed,
-            execution: TMatrixExecutionDescriptor::FreshProcessPerGridPoint,
-            normalization_number_concentration_m3: 1.0,
-        };
-        let table = constant_runtime(axes, science, descriptor);
-        let context = ClosureContext::new(6, 273.15, 1.5)
-            .unwrap()
-            .with_orientation(OrientationDefinition::Gaussian20Research);
-        let rain = close_conventional_category(
-            &context,
-            &ConventionalCategoryInput::new(ConventionalHydrometeor::Rain, 1.0e-4, Some(2.0))
-                .with_characteristic_diameter_m(1.0e-3)
-                .with_minor_to_major_axis_ratio(0.9)
-                .with_fall_speed_m_s(2.0),
-        )
-        .unwrap();
+        let table = rain_runtime([250.0, 313.15]);
+        let rain = closed_rain(273.15);
         assert_eq!(
             rain.shape().bulk_density_kg_m3(),
             LIQUID_WATER_DENSITY_KG_M3
@@ -4565,6 +4615,43 @@ mod tests {
         assert_eq!(contribution.represented_mixing_ratio_kgkg(), 2.5e-5);
         assert_eq!(contribution.consumed_paired_liquid_mass_kgkg(), 0.0);
         assert!((contribution.additive().zh().get() - 1.5).abs() <= 1.0e-14);
+    }
+
+    #[test]
+    fn standalone_rain_accepts_only_the_bounded_temperature_edge_tolerance() {
+        let table = rain_runtime([225.0, 313.15]);
+        let evaluate =
+            |temperature_k| table.evaluate(&closed_rain(temperature_k), request(FREQUENCY_HZ, 1.0));
+
+        let minimum = evaluate(225.0).unwrap();
+        assert_eq!(evaluate(224.911_436_141_626_6).unwrap(), minimum);
+
+        let tolerance_edge = 225.0 - RAIN_LUT_TEMPERATURE_EDGE_TOLERANCE_K;
+        assert_eq!(evaluate(tolerance_edge).unwrap(), minimum);
+
+        let just_outside = f64::from_bits(tolerance_edge.to_bits() - 1);
+        assert_eq!(
+            evaluate(just_outside),
+            Err(EvaluationError::Interpolation(
+                InterpolationError::OutsideAxis {
+                    kind: AxisKind::Temperature,
+                    value: just_outside,
+                    minimum: 225.0,
+                    maximum: 313.15,
+                }
+            ))
+        );
+        assert!(matches!(
+            evaluate(224.0),
+            Err(EvaluationError::Interpolation(
+                InterpolationError::OutsideAxis {
+                    kind: AxisKind::Temperature,
+                    value: 224.0,
+                    minimum: 225.0,
+                    maximum: 313.15,
+                }
+            ))
+        ));
     }
 
     fn raw_property_descriptor(wet: bool) -> RawPropertyStateDescriptor {
