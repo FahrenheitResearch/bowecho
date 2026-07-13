@@ -3035,10 +3035,13 @@ mod tests {
         assert!(guide_src.contains("not independently validated"));
         assert!(guide_src.contains("make no operational claim"));
         let stale_p3_claim = ["P3 is", "characteristic-particle"].join(" ");
+        let stale_psd_claim = ["not", "PSD-integrated"].join(" ");
+        let stale_bowecho_version = ["BowEcho", "v0."].join(" ");
+        let stale_simsat_version = ["SimSat", "v0."].join(" ");
         assert!(!guide_src.contains(&stale_p3_claim));
-        assert!(!guide_src.contains("not PSD-integrated"));
-        assert!(!guide_src.contains("BowEcho v0."));
-        assert!(!guide_src.contains("SimSat v0."));
+        assert!(!guide_src.contains(&stale_psd_claim));
+        assert!(!guide_src.contains(&stale_bowecho_version));
+        assert!(!guide_src.contains(&stale_simsat_version));
 
         // Formula Lab must retain the explicit capability boundary rather
         // than implying every stored model has raw-WRF grid geometry.
