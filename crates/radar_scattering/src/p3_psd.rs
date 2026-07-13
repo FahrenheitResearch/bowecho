@@ -1106,16 +1106,25 @@ impl P3Psd {
         let mut integrated_mass_squared = 0.0;
         let mut integrated_m6 = 0.0;
         for segment in breakpoints.windows(2) {
-            // P3 permits a non-integer shape parameter between zero and one.
-            // Direct Gauss-Legendre integration of D^mu on the first panel
-            // then converges slowly because its derivative is singular at
-            // D=0. D=t^4 regularizes that endpoint while preserving the exact
-            // physical diameter domain and the original node budget. Retain
-            // direct-D quadrature for mu>=1, where the endpoint is already
-            // smooth and the transform would unnecessarily steepen D^mu.
-            let regularize_origin = segment[0] == 0.0 && self.mu < 1.0;
-            let (half_width, midpoint) = if regularize_origin {
-                let transformed_upper = segment[1].sqrt().sqrt();
+            // P3 permits non-integer shape parameters. Direct Gauss-Legendre
+            // integration of D^mu on the first panel then converges slowly
+            // while low-order derivatives remain singular at D=0. Use D=t^4
+            // below mu=1 and D=t^2 below mu=2; both substitutions preserve the
+            // exact physical diameter domain and regularize the endpoint while
+            // avoiding an unnecessarily steep transform for smoother shapes.
+            let origin_power = if segment[0] == 0.0 {
+                if self.mu < 1.0 {
+                    4
+                } else if self.mu < 2.0 {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                1
+            };
+            let (half_width, midpoint) = if origin_power > 1 {
+                let transformed_upper = segment[1].powf(1.0 / f64::from(origin_power));
                 (0.5 * transformed_upper, 0.5 * transformed_upper)
             } else {
                 (
@@ -1125,8 +1134,11 @@ impl P3Psd {
             };
             for local in 0..GL8_POINTS {
                 let coordinate = midpoint + half_width * GL8_ABSCISSAE[local];
-                let (diameter, jacobian) = if regularize_origin {
-                    (coordinate.powi(4), 4.0 * coordinate.powi(3))
+                let (diameter, jacobian) = if origin_power > 1 {
+                    (
+                        coordinate.powi(origin_power),
+                        f64::from(origin_power) * coordinate.powi(origin_power - 1),
+                    )
                 } else {
                     (coordinate, 1.0)
                 };
@@ -2349,6 +2361,47 @@ mod tests {
                 .iter()
                 .all(|node| node.maximum_dimension_m < 0.080)
         );
+        for error in [
+            quadrature.audit.number_quadrature_relative_error,
+            quadrature.audit.mass_quadrature_relative_error,
+            quadrature
+                .audit
+                .mass_squared_radar_weight_quadrature_relative_error,
+            quadrature.audit.sixth_moment_quadrature_relative_error,
+        ] {
+            assert!(error <= quadrature.audit.config.maximum_quadrature_relative_error);
+        }
+    }
+
+    #[test]
+    fn origin_transform_closes_reported_rimed_shape_above_one() {
+        let scheme = P3WrfScheme::Mp50OneIceFixedCloudNumber;
+        let lambda = 15_174.831_054_687_5;
+        let mu = 1.152_940_869_331_359_9;
+        let input = P3PsdInput {
+            scheme,
+            category: P3Category::Category1,
+            total_ice_kgkg: 0.004_428_890_068_084_001_5,
+            total_number_per_kg: 1_322_476.625,
+            rime_mass_kgkg: 0.004_155_966_918_915_51,
+            rime_volume_m3_per_kg: 5.698_338_554_793_736e-6,
+            dry_air_density_kg_m3: 0.437_512_844_800_949_1,
+            moment: P3IceMomentInput::TwoMoment,
+        };
+        let psd = P3Psd::reconstruct(
+            input,
+            &fixture_table(scheme, lambda, mu),
+            P3ReconstructionConfig::default(),
+        )
+        .unwrap();
+        let quadrature = psd
+            .quadrature_bounded_with_dimension_breakpoints(
+                P3QuadratureConfig::default(),
+                0.080,
+                &[50.0e-6],
+            )
+            .unwrap();
+
         for error in [
             quadrature.audit.number_quadrature_relative_error,
             quadrature.audit.mass_quadrature_relative_error,
