@@ -1,0 +1,19 @@
+[package]
+name = "simradar_cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+# Driver-only, dynamically loaded CUDA. BowEcho binaries never link cudart or
+# require the CUDA Toolkit; an NVIDIA display/compute driver is sufficient.
+cudarc = { version = "=0.19.8", default-features = false, features = [
+    "std",
+    "driver",
+    "dynamic-loading",
+    "cuda-12000",
+] }
+
