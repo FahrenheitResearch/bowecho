@@ -1458,6 +1458,7 @@ pub fn blend_raw_property_cells(
                         *output_qzi += sample.weight * value_qzi;
                     }
                 }
+                normalize_blended_p3_category(&mut output);
                 categories.push(RawPropertyCategory::P3(output));
             }
             RawPropertyCategory::Ishmael(first_value) => {
@@ -1519,6 +1520,16 @@ pub fn blend_raw_property_cells(
                 qrain_kgkg += sample.weight * qrain;
                 qnrain_per_kg += sample.weight * qnrain;
             }
+            // A clear/echo interpolation can create a positive value below
+            // P3's source-level activity floor even though every endpoint is
+            // already normalized. Apply the same complete-tuple rule at this
+            // new raw-state boundary. ISHMAEL has no equivalent qsmall rule.
+            if matches!(first.microphysics_scheme_id, 50..=53)
+                && below_p3_qsmall_after_wrf_real_rounding(qrain_kgkg)
+            {
+                qrain_kgkg = 0.0;
+                qnrain_per_kg = 0.0;
+            }
             RawRainState::Available {
                 qrain_kgkg,
                 qnrain_per_kg,
@@ -1545,6 +1556,37 @@ pub fn blend_raw_property_cells(
         categories,
         rain,
     })
+}
+
+fn normalize_blended_p3_category(category: &mut RawP3Category) {
+    // WRF applies qsmall to default-REAL P3 state before reconstructing the
+    // PSD. Convex spatial/temporal blending introduces a new state that was
+    // not present at either file boundary, so normalize it as a complete P3
+    // tuple before nonlinear closure. Leaving number/rime/QZI active with a
+    // cleared mass would manufacture an internally inconsistent category.
+    if below_p3_qsmall_after_wrf_real_rounding(category.qice_kgkg) {
+        category.qice_kgkg = 0.0;
+        category.qnice_per_kg = 0.0;
+        category.qir_kgkg = 0.0;
+        category.qib_m3_per_kg = 0.0;
+        if let Some(qzi) = &mut category.qzi {
+            *qzi = 0.0;
+        }
+        return;
+    }
+
+    // P3 independently clears the rime mass/volume pair below qsmall while
+    // retaining an otherwise active total-ice category.
+    if below_p3_qsmall_after_wrf_real_rounding(category.qir_kgkg) {
+        category.qir_kgkg = 0.0;
+        category.qib_m3_per_kg = 0.0;
+    }
+}
+
+fn below_p3_qsmall_after_wrf_real_rounding(value: f64) -> bool {
+    // P3's source and PSD validator make this decision in WRF default REAL.
+    // Matching that rounding keeps the exact qsmall boundary active.
+    (value as f32) < WRF_P3_QSMALL_KGKG as f32
 }
 
 fn blend_ishmael_diagnostic(
@@ -3954,6 +3996,98 @@ mod tests {
             5.0e-5,
             1.0e-10,
         );
+    }
+
+    #[test]
+    fn p3_raw_blend_clears_reported_sub_qsmall_echo_tail_as_complete_tuple() {
+        let scene = read_property_scene(&p3_50_provider(50, 2, 1), 0).unwrap();
+        let echo = scene.raw_cell(1).unwrap();
+        let echo_mass = echo.categories()[0].mixing_ratio_kgkg();
+        let reported_tail = 7.072_708_808_391_012e-16;
+        let echo_weight = reported_tail / echo_mass;
+        assert_close(echo_weight * echo_mass, reported_tail, 1.0e-30);
+
+        let blended = blend_raw_property_cells(&[
+            WeightedRawPropertyCell::new(&scene, 0, 1.0 - echo_weight),
+            WeightedRawPropertyCell::new(&scene, 1, echo_weight),
+        ])
+        .unwrap();
+        let RawPropertyCategory::P3(raw_p3) = &blended.categories()[0] else {
+            panic!("expected raw P3 tuple")
+        };
+        assert_eq!(raw_p3.qice_kgkg, 0.0);
+        assert_eq!(raw_p3.qnice_per_kg, 0.0);
+        assert_eq!(raw_p3.qir_kgkg, 0.0);
+        assert_eq!(raw_p3.qib_m3_per_kg, 0.0);
+        assert!(
+            close_raw_property_cell(&blended, OrientationDefinition::SchemeDefault)
+                .unwrap()
+                .categories()
+                .is_empty()
+        );
+
+        let mut triple_moment_tail = RawP3Category {
+            category: P3Category::Category1,
+            qice_kgkg: reported_tail,
+            qnice_per_kg: 42.0,
+            qir_kgkg: reported_tail,
+            qib_m3_per_kg: 1.0e-18,
+            qzi: Some(3.0e-12),
+        };
+        normalize_blended_p3_category(&mut triple_moment_tail);
+        assert_eq!(triple_moment_tail.qzi, Some(0.0));
+        assert_eq!(triple_moment_tail.qnice_per_kg, 0.0);
+    }
+
+    #[test]
+    fn p3_raw_blend_keeps_wrf_real_qsmall_boundary_and_clears_only_tiny_rime() {
+        let scene = read_property_scene(&p3_50_provider(50, 2, 1), 0).unwrap();
+        let echo_mass = scene.raw_cell(1).unwrap().categories()[0].mixing_ratio_kgkg();
+        let qsmall = WRF_P3_QSMALL_KGKG;
+        let echo_weight = qsmall / echo_mass;
+        let blended = blend_raw_property_cells(&[
+            WeightedRawPropertyCell::new(&scene, 0, 1.0 - echo_weight),
+            WeightedRawPropertyCell::new(&scene, 1, echo_weight),
+        ])
+        .unwrap();
+        let RawPropertyCategory::P3(raw_p3) = &blended.categories()[0] else {
+            panic!("expected raw P3 tuple")
+        };
+        assert_eq!(raw_p3.qice_kgkg as f32, qsmall as f32);
+        assert!(raw_p3.qnice_per_kg > 0.0);
+        assert_eq!(raw_p3.qir_kgkg, 0.0);
+        assert_eq!(raw_p3.qib_m3_per_kg, 0.0);
+    }
+
+    #[test]
+    fn p3_raw_blend_clears_complete_sub_qsmall_rain_tuple() {
+        let qsmall = WRF_P3_QSMALL_KGKG;
+        let provider = p3_50_provider(50, 2, 1)
+            .field("QRAIN", vec![0.0, qsmall], "kg kg-1")
+            .field("QNRAIN", vec![0.0, 1.0e6], "# kg-1");
+        let scene = read_property_scene(&provider, 0).unwrap();
+        let blended = blend_raw_property_cells(&[
+            WeightedRawPropertyCell::new(&scene, 0, 0.5),
+            WeightedRawPropertyCell::new(&scene, 1, 0.5),
+        ])
+        .unwrap();
+        assert!(matches!(
+            blended.rain(),
+            RawRainState::Available {
+                qrain_kgkg: 0.0,
+                qnrain_per_kg: 0.0
+            }
+        ));
+
+        let boundary =
+            blend_raw_property_cells(&[WeightedRawPropertyCell::new(&scene, 1, 1.0)]).unwrap();
+        assert!(matches!(
+            boundary.rain(),
+            RawRainState::Available {
+                qrain_kgkg,
+                qnrain_per_kg
+            } if *qrain_kgkg as f32 == qsmall as f32 && *qnrain_per_kg > 0.0
+        ));
     }
 
     #[test]

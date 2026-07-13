@@ -1281,6 +1281,42 @@ mod tests {
     }
 
     #[test]
+    fn raw_state_linear_normalizes_reported_sub_qsmall_p3_echo_tail_to_clear() {
+        let clear_scene =
+            property_scene("qsmall-clear", 270.0, 0.0, 0.0, 0.0, 0.0, Some((0.0, 0.0)));
+        let echo_scene = property_scene(
+            "qsmall-echo",
+            270.0,
+            1.0e-4,
+            1.0e6,
+            4.0e-5,
+            1.0e-7,
+            Some((0.0, 0.0)),
+        );
+        let gate = endpoint_gate(270.0, 0.0, 10.0);
+        let clear = RawStateLinearEndpoint::new(&clear_scene, 0, &gate);
+        let echo = RawStateLinearEndpoint::new(&echo_scene, 0, &gate);
+        let reported_tail = 7.072_708_808_391_012e-16;
+        let echo_mass = echo_scene.raw_cell(0).unwrap().categories()[0].mixing_ratio_kgkg();
+        let alpha = reported_tail / echo_mass;
+
+        let interpolated = interpolate_raw_state_linear(Some(clear), Some(echo), alpha).unwrap();
+        assert_eq!(
+            interpolated.property_cell.categories()[0].mixing_ratio_kgkg(),
+            0.0
+        );
+        assert!(
+            close_raw_property_cell(
+                &interpolated.property_cell,
+                OrientationDefinition::SchemeDefault,
+            )
+            .unwrap()
+            .categories()
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn raw_state_linear_combines_full_spatial_stencils_before_temporal_blend() {
         let left_scene = two_cell_property_scene("left-spatial", [1.0e-4, 3.0e-4]);
         let right_scene = two_cell_property_scene("right-spatial", [5.0e-4, 9.0e-4]);
