@@ -4558,7 +4558,14 @@ mod tests {
         ) else {
             return;
         };
-        const CELL: usize = 5_779_317;
+        let cell = std::env::var("BOWECHO_P3_SUPPORT_CELL")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("BOWECHO_P3_SUPPORT_CELL is an integer")
+            })
+            .unwrap_or(5_779_317);
 
         let file = wrf_core::WrfFile::open(&wrf_path).expect("open WRF fixture");
         let scheme_id = file.global_attr_i32("MP_PHYSICS").expect("MP_PHYSICS");
@@ -4571,7 +4578,7 @@ mod tests {
         )
         .expect("read P3 scene");
         let table = P3OfficialTableV54::load_path(table_kind, table_path).expect("load P3 table");
-        let raw = scene.raw_cell(CELL).expect("read reported cell");
+        let raw = scene.raw_cell(cell).expect("read reported cell");
 
         for value in raw
             .categories()
@@ -4585,7 +4592,7 @@ mod tests {
                 p3_psd_input(scheme, value, raw.dry_air_density_kg_m3()).expect("map P3 input");
             let psd = P3Psd::reconstruct(input, &table, P3ReconstructionConfig::default())
                 .expect("reconstruct P3 PSD");
-            eprintln!("cell={CELL} category={:?} input={input:#?}", value.category);
+            eprintln!("cell={cell} category={:?} input={input:#?}", value.category);
             {
                 let minimum_density_kg_m3 = 1.5;
                 let minimum_diameter_m = 50e-6;
@@ -4664,7 +4671,7 @@ mod tests {
                 );
                 assert!(
                     omitted[2] < P3_MAXIMUM_OMITTED_RADAR_WEIGHT_FRACTION,
-                    "reported cell {CELL} mass-squared radar-weight omission {} must remain below {}",
+                    "reported cell {cell} mass-squared radar-weight omission {} must remain below {}",
                     omitted[2],
                     P3_MAXIMUM_OMITTED_RADAR_WEIGHT_FRACTION
                 );
