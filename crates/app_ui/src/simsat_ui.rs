@@ -3685,9 +3685,11 @@ mod tests {
 
     #[test]
     fn quick_modes_apply_reviewed_values_and_refuse_mislabeled_sensor_qa() {
-        let mut pane = SimSatPane::default();
-        pane.surface_postlight_toe = true;
-        pane.topdown_shadow_antialias = false;
+        let mut pane = SimSatPane {
+            surface_postlight_toe: true,
+            topdown_shadow_antialias: false,
+            ..SimSatPane::default()
+        };
         pane.apply_quick_mode(SimSatQuickMode::RecommendedDisplay)
             .unwrap();
         assert_eq!(
@@ -3781,13 +3783,15 @@ mod tests {
 
     #[test]
     fn v1_reviewed_display_state_migrates_without_resetting_unowned_choices() {
-        let mut legacy = SimSatPane::default();
-        legacy.product = SimSatProduct::Sandwich;
-        legacy.margin_frac = 0.25;
-        legacy.bluemarble_month = 7;
-        legacy.sun_override = true;
-        legacy.land_sza_max_gain = LEGACY_REVIEWED_SZA_MAX_GAIN;
-        legacy.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+        let legacy = SimSatPane {
+            product: SimSatProduct::Sandwich,
+            margin_frac: 0.25,
+            bluemarble_month: 7,
+            sun_override: true,
+            land_sza_max_gain: LEGACY_REVIEWED_SZA_MAX_GAIN,
+            fractional_cloud_mode: FractionalCloudMode::EffectiveOd,
+            ..SimSatPane::default()
+        };
         assert!(legacy.legacy_display_baseline_matches(false));
 
         let mut restored = SimSatPane::new(Some(&legacy_v1_saved_value(&legacy)));
@@ -3816,9 +3820,11 @@ mod tests {
 
     #[test]
     fn v1_custom_display_state_preserves_custom_science_controls() {
-        let mut legacy = SimSatPane::default();
-        legacy.land_sza_max_gain = 2.25;
-        legacy.fractional_cloud_mode = FractionalCloudMode::Deterministic8;
+        let legacy = SimSatPane {
+            land_sza_max_gain: 2.25,
+            fractional_cloud_mode: FractionalCloudMode::Deterministic8,
+            ..SimSatPane::default()
+        };
 
         let restored = SimSatPane::new(Some(&legacy_v1_saved_value(&legacy)));
         assert_eq!(restored.land_sza_max_gain, 2.25);
