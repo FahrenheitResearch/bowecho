@@ -614,6 +614,20 @@ impl<N, O> From<WorkerRequest<N, O>> for PendingRequest<N, O> {
     }
 }
 
+struct WorkerBatchScratch<N> {
+    nodes: Vec<N>,
+    spans: Vec<(usize, usize)>,
+}
+
+impl<N> WorkerBatchScratch<N> {
+    fn new(config: WrfTMatrixCudaBatchConfig) -> Self {
+        Self {
+            nodes: Vec::with_capacity(config.max_nodes),
+            spans: Vec::with_capacity(config.max_requests),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ServiceState {
     fallback: OnceLock<WrfTMatrixCudaFallbackReason>,
@@ -645,6 +659,7 @@ fn run_worker<N, O, B>(
     B: BatchBackend<N, O>,
 {
     let mut pending = VecDeque::new();
+    let mut scratch = WorkerBatchScratch::new(config);
     let mut shutdown = false;
     let mut batch_sequence = 0_u64;
 
@@ -708,9 +723,14 @@ fn run_worker<N, O, B>(
         }
 
         batch_sequence = batch_sequence.saturating_add(1);
-        if let Err(failure) =
-            process_one_batch(&mut pending, &mut backend, config, batch_sequence, &state)
-        {
+        if let Err(failure) = process_one_batch(
+            &mut pending,
+            &mut backend,
+            config,
+            batch_sequence,
+            &state,
+            &mut scratch,
+        ) {
             let reason = state.disable(failure);
             fail_pending(&mut pending, &reason);
         }
@@ -784,6 +804,7 @@ fn process_one_batch<N, O, B>(
     config: WrfTMatrixCudaBatchConfig,
     batch_sequence: u64,
     state: &ServiceState,
+    scratch: &mut WorkerBatchScratch<N>,
 ) -> Result<(), WrfTMatrixCudaFallbackReason>
 where
     N: Clone,
@@ -793,8 +814,10 @@ where
         .front()
         .expect("process_one_batch requires pending work")
         .role;
-    let mut batch_nodes = Vec::with_capacity(config.max_nodes);
-    let mut spans = Vec::with_capacity(config.max_requests);
+    scratch.nodes.clear();
+    scratch.spans.clear();
+    let batch_nodes = &mut scratch.nodes;
+    let spans = &mut scratch.spans;
 
     for (request_index, request) in pending.iter_mut().enumerate() {
         if request.role != role || spans.len() == config.max_requests {
@@ -819,17 +842,19 @@ where
     debug_assert!(!batch_nodes.is_empty());
     saturating_increment(&state.batches_submitted, 1);
     saturating_increment(&state.nodes_submitted, usize_to_u64(batch_nodes.len()));
-    let evaluated = catch_unwind(AssertUnwindSafe(|| backend.evaluate(role, &batch_nodes)))
-        .map_err(|_| WrfTMatrixCudaFallbackReason {
-            failed_batch_sequence: Some(batch_sequence),
-            discarded_node_count: batch_nodes.len(),
-            detail: "CUDA backend panicked while executing the batch".to_owned(),
-        })?
-        .map_err(|detail| WrfTMatrixCudaFallbackReason {
-            failed_batch_sequence: Some(batch_sequence),
-            discarded_node_count: batch_nodes.len(),
-            detail,
-        })?;
+    let evaluated = catch_unwind(AssertUnwindSafe(|| {
+        backend.evaluate(role, batch_nodes.as_slice())
+    }))
+    .map_err(|_| WrfTMatrixCudaFallbackReason {
+        failed_batch_sequence: Some(batch_sequence),
+        discarded_node_count: batch_nodes.len(),
+        detail: "CUDA backend panicked while executing the batch".to_owned(),
+    })?
+    .map_err(|detail| WrfTMatrixCudaFallbackReason {
+        failed_batch_sequence: Some(batch_sequence),
+        discarded_node_count: batch_nodes.len(),
+        detail,
+    })?;
     if evaluated.len() != batch_nodes.len() {
         return Err(WrfTMatrixCudaFallbackReason {
             failed_batch_sequence: Some(batch_sequence),
@@ -850,7 +875,7 @@ where
     }
 
     let mut outputs = evaluated.into_iter();
-    for (request_index, count) in spans {
+    for &(request_index, count) in spans.iter() {
         let request = pending
             .get_mut(request_index)
             .expect("batch span points to a stable pending request");
@@ -1018,8 +1043,9 @@ mod tests {
         let (second, second_reply) = pending(WrfTMatrixCudaTableRole::DryOblate, vec![9, 4, 7]);
         let (other_role, other_reply) = pending(WrfTMatrixCudaTableRole::DryProlate, vec![100]);
         let mut queue = VecDeque::from([first, second, other_role]);
+        let mut scratch = WorkerBatchScratch::new(config);
 
-        process_one_batch(&mut queue, &mut backend, config, 1, &state).unwrap();
+        process_one_batch(&mut queue, &mut backend, config, 1, &state, &mut scratch).unwrap();
 
         assert_eq!(first_reply.recv().unwrap().unwrap(), vec![2, 4]);
         assert_eq!(second_reply.recv().unwrap().unwrap(), vec![18, 8, 14]);
@@ -1213,12 +1239,17 @@ mod tests {
         let input = (0..10).collect::<Vec<_>>();
         let (request, reply) = pending(WrfTMatrixCudaTableRole::DryProlate, input.clone());
         let mut queue = VecDeque::from([request]);
+        let mut scratch = WorkerBatchScratch::new(config);
+        let node_capacity = scratch.nodes.capacity();
+        let span_capacity = scratch.spans.capacity();
 
-        process_one_batch(&mut queue, &mut backend, config, 1, &state).unwrap();
+        process_one_batch(&mut queue, &mut backend, config, 1, &state, &mut scratch).unwrap();
         assert!(reply.try_recv().is_err());
-        process_one_batch(&mut queue, &mut backend, config, 2, &state).unwrap();
+        process_one_batch(&mut queue, &mut backend, config, 2, &state, &mut scratch).unwrap();
         assert!(reply.try_recv().is_err());
-        process_one_batch(&mut queue, &mut backend, config, 3, &state).unwrap();
+        process_one_batch(&mut queue, &mut backend, config, 3, &state, &mut scratch).unwrap();
+        assert_eq!(scratch.nodes.capacity(), node_capacity);
+        assert_eq!(scratch.spans.capacity(), span_capacity);
 
         assert_eq!(
             reply.recv().unwrap().unwrap(),
@@ -1251,8 +1282,10 @@ mod tests {
         let (first, first_reply) = pending(WrfTMatrixCudaTableRole::DryOblate, vec![1, 2]);
         let (second, second_reply) = pending(WrfTMatrixCudaTableRole::DryOblate, vec![3]);
         let mut queue = VecDeque::from([first, second]);
+        let mut scratch = WorkerBatchScratch::new(config);
 
-        let failure = process_one_batch(&mut queue, &mut backend, config, 7, &state).unwrap_err();
+        let failure = process_one_batch(&mut queue, &mut backend, config, 7, &state, &mut scratch)
+            .unwrap_err();
         let stored = state.disable(failure);
         fail_pending(&mut queue, &stored);
         let first_error = first_reply.recv().unwrap().unwrap_err();
@@ -1314,8 +1347,10 @@ mod tests {
         let config = WrfTMatrixCudaBatchConfig::new(4, 4).unwrap();
         let (request, reply) = pending(WrfTMatrixCudaTableRole::DryOblate, vec![7, 8]);
         let mut queue = VecDeque::from([request]);
+        let mut scratch = WorkerBatchScratch::new(config);
 
-        let failure = process_one_batch(&mut queue, &mut backend, config, 1, &state).unwrap_err();
+        let failure = process_one_batch(&mut queue, &mut backend, config, 1, &state, &mut scratch)
+            .unwrap_err();
 
         assert_eq!(failure, state.fallback().unwrap());
         assert_eq!(queue[0].outputs, Vec::<u32>::new());
