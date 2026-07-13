@@ -30,7 +30,7 @@ use thiserror::Error;
 
 use crate::{P3Category, Sha256Digest};
 
-pub const P3_PSD_REVISION: &str = "wrf-p3-v4.5.2-table-v5.4-psd-v2";
+pub const P3_PSD_REVISION: &str = "wrf-p3-v4.5.2-table-v5.4-psd-v3";
 pub const P3_WRF_SOURCE_COMMIT: &str = "f52c197ed39d12e087d02c50f412d90d418f6186";
 pub const P3_WRF_RELEASE: &str = "v4.7.1";
 pub const P3_MODULE_VERSION: &str = "4.5.2";
@@ -629,6 +629,21 @@ impl P3PiecewiseParticleLaw {
             };
         positive("P3 particle mass", mass_kg)?;
         positive("P3 particle projected area", projected_area_m2)?;
+        let projected_area_consistency = if region == P3ParticleRegion::PartiallyRimed
+            && projected_area_m2 > PI / 4.0 * maximum_dimension_m.powi(2) * (1.0 + 1.0e-10)
+        {
+            // The pinned generator derives the partially-rimed breakpoint
+            // from the previous fixed-point coefficient, then retains the
+            // updated coefficient when its one-percent convergence test
+            // exits. Near that stale breakpoint the native interpolation can
+            // therefore report A > pi*Dmax^2/4. Preserve that raw source value
+            // and identify its provenance explicitly so a downstream shape
+            // policy can close it without granting arbitrary overshoots the
+            // same authority.
+            P3ProjectedAreaConsistency::PinnedFinalCoefficientTransitionOvershoot
+        } else {
+            P3ProjectedAreaConsistency::GeometricallyBounded
+        };
         Ok(P3ParticleGeometry {
             maximum_dimension_m,
             mass_kg,
@@ -636,6 +651,7 @@ impl P3PiecewiseParticleLaw {
             effective_spherical_density_kg_m3: mass_kg / (PI / 6.0 * maximum_dimension_m.powi(3)),
             region,
             shape_authority: P3ShapeAuthority::MaximumDimensionAndProjectedAreaOnly,
+            projected_area_consistency,
         })
     }
 }
@@ -657,6 +673,22 @@ pub enum P3ShapeAuthority {
     MaximumDimensionAndProjectedAreaOnly,
 }
 
+/// Geometric consistency state for a native P3 projected-area value.
+///
+/// The pinned source deliberately stops its graupel-density fixed point at a
+/// one-percent coefficient residual. It computes the partially-rimed
+/// breakpoint before the final coefficient update, so a narrow transition
+/// interval can retain an area larger than the circle defined by P3's own
+/// maximum dimension. This enum distinguishes that known, pinned-source
+/// artifact from an arbitrary invalid mass/area tuple.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum P3ProjectedAreaConsistency {
+    #[default]
+    GeometricallyBounded,
+    PinnedFinalCoefficientTransitionOvershoot,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct P3ParticleGeometry {
     pub maximum_dimension_m: f64,
@@ -665,6 +697,8 @@ pub struct P3ParticleGeometry {
     pub effective_spherical_density_kg_m3: f64,
     pub region: P3ParticleRegion,
     pub shape_authority: P3ShapeAuthority,
+    #[serde(default)]
+    pub(crate) projected_area_consistency: P3ProjectedAreaConsistency,
 }
 
 impl P3ParticleGeometry {
@@ -678,6 +712,13 @@ impl P3ParticleGeometry {
             self.region,
             P3ParticleRegion::SmallDenseSphere | P3ParticleRegion::FullyRimedSphere
         )
+    }
+
+    /// Whether the raw pinned area is geometrically bounded by `Dmax` or is
+    /// the explicitly identified final-coefficient transition artifact.
+    #[must_use]
+    pub const fn projected_area_consistency(self) -> P3ProjectedAreaConsistency {
+        self.projected_area_consistency
     }
 }
 

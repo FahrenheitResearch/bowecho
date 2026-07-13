@@ -18,8 +18,8 @@ use thiserror::Error;
 
 use crate::{
     AdditiveScattering, OutputError, P3_SOLID_ICE_DENSITY_KG_M3, P3ParticleRegion,
-    P3PopulationMoments, P3Psd, P3PsdError, P3QuadratureAudit, P3QuadratureConfig,
-    P3QuadratureNode, PsdParticleDomain, PsdSpheroidHabit,
+    P3PopulationMoments, P3ProjectedAreaConsistency, P3Psd, P3PsdError, P3QuadratureAudit,
+    P3QuadratureConfig, P3QuadratureNode, PsdParticleDomain, PsdSpheroidHabit,
 };
 
 pub const P3_SPHERICAL_INTEGRATION_REVISION: &str =
@@ -27,15 +27,9 @@ pub const P3_SPHERICAL_INTEGRATION_REVISION: &str =
 pub const P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION: &str =
     "wrf-p3-v5.4-projected-area-equivalent-oblate-gaussian20-research-v4";
 pub const P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION: &str =
-    "wrf-p3-v5.4-area-spheroid-solid-ice-constrained-gaussian20-research-v2";
+    "wrf-p3-v5.4-area-spheroid-fixed-point-area-closure-gaussian20-research-v3";
 pub const P3_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION: &str =
     "wrf-p3-v5.4-exact-small-dense-sphere-rayleigh-table-floor-bridge-v1";
-/// The source P3 rime-density fixed point exits below one-percent relative
-/// change. A small area overshoot created by that final coefficient update is
-/// eligible for the explicit prolate side of the equivalent-spheroid policy;
-/// larger inconsistencies remain shape omissions.
-pub const P3_SOURCE_AREA_OVERSHOOT_RELATIVE_LIMIT: f64 = 0.01;
-
 /// Native diameter grid used by the pinned WRF source's P3-module-v4.5.2,
 /// lookup-generator-v5.4 fall-speed and reflectivity moment integrations.
 ///
@@ -104,15 +98,16 @@ pub enum P3TMatrixShapePolicy {
     /// external assumption, not a P3-predicted canting distribution.
     ProjectedAreaEquivalentOblateGaussian20ResearchV1,
     /// Research-only projected-area-equivalent spheroid. The usual P3 area
-    /// maps to an oblate with horizontal major diameter Dmax. A source-law
-    /// area up to one percent above the Dmax circle, caused by the pinned
-    /// rime-density fixed-point tolerance, maps continuously to a prolate that
-    /// preserves source area and mass without clamping either value. Where the
+    /// maps to an oblate with horizontal major diameter Dmax. A typed native
+    /// partially-rimed transition artifact caused by the pinned rime-density
+    /// fixed point is closed to the Dmax sphere for scattering while its raw
+    /// source area remains recorded and audited. This preserves mass and P3's
+    /// actual maximum dimension instead of inventing a larger prolate axis.
+    /// Any unmarked area above the Dmax circle remains a shape omission. Where the
     /// empirical P3 area-law transition would otherwise imply a homogeneous
     /// density above P3's own 900 kg/m3 solid-ice density, the mapping instead
     /// preserves particle mass at that physical density bound and retains the
-    /// native normalized area as its aspect-ratio proxy. Larger source-area
-    /// overshoots remain shape omissions.
+    /// native normalized area as its aspect-ratio proxy.
     ProjectedAreaEquivalentSpheroidGaussian20ResearchV1,
 }
 
@@ -280,6 +275,9 @@ pub struct P3TMatrixIntegrationAudit {
     pub outside_table_nodes: usize,
     pub projected_area_equivalent_nodes: usize,
     pub solid_ice_constrained_nodes: usize,
+    pub fixed_point_area_closure_nodes: usize,
+    pub maximum_fixed_point_raw_area_ratio: Option<f64>,
+    pub fixed_point_area_closure_radar_weight_fraction: f64,
     pub small_sphere_rayleigh_bridge_nodes: usize,
     pub source_domain: P3TMatrixSourceDomainAudit,
     pub in_source_shape_table_omission: P3TMatrixInSourceOmissionAudit,
@@ -308,12 +306,14 @@ pub enum P3TMatrixIntegrationError<E: Error + 'static> {
     #[error("construct exact P3 quadrature: {0}")]
     Psd(#[source] P3PsdError),
     #[error(
-        "P3 cannot be represented inside the inferred WRF source integration domain by the existing spheroidal tables without an invented shape: in-source omitted number={number_fraction}, mass={mass_fraction}, equivalent-ice-volume-squared radar weight={radar_weight_fraction}; in-source limits are {maximum_number}, {maximum_mass}, {maximum_radar_weight}"
+        "P3 cannot be represented inside the inferred WRF source integration domain by the existing spheroidal tables without an invented shape: in-source omitted number={number_fraction}, mass={mass_fraction}, equivalent-ice-volume-squared radar weight={radar_weight_fraction} (shape={shape_radar_weight_fraction}, table={table_radar_weight_fraction}); in-source limits are {maximum_number}, {maximum_mass}, {maximum_radar_weight}"
     )]
     ShapeOrTableOmission {
         number_fraction: f64,
         mass_fraction: f64,
         radar_weight_fraction: f64,
+        shape_radar_weight_fraction: f64,
+        table_radar_weight_fraction: f64,
         maximum_number: f64,
         maximum_mass: f64,
         maximum_radar_weight: f64,
@@ -346,6 +346,8 @@ pub struct P3TMatrixParticleNode {
     shape_policy: P3TMatrixShapePolicy,
     scattering_route: P3ParticleScatteringRoute,
     solid_ice_constrained: bool,
+    fixed_point_area_closed: bool,
+    source_projected_area_ratio: f64,
 }
 
 impl P3TMatrixParticleNode {
@@ -387,6 +389,16 @@ impl P3TMatrixParticleNode {
     #[must_use]
     pub const fn solid_ice_constrained(self) -> bool {
         self.solid_ice_constrained
+    }
+
+    #[must_use]
+    pub const fn fixed_point_area_closed(self) -> bool {
+        self.fixed_point_area_closed
+    }
+
+    #[must_use]
+    pub const fn source_projected_area_ratio(self) -> f64 {
+        self.source_projected_area_ratio
     }
 }
 
@@ -463,6 +475,8 @@ where
     let mut supported = Vec::new();
     let mut projected_area_equivalent_nodes = 0;
     let mut solid_ice_constrained_nodes = 0;
+    let mut fixed_point_area_closure = OmittedWeights::default();
+    let mut maximum_fixed_point_raw_area_ratio: Option<f64> = None;
     let mut small_sphere_rayleigh_bridge_nodes = 0;
     for (index, node) in quadrature.nodes.iter().enumerate() {
         let mut table_node = match config.shape_policy {
@@ -485,6 +499,8 @@ where
                     shape_policy: config.shape_policy,
                     scattering_route: P3ParticleScatteringRoute::TMatrixTable,
                     solid_ice_constrained: false,
+                    fixed_point_area_closed: false,
+                    source_projected_area_ratio: 1.0,
                 }
             }
             P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1 => {
@@ -510,6 +526,15 @@ where
             }
         };
         solid_ice_constrained_nodes += usize::from(table_node.solid_ice_constrained);
+        if table_node.fixed_point_area_closed {
+            fixed_point_area_closure.add(node);
+            maximum_fixed_point_raw_area_ratio = Some(
+                maximum_fixed_point_raw_area_ratio
+                    .map_or(table_node.source_projected_area_ratio, |maximum| {
+                        maximum.max(table_node.source_projected_area_ratio)
+                    }),
+            );
+        }
         if small_sphere_bridge_applies(config, *node, table_node, table_support) {
             table_node.scattering_route =
                 P3ParticleScatteringRoute::TableFloorAnchoredSmallDenseSphereRayleighV1;
@@ -555,6 +580,8 @@ where
             number_fraction: total_fractions[0],
             mass_fraction: total_fractions[1],
             radar_weight_fraction: total_fractions[2],
+            shape_radar_weight_fraction: non_spherical_fractions[2],
+            table_radar_weight_fraction: outside_table_fractions[2],
             maximum_number: config.maximum_omitted_number_fraction,
             maximum_mass: config.maximum_omitted_mass_fraction,
             maximum_radar_weight: config.maximum_omitted_radar_weight_fraction,
@@ -594,6 +621,10 @@ where
             outside_table_nodes: outside_table.nodes,
             projected_area_equivalent_nodes,
             solid_ice_constrained_nodes,
+            fixed_point_area_closure_nodes: fixed_point_area_closure.nodes,
+            maximum_fixed_point_raw_area_ratio,
+            fixed_point_area_closure_radar_weight_fraction: fixed_point_area_closure.radar_weight
+                / source_represented.mass_squared_radar_weight_kg2_m3,
             small_sphere_rayleigh_bridge_nodes,
             source_domain: P3TMatrixSourceDomainAudit {
                 provenance: P3_TMATRIX_SOURCE_DOMAIN_PROVENANCE,
@@ -679,7 +710,7 @@ fn projected_area_equivalent_spheroid(
 fn projected_area_equivalent_spheroid_impl(
     node: P3QuadratureNode,
     shape_policy: P3TMatrixShapePolicy,
-    permit_source_tolerance_prolate: bool,
+    permit_fixed_point_area_closure: bool,
 ) -> Result<P3TMatrixParticleNode, &'static str> {
     let maximum_dimension = node.particle.maximum_dimension_m;
     let raw_ratio = 4.0 * node.particle.projected_area_m2 / (PI * maximum_dimension.powi(2));
@@ -687,28 +718,42 @@ fn projected_area_equivalent_spheroid_impl(
         return Err("4A/(pi Dmax^2) is nonpositive or nonfinite");
     }
     let roundoff_limit = 1.0 + 1.0e-10;
-    let source_tolerance_limit = 1.0 + P3_SOURCE_AREA_OVERSHOOT_RELATIVE_LIMIT;
-    if (!permit_source_tolerance_prolate && raw_ratio > roundoff_limit)
-        || raw_ratio > source_tolerance_limit
-    {
+    // P3's one-percent convergence test applies to the graupel coefficient,
+    // while its last partially-rimed breakpoint is still based on the prior
+    // coefficient. The resulting source artifact is not bounded to one
+    // percent in area (the error is amplified at low rime fraction). Only the
+    // typed geometry produced by that pinned source sequence may use this
+    // closure. A prolate that preserved the impossible raw area would require
+    // a major axis larger than P3's declared Dmax, so retain the raw area for
+    // audit and use the mass-preserving Dmax sphere for scattering.
+    let fixed_point_area_closed = permit_fixed_point_area_closure
+        && raw_ratio > roundoff_limit
+        && node.particle.region == P3ParticleRegion::PartiallyRimed
+        && node.particle.projected_area_consistency
+            == P3ProjectedAreaConsistency::PinnedFinalCoefficientTransitionOvershoot;
+    if raw_ratio > roundoff_limit && !fixed_point_area_closed {
         return Err("4A/(pi Dmax^2) exceeds the selected equivalent-spheroid authority");
     }
     let roundoff_sphere = raw_ratio > 1.0 && raw_ratio <= roundoff_limit;
-    let volume_ratio = if roundoff_sphere { 1.0 } else { raw_ratio };
-    let (habit, axis_ratio) = if roundoff_sphere || (raw_ratio - 1.0).abs() <= 1.0e-10 {
-        (PsdSpheroidHabit::Spherical, 1.0)
-    } else if raw_ratio < 1.0 {
-        (PsdSpheroidHabit::Oblate, raw_ratio)
+    let geometry_ratio = if roundoff_sphere || fixed_point_area_closed {
+        1.0
     } else {
-        // Preserve the source projected area exactly: horizontal diameter is
-        // Dmax and vertical diameter is raw_ratio*Dmax, so the prolate
-        // minor/major ratio is its reciprocal. This is a named research
-        // mapping, not a claim that P3 predicts a prolate habit.
-        (PsdSpheroidHabit::Prolate, raw_ratio.recip())
+        raw_ratio
     };
-    let area_equivalent_diameter = maximum_dimension * volume_ratio.cbrt();
+    let (habit, axis_ratio) =
+        if roundoff_sphere || fixed_point_area_closed || (raw_ratio - 1.0).abs() <= 1.0e-10 {
+            (PsdSpheroidHabit::Spherical, 1.0)
+        } else {
+            (PsdSpheroidHabit::Oblate, raw_ratio)
+        };
+    let area_equivalent_diameter = maximum_dimension * geometry_ratio.cbrt();
     let area_equivalent_volume = PI / 6.0 * area_equivalent_diameter.powi(3);
     let area_equivalent_density = node.particle.mass_kg / area_equivalent_volume;
+    if fixed_point_area_closed
+        && area_equivalent_density > P3_SOLID_ICE_DENSITY_KG_M3 * (1.0 + 1.0e-10)
+    {
+        return Err("fixed-point area closure exceeds P3 solid-ice density");
+    }
     // P3's empirical unrimed area law changes at the exact small-sphere
     // boundary. Treating that projected-area fill factor as the volume of a
     // homogeneous spheroid can then demand more than P3's own solid-ice
@@ -746,6 +791,8 @@ fn projected_area_equivalent_spheroid_impl(
         shape_policy,
         scattering_route: P3ParticleScatteringRoute::TMatrixTable,
         solid_ice_constrained,
+        fixed_point_area_closed,
+        source_projected_area_ratio: raw_ratio,
     })
 }
 
@@ -793,7 +840,9 @@ fn contains(range: [f64; 2], value: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{P3ParticleGeometry, P3ParticleRegion, P3ShapeAuthority};
+    use crate::{
+        P3ParticleGeometry, P3ParticleRegion, P3ProjectedAreaConsistency, P3ShapeAuthority,
+    };
 
     fn node(maximum_dimension_m: f64, mass_kg: f64, number_m3: f64) -> P3QuadratureNode {
         P3QuadratureNode {
@@ -807,6 +856,7 @@ mod tests {
                     / (PI / 6.0 * maximum_dimension_m.powi(3)),
                 region: P3ParticleRegion::DenseUnrimed,
                 shape_authority: P3ShapeAuthority::MaximumDimensionAndProjectedAreaOnly,
+                projected_area_consistency: P3ProjectedAreaConsistency::GeometricallyBounded,
             },
         }
     }
@@ -874,23 +924,74 @@ mod tests {
     }
 
     #[test]
-    fn projected_area_above_circumscribing_circle_is_not_clamped() {
+    fn unmarked_projected_area_above_circumscribing_circle_is_rejected() {
         let mut invalid = node(0.01, 1.0e-9, 1.0);
         invalid.particle.projected_area_m2 *= 1.001;
         assert!(projected_area_equivalent_oblate(invalid).is_err());
+        assert!(projected_area_equivalent_spheroid(invalid).is_err());
+    }
 
-        let mapped = projected_area_equivalent_spheroid(invalid).unwrap();
-        assert_eq!(mapped.habit(), PsdSpheroidHabit::Prolate);
-        assert!((mapped.minor_to_major_axis_ratio() - 1.0 / 1.001).abs() < 1.0e-14);
-        assert!((mapped.equivolume_diameter_m() - 0.01 * 1.001_f64.cbrt()).abs() < 1.0e-14);
+    #[test]
+    fn pinned_fixed_point_area_artifact_is_mass_and_dmax_preserving_sphere() {
+        let law = crate::P3PiecewiseParticleLaw::reconstruct(0.05, 400.0).unwrap();
+        let diameter = law.graupel_to_partially_rimed_m * (1.0 + 1.0e-10);
+        let particle = law.particle(diameter).unwrap();
+        let raw_ratio = 4.0 * particle.projected_area_m2 / (PI * diameter.powi(2));
+        assert_eq!(particle.region, P3ParticleRegion::PartiallyRimed);
+        assert_eq!(
+            particle.projected_area_consistency,
+            P3ProjectedAreaConsistency::PinnedFinalCoefficientTransitionOvershoot
+        );
+        assert!((raw_ratio - 1.129_021_578_122_912_7).abs() < 1.0e-10);
+
+        let source = P3QuadratureNode {
+            maximum_dimension_m: diameter,
+            number_concentration_m3: 1.0,
+            particle,
+        };
+        assert!(projected_area_equivalent_oblate(source).is_err());
+        let mapped = projected_area_equivalent_spheroid(source).unwrap();
+        assert_eq!(mapped.habit(), PsdSpheroidHabit::Spherical);
+        assert_eq!(
+            mapped.minor_to_major_axis_ratio().to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(mapped.equivolume_diameter_m().to_bits(), diameter.to_bits());
+        assert!(mapped.fixed_point_area_closed());
+        assert!((mapped.source_projected_area_ratio() - raw_ratio).abs() < 1.0e-14);
+        assert!((mapped.bulk_density_kg_m3() - 310.780_824_238_289_7).abs() < 1.0e-6);
+        assert!(mapped.bulk_density_kg_m3() <= P3_SOLID_ICE_DENSITY_KG_M3);
+        let reconstructed_mass =
+            mapped.bulk_density_kg_m3() * PI / 6.0 * mapped.equivolume_diameter_m().powi(3);
+        assert!((reconstructed_mass - particle.mass_kg).abs() / particle.mass_kg < 1.0e-12);
         assert_eq!(
             mapped.source().particle.projected_area_m2,
-            invalid.particle.projected_area_m2
+            particle.projected_area_m2
         );
+    }
 
-        let mut excessive = invalid;
-        excessive.particle.projected_area_m2 = PI / 4.0 * 0.01_f64.powi(2) * 1.011;
-        assert!(projected_area_equivalent_spheroid(excessive).is_err());
+    #[test]
+    fn nominal_partially_rimed_area_remains_oblate_and_unchanged() {
+        let law = crate::P3PiecewiseParticleLaw::reconstruct(0.5, 400.0).unwrap();
+        let diameter = law.graupel_to_partially_rimed_m * 10.0;
+        let particle = law.particle(diameter).unwrap();
+        let raw_ratio = 4.0 * particle.projected_area_m2 / (PI * diameter.powi(2));
+        assert_eq!(particle.region, P3ParticleRegion::PartiallyRimed);
+        assert_eq!(
+            particle.projected_area_consistency,
+            P3ProjectedAreaConsistency::GeometricallyBounded
+        );
+        assert!(raw_ratio < 1.0);
+        let mapped = projected_area_equivalent_spheroid(P3QuadratureNode {
+            maximum_dimension_m: diameter,
+            number_concentration_m3: 1.0,
+            particle,
+        })
+        .unwrap();
+        assert_eq!(mapped.habit(), PsdSpheroidHabit::Oblate);
+        assert!(!mapped.fixed_point_area_closed());
+        assert!((mapped.minor_to_major_axis_ratio() - raw_ratio).abs() < 1.0e-14);
+        assert!((mapped.equivolume_diameter_m() - diameter * raw_ratio.cbrt()).abs() < 1.0e-14);
     }
 
     #[test]

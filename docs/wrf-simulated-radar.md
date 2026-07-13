@@ -521,10 +521,17 @@ derive `Deq = (6m / (pi * 900))^(1/3)`, and retain
 `4A / (pi * Dmax^2)` as the aspect-ratio proxy. This declared
 solid-ice-constrained mapping is audited separately; it is not a clamp to a
 table coordinate and does not claim to preserve absolute projected area in
-that branch. When the pinned rime-density fixed-point update leaves projected
-area up to one percent above the Dmax circle, the mapping still preserves that
-source area and mass with a continuous prolate equivalent. Larger
-inconsistencies remain shape omissions.
+that branch. The pinned rime-density fixed point tests a one-percent
+*coefficient* residual, but computes the partially-rimed breakpoint before its
+final coefficient update. Near that stale breakpoint the native area
+interpolation can therefore report `A > pi Dmax^2 / 4`; the coefficient
+tolerance is not a one-percent area bound. BowEcho preserves that raw source
+value and marks only this typed partially-rimed transition artifact. For
+scattering it is closed to the true `Dmax` sphere, with `Deq = Dmax` and
+`rho = 6m / (pi Dmax^3)`, preserving mass and maximum dimension without
+inventing a prolate axis larger than P3's `Dmax`. Closure count, maximum raw
+area ratio, and mass-squared radar-weight fraction are audited. Any unmarked
+area above the `Dmax` circle remains a shape omission.
 
 One separately versioned route covers only P3's exact 900 kg m^-3 small dense
 spheres whose diameter is below the dry table's 50 micrometre lower edge. It

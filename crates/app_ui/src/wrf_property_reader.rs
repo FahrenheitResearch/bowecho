@@ -43,9 +43,19 @@ const WRF_KAPPA: f64 = 0.285_714_285_7;
 const DRY_AIR_GAS_CONSTANT_J_KG_K: f64 = 287.05;
 const WATER_VAPOR_GAS_CONSTANT_J_KG_K: f64 = 461.5;
 const WRF_FILL_MAGNITUDE: f64 = 1.0e30;
+// WRF dynamics can leave small negative upper-level QVAPOR undershoots.
+// Thermodynamic paths already require physical nonnegative vapor, so clamp a
+// bounded residue (at most 0.01 g/kg) to dry air and reject anything larger.
+const WRF_NEGATIVE_WATER_VAPOR_RESIDUE_LIMIT_KGKG: f64 = 1.0e-5_f32 as f64;
 // WRF P3's source-level hydrometeor activity threshold (`qsmall`). Keep this
 // distinct from ISHMAEL, whose source code does not establish the same floor.
 const WRF_P3_QSMALL_KGKG: f64 = 1.0e-14_f32 as f64;
+// WRF output can retain sparse default-REAL transport undershoots at lateral
+// boundaries even though hydrometeor mass is physically nonnegative. Keep the
+// cleanup band separate from qsmall: values inside this scientifically
+// negligible absolute band become inactive zero, while a larger negative mass
+// remains a typed file error. 1e-10 kg/kg is 0.1 microgram per kilogram.
+const WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG: f64 = 1.0e-10_f32 as f64;
 const WRF_P3_NSMALL_PER_KG: f64 = 1.0e-16;
 const WRF_P3_RIME_VOLUME_MIN_M3_PER_KG: f32 = 1.0e-15_f32;
 const WRF_P3_RIME_DENSITY_MIN_KG_M3: f32 = 50.0;
@@ -2306,7 +2316,11 @@ fn read_mass_field<P: PropertyFieldProvider + ?Sized>(
     let mut indices = Vec::new();
     let mut values = Vec::new();
     let p3_qsmall = matches!(category, WrfPropertyCategory::P3(_));
-    let negative_limit = if p3_qsmall { -WRF_P3_QSMALL_KGKG } else { 0.0 };
+    let negative_limit = if p3_qsmall {
+        -WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG
+    } else {
+        0.0
+    };
     for (cell_index, value) in normalized.values.iter().copied().enumerate() {
         if is_missing(value) {
             return Err(WrfPropertyReadError::MissingMassValue {
@@ -2389,7 +2403,7 @@ fn read_p3_rime_mass_field<P: PropertyFieldProvider + ?Sized>(
                 cell_index: position,
             });
         }
-        if source_value < -WRF_P3_QSMALL_KGKG {
+        if source_value < -WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG {
             return Err(WrfPropertyReadError::NegativeMassValue {
                 field: spec.name,
                 cell_index: position,
@@ -2397,7 +2411,8 @@ fn read_p3_rime_mass_field<P: PropertyFieldProvider + ?Sized>(
             });
         }
         // P3's rime-consistency path clears qirim below qsmall. Preserve the
-        // reader's fail-closed policy outside the source-level residue band.
+        // reader's fail-closed policy outside the bounded transport-residue
+        // band declared above.
         let value = if source_value < WRF_P3_QSMALL_KGKG {
             0.0
         } else {
@@ -2525,12 +2540,16 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
                 provenance,
             );
         }
-        // P3's `get_rain_dsd2` clears the complete rain tuple below qsmall.
-        // ISHMAEL retains the reader's independent exact-zero behavior.
-        if p3_rain && value < WRF_P3_QSMALL_KGKG {
-            continue;
-        }
-        if value < 0.0 {
+        // P3's `get_rain_dsd2` clears the complete rain tuple below qsmall,
+        // but only after the same bounded negative-residue check used by its
+        // ice masses. ISHMAEL retains exact-negative validation.
+        if value
+            < if p3_rain {
+                -WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG
+            } else {
+                0.0
+            }
+        {
             return (
                 SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
                     field: QRAIN_FIELD.name,
@@ -2538,6 +2557,9 @@ fn read_rain<P: PropertyFieldProvider + ?Sized>(
                 }),
                 provenance,
             );
+        }
+        if p3_rain && value < WRF_P3_QSMALL_KGKG {
+            continue;
         }
         if value > 0.0 {
             let compact = match narrow_f32(QRAIN_FIELD.name, cell_index, value) {
@@ -2679,13 +2701,14 @@ fn read_environment<P: PropertyFieldProvider + ?Sized>(
     for cell_index in 0..cell_count {
         let pressure = f64::from(air_density_kg_m3[cell_index]);
         let temperature = f64::from(temperature_k[cell_index]);
-        let qv = f64::from(water_vapor[cell_index]);
-        if !qv.is_finite() || qv < 0.0 {
+        let source_qv = f64::from(water_vapor[cell_index]);
+        if !source_qv.is_finite() || source_qv < -WRF_NEGATIVE_WATER_VAPOR_RESIDUE_LIMIT_KGKG {
             return Err(WrfPropertyReadError::InvalidEnvironment {
                 cell_index,
-                reason: "QVAPOR must be finite and nonnegative",
+                reason: "QVAPOR must be finite and above the bounded negative-residue limit",
             });
         }
+        let qv = source_qv.max(0.0);
         // WRF QVAPOR is water-vapor mixing ratio per kilogram of dry air.
         // The ideal-gas mixture therefore gives p = rho_d * (Rd + qv*Rv) * T.
         let dry_density = pressure
@@ -3213,6 +3236,43 @@ mod tests {
     }
 
     #[test]
+    fn bounded_negative_wrf_qvapor_is_dry_air_and_larger_negative_fails() {
+        let provider = TinyProvider::new(50, 2)
+            .field("QICE", vec![0.0; 2], "kg kg-1")
+            .environment(280.0)
+            .field(
+                "QVAPOR",
+                vec![
+                    -1.469_712_515_245_191_8e-6,
+                    -WRF_NEGATIVE_WATER_VAPOR_RESIDUE_LIMIT_KGKG,
+                ],
+                "kg kg-1",
+            );
+        let scene = read_property_scene(&provider, 0).unwrap();
+        let expected_dry = 100_000.0 / (280.0 * DRY_AIR_GAS_CONSTANT_J_KG_K);
+        for cell_index in 0..2 {
+            let raw = scene.raw_cell(cell_index).unwrap();
+            assert_close(raw.dry_air_density_kg_m3(), expected_dry, 2.0e-6);
+            assert_close(raw.environment().air_density_kg_m3(), expected_dry, 2.0e-6);
+        }
+
+        let first_rejected_negative = -f64::from(f32::from_bits(
+            (WRF_NEGATIVE_WATER_VAPOR_RESIDUE_LIMIT_KGKG as f32).to_bits() + 1,
+        ));
+        let invalid = TinyProvider::new(50, 1)
+            .field("QICE", vec![0.0], "kg kg-1")
+            .environment(280.0)
+            .field("QVAPOR", vec![first_rejected_negative], "kg kg-1");
+        assert_eq!(
+            read_property_scene(&invalid, 0).unwrap_err(),
+            WrfPropertyReadError::InvalidEnvironment {
+                cell_index: 0,
+                reason: "QVAPOR must be finite and above the bounded negative-residue limit",
+            }
+        );
+    }
+
+    #[test]
     fn p3_52_retains_both_sparse_categories_and_sorted_union() {
         let scene = read_property_scene(&p3_52_provider(271.65), 0).unwrap();
         assert_eq!(scene.active_cell_indices(), &[1, 2, 3]);
@@ -3502,7 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_qsmall_boundary_is_active_and_larger_negative_mass_is_typed() {
+    fn p3_qsmall_boundary_is_active_and_bounded_negative_mass_is_inactive() {
         let exact = TinyProvider::new(50, 1)
             .field("QICE", vec![WRF_P3_QSMALL_KGKG], "kg kg-1")
             .environment(270.0);
@@ -3514,16 +3574,34 @@ mod tests {
             }
         );
 
+        let bounded_residues = TinyProvider::new(52, 3)
+            .field(
+                "QICE",
+                vec![
+                    -1.091_389_755_262_725_5e-14,
+                    -1.324_547_676_401_222e-12,
+                    -WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG,
+                ],
+                "kg kg-1",
+            )
+            .field("QICE2", vec![0.0; 3], "kg kg-1")
+            .environment(270.0);
+        let scene = read_property_scene(&bounded_residues, 0).unwrap();
+        assert!(scene.categories().is_empty());
+
+        let first_rejected_negative = -f64::from(f32::from_bits(
+            (WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG as f32).to_bits() + 1,
+        ));
         for (provider, field, category) in [
             (
-                TinyProvider::new(50, 1).field("QICE", vec![-1.01 * WRF_P3_QSMALL_KGKG], "kg kg-1"),
+                TinyProvider::new(50, 1).field("QICE", vec![first_rejected_negative], "kg kg-1"),
                 "QICE",
                 WrfPropertyCategory::P3(P3Category::Category1),
             ),
             (
                 TinyProvider::new(52, 1)
                     .field("QICE", vec![0.0], "kg kg-1")
-                    .field("QICE2", vec![-1.01 * WRF_P3_QSMALL_KGKG], "kg kg-1"),
+                    .field("QICE2", vec![first_rejected_negative], "kg kg-1"),
                 "QICE2",
                 WrfPropertyCategory::P3(P3Category::Category2),
             ),
@@ -3533,7 +3611,7 @@ mod tests {
                 WrfPropertyReadError::NegativeMassValue {
                     field,
                     cell_index: 0,
-                    value: -1.01 * WRF_P3_QSMALL_KGKG,
+                    value: first_rejected_negative,
                 },
                 "{category} must retain typed gross-negative mass"
             );
@@ -3574,14 +3652,29 @@ mod tests {
             assert_eq!(second_zero.qir_kgkg, 0.0);
         }
 
+        let bounded_negative = p3_50_provider(50, 1, 0).field(
+            "QIR",
+            vec![-WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG],
+            "kg kg-1",
+        );
+        let scene = read_property_scene(&bounded_negative, 0).unwrap();
+        let cell = scene.raw_cell(0).unwrap();
+        let RawPropertyCategory::P3(category) = &cell.categories()[0] else {
+            panic!("expected P3 category")
+        };
+        assert_eq!(category.qir_kgkg, 0.0);
+
+        let first_rejected_negative = -f64::from(f32::from_bits(
+            (WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG as f32).to_bits() + 1,
+        ));
         let materially_negative =
-            p3_50_provider(50, 1, 0).field("QIR", vec![-1.01 * WRF_P3_QSMALL_KGKG], "kg kg-1");
+            p3_50_provider(50, 1, 0).field("QIR", vec![first_rejected_negative], "kg kg-1");
         assert_eq!(
             read_property_scene(&materially_negative, 0).unwrap_err(),
             WrfPropertyReadError::NegativeMassValue {
                 field: "QIR",
                 cell_index: 0,
-                value: -1.01 * WRF_P3_QSMALL_KGKG,
+                value: first_rejected_negative,
             }
         );
     }
@@ -3652,16 +3745,41 @@ mod tests {
             / (std::f64::consts::PI * WRF_P3_RAIN_WATER_DENSITY_KG_M3);
         assert_close(f64::from(qnrain_per_kg[0]), expected_number, 1.0e-9);
 
-        let reported_residue = TinyProvider::new(50, 1)
-            .field("QRAIN", vec![-1.079_097_951_945_35e-14], "kg kg-1")
+        let bounded_residues = TinyProvider::new(50, 3)
+            .field(
+                "QRAIN",
+                vec![
+                    -1.079_097_951_945_35e-14,
+                    -4.269_383_512_087_86e-14,
+                    -WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG,
+                ],
+                "kg kg-1",
+            )
+            .field("QNRAIN", vec![f64::NAN; 3], "kg-1");
+        let (rain, _) = read_rain(&bounded_residues, 0, 3, 50);
+        for cell_index in 0..3 {
+            assert!(matches!(
+                rain.raw_at(cell_index),
+                RawRainState::Available {
+                    qrain_kgkg: 0.0,
+                    qnrain_per_kg: 0.0
+                }
+            ));
+        }
+
+        let first_rejected_negative = -f64::from(f32::from_bits(
+            (WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG as f32).to_bits() + 1,
+        ));
+        let invalid = TinyProvider::new(50, 1)
+            .field("QRAIN", vec![first_rejected_negative], "kg kg-1")
             .field("QNRAIN", vec![f64::NAN], "kg-1");
-        let (rain, _) = read_rain(&reported_residue, 0, 1, 50);
+        let (rain, _) = read_rain(&invalid, 0, 1, 50);
         assert!(matches!(
-            rain.raw_at(0),
-            RawRainState::Available {
-                qrain_kgkg: 0.0,
-                qnrain_per_kg: 0.0
-            }
+            rain,
+            SparseRainStorage::Unavailable(RainUnavailableReason::InvalidField {
+                field: "QRAIN",
+                ..
+            })
         ));
     }
 
@@ -3948,18 +4066,18 @@ mod tests {
             .iter()
             .map(|&value| value >= WRF_P3_QSMALL_KGKG)
             .collect::<Vec<_>>();
-        let tiny_negative_indices = source_qice
+        let bounded_negative_indices = source_qice
             .iter()
             .copied()
             .enumerate()
-            .filter(|&(_, value)| (-WRF_P3_QSMALL_KGKG..0.0).contains(&value))
+            .filter(|&(_, value)| (-WRF_P3_NEGATIVE_MASS_RESIDUE_LIMIT_KGKG..0.0).contains(&value))
             .map(|(cell_index, _)| {
                 u32::try_from(cell_index).expect("WRF property grid index fits u32")
             })
             .collect::<Vec<_>>();
         assert!(
-            !tiny_negative_indices.is_empty(),
-            "property fixture must exercise a negative QICE qsmall residue"
+            !bounded_negative_indices.is_empty(),
+            "property fixture must exercise a bounded negative QICE residue"
         );
         drop(source_qice);
         let active_negative_qir_indices = file
@@ -3987,7 +4105,7 @@ mod tests {
             .categories()
             .iter()
             .find(|category| category.category() == WrfPropertyCategory::P3(P3Category::Category1));
-        for cell_index in tiny_negative_indices {
+        for cell_index in bounded_negative_indices {
             assert!(
                 category_one.is_none_or(|category| {
                     category
@@ -3995,7 +4113,7 @@ mod tests {
                         .binary_search(&cell_index)
                         .is_err()
                 }),
-                "qsmall residue cell {cell_index} remained active"
+                "bounded negative QICE residue cell {cell_index} remained active"
             );
         }
         let category_one = category_one.expect("fixture retains active P3 category 1");

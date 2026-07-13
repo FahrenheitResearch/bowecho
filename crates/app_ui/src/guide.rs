@@ -1379,10 +1379,14 @@ fn wrf(ui: &mut egui::Ui) {
          a higher density; that branch instead preserves source mass at 900 kg/m3, derives \
          Deq=(6m/(pi*900))^(1/3), and retains normalized source area as the aspect-ratio proxy. \
          This solid-ice-constrained node is audited and is not a table-coordinate clamp; it does \
-         not claim exact absolute-area preservation. A rare source-area overshoot within P3's \
-         pinned one-percent rime-density iteration tolerance still maps continuously to a prolate \
-         while preserving source area and mass. Gaussian-20 canting and every spheroidal habit \
-         remain external research assumptions. Larger inconsistencies remain omissions. A strict \
+         not claim exact absolute-area preservation. P3's one-percent rime-density convergence \
+         test is a coefficient tolerance, not an area bound: its partially-rimed breakpoint is \
+         computed before the final coefficient update and can retain a raw area larger than the \
+         Dmax circle. BowEcho marks only that pinned transition artifact, preserves its raw area \
+         in the audit, and closes scattering to a mass-preserving sphere at the true Dmax instead \
+         of inventing a larger prolate axis. Closure count, maximum raw area ratio and radar-weight \
+         fraction are audited; any unmarked overshoot remains an omission. Gaussian-20 canting \
+         and every nonspherical habit remain external research assumptions. A strict \
          shape-authoritative mode evaluates only P3's genuinely \
          spherical regions under omission budgets. The old single-characteristic-particle \
          production dispatch is removed.",

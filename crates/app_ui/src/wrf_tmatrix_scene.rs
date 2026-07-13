@@ -1144,7 +1144,7 @@ impl WrfTMatrixScene {
                                 "lambda/mu and analytic closure are exact P3; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately and without renormalization; oblate shape is projected-area-equivalent and Gaussian-20 canting is an external research assumption, not P3-predicted habit or orientation"
                             }
                             P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1 => {
-                                "lambda/mu and analytic closure are exact P3; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately and without renormalization; the area-equivalent spheroid preserves mass, uses a continuous 900 kg/m3 source-solid-ice construction where the empirical area-law transition cannot define a physical homogeneous volume, and maps only the pinned one-percent rime-iteration area overshoot to prolate; exact P3 small dense spheres below the 50 um T-matrix floor use the separately versioned Rayleigh-limit bridge; Gaussian-20 canting and spheroidal habit remain external research assumptions"
+                                "lambda/mu and analytic closure are exact P3; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately and without renormalization; the area-equivalent spheroid preserves mass and uses a continuous 900 kg/m3 source-solid-ice construction where the empirical area-law transition cannot define a physical homogeneous volume; a typed projected-area overshoot caused by P3's stale final fixed-point breakpoint is sphere-closed at the true Dmax while its raw area and radar weight remain audited; exact P3 small dense spheres below the 50 um T-matrix floor use the separately versioned Rayleigh-limit bridge; Gaussian-20 canting and nonspherical habit remain external research assumptions"
                             }
                         },
                     }
@@ -3956,6 +3956,7 @@ mod tests {
     use crate::wrf_property_reader::{RawRainState, read_wrf_property_scene};
     use crate::wrf_scene_inventory::WrfSourceIdentity;
     use radar_scattering::P3Category;
+    use radar_scattering::P3ProjectedAreaConsistency;
 
     fn additive(values: [f64; 9]) -> AdditiveScattering {
         AdditiveScattering::from_components(values).unwrap()
@@ -4523,12 +4524,14 @@ mod tests {
             })
             .expect("fixture has active P3 rime above the density ceiling");
 
+        let bounded_negative_mass_limit = f64::from(1.0e-10_f32);
         let negative_qice_index = qice
             .iter()
-            .position(|&value| value < 0.0 && value >= -qsmall)
-            .expect("fixture contains a negative QICE qsmall residue");
+            .position(|&value| value < 0.0 && value >= -bounded_negative_mass_limit)
+            .expect("fixture contains a bounded negative QICE transport residue");
         assert!(
-            qice[negative_qice_index] < 0.0 && qice[negative_qice_index] >= -qsmall,
+            qice[negative_qice_index] < 0.0
+                && qice[negative_qice_index] >= -bounded_negative_mass_limit,
             "fixture no longer contains a negative QICE residue"
         );
         drop((qice, qir, qib));
@@ -4778,12 +4781,15 @@ mod tests {
                 let mut by_diameter = [0.0_f64; 3];
                 let mut by_density = [0.0_f64; 3];
                 let mut by_ratio = [0.0_f64; 3];
+                let mut by_source_area_overshoot = [0.0_f64; 3];
+                let mut maximum_raw_area_ratio = f64::NEG_INFINITY;
                 let mut minimum_coordinates = [f64::INFINITY; 3];
                 let mut maximum_coordinates = [f64::NEG_INFINITY; 3];
                 for node in &quadrature.nodes {
-                    let ratio = (4.0 * node.particle.projected_area_m2
-                        / (std::f64::consts::PI * node.particle.maximum_dimension_m.powi(2)))
-                    .min(1.0);
+                    let raw_area_ratio = 4.0 * node.particle.projected_area_m2
+                        / (std::f64::consts::PI * node.particle.maximum_dimension_m.powi(2));
+                    maximum_raw_area_ratio = maximum_raw_area_ratio.max(raw_area_ratio);
+                    let ratio = raw_area_ratio.min(1.0);
                     let equivolume_diameter_m = node.particle.maximum_dimension_m * ratio.cbrt();
                     let density_kg_m3 = node.particle.mass_kg
                         / (std::f64::consts::PI / 6.0 * equivolume_diameter_m.powi(3));
@@ -4816,6 +4822,11 @@ mod tests {
                         if ratio_outside {
                             by_ratio[moment] += weights[moment];
                         }
+                        if node.particle.projected_area_consistency()
+                            == P3ProjectedAreaConsistency::PinnedFinalCoefficientTransitionOvershoot
+                        {
+                            by_source_area_overshoot[moment] += weights[moment];
+                        }
                     }
                 }
                 let totals = [
@@ -4832,13 +4843,14 @@ mod tests {
                     &mut by_diameter,
                     &mut by_density,
                     &mut by_ratio,
+                    &mut by_source_area_overshoot,
                 ] {
                     for moment in 0..3 {
                         values[moment] /= totals[moment];
                     }
                 }
                 eprintln!(
-                    "minRho={minimum_density_kg_m3:.9e} totals(number,mass,mass2-radar)={totals:?} omitted(number,mass,mass2-radar)={omitted:?} diameter={by_diameter:?} density={by_density:?} ratio={by_ratio:?} coords_min={minimum_coordinates:?} coords_max={maximum_coordinates:?}"
+                    "minRho={minimum_density_kg_m3:.9e} totals(number,mass,mass2-radar)={totals:?} omitted(number,mass,mass2-radar)={omitted:?} diameter={by_diameter:?} density={by_density:?} ratio={by_ratio:?} source_area_overshoot={by_source_area_overshoot:?} max_raw_area_ratio={maximum_raw_area_ratio} coords_min={minimum_coordinates:?} coords_max={maximum_coordinates:?}"
                 );
                 assert!(
                     omitted[2] < P3_MAXIMUM_OMITTED_RADAR_WEIGHT_FRACTION,
