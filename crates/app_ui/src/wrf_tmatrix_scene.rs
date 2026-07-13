@@ -68,6 +68,16 @@ const P3_MAXIMUM_OMITTED_NUMBER_FRACTION: f64 = 0.999;
 const P3_MAXIMUM_OMITTED_MASS_FRACTION: f64 = 0.05;
 const P3_MAXIMUM_OMITTED_D6_FRACTION: f64 = 0.001;
 
+// P3 retains an ice category while it melts above freezing, but WRF P3 v4.5.2
+// does not predict liquid fraction within that category (the source calls
+// that future work). Ambient air temperature is therefore not a valid dry-ice
+// material temperature above the freezing/melting point. Keep the native
+// PSD/geometry unchanged and diagnose only the phase-constrained particle
+// temperature: ice colder than freezing follows the air; melting ice is held
+// at 273.15 K. This is a physical phase constraint, not a generic LUT-edge
+// clamp.
+const ICE_MELTING_TEMPERATURE_K: f64 = 273.15;
+
 // Exact coordinate contract for the versioned five-table research bundle.
 // Each frozen role keeps its own solver-complete diameter domain; no renderer
 // invariant requires the four phase/shape tables to share a size axis.
@@ -1597,7 +1607,7 @@ fn build_p3_psd_cell_into(
                         node.bulk_density_kg_m3(),
                     )?;
                     let query = TMatrixParticleNodeQuery::new(
-                        raw.environment().temperature_k(),
+                        dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
                         node.equivolume_diameter_m(),
                         node.bulk_density_kg_m3(),
                         node.minor_to_major_axis_ratio(),
@@ -2026,7 +2036,7 @@ fn build_ishmael_psd_cell_into(
                     let positive_down_speed = table.dry_particle_node_terminal_speed_m_s(node)?;
                     let query = TMatrixParticleNodeQuery::from_psd_node(
                         node,
-                        raw.environment().temperature_k(),
+                        dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
                         positive_down_speed,
                         validated.ishmael_fall_speed,
                         gaussian20_orientation(),
@@ -2084,6 +2094,14 @@ fn build_ishmael_psd_cell_into(
         retained: true,
         counts,
     })
+}
+
+pub(crate) fn dry_frozen_particle_temperature_k(ambient_temperature_k: f64) -> f64 {
+    if ambient_temperature_k > ICE_MELTING_TEMPERATURE_K {
+        ICE_MELTING_TEMPERATURE_K
+    } else {
+        ambient_temperature_k
+    }
 }
 
 fn gaussian20_orientation() -> OrientationModel {
@@ -2176,7 +2194,7 @@ fn evaluate_p3_psd_raw_cell(
                     node.bulk_density_kg_m3(),
                 )?;
                 let query = TMatrixParticleNodeQuery::new(
-                    raw.environment().temperature_k(),
+                    dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
                     node.equivolume_diameter_m(),
                     node.bulk_density_kg_m3(),
                     node.minor_to_major_axis_ratio(),
@@ -2430,7 +2448,7 @@ fn evaluate_ishmael_psd_raw_cell(
                 let positive_down_speed = table.dry_particle_node_terminal_speed_m_s(node)?;
                 let query = TMatrixParticleNodeQuery::from_psd_node(
                     node,
-                    raw.environment().temperature_k(),
+                    dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
                     positive_down_speed,
                     validated.ishmael_fall_speed,
                     gaussian20_orientation(),
@@ -4045,6 +4063,21 @@ mod tests {
             true,
             DIAGNOSTIC_COEXISTENCE_WARM_K + 1.0e-6,
         ));
+    }
+
+    #[test]
+    fn dry_frozen_temperature_mapping_is_an_upper_only_phase_constraint() {
+        assert_eq!(dry_frozen_particle_temperature_k(190.0), 190.0);
+        assert_eq!(
+            dry_frozen_particle_temperature_k(ICE_MELTING_TEMPERATURE_K),
+            ICE_MELTING_TEMPERATURE_K
+        );
+        assert_eq!(
+            dry_frozen_particle_temperature_k(285.722_229),
+            ICE_MELTING_TEMPERATURE_K
+        );
+        assert_eq!(dry_frozen_particle_temperature_k(180.0), 180.0);
+        assert!(dry_frozen_particle_temperature_k(f64::NAN).is_nan());
     }
 
     #[test]

@@ -659,7 +659,8 @@ mod tests {
             "fixture must contain active P3 rain"
         );
 
-        let rain_lut = &embedded_luts().expect("load embedded T-matrix tables").rain;
+        let embedded = embedded_luts().expect("load embedded T-matrix tables");
+        let rain_lut = &embedded.rain;
         let axis_bounds = |kind| {
             let coordinates = rain_lut
                 .offline_lut()
@@ -741,6 +742,60 @@ mod tests {
             "fixture must contain a combined frozen-and-rain evaluator cell"
         );
 
+        let dry_temperature_bounds = {
+            let coordinates = embedded
+                .dry_oblate
+                .offline_lut()
+                .header()
+                .axes()
+                .iter()
+                .find(|axis| axis.kind() == AxisKind::Temperature)
+                .expect("embedded dry-frozen table has a temperature axis")
+                .coordinates();
+            (*coordinates.first().unwrap(), *coordinates.last().unwrap())
+        };
+        let mut frozen_ambient_temperature_extrema =
+            [(f64::INFINITY, 0_usize), (f64::NEG_INFINITY, 0_usize)];
+        let mut frozen_population_cells = 0_usize;
+        for category in scene.categories() {
+            for &cell_index in category.active_cell_indices() {
+                let cell_index = cell_index as usize;
+                let ambient_temperature_k = scene
+                    .environment_at(cell_index)
+                    .unwrap_or_else(|error| {
+                        panic!("read frozen environment at cell {cell_index}: {error}")
+                    })
+                    .unwrap_or_else(|| panic!("missing frozen environment at cell {cell_index}"))
+                    .temperature_k();
+                let material_temperature_k =
+                    crate::wrf_tmatrix_scene::dry_frozen_particle_temperature_k(
+                        ambient_temperature_k,
+                    );
+                assert!(
+                    dry_temperature_bounds.0 <= material_temperature_k
+                        && material_temperature_k <= dry_temperature_bounds.1,
+                    "phase-constrained frozen material temperature {material_temperature_k} K from ambient {ambient_temperature_k} K at cell {cell_index} is outside embedded dry LUT [{}, {}] K",
+                    dry_temperature_bounds.0,
+                    dry_temperature_bounds.1
+                );
+                if ambient_temperature_k < frozen_ambient_temperature_extrema[0].0 {
+                    frozen_ambient_temperature_extrema[0] = (ambient_temperature_k, cell_index);
+                }
+                if ambient_temperature_k > frozen_ambient_temperature_extrema[1].0 {
+                    frozen_ambient_temperature_extrema[1] = (ambient_temperature_k, cell_index);
+                }
+                frozen_population_cells += 1;
+            }
+        }
+        assert!(
+            frozen_population_cells > 0,
+            "fixture must contain active frozen P3 populations"
+        );
+        assert!(
+            frozen_ambient_temperature_extrema[1].0 > 273.15,
+            "fixture must exercise active P3 ice in above-freezing ambient air"
+        );
+
         let official_table =
             radar_scattering::P3OfficialTableV54::load_path(table_kind, table_path)
                 .expect("load BOWECHO_P3_TABLE_FIXTURE");
@@ -797,6 +852,11 @@ mod tests {
         if REPORTED_RAIN_FAILURE_CELL < scene.cell_count() {
             evaluator_indices.insert(REPORTED_RAIN_FAILURE_CELL);
         }
+        evaluator_indices.extend(
+            frozen_ambient_temperature_extrema
+                .into_iter()
+                .map(|(_, cell_index)| cell_index),
+        );
 
         for cell_index in evaluator_indices.iter().copied() {
             let raw = scene

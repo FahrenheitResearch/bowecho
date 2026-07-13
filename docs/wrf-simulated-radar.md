@@ -536,8 +536,17 @@ part of the research uncertainty rather than evidence of validation. Wet
 coexistence nodes use Liebe-Hufford-Manabe liquid water with symmetric
 Bruggeman mixing only over 269.15-275.15 K (-4 to +2 degrees C).
 Standalone and unpaired residual rain uses its separate temperature-dependent
-Liebe-Hufford-Manabe table over 250-313.15 K; paired liquid is removed exactly
+Liebe-Hufford-Manabe table over 225-313.15 K; paired liquid is removed exactly
 once before residual rain is evaluated.
+
+For scheme-native P3 and ISHMAEL dry-frozen PSD nodes, the table coordinate is
+the phase-constrained particle/material temperature, not blindly the ambient
+air temperature: it follows ambient air below freezing and is capped at
+273.15 K while the source retains ice in above-freezing air. The raw
+environment, PSD, mass, shape, and any separate rain remain unchanged. This is
+an explicit melting-phase constraint, not generic LUT clamping or a diagnosed
+liquid fraction; neither scheme supplies enough native state here to invent a
+wet-particle PSD.
 
 Lookup is bounded: there is no clamping or extrapolation across particle,
 material, temperature, frequency, orientation, or view axes. Signed KDP is
