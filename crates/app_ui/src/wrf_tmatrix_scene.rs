@@ -4598,7 +4598,12 @@ mod tests {
                 p3_psd_input(scheme, value, raw.dry_air_density_kg_m3()).expect("map P3 input");
             let psd = P3Psd::reconstruct(input, &table, P3ReconstructionConfig::default())
                 .expect("reconstruct P3 PSD");
-            eprintln!("cell={cell} category={:?} input={input:#?}", value.category);
+            eprintln!(
+                "cell={cell} category={:?} lambda={} mu={} input={input:#?}",
+                value.category,
+                psd.lambda_m_inv(),
+                psd.mu()
+            );
             {
                 let minimum_density_kg_m3 = 1.5;
                 let minimum_diameter_m = 50e-6;
