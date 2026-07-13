@@ -1,0 +1,95 @@
+{
+  "abi_revision": 1,
+  "artifacts": [
+    {
+      "architecture": "sm_75",
+      "bytes": 7592,
+      "file": "p3_lut_segments_sm75.cubin",
+      "sha256": "b9c176427f0339aa9e5912ffc7253b0c59d3a24514505c94ff1de2cc24ee47ea"
+    },
+    {
+      "architecture": "sm_80",
+      "bytes": 7720,
+      "file": "p3_lut_segments_sm80.cubin",
+      "sha256": "ffb4c9a2cb700d5c6587b95c2673b2f86fd76961ce7309029e51f2a4776e76f5"
+    },
+    {
+      "architecture": "sm_86",
+      "bytes": 7592,
+      "file": "p3_lut_segments_sm86.cubin",
+      "sha256": "8351dc00277c3b6c87081ce6b9b6bd51f3890b5c1d0e1ef962da5f0500fb61a2"
+    },
+    {
+      "architecture": "sm_87",
+      "bytes": 7976,
+      "file": "p3_lut_segments_sm87.cubin",
+      "sha256": "b25014f9bb6280987c2811ee7f24a739f052ebac958e8309863d0b1218cfba80"
+    },
+    {
+      "architecture": "sm_88",
+      "bytes": 7592,
+      "file": "p3_lut_segments_sm88.cubin",
+      "sha256": "14fe2f80d12e96614ace6f1cbdb1385ecadd514863e2966d91ed90e87da27606"
+    },
+    {
+      "architecture": "sm_89",
+      "bytes": 7592,
+      "file": "p3_lut_segments_sm89.cubin",
+      "sha256": "23a83849089f1e044ca4039dcfebab113be9caa93ac03269fe64a1f60176009c"
+    },
+    {
+      "architecture": "sm_90",
+      "bytes": 8416,
+      "file": "p3_lut_segments_sm90.cubin",
+      "sha256": "038a68917186c2de2a76f0dd08f22c9c1d9b12e5c402500982b493ec23e417c6"
+    },
+    {
+      "architecture": "sm_100",
+      "bytes": 13336,
+      "file": "p3_lut_segments_sm100.cubin",
+      "sha256": "3ec0bebe1be9784e340556dfdcbe83bca36232edeecdef18fef37becb7d6a1af"
+    },
+    {
+      "architecture": "sm_103",
+      "bytes": 15368,
+      "file": "p3_lut_segments_sm103.cubin",
+      "sha256": "e935031fc512b0cf995521ca1e341516ffe88709de91677b125836ef6dc5ce31"
+    },
+    {
+      "architecture": "sm_110",
+      "bytes": 15888,
+      "file": "p3_lut_segments_sm110.cubin",
+      "sha256": "117ca90be41285f9b7a14c2c33b3b7f48ee0dd30483643f16a7c59da860ffb11"
+    },
+    {
+      "architecture": "sm_120",
+      "bytes": 14696,
+      "file": "p3_lut_segments_sm120.cubin",
+      "sha256": "957484b0d775cfe5948fb49d7da25747766336dd920697414774765f2fb76cc2"
+    },
+    {
+      "architecture": "sm_121",
+      "bytes": 14696,
+      "file": "p3_lut_segments_sm121.cubin",
+      "sha256": "6bbaa6e8bfaded281e0dc9015699210c3e8737cd9d122fec84cd9ebf47c80be8"
+    },
+    {
+      "architecture": "compute_75 PTX fallback",
+      "bytes": 11499,
+      "file": "p3_lut_segments.ptx",
+      "sha256": "36c4fba0f275d5d96f77e97ece5babc1b6c232139b415df91a0c20c449f5e0de"
+    }
+  ],
+  "generator": "NVIDIA NVRTC 13.0",
+  "kernel": "bowecho_p3_lut_segments_v1",
+  "options": [
+    "--ftz=false",
+    "--prec-sqrt=true",
+    "--prec-div=true",
+    "--fmad=false",
+    "--std=c++17"
+  ],
+  "ptx_virtual_architecture": "compute_75",
+  "source": "p3_lut_segments.cu",
+  "source_sha256": "e195b579b7853775690f7e5fdd8dfa745c3efd7449c4f90ee9ee82750168584b"
+}

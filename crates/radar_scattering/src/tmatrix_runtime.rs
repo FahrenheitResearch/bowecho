@@ -14,9 +14,9 @@ use crate::{
     AdditiveScattering, AxisCoordinate, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
     DiagnosticWetCategory, EffectiveMediumRule, InterpolationError, KernelModel,
     LIQUID_WATER_DENSITY_KG_M3, LutError, MeltingModel, MicrophysicsFamily, MixtureTopology,
-    OfflineLut, OrientationModel, OutputError, ParticleState, PsdError, PsdFallSpeedAuthority,
-    PsdFallSpeedProvenance, PsdParticleDomain, PsdParticleNode, PsdSpheroidHabit, Sha256Digest,
-    TMatrixImplementation, TableValidation, TemporalSampling, Unit,
+    OfflineLut, OrientationModel, OutputError, ParticleState, PreparedInterpolationPlan, PsdError,
+    PsdFallSpeedAuthority, PsdFallSpeedProvenance, PsdParticleDomain, PsdParticleNode,
+    PsdSpheroidHabit, Sha256Digest, TMatrixImplementation, TableValidation, TemporalSampling, Unit,
 };
 
 const PYTMATRIX_KERNEL: &str = "pytmatrix-0.3.3";
@@ -411,6 +411,40 @@ pub struct PreparedTMatrixParticleNode {
     table_file_sha256: Sha256Digest,
     coordinates: Vec<AxisCoordinate>,
     positive_down_fall_speed_m_s: f64,
+}
+
+/// Fixed-size LUT execution facts admitted by an owning T-matrix table.
+///
+/// Callers cannot construct this descriptor or replace its interpolation
+/// brackets, table identity, or terminal speed. It is therefore safe to hand
+/// to an execution backend after [`ResearchTMatrixLut`] has admitted the
+/// opaque particle node. The descriptor owns no heap allocation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreparedTMatrixLutInterpolation {
+    table_file_sha256: Sha256Digest,
+    plan: PreparedInterpolationPlan,
+    positive_down_fall_speed_m_s: f64,
+}
+
+impl PreparedTMatrixLutInterpolation {
+    /// Exact LUT file identity that admitted and bracketed this node.
+    #[must_use]
+    pub const fn table_file_sha256(&self) -> Sha256Digest {
+        self.table_file_sha256
+    }
+
+    /// Fixed CPU-bracketed interpolation layout in the table's exact axis
+    /// order.
+    #[must_use]
+    pub const fn interpolation_plan(&self) -> &PreparedInterpolationPlan {
+        &self.plan
+    }
+
+    /// Positive-down terminal speed solved and bound by the owning table.
+    #[must_use]
+    pub const fn positive_down_fall_speed_m_s(&self) -> f64 {
+        self.positive_down_fall_speed_m_s
+    }
 }
 
 impl PreparedTMatrixParticleNode {
@@ -1079,16 +1113,36 @@ impl ResearchTMatrixLut {
         &self,
         prepared: &PreparedTMatrixParticleNode,
     ) -> Result<AdditiveScattering, EvaluationError> {
+        let interpolation = self.prepare_dry_particle_lut_interpolation(prepared)?;
+        replace_fall_moments(
+            self.lut
+                .interpolate_prepared(interpolation.interpolation_plan())?,
+            interpolation.positive_down_fall_speed_m_s(),
+        )
+    }
+
+    /// Bind an opaque dry particle node to this table's fixed interpolation
+    /// layout for a batched execution backend.
+    ///
+    /// Identity is checked before coordinates are bracketed. The returned
+    /// descriptor contains the exact terminal speed already solved by this
+    /// table; no backend-facing API accepts caller-supplied coordinates or a
+    /// replacement speed.
+    pub fn prepare_dry_particle_lut_interpolation(
+        &self,
+        prepared: &PreparedTMatrixParticleNode,
+    ) -> Result<PreparedTMatrixLutInterpolation, EvaluationError> {
         if prepared.table_file_sha256 != self.file_sha256 {
             return Err(EvaluationError::PreparedParticleNodeTableMismatch {
                 expected: self.file_sha256,
                 actual: prepared.table_file_sha256,
             });
         }
-        replace_fall_moments(
-            self.lut.interpolate(&prepared.coordinates)?,
-            prepared.positive_down_fall_speed_m_s,
-        )
+        Ok(PreparedTMatrixLutInterpolation {
+            table_file_sha256: self.file_sha256,
+            plan: self.lut.prepare_interpolation(&prepared.coordinates)?,
+            positive_down_fall_speed_m_s: prepared.positive_down_fall_speed_m_s,
+        })
     }
 
     fn prepare_dry_particle_node_query(
@@ -3976,6 +4030,37 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(prepared.positive_down_fall_speed_m_s(), exact_speed);
+        let interpolation = table
+            .prepare_dry_particle_lut_interpolation(&prepared)
+            .unwrap();
+        assert_eq!(interpolation.table_file_sha256(), table.file_sha256());
+        assert_eq!(interpolation.positive_down_fall_speed_m_s(), exact_speed);
+        assert!(!std::mem::needs_drop::<PreparedTMatrixLutInterpolation>());
+        let plan = interpolation.interpolation_plan();
+        assert_eq!(plan.base_point_index(), 0);
+        assert_eq!(plan.active_axis_count(), 5);
+        assert_eq!(plan.corner_count(), 32);
+        assert_eq!(&plan.upper_point_offsets()[..5], &[16_u64, 8, 4, 2, 1]);
+        assert_eq!(
+            &plan.upper_fractions()[..5],
+            &[
+                (1.0e-3 - 1.0e-6) / (0.01 - 1.0e-6),
+                (260.0 - 200.0) / (300.0 - 200.0),
+                (400.0 - 50.0) / (917.0 - 50.0),
+                (0.8 - 0.1) / (1.0 - 0.1),
+                (1.0 - (-0.5)) / (20.0 - (-0.5)),
+            ]
+        );
+        assert!(
+            plan.upper_point_offsets()[5..]
+                .iter()
+                .all(|value| *value == 0)
+        );
+        assert!(
+            plan.upper_fractions()[5..]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
         let prepared_output = table
             .evaluate_prepared_dry_particle_node_per_m3(&prepared)
             .unwrap();
@@ -3984,6 +4069,10 @@ mod tests {
         let (other_table, _, _) = fixture();
         assert!(matches!(
             other_table.evaluate_prepared_dry_particle_node_per_m3(&prepared),
+            Err(EvaluationError::PreparedParticleNodeTableMismatch { .. })
+        ));
+        assert!(matches!(
+            other_table.prepare_dry_particle_lut_interpolation(&prepared),
             Err(EvaluationError::PreparedParticleNodeTableMismatch { .. })
         ));
     }

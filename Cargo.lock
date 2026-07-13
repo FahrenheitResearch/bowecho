@@ -334,6 +334,7 @@ dependencies = [
  "settings",
  "sha2",
  "sharprs",
+ "simradar_cuda",
  "simsat",
  "styles",
  "thiserror 2.0.18",
@@ -5675,6 +5676,9 @@ name = "simradar_cuda"
 version = "0.33.2"
 dependencies = [
  "cudarc",
+ "radar_scattering",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

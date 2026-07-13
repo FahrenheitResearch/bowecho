@@ -10,8 +10,20 @@ use std::sync::OnceLock;
 
 use thiserror::Error;
 
+#[cfg(any(windows, target_os = "linux"))]
+mod adapter;
+
+#[cfg(any(windows, target_os = "linux"))]
+mod kernel;
+
+#[cfg(any(windows, target_os = "linux"))]
+pub use adapter::{
+    CudaLutNodePreparationError, CudaPreparedTMatrixNode, CudaSegmentLayoutError,
+    CudaTMatrixExecutionError, CudaTMatrixExecutor, CudaTMatrixSegment,
+};
+
 /// Minimum architecture supported by the first deterministic f64 P3 kernel.
-pub const MINIMUM_COMPUTE_CAPABILITY: (i32, i32) = (6, 0);
+pub const MINIMUM_COMPUTE_CAPABILITY: (i32, i32) = (7, 5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaDeviceInfo {
@@ -207,8 +219,8 @@ mod tests {
             compute_capability_minor: minor,
             total_memory_bytes: 1,
         };
-        assert!(!make(5, 9).supports_p3_kernel());
-        assert!(make(6, 0).supports_p3_kernel());
+        assert!(!make(7, 4).supports_p3_kernel());
+        assert!(make(7, 5).supports_p3_kernel());
         assert!(make(12, 0).supports_p3_kernel());
     }
 
