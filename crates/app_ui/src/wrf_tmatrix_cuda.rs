@@ -1147,4 +1147,100 @@ mod tests {
         assert_eq!(report.nodes_completed, 1);
         assert_eq!(report.fallback_reason, None);
     }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "manual CUDA throughput microbenchmark; requires a supported NVIDIA GPU"]
+    fn manual_cuda_throughput_matches_scalar_cpu_for_65k_nodes() {
+        const NODE_COUNT: usize = 65_536;
+
+        let availability = probe_cuda_cached();
+        let Some(device) = availability.preferred_device() else {
+            eprintln!("skipping CUDA throughput benchmark: {availability:?}");
+            return;
+        };
+        let service = WrfTMatrixCudaBatchService::open_with_config(
+            device.ordinal,
+            WrfTMatrixCudaBatchConfig::new(NODE_COUNT, 1).unwrap(),
+        )
+        .unwrap();
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .unwrap();
+        let table = owner.borrowed_bundle().dry_oblate;
+        let request = TMatrixEvaluationRequest::new(
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+            SpheroidConvention::OblateMinorVertical,
+            RadarViewGeometry::horizontal(),
+        )
+        .unwrap();
+        let prepared = table
+            .prepare_dry_particle_geometry_per_m3(
+                260.0,
+                1.0e-3,
+                400.0,
+                0.8,
+                PsdSpheroidHabit::Oblate,
+                None,
+                None,
+                table.dry_particle_node_fall_speed_provenance().unwrap(),
+                OrientationModel::GaussianCanting {
+                    mean_deg: 0.0,
+                    standard_deviation_deg: 20.0,
+                    quadrature_points: 50,
+                },
+                request,
+            )
+            .unwrap();
+        let interpolation = table
+            .prepare_dry_particle_lut_interpolation(&prepared)
+            .unwrap();
+        let cuda_node = CudaPreparedTMatrixNode::new(&interpolation, 1.0).unwrap();
+
+        let cpu_started = std::time::Instant::now();
+        let cpu = (0..NODE_COUNT)
+            .map(|_| {
+                table
+                    .evaluate_prepared_dry_particle_node_per_m3(&prepared)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let cpu_elapsed = cpu_started.elapsed();
+
+        let gpu_started = std::time::Instant::now();
+        let gpu = service
+            .evaluate_particles(
+                WrfTMatrixCudaTableRole::DryOblate,
+                vec![cuda_node; NODE_COUNT],
+            )
+            .unwrap();
+        let gpu_elapsed = gpu_started.elapsed();
+
+        assert_eq!(gpu.len(), cpu.len());
+        for (index, (gpu_node, cpu_node)) in gpu.iter().zip(&cpu).enumerate() {
+            assert_eq!(
+                gpu_node.components().map(f64::to_bits),
+                cpu_node.components().map(f64::to_bits),
+                "GPU node {index} differs from the scalar CPU oracle"
+            );
+        }
+        let report = service.report();
+        assert_eq!(report.requests_submitted, 1);
+        assert_eq!(report.batches_submitted, 1);
+        assert_eq!(report.batches_completed, 1);
+        assert_eq!(report.nodes_completed, NODE_COUNT as u64);
+        assert_eq!(report.fallback_reason, None);
+        eprintln!(
+            "T-matrix throughput ({}): CPU {:.0} nodes/s ({:.3} s); CUDA {:.0} nodes/s ({:.3} s); service batches {}/{}",
+            report.device.name,
+            NODE_COUNT as f64 / cpu_elapsed.as_secs_f64(),
+            cpu_elapsed.as_secs_f64(),
+            NODE_COUNT as f64 / gpu_elapsed.as_secs_f64(),
+            gpu_elapsed.as_secs_f64(),
+            report.batches_completed,
+            report.batches_submitted,
+        );
+    }
 }
