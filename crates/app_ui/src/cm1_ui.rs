@@ -84,6 +84,11 @@ struct ProfileTask {
     rx: Receiver<Result<cm1::Cm1NativeColumnProfile, String>>,
 }
 
+#[derive(Debug)]
+struct ThermodynamicTask {
+    rx: Receiver<Result<cm1::Cm1ThermodynamicColumn, String>>,
+}
+
 #[derive(Debug, Default)]
 pub struct Cm1ImportPanel {
     pub open: bool,
@@ -104,6 +109,10 @@ pub struct Cm1ImportPanel {
     profile_task: Option<ProfileTask>,
     profile: Option<cm1::Cm1NativeColumnProfile>,
     profile_message: Option<String>,
+    accept_default_thermodynamic_constants: bool,
+    thermodynamic_task: Option<ThermodynamicTask>,
+    thermodynamic_profile: Option<cm1::Cm1ThermodynamicColumn>,
+    thermodynamic_message: Option<String>,
     message: Option<String>,
 }
 
@@ -124,6 +133,7 @@ impl Cm1ImportPanel {
     ) -> Option<Cm1ImportRequest> {
         self.poll_inspection(ctx);
         self.poll_profile(ctx);
+        self.poll_thermodynamic_profile(ctx);
         if !self.open {
             return None;
         }
@@ -235,6 +245,10 @@ impl Cm1ImportPanel {
             self.profile_task = None;
             self.profile = None;
             self.profile_message = None;
+            self.accept_default_thermodynamic_constants = false;
+            self.thermodynamic_task = None;
+            self.thermodynamic_profile = None;
+            self.thermodynamic_message = None;
         }
         self.message = Some(match mode {
             InspectMode::Inventory => "Inspecting native CM1 metadata…".to_owned(),
@@ -360,6 +374,78 @@ impl Cm1ImportPanel {
                 self.profile_message = Some("CM1 column worker stopped unexpectedly".to_owned());
                 self.profile = None;
                 self.profile_task = None;
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn begin_thermodynamic_profile(
+        &mut self,
+        inventory: Cm1Inventory,
+        time_index: usize,
+        x_index: usize,
+        y_index: usize,
+        ctx: &egui::Context,
+    ) {
+        self.thermodynamic_profile = None;
+        self.thermodynamic_message = Some(format!(
+            "Deriving native thermodynamic column at x={x_index}, y={y_index}..."
+        ));
+        let (tx, rx) = channel();
+        std::thread::Builder::new()
+            .name("bowecho-cm1-thermodynamic-profile".to_owned())
+            .spawn(move || {
+                crate::wrf_process::lower_import_thread_priority();
+                let result = (|| {
+                    let nc = netcrust::open(&inventory.source_path)
+                        .map_err(|error| error.to_string())?;
+                    cm1::read_thermodynamic_column(
+                        &nc,
+                        &inventory,
+                        time_index,
+                        x_index,
+                        y_index,
+                        cm1::Cm1ThermodynamicConstants::official_defaults(),
+                    )
+                    .map_err(|error| error.to_string())
+                })();
+                let _ = tx.send(result);
+            })
+            .expect("spawn CM1 thermodynamic-profile worker");
+        self.thermodynamic_task = Some(ThermodynamicTask { rx });
+        ctx.request_repaint();
+    }
+
+    fn poll_thermodynamic_profile(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.thermodynamic_task.as_ref() else {
+            return;
+        };
+        match task.rx.try_recv() {
+            Ok(Ok(profile)) => {
+                self.thermodynamic_message = Some(format!(
+                    "Derived {} native thermodynamic level(s); {} level(s) contain unavailable values.",
+                    profile.pressure_hpa.len(),
+                    profile.invalid_levels.len()
+                ));
+                self.thermodynamic_profile = Some(profile);
+                self.thermodynamic_task = None;
+                ctx.request_repaint();
+            }
+            Ok(Err(error)) => {
+                self.thermodynamic_message =
+                    Some(format!("CM1 thermodynamic profile failed: {error}"));
+                self.thermodynamic_profile = None;
+                self.thermodynamic_task = None;
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.thermodynamic_message =
+                    Some("CM1 thermodynamic-profile worker stopped unexpectedly".to_owned());
+                self.thermodynamic_profile = None;
+                self.thermodynamic_task = None;
                 ctx.request_repaint();
             }
         }
@@ -512,6 +598,7 @@ impl Cm1ImportPanel {
                             .clicked()
                         {
                             self.profile = None;
+                            self.thermodynamic_profile = None;
                         }
                     }
                 });
@@ -570,6 +657,8 @@ impl Cm1ImportPanel {
 
             self.column_profile_ui(ui, inventory, variable, ctx);
         }
+
+        self.thermodynamic_profile_ui(ui, inventory, ctx);
 
         let unavailable = inventory
             .variables
@@ -638,6 +727,7 @@ impl Cm1ImportPanel {
                         .changed();
                     if x_changed || y_changed {
                         self.profile = None;
+                        self.thermodynamic_profile = None;
                     }
                     if ui
                         .add_enabled(
@@ -728,6 +818,213 @@ impl Cm1ImportPanel {
                                     ));
                                     ui.monospace(format_profile_value(*value));
                                     ui.end_row();
+                                }
+                            });
+                    });
+                ui.label(
+                    egui::RichText::new(&profile.provenance)
+                        .small()
+                        .weak(),
+                );
+            });
+    }
+
+    fn thermodynamic_profile_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        inventory: &Cm1Inventory,
+        ctx: &egui::Context,
+    ) {
+        egui::CollapsingHeader::new("Meteorological profile readiness")
+            .default_open(false)
+            .show(ui, |ui| {
+                let readiness = cm1::thermodynamic_readiness(inventory);
+                ui.label(
+                    egui::RichText::new(
+                        "A real CM1 thermodynamic column requires exact total th/prs/qv, physical zhval, horizontal winds, and a defensible moving-frame correction.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                thermodynamic_field_status(
+                    ui,
+                    "Potential temperature",
+                    &readiness.potential_temperature,
+                );
+                thermodynamic_field_status(ui, "Pressure", &readiness.pressure);
+                thermodynamic_field_status(
+                    ui,
+                    "Water-vapor mixing ratio",
+                    &readiness.water_vapor_mixing_ratio,
+                );
+                thermodynamic_field_status(ui, "Horizontal u", &readiness.grid_relative_u);
+                thermodynamic_field_status(ui, "Horizontal v", &readiness.grid_relative_v);
+                thermodynamic_field_status(
+                    ui,
+                    "Physical model height",
+                    &readiness.model_level_height,
+                );
+                match &readiness.wind_frame_correction {
+                    Cm1Availability::Available(cm1::Cm1WindFrameCorrection::StationaryDomain) => {
+                        ui.label(
+                            egui::RichText::new("Wind frame: ready - stationary domain")
+                                .small(),
+                        );
+                    }
+                    Cm1Availability::Available(
+                        cm1::Cm1WindFrameCorrection::AddDomainVelocity { provenance, .. },
+                    ) => {
+                        ui.label(
+                            egui::RichText::new(format!("Wind frame: ready - {provenance}"))
+                                .small(),
+                        );
+                    }
+                    Cm1Availability::Unavailable { reason } => {
+                        ui.label(
+                            egui::RichText::new(format!("Wind frame: unavailable - {reason}"))
+                                .small()
+                                .color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                }
+                if let Some(reason) = readiness.sounding_viewer.unavailable_reason() {
+                    ui.label(
+                        egui::RichText::new(format!("Sounding viewer: not enabled - {reason}"))
+                            .small()
+                            .color(ui.visuals().warn_fg_color),
+                    );
+                }
+                if !readiness.can_derive_native_profile() {
+                    return;
+                }
+                ui.separator();
+                ui.checkbox(
+                    &mut self.accept_default_thermodynamic_constants,
+                    "Use official CM1 default Rd/Cp/Rv constants",
+                )
+                .on_hover_text(
+                    "Native cm1out does not record testcase. Testcase 4 and 5 override Cp, so this choice cannot claim those special-testcase constants are exact.",
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Default conversion: Rd=287.04, Cp=1005.7, Rv=461.5 J kg^-1 K^-1. Special testcase 4/5 constants cannot be identified from cm1out alone.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                let nx = inventory.axes.xh.raw_values.len();
+                let ny = inventory.axes.yh.raw_values.len();
+                self.profile_x_index = self.profile_x_index.min(nx.saturating_sub(1));
+                self.profile_y_index = self.profile_y_index.min(ny.saturating_sub(1));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Scalar cell");
+                    let x_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut self.profile_x_index)
+                                .range(0..=nx.saturating_sub(1))
+                                .prefix("x "),
+                        )
+                        .changed();
+                    let y_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut self.profile_y_index)
+                                .range(0..=ny.saturating_sub(1))
+                                .prefix("y "),
+                        )
+                        .changed();
+                    if x_changed || y_changed {
+                        self.profile = None;
+                        self.thermodynamic_profile = None;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.accept_default_thermodynamic_constants
+                                && self.thermodynamic_task.is_none()
+                                && nx > 0
+                                && ny > 0,
+                            egui::Button::new("Derive native thermodynamic profile"),
+                        )
+                        .clicked()
+                    {
+                        self.begin_thermodynamic_profile(
+                            inventory.clone(),
+                            self.time_index,
+                            self.profile_x_index,
+                            self.profile_y_index,
+                            ctx,
+                        );
+                    }
+                    if self.thermodynamic_task.is_some() {
+                        ui.spinner();
+                    }
+                });
+                if let Some(message) = &self.thermodynamic_message {
+                    ui.label(egui::RichText::new(message).small());
+                }
+                let Some(profile) = &self.thermodynamic_profile else {
+                    return;
+                };
+                egui::ScrollArea::vertical()
+                    .id_salt("cm1_thermodynamic_column_rows")
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("cm1_thermodynamic_column_grid")
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for heading in [
+                                    "k",
+                                    "model z",
+                                    "p",
+                                    "T",
+                                    "Td",
+                                    "u/v grid",
+                                    "u/v east-north",
+                                ] {
+                                    ui.strong(heading);
+                                }
+                                ui.end_row();
+                                for level in 0..profile.pressure_hpa.len() {
+                                    ui.monospace(level.to_string());
+                                    ui.monospace(format_profile_height(
+                                        Some(profile.model_level_height_m.as_slice()),
+                                        level,
+                                    ));
+                                    ui.monospace(format!(
+                                        "{} hPa",
+                                        format_profile_value(profile.pressure_hpa[level])
+                                    ));
+                                    ui.monospace(format!(
+                                        "{} C",
+                                        format_profile_value(profile.temperature_c[level])
+                                    ));
+                                    ui.monospace(format!(
+                                        "{} C",
+                                        format_profile_value(profile.dewpoint_c[level])
+                                    ));
+                                    ui.monospace(format!(
+                                        "{}/{}",
+                                        format_profile_value(profile.u_grid_relative_mps[level]),
+                                        format_profile_value(profile.v_grid_relative_mps[level])
+                                    ));
+                                    ui.monospace(format!(
+                                        "{}/{} m/s",
+                                        format_profile_value(profile.u_east_mps[level]),
+                                        format_profile_value(profile.v_north_mps[level])
+                                    ));
+                                    ui.end_row();
+                                    if let Some((_, reason)) = profile
+                                        .invalid_levels
+                                        .iter()
+                                        .find(|(invalid_level, _)| *invalid_level == level)
+                                    {
+                                        ui.weak("");
+                                        ui.label(
+                                            egui::RichText::new(reason)
+                                                .small()
+                                                .color(ui.visuals().warn_fg_color),
+                                        );
+                                        ui.end_row();
+                                    }
                                 }
                             });
                     });
@@ -1344,6 +1641,31 @@ fn format_profile_height(levels_m: Option<&[f64]>, index: usize) -> String {
         .filter(|value| value.is_finite())
         .map(|value| format!("{value:.1} m"))
         .unwrap_or_else(|| "unavailable".to_owned())
+}
+
+fn thermodynamic_field_status(
+    ui: &mut egui::Ui,
+    label: &str,
+    field: &Cm1Availability<cm1::Cm1ThermodynamicField>,
+) {
+    match field {
+        Cm1Availability::Available(field) => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{label}: ready - {} [{}] - {}",
+                    field.variable, field.units, field.interpretation
+                ))
+                .small(),
+            );
+        }
+        Cm1Availability::Unavailable { reason } => {
+            ui.label(
+                egui::RichText::new(format!("{label}: unavailable - {reason}"))
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+            );
+        }
+    }
 }
 
 fn format_profile_value(value: f64) -> String {
