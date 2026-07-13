@@ -15,11 +15,11 @@ use radar_scattering::{
     DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K, DiagnosticWetCategory,
     EvaluationError, FallMomentPolicy, ISHMAEL_PSD_REVISION, IshmaelPsd, IshmaelPsdInput,
     MixtureTopology, OrientationDefinition, OrientationModel, OutputError, P3_MODULE_VERSION,
-    P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION, P3_PSD_REVISION,
-    P3_SPHERICAL_INTEGRATION_REVISION, P3_TABLE_READER_REVISION, P3_WRF_SOURCE_COMMIT,
-    P3IceMomentInput, P3LookupTableV54, P3OfficialTableKind, P3OfficialTableV54, P3Psd, P3PsdError,
-    P3PsdInput, P3QuadratureNode, P3ReconstructionConfig, P3ShapeAuthority,
-    P3TMatrixIntegrationConfig, P3TMatrixIntegrationError, P3TMatrixParticleNode,
+    P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION, P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION,
+    P3_PSD_REVISION, P3_SPHERICAL_INTEGRATION_REVISION, P3_TABLE_READER_REVISION,
+    P3_WRF_SOURCE_COMMIT, P3IceMomentInput, P3LookupTableV54, P3OfficialTableKind,
+    P3OfficialTableV54, P3Psd, P3PsdError, P3PsdInput, P3QuadratureNode, P3ReconstructionConfig,
+    P3ShapeAuthority, P3TMatrixIntegrationConfig, P3TMatrixIntegrationError, P3TMatrixParticleNode,
     P3TMatrixShapePolicy, P3WrfScheme, ParticleState, PolarAccumulatorQuantities, PsdError,
     PsdFallSpeedProvenance, PsdIntegrationConfig, PsdIntegrationError, PsdParticleNode,
     PsdParticleSupport, PsdSpheroidHabit, RadarViewApplicability, RadarViewGeometry,
@@ -696,13 +696,13 @@ impl WrfTMatrixP3Resources {
         })
     }
 
-    pub fn projected_area_equivalent_oblate_research(
+    pub fn projected_area_equivalent_spheroid_research(
         table: Arc<P3OfficialTableV54>,
     ) -> Result<Self, radar_scattering::P3TMatrixIntegrationConfigError> {
         Ok(Self {
             table,
             integration: production_p3_integration_config(
-                P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1,
+                P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1,
             )?,
         })
     }
@@ -1113,6 +1113,9 @@ impl WrfTMatrixScene {
                         P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1 => {
                             P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION
                         }
+                        P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1 => {
+                            P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION
+                        }
                     };
                     WrfTMatrixFrozenScatteringAudit::P3SchemeNativePsdV1 {
                         p3_psd_revision: P3_PSD_REVISION,
@@ -1130,6 +1133,9 @@ impl WrfTMatrixScene {
                             }
                             P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1 => {
                                 "lambda/mu and analytic closure are exact P3; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately and without renormalization; oblate shape is projected-area-equivalent and Gaussian-20 canting is an external research assumption, not P3-predicted habit or orientation"
+                            }
+                            P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1 => {
+                                "lambda/mu and analytic closure are exact P3; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately and without renormalization; source mass and projected area map continuously to an equivalent oblate or, only for the pinned one-percent rime-iteration overshoot, prolate spheroid without clamping; Gaussian-20 canting and spheroidal habit remain external research assumptions"
                             }
                         },
                     }

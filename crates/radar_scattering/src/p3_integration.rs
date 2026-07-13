@@ -22,6 +22,13 @@ pub const P3_SPHERICAL_INTEGRATION_REVISION: &str =
     "wrf-p3-v5.4-shape-authoritative-spherical-integration-v4";
 pub const P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION: &str =
     "wrf-p3-v5.4-projected-area-equivalent-oblate-gaussian20-research-v4";
+pub const P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION: &str =
+    "wrf-p3-v5.4-projected-area-equivalent-spheroid-gaussian20-research-v1";
+/// The source P3 rime-density fixed point exits below one-percent relative
+/// change. A small area overshoot created by that final coefficient update is
+/// eligible for the explicit prolate side of the equivalent-spheroid policy;
+/// larger inconsistencies remain shape omissions.
+pub const P3_SOURCE_AREA_OVERSHOOT_RELATIVE_LIMIT: f64 = 0.01;
 
 /// Native diameter grid used by the pinned WRF source's P3-module-v4.5.2,
 /// lookup-generator-v5.4 fall-speed and reflectivity moment integrations.
@@ -90,6 +97,13 @@ pub enum P3TMatrixShapePolicy {
     /// area equals P3 A(D). The existing Gaussian-20 table ODF is an explicit
     /// external assumption, not a P3-predicted canting distribution.
     ProjectedAreaEquivalentOblateGaussian20ResearchV1,
+    /// Research-only projected-area-equivalent spheroid. The usual P3 area
+    /// maps to an oblate with horizontal major diameter Dmax. A source-law
+    /// area up to one percent above the Dmax circle, caused by the pinned
+    /// rime-density fixed-point tolerance, maps continuously to a prolate that
+    /// preserves source area and mass without clamping either value. Larger
+    /// overshoots remain shape omissions.
+    ProjectedAreaEquivalentSpheroidGaussian20ResearchV1,
 }
 
 /// Explicit omission gates for the only shape-authoritative P3/T-matrix seam.
@@ -428,6 +442,14 @@ where
                 projected_area_equivalent_nodes += 1;
                 table_node
             }
+            P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1 => {
+                let Ok(table_node) = projected_area_equivalent_spheroid(*node) else {
+                    non_spherical.add(node);
+                    continue;
+                };
+                projected_area_equivalent_nodes += 1;
+                table_node
+            }
         };
         let inside_table = table_support
             .domain_for(table_node.habit)
@@ -495,6 +517,9 @@ where
                 P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1 => {
                     P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION
                 }
+                P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1 => {
+                    P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION
+                }
             },
             config,
             quadrature: quadrature.audit,
@@ -539,15 +564,54 @@ where
 fn projected_area_equivalent_oblate(
     node: P3QuadratureNode,
 ) -> Result<P3TMatrixParticleNode, &'static str> {
+    projected_area_equivalent_spheroid_impl(
+        node,
+        P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1,
+        false,
+    )
+}
+
+fn projected_area_equivalent_spheroid(
+    node: P3QuadratureNode,
+) -> Result<P3TMatrixParticleNode, &'static str> {
+    projected_area_equivalent_spheroid_impl(
+        node,
+        P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1,
+        true,
+    )
+}
+
+fn projected_area_equivalent_spheroid_impl(
+    node: P3QuadratureNode,
+    shape_policy: P3TMatrixShapePolicy,
+    permit_source_tolerance_prolate: bool,
+) -> Result<P3TMatrixParticleNode, &'static str> {
     let maximum_dimension = node.particle.maximum_dimension_m;
     let raw_ratio = 4.0 * node.particle.projected_area_m2 / (PI * maximum_dimension.powi(2));
-    if !raw_ratio.is_finite() || raw_ratio <= 0.0 || raw_ratio > 1.0 + 1.0e-10 {
-        return Err("4A/(pi Dmax^2) is outside the equivalent-oblate domain");
+    if !raw_ratio.is_finite() || raw_ratio <= 0.0 {
+        return Err("4A/(pi Dmax^2) is nonpositive or nonfinite");
     }
-    // Only absorb roundoff at the analytic spherical boundary; values above
-    // the tolerance fail instead of silently becoming spheres.
-    let ratio = raw_ratio.min(1.0);
-    let equivolume_diameter = maximum_dimension * ratio.cbrt();
+    let roundoff_limit = 1.0 + 1.0e-10;
+    let source_tolerance_limit = 1.0 + P3_SOURCE_AREA_OVERSHOOT_RELATIVE_LIMIT;
+    if (!permit_source_tolerance_prolate && raw_ratio > roundoff_limit)
+        || raw_ratio > source_tolerance_limit
+    {
+        return Err("4A/(pi Dmax^2) exceeds the selected equivalent-spheroid authority");
+    }
+    let roundoff_sphere = raw_ratio > 1.0 && raw_ratio <= roundoff_limit;
+    let volume_ratio = if roundoff_sphere { 1.0 } else { raw_ratio };
+    let (habit, axis_ratio) = if roundoff_sphere || (raw_ratio - 1.0).abs() <= 1.0e-10 {
+        (PsdSpheroidHabit::Spherical, 1.0)
+    } else if raw_ratio < 1.0 {
+        (PsdSpheroidHabit::Oblate, raw_ratio)
+    } else {
+        // Preserve the source projected area exactly: horizontal diameter is
+        // Dmax and vertical diameter is raw_ratio*Dmax, so the prolate
+        // minor/major ratio is its reciprocal. This is a named research
+        // mapping, not a claim that P3 predicts a prolate habit.
+        (PsdSpheroidHabit::Prolate, raw_ratio.recip())
+    };
+    let equivolume_diameter = maximum_dimension * volume_ratio.cbrt();
     let volume = PI / 6.0 * equivolume_diameter.powi(3);
     let density = node.particle.mass_kg / volume;
     if !equivolume_diameter.is_finite()
@@ -561,13 +625,9 @@ fn projected_area_equivalent_oblate(
         source: node,
         equivolume_diameter_m: equivolume_diameter,
         bulk_density_kg_m3: density,
-        minor_to_major_axis_ratio: ratio,
-        habit: if (ratio - 1.0).abs() <= 1.0e-10 {
-            PsdSpheroidHabit::Spherical
-        } else {
-            PsdSpheroidHabit::Oblate
-        },
-        shape_policy: P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1,
+        minor_to_major_axis_ratio: axis_ratio,
+        habit,
+        shape_policy,
     })
 }
 
@@ -700,5 +760,18 @@ mod tests {
         let mut invalid = node(0.01, 1.0e-6, 1.0);
         invalid.particle.projected_area_m2 *= 1.001;
         assert!(projected_area_equivalent_oblate(invalid).is_err());
+
+        let mapped = projected_area_equivalent_spheroid(invalid).unwrap();
+        assert_eq!(mapped.habit(), PsdSpheroidHabit::Prolate);
+        assert!((mapped.minor_to_major_axis_ratio() - 1.0 / 1.001).abs() < 1.0e-14);
+        assert!((mapped.equivolume_diameter_m() - 0.01 * 1.001_f64.cbrt()).abs() < 1.0e-14);
+        assert_eq!(
+            mapped.source().particle.projected_area_m2,
+            invalid.particle.projected_area_m2
+        );
+
+        let mut excessive = invalid;
+        excessive.particle.projected_area_m2 = PI / 4.0 * 0.01_f64.powi(2) * 1.011;
+        assert!(projected_area_equivalent_spheroid(excessive).is_err());
     }
 }

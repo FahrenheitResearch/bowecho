@@ -1359,6 +1359,11 @@ fn wrf(ui: &mut egui::Ui) {
          audits omitted number, mass and equivalent-volume sixth-moment tails. P3 audits omitted \
          number, mass and its scheme-consistent mass-squared (equivalent-ice-volume-squared) radar \
          weight; native P3 M6 remains the separate PSD/quadrature closure authority. \
+         For source-compatible radar moments, the pinned P3 v5.4 operator uses its documented \
+         40,000 by 2-micrometre integration grid through an 80 mm upper edge. BowEcho retains \
+         analytic closure to infinity without renormalization, reports the excluded analytic \
+         tail separately, and applies shape/table coverage budgets only within that source \
+         domain. \
          Wet ISHMAEL PSD allocation remains unavailable rather than replaced by a characteristic \
          particle.",
     );
@@ -1366,9 +1371,12 @@ fn wrf(ui: &mut egui::Ui) {
         ui,
         "P3 itself predicts Dmax, mass and projected area but not a unique spheroidal habit or \
          canting distribution. BowEcho's usable P3 policy preserves the exact PSD and native \
-         mass/area law, then applies an explicitly versioned projected-area-equivalent oblate \
-         shape plus the table's Gaussian-20 canting as external research assumptions. Provenance \
-         says so directly. A strict shape-authoritative mode evaluates only P3's genuinely \
+         mass/area law, then applies an explicitly versioned projected-area-equivalent spheroid \
+         plus the table's Gaussian-20 canting as external research assumptions. The normal branch \
+         is oblate. A rare source-law area overshoot within P3's pinned one-percent rime-density \
+         iteration tolerance maps continuously to a prolate while preserving source area and mass; \
+         it is not clamped to a sphere. Larger inconsistencies remain omissions. Provenance says \
+         so directly. A strict shape-authoritative mode evaluates only P3's genuinely \
          spherical regions under omission budgets. The old single-characteristic-particle \
          production dispatch is removed.",
     );
@@ -3065,7 +3073,8 @@ mod tests {
         assert!(guide_src.contains("old single-characteristic-particle"));
         assert!(guide_src.contains("official WRF v5.4 two-moment table"));
         assert!(guide_src.contains("reconstructed scheme-native PSDs per particle"));
-        assert!(guide_src.contains("projected-area-equivalent oblate"));
+        assert!(guide_src.contains("projected-area-equivalent spheroid"));
+        assert!(guide_src.contains("80 mm upper edge"));
         assert!(guide_src.contains("WRF refractivity (research)"));
         assert!(guide_src.contains("not independently validated"));
         assert!(guide_src.contains("make no operational claim"));

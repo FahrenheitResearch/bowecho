@@ -490,7 +490,11 @@ solve. BowEcho downloads that 1.6 or 17.9 MB asset only when required, caches
 it outside the executable, and accepts it only after the pinned byte length,
 SHA-256, header, record layout, source commit, and scheme/table-kind checks all
 pass. PSD quadrature then integrates additive scattering through the dry
-T-matrix node tables. Table-support omissions remain fail-closed and are
+T-matrix node tables over the pinned lookup generator's 40,000 by 2-micrometre
+moment grid, whose upper bin edge is 80 mm in native P3 maximum dimension.
+The analytic PSD closure still extends to infinity and is not renormalized;
+the population above 80 mm is reported separately as source-domain exclusion.
+Table-support omissions remain fail-closed inside the source domain and are
 audited independently by number, mass, and P3's scheme-consistent
 mass-squared (equivalent-ice-volume-squared) radar weight. The latter matches
 the variable-density ice reflectivity weight in the official P3 table
@@ -505,8 +509,12 @@ fabricated.
 P3 predicts maximum dimension, mass, and projected area, but not one unique
 spheroidal habit or canting distribution. The usable research policy therefore
 keeps lambda, mu, PSD weights, mass, and area scheme-native while mapping each
-node to an explicitly named projected-area-equivalent oblate spheroid with the
-table's Gaussian-20 canting assumption. Provenance states that this shape and
+node to an explicitly named projected-area-equivalent spheroid with the table's
+Gaussian-20 canting assumption. The normal branch is oblate. When the pinned
+P3 rime-density fixed-point update leaves projected area up to one percent
+above the Dmax circle, the mapping preserves that source area and mass with a
+continuous prolate equivalent rather than clamping it to a sphere. Larger
+inconsistencies remain shape omissions. Provenance states that this shape and
 orientation are external research assumptions, not P3 predictions. A stricter
 shape-authoritative policy exists and evaluates only genuinely spherical P3
 regions under omission budgets; neither policy silently revives the removed

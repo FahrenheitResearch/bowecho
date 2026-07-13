@@ -342,9 +342,10 @@ fn embedded_p3_raw_evaluator(
         P3OfficialTableKind::ThreeMoment => &P3_THREE_MOMENT_RAW_EVALUATOR,
     };
     match slot.get_or_init(move || {
-        let p3 = WrfTMatrixP3Resources::projected_area_equivalent_oblate_research(table).map_err(
-            |error| format!("configure P3 projected-area T-matrix integration: {error}"),
-        )?;
+        let p3 = WrfTMatrixP3Resources::projected_area_equivalent_spheroid_research(table)
+            .map_err(|error| {
+                format!("configure P3 projected-area T-matrix integration: {error}")
+            })?;
         WrfTMatrixRawEvaluator::new_with_p3(embedded_luts()?.bundle(), p3)
             .map_err(|error| format!("validate embedded P3 raw property evaluator: {error}"))
     }) {
@@ -363,7 +364,7 @@ fn embedded_p3_resources(
         _ => return Ok(None),
     };
     let table = crate::wrf_p3_assets::load_or_download_official_p3_table(kind, progress)?;
-    WrfTMatrixP3Resources::projected_area_equivalent_oblate_research(table)
+    WrfTMatrixP3Resources::projected_area_equivalent_spheroid_research(table)
         .map(Some)
         .map_err(|error| format!("configure P3 projected-area T-matrix integration: {error}"))
 }
@@ -675,7 +676,7 @@ mod tests {
             radar_scattering::P3OfficialTableV54::load_path(table_kind, table_path)
                 .expect("load exact official BOWECHO_P3_TABLE_FIXTURE");
         let table_spec = table_kind.asset_spec();
-        let p3 = WrfTMatrixP3Resources::projected_area_equivalent_oblate_research(Arc::new(
+        let p3 = WrfTMatrixP3Resources::projected_area_equivalent_spheroid_research(Arc::new(
             official_table,
         ))
         .expect("configure production P3 integration for exact cell");
@@ -881,7 +882,7 @@ mod tests {
         let official_table =
             radar_scattering::P3OfficialTableV54::load_path(table_kind, table_path)
                 .expect("load BOWECHO_P3_TABLE_FIXTURE");
-        let p3 = WrfTMatrixP3Resources::projected_area_equivalent_oblate_research(Arc::new(
+        let p3 = WrfTMatrixP3Resources::projected_area_equivalent_spheroid_research(Arc::new(
             official_table,
         ))
         .expect("configure production P3 integration");
