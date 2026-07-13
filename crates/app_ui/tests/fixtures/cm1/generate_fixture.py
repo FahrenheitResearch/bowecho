@@ -85,15 +85,24 @@ with netCDF4.Dataset(OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
     u = nc.createVariable("u", "f4", ("time", "zh", "yh", "xf"))
     u.long_name = "u velocity"
     u.units = "m/s"
-    u[:] = 0.0
+    u[:] = np.broadcast_to(
+        np.array([0.0, 2.0, 4.0, 6.0], dtype=np.float32)[None, None, None, :],
+        (2, 2, 2, 4),
+    )
     v = nc.createVariable("v", "f4", ("time", "zh", "yf", "xh"))
     v.long_name = "v velocity"
     v.units = "m/s"
-    v[:] = 0.0
+    v[:] = np.broadcast_to(
+        np.array([0.0, 4.0, 8.0], dtype=np.float32)[None, None, :, None],
+        (2, 2, 3, 3),
+    )
     w = nc.createVariable("w", "f4", ("time", "zf", "yh", "xh"))
     w.long_name = "w velocity"
     w.units = "m/s"
-    w[:] = 0.0
+    w[:] = np.broadcast_to(
+        np.array([0.0, 10.0, 20.0], dtype=np.float32)[None, :, None, None],
+        (2, 3, 2, 3),
+    )
 
     nc.setncattr("CM1 version", "cm1r21.1")
     nc.setncattr("Conventions", "CF-1.7")

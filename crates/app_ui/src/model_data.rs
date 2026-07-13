@@ -2895,7 +2895,7 @@ impl ModelDataDock {
             });
             ui.label(
                 egui::RichText::new(
-                    "Inspect cm1out directly, choose an exact output time and native level, then store the selected plane under model=cm1. CM1 files never pass through the WRF reader.",
+                    "Inspect cm1out directly, choose an exact output time and native level, then store the selected plane under model=cm1. Native u/v/w are explicitly destaggered; CM1 files never pass through the WRF reader.",
                 )
                 .small()
                 .weak(),

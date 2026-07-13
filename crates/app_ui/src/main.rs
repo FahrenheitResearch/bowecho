@@ -20724,7 +20724,7 @@ impl ViewerApp {
             if ui
                 .selectable_label(cm1_open, "CM1")
                 .on_hover_text(
-                    "Inspect native NCAR CM1 output, choose a scalar/time/level, and explicitly place its local Cartesian domain",
+                    "Inspect native NCAR CM1 output, choose a field/time/level, and explicitly place its local Cartesian domain",
                 )
                 .clicked()
             {

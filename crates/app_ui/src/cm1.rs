@@ -161,6 +161,21 @@ impl Cm1VariableRole {
     pub fn is_plottable_scalar(&self) -> bool {
         matches!(self, Self::NativeScalar2D | Self::NativeScalar3D)
     }
+
+    /// A field that BowEcho can place on the scalar x/y grid without
+    /// inventing scientific semantics. Staggered CM1 vectors are included
+    /// only because their official Arakawa-C locations define an exact
+    /// adjacent-face average onto the scalar grid.
+    pub fn is_horizontal_plane_compatible(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeScalar2D
+                | Self::NativeScalar3D
+                | Self::NativeXStaggered3D
+                | Self::NativeYStaggered3D
+                | Self::NativeZStaggered3D
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,6 +320,14 @@ impl Cm1Inventory {
             .filter(|variable| variable.role.is_plottable_scalar())
     }
 
+    /// Native scalar fields plus staggered vector components that can be
+    /// explicitly averaged onto the CM1 scalar grid.
+    pub fn horizontal_plane_variables(&self) -> impl Iterator<Item = &Cm1Variable> {
+        self.variables
+            .iter()
+            .filter(|variable| variable.role.is_horizontal_plane_compatible())
+    }
+
     /// Native-domain offset relative to the user anchor for a particular
     /// output record. Follow-domain is always zero. Fixed-world fails closed
     /// for a moving file that lacks accumulated displacement.
@@ -335,6 +358,17 @@ impl Cm1Inventory {
 }
 
 /// One native scalar plane in row-major `[y][x]` order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cm1PlaneTransform {
+    NativeScalar,
+    /// Adjacent xf faces averaged onto xh.
+    DestaggeredX,
+    /// Adjacent yf faces averaged onto yh.
+    DestaggeredY,
+    /// Adjacent zf faces averaged onto zh.
+    DestaggeredZ,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cm1NativePlane {
     pub variable: String,
@@ -348,6 +382,7 @@ pub struct Cm1NativePlane {
     pub x_m: Vec<f64>,
     pub y_m: Vec<f64>,
     pub values: Vec<f64>,
+    pub transform: Cm1PlaneTransform,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1207,7 +1242,260 @@ pub fn read_native_scalar_plane(
         x_m: x_m.to_vec(),
         y_m: y_m.to_vec(),
         values,
+        transform: Cm1PlaneTransform::NativeScalar,
     })
+}
+
+/// Read a native CM1 field onto the scalar x/y grid. Scalar fields are
+/// unchanged. Official x/y/z-staggered 3-D fields are centred with the
+/// standard adjacent-face arithmetic mean; that transform is returned in
+/// [`Cm1NativePlane::transform`] and must remain visible in provenance/UI.
+pub fn read_horizontal_mass_grid_plane(
+    nc: &NcFile,
+    inventory: &Cm1Inventory,
+    variable_name: &str,
+    time_index: usize,
+    level_index: Option<usize>,
+) -> Result<Cm1NativePlane, Cm1Error> {
+    let metadata = inventory
+        .variable(variable_name)
+        .ok_or_else(|| Cm1Error::UnknownVariable(variable_name.to_string()))?;
+    match metadata.role {
+        Cm1VariableRole::NativeScalar2D | Cm1VariableRole::NativeScalar3D => {
+            read_native_scalar_plane(nc, inventory, variable_name, time_index, level_index)
+        }
+        Cm1VariableRole::NativeXStaggered3D
+        | Cm1VariableRole::NativeYStaggered3D
+        | Cm1VariableRole::NativeZStaggered3D => read_destaggered_plane(
+            nc,
+            inventory,
+            metadata,
+            time_index,
+            level_index.unwrap_or(0),
+        ),
+        ref other => Err(Cm1Error::UnsupportedScalar {
+            name: metadata.name.clone(),
+            reason: format!("inventoried role is {other:?}"),
+        }),
+    }
+}
+
+fn read_destaggered_plane(
+    nc: &NcFile,
+    inventory: &Cm1Inventory,
+    metadata: &Cm1Variable,
+    time_index: usize,
+    level_index: usize,
+) -> Result<Cm1NativePlane, Cm1Error> {
+    if time_index >= inventory.time.record_count {
+        return Err(Cm1Error::TimeIndex {
+            index: time_index,
+            count: inventory.time.record_count,
+        });
+    }
+    let x_m = required_axis_values(&inventory.axes.xh)?;
+    let y_m = required_axis_values(&inventory.axes.yh)?;
+    let scalar_levels = required_axis_values(&inventory.axes.zh)?;
+    if level_index >= scalar_levels.len() {
+        return Err(Cm1Error::LevelIndex {
+            name: metadata.name.clone(),
+            index: level_index,
+            count: scalar_levels.len(),
+        });
+    }
+    let nx = x_m.len();
+    let ny = y_m.len();
+    let (values, transform) = match metadata.role {
+        Cm1VariableRole::NativeXStaggered3D => {
+            let raw_nx = required_axis_values(&inventory.axes.xf)?.len();
+            if raw_nx != nx.saturating_add(1) {
+                return Err(Cm1Error::PlaneShape {
+                    name: metadata.name.clone(),
+                    dimensions: metadata.dimensions.clone(),
+                });
+            }
+            let raw = read_horizontal_slice_row_major(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.scalar_z_dimension,
+                level_index,
+                &inventory.topology.staggered_x_dimension,
+                &inventory.topology.scalar_y_dimension,
+                raw_nx,
+                ny,
+            )?;
+            let mut centred = Vec::with_capacity(nx * ny);
+            for y in 0..ny {
+                for x in 0..nx {
+                    centred.push(0.5 * (raw[y * raw_nx + x] + raw[y * raw_nx + x + 1]));
+                }
+            }
+            (centred, Cm1PlaneTransform::DestaggeredX)
+        }
+        Cm1VariableRole::NativeYStaggered3D => {
+            let raw_ny = required_axis_values(&inventory.axes.yf)?.len();
+            if raw_ny != ny.saturating_add(1) {
+                return Err(Cm1Error::PlaneShape {
+                    name: metadata.name.clone(),
+                    dimensions: metadata.dimensions.clone(),
+                });
+            }
+            let raw = read_horizontal_slice_row_major(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.scalar_z_dimension,
+                level_index,
+                &inventory.topology.scalar_x_dimension,
+                &inventory.topology.staggered_y_dimension,
+                nx,
+                raw_ny,
+            )?;
+            let mut centred = Vec::with_capacity(nx * ny);
+            for y in 0..ny {
+                for x in 0..nx {
+                    centred.push(0.5 * (raw[y * nx + x] + raw[(y + 1) * nx + x]));
+                }
+            }
+            (centred, Cm1PlaneTransform::DestaggeredY)
+        }
+        Cm1VariableRole::NativeZStaggered3D => {
+            let raw_levels = required_axis_values(&inventory.axes.zf)?.len();
+            if raw_levels != scalar_levels.len().saturating_add(1) {
+                return Err(Cm1Error::PlaneShape {
+                    name: metadata.name.clone(),
+                    dimensions: metadata.dimensions.clone(),
+                });
+            }
+            let below = read_horizontal_slice_row_major(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.staggered_z_dimension,
+                level_index,
+                &inventory.topology.scalar_x_dimension,
+                &inventory.topology.scalar_y_dimension,
+                nx,
+                ny,
+            )?;
+            let above = read_horizontal_slice_row_major(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.staggered_z_dimension,
+                level_index + 1,
+                &inventory.topology.scalar_x_dimension,
+                &inventory.topology.scalar_y_dimension,
+                nx,
+                ny,
+            )?;
+            (
+                below
+                    .into_iter()
+                    .zip(above)
+                    .map(|(below, above)| 0.5 * (below + above))
+                    .collect(),
+                Cm1PlaneTransform::DestaggeredZ,
+            )
+        }
+        _ => unreachable!("caller restricts to staggered roles"),
+    };
+    Ok(Cm1NativePlane {
+        variable: metadata.name.clone(),
+        units: metadata.units.clone(),
+        long_name: metadata.long_name.clone(),
+        time_index,
+        level_index: Some(level_index),
+        nominal_level_m: Some(scalar_levels[level_index]),
+        nx,
+        ny,
+        x_m: x_m.to_vec(),
+        y_m: y_m.to_vec(),
+        values,
+        transform,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_horizontal_slice_row_major(
+    nc: &NcFile,
+    metadata: &Cm1Variable,
+    time_index: usize,
+    vertical_dimension: &str,
+    level_index: usize,
+    x_dimension: &str,
+    y_dimension: &str,
+    nx: usize,
+    ny: usize,
+) -> Result<Vec<f64>, Cm1Error> {
+    let mut selection = Vec::with_capacity(metadata.dimensions.len());
+    let mut remaining_dimensions = Vec::new();
+    for dimension in &metadata.dimensions {
+        if dimension.eq_ignore_ascii_case("time") {
+            selection.push(NcSliceInfoElem::Index(time_index as u64));
+        } else if dimension.eq_ignore_ascii_case(vertical_dimension) {
+            selection.push(NcSliceInfoElem::Index(level_index as u64));
+        } else {
+            selection.push(NcSliceInfoElem::Slice {
+                start: 0,
+                end: u64::MAX,
+                step: 1,
+            });
+            remaining_dimensions.push(dimension.clone());
+        }
+    }
+    if remaining_dimensions.len() != 2
+        || !remaining_dimensions
+            .iter()
+            .any(|dimension| dimension.eq_ignore_ascii_case(x_dimension))
+        || !remaining_dimensions
+            .iter()
+            .any(|dimension| dimension.eq_ignore_ascii_case(y_dimension))
+    {
+        return Err(Cm1Error::PlaneShape {
+            name: metadata.name.clone(),
+            dimensions: remaining_dimensions,
+        });
+    }
+    let array = nc.read_array_f64_slice(
+        &metadata.name,
+        &NcSliceInfo {
+            selections: selection,
+        },
+    )?;
+    let mut values = if remaining_dimensions[0].eq_ignore_ascii_case(y_dimension) {
+        if array.shape() != [ny, nx] {
+            return Err(Cm1Error::PlaneShape {
+                name: metadata.name.clone(),
+                dimensions: remaining_dimensions,
+            });
+        }
+        array.into_values()
+    } else {
+        if array.shape() != [nx, ny] {
+            return Err(Cm1Error::PlaneShape {
+                name: metadata.name.clone(),
+                dimensions: remaining_dimensions,
+            });
+        }
+        let source = array.into_values();
+        let mut transposed = vec![0.0; nx * ny];
+        for x in 0..nx {
+            for y in 0..ny {
+                transposed[y * nx + x] = source[x * ny + y];
+            }
+        }
+        transposed
+    };
+    if let Some(missing) = metadata.missing_value {
+        for value in &mut values {
+            if value.to_bits() == missing.to_bits() || *value == missing {
+                *value = f64::NAN;
+            }
+        }
+    }
+    Ok(values)
 }
 
 fn required_axis_values(axis: &Cm1Axis) -> Result<&[f64], Cm1Error> {
@@ -1827,6 +2115,32 @@ mod tests {
         assert_eq!((plane.nx, plane.ny), (3, 2));
         assert_eq!(plane.nominal_level_m, Some(1_500.0));
         assert_eq!(plane.values, vec![110.0, 111.0, 112.0, 113.0, 114.0, 115.0]);
+        assert_eq!(plane.transform, Cm1PlaneTransform::NativeScalar);
+    }
+
+    #[test]
+    fn official_staggered_vectors_are_averaged_onto_scalar_grid() {
+        let path = fixture_path();
+        let nc = netcrust::open(&path).expect("open fixture");
+        let inventory = inspect_file(&nc, &path).expect("inspect fixture");
+
+        let u =
+            read_horizontal_mass_grid_plane(&nc, &inventory, "u", 0, Some(0)).expect("destagger u");
+        assert_eq!(u.transform, Cm1PlaneTransform::DestaggeredX);
+        assert_eq!(u.values, vec![1.0, 3.0, 5.0, 1.0, 3.0, 5.0]);
+
+        let v =
+            read_horizontal_mass_grid_plane(&nc, &inventory, "v", 0, Some(0)).expect("destagger v");
+        assert_eq!(v.transform, Cm1PlaneTransform::DestaggeredY);
+        assert_eq!(v.values, vec![2.0, 2.0, 2.0, 6.0, 6.0, 6.0]);
+
+        let w0 = read_horizontal_mass_grid_plane(&nc, &inventory, "w", 0, Some(0))
+            .expect("destagger w level 0");
+        assert_eq!(w0.transform, Cm1PlaneTransform::DestaggeredZ);
+        assert_eq!(w0.values, vec![5.0; 6]);
+        let w1 = read_horizontal_mass_grid_plane(&nc, &inventory, "w", 0, Some(1))
+            .expect("destagger w level 1");
+        assert_eq!(w1.values, vec![15.0; 6]);
     }
 
     #[test]

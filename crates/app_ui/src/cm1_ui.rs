@@ -120,11 +120,11 @@ impl Cm1ImportPanel {
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.heading("CM1 import");
-                    ui.weak("Native NCAR CM1 scalar fields with explicit world placement");
+                    ui.weak("Native NCAR CM1 horizontal fields with explicit world placement");
                 });
                 ui.label(
                     egui::RichText::new(
-                        "CM1 supplies a local Cartesian grid, not map-projected latitude/longitude. BowEcho will not infer a location from ctrlat/ctrlon.",
+                        "CM1 supplies a local Cartesian grid, not map-projected latitude/longitude. BowEcho will not infer a location from ctrlat/ctrlon; staggered u/v/w are explicitly averaged onto the scalar grid.",
                     )
                     .small()
                     .weak(),
@@ -238,17 +238,17 @@ impl Cm1ImportPanel {
                     result
                         .inventory
                         .variable(selected)
-                        .is_none_or(|variable| !variable.role.is_plottable_scalar())
+                        .is_none_or(|variable| !variable.role.is_horizontal_plane_compatible())
                 }) {
                     self.selected_variable = result
                         .inventory
-                        .plottable_scalar_variables()
+                        .horizontal_plane_variables()
                         .next()
                         .map(|variable| variable.name.clone());
                 }
                 self.message = Some(format!(
-                    "CM1 inventory ready: {} native scalar field(s), {} output time(s)",
-                    result.inventory.plottable_scalar_variables().count(),
+                    "CM1 inventory ready: {} compatible horizontal field(s), {} output time(s)",
+                    result.inventory.horizontal_plane_variables().count(),
                     result.inventory.time.record_count
                 ));
                 self.inventory = Some(result.inventory);
@@ -345,8 +345,8 @@ impl Cm1ImportPanel {
     }
 
     fn selection_ui(&mut self, ui: &mut egui::Ui, inventory: &Cm1Inventory) {
-        ui.strong("Native scalar plane");
-        let plottable = inventory.plottable_scalar_variables().collect::<Vec<_>>();
+        ui.strong("Native horizontal plane");
+        let plottable = inventory.horizontal_plane_variables().collect::<Vec<_>>();
         let selected_label = self
             .selected_variable
             .as_deref()
@@ -383,6 +383,9 @@ impl Cm1ImportPanel {
                     match variable.role {
                         Cm1VariableRole::NativeScalar2D => "2-D scalar",
                         Cm1VariableRole::NativeScalar3D => "3-D scalar",
+                        Cm1VariableRole::NativeXStaggered3D => "3-D x-staggered; averaged to xh",
+                        Cm1VariableRole::NativeYStaggered3D => "3-D y-staggered; averaged to yh",
+                        Cm1VariableRole::NativeZStaggered3D => "3-D z-staggered; averaged to zh",
                         _ => "unsupported",
                     },
                     variable.units.as_deref().unwrap_or("not declared"),
@@ -411,17 +414,15 @@ impl Cm1ImportPanel {
         });
 
         if let Some(variable) = selected
-            && matches!(variable.role, Cm1VariableRole::NativeScalar3D)
+            && matches!(
+                variable.role,
+                Cm1VariableRole::NativeScalar3D
+                    | Cm1VariableRole::NativeXStaggered3D
+                    | Cm1VariableRole::NativeYStaggered3D
+                    | Cm1VariableRole::NativeZStaggered3D
+            )
         {
-            let levels = variable
-                .dimensions
-                .iter()
-                .zip(&variable.shape)
-                .find(|(dimension, _)| {
-                    dimension.eq_ignore_ascii_case(&inventory.topology.scalar_z_dimension)
-                })
-                .map(|(_, &count)| count)
-                .unwrap_or(0);
+            let levels = inventory.axes.zh.raw_values.len();
             if self.level_index >= levels {
                 self.level_index = 0;
             }
@@ -453,7 +454,7 @@ impl Cm1ImportPanel {
         let unavailable = inventory
             .variables
             .iter()
-            .filter(|variable| !variable.role.is_plottable_scalar())
+            .filter(|variable| !variable.role.is_horizontal_plane_compatible())
             .collect::<Vec<_>>();
         egui::CollapsingHeader::new(format!(
             "Unavailable / non-scalar fields ({})",
@@ -466,9 +467,6 @@ impl Cm1ImportPanel {
                     Cm1VariableRole::Coordinate => "coordinate axis".to_owned(),
                     Cm1VariableRole::Time => "time coordinate".to_owned(),
                     Cm1VariableRole::Metadata => "metadata".to_owned(),
-                    Cm1VariableRole::NativeXStaggered3D => "x-staggered vector field".to_owned(),
-                    Cm1VariableRole::NativeYStaggered3D => "y-staggered vector field".to_owned(),
-                    Cm1VariableRole::NativeZStaggered3D => "z-staggered vector field".to_owned(),
                     Cm1VariableRole::Unsupported { reason } => reason.clone(),
                     role => format!("role {role:?}"),
                 };
@@ -574,7 +572,10 @@ impl Cm1ImportPanel {
             .ok_or_else(|| "The selected field is no longer in the inventory.".to_owned())?;
         let level_index = match metadata.role {
             Cm1VariableRole::NativeScalar2D => None,
-            Cm1VariableRole::NativeScalar3D => Some(self.level_index),
+            Cm1VariableRole::NativeScalar3D
+            | Cm1VariableRole::NativeXStaggered3D
+            | Cm1VariableRole::NativeYStaggered3D
+            | Cm1VariableRole::NativeZStaggered3D => Some(self.level_index),
             _ => return Err("Choose a native scalar field.".to_owned()),
         };
         let latitude = parse_coordinate(&self.anchor_latitude, "latitude", -90.0, 90.0)?;
@@ -654,7 +655,7 @@ fn import_selected_plane(
             .unwrap_or_default()
     ));
     let nc = netcrust::open(&request.source_path).map_err(|error| error.to_string())?;
-    let plane = cm1::read_native_scalar_plane(
+    let plane = cm1::read_horizontal_mass_grid_plane(
         &nc,
         &request.inventory,
         &request.variable,
@@ -785,6 +786,7 @@ fn write_provenance(
             "dimensions": metadata.map(|value| &value.dimensions),
             "shape": metadata.map(|value| &value.shape),
             "stored_name": stored_variable,
+            "grid_transform": format!("{:?}", plane.transform),
         },
         "selection": {
             "time_index": request.time_index,
@@ -1026,7 +1028,7 @@ mod tests {
         let request = Cm1ImportRequest {
             source_path,
             inventory,
-            variable: "custom_scalar".to_owned(),
+            variable: "u".to_owned(),
             time_index: 1,
             level_index: Some(1),
             placement: Cm1Placement {
@@ -1045,7 +1047,7 @@ mod tests {
             import_selected_plane(&request, &store_root, &mut |message| progress.push(message))
                 .expect("import fixture plane");
         assert_eq!(summary.model, "cm1");
-        assert_eq!(summary.variable, "cm1_custom_scalar_k001");
+        assert_eq!(summary.variable, "cm1_u_k001");
         assert_eq!(
             summary.hour.exact_time.map(|time| time.lead_seconds),
             Some(60)
@@ -1060,7 +1062,8 @@ mod tests {
         let provenance =
             std::fs::read_to_string(&summary.provenance_path).expect("read CM1 provenance sidecar");
         assert!(provenance.contains("bowecho-cm1-provenance-v1"));
-        assert!(provenance.contains("custom_scalar"));
+        assert!(provenance.contains("\"name\": \"u\""));
+        assert!(provenance.contains("DestaggeredX"));
         assert!(provenance.contains("FollowDomain"));
         assert!(!progress.is_empty());
         let _ = std::fs::remove_dir_all(store_root);

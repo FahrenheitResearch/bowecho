@@ -19,7 +19,10 @@ science. Regenerate it with `generate_fixture.py`; the generated binary is
 committed so Rust tests do not require Python or libnetcdf.
 
 Generated fixture SHA-256:
-`7B798AE707EFA73517E1C6C449906BBC8A717AF86F3C48560D8E81738625756A`.
+`228648F955295BEA7FF3B4F7D30F706DE79811FDCA17AA22D9B6D1DE50528CC5`.
+Its `u`, `v`, and `w` faces contain simple nonzero sequences so tests can
+verify the exact adjacent-face averages used to destagger `xf/yf/zf` fields
+onto the `xh/yh/zh` scalar grid.
 
 `cm1out_legacy_r19.nc` reproduces the official r18/r19 topology, whose data
 dimensions are `ni/nj/nk` and `nip1/njp1/nkp1` while coordinate variables are
