@@ -33,6 +33,10 @@ pub const ISHMAEL_PSD_REVISION: &str = "wrf-jensen-ishmael-gamma-final-check-v3"
 /// to the authenticated solid-ice constituent endpoint of the dry LUTs.
 pub const ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION: &str =
     "ishmael-mass-preserving-solid-ice-material-closure-v1";
+/// Versioned scattering route for exact native ISHMAEL spheres below a dry
+/// T-matrix table's lower diameter coordinate.
+pub const ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION: &str =
+    "wrf-ishmael-exact-sphere-rayleigh-table-floor-bridge-v1";
 
 /// ISHMAEL's fixed gamma shape parameter, `nu`.
 pub const ISHMAEL_GAMMA_SHAPE: f64 = 4.0;
@@ -103,6 +107,24 @@ pub enum SchemePsdRevision {
     IshmaelGammaV1,
     IshmaelGammaVarCheckV2,
     IshmaelGammaFinalCheckV3,
+    IshmaelGammaFinalCheckRayleighBridgeV4,
+}
+
+/// Explicit treatment of exact native ISHMAEL spheres below a particle LUT's
+/// diameter floor. It never applies to nonspherical particles or another
+/// coordinate miss.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IshmaelSmallSphereScatteringPolicy {
+    Disabled,
+    RayleighLimitBelowTableDiameterFloorV1,
+}
+
+/// Per-node scattering route selected during ISHMAEL PSD preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IshmaelParticleScatteringRoute {
+    TMatrixTable,
+    TableFloorAnchoredExactSphereRayleighV1,
 }
 
 /// Deterministic bounded quadrature implemented by this revision.
@@ -867,16 +889,22 @@ impl IshmaelPsd {
         (((diameter_m.ln() - diameter_at_scale.ln()) * 3.0) / (2.0 + self.aspect_power_delta)).exp()
     }
 
+    fn is_exact_spherical_distribution(self) -> bool {
+        self.aspect_power_delta.to_bits() == 1.0_f64.to_bits()
+            && self.a_scale_m.to_bits() == self.c_at_a_scale_m.to_bits()
+    }
+
     fn support_intervals(
         self,
         support: PsdParticleSupport,
         upper_scaled_a: f64,
         material: IshmaelSolidIceMaterialClosure,
+        small_sphere_policy: IshmaelSmallSphereScatteringPolicy,
     ) -> Vec<SupportInterval> {
         let exponent = self.aspect_power_delta - 1.0;
         let log_ratio_at_scale = (self.c_at_a_scale_m / self.a_scale_m).ln();
         let table_to_source_diameter = 1.0 / material.linear_dimension_scale;
-        let mut intervals = Vec::with_capacity(3);
+        let mut intervals = Vec::with_capacity(4);
 
         if exponent == 0.0 {
             if let Some(domain) = support.spherical
@@ -886,11 +914,18 @@ impl IshmaelPsd {
                 )
                 && contains(domain.minor_to_major_axis_ratio, 1.0)
             {
+                let diameter_lower = self.scaled_a_for_diameter(
+                    domain.equivolume_diameter_m[0] * table_to_source_diameter,
+                );
+                if small_sphere_policy
+                    == IshmaelSmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1
+                    && self.is_exact_spherical_distribution()
+                {
+                    push_clipped_interval(&mut intervals, 0.0, diameter_lower, upper_scaled_a);
+                }
                 push_clipped_interval(
                     &mut intervals,
-                    self.scaled_a_for_diameter(
-                        domain.equivolume_diameter_m[0] * table_to_source_diameter,
-                    ),
+                    diameter_lower,
                     self.scaled_a_for_diameter(
                         domain.equivolume_diameter_m[1] * table_to_source_diameter,
                     ),
@@ -1009,6 +1044,7 @@ impl IshmaelPsd {
             number_density_m3,
             rime_mass_fraction: None,
             rime_density_kg_m3: None,
+            scattering_route: IshmaelParticleScatteringRoute::TMatrixTable,
         })
     }
 }
@@ -1055,6 +1091,7 @@ pub struct PsdParticleNode {
     number_density_m3: f64,
     rime_mass_fraction: Option<f64>,
     rime_density_kg_m3: Option<f64>,
+    scattering_route: IshmaelParticleScatteringRoute,
 }
 
 impl PsdParticleNode {
@@ -1146,6 +1183,11 @@ impl PsdParticleNode {
     #[must_use]
     pub const fn rime_density_kg_m3(self) -> Option<f64> {
         self.rime_density_kg_m3
+    }
+
+    #[must_use]
+    pub const fn scattering_route(self) -> IshmaelParticleScatteringRoute {
+        self.scattering_route
     }
 }
 
@@ -1532,6 +1574,7 @@ pub struct PsdIntegrationConfig {
     maximum_domain_omitted_number_fraction: f64,
     maximum_domain_omitted_mass_fraction: f64,
     maximum_domain_omitted_d6_fraction: f64,
+    small_sphere_scattering_policy: IshmaelSmallSphereScatteringPolicy,
 }
 
 impl PsdIntegrationConfig {
@@ -1614,7 +1657,25 @@ impl PsdIntegrationConfig {
             maximum_domain_omitted_number_fraction,
             maximum_domain_omitted_mass_fraction,
             maximum_domain_omitted_d6_fraction,
+            small_sphere_scattering_policy: IshmaelSmallSphereScatteringPolicy::Disabled,
         })
+    }
+
+    #[must_use]
+    pub const fn with_small_sphere_scattering_policy(
+        mut self,
+        policy: IshmaelSmallSphereScatteringPolicy,
+    ) -> Self {
+        self.small_sphere_scattering_policy = policy;
+        self.revision = match policy {
+            IshmaelSmallSphereScatteringPolicy::Disabled => {
+                SchemePsdRevision::IshmaelGammaFinalCheckV3
+            }
+            IshmaelSmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1 => {
+                SchemePsdRevision::IshmaelGammaFinalCheckRayleighBridgeV4
+            }
+        };
+        self
     }
 
     #[must_use]
@@ -1681,6 +1742,11 @@ impl PsdIntegrationConfig {
     pub const fn maximum_domain_omitted_d6_fraction(self) -> f64 {
         self.maximum_domain_omitted_d6_fraction
     }
+
+    #[must_use]
+    pub const fn small_sphere_scattering_policy(self) -> IshmaelSmallSphereScatteringPolicy {
+        self.small_sphere_scattering_policy
+    }
 }
 
 impl Default for PsdIntegrationConfig {
@@ -1742,6 +1808,10 @@ pub struct PsdIntegrationAudit {
     pub d6_closure_relative_error: f64,
     pub maximum_additive_convergence_error: f64,
     pub maximum_additive_convergence_component: usize,
+    /// Versioned route used for exact spherical sub-floor nodes, when enabled.
+    pub small_sphere_scattering_revision: Option<&'static str>,
+    /// Number of bridge nodes in the accepted refined convergence rule.
+    pub small_sphere_rayleigh_bridge_nodes: usize,
 }
 
 /// Additive and application-accumulator forms of one integrated PSD.
@@ -2010,6 +2080,13 @@ impl PreparedIshmaelPsdIntegration {
             d6_closure_relative_error: convergence.closure_errors[2],
             maximum_additive_convergence_error: convergence.maximum_additive_error,
             maximum_additive_convergence_component: convergence.maximum_additive_component,
+            small_sphere_scattering_revision: match self.config.small_sphere_scattering_policy {
+                IshmaelSmallSphereScatteringPolicy::Disabled => None,
+                IshmaelSmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1 => {
+                    Some(ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION)
+                }
+            },
+            small_sphere_rayleigh_bridge_nodes: refined.small_sphere_rayleigh_bridge_nodes,
         };
         Ok(PsdIntegrationResult {
             additive: refined.additive,
@@ -2072,8 +2149,12 @@ fn prepare_ishmael_psd_impl(
 ) -> Result<PreparedIshmaelPsdIntegration, PsdError> {
     material_closure.validate_for(*distribution)?;
     let upper_scaled_a = tail_cutoff(*distribution, config)?;
-    let support_intervals =
-        distribution.support_intervals(support, upper_scaled_a, material_closure);
+    let support_intervals = distribution.support_intervals(
+        support,
+        upper_scaled_a,
+        material_closure,
+        config.small_sphere_scattering_policy,
+    );
     let tails = MomentFractions {
         number: regularized_gamma_q(ISHMAEL_GAMMA_SHAPE, upper_scaled_a)?,
         mass: regularized_gamma_q(
@@ -2098,6 +2179,7 @@ fn prepare_ishmael_psd_impl(
         upper_scaled_a,
         support,
         material_closure,
+        config.small_sphere_scattering_policy,
         &support_intervals,
         config.maximum_refined_nodes as usize,
     )?;
@@ -2107,6 +2189,7 @@ fn prepare_ishmael_psd_impl(
         upper_scaled_a,
         support,
         material_closure,
+        config.small_sphere_scattering_policy,
         &support_intervals,
         config.maximum_refined_nodes as usize,
     )?;
@@ -2116,6 +2199,7 @@ fn prepare_ishmael_psd_impl(
         upper_scaled_a,
         support,
         material_closure,
+        config.small_sphere_scattering_policy,
         &support_intervals,
         config.maximum_refined_nodes as usize,
     ) {
@@ -2210,6 +2294,7 @@ struct PreparedPsdRule {
 struct RuleAccumulation {
     additive: AdditiveScattering,
     nodes_evaluated: usize,
+    small_sphere_rayleigh_bridge_nodes: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2298,6 +2383,7 @@ fn prepare_rule(
     upper_scaled_a: f64,
     support: PsdParticleSupport,
     material_closure: IshmaelSolidIceMaterialClosure,
+    small_sphere_policy: IshmaelSmallSphereScatteringPolicy,
     support_intervals: &[SupportInterval],
     maximum_nodes: usize,
 ) -> Result<PreparedPsdRule, PsdError> {
@@ -2342,7 +2428,7 @@ fn prepare_rule(
                 "ISHMAEL quadrature number fraction",
                 dx_weight * gamma_pdf,
             )?;
-            let node = distribution.node(index, scaled_a, number_fraction)?;
+            let mut node = distribution.node(index, scaled_a, number_fraction)?;
             let mass_fraction =
                 number_fraction * node.particle_mass_kg / distribution.mean_particle_mass_kg;
             let d6_fraction = number_fraction * node.equivolume_diameter_m.powi(6)
@@ -2356,7 +2442,16 @@ fn prepare_rule(
 
             let scattering_node =
                 IshmaelScatteringParticleNode::from_source(node, material_closure);
-            if support.contains_scattering(scattering_node) {
+            if ishmael_small_sphere_bridge_applies(
+                small_sphere_policy,
+                node,
+                scattering_node,
+                support,
+            ) {
+                node.scattering_route =
+                    IshmaelParticleScatteringRoute::TableFloorAnchoredExactSphereRayleighV1;
+                nodes.push(node);
+            } else if support.contains_scattering(scattering_node) {
                 nodes.push(node);
             }
             index += 1;
@@ -2364,6 +2459,36 @@ fn prepare_rule(
     }
 
     Ok(PreparedPsdRule { nodes, all })
+}
+
+fn ishmael_small_sphere_bridge_applies(
+    policy: IshmaelSmallSphereScatteringPolicy,
+    source: PsdParticleNode,
+    scattering: IshmaelScatteringParticleNode,
+    support: PsdParticleSupport,
+) -> bool {
+    if policy != IshmaelSmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1
+        || source.habit != PsdSpheroidHabit::Spherical
+        || source.a_semi_axis_m.to_bits() != source.c_semi_axis_m.to_bits()
+        || source.minor_to_major_axis_ratio.to_bits() != 1.0_f64.to_bits()
+        || scattering.habit() != PsdSpheroidHabit::Spherical
+        || scattering.a_semi_axis_m().to_bits() != scattering.c_semi_axis_m().to_bits()
+        || scattering.minor_to_major_axis_ratio().to_bits() != 1.0_f64.to_bits()
+    {
+        return false;
+    }
+    let Some(domain) = support.spherical() else {
+        return false;
+    };
+    scattering.equivolume_diameter_m() < domain.equivolume_diameter_range_m()[0]
+        && contains(
+            domain.bulk_density_range_kg_m3(),
+            scattering.bulk_density_kg_m3(),
+        )
+        && contains(
+            domain.minor_to_major_axis_ratio_range(),
+            scattering.minor_to_major_axis_ratio(),
+        )
 }
 
 fn finish_prepared_rule<F, E>(
@@ -2376,7 +2501,13 @@ where
     E: Error + 'static,
 {
     let mut additive = AdditiveScattering::default();
+    let mut small_sphere_rayleigh_bridge_nodes = 0;
     for node in &prepared.nodes {
+        if node.scattering_route()
+            == IshmaelParticleScatteringRoute::TableFloorAnchoredExactSphereRayleighV1
+        {
+            small_sphere_rayleigh_bridge_nodes += 1;
+        }
         let node_index = node.index();
         let per_particle = evaluate_particle(level, node_index, node).map_err(|source| {
             PsdIntegrationError::NodeEvaluation {
@@ -2395,6 +2526,7 @@ where
     Ok(RuleAccumulation {
         additive,
         nodes_evaluated: prepared.nodes.len(),
+        small_sphere_rayleigh_bridge_nodes,
     })
 }
 
@@ -3315,6 +3447,159 @@ mod tests {
         )
         .unwrap();
         assert!(!saw_non_spherical);
+    }
+
+    #[test]
+    fn exact_sphere_policy_represents_sub_floor_nodes_with_an_audited_route() {
+        let spherical = IshmaelPsd::reconstruct(input_from_scales(
+            IshmaelIceCategory::Columnar,
+            8.238_847_892_5e-6,
+            8.238_847_892_5e-6,
+            475.918_69,
+        ))
+        .unwrap();
+        assert!(spherical.is_exact_spherical_distribution());
+        let floor_m = 50.0e-6;
+        let domain = PsdParticleDomain::new(
+            [floor_m, 0.02],
+            [100.0, ICE_MATERIAL_DENSITY_KG_M3],
+            [0.1, 1.0],
+        )
+        .unwrap();
+        let support = PsdParticleSupport::uniform(domain);
+        let fall_speed = synthetic_fall_speed_provenance();
+
+        let disabled = prepare_ishmael_psd(
+            &spherical,
+            PsdIntegrationConfig::default(),
+            support,
+            fall_speed,
+        )
+        .unwrap();
+        assert!(disabled.nodes().all(|(_, _, node)| {
+            node.scattering_route() == IshmaelParticleScatteringRoute::TMatrixTable
+        }));
+        assert!(matches!(
+            disabled.finish(|_, _, node| Ok::<_, Infallible>(synthetic_per_particle(node))),
+            Err(PsdIntegrationError::Psd(PsdError::DomainOmission { .. }))
+        ));
+
+        let enabled_config = PsdIntegrationConfig::default().with_small_sphere_scattering_policy(
+            IshmaelSmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1,
+        );
+        let enabled = prepare_ishmael_psd(&spherical, enabled_config, support, fall_speed).unwrap();
+        let mut saw_bridge = false;
+        let mut saw_table = false;
+        for (_, _, node) in enabled.nodes() {
+            match node.scattering_route() {
+                IshmaelParticleScatteringRoute::TableFloorAnchoredExactSphereRayleighV1 => {
+                    saw_bridge = true;
+                    assert!(node.equivolume_diameter_m() < floor_m);
+                    assert_eq!(node.habit(), PsdSpheroidHabit::Spherical);
+                    assert_eq!(
+                        node.a_semi_axis_m().to_bits(),
+                        node.c_semi_axis_m().to_bits()
+                    );
+                }
+                IshmaelParticleScatteringRoute::TMatrixTable => {
+                    saw_table = true;
+                    assert!(node.equivolume_diameter_m() >= floor_m);
+                }
+            }
+        }
+        assert!(saw_bridge && saw_table);
+
+        let result = enabled
+            .finish(|_, _, node| Ok::<_, Infallible>(synthetic_per_particle(node)))
+            .unwrap();
+        let audit = result.audit();
+        assert_eq!(
+            audit.revision,
+            SchemePsdRevision::IshmaelGammaFinalCheckRayleighBridgeV4
+        );
+        assert_eq!(
+            audit.small_sphere_scattering_revision,
+            Some(ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION)
+        );
+        assert!(audit.small_sphere_rayleigh_bridge_nodes > 0);
+        assert!(audit.domain_omitted_number_fraction <= 1.0e-12);
+        assert!(audit.domain_omitted_mass_fraction <= 1.0e-12);
+        assert!(audit.domain_omitted_d6_fraction <= 1.0e-12);
+    }
+
+    #[test]
+    fn small_sphere_policy_does_not_bridge_nonspheres_or_other_domain_misses() {
+        let policy = PsdIntegrationConfig::default().with_small_sphere_scattering_policy(
+            IshmaelSmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1,
+        );
+        let domain = PsdParticleDomain::new(
+            [500.0e-6, 0.02],
+            [500.0, ICE_MATERIAL_DENSITY_KG_M3],
+            [0.1, 1.0],
+        )
+        .unwrap();
+        let support = PsdParticleSupport::new(Some(domain), None, Some(domain));
+        let fall_speed = synthetic_fall_speed_provenance();
+
+        let nonspherical = IshmaelPsd::reconstruct(input_from_scales(
+            IshmaelIceCategory::Columnar,
+            8.238_847_892_5e-6,
+            7.5e-6,
+            600.0,
+        ))
+        .unwrap();
+        let prepared = prepare_ishmael_psd(&nonspherical, policy, support, fall_speed).unwrap();
+        assert!(prepared.nodes().all(|(_, _, node)| {
+            node.scattering_route() == IshmaelParticleScatteringRoute::TMatrixTable
+        }));
+        let result =
+            prepared.finish(|_, _, node| Ok::<_, Infallible>(synthetic_per_particle(node)));
+        assert!(
+            matches!(
+                result,
+                Err(PsdIntegrationError::Psd(PsdError::DomainOmission { .. }))
+            ),
+            "nonspherical miss unexpectedly produced {result:?}; omitted={:?}",
+            prepared.omitted
+        );
+
+        let density_miss = IshmaelPsd::reconstruct(input_from_scales(
+            IshmaelIceCategory::Columnar,
+            8.238_847_892_5e-6,
+            8.238_847_892_5e-6,
+            475.918_69,
+        ))
+        .unwrap();
+        let prepared = prepare_ishmael_psd(&density_miss, policy, support, fall_speed).unwrap();
+        assert_eq!(prepared.nodes().count(), 0);
+        assert!(matches!(
+            prepared.finish(|_, _, node| Ok::<_, Infallible>(synthetic_per_particle(node))),
+            Err(PsdIntegrationError::Psd(PsdError::DomainOmission { .. }))
+        ));
+
+        let upper_limited_domain = PsdParticleDomain::new(
+            [1.0e-9, 10.0e-6],
+            [100.0, ICE_MATERIAL_DENSITY_KG_M3],
+            [0.1, 1.0],
+        )
+        .unwrap();
+        let prepared = prepare_ishmael_psd(
+            &density_miss,
+            policy,
+            PsdParticleSupport::uniform(upper_limited_domain),
+            fall_speed,
+        )
+        .unwrap();
+        assert!(prepared.nodes().all(|(_, _, node)| {
+            let diameter = node.equivolume_diameter_m();
+            diameter <= 10.0e-6
+                && (node.scattering_route() == IshmaelParticleScatteringRoute::TMatrixTable
+                    || diameter < 1.0e-9)
+        }));
+        assert!(matches!(
+            prepared.finish(|_, _, node| Ok::<_, Infallible>(synthetic_per_particle(node))),
+            Err(PsdIntegrationError::Psd(PsdError::DomainOmission { .. }))
+        ));
     }
 
     #[test]

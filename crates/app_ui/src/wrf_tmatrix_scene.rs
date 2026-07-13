@@ -18,10 +18,12 @@ use radar_scattering::{
     AdditiveScattering, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
     DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K, DiagnosticWetCategory,
     EvaluationError, FallMomentPolicy, ICE_MATERIAL_DENSITY_KG_M3, ISHMAEL_PSD_REVISION,
-    ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION, IshmaelPsd, IshmaelPsdInput, MixtureTopology,
-    OrientationDefinition, OrientationModel, OutputError, P3_MODULE_VERSION,
-    P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION, P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION,
-    P3_PSD_REVISION, P3_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION, P3_SOLID_ICE_DENSITY_KG_M3,
+    ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION, ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION,
+    IshmaelParticleScatteringRoute, IshmaelPsd, IshmaelPsdInput, IshmaelScatteringParticleNode,
+    IshmaelSmallSphereScatteringPolicy, MixtureTopology, OrientationDefinition, OrientationModel,
+    OutputError, P3_MODULE_VERSION, P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION,
+    P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION, P3_PSD_REVISION,
+    P3_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION, P3_SOLID_ICE_DENSITY_KG_M3,
     P3_SPHERICAL_INTEGRATION_REVISION, P3_TABLE_READER_REVISION, P3_WRF_SOURCE_COMMIT,
     P3IceMomentInput, P3LookupTableV54, P3OfficialTableKind, P3OfficialTableV54, P3ParticleRegion,
     P3ParticleScatteringRoute, P3Psd, P3PsdError, P3PsdInput, P3QuadratureNode,
@@ -1029,6 +1031,7 @@ pub enum WrfTMatrixFrozenScatteringAudit {
         scheme_psd_revision: &'static str,
         ishmael_reconstruction_revision: &'static str,
         solid_ice_material_closure_revision: &'static str,
+        small_sphere_scattering_revision: &'static str,
         authenticated_ice_material_density_kg_m3: f64,
         integration: PsdIntegrationConfig,
         support: PsdParticleSupport,
@@ -1347,6 +1350,8 @@ impl WrfTMatrixScene {
                         ishmael_reconstruction_revision: ISHMAEL_PSD_REVISION,
                         solid_ice_material_closure_revision:
                             ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION,
+                        small_sphere_scattering_revision:
+                            ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION,
                         authenticated_ice_material_density_kg_m3: validated
                             .ishmael_ice_material_density_kg_m3,
                         integration: validated.ishmael_psd_config,
@@ -1719,6 +1724,9 @@ fn production_ishmael_psd_config() -> PsdIntegrationConfig {
         ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION,
     )
     .expect("the versioned production ISHMAEL PSD config is valid")
+    .with_small_sphere_scattering_policy(
+        IshmaelSmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1,
+    )
 }
 
 #[derive(Debug)]
@@ -2403,7 +2411,7 @@ fn floor_anchored_rayleigh_sphere(
 ) -> Result<AdditiveScattering, EvaluationError> {
     if !diameter_ratio.is_finite() || diameter_ratio <= 0.0 || diameter_ratio > 1.0 {
         return Err(EvaluationError::InvalidQuery {
-            field: "P3 Rayleigh bridge diameter ratio",
+            field: "table-floor Rayleigh bridge diameter ratio",
             value: diameter_ratio,
         });
     }
@@ -2424,7 +2432,7 @@ fn floor_anchored_rayleigh_sphere(
             .max(f64::MIN_POSITIVE);
     if absorption_cross_section_mm2 < -negative_tolerance {
         return Err(EvaluationError::InvalidQuery {
-            field: "P3 Rayleigh bridge anchor absorption cross section",
+            field: "table-floor Rayleigh bridge anchor absorption cross section",
             value: absorption_cross_section_mm2,
         });
     }
@@ -2444,6 +2452,52 @@ fn floor_anchored_rayleigh_sphere(
         reflectivity * target_speed * target_speed,
     ])
     .map_err(EvaluationError::Output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_table_floor_anchored_rayleigh_sphere(
+    table: &ResearchTMatrixLut,
+    target_diameter_m: f64,
+    target_density_kg_m3: f64,
+    target_speed_m_s: f64,
+    temperature_k: f64,
+    rime_fraction: Option<f64>,
+    rime_density_kg_m3: Option<f64>,
+    fall_speed: PsdFallSpeedProvenance,
+    request: TMatrixEvaluationRequest,
+) -> Result<AdditiveScattering, EvaluationError> {
+    let domain = table.dry_particle_node_domain()?;
+    let anchor_diameter_m = domain.equivolume_diameter_range_m()[0];
+    if target_diameter_m >= anchor_diameter_m {
+        return Err(EvaluationError::InvalidQuery {
+            field: "Rayleigh bridge diameter below table floor",
+            value: target_diameter_m,
+        });
+    }
+    let anchor = table.prepare_dry_particle_geometry_lut_interpolation_per_m3(
+        temperature_k,
+        anchor_diameter_m,
+        target_density_kg_m3,
+        1.0,
+        PsdSpheroidHabit::Spherical,
+        rime_fraction,
+        rime_density_kg_m3,
+        fall_speed,
+        gaussian20_orientation(),
+        request,
+    )?;
+    let anchor = table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(&anchor)?;
+    let reference_water_factor_squared = table
+        .descriptor()
+        .radar()
+        .reference_water_dielectric_factor_squared;
+    floor_anchored_rayleigh_sphere(
+        anchor.components(),
+        target_diameter_m / anchor_diameter_m,
+        target_speed_m_s,
+        request.frequency_hz(),
+        reference_water_factor_squared,
+    )
 }
 
 /// CPU-admitted P3 particle work. Table nodes carry the owning table's opaque
@@ -2571,38 +2625,16 @@ fn evaluate_p3_rayleigh_bridge_node(
             value: node.minor_to_major_axis_ratio(),
         });
     }
-    let domain = table.dry_particle_node_domain()?;
-    let anchor_diameter = domain.equivolume_diameter_range_m()[0];
-    if target_diameter >= anchor_diameter {
-        return Err(EvaluationError::InvalidQuery {
-            field: "P3 Rayleigh bridge diameter below table floor",
-            value: target_diameter,
-        });
-    }
-    let anchor = table.prepare_dry_particle_geometry_lut_interpolation_per_m3(
-        temperature_k,
-        anchor_diameter,
+    evaluate_table_floor_anchored_rayleigh_sphere(
+        table,
+        target_diameter,
         target_density,
-        1.0,
-        PsdSpheroidHabit::Spherical,
+        target_speed,
+        temperature_k,
         Some(rime_fraction),
         rime_density,
         fall_speed,
-        gaussian20_orientation(),
         request,
-    )?;
-    let anchor = table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(&anchor)?;
-    let diameter_ratio = target_diameter / anchor_diameter;
-    let reference_water_factor_squared = table
-        .descriptor()
-        .radar()
-        .reference_water_dielectric_factor_squared;
-    floor_anchored_rayleigh_sphere(
-        anchor.components(),
-        diameter_ratio,
-        target_speed,
-        request.frequency_hz(),
-        reference_water_factor_squared,
     )
 }
 
@@ -3101,12 +3133,59 @@ fn evaluate_characteristic_raw_cell(
         .map_err(WrfTMatrixRawEvaluationError::Output)
 }
 
+enum PreparedIshmaelParticleRoute<'table> {
+    TMatrixTable {
+        table: &'table ResearchTMatrixLut,
+        prepared: PreparedTMatrixLutInterpolation,
+    },
+    CpuRayleighBridge {
+        table: &'table ResearchTMatrixLut,
+        scattering_node: IshmaelScatteringParticleNode,
+        temperature_k: f64,
+        fall_speed: PsdFallSpeedProvenance,
+        request: TMatrixEvaluationRequest,
+    },
+}
+
 struct PreparedIshmaelParticleEvaluation<'table> {
     level: PsdQuadratureLevel,
     node_index: usize,
     role: WrfTMatrixCudaTableRole,
-    table: &'table ResearchTMatrixLut,
-    prepared: PreparedTMatrixLutInterpolation,
+    route: PreparedIshmaelParticleRoute<'table>,
+}
+
+impl<'table> PreparedIshmaelParticleEvaluation<'table> {
+    fn evaluate_cpu(&self) -> Result<AdditiveScattering, EvaluationError> {
+        match &self.route {
+            PreparedIshmaelParticleRoute::TMatrixTable { table, prepared } => {
+                table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(prepared)
+            }
+            PreparedIshmaelParticleRoute::CpuRayleighBridge {
+                table,
+                scattering_node,
+                temperature_k,
+                fall_speed,
+                request,
+            } => evaluate_ishmael_rayleigh_bridge_node(
+                table,
+                *scattering_node,
+                *temperature_k,
+                *fall_speed,
+                *request,
+            ),
+        }
+    }
+
+    fn table_binding(
+        &self,
+    ) -> Option<(&'table ResearchTMatrixLut, &PreparedTMatrixLutInterpolation)> {
+        match &self.route {
+            PreparedIshmaelParticleRoute::TMatrixTable { table, prepared } => {
+                Some((*table, prepared))
+            }
+            PreparedIshmaelParticleRoute::CpuRayleighBridge { .. } => None,
+        }
+    }
 }
 
 struct PreparedIshmaelParticleIntegration<'table> {
@@ -3141,14 +3220,12 @@ impl<'table> PreparedIshmaelParticleIntegration<'table> {
                 (level, node_index),
                 (evaluation.level, evaluation.node_index)
             );
-            evaluate_table(
-                position,
-                level,
-                node_index,
-                node,
-                evaluation.table,
-                &evaluation.prepared,
-            )
+            match &evaluation.route {
+                PreparedIshmaelParticleRoute::TMatrixTable { table, prepared } => {
+                    evaluate_table(position, level, node_index, node, table, prepared)
+                }
+                PreparedIshmaelParticleRoute::CpuRayleighBridge { .. } => evaluation.evaluate_cpu(),
+            }
         });
         if let Ok(result) = &result {
             let base_node_count = self.integration.node_count(PsdQuadratureLevel::Coarse)
@@ -3168,6 +3245,60 @@ impl<'table> PreparedIshmaelParticleIntegration<'table> {
             table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(prepared)
         })
     }
+}
+
+fn evaluate_ishmael_rayleigh_bridge_node(
+    table: &ResearchTMatrixLut,
+    scattering_node: IshmaelScatteringParticleNode,
+    temperature_k: f64,
+    fall_speed: PsdFallSpeedProvenance,
+    request: TMatrixEvaluationRequest,
+) -> Result<AdditiveScattering, EvaluationError> {
+    let source = scattering_node.source();
+    if source.scattering_route()
+        != IshmaelParticleScatteringRoute::TableFloorAnchoredExactSphereRayleighV1
+        || source.habit() != PsdSpheroidHabit::Spherical
+        || scattering_node.habit() != PsdSpheroidHabit::Spherical
+        || source.a_semi_axis_m().to_bits() != source.c_semi_axis_m().to_bits()
+        || scattering_node.a_semi_axis_m().to_bits() != scattering_node.c_semi_axis_m().to_bits()
+        || source.minor_to_major_axis_ratio().to_bits() != 1.0_f64.to_bits()
+        || scattering_node.minor_to_major_axis_ratio().to_bits() != 1.0_f64.to_bits()
+    {
+        return Err(EvaluationError::InvalidQuery {
+            field: "ISHMAEL Rayleigh bridge exact-sphere contract",
+            value: scattering_node.minor_to_major_axis_ratio(),
+        });
+    }
+    let target_diameter_m = scattering_node.equivolume_diameter_m();
+    let target_density_kg_m3 = scattering_node.bulk_density_kg_m3();
+    let domain = table.dry_particle_node_domain()?;
+    let diameter_range = domain.equivolume_diameter_range_m();
+    let density_range = domain.bulk_density_range_kg_m3();
+    let ratio_range = domain.minor_to_major_axis_ratio_range();
+    if target_diameter_m >= diameter_range[0]
+        || target_density_kg_m3 < density_range[0]
+        || target_density_kg_m3 > density_range[1]
+        || ratio_range[0] > 1.0
+        || ratio_range[1] < 1.0
+    {
+        return Err(EvaluationError::InvalidQuery {
+            field: "ISHMAEL Rayleigh bridge table-floor density/diameter contract",
+            value: target_diameter_m,
+        });
+    }
+    let target_speed_m_s =
+        table.dry_particle_geometry_terminal_speed_m_s(target_diameter_m, target_density_kg_m3)?;
+    evaluate_table_floor_anchored_rayleigh_sphere(
+        table,
+        target_diameter_m,
+        target_density_kg_m3,
+        target_speed_m_s,
+        temperature_k,
+        source.rime_mass_fraction(),
+        source.rime_density_kg_m3(),
+        fall_speed,
+        request,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3209,30 +3340,43 @@ fn prepare_ishmael_particle_integration<'table>(
                 prolate_request,
             ),
         };
-        let prepared = table
-            .prepare_dry_particle_geometry_lut_interpolation_per_m3(
-                temperature_k,
-                scattering_node.equivolume_diameter_m(),
-                scattering_node.bulk_density_kg_m3(),
-                scattering_node.minor_to_major_axis_ratio(),
-                scattering_node.habit(),
-                node.rime_mass_fraction(),
-                node.rime_density_kg_m3(),
-                fall_speed,
-                gaussian20_orientation(),
-                request,
-            )
-            .map_err(|source| PsdIntegrationError::NodeEvaluation {
-                level,
-                node_index,
-                source,
-            })?;
+        let route = match node.scattering_route() {
+            IshmaelParticleScatteringRoute::TMatrixTable => {
+                let prepared = table
+                    .prepare_dry_particle_geometry_lut_interpolation_per_m3(
+                        temperature_k,
+                        scattering_node.equivolume_diameter_m(),
+                        scattering_node.bulk_density_kg_m3(),
+                        scattering_node.minor_to_major_axis_ratio(),
+                        scattering_node.habit(),
+                        node.rime_mass_fraction(),
+                        node.rime_density_kg_m3(),
+                        fall_speed,
+                        gaussian20_orientation(),
+                        request,
+                    )
+                    .map_err(|source| PsdIntegrationError::NodeEvaluation {
+                        level,
+                        node_index,
+                        source,
+                    })?;
+                PreparedIshmaelParticleRoute::TMatrixTable { table, prepared }
+            }
+            IshmaelParticleScatteringRoute::TableFloorAnchoredExactSphereRayleighV1 => {
+                PreparedIshmaelParticleRoute::CpuRayleighBridge {
+                    table,
+                    scattering_node,
+                    temperature_k,
+                    fall_speed,
+                    request,
+                }
+            }
+        };
         evaluations.push(PreparedIshmaelParticleEvaluation {
             level,
             node_index,
             role,
-            table,
-            prepared,
+            route,
         });
     }
     Ok(PreparedIshmaelParticleIntegration {
@@ -3260,7 +3404,10 @@ fn finish_ishmael_particle_integration(
     let mut prolate_nodes = Vec::new();
     for (position, evaluation) in prepared.evaluations.iter().enumerate() {
         check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
-        let cuda_node = match CudaPreparedTMatrixNode::new(&evaluation.prepared, 1.0) {
+        let Some((_table, admitted)) = evaluation.table_binding() else {
+            continue;
+        };
+        let cuda_node = match CudaPreparedTMatrixNode::new(admitted, 1.0) {
             Ok(cuda_node) => cuda_node,
             Err(error) => {
                 check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
@@ -3316,7 +3463,14 @@ fn finish_ishmael_particle_integration(
             outputs[position] = Some(output);
         }
     }
-    if outputs.iter().any(Option::is_none) {
+    if prepared
+        .evaluations
+        .iter()
+        .enumerate()
+        .any(|(position, evaluation)| {
+            evaluation.table_binding().is_some() && outputs[position].is_none()
+        })
+    {
         check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         cuda.disable_for_cpu_fallback(
             "CUDA omitted an admitted ISHMAEL particle output".to_owned(),
@@ -3327,7 +3481,7 @@ fn finish_ishmael_particle_integration(
 
     prepared
         .finish_with_table_evaluator(|position, _, _, _, _, _| {
-            Ok(outputs[position].expect("all ISHMAEL CUDA outputs were checked above"))
+            Ok(outputs[position].expect("all ISHMAEL LUT-backed CUDA outputs were checked above"))
         })
         .map_err(ParticleFinishError::Science)
 }
@@ -3342,18 +3496,13 @@ fn finish_ishmael_cpu_cancellable(
     let mut outputs = Vec::with_capacity(prepared.evaluations.len());
     for evaluation in &prepared.evaluations {
         check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
-        outputs.push(
-            evaluation
-                .table
-                .evaluate_prepared_dry_particle_lut_interpolation_per_m3(&evaluation.prepared)
-                .map_err(|source| {
-                    ParticleFinishError::Science(PsdIntegrationError::NodeEvaluation {
-                        level: evaluation.level,
-                        node_index: evaluation.node_index,
-                        source,
-                    })
-                })?,
-        );
+        outputs.push(evaluation.evaluate_cpu().map_err(|source| {
+            ParticleFinishError::Science(PsdIntegrationError::NodeEvaluation {
+                level: evaluation.level,
+                node_index: evaluation.node_index,
+                source,
+            })
+        })?);
     }
     check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
     prepared
@@ -3559,6 +3708,9 @@ fn raw_batch_role_node_counts(prepared: &[PreparedRawBatchEvaluation<'_>]) -> (u
             PreparedRawBatchEvaluation::Ishmael(request) => {
                 for category in &request.categories {
                     for evaluation in &category.integration.evaluations {
+                        if evaluation.table_binding().is_none() {
+                            continue;
+                        }
                         match evaluation.role {
                             WrfTMatrixCudaTableRole::DryOblate => {
                                 oblate = oblate.saturating_add(1);
@@ -3836,10 +3988,10 @@ fn finish_raw_batch(
                         {
                             check_cancel(cancel)
                                 .map_err(|()| WrfTMatrixRawBatchError::Cancelled)?;
-                            let cuda_node = match CudaPreparedTMatrixNode::new(
-                                &evaluation.prepared,
-                                1.0,
-                            ) {
+                            let Some((_table, admitted)) = evaluation.table_binding() else {
+                                continue;
+                            };
+                            let cuda_node = match CudaPreparedTMatrixNode::new(admitted, 1.0) {
                                 Ok(cuda_node) => cuda_node,
                                 Err(error) => {
                                     check_cancel(cancel)
@@ -4064,7 +4216,7 @@ fn finish_prepared_ishmael_raw_batch(
                 .integration
                 .finish_with_table_evaluator(|position, _, _, _, _, _| {
                     Ok(category.cuda_outputs[position]
-                        .expect("both CUDA role sweeps populated every ISHMAEL particle output"))
+                        .expect("both CUDA role sweeps populated every ISHMAEL LUT-backed output"))
                 })
                 .map_err(
                     |source| WrfTMatrixRawEvaluationError::IshmaelPsdIntegration {
@@ -5702,6 +5854,64 @@ mod tests {
         test(&prepared);
     }
 
+    fn with_exact_spherical_ishmael_bridge_prepared(
+        test: impl for<'table> FnOnce(&PreparedIshmaelParticleIntegration<'table>),
+    ) {
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let tables = owner.borrowed_bundle();
+        let validated = validate_bundle(tables).expect("validate embedded table bundle");
+        let distribution = IshmaelPsd::reconstruct_wrf_source_checked(
+            IshmaelPsdInput::new(
+                radar_scattering::IshmaelIceCategory::Columnar,
+                f64::from(f32::from_bits(0x2ce8_e0d2)),
+                f64::from(f32::from_bits(0x3d4a_a53e)),
+                f64::from(f32::from_bits(0x23ff_3104)),
+                f64::from(f32::from_bits(0x23ff_3104)),
+                f64::from(f32::from_bits(0x3f3f_f540)),
+            ),
+            f64::from(f32::from_bits(0x4382_ce77)),
+        )
+        .expect("reconstruct exact fixture spherical-columnar source tuple");
+        assert_eq!(distribution.a_scale_m().to_bits(), 0x3ee1_4732_a1d5_7f71);
+        assert_eq!(
+            distribution.c_at_a_scale_m().to_bits(),
+            0x3ee1_4732_a1d5_7f71
+        );
+        assert_eq!(
+            distribution.aspect_power_delta().to_bits(),
+            1.0_f64.to_bits()
+        );
+        let oblate_request = evaluation_request(
+            validated.frequency_hz,
+            -0.5,
+            SpheroidConvention::OblateMinorVertical,
+        )
+        .unwrap();
+        let prolate_request = evaluation_request(
+            validated.frequency_hz,
+            -0.5,
+            SpheroidConvention::ProlateMajorVertical,
+        )
+        .unwrap();
+        let prepared = prepare_ishmael_particle_integration(
+            &distribution,
+            validated.ishmael_psd_config,
+            validated.ishmael_particle_support,
+            validated.ishmael_fall_speed,
+            validated.ishmael_ice_material_density_kg_m3,
+            tables,
+            f64::from(f32::from_bits(0x4382_ce77)),
+            oblate_request,
+            prolate_request,
+        )
+        .expect("prepare exact fixture spherical-columnar bridge workload");
+        test(&prepared);
+    }
+
     fn prepare_captured_solid_ice_ishmael<'table>(
         tables: WrfTMatrixLutBundle<'table>,
         validated: ValidatedBundle<'table>,
@@ -5845,12 +6055,18 @@ mod tests {
         let oblate_nodes = integration
             .evaluations
             .iter()
-            .filter(|evaluation| evaluation.role == WrfTMatrixCudaTableRole::DryOblate)
+            .filter(|evaluation| {
+                evaluation.role == WrfTMatrixCudaTableRole::DryOblate
+                    && evaluation.table_binding().is_some()
+            })
             .count();
         let prolate_nodes = integration
             .evaluations
             .iter()
-            .filter(|evaluation| evaluation.role == WrfTMatrixCudaTableRole::DryProlate)
+            .filter(|evaluation| {
+                evaluation.role == WrfTMatrixCudaTableRole::DryProlate
+                    && evaluation.table_binding().is_some()
+            })
             .count();
         let cuda_outputs = (0..integration.evaluations.len()).map(|_| None).collect();
         (
@@ -5908,11 +6124,38 @@ mod tests {
             &[2.54e-3, 1.27e-3, 3.81e-3, 5.08e-3, 6.35e-4],
             1.3,
         );
-        let oblate_nodes = oblate.2.saturating_add(prolate.2);
-        let prolate_nodes = oblate.3.saturating_add(prolate.3);
+        let sphere = embedded_ishmael_raw_batch_case(
+            tables,
+            validated,
+            WrfPropertyCategory::IshmaelAggregate,
+            radar_scattering::IshmaelIceCategory::Aggregate,
+            5.592_415_808_136_224e-11,
+            5.592_415_808_136_224e-11,
+            &[1.337_833_514_336_37e-5],
+            0.5,
+        );
+        let PreparedRawBatchEvaluation::Ishmael(sphere_request) = &sphere.0 else {
+            unreachable!("the exact-sphere raw-batch fixture is ISHMAEL")
+        };
+        assert!(
+            sphere_request.categories[0]
+                .integration
+                .evaluations
+                .iter()
+                .any(|evaluation| evaluation.table_binding().is_none())
+        );
+        assert!(
+            sphere_request.categories[0]
+                .integration
+                .evaluations
+                .iter()
+                .any(|evaluation| evaluation.table_binding().is_some())
+        );
+        let oblate_nodes = oblate.2.saturating_add(prolate.2).saturating_add(sphere.2);
+        let prolate_nodes = oblate.3.saturating_add(prolate.3).saturating_add(sphere.3);
         test(
-            vec![oblate.0, prolate.0],
-            vec![oblate.1, prolate.1],
+            vec![oblate.0, prolate.0, sphere.0],
+            vec![oblate.1, prolate.1, sphere.1],
             oblate_nodes,
             prolate_nodes,
         );
@@ -5961,6 +6204,58 @@ mod tests {
     }
 
     #[test]
+    fn exact_spherical_ishmael_cell_uses_cpu_bridge_and_lut_primary_routes() {
+        with_exact_spherical_ishmael_bridge_prepared(|prepared| {
+            let mut bridge_nodes = 0_usize;
+            let mut table_nodes = 0_usize;
+            for (evaluation, (_, _, node)) in prepared
+                .evaluations
+                .iter()
+                .zip(prepared.integration.nodes())
+            {
+                match node.scattering_route() {
+                    IshmaelParticleScatteringRoute::TMatrixTable => {
+                        table_nodes += 1;
+                        assert!(evaluation.table_binding().is_some());
+                    }
+                    IshmaelParticleScatteringRoute::TableFloorAnchoredExactSphereRayleighV1 => {
+                        bridge_nodes += 1;
+                        assert!(evaluation.table_binding().is_none());
+                        assert_eq!(evaluation.role, WrfTMatrixCudaTableRole::DryOblate);
+                    }
+                }
+            }
+            assert!(bridge_nodes > 0);
+            assert!(table_nodes > 0);
+
+            let cpu = prepared.finish_cpu().unwrap();
+            let mut primary_table_calls = 0_usize;
+            let primary = prepared
+                .finish_with_table_evaluator(|_, _, _, _, table, interpolation| {
+                    primary_table_calls += 1;
+                    table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(interpolation)
+                })
+                .unwrap();
+            assert!(primary_table_calls > 0);
+            assert!(primary_table_calls < primary.audit().total_nodes_reduced);
+            assert_psd_result_bitwise_eq(primary, cpu);
+            let audit = primary.audit();
+            assert_eq!(
+                audit.small_sphere_scattering_revision,
+                Some(ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION)
+            );
+            assert!(audit.small_sphere_rayleigh_bridge_nodes > 0);
+            assert!(
+                audit.domain_omitted_number_fraction <= ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION
+            );
+            assert!(
+                audit.domain_omitted_mass_fraction <= ISHMAEL_PSD_MAXIMUM_OMITTED_MASS_FRACTION
+            );
+            assert!(audit.domain_omitted_d6_fraction <= ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION);
+        });
+    }
+
+    #[test]
     fn ishmael_base_success_consumes_only_the_base_ordered_prefix() {
         with_embedded_ishmael_prepared(|prepared| {
             let base_node_count = prepared.integration.node_count(PsdQuadratureLevel::Coarse)
@@ -5969,6 +6264,8 @@ mod tests {
             let expected = prepared
                 .evaluations
                 .iter()
+                .take(base_node_count)
+                .filter(|evaluation| evaluation.table_binding().is_some())
                 .map(|evaluation| (evaluation.level, evaluation.node_index))
                 .collect::<Vec<_>>();
             let mut visited = Vec::new();
@@ -5979,7 +6276,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(result.audit().refinement_steps, 0);
-            assert_eq!(visited, expected[..base_node_count]);
+            assert_eq!(visited, expected);
             assert!(
                 visited
                     .iter()
@@ -5994,6 +6291,7 @@ mod tests {
             let expected = prepared
                 .evaluations
                 .iter()
+                .filter(|evaluation| evaluation.table_binding().is_some())
                 .map(|evaluation| (evaluation.level, evaluation.node_index))
                 .collect::<Vec<_>>();
             let unique = expected.iter().copied().collect::<BTreeSet<_>>();
@@ -6095,32 +6393,41 @@ mod tests {
             assert_eq!(result.audit().refinement_steps, 0, "{label}");
             let expected_component_bits = match label {
                 "cell 3119612 planar" => [
-                    4_584_814_127_193_595_147,
-                    4_584_814_127_193_595_191,
-                    4_584_814_127_193_595_169,
+                    4_584_814_127_194_777_157,
+                    4_584_814_127_194_777_201,
+                    4_584_814_127_194_777_179,
                     13_496_351_942_250_142_541,
                     4_319_305_828_281_550_870,
-                    4_486_107_859_242_813_849,
-                    4_486_107_859_242_813_848,
-                    4_592_725_846_421_530_560,
-                    4_601_202_897_700_065_374,
+                    4_486_107_865_789_088_444,
+                    4_486_107_865_789_088_443,
+                    4_592_725_846_421_563_132,
+                    4_601_202_897_700_065_836,
                 ],
                 "cell 3790530 aggregate" => [
-                    4_557_348_784_881_444_932,
-                    4_557_348_784_881_445_017,
-                    4_557_348_784_881_444_974,
+                    4_557_348_784_881_753_620,
+                    4_557_348_784_881_753_705,
+                    4_557_348_784_881_753_662,
                     13_474_860_641_124_642_613,
                     4_286_781_360_730_856_214,
-                    4_454_737_030_872_670_977,
-                    4_454_737_030_872_670_976,
-                    4_566_661_766_687_246_755,
-                    4_576_176_074_442_968_020,
+                    4_454_737_032_576_173_191,
+                    4_454_737_032_576_173_190,
+                    4_566_661_766_687_248_884,
+                    4_576_176_074_442_968_050,
                 ],
                 _ => panic!("unexpected captured population label {label}"),
             };
             assert_eq!(
                 result.additive().components().map(f64::to_bits),
                 expected_component_bits,
+                "{label}"
+            );
+            assert_eq!(
+                result.audit().small_sphere_scattering_revision,
+                Some(ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION),
+                "{label}"
+            );
+            assert!(
+                result.audit().small_sphere_rayleigh_bridge_nodes > 0,
                 "{label}"
             );
             assert!(
@@ -6150,12 +6457,7 @@ mod tests {
         let cpu_nodes = prepared
             .evaluations
             .iter()
-            .map(|evaluation| {
-                evaluation
-                    .table
-                    .evaluate_prepared_dry_particle_lut_interpolation_per_m3(&evaluation.prepared)
-                    .unwrap()
-            })
+            .map(|evaluation| evaluation.evaluate_cpu().unwrap())
             .collect::<Vec<_>>();
         let mut gpu_nodes = vec![None; prepared.evaluations.len()];
         for role in [
@@ -6166,13 +6468,19 @@ mod tests {
                 .evaluations
                 .iter()
                 .enumerate()
-                .filter_map(|(position, evaluation)| (evaluation.role == role).then_some(position))
+                .filter_map(|(position, evaluation)| {
+                    (evaluation.role == role && evaluation.table_binding().is_some())
+                        .then_some(position)
+                })
                 .collect::<Vec<_>>();
             let staged = positions
                 .iter()
                 .map(|&position| {
                     let evaluation = &prepared.evaluations[position];
-                    CudaPreparedTMatrixNode::new(&evaluation.prepared, 1.0).unwrap()
+                    let (_, admitted) = evaluation
+                        .table_binding()
+                        .expect("only LUT-backed nodes are staged");
+                    CudaPreparedTMatrixNode::new(admitted, 1.0).unwrap()
                 })
                 .collect::<Vec<_>>();
             if staged.is_empty() {
@@ -6188,7 +6496,15 @@ mod tests {
                 gpu_nodes[position] = Some(output);
             }
         }
-        assert!(gpu_nodes.iter().all(Option::is_some));
+        assert!(
+            prepared
+                .evaluations
+                .iter()
+                .zip(&gpu_nodes)
+                .all(
+                    |(evaluation, output)| evaluation.table_binding().is_some() == output.is_some()
+                )
+        );
 
         let cpu_category = prepared.finish_cpu().unwrap();
         assert_eq!(
@@ -6199,26 +6515,22 @@ mod tests {
         let gpu_category = prepared
             .finish_with_table_evaluator(|position, level, node_index, _, _, _| {
                 visited.push((position, level, node_index));
-                Ok(gpu_nodes[position].expect("every prepared node has a GPU result"))
+                Ok(gpu_nodes[position].expect("every LUT-backed prepared node has a GPU result"))
             })
             .unwrap();
-        let expected_consumed = if expected_refinement_steps == 0 {
+        let consumed_evaluations = if expected_refinement_steps == 0 {
             prepared.integration.node_count(PsdQuadratureLevel::Coarse)
                 + prepared.integration.node_count(PsdQuadratureLevel::Refined)
         } else {
             prepared.evaluations.len()
         };
-        assert_eq!(visited.len(), expected_consumed);
-        for (expected_position, &(position, level, node_index)) in visited.iter().enumerate() {
-            assert_eq!(position, expected_position);
-            assert_eq!(
-                (level, node_index),
-                (
-                    prepared.evaluations[position].level,
-                    prepared.evaluations[position].node_index
-                )
-            );
-        }
+        let expected = prepared.evaluations[..consumed_evaluations]
+            .iter()
+            .enumerate()
+            .filter(|(_, evaluation)| evaluation.table_binding().is_some())
+            .map(|(position, evaluation)| (position, evaluation.level, evaluation.node_index))
+            .collect::<Vec<_>>();
+        assert_eq!(visited, expected);
         assert_psd_result_bitwise_eq(gpu_category, cpu_category);
     }
 
@@ -6661,6 +6973,14 @@ mod tests {
     #[test]
     fn production_ishmael_psd_omission_contract_is_independent_by_moment() {
         let config = production_ishmael_psd_config();
+        assert_eq!(
+            config.revision(),
+            radar_scattering::SchemePsdRevision::IshmaelGammaFinalCheckRayleighBridgeV4
+        );
+        assert_eq!(
+            config.small_sphere_scattering_policy(),
+            IshmaelSmallSphereScatteringPolicy::RayleighLimitBelowTableDiameterFloorV1
+        );
         assert_eq!(
             config.maximum_domain_omitted_number_fraction(),
             ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION
@@ -7138,6 +7458,76 @@ mod tests {
                 checked.input().qnice_per_kg().to_bits(),
                 aggregate.qnice_per_kg.to_bits()
             );
+        }
+        if cell == 4_776_084 {
+            let raw = source
+                .raw_cell(cell)
+                .expect("read exact spherical columnar cell");
+            assert_eq!(
+                raw.environment().temperature_k().to_bits(),
+                0x4070_59ce_e000_0000
+            );
+            assert_eq!(raw.dry_air_density_kg_m3().to_bits(), 0x3fe7_fea8_0000_0000);
+            let columnar = raw
+                .categories()
+                .iter()
+                .find_map(|category| match category {
+                    RawPropertyCategory::Ishmael(value)
+                        if value.category == WrfPropertyCategory::IshmaelColumnar =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .expect("exact fixture cell retains the columnar tuple");
+            assert_eq!(
+                (
+                    columnar.qice_kgkg.to_bits(),
+                    columnar.qnice_per_kg.to_bits(),
+                    columnar.qvoli_m3_per_kg.to_bits(),
+                    columnar.qaoli_m3_per_kg.to_bits(),
+                ),
+                (
+                    0x3d9d_1c1a_4000_0000,
+                    0x3fa9_54a7_c000_0000,
+                    0x3c7f_e620_8000_0000,
+                    0x3c7f_e620_8000_0000,
+                )
+            );
+            let checked = IshmaelPsd::reconstruct_wrf_source_checked(
+                IshmaelPsdInput::new(
+                    radar_scattering::IshmaelIceCategory::Columnar,
+                    columnar.qice_kgkg,
+                    columnar.qnice_per_kg,
+                    columnar.qvoli_m3_per_kg,
+                    columnar.qaoli_m3_per_kg,
+                    raw.dry_air_density_kg_m3(),
+                ),
+                raw.environment().temperature_k(),
+            )
+            .expect("replay exact WRF spherical-columnar source state");
+            assert_eq!(checked.a_scale_m().to_bits(), 0x3ee1_4732_a1d5_7f71);
+            assert_eq!(checked.c_at_a_scale_m().to_bits(), 0x3ee1_4732_a1d5_7f71);
+            assert_eq!(checked.aspect_power_delta().to_bits(), 1.0_f64.to_bits());
+            assert_eq!(
+                checked.bulk_density_kg_m3().to_bits(),
+                0x407d_beb2_f540_f757
+            );
+            let audit = checked.reconstruction_audit();
+            assert_eq!(audit.delta_bound_excursion, 0.0);
+            assert_eq!(audit.density_bound_excursion_kg_m3, 0.0);
+            assert!(!audit.source_density_state_projected);
+            assert_eq!(audit.qvoli_source_projection_relative_change, 0.0);
+            assert_eq!(audit.qaoli_source_projection_relative_change, 0.0);
+            assert_eq!(audit.qnice_source_projection_relative_change, 0.0);
+            assert!(!audit.source_aggregate_final_check_applied);
+            assert!(!audit.source_cold_aggregate_reset_applied);
+            assert!(!audit.source_aggregate_size_cap_applied);
+            assert!(!audit.source_number_floor_applied);
+            assert!(!audit.source_moment_floor_applied);
+            assert!(!audit.source_axis_floor_applied);
+            assert!(!audit.source_var_check_small_ice_applied);
+            assert!(!audit.source_var_check_large_ice_applied);
         }
 
         let owner = load_property_tmatrix_tables_exact(

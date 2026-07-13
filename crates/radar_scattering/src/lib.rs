@@ -88,14 +88,15 @@ pub use particle::{
 pub use scheme_psd::{
     DEFAULT_ADDITIVE_ABSOLUTE_TOLERANCES, ISHMAEL_DELTA_RANGE, ISHMAEL_DENSITY_RANGE_KG_M3,
     ISHMAEL_GAMMA_SHAPE, ISHMAEL_MONOMER_SEMI_AXIS_M, ISHMAEL_PSD_REVISION,
-    ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION, IshmaelPsd, IshmaelPsdInput,
-    IshmaelReconstructionAudit, IshmaelScatteringParticleNode, IshmaelSolidIceMaterialClosure,
-    PreparedIshmaelPsdIntegration, PsdError, PsdFallSpeedAuthority, PsdFallSpeedProvenance,
-    PsdIntegrationAudit, PsdIntegrationConfig, PsdIntegrationError, PsdIntegrationResult,
-    PsdParticleDomain, PsdParticleNode, PsdParticleSupport, PsdQuadratureLevel, PsdQuadratureRule,
-    PsdSourceCategory, PsdSpheroidHabit, SCHEME_PSD_REVISION, SchemePsdRevision,
-    analytic_gamma_moment, integrate_ishmael_psd, prepare_ishmael_psd,
-    prepare_ishmael_psd_with_solid_ice_material_closure,
+    ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION, ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION,
+    IshmaelParticleScatteringRoute, IshmaelPsd, IshmaelPsdInput, IshmaelReconstructionAudit,
+    IshmaelScatteringParticleNode, IshmaelSmallSphereScatteringPolicy,
+    IshmaelSolidIceMaterialClosure, PreparedIshmaelPsdIntegration, PsdError, PsdFallSpeedAuthority,
+    PsdFallSpeedProvenance, PsdIntegrationAudit, PsdIntegrationConfig, PsdIntegrationError,
+    PsdIntegrationResult, PsdParticleDomain, PsdParticleNode, PsdParticleSupport,
+    PsdQuadratureLevel, PsdQuadratureRule, PsdSourceCategory, PsdSpheroidHabit,
+    SCHEME_PSD_REVISION, SchemePsdRevision, analytic_gamma_moment, integrate_ishmael_psd,
+    prepare_ishmael_psd, prepare_ishmael_psd_with_solid_ice_material_closure,
 };
 pub use science::{
     EffectiveMediumRule, KernelModel, MeltingModel, OrientationModel, ScienceError,
