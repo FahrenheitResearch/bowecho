@@ -5,6 +5,7 @@
 //! Heavier than `local_import`, but produces the full model field set.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -332,6 +333,13 @@ fn process_paths(
     files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     if files.is_empty() {
         return Err("No supported WRF files selected".to_string());
+    }
+    let domains = selected_wrf_domains(&files);
+    if domains.len() > 1 {
+        return Err(format!(
+            "Selection mixes WRF domains {}; process one domain at a time so each grid is stored in its own run",
+            domains.join(", ")
+        ));
     }
 
     let model = "wrf".to_string();
@@ -1092,16 +1100,55 @@ fn wrf_projection(file: &WrfFile) -> Option<GridProjection> {
 }
 
 fn process_run_name(files: &[PathBuf]) -> String {
-    let first = files
-        .first()
+    let first_path = files.first();
+    let first = first_path
         .and_then(|path| path.file_name())
         .and_then(|value| value.to_str())
         .unwrap_or("wrfout");
+    let domain_suffix = parse_wrf_domain(first)
+        .map(|domain| format!("_{domain}"))
+        .unwrap_or_default();
     if let Some(stamp) = parse_wrf_timestamp(first) {
-        format!("local_{stamp}")
+        format!("local_{stamp}{domain_suffix}")
     } else {
-        format!("local_{}", now_unix())
+        format!("local_{}{domain_suffix}", now_unix())
     }
+}
+
+pub(crate) fn selected_wrf_domains(files: &[PathBuf]) -> Vec<String> {
+    files
+        .iter()
+        .filter_map(|path| path.file_name())
+        .filter_map(|name| name.to_str())
+        .filter_map(parse_wrf_domain)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Extract and normalize the WRF domain token from an ordinary unrestricted
+/// `wrfout_dNN_*` filename. The file may be extensionless and the domain may
+/// contain more than two digits; the returned store token is always at least
+/// two digits (`d2` becomes `d02`). A renamed/nonstandard file safely returns
+/// `None`, preserving the pre-domain run-name fallback.
+pub(crate) fn parse_wrf_domain(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let marker = "wrfout_d";
+    for marker_start in lower.match_indices(marker).map(|(start, _)| start) {
+        let digits_start = marker_start + marker.len();
+        let digits = lower[digits_start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if digits.is_empty() {
+            continue;
+        }
+        let domain = digits.parse::<u16>().ok()?;
+        if domain > 0 {
+            return Some(format!("d{domain:02}"));
+        }
+    }
+    None
 }
 
 /// Extract a sortable `YYYYMMDDHHMMSS` stamp from a wrfout-style filename
@@ -1262,6 +1309,51 @@ mod tests {
             parse_wrf_timestamp("wrfout_d02_1974-04-03_09_00_00"),
             Some("19740403090000".to_string())
         );
+    }
+
+    #[test]
+    fn processed_run_names_separate_domains_but_group_one_domain_time_series() {
+        let d02_first = PathBuf::from("wrfout_d02_1974-04-03_13_15_00");
+        let d02_later = PathBuf::from("wrfout_d02_1974-04-03_13_20_00");
+        let d03_first = PathBuf::from("wrfout_d03_1974-04-03_13_15_00");
+
+        let d02_run = process_run_name(&[d02_first.clone(), d02_later]);
+        let d03_run = process_run_name(&[d03_first]);
+
+        assert_eq!(d02_run, "local_19740403131500_d02");
+        assert_eq!(d03_run, "local_19740403131500_d03");
+        assert_ne!(d02_run, d03_run);
+        assert_eq!(process_run_name(&[d02_first]), d02_run);
+    }
+
+    #[test]
+    fn wrf_domain_parser_accepts_any_extension_and_normalizes_width() {
+        assert_eq!(
+            parse_wrf_domain("wrfout_d2_1974-04-03_13:15:00.nc"),
+            Some("d02".to_owned())
+        );
+        assert_eq!(
+            parse_wrf_domain("WRFOUT_D104_1974-04-03_13_15_00"),
+            Some("d104".to_owned())
+        );
+        assert_eq!(parse_wrf_domain("renamed_output.nc"), None);
+    }
+
+    #[test]
+    fn mixed_domain_processing_stops_before_writing_a_shared_grid_run() {
+        let files = [
+            PathBuf::from("wrfout_d02_1974-04-03_13_15_00"),
+            PathBuf::from("wrfout_d03_1974-04-03_13_15_00"),
+        ];
+        let (tx, _rx) = channel();
+        let error = process_paths(
+            &files,
+            Path::new("unused-store"),
+            &WrfProcessOptions::default(),
+            &tx,
+        )
+        .expect_err("mixed-domain selection must not share one run");
+        assert!(error.contains("d02, d03"), "unexpected error: {error}");
     }
 
     #[test]

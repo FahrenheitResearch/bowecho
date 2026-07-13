@@ -187,6 +187,11 @@ fn import_paths(
             .map_err(ImportError::Grib);
     }
 
+    let domains = crate::wrf_process::selected_wrf_domains(&files);
+    if domains.len() > 1 {
+        return Err(ImportError::MixedWrfDomains(domains));
+    }
+
     let model = "wrf".to_string();
     let run = import_run_name(&files);
     let total = files.len();
@@ -984,7 +989,13 @@ fn import_run_name(paths: &[PathBuf]) -> String {
                 .unwrap_or("local")
                 .to_string()
         });
-    sanitize_run_name(&format!("local_wrf_{stamp}"))
+    let domain_suffix = first
+        .and_then(|path| path.file_name())
+        .and_then(|value| value.to_str())
+        .and_then(crate::wrf_process::parse_wrf_domain)
+        .map(|domain| format!("_{domain}"))
+        .unwrap_or_default();
+    sanitize_run_name(&format!("local_wrf_{stamp}{domain_suffix}"))
 }
 
 fn timestamp_from_path(path: &Path) -> Option<String> {
@@ -1905,6 +1916,43 @@ mod tests {
     }
 
     #[test]
+    fn imported_run_names_separate_domains_but_group_one_domain_time_series() {
+        let d02_first = PathBuf::from("wrfout_d02_1974-04-03_13_15_00");
+        let d02_later = PathBuf::from("wrfout_d02_1974-04-03_13_20_00");
+        let d03_first = PathBuf::from("wrfout_d03_1974-04-03_13_15_00");
+
+        let d02_run = import_run_name(&[d02_first.clone(), d02_later]);
+        let d03_run = import_run_name(&[d03_first]);
+
+        assert_eq!(d02_run, "local_wrf_19740403_131500_d02");
+        assert_eq!(d03_run, "local_wrf_19740403_131500_d03");
+        assert_ne!(d02_run, d03_run);
+        assert_eq!(import_run_name(&[d02_first]), d02_run);
+    }
+
+    #[test]
+    fn imported_run_name_keeps_legacy_fallback_without_a_domain_token() {
+        assert_eq!(
+            import_run_name(&[PathBuf::from("renamed_1974-04-03_13_15_00.nc")]),
+            "local_wrf_19740403_131500"
+        );
+    }
+
+    #[test]
+    fn mixed_domain_import_stops_before_writing_a_shared_grid_run() {
+        let files = [
+            PathBuf::from("wrfout_d02_1974-04-03_13_15_00"),
+            PathBuf::from("wrfout_d03_1974-04-03_13_15_00"),
+        ];
+        let mut progress = |_message: String| {};
+        let error = import_paths(&files, Path::new("unused-store"), &mut progress)
+            .expect_err("mixed-domain selection must not share one run");
+        assert!(
+            matches!(error, ImportError::MixedWrfDomains(domains) if domains == ["d02", "d03"])
+        );
+    }
+
+    #[test]
     fn folder_scan_finds_extensionless_nested_wrf_files() {
         let root = temp_dir("scan");
         let nested = root.join("member").join("d02");
@@ -2391,6 +2439,11 @@ pub(crate) enum ImportError {
     Grib(String),
     #[error("selection mixes GRIB1 and WRF/NetCDF files — import them separately")]
     MixedGribSelection,
+    #[error(
+        "selection mixes WRF domains {} - process one domain at a time so each grid is stored in its own run",
+        .0.join(", ")
+    )]
+    MixedWrfDomains(Vec<String>),
     #[error(transparent)]
     Netcdf(#[from] netcrust::Error),
     #[error(transparent)]
