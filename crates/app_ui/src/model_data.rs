@@ -2004,9 +2004,10 @@ impl ModelDataDock {
             && !self.formula_lab.busy()
         {
             self.import_message = Some(format!(
-                "Importing CM1 {} at output {}{}",
+                "Importing CM1 {} across {} selected output(s); opening output {}{}",
                 request.variable,
-                request.time_index,
+                request.time_indices.len(),
+                request.display_time_index,
                 request
                     .level_index
                     .map(|level| format!(", native level {level}"))
@@ -2400,7 +2401,8 @@ impl ModelDataDock {
                 match done {
                     Some(Ok(summary)) => PollResult::FinishedCm1 {
                         message: format!(
-                            "Imported CM1 {} -> run “{}”; provenance {}",
+                            "Imported {} CM1 frame(s) of {} -> run “{}”; provenance {}",
+                            summary.hours_written,
                             summary.variable,
                             summary.run,
                             summary.provenance_path.display()
@@ -2895,7 +2897,7 @@ impl ModelDataDock {
             });
             ui.label(
                 egui::RichText::new(
-                    "Inspect cm1out directly, choose an exact output time and native level, then store the selected plane under model=cm1. Native u/v/w are explicitly destaggered; CM1 files never pass through the WRF reader.",
+                    "Inspect cm1out directly, choose one output or its full exact-time loop and a native level, then store it under model=cm1. Native u/v/w are explicitly destaggered; CM1 files never pass through the WRF reader.",
                 )
                 .small()
                 .weak(),

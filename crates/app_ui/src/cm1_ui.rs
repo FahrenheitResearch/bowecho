@@ -40,6 +40,7 @@ pub struct Cm1ImportSummary {
     pub model: String,
     pub run: String,
     pub variable: String,
+    pub hours_written: usize,
     pub hour: rw_ui::HourKey,
     pub provenance_path: PathBuf,
 }
@@ -51,7 +52,11 @@ pub struct Cm1ImportRequest {
     pub source_path: PathBuf,
     pub inventory: Cm1Inventory,
     pub variable: String,
-    pub time_index: usize,
+    /// Ordered, immutable native output-record selections. Each becomes one
+    /// ordinal rw-store slot with its own exact physical time.
+    pub time_indices: Vec<usize>,
+    /// Record to select after the run lands (must be in `time_indices`).
+    pub display_time_index: usize,
     pub level_index: Option<usize>,
     pub placement: Cm1Placement,
 }
@@ -84,6 +89,7 @@ pub struct Cm1ImportPanel {
     diagnostic_note: Option<String>,
     selected_variable: Option<String>,
     time_index: usize,
+    import_all_times: bool,
     level_index: usize,
     anchor_latitude: String,
     anchor_longitude: String,
@@ -178,13 +184,18 @@ impl Cm1ImportPanel {
                 if let Some(status) = shared_import_message {
                     ui.label(egui::RichText::new(status).small().weak());
                 }
+                let import_label = if self.import_all_times {
+                    "Store exact-time loop and open in Models"
+                } else {
+                    "Store selected plane and open in Models"
+                };
                 if ui
                     .add_enabled(
                         !import_busy && validation.is_ok(),
-                        egui::Button::new("Store selected plane and open in Models"),
+                        egui::Button::new(import_label),
                     )
                     .on_hover_text(
-                        "Reads exactly the selected native scalar/time/level and writes it under model=cm1 with an exact time and a provenance sidecar.",
+                        "Reads the immutable native field/time/level selection and writes it under model=cm1 with exact physical times and a provenance sidecar.",
                     )
                     .clicked()
                 {
@@ -202,6 +213,7 @@ impl Cm1ImportPanel {
             self.inventory = None;
             self.selected_variable = None;
             self.time_index = 0;
+            self.import_all_times = false;
             self.level_index = 0;
             self.anchor_latitude.clear();
             self.anchor_longitude.clear();
@@ -398,7 +410,11 @@ impl Cm1ImportPanel {
         }
 
         ui.horizontal(|ui| {
-            ui.label("Output time");
+            ui.label(if self.import_all_times {
+                "Open after import"
+            } else {
+                "Output time"
+            });
             let time_label = cm1_time_label(inventory, self.time_index);
             egui::ComboBox::from_id_salt("cm1_output_time")
                 .selected_text(time_label)
@@ -412,6 +428,20 @@ impl Cm1ImportPanel {
                     }
                 });
         });
+        if inventory.time.record_count > 1 {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Time scope");
+                ui.selectable_value(&mut self.import_all_times, false, "Selected record");
+                ui.selectable_value(
+                    &mut self.import_all_times,
+                    true,
+                    format!("All {} records (loop)", inventory.time.record_count),
+                )
+                .on_hover_text(
+                    "Write the ordered CM1 time axis into one exact-time model run. Every frame must use a bit-identical placed grid.",
+                );
+            });
+        }
 
         if let Some(variable) = selected
             && matches!(
@@ -588,14 +618,46 @@ impl Cm1ImportPanel {
             anchor_latitude_deg: latitude,
             anchor_longitude_deg: longitude,
         };
+        let time_indices = if self.import_all_times {
+            (0..inventory.time.record_count).collect::<Vec<_>>()
+        } else {
+            vec![self.time_index]
+        };
+        if time_indices.len() > usize::from(u16::MAX) + 1 {
+            return Err(format!(
+                "CM1 run has {} records; one BowEcho run supports at most {} ordered slots.",
+                time_indices.len(),
+                usize::from(u16::MAX) + 1
+            ));
+        }
         cm1::georeference_scalar_grid(inventory, &placement, self.time_index)
             .map_err(|error| error.to_string())?;
-        exact_time(inventory, self.time_index)?;
+        for &time_index in &time_indices {
+            exact_time(inventory, time_index)?;
+        }
+        if self.import_all_times
+            && mode == Cm1PlacementMode::FixedWorld
+            && let Cm1DomainMotion::ExplicitDisplacement {
+                east_m, north_m, ..
+            } = &inventory.motion.domain_motion
+            && (east_m
+                .windows(2)
+                .any(|pair| pair[0].to_bits() != pair[1].to_bits())
+                || north_m
+                    .windows(2)
+                    .any(|pair| pair[0].to_bits() != pair[1].to_bits()))
+        {
+            return Err(
+                "Moving Fixed-world frames do not share one grid. Choose Follow domain for a loop, or import one selected record."
+                    .to_owned(),
+            );
+        }
         Ok(Cm1ImportRequest {
             source_path,
             inventory: inventory.clone(),
             variable,
-            time_index: self.time_index,
+            time_indices,
+            display_time_index: self.time_index,
             level_index,
             placement,
         })
@@ -645,100 +707,167 @@ fn import_selected_plane(
     store_root: &Path,
     progress: &mut dyn FnMut(String),
 ) -> Result<Cm1ImportSummary, String> {
+    validate_request_times(request)?;
+    let total = request.time_indices.len();
     progress(format!(
-        "CM1: reading {} at output {}{}",
-        request.variable,
-        request.time_index,
-        request
-            .level_index
-            .map(|level| format!(", native level {level}"))
-            .unwrap_or_default()
+        "CM1: preflighting {total} ordered frame(s) for one bit-identical placed grid"
     ));
-    let nc = netcrust::open(&request.source_path).map_err(|error| error.to_string())?;
-    let plane = cm1::read_horizontal_mass_grid_plane(
-        &nc,
-        &request.inventory,
-        &request.variable,
-        request.time_index,
-        request.level_index,
-    )
-    .map_err(|error| error.to_string())?;
-    let georef =
-        cm1::georeference_scalar_grid(&request.inventory, &request.placement, request.time_index)
+    let mut exact_times: Vec<(usize, RwsExactTime)> = Vec::with_capacity(total);
+    let mut reference_georef = None;
+    let mut reference_offset: Option<(f64, f64)> = None;
+    for &time_index in &request.time_indices {
+        let exact = exact_time(&request.inventory, time_index)?;
+        if let Some((previous_index, previous)) = exact_times.last()
+            && previous.lead_seconds >= exact.lead_seconds
+        {
+            return Err(format!(
+                "CM1 exact times are not strictly increasing: output {previous_index} is {} s and output {time_index} is {} s.",
+                previous.lead_seconds, exact.lead_seconds
+            ));
+        }
+        let offset = request
+            .inventory
+            .placement_offset_m(request.placement.mode, time_index)
             .map_err(|error| error.to_string())?;
+        if let (Some(reference), Some(reference_offset)) = (&reference_georef, reference_offset) {
+            // Identical placement offsets feed identical x/y axes and anchor
+            // into the deterministic georeference, so the f32 grid is
+            // necessarily bit-identical without repeating millions of trig
+            // operations for every Follow-domain frame. Changed offsets are
+            // evaluated and compared at the actual stored f32 precision.
+            if offset.0.to_bits() != reference_offset.0.to_bits()
+                || offset.1.to_bits() != reference_offset.1.to_bits()
+            {
+                let georef = cm1::georeference_scalar_grid(
+                    &request.inventory,
+                    &request.placement,
+                    time_index,
+                )
+                .map_err(|error| error.to_string())?;
+                if !georeferenced_grids_bit_identical(reference, &georef) {
+                    return Err(format!(
+                        "CM1 output {time_index} does not share a bit-identical placed grid with output {}. Moving Fixed-world frames must be imported separately; choose Follow domain for one loop.",
+                        request.time_indices[0]
+                    ));
+                }
+            }
+        } else {
+            reference_georef = Some(
+                cm1::georeference_scalar_grid(&request.inventory, &request.placement, time_index)
+                    .map_err(|error| error.to_string())?,
+            );
+            reference_offset = Some(offset);
+        }
+        exact_times.push((time_index, exact));
+    }
+    let georef = reference_georef.ok_or_else(|| "No CM1 output times were selected.".to_owned())?;
     let shape = GridShape::new(georef.nx, georef.ny).map_err(|error| error.to_string())?;
     let grid = LatLonGrid::new(shape, georef.lat_deg.clone(), georef.lon_deg.clone())
         .map_err(|error| error.to_string())?;
-    let values = plane
-        .values
-        .iter()
-        .enumerate()
-        .map(|(index, &value)| {
-            if value.is_nan() {
-                Ok(f32::NAN)
-            } else if value.is_finite()
-                && value >= f64::from(f32::MIN)
-                && value <= f64::from(f32::MAX)
-            {
-                Ok(value as f32)
-            } else {
-                Err(format!(
-                    "CM1 {} value at cell {index} cannot be represented as a finite f32: {value}",
-                    request.variable
-                ))
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let exact = exact_time(&request.inventory, request.time_index)?;
+    let nc = netcrust::open(&request.source_path).map_err(|error| error.to_string())?;
     let field_name = stored_field_name(&request.variable, request.level_index);
-    let units = plane.units.as_deref().unwrap_or("unknown");
     let run = run_name(request);
-    let derived = [DerivedFieldInput {
-        name: &field_name,
-        units,
-        values: &values,
-    }];
     let projection = GridProjection::Geographic;
-    progress(format!("CM1: writing model=cm1 run={run}"));
-    write_hour_from_grid_with_derived_exact(
-        store_root,
-        "cm1",
-        &run,
-        0,
-        exact,
-        &grid,
-        Some(&projection),
-        &[],
-        &derived,
-        &[],
-        concat!("bowecho-cm1-import-", env!("CARGO_PKG_VERSION")),
-        now_unix(),
-    )
-    .map_err(|error| error.to_string())?;
+    let mut representative_plane = None;
+    let mut hours_written = 0usize;
+    for (slot, &(time_index, exact)) in exact_times.iter().enumerate() {
+        progress(format!(
+            "CM1 frame {}/{}: reading {} at output {}{}",
+            slot + 1,
+            total,
+            request.variable,
+            time_index,
+            request
+                .level_index
+                .map(|level| format!(", native level {level}"))
+                .unwrap_or_default()
+        ));
+        let result = (|| {
+            let plane = cm1::read_horizontal_mass_grid_plane(
+                &nc,
+                &request.inventory,
+                &request.variable,
+                time_index,
+                request.level_index,
+            )
+            .map_err(|error| error.to_string())?;
+            let values = values_f32(&request.variable, &plane.values)?;
+            let derived = [DerivedFieldInput {
+                name: &field_name,
+                units: plane.units.as_deref().unwrap_or("unknown"),
+                values: &values,
+            }];
+            progress(format!(
+                "CM1 frame {}/{}: writing exact-time slot {slot} to model=cm1 run={run}",
+                slot + 1,
+                total
+            ));
+            write_hour_from_grid_with_derived_exact(
+                store_root,
+                "cm1",
+                &run,
+                u16::try_from(slot).expect("request time count is bounded"),
+                exact,
+                &grid,
+                Some(&projection),
+                &[],
+                &derived,
+                &[],
+                concat!("bowecho-cm1-import-", env!("CARGO_PKG_VERSION")),
+                now_unix(),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok::<_, String>(plane)
+        })();
+        match result {
+            Ok(plane) => {
+                hours_written += 1;
+                representative_plane.get_or_insert(plane);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "CM1 import stopped after writing {hours_written}/{total} frame(s): {error}"
+                ));
+            }
+        }
+    }
+    let representative_plane = representative_plane
+        .ok_or_else(|| "CM1 import produced no representative field plane.".to_owned())?;
 
     let provenance_path = store_root
         .join("cm1")
         .join(&run)
         .join("cm1-provenance.json");
-    write_provenance(
+    if let Err(error) = write_provenance(
         &provenance_path,
         request,
-        &plane,
+        &representative_plane,
         &georef.provenance,
         &field_name,
-        exact,
-    )?;
+        &exact_times,
+    ) {
+        return Err(format!(
+            "CM1 wrote {hours_written}/{total} frame(s), but the provenance sidecar failed: {error}"
+        ));
+    }
+    let display_slot = request
+        .time_indices
+        .iter()
+        .position(|&index| index == request.display_time_index)
+        .ok_or_else(|| "CM1 display time is not part of the imported selection.".to_owned())?;
+    let display_exact = exact_times[display_slot].1;
     let hour = rw_ui::HourKey {
         model: "cm1".to_owned(),
         run: run.clone(),
-        hour: 0,
-        exact_time: Some(exact),
+        hour: u16::try_from(display_slot).expect("request time count is bounded"),
+        exact_time: Some(display_exact),
     };
     Ok(Cm1ImportSummary {
         store_root: store_root.to_path_buf(),
         model: "cm1".to_owned(),
         run,
         variable: field_name,
+        hours_written,
         hour,
         provenance_path,
     })
@@ -750,7 +879,7 @@ fn write_provenance(
     plane: &cm1::Cm1NativePlane,
     georeference_provenance: &str,
     stored_variable: &str,
-    exact: RwsExactTime,
+    exact_times: &[(usize, RwsExactTime)],
 ) -> Result<(), String> {
     let motion = match &request.inventory.motion.domain_motion {
         Cm1DomainMotion::Static => serde_json::json!({ "kind": "static" }),
@@ -789,11 +918,16 @@ fn write_provenance(
             "grid_transform": format!("{:?}", plane.transform),
         },
         "selection": {
-            "time_index": request.time_index,
+            "time_indices": request.time_indices,
+            "display_time_index": request.display_time_index,
             "level_index": request.level_index,
             "nominal_level_m": plane.nominal_level_m,
-            "lead_seconds": exact.lead_seconds,
-            "valid_unix": exact.valid_unix,
+            "frames": exact_times.iter().enumerate().map(|(slot, (time_index, exact))| serde_json::json!({
+                "storage_slot": slot,
+                "time_index": time_index,
+                "lead_seconds": exact.lead_seconds,
+                "valid_unix": exact.valid_unix,
+            })).collect::<Vec<_>>(),
         },
         "placement": {
             "mode": format!("{:?}", request.placement.mode),
@@ -808,6 +942,117 @@ fn write_provenance(
     let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
     atomic_write_bytes(path, &bytes)
         .map_err(|error| format!("atomically write {}: {error}", path.display()))
+}
+
+fn validate_request_times(request: &Cm1ImportRequest) -> Result<(), String> {
+    match &request.inventory.file_layout {
+        Cm1FileLayout::CompleteDomain { .. } => {}
+        Cm1FileLayout::MpiTile { .. } => {
+            return Err(
+                "A single CM1 MPI tile cannot be imported as a complete domain.".to_owned(),
+            );
+        }
+        Cm1FileLayout::Unresolved { reason } => {
+            return Err(format!("CM1 file layout is unresolved: {reason}"));
+        }
+    }
+    if request.time_indices.is_empty() {
+        return Err("No CM1 output times were selected.".to_owned());
+    }
+    if request.time_indices.len() > usize::from(u16::MAX) + 1 {
+        return Err(format!(
+            "CM1 selection has {} records; one run supports at most {} ordered slots.",
+            request.time_indices.len(),
+            usize::from(u16::MAX) + 1
+        ));
+    }
+    if request
+        .time_indices
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err("CM1 output selections must be unique and strictly ordered.".to_owned());
+    }
+    if request
+        .time_indices
+        .iter()
+        .any(|&index| index >= request.inventory.time.record_count)
+    {
+        return Err(format!(
+            "CM1 output selection exceeds the {}-record native time axis.",
+            request.inventory.time.record_count
+        ));
+    }
+    if !request.time_indices.contains(&request.display_time_index) {
+        return Err("CM1 display time is not part of the immutable import selection.".to_owned());
+    }
+    let variable = request
+        .inventory
+        .variable(&request.variable)
+        .ok_or_else(|| {
+            format!(
+                "CM1 variable {} is no longer inventoried.",
+                request.variable
+            )
+        })?;
+    match variable.role {
+        Cm1VariableRole::NativeScalar2D if request.level_index.is_none() => {}
+        Cm1VariableRole::NativeScalar3D
+        | Cm1VariableRole::NativeXStaggered3D
+        | Cm1VariableRole::NativeYStaggered3D
+        | Cm1VariableRole::NativeZStaggered3D
+            if request
+                .level_index
+                .is_some_and(|level| level < request.inventory.axes.zh.raw_values.len()) => {}
+        _ => {
+            return Err(format!(
+                "CM1 variable {} and native level {:?} are not a valid scalar-grid plane selection.",
+                request.variable, request.level_index
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn georeferenced_grids_bit_identical(
+    left: &cm1::Cm1GeoreferencedGrid,
+    right: &cm1::Cm1GeoreferencedGrid,
+) -> bool {
+    left.nx == right.nx
+        && left.ny == right.ny
+        && left.lat_deg.len() == right.lat_deg.len()
+        && left.lon_deg.len() == right.lon_deg.len()
+        && left
+            .lat_deg
+            .iter()
+            .zip(&right.lat_deg)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        && left
+            .lon_deg
+            .iter()
+            .zip(&right.lon_deg)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+fn values_f32(variable: &str, values: &[f64]) -> Result<Vec<f32>, String> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| {
+            if value.is_nan() {
+                Ok(f32::NAN)
+            } else if value.is_finite()
+                && value >= f64::from(f32::MIN)
+                && value <= f64::from(f32::MAX)
+            {
+                Ok(value as f32)
+            } else {
+                Err(format!(
+                    "CM1 {variable} value at cell {index} cannot be represented as a finite f32: {value}"
+                ))
+            }
+        })
+        .collect()
 }
 
 fn exact_time(inventory: &Cm1Inventory, time_index: usize) -> Result<RwsExactTime, String> {
@@ -918,13 +1163,17 @@ fn run_name(request: &Cm1ImportRequest) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or("cm1out");
     let config = format!(
-        "{}|{}|{}|{:?}|{:.9}|{:.9}",
+        "{}|{}|{:?}|{}|{:?}|{:016x}|{:016x}",
         request.source_path.display(),
         request.variable,
-        request.time_index,
+        request.time_indices,
+        request
+            .level_index
+            .map(|level| level.to_string())
+            .unwrap_or_else(|| "surface".to_owned()),
         request.placement.mode,
-        request.placement.anchor_latitude_deg,
-        request.placement.anchor_longitude_deg,
+        request.placement.anchor_latitude_deg.to_bits(),
+        request.placement.anchor_longitude_deg.to_bits(),
     );
     let digest = Sha256::digest(config.as_bytes());
     let hash = digest[..6]
@@ -939,14 +1188,19 @@ fn run_name(request: &Cm1ImportRequest) -> String {
         Cm1PlacementMode::FixedWorld => "fixed",
         Cm1PlacementMode::FollowDomain => "follow",
     };
+    let time_scope = if request.time_indices.len() == 1 {
+        format!("t{:03}", request.time_indices[0])
+    } else {
+        format!("loop{:03}", request.time_indices.len())
+    };
     let human = format!(
-        "cm1_{}_{}_t{:03}_{}_{}_{}",
+        "cm1_{}_{}_{}_{}_{}_{}",
+        hash,
         sanitize_slug(stem),
         sanitize_slug(&request.variable),
-        request.time_index,
+        time_scope,
         level,
-        mode,
-        hash
+        mode
     );
     human.chars().take(120).collect()
 }
@@ -1029,7 +1283,8 @@ mod tests {
             source_path,
             inventory,
             variable: "u".to_owned(),
-            time_index: 1,
+            time_indices: vec![1],
+            display_time_index: 1,
             level_index: Some(1),
             placement: Cm1Placement {
                 mode: Cm1PlacementMode::FollowDomain,
@@ -1037,11 +1292,7 @@ mod tests {
                 anchor_longitude_deg: -97.0,
             },
         };
-        let store_root = std::env::temp_dir().join(format!(
-            "bowecho-cm1-import-test-{}-{}",
-            std::process::id(),
-            now_unix()
-        ));
+        let store_root = test_store_root("selected");
         let mut progress = Vec::new();
         let summary =
             import_selected_plane(&request, &store_root, &mut |message| progress.push(message))
@@ -1067,5 +1318,78 @@ mod tests {
         assert!(provenance.contains("FollowDomain"));
         assert!(!progress.is_empty());
         let _ = std::fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn follow_domain_import_writes_ordered_exact_time_loop() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc");
+        let inventory = cm1::inspect_path(&source_path).expect("fixture inventory");
+        let request = Cm1ImportRequest {
+            source_path,
+            inventory,
+            variable: "cref".to_owned(),
+            time_indices: vec![0, 1],
+            display_time_index: 1,
+            level_index: None,
+            placement: Cm1Placement {
+                mode: Cm1PlacementMode::FollowDomain,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+        };
+        let store_root = test_store_root("loop");
+        let summary = import_selected_plane(&request, &store_root, &mut |_| {})
+            .expect("import exact CM1 loop");
+        let run_dir = store_root.join("cm1").join(&summary.run);
+        assert_eq!(summary.hours_written, 2);
+        assert_eq!(summary.hour.hour, 1);
+        assert_eq!(
+            summary.hour.exact_time.map(|time| time.lead_seconds),
+            Some(60)
+        );
+        assert!(run_dir.join("f000.rws").is_file());
+        assert!(run_dir.join("f001.rws").is_file());
+        let provenance = std::fs::read_to_string(&summary.provenance_path)
+            .expect("read loop provenance sidecar");
+        assert!(provenance.contains("\"time_indices\": ["));
+        assert!(provenance.contains("\"storage_slot\": 1"));
+        let _ = std::fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn moving_fixed_world_loop_fails_before_writing_any_slot() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc");
+        let mut inventory = cm1::inspect_path(&source_path).expect("fixture inventory");
+        let diagnostics = cm1::diagnostic_files_in_folder(source_path.parent().expect("parent"));
+        cm1::attach_motion_diagnostics(&mut inventory, &diagnostics)
+            .expect("attach exact motion diagnostics");
+        let request = Cm1ImportRequest {
+            source_path,
+            inventory,
+            variable: "cref".to_owned(),
+            time_indices: vec![0, 1],
+            display_time_index: 0,
+            level_index: None,
+            placement: Cm1Placement {
+                mode: Cm1PlacementMode::FixedWorld,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+        };
+        let store_root = test_store_root("moving-fixed");
+        let error = import_selected_plane(&request, &store_root, &mut |_| {})
+            .expect_err("moving Fixed-world grids must not share one run");
+        assert!(error.contains("bit-identical placed grid"), "{error}");
+        assert!(!store_root.join("cm1").exists());
+    }
+
+    fn test_store_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bowecho-cm1-import-test-{label}-{}-{}",
+            std::process::id(),
+            now_unix()
+        ))
     }
 }
