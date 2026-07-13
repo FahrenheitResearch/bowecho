@@ -4579,9 +4579,8 @@ mod tests {
             let psd = P3Psd::reconstruct(input, &table, P3ReconstructionConfig::default())
                 .expect("reconstruct P3 PSD");
             eprintln!("cell={CELL} category={:?} input={input:#?}", value.category);
-            for minimum_diameter_m in [
-                50e-6, 45e-6, 40e-6, 35e-6, 30e-6, 25e-6, 20e-6, 15e-6, 10e-6, 5e-6, 1e-6,
-            ] {
+            for minimum_density_kg_m3 in [1.5, 1.4, 1.3, 1.2, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5] {
+                let minimum_diameter_m = 50e-6;
                 let quadrature = psd
                     .quadrature_with_dimension_breakpoints(
                         radar_scattering::P3QuadratureConfig::default(),
@@ -4616,7 +4615,7 @@ mod tests {
                     ];
                     let diameter_outside =
                         !(minimum_diameter_m..=0.089).contains(&equivolume_diameter_m);
-                    let density_outside = !(1.5..=917.0).contains(&density_kg_m3);
+                    let density_outside = !(minimum_density_kg_m3..=917.0).contains(&density_kg_m3);
                     let ratio_outside = !(0.1..=1.0).contains(&ratio);
                     for moment in 0..3 {
                         if diameter_outside || density_outside || ratio_outside {
@@ -4649,7 +4648,7 @@ mod tests {
                     }
                 }
                 eprintln!(
-                    "minD={minimum_diameter_m:.9e} omitted={omitted:?} diameter={by_diameter:?} density={by_density:?} ratio={by_ratio:?} coords_min={minimum_coordinates:?} coords_max={maximum_coordinates:?}"
+                    "minRho={minimum_density_kg_m3:.9e} omitted={omitted:?} diameter={by_diameter:?} density={by_density:?} ratio={by_ratio:?} coords_min={minimum_coordinates:?} coords_max={maximum_coordinates:?}"
                 );
             }
         }
