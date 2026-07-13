@@ -80,7 +80,10 @@ with netCDF4.Dataset(OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
     zhval = nc.createVariable("zhval", "f4", ("time", "zh", "yh", "xh"))
     zhval.long_name = "height on model levels"
     zhval.units = "m"
-    zhval[:] = np.array([500.0, 1500.0], dtype=np.float32)[None, :, None, None]
+    zhval[:] = np.broadcast_to(
+        np.array([500.0, 1500.0], dtype=np.float32)[None, :, None, None],
+        (2, 2, 2, 3),
+    )
 
     u = nc.createVariable("u", "f4", ("time", "zh", "yh", "xf"))
     u.long_name = "u velocity"

@@ -385,6 +385,39 @@ pub struct Cm1NativePlane {
     pub transform: Cm1PlaneTransform,
 }
 
+/// Physical height sampled at one CM1 scalar-grid column. CM1's official
+/// writer calls `zhval` "height on model levels"; BowEcho deliberately does
+/// not relabel that quantity as MSL because the native file does not declare
+/// a vertical datum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cm1ModelHeightColumn {
+    pub variable: String,
+    pub source_units: String,
+    pub values_m: Vec<f64>,
+    pub interpretation: String,
+}
+
+/// One efficient native CM1 vertical column on the scalar x/y grid. Values
+/// are ordered bottom-to-top in the file's native scalar-z order. Horizontal
+/// and vertical staggering is resolved only through the official adjacent-
+/// face arithmetic means recorded by `transform`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cm1NativeColumnProfile {
+    pub variable: String,
+    pub units: Option<String>,
+    pub long_name: Option<String>,
+    pub time_index: usize,
+    pub x_index: usize,
+    pub y_index: usize,
+    pub local_x_m: f64,
+    pub local_y_m: f64,
+    pub nominal_level_m: Cm1Availability<Vec<f64>>,
+    pub model_level_height_m: Cm1Availability<Cm1ModelHeightColumn>,
+    pub values: Vec<f64>,
+    pub transform: Cm1PlaneTransform,
+    pub provenance: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Cm1Error {
     #[error("NetCDF read error: {0}")]
@@ -423,6 +456,20 @@ pub enum Cm1Error {
 
     #[error("CM1 native plane {name} retained unexpected dimensions {dimensions:?}")]
     PlaneShape {
+        name: String,
+        dimensions: Vec<String>,
+    },
+
+    #[error("CM1 scalar-grid column index ({x}, {y}) is outside {nx} x {ny}")]
+    ColumnIndex {
+        x: usize,
+        y: usize,
+        nx: usize,
+        ny: usize,
+    },
+
+    #[error("CM1 native column {name} retained unexpected dimensions {dimensions:?}")]
+    ColumnShape {
         name: String,
         dimensions: Vec<String>,
     },
@@ -1278,6 +1325,321 @@ pub fn read_horizontal_mass_grid_plane(
             reason: format!("inventoried role is {other:?}"),
         }),
     }
+}
+
+/// Read one native 3-D CM1 field as a scalar-grid vertical column without
+/// loading a full horizontal plane at every level. This is the first-class
+/// profile primitive used by the CM1 UI; it preserves native model levels and
+/// does not invent pressure coordinates or a vertical datum.
+pub fn read_native_column_profile(
+    nc: &NcFile,
+    inventory: &Cm1Inventory,
+    variable_name: &str,
+    time_index: usize,
+    x_index: usize,
+    y_index: usize,
+) -> Result<Cm1NativeColumnProfile, Cm1Error> {
+    if time_index >= inventory.time.record_count {
+        return Err(Cm1Error::TimeIndex {
+            index: time_index,
+            count: inventory.time.record_count,
+        });
+    }
+    let x_m = required_axis_values(&inventory.axes.xh)?;
+    let y_m = required_axis_values(&inventory.axes.yh)?;
+    if x_index >= x_m.len() || y_index >= y_m.len() {
+        return Err(Cm1Error::ColumnIndex {
+            x: x_index,
+            y: y_index,
+            nx: x_m.len(),
+            ny: y_m.len(),
+        });
+    }
+    let metadata = inventory
+        .variable(variable_name)
+        .ok_or_else(|| Cm1Error::UnknownVariable(variable_name.to_string()))?;
+    let nz = inventory.axes.zh.raw_values.len();
+    let (values, transform) = match metadata.role {
+        Cm1VariableRole::NativeScalar3D => (
+            read_vertical_line(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.scalar_z_dimension,
+                &inventory.topology.scalar_x_dimension,
+                x_index,
+                &inventory.topology.scalar_y_dimension,
+                y_index,
+                nz,
+            )?,
+            Cm1PlaneTransform::NativeScalar,
+        ),
+        Cm1VariableRole::NativeXStaggered3D => {
+            let raw_nx = inventory.axes.xf.raw_values.len();
+            if raw_nx != x_m.len().saturating_add(1) {
+                return Err(Cm1Error::ColumnShape {
+                    name: metadata.name.clone(),
+                    dimensions: metadata.dimensions.clone(),
+                });
+            }
+            let west = read_vertical_line(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.scalar_z_dimension,
+                &inventory.topology.staggered_x_dimension,
+                x_index,
+                &inventory.topology.scalar_y_dimension,
+                y_index,
+                nz,
+            )?;
+            let east = read_vertical_line(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.scalar_z_dimension,
+                &inventory.topology.staggered_x_dimension,
+                x_index + 1,
+                &inventory.topology.scalar_y_dimension,
+                y_index,
+                nz,
+            )?;
+            (
+                west.into_iter()
+                    .zip(east)
+                    .map(|(west, east)| 0.5 * (west + east))
+                    .collect(),
+                Cm1PlaneTransform::DestaggeredX,
+            )
+        }
+        Cm1VariableRole::NativeYStaggered3D => {
+            let raw_ny = inventory.axes.yf.raw_values.len();
+            if raw_ny != y_m.len().saturating_add(1) {
+                return Err(Cm1Error::ColumnShape {
+                    name: metadata.name.clone(),
+                    dimensions: metadata.dimensions.clone(),
+                });
+            }
+            let south = read_vertical_line(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.scalar_z_dimension,
+                &inventory.topology.scalar_x_dimension,
+                x_index,
+                &inventory.topology.staggered_y_dimension,
+                y_index,
+                nz,
+            )?;
+            let north = read_vertical_line(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.scalar_z_dimension,
+                &inventory.topology.scalar_x_dimension,
+                x_index,
+                &inventory.topology.staggered_y_dimension,
+                y_index + 1,
+                nz,
+            )?;
+            (
+                south
+                    .into_iter()
+                    .zip(north)
+                    .map(|(south, north)| 0.5 * (south + north))
+                    .collect(),
+                Cm1PlaneTransform::DestaggeredY,
+            )
+        }
+        Cm1VariableRole::NativeZStaggered3D => {
+            let raw_nz = inventory.axes.zf.raw_values.len();
+            if raw_nz != nz.saturating_add(1) {
+                return Err(Cm1Error::ColumnShape {
+                    name: metadata.name.clone(),
+                    dimensions: metadata.dimensions.clone(),
+                });
+            }
+            let faces = read_vertical_line(
+                nc,
+                metadata,
+                time_index,
+                &inventory.topology.staggered_z_dimension,
+                &inventory.topology.scalar_x_dimension,
+                x_index,
+                &inventory.topology.scalar_y_dimension,
+                y_index,
+                raw_nz,
+            )?;
+            (
+                faces
+                    .windows(2)
+                    .map(|faces| 0.5 * (faces[0] + faces[1]))
+                    .collect(),
+                Cm1PlaneTransform::DestaggeredZ,
+            )
+        }
+        ref other => {
+            return Err(Cm1Error::UnsupportedScalar {
+                name: metadata.name.clone(),
+                reason: format!("a vertical profile requires a 3-D field, got {other:?}"),
+            });
+        }
+    };
+    let nominal_level_m = inventory.axes.zh.values_m.clone();
+    if nominal_level_m
+        .available()
+        .is_some_and(|levels| levels.len() != values.len())
+    {
+        return Err(Cm1Error::ColumnShape {
+            name: metadata.name.clone(),
+            dimensions: metadata.dimensions.clone(),
+        });
+    }
+    let model_level_height_m =
+        read_model_height_column(nc, inventory, time_index, x_index, y_index, values.len());
+    Ok(Cm1NativeColumnProfile {
+        variable: metadata.name.clone(),
+        units: metadata.units.clone(),
+        long_name: metadata.long_name.clone(),
+        time_index,
+        x_index,
+        y_index,
+        local_x_m: x_m[x_index],
+        local_y_m: y_m[y_index],
+        nominal_level_m,
+        model_level_height_m,
+        values,
+        transform,
+        provenance: format!(
+            "native CM1 scalar-grid column; transform={transform:?}; vertical order and nominal zh preserved; no pressure interpolation; no MSL datum inferred"
+        ),
+    })
+}
+
+fn read_model_height_column(
+    nc: &NcFile,
+    inventory: &Cm1Inventory,
+    time_index: usize,
+    x_index: usize,
+    y_index: usize,
+    expected_levels: usize,
+) -> Cm1Availability<Cm1ModelHeightColumn> {
+    let variable_name = match &inventory.physical_height_variable {
+        Cm1Availability::Available(name) => name,
+        Cm1Availability::Unavailable { reason } => {
+            return Cm1Availability::Unavailable {
+                reason: reason.clone(),
+            };
+        }
+    };
+    let Some(metadata) = inventory.variable(variable_name) else {
+        return Cm1Availability::Unavailable {
+            reason: format!("inventoried physical-height field `{variable_name}` disappeared"),
+        };
+    };
+    let Some(source_units) = metadata.units.clone() else {
+        return Cm1Availability::Unavailable {
+            reason: format!("`{variable_name}` has no units; physical height cannot be converted"),
+        };
+    };
+    let Some(scale) = length_scale_to_metres(&source_units) else {
+        return Cm1Availability::Unavailable {
+            reason: format!(
+                "`{variable_name}` uses unsupported physical-height units `{source_units}`"
+            ),
+        };
+    };
+    let values = match read_vertical_line(
+        nc,
+        metadata,
+        time_index,
+        &inventory.topology.scalar_z_dimension,
+        &inventory.topology.scalar_x_dimension,
+        x_index,
+        &inventory.topology.scalar_y_dimension,
+        y_index,
+        expected_levels,
+    ) {
+        Ok(values) => values,
+        Err(error) => {
+            return Cm1Availability::Unavailable {
+                reason: format!("cannot read `{variable_name}` at this column: {error}"),
+            };
+        }
+    };
+    Cm1Availability::Available(Cm1ModelHeightColumn {
+        variable: variable_name.clone(),
+        source_units,
+        values_m: values.into_iter().map(|value| value * scale).collect(),
+        interpretation: "official CM1 height on model levels; vertical datum is not declared, so this is not labeled MSL"
+            .to_string(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_vertical_line(
+    nc: &NcFile,
+    metadata: &Cm1Variable,
+    time_index: usize,
+    vertical_dimension: &str,
+    x_dimension: &str,
+    x_index: usize,
+    y_dimension: &str,
+    y_index: usize,
+    vertical_count: usize,
+) -> Result<Vec<f64>, Cm1Error> {
+    let mut selection = Vec::with_capacity(metadata.dimensions.len());
+    let mut remaining_dimensions = Vec::new();
+    for dimension in &metadata.dimensions {
+        if dimension.eq_ignore_ascii_case("time") {
+            selection.push(NcSliceInfoElem::Index(time_index as u64));
+        } else if dimension.eq_ignore_ascii_case(vertical_dimension) {
+            selection.push(NcSliceInfoElem::Slice {
+                start: 0,
+                end: u64::MAX,
+                step: 1,
+            });
+            remaining_dimensions.push(dimension.clone());
+        } else if dimension.eq_ignore_ascii_case(x_dimension) {
+            selection.push(NcSliceInfoElem::Index(x_index as u64));
+        } else if dimension.eq_ignore_ascii_case(y_dimension) {
+            selection.push(NcSliceInfoElem::Index(y_index as u64));
+        } else {
+            return Err(Cm1Error::ColumnShape {
+                name: metadata.name.clone(),
+                dimensions: metadata.dimensions.clone(),
+            });
+        }
+    }
+    if remaining_dimensions.len() != 1
+        || !remaining_dimensions[0].eq_ignore_ascii_case(vertical_dimension)
+    {
+        return Err(Cm1Error::ColumnShape {
+            name: metadata.name.clone(),
+            dimensions: remaining_dimensions,
+        });
+    }
+    let array = nc.read_array_f64_slice(
+        &metadata.name,
+        &NcSliceInfo {
+            selections: selection,
+        },
+    )?;
+    if array.shape() != [vertical_count] {
+        return Err(Cm1Error::ColumnShape {
+            name: metadata.name.clone(),
+            dimensions: remaining_dimensions,
+        });
+    }
+    let mut values = array.into_values();
+    if let Some(missing) = metadata.missing_value {
+        for value in &mut values {
+            if value.to_bits() == missing.to_bits() || *value == missing {
+                *value = f64::NAN;
+            }
+        }
+    }
+    Ok(values)
 }
 
 fn read_destaggered_plane(
@@ -2141,6 +2503,60 @@ mod tests {
         let w1 = read_horizontal_mass_grid_plane(&nc, &inventory, "w", 0, Some(1))
             .expect("destagger w level 1");
         assert_eq!(w1.values, vec![15.0; 6]);
+    }
+
+    #[test]
+    fn native_columns_preserve_levels_and_exact_staggering() {
+        let path = fixture_path();
+        let nc = netcrust::open(&path).expect("open fixture");
+        let inventory = inspect_file(&nc, &path).expect("inspect fixture");
+
+        let scalar = read_native_column_profile(&nc, &inventory, "custom_scalar", 1, 2, 1)
+            .expect("read scalar column");
+        assert_eq!(scalar.values, vec![105.0, 115.0]);
+        assert_eq!(
+            scalar.nominal_level_m.available(),
+            Some(&vec![500.0, 1_500.0])
+        );
+        let physical = scalar
+            .model_level_height_m
+            .available()
+            .expect("physical model heights");
+        assert_eq!(physical.variable, "zhval");
+        assert_eq!(physical.values_m, vec![500.0, 1_500.0]);
+        assert!(physical.interpretation.contains("not labeled MSL"));
+        assert_eq!(scalar.transform, Cm1PlaneTransform::NativeScalar);
+
+        let u = read_native_column_profile(&nc, &inventory, "u", 0, 1, 0)
+            .expect("read destaggered u column");
+        assert_eq!(u.values, vec![3.0, 3.0]);
+        assert_eq!(u.transform, Cm1PlaneTransform::DestaggeredX);
+
+        let v = read_native_column_profile(&nc, &inventory, "v", 0, 2, 0)
+            .expect("read destaggered v column");
+        assert_eq!(v.values, vec![2.0, 2.0]);
+        assert_eq!(v.transform, Cm1PlaneTransform::DestaggeredY);
+
+        let w = read_native_column_profile(&nc, &inventory, "w", 0, 0, 1)
+            .expect("read destaggered w column");
+        assert_eq!(w.values, vec![5.0, 15.0]);
+        assert_eq!(w.transform, Cm1PlaneTransform::DestaggeredZ);
+    }
+
+    #[test]
+    fn native_column_rejects_out_of_domain_location() {
+        let path = fixture_path();
+        let nc = netcrust::open(&path).expect("open fixture");
+        let inventory = inspect_file(&nc, &path).expect("inspect fixture");
+        assert!(matches!(
+            read_native_column_profile(&nc, &inventory, "custom_scalar", 0, 3, 0),
+            Err(Cm1Error::ColumnIndex {
+                x: 3,
+                y: 0,
+                nx: 3,
+                ny: 2
+            })
+        ));
     }
 
     #[test]
