@@ -891,7 +891,7 @@ fn honesty_callout(ui: &mut egui::Ui) {
     egui::Frame::new()
         .fill(egui::Color32::from_rgba_unmultiplied(76, 121, 190, 20))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(94, 141, 214, 95),
         ))
         .corner_radius(4)
@@ -1540,7 +1540,7 @@ fn spectrum_plot(ui: &mut egui::Ui, spectrum: &DopplerSpectrum, visible: &Spectr
         let y = plot.bottom() - ((db + 60.0) / 60.0) as f32 * plot.height();
         painter.line_segment(
             [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-            egui::Stroke::new(1.0, grid),
+            egui::Stroke::new(1.0_f32, grid),
         );
         painter.text(
             egui::pos2(plot.left() - 6.0, y),
@@ -1555,7 +1555,7 @@ fn spectrum_plot(ui: &mut egui::Ui, spectrum: &DopplerSpectrum, visible: &Spectr
         let velocity = x_min + f64::from(fraction) * (x_max - x_min);
         painter.line_segment(
             [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
-            egui::Stroke::new(1.0, grid.gamma_multiply(0.65)),
+            egui::Stroke::new(1.0_f32, grid.gamma_multiply(0.65)),
         );
         painter.text(
             egui::pos2(x, plot.bottom() + 7.0),
@@ -1667,7 +1667,7 @@ fn spectrum_plot(ui: &mut egui::Ui, spectrum: &DopplerSpectrum, visible: &Spectr
                 egui::pos2(position.x, plot.top()),
                 egui::pos2(position.x, plot.bottom()),
             ],
-            egui::Stroke::new(1.0, visuals.text_color().gamma_multiply(0.45)),
+            egui::Stroke::new(1.0_f32, visuals.text_color().gamma_multiply(0.45)),
         );
         response.on_hover_text(format!("{velocity:.3} m/s"));
     }
@@ -1898,7 +1898,7 @@ fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
             color.b(),
             28,
         ))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.65)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.65)))
         .corner_radius(4)
         .inner_margin(egui::Margin::symmetric(6, 3))
         .show(ui, |ui| {

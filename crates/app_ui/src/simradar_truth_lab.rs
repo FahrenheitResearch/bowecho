@@ -633,7 +633,7 @@ fn scope_callout(ui: &mut egui::Ui) {
     egui::Frame::new()
         .fill(egui::Color32::from_rgba_unmultiplied(76, 121, 190, 20))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(94, 141, 214, 95),
         ))
         .corner_radius(4)
@@ -667,7 +667,7 @@ fn error_ui(ui: &mut egui::Ui, error: &TruthLabError) {
     egui::Frame::new()
         .fill(egui::Color32::from_rgba_unmultiplied(194, 139, 38, 24))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(219, 164, 52, 120),
         ))
         .corner_radius(4)
@@ -738,7 +738,7 @@ fn pipeline_stage(
             color.b(),
             22,
         ))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.65)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.65)))
         .corner_radius(4)
         .inner_margin(egui::Margin::symmetric(10, 7))
         .show(ui, |ui| {
@@ -839,7 +839,7 @@ fn comparison_card(
             color.b(),
             16,
         ))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.55)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.55)))
         .corner_radius(4)
         .inner_margin(egui::Margin::symmetric(9, 8))
         .show(ui, |ui| {
@@ -1020,7 +1020,7 @@ fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
             color.b(),
             28,
         ))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.65)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.65)))
         .corner_radius(4)
         .inner_margin(egui::Margin::symmetric(6, 3))
         .show(ui, |ui| {
