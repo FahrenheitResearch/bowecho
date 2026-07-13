@@ -75,6 +75,34 @@ struct UploadedLut {
     values: cudarc::driver::CudaSlice<f64>,
 }
 
+#[derive(Default)]
+struct HostBatchStaging {
+    base_indices: Vec<u64>,
+    upper_offsets: Vec<u64>,
+    upper_fractions: Vec<f64>,
+    active_counts: Vec<u32>,
+    number_concentrations: Vec<f64>,
+    fall_speeds: Vec<f64>,
+    segment_starts: Vec<u32>,
+    segment_counts: Vec<u32>,
+}
+
+struct DeviceBatchBuffers {
+    node_capacity: usize,
+    segment_capacity: usize,
+    base_indices: cudarc::driver::CudaSlice<u64>,
+    upper_offsets: cudarc::driver::CudaSlice<u64>,
+    upper_fractions: cudarc::driver::CudaSlice<f64>,
+    active_counts: cudarc::driver::CudaSlice<u32>,
+    number_concentrations: cudarc::driver::CudaSlice<f64>,
+    fall_speeds: cudarc::driver::CudaSlice<f64>,
+    segment_starts: cudarc::driver::CudaSlice<u32>,
+    segment_counts: cudarc::driver::CudaSlice<u32>,
+    outputs: cudarc::driver::CudaSlice<f64>,
+    error_codes: cudarc::driver::CudaSlice<u32>,
+    error_nodes: cudarc::driver::CudaSlice<u32>,
+}
+
 /// Loaded deterministic CUDA kernel bound to one NVIDIA primary context.
 /// Table payloads become persistent in the next adapter layer; this low-level
 /// executor intentionally accepts an explicit validated payload so its ABI and
@@ -86,6 +114,8 @@ pub(crate) struct CudaLutExecutor {
     device: CudaDeviceInfo,
     kernel_artifact: &'static str,
     uploaded_luts: HashMap<Sha256Digest, UploadedLut>,
+    host_batch: HostBatchStaging,
+    device_batch: Option<DeviceBatchBuffers>,
 }
 
 impl std::fmt::Debug for CudaLutExecutor {
@@ -147,6 +177,8 @@ impl CudaLutExecutor {
             },
             kernel_artifact: artifact.label,
             uploaded_luts: HashMap::new(),
+            host_batch: HostBatchStaging::default(),
+            device_batch: None,
         })
     }
 
@@ -215,63 +247,62 @@ impl CudaLutExecutor {
         if segments.is_empty() {
             return Ok(Vec::new());
         }
-        let base_indices = nodes
-            .iter()
-            .map(|node| node.base_point_index)
-            .collect::<Vec<_>>();
-        let upper_offsets = nodes
-            .iter()
-            .flat_map(|node| node.upper_point_offsets)
-            .collect::<Vec<_>>();
-        let upper_fractions = nodes
-            .iter()
-            .flat_map(|node| node.upper_fractions)
-            .collect::<Vec<_>>();
-        let active_counts = nodes
-            .iter()
-            .map(|node| node.active_axis_count)
-            .collect::<Vec<_>>();
-        let number_concentrations = nodes
-            .iter()
-            .map(|node| node.number_concentration_m3)
-            .collect::<Vec<_>>();
-        let fall_speeds = nodes
-            .iter()
-            .map(|node| node.positive_down_fall_speed_m_s)
-            .collect::<Vec<_>>();
-        let segment_starts = segments
-            .iter()
-            .map(|segment| segment.first_node)
-            .collect::<Vec<_>>();
-        let segment_counts = segments
-            .iter()
-            .map(|segment| segment.node_count)
-            .collect::<Vec<_>>();
-
-        let base_device = self.copy_to_device("upload LUT base indices", &base_indices)?;
-        let offsets_device = self.copy_to_device("upload LUT upper offsets", &upper_offsets)?;
-        let fractions_device =
-            self.copy_to_device("upload LUT upper fractions", &upper_fractions)?;
-        let active_device = self.copy_to_device("upload LUT active-axis counts", &active_counts)?;
-        let concentration_device = self.copy_to_device(
-            "upload LUT population concentrations",
-            &number_concentrations,
+        self.stage_host_batch(nodes, segments);
+        self.ensure_device_batch_capacity(nodes.len(), segments.len())?;
+        let stream = Arc::clone(&self.stream);
+        let host = &self.host_batch;
+        let device = self
+            .device_batch
+            .as_mut()
+            .expect("nonempty CUDA batch allocated reusable device buffers");
+        copy_to_existing(
+            &stream,
+            "upload LUT base indices",
+            &host.base_indices,
+            &mut device.base_indices,
         )?;
-        let speed_device = self.copy_to_device("upload LUT fall speeds", &fall_speeds)?;
-        let starts_device = self.copy_to_device("upload segment starts", &segment_starts)?;
-        let counts_device = self.copy_to_device("upload segment counts", &segment_counts)?;
-        let mut output_device = self
-            .stream
-            .alloc_zeros::<f64>(segments.len() * CUDA_LUT_COMPONENT_COUNT)
-            .map_err(|error| driver_error("allocate CUDA segment output", error))?;
-        let mut error_code_device = self
-            .stream
-            .alloc_zeros::<u32>(segments.len())
-            .map_err(|error| driver_error("allocate CUDA error codes", error))?;
-        let mut error_node_device = self
-            .stream
-            .alloc_zeros::<u32>(segments.len())
-            .map_err(|error| driver_error("allocate CUDA error nodes", error))?;
+        copy_to_existing(
+            &stream,
+            "upload LUT upper offsets",
+            &host.upper_offsets,
+            &mut device.upper_offsets,
+        )?;
+        copy_to_existing(
+            &stream,
+            "upload LUT upper fractions",
+            &host.upper_fractions,
+            &mut device.upper_fractions,
+        )?;
+        copy_to_existing(
+            &stream,
+            "upload LUT active-axis counts",
+            &host.active_counts,
+            &mut device.active_counts,
+        )?;
+        copy_to_existing(
+            &stream,
+            "upload LUT population concentrations",
+            &host.number_concentrations,
+            &mut device.number_concentrations,
+        )?;
+        copy_to_existing(
+            &stream,
+            "upload LUT fall speeds",
+            &host.fall_speeds,
+            &mut device.fall_speeds,
+        )?;
+        copy_to_existing(
+            &stream,
+            "upload segment starts",
+            &host.segment_starts,
+            &mut device.segment_starts,
+        )?;
+        copy_to_existing(
+            &stream,
+            "upload segment counts",
+            &host.segment_counts,
+            &mut device.segment_counts,
+        )?;
 
         let table_point_count = table_point_count as u64;
         let node_count = nodes.len() as u32;
@@ -285,19 +316,19 @@ impl CudaLutExecutor {
         launch
             .arg(table_device)
             .arg(&table_point_count)
-            .arg(&base_device)
-            .arg(&offsets_device)
-            .arg(&fractions_device)
-            .arg(&active_device)
-            .arg(&concentration_device)
-            .arg(&speed_device)
+            .arg(&device.base_indices)
+            .arg(&device.upper_offsets)
+            .arg(&device.upper_fractions)
+            .arg(&device.active_counts)
+            .arg(&device.number_concentrations)
+            .arg(&device.fall_speeds)
             .arg(&node_count)
-            .arg(&starts_device)
-            .arg(&counts_device)
+            .arg(&device.segment_starts)
+            .arg(&device.segment_counts)
             .arg(&segment_count)
-            .arg(&mut output_device)
-            .arg(&mut error_code_device)
-            .arg(&mut error_node_device);
+            .arg(&mut device.outputs)
+            .arg(&mut device.error_codes)
+            .arg(&mut device.error_nodes);
         unsafe {
             launch.launch(LaunchConfig {
                 grid_dim: (segment_count, 1, 1),
@@ -307,13 +338,11 @@ impl CudaLutExecutor {
         }
         .map_err(|error| driver_error("launch CUDA LUT segment kernel", error))?;
 
-        let error_codes = self
-            .stream
-            .clone_dtoh(&error_code_device)
+        let error_codes = stream
+            .clone_dtoh(&device.error_codes.slice(..segments.len()))
             .map_err(|error| driver_error("download CUDA error codes", error))?;
-        let error_nodes = self
-            .stream
-            .clone_dtoh(&error_node_device)
+        let error_nodes = stream
+            .clone_dtoh(&device.error_nodes.slice(..segments.len()))
             .map_err(|error| driver_error("download CUDA error nodes", error))?;
         if let Some((segment, &code)) = error_codes.iter().enumerate().find(|(_, code)| **code != 0)
         {
@@ -323,9 +352,12 @@ impl CudaLutExecutor {
                 code,
             });
         }
-        let output = self
-            .stream
-            .clone_dtoh(&output_device)
+        let output = stream
+            .clone_dtoh(
+                &device
+                    .outputs
+                    .slice(..segments.len() * CUDA_LUT_COMPONENT_COUNT),
+            )
             .map_err(|error| driver_error("download CUDA segment output", error))?;
         output
             .chunks_exact(CUDA_LUT_COMPONENT_COUNT)
@@ -340,6 +372,104 @@ impl CudaLutExecutor {
             .collect()
     }
 
+    fn stage_host_batch(&mut self, nodes: &[CudaLutNodePlan], segments: &[CudaLutSegment]) {
+        let host = &mut self.host_batch;
+        host.base_indices.clear();
+        host.upper_offsets.clear();
+        host.upper_fractions.clear();
+        host.active_counts.clear();
+        host.number_concentrations.clear();
+        host.fall_speeds.clear();
+        host.segment_starts.clear();
+        host.segment_counts.clear();
+        host.base_indices
+            .extend(nodes.iter().map(|node| node.base_point_index));
+        host.upper_offsets
+            .extend(nodes.iter().flat_map(|node| node.upper_point_offsets));
+        host.upper_fractions
+            .extend(nodes.iter().flat_map(|node| node.upper_fractions));
+        host.active_counts
+            .extend(nodes.iter().map(|node| node.active_axis_count));
+        host.number_concentrations
+            .extend(nodes.iter().map(|node| node.number_concentration_m3));
+        host.fall_speeds
+            .extend(nodes.iter().map(|node| node.positive_down_fall_speed_m_s));
+        host.segment_starts
+            .extend(segments.iter().map(|segment| segment.first_node));
+        host.segment_counts
+            .extend(segments.iter().map(|segment| segment.node_count));
+    }
+
+    fn ensure_device_batch_capacity(
+        &mut self,
+        node_count: usize,
+        segment_count: usize,
+    ) -> Result<(), CudaSegmentExecutionError> {
+        let sufficient = self.device_batch.as_ref().is_some_and(|buffers| {
+            buffers.node_capacity >= node_count && buffers.segment_capacity >= segment_count
+        });
+        if sufficient {
+            return Ok(());
+        }
+        let node_capacity = self
+            .device_batch
+            .as_ref()
+            .map_or(node_count, |buffers| buffers.node_capacity.max(node_count))
+            .next_power_of_two();
+        let segment_capacity = self
+            .device_batch
+            .as_ref()
+            .map_or(segment_count, |buffers| {
+                buffers.segment_capacity.max(segment_count)
+            })
+            .next_power_of_two();
+        let allocate_u64 = |operation| {
+            self.stream
+                .alloc_zeros::<u64>(node_capacity)
+                .map_err(|error| driver_error(operation, error))
+        };
+        let allocate_node_f64 = |operation| {
+            self.stream
+                .alloc_zeros::<f64>(node_capacity)
+                .map_err(|error| driver_error(operation, error))
+        };
+        let allocate_segment_u32 = |operation| {
+            self.stream
+                .alloc_zeros::<u32>(segment_capacity)
+                .map_err(|error| driver_error(operation, error))
+        };
+        self.device_batch = Some(DeviceBatchBuffers {
+            node_capacity,
+            segment_capacity,
+            base_indices: allocate_u64("allocate CUDA LUT base indices")?,
+            upper_offsets: self
+                .stream
+                .alloc_zeros::<u64>(node_capacity * CUDA_MAX_ACTIVE_AXES)
+                .map_err(|error| driver_error("allocate CUDA LUT upper offsets", error))?,
+            upper_fractions: self
+                .stream
+                .alloc_zeros::<f64>(node_capacity * CUDA_MAX_ACTIVE_AXES)
+                .map_err(|error| driver_error("allocate CUDA LUT upper fractions", error))?,
+            active_counts: self
+                .stream
+                .alloc_zeros::<u32>(node_capacity)
+                .map_err(|error| driver_error("allocate CUDA LUT active-axis counts", error))?,
+            number_concentrations: allocate_node_f64(
+                "allocate CUDA LUT population concentrations",
+            )?,
+            fall_speeds: allocate_node_f64("allocate CUDA LUT fall speeds")?,
+            segment_starts: allocate_segment_u32("allocate CUDA segment starts")?,
+            segment_counts: allocate_segment_u32("allocate CUDA segment counts")?,
+            outputs: self
+                .stream
+                .alloc_zeros::<f64>(segment_capacity * CUDA_LUT_COMPONENT_COUNT)
+                .map_err(|error| driver_error("allocate CUDA segment output", error))?,
+            error_codes: allocate_segment_u32("allocate CUDA error codes")?,
+            error_nodes: allocate_segment_u32("allocate CUDA error nodes")?,
+        });
+        Ok(())
+    }
+
     fn copy_to_device<T: cudarc::driver::DeviceRepr>(
         &self,
         operation: &'static str,
@@ -349,6 +479,17 @@ impl CudaLutExecutor {
             .clone_htod(values)
             .map_err(|error| driver_error(operation, error))
     }
+}
+
+fn copy_to_existing<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    operation: &'static str,
+    values: &[T],
+    device: &mut cudarc::driver::CudaSlice<T>,
+) -> Result<(), CudaSegmentExecutionError> {
+    stream
+        .memcpy_htod(values, device)
+        .map_err(|error| driver_error(operation, error))
 }
 
 fn validate_batch(
@@ -672,5 +813,62 @@ mod tests {
                 .unwrap();
             assert_eq!(repeated[0].components().map(f64::to_bits), expected_bits);
         }
+
+        // Grow every reusable host/device staging array, then deliberately
+        // submit a much smaller batch with different values. Only the active
+        // prefixes may be copied, launched, and downloaded; stale output/error
+        // tails from the larger launch must remain unreachable.
+        let large_nodes = vec![interior_node(1.25, 2.5); 64];
+        let large_segments = (0..large_nodes.len())
+            .map(|node| CudaLutSegment {
+                first_node: node as u32,
+                node_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let large_expected = ordered_cpu_segments(&table, &large_nodes, &large_segments);
+        let large = executor
+            .evaluate_preloaded_segments(
+                table_digest,
+                table_point_count,
+                &large_nodes,
+                &large_segments,
+            )
+            .unwrap();
+        assert_eq!(large, large_expected);
+        assert_eq!(
+            executor.device_batch.as_ref().unwrap().node_capacity,
+            large_nodes.len()
+        );
+        assert_eq!(
+            executor.device_batch.as_ref().unwrap().segment_capacity,
+            large_segments.len()
+        );
+
+        let small_nodes = [interior_node(0.125, 7.0)];
+        let small_segments = [CudaLutSegment {
+            first_node: 0,
+            node_count: 1,
+        }];
+        let small_expected = ordered_cpu_segments(&table, &small_nodes, &small_segments);
+        let small = executor
+            .evaluate_preloaded_segments(
+                table_digest,
+                table_point_count,
+                &small_nodes,
+                &small_segments,
+            )
+            .unwrap();
+        assert_eq!(small.len(), 1);
+        assert_eq!(small, small_expected);
+        assert_eq!(
+            executor.device_batch.as_ref().unwrap().node_capacity,
+            large_nodes.len(),
+            "smaller follow-up must reuse the existing node buffers"
+        );
+        assert_eq!(
+            executor.device_batch.as_ref().unwrap().segment_capacity,
+            large_segments.len(),
+            "smaller follow-up must reuse the existing output/error buffers"
+        );
     }
 }

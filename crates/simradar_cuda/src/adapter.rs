@@ -61,6 +61,8 @@ impl CudaPreloadedTMatrixTable {
 /// cannot be replaced independently by callers.
 pub struct CudaTMatrixExecutor {
     inner: CudaLutExecutor,
+    staged_plans: Vec<crate::prepared::CudaLutNodePlan>,
+    staged_segments: Vec<CudaLutSegment>,
 }
 
 impl std::fmt::Debug for CudaTMatrixExecutor {
@@ -77,6 +79,8 @@ impl CudaTMatrixExecutor {
     pub fn open(ordinal: usize) -> Result<Self, CudaTMatrixExecutionError> {
         Ok(Self {
             inner: CudaLutExecutor::open(ordinal)?,
+            staged_plans: Vec::new(),
+            staged_segments: Vec::new(),
         })
     }
 
@@ -121,20 +125,20 @@ impl CudaTMatrixExecutor {
         segments: &[CudaTMatrixSegment],
     ) -> Result<Vec<AdditiveScattering>, CudaTMatrixExecutionError> {
         validate_node_table_identity(table.table_file_sha256, nodes)?;
-        let plans = nodes.iter().map(|node| node.plan).collect::<Vec<_>>();
-        let segments = segments
-            .iter()
-            .map(|segment| CudaLutSegment {
+        self.staged_plans.clear();
+        self.staged_plans.extend(nodes.iter().map(|node| node.plan));
+        self.staged_segments.clear();
+        self.staged_segments
+            .extend(segments.iter().map(|segment| CudaLutSegment {
                 first_node: segment.first_node,
                 node_count: segment.node_count,
-            })
-            .collect::<Vec<_>>();
+            }));
         self.inner
             .evaluate_preloaded_segments(
                 table.table_file_sha256,
                 table.point_count,
-                &plans,
-                &segments,
+                &self.staged_plans,
+                &self.staged_segments,
             )
             .map_err(Into::into)
     }

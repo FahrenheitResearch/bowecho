@@ -10,9 +10,10 @@
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use radar_scattering::AdditiveScattering;
 use simradar_cuda::{CudaAvailability, CudaPreparedTMatrixNode, probe_cuda_cached};
@@ -36,6 +37,12 @@ pub const DEFAULT_CUDA_TMATRIX_BATCH_NODES: usize = 16_384;
 /// This additional bound prevents a burst of tiny Rayon requests from making
 /// one batch's reply fan-out unbounded.
 pub const DEFAULT_CUDA_TMATRIX_BATCH_REQUESTS: usize = 256;
+
+/// Give sibling Rayon tasks a bounded opportunity to reach the dedicated GPU
+/// worker before its first launch. Without this short linger, the worker often
+/// wakes on one request and submits a tiny kernel while the other CPU workers
+/// are still enqueuing their already-prepared nodes.
+const CUDA_TMATRIX_COALESCE_WAIT: Duration = Duration::from_micros(250);
 
 /// Exact preloaded dry LUT selected for one request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -382,6 +389,7 @@ struct ProductionBackend {
     executor: CudaTMatrixExecutor,
     dry_oblate: CudaPreloadedTMatrixTable,
     dry_prolate: CudaPreloadedTMatrixTable,
+    independent_segments: Vec<CudaTMatrixSegment>,
     report: WrfTMatrixCudaDeviceReport,
 }
 
@@ -423,6 +431,7 @@ impl ProductionBackend {
             executor,
             dry_oblate,
             dry_prolate,
+            independent_segments: Vec::new(),
             report,
         })
     }
@@ -439,11 +448,14 @@ impl BatchBackend<CudaPreparedTMatrixNode, AdditiveScattering> for ProductionBac
             WrfTMatrixCudaTableRole::DryOblate => self.dry_oblate,
             WrfTMatrixCudaTableRole::DryProlate => self.dry_prolate,
         };
-        let segments = (0..nodes.len())
-            .map(|index| CudaTMatrixSegment::new(index, 1).map_err(|error| error.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.independent_segments.clear();
+        self.independent_segments.reserve(nodes.len());
+        for index in 0..nodes.len() {
+            self.independent_segments
+                .push(CudaTMatrixSegment::new(index, 1).map_err(|error| error.to_string())?);
+        }
         self.executor
-            .evaluate_preloaded_segments(table, nodes, &segments)
+            .evaluate_preloaded_segments(table, nodes, &self.independent_segments)
             .map_err(|error| error.to_string())
     }
 }
@@ -587,9 +599,13 @@ fn run_worker<N, O, B>(
             continue;
         }
 
+        let mut woke_from_empty = false;
         if pending.is_empty() && !shutdown {
             match receiver.recv() {
-                Ok(WorkerCommand::Request(request)) => pending.push_back(request.into()),
+                Ok(WorkerCommand::Request(request)) => {
+                    pending.push_back(request.into());
+                    woke_from_empty = true;
+                }
                 Ok(WorkerCommand::Shutdown) => shutdown = true,
                 Err(_) => break,
             }
@@ -605,6 +621,17 @@ fn run_worker<N, O, B>(
                     break;
                 }
             }
+        }
+
+        if woke_from_empty && !shutdown {
+            linger_for_peer_requests(
+                &receiver,
+                &mut pending,
+                config,
+                &mut shutdown,
+                &state,
+                CUDA_TMATRIX_COALESCE_WAIT,
+            );
         }
 
         if pending.is_empty() {
@@ -628,6 +655,55 @@ fn run_worker<N, O, B>(
         {
             let reason = state.disable(failure);
             fail_pending(&mut pending, &reason);
+        }
+    }
+}
+
+fn linger_for_peer_requests<N, O>(
+    receiver: &Receiver<WorkerCommand<N, O>>,
+    pending: &mut VecDeque<PendingRequest<N, O>>,
+    config: WrfTMatrixCudaBatchConfig,
+    shutdown: &mut bool,
+    state: &ServiceState,
+    coalesce_wait: Duration,
+) {
+    let Some(role) = pending.front().map(|request| request.role) else {
+        return;
+    };
+    let deadline = Instant::now() + coalesce_wait;
+    loop {
+        let queued_nodes = pending
+            .iter()
+            .filter(|request| request.role == role)
+            .map(|request| request.nodes.len().saturating_sub(request.next_node))
+            .fold(0_usize, usize::saturating_add);
+        if pending.len() >= config.max_requests
+            || queued_nodes >= config.max_nodes
+            || state.fallback().is_some()
+        {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(WorkerCommand::Request(request)) => {
+                let role_changed = request.role != role;
+                pending.push_back(request.into());
+                if role_changed {
+                    break;
+                }
+            }
+            Ok(WorkerCommand::Shutdown) => {
+                *shutdown = true;
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                *shutdown = true;
+                break;
+            }
         }
     }
 }
@@ -768,6 +844,7 @@ mod tests {
         OrientationModel, PsdSpheroidHabit, RadarViewGeometry, SpheroidConvention,
         TMatrixEvaluationRequest,
     };
+    use rayon::prelude::*;
 
     use super::*;
 
@@ -882,6 +959,44 @@ mod tests {
             *control.calls.lock().unwrap(),
             vec![(WrfTMatrixCudaTableRole::DryOblate, vec![1, 2, 9, 4, 7])]
         );
+    }
+
+    #[test]
+    fn bounded_linger_collects_a_late_peer_and_stops_at_role_boundary() {
+        let config = WrfTMatrixCudaBatchConfig::new(8, 8).unwrap();
+        let state = ServiceState::default();
+        let (first, _first_reply) = pending(WrfTMatrixCudaTableRole::DryOblate, vec![1]);
+        let mut queue = VecDeque::from([first]);
+        let (commands, receiver) = mpsc::channel();
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            for (role, nodes) in [
+                (WrfTMatrixCudaTableRole::DryOblate, vec![2, 3]),
+                (WrfTMatrixCudaTableRole::DryProlate, vec![4]),
+            ] {
+                let (reply, _response) = mpsc::sync_channel(1);
+                commands
+                    .send(WorkerCommand::Request(WorkerRequest { role, nodes, reply }))
+                    .unwrap();
+            }
+        });
+        let mut shutdown = false;
+        linger_for_peer_requests(
+            &receiver,
+            &mut queue,
+            config,
+            &mut shutdown,
+            &state,
+            Duration::from_millis(100),
+        );
+        sender.join().unwrap();
+
+        assert!(!shutdown);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].nodes, vec![1]);
+        assert_eq!(queue[1].nodes, vec![2, 3]);
+        assert_eq!(queue[2].nodes, vec![4]);
+        assert_eq!(queue[2].role, WrfTMatrixCudaTableRole::DryProlate);
     }
 
     #[test]
@@ -1153,6 +1268,7 @@ mod tests {
     #[ignore = "manual CUDA throughput microbenchmark; requires a supported NVIDIA GPU"]
     fn manual_cuda_throughput_matches_scalar_cpu_for_65k_nodes() {
         const NODE_COUNT: usize = 65_536;
+        const CUDA_BATCHES: usize = 5;
 
         let availability = probe_cuda_cached();
         let Some(device) = availability.preferred_device() else {
@@ -1161,7 +1277,8 @@ mod tests {
         };
         let service = WrfTMatrixCudaBatchService::open_with_config(
             device.ordinal,
-            WrfTMatrixCudaBatchConfig::new(NODE_COUNT, 1).unwrap(),
+            WrfTMatrixCudaBatchConfig::new(NODE_COUNT, DEFAULT_CUDA_TMATRIX_BATCH_REQUESTS)
+                .unwrap(),
         )
         .unwrap();
         let owner = load_property_tmatrix_tables_exact(
@@ -1209,14 +1326,26 @@ mod tests {
             .collect::<Vec<_>>();
         let cpu_elapsed = cpu_started.elapsed();
 
-        let gpu_started = std::time::Instant::now();
-        let gpu = service
-            .evaluate_particles(
-                WrfTMatrixCudaTableRole::DryOblate,
-                vec![cuda_node; NODE_COUNT],
-            )
-            .unwrap();
-        let gpu_elapsed = gpu_started.elapsed();
+        let mut gpu_samples = Vec::with_capacity(CUDA_BATCHES);
+        let mut gpu = Vec::new();
+        for _ in 0..CUDA_BATCHES {
+            let gpu_started = std::time::Instant::now();
+            gpu = service
+                .evaluate_particles(
+                    WrfTMatrixCudaTableRole::DryOblate,
+                    vec![cuda_node; NODE_COUNT],
+                )
+                .unwrap();
+            gpu_samples.push(gpu_started.elapsed());
+        }
+        let gpu_elapsed = gpu_samples.iter().copied().sum::<std::time::Duration>();
+        let cold_gpu_elapsed = gpu_samples[0];
+        let steady_gpu_elapsed = gpu_samples
+            .iter()
+            .skip(1)
+            .copied()
+            .sum::<std::time::Duration>()
+            / (CUDA_BATCHES - 1) as u32;
 
         assert_eq!(gpu.len(), cpu.len());
         for (index, (gpu_node, cpu_node)) in gpu.iter().zip(&cpu).enumerate() {
@@ -1227,20 +1356,73 @@ mod tests {
             );
         }
         let report = service.report();
-        assert_eq!(report.requests_submitted, 1);
-        assert_eq!(report.batches_submitted, 1);
-        assert_eq!(report.batches_completed, 1);
-        assert_eq!(report.nodes_completed, NODE_COUNT as u64);
+        assert_eq!(report.requests_submitted, CUDA_BATCHES as u64);
+        assert_eq!(report.batches_submitted, CUDA_BATCHES as u64);
+        assert_eq!(report.batches_completed, CUDA_BATCHES as u64);
+        assert_eq!(report.nodes_completed, (NODE_COUNT * CUDA_BATCHES) as u64);
         assert_eq!(report.fallback_reason, None);
         eprintln!(
-            "T-matrix throughput ({}): CPU {:.0} nodes/s ({:.3} s); CUDA {:.0} nodes/s ({:.3} s); service batches {}/{}",
+            "T-matrix throughput ({}): CPU {:.0} nodes/s ({:.6} s); CUDA {:.0} nodes/s ({:.6} s mean); cold {:.6} s; steady {:.6} s; steady speedup {:.3}x; service batches {}/{}",
             report.device.name,
             NODE_COUNT as f64 / cpu_elapsed.as_secs_f64(),
             cpu_elapsed.as_secs_f64(),
-            NODE_COUNT as f64 / gpu_elapsed.as_secs_f64(),
-            gpu_elapsed.as_secs_f64(),
+            (NODE_COUNT * CUDA_BATCHES) as f64 / gpu_elapsed.as_secs_f64(),
+            gpu_elapsed.as_secs_f64() / CUDA_BATCHES as f64,
+            cold_gpu_elapsed.as_secs_f64(),
+            steady_gpu_elapsed.as_secs_f64(),
+            cpu_elapsed.as_secs_f64() / steady_gpu_elapsed.as_secs_f64(),
             report.batches_completed,
             report.batches_submitted,
+        );
+        eprintln!(
+            "CUDA 65k batch samples: {:?}",
+            gpu_samples
+                .iter()
+                .map(std::time::Duration::as_secs_f64)
+                .collect::<Vec<_>>()
+        );
+
+        const BURST_REQUESTS: usize = 64;
+        const BURST_NODES_PER_REQUEST: usize = NODE_COUNT / BURST_REQUESTS;
+        let before_burst = service.report();
+        let burst_started = std::time::Instant::now();
+        let burst = (0..BURST_REQUESTS)
+            .into_par_iter()
+            .map(|_| {
+                service
+                    .evaluate_particles(
+                        WrfTMatrixCudaTableRole::DryOblate,
+                        vec![cuda_node; BURST_NODES_PER_REQUEST],
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let burst_elapsed = burst_started.elapsed();
+        assert_eq!(burst.len(), BURST_REQUESTS);
+        for (request, outputs) in burst.iter().enumerate() {
+            assert_eq!(outputs.len(), BURST_NODES_PER_REQUEST);
+            for (node, output) in outputs.iter().enumerate() {
+                assert_eq!(
+                    output.components().map(f64::to_bits),
+                    cpu[0].components().map(f64::to_bits),
+                    "burst request {request}, node {node} differs from CPU"
+                );
+            }
+        }
+        let after_burst = service.report();
+        let burst_batches = after_burst.batches_completed - before_burst.batches_completed;
+        assert_eq!(
+            after_burst.requests_submitted - before_burst.requests_submitted,
+            BURST_REQUESTS as u64
+        );
+        assert_eq!(
+            after_burst.nodes_completed - before_burst.nodes_completed,
+            NODE_COUNT as u64
+        );
+        eprintln!(
+            "CUDA concurrent burst: {BURST_REQUESTS} requests x {BURST_NODES_PER_REQUEST} nodes -> {burst_batches} batches in {:.6} s ({:.0} nodes/s)",
+            burst_elapsed.as_secs_f64(),
+            NODE_COUNT as f64 / burst_elapsed.as_secs_f64(),
         );
     }
 }
