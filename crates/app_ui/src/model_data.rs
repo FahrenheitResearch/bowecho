@@ -673,7 +673,14 @@ impl SyntheticRadarUiState {
     }
 
     fn to_cm1_config(&self) -> Result<crate::wrf_radar::SyntheticRadarConfig, String> {
-        let mut config = self.to_config()?;
+        // CM1 owns an explicitly placed, usually small idealized domain. A
+        // persisted WRF/NEXRAD site can be hundreds of kilometres outside it,
+        // yielding an all-missing polar scan while the native scene is healthy.
+        // Preserve shared scan/presentation controls, but always resolve the
+        // CM1 antenna from the placed domain's center cell.
+        let mut cm1_state = self.clone();
+        cm1_state.placement = SynthPlacement::DomainCenter;
+        let mut config = cm1_state.to_config()?;
         // CM1's first-class adapter samples a scalar native-dbz scene. Keep
         // every WRF-only or polarimetric branch impossible even when those
         // controls remain selected in the shared simulated-radar workspace.
@@ -687,13 +694,10 @@ impl SyntheticRadarUiState {
             crate::wrf_radar::PropagationGeometry::StandardFourThirdsEarth;
         config.atmosphere_time_mode = app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
         config.exact_replay_template = None;
-        config.site_name = Some(match (config.site_lat_deg, config.site_lon_deg) {
-            (Some(lat), Some(lon)) => format!("Simulated CM1 radar @ {lat:.3}, {lon:.3}"),
-            _ => "Simulated CM1 radar at placed domain centre".to_owned(),
-        });
-        if !matches!(self.placement, SynthPlacement::NexradSite) {
-            config.site_id = "CM1".to_owned();
-        }
+        config.site_lat_deg = None;
+        config.site_lon_deg = None;
+        config.site_id = "CM1".to_owned();
+        config.site_name = Some("Simulated CM1 radar at placed domain centre".to_owned());
         Ok(config)
     }
 
@@ -8558,6 +8562,32 @@ mod tests {
         .to_config()
         .unwrap();
         assert_eq!(under.clutter_intensity, 0.0, "clamped to 0.0");
+    }
+
+    #[test]
+    fn cm1_radar_ignores_stale_wrf_site_and_uses_placed_domain_center() {
+        let state = SyntheticRadarUiState {
+            placement: SynthPlacement::NexradSite,
+            // Deliberately invalid: a hidden WRF-only choice must neither
+            // block CM1 nor leak an out-of-domain antenna into its scan.
+            site_id_text: "NOT-A-SITE".to_owned(),
+            max_range_km: 80.0,
+            ..SyntheticRadarUiState::default()
+        };
+        assert!(
+            state.to_config().is_err(),
+            "ordinary WRF launch stays strict"
+        );
+
+        let config = state.to_cm1_config().expect("CM1 owns centered placement");
+        assert_eq!(config.site_id, "CM1");
+        assert_eq!(config.site_lat_deg, None);
+        assert_eq!(config.site_lon_deg, None);
+        assert_eq!(
+            config.site_name.as_deref(),
+            Some("Simulated CM1 radar at placed domain centre")
+        );
+        assert_eq!(config.max_range_m, 80_000.0);
     }
 
     /// NEXRAD-id placement resolves through the app's compiled-in site

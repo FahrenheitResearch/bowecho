@@ -1516,7 +1516,8 @@ fn cm1(ui: &mut egui::Ui) {
         ui,
         "1. Open cm1out file…",
         "— inspect native axes, output records, variables, units, staggering and complete-domain \
-         status. Unsupported shapes stay listed with a reason.",
+         status. A multi-record file opens on its final, latest evolved output; output 0 remains \
+         selectable for initialization-state inspection. Unsupported shapes stay listed with a reason.",
     );
     action(
         ui,
@@ -1573,9 +1574,10 @@ fn cm1(ui: &mut egui::Ui) {
         "Build native REF/VEL in Radar requires an assembled complete domain with native 3-D \
          dbz, physical zhval, horizontal and vertical winds, exact time and explicit placement. \
          Native zs supplies terrain; when it is absent, only an explicit flat-idealized-domain \
-         choice may use model-z = 0. The compatible scan, range, gate, virtual-site, blockage, \
-         noise and presentation controls come from the WRF simulated-radar panel. The first \
-         completed tilt opens while the remaining tilts process.",
+         choice may use model-z = 0. The antenna is fixed at the placed CM1 domain center, so a \
+         saved WRF/NEXRAD site cannot land outside the idealized grid. Compatible scan, range, \
+         gate, blockage, noise and presentation controls come from the WRF simulated-radar panel. \
+         The first completed tilt opens while the remaining tilts process.",
     );
     para(
         ui,
@@ -3285,6 +3287,8 @@ mod tests {
         assert!(guide_src.contains("Meteorological profile readiness"));
         assert!(guide_src.contains("Build native REF/VEL in Radar"));
         assert!(guide_src.contains("native 3-D dbz"));
+        assert!(guide_src.contains("final, latest evolved output"));
+        assert!(guide_src.contains("fixed at the placed CM1 domain center"));
         assert!(guide_src.contains("does not extrude 2-D cref"));
         assert!(guide_src.contains("docs/cm1-guide.md"));
     }

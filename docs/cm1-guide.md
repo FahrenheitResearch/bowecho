@@ -58,9 +58,11 @@ To exercise the supported path:
    workflow with a CM1 provenance sidecar.
 
 Because these samples contain one output record, they cannot demonstrate a
-loop. A multi-record CM1 file exposes **All N records (loop)** and writes an
-ordered exact-time run when every record has a valid whole-second time and
-shares the same placed grid.
+loop. A multi-record CM1 file initially selects its final output, which is the
+latest evolved state on the official ordered time axis; output 0 remains
+available when the initialization state is the intended target. **All N
+records (loop)** writes an ordered exact-time run when every record has a valid
+whole-second time and shares the same placed grid.
 
 ## Placement and moving domains
 
@@ -125,13 +127,15 @@ A radar-ready file must be one assembled complete domain and contain:
 
 Then:
 
-1. Open the file, select the output record, enter the explicit center
-   latitude/longitude, and choose Follow domain or an available Fixed-world
-   placement.
-2. Configure scan, range, gate spacing, virtual site, blockage, noise, and
-   presentation in **Windows > WRF > WRF simulated radar**. CM1 reuses those
-   compatible controls.
-3. Return to **Windows > CM1** and choose **Build native REF/VEL in Radar**.
+1. Open the file, confirm the selected output (the final output is selected by
+   default), enter the explicit center latitude/longitude, and choose Follow
+   domain or an available Fixed-world placement.
+2. Configure scan, range, gate spacing, blockage, noise, and presentation in
+   **Windows > WRF > WRF simulated radar**. CM1 reuses those compatible
+   controls, but always places its virtual radar at the center of the placed
+   CM1 domain; a saved WRF/NEXRAD site does not carry over.
+3. Return to **Windows > CM1** and choose **Build output N native REF/VEL in
+   Radar**.
    BowEcho opens the first completed tilt while the rest of the volume
    continues processing.
 
@@ -143,9 +147,10 @@ missing `zs` field with model-z = 0; it does not replace missing `dbz`,
 
 The CM1 radar adapter samples the file's native scalar `dbz` and earth-frame
 winds through BowEcho's existing polar geometry. It is CPU-only, uses one
-frozen CM1 record, and uses standard 4/3-Earth propagation geometry. It can
-reuse compatible scan, pulse-volume, terrain-blockage, noise, and presentation
-controls from the WRF radar panel.
+frozen CM1 record, places the antenna at the explicitly placed domain center,
+and uses standard 4/3-Earth propagation geometry. It can reuse compatible
+scan, pulse-volume, terrain-blockage, noise, and presentation controls from the
+WRF radar panel.
 
 It does not currently:
 

@@ -411,6 +411,11 @@ impl Cm1ImportPanel {
         };
         match task.rx.try_recv() {
             Ok(Ok(result)) => {
+                // A freshly opened evolving simulation should show its most
+                // mature available state, not the usually quiet initialization
+                // record. Attaching motion diagnostics to an already inspected
+                // file must preserve the user's explicit time selection.
+                let initialize_selection = self.inventory.is_none();
                 self.diagnostic_files = result.diagnostic_files;
                 self.diagnostic_note = result.diagnostic_note;
                 if self.selected_variable.as_deref().is_none_or(|selected| {
@@ -422,10 +427,14 @@ impl Cm1ImportPanel {
                     self.selected_variable = preferred_horizontal_variable(&result.inventory)
                         .map(|variable| variable.name.clone());
                 }
+                if initialize_selection {
+                    self.time_index = default_cm1_time_index(&result.inventory);
+                }
                 self.message = Some(format!(
-                    "CM1 inventory ready: {} compatible horizontal field(s), {} output time(s)",
+                    "CM1 inventory ready: {} compatible horizontal field(s), {} output time(s); selected output {}",
                     result.inventory.horizontal_plane_variables().count(),
-                    result.inventory.time.record_count
+                    result.inventory.time.record_count,
+                    self.time_index,
                 ));
                 self.inventory = Some(result.inventory);
                 self.inspect_task = None;
@@ -765,6 +774,23 @@ impl Cm1ImportPanel {
                 });
         });
         if inventory.time.record_count > 1 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "New files open on the final output ({}), which is normally the most evolved state. Output 0 is the initialization record and may be meteorologically quiet.",
+                    default_cm1_time_index(inventory)
+                ))
+                .small()
+                .weak(),
+            );
+            if self.time_index == 0 {
+                ui.label(
+                    egui::RichText::new(
+                        "Output 0 is selected. A uniform plot or radar can be the model's real initialization state; choose a later output to inspect the evolved storm.",
+                    )
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+                );
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Time scope");
                 ui.selectable_value(&mut self.import_all_times, false, "Selected record");
@@ -1320,7 +1346,7 @@ impl Cm1ImportPanel {
         );
         ui.label(
             egui::RichText::new(
-                "Scan, range, gate, virtual-site, blockage, noise, and presentation controls come from the WRF simulated-radar control panel; incompatible WRF-only controls are ignored and revalidated by the CM1 worker.",
+                "The CM1 virtual radar is placed at the center of this explicitly placed domain. Scan, range, gate, blockage, noise, and presentation controls come from the WRF simulated-radar control panel; saved WRF site coordinates and incompatible WRF-only science controls do not carry into CM1.",
             )
             .small()
             .weak(),
@@ -1337,7 +1363,10 @@ impl Cm1ImportPanel {
         if ui
             .add_enabled(
                 !import_busy && validation.is_ok(),
-                egui::Button::new("Build native REF/VEL in Radar"),
+                egui::Button::new(format!(
+                    "Build output {} native REF/VEL in Radar",
+                    self.time_index
+                )),
             )
             .clicked()
         {
@@ -1480,6 +1509,14 @@ impl Cm1ImportPanel {
             placement,
         })
     }
+}
+
+fn default_cm1_time_index(inventory: &Cm1Inventory) -> usize {
+    // The official CM1 time axis is ordered by elapsed simulation time. Avoid
+    // guessing "storminess" from one field (or eagerly reading a large 3-D
+    // volume during metadata inspection); the final recorded state is the
+    // deterministic, scientifically transparent default.
+    inventory.time.record_count.saturating_sub(1)
 }
 
 fn preferred_horizontal_variable(inventory: &Cm1Inventory) -> Option<&cm1::Cm1Variable> {
@@ -2206,6 +2243,62 @@ mod tests {
         assert_eq!(
             preferred_horizontal_variable(&inventory).map(|variable| variable.name.as_str()),
             Some("cref")
+        );
+    }
+
+    #[test]
+    fn evolving_cm1_file_defaults_to_final_output_record() {
+        let inventory = cm1::inspect_path(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc"),
+        )
+        .expect("fixture inventory");
+        assert_eq!(inventory.time.record_count, 2);
+        assert_eq!(default_cm1_time_index(&inventory), 1);
+    }
+
+    #[test]
+    fn optional_real_evolving_cm1_default_reads_the_storm_scene() {
+        let Some(path) = std::env::var_os("BOWECHO_CM1_EVOLVING_FIXTURE").map(PathBuf::from) else {
+            return;
+        };
+        let nc = netcrust::open(&path).expect("open evolving CM1 fixture");
+        let inventory = cm1::inspect_file(&nc, &path).expect("inspect evolving CM1 fixture");
+        let selected = default_cm1_time_index(&inventory);
+        assert!(
+            selected > 0,
+            "evolving fixture must have a post-initialization record"
+        );
+        let scene = cm1::read_radar_scene(
+            &nc,
+            &inventory,
+            &Cm1Placement {
+                mode: Cm1PlacementMode::FollowDomain,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+            selected,
+            cm1::Cm1TerrainPolicy::RequireNative,
+        )
+        .expect("read default evolving radar scene");
+        let maximum_dbz = scene
+            .dbz
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
+        let maximum_updraft_mps = scene
+            .w_mps
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            maximum_dbz >= 20.0,
+            "default scene max REF was {maximum_dbz}"
+        );
+        assert!(
+            maximum_updraft_mps >= 5.0,
+            "default scene max updraft was {maximum_updraft_mps} m/s"
         );
     }
 

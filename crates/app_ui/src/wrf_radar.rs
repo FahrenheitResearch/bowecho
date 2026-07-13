@@ -10645,6 +10645,71 @@ mod tests {
     }
 
     #[test]
+    fn optional_real_evolving_cm1_final_record_renders_centered_ref_tilt() {
+        let Some(path) = std::env::var_os("BOWECHO_CM1_EVOLVING_FIXTURE").map(PathBuf::from) else {
+            return;
+        };
+        let nc = netcrust::open(&path).expect("open evolving CM1 fixture");
+        let inventory =
+            app_ui::cm1::inspect_file(&nc, &path).expect("inspect evolving CM1 fixture");
+        let time_index = inventory.time.record_count.saturating_sub(1);
+        assert!(time_index > 0, "fixture must have an evolved output");
+        let scene = app_ui::cm1::read_radar_scene(
+            &nc,
+            &inventory,
+            &app_ui::cm1::Cm1Placement {
+                mode: app_ui::cm1::Cm1PlacementMode::FollowDomain,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+            time_index,
+            app_ui::cm1::Cm1TerrainPolicy::RequireNative,
+        )
+        .expect("read evolved CM1 radar scene");
+        let valid_time = scene.valid_time_utc;
+        let fields = cm1_radar_fields(scene).expect("adapt evolved CM1 scene");
+        let config = SyntheticRadarConfig {
+            site_id: "CM1".to_owned(),
+            site_name: Some("Centered CM1 regression radar".to_owned()),
+            site_lat_deg: None,
+            site_lon_deg: None,
+            max_range_m: 80_000.0,
+            gate_spacing_m: 1_000.0,
+            elevations_deg: vec![0.5],
+            ref_gate_texture: false,
+            vel_gate_texture: false,
+            instrument_noise: false,
+            ..SyntheticRadarConfig::default()
+        };
+        let volume = build_synthetic_volume(&fields, valid_time, &config);
+        assert_eq!(volume.cuts.len(), 1);
+        let MomentStorage::F32(values) = &volume.cuts[0].moments[&MomentType::Reflectivity].storage
+        else {
+            panic!("CM1 REF tilt must use F32 storage");
+        };
+        let finite = values
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        assert!(
+            !finite.is_empty(),
+            "centered tilt did not intersect the storm"
+        );
+        let minimum = finite.iter().copied().fold(f32::INFINITY, f32::min);
+        let maximum = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!(
+            "centered evolving CM1 tilt: {} finite REF gates, range {minimum:.3}..{maximum:.3} dBZ",
+            finite.len()
+        );
+        assert!(maximum >= 20.0, "centered tilt max REF was {maximum} dBZ");
+        assert!(
+            maximum > minimum,
+            "centered tilt was unexpectedly uniform at {maximum} dBZ"
+        );
+    }
+
+    #[test]
     fn cm1_scalar_config_rejects_wrf_only_and_polarimetric_branches() {
         validate_cm1_scalar_radar_config(&SyntheticRadarConfig::default())
             .expect("portable scalar default");
