@@ -44,6 +44,7 @@ mod basemap_towns;
 mod batch_plots;
 mod brand;
 mod chrome_readouts;
+mod cm1_ui;
 mod data_packs;
 mod dealias_env;
 /// Phase 4e stage (ii): the differential suite gating the primary unify
@@ -19902,6 +19903,7 @@ impl eframe::App for ViewerApp {
         if let Some(dock) = self.model_dock.as_mut() {
             dock.auxiliary_windows(&ctx);
         }
+        self.apply_cm1_window_requests();
         self.vwp_window(&ctx);
         self.radar_overlays_window(&ctx);
         self.satellite_window(&ctx);
@@ -20715,6 +20717,24 @@ impl ViewerApp {
         .ui(ui, |ui| {
             ui.set_min_width(170.0);
             let mut toggle: Option<dock::WorkspacePane> = None;
+            let cm1_open = self
+                .model_dock
+                .as_ref()
+                .is_some_and(model_data::ModelDataDock::cm1_window_open);
+            if ui
+                .selectable_label(cm1_open, "CM1")
+                .on_hover_text(
+                    "Inspect native NCAR CM1 output, choose a scalar/time/level, and explicitly place its local Cartesian domain",
+                )
+                .clicked()
+            {
+                self.model_enabled = true;
+                self.ensure_model_data_dock(ui.ctx());
+                if let Some(model_dock) = self.model_dock.as_mut() {
+                    model_dock.open_cm1_window();
+                }
+                ui.close();
+            }
             for (pane, label, hover) in [
                 (
                     dock::WorkspacePane::FormulaLab,
@@ -30646,6 +30666,17 @@ impl ViewerApp {
             self.model_enabled = true;
             self.open_viewer(dock::WorkspacePane::FormulaLab);
         }
+        if open_models {
+            self.model_enabled = true;
+            self.open_viewer(dock::WorkspacePane::Model);
+        }
+    }
+
+    fn apply_cm1_window_requests(&mut self) {
+        let open_models = self
+            .model_dock
+            .as_mut()
+            .is_some_and(model_data::ModelDataDock::take_cm1_open_models_requested);
         if open_models {
             self.model_enabled = true;
             self.open_viewer(dock::WorkspacePane::Model);

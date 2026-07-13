@@ -43,6 +43,10 @@ pub(crate) mod iso_fields;
     allow(dead_code)
 )]
 enum ImportJob {
+    /// Native NCAR CM1 scalar-plane import. CM1 has its own inventory,
+    /// explicit local-Cartesian placement, exact-time store route, and
+    /// provenance sidecar; it never passes through the WRF fallback reader.
+    Cm1(crate::cm1_ui::Cm1ImportTask),
     /// Light path (`local_import`): 2D surface fields + isobaric sounding
     /// volumes. Handles raw `wrfout`, post-processed climate wrfout, and plain
     /// NetCDF. Streams per-stage progress messages then a `Done`, same shape
@@ -1128,6 +1132,13 @@ pub struct ModelDataDock {
     store_root: PathBuf,
     /// Running local WRF/NetCDF import, if any (drained in `poll_import`).
     import_job: Option<ImportJob>,
+    /// First-class native CM1 inspection/placement window. The panel owns
+    /// only UI and metadata inspection state; store work joins `import_job`
+    /// so the existing busy guard, pump, rescan, and plot handoff apply.
+    cm1: crate::cm1_ui::Cm1ImportPanel,
+    /// One-shot handoff after a successful CM1 store write. Main opens the
+    /// shared Models surface outside any auxiliary-window borrow.
+    cm1_open_models_requested: bool,
     /// Finished synthetic-radar volumes waiting for the app to install them in
     /// the loop engine (one-shot, drained by [`Self::take_synthetic_radar`]).
     synthetic_radar_result: Option<crate::wrf_radar::SyntheticRadarOutput>,
@@ -1307,6 +1318,8 @@ impl ModelDataDock {
             repaint: ctx.clone(),
             store_root,
             import_job: None,
+            cm1: crate::cm1_ui::Cm1ImportPanel::default(),
+            cm1_open_models_requested: false,
             synthetic_radar_result: None,
             synthetic_radar_preview: None,
             synthetic_radar_replay_result: None,
@@ -1955,6 +1968,22 @@ impl ModelDataDock {
         std::mem::take(&mut self.formula_lab_open_models_requested)
     }
 
+    /// Open the dedicated native-CM1 workflow. It is intentionally separate
+    /// from the generic WRF/NetCDF picker because CM1 requires explicit local
+    /// Cartesian placement before any store write.
+    pub fn open_cm1_window(&mut self) {
+        self.cm1.open();
+        self.repaint.request_repaint();
+    }
+
+    pub fn cm1_window_open(&self) -> bool {
+        self.cm1.is_open()
+    }
+
+    pub fn take_cm1_open_models_requested(&mut self) -> bool {
+        std::mem::take(&mut self.cm1_open_models_requested)
+    }
+
     pub fn formula_lab_state_json(&self) -> serde_json::Value {
         self.formula_lab.state_json()
     }
@@ -1966,6 +1995,30 @@ impl ModelDataDock {
     /// Draw auxiliary windows that belong to the shared Models/WRF backend
     /// exactly once per app frame, independent of which owner surface is open.
     pub fn auxiliary_windows(&mut self, ctx: &egui::Context) {
+        let import_message = self.import_message.clone();
+        if let Some(request) = self.cm1.show_window(
+            ctx,
+            self.import_job.is_some() || self.formula_lab.busy(),
+            import_message.as_deref(),
+        ) && self.import_job.is_none()
+            && !self.formula_lab.busy()
+        {
+            self.import_message = Some(format!(
+                "Importing CM1 {} at output {}{}",
+                request.variable,
+                request.time_index,
+                request
+                    .level_index
+                    .map(|level| format!(", native level {level}"))
+                    .unwrap_or_default()
+            ));
+            self.import_job = Some(ImportJob::Cm1(crate::cm1_ui::spawn_import(
+                request,
+                self.store_root.clone(),
+            )));
+            self.repaint.request_repaint();
+        }
+
         if self.gdex.open {
             let cache_dir = settings::gdex_cache_dir();
             self.gdex.ui(ctx, &cache_dir);
@@ -2295,6 +2348,12 @@ impl ModelDataDock {
                 /// and for jobs with no store output.
                 plot: Option<(PathBuf, String, String)>,
             },
+            /// A CM1 plane landed with an exact hour key. Select it before
+            /// opening Models so the user sees the requested field/run.
+            FinishedCm1 {
+                message: String,
+                summary: crate::cm1_ui::Cm1ImportSummary,
+            },
             /// A synthetic-radar job finished: its volumes go to the app to
             /// loop, not to the store, so this carries the output out.
             FinishedSynthetic {
@@ -2319,6 +2378,45 @@ impl ModelDataDock {
 
         let result = match self.import_job.as_ref() {
             None => PollResult::Idle,
+            Some(ImportJob::Cm1(task)) => {
+                let mut latest = None;
+                let mut done = None;
+                loop {
+                    match task.rx.try_recv() {
+                        Ok(crate::cm1_ui::Cm1ImportMessage::Progress(message)) => {
+                            latest = Some(message);
+                        }
+                        Ok(crate::cm1_ui::Cm1ImportMessage::Done(outcome)) => {
+                            done = Some(outcome);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            done = Some(Err("CM1 import worker stopped unexpectedly".to_owned()));
+                            break;
+                        }
+                    }
+                }
+                match done {
+                    Some(Ok(summary)) => PollResult::FinishedCm1 {
+                        message: format!(
+                            "Imported CM1 {} -> run “{}”; provenance {}",
+                            summary.variable,
+                            summary.run,
+                            summary.provenance_path.display()
+                        ),
+                        summary,
+                    },
+                    Some(Err(error)) => PollResult::Finished {
+                        message: format!("CM1 import failed: {error}"),
+                        plot: None,
+                    },
+                    None => match latest {
+                        Some(message) => PollResult::Progress(message),
+                        None => PollResult::Progress(String::new()),
+                    },
+                }
+            }
             Some(ImportJob::Local(task)) => {
                 // Drain the whole backlog and show only the newest progress
                 // line — same pattern as the heavy path below.
@@ -2538,6 +2636,17 @@ impl ModelDataDock {
                 {
                     self.start_plot_job(store_root, model, run);
                 }
+            }
+            PollResult::FinishedCm1 { message, summary } => {
+                self.import_message = Some(message);
+                self.import_job = None;
+                self.select_hour_key(summary.hour.clone());
+                self.rescan();
+                self.cm1_open_models_requested = true;
+                if self.wrf_options.auto_plot {
+                    self.start_plot_job(summary.store_root, summary.model, summary.run);
+                }
+                self.repaint.request_repaint();
             }
             PollResult::FinishedSynthetic { message, output } => {
                 self.import_message = Some(message);
@@ -2779,6 +2888,23 @@ impl ModelDataDock {
             .weak(),
         );
         ui.add_space(6.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("CM1 native output");
+                ui.weak("Local Cartesian scalar inventory · explicit anchor · moving-domain placement");
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Inspect cm1out directly, choose an exact output time and native level, then store the selected plane under model=cm1. CM1 files never pass through the WRF reader.",
+                )
+                .small()
+                .weak(),
+            );
+            if ui.button("Open CM1 import…").clicked() {
+                self.open_cm1_window();
+            }
+        });
+        ui.add_space(8.0);
         model_subheading(ui, "Batch plots");
         self.plot_controls(ui);
     }
