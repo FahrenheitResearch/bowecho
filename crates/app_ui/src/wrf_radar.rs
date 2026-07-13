@@ -1160,11 +1160,13 @@ fn resolve_coupled_instrument(
     };
     let sampling = resolve_estimator_sampling(&timing, &estimator_config)
         .map_err(|error| format!("resolve coupled moment-estimator sampling: {error}"))?;
-    // Five response nodes include the zero-weight support endpoints; the
-    // three interior nodes form a normalized center/half-pulse quadrature.
+    // Retain the three central nodes of the five-node midpoint response for
+    // the compact beam quadratures, then renormalize after truncating its two
+    // outer-tail nodes.
     let response = MatchedFilterRangeResponse::new(instrument.pulse_width_s, 5)
         .map_err(|error| format!("resolve matched-filter range response: {error}"))?;
     let samples = &response.samples()[1..4];
+    let retained_range_weight = samples.iter().map(|sample| sample.weight).sum::<f64>();
     let negative = samples[0];
     let center = samples[1];
     let positive = samples[2];
@@ -1173,7 +1175,7 @@ fn resolve_coupled_instrument(
         az_sigma: 0.0,
         el_sigma: 0.0,
         range_offset_m: center.offset_m,
-        weight: center.weight,
+        weight: center.weight / retained_range_weight,
     });
     for &(az_sigma, el_sigma) in &[(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
         for range in [negative, positive] {
@@ -1181,7 +1183,7 @@ fn resolve_coupled_instrument(
                 az_sigma,
                 el_sigma,
                 range_offset_m: range.offset_m,
-                weight: range.weight / 4.0,
+                weight: range.weight / retained_range_weight / 4.0,
             });
         }
     }
@@ -1196,7 +1198,8 @@ fn resolve_coupled_instrument(
                     az_sigma,
                     el_sigma,
                     range_offset_m: range.offset_m,
-                    weight: angular_weights[az_index] * angular_weights[el_index] * range.weight,
+                    weight: angular_weights[az_index] * angular_weights[el_index] * range.weight
+                        / retained_range_weight,
                 });
             }
         }

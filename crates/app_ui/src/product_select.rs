@@ -56,17 +56,21 @@ fn picker_product_rank(product: &DisplayProduct) -> (u16, &str) {
         DisplayProduct::Moment(MomentType::SpectrumWidth) => 60,
         DisplayProduct::Moment(MomentType::DifferentialPhase) => 70,
         DisplayProduct::Moment(MomentType::SpecificDifferentialPhase) => 80,
-        DisplayProduct::Derived(DerivedProduct::CompositeReflectivity) => 100,
-        DisplayProduct::Derived(DerivedProduct::EchoTops) => 110,
-        DisplayProduct::Derived(DerivedProduct::Vil) => 120,
-        DisplayProduct::Derived(DerivedProduct::VilDensity) => 121,
-        DisplayProduct::Derived(DerivedProduct::Mehs) => 130,
-        DisplayProduct::Derived(DerivedProduct::Posh) => 131,
-        DisplayProduct::Derived(DerivedProduct::Poh) => 132,
-        DisplayProduct::Derived(DerivedProduct::Marc) => 140,
-        DisplayProduct::Derived(DerivedProduct::GustProxy) => 150,
-        DisplayProduct::Derived(DerivedProduct::AzimuthalShear) => 160,
-        DisplayProduct::Derived(DerivedProduct::Divergence) => 161,
+        // Keep the simulated-radar stage, support, and difference fields below
+        // the ordinary derived-product block. Their 81..116 ranks are a
+        // deliberate scientific progression; sharing the old 100/110 ranks
+        // made CREF/ET interleave with that progression by label.
+        DisplayProduct::Derived(DerivedProduct::CompositeReflectivity) => 120,
+        DisplayProduct::Derived(DerivedProduct::EchoTops) => 130,
+        DisplayProduct::Derived(DerivedProduct::Vil) => 140,
+        DisplayProduct::Derived(DerivedProduct::VilDensity) => 141,
+        DisplayProduct::Derived(DerivedProduct::Mehs) => 150,
+        DisplayProduct::Derived(DerivedProduct::Posh) => 151,
+        DisplayProduct::Derived(DerivedProduct::Poh) => 152,
+        DisplayProduct::Derived(DerivedProduct::Marc) => 160,
+        DisplayProduct::Derived(DerivedProduct::GustProxy) => 170,
+        DisplayProduct::Derived(DerivedProduct::AzimuthalShear) => 180,
+        DisplayProduct::Derived(DerivedProduct::Divergence) => 181,
         DisplayProduct::Moment(MomentType::Unknown(name)) => match name.as_str() {
             "IREF" => 81,
             "IVEL" => 82,

@@ -1354,8 +1354,9 @@ fn wrf(ui: &mut egui::Ui) {
          P3 50–52 reconstruct lambda/mu from the exact official WRF v5.4 two-moment table; P3 53 \
          uses the exact triple-moment table and WRF M3/M6 iteration. BowEcho lazily downloads only \
          the required 1.6 or 17.9 MB file and accepts it only after pinned size, SHA-256, header, \
-         layout, source-revision and scheme checks. Both paths integrate per-particle scattering \
-         through the dry T-matrix tables and audit omitted number, mass and sixth-moment tails. \
+         layout, source-revision and scheme checks. Production P3 and dry ISHMAEL integrate their \
+         reconstructed scheme-native PSDs per particle through the dry T-matrix tables and audit \
+         omitted number, mass and sixth-moment tails. \
          Wet ISHMAEL PSD allocation remains unavailable rather than replaced by a characteristic \
          particle.",
     );
@@ -3028,11 +3029,13 @@ mod tests {
         assert!(guide_src.contains("Wet ISHMAEL PSD allocation is unavailable"));
         assert!(guide_src.contains("old single-characteristic-particle"));
         assert!(guide_src.contains("official WRF v5.4 two-moment table"));
+        assert!(guide_src.contains("reconstructed scheme-native PSDs per particle"));
         assert!(guide_src.contains("projected-area-equivalent oblate"));
         assert!(guide_src.contains("WRF refractivity (research)"));
         assert!(guide_src.contains("not independently validated"));
         assert!(guide_src.contains("make no operational claim"));
-        assert!(!guide_src.contains("P3 is characteristic-particle"));
+        let stale_p3_claim = ["P3 is", "characteristic-particle"].join(" ");
+        assert!(!guide_src.contains(&stale_p3_claim));
         assert!(!guide_src.contains("not PSD-integrated"));
         assert!(!guide_src.contains("BowEcho v0."));
         assert!(!guide_src.contains("SimSat v0."));
