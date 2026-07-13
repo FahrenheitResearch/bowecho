@@ -24,14 +24,15 @@ use radar_scattering::{
     P3IceMomentInput, P3LookupTableV54, P3OfficialTableKind, P3OfficialTableV54, P3ParticleRegion,
     P3ParticleScatteringRoute, P3Psd, P3PsdError, P3PsdInput, P3QuadratureNode,
     P3ReconstructionConfig, P3ShapeAuthority, P3SmallSphereScatteringPolicy,
-    P3TMatrixIntegrationConfig, P3TMatrixIntegrationError, P3TMatrixParticleNode,
-    P3TMatrixShapePolicy, P3WrfScheme, ParticleState, PolarAccumulatorQuantities, PsdError,
-    PsdFallSpeedProvenance, PsdIntegrationConfig, PsdIntegrationError, PsdParticleNode,
+    P3TMatrixIntegrationConfig, P3TMatrixIntegrationError, P3TMatrixIntegrationResult,
+    P3TMatrixParticleNode, P3TMatrixShapePolicy, P3WrfScheme, ParticleState,
+    PolarAccumulatorQuantities, PreparedP3TMatrixIntegration, PreparedTMatrixParticleNode,
+    PsdError, PsdFallSpeedProvenance, PsdIntegrationConfig, PsdIntegrationError, PsdParticleNode,
     PsdParticleSupport, PsdSpheroidHabit, RadarViewApplicability, RadarViewGeometry,
     ResearchTMatrixLut, SCHEME_PSD_REVISION, Sha256Digest, SpheroidConvention,
     TMatrixEvaluationRequest, TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory,
     TMatrixParticleNodeQuery, TMatrixPopulationRole, integrate_ishmael_psd,
-    integrate_p3_tmatrix_psd,
+    integrate_p3_tmatrix_psd, prepare_p3_tmatrix_psd,
 };
 use rayon::prelude::*;
 use thiserror::Error;
@@ -2178,6 +2179,101 @@ fn floor_anchored_rayleigh_sphere(
     .map_err(EvaluationError::Output)
 }
 
+/// CPU-admitted P3 particle work. Table nodes carry the owning table's opaque
+/// prepared token, while the below-floor Rayleigh bridge remains an explicit
+/// CPU-only route and can never be staged as a LUT node by an accelerator.
+enum PreparedP3ParticleEvaluation<'table> {
+    TMatrixTable {
+        table: &'table ResearchTMatrixLut,
+        prepared: PreparedTMatrixParticleNode,
+    },
+    CpuRayleighBridge {
+        table: &'table ResearchTMatrixLut,
+        node: P3TMatrixParticleNode,
+        temperature_k: f64,
+        rime_fraction: f64,
+        rime_density: Option<f64>,
+        fall_speed: PsdFallSpeedProvenance,
+        request: TMatrixEvaluationRequest,
+    },
+}
+
+impl<'table> PreparedP3ParticleEvaluation<'table> {
+    fn evaluate_cpu(&self) -> Result<AdditiveScattering, EvaluationError> {
+        match self {
+            Self::TMatrixTable { table, prepared } => {
+                table.evaluate_prepared_dry_particle_node_per_m3(prepared)
+            }
+            Self::CpuRayleighBridge {
+                table,
+                node,
+                temperature_k,
+                rime_fraction,
+                rime_density,
+                fall_speed,
+                request,
+            } => evaluate_p3_rayleigh_bridge_node(
+                table,
+                node,
+                *temperature_k,
+                *rime_fraction,
+                *rime_density,
+                *fall_speed,
+                *request,
+            ),
+        }
+    }
+
+    fn table_binding(&self) -> Option<(&'table ResearchTMatrixLut, &PreparedTMatrixParticleNode)> {
+        match self {
+            Self::TMatrixTable { table, prepared } => Some((*table, prepared)),
+            Self::CpuRayleighBridge { .. } => None,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_p3_particle_node<'table>(
+    table: &'table ResearchTMatrixLut,
+    node: &P3TMatrixParticleNode,
+    temperature_k: f64,
+    rime_fraction: f64,
+    rime_density: Option<f64>,
+    fall_speed: PsdFallSpeedProvenance,
+    request: TMatrixEvaluationRequest,
+) -> Result<PreparedP3ParticleEvaluation<'table>, EvaluationError> {
+    match node.scattering_route() {
+        P3ParticleScatteringRoute::TMatrixTable => {
+            let prepared = table.prepare_dry_particle_geometry_per_m3(
+                temperature_k,
+                node.equivolume_diameter_m(),
+                node.bulk_density_kg_m3(),
+                node.minor_to_major_axis_ratio(),
+                node.habit(),
+                Some(rime_fraction),
+                rime_density,
+                fall_speed,
+                gaussian20_orientation(),
+                request,
+            )?;
+            Ok(PreparedP3ParticleEvaluation::TMatrixTable { table, prepared })
+        }
+        P3ParticleScatteringRoute::TableFloorAnchoredSmallDenseSphereRayleighV1 => {
+            Ok(PreparedP3ParticleEvaluation::CpuRayleighBridge {
+                table,
+                node: *node,
+                temperature_k,
+                rime_fraction,
+                rime_density,
+                fall_speed,
+                request,
+            })
+        }
+    }
+}
+
+/// Preserve the existing scalar CPU oracle: admission and evaluation are now
+/// separate, but their order and arithmetic are unchanged.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_p3_particle_node(
     table: &ResearchTMatrixLut,
@@ -2188,24 +2284,30 @@ fn evaluate_p3_particle_node(
     fall_speed: PsdFallSpeedProvenance,
     request: TMatrixEvaluationRequest,
 ) -> Result<AdditiveScattering, EvaluationError> {
+    prepare_p3_particle_node(
+        table,
+        node,
+        temperature_k,
+        rime_fraction,
+        rime_density,
+        fall_speed,
+        request,
+    )?
+    .evaluate_cpu()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_p3_rayleigh_bridge_node(
+    table: &ResearchTMatrixLut,
+    node: &P3TMatrixParticleNode,
+    temperature_k: f64,
+    rime_fraction: f64,
+    rime_density: Option<f64>,
+    fall_speed: PsdFallSpeedProvenance,
+    request: TMatrixEvaluationRequest,
+) -> Result<AdditiveScattering, EvaluationError> {
     let target_diameter = node.equivolume_diameter_m();
     let target_density = node.bulk_density_kg_m3();
-    if node.scattering_route() == P3ParticleScatteringRoute::TMatrixTable {
-        let prepared = table.prepare_dry_particle_geometry_per_m3(
-            temperature_k,
-            target_diameter,
-            target_density,
-            node.minor_to_major_axis_ratio(),
-            node.habit(),
-            Some(rime_fraction),
-            rime_density,
-            fall_speed,
-            gaussian20_orientation(),
-            request,
-        )?;
-        return table.evaluate_prepared_dry_particle_node_per_m3(&prepared);
-    }
-
     let target_speed =
         table.dry_particle_geometry_terminal_speed_m_s(target_diameter, target_density)?;
 
@@ -2257,6 +2359,123 @@ fn evaluate_p3_particle_node(
         request.frequency_hz(),
         reference_water_factor_squared,
     )
+}
+
+/// Ordered P3 integration admission for the future batch executor. The
+/// original quadrature node indices remain attached to every prepared entry;
+/// [`PreparedP3TMatrixIntegration::finish`] still owns population scaling and
+/// the exact serial source-order reduction.
+#[allow(dead_code)]
+struct PreparedP3ParticleIntegration<'table> {
+    integration: PreparedP3TMatrixIntegration,
+    evaluations: Vec<(usize, PreparedP3ParticleEvaluation<'table>)>,
+}
+
+#[allow(dead_code)]
+impl<'table> PreparedP3ParticleIntegration<'table> {
+    /// Only LUT-backed nodes are exposed to a batch executor. CPU-only
+    /// Rayleigh bridge entries are deliberately absent from this iterator.
+    fn table_nodes(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            usize,
+            P3TMatrixParticleNode,
+            &'table ResearchTMatrixLut,
+            &PreparedTMatrixParticleNode,
+        ),
+    > + '_ {
+        self.integration.nodes().zip(&self.evaluations).filter_map(
+            |((node_index, node), (prepared_index, evaluation))| {
+                debug_assert_eq!(node_index, *prepared_index);
+                evaluation
+                    .table_binding()
+                    .map(|(table, prepared)| (node_index, node, table, prepared))
+            },
+        )
+    }
+
+    /// Finish through a caller-selected table evaluator while retaining the
+    /// scalar CPU Rayleigh route and the library-owned exact reduction.
+    fn finish_with_table_evaluator<F>(
+        &self,
+        mut evaluate_table: F,
+    ) -> Result<P3TMatrixIntegrationResult, P3TMatrixIntegrationError<EvaluationError>>
+    where
+        F: FnMut(
+            usize,
+            &P3TMatrixParticleNode,
+            &'table ResearchTMatrixLut,
+            &PreparedTMatrixParticleNode,
+        ) -> Result<AdditiveScattering, EvaluationError>,
+    {
+        let mut cursor = 0_usize;
+        let result = self.integration.finish(|node_index, node| {
+            let (prepared_index, evaluation) = self
+                .evaluations
+                .get(cursor)
+                .expect("prepared P3 workload matches its admitted integration");
+            cursor += 1;
+            debug_assert_eq!(node_index, *prepared_index);
+            match evaluation {
+                PreparedP3ParticleEvaluation::TMatrixTable { table, prepared } => {
+                    evaluate_table(node_index, node, table, prepared)
+                }
+                PreparedP3ParticleEvaluation::CpuRayleighBridge { .. } => evaluation.evaluate_cpu(),
+            }
+        });
+        debug_assert_eq!(cursor, self.evaluations.len());
+        result
+    }
+
+    fn finish_cpu(
+        &self,
+    ) -> Result<P3TMatrixIntegrationResult, P3TMatrixIntegrationError<EvaluationError>> {
+        self.finish_with_table_evaluator(|_, _, table, prepared| {
+            table.evaluate_prepared_dry_particle_node_per_m3(prepared)
+        })
+    }
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn prepare_p3_particle_integration<'table>(
+    distribution: &P3Psd,
+    config: P3TMatrixIntegrationConfig,
+    table_support: PsdParticleSupport,
+    tables: WrfTMatrixLutBundle<'table>,
+    temperature_k: f64,
+    rime_fraction: f64,
+    rime_density: Option<f64>,
+    fall_speed: PsdFallSpeedProvenance,
+    oblate_request: TMatrixEvaluationRequest,
+    prolate_request: TMatrixEvaluationRequest,
+) -> Result<PreparedP3ParticleIntegration<'table>, P3TMatrixIntegrationError<EvaluationError>> {
+    let integration = prepare_p3_tmatrix_psd(distribution, config, table_support)
+        .map_err(P3TMatrixIntegrationError::<EvaluationError>::from)?;
+    let mut evaluations = Vec::with_capacity(integration.node_count());
+    for (node_index, node) in integration.nodes() {
+        let (table, request) = match node.habit() {
+            PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
+                (tables.dry_oblate, oblate_request)
+            }
+            PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
+        };
+        let evaluation = prepare_p3_particle_node(
+            table,
+            &node,
+            temperature_k,
+            rime_fraction,
+            rime_density,
+            fall_speed,
+            request,
+        )
+        .map_err(|source| P3TMatrixIntegrationError::Evaluation { node_index, source })?;
+        evaluations.push((node_index, evaluation));
+    }
+    Ok(PreparedP3ParticleIntegration {
+        integration,
+        evaluations,
+    })
 }
 
 fn evaluate_p3_psd_raw_cell(
