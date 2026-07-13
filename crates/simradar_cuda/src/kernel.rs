@@ -7,10 +7,12 @@ use cudarc::{
 use radar_scattering::{AdditiveScattering, OutputError, Sha256Digest};
 use thiserror::Error;
 
-use crate::{CudaDeviceInfo, MINIMUM_COMPUTE_CAPABILITY};
+use crate::{
+    CudaDeviceInfo, MINIMUM_COMPUTE_CAPABILITY,
+    prepared::{CUDA_MAX_ACTIVE_AXES, CudaLutNodePlan},
+};
 
 pub(crate) const CUDA_LUT_COMPONENT_COUNT: usize = AdditiveScattering::COMPONENT_COUNT;
-pub(crate) const CUDA_MAX_ACTIVE_AXES: usize = 8;
 const KERNEL_NAME: &str = "bowecho_p3_lut_segments_v1";
 const KERNEL_PTX: &str = include_str!("../kernels/p3_lut_segments.ptx");
 #[cfg(test)]
@@ -60,20 +62,6 @@ fn kernel_artifact_for_compute_capability(major: i32, minor: i32) -> KernelArtif
             image: KernelImage::Ptx(KERNEL_PTX),
         },
     }
-}
-
-/// Host-side form of one CPU-admitted LUT interpolation plus the population
-/// scale/fall-speed facts applied after interpolation. This is an execution
-/// descriptor, not a science authority: callers must obtain the bracket plan
-/// from the owning validated OfflineLut.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct CudaLutNodePlan {
-    pub(crate) base_point_index: u64,
-    pub(crate) upper_point_offsets: [u64; CUDA_MAX_ACTIVE_AXES],
-    pub(crate) upper_fractions: [f64; CUDA_MAX_ACTIVE_AXES],
-    pub(crate) active_axis_count: u32,
-    pub(crate) number_concentration_m3: f64,
-    pub(crate) positive_down_fall_speed_m_s: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

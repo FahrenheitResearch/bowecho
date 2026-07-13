@@ -4,16 +4,22 @@
 //! version understood by an older-but-compatible NVIDIA driver; PTX remains a
 //! forward-compatible fallback for architectures not known to this build.
 
+#[cfg(any(windows, target_os = "linux"))]
 use std::{
     ffi::{CStr, CString, c_char},
     path::PathBuf,
 };
 
+#[cfg(any(windows, target_os = "linux"))]
 use cudarc::nvrtc::{result, sys};
+#[cfg(any(windows, target_os = "linux"))]
 use serde_json::json;
+#[cfg(any(windows, target_os = "linux"))]
 use sha2::{Digest, Sha256};
 
+#[cfg(any(windows, target_os = "linux"))]
 const ARCHITECTURES: &[u32] = &[75, 80, 86, 87, 88, 89, 90, 100, 103, 110, 120, 121];
+#[cfg(any(windows, target_os = "linux"))]
 const COMMON_OPTIONS: &[&str] = &[
     "--ftz=false",
     "--prec-sqrt=true",
@@ -22,10 +28,12 @@ const COMMON_OPTIONS: &[&str] = &[
     "--std=c++17",
 ];
 
+#[cfg(any(windows, target_os = "linux"))]
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 unsafe fn get_cubin(program: sys::nvrtcProgram) -> Result<Vec<u8>, result::NvrtcError> {
     let mut size = 0_usize;
     unsafe { sys::nvrtcGetCUBINSize(program, &mut size) }.result()?;
@@ -34,6 +42,7 @@ unsafe fn get_cubin(program: sys::nvrtcProgram) -> Result<Vec<u8>, result::Nvrtc
     Ok(cubin)
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn compile(source: &CString, architecture: &str, cubin: bool) -> Result<Vec<u8>, String> {
     let name = c"p3_lut_segments.cu";
     let program = result::create_program(source, Some(name)).map_err(|error| error.to_string())?;
@@ -70,6 +79,7 @@ fn compile(source: &CString, architecture: &str, cubin: bool) -> Result<Vec<u8>,
     Ok(output)
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source_path = crate_root.join("kernels/p3_lut_segments.cu");
@@ -116,4 +126,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         manifest_path.display()
     );
     Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn main() {
+    eprintln!("the CUDA kernel rebuild helper is supported on Windows and Linux");
 }

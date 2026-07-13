@@ -8,7 +8,10 @@
 
 use std::sync::OnceLock;
 
+#[cfg(any(windows, target_os = "linux"))]
 use thiserror::Error;
+
+mod prepared;
 
 #[cfg(any(windows, target_os = "linux"))]
 mod adapter;
@@ -16,10 +19,12 @@ mod adapter;
 #[cfg(any(windows, target_os = "linux"))]
 mod kernel;
 
+pub use prepared::{CudaLutNodePreparationError, CudaPreparedTMatrixNode};
+
 #[cfg(any(windows, target_os = "linux"))]
 pub use adapter::{
-    CudaLutNodePreparationError, CudaPreloadedTMatrixTable, CudaPreparedTMatrixNode,
-    CudaSegmentLayoutError, CudaTMatrixExecutionError, CudaTMatrixExecutor, CudaTMatrixSegment,
+    CudaPreloadedTMatrixTable, CudaSegmentLayoutError, CudaTMatrixExecutionError,
+    CudaTMatrixExecutor, CudaTMatrixSegment,
 };
 
 /// Minimum architecture supported by the first deterministic f64 P3 kernel.
@@ -197,6 +202,7 @@ fn driver_api_version() -> Result<i32, CudaProbeError> {
     }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 enum CudaProbeError {
     #[error("{operation}: {detail}")]
