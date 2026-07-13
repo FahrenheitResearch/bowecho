@@ -27,7 +27,8 @@ use simsat::derived::DerivedField;
 use simsat::instrument_footprint::InstrumentFootprint;
 use simsat::optics::CloudOpticsMode;
 use simsat::render::{
-    CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, GROUND_DAY_LIFT, LandAppearanceConfig, RHO_HIGHLIGHT_MAX,
+    CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, GROUND_DAY_LIFT, LandAppearanceConfig,
+    RHO_HIGHLIGHT_MAX, SurfacePostlightToeConfig,
 };
 use simsat::store_out::{self, IrFrame, VisibleFrame};
 use simsat::thermal_sensor::ThermalSensor;
@@ -324,8 +325,9 @@ impl SimSatQuickMode {
         match self {
             Self::RecommendedDisplay => {
                 "Owner-reviewed visible defaults: CPU-quality rendering, model-native output, \
-                 OD 0.15, exposure 1.5, AOD 0.05, fixed optics, Effective OD, corrections and \
-                 edge feathering on, and experimental storage/footprints off."
+                 OD 0.15, exposure 1.5, AOD 0.05, fixed optics, deterministic two-subcolumn \
+                 closure, corrections, edge feathering and top-down shadow anti-aliasing on, \
+                 with experimental storage/footprints off."
             }
             Self::HighQualityVisible => {
                 "Recommended Display plus the deterministic four-subcolumn cloud reference and \
@@ -362,7 +364,8 @@ fn cloud_transport_label(mode: CloudMultiscatterMode) -> &'static str {
 fn fractional_cloud_mode_label(mode: FractionalCloudMode) -> &'static str {
     match mode {
         FractionalCloudMode::Off => "Off",
-        FractionalCloudMode::EffectiveOd => "Effective OD (fast / default)",
+        FractionalCloudMode::EffectiveOd => "Effective OD (fast / explicit)",
+        FractionalCloudMode::Deterministic2 => "Deterministic 2 (recommended)",
         FractionalCloudMode::Deterministic4 => "Deterministic 4 (reference)",
         FractionalCloudMode::Deterministic8 => "Deterministic 8 (convergence)",
         FractionalCloudMode::Deterministic16 => "Deterministic 16 (convergence)",
@@ -466,6 +469,7 @@ struct RenderJob {
     land_dark_toe_knee: f32,
     land_dark_toe_gamma: f32,
     land_dark_toe_max_gain: f32,
+    surface_postlight_toe: SurfacePostlightToeConfig,
     clouds: bool,
     fractional_clouds: bool,
     fractional_cloud_mode: FractionalCloudMode,
@@ -476,6 +480,7 @@ struct RenderJob {
     beer_powder: bool,
     topdown_stratiform_regularization: bool,
     topdown_cloud_footprint: bool,
+    topdown_shadow_antialias: bool,
     thermal_sensor: ThermalSensor,
     instrument_footprint: InstrumentFootprint,
     sun_override: bool,
@@ -618,7 +623,9 @@ struct RenderTask {
     cancel: Arc<AtomicBool>,
 }
 
-const SIMSAT_STATE_SCHEMA: u32 = 1;
+const LEGACY_SIMSAT_STATE_SCHEMA: u32 = 1;
+const SIMSAT_STATE_SCHEMA: u32 = 2;
+const LEGACY_REVIEWED_SZA_MAX_GAIN: f32 = 1.6;
 
 /// Versioned opaque payload stored inside BowEcho's application settings. Source
 /// paths, cached-file selections, live jobs, progress, and rendered output stay
@@ -653,6 +660,10 @@ struct SimSatSavedState {
     land_dark_toe_knee: f32,
     land_dark_toe_gamma: f32,
     land_dark_toe_max_gain: f32,
+    surface_postlight_toe: bool,
+    surface_postlight_toe_knee: f32,
+    surface_postlight_toe_gamma: f32,
+    surface_postlight_toe_max_gain: f32,
     clouds: bool,
     fractional_clouds: bool,
     fractional_cloud_mode: String,
@@ -663,6 +674,7 @@ struct SimSatSavedState {
     beer_powder: bool,
     topdown_stratiform_regularization: bool,
     topdown_cloud_footprint: bool,
+    topdown_shadow_antialias: bool,
     thermal_sensor: String,
     instrument_footprint: String,
     sun_override: bool,
@@ -706,6 +718,10 @@ impl SimSatSavedState {
             land_dark_toe_knee: pane.land_dark_toe_knee,
             land_dark_toe_gamma: pane.land_dark_toe_gamma,
             land_dark_toe_max_gain: pane.land_dark_toe_max_gain,
+            surface_postlight_toe: pane.surface_postlight_toe,
+            surface_postlight_toe_knee: pane.surface_postlight_toe_knee,
+            surface_postlight_toe_gamma: pane.surface_postlight_toe_gamma,
+            surface_postlight_toe_max_gain: pane.surface_postlight_toe_max_gain,
             clouds: pane.clouds,
             fractional_clouds: pane.fractional_clouds,
             fractional_cloud_mode: pane.fractional_cloud_mode.slug().to_owned(),
@@ -716,6 +732,7 @@ impl SimSatSavedState {
             beer_powder: pane.beer_powder,
             topdown_stratiform_regularization: pane.topdown_stratiform_regularization,
             topdown_cloud_footprint: pane.topdown_cloud_footprint,
+            topdown_shadow_antialias: pane.topdown_shadow_antialias,
             thermal_sensor: pane.thermal_sensor.slug().to_owned(),
             instrument_footprint: pane.instrument_footprint.slug().to_owned(),
             sun_override: pane.sun_override,
@@ -783,10 +800,15 @@ impl SimSatSavedState {
         pane.land_dark_toe_knee = self.land_dark_toe_knee.clamp(0.001, 0.25);
         pane.land_dark_toe_gamma = self.land_dark_toe_gamma.clamp(0.05, 1.0);
         pane.land_dark_toe_max_gain = self.land_dark_toe_max_gain.clamp(1.0, 4.0);
+        pane.surface_postlight_toe = self.surface_postlight_toe;
+        pane.surface_postlight_toe_knee = self.surface_postlight_toe_knee.clamp(0.001, 0.5);
+        pane.surface_postlight_toe_gamma = self.surface_postlight_toe_gamma.clamp(0.05, 1.0);
+        pane.surface_postlight_toe_max_gain = self.surface_postlight_toe_max_gain.clamp(1.0, 4.0);
         pane.clouds = self.clouds;
         pane.fractional_clouds = self.fractional_clouds;
         pane.fractional_cloud_mode = match self.fractional_cloud_mode.as_str() {
             "off" => FractionalCloudMode::Off,
+            "deterministic-2" => FractionalCloudMode::Deterministic2,
             "deterministic-4" => FractionalCloudMode::Deterministic4,
             "deterministic-8" => FractionalCloudMode::Deterministic8,
             "deterministic-16" => FractionalCloudMode::Deterministic16,
@@ -806,6 +828,7 @@ impl SimSatSavedState {
         pane.beer_powder = self.beer_powder;
         pane.topdown_stratiform_regularization = self.topdown_stratiform_regularization;
         pane.topdown_cloud_footprint = self.topdown_cloud_footprint;
+        pane.topdown_shadow_antialias = self.topdown_shadow_antialias;
         if let Some(sensor) = ThermalSensor::parse(&self.thermal_sensor) {
             pane.thermal_sensor = sensor;
         }
@@ -856,6 +879,10 @@ pub(crate) struct SimSatPane {
     land_dark_toe_knee: f32,
     land_dark_toe_gamma: f32,
     land_dark_toe_max_gain: f32,
+    surface_postlight_toe: bool,
+    surface_postlight_toe_knee: f32,
+    surface_postlight_toe_gamma: f32,
+    surface_postlight_toe_max_gain: f32,
     clouds: bool,
     fractional_clouds: bool,
     fractional_cloud_mode: FractionalCloudMode,
@@ -866,6 +893,7 @@ pub(crate) struct SimSatPane {
     beer_powder: bool,
     topdown_stratiform_regularization: bool,
     topdown_cloud_footprint: bool,
+    topdown_shadow_antialias: bool,
     thermal_sensor: ThermalSensor,
     instrument_footprint: InstrumentFootprint,
     sun_override: bool,
@@ -895,6 +923,7 @@ impl Default for SimSatPane {
             .map(|spec| (spec.date, spec.cycle))
             .unwrap_or((fallback_date, fallback_cycle));
         let land = LandAppearanceConfig::default();
+        let surface_postlight_toe = SurfacePostlightToeConfig::default();
         Self {
             source_mode: SourceMode::Local,
             local_path: String::new(),
@@ -930,9 +959,13 @@ impl Default for SimSatPane {
             land_dark_toe_knee: land.dark_toe_knee as f32,
             land_dark_toe_gamma: land.dark_toe_gamma as f32,
             land_dark_toe_max_gain: land.dark_toe_max_gain as f32,
+            surface_postlight_toe: surface_postlight_toe.enabled,
+            surface_postlight_toe_knee: surface_postlight_toe.knee as f32,
+            surface_postlight_toe_gamma: surface_postlight_toe.gamma as f32,
+            surface_postlight_toe_max_gain: surface_postlight_toe.max_gain as f32,
             clouds: true,
             fractional_clouds: true,
-            fractional_cloud_mode: FractionalCloudMode::EffectiveOd,
+            fractional_cloud_mode: FractionalCloudMode::Deterministic2,
             cloud_optical_depth_scale: simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
             cloud_optics: CloudOpticsMode::Fixed,
             feather_exposed_domain_edges: true,
@@ -940,6 +973,7 @@ impl Default for SimSatPane {
             beer_powder: false,
             topdown_stratiform_regularization: false,
             topdown_cloud_footprint: false,
+            topdown_shadow_antialias: true,
             thermal_sensor: ThermalSensor::FastGray,
             instrument_footprint: InstrumentFootprint::Off,
             sun_override: false,
@@ -964,13 +998,23 @@ impl Default for SimSatPane {
 impl SimSatPane {
     pub(crate) fn new(saved: Option<&serde_json::Value>) -> Self {
         let mut pane = Self::default();
+        let mut migrated_legacy_state = false;
         if let Some(saved) = saved
             && let Ok(state) = serde_json::from_value::<SimSatSavedState>(saved.clone())
-            && state.schema == SIMSAT_STATE_SCHEMA
         {
-            state.apply_to(&mut pane);
+            match state.schema {
+                SIMSAT_STATE_SCHEMA => state.apply_to(&mut pane),
+                LEGACY_SIMSAT_STATE_SCHEMA => {
+                    state.apply_to(&mut pane);
+                    pane.migrate_legacy_reviewed_defaults();
+                    migrated_legacy_state = true;
+                }
+                _ => {}
+            }
         }
-        pane.persisted_state_dirty = false;
+        // A v1 payload is rewritten once as v2. Custom controls survive, while
+        // the exact old quick-mode baselines receive the reviewed v0.2 defaults.
+        pane.persisted_state_dirty = migrated_legacy_state;
         pane
     }
 
@@ -1006,6 +1050,47 @@ impl SimSatPane {
         }
     }
 
+    fn surface_postlight_toe_config(&self) -> SurfacePostlightToeConfig {
+        SurfacePostlightToeConfig {
+            enabled: self.surface_postlight_toe,
+            knee: f64::from(self.surface_postlight_toe_knee),
+            gamma: f64::from(self.surface_postlight_toe_gamma),
+            max_gain: f64::from(self.surface_postlight_toe_max_gain),
+        }
+    }
+
+    fn reset_surface_postlight_toe(&mut self) {
+        let toe = SurfacePostlightToeConfig::default();
+        self.surface_postlight_toe = toe.enabled;
+        self.surface_postlight_toe_knee = toe.knee as f32;
+        self.surface_postlight_toe_gamma = toe.gamma as f32;
+        self.surface_postlight_toe_max_gain = toe.max_gain as f32;
+    }
+
+    /// Migrate only settings that are provably one of the v1 quick-mode
+    /// baselines. Any custom v1 state retains all of its existing values; the
+    /// two new v0.2 controls take their safe defaults through serde's struct
+    /// default (post-light toe off, top-down shadow anti-aliasing on).
+    fn migrate_legacy_reviewed_defaults(&mut self) {
+        let legacy_recommended = self.legacy_display_baseline_matches(false);
+        let legacy_high_quality = self.legacy_display_baseline_matches(true);
+        let legacy_sensor_qa = self.legacy_sensor_qa_matches();
+
+        if legacy_recommended || legacy_high_quality {
+            self.land_sza_max_gain = LandAppearanceConfig::default().sza_max_gain as f32;
+            if legacy_recommended {
+                self.fractional_cloud_mode = FractionalCloudMode::Deterministic2;
+            }
+            self.reset_surface_postlight_toe();
+            self.topdown_shadow_antialias = true;
+        } else if legacy_sensor_qa {
+            self.land_sza_max_gain = LandAppearanceConfig::identity().sza_max_gain as f32;
+            self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+            self.reset_surface_postlight_toe();
+            self.topdown_shadow_antialias = false;
+        }
+    }
+
     fn apply_display_baseline(&mut self) {
         let land = LandAppearanceConfig::default();
         self.storage_profile = StorageProfile::CompactU8;
@@ -1023,9 +1108,10 @@ impl SimSatPane {
         self.land_dark_toe_knee = land.dark_toe_knee as f32;
         self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
         self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
+        self.reset_surface_postlight_toe();
         self.clouds = true;
         self.fractional_clouds = true;
-        self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+        self.fractional_cloud_mode = FractionalCloudMode::Deterministic2;
         self.cloud_optical_depth_scale = simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE;
         self.cloud_optics = CloudOpticsMode::Fixed;
         self.feather_exposed_domain_edges = true;
@@ -1034,6 +1120,7 @@ impl SimSatPane {
         self.granulation = false;
         self.topdown_stratiform_regularization = false;
         self.topdown_cloud_footprint = false;
+        self.topdown_shadow_antialias = true;
         self.exposure = DEFAULT_EXPOSURE as f32;
         self.ground_gain = GROUND_DAY_LIFT as f32;
         self.cloud_softclip = CLOUD_SOFTCLIP_KNEE as f32;
@@ -1080,6 +1167,9 @@ impl SimSatPane {
                 self.geo_navigation = GeoNavigation::GoesRAbiFixedGrid;
                 self.render_intent = RenderIntent::SensorFastGray;
                 self.quality = RenderQuality::Final;
+                self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+                self.reset_surface_postlight_toe();
+                self.topdown_shadow_antialias = false;
                 match self.product {
                     SimSatProduct::Visible => {
                         self.apply_sensor_qa_visible();
@@ -1109,6 +1199,7 @@ impl SimSatPane {
         self.land_dark_toe_knee = land.dark_toe_knee as f32;
         self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
         self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
+        self.reset_surface_postlight_toe();
         self.clouds = true;
         self.fractional_clouds = true;
         self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
@@ -1120,6 +1211,7 @@ impl SimSatPane {
         self.granulation = false;
         self.topdown_stratiform_regularization = false;
         self.topdown_cloud_footprint = false;
+        self.topdown_shadow_antialias = false;
         self.exposure = 1.0;
         self.ground_gain = 1.0;
         self.cloud_softclip = 1.0;
@@ -1139,6 +1231,35 @@ impl SimSatPane {
     }
 
     fn display_baseline_matches(&self, high_quality: bool) -> bool {
+        self.display_baseline_matches_for(
+            high_quality,
+            LandAppearanceConfig::default().sza_max_gain as f32,
+            if high_quality {
+                FractionalCloudMode::Deterministic4
+            } else {
+                FractionalCloudMode::Deterministic2
+            },
+        )
+    }
+
+    fn legacy_display_baseline_matches(&self, high_quality: bool) -> bool {
+        self.display_baseline_matches_for(
+            high_quality,
+            LEGACY_REVIEWED_SZA_MAX_GAIN,
+            if high_quality {
+                FractionalCloudMode::Deterministic4
+            } else {
+                FractionalCloudMode::EffectiveOd
+            },
+        )
+    }
+
+    fn display_baseline_matches_for(
+        &self,
+        high_quality: bool,
+        expected_sza_max_gain: f32,
+        expected_fractional_mode: FractionalCloudMode,
+    ) -> bool {
         let land = LandAppearanceConfig::default();
         self.product.is_visible_family()
             && self.storage_profile == StorageProfile::CompactU8
@@ -1154,19 +1275,15 @@ impl SimSatPane {
             && self.atmosphere_correction
             && self.terrain_atmosphere
             && self.land_sza_normalization == land.sza_normalization
-            && near_f32(self.land_sza_max_gain, land.sza_max_gain as f32)
+            && near_f32(self.land_sza_max_gain, expected_sza_max_gain)
             && self.land_dark_toe == land.dark_toe
             && near_f32(self.land_dark_toe_knee, land.dark_toe_knee as f32)
             && near_f32(self.land_dark_toe_gamma, land.dark_toe_gamma as f32)
             && near_f32(self.land_dark_toe_max_gain, land.dark_toe_max_gain as f32)
+            && !self.surface_postlight_toe
             && self.clouds
             && self.fractional_clouds
-            && self.fractional_cloud_mode
-                == if high_quality {
-                    FractionalCloudMode::Deterministic4
-                } else {
-                    FractionalCloudMode::EffectiveOd
-                }
+            && self.fractional_cloud_mode == expected_fractional_mode
             && near_f32(
                 self.cloud_optical_depth_scale,
                 simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE,
@@ -1178,6 +1295,7 @@ impl SimSatPane {
             && !self.granulation
             && !self.topdown_stratiform_regularization
             && !self.topdown_cloud_footprint
+            && self.topdown_shadow_antialias
             && near_f32(self.exposure, DEFAULT_EXPOSURE as f32)
             && near_f32(self.ground_gain, GROUND_DAY_LIFT as f32)
             && near_f32(
@@ -1192,6 +1310,16 @@ impl SimSatPane {
     }
 
     fn sensor_qa_matches(&self) -> bool {
+        self.sensor_qa_core_matches()
+            && !self.surface_postlight_toe
+            && !self.topdown_shadow_antialias
+    }
+
+    fn legacy_sensor_qa_matches(&self) -> bool {
+        self.sensor_qa_core_matches()
+    }
+
+    fn sensor_qa_core_matches(&self) -> bool {
         let common = self.product.supports_sensor_qa()
             && self.satellite != SatelliteChoice::Himawari
             && self.storage_profile == StorageProfile::CompactU8
@@ -1830,6 +1958,10 @@ impl SimSatPane {
             )
         } else if self.storage_profile == StorageProfile::ScienceCloudF16 {
             Some("ScienceCloudF16 is CPU-only because the GPU path consumes CompactU8 codes.")
+        } else if self.surface_postlight_toe {
+            Some(
+                "Post-light surface toe is CPU-only; turn it off for GPU preview or render the requested terrain recovery to Satellite on CPU.",
+            )
         } else if self.render_intent == RenderIntent::SensorFastGray {
             Some("Sensor Fast Gray is CPU-only so its strict operator cannot be weakened.")
         } else if self.instrument_footprint != InstrumentFootprint::Off {
@@ -1906,7 +2038,7 @@ impl SimSatPane {
                         && self.fractional_clouds
                         && self.fractional_cloud_mode == FractionalCloudMode::Off
                     {
-                        self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+                        self.fractional_cloud_mode = FractionalCloudMode::Deterministic2;
                     }
                     if self.fractional_clouds {
                         ui.horizontal_wrapped(|ui| {
@@ -1918,6 +2050,7 @@ impl SimSatPane {
                                 .show_ui(ui, |ui| {
                                     for mode in [
                                         FractionalCloudMode::EffectiveOd,
+                                        FractionalCloudMode::Deterministic2,
                                         FractionalCloudMode::Deterministic4,
                                         FractionalCloudMode::Deterministic8,
                                         FractionalCloudMode::Deterministic16,
@@ -2062,10 +2195,20 @@ impl SimSatPane {
                              radiance while terrain remains sharp. CPU-only, top-down visible \
                              output only; thermal, derived, and geostationary products ignore it.",
                         );
+                        ui.checkbox(
+                            &mut self.topdown_shadow_antialias,
+                            "Top-down shadow anti-aliasing",
+                        )
+                        .on_hover_text(
+                            "Default-on display filter for the top-down ground cloud-shadow map. \
+                             It reduces fixed-grid dash/ring aliasing without blurring cloud \
+                             radiance or terrain. Turn it off only for an exact raw shadow-map \
+                             diagnostic. Sensor Fast Gray temporarily forces it off.",
+                        );
                     });
                     if self.view != OutputView::TopDown {
                         ui.weak(
-                            "Stratiform reconstruction and cloud footprint apply only to top-down visible output.",
+                            "Stratiform reconstruction, cloud footprint and shadow anti-aliasing apply only to top-down visible output.",
                         );
                     }
                 });
@@ -2157,6 +2300,34 @@ impl SimSatPane {
                             .text("Toe max gain"),
                     );
                 });
+                ui.separator();
+                ui.label("Experimental post-lighting terrain recovery");
+                ui.checkbox(
+                    &mut self.surface_postlight_toe,
+                    "Post-light surface toe (CPU)",
+                )
+                .on_hover_text(
+                    "Default-off display experiment. Applies a bounded scalar toe to land after \
+                     lighting and camera transmittance, before atmospheric airlight and clouds. \
+                     Ocean/glint, cloud radiance, raw bands and Sensor Fast Gray are unchanged.",
+                );
+                ui.add_enabled_ui(self.surface_postlight_toe, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.surface_postlight_toe_knee, 0.001..=0.5)
+                            .text("Post-light knee"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.surface_postlight_toe_gamma, 0.05..=1.0)
+                            .text("Post-light gamma"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.surface_postlight_toe_max_gain, 1.0..=4.0)
+                            .text("Post-light max gain"),
+                    );
+                    ui.weak(
+                        "CPU finished-visible land only; GPU preview reports and temporarily disables it.",
+                    );
+                });
                 if ui.button("Restore shipped display calibration").clicked() {
                     let land = LandAppearanceConfig::default();
                     self.exposure = DEFAULT_EXPOSURE as f32;
@@ -2169,6 +2340,7 @@ impl SimSatPane {
                     self.land_dark_toe_knee = land.dark_toe_knee as f32;
                     self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
                     self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
+                    self.reset_surface_postlight_toe();
                 }
                 ui.weak(
                     "Display-only: raw visible bands, IR, water vapor, and derived fields are unchanged.",
@@ -2360,6 +2532,7 @@ impl SimSatPane {
             land_dark_toe_knee: self.land_dark_toe_knee,
             land_dark_toe_gamma: self.land_dark_toe_gamma,
             land_dark_toe_max_gain: self.land_dark_toe_max_gain,
+            surface_postlight_toe: self.surface_postlight_toe_config(),
             clouds: self.clouds,
             fractional_clouds: self.fractional_clouds,
             fractional_cloud_mode: self.fractional_cloud_mode,
@@ -2370,6 +2543,7 @@ impl SimSatPane {
             beer_powder: self.beer_powder,
             topdown_stratiform_regularization: self.topdown_stratiform_regularization,
             topdown_cloud_footprint: self.topdown_cloud_footprint,
+            topdown_shadow_antialias: self.topdown_shadow_antialias,
             thermal_sensor: self.thermal_sensor,
             instrument_footprint: self.instrument_footprint,
             sun_override: self.sun_override,
@@ -2641,6 +2815,7 @@ fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
         dark_toe_gamma: f64::from(job.land_dark_toe_gamma),
         dark_toe_max_gain: f64::from(job.land_dark_toe_max_gain),
     };
+    params.surface_postlight_toe = job.surface_postlight_toe;
     params.steps = job.quality.steps();
     params.multiscatter = job.cloud_transport == CloudMultiscatterMode::LegacyOctaves;
     params.cloud_multiscatter = Some(job.cloud_transport);
@@ -2655,6 +2830,8 @@ fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
     params.topdown_stratiform_regularization =
         job.topdown_stratiform_regularization && job.view == OutputView::TopDown;
     params.topdown_cloud_footprint = job.topdown_cloud_footprint && job.view == OutputView::TopDown;
+    params.topdown_shadow_antialias =
+        job.topdown_shadow_antialias && job.view == OutputView::TopDown;
     params.thermal_sensor = job.thermal_sensor;
     params.instrument_footprint = job.instrument_footprint;
     params.sun_override = job.sun_override.then_some(SunOverride {
@@ -3218,6 +3395,10 @@ mod tests {
             land_dark_toe_knee: 0.06,
             land_dark_toe_gamma: 0.75,
             land_dark_toe_max_gain: 1.3,
+            surface_postlight_toe: SurfacePostlightToeConfig {
+                enabled: true,
+                ..SurfacePostlightToeConfig::default()
+            },
             clouds: true,
             fractional_clouds: false,
             fractional_cloud_mode: FractionalCloudMode::Deterministic8,
@@ -3228,6 +3409,7 @@ mod tests {
             beer_powder: true,
             topdown_stratiform_regularization: true,
             topdown_cloud_footprint: true,
+            topdown_shadow_antialias: true,
             thermal_sensor: ThermalSensor::GoesRAbiBand13Fm4,
             instrument_footprint: InstrumentFootprint::Off,
             sun_override: true,
@@ -3263,6 +3445,7 @@ mod tests {
         assert!(!params.terrain_atmosphere);
         assert!(!params.land_appearance.sza_normalization);
         assert!(!params.land_appearance.dark_toe);
+        assert!(params.surface_postlight_toe.enabled);
         assert!(params.clouds);
         assert!(!params.multiscatter);
         assert_eq!(
@@ -3281,6 +3464,7 @@ mod tests {
         assert_eq!(params.granulation, Some(true));
         assert!(params.topdown_stratiform_regularization);
         assert!(params.topdown_cloud_footprint);
+        assert!(params.topdown_shadow_antialias);
         assert_eq!(params.thermal_sensor, ThermalSensor::GoesRAbiBand13Fm4);
         assert_eq!(params.instrument_footprint, InstrumentFootprint::Off);
         assert_eq!(
@@ -3317,10 +3501,15 @@ mod tests {
         assert!(pane.atmosphere_correction);
         assert!(pane.terrain_atmosphere);
         assert_eq!(pane.land_sza_normalization, land.sza_normalization);
+        assert_eq!(pane.land_sza_max_gain, land.sza_max_gain as f32);
         assert_eq!(pane.land_dark_toe, land.dark_toe);
+        assert!(!pane.surface_postlight_toe);
         assert!(pane.clouds);
         assert!(pane.fractional_clouds);
-        assert_eq!(pane.fractional_cloud_mode, FractionalCloudMode::EffectiveOd);
+        assert_eq!(
+            pane.fractional_cloud_mode,
+            FractionalCloudMode::Deterministic2
+        );
         assert_eq!(
             pane.cloud_optical_depth_scale,
             simsat::clouds::DEFAULT_CLOUD_OPTICAL_DEPTH_SCALE
@@ -3332,8 +3521,13 @@ mod tests {
         assert!(!pane.granulation);
         assert!(!pane.topdown_stratiform_regularization);
         assert!(!pane.topdown_cloud_footprint);
+        assert!(pane.topdown_shadow_antialias);
         assert_eq!(pane.thermal_sensor, ThermalSensor::FastGray);
         assert_eq!(pane.instrument_footprint, InstrumentFootprint::Off);
+        assert_eq!(
+            pane.active_quick_mode(),
+            Some(SimSatQuickMode::RecommendedDisplay)
+        );
     }
 
     #[test]
@@ -3492,6 +3686,17 @@ mod tests {
     #[test]
     fn quick_modes_apply_reviewed_values_and_refuse_mislabeled_sensor_qa() {
         let mut pane = SimSatPane::default();
+        pane.surface_postlight_toe = true;
+        pane.topdown_shadow_antialias = false;
+        pane.apply_quick_mode(SimSatQuickMode::RecommendedDisplay)
+            .unwrap();
+        assert_eq!(
+            pane.fractional_cloud_mode,
+            FractionalCloudMode::Deterministic2
+        );
+        assert!(!pane.surface_postlight_toe);
+        assert!(pane.topdown_shadow_antialias);
+
         pane.apply_quick_mode(SimSatQuickMode::HighQualityVisible)
             .unwrap();
         assert_eq!(
@@ -3517,6 +3722,22 @@ mod tests {
         assert_eq!(pane.geo_navigation, GeoNavigation::GoesRAbiFixedGrid);
         assert_eq!(pane.resolution, ResolutionMode::Abi2km);
         assert_eq!(pane.thermal_sensor, ThermalSensor::GoesRAbiBand13Fm4);
+        assert_eq!(pane.fractional_cloud_mode, FractionalCloudMode::EffectiveOd);
+        assert!(!pane.surface_postlight_toe);
+        assert!(!pane.topdown_shadow_antialias);
+    }
+
+    #[test]
+    fn postlight_surface_toe_blocks_gpu_preview_instead_of_weakening_the_request() {
+        let mut pane = SimSatPane::default();
+        assert_eq!(pane.gpu_preview_unavailable_reason(), None);
+        pane.surface_postlight_toe = true;
+        assert_eq!(
+            pane.gpu_preview_unavailable_reason(),
+            Some(
+                "Post-light surface toe is CPU-only; turn it off for GPU preview or render the requested terrain recovery to Satellite on CPU."
+            )
+        );
     }
 
     #[test]
@@ -3534,8 +3755,127 @@ mod tests {
         assert_eq!(restored.product, SimSatProduct::Ir13);
         assert_eq!(restored.render_intent, RenderIntent::SensorFastGray);
         assert_eq!(restored.thermal_sensor, ThermalSensor::GoesRAbiBand13Fm4);
+        assert!(!restored.surface_postlight_toe);
+        assert!(!restored.topdown_shadow_antialias);
         assert!(restored.local_path.is_empty());
         assert!(restored.task.is_none());
         assert!(!restored.persisted_state_dirty);
+    }
+
+    fn legacy_v1_saved_value(pane: &SimSatPane) -> serde_json::Value {
+        let mut state = SimSatSavedState::from_pane(pane);
+        state.schema = LEGACY_SIMSAT_STATE_SCHEMA;
+        let mut value = serde_json::to_value(state).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "surface_postlight_toe",
+            "surface_postlight_toe_knee",
+            "surface_postlight_toe_gamma",
+            "surface_postlight_toe_max_gain",
+            "topdown_shadow_antialias",
+        ] {
+            object.remove(field);
+        }
+        value
+    }
+
+    #[test]
+    fn v1_reviewed_display_state_migrates_without_resetting_unowned_choices() {
+        let mut legacy = SimSatPane::default();
+        legacy.product = SimSatProduct::Sandwich;
+        legacy.margin_frac = 0.25;
+        legacy.bluemarble_month = 7;
+        legacy.sun_override = true;
+        legacy.land_sza_max_gain = LEGACY_REVIEWED_SZA_MAX_GAIN;
+        legacy.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
+        assert!(legacy.legacy_display_baseline_matches(false));
+
+        let mut restored = SimSatPane::new(Some(&legacy_v1_saved_value(&legacy)));
+        assert_eq!(restored.product, SimSatProduct::Sandwich);
+        assert_eq!(restored.margin_frac, 0.25);
+        assert_eq!(restored.bluemarble_month, 7);
+        assert!(restored.sun_override);
+        assert_eq!(
+            restored.land_sza_max_gain,
+            LandAppearanceConfig::default().sza_max_gain as f32
+        );
+        assert_eq!(
+            restored.fractional_cloud_mode,
+            FractionalCloudMode::Deterministic2
+        );
+        assert!(!restored.surface_postlight_toe);
+        assert!(restored.topdown_shadow_antialias);
+        assert!(restored.persisted_state_dirty);
+
+        let rewritten = restored.take_persisted_state_if_dirty().unwrap();
+        assert_eq!(
+            rewritten["schema"].as_u64(),
+            Some(u64::from(SIMSAT_STATE_SCHEMA))
+        );
+    }
+
+    #[test]
+    fn v1_custom_display_state_preserves_custom_science_controls() {
+        let mut legacy = SimSatPane::default();
+        legacy.land_sza_max_gain = 2.25;
+        legacy.fractional_cloud_mode = FractionalCloudMode::Deterministic8;
+
+        let restored = SimSatPane::new(Some(&legacy_v1_saved_value(&legacy)));
+        assert_eq!(restored.land_sza_max_gain, 2.25);
+        assert_eq!(
+            restored.fractional_cloud_mode,
+            FractionalCloudMode::Deterministic8
+        );
+        assert!(!restored.surface_postlight_toe);
+        assert!(restored.topdown_shadow_antialias);
+        assert!(restored.persisted_state_dirty);
+    }
+
+    #[test]
+    fn v1_high_quality_state_keeps_its_four_member_reference() {
+        let mut legacy = SimSatPane::default();
+        legacy
+            .apply_quick_mode(SimSatQuickMode::HighQualityVisible)
+            .unwrap();
+        legacy.land_sza_max_gain = LEGACY_REVIEWED_SZA_MAX_GAIN;
+        assert!(legacy.legacy_display_baseline_matches(true));
+
+        let restored = SimSatPane::new(Some(&legacy_v1_saved_value(&legacy)));
+        assert_eq!(
+            restored.land_sza_max_gain,
+            LandAppearanceConfig::default().sza_max_gain as f32
+        );
+        assert_eq!(
+            restored.fractional_cloud_mode,
+            FractionalCloudMode::Deterministic4
+        );
+        assert_eq!(
+            restored.active_quick_mode(),
+            Some(SimSatQuickMode::HighQualityVisible)
+        );
+    }
+
+    #[test]
+    fn v1_sensor_qa_state_migrates_to_the_strict_v2_control_baseline() {
+        let mut legacy = SimSatPane::default();
+        legacy.apply_quick_mode(SimSatQuickMode::SensorQa).unwrap();
+        legacy.land_sza_max_gain = LEGACY_REVIEWED_SZA_MAX_GAIN;
+        assert!(legacy.legacy_sensor_qa_matches());
+
+        let restored = SimSatPane::new(Some(&legacy_v1_saved_value(&legacy)));
+        assert_eq!(
+            restored.land_sza_max_gain,
+            LandAppearanceConfig::identity().sza_max_gain as f32
+        );
+        assert_eq!(
+            restored.fractional_cloud_mode,
+            FractionalCloudMode::EffectiveOd
+        );
+        assert!(!restored.surface_postlight_toe);
+        assert!(!restored.topdown_shadow_antialias);
+        assert_eq!(
+            restored.active_quick_mode(),
+            Some(SimSatQuickMode::SensorQa)
+        );
     }
 }
