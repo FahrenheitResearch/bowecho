@@ -21,14 +21,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AdditiveScattering, IshmaelIceCategory, OutputError, P3Category, PolarAccumulatorQuantities,
-    Sha256Digest,
+    AdditiveScattering, ICE_MATERIAL_DENSITY_KG_M3, IshmaelIceCategory, OutputError, P3Category,
+    PolarAccumulatorQuantities, Sha256Digest,
 };
 
 /// Version stamped on the first scheme-native PSD implementation.
 pub const SCHEME_PSD_REVISION: &str = "scheme-psd-v1";
 /// Version stamped on the ISHMAEL reconstruction equations.
 pub const ISHMAEL_PSD_REVISION: &str = "wrf-jensen-ishmael-gamma-v1";
+/// Mass- and shape-preserving binding from ISHMAEL's source density ceiling
+/// to the authenticated solid-ice constituent endpoint of the dry LUTs.
+pub const ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION: &str =
+    "ishmael-mass-preserving-solid-ice-material-closure-v1";
 
 /// ISHMAEL's fixed gamma shape parameter, `nu`.
 pub const ISHMAEL_GAMMA_SHAPE: f64 = 4.0;
@@ -260,6 +264,7 @@ pub struct IshmaelPsd {
     c_at_a_scale_m: f64,
     aspect_power_delta: f64,
     bulk_density_kg_m3: f64,
+    mass_preserving_bulk_density_kg_m3: f64,
     mean_particle_mass_kg: f64,
     mean_equivolume_diameter_sixth_m6: f64,
     reconstruction: IshmaelReconstructionAudit,
@@ -359,6 +364,7 @@ impl IshmaelPsd {
             c_at_a_scale_m,
             aspect_power_delta,
             bulk_density_kg_m3,
+            mass_preserving_bulk_density_kg_m3: raw_bulk_density_kg_m3,
             mean_particle_mass_kg,
             mean_equivolume_diameter_sixth_m6,
             reconstruction,
@@ -393,6 +399,15 @@ impl IshmaelPsd {
     #[must_use]
     pub const fn bulk_density_kg_m3(self) -> f64 {
         self.bulk_density_kg_m3
+    }
+
+    /// Native mean mass divided by native mean volume before an accepted
+    /// source-bound roundoff excursion is canonicalized. Particle mass and
+    /// any mass-preserving table geometry use this value; the bounded density
+    /// remains the authoritative scheme material state.
+    #[must_use]
+    pub const fn mass_preserving_bulk_density_kg_m3(self) -> f64 {
+        self.mass_preserving_bulk_density_kg_m3
     }
 
     #[must_use]
@@ -441,20 +456,29 @@ impl IshmaelPsd {
         self,
         support: PsdParticleSupport,
         upper_scaled_a: f64,
+        material: IshmaelSolidIceMaterialClosure,
     ) -> Vec<SupportInterval> {
         let exponent = self.aspect_power_delta - 1.0;
         let log_ratio_at_scale = (self.c_at_a_scale_m / self.a_scale_m).ln();
+        let table_to_source_diameter = 1.0 / material.linear_dimension_scale;
         let mut intervals = Vec::with_capacity(3);
 
         if exponent == 0.0 {
             if let Some(domain) = support.spherical
-                && contains(domain.bulk_density_kg_m3, self.bulk_density_kg_m3)
+                && contains(
+                    domain.bulk_density_kg_m3,
+                    material.scattering_bulk_density_kg_m3,
+                )
                 && contains(domain.minor_to_major_axis_ratio, 1.0)
             {
                 push_clipped_interval(
                     &mut intervals,
-                    self.scaled_a_for_diameter(domain.equivolume_diameter_m[0]),
-                    self.scaled_a_for_diameter(domain.equivolume_diameter_m[1]),
+                    self.scaled_a_for_diameter(
+                        domain.equivolume_diameter_m[0] * table_to_source_diameter,
+                    ),
+                    self.scaled_a_for_diameter(
+                        domain.equivolume_diameter_m[1] * table_to_source_diameter,
+                    ),
                     upper_scaled_a,
                 );
             }
@@ -468,12 +492,17 @@ impl IshmaelPsd {
             let Some(domain) = domain else {
                 continue;
             };
-            if !contains(domain.bulk_density_kg_m3, self.bulk_density_kg_m3) {
+            if !contains(
+                domain.bulk_density_kg_m3,
+                material.scattering_bulk_density_kg_m3,
+            ) {
                 continue;
             }
 
-            let diameter_lower = self.scaled_a_for_diameter(domain.equivolume_diameter_m[0]);
-            let diameter_upper = self.scaled_a_for_diameter(domain.equivolume_diameter_m[1]);
+            let diameter_lower = self
+                .scaled_a_for_diameter(domain.equivolume_diameter_m[0] * table_to_source_diameter);
+            let diameter_upper = self
+                .scaled_a_for_diameter(domain.equivolume_diameter_m[1] * table_to_source_diameter);
             let [ratio_minimum, ratio_maximum] = domain.minor_to_major_axis_ratio;
             let raw_log_bounds = match habit {
                 PsdSpheroidHabit::Oblate => [ratio_minimum.ln(), ratio_maximum.ln()],
@@ -512,8 +541,10 @@ impl IshmaelPsd {
             "ISHMAEL node volume",
             (4.0 / 3.0) * PI * a_semi_axis_m * a_semi_axis_m * c_semi_axis_m,
         )?;
-        let mass_kg =
-            checked_positive_computation("ISHMAEL node mass", self.bulk_density_kg_m3 * volume_m3)?;
+        let mass_kg = checked_positive_computation(
+            "ISHMAEL node mass",
+            self.mass_preserving_bulk_density_kg_m3 * volume_m3,
+        )?;
         let equivolume_diameter_m = checked_positive_computation(
             "ISHMAEL node equivalent-volume diameter",
             2.0 * (a_semi_axis_m * a_semi_axis_m * c_semi_axis_m).cbrt(),
@@ -554,6 +585,7 @@ impl IshmaelPsd {
             c_semi_axis_m,
             equivolume_diameter_m,
             bulk_density_kg_m3: self.bulk_density_kg_m3,
+            mass_preserving_bulk_density_kg_m3: self.mass_preserving_bulk_density_kg_m3,
             minor_to_major_axis_ratio,
             habit,
             particle_volume_m3: volume_m3,
@@ -599,6 +631,7 @@ pub struct PsdParticleNode {
     c_semi_axis_m: f64,
     equivolume_diameter_m: f64,
     bulk_density_kg_m3: f64,
+    mass_preserving_bulk_density_kg_m3: f64,
     minor_to_major_axis_ratio: f64,
     habit: PsdSpheroidHabit,
     particle_volume_m3: f64,
@@ -653,6 +686,13 @@ impl PsdParticleNode {
         self.bulk_density_kg_m3
     }
 
+    /// Density implied by this node's native mass and volume before bounded
+    /// transport roundoff is canonicalized in [`Self::bulk_density_kg_m3`].
+    #[must_use]
+    pub const fn mass_preserving_bulk_density_kg_m3(self) -> f64 {
+        self.mass_preserving_bulk_density_kg_m3
+    }
+
     #[must_use]
     pub const fn minor_to_major_axis_ratio(self) -> f64 {
         self.minor_to_major_axis_ratio
@@ -691,6 +731,215 @@ impl PsdParticleNode {
     #[must_use]
     pub const fn rime_density_kg_m3(self) -> Option<f64> {
         self.rime_density_kg_m3
+    }
+}
+
+/// Auditable material binding applied before ISHMAEL particle-table support
+/// and interpolation are evaluated.
+///
+/// ISHMAEL permits reconstructed bulk density through 920 kg m^-3, while the
+/// authenticated dry LUT dielectric treats 917 kg m^-3 as unit solid-ice
+/// volume fraction. A source density above that constituent endpoint cannot
+/// be queried as a homogeneous particle without implying ice volume fraction
+/// greater than one. The versioned closure therefore expands every linear
+/// dimension uniformly by `(rho_source / 917)^(1/3)` and queries the solid-ice
+/// endpoint. This preserves native particle mass, aspect ratio, and habit.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct IshmaelSolidIceMaterialClosure {
+    revision: &'static str,
+    applied: bool,
+    source_bulk_density_kg_m3: f64,
+    mass_preserving_source_bulk_density_kg_m3: f64,
+    scattering_bulk_density_kg_m3: f64,
+    linear_dimension_scale: f64,
+}
+
+impl IshmaelSolidIceMaterialClosure {
+    fn native(
+        source_bulk_density_kg_m3: f64,
+        mass_preserving_source_bulk_density_kg_m3: f64,
+    ) -> Self {
+        Self {
+            revision: ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION,
+            applied: false,
+            source_bulk_density_kg_m3,
+            mass_preserving_source_bulk_density_kg_m3,
+            scattering_bulk_density_kg_m3: source_bulk_density_kg_m3,
+            linear_dimension_scale: 1.0,
+        }
+    }
+
+    fn for_authenticated_table(
+        source_bulk_density_kg_m3: f64,
+        mass_preserving_source_bulk_density_kg_m3: f64,
+        authenticated_ice_material_density_kg_m3: f64,
+    ) -> Result<Self, PsdError> {
+        if authenticated_ice_material_density_kg_m3.to_bits()
+            != ICE_MATERIAL_DENSITY_KG_M3.to_bits()
+        {
+            return Err(PsdError::SolidIceMaterialEndpoint {
+                expected_kg_m3: ICE_MATERIAL_DENSITY_KG_M3,
+                actual_kg_m3: authenticated_ice_material_density_kg_m3,
+            });
+        }
+        if !(source_bulk_density_kg_m3.is_finite()
+            && ISHMAEL_DENSITY_RANGE_KG_M3[0] <= source_bulk_density_kg_m3
+            && source_bulk_density_kg_m3 <= ISHMAEL_DENSITY_RANGE_KG_M3[1])
+        {
+            return Err(PsdError::OutsideReconstructionBound {
+                field: "ISHMAEL solid-ice material-closure source density",
+                value: source_bulk_density_kg_m3,
+                minimum: ISHMAEL_DENSITY_RANGE_KG_M3[0],
+                maximum: ISHMAEL_DENSITY_RANGE_KG_M3[1],
+            });
+        }
+        if source_bulk_density_kg_m3 <= authenticated_ice_material_density_kg_m3 {
+            return Ok(Self::native(
+                source_bulk_density_kg_m3,
+                mass_preserving_source_bulk_density_kg_m3,
+            ));
+        }
+        if !(mass_preserving_source_bulk_density_kg_m3.is_finite()
+            && mass_preserving_source_bulk_density_kg_m3 > 0.0)
+        {
+            return Err(PsdError::InvalidComputation {
+                field: "ISHMAEL native mass/volume density",
+                value: mass_preserving_source_bulk_density_kg_m3,
+            });
+        }
+        let linear_dimension_scale = (mass_preserving_source_bulk_density_kg_m3
+            / authenticated_ice_material_density_kg_m3)
+            .cbrt();
+        if !(linear_dimension_scale.is_finite() && linear_dimension_scale > 1.0) {
+            return Err(PsdError::InvalidComputation {
+                field: "ISHMAEL solid-ice material-closure linear scale",
+                value: linear_dimension_scale,
+            });
+        }
+        Ok(Self {
+            revision: ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION,
+            applied: true,
+            source_bulk_density_kg_m3,
+            mass_preserving_source_bulk_density_kg_m3,
+            scattering_bulk_density_kg_m3: authenticated_ice_material_density_kg_m3,
+            linear_dimension_scale,
+        })
+    }
+
+    fn validate_for(self, distribution: IshmaelPsd) -> Result<(), PsdError> {
+        let expected = if self.applied {
+            Self::for_authenticated_table(
+                distribution.bulk_density_kg_m3,
+                distribution.mass_preserving_bulk_density_kg_m3,
+                self.scattering_bulk_density_kg_m3,
+            )?
+        } else {
+            Self::native(
+                distribution.bulk_density_kg_m3,
+                distribution.mass_preserving_bulk_density_kg_m3,
+            )
+        };
+        if self != expected {
+            return Err(PsdError::InvalidMaterialClosure);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> &'static str {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn applied(self) -> bool {
+        self.applied
+    }
+
+    #[must_use]
+    pub const fn source_bulk_density_kg_m3(self) -> f64 {
+        self.source_bulk_density_kg_m3
+    }
+
+    /// Native mass divided by native volume, including any accepted and
+    /// separately audited roundoff excursion beyond the bounded scheme state.
+    #[must_use]
+    pub const fn mass_preserving_source_bulk_density_kg_m3(self) -> f64 {
+        self.mass_preserving_source_bulk_density_kg_m3
+    }
+
+    #[must_use]
+    pub const fn scattering_bulk_density_kg_m3(self) -> f64 {
+        self.scattering_bulk_density_kg_m3
+    }
+
+    #[must_use]
+    pub const fn linear_dimension_scale(self) -> f64 {
+        self.linear_dimension_scale
+    }
+}
+
+/// One native ISHMAEL quadrature node after the explicit table-material
+/// closure has been applied to scattering geometry. The source node remains
+/// intact for number, mass, QVOLI/QAOLI, and D6 closure accounting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IshmaelScatteringParticleNode {
+    source: PsdParticleNode,
+    a_semi_axis_m: f64,
+    c_semi_axis_m: f64,
+    equivolume_diameter_m: f64,
+    bulk_density_kg_m3: f64,
+}
+
+impl IshmaelScatteringParticleNode {
+    fn from_source(source: PsdParticleNode, material: IshmaelSolidIceMaterialClosure) -> Self {
+        let scale = material.linear_dimension_scale;
+        Self {
+            source,
+            a_semi_axis_m: source.a_semi_axis_m * scale,
+            c_semi_axis_m: source.c_semi_axis_m * scale,
+            equivolume_diameter_m: source.equivolume_diameter_m * scale,
+            bulk_density_kg_m3: material.scattering_bulk_density_kg_m3,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(self) -> PsdParticleNode {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn a_semi_axis_m(self) -> f64 {
+        self.a_semi_axis_m
+    }
+
+    #[must_use]
+    pub const fn c_semi_axis_m(self) -> f64 {
+        self.c_semi_axis_m
+    }
+
+    #[must_use]
+    pub const fn equivolume_diameter_m(self) -> f64 {
+        self.equivolume_diameter_m
+    }
+
+    #[must_use]
+    pub const fn bulk_density_kg_m3(self) -> f64 {
+        self.bulk_density_kg_m3
+    }
+
+    #[must_use]
+    pub const fn minor_to_major_axis_ratio(self) -> f64 {
+        self.source.minor_to_major_axis_ratio
+    }
+
+    #[must_use]
+    pub const fn habit(self) -> PsdSpheroidHabit {
+        self.source.habit
+    }
+
+    #[must_use]
+    pub const fn particle_mass_kg(self) -> f64 {
+        self.source.particle_mass_kg
     }
 }
 
@@ -763,6 +1012,15 @@ impl PsdParticleDomain {
                 node.minor_to_major_axis_ratio,
             )
     }
+
+    fn contains_scattering(self, node: IshmaelScatteringParticleNode) -> bool {
+        contains(self.equivolume_diameter_m, node.equivolume_diameter_m)
+            && contains(self.bulk_density_kg_m3, node.bulk_density_kg_m3)
+            && contains(
+                self.minor_to_major_axis_ratio,
+                node.minor_to_major_axis_ratio(),
+            )
+    }
 }
 
 impl Default for PsdParticleDomain {
@@ -828,6 +1086,11 @@ impl PsdParticleSupport {
     pub fn contains(self, node: PsdParticleNode) -> bool {
         self.domain_for(node.habit())
             .is_some_and(|domain| domain.contains(node))
+    }
+
+    fn contains_scattering(self, node: IshmaelScatteringParticleNode) -> bool {
+        self.domain_for(node.habit())
+            .is_some_and(|domain| domain.contains_scattering(node))
     }
 }
 
@@ -1032,6 +1295,10 @@ pub struct PsdIntegrationAudit {
     pub quadrature: PsdQuadratureRule,
     pub fall_speed: PsdFallSpeedProvenance,
     pub reconstruction: IshmaelReconstructionAudit,
+    /// Native-to-table material geometry binding. Native distribution moments
+    /// remain governed by `reconstruction`; only support, LUT geometry, and
+    /// the LUT-owned terminal-speed query consume this mapped state.
+    pub material_closure: IshmaelSolidIceMaterialClosure,
     /// Number of magnitude-triggered factor-of-two refinements beyond the
     /// configured base coarse/refined pair.
     pub refinement_steps: u8,
@@ -1100,6 +1367,7 @@ pub struct PreparedIshmaelPsdIntegration {
     config: PsdIntegrationConfig,
     support: PsdParticleSupport,
     fall_speed: PsdFallSpeedProvenance,
+    material_closure: IshmaelSolidIceMaterialClosure,
     coarse: PreparedPsdRule,
     refined: PreparedPsdRule,
     adaptive_refined: Option<PreparedPsdRule>,
@@ -1174,6 +1442,18 @@ impl PreparedIshmaelPsdIntegration {
     #[must_use]
     pub const fn upper_scaled_a(&self) -> f64 {
         self.upper_scaled_a
+    }
+
+    #[must_use]
+    pub const fn material_closure(&self) -> IshmaelSolidIceMaterialClosure {
+        self.material_closure
+    }
+
+    /// Derive the exact table-ready geometry used during support admission.
+    /// The returned value retains its native source node and mass.
+    #[must_use]
+    pub fn scattering_particle(&self, node: PsdParticleNode) -> IshmaelScatteringParticleNode {
+        IshmaelScatteringParticleNode::from_source(node, self.material_closure)
     }
 
     /// Analytic/quadrature closure errors already fixed by preparation. The
@@ -1291,6 +1571,7 @@ impl PreparedIshmaelPsdIntegration {
             quadrature: self.config.quadrature,
             fall_speed: self.fall_speed,
             reconstruction: self.distribution.reconstruction,
+            material_closure: self.material_closure,
             refinement_steps,
             coarse_nodes_evaluated: coarse.nodes_evaluated,
             refined_nodes_evaluated: refined.nodes_evaluated,
@@ -1334,8 +1615,50 @@ pub fn prepare_ishmael_psd(
     support: PsdParticleSupport,
     fall_speed: PsdFallSpeedProvenance,
 ) -> Result<PreparedIshmaelPsdIntegration, PsdError> {
+    prepare_ishmael_psd_impl(
+        distribution,
+        config,
+        support,
+        fall_speed,
+        IshmaelSolidIceMaterialClosure::native(
+            distribution.bulk_density_kg_m3,
+            distribution.mass_preserving_bulk_density_kg_m3,
+        ),
+    )
+}
+
+/// Construct an ISHMAEL workload using the authenticated dry-LUT solid-ice
+/// material endpoint. Source density through the scheme's validated 920 kg
+/// m^-3 cap is retained in native PSD mass and moment accounting. Only source
+/// states denser than the exact 917 kg m^-3 constituent endpoint are mapped,
+/// by a uniform mass-preserving linear scale, before table support and
+/// interpolation.
+pub fn prepare_ishmael_psd_with_solid_ice_material_closure(
+    distribution: &IshmaelPsd,
+    config: PsdIntegrationConfig,
+    support: PsdParticleSupport,
+    fall_speed: PsdFallSpeedProvenance,
+    authenticated_ice_material_density_kg_m3: f64,
+) -> Result<PreparedIshmaelPsdIntegration, PsdError> {
+    let material_closure = IshmaelSolidIceMaterialClosure::for_authenticated_table(
+        distribution.bulk_density_kg_m3,
+        distribution.mass_preserving_bulk_density_kg_m3,
+        authenticated_ice_material_density_kg_m3,
+    )?;
+    prepare_ishmael_psd_impl(distribution, config, support, fall_speed, material_closure)
+}
+
+fn prepare_ishmael_psd_impl(
+    distribution: &IshmaelPsd,
+    config: PsdIntegrationConfig,
+    support: PsdParticleSupport,
+    fall_speed: PsdFallSpeedProvenance,
+    material_closure: IshmaelSolidIceMaterialClosure,
+) -> Result<PreparedIshmaelPsdIntegration, PsdError> {
+    material_closure.validate_for(*distribution)?;
     let upper_scaled_a = tail_cutoff(*distribution, config)?;
-    let support_intervals = distribution.support_intervals(support, upper_scaled_a);
+    let support_intervals =
+        distribution.support_intervals(support, upper_scaled_a, material_closure);
     let tails = MomentFractions {
         number: regularized_gamma_q(ISHMAEL_GAMMA_SHAPE, upper_scaled_a)?,
         mass: regularized_gamma_q(
@@ -1359,6 +1682,7 @@ pub fn prepare_ishmael_psd(
         usize::from(config.coarse_panels),
         upper_scaled_a,
         support,
+        material_closure,
         &support_intervals,
         config.maximum_refined_nodes as usize,
     )?;
@@ -1367,6 +1691,7 @@ pub fn prepare_ishmael_psd(
         usize::from(config.coarse_panels) * REFINEMENT_FACTOR,
         upper_scaled_a,
         support,
+        material_closure,
         &support_intervals,
         config.maximum_refined_nodes as usize,
     )?;
@@ -1375,6 +1700,7 @@ pub fn prepare_ishmael_psd(
         usize::from(config.coarse_panels) * REFINEMENT_FACTOR * REFINEMENT_FACTOR,
         upper_scaled_a,
         support,
+        material_closure,
         &support_intervals,
         config.maximum_refined_nodes as usize,
     ) {
@@ -1388,6 +1714,7 @@ pub fn prepare_ishmael_psd(
         config,
         support,
         fall_speed,
+        material_closure,
         coarse,
         refined,
         adaptive_refined,
@@ -1555,6 +1882,7 @@ fn prepare_rule(
     panels: usize,
     upper_scaled_a: f64,
     support: PsdParticleSupport,
+    material_closure: IshmaelSolidIceMaterialClosure,
     support_intervals: &[SupportInterval],
     maximum_nodes: usize,
 ) -> Result<PreparedPsdRule, PsdError> {
@@ -1611,7 +1939,9 @@ fn prepare_rule(
             };
             add_fractions(&mut all, fractions);
 
-            if support.contains(node) {
+            let scattering_node =
+                IshmaelScatteringParticleNode::from_source(node, material_closure);
+            if support.contains_scattering(scattering_node) {
                 nodes.push(node);
             }
             index += 1;
@@ -1924,6 +2254,15 @@ pub enum PsdError {
     },
     #[error("{field} produced an invalid nonpositive or nonfinite value {value}")]
     InvalidComputation { field: &'static str, value: f64 },
+    #[error(
+        "authenticated dry-LUT solid-ice material endpoint must be exactly {expected_kg_m3} kg m^-3, got {actual_kg_m3} kg m^-3"
+    )]
+    SolidIceMaterialEndpoint {
+        expected_kg_m3: f64,
+        actual_kg_m3: f64,
+    },
+    #[error("ISHMAEL solid-ice material closure does not match the native distribution")]
+    InvalidMaterialClosure,
     #[error("{field} value {value} is outside [{minimum}, {maximum}]")]
     OutsideReconstructionBound {
         field: &'static str,
@@ -2212,6 +2551,137 @@ mod tests {
         .unwrap();
         assert!(saw_oblate);
         assert!(saw_prolate);
+    }
+
+    #[test]
+    fn authenticated_solid_ice_closure_preserves_mass_and_shape_at_918_for_both_habits() {
+        let domain = PsdParticleDomain::new(
+            [1.0e-9, 1.0],
+            [1.5, ICE_MATERIAL_DENSITY_KG_M3],
+            [0.01, 1.0],
+        )
+        .unwrap();
+        let support = PsdParticleSupport::uniform(domain);
+        for (a_scale_m, c_at_a_scale_m, expected_habit) in [
+            (50.0e-6, 25.0e-6, PsdSpheroidHabit::Oblate),
+            (50.0e-6, 100.0e-6, PsdSpheroidHabit::Prolate),
+        ] {
+            let distribution = IshmaelPsd::reconstruct(input_from_scales(
+                IshmaelIceCategory::Planar,
+                a_scale_m,
+                c_at_a_scale_m,
+                918.0,
+            ))
+            .unwrap();
+            let native = prepare_ishmael_psd(
+                &distribution,
+                PsdIntegrationConfig::default(),
+                support,
+                synthetic_fall_speed_provenance(),
+            )
+            .unwrap();
+            let native_error = native
+                .finish(|_, _, node| Ok::<_, Infallible>(synthetic_per_particle(node)))
+                .expect_err("native rho=918 remains outside exact rho<=917 LUT support");
+            assert!(matches!(
+                native_error,
+                PsdIntegrationError::Psd(PsdError::DomainOmission { .. })
+            ));
+
+            let prepared = prepare_ishmael_psd_with_solid_ice_material_closure(
+                &distribution,
+                PsdIntegrationConfig::default(),
+                support,
+                synthetic_fall_speed_provenance(),
+                ICE_MATERIAL_DENSITY_KG_M3,
+            )
+            .unwrap();
+            let material = prepared.material_closure();
+            assert_eq!(
+                material.revision(),
+                ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION
+            );
+            assert!(material.applied());
+            assert_eq!(
+                material.source_bulk_density_kg_m3().to_bits(),
+                distribution.bulk_density_kg_m3().to_bits()
+            );
+            assert_eq!(
+                material.scattering_bulk_density_kg_m3(),
+                ICE_MATERIAL_DENSITY_KG_M3
+            );
+            assert_relative(
+                material.linear_dimension_scale(),
+                (distribution.bulk_density_kg_m3() / ICE_MATERIAL_DENSITY_KG_M3).cbrt(),
+                2.0e-15,
+            );
+
+            let mut saw_expected_habit = false;
+            for (_, _, source) in prepared.nodes() {
+                let scattering = prepared.scattering_particle(source);
+                saw_expected_habit |= scattering.habit() == expected_habit;
+                assert_eq!(scattering.habit(), source.habit());
+                assert_eq!(
+                    scattering.minor_to_major_axis_ratio().to_bits(),
+                    source.minor_to_major_axis_ratio().to_bits()
+                );
+                assert_relative(
+                    scattering.equivolume_diameter_m(),
+                    source.equivolume_diameter_m() * material.linear_dimension_scale(),
+                    2.0e-15,
+                );
+                let mapped_mass = ICE_MATERIAL_DENSITY_KG_M3
+                    * (4.0 / 3.0)
+                    * PI
+                    * scattering.a_semi_axis_m().powi(2)
+                    * scattering.c_semi_axis_m();
+                assert_relative(mapped_mass, source.particle_mass_kg(), 5.0e-15);
+                assert_eq!(scattering.particle_mass_kg(), source.particle_mass_kg());
+            }
+            assert!(saw_expected_habit);
+
+            let result = prepared
+                .finish(|_, _, node| Ok::<_, Infallible>(synthetic_per_particle(node)))
+                .unwrap();
+            let audit = result.audit();
+            assert_eq!(audit.material_closure, material);
+            assert_eq!(
+                audit.expected_mass_concentration_kg_m3.to_bits(),
+                distribution.mass_concentration_kg_m3().to_bits()
+            );
+            assert_eq!(
+                audit.expected_d6_concentration_m3.to_bits(),
+                (distribution.number_density_m3()
+                    * distribution.mean_equivolume_diameter_sixth_m6())
+                .to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn solid_ice_closure_rejects_an_unauthenticated_material_endpoint() {
+        let distribution = IshmaelPsd::reconstruct(input_from_scales(
+            IshmaelIceCategory::Aggregate,
+            50.0e-6,
+            50.0e-6,
+            920.0,
+        ))
+        .unwrap();
+        let error = prepare_ishmael_psd_with_solid_ice_material_closure(
+            &distribution,
+            PsdIntegrationConfig::default(),
+            PsdParticleSupport::default(),
+            synthetic_fall_speed_provenance(),
+            916.9,
+        )
+        .expect_err("an arbitrary density clamp must not enter the closure");
+        assert_eq!(
+            error,
+            PsdError::SolidIceMaterialEndpoint {
+                expected_kg_m3: ICE_MATERIAL_DENSITY_KG_M3,
+                actual_kg_m3: 916.9,
+            }
+        );
     }
 
     #[test]

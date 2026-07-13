@@ -25,7 +25,9 @@ pub const DIAGNOSTIC_COEXISTENCE_COLD_K: f64 = 269.15;
 /// Warm edge (+2 C) of the explicitly diagnostic coexistence envelope.
 pub const DIAGNOSTIC_COEXISTENCE_WARM_K: f64 = 275.15;
 
-const ICE_MATERIAL_DENSITY_KG_M3: f64 = 917.0;
+/// Solid-ice constituent density used by the versioned property closures and
+/// authenticated dry frozen-particle LUT material model.
+pub const ICE_MATERIAL_DENSITY_KG_M3: f64 = 917.0;
 /// Liquid-water material density used by the versioned T-matrix assets.
 ///
 /// Keep conventional liquid closure on the same exact reference as the LUT

@@ -25,9 +25,9 @@ pub use closure::{
     ClosedOrientation, ClosedParticleCategory, ClosureContext, ClosureError,
     ConventionalCategoryInput, DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K,
     DiagnosticCantingTransition, DiagnosticCoexistenceInput, DiagnosticCoexistenceResult,
-    DiagnosticWetCategory, IshmaelCategoryInput, IshmaelDiagnostics, IshmaelSourceFields,
-    LIQUID_WATER_DENSITY_KG_M3, MixtureMetadata, MixtureScatteringStatus, MixtureTopology,
-    OrientationDefinition, P3Category, P3CategoryInput, PROPERTY_CLOSURE_REVISION,
+    DiagnosticWetCategory, ICE_MATERIAL_DENSITY_KG_M3, IshmaelCategoryInput, IshmaelDiagnostics,
+    IshmaelSourceFields, LIQUID_WATER_DENSITY_KG_M3, MixtureMetadata, MixtureScatteringStatus,
+    MixtureTopology, OrientationDefinition, P3Category, P3CategoryInput, PROPERTY_CLOSURE_REVISION,
     PropertyProvenance, PropertySourceKind, SourcedScalar, close_conventional_category,
     close_ishmael_category, close_p3_category, diagnose_coexistence,
 };
@@ -87,13 +87,15 @@ pub use particle::{
 };
 pub use scheme_psd::{
     DEFAULT_ADDITIVE_ABSOLUTE_TOLERANCES, ISHMAEL_DELTA_RANGE, ISHMAEL_DENSITY_RANGE_KG_M3,
-    ISHMAEL_GAMMA_SHAPE, ISHMAEL_MONOMER_SEMI_AXIS_M, ISHMAEL_PSD_REVISION, IshmaelPsd,
-    IshmaelPsdInput, IshmaelReconstructionAudit, PreparedIshmaelPsdIntegration, PsdError,
-    PsdFallSpeedAuthority, PsdFallSpeedProvenance, PsdIntegrationAudit, PsdIntegrationConfig,
-    PsdIntegrationError, PsdIntegrationResult, PsdParticleDomain, PsdParticleNode,
-    PsdParticleSupport, PsdQuadratureLevel, PsdQuadratureRule, PsdSourceCategory, PsdSpheroidHabit,
-    SCHEME_PSD_REVISION, SchemePsdRevision, analytic_gamma_moment, integrate_ishmael_psd,
-    prepare_ishmael_psd,
+    ISHMAEL_GAMMA_SHAPE, ISHMAEL_MONOMER_SEMI_AXIS_M, ISHMAEL_PSD_REVISION,
+    ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION, IshmaelPsd, IshmaelPsdInput,
+    IshmaelReconstructionAudit, IshmaelScatteringParticleNode, IshmaelSolidIceMaterialClosure,
+    PreparedIshmaelPsdIntegration, PsdError, PsdFallSpeedAuthority, PsdFallSpeedProvenance,
+    PsdIntegrationAudit, PsdIntegrationConfig, PsdIntegrationError, PsdIntegrationResult,
+    PsdParticleDomain, PsdParticleNode, PsdParticleSupport, PsdQuadratureLevel, PsdQuadratureRule,
+    PsdSourceCategory, PsdSpheroidHabit, SCHEME_PSD_REVISION, SchemePsdRevision,
+    analytic_gamma_moment, integrate_ishmael_psd, prepare_ishmael_psd,
+    prepare_ishmael_psd_with_solid_ice_material_closure,
 };
 pub use science::{
     EffectiveMediumRule, KernelModel, MeltingModel, OrientationModel, ScienceError,

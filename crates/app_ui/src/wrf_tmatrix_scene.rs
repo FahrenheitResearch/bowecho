@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use radar_scattering::{
     AdditiveScattering, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
     DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K, DiagnosticWetCategory,
-    EvaluationError, FallMomentPolicy, ISHMAEL_PSD_REVISION, IshmaelPsd, IshmaelPsdInput,
-    MixtureTopology, OrientationDefinition, OrientationModel, OutputError, P3_MODULE_VERSION,
+    EvaluationError, FallMomentPolicy, ICE_MATERIAL_DENSITY_KG_M3, ISHMAEL_PSD_REVISION,
+    ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION, IshmaelPsd, IshmaelPsdInput, MixtureTopology,
+    OrientationDefinition, OrientationModel, OutputError, P3_MODULE_VERSION,
     P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION, P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION,
     P3_PSD_REVISION, P3_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION, P3_SOLID_ICE_DENSITY_KG_M3,
     P3_SPHERICAL_INTEGRATION_REVISION, P3_TABLE_READER_REVISION, P3_WRF_SOURCE_COMMIT,
@@ -33,7 +34,8 @@ use radar_scattering::{
     PsdQuadratureLevel, PsdSpheroidHabit, RadarViewApplicability, RadarViewGeometry,
     ResearchTMatrixLut, SCHEME_PSD_REVISION, Sha256Digest, SpheroidConvention,
     TMatrixEvaluationRequest, TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory,
-    TMatrixPopulationRole, prepare_ishmael_psd, prepare_p3_tmatrix_psd,
+    TMatrixPopulationRole, prepare_ishmael_psd_with_solid_ice_material_closure,
+    prepare_p3_tmatrix_psd,
 };
 use rayon::prelude::*;
 use simradar_cuda::CudaPreparedTMatrixNode;
@@ -1026,6 +1028,8 @@ pub enum WrfTMatrixFrozenScatteringAudit {
     IshmaelSchemeNativePsdDryFrozenV1 {
         scheme_psd_revision: &'static str,
         ishmael_reconstruction_revision: &'static str,
+        solid_ice_material_closure_revision: &'static str,
+        authenticated_ice_material_density_kg_m3: f64,
         integration: PsdIntegrationConfig,
         support: PsdParticleSupport,
         fall_speed: PsdFallSpeedProvenance,
@@ -1341,6 +1345,10 @@ impl WrfTMatrixScene {
                     WrfTMatrixFrozenScatteringAudit::IshmaelSchemeNativePsdDryFrozenV1 {
                         scheme_psd_revision: SCHEME_PSD_REVISION,
                         ishmael_reconstruction_revision: ISHMAEL_PSD_REVISION,
+                        solid_ice_material_closure_revision:
+                            ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION,
+                        authenticated_ice_material_density_kg_m3: validated
+                            .ishmael_ice_material_density_kg_m3,
                         integration: validated.ishmael_psd_config,
                         support: validated.ishmael_particle_support,
                         fall_speed: validated.ishmael_fall_speed,
@@ -1681,6 +1689,7 @@ struct ValidatedBundle<'a> {
     ishmael_psd_config: PsdIntegrationConfig,
     ishmael_particle_support: PsdParticleSupport,
     ishmael_fall_speed: PsdFallSpeedProvenance,
+    ishmael_ice_material_density_kg_m3: f64,
 }
 
 fn production_p3_integration_config(
@@ -2297,6 +2306,7 @@ fn build_ishmael_psd_cell_into(
                 validated.ishmael_psd_config,
                 validated.ishmael_particle_support,
                 validated.ishmael_fall_speed,
+                validated.ishmael_ice_material_density_kg_m3,
                 tables,
                 dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
                 oblate_request,
@@ -3163,20 +3173,28 @@ fn prepare_ishmael_particle_integration<'table>(
     config: PsdIntegrationConfig,
     support: PsdParticleSupport,
     fall_speed: PsdFallSpeedProvenance,
+    authenticated_ice_material_density_kg_m3: f64,
     tables: WrfTMatrixLutBundle<'table>,
     temperature_k: f64,
     oblate_request: TMatrixEvaluationRequest,
     prolate_request: TMatrixEvaluationRequest,
 ) -> Result<PreparedIshmaelParticleIntegration<'table>, PsdIntegrationError<EvaluationError>> {
-    let integration = prepare_ishmael_psd(distribution, config, support, fall_speed)
-        .map_err(PsdIntegrationError::<EvaluationError>::from)?;
+    let integration = prepare_ishmael_psd_with_solid_ice_material_closure(
+        distribution,
+        config,
+        support,
+        fall_speed,
+        authenticated_ice_material_density_kg_m3,
+    )
+    .map_err(PsdIntegrationError::<EvaluationError>::from)?;
     let mut evaluations = Vec::with_capacity(
         integration.node_count(PsdQuadratureLevel::Coarse)
             + integration.node_count(PsdQuadratureLevel::Refined)
             + integration.node_count(PsdQuadratureLevel::AdaptiveRefined),
     );
     for (level, node_index, node) in integration.nodes() {
-        let (role, table, request) = match node.habit() {
+        let scattering_node = integration.scattering_particle(node);
+        let (role, table, request) = match scattering_node.habit() {
             PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => (
                 WrfTMatrixCudaTableRole::DryOblate,
                 tables.dry_oblate,
@@ -3191,10 +3209,10 @@ fn prepare_ishmael_particle_integration<'table>(
         let prepared = table
             .prepare_dry_particle_geometry_lut_interpolation_per_m3(
                 temperature_k,
-                node.equivolume_diameter_m(),
-                node.bulk_density_kg_m3(),
-                node.minor_to_major_axis_ratio(),
-                node.habit(),
+                scattering_node.equivolume_diameter_m(),
+                scattering_node.bulk_density_kg_m3(),
+                scattering_node.minor_to_major_axis_ratio(),
+                scattering_node.habit(),
                 node.rime_mass_fraction(),
                 node.rime_density_kg_m3(),
                 fall_speed,
@@ -3406,6 +3424,7 @@ fn evaluate_ishmael_psd_raw_cell(
             validated.ishmael_psd_config,
             validated.ishmael_particle_support,
             validated.ishmael_fall_speed,
+            validated.ishmael_ice_material_density_kg_m3,
             tables,
             dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
             oblate_request,
@@ -3721,6 +3740,7 @@ fn prepare_ishmael_raw_batch_evaluation<'table>(
             validated.ishmael_psd_config,
             validated.ishmael_particle_support,
             validated.ishmael_fall_speed,
+            validated.ishmael_ice_material_density_kg_m3,
             tables,
             dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
             oblate_request,
@@ -4670,17 +4690,37 @@ fn validate_bundle(
         }
     }
 
+    let mut dry_ice_material_density_kg_m3 = None;
     for role in [
         WrfTMatrixTableRole::DryOblate,
         WrfTMatrixTableRole::DryProlate,
     ] {
         let table = table_for_role(tables, role);
-        if !matches!(
-            table.descriptor().material(),
-            TMatrixMaterial::SymmetricBruggemanSphericalAirIceMatzler2006V1 { .. }
-        ) {
+        let TMatrixMaterial::SymmetricBruggemanSphericalAirIceMatzler2006V1 {
+            ice_material_density_kg_m3,
+            ..
+        } = table.descriptor().material()
+        else {
             return Err(WrfTMatrixBundleError::DryMaterial { role });
+        };
+        if let Some(reference) = dry_ice_material_density_kg_m3
+            && f64::to_bits(reference) != ice_material_density_kg_m3.to_bits()
+        {
+            return Err(WrfTMatrixBundleError::DryIceMaterialDensityMismatch {
+                reference_kg_m3: reference,
+                actual_kg_m3: *ice_material_density_kg_m3,
+                role,
+            });
         }
+        dry_ice_material_density_kg_m3 = Some(*ice_material_density_kg_m3);
+    }
+    let dry_ice_material_density_kg_m3 =
+        dry_ice_material_density_kg_m3.expect("both dry table roles were inspected");
+    if dry_ice_material_density_kg_m3.to_bits() != ICE_MATERIAL_DENSITY_KG_M3.to_bits() {
+        return Err(WrfTMatrixBundleError::DryIceMaterialEndpoint {
+            expected_kg_m3: ICE_MATERIAL_DENSITY_KG_M3,
+            actual_kg_m3: dry_ice_material_density_kg_m3,
+        });
     }
     for role in [
         WrfTMatrixTableRole::WetOblate,
@@ -4794,6 +4834,19 @@ fn validate_bundle(
             role: WrfTMatrixTableRole::DryProlate,
             source,
         })?;
+    for (role, domain) in [
+        (WrfTMatrixTableRole::DryOblate, oblate_domain),
+        (WrfTMatrixTableRole::DryProlate, prolate_domain),
+    ] {
+        let support_endpoint = domain.bulk_density_range_kg_m3()[1];
+        if support_endpoint.to_bits() != dry_ice_material_density_kg_m3.to_bits() {
+            return Err(WrfTMatrixBundleError::DryIceMaterialSupportEndpoint {
+                role,
+                material_kg_m3: dry_ice_material_density_kg_m3,
+                support_kg_m3: support_endpoint,
+            });
+        }
+    }
     let oblate_fall_speed = tables
         .dry_oblate
         .dry_particle_node_fall_speed_provenance()
@@ -4832,6 +4885,7 @@ fn validate_bundle(
             Some(oblate_domain),
         ),
         ishmael_fall_speed: oblate_fall_speed,
+        ishmael_ice_material_density_kg_m3: dry_ice_material_density_kg_m3,
     })
 }
 
@@ -5406,6 +5460,29 @@ pub enum WrfTMatrixBundleError {
     Orientation { role: WrfTMatrixTableRole },
     #[error("{role} table must use the property-aware dry air/ice Bruggeman material")]
     DryMaterial { role: WrfTMatrixTableRole },
+    #[error(
+        "{role} dry-table ice material density {actual_kg_m3} kg m^-3 differs from bundle reference {reference_kg_m3} kg m^-3"
+    )]
+    DryIceMaterialDensityMismatch {
+        role: WrfTMatrixTableRole,
+        reference_kg_m3: f64,
+        actual_kg_m3: f64,
+    },
+    #[error(
+        "dry-table authenticated solid-ice material endpoint must be exactly {expected_kg_m3} kg m^-3, got {actual_kg_m3} kg m^-3"
+    )]
+    DryIceMaterialEndpoint {
+        expected_kg_m3: f64,
+        actual_kg_m3: f64,
+    },
+    #[error(
+        "{role} dry-table support density endpoint {support_kg_m3} kg m^-3 differs from authenticated material endpoint {material_kg_m3} kg m^-3"
+    )]
+    DryIceMaterialSupportEndpoint {
+        role: WrfTMatrixTableRole,
+        material_kg_m3: f64,
+        support_kg_m3: f64,
+    },
     #[error("{role} table must use the property-aware air/ice/water Bruggeman material")]
     WetMaterial { role: WrfTMatrixTableRole },
     #[error("rain table must use temperature-dependent Liebe-1991 liquid water")]
@@ -5552,6 +5629,7 @@ mod tests {
             validated.ishmael_psd_config,
             validated.ishmael_particle_support,
             validated.ishmael_fall_speed,
+            validated.ishmael_ice_material_density_kg_m3,
             tables,
             260.0,
             oblate_request,
@@ -5599,6 +5677,7 @@ mod tests {
             validated.ishmael_psd_config,
             validated.ishmael_particle_support,
             validated.ishmael_fall_speed,
+            validated.ishmael_ice_material_density_kg_m3,
             tables,
             ICE_MELTING_TEMPERATURE_K,
             oblate_request,
@@ -5612,6 +5691,84 @@ mod tests {
                 > 0
         );
         test(&prepared);
+    }
+
+    fn prepare_captured_solid_ice_ishmael<'table>(
+        tables: WrfTMatrixLutBundle<'table>,
+        validated: ValidatedBundle<'table>,
+        category: radar_scattering::IshmaelIceCategory,
+        qice_kgkg: f64,
+        qnice_per_kg: f64,
+        qvoli_qaoli_m3_per_kg: f64,
+        dry_air_density_kg_m3: f64,
+    ) -> PreparedIshmaelParticleIntegration<'table> {
+        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
+            category,
+            qice_kgkg,
+            qnice_per_kg,
+            qvoli_qaoli_m3_per_kg,
+            qvoli_qaoli_m3_per_kg,
+            dry_air_density_kg_m3,
+        ))
+        .expect("reconstruct captured dense spherical ISHMAEL population");
+        assert_eq!(distribution.bulk_density_kg_m3(), 920.0);
+        let oblate_request = evaluation_request(
+            validated.frequency_hz,
+            -0.5,
+            SpheroidConvention::OblateMinorVertical,
+        )
+        .unwrap();
+        let prolate_request = evaluation_request(
+            validated.frequency_hz,
+            -0.5,
+            SpheroidConvention::ProlateMajorVertical,
+        )
+        .unwrap();
+        prepare_ishmael_particle_integration(
+            &distribution,
+            validated.ishmael_psd_config,
+            validated.ishmael_particle_support,
+            validated.ishmael_fall_speed,
+            validated.ishmael_ice_material_density_kg_m3,
+            tables,
+            ICE_MELTING_TEMPERATURE_K,
+            oblate_request,
+            prolate_request,
+        )
+        .expect("prepare captured dense spherical ISHMAEL population")
+    }
+
+    fn with_captured_solid_ice_ishmael_prepared(
+        mut test: impl for<'table> FnMut(&'static str, &PreparedIshmaelParticleIntegration<'table>),
+    ) {
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let tables = owner.borrowed_bundle();
+        let validated = validate_bundle(tables).expect("validate embedded table bundle");
+        let planar = prepare_captured_solid_ice_ishmael(
+            tables,
+            validated,
+            radar_scattering::IshmaelIceCategory::Planar,
+            1.752_276_403_976_793_5e-7,
+            3.476_882_696_151_733_4,
+            3.789_174_106_861_442_6e-13,
+            1.018_401_503_562_927_2,
+        );
+        test("cell 3119612 planar", &planar);
+
+        let aggregate = prepare_captured_solid_ice_ishmael(
+            tables,
+            validated,
+            radar_scattering::IshmaelIceCategory::Aggregate,
+            1.459_221_854_460_679_4e-9,
+            0.015_616_921_707_987_785,
+            3.155_463_908_625_943_4e-15,
+            0.964_799_642_562_866_2,
+        );
+        test("cell 3790530 aggregate", &aggregate);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5659,6 +5816,7 @@ mod tests {
                     validated.ishmael_psd_config,
                     validated.ishmael_particle_support,
                     validated.ishmael_fall_speed,
+                    validated.ishmael_ice_material_density_kg_m3,
                     tables,
                     260.0,
                     oblate_request,
@@ -5853,6 +6011,127 @@ mod tests {
         });
     }
 
+    #[test]
+    fn captured_ishmael_solid_ice_populations_use_mass_preserving_lut_geometry() {
+        with_captured_solid_ice_ishmael_prepared(|label, prepared| {
+            let material = prepared.integration.material_closure();
+            assert!(material.applied(), "{label}");
+            assert_eq!(material.source_bulk_density_kg_m3(), 920.0, "{label}");
+            assert_eq!(
+                material.scattering_bulk_density_kg_m3(),
+                ICE_MATERIAL_DENSITY_KG_M3,
+                "{label}"
+            );
+            assert!(
+                material.mass_preserving_source_bulk_density_kg_m3() > 920.0,
+                "{label}"
+            );
+            let expected_scale = (material.mass_preserving_source_bulk_density_kg_m3()
+                / ICE_MATERIAL_DENSITY_KG_M3)
+                .cbrt();
+            assert_eq!(
+                material.linear_dimension_scale().to_bits(),
+                expected_scale.to_bits(),
+                "{label}"
+            );
+            assert!(!prepared.evaluations.is_empty(), "{label}");
+            let mut checked_nodes = 0_usize;
+            for (evaluation, (level, node_index, source)) in prepared
+                .evaluations
+                .iter()
+                .zip(prepared.integration.nodes())
+            {
+                checked_nodes += 1;
+                assert_eq!(
+                    (evaluation.level, evaluation.node_index),
+                    (level, node_index)
+                );
+                let scattering = prepared.integration.scattering_particle(source);
+                assert_eq!(evaluation.role, WrfTMatrixCudaTableRole::DryOblate);
+                assert_eq!(source.bulk_density_kg_m3(), 920.0, "{label}");
+                assert_eq!(
+                    source.mass_preserving_bulk_density_kg_m3().to_bits(),
+                    material
+                        .mass_preserving_source_bulk_density_kg_m3()
+                        .to_bits(),
+                    "{label}"
+                );
+                assert_eq!(
+                    scattering.bulk_density_kg_m3(),
+                    ICE_MATERIAL_DENSITY_KG_M3,
+                    "{label}"
+                );
+                assert_eq!(scattering.habit(), PsdSpheroidHabit::Spherical);
+                assert_eq!(
+                    scattering.equivolume_diameter_m().to_bits(),
+                    (source.equivolume_diameter_m() * expected_scale).to_bits(),
+                    "{label}"
+                );
+                let mapped_mass = ICE_MATERIAL_DENSITY_KG_M3
+                    * (4.0 / 3.0)
+                    * PI
+                    * scattering.a_semi_axis_m().powi(2)
+                    * scattering.c_semi_axis_m();
+                let relative_mass_error =
+                    (mapped_mass - source.particle_mass_kg()).abs() / source.particle_mass_kg();
+                assert!(
+                    relative_mass_error <= 6.0e-15,
+                    "{label}: {relative_mass_error:e}"
+                );
+            }
+            assert_eq!(checked_nodes, prepared.evaluations.len(), "{label}");
+
+            let result = prepared.finish_cpu().unwrap();
+            assert_eq!(result.audit().material_closure, material, "{label}");
+            assert_eq!(result.audit().refinement_steps, 0, "{label}");
+            let expected_component_bits = match label {
+                "cell 3119612 planar" => [
+                    4_584_814_127_193_595_147,
+                    4_584_814_127_193_595_191,
+                    4_584_814_127_193_595_169,
+                    13_496_351_942_250_142_541,
+                    4_319_305_828_281_550_870,
+                    4_486_107_859_242_813_849,
+                    4_486_107_859_242_813_848,
+                    4_592_725_846_421_530_560,
+                    4_601_202_897_700_065_374,
+                ],
+                "cell 3790530 aggregate" => [
+                    4_557_348_784_881_444_932,
+                    4_557_348_784_881_445_017,
+                    4_557_348_784_881_444_974,
+                    13_474_860_641_124_642_613,
+                    4_286_781_360_730_856_214,
+                    4_454_737_030_872_670_977,
+                    4_454_737_030_872_670_976,
+                    4_566_661_766_687_246_755,
+                    4_576_176_074_442_968_020,
+                ],
+                _ => panic!("unexpected captured population label {label}"),
+            };
+            assert_eq!(
+                result.additive().components().map(f64::to_bits),
+                expected_component_bits,
+                "{label}"
+            );
+            assert!(
+                result.audit().domain_omitted_number_fraction
+                    <= ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION,
+                "{label}"
+            );
+            assert!(
+                result.audit().domain_omitted_mass_fraction
+                    <= ISHMAEL_PSD_MAXIMUM_OMITTED_MASS_FRACTION,
+                "{label}"
+            );
+            assert!(
+                result.audit().domain_omitted_d6_fraction
+                    <= ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION,
+                "{label}"
+            );
+        });
+    }
+
     #[cfg(any(windows, target_os = "linux"))]
     fn assert_ishmael_prepared_gpu_parity(
         prepared: &PreparedIshmaelParticleIntegration<'_>,
@@ -5953,6 +6232,9 @@ mod tests {
         });
         with_reported_ishmael_planar_prepared(|prepared| {
             assert_ishmael_prepared_gpu_parity(prepared, &service, 1);
+        });
+        with_captured_solid_ice_ishmael_prepared(|_, prepared| {
+            assert_ishmael_prepared_gpu_parity(prepared, &service, 0);
         });
 
         let report = service.report();
@@ -6825,6 +7107,7 @@ mod tests {
                 config,
                 validated.ishmael_particle_support,
                 validated.ishmael_fall_speed,
+                validated.ishmael_ice_material_density_kg_m3,
                 tables,
                 ICE_MELTING_TEMPERATURE_K,
                 oblate_request,
