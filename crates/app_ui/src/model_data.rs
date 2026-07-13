@@ -203,13 +203,13 @@ impl SyntheticRadarRecipe {
                 "All polarimetric products without noise, velocity folding, or terrain blockage, so the model microphysics is easiest to inspect."
             }
             Self::RealRadar => {
-                "A practical virtual S-band radar with beam averaging, fall speed, terrain blockage, dual-pol propagation, sensitivity, timed rays, and folded velocity."
+                "A practical virtual S-band radar with beam averaging, fall speed, terrain blockage, dual-pol propagation, sensitivity, timed rays, and folded velocity. The atmosphere stays frozen unless temporal interpolation is enabled manually."
             }
             Self::MaximumFidelity => {
-                "The full virtual instrument with 27-point pulse-volume integration. Best for one file or a short loop; source-model resolution still limits detail."
+                "The full virtual instrument with 27-point pulse-volume integration and adjacent-time atmosphere interpolation. Best for a short loop; source-model resolution still limits detail."
             }
             Self::PropertyTMatrixResearch => {
-                "Opt-in, fail-closed property T-matrix for exact supported P3/ISHMAEL files. Defaults to embedded 2.8 GHz S with full-stencil raw-state interpolation; experts can select validated local S/C/X packs for frozen/additive timing."
+                "Opt-in, fail-closed property T-matrix for exact supported P3/ISHMAEL files. Defaults to embedded 2.8 GHz S with a frozen atmosphere; experts can opt into full-stencil raw-state temporal interpolation or validated local S/C/X packs."
             }
         }
     }
@@ -718,7 +718,10 @@ impl SyntheticRadarUiState {
         self.propagation = preset.propagation;
         self.propagation_geometry = preset.propagation_geometry;
         self.scan_timing = preset.scan_timing;
-        self.atmosphere_time_mode = preset.atmosphere_time_mode;
+        // Science modes should be usable on one WRF scene by default. Timed
+        // adjacent-scene interpolation is a separate, expensive fidelity
+        // choice; only the explicitly named Maximum Fidelity recipe enables it.
+        self.atmosphere_time_mode = app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
         self.missing_neighbor_policy = preset.missing_neighbor_policy;
         // Resource policy belongs to the user, not to a science mode. Keep a
         // customized RAM cap intact when switching Truth/Instrument/Presentation.
@@ -796,8 +799,6 @@ impl SyntheticRadarUiState {
             }
             SyntheticRadarRecipe::RealRadar => {
                 self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
-                self.atmosphere_time_mode =
-                    app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent;
                 self.missing_neighbor_policy =
                     app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
             }
@@ -822,7 +823,7 @@ impl SyntheticRadarUiState {
                 self.reflectivity_sampling = crate::wrf_radar::ReflectivitySampling::LinearZ;
                 self.beam_integration = crate::wrf_radar::BeamIntegration::Balanced;
                 self.atmosphere_time_mode =
-                    app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear;
+                    app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
                 self.missing_neighbor_policy =
                     app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
             }
@@ -7722,7 +7723,7 @@ mod tests {
         assert_eq!(instrument.scan_timing, ScanTiming::TimedVolume);
         assert_eq!(
             instrument.atmosphere_time_mode,
-            app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
+            app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart
         );
         assert!(instrument.instrument_noise);
         assert!(instrument.fold_velocity);
@@ -7767,7 +7768,7 @@ mod tests {
         assert_eq!(real.scan_timing, ScanTiming::TimedVolume);
         assert_eq!(
             real.atmosphere_time_mode,
-            app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
+            app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart
         );
         assert_eq!(
             real.missing_neighbor_policy,
@@ -7832,7 +7833,7 @@ mod tests {
         assert_eq!(research.beam_integration, BeamIntegration::Balanced);
         assert_eq!(
             research.atmosphere_time_mode,
-            app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
+            app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart
         );
         assert!(research.dual_pol && research.propagation);
         assert_eq!(
