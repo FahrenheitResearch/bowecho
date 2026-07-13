@@ -3,10 +3,17 @@
 > **Historical design document (superseded integration shape).** This records
 > the original pre-implementation engine plan and explains scientific/design
 > choices, but its statement below that SimSat is standalone-only is no longer
-> current. SimSat v0.1.9 now ships both its standalone Studio and an embedded
-> first-class BowEcho workspace under **Windows > SimSat**. For supported
-> inputs, controls, products, cache behavior, output routing, and current
-> limitations in BowEcho, use [docs/simsat-guide.md](simsat-guide.md).
+> current. SimSat v0.2.0 ships both its standalone Studio and an embedded
+> first-class BowEcho workspace under **Windows > SimSat**. Its reviewed display
+> baseline now uses the deterministic two-subcolumn closure, a 4.0 bounded
+> low-sun land-normalization gain, direct top-down camera-to-cloud atmosphere,
+> a transmittance-space ground-shadow anti-alias filter, and a 4096-step sun-OD
+> ceiling. The optional post-light terrain toe remains a default-off CPU display
+> experiment. NOAA heritage Natural longwave grayscale is available, while
+> BowEcho preserves an existing persisted CIMSS choice. Compact production
+> caches remain SSB v6. For supported inputs, controls, products, cache behavior,
+> output routing, and current limitations in BowEcho, use
+> [docs/simsat-guide.md](simsat-guide.md).
 
 *Drafted 2026-07-07 for the v0.31 headline. Repo: BowEcho (`crates/app_ui`, eframe 0.34.3, wgpu 29.0.3 via `eframe::egui_wgpu`).*
 *Canonical real-data fixture: the Enderlin 250 m run (`wrfout_d03_2025-06-21_*`, 800×800×79 ≈ 50.5 M cells, ~2 GB/file — see `docs/wrf-import-large-grids.md`).*

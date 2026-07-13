@@ -1,6 +1,6 @@
 # SimSat in BowEcho
 
-BowEcho embeds SimSat v0.1.9 as a first-class simulated-satellite workspace.
+BowEcho embeds SimSat v0.2.0 as a first-class simulated-satellite workspace.
 Open **Windows > SimSat** to render WRF or HRRR native-level atmospheres into
 visible, thermal, water-vapor, and derived satellite products.
 
@@ -38,8 +38,10 @@ preset-owned controls make the current mode **Custom**.
 
 - **Recommended Display** restores the reviewed visible baseline: CPU offline
   quality, Model native, CompactU8, exposure 1.5, AOD 0.05, cloud OD 0.15,
-  Effective OD fractional clouds, fixed particle optics, and experimental
-  footprint/transport controls off.
+  the deterministic two-subcolumn fractional-cloud closure, fixed particle
+  optics, the reviewed 4.0 low-sun land-normalization bound, exposed-edge
+  feathering and top-down ground-shadow anti-aliasing on, and experimental
+  footprint/transport/post-light controls off.
 - **High Quality Visible** starts from Recommended Display, then selects the
   deterministic four-subcolumn reference and a 0.45 highlight knee. It is
   slower and is not a blanket claim of greater model accuracy.
@@ -125,6 +127,15 @@ derived scalar values. Derived products use fixed physical palettes across
 frames, which keeps a loop comparable instead of rescaling each image
 independently.
 
+BowEcho recolors stored Kelvin IR/WV frames live in the Satellite window.
+SimSat v0.2.0 adds **Natural (NOAA heritage)** for longwave IR: NOAA's
+continuous bi-linear grayscale display transfer. It is available in BowEcho's
+IR-enhancement picker, while existing BowEcho settings retain their persisted
+**CIMSS** default instead of being silently migrated. Natural is a display
+palette only; the stored Band-13 brightness-temperature plane remains Kelvin.
+For water-vapor bands, Natural deliberately uses each band's scaled grayscale
+rather than forcing the Band-13 breakpoint.
+
 ## View geometry
 
 ### Geostationary
@@ -149,6 +160,13 @@ itself make the radiometry sensor-exact.
 Top-down output is registered to the model's own projection and can be placed
 directly on a map. Satellite choice is ignored because rays are vertical
 rather than emitted from a geostationary viewpoint.
+
+SimSat v0.2.0 now integrates the top-down camera-to-cloud atmospheric column
+directly. The final cloud composite includes surface transmission, cloud
+radiance transmission, and the airlight in front of the cloud. This replaces
+the older top-down simplification that omitted front airlight and is mirrored
+by the CPU and GPU render paths. It remains SimSat's approximate atmosphere,
+not a measured or line-by-line sensor retrieval.
 
 The BowEcho integration exposes geostationary and top-down views. SimSat
 Studio's separate free perspective camera is not exposed as a BowEcho
@@ -244,7 +262,7 @@ Progress displays completed frames versus the discovered total. Use
 
 ### Exposure
 
-Finished-visible display gain. SimSat v0.1.9 ships at 1.5; 1.0 is neutral
+Finished-visible display gain. SimSat v0.2.0 ships at 1.5; 1.0 is neutral
 physical reflectance. Exposure does not modify raw scalar products.
 
 ### Aerosol optical depth
@@ -299,11 +317,13 @@ are automatically more accurate for every cloud.
 
 ### Fractional-cloud closure
 
-**Effective OD** is the fast production default. Deterministic 4, 8, and 16
-perform that many fixed-stratified shared-u maximum-overlap cloud marches,
-average linear radiance, and tonemap once. They are CPU convergence/reference
-operators with approximately 4x/8x/16x cloud-march cost, not full stochastic
-McICA implementations.
+**Deterministic 2** is the reviewed finished-display default. It performs two
+fixed-stratified shared-u maximum-overlap cloud marches, averages linear
+radiance, and tonemaps once. **Effective OD** remains the faster explicit
+sensor-compatible/homogeneous choice. Deterministic 4, 8, and 16 retain their
+higher-cost reference/convergence roles. These bounded deterministic closures
+are not full stochastic or max-random McICA implementations, and additional
+members do not guarantee a more accurate forecast cloud field.
 
 ### Particle optics
 
@@ -357,6 +377,17 @@ seven-tap filter to the pre-tonemap cloud-radiance residual while leaving the
 terrain/base map sharp. It is CPU-only and ignored by geostationary, thermal,
 derived, cloud-layer, and perspective output.
 
+### Top-down shadow anti-aliasing
+
+Enabled in Recommended Display. It applies a normalized 5 by 5 binomial filter
+to the top-down ground cloud-shadow field in **transmittance** space, leaving
+the raw sun-optical-depth field and cloud radiance unchanged. The sun-OD march
+also permits up to 4096 samples in v0.2.0, raised from 1024, so fine vertical
+grids are less likely to produce coherent dashed or ring-shaped ground-shadow
+artifacts. Geostationary, raw-band, thermal, derived, and Sensor Fast Gray
+paths keep the unfiltered contract. This is an anti-aliasing and sampling
+improvement, not new meteorological detail or an instrument PSF.
+
 ## Lighting and ground
 
 ### Sun position
@@ -375,15 +406,25 @@ ground for valid date; forcing month 1-12 is a what-if surface.
 
 Ground lift, highlight knee/ceiling, solar-zenith land normalization, and the
 dark-land reflectance toe affect finished visible-family RGB. **Restore shipped
-display calibration** returns those controls to SimSat v0.1.9 defaults.
+display calibration** returns those controls to SimSat v0.2.0 defaults. The
+reviewed maximum gain for the low-sun land-normalization operator is now 4.0;
+its existing elevation ramp keeps twilight and high-sun scenes neutral.
+
+**Post-light surface toe (CPU)** is a separate, optional experiment. It applies
+a bounded color-preserving lift to land after lighting and view attenuation but
+before atmospheric airlight and cloud compositing. It is off by default, does
+not alter water/glint or raw products, and is disabled by Sensor Fast Gray. GPU
+preview cannot reproduce this experiment; use Render to Satellite for a frame
+that must include it.
 
 Raw visible bands, IR, water vapor, and derived products do not consume these
 display-only controls.
 
 ## Cache behavior
 
-BowEcho uses a versioned SimSat engine cache. SimSat v0.1.9 writes compact SSB
-format v6. The experimental ScienceCloudF16 profile uses a disjoint v7 cache.
+BowEcho uses a versioned SimSat engine cache. SimSat v0.2.0 keeps the compact
+production cache at **SSB v6**; this release does not force a compact-cache
+format bump. The experimental ScienceCloudF16 profile uses a disjoint v7 cache.
 
 Older brick caches cannot masquerade as v6:
 
@@ -430,11 +471,13 @@ Visible true color combines:
 - Cox-Munk wind-ruffled water glint
 - an ABI-like display transform
 
-SimSat v0.1.9 also uses a shared 0--12 degree low-sun surface-help ramp for
+SimSat v0.2.0 also uses a shared 0--12 degree low-sun surface-help ramp for
 land normalization, dark-toe recovery, ground lift, and water-albedo
 assistance; direct water sunlight is no longer artificially day-gated. The
-reviewed display cloud-shadow floor is 0.45, and finite-sun shadow softening
-uses the Sun's angular radius.
+reviewed land-normalization bound is 4.0, the display cloud-shadow floor is
+0.45, and finite-sun shadow softening uses the Sun's angular radius. Top-down
+ground shadows additionally use the reviewed transmittance-space anti-alias
+filter and the higher 4096-step sun-OD ceiling described above.
 
 IR uses a gray-body emission march through the model cloud/atmosphere plus a
 surface term, then converts radiance to true-Kelvin brightness temperature.
@@ -456,6 +499,14 @@ Water-vapor bands use related band-averaged moisture weighting.
   ABI GeoColor. Its night side uses the IR composite; there is no city-lights
   layer.
 - GPU output is a visible-only preview, not a stored quality tier.
+- Natural NOAA longwave grayscale is a display transfer, not a change to the
+  Kelvin thermal operator or proof of sensor validation. BowEcho preserves an
+  existing persisted CIMSS choice until the user changes it.
+- The top-down front-atmosphere march and shadow anti-aliasing improve the
+  renderer's approximation; they do not add sub-grid weather, a measured
+  instrument footprint, or line-by-line radiative transfer.
+- The post-light surface toe is an optional CPU-only display experiment, not a
+  scientific correction to model terrain or cloud fields.
 - ScienceCloudF16, native particle optics, deterministic fractional clouds,
   the ABI MTF footprint, granulation, delta-flux transport, stratiform/cloud
   footprints, and sun override are opt-in and explicitly experimental,
@@ -489,8 +540,9 @@ cannot be upgraded.
 
 Preview requires a compatible wgpu adapter and supports Visible true color
 only. Sensor Fast Gray, ScienceCloudF16, exact GOES-R geostationary navigation,
-and instrument footprints are CPU-only. Use Render to Satellite for the normal
-CPU result; BowEcho will not silently turn a failed preview into a stored frame.
+instrument footprints, and the optional post-light surface toe are CPU-only.
+Use Render to Satellite for the normal CPU result; BowEcho will not silently
+turn a failed preview into a stored frame.
 
 ### Broad top-down clouds show model-grid rings
 
