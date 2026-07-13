@@ -9,6 +9,7 @@ pub mod wrf_scene_inventory;
 pub mod wrf_temporal;
 pub mod wrf_tmatrix_assets;
 pub mod wrf_tmatrix_band_assets;
+pub mod wrf_tmatrix_cuda;
 pub mod wrf_tmatrix_scene;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
