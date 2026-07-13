@@ -769,6 +769,10 @@ impl WofsState {
         }
     }
 
+    fn retry_georef_for_run(&mut self, run_id: &str) {
+        self.georef_failed.remove(run_id);
+    }
+
     /// "Show on map" toggle + opacity + calibration status, rendered inside
     /// the WoFS window.
     pub fn drape_controls_ui(&mut self, ui: &mut egui::Ui) {
@@ -776,8 +780,8 @@ impl WofsState {
             ui.checkbox(&mut self.drape_on_map, "Show on map")
                 .on_hover_text(
                     "Drape the current product onto the radar map. The georeference is \
-                 calibrated per run by OCR-ing ~20 sounding-PNG titles (the stations' \
-                 true lat/lons) and bilinear-fitting the domain.",
+                 calibrated per run by OCR-ing sounding-PNG titles (the stations' \
+                 true lat/lons) and quadratic-fitting the Lambert domain.",
                 );
             if !self.drape_on_map {
                 return;
@@ -803,11 +807,18 @@ impl WofsState {
                     georef.lat_max_resid,
                     georef.lon_max_resid
                 ));
-            } else if let Some(error) = self.georef_failed.get(&run_id) {
+            } else if let Some(error) = self.georef_failed.get(&run_id).cloned() {
                 ui.colored_label(
                     egui::Color32::from_rgb(230, 150, 90),
                     format!("drape disabled for this run: {error}"),
                 );
+                if ui
+                    .small_button("Retry")
+                    .on_hover_text("Retry this run's sounding-title calibration")
+                    .clicked()
+                {
+                    self.retry_georef_for_run(&run_id);
+                }
             } else if self.georef_rx.as_ref().is_some_and(|(id, _)| *id == run_id) {
                 ui.spinner();
                 ui.weak(format!(
@@ -1115,6 +1126,17 @@ mod tests {
             product_label("uh_2to5__prob_thresh_75"),
             "2-5 km updraft helicity (probability >=75)"
         );
+    }
+
+    #[test]
+    fn failed_georef_can_be_retried_without_restarting() {
+        let mut state = WofsState::default();
+        let run_id = "WOFSRun20260711-130130d1";
+        state
+            .georef_failed
+            .insert(run_id.to_owned(), "temporary CDN timeout".to_owned());
+        state.retry_georef_for_run(run_id);
+        assert!(!state.georef_failed.contains_key(run_id));
     }
 
     /// Live round-trip against the running WoFS: catalog -> station

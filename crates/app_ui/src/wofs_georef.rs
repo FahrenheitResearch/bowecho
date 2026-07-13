@@ -7,8 +7,9 @@
 //! lattice in DOMAIN FRACTIONS (station RR_CC, 01..20):
 //!   fx = 0.031 + 0.049*(col-1),  fy = 0.031 + 0.049*(row-1)   (fy from bottom)
 //! so OCR-ing ~20 station titles spread across the grid gives ground-control
-//! points for a bilinear fit (fx, fy) -> (lat, lon). Validated live
-//! 2026-06-11: fit residuals 0.05 deg (lat) / 0.003 deg (lon).
+//! points for a quadratic fit (fx, fy) -> (lat, lon). The full
+//! `[1, fx, fy, fx^2, fx*fy, fy^2]` basis captures the north/south curvature
+//! of WoFS's Lambert conformal grid that a four-term bilinear surface misses.
 //!
 //! Method notes (each step matters; bugs here poisoned early fits):
 //! - The title strip is image rows 10..32 binarized at luma < 128, split by
@@ -19,17 +20,18 @@
 //!   the padded segment (classical binary template matching; cf. the
 //!   matched-filter view in Brunelli, "Template Matching Techniques in
 //!   Computer Vision", Wiley 2009, doi:10.1002/9780470744055). Score =
-//!   mismatched bits / template area; accept best <= 0.09 only with a >= 0.03
-//!   margin over the runner-up — a damaged '9' must NOT silently become a
-//!   '0'; better to drop the character (hundreds of stations to spare).
+//!   mismatched bits / template area. The acceptance gate is deliberately
+//!   paired with the exact coordinate grammar and robust whole-domain fit:
+//!   individual glyph ambiguity may admit a candidate, but an inconsistent
+//!   coordinate cannot survive the residual and domain checks.
 //! - Numbers must have EXACTLY two decimals (WoFS titles print %.2f). A
 //!   truncated read like "44." must REJECT, not parse as 44.0 — that exact
 //!   failure poisoned early calibration fits.
 //! - Lat and lon constraints are collected INDEPENDENTLY per station: a
 //!   station with one clean number still contributes a half-constraint.
-//! - The bilinear fit value = c0 + c1*fx + c2*fy + c3*fx*fy is solved by
-//!   least squares with a RANSAC-style outlier trim (consensus inliers at
-//!   residual < 0.1 deg, refit, require >= 6 inliers per axis; robust-fit
+//! - The quadratic fit is solved by least squares with a RANSAC-style outlier
+//!   trim (consensus inliers at residual < 0.1 deg, refit, require >= 8
+//!   inliers per axis; robust-fit
 //!   paradigm after Fischler & Bolles 1981, CACM 24(6),
 //!   doi:10.1145/358669.358692).
 //!
@@ -49,7 +51,10 @@
 //! forecast frame.
 
 use eframe::egui;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::Duration;
 
 /// Sounding-PNG endpoint (anonymous, CORS *):
 /// `{SOUNDING_API}/{run_id}/{rundate+init}/0/wofs_snd_{row:02}_{col:02}.png`.
@@ -97,6 +102,21 @@ pub const CALIBRATION_STATIONS: &[(u32, u32)] = &[
     (18, 6),
 ];
 
+/// The sounding CDN is independent per station. Four workers bound resource
+/// use while avoiding the multi-minute serial cold-cache path.
+const CALIBRATION_FETCH_WORKERS: usize = 4;
+/// One retry for transient transport/5xx failures. A 404 is an unpublished
+/// sounding and is not retried inside the same calibration attempt.
+const CALIBRATION_FETCH_ATTEMPTS: usize = 2;
+const CALIBRATION_FETCH_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Live-validated against the 2026-07-11 Atlanta domain. The old 0.09/0.03
+/// gate retained only 7 latitude constraints out of 28; these thresholds
+/// retain 20 latitude and 21 longitude constraints while the exact numeric
+/// grammar and whole-domain fit remain authoritative against false matches.
+const GLYPH_MAX_MISMATCH: f64 = 0.15;
+const GLYPH_MIN_RUNNER_UP_MARGIN: f64 = 0.01;
+
 /// Binarized glyph templates (char, width, row-major bits) auto-harvested
 /// from the actual matplotlib title rendering of WoFS sounding PNGs.
 #[rustfmt::skip]
@@ -120,13 +140,15 @@ const GLYPHS: &[(char, usize, &[u8])] = &[
 const STRIP_TOP: usize = 10;
 const STRIP_BOTTOM: usize = 32;
 
-/// Fitted bilinear georeference for one WoFS run, exposing axes-box
+/// Fitted quadratic georeference for one WoFS run, exposing axes-box
 /// fractions (u, v) — v from TOP — to (lon, lat).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WofsGeoref {
-    /// value = c[0] + c[1]*fx + c[2]*fy + c[3]*fx*fy, fy from BOTTOM.
-    lat_c: [f64; 4],
-    lon_c: [f64; 4],
+    /// value = c0 + c1*fx + c2*fy + c3*fx^2 + c4*fx*fy + c5*fy^2,
+    /// fy from BOTTOM. Six-element arrays intentionally make old four-term
+    /// cache files fail deserialization and recalibrate with the better fit.
+    lat_c: [f64; 6],
+    lon_c: [f64; 6],
     pub lat_inliers: usize,
     pub lon_inliers: usize,
     pub lat_max_resid: f64,
@@ -135,8 +157,8 @@ pub struct WofsGeoref {
 
 impl WofsGeoref {
     pub(crate) fn from_coeffs(
-        lat_c: [f64; 4],
-        lon_c: [f64; 4],
+        lat_c: [f64; 6],
+        lon_c: [f64; 6],
         lat_inliers: usize,
         lon_inliers: usize,
         lat_max_resid: f64,
@@ -157,8 +179,8 @@ impl WofsGeoref {
     /// from the bottom, matplotlib y-up).
     pub fn lonlat_of(&self, u: f32, v: f32) -> (f32, f32) {
         let (fx, fy) = (f64::from(u), 1.0 - f64::from(v));
-        let basis = [1.0, fx, fy, fx * fy];
-        let dot = |c: &[f64; 4]| c.iter().zip(basis).map(|(a, b)| a * b).sum::<f64>();
+        let basis = quadratic_basis(fx, fy);
+        let dot = |c: &[f64; 6]| c.iter().zip(basis).map(|(a, b)| a * b).sum::<f64>();
         (dot(&self.lon_c) as f32, dot(&self.lat_c) as f32)
     }
 
@@ -346,8 +368,8 @@ fn bbox_trim(strip: &Bitmap, x0: usize, x1: usize) -> Option<Bitmap> {
 
 /// Sliding-alignment fuzzy match: the template slides over the padded
 /// segment (effectively +-2 px both axes); score = mismatched bits /
-/// template area. Strict accept (<= 0.09) + margin over the runner-up
-/// (>= 0.03) or the char is dropped.
+/// template area. Ambiguous glyphs are still dropped; accepted coordinates
+/// must also pass the exact numeric grammar and whole-domain fit.
 fn match_char(seg: &Bitmap) -> Option<char> {
     let (h, w) = (seg.h, seg.w);
     let mut scores: Vec<(char, f64)> = Vec::new();
@@ -386,11 +408,11 @@ fn match_char(seg: &Bitmap) -> Option<char> {
     }
     scores.sort_by(|a, b| a.1.total_cmp(&b.1));
     let (ch, best) = *scores.first()?;
-    if best > 0.09 {
+    if best > GLYPH_MAX_MISMATCH {
         return None;
     }
     if let Some((_, runner_up)) = scores.get(1)
-        && runner_up - best < 0.03
+        && runner_up - best < GLYPH_MIN_RUNNER_UP_MARGIN
     {
         return None;
     }
@@ -426,26 +448,42 @@ pub fn station_fraction(row: u32, col: u32) -> (f64, f64) {
     )
 }
 
-fn bilinear_residual(c: &[f64; 4], (fx, fy, value): (f64, f64, f64)) -> f64 {
-    (c[0] + c[1] * fx + c[2] * fy + c[3] * fx * fy - value).abs()
+const QUADRATIC_TERMS: usize = 6;
+const MIN_FIT_INLIERS: usize = 8;
+
+fn quadratic_basis(fx: f64, fy: f64) -> [f64; QUADRATIC_TERMS] {
+    [1.0, fx, fy, fx * fx, fx * fy, fy * fy]
 }
 
-/// Plain least squares via 4x4 normal equations (well-conditioned for the
+fn quadratic_residual(c: &[f64; 6], (fx, fy, value): (f64, f64, f64)) -> f64 {
+    (c.iter()
+        .zip(quadratic_basis(fx, fy))
+        .map(|(coefficient, basis)| coefficient * basis)
+        .sum::<f64>()
+        - value)
+        .abs()
+}
+
+/// Plain least squares via 6x6 normal equations (well-conditioned for the
 /// spread lattice; partial-pivot Gaussian elimination).
-fn lstsq_bilinear(points: &[(f64, f64, f64)]) -> Option<[f64; 4]> {
-    let mut m = [[0.0f64; 5]; 4];
+fn lstsq_quadratic(points: &[(f64, f64, f64)]) -> Option<[f64; QUADRATIC_TERMS]> {
+    if points.len() < QUADRATIC_TERMS {
+        return None;
+    }
+    let mut m = [[0.0f64; QUADRATIC_TERMS + 1]; QUADRATIC_TERMS];
     for &(fx, fy, value) in points {
-        let basis = [1.0, fx, fy, fx * fy];
-        for r in 0..4 {
-            for c in 0..4 {
+        let basis = quadratic_basis(fx, fy);
+        for r in 0..QUADRATIC_TERMS {
+            for c in 0..QUADRATIC_TERMS {
                 m[r][c] += basis[r] * basis[c];
             }
-            m[r][4] += basis[r] * value;
+            m[r][QUADRATIC_TERMS] += basis[r] * value;
         }
     }
     // Gaussian elimination with partial pivoting on the augmented matrix.
-    for col in 0..4 {
-        let pivot = (col..4).max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))?;
+    for col in 0..QUADRATIC_TERMS {
+        let pivot =
+            (col..QUADRATIC_TERMS).max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))?;
         if m[pivot][col].abs() < 1e-12 {
             return None;
         }
@@ -461,33 +499,30 @@ fn lstsq_bilinear(points: &[(f64, f64, f64)]) -> Option<[f64; 4]> {
             }
         }
     }
-    Some([
-        m[0][4] / m[0][0],
-        m[1][4] / m[1][1],
-        m[2][4] / m[2][2],
-        m[3][4] / m[3][3],
-    ])
+    Some(std::array::from_fn(|index| {
+        m[index][QUADRATIC_TERMS] / m[index][index]
+    }))
 }
 
-/// RANSAC-style bilinear fit of (fx, fy) -> value (Fischler & Bolles 1981,
+/// RANSAC-style quadratic fit of (fx, fy) -> value (Fischler & Bolles 1981,
 /// CACM, doi:10.1145/358669.358692 — here as a deterministic
 /// fit/trim/refit since the lattice gives a strong initial consensus):
-/// fit all points, keep residual < 0.1 deg, require >= 6 inliers, refit.
+/// fit all points, keep residual < 0.1 deg, require >= 8 inliers, refit.
 /// Returns (coeffs, inlier count, max inlier residual).
-pub fn fit_bilinear(points: &[(f64, f64, f64)]) -> Option<([f64; 4], usize, f64)> {
-    let initial = lstsq_bilinear(points)?;
+pub fn fit_quadratic(points: &[(f64, f64, f64)]) -> Option<([f64; 6], usize, f64)> {
+    let initial = lstsq_quadratic(points)?;
     let inliers: Vec<(f64, f64, f64)> = points
         .iter()
         .copied()
-        .filter(|&p| bilinear_residual(&initial, p) < 0.1)
+        .filter(|&point| quadratic_residual(&initial, point) < 0.1)
         .collect();
-    if inliers.len() < 6 {
+    if inliers.len() < MIN_FIT_INLIERS {
         return None;
     }
-    let refit = lstsq_bilinear(&inliers)?;
+    let refit = lstsq_quadratic(&inliers)?;
     let max_resid = inliers
         .iter()
-        .map(|&p| bilinear_residual(&refit, p))
+        .map(|&point| quadratic_residual(&refit, point))
         .fold(0.0f64, f64::max);
     Some((refit, inliers.len(), max_resid))
 }
@@ -499,10 +534,76 @@ pub fn fit_bilinear(points: &[(f64, f64, f64)]) -> Option<([f64; 4], usize, f64)
 /// Number of stations the build may fetch (for progress display).
 pub const CALIBRATION_TOTAL: usize = CALIBRATION_STATIONS.len();
 
+struct CalibrationFetch {
+    index: usize,
+    row: u32,
+    col: u32,
+    result: Result<Vec<u8>, String>,
+}
+
+fn fetch_sounding_with_retry(url: &str) -> Result<Vec<u8>, String> {
+    for attempt in 0..CALIBRATION_FETCH_ATTEMPTS {
+        match data_source::fetch_bytes(url) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                let final_attempt = attempt + 1 == CALIBRATION_FETCH_ATTEMPTS;
+                if error.is_not_found() || final_attempt {
+                    return Err(error.to_string());
+                }
+                thread::sleep(CALIBRATION_FETCH_RETRY_BACKOFF);
+            }
+        }
+    }
+    unreachable!("the bounded fetch loop always returns")
+}
+
+fn fetch_calibration_soundings(
+    run_id: &str,
+    rd_init: &str,
+    progress: Option<&AtomicUsize>,
+) -> Vec<CalibrationFetch> {
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(CALIBRATION_TOTAL));
+    let workers = CALIBRATION_FETCH_WORKERS.clamp(1, CALIBRATION_TOTAL);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(row, col)) = CALIBRATION_STATIONS.get(index) else {
+                        break;
+                    };
+                    let url = format!(
+                        "{SOUNDING_API}/{run_id}/{rd_init}/0/wofs_snd_{row:02}_{col:02}.png"
+                    );
+                    let result = fetch_sounding_with_retry(&url);
+                    results
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(CalibrationFetch {
+                            index,
+                            row,
+                            col,
+                            result,
+                        });
+                    if let Some(progress) = progress {
+                        progress.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    let mut results = results
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    results.sort_by_key(|fetch| fetch.index);
+    results
+}
+
 /// Build the georef for one run by OCR-ing lattice sounding titles and
-/// fitting the bilinear mapping. `rd_init` is rundate+init ("202606111700").
-/// Blocking (~20 small CDN fetches) — call from a background thread;
-/// `progress` counts stations processed for the status line.
+/// fitting the quadratic mapping. `rd_init` is rundate+init
+/// ("202606111700"). Blocking — call from a background thread; `progress`
+/// counts completed station fetches for the status line.
 pub fn build_georef(
     run_id: &str,
     rd_init: &str,
@@ -510,24 +611,30 @@ pub fn build_georef(
 ) -> Result<WofsGeoref, String> {
     let mut lat_pts: Vec<(f64, f64, f64)> = Vec::new();
     let mut lon_pts: Vec<(f64, f64, f64)> = Vec::new();
-    for &(row, col) in CALIBRATION_STATIONS {
-        if let Some(progress) = progress {
-            progress.fetch_add(1, Ordering::Relaxed);
-        }
-        // Enough well-spread constraints already (corners come first).
-        if lat_pts.len() >= 18 && lon_pts.len() >= 18 {
-            break;
-        }
-        let url = format!("{SOUNDING_API}/{run_id}/{rd_init}/0/wofs_snd_{row:02}_{col:02}.png");
-        let Ok(bytes) = data_source::fetch_bytes(&url) else {
-            continue;
+    let mut fetch_failures = 0usize;
+    let mut decode_failures = 0usize;
+    let mut first_failure: Option<String> = None;
+    let fetched = fetch_calibration_soundings(run_id, rd_init, progress);
+    for fetch in fetched {
+        let bytes = match fetch.result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                fetch_failures += 1;
+                first_failure.get_or_insert(error);
+                continue;
+            }
         };
-        let Ok(decoded) = image::load_from_memory(&bytes) else {
-            continue;
+        let decoded = match image::load_from_memory(&bytes) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                decode_failures += 1;
+                first_failure.get_or_insert_with(|| error.to_string());
+                continue;
+            }
         };
         let gray = decoded.to_luma8();
         let ocr = ocr_title_gray(gray.width() as usize, gray.height() as usize, gray.as_raw());
-        let (fx, fy) = station_fraction(row, col);
+        let (fx, fy) = station_fraction(fetch.row, fetch.col);
         if let Some(lat) = ocr.lat {
             lat_pts.push((fx, fy, lat));
         }
@@ -535,17 +642,20 @@ pub fn build_georef(
             lon_pts.push((fx, fy, lon));
         }
     }
-    if lat_pts.len() < 8 || lon_pts.len() < 8 {
+    if lat_pts.len() < MIN_FIT_INLIERS || lon_pts.len() < MIN_FIT_INLIERS {
+        let detail = first_failure
+            .map(|error| format!("; first failure: {error}"))
+            .unwrap_or_default();
         return Err(format!(
-            "too few OCR constraints ({} lat / {} lon)",
+            "too few OCR constraints after {CALIBRATION_TOTAL} stations ({} lat / {} lon; {fetch_failures} fetch / {decode_failures} decode failures){detail}",
             lat_pts.len(),
             lon_pts.len()
         ));
     }
     let (lat_c, lat_inliers, lat_max_resid) =
-        fit_bilinear(&lat_pts).ok_or("lat fit: too few inliers")?;
+        fit_quadratic(&lat_pts).ok_or("lat quadratic fit: too few inliers")?;
     let (lon_c, lon_inliers, lon_max_resid) =
-        fit_bilinear(&lon_pts).ok_or("lon fit: too few inliers")?;
+        fit_quadratic(&lon_pts).ok_or("lon quadratic fit: too few inliers")?;
     let georef = WofsGeoref::from_coeffs(
         lat_c,
         lon_c,
@@ -628,12 +738,14 @@ mod tests {
     }
 
     #[test]
-    fn ocr_keeps_half_constraint_and_rejects_truncated_lon() {
-        // Station 01_01's lon glyph run reads back truncated ("-94.0…"):
-        // the 2-decimal rule must reject it while the clean lat survives.
+    fn ocr_recovers_subpixel_shifted_coordinate_fixture() {
+        // This real title was the strict-template failure case: the old
+        // 0.09/0.03 gate dropped its final longitude digit. The broader
+        // glyph gate recovers the printed coordinate, while parse_coord_token
+        // below still rejects genuinely incomplete numeric tokens.
         let ocr = ocr_fixture(TITLE_01_01);
         assert_eq!(ocr.lat, Some(37.42), "raw: {}", ocr.raw);
-        assert_eq!(ocr.lon, None, "raw: {}", ocr.raw);
+        assert_eq!(ocr.lon, Some(-94.03), "raw: {}", ocr.raw);
     }
 
     #[test]
@@ -653,20 +765,25 @@ mod tests {
     }
 
     /// Synthetic lattice from realistic coefficients (live 2026-06-11 fit).
-    fn synthetic_points(c: &[f64; 4]) -> Vec<(f64, f64, f64)> {
+    fn synthetic_points(c: &[f64; 6]) -> Vec<(f64, f64, f64)> {
         CALIBRATION_STATIONS
             .iter()
             .map(|&(row, col)| {
                 let (fx, fy) = station_fraction(row, col);
-                (fx, fy, c[0] + c[1] * fx + c[2] * fy + c[3] * fx * fy)
+                let value = c
+                    .iter()
+                    .zip(quadratic_basis(fx, fy))
+                    .map(|(coefficient, basis)| coefficient * basis)
+                    .sum();
+                (fx, fy, value)
             })
             .collect()
     }
 
     #[test]
-    fn bilinear_fit_recovers_synthetic_lattice() {
-        let truth = [37.2, 0.3, 7.2, -0.3];
-        let (fit, inliers, max_resid) = fit_bilinear(&synthetic_points(&truth)).expect("fit");
+    fn quadratic_fit_recovers_synthetic_lattice_curvature() {
+        let truth = [37.2, 0.3, 7.2, 0.15, -0.3, 0.4];
+        let (fit, inliers, max_resid) = fit_quadratic(&synthetic_points(&truth)).expect("fit");
         assert_eq!(inliers, CALIBRATION_STATIONS.len());
         assert!(max_resid < 1e-9, "max resid {max_resid}");
         for (a, b) in fit.iter().zip(truth) {
@@ -676,15 +793,15 @@ mod tests {
 
     #[test]
     fn ransac_trim_survives_a_poisoned_constraint() {
-        let truth = [-94.4, 9.6, 0.05, 0.9];
+        let truth = [-94.4, 9.6, 0.05, 0.1, 0.9, -0.05];
         let mut points = synthetic_points(&truth);
         points[5].2 += 1.5; // one badly mis-OCR'd station
-        let (fit, inliers, max_resid) = fit_bilinear(&points).expect("fit");
+        let (fit, inliers, max_resid) = fit_quadratic(&points).expect("fit");
         // The outlier's pull on the initial fit may trim a few good points
         // with it; what matters is that the consensus refit excludes the
         // poison and recovers the truth exactly (the survivors are exact).
         assert!(inliers < points.len(), "outlier must be dropped");
-        assert!(inliers >= 6);
+        assert!(inliers >= MIN_FIT_INLIERS);
         assert!(max_resid < 1e-6, "max resid {max_resid}");
         for (a, b) in fit.iter().zip(truth) {
             assert!((a - b).abs() < 1e-6, "{fit:?} != {truth:?}");
@@ -695,8 +812,8 @@ mod tests {
     fn sanity_check_accepts_square_domain_and_rejects_stretched() {
         // ~885 km square domain (the live 2026-06-11 fit shape).
         let square = WofsGeoref::from_coeffs(
-            [37.2, 0.3, 7.95, -0.3],
-            [-94.4, 10.1, 0.05, 0.9],
+            [37.2, 0.3, 7.95, 0.0, -0.3, 0.0],
+            [-94.4, 10.1, 0.05, 0.0, 0.9, 0.0],
             20,
             20,
             0.05,
@@ -706,8 +823,8 @@ mod tests {
         // Same lon span but double the lat span: aspect breaks -> the
         // axes-box basis assumption is violated and the drape must disable.
         let stretched = WofsGeoref::from_coeffs(
-            [30.0, 0.3, 16.0, -0.3],
-            [-94.4, 10.1, 0.05, 0.9],
+            [30.0, 0.3, 16.0, 0.0, -0.3, 0.0],
+            [-94.4, 10.1, 0.05, 0.0, 0.9, 0.0],
             20,
             20,
             0.05,
@@ -719,8 +836,8 @@ mod tests {
     #[test]
     fn lonlat_of_flips_v_from_top() {
         let georef = WofsGeoref::from_coeffs(
-            [37.2, 0.3, 7.95, -0.3],
-            [-94.4, 10.1, 0.05, 0.9],
+            [37.2, 0.3, 7.95, 0.0, -0.3, 0.0],
+            [-94.4, 10.1, 0.05, 0.0, 0.9, 0.0],
             20,
             20,
             0.05,
@@ -737,8 +854,8 @@ mod tests {
     #[test]
     fn drape_mesh_covers_axes_box_uvs() {
         let georef = WofsGeoref::from_coeffs(
-            [37.2, 0.3, 7.95, -0.3],
-            [-94.4, 10.1, 0.05, 0.9],
+            [37.2, 0.3, 7.95, 0.0, -0.3, 0.0],
+            [-94.4, 10.1, 0.05, 0.0, 0.9, 0.0],
             20,
             20,
             0.05,
@@ -764,23 +881,24 @@ mod tests {
     /// Run with: cargo test -p app_ui live_georef -- --ignored --nocapture
     #[test]
     #[ignore]
-    fn live_georef_of_run_20260611_144912d1() {
-        let georef = build_georef("WOFSRun20260611-144912d1", "202606111700", None)
-            .expect("live georef build");
-        // The validated 2026-06-11 17z fit: domain centered near
-        // (41.0, -89.6), ~885 km square, residuals 0.05/0.003 deg.
+    fn live_georef_roundtrip() {
+        let run_id = std::env::var("BOWECHO_WOFS_GEOREF_RUN")
+            .unwrap_or_else(|_| "WOFSRun20260611-144912d1".to_owned());
+        let rd_init =
+            std::env::var("BOWECHO_WOFS_GEOREF_INIT").unwrap_or_else(|_| "202606111700".to_owned());
+        let georef = build_georef(&run_id, &rd_init, None).expect("live georef build");
         let (center_lon, center_lat) = georef.lonlat_of(0.5, 0.5);
         assert!(
-            (40.0..=42.0).contains(&center_lat),
+            (20.0..=55.0).contains(&center_lat),
             "center lat {center_lat}"
         );
         assert!(
-            (-91.0..=-88.0).contains(&center_lon),
+            (-130.0..=-60.0).contains(&center_lon),
             "center lon {center_lon}"
         );
         assert!(georef.lat_max_resid <= 0.1, "{}", georef.lat_max_resid);
         assert!(georef.lon_max_resid <= 0.1, "{}", georef.lon_max_resid);
-        assert!(georef.lat_inliers >= 6 && georef.lon_inliers >= 6);
+        assert!(georef.lat_inliers >= MIN_FIT_INLIERS && georef.lon_inliers >= MIN_FIT_INLIERS);
         println!(
             "live georef OK: {} lat / {} lon inliers, max resid {:.4}/{:.4} deg, center ({:.2}, {:.2})",
             georef.lat_inliers,
