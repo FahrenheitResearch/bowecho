@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 use std::f64::consts::PI;
 use std::mem::size_of;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use radar_scattering::{
     AdditiveScattering, AxisKind, ClosedParticleCategory, ConventionalHydrometeor,
@@ -68,6 +69,20 @@ const PER_WORKER_ALLOCATION_GUARD_BYTES: usize = 16 * 1024;
 // fail closed; no particle coordinate is clipped onto a table edge.
 const ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION: f64 = 0.999;
 const ISHMAEL_PSD_MAXIMUM_OMITTED_MASS_FRACTION: f64 = 0.05;
+
+fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), ()> {
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum ParticleFinishError<E> {
+    Cancelled,
+    Science(E),
+}
 const ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION: f64 = 0.001;
 
 // P3 independently gates omitted number, mass, and the official P3
@@ -767,15 +782,42 @@ impl<'a> WrfTMatrixRawEvaluator<'a> {
         elevation_deg: f64,
         cuda: Option<&WrfTMatrixCudaBatchService>,
     ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
+        self.evaluate_with_cuda_and_cancel(raw, elevation_deg, cuda, None)
+    }
+
+    /// Cancellation-aware form used by long-running synthetic-radar jobs.
+    /// Cancellation is checked before CUDA-to-CPU replay so a user stop does
+    /// not masquerade as an accelerator failure or launch expensive replay.
+    pub fn evaluate_with_cuda_and_cancel(
+        &self,
+        raw: &RawPropertyCell,
+        elevation_deg: f64,
+        cuda: Option<&WrfTMatrixCudaBatchService>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
+        check_cancel(cancel).map_err(|()| WrfTMatrixRawEvaluationError::Cancelled)?;
         match raw.microphysics_scheme_id() {
             50..=53 => {
                 let p3 = self.p3.as_ref().ok_or_else(|| raw_p3_table_required(raw))?;
                 validate_raw_p3_table(raw.microphysics_scheme_id(), p3.table.as_ref())?;
-                evaluate_p3_psd_raw_cell(raw, self.tables, self.validated, p3, elevation_deg, cuda)
+                evaluate_p3_psd_raw_cell(
+                    raw,
+                    self.tables,
+                    self.validated,
+                    p3,
+                    elevation_deg,
+                    cuda,
+                    cancel,
+                )
             }
-            55 => {
-                evaluate_ishmael_psd_raw_cell(raw, self.tables, self.validated, elevation_deg, cuda)
-            }
+            55 => evaluate_ishmael_psd_raw_cell(
+                raw,
+                self.tables,
+                self.validated,
+                elevation_deg,
+                cuda,
+                cancel,
+            ),
             scheme_id => Err(WrfTMatrixRawEvaluationError::UnsupportedScheme { scheme_id }),
         }
     }
@@ -992,6 +1034,7 @@ impl WrfTMatrixScene {
             WrfTMatrixRainMode::FullProperty,
             None,
             None,
+            None,
         )
     }
 
@@ -1000,7 +1043,7 @@ impl WrfTMatrixScene {
         tables: WrfTMatrixLutBundle<'_>,
         rain_mode: WrfTMatrixRainMode,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, None, None)
+        Self::build_internal(source, tables, rain_mode, None, None, None)
     }
 
     pub fn build_with_rain_mode_and_cuda(
@@ -1009,7 +1052,27 @@ impl WrfTMatrixScene {
         rain_mode: WrfTMatrixRainMode,
         cuda: &WrfTMatrixCudaBatchService,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, None, Some(cuda))
+        Self::build_internal(source, tables, rain_mode, None, Some(cuda), None)
+    }
+
+    pub fn build_with_rain_mode_and_cuda_and_cancel(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        rain_mode: WrfTMatrixRainMode,
+        cuda: &WrfTMatrixCudaBatchService,
+        cancel: &AtomicBool,
+    ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        Self::build_internal(source, tables, rain_mode, None, Some(cuda), Some(cancel))
+    }
+
+    pub fn build_with_rain_mode_and_optional_cuda_and_cancel(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        rain_mode: WrfTMatrixRainMode,
+        cuda: Option<&WrfTMatrixCudaBatchService>,
+        cancel: &AtomicBool,
+    ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        Self::build_internal(source, tables, rain_mode, None, cuda, Some(cancel))
     }
 
     pub fn build_with_p3(
@@ -1023,6 +1086,7 @@ impl WrfTMatrixScene {
             WrfTMatrixRainMode::FullProperty,
             Some(p3),
             None,
+            None,
         )
     }
 
@@ -1032,7 +1096,7 @@ impl WrfTMatrixScene {
         p3: WrfTMatrixP3Resources,
         rain_mode: WrfTMatrixRainMode,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, Some(p3), None)
+        Self::build_internal(source, tables, rain_mode, Some(p3), None, None)
     }
 
     pub fn build_with_p3_and_rain_mode_and_cuda(
@@ -1042,7 +1106,18 @@ impl WrfTMatrixScene {
         rain_mode: WrfTMatrixRainMode,
         cuda: &WrfTMatrixCudaBatchService,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, Some(p3), Some(cuda))
+        Self::build_internal(source, tables, rain_mode, Some(p3), Some(cuda), None)
+    }
+
+    pub fn build_with_p3_and_rain_mode_and_cuda_and_cancel(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        p3: WrfTMatrixP3Resources,
+        rain_mode: WrfTMatrixRainMode,
+        cuda: Option<&WrfTMatrixCudaBatchService>,
+        cancel: &AtomicBool,
+    ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        Self::build_internal(source, tables, rain_mode, Some(p3), cuda, Some(cancel))
     }
 
     fn build_internal(
@@ -1051,7 +1126,9 @@ impl WrfTMatrixScene {
         rain_mode: WrfTMatrixRainMode,
         p3: Option<WrfTMatrixP3Resources>,
         cuda: Option<&WrfTMatrixCudaBatchService>,
+        cancel: Option<&AtomicBool>,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
         let validated = validate_bundle(tables)?;
         validate_source_shape(source)?;
         let p3 = validate_scene_p3_resources(source.microphysics_scheme_id(), p3)?;
@@ -1083,6 +1160,7 @@ impl WrfTMatrixScene {
                                 p3.as_ref(),
                                 rain_mode,
                                 cuda,
+                                cancel,
                                 output,
                             )?;
                             if !summary.retained {
@@ -1114,6 +1192,7 @@ impl WrfTMatrixScene {
                             p3.as_ref(),
                             rain_mode,
                             cuda,
+                            cancel,
                             output,
                         )
                     })
@@ -1126,6 +1205,7 @@ impl WrfTMatrixScene {
                 )?
             }
         };
+        check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
         let mut full_cell_to_compact_row = vec![u32::MAX; source.cell_count()];
         for (compact_row, &source_cell) in source_cell_indices.iter().enumerate() {
             let compact_row =
@@ -1545,11 +1625,13 @@ fn build_cell_into(
     p3: Option<&WrfTMatrixP3Resources>,
     rain_mode: WrfTMatrixRainMode,
     cuda: Option<&WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
     output: &mut [f32],
 ) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
+    check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
     if source.microphysics_scheme_id() == 55 {
         build_ishmael_psd_cell_into(
-            source, cell_index, tables, validated, rain_mode, cuda, output,
+            source, cell_index, tables, validated, rain_mode, cuda, cancel, output,
         )
     } else {
         build_p3_psd_cell_into(
@@ -1560,6 +1642,7 @@ fn build_cell_into(
             p3.expect("P3 resources validated before parallel scene build"),
             rain_mode,
             cuda,
+            cancel,
             output,
         )
     }
@@ -1574,8 +1657,10 @@ fn build_p3_psd_cell_into(
     p3: &WrfTMatrixP3Resources,
     rain_mode: WrfTMatrixRainMode,
     cuda: Option<&WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
     output: &mut [f32],
 ) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
+    check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
     let elevations = validated.radar_elevations_deg;
     let expected_components = elevations
         .len()
@@ -1656,6 +1741,7 @@ fn build_p3_psd_cell_into(
         ..WrfTMatrixAuditCounts::default()
     };
     for (elevation_index, &elevation_deg) in elevations.iter().enumerate() {
+        check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
         let oblate_request = evaluation_request(
             validated.frequency_hz,
             elevation_deg,
@@ -1693,14 +1779,19 @@ fn build_p3_psd_cell_into(
                 category: *category,
                 source,
             })?;
-            let integration = finish_p3_particle_integration(&prepared, cuda).map_err(|source| {
-                WrfTMatrixSceneBuildError::P3PsdIntegration {
-                    cell_index,
-                    elevation_deg,
-                    category: *category,
-                    source,
-                }
-            })?;
+            let integration = finish_p3_particle_integration(&prepared, cuda, cancel).map_err(
+                |error| match error {
+                    ParticleFinishError::Cancelled => WrfTMatrixSceneBuildError::Cancelled,
+                    ParticleFinishError::Science(source) => {
+                        WrfTMatrixSceneBuildError::P3PsdIntegration {
+                            cell_index,
+                            elevation_deg,
+                            category: *category,
+                            source,
+                        }
+                    }
+                },
+            )?;
             additive = additive
                 .checked_add(integration.additive())
                 .map_err(|source| WrfTMatrixSceneBuildError::Accumulation {
@@ -1992,6 +2083,7 @@ fn build_characteristic_cell_into(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_ishmael_psd_cell_into(
     source: &WrfPropertyScene,
     cell_index: usize,
@@ -1999,8 +2091,10 @@ fn build_ishmael_psd_cell_into(
     validated: ValidatedBundle<'_>,
     rain_mode: WrfTMatrixRainMode,
     cuda: Option<&WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
     output: &mut [f32],
 ) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
+    check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
     let elevations = validated.radar_elevations_deg;
     let expected_components = elevations
         .len()
@@ -2083,6 +2177,7 @@ fn build_ishmael_psd_cell_into(
         ..WrfTMatrixAuditCounts::default()
     };
     for (elevation_index, &elevation_deg) in elevations.iter().enumerate() {
+        check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
         let oblate_request = evaluation_request(
             validated.frequency_hz,
             elevation_deg,
@@ -2111,14 +2206,18 @@ fn build_ishmael_psd_cell_into(
                 category,
                 source,
             })?;
-            let integration = finish_ishmael_particle_integration(&prepared, cuda).map_err(
-                |source| WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
-                    cell_index,
-                    elevation_deg,
-                    category,
-                    source,
-                },
-            )?;
+            let integration = finish_ishmael_particle_integration(&prepared, cuda, cancel)
+                .map_err(|error| match error {
+                    ParticleFinishError::Cancelled => WrfTMatrixSceneBuildError::Cancelled,
+                    ParticleFinishError::Science(source) => {
+                        WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
+                            cell_index,
+                            elevation_deg,
+                            category,
+                            source,
+                        }
+                    }
+                })?;
             additive = additive
                 .checked_add(integration.additive())
                 .map_err(|source| WrfTMatrixSceneBuildError::Accumulation {
@@ -2514,6 +2613,7 @@ fn evaluate_p3_psd_raw_cell(
     p3: &WrfTMatrixP3Resources,
     elevation_deg: f64,
     cuda: Option<&WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
     let scheme = P3WrfScheme::try_from(raw.microphysics_scheme_id()).map_err(|source| {
         WrfTMatrixRawEvaluationError::P3PsdReconstruction {
@@ -2590,12 +2690,17 @@ fn evaluate_p3_psd_raw_cell(
             category: *category,
             source,
         })?;
-        let integration = finish_p3_particle_integration(&prepared, cuda).map_err(|source| {
-            WrfTMatrixRawEvaluationError::P3PsdIntegration {
-                category: *category,
-                source,
-            }
-        })?;
+        let integration = finish_p3_particle_integration(&prepared, cuda, cancel).map_err(
+            |error| match error {
+                ParticleFinishError::Cancelled => WrfTMatrixRawEvaluationError::Cancelled,
+                ParticleFinishError::Science(source) => {
+                    WrfTMatrixRawEvaluationError::P3PsdIntegration {
+                        category: *category,
+                        source,
+                    }
+                }
+            },
+        )?;
         additive = additive
             .checked_add(integration.additive())
             .map_err(|source| WrfTMatrixRawEvaluationError::Accumulation {
@@ -2631,9 +2736,14 @@ fn evaluate_p3_psd_raw_cell(
 fn finish_p3_particle_integration(
     prepared: &PreparedP3ParticleIntegration<'_>,
     cuda: Option<&WrfTMatrixCudaBatchService>,
-) -> Result<P3TMatrixIntegrationResult, P3TMatrixIntegrationError<EvaluationError>> {
+    cancel: Option<&AtomicBool>,
+) -> Result<
+    P3TMatrixIntegrationResult,
+    ParticleFinishError<P3TMatrixIntegrationError<EvaluationError>>,
+> {
+    check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
     let Some(cuda) = cuda else {
-        return prepared.finish_cpu();
+        return finish_p3_cpu_cancellable(prepared, cancel);
     };
 
     let mut oblate_nodes = Vec::new();
@@ -2641,24 +2751,27 @@ fn finish_p3_particle_integration(
     let mut prolate_nodes = Vec::new();
     let mut prolate_indices = Vec::new();
     for (node_index, node, table, admitted) in prepared.table_nodes() {
+        check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         let interpolation = match table.prepare_dry_particle_lut_interpolation(admitted) {
             Ok(interpolation) => interpolation,
             Err(error) => {
+                check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
                 cuda.disable_for_cpu_fallback(
                     format!("prepare admitted P3 node {node_index} for CUDA: {error}"),
                     0,
                 );
-                return prepared.finish_cpu();
+                return finish_p3_cpu_cancellable(prepared, cancel);
             }
         };
         let cuda_node = match CudaPreparedTMatrixNode::new(&interpolation, 1.0) {
             Ok(cuda_node) => cuda_node,
             Err(error) => {
+                check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
                 cuda.disable_for_cpu_fallback(
                     format!("stage admitted P3 node {node_index} for CUDA: {error}"),
                     0,
                 );
-                return prepared.finish_cpu();
+                return finish_p3_cpu_cancellable(prepared, cancel);
             }
         };
         match node.habit() {
@@ -2691,19 +2804,57 @@ fn finish_p3_particle_integration(
         if nodes.is_empty() {
             continue;
         }
+        check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         let evaluated = match cuda.evaluate_particles(role, nodes) {
             Ok(evaluated) => evaluated,
-            Err(_) => return prepared.finish_cpu(),
+            Err(_) => {
+                check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
+                return finish_p3_cpu_cancellable(prepared, cancel);
+            }
         };
+        check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         debug_assert_eq!(indices.len(), evaluated.len());
         outputs.extend(indices.into_iter().zip(evaluated));
     }
 
-    prepared.finish_with_table_evaluator(|node_index, _, _, _| {
-        Ok(*outputs
-            .get(&node_index)
-            .expect("CUDA returned one ordered answer for every admitted P3 table node"))
-    })
+    prepared
+        .finish_with_table_evaluator(|node_index, _, _, _| {
+            Ok(*outputs
+                .get(&node_index)
+                .expect("CUDA returned one ordered answer for every admitted P3 table node"))
+        })
+        .map_err(ParticleFinishError::Science)
+}
+
+fn finish_p3_cpu_cancellable(
+    prepared: &PreparedP3ParticleIntegration<'_>,
+    cancel: Option<&AtomicBool>,
+) -> Result<
+    P3TMatrixIntegrationResult,
+    ParticleFinishError<P3TMatrixIntegrationError<EvaluationError>>,
+> {
+    let Some(_) = cancel else {
+        return prepared.finish_cpu().map_err(ParticleFinishError::Science);
+    };
+    let mut outputs = std::collections::HashMap::with_capacity(prepared.evaluations.len());
+    for (node_index, evaluation) in &prepared.evaluations {
+        check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
+        let output = evaluation.evaluate_cpu().map_err(|source| {
+            ParticleFinishError::Science(P3TMatrixIntegrationError::Evaluation {
+                node_index: *node_index,
+                source,
+            })
+        })?;
+        outputs.insert(*node_index, output);
+    }
+    check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
+    prepared
+        .finish_with_table_evaluator(|node_index, _, _, _| {
+            Ok(*outputs
+                .get(&node_index)
+                .expect("cancellable CPU pass evaluated every admitted P3 node"))
+        })
+        .map_err(ParticleFinishError::Science)
 }
 
 #[allow(dead_code)]
@@ -2875,7 +3026,10 @@ impl<'table> PreparedIshmaelParticleIntegration<'table> {
                 .get(position)
                 .expect("prepared ISHMAEL workload matches both quadrature grids");
             cursor += 1;
-            debug_assert_eq!((level, node_index), (evaluation.level, evaluation.node_index));
+            debug_assert_eq!(
+                (level, node_index),
+                (evaluation.level, evaluation.node_index)
+            );
             evaluate_table(
                 position,
                 level,
@@ -2889,9 +3043,7 @@ impl<'table> PreparedIshmaelParticleIntegration<'table> {
         result
     }
 
-    fn finish_cpu(
-        &self,
-    ) -> Result<PsdIntegrationResult, PsdIntegrationError<EvaluationError>> {
+    fn finish_cpu(&self) -> Result<PsdIntegrationResult, PsdIntegrationError<EvaluationError>> {
         self.finish_with_table_evaluator(|_, _, _, _, table, prepared| {
             table.evaluate_prepared_dry_particle_node_per_m3(prepared)
         })
@@ -2963,9 +3115,11 @@ fn prepare_ishmael_particle_integration<'table>(
 fn finish_ishmael_particle_integration(
     prepared: &PreparedIshmaelParticleIntegration<'_>,
     cuda: Option<&WrfTMatrixCudaBatchService>,
-) -> Result<PsdIntegrationResult, PsdIntegrationError<EvaluationError>> {
+    cancel: Option<&AtomicBool>,
+) -> Result<PsdIntegrationResult, ParticleFinishError<PsdIntegrationError<EvaluationError>>> {
+    check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
     let Some(cuda) = cuda else {
-        return prepared.finish_cpu();
+        return finish_ishmael_cpu_cancellable(prepared, cancel);
     };
 
     let mut oblate_positions = Vec::new();
@@ -2973,12 +3127,14 @@ fn finish_ishmael_particle_integration(
     let mut prolate_positions = Vec::new();
     let mut prolate_nodes = Vec::new();
     for (position, evaluation) in prepared.evaluations.iter().enumerate() {
+        check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         let interpolation = match evaluation
             .table
             .prepare_dry_particle_lut_interpolation(&evaluation.prepared)
         {
             Ok(interpolation) => interpolation,
             Err(error) => {
+                check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
                 cuda.disable_for_cpu_fallback(
                     format!(
                         "prepare admitted ISHMAEL {:?} node {} for CUDA: {error}",
@@ -2986,12 +3142,13 @@ fn finish_ishmael_particle_integration(
                     ),
                     0,
                 );
-                return prepared.finish_cpu();
+                return finish_ishmael_cpu_cancellable(prepared, cancel);
             }
         };
         let cuda_node = match CudaPreparedTMatrixNode::new(&interpolation, 1.0) {
             Ok(cuda_node) => cuda_node,
             Err(error) => {
+                check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
                 cuda.disable_for_cpu_fallback(
                     format!(
                         "stage admitted ISHMAEL {:?} node {} for CUDA: {error}",
@@ -2999,7 +3156,7 @@ fn finish_ishmael_particle_integration(
                     ),
                     0,
                 );
-                return prepared.finish_cpu();
+                return finish_ishmael_cpu_cancellable(prepared, cancel);
             }
         };
         match evaluation.role {
@@ -3030,26 +3187,63 @@ fn finish_ishmael_particle_integration(
         if nodes.is_empty() {
             continue;
         }
+        check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         let evaluated = match cuda.evaluate_particles(role, nodes) {
             Ok(evaluated) => evaluated,
-            Err(_) => return prepared.finish_cpu(),
+            Err(_) => {
+                check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
+                return finish_ishmael_cpu_cancellable(prepared, cancel);
+            }
         };
+        check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         debug_assert_eq!(positions.len(), evaluated.len());
         for (position, output) in positions.into_iter().zip(evaluated) {
             outputs[position] = Some(output);
         }
     }
     if outputs.iter().any(Option::is_none) {
+        check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
         cuda.disable_for_cpu_fallback(
             "CUDA omitted an admitted ISHMAEL particle output".to_owned(),
             prepared.evaluations.len(),
         );
-        return prepared.finish_cpu();
+        return finish_ishmael_cpu_cancellable(prepared, cancel);
     }
 
-    prepared.finish_with_table_evaluator(|position, _, _, _, _, _| {
-        Ok(outputs[position].expect("all ISHMAEL CUDA outputs were checked above"))
-    })
+    prepared
+        .finish_with_table_evaluator(|position, _, _, _, _, _| {
+            Ok(outputs[position].expect("all ISHMAEL CUDA outputs were checked above"))
+        })
+        .map_err(ParticleFinishError::Science)
+}
+
+fn finish_ishmael_cpu_cancellable(
+    prepared: &PreparedIshmaelParticleIntegration<'_>,
+    cancel: Option<&AtomicBool>,
+) -> Result<PsdIntegrationResult, ParticleFinishError<PsdIntegrationError<EvaluationError>>> {
+    let Some(_) = cancel else {
+        return prepared.finish_cpu().map_err(ParticleFinishError::Science);
+    };
+    let mut outputs = Vec::with_capacity(prepared.evaluations.len());
+    for evaluation in &prepared.evaluations {
+        check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
+        outputs.push(
+            evaluation
+                .table
+                .evaluate_prepared_dry_particle_node_per_m3(&evaluation.prepared)
+                .map_err(|source| {
+                    ParticleFinishError::Science(PsdIntegrationError::NodeEvaluation {
+                        level: evaluation.level,
+                        node_index: evaluation.node_index,
+                        source,
+                    })
+                })?,
+        );
+    }
+    check_cancel(cancel).map_err(|()| ParticleFinishError::Cancelled)?;
+    prepared
+        .finish_with_table_evaluator(|position, _, _, _, _, _| Ok(outputs[position]))
+        .map_err(ParticleFinishError::Science)
 }
 
 fn evaluate_ishmael_psd_raw_cell(
@@ -3058,6 +3252,7 @@ fn evaluate_ishmael_psd_raw_cell(
     validated: ValidatedBundle<'_>,
     elevation_deg: f64,
     cuda: Option<&WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
     let mut frozen = Vec::with_capacity(raw.categories().len());
     for category in raw.categories() {
@@ -3125,9 +3320,15 @@ fn evaluate_ishmael_psd_raw_cell(
         .map_err(
             |source| WrfTMatrixRawEvaluationError::IshmaelPsdIntegration { category, source },
         )?;
-        let integration = finish_ishmael_particle_integration(&prepared, cuda).map_err(
-            |source| WrfTMatrixRawEvaluationError::IshmaelPsdIntegration { category, source },
-        )?;
+        let integration =
+            finish_ishmael_particle_integration(&prepared, cuda, cancel).map_err(|error| {
+                match error {
+                    ParticleFinishError::Cancelled => WrfTMatrixRawEvaluationError::Cancelled,
+                    ParticleFinishError::Science(source) => {
+                        WrfTMatrixRawEvaluationError::IshmaelPsdIntegration { category, source }
+                    }
+                }
+            })?;
         additive = additive
             .checked_add(integration.additive())
             .map_err(|source| WrfTMatrixRawEvaluationError::Accumulation {
@@ -4062,6 +4263,8 @@ impl std::fmt::Display for WrfTMatrixContribution {
 
 #[derive(Debug, Error)]
 pub enum WrfTMatrixRawEvaluationError {
+    #[error("synthetic-radar T-matrix evaluation cancelled")]
+    Cancelled,
     #[error("raw property T-matrix evaluation does not support WRF mp_physics={scheme_id}")]
     UnsupportedScheme { scheme_id: i32 },
     #[error(
@@ -4150,6 +4353,8 @@ pub enum WrfTMatrixRawEvaluationError {
 
 #[derive(Debug, Error)]
 pub enum WrfTMatrixSceneBuildError {
+    #[error("synthetic-radar T-matrix scene build cancelled")]
+    Cancelled,
     #[error(transparent)]
     Bundle(#[from] WrfTMatrixBundleError),
     #[error(
@@ -4637,7 +4842,8 @@ mod tests {
         );
         with_embedded_ishmael_prepared(|prepared| {
             let expected = prepared.finish_cpu().unwrap();
-            let replayed = finish_ishmael_particle_integration(prepared, Some(&service)).unwrap();
+            let replayed =
+                finish_ishmael_particle_integration(prepared, Some(&service), None).unwrap();
             assert_psd_result_bitwise_eq(replayed, expected);
 
             let failed_report = service.report();
@@ -4660,7 +4866,7 @@ mod tests {
             assert_eq!(failed_report.nodes_completed, 0);
 
             let replayed_while_disabled =
-                finish_ishmael_particle_integration(prepared, Some(&service)).unwrap();
+                finish_ishmael_particle_integration(prepared, Some(&service), None).unwrap();
             assert_psd_result_bitwise_eq(replayed_while_disabled, expected);
             let disabled_report = service.report();
             assert_eq!(
@@ -4679,6 +4885,36 @@ mod tests {
                 disabled_report.fallback_reason,
                 failed_report.fallback_reason
             );
+        });
+    }
+
+    #[test]
+    fn cancelled_cuda_category_does_not_submit_disable_or_cpu_replay() {
+        let service = WrfTMatrixCudaBatchService::failing_for_test(
+            "a cancelled category must never reach this backend",
+        );
+        let cancel = AtomicBool::new(true);
+        with_embedded_ishmael_prepared(|prepared| {
+            let error =
+                finish_ishmael_particle_integration(prepared, Some(&service), Some(&cancel))
+                    .expect_err("pre-cancelled category stops before CUDA or CPU evaluation");
+            assert!(matches!(error, ParticleFinishError::Cancelled));
+        });
+        let report = service.report();
+        assert_eq!(report.requests_submitted, 0);
+        assert_eq!(report.batches_submitted, 0);
+        assert_eq!(report.nodes_submitted, 0);
+        assert_eq!(report.fallback_reason, None);
+    }
+
+    #[test]
+    fn cancellable_cpu_finish_preserves_exact_ishmael_reduction() {
+        let cancel = AtomicBool::new(false);
+        with_embedded_ishmael_prepared(|prepared| {
+            let expected = prepared.finish_cpu().unwrap();
+            let actual =
+                finish_ishmael_particle_integration(prepared, None, Some(&cancel)).unwrap();
+            assert_psd_result_bitwise_eq(actual, expected);
         });
     }
 

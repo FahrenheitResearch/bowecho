@@ -2,6 +2,7 @@
 //! used by the WRF simulated radar research operator.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
 use radar_scattering::{
@@ -321,13 +322,22 @@ pub fn evaluate_embedded_raw_property_cell_with_cuda(
     elevation_deg: f64,
     cuda: Option<&crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
 ) -> Result<Option<PolarAccumulatorQuantities>, String> {
+    evaluate_embedded_raw_property_cell_with_cuda_and_cancel(raw, elevation_deg, cuda, None)
+}
+
+pub fn evaluate_embedded_raw_property_cell_with_cuda_and_cancel(
+    raw: &RawPropertyCell,
+    elevation_deg: f64,
+    cuda: Option<&crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<PolarAccumulatorQuantities>, String> {
     let evaluator = match raw.microphysics_scheme_id() {
         50..=52 => embedded_p3_raw_evaluator(P3OfficialTableKind::TwoMoment, &|_| {})?,
         53 => embedded_p3_raw_evaluator(P3OfficialTableKind::ThreeMoment, &|_| {})?,
         _ => embedded_raw_evaluator()?,
     };
     evaluator
-        .evaluate_with_cuda(raw, elevation_deg, cuda)
+        .evaluate_with_cuda_and_cancel(raw, elevation_deg, cuda, cancel)
         .map_err(|error| format!("evaluate embedded raw property cell: {error}"))
 }
 
@@ -398,6 +408,7 @@ pub fn build_property_tmatrix_scene(
         rain_mode,
         progress,
         None,
+        None,
     )
 }
 
@@ -420,6 +431,30 @@ pub fn build_property_tmatrix_scene_with_cuda(
         rain_mode,
         progress,
         Some(cuda),
+        None,
+    )
+}
+
+/// Cancellation-aware scene builder used by synthetic-radar workers. The
+/// token is observed inside the parallel active-cell build and before any
+/// CUDA failure can trigger category-level CPU replay.
+pub fn build_property_tmatrix_scene_with_cancel(
+    source: &WrfPropertyScene,
+    maximum_owned_peak_bytes: usize,
+    table_owner: PropertyTMatrixTables,
+    rain_mode: WrfTMatrixRainMode,
+    progress: &(impl Fn(&str) + ?Sized),
+    cuda: Option<&crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
+    cancel: &AtomicBool,
+) -> Result<PropertyTMatrixSceneBuild, String> {
+    build_property_tmatrix_scene_internal(
+        source,
+        maximum_owned_peak_bytes,
+        table_owner,
+        rain_mode,
+        progress,
+        cuda,
+        Some(cancel),
     )
 }
 
@@ -430,6 +465,7 @@ fn build_property_tmatrix_scene_internal(
     rain_mode: WrfTMatrixRainMode,
     progress: &(impl Fn(&str) + ?Sized),
     cuda: Option<&crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<PropertyTMatrixSceneBuild, String> {
     let table_identity = table_owner.identity();
     let table_source = table_owner.source_kind();
@@ -448,17 +484,27 @@ fn build_property_tmatrix_scene_internal(
             maximum_owned_peak_bytes as f64 / 1024.0_f64.powi(3),
         ));
     }
-    let scene = match (p3, cuda) {
-        (Some(p3), Some(cuda)) => WrfTMatrixScene::build_with_p3_and_rain_mode_and_cuda(
+    let scene = match (p3, cuda, cancel) {
+        (Some(p3), cuda, Some(cancel)) => {
+            WrfTMatrixScene::build_with_p3_and_rain_mode_and_cuda_and_cancel(
+                source, tables, p3, rain_mode, cuda, cancel,
+            )
+        }
+        (None, cuda, Some(cancel)) => {
+            WrfTMatrixScene::build_with_rain_mode_and_optional_cuda_and_cancel(
+                source, tables, rain_mode, cuda, cancel,
+            )
+        }
+        (Some(p3), Some(cuda), None) => WrfTMatrixScene::build_with_p3_and_rain_mode_and_cuda(
             source, tables, p3, rain_mode, cuda,
         ),
-        (Some(p3), None) => {
+        (Some(p3), None, None) => {
             WrfTMatrixScene::build_with_p3_and_rain_mode(source, tables, p3, rain_mode)
         }
-        (None, Some(cuda)) => {
+        (None, Some(cuda), None) => {
             WrfTMatrixScene::build_with_rain_mode_and_cuda(source, tables, rain_mode, cuda)
         }
-        (None, None) => WrfTMatrixScene::build_with_rain_mode(source, tables, rain_mode),
+        (None, None, None) => WrfTMatrixScene::build_with_rain_mode(source, tables, rain_mode),
     }
     .map_err(|error| format!("evaluate selected property-scattering tables: {error}"))?;
     Ok(PropertyTMatrixSceneBuild {

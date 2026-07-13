@@ -2272,6 +2272,9 @@ impl ModelDataDock {
                 message: String,
                 output: crate::wrf_radar::SyntheticRadarReplayOutput,
             },
+            /// User-requested cancellation is a normal terminal state, not a
+            /// failed science/backend run and never triggers a store rescan.
+            Cancelled,
         }
 
         let result = match self.import_job.as_ref() {
@@ -2389,6 +2392,7 @@ impl ModelDataDock {
                     }
                 }
                 match done {
+                    Some(_) if task.cancellation_requested() => PollResult::Cancelled,
                     Some(Ok(output)) => {
                         let ducting = output
                             .notes
@@ -2404,6 +2408,9 @@ impl ModelDataDock {
                             ),
                             output,
                         }
+                    }
+                    Some(Err(error)) if crate::wrf_radar::is_synthetic_radar_cancelled(&error) => {
+                        PollResult::Cancelled
                     }
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("Synthetic radar failed: {error}"),
@@ -2446,6 +2453,7 @@ impl ModelDataDock {
                     }
                 }
                 match done {
+                    Some(_) if task.cancellation_requested() => PollResult::Cancelled,
                     Some(Ok(output)) => PollResult::FinishedReplay {
                         message: format!(
                             "Replayed {} WRF frame(s) through the displayed observed scan",
@@ -2453,6 +2461,9 @@ impl ModelDataDock {
                         ),
                         output,
                     },
+                    Some(Err(error)) if crate::wrf_radar::is_synthetic_radar_cancelled(&error) => {
+                        PollResult::Cancelled
+                    }
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("Exact radar replay failed: {error}"),
                         plot: None,
@@ -2516,6 +2527,12 @@ impl ModelDataDock {
                     .map(|frame| frame.simulated.clone())
                     .collect();
                 self.synthetic_radar_replay_result = Some(output);
+                self.repaint.request_repaint();
+            }
+            PollResult::Cancelled => {
+                self.import_message = Some("Synthetic radar cancelled".to_owned());
+                self.import_job = None;
+                self.synthetic_radar_preview = None;
                 self.repaint.request_repaint();
             }
         }
@@ -2704,6 +2721,7 @@ impl ModelDataDock {
         let task = crate::wrf_radar::SyntheticRadarTask {
             label: "test import".to_owned(),
             rx,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         self.import_job = Some(ImportJob::SyntheticRadar(task));
     }
@@ -2730,6 +2748,9 @@ impl ModelDataDock {
     /// Formula Lab, and one synthetic-radar result queue.
     pub fn wrf_ui(&mut self, ui: &mut egui::Ui) {
         self.handle_responses();
+        // Keep long-running job state and Cancel fixed above the scrolling
+        // workspace so it cannot disappear below a tall recipe/control panel.
+        self.import_status_ui(ui);
         egui::ScrollArea::vertical()
             .id_salt("wrf_workspace_scroll")
             .auto_shrink([false, false])
@@ -2754,7 +2775,6 @@ impl ModelDataDock {
                     .default_open(false)
                     .show(ui, |ui| self.gdex_controls(ui));
 
-                self.import_status_ui(ui);
             });
     }
 
@@ -2790,15 +2810,49 @@ impl ModelDataDock {
         });
     }
 
-    fn import_status_ui(&self, ui: &mut egui::Ui) {
-        if let Some(message) = &self.import_message {
+    fn import_status_ui(&mut self, ui: &mut egui::Ui) {
+        if let Some(message) = self.import_message.clone() {
+            let cancel_requested = match self.import_job.as_ref() {
+                Some(ImportJob::SyntheticRadar(task)) => task.cancellation_requested(),
+                Some(ImportJob::SyntheticRadarReplay(task)) => task.cancellation_requested(),
+                _ => false,
+            };
+            let cancellable = matches!(
+                self.import_job.as_ref(),
+                Some(ImportJob::SyntheticRadar(_)) | Some(ImportJob::SyntheticRadarReplay(_))
+            );
+            let mut cancel_clicked = false;
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if self.import_job.is_some() {
                     ui.spinner();
                 }
-                crate::panel_kit::status_block(ui, message, None);
+                if cancellable {
+                    cancel_clicked = ui
+                        .add_enabled(
+                            !cancel_requested,
+                            egui::Button::new(if cancel_requested {
+                                "Cancelling…"
+                            } else {
+                                "Cancel"
+                            }),
+                        )
+                        .on_hover_text(
+                            "Stop after the current bounded radar work unit; completed preview tilts are removed.",
+                        )
+                        .clicked();
+                }
+                crate::panel_kit::status_block(ui, &message, None);
             });
+            if cancel_clicked {
+                match self.import_job.as_ref() {
+                    Some(ImportJob::SyntheticRadar(task)) => task.request_cancel(),
+                    Some(ImportJob::SyntheticRadarReplay(task)) => task.request_cancel(),
+                    _ => {}
+                }
+                self.import_message = Some("Cancelling synthetic radar…".to_owned());
+                self.repaint.request_repaint();
+            }
         }
     }
 
@@ -4875,10 +4929,17 @@ impl ModelDataDock {
                                     state.atmosphere_time_mode,
                                     app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
                                 ) {
+                                    let workload_warning = match state.compute_preference {
+                                        crate::wrf_radar::SyntheticRadarComputePreference::Cpu => {
+                                            "⚠ Heavy CPU computation: raw-state P3/ISHMAEL reconstructs and integrates the native PSD at every sampled gate and can use all available CPU cores. Tilt 1 appears as a preview as soon as it completes while the remaining tilts continue; the first tilt can still take several minutes on dense, multi-sample volumes."
+                                        }
+                                        crate::wrf_radar::SyntheticRadarComputePreference::Auto
+                                        | crate::wrf_radar::SyntheticRadarComputePreference::NvidiaCuda => {
+                                            "⚠ Heavy computation: CUDA accelerates supported native dry P3/ISHMAEL LUT work; the CPU still owns reconstruction, ordered PSD reduction, and fallback. Tilt 1 appears as a preview as soon as it completes while the remaining tilts continue; the first tilt can still take several minutes on dense, multi-sample volumes."
+                                        }
+                                    };
                                     ui.label(
-                                        egui::RichText::new(
-                                            "⚠ CPU-intensive: raw-state P3/ISHMAEL T-matrix reconstructs and integrates the native PSD at every sampled gate and intentionally uses all available CPU cores. Tilt 1 appears as a preview as soon as it completes while the remaining tilts continue; the first tilt can still take several minutes on dense, multi-sample volumes.",
-                                        )
+                                        egui::RichText::new(workload_warning)
                                         .small()
                                         .color(crate::ui_theme::theme().warn),
                                     );
@@ -6734,6 +6795,64 @@ mod tests {
         assert!(
             dock.import_in_flight(),
             "a running import job is reported so the app pauses live radar decode"
+        );
+    }
+
+    #[test]
+    fn synthetic_radar_cancel_wins_over_queued_success_and_deep_wrapped_cancel_is_normal() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task = crate::wrf_radar::SyntheticRadarTask {
+            label: "cancel race".to_owned(),
+            rx,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        task.request_cancel();
+        assert!(task.cancellation_requested());
+        tx.send(crate::wrf_radar::SyntheticRadarMessage::Done(Ok(
+            crate::wrf_radar::SyntheticRadarOutput {
+                label: "must not install".to_owned(),
+                volumes: Vec::new(),
+                notes: Vec::new(),
+                config_fingerprint: 0,
+                frame_sources: Vec::new(),
+            },
+        )))
+        .unwrap();
+        dock.import_job = Some(ImportJob::SyntheticRadar(task));
+        dock.poll_import();
+        assert_eq!(
+            dock.import_message.as_deref(),
+            Some("Synthetic radar cancelled")
+        );
+        assert!(dock.import_job.is_none());
+        assert!(dock.synthetic_radar_result.is_none());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(crate::wrf_radar::SyntheticRadarMessage::Done(Err(
+            "wrfout time 0: build property T-matrix scene: evaluate selected property-scattering tables: synthetic-radar T-matrix scene build cancelled"
+                .to_owned(),
+        )))
+        .unwrap();
+        dock.import_job = Some(ImportJob::SyntheticRadar(
+            crate::wrf_radar::SyntheticRadarTask {
+                label: "deep cancel".to_owned(),
+                rx,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        ));
+        dock.poll_import();
+        assert_eq!(
+            dock.import_message.as_deref(),
+            Some("Synthetic radar cancelled")
+        );
+        assert!(
+            !dock
+                .import_message
+                .as_deref()
+                .is_some_and(|message| message.contains("failed"))
         );
     }
 

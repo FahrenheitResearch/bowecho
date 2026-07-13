@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
@@ -79,6 +80,36 @@ use app_ui::wrf_temporal::{
 /// Operational adaptations intentionally outside the checked base-pattern
 /// catalog and this synthetic renderer.
 pub const BUILD_24_NO_ADAPTATIONS_CAVEAT: &str = "Base pattern only: SAILS, MRLE, AVSET, Add-MPDA, and site-specific low-tilt adaptations are absent.";
+
+/// Stable worker result used to distinguish a user cancellation from a
+/// science/backend failure all the way through the model-window job pump.
+pub const SYNTHETIC_RADAR_CANCELLED: &str = "Synthetic radar cancelled";
+
+#[must_use]
+pub fn is_synthetic_radar_cancelled(error: &str) -> bool {
+    error == SYNTHETIC_RADAR_CANCELLED
+        || error.ends_with("synthetic-radar T-matrix evaluation cancelled")
+        || error.ends_with("synthetic-radar T-matrix scene build cancelled")
+}
+
+fn check_synthetic_radar_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Acquire) {
+        Err(SYNTHETIC_RADAR_CANCELLED.to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn normalize_synthetic_radar_cancel<T>(
+    result: Result<T, String>,
+    cancel: &AtomicBool,
+) -> Result<T, String> {
+    if cancel.load(Ordering::Acquire) {
+        Err(SYNTHETIC_RADAR_CANCELLED.to_owned())
+    } else {
+        result
+    }
+}
 
 /// Default WSR-88D-like elevation ladder (deg). Covers the low tilts that
 /// dominate a plan-view display plus enough high tilts for cross-sections.
@@ -2113,7 +2144,11 @@ fn read_wrf_radar_fields_for_config_reporting(
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
     reserved_memory_bytes: usize,
+    cancel: Option<&AtomicBool>,
 ) -> Result<WrfRadarFields, String> {
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
     let property_tmatrix = matches!(
         config.polarimetric_kernel,
         PolarimetricKernel::PropertyTMatrixResearchV1
@@ -2125,6 +2160,9 @@ fn read_wrf_radar_fields_for_config_reporting(
         progress,
         !property_tmatrix,
     )?;
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
     let expected = fields.nx * fields.ny * fields.nz;
 
     if matches!(
@@ -2184,6 +2222,9 @@ fn read_wrf_radar_fields_for_config_reporting(
             timeidx,
         )
         .map_err(|error| format!("read native P3/ISHMAEL property state: {error}"))?;
+        if let Some(cancel) = cancel {
+            check_synthetic_radar_cancel(cancel)?;
+        }
         if property_scene.cell_count() != expected {
             return Err(format!(
                 "property scene has {} cells, expected {expected}",
@@ -2231,24 +2272,41 @@ fn read_wrf_radar_fields_for_config_reporting(
         } else {
             let maximum_owned_peak_bytes =
                 maximum_owned_peak_bytes.expect("non-raw property build has a budget");
-            let built = match config.runtime_cuda_service.as_deref() {
-                Some(cuda) => app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene_with_cuda(
+            let built = if let Some(cancel) = cancel {
+                app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene_with_cancel(
                     &property_scene,
                     maximum_owned_peak_bytes,
                     table_owner,
                     config.property_tmatrix_rain_sensitivity.runtime(),
                     progress,
-                    cuda,
-                ),
-                None => app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene(
-                    &property_scene,
-                    maximum_owned_peak_bytes,
-                    table_owner,
-                    config.property_tmatrix_rain_sensitivity.runtime(),
-                    progress,
-                ),
+                    config.runtime_cuda_service.as_deref(),
+                    cancel,
+                )
+            } else {
+                match config.runtime_cuda_service.as_deref() {
+                    Some(cuda) => {
+                        app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene_with_cuda(
+                            &property_scene,
+                            maximum_owned_peak_bytes,
+                            table_owner,
+                            config.property_tmatrix_rain_sensitivity.runtime(),
+                            progress,
+                            cuda,
+                        )
+                    }
+                    None => app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene(
+                        &property_scene,
+                        maximum_owned_peak_bytes,
+                        table_owner,
+                        config.property_tmatrix_rain_sensitivity.runtime(),
+                        progress,
+                    ),
+                }
             }
             .map_err(|error| format!("build property T-matrix scene: {error}"))?;
+            if let Some(cancel) = cancel {
+                check_synthetic_radar_cancel(cancel)?;
+            }
             let property_scattering = built.scene;
             fields.dual_pol_status = Some(format!(
                 "property-aware T-matrix research input (mp_physics={}; table={}; source={:?}; frequency={:.0} Hz; rain={:?}; raw fields={fields_read}; build peak {:.2} GiB)",
@@ -2940,7 +2998,25 @@ fn try_build_synthetic_volume_reporting(
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
 ) -> Result<RadarVolume, String> {
-    build_synthetic_volume_reporting_inner(fields, valid_time, config, progress, None, None)
+    build_synthetic_volume_reporting_inner(fields, valid_time, config, progress, None, None, None)
+}
+
+fn try_build_synthetic_volume_reporting_cancellable(
+    fields: &WrfRadarFields,
+    valid_time: DateTime<Utc>,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+    cancel: &AtomicBool,
+) -> Result<RadarVolume, String> {
+    build_synthetic_volume_reporting_inner(
+        fields,
+        valid_time,
+        config,
+        progress,
+        None,
+        None,
+        Some(cancel),
+    )
 }
 
 fn try_build_synthetic_volume_reporting_previewing(
@@ -2957,6 +3033,26 @@ fn try_build_synthetic_volume_reporting_previewing(
         progress,
         None,
         Some(cut_completed),
+        None,
+    )
+}
+
+fn try_build_synthetic_volume_reporting_previewing_cancellable(
+    fields: &WrfRadarFields,
+    valid_time: DateTime<Utc>,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+    cut_completed: &dyn Fn(&RadarVolume, usize, usize),
+    cancel: &AtomicBool,
+) -> Result<RadarVolume, String> {
+    build_synthetic_volume_reporting_inner(
+        fields,
+        valid_time,
+        config,
+        progress,
+        None,
+        Some(cut_completed),
+        Some(cancel),
     )
 }
 
@@ -2980,6 +3076,7 @@ fn build_synthetic_volume_reporting_temporal(
         progress,
         Some(TemporalRenderContext { neighbor, plan }),
         None,
+        None,
     )
 }
 
@@ -2999,6 +3096,29 @@ fn build_synthetic_volume_reporting_temporal_previewing(
         progress,
         Some(TemporalRenderContext { neighbor, plan }),
         Some(cut_completed),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_synthetic_volume_reporting_temporal_previewing_cancellable(
+    fields: &WrfRadarFields,
+    neighbor: &WrfRadarFields,
+    valid_time: DateTime<Utc>,
+    config: &SyntheticRadarConfig,
+    progress: &dyn Fn(&str),
+    plan: &TemporalScenePlan,
+    cut_completed: &dyn Fn(&RadarVolume, usize, usize),
+    cancel: &AtomicBool,
+) -> Result<RadarVolume, String> {
+    build_synthetic_volume_reporting_inner(
+        fields,
+        valid_time,
+        config,
+        progress,
+        Some(TemporalRenderContext { neighbor, plan }),
+        Some(cut_completed),
+        Some(cancel),
     )
 }
 
@@ -3011,7 +3131,11 @@ fn build_synthetic_volume_reporting_inner(
     progress: &dyn Fn(&str),
     temporal: Option<TemporalRenderContext<'_>>,
     cut_completed: Option<&CutCompletedCallback<'_>>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<RadarVolume, String> {
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
     config.validate_science_contract()?;
     if let Some(template) = config.exact_replay_template.as_deref() {
         return build_exact_replay_volume(
@@ -3021,6 +3145,7 @@ fn build_synthetic_volume_reporting_inner(
             template,
             progress,
             temporal.as_ref(),
+            cancel,
         );
     }
     let coupled_instrument = resolve_coupled_instrument(config)?;
@@ -3401,11 +3526,18 @@ fn build_synthetic_volume_reporting_inner(
             )
         });
 
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
+
     let mut decoded_radials = 0usize;
     let mut cut_start_ms = 0i32;
     let tilt_total = scan_legs.len();
     let mut cuda_fallback_reported = false;
     for (cut_index, leg) in scan_legs.iter().enumerate() {
+        if let Some(cancel) = cancel {
+            check_synthetic_radar_cancel(cancel)?;
+        }
         if !cuda_fallback_reported
             && let Some(reason) = config
                 .runtime_cuda_service
@@ -3443,6 +3575,7 @@ fn build_synthetic_volume_reporting_inner(
             cut_start_ms,
             coupled_instrument.as_ref(),
             None,
+            cancel,
         )?;
         decoded_radials += cut.radials.len();
         volume.cuts.push(cut);
@@ -3461,6 +3594,9 @@ fn build_synthetic_volume_reporting_inner(
         if let Some(cut_completed) = cut_completed {
             cut_completed(&volume, cut_index + 1, tilt_total);
         }
+        if let Some(cancel) = cancel {
+            check_synthetic_radar_cancel(cancel)?;
+        }
         if matches!(config.scan_timing, ScanTiming::TimedVolume) {
             cut_start_ms = advance_cut_start_ms(config, leg, cut_start_ms);
         }
@@ -3476,7 +3612,11 @@ fn build_exact_replay_volume(
     template: &ExactScanTemplate,
     progress: &dyn Fn(&str),
     temporal: Option<&TemporalRenderContext<'_>>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<RadarVolume, String> {
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
     let cells = fields.cells();
     let site_lat = f64::from(
         template
@@ -3747,6 +3887,7 @@ fn build_exact_replay_volume(
                     0,
                     None,
                     Some(&ray_plan),
+                    cancel,
                 )?;
                 if quality_source_index == Some(moment_index) {
                     for quality in QualityMoment::ALL {
@@ -4259,7 +4400,11 @@ fn sample_gate_with_quality_instrument(
     terrain_horizon: Option<&TerrainHorizon>,
     mut refracted_terrain_blockage: Option<&mut [bool]>,
     coupled_instrument: Option<&CoupledInstrumentContext>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<GateSampleResult, String> {
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
     let beam_sigma_deg = gaussian_beam_sigma_deg(f64::from(config.beam_width_deg.max(0.05)));
     let physical_points =
         coupled_instrument.and_then(|instrument| instrument.quadrature(config.beam_integration));
@@ -4331,6 +4476,7 @@ fn sample_gate_with_quality_instrument(
             config.atmosphere_time_mode,
             config.reflectivity_sampling,
             config.runtime_cuda_service.as_deref(),
+            cancel,
         )?
         else {
             return Ok(());
@@ -4502,6 +4648,7 @@ fn sample_gate_with_quality(
         BeamPropagationGeometry::StandardFourThirdsEarth,
         config,
         terrain_horizon,
+        None,
         None,
         None,
     )
@@ -4759,7 +4906,11 @@ fn build_cut(
     cut_start_ms: i32,
     coupled_instrument: Option<&CoupledInstrumentContext>,
     ray_plan_override: Option<&[SyntheticRayPlan]>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ElevationCut, String> {
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
     let gate_count = gate_range.gate_count;
     // Instrument mode already applies its range-varying radar-equation
     // sensitivity gate below; a fixed 0 dBZ presentation floor would erase
@@ -4820,6 +4971,9 @@ fn build_cut(
     let rows: Vec<CutMomentRow> = ray_plan
         .par_iter()
         .map(|ray| -> Result<CutMomentRow, String> {
+            if let Some(cancel) = cancel {
+                check_synthetic_radar_cancel(cancel)?;
+            }
             let iaz = ray.source_index;
             let az_deg = f64::from(ray.azimuth_deg);
             let ray_elevation_deg = f64::from(ray.elevation_deg);
@@ -4841,6 +4995,11 @@ fn build_cut(
                 && beam_geometry.is_wrf_refractivity())
             .then(|| vec![false; quadrature_count]);
             for gate in 0..gate_count {
+                if gate % 8 == 0
+                    && let Some(cancel) = cancel
+                {
+                    check_synthetic_radar_cancel(cancel)?;
+                }
                 let slant_m = f64::from(gate_range.first_gate_m) + gate as f64 * spacing;
                 let center_geometry =
                     beam_geometry.point(ray_elevation_deg, &gate_range, gate, 0.0, slant_m)?;
@@ -4865,6 +5024,7 @@ fn build_cut(
                     terrain_horizon,
                     refracted_terrain_blockage.as_deref_mut(),
                     coupled_instrument,
+                    cancel,
                 )?;
                 if config.emit_quality_fields {
                     row.model_coverage[gate] =
@@ -5382,7 +5542,11 @@ fn sample_column_temporal(
     atmosphere_time_mode: AtmosphereTimeMode,
     reflectivity_sampling: ReflectivitySampling,
     cuda: Option<&app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Option<ColumnSample>, String> {
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
     if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
         return Err(format!(
             "temporal atmosphere weight {alpha} is outside the closed [0,1] interval"
@@ -5399,6 +5563,7 @@ fn sample_column_temporal(
             z_msl,
             beam_elevation_deg,
             cuda,
+            cancel,
         );
     }
     if alpha <= 0.0 {
@@ -5506,7 +5671,11 @@ fn sample_column_raw_state_linear(
     z_msl: f32,
     beam_elevation_deg: f64,
     cuda: Option<&app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Option<ColumnSample>, String> {
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
     let left = if alpha < 1.0 {
         raw_spatial_endpoint(fields, cells, lat, lon, z_msl)?
     } else {
@@ -5553,11 +5722,16 @@ fn sample_column_raw_state_linear(
         (None, Some(right)) => right.tke_m2s2,
         (None, None) => return Ok(None),
     };
-    let polar = app_ui::wrf_tmatrix_assets::evaluate_embedded_raw_property_cell_with_cuda(
-        &blended.property_cell,
-        beam_elevation_deg,
-        cuda,
-    )?;
+    let polar =
+        app_ui::wrf_tmatrix_assets::evaluate_embedded_raw_property_cell_with_cuda_and_cancel(
+            &blended.property_cell,
+            beam_elevation_deg,
+            cuda,
+            cancel,
+        )?;
+    if let Some(cancel) = cancel {
+        check_synthetic_radar_cancel(cancel)?;
+    }
     let polar = polar.map(|quantities| {
         let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
         accumulator.add(1.0, tmatrix_as_contribution(quantities));
@@ -6546,6 +6720,7 @@ fn explain_selected_gate(
         &config,
         &progress,
         0,
+        None,
     )
     .map_err(WhyThisGateUnavailable::WorkerFailed)?;
     let neighbor_pair = if let Some(neighbor) = neighbor {
@@ -6557,6 +6732,7 @@ fn explain_selected_gate(
             &config,
             &progress,
             0,
+            None,
         )
         .map_err(WhyThisGateUnavailable::WorkerFailed)?;
         validate_temporal_field_pair(&anchor_fields, &fields)
@@ -6662,6 +6838,7 @@ fn explain_selected_gate(
             terrain_horizon.as_ref(),
             refracted_terrain_blockage.as_deref_mut(),
             coupled.as_ref(),
+            None,
         )
         .map_err(WhyThisGateUnavailable::WorkerFailed)?;
         if gate == identity.gate_index {
@@ -7394,6 +7571,7 @@ fn inspector_spatial_targets(
             config.atmosphere_time_mode,
             config.reflectivity_sampling,
             None,
+            None,
         )
         .map_err(WhyThisGateUnavailable::WorkerFailed)?
         .is_none()
@@ -7651,6 +7829,18 @@ impl std::fmt::Debug for SyntheticRadarOutput {
 pub struct SyntheticRadarTask {
     pub label: String,
     pub rx: Receiver<SyntheticRadarMessage>,
+    pub(crate) cancel: Arc<AtomicBool>,
+}
+
+impl SyntheticRadarTask {
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn cancellation_requested(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
 }
 
 /// Source selection for operational HRRR/RRFS forecast radar. Files remain
@@ -7689,6 +7879,18 @@ pub struct SyntheticRadarReplayOutput {
 pub struct SyntheticRadarReplayTask {
     pub label: String,
     pub rx: Receiver<SyntheticRadarReplayMessage>,
+    pub(crate) cancel: Arc<AtomicBool>,
+}
+
+impl SyntheticRadarReplayTask {
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn cancellation_requested(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
 }
 
 /// Existing-file worker seam for the ThreeStacked validation workspace. It
@@ -7702,13 +7904,14 @@ pub fn spawn_synthetic_radar_replay(
 ) -> SyntheticRadarReplayTask {
     let label = format!("Exact radar replay from {} WRF source(s)", paths.len());
     let (tx, rx) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
     let template = match ExactScanTemplate::from_volume(&observed) {
         Ok(template) => template,
         Err(error) => {
             let _ = tx.send(SyntheticRadarReplayMessage::Done(Err(format!(
                 "extract exact observed scan template: {error}"
             ))));
-            return SyntheticRadarReplayTask { label, rx };
+            return SyntheticRadarReplayTask { label, rx, cancel };
         }
     };
     normalize_replay_config_for_observed(&mut config, &observed);
@@ -7722,6 +7925,8 @@ pub fn spawn_synthetic_radar_replay(
     }
     config.exact_replay_template = Some(Arc::new(template));
     let base = spawn_synthetic_radar(paths, config);
+    let cancel = Arc::clone(&base.cancel);
+    let bridge_cancel = Arc::clone(&cancel);
     std::thread::Builder::new()
         .name("wrf-exact-replay-products".to_string())
         .spawn(move || {
@@ -7735,6 +7940,7 @@ pub fn spawn_synthetic_radar_replay(
                     SyntheticRadarMessage::Preview(_) => {}
                     SyntheticRadarMessage::Done(result) => {
                         let replay_result = result.and_then(|output| {
+                            check_synthetic_radar_cancel(&bridge_cancel)?;
                             let mut frames = Vec::with_capacity(output.volumes.len());
                             let mut notes = output.notes;
                             notes.push(
@@ -7744,6 +7950,7 @@ pub fn spawn_synthetic_radar_replay(
                             for (mut simulated, source_descriptor) in
                                 output.volumes.into_iter().zip(output.frame_sources)
                             {
+                                check_synthetic_radar_cancel(&bridge_cancel)?;
                                 copy_observed_ray_instrument_metadata(
                                     &observed,
                                     Arc::make_mut(&mut simulated),
@@ -7784,6 +7991,8 @@ pub fn spawn_synthetic_radar_replay(
                                 config_fingerprint: output.config_fingerprint,
                             })
                         });
+                        let replay_result =
+                            normalize_synthetic_radar_cancel(replay_result, &bridge_cancel);
                         let _ = tx.send(SyntheticRadarReplayMessage::Done(replay_result));
                         break;
                     }
@@ -7791,7 +8000,7 @@ pub fn spawn_synthetic_radar_replay(
             }
         })
         .expect("spawn exact replay product bridge");
-    SyntheticRadarReplayTask { label, rx }
+    SyntheticRadarReplayTask { label, rx, cancel }
 }
 
 /// Spawn a worker that turns each forecast time of the given wrfout file(s)
@@ -7812,15 +8021,19 @@ pub fn spawn_synthetic_radar(
         label.push_str(" [T-matrix research]");
     }
     let (tx, rx) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
     let label_for_thread = label.clone();
     std::thread::Builder::new()
         .name("rw-ui-wrf-synth-radar".to_string())
         .spawn(move || {
-            let result = build_synthetic_from_paths(&paths, &config, &label_for_thread, &tx);
+            let result =
+                build_synthetic_from_paths(&paths, &config, &label_for_thread, &tx, &worker_cancel);
+            let result = normalize_synthetic_radar_cancel(result, &worker_cancel);
             let _ = tx.send(SyntheticRadarMessage::Done(result));
         })
         .expect("spawn WRF synthetic-radar worker");
-    SyntheticRadarTask { label, rx }
+    SyntheticRadarTask { label, rx, cancel }
 }
 
 /// Spawn native HRRR/RRFS GRIB -> ordinary synthetic `RadarVolume` frames.
@@ -7851,21 +8064,27 @@ pub fn spawn_operational_radar(
         ),
     };
     let (tx, rx) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
     let thread_label = label.clone();
     std::thread::Builder::new()
         .name("operational-forecast-radar".to_owned())
         .spawn(move || {
-            let result = build_operational_radar(source, &config, &thread_label, &tx);
+            let result =
+                build_operational_radar(source, &config, &thread_label, &tx, &worker_cancel);
+            let result = normalize_synthetic_radar_cancel(result, &worker_cancel);
             let _ = tx.send(SyntheticRadarMessage::Done(result));
         })
         .expect("spawn operational forecast-radar worker");
-    SyntheticRadarTask { label, rx }
+    SyntheticRadarTask { label, rx, cancel }
 }
 
 fn resolve_operational_radar_paths(
     source: OperationalRadarSource,
     tx: &Sender<SyntheticRadarMessage>,
+    cancel: &AtomicBool,
 ) -> Result<Vec<PathBuf>, String> {
+    check_synthetic_radar_cancel(cancel)?;
     match source {
         OperationalRadarSource::Files(paths) => {
             let mut seen = std::collections::BTreeSet::new();
@@ -7904,12 +8123,13 @@ fn resolve_operational_radar_paths(
                 Utc::now(),
                 forecast_hours[0],
             );
-            let cancel = std::sync::atomic::AtomicBool::new(false);
             let mut last_error = None;
             for candidate in candidates {
+                check_synthetic_radar_cancel(cancel)?;
                 let mut cycle_paths = Vec::with_capacity(forecast_hours.len());
                 let mut cycle_failed = false;
                 for &forecast_hour in &forecast_hours {
+                    check_synthetic_radar_cancel(cancel)?;
                     let specs = crate::operational_radar_grib::latest_hrrr_native_specs(
                         Utc::now(),
                         forecast_hour,
@@ -7943,11 +8163,11 @@ fn resolve_operational_radar_paths(
                     match crate::operational_radar_grib::acquire_hrrr_native_input(
                         &spec,
                         &input_root,
-                        &cancel,
+                        cancel,
                         &progress,
                     ) {
                         Ok(Some(path)) => cycle_paths.push(path),
-                        Ok(None) => return Err("Latest HRRR download was cancelled".to_owned()),
+                        Ok(None) => return Err(SYNTHETIC_RADAR_CANCELLED.to_owned()),
                         Err(error) => {
                             cycle_failed = true;
                             last_error = Some(error.to_string());
@@ -7981,7 +8201,9 @@ fn build_operational_radar(
     config: &SyntheticRadarConfig,
     label: &str,
     tx: &Sender<SyntheticRadarMessage>,
+    cancel: &AtomicBool,
 ) -> Result<SyntheticRadarOutput, String> {
+    check_synthetic_radar_cancel(cancel)?;
     config.validate_science_contract()?;
     if !matches!(
         config.propagation_geometry,
@@ -8010,7 +8232,7 @@ fn build_operational_radar(
                 .to_owned(),
         );
     }
-    let paths = resolve_operational_radar_paths(source, tx)?;
+    let paths = resolve_operational_radar_paths(source, tx, cancel)?;
     let site = match (config.site_lat_deg, config.site_lon_deg) {
         (Some(lat), Some(lon)) => Some((lat, lon)),
         (None, None) => None,
@@ -8025,6 +8247,7 @@ fn build_operational_radar(
     let mut notes = Vec::new();
     let mut inventory_contract: Option<OperationalInventoryContract> = None;
     for (index, path) in paths.iter().enumerate() {
+        check_synthetic_radar_cancel(cancel)?;
         let _ = tx.send(SyntheticRadarMessage::Progress(format!(
             "Reading operational source {}/{}: {}",
             index + 1,
@@ -8079,11 +8302,12 @@ fn build_operational_radar(
         let model = state.provenance.model.label().to_owned();
         let scheme = state.provenance.scheme_assumption.stable_id().to_owned();
         let source_notes = state.provenance.notes.clone();
-        let mut volume = try_build_synthetic_volume_reporting(
+        let mut volume = try_build_synthetic_volume_reporting_cancellable(
             &operational_radar_fields(state)?,
             valid_time.to_owned(),
             config,
             &progress,
+            cancel,
         )?;
         volume.metadata.source_path = Some(path.display().to_string());
         volume.metadata.archive_version = Some("simulated-operational-forecast".to_owned());
@@ -8149,7 +8373,9 @@ fn build_operational_radar(
 
 enum TMatrixExecutionRuntime {
     NotApplicable,
-    CpuReference { reason: String },
+    CpuReference {
+        reason: String,
+    },
     NvidiaCuda {
         service: Arc<app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
     },
@@ -8158,35 +8384,40 @@ enum TMatrixExecutionRuntime {
 fn resolve_tmatrix_execution_runtime(
     config: &SyntheticRadarConfig,
     tx: &Sender<SyntheticRadarMessage>,
-) -> (SyntheticRadarConfig, TMatrixExecutionRuntime) {
+    cancel: &AtomicBool,
+) -> Result<(SyntheticRadarConfig, TMatrixExecutionRuntime), String> {
+    check_synthetic_radar_cancel(cancel)?;
     let mut runtime_config = config.clone();
     runtime_config.runtime_cuda_service = None;
     if !matches!(
         config.polarimetric_kernel,
         PolarimetricKernel::PropertyTMatrixResearchV1
     ) {
-        return (runtime_config, TMatrixExecutionRuntime::NotApplicable);
+        return Ok((runtime_config, TMatrixExecutionRuntime::NotApplicable));
     }
-    if matches!(config.compute_preference, SyntheticRadarComputePreference::Cpu) {
-        return (
+    if matches!(
+        config.compute_preference,
+        SyntheticRadarComputePreference::Cpu
+    ) {
+        return Ok((
             runtime_config,
             TMatrixExecutionRuntime::CpuReference {
                 reason: "CPU selected by user".to_owned(),
             },
-        );
+        ));
     }
     if !matches!(
         config.property_tmatrix_table_source,
         app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
     ) || config.radar_frequency_mhz != PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ
     {
-        return (
+        return Ok((
             runtime_config,
             TMatrixExecutionRuntime::CpuReference {
                 reason: "CUDA v1 requires the authenticated legacy embedded 2.8 GHz dry-table pack"
                     .to_owned(),
             },
-        );
+        ));
     }
 
     let _ = tx.send(SyntheticRadarMessage::Progress(
@@ -8204,20 +8435,22 @@ fn resolve_tmatrix_execution_runtime(
                 report.device.kernel_artifact,
             )));
             runtime_config.runtime_cuda_service = Some(Arc::clone(&service));
-            (
+            check_synthetic_radar_cancel(cancel)?;
+            Ok((
                 runtime_config,
                 TMatrixExecutionRuntime::NvidiaCuda { service },
-            )
+            ))
         }
         Err(error) => {
             let reason = error.to_string();
             let _ = tx.send(SyntheticRadarMessage::Progress(format!(
                 "CUDA unavailable ({reason}); continuing on the exact CPU reference path"
             )));
-            (
+            check_synthetic_radar_cancel(cancel)?;
+            Ok((
                 runtime_config,
                 TMatrixExecutionRuntime::CpuReference { reason },
-            )
+            ))
         }
     }
 }
@@ -8260,9 +8493,7 @@ fn finish_tmatrix_execution_report(
                 (
                     format!(
                         "T-matrix CUDA used {identity}; completed {} nodes in {}/{} batches before fallback ({reason}); the discarded/remaining work replayed on CPU",
-                        report.nodes_completed,
-                        report.batches_completed,
-                        report.batches_submitted,
+                        report.nodes_completed, report.batches_completed, report.batches_submitted,
                     ),
                     format!(
                         "tmatrix_compute_preference={preference}; tmatrix_execution_backend=cuda_then_cpu_replay; cuda_device={}; cuda_compute={}.{}; cuda_kernel={}; cuda_requests={}; cuda_batches_completed={}; cuda_batches_submitted={}; cuda_nodes_completed={}; cuda_nodes_submitted={}; cuda_fallback={reason}",
@@ -8308,9 +8539,12 @@ fn build_synthetic_from_paths(
     config: &SyntheticRadarConfig,
     label: &str,
     tx: &Sender<SyntheticRadarMessage>,
+    cancel: &AtomicBool,
 ) -> Result<SyntheticRadarOutput, String> {
-    let (runtime_config, runtime) = resolve_tmatrix_execution_runtime(config, tx);
-    let mut output = build_synthetic_from_paths_inner(paths, &runtime_config, label, tx)?;
+    check_synthetic_radar_cancel(cancel)?;
+    let (runtime_config, runtime) = resolve_tmatrix_execution_runtime(config, tx, cancel)?;
+    let mut output = build_synthetic_from_paths_inner(paths, &runtime_config, label, tx, cancel)?;
+    check_synthetic_radar_cancel(cancel)?;
     finish_tmatrix_execution_report(&mut output, config.compute_preference, &runtime);
     Ok(output)
 }
@@ -8320,7 +8554,9 @@ fn build_synthetic_from_paths_inner(
     config: &SyntheticRadarConfig,
     label: &str,
     tx: &Sender<SyntheticRadarMessage>,
+    cancel: &AtomicBool,
 ) -> Result<SyntheticRadarOutput, String> {
+    check_synthetic_radar_cancel(cancel)?;
     config.validate_science_contract()?;
     if paths.is_empty() {
         return Err("No WRF files selected".to_string());
@@ -8338,6 +8574,7 @@ fn build_synthetic_from_paths_inner(
         "Inventorying WRF run, domain, grid, and internal times…".to_owned(),
     ));
     let selected = inventory_selected_wrf_paths(&files)?;
+    check_synthetic_radar_cancel(cancel)?;
     let scenes = selected.group.scenes.clone();
     let config_fingerprint = scene_build_fingerprint(config, &selected.group);
     let property_build_reservation_bytes = if matches!(
@@ -8381,6 +8618,7 @@ fn build_synthetic_from_paths_inner(
             tx,
             notes,
             config_fingerprint,
+            cancel,
         );
     }
 
@@ -8396,6 +8634,7 @@ fn build_synthetic_from_paths_inner(
     let mut opened_path: Option<PathBuf> = None;
     let mut opened_file: Option<WrfFile> = None;
     for (frame_index, scene) in scenes.iter().enumerate() {
+        check_synthetic_radar_cancel(cancel)?;
         if opened_path.as_ref() != Some(&scene.path) {
             opened_file = Some(WrfFile::open(&scene.path).map_err(|error| {
                 format!(
@@ -8438,6 +8677,7 @@ fn build_synthetic_from_paths_inner(
             config,
             &progress,
             property_build_reservation_bytes,
+            Some(cancel),
         ) {
             Ok(fields) => fields,
             Err(error) => {
@@ -8449,6 +8689,7 @@ fn build_synthetic_from_paths_inner(
                 continue;
             }
         };
+        check_synthetic_radar_cancel(cancel)?;
         let valid_time = scene
             .time
             .valid_time()
@@ -8468,12 +8709,13 @@ fn build_synthetic_from_paths_inner(
                     );
                 }
             };
-        let mut volume = match try_build_synthetic_volume_reporting_previewing(
+        let mut volume = match try_build_synthetic_volume_reporting_previewing_cancellable(
             &fields,
             valid_time,
             config,
             &progress,
             &first_cut_preview,
+            cancel,
         ) {
             Ok(volume) => volume,
             Err(error) => {
@@ -8609,7 +8851,9 @@ fn build_temporal_synthetic_from_scenes(
     tx: &Sender<SyntheticRadarMessage>,
     mut notes: Vec<String>,
     config_fingerprint: u64,
+    cancel: &AtomicBool,
 ) -> Result<SyntheticRadarOutput, String> {
+    check_synthetic_radar_cancel(cancel)?;
     if !matches!(config.scan_timing, ScanTiming::TimedVolume) {
         return Err(
             "Adjacent-scene atmosphere interpolation requires Timed volume scan timing".to_string(),
@@ -8619,6 +8863,7 @@ fn build_temporal_synthetic_from_scenes(
     let scan_duration = Duration::milliseconds(scan_duration_ms);
     let mut plans = Vec::with_capacity(group.scenes.len());
     for (frame_index, scene) in group.scenes.iter().enumerate() {
+        check_synthetic_radar_cancel(cancel)?;
         plans.push(
             plan_for_scene(
                 group,
@@ -8676,6 +8921,7 @@ fn build_temporal_synthetic_from_scenes(
     let mut volumes = Vec::new();
     let mut frame_sources = Vec::new();
     for (frame_index, (scene, plan)) in group.scenes.iter().zip(plans).enumerate() {
+        check_synthetic_radar_cancel(cancel)?;
         let Some(plan) = plan else {
             notes.push(format!(
                 "{} time {} dropped: no adjacent WRF scene covers the timed scan",
@@ -8704,6 +8950,7 @@ fn build_temporal_synthetic_from_scenes(
             &progress,
             estimate,
             budget_bytes,
+            cancel,
         ) {
             Ok(fields) => fields,
             Err(error) => {
@@ -8781,6 +9028,7 @@ fn build_temporal_synthetic_from_scenes(
                     &progress,
                     estimate,
                     budget_bytes,
+                    cancel,
                 ) {
                     Ok(fields) => TemporalNeighborResolution::Fields(fields),
                     Err(error) => match config.missing_neighbor_policy {
@@ -8790,13 +9038,15 @@ fn build_temporal_synthetic_from_scenes(
                                 display_name(&scene.path),
                                 scene.time_index
                             ));
-                            let volume = try_build_synthetic_volume_reporting_previewing(
-                                &anchor,
-                                valid_time,
-                                config,
-                                &progress,
-                                &first_cut_preview,
-                            )?;
+                            let volume =
+                                try_build_synthetic_volume_reporting_previewing_cancellable(
+                                    &anchor,
+                                    valid_time,
+                                    config,
+                                    &progress,
+                                    &first_cut_preview,
+                                    cancel,
+                                )?;
                             TemporalNeighborResolution::Held(
                                 volume,
                                 "held_anchor_neighbor_read_error".to_string(),
@@ -8837,12 +9087,13 @@ fn build_temporal_synthetic_from_scenes(
                                         scene.time_index
                                     ));
                                     (
-                                        try_build_synthetic_volume_reporting_previewing(
+                                        try_build_synthetic_volume_reporting_previewing_cancellable(
                                             &anchor,
                                             valid_time,
                                             config,
                                             &progress,
                                             &first_cut_preview,
+                                            cancel,
                                         )?,
                                         "held_anchor_property_mismatch".to_string(),
                                     )
@@ -8859,7 +9110,7 @@ fn build_temporal_synthetic_from_scenes(
                             }
                         } else {
                             (
-                                build_synthetic_volume_reporting_temporal_previewing(
+                                build_synthetic_volume_reporting_temporal_previewing_cancellable(
                                     &anchor,
                                     &neighbor,
                                     valid_time,
@@ -8867,6 +9118,7 @@ fn build_temporal_synthetic_from_scenes(
                                     &progress,
                                     &plan,
                                     &first_cut_preview,
+                                    cancel,
                                 )?,
                                 config.atmosphere_time_mode.provenance_name().to_string(),
                             )
@@ -8875,22 +9127,24 @@ fn build_temporal_synthetic_from_scenes(
                 }
             }
             TemporalSamplingOutcome::Frozen => (
-                try_build_synthetic_volume_reporting_previewing(
+                try_build_synthetic_volume_reporting_previewing_cancellable(
                     &anchor,
                     valid_time,
                     config,
                     &progress,
                     &first_cut_preview,
+                    cancel,
                 )?,
                 "frozen".to_string(),
             ),
             TemporalSamplingOutcome::HeldAnchor(reason) => (
-                try_build_synthetic_volume_reporting_previewing(
+                try_build_synthetic_volume_reporting_previewing_cancellable(
                     &anchor,
                     valid_time,
                     config,
                     &progress,
                     &first_cut_preview,
+                    cancel,
                 )?,
                 match reason {
                     HoldReason::NoLaterScene => "held_anchor_no_later_scene".to_string(),
@@ -9147,7 +9401,9 @@ fn cached_temporal_fields(
     progress: &dyn Fn(&str),
     estimate: TemporalMemoryEstimate,
     budget_bytes: usize,
+    cancel: &AtomicBool,
 ) -> Result<Arc<WrfRadarFields>, String> {
+    check_synthetic_radar_cancel(cancel)?;
     let key = (scene.source_identity.0.clone(), scene.time_index);
     if let Some(fields) = cache.get(&key) {
         return Ok(Arc::clone(fields));
@@ -9174,7 +9430,9 @@ fn cached_temporal_fields(
         config,
         progress,
         reserved_memory_bytes,
+        Some(cancel),
     )?);
+    check_synthetic_radar_cancel(cancel)?;
     let evicted = cache.insert(key.clone(), Arc::clone(&fields));
     if let Err(error) = ensure_temporal_runtime_cache_budget(cache, estimate, budget_bytes) {
         let _ = cache.remove(&key);
@@ -9521,6 +9779,7 @@ mod tests {
     #[test]
     fn operational_local_sources_are_extension_unrestricted_and_stably_deduplicated() {
         let (tx, _rx) = channel();
+        let cancel = AtomicBool::new(false);
         let paths = resolve_operational_radar_paths(
             OperationalRadarSource::Files(vec![
                 PathBuf::from("hrrr.wrfnat.grib2"),
@@ -9528,6 +9787,7 @@ mod tests {
                 PathBuf::from("hrrr.wrfnat.grib2"),
             ]),
             &tx,
+            &cancel,
         )
         .unwrap();
         assert_eq!(
@@ -9736,7 +9996,8 @@ mod tests {
 
         let config = SyntheticRadarConfig::default();
         let (tx, rx) = channel();
-        let output = build_synthetic_from_paths(&paths, &config, "multi-file test", &tx)
+        let cancel = AtomicBool::new(false);
+        let output = build_synthetic_from_paths(&paths, &config, "multi-file test", &tx, &cancel)
             .expect("build synthetic volumes from real multi-file fixture");
         drop(tx);
 
@@ -9960,6 +10221,7 @@ mod tests {
             AtmosphereTimeMode::LinearAdjacent,
             ReflectivitySampling::LinearZ,
             None,
+            None,
         )
         .expect("midpoint query")
         .expect("midpoint model column");
@@ -9977,6 +10239,7 @@ mod tests {
             0.5,
             AtmosphereTimeMode::LinearAdjacent,
             ReflectivitySampling::LinearZ,
+            None,
             None,
         )
         .expect("anchor query")
@@ -10376,6 +10639,7 @@ mod tests {
                     partial.metadata.decoded_radial_count,
                 ));
             }),
+            None,
         )
         .unwrap();
 
@@ -13220,6 +13484,7 @@ mod tests {
             &cpu_config,
             &|stage| eprintln!("[cuda-parity] {stage}"),
             0,
+            None,
         )
         .expect("read native property fixture");
         let property = fields
@@ -13248,13 +13513,11 @@ mod tests {
             .cloned()
             .expect("fixture scene has a valid time");
 
-        let cpu = try_build_synthetic_volume_reporting(
-            &fields,
-            valid_time,
-            &cpu_config,
-            &|stage| eprintln!("[cuda-parity cpu] {stage}"),
-        )
-        .expect("CPU native T-matrix reference volume");
+        let cpu =
+            try_build_synthetic_volume_reporting(&fields, valid_time, &cpu_config, &|stage| {
+                eprintln!("[cuda-parity cpu] {stage}")
+            })
+            .expect("CPU native T-matrix reference volume");
         let service = Arc::new(
             app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService::open_preferred()
                 .expect("open CUDA T-matrix service"),
@@ -13262,17 +13525,18 @@ mod tests {
         let mut cuda_config = cpu_config.clone();
         cuda_config.compute_preference = SyntheticRadarComputePreference::NvidiaCuda;
         cuda_config.runtime_cuda_service = Some(Arc::clone(&service));
-        let cuda = try_build_synthetic_volume_reporting(
-            &fields,
-            valid_time,
-            &cuda_config,
-            &|stage| eprintln!("[cuda-parity gpu] {stage}"),
-        )
-        .expect("CUDA native T-matrix volume");
+        let cuda =
+            try_build_synthetic_volume_reporting(&fields, valid_time, &cuda_config, &|stage| {
+                eprintln!("[cuda-parity gpu] {stage}")
+            })
+            .expect("CUDA native T-matrix volume");
 
         assert_eq!(cpu.cuts, cuda.cuts, "CPU/CUDA radar science differs");
         let report = service.report();
-        assert!(report.nodes_completed > 0, "fixture submitted no CUDA nodes");
+        assert!(
+            report.nodes_completed > 0,
+            "fixture submitted no CUDA nodes"
+        );
         assert_eq!(report.fallback_reason, None, "CUDA unexpectedly fell back");
         eprintln!(
             "[cuda-parity] bit-identical: {} nodes in {} batches / {} requests",
