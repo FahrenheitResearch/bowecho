@@ -58,8 +58,9 @@ pub use p3_integration::{
     P3ParticleScatteringRoute, P3SmallSphereScatteringPolicy, P3TMatrixInSourceOmissionAudit,
     P3TMatrixIntegrationAudit, P3TMatrixIntegrationConfig, P3TMatrixIntegrationConfigError,
     P3TMatrixIntegrationError, P3TMatrixIntegrationResult, P3TMatrixParticleNode,
-    P3TMatrixShapePolicy, P3TMatrixSourceDomainAudit, P3TMatrixSourceDomainAuthority,
-    P3TMatrixSourceDomainProvenance, P3TMatrixWeightFractions, integrate_p3_tmatrix_psd,
+    P3TMatrixPreparationError, P3TMatrixShapePolicy, P3TMatrixSourceDomainAudit,
+    P3TMatrixSourceDomainAuthority, P3TMatrixSourceDomainProvenance, P3TMatrixWeightFractions,
+    PreparedP3TMatrixIntegration, integrate_p3_tmatrix_psd, prepare_p3_tmatrix_psd,
 };
 pub use p3_psd::{
     P3_MODULE_VERSION, P3_MU_RANGE, P3_MULTICATEGORY_DOI, P3_PART_I_DOI, P3_PSD_REVISION,

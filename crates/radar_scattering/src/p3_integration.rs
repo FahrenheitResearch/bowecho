@@ -342,6 +342,66 @@ pub enum P3TMatrixIntegrationError<E: Error + 'static> {
     },
 }
 
+/// Failure while constructing the exact, ordered P3 particle workload.
+///
+/// Preparation deliberately contains every PSD, shape, support, and omission
+/// gate. Once this succeeds, evaluating the returned particles cannot change
+/// which source nodes are included or the completed integration audit.
+#[derive(Debug, Error)]
+pub enum P3TMatrixPreparationError {
+    #[error("construct exact P3 quadrature: {0}")]
+    Psd(#[source] P3PsdError),
+    #[error(
+        "P3 cannot be represented inside the inferred WRF source integration domain by the existing spheroidal tables without an invented shape: in-source omitted number={number_fraction}, mass={mass_fraction}, equivalent-ice-volume-squared radar weight={radar_weight_fraction} (shape={shape_radar_weight_fraction}, table={table_radar_weight_fraction}); in-source limits are {maximum_number}, {maximum_mass}, {maximum_radar_weight}"
+    )]
+    ShapeOrTableOmission {
+        number_fraction: f64,
+        mass_fraction: f64,
+        radar_weight_fraction: f64,
+        shape_radar_weight_fraction: f64,
+        table_radar_weight_fraction: f64,
+        maximum_number: f64,
+        maximum_mass: f64,
+        maximum_radar_weight: f64,
+    },
+    #[error("P3 projected-area equivalent geometry is invalid at node {node_index}: {message}")]
+    InvalidEquivalentGeometry { node_index: usize, message: String },
+}
+
+impl<E: Error + 'static> From<P3TMatrixPreparationError> for P3TMatrixIntegrationError<E> {
+    fn from(source: P3TMatrixPreparationError) -> Self {
+        match source {
+            P3TMatrixPreparationError::Psd(source) => Self::Psd(source),
+            P3TMatrixPreparationError::ShapeOrTableOmission {
+                number_fraction,
+                mass_fraction,
+                radar_weight_fraction,
+                shape_radar_weight_fraction,
+                table_radar_weight_fraction,
+                maximum_number,
+                maximum_mass,
+                maximum_radar_weight,
+            } => Self::ShapeOrTableOmission {
+                number_fraction,
+                mass_fraction,
+                radar_weight_fraction,
+                shape_radar_weight_fraction,
+                table_radar_weight_fraction,
+                maximum_number,
+                maximum_mass,
+                maximum_radar_weight,
+            },
+            P3TMatrixPreparationError::InvalidEquivalentGeometry {
+                node_index,
+                message,
+            } => Self::InvalidEquivalentGeometry {
+                node_index,
+                message,
+            },
+        }
+    }
+}
+
 /// One table-ready particle. Exact-sphere nodes have ratio one; research-mode
 /// nodes retain the explicit projected-area-equivalent oblate mapping.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -410,6 +470,73 @@ impl P3TMatrixParticleNode {
     }
 }
 
+/// Fully checked, identity-preserving P3 particle workload.
+///
+/// Nodes retain their source-quadrature indices and exact source order. This
+/// lets a caller evaluate the particle scattering in a batch (including on an
+/// accelerator) and then feed those results back through [`Self::finish`] for
+/// the same checked population scaling and serial reduction as the CPU path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedP3TMatrixIntegration {
+    nodes: Vec<(usize, P3TMatrixParticleNode)>,
+    audit: P3TMatrixIntegrationAudit,
+}
+
+impl PreparedP3TMatrixIntegration {
+    /// Ordered table-ready particles paired with their original quadrature
+    /// indices. The copied node values keep the private storage encapsulated
+    /// while remaining convenient for a batch builder.
+    pub fn nodes(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (usize, P3TMatrixParticleNode)> + DoubleEndedIterator + '_
+    {
+        self.nodes.iter().copied()
+    }
+
+    #[must_use]
+    pub const fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Completed preparation audit. Evaluation cannot alter this audit or the
+    /// selected source-node identities.
+    #[must_use]
+    pub const fn audit(&self) -> P3TMatrixIntegrationAudit {
+        self.audit
+    }
+
+    /// Evaluate (or retrieve an already batched result for) every prepared
+    /// particle, then scale and accumulate in exact source-quadrature order.
+    ///
+    /// The callback receives the original source node index so an external
+    /// batch result can be matched without losing error provenance.
+    pub fn finish<E, F>(
+        &self,
+        mut evaluate_one_particle_per_m3: F,
+    ) -> Result<P3TMatrixIntegrationResult, P3TMatrixIntegrationError<E>>
+    where
+        E: Error + 'static,
+        F: FnMut(usize, &P3TMatrixParticleNode) -> Result<AdditiveScattering, E>,
+    {
+        let mut additive = AdditiveScattering::default();
+        for &(node_index, node) in &self.nodes {
+            let per_particle = evaluate_one_particle_per_m3(node_index, &node)
+                .map_err(|source| P3TMatrixIntegrationError::Evaluation { node_index, source })?;
+            let scaled = per_particle
+                .checked_scale(node.source.number_concentration_m3)
+                .map_err(|source| P3TMatrixIntegrationError::Output { node_index, source })?;
+            additive = additive
+                .checked_add(scaled)
+                .map_err(|source| P3TMatrixIntegrationError::Output { node_index, source })?;
+        }
+
+        Ok(P3TMatrixIntegrationResult {
+            additive,
+            audit: self.audit,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct OmittedWeights {
     number: f64,
@@ -453,6 +580,23 @@ where
     E: Error + 'static,
     F: FnMut(&P3TMatrixParticleNode) -> Result<AdditiveScattering, E>,
 {
+    let prepared = prepare_p3_tmatrix_psd(distribution, config, table_support)
+        .map_err(P3TMatrixIntegrationError::from)?;
+    prepared.finish(|_, node| evaluate_one_particle_per_m3(node))
+}
+
+/// Construct the exact ordered P3/T-matrix workload without evaluating its
+/// particle scattering.
+///
+/// This phase performs all PSD reconstruction, quadrature, shape mapping,
+/// table-support selection, source-domain accounting, and omission gates. A
+/// successful value is therefore safe to batch: its nodes and audit cannot be
+/// changed by the execution backend selected for the per-particle work.
+pub fn prepare_p3_tmatrix_psd(
+    distribution: &P3Psd,
+    config: P3TMatrixIntegrationConfig,
+    table_support: crate::PsdParticleSupport,
+) -> Result<PreparedP3TMatrixIntegration, P3TMatrixPreparationError> {
     let mut diameter_breakpoints = Vec::with_capacity(4);
     for domain in [table_support.spherical(), table_support.oblate()]
         .into_iter()
@@ -463,20 +607,20 @@ where
     let source_upper_m = P3_WRF_LOOKUP_INTEGRATION_MAXIMUM_DIMENSION_M;
     let analytic_total = distribution
         .analytic_population_moments(0.0, f64::INFINITY)
-        .map_err(P3TMatrixIntegrationError::Psd)?;
+        .map_err(P3TMatrixPreparationError::Psd)?;
     let source_represented = distribution
         .analytic_population_moments(0.0, source_upper_m)
-        .map_err(P3TMatrixIntegrationError::Psd)?;
+        .map_err(P3TMatrixPreparationError::Psd)?;
     let source_excluded = distribution
         .analytic_population_moments(source_upper_m, f64::INFINITY)
-        .map_err(P3TMatrixIntegrationError::Psd)?;
+        .map_err(P3TMatrixPreparationError::Psd)?;
     let quadrature = distribution
         .quadrature_bounded_with_dimension_breakpoints(
             config.quadrature,
             source_upper_m,
             &diameter_breakpoints,
         )
-        .map_err(P3TMatrixIntegrationError::Psd)?;
+        .map_err(P3TMatrixPreparationError::Psd)?;
 
     let mut non_spherical = OmittedWeights::default();
     let mut outside_table = OmittedWeights::default();
@@ -584,7 +728,7 @@ where
         || total_fractions[1] > config.maximum_omitted_mass_fraction
         || total_fractions[2] > config.maximum_omitted_radar_weight_fraction
     {
-        return Err(P3TMatrixIntegrationError::ShapeOrTableOmission {
+        return Err(P3TMatrixPreparationError::ShapeOrTableOmission {
             number_fraction: total_fractions[0],
             mass_fraction: total_fractions[1],
             radar_weight_fraction: total_fractions[2],
@@ -596,20 +740,9 @@ where
         });
     }
 
-    let mut additive = AdditiveScattering::default();
-    for &(node_index, node) in &supported {
-        let per_particle = evaluate_one_particle_per_m3(&node)
-            .map_err(|source| P3TMatrixIntegrationError::Evaluation { node_index, source })?;
-        let scaled = per_particle
-            .checked_scale(node.source.number_concentration_m3)
-            .map_err(|source| P3TMatrixIntegrationError::Output { node_index, source })?;
-        additive = additive
-            .checked_add(scaled)
-            .map_err(|source| P3TMatrixIntegrationError::Output { node_index, source })?;
-    }
-
-    Ok(P3TMatrixIntegrationResult {
-        additive,
+    let supported_nodes = supported.len();
+    Ok(PreparedP3TMatrixIntegration {
+        nodes: supported,
         audit: P3TMatrixIntegrationAudit {
             revision: match config.shape_policy {
                 P3TMatrixShapePolicy::StrictShapeAuthoritativeSpheres => {
@@ -624,7 +757,7 @@ where
             },
             config,
             quadrature: quadrature.audit,
-            supported_nodes: supported.len(),
+            supported_nodes,
             non_spherical_nodes: non_spherical.nodes,
             outside_table_nodes: outside_table.nodes,
             projected_area_equivalent_nodes,
@@ -849,8 +982,90 @@ fn contains(range: [f64; 2], value: f64) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        P3ParticleGeometry, P3ParticleRegion, P3ProjectedAreaConsistency, P3ShapeAuthority,
+        P3_MODULE_VERSION, P3_TABLE_GENERATOR_VERSION, P3_WRF_SOURCE_COMMIT, P3Category,
+        P3LookupAxisClamps, P3LookupFailure, P3LookupQuery, P3LookupSolution,
+        P3LookupTableDescriptor, P3LookupTableV54, P3ParticleGeometry, P3ParticleRegion,
+        P3ProjectedAreaConsistency, P3PsdInput, P3ReconstructionConfig, P3ShapeAuthority,
+        P3WrfScheme, Sha256Digest,
     };
+
+    #[derive(Clone)]
+    struct ExactFixtureTable {
+        descriptor: P3LookupTableDescriptor,
+    }
+
+    impl P3LookupTableV54 for ExactFixtureTable {
+        fn descriptor(&self) -> &P3LookupTableDescriptor {
+            &self.descriptor
+        }
+
+        fn lookup_psd(&self, _query: P3LookupQuery) -> Result<P3LookupSolution, P3LookupFailure> {
+            Ok(P3LookupSolution {
+                slope_lambda_m_inv: 2.0e5,
+                shape_mu: 2.0,
+                axis_clamps: P3LookupAxisClamps::default(),
+                inverse_qmin_per_kg: 1.0e30,
+                inverse_qmax_per_kg: 1.0e-30,
+            })
+        }
+    }
+
+    fn fixture_psd() -> P3Psd {
+        let scheme = P3WrfScheme::Mp51OneIcePredictedCloudNumber;
+        let table = ExactFixtureTable {
+            descriptor: P3LookupTableDescriptor {
+                wrf_source_commit: P3_WRF_SOURCE_COMMIT.to_owned(),
+                p3_module_version: P3_MODULE_VERSION.to_owned(),
+                generator_version: P3_TABLE_GENERATOR_VERSION.to_owned(),
+                table_version: scheme.required_table_version().to_owned(),
+                table_sha256: Sha256Digest::from_hex(scheme.required_table_sha256()).unwrap(),
+            },
+        };
+        P3Psd::reconstruct(
+            P3PsdInput::two_moment(scheme, P3Category::Category1, 1.0e-5, 1.0e6, 0.0, 0.0, 1.0),
+            &table,
+            P3ReconstructionConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn fixture_integration_contract() -> (P3TMatrixIntegrationConfig, crate::PsdParticleSupport) {
+        let config = P3TMatrixIntegrationConfig::new(
+            P3TMatrixShapePolicy::ProjectedAreaEquivalentSpheroidGaussian20ResearchV1,
+            P3SmallSphereScatteringPolicy::Disabled,
+            P3QuadratureConfig::default(),
+            0.999_999,
+            0.999_999,
+            0.999_999,
+        )
+        .unwrap();
+        // The nonzero diameter floor intentionally omits leading quadrature
+        // nodes, so prepared indices prove source identity rather than merely
+        // mirroring the compact batch ordinal.
+        let domain = PsdParticleDomain::new(
+            [10.0e-6, 0.09],
+            [f64::MIN_POSITIVE, 1_000.0],
+            [f64::MIN_POSITIVE, 1.0],
+        )
+        .unwrap();
+        (config, crate::PsdParticleSupport::uniform(domain))
+    }
+
+    fn fixture_particle_scattering(node: &P3TMatrixParticleNode) -> AdditiveScattering {
+        let factor = 1.0 + 1.0e3 * node.equivolume_diameter_m();
+        AdditiveScattering::from_components([
+            2.0 * factor,
+            factor,
+            0.5 * factor,
+            0.25 * factor,
+            0.01 * factor,
+            0.001 * factor,
+            0.002 * factor,
+            3.0 * factor,
+            4.5 * factor,
+        ])
+        .unwrap()
+    }
 
     fn node(maximum_dimension_m: f64, mass_kg: f64, number_m3: f64) -> P3QuadratureNode {
         P3QuadratureNode {
@@ -867,6 +1082,124 @@ mod tests {
                 projected_area_consistency: P3ProjectedAreaConsistency::GeometricallyBounded,
             },
         }
+    }
+
+    #[test]
+    fn prepared_batch_seam_preserves_legacy_bits_order_and_audit() {
+        let psd = fixture_psd();
+        let (config, support) = fixture_integration_contract();
+        let prepared = prepare_p3_tmatrix_psd(&psd, config, support).unwrap();
+        let indexed_nodes = prepared.nodes().collect::<Vec<_>>();
+
+        assert!(!indexed_nodes.is_empty());
+        assert!(indexed_nodes[0].0 > 0);
+        assert_eq!(prepared.node_count(), prepared.audit().supported_nodes);
+        assert!(indexed_nodes.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+        // This is the exact scale/add statement order used by the legacy
+        // implementation before the prepare/finish split.
+        let mut manual_legacy = AdditiveScattering::default();
+        for (_, node) in &indexed_nodes {
+            let scaled = fixture_particle_scattering(node)
+                .checked_scale(node.source().number_concentration_m3)
+                .unwrap();
+            manual_legacy = manual_legacy.checked_add(scaled).unwrap();
+        }
+
+        let explicit = prepared
+            .finish(|_, node| {
+                Ok::<AdditiveScattering, std::io::Error>(fixture_particle_scattering(node))
+            })
+            .unwrap();
+        let delegated = integrate_p3_tmatrix_psd(&psd, config, support, |node| {
+            Ok::<AdditiveScattering, std::io::Error>(fixture_particle_scattering(node))
+        })
+        .unwrap();
+
+        assert_eq!(
+            explicit.additive().components().map(f64::to_bits),
+            manual_legacy.components().map(f64::to_bits)
+        );
+        assert_eq!(
+            delegated.additive().components().map(f64::to_bits),
+            manual_legacy.components().map(f64::to_bits)
+        );
+        assert_eq!(explicit.audit(), prepared.audit());
+        assert_eq!(delegated.audit(), prepared.audit());
+    }
+
+    #[test]
+    fn prepared_finish_retains_source_indices_for_evaluation_and_output_errors() {
+        let psd = fixture_psd();
+        let (config, support) = fixture_integration_contract();
+        let prepared = prepare_p3_tmatrix_psd(&psd, config, support).unwrap();
+        let (evaluation_node_index, evaluation_node) = prepared.nodes().nth(3).unwrap();
+        let evaluation_diameter_bits = evaluation_node.source().maximum_dimension_m.to_bits();
+
+        let explicit_error = prepared
+            .finish(|node_index, node| {
+                if node_index == evaluation_node_index {
+                    Err(std::io::Error::other(
+                        "deliberate prepared evaluation failure",
+                    ))
+                } else {
+                    Ok(fixture_particle_scattering(node))
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(
+            explicit_error,
+            P3TMatrixIntegrationError::Evaluation { node_index, .. }
+                if node_index == evaluation_node_index
+        ));
+
+        let delegated_error = integrate_p3_tmatrix_psd(&psd, config, support, |node| {
+            if node.source().maximum_dimension_m.to_bits() == evaluation_diameter_bits {
+                Err(std::io::Error::other(
+                    "deliberate delegated evaluation failure",
+                ))
+            } else {
+                Ok(fixture_particle_scattering(node))
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(
+            delegated_error,
+            P3TMatrixIntegrationError::Evaluation { node_index, .. }
+                if node_index == evaluation_node_index
+        ));
+
+        let output_node_index = prepared
+            .nodes()
+            .find(|(_, node)| node.source().number_concentration_m3 > 1.0)
+            .map(|(node_index, _)| node_index)
+            .unwrap();
+        let overflow = AdditiveScattering::from_components([
+            f64::MAX,
+            f64::MAX,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ])
+        .unwrap();
+        let output_error = prepared
+            .finish(|node_index, _| {
+                Ok::<AdditiveScattering, std::io::Error>(if node_index == output_node_index {
+                    overflow
+                } else {
+                    AdditiveScattering::default()
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(
+            output_error,
+            P3TMatrixIntegrationError::Output { node_index, .. }
+                if node_index == output_node_index
+        ));
     }
 
     #[test]
