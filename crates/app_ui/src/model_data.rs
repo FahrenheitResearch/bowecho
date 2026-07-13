@@ -350,9 +350,15 @@ struct SyntheticRadarUiState {
     /// Holding the anchor preserves the historical final frame.
     #[serde(default)]
     missing_neighbor_policy: app_ui::wrf_temporal::MissingNeighborPolicy,
-    /// User-controlled preflight budget for the two-scene temporal cache.
+    /// User-controlled preflight cap for the complete temporal build.
     #[serde(default = "default_synth_temporal_memory_budget_mib")]
     temporal_memory_budget_mib: usize,
+    /// Migration marker introduced with the 64 GiB default. v0.33.1 wrote its
+    /// then-default 8 GiB value into every settings file, so absence of this
+    /// marker lets restore distinguish that legacy default from a deliberate
+    /// 8 GiB choice made in the current UI.
+    #[serde(default)]
+    temporal_memory_budget_user_set: bool,
     #[serde(default = "default_synth_rotation_rate_deg_s")]
     rotation_rate_deg_s: f32,
     #[serde(default = "default_synth_transition_delay_s")]
@@ -468,7 +474,17 @@ fn default_synth_estimator_independent_sample_fraction() -> f32 {
 }
 
 fn default_synth_temporal_memory_budget_mib() -> usize {
-    8192
+    65_536
+}
+
+const MIB_PER_GIB: f64 = 1024.0;
+
+fn synth_temporal_budget_gib(memory_budget_mib: usize) -> f64 {
+    memory_budget_mib as f64 / MIB_PER_GIB
+}
+
+fn synth_temporal_budget_mib_from_gib(memory_budget_gib: f64) -> usize {
+    ((memory_budget_gib.clamp(1.0, 64.0) * MIB_PER_GIB).round() as usize).clamp(1024, 65_536)
 }
 
 fn default_synth_sensitivity_dbz_at_1km() -> f32 {
@@ -578,6 +594,7 @@ impl Default for SyntheticRadarUiState {
             atmosphere_time_mode: app_ui::wrf_temporal::AtmosphereTimeMode::default(),
             missing_neighbor_policy: app_ui::wrf_temporal::MissingNeighborPolicy::default(),
             temporal_memory_budget_mib: default_synth_temporal_memory_budget_mib(),
+            temporal_memory_budget_user_set: false,
             rotation_rate_deg_s: default_synth_rotation_rate_deg_s(),
             transition_delay_s: default_synth_transition_delay_s(),
             prf_hz: default_synth_prf_hz(),
@@ -703,7 +720,8 @@ impl SyntheticRadarUiState {
         self.scan_timing = preset.scan_timing;
         self.atmosphere_time_mode = preset.atmosphere_time_mode;
         self.missing_neighbor_policy = preset.missing_neighbor_policy;
-        self.temporal_memory_budget_mib = preset.temporal_memory_budget_mib;
+        // Resource policy belongs to the user, not to a science mode. Keep a
+        // customized RAM cap intact when switching Truth/Instrument/Presentation.
         self.coupled_single_prf_estimator = preset.coupled_single_prf_estimator;
         self.estimator_dwell_ms = preset.estimator_dwell_ms;
         self.estimator_pulse_count = preset.estimator_pulse_count;
@@ -749,7 +767,9 @@ impl SyntheticRadarUiState {
         self.emit_stage_diagnostics = defaults.emit_stage_diagnostics;
         self.atmosphere_time_mode = app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
         self.missing_neighbor_policy = app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
-        self.temporal_memory_budget_mib = default_synth_temporal_memory_budget_mib();
+        // Resource policy belongs to the user, not to a science recipe. In
+        // particular, selecting a temporal/P3 recipe must not silently reset a
+        // previously saved build RAM cap.
         self.sensitivity_dbz_at_1km = defaults.sensitivity_dbz_at_1km;
         self.emit_quality_fields = defaults.emit_quality_fields;
         self.minimum_model_coverage_fraction = defaults.minimum_model_coverage_fraction;
@@ -815,6 +835,25 @@ impl SyntheticRadarUiState {
             expected.apply_recipe(*recipe);
             expected == *self
         })
+    }
+
+    /// Restore the opaque settings value with the one required budget
+    /// migration. v0.33.1 serialized 8192 even when the user never touched the
+    /// control; migrate only that unmarked legacy default. Any unmarked
+    /// non-default value was customized and becomes marked, while a marked
+    /// 8 GiB value remains an intentional current-version choice.
+    fn from_persisted_value(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        let had_budget = value.get("temporal_memory_budget_mib").is_some();
+        let had_user_set_marker = value.get("temporal_memory_budget_user_set").is_some();
+        let mut state = serde_json::from_value::<Self>(value.clone())?;
+        if !had_user_set_marker {
+            if had_budget && state.temporal_memory_budget_mib == 8_192 {
+                state.temporal_memory_budget_mib = default_synth_temporal_memory_budget_mib();
+            } else if had_budget {
+                state.temporal_memory_budget_user_set = true;
+            }
+        }
+        Ok(state)
     }
 
     fn clamped_range_km(&self) -> f64 {
@@ -2207,7 +2246,7 @@ impl ModelDataDock {
     /// Returns false on malformed JSON — left at today's defaults (domain
     /// centre, 230 km / 250 m), so a bad entry never breaks the import.
     pub fn apply_wrf_synth_radar_json(&mut self, value: &serde_json::Value) -> bool {
-        match serde_json::from_value::<SyntheticRadarUiState>(value.clone()) {
+        match SyntheticRadarUiState::from_persisted_value(value) {
             Ok(state) => {
                 self.synth_radar = state;
                 true
@@ -4972,19 +5011,35 @@ impl ModelDataDock {
                                     );
                                 });
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.label("Temporal memory budget:");
-                                    ui.add(
-                                        egui::DragValue::new(
-                                            &mut state.temporal_memory_budget_mib,
-                                        )
-                                        .range(1024..=65_536)
-                                        .speed(256)
-                                        .suffix(" MiB"),
-                                    )
-                                    .on_hover_text(
-                                        "Preflight limit for input scenes, read/cut scratch, and every retained output frame. The run stops before allocating a build whose estimated peak would exceed this budget.",
+                                    ui.label("Temporal build RAM cap:");
+                                    let mut budget_gib = synth_temporal_budget_gib(
+                                        state.temporal_memory_budget_mib,
                                     );
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut budget_gib)
+                                                .range(1.0..=64.0)
+                                                .speed(0.25)
+                                                .fixed_decimals(2)
+                                                .suffix(" GiB"),
+                                        )
+                                        .on_hover_text(
+                                            "Safety cap for this WRF synthetic-radar build: input scenes, read/cut scratch, and every retained output frame. It is saved across restarts and is separate from the radar playback-loop RAM budget.",
+                                        )
+                                        .changed()
+                                    {
+                                        state.temporal_memory_budget_mib =
+                                            synth_temporal_budget_mib_from_gib(budget_gib);
+                                        state.temporal_memory_budget_user_set = true;
+                                    }
                                 });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Saved WRF radar setting; separate from playback-loop RAM.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
                             }
                             if state.scan_strategy.is_named_vcp() {
                                 ui.label(
@@ -7205,8 +7260,8 @@ mod tests {
             "the backward-compatible final-frame policy holds the anchor"
         );
         assert_eq!(
-            empty.temporal_memory_budget_mib, 8192,
-            "older settings receive the bounded two-scene cache budget"
+            empty.temporal_memory_budget_mib, 65_536,
+            "older settings receive the 64 GiB temporal-build RAM cap"
         );
         assert_eq!(
             empty.rotation_rate_deg_s,
@@ -7788,6 +7843,76 @@ mod tests {
         assert!(research.emit_quality_fields);
         assert_eq!(research.minimum_model_coverage_fraction, 0.0);
         assert!(research.validate_science_contract().is_ok());
+    }
+
+    #[test]
+    fn synth_radar_temporal_ram_cap_round_trips_and_survives_presets() {
+        use crate::wrf_radar::SimulationMode;
+
+        assert_eq!(default_synth_temporal_memory_budget_mib(), 65_536);
+        assert_eq!(synth_temporal_budget_gib(12_288), 12.0);
+        assert_eq!(synth_temporal_budget_mib_from_gib(12.25), 12_544);
+        assert_eq!(synth_temporal_budget_mib_from_gib(0.0), 1_024);
+        assert_eq!(synth_temporal_budget_mib_from_gib(100.0), 65_536);
+
+        let customized = SyntheticRadarUiState {
+            temporal_memory_budget_mib: 24_576,
+            temporal_memory_budget_user_set: true,
+            ..SyntheticRadarUiState::default()
+        };
+        let persisted = serde_json::to_value(&customized).unwrap();
+        let mut restored: SyntheticRadarUiState = serde_json::from_value(persisted).unwrap();
+        assert_eq!(restored.temporal_memory_budget_mib, 24_576);
+
+        for mode in [
+            SimulationMode::Truth,
+            SimulationMode::Instrument,
+            SimulationMode::Presentation,
+        ] {
+            restored.apply_mode_preset(mode);
+            assert_eq!(
+                restored.temporal_memory_budget_mib, 24_576,
+                "science mode selection must not own the user's RAM cap"
+            );
+        }
+        for recipe in SyntheticRadarRecipe::ALL {
+            restored.apply_recipe(recipe);
+            assert_eq!(
+                restored.temporal_memory_budget_mib,
+                24_576,
+                "recipe {} must not reset the user's RAM cap",
+                recipe.label()
+            );
+        }
+
+        // Upgrade behavior: an older settings object without the field gets
+        // today's 64 GiB default. v0.33.1's serialized 8 GiB default is
+        // migrated, but every other legacy value is treated as a customization.
+        let absent = SyntheticRadarUiState::from_persisted_value(&serde_json::json!({})).unwrap();
+        assert_eq!(absent.temporal_memory_budget_mib, 65_536);
+        assert!(!absent.temporal_memory_budget_user_set);
+
+        let migrated = SyntheticRadarUiState::from_persisted_value(&serde_json::json!({
+            "temporal_memory_budget_mib": 8_192
+        }))
+        .unwrap();
+        assert_eq!(migrated.temporal_memory_budget_mib, 65_536);
+        assert!(!migrated.temporal_memory_budget_user_set);
+
+        let legacy_custom = SyntheticRadarUiState::from_persisted_value(&serde_json::json!({
+            "temporal_memory_budget_mib": 24_576
+        }))
+        .unwrap();
+        assert_eq!(legacy_custom.temporal_memory_budget_mib, 24_576);
+        assert!(legacy_custom.temporal_memory_budget_user_set);
+
+        let intentional_eight = SyntheticRadarUiState::from_persisted_value(&serde_json::json!({
+            "temporal_memory_budget_mib": 8_192,
+            "temporal_memory_budget_user_set": true
+        }))
+        .unwrap();
+        assert_eq!(intentional_eight.temporal_memory_budget_mib, 8_192);
+        assert!(intentional_eight.temporal_memory_budget_user_set);
     }
 
     #[test]

@@ -697,7 +697,7 @@ impl Default for SyntheticRadarConfig {
             scan_timing: ScanTiming::InstantaneousTruth,
             atmosphere_time_mode: AtmosphereTimeMode::FrozenAtVolumeStart,
             missing_neighbor_policy: MissingNeighborPolicy::HoldAnchor,
-            temporal_memory_budget_mib: 8_192,
+            temporal_memory_budget_mib: 65_536,
             rotation_rate_deg_s: 18.0,
             transition_delay_s: 3.5,
             prf_hz: 1_000.0,
@@ -8979,11 +8979,7 @@ fn build_temporal_synthetic_from_scenes(
             budget_bytes as f64 / 1024.0_f64.powi(3),
         ));
     } else {
-        return Err(format!(
-            "Temporal build needs an estimated {:.2} GiB, above the configured {:.2} GiB budget",
-            required_bytes as f64 / 1024.0_f64.powi(3),
-            budget_bytes as f64 / 1024.0_f64.powi(3),
-        ));
+        return Err(temporal_build_budget_error(required_bytes, budget_bytes));
     }
 
     let mut cache: TwoSceneCache<(String, usize), Arc<WrfRadarFields>> = TwoSceneCache::default();
@@ -9274,6 +9270,14 @@ fn build_temporal_synthetic_from_scenes(
         config_fingerprint,
         frame_sources,
     })
+}
+
+fn temporal_build_budget_error(required_bytes: usize, budget_bytes: usize) -> String {
+    format!(
+        "Temporal build needs an estimated {:.2} GiB, above the configured {:.2} GiB budget. Change 'Temporal build RAM cap' under WRF Synthetic radar > Instrument & propagation, select fewer WRF frames, or turn off Ideal/Measured stage diagnostics; raise the cap only when that RAM is actually available",
+        required_bytes as f64 / 1024.0_f64.powi(3),
+        budget_bytes as f64 / 1024.0_f64.powi(3),
+    )
 }
 
 // This short-lived control value favors clear ownership at the scan boundary;
@@ -9986,6 +9990,16 @@ mod tests {
             polar.compact_bytes_per_scene - scalar.compact_bytes_per_scene,
             polar.cells_per_scene * 9
         );
+    }
+
+    #[test]
+    fn temporal_budget_error_points_to_the_distinct_build_cap_and_reductions() {
+        let error = temporal_build_budget_error(57 * 1024_usize.pow(3), 8 * 1024_usize.pow(3));
+        assert!(error.contains("57.00 GiB"));
+        assert!(error.contains("8.00 GiB"));
+        assert!(error.contains("Temporal build RAM cap"));
+        assert!(error.contains("select fewer WRF frames"));
+        assert!(error.contains("turn off Ideal/Measured stage diagnostics"));
     }
 
     #[test]
