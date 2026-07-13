@@ -3766,8 +3766,9 @@ pub enum WrfTMatrixSceneQueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wrf_property_reader::read_wrf_property_scene;
+    use crate::wrf_property_reader::{RawRainState, read_wrf_property_scene};
     use crate::wrf_scene_inventory::WrfSourceIdentity;
+    use radar_scattering::P3Category;
 
     fn additive(values: [f64; 9]) -> AdditiveScattering {
         AdditiveScattering::from_components(values).unwrap()
@@ -4233,7 +4234,7 @@ mod tests {
     }
 
     #[test]
-    fn real_p3_fixture_reconstructs_reader_normalized_property_cells() {
+    fn real_p3_fixture_reconstructs_every_reader_normalized_property_cell() {
         let (Some(wrf_path), Some(table_path)) = (
             std::env::var_os("BOWECHO_WRF_PROPERTY_FIXTURE"),
             std::env::var_os("BOWECHO_P3_TABLE_FIXTURE"),
@@ -4242,12 +4243,11 @@ mod tests {
         };
 
         let file = wrf_core::WrfFile::open(&wrf_path).expect("open BOWECHO_WRF_PROPERTY_FIXTURE");
-        assert_eq!(
-            file.global_attr_i32("MP_PHYSICS")
-                .expect("fixture has MP_PHYSICS"),
-            50,
-            "this regression fixture must use two-moment P3 mp_physics=50"
-        );
+        let scheme_id = file
+            .global_attr_i32("MP_PHYSICS")
+            .expect("fixture has MP_PHYSICS");
+        let scheme = P3WrfScheme::try_from(scheme_id).expect("fixture uses supported P3 physics");
+        let table_kind = required_p3_table_kind(scheme_id).expect("P3 scheme has a table kind");
 
         let qsmall = f64::from(radar_scattering::P3_WRF_QSMALL_KGKG);
         let bsmall = f64::from(1.0e-15_f32);
@@ -4287,10 +4287,13 @@ mod tests {
             })
             .expect("fixture has active P3 rime above the density ceiling");
 
-        const NEGATIVE_QICE_INDEX: usize = 6_480_117;
+        let negative_qice_index = qice
+            .iter()
+            .position(|&value| value < 0.0 && value >= -qsmall)
+            .expect("fixture contains a negative QICE qsmall residue");
         assert!(
-            qice[NEGATIVE_QICE_INDEX] < 0.0 && qice[NEGATIVE_QICE_INDEX] >= -qsmall,
-            "fixture no longer contains the original QICE residue"
+            qice[negative_qice_index] < 0.0 && qice[negative_qice_index] >= -qsmall,
+            "fixture no longer contains a negative QICE residue"
         );
         drop((qice, qir, qib));
         file.clear_cache();
@@ -4301,11 +4304,11 @@ mod tests {
             0,
         )
         .expect("read normalized P3 property scene");
-        let table = P3OfficialTableV54::load_path(P3OfficialTableKind::TwoMoment, table_path)
+        let table = P3OfficialTableV54::load_path(table_kind, table_path)
             .expect("load BOWECHO_P3_TABLE_FIXTURE");
 
         let inactive = scene
-            .raw_cell(NEGATIVE_QICE_INDEX)
+            .raw_cell(negative_qice_index)
             .expect("read original negative-QICE cell");
         assert!(
             inactive
@@ -4325,12 +4328,8 @@ mod tests {
                     _ => None,
                 })
                 .expect("selected source cell retains active P3 ice");
-            let input = p3_psd_input(
-                P3WrfScheme::Mp50OneIceFixedCloudNumber,
-                value,
-                raw.dry_air_density_kg_m3(),
-            )
-            .expect("mp50 maps to a two-moment P3 input");
+            let input = p3_psd_input(scheme, value, raw.dry_air_density_kg_m3())
+                .expect("supported P3 scheme maps to a native P3 input");
             let psd = P3Psd::reconstruct(input, &table, P3ReconstructionConfig::default())
                 .expect("production P3 input reconstructs");
             (input, psd)
@@ -4358,6 +4357,128 @@ mod tests {
         assert!(
             (high_density.rime_mass_kgkg / high_density.rime_volume_m3_per_kg - 900.0).abs()
                 < 1.0e-3
+        );
+
+        let source_qrain = file.read_var("QRAIN", 0).expect("read fixture QRAIN");
+        let mut negative_rain_cells = 0_usize;
+        let mut active_positive_rain_cells = 0_usize;
+        for (cell_index, &source_mass) in source_qrain.iter().enumerate() {
+            if source_mass < 0.0 {
+                negative_rain_cells += 1;
+                let raw = scene.raw_cell(cell_index).unwrap_or_else(|error| {
+                    panic!("read negative-QRAIN cell {cell_index}: {error}")
+                });
+                assert_eq!(
+                    raw.rain(),
+                    &RawRainState::Available {
+                        qrain_kgkg: 0.0,
+                        qnrain_per_kg: 0.0,
+                    },
+                    "source QRAIN {source_mass} at cell {cell_index} must be normalized to available clear rain"
+                );
+            } else if source_mass >= qsmall {
+                active_positive_rain_cells += 1;
+                let raw = scene.raw_cell(cell_index).unwrap_or_else(|error| {
+                    panic!("read active positive-QRAIN cell {cell_index}: {error}")
+                });
+                match raw.rain() {
+                    RawRainState::Available {
+                        qrain_kgkg,
+                        qnrain_per_kg,
+                    } => {
+                        assert!(
+                            *qrain_kgkg > 0.0,
+                            "source QRAIN {source_mass} at cell {cell_index} was cleared"
+                        );
+                        assert!(
+                            *qnrain_per_kg > 0.0,
+                            "active rain number at cell {cell_index} was not normalized positive"
+                        );
+                    }
+                    RawRainState::Unavailable(reason) => panic!(
+                        "source QRAIN {source_mass} at cell {cell_index} became unavailable: {reason}"
+                    ),
+                }
+            }
+        }
+        drop(source_qrain);
+        file.clear_cache();
+        assert!(
+            negative_rain_cells > 0,
+            "fixture must retain the reported negative QRAIN regression"
+        );
+        assert!(
+            active_positive_rain_cells > 0,
+            "fixture must contain active positive rain"
+        );
+
+        let default_tolerance = P3ReconstructionConfig::default().maximum_moment_relative_error;
+        let diagnostic_config = P3ReconstructionConfig {
+            maximum_moment_relative_error: 0.999,
+        };
+        let mut reconstructed_categories = 0_usize;
+        let mut closures_over_default = 0_usize;
+        let mut worst_closure: Option<(f64, usize, P3Category, &'static str, P3PsdInput)> = None;
+
+        for sparse_category in scene.categories() {
+            let WrfPropertyCategory::P3(category) = sparse_category.category() else {
+                continue;
+            };
+            for &compact_cell_index in sparse_category.active_cell_indices() {
+                let cell_index = compact_cell_index as usize;
+                let raw = scene
+                    .raw_cell(cell_index)
+                    .unwrap_or_else(|error| panic!("read active P3 cell {cell_index}: {error}"));
+                let value = raw
+                    .categories()
+                    .iter()
+                    .find_map(|raw_category| match raw_category {
+                        RawPropertyCategory::P3(value) if value.category == category => Some(value),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("active P3 cell {cell_index} is missing category {category:?}")
+                    });
+                let input = p3_psd_input(scheme, value, raw.dry_air_density_kg_m3())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "production p3_psd_input rejected cell {cell_index}, category {category:?}, raw {value:#?}"
+                        )
+                    });
+                let psd = P3Psd::reconstruct(input, &table, diagnostic_config).unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "production P3 reconstruction failed at cell {cell_index}, category {category:?}, input {input:#?}: {error}"
+                        )
+                    },
+                );
+                reconstructed_categories += 1;
+                let closure = psd.closure_audit();
+                for (moment, error) in [
+                    ("number", Some(closure.number_relative_error)),
+                    ("mass", Some(closure.mass_relative_error)),
+                    ("sixth", closure.sixth_moment_relative_error),
+                ] {
+                    let Some(error) = error else {
+                        continue;
+                    };
+                    if error > default_tolerance {
+                        closures_over_default += 1;
+                    }
+                    if worst_closure
+                        .as_ref()
+                        .is_none_or(|(worst, ..)| error > *worst)
+                    {
+                        worst_closure = Some((error, cell_index, category, moment, input));
+                    }
+                }
+            }
+        }
+
+        let (worst_error, worst_cell, worst_category, worst_moment, worst_input) =
+            worst_closure.expect("fixture contains an active P3 category");
+        eprintln!(
+            "P3 full-fixture sweep: reconstructed={reconstructed_categories}, negative_rain_cleared={negative_rain_cells}, active_positive_rain={active_positive_rain_cells}, closures_over_default={closures_over_default}, worst={worst_error} ({worst_moment}) at cell {worst_cell}, category {worst_category:?}, input {worst_input:#?}"
         );
     }
 }
