@@ -13606,7 +13606,49 @@ mod tests {
             .expect("CUDA native T-matrix volume");
         let cuda_elapsed = cuda_started.elapsed();
 
-        assert_eq!(cpu.cuts, cuda.cuts, "CPU/CUDA radar science differs");
+        assert_eq!(cpu.cuts.len(), cuda.cuts.len(), "cut count differs");
+        for (cut_index, (cpu_cut, cuda_cut)) in cpu.cuts.iter().zip(&cuda.cuts).enumerate() {
+            assert_eq!(
+                cpu_cut.elevation_deg.to_bits(),
+                cuda_cut.elevation_deg.to_bits(),
+                "cut {cut_index} elevation differs"
+            );
+            assert_eq!(cpu_cut.elevation_number, cuda_cut.elevation_number);
+            assert_eq!(
+                cpu_cut.radials, cuda_cut.radials,
+                "cut {cut_index} radial geometry differs"
+            );
+            assert_eq!(
+                cpu_cut.ray_instrument_metadata,
+                cuda_cut.ray_instrument_metadata
+            );
+            assert_eq!(cpu_cut.moments.len(), cuda_cut.moments.len());
+            for (moment, cpu_grid) in &cpu_cut.moments {
+                let cuda_grid = &cuda_cut.moments[moment];
+                assert_eq!(cpu_grid.moment, cuda_grid.moment);
+                assert_eq!(cpu_grid.gate_range, cuda_grid.gate_range);
+                assert_eq!(cpu_grid.scale.to_bits(), cuda_grid.scale.to_bits());
+                assert_eq!(cpu_grid.offset.to_bits(), cuda_grid.offset.to_bits());
+                assert_eq!(cpu_grid.nodata, cuda_grid.nodata);
+                assert_eq!(cpu_grid.range_folded, cuda_grid.range_folded);
+                assert_eq!(cpu_grid.radial_indices, cuda_grid.radial_indices);
+                let (MomentStorage::F32(cpu_values), MomentStorage::F32(cuda_values)) =
+                    (&cpu_grid.storage, &cuda_grid.storage)
+                else {
+                    panic!("cut {cut_index} moment {moment:?} is not F32");
+                };
+                assert_eq!(cpu_values.len(), cuda_values.len());
+                for (value_index, (&cpu_value, &cuda_value)) in
+                    cpu_values.iter().zip(cuda_values).enumerate()
+                {
+                    assert_eq!(
+                        cpu_value.to_bits(),
+                        cuda_value.to_bits(),
+                        "cut {cut_index} moment {moment:?} value {value_index} differs"
+                    );
+                }
+            }
+        }
         let report = service.report();
         assert!(
             report.nodes_completed > 0,
