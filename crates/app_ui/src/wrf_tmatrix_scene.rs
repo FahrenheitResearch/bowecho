@@ -4447,13 +4447,48 @@ fn compact_components(additive: AdditiveScattering) -> Result<[f32; 9], CompactS
         }
         compact[index] = converted;
     }
-    // Quantization must still satisfy covariance and fall-moment invariants;
-    // never repair an invalid compact tuple by saturation or clamping.
+    // Independent nearest-f32 rounding can put an otherwise-valid fall-moment
+    // triple just outside S*ZH >= F^2. Keep nearest-f32 ZH and F, then move S
+    // to the smallest representable f32 on the valid side of that boundary.
+    // This is a directed quantization of a valid source tuple, not a repair of
+    // invalid evaluator output: `additive` was validated before reaching here.
+    if matches!(
+        decode_components(&compact),
+        Err(WrfTMatrixSceneQueryError::Output(
+            OutputError::NegativeFallSpeedVariance { .. }
+        ))
+    ) {
+        project_compact_second_fall_moment(&mut compact)?;
+    }
+
+    // Quantization must still satisfy every covariance and fall-moment
+    // invariant. Genuinely invalid compact tuples remain errors.
     decode_components(&compact).map_err(|error| match error {
         WrfTMatrixSceneQueryError::Output(source) => CompactScatteringError::RoundTrip(source),
         _ => unreachable!("decoding a fixed nine-component array cannot be a storage error"),
     })?;
     Ok(compact)
+}
+
+fn project_compact_second_fall_moment(
+    compact: &mut [f32; AdditiveScattering::COMPONENT_COUNT],
+) -> Result<(), CompactScatteringError> {
+    let zh = f64::from(compact[0]);
+    let first = f64::from(compact[7]);
+    debug_assert!(zh > 0.0);
+    let minimum_second = first * first / zh;
+    let mut second = minimum_second as f32;
+    if f64::from(second) < minimum_second {
+        second = f32::from_bits(second.to_bits() + 1);
+    }
+    if !second.is_finite() {
+        return Err(CompactScatteringError::OutsideF32 {
+            index: 8,
+            value: minimum_second,
+        });
+    }
+    compact[8] = second;
+    Ok(())
 }
 
 fn decode_components(values: &[f32]) -> Result<AdditiveScattering, WrfTMatrixSceneQueryError> {
@@ -5968,6 +6003,39 @@ mod tests {
         assert_eq!(half_components[5], half_components[6]);
         assert_eq!(half_components[7], 2.0);
         assert_eq!(half_components[8], 4.0);
+    }
+
+    #[test]
+    fn compact_quantization_projects_reported_fall_moment_roundoff() {
+        // This valid f64 tuple is the source interval that independently
+        // rounds to the exact failing compact tuple reported from the field.
+        let source = additive([
+            29.762_806_8,
+            29.762_806_8,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            138.382_546,
+            643.411_45,
+        ]);
+        let nearest = source.components().map(|value| value as f32);
+        assert_eq!(nearest[0], 29.762_805_938_720_703_f32);
+        assert_eq!(nearest[7], 138.382_553_100_585_94_f32);
+        assert_eq!(nearest[8], 643.411_437_988_281_3_f32);
+        assert!(matches!(
+            decode_components(&nearest),
+            Err(WrfTMatrixSceneQueryError::Output(
+                OutputError::NegativeFallSpeedVariance { .. }
+            ))
+        ));
+
+        let compact = compact_components(source).expect("directed compact quantization");
+        assert_eq!(compact[0], nearest[0]);
+        assert_eq!(compact[7], nearest[7]);
+        assert_eq!(compact[8], f32::from_bits(nearest[8].to_bits() + 1));
+        decode_components(&compact).expect("projected tuple remains physically valid");
     }
 
     fn synthetic_scene() -> WrfTMatrixScene {
