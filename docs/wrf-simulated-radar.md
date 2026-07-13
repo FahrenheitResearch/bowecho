@@ -494,6 +494,8 @@ T-matrix node tables over the pinned lookup generator's 40,000 by 2-micrometre
 moment grid, whose upper bin edge is 80 mm in native P3 maximum dimension.
 The analytic PSD closure still extends to infinity and is not renormalized;
 the population above 80 mm is reported separately as source-domain exclusion.
+No node above that source edge reaches spheroid mapping or either scattering
+route.
 Table-support omissions remain fail-closed inside the source domain and are
 audited independently by number, mass, and P3's scheme-consistent
 mass-squared (equivalent-ice-volume-squared) radar weight. The latter matches
@@ -507,17 +509,40 @@ mass retain their independent hard gates; no missing node is clamped or
 fabricated.
 
 P3 predicts maximum dimension, mass, and projected area, but not one unique
-spheroidal habit or canting distribution. The usable research policy therefore
-keeps lambda, mu, PSD weights, mass, and area scheme-native while mapping each
-node to an explicitly named projected-area-equivalent spheroid with the table's
-Gaussian-20 canting assumption. The normal branch is oblate. When the pinned
-P3 rime-density fixed-point update leaves projected area up to one percent
-above the Dmax circle, the mapping preserves that source area and mass with a
-continuous prolate equivalent rather than clamping it to a sphere. Larger
-inconsistencies remain shape omissions. Provenance states that this shape and
-orientation are external research assumptions, not P3 predictions. A stricter
-shape-authoritative policy exists and evaluates only genuinely spherical P3
-regions under omission budgets; neither policy silently revives the removed
+spheroidal habit or canting distribution. The usable research policy leaves
+lambda, mu, PSD weights, and the native mass/area law unchanged, then applies
+an explicitly versioned area-derived spheroid with the table's Gaussian-20
+canting assumption. Where the exact projected-area construction implies at
+most P3's 900 kg m^-3 solid-ice density, it remains exactly
+projected-area-equivalent. At the empirical small-sphere/dense-unrimed area-law
+transition, that construction can imply a higher, nonphysical homogeneous
+density. Those nodes instead preserve source mass at exactly 900 kg m^-3,
+derive `Deq = (6m / (pi * 900))^(1/3)`, and retain
+`4A / (pi * Dmax^2)` as the aspect-ratio proxy. This declared
+solid-ice-constrained mapping is audited separately; it is not a clamp to a
+table coordinate and does not claim to preserve absolute projected area in
+that branch. When the pinned rime-density fixed-point update leaves projected
+area up to one percent above the Dmax circle, the mapping still preserves that
+source area and mass with a continuous prolate equivalent. Larger
+inconsistencies remain shape omissions.
+
+One separately versioned route covers only P3's exact 900 kg m^-3 small dense
+spheres whose diameter is below the dry table's 50 micrometre lower edge. It
+evaluates the same material, temperature, frequency, and radar view at the
+50-micrometre spherical table node, then applies the analytic sphere limits:
+sixth-power diameter scaling for backscatter/covariance and third-power
+absorption plus sixth-power scattering for extinction. The target-diameter
+terminal speed supplies the fall moments. This table-floor-anchored route is
+selected before lookup and recorded in the P3 audit. Nonspherical particles
+and diameter, density, aspect-ratio, temperature, frequency, or view misses
+cannot enter it; every such unsupported case remains fail-closed. It is
+therefore a named exact-sphere source contract, not an arbitrary or silent
+Rayleigh fallback.
+
+Provenance states that the spheroidal shape and orientation are external
+research assumptions, not P3 predictions. A stricter shape-authoritative
+policy exists and evaluates only genuinely spherical P3 regions under
+omission budgets; neither policy silently revives the removed
 single-characteristic-particle production path.
 
 ### Full-property and Frozen-only sensitivity
@@ -605,9 +630,10 @@ scope boundary are recorded in
 `validation/tmatrix/refined_grid_v10_property_bundle_acceptance.json`.
 
 This remains **research-only and not independently validated**. ISHMAEL and P3
-now integrate their reconstructable native PSDs, but P3 spheroid shape/canting
-remains the explicit projected-area-equivalent research mapping described
-above. The reproducible generator checks table integrity and held-out
+now integrate their reconstructable native PSDs, but P3 spheroid shape/canting,
+the solid-ice-constrained branch, and the exact-small-sphere sub-floor route
+remain the explicit versioned research assumptions described above. The
+reproducible generator checks table integrity and held-out
 interpolation, not agreement with an operational radar. No PSD implementation,
 table, orientation model, VCP choice, or visually plausible output creates an
 operational-calibration claim.
@@ -744,8 +770,9 @@ variables.
   to scalar REF/VEL with a diagnostic note.
 - The opt-in T-matrix contract is research-only, table-bounded, and not
   independently validated. ISHMAEL and P3 have scheme-native PSD paths; P3's
-  equivalent-oblate shape and Gaussian-20 canting remain external assumptions.
-  Neither is operational calibration.
+  area/mass spheroid mapping, 900 kg m^-3 solid-ice constraint, Gaussian-20
+  canting, and exact-small-sphere sub-floor route remain explicit external
+  assumptions. None is operational calibration or a general table fallback.
 - The legacy embedded 2.8 GHz S bundle is the only shipped property-table
   source. No validated C- or X-band pack ships; selecting those exact bands
   requires a separately installed, evidence-backed `validated_research` pack

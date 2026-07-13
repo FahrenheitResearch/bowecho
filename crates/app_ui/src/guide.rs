@@ -1168,7 +1168,9 @@ fn wrf(ui: &mut egui::Ui) {
         "P3/ISHMAEL T-matrix (research)",
         "— opt-in property-aware dual-pol using the shipped legacy embedded 2.8 GHz S tables, \
          Full property sensitivity and Raw-state pre-closure. Exact supported inputs are \
-         required; it never substitutes another table source, band or Rayleigh.",
+         required; it never substitutes another table source or band. The only Rayleigh-limit \
+         route is the named, audited bridge for exact P3 small dense spheres below the table \
+         floor; every other unsupported lookup fails closed.",
     );
     para(
         ui,
@@ -1362,23 +1364,39 @@ fn wrf(ui: &mut egui::Ui) {
          For source-compatible radar moments, the pinned P3 v5.4 operator uses its documented \
          40,000 by 2-micrometre integration grid through an 80 mm upper edge. BowEcho retains \
          analytic closure to infinity without renormalization, reports the excluded analytic \
-         tail separately, and applies shape/table coverage budgets only within that source \
-         domain. \
+         tail separately, sends no node above that edge to shape or scattering evaluation, and \
+         applies shape/table coverage budgets only within that source domain. \
          Wet ISHMAEL PSD allocation remains unavailable rather than replaced by a characteristic \
          particle.",
     );
     para(
         ui,
         "P3 itself predicts Dmax, mass and projected area but not a unique spheroidal habit or \
-         canting distribution. BowEcho's usable P3 policy preserves the exact PSD and native \
-         mass/area law, then applies an explicitly versioned projected-area-equivalent spheroid \
-         plus the table's Gaussian-20 canting as external research assumptions. The normal branch \
-         is oblate. A rare source-law area overshoot within P3's pinned one-percent rime-density \
-         iteration tolerance maps continuously to a prolate while preserving source area and mass; \
-         it is not clamped to a sphere. Larger inconsistencies remain omissions. Provenance says \
-         so directly. A strict shape-authoritative mode evaluates only P3's genuinely \
+         canting distribution. BowEcho leaves the exact PSD and native mass/area law unchanged. \
+         Where its explicitly versioned projected-area-equivalent spheroid implies no more than \
+         P3's 900 kg/m3 solid-ice density, source area and mass are preserved. At the empirical \
+         small-sphere/dense-unrimed area transition, an exact-area homogeneous spheroid can imply \
+         a higher density; that branch instead preserves source mass at 900 kg/m3, derives \
+         Deq=(6m/(pi*900))^(1/3), and retains normalized source area as the aspect-ratio proxy. \
+         This solid-ice-constrained node is audited and is not a table-coordinate clamp; it does \
+         not claim exact absolute-area preservation. A rare source-area overshoot within P3's \
+         pinned one-percent rime-density iteration tolerance still maps continuously to a prolate \
+         while preserving source area and mass. Gaussian-20 canting and every spheroidal habit \
+         remain external research assumptions. Larger inconsistencies remain omissions. A strict \
+         shape-authoritative mode evaluates only P3's genuinely \
          spherical regions under omission budgets. The old single-characteristic-particle \
          production dispatch is removed.",
+    );
+    para(
+        ui,
+        "A separately versioned route covers only exact P3 900 kg/m3 small dense spheres below \
+         the dry spherical table's 50 micrometre diameter floor. It anchors the same material, \
+         temperature, frequency and radar view at the first table diameter, then applies analytic \
+         sphere scaling: D^6 for backscatter/covariance and D^3 absorption plus D^6 scattering \
+         for extinction. Target-diameter terminal speed supplies the fall moments. Selection \
+         happens before lookup and is recorded in the audit. Nonspherical particles and every \
+         other diameter, density, aspect-ratio, temperature, frequency or view miss remain hard \
+         errors; this is not an arbitrary or silent fallback.",
     );
     para(
         ui,
@@ -1387,7 +1405,9 @@ fn wrf(ui: &mut egui::Ui) {
          0.95\u{00b0}-FWHM Gaussian beam sigma; a wider custom beam fails closed. Within the \
          declared axes, Waterman T-matrix nodes retain nonspherical, non-Rayleigh/resonant \
          behavior. Missing or mismatched tables, properties, frequency, orientation, shape or \
-         view coordinates are errors, never silent Rayleigh fallback. Both the scheme-native \
+         view coordinates are errors. The named exact-small-sphere sub-floor route above is \
+         selected before lookup and cannot accept those misses; there is never silent Rayleigh fallback. \
+         Both the scheme-native \
          ISHMAEL and P3 PSD branches are research-only, are not independently validated, and make \
          no operational claim; P3 shape/canting remains the named external assumption above.",
     );
@@ -1434,9 +1454,10 @@ fn wrf(ui: &mut egui::Ui) {
          inputs, or unsupported closures fall back explicitly to scalar REF/VEL with a note. \
          The opt-in T-matrix contract is table-bounded research: it can represent nonspherical \
          and non-Rayleigh/resonant scattering within its declared axes. ISHMAEL and P3 frozen \
-         categories use scheme-native PSD integration; P3's equivalent-oblate shape and \
-         Gaussian-20 canting remain external assumptions. Wet ISHMAEL PSD allocation and a \
-         complete prognostic melting-layer model remain unavailable.",
+         categories use scheme-native PSD integration; P3's area/mass spheroid mapping, 900 \
+         kg/m3 solid-ice constraint, Gaussian-20 canting, and exact-small-sphere sub-floor route \
+         remain explicit external assumptions rather than a general fallback. Wet ISHMAEL PSD \
+         allocation and a complete prognostic melting-layer model remain unavailable.",
     );
     para(
         ui,
