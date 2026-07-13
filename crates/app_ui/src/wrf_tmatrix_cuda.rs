@@ -1646,11 +1646,17 @@ mod tests {
         const POPULATIONS_PER_GATE: usize = 3;
         const NODES_PER_POPULATION: usize = 32;
         const CENTER_BEAM_SAMPLE_POINTS: usize = 1;
-        const GATES_PER_CHUNK: usize =
-            crate::wrf_radar::raw_tmatrix_pipeline_gate_chunk(CENTER_BEAM_SAMPLE_POINTS);
+        // Keep the benchmark's explicit Center-mode mirror guarded here;
+        // wrf_radar owns and unit-tests the production quadrature mapping.
+        const HOST_COLUMN_BUDGET: usize = 8 * 27;
+        const HOST_GATE_CAP: usize = 64;
+        const GATES_PER_CHUNK: usize = HOST_GATE_CAP;
         const HOST_CHUNKS: usize = (GATES + GATES_PER_CHUNK - 1) / GATES_PER_CHUNK;
         const POPULATIONS: usize = GATES * POPULATIONS_PER_GATE;
         const NODE_COUNT: usize = POPULATIONS * NODES_PER_POPULATION;
+
+        assert_eq!(GATES_PER_CHUNK, 64);
+        assert!(GATES_PER_CHUNK * CENTER_BEAM_SAMPLE_POINTS <= HOST_COLUMN_BUDGET);
 
         let availability = probe_cuda_cached();
         let Some(device) = availability.preferred_device() else {
