@@ -212,9 +212,10 @@ instead of displayed.
 ## Related WRF and simulated-satellite guides
 
 - [WRF simulated radar](wrf-simulated-radar.md) explains which WRF workflow to
-  choose, the five complete radar recipes, the **Refresh current frame(s)**
-  experimentation path, moment meanings, dual-pol/propagation science,
-  CfRadial provenance, and current limitations.
+  choose, the six complete radar recipes, the **Refresh current frame(s)**
+  experimentation path, native P3/ISHMAEL CPU and NVIDIA CUDA execution,
+  moment meanings, dual-pol/propagation science, CfRadial provenance, and
+  current limitations.
 - [SimSat in BowEcho](simsat-guide.md) explains local WRF and HRRR wrfnat
   inputs, all simulated-satellite products, view/resolution choices,
   atmosphere and cloud controls, durable CPU output versus GPU preview, cache

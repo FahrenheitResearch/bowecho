@@ -157,12 +157,66 @@ the recipe, subject to the exact table/time compatibility rules below.
 | Clean dual-pol | Microphysics comparison | Balanced (9) | Polarimetry/propagation without noise, folds, or blockage |
 | Real radar (balanced) | Practical virtual radar | Balanced (9) | Full S-band instrument path |
 | Maximum fidelity (slow) | One frame or short loop | Reference (27) | Full deterministic 3 x 3 x 3 integration |
-| P3/ISHMAEL T-matrix (research) | Supported P3/ISHMAEL experiments | Balanced (9) | Research-only non-Rayleigh dual-pol; no fallback |
+| P3/ISHMAEL T-matrix (research) | Supported P3/ISHMAEL experiments | Balanced (9) | Research-only non-Rayleigh dual-pol; CPU execution fallback, no science-kernel substitution |
 
 Recipes preserve antenna placement, maximum range, and gate geometry. They
 reset the interacting physics and calibration controls; this is why selecting
 a new recipe is safer than toggling one checkbox on top of an unrelated old
 configuration.
+
+## Native P3/ISHMAEL compute and NVIDIA CUDA
+
+The **Compute** selector applies only to the opt-in native P3/ISHMAEL
+property T-matrix operator. Bulk-Rayleigh recipes and operational HRRR/RRFS
+forecast radar remain on the CPU.
+
+| Choice | Behavior |
+|---|---|
+| **Auto** | Recommended. Use a qualified NVIDIA CUDA device for eligible work when one is ready; otherwise use the portable CPU reference path. |
+| **CPU** | Always use the CPU reference path. This is the reproducibility and non-NVIDIA option. |
+| **NVIDIA CUDA** | Prefer CUDA for eligible work, with automatic CPU replay if initialization or execution fails. It is not a require-GPU mode. |
+
+CUDA acceleration is available on Windows and Linux with a working NVIDIA
+driver and a GPU of compute capability **7.5 or newer**. macOS and older or
+unavailable NVIDIA devices use CPU. The status directly below the selector
+reports the cached hardware probe: the detected device and compute capability,
+or why no qualified CUDA device is available.
+
+The current CUDA backend is deliberately narrow. It accelerates admitted dry
+oblate/prolate particle-node interpolation for the shipped, authenticated
+legacy embedded **2.8 GHz S-band** tables. WRF reads, raw-state blending,
+microphysical closure, P3/ISHMAEL PSD construction, particle admission,
+population weights, and ordered category reductions remain on CPU. Rain,
+wet-frozen coexistence, propagation, instrument effects, geometry, and final
+volume construction also remain on CPU. Validated local S/C/X packs currently
+use CPU even when NVIDIA CUDA is selected.
+
+CUDA is an execution optimization, not a different science kernel. If a GPU
+batch or its preparation fails, BowEcho discards the incomplete GPU result,
+recomputes the whole affected hydrometeor category through the CPU reference
+path, and keeps later T-matrix work on CPU for that job. It never publishes a
+partly evaluated category. This fallback does **not** relax the research
+contract: an unsupported scheme, missing native field, out-of-table particle,
+or invalid table still stops the run instead of silently substituting bulk
+Rayleigh scattering.
+
+> **Heavy workload:** Native P3/ISHMAEL PSD integration can keep the CPU busy
+> even when CUDA is active. The displayed pulse-volume estimate multiplies
+> samples per gate, gates, rays, and tilts; start an unfamiliar case with one
+> file and a short scan before committing to a long loop.
+
+The worker streams its current stage and CUDA/fallback status while it runs.
+For an ordinary build, the first completed tilt of the first forecast frame is
+installed immediately as a clearly marked partial preview; the finished
+volume replaces it while the same worker continues. The preview is not a
+complete scan or export result. Exact observed-scan replay waits for its
+aligned comparison result instead of installing this preview. Simulated-radar
+builds do not currently expose a mid-build **Cancel** button.
+
+Completed-volume and CfRadial provenance records the requested compute choice,
+actual CPU/CUDA backend, CUDA device and kernel identity when used, submitted
+and completed batch/node counts, CPU-owned reduction, and any CPU replay
+reason. Choosing CUDA therefore does not hide how the result was executed.
 
 ## Build and refresh lifecycle
 
@@ -784,6 +838,9 @@ variables.
   source. No validated C- or X-band pack ships; selecting those exact bands
   requires a separately installed, evidence-backed `validated_research` pack
   and otherwise fails closed.
+- NVIDIA CUDA is an optional execution backend for admitted dry nodes in that
+  embedded 2.8 GHz bundle. It does not accelerate every simulated-radar stage,
+  expand table support, or change the fail-closed property-science contract.
 - Symmetric Bruggeman air/ice/water mixing represents a declared effective
   medium; it is not a complete prognostic melting-layer microphysics model.
 - Deterministic clutter and texture are optional synthetic instrument effects,
