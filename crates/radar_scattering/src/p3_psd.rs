@@ -711,6 +711,17 @@ pub struct P3MomentClosureAudit {
     pub table_axis_clamps: P3LookupAxisClamps,
 }
 
+/// Exact analytic moments of the reconstructed P3 population on one maximum-
+/// dimension interval. The mass-squared term is the scheme-consistent
+/// Rayleigh radar weight before the constant solid-ice-density factor.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct P3PopulationMoments {
+    pub number_density_m3: f64,
+    pub mass_concentration_kg_m3: f64,
+    pub mass_squared_radar_weight_kg2_m3: f64,
+    pub sixth_moment_m3: f64,
+}
+
 /// Reconstructed gamma number distribution `N0 D^mu exp(-lambda D)`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct P3Psd {
@@ -946,11 +957,99 @@ impl P3Psd {
         config: P3QuadratureConfig,
         additional_breakpoints_m: &[f64],
     ) -> Result<P3Quadrature, P3PsdError> {
+        let upper_m = self.tail_cutoff(config.maximum_tail_fraction, config.maximum_scaled_d)?;
+        self.quadrature_bounded_internal(config, upper_m, upper_m, additional_breakpoints_m)
+    }
+
+    /// Build P3 quadrature strictly inside `[0, maximum_dimension_m]`.
+    ///
+    /// The analytic interval totals, including the exact piecewise `N*m^2`
+    /// moment, remain the closure denominators. Original node weights are not
+    /// renormalized to the bounded population.
+    pub fn quadrature_bounded_with_dimension_breakpoints(
+        &self,
+        config: P3QuadratureConfig,
+        maximum_dimension_m: f64,
+        additional_breakpoints_m: &[f64],
+    ) -> Result<P3Quadrature, P3PsdError> {
+        positive("P3 quadrature maximum dimension", maximum_dimension_m)?;
+        let natural_upper = self
+            .tail_cutoff(config.maximum_tail_fraction, config.maximum_scaled_d)?
+            .min(maximum_dimension_m);
+        self.quadrature_bounded_internal(
+            config,
+            maximum_dimension_m,
+            natural_upper,
+            additional_breakpoints_m,
+        )
+    }
+
+    /// Exact reconstructed-population moments over `[lower_m, upper_m]`.
+    /// `upper_m` may be positive infinity.
+    pub fn analytic_population_moments(
+        &self,
+        lower_m: f64,
+        upper_m: f64,
+    ) -> Result<P3PopulationMoments, P3PsdError> {
+        if !lower_m.is_finite() || lower_m < 0.0 {
+            return Err(P3PsdError::InvalidComputation {
+                field: "P3 analytic interval lower dimension",
+                value: lower_m,
+            });
+        }
+        if upper_m.is_nan() || upper_m <= lower_m {
+            return Err(P3PsdError::InvalidComputation {
+                field: "P3 analytic interval upper dimension",
+                value: upper_m,
+            });
+        }
+        Ok(P3PopulationMoments {
+            number_density_m3: gamma_raw_moment_interval(
+                self.n0_intercept_si,
+                self.lambda_m_inv,
+                self.mu,
+                0.0,
+                lower_m,
+                upper_m,
+            )?,
+            mass_concentration_kg_m3: integrate_piecewise_mass(
+                self.n0_intercept_si,
+                self.lambda_m_inv,
+                self.mu,
+                self.law,
+                lower_m,
+                upper_m,
+            )?,
+            mass_squared_radar_weight_kg2_m3: integrate_piecewise_mass_squared(
+                self.n0_intercept_si,
+                self.lambda_m_inv,
+                self.mu,
+                self.law,
+                lower_m,
+                upper_m,
+            )?,
+            sixth_moment_m3: gamma_raw_moment_interval(
+                self.n0_intercept_si,
+                self.lambda_m_inv,
+                self.mu,
+                6.0,
+                lower_m,
+                upper_m,
+            )?,
+        })
+    }
+
+    fn quadrature_bounded_internal(
+        &self,
+        config: P3QuadratureConfig,
+        upper_m: f64,
+        panel_upper_m: f64,
+        additional_breakpoints_m: &[f64],
+    ) -> Result<P3Quadrature, P3PsdError> {
         config.validate()?;
         for &breakpoint in additional_breakpoints_m {
             positive("P3 additional quadrature breakpoint", breakpoint)?;
         }
-        let upper_m = self.tail_cutoff(config.maximum_tail_fraction, config.maximum_scaled_d)?;
         let required_base_nodes = usize::from(config.panels)
             .checked_mul(GL8_POINTS)
             .ok_or(P3PsdError::NodeBudgetOverflow)?;
@@ -962,8 +1061,14 @@ impl P3Psd {
         }
 
         let mut breakpoints = (0..=usize::from(config.panels))
-            .map(|index| upper_m * index as f64 / f64::from(config.panels))
+            .map(|index| panel_upper_m * index as f64 / f64::from(config.panels))
             .collect::<Vec<_>>();
+        if panel_upper_m < upper_m {
+            // The natural tail cutoff keeps the resolved panels concentrated
+            // where the PSD lives; this final source-domain segment preserves
+            // the hard upper edge without generating any out-of-domain node.
+            breakpoints.push(upper_m);
+        }
         for threshold in [
             self.law.small_sphere_limit_m,
             self.law.dense_unrimed_to_graupel_m,
@@ -997,6 +1102,7 @@ impl P3Psd {
         let mut nodes = Vec::with_capacity(required_nodes);
         let mut integrated_number = 0.0;
         let mut integrated_mass = 0.0;
+        let mut integrated_mass_squared = 0.0;
         let mut integrated_m6 = 0.0;
         for segment in breakpoints.windows(2) {
             let half_width = 0.5 * (segment[1] - segment[0]);
@@ -1008,6 +1114,7 @@ impl P3Psd {
                 let particle = self.law.particle(diameter)?;
                 integrated_number += number_weight;
                 integrated_mass += number_weight * particle.mass_kg;
+                integrated_mass_squared += number_weight * particle.mass_kg.powi(2);
                 integrated_m6 += number_weight * diameter.powi(6);
                 nodes.push(P3QuadratureNode {
                     maximum_dimension_m: diameter,
@@ -1017,39 +1124,20 @@ impl P3Psd {
             }
         }
 
-        let total_number = self.closure.reconstructed_number_density_m3;
-        let total_mass = self.closure.reconstructed_mass_concentration_kg_m3;
-        let total_m6 = self.closure.reconstructed_sixth_moment_m3;
-        let tail_number = gamma_raw_moment_interval(
-            self.n0_intercept_si,
-            self.lambda_m_inv,
-            self.mu,
-            0.0,
-            upper_m,
-            f64::INFINITY,
-        )?;
-        let tail_mass = integrate_piecewise_mass(
-            self.n0_intercept_si,
-            self.lambda_m_inv,
-            self.mu,
-            self.law,
-            upper_m,
-            f64::INFINITY,
-        )?;
-        let tail_m6 = gamma_raw_moment_interval(
-            self.n0_intercept_si,
-            self.lambda_m_inv,
-            self.mu,
-            6.0,
-            upper_m,
-            f64::INFINITY,
-        )?;
-        let number_error = relative_error(integrated_number, total_number - tail_number);
-        let mass_error = relative_error(integrated_mass, total_mass - tail_mass);
-        let m6_error = relative_error(integrated_m6, total_m6 - tail_m6);
+        let analytic_domain = self.analytic_population_moments(0.0, upper_m)?;
+        let analytic_tail = self.analytic_population_moments(upper_m, f64::INFINITY)?;
+        let analytic_full = self.analytic_population_moments(0.0, f64::INFINITY)?;
+        let number_error = relative_error(integrated_number, analytic_domain.number_density_m3);
+        let mass_error = relative_error(integrated_mass, analytic_domain.mass_concentration_kg_m3);
+        let mass_squared_error = relative_error(
+            integrated_mass_squared,
+            analytic_domain.mass_squared_radar_weight_kg2_m3,
+        );
+        let m6_error = relative_error(integrated_m6, analytic_domain.sixth_moment_m3);
         for (moment, error) in [
             ("number", number_error),
             ("mass", mass_error),
+            ("mass-squared radar weight", mass_squared_error),
             ("sixth", m6_error),
         ] {
             if error > config.maximum_quadrature_relative_error {
@@ -1069,16 +1157,30 @@ impl P3Psd {
                 omission: P3OmissionTailAudit {
                     lower_domain_omitted_number_fraction: 0.0,
                     lower_domain_omitted_mass_fraction: 0.0,
+                    lower_domain_omitted_mass_squared_radar_weight_fraction: 0.0,
                     lower_domain_omitted_sixth_moment_fraction: 0.0,
-                    upper_tail_number_fraction: tail_number / total_number,
-                    upper_tail_mass_fraction: tail_mass / total_mass,
-                    upper_tail_sixth_moment_fraction: tail_m6 / total_m6,
+                    upper_tail_number_fraction: analytic_tail.number_density_m3
+                        / analytic_full.number_density_m3,
+                    upper_tail_mass_fraction: analytic_tail.mass_concentration_kg_m3
+                        / analytic_full.mass_concentration_kg_m3,
+                    upper_tail_mass_squared_radar_weight_fraction: analytic_tail
+                        .mass_squared_radar_weight_kg2_m3
+                        / analytic_full.mass_squared_radar_weight_kg2_m3,
+                    upper_tail_sixth_moment_fraction: analytic_tail.sixth_moment_m3
+                        / analytic_full.sixth_moment_m3,
                 },
+                analytic_domain_number_density_m3: analytic_domain.number_density_m3,
+                analytic_domain_mass_concentration_kg_m3: analytic_domain.mass_concentration_kg_m3,
+                analytic_domain_mass_squared_radar_weight_kg2_m3: analytic_domain
+                    .mass_squared_radar_weight_kg2_m3,
+                analytic_domain_sixth_moment_m3: analytic_domain.sixth_moment_m3,
                 represented_number_density_m3: integrated_number,
                 represented_mass_concentration_kg_m3: integrated_mass,
+                represented_mass_squared_radar_weight_kg2_m3: integrated_mass_squared,
                 represented_sixth_moment_m3: integrated_m6,
                 number_quadrature_relative_error: number_error,
                 mass_quadrature_relative_error: mass_error,
+                mass_squared_radar_weight_quadrature_relative_error: mass_squared_error,
                 sixth_moment_quadrature_relative_error: m6_error,
             },
         })
@@ -1207,9 +1309,11 @@ pub struct P3QuadratureNode {
 pub struct P3OmissionTailAudit {
     pub lower_domain_omitted_number_fraction: f64,
     pub lower_domain_omitted_mass_fraction: f64,
+    pub lower_domain_omitted_mass_squared_radar_weight_fraction: f64,
     pub lower_domain_omitted_sixth_moment_fraction: f64,
     pub upper_tail_number_fraction: f64,
     pub upper_tail_mass_fraction: f64,
+    pub upper_tail_mass_squared_radar_weight_fraction: f64,
     pub upper_tail_sixth_moment_fraction: f64,
 }
 
@@ -1219,11 +1323,17 @@ pub struct P3QuadratureAudit {
     pub upper_dimension_m: f64,
     pub nodes_evaluated: usize,
     pub omission: P3OmissionTailAudit,
+    pub analytic_domain_number_density_m3: f64,
+    pub analytic_domain_mass_concentration_kg_m3: f64,
+    pub analytic_domain_mass_squared_radar_weight_kg2_m3: f64,
+    pub analytic_domain_sixth_moment_m3: f64,
     pub represented_number_density_m3: f64,
     pub represented_mass_concentration_kg_m3: f64,
+    pub represented_mass_squared_radar_weight_kg2_m3: f64,
     pub represented_sixth_moment_m3: f64,
     pub number_quadrature_relative_error: f64,
     pub mass_quadrature_relative_error: f64,
+    pub mass_squared_radar_weight_quadrature_relative_error: f64,
     pub sixth_moment_quadrature_relative_error: f64,
 }
 
@@ -1417,6 +1527,59 @@ fn integrate_piecewise_mass(
     } else {
         Err(P3PsdError::InvalidComputation {
             field: "P3 piecewise mass integral",
+            value: total,
+        })
+    }
+}
+
+fn integrate_piecewise_mass_squared(
+    n0: f64,
+    lambda: f64,
+    mu: f64,
+    law: P3PiecewiseParticleLaw,
+    lower: f64,
+    upper: f64,
+) -> Result<f64, P3PsdError> {
+    let regions = [
+        (
+            0.0,
+            law.small_sphere_limit_m,
+            PI / 6.0 * SOLID_ICE_DENSITY_KG_M3,
+            3.0,
+        ),
+        (
+            law.small_sphere_limit_m,
+            law.dense_unrimed_to_graupel_m,
+            UNRIMED_MASS_COEFFICIENT,
+            UNRIMED_MASS_EXPONENT,
+        ),
+        (
+            law.dense_unrimed_to_graupel_m,
+            law.graupel_to_partially_rimed_m,
+            law.graupel_mass_coefficient,
+            3.0,
+        ),
+        (
+            law.graupel_to_partially_rimed_m,
+            f64::INFINITY,
+            law.partially_rimed_mass_coefficient,
+            law.partially_rimed_mass_exponent,
+        ),
+    ];
+    let mut total = 0.0;
+    for (region_lower, region_upper, coefficient, exponent) in regions {
+        let start = lower.max(region_lower);
+        let end = upper.min(region_upper);
+        if end > start {
+            total += coefficient.powi(2)
+                * gamma_raw_moment_interval(n0, lambda, mu, 2.0 * exponent, start, end)?;
+        }
+    }
+    if total.is_finite() && total >= 0.0 {
+        Ok(total)
+    } else {
+        Err(P3PsdError::InvalidComputation {
+            field: "P3 piecewise mass-squared integral",
             value: total,
         })
     }
@@ -2088,9 +2251,95 @@ mod tests {
         assert!(!quadrature.nodes.is_empty());
         assert!(quadrature.audit.omission.upper_tail_number_fraction <= 1.01e-10);
         assert!(quadrature.audit.omission.upper_tail_mass_fraction <= 1.01e-10);
+        assert!(
+            quadrature
+                .audit
+                .omission
+                .upper_tail_mass_squared_radar_weight_fraction
+                <= 1.01e-10
+        );
         assert!(quadrature.audit.omission.upper_tail_sixth_moment_fraction <= 1.01e-10);
         assert!(quadrature.audit.number_quadrature_relative_error <= 2.0e-7);
         assert!(quadrature.audit.mass_quadrature_relative_error <= 2.0e-7);
+        assert!(
+            quadrature
+                .audit
+                .mass_squared_radar_weight_quadrature_relative_error
+                <= 2.0e-7
+        );
         assert!(quadrature.audit.sixth_moment_quadrature_relative_error <= 2.0e-7);
+    }
+
+    #[test]
+    fn bounded_quadrature_preserves_source_edge_without_renormalizing_tail() {
+        let scheme = P3WrfScheme::Mp50OneIceFixedCloudNumber;
+        let lambda = 100.0;
+        let mu = 3.0;
+        let input = state_from_exact_distribution(scheme, lambda, mu, 1.0e-4, 1.0);
+        let psd = P3Psd::reconstruct(
+            input,
+            &fixture_table(scheme, lambda, mu),
+            P3ReconstructionConfig {
+                maximum_moment_relative_error: 1.0e-10,
+            },
+        )
+        .unwrap();
+        let source_edge = 0.080;
+        let full = psd.analytic_population_moments(0.0, f64::INFINITY).unwrap();
+        let represented = psd.analytic_population_moments(0.0, source_edge).unwrap();
+        let excluded = psd
+            .analytic_population_moments(source_edge, f64::INFINITY)
+            .unwrap();
+        let quadrature = psd
+            .quadrature_bounded_with_dimension_breakpoints(
+                P3QuadratureConfig::default(),
+                source_edge,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(
+            quadrature.audit.upper_dimension_m.to_bits(),
+            source_edge.to_bits()
+        );
+        assert!(
+            quadrature
+                .nodes
+                .iter()
+                .all(|node| node.maximum_dimension_m < source_edge)
+        );
+        assert!(excluded.mass_squared_radar_weight_kg2_m3 > 0.0);
+        assert!(
+            represented.mass_squared_radar_weight_kg2_m3 < full.mass_squared_radar_weight_kg2_m3
+        );
+        for (whole, partitioned) in [
+            (
+                full.number_density_m3,
+                represented.number_density_m3 + excluded.number_density_m3,
+            ),
+            (
+                full.mass_concentration_kg_m3,
+                represented.mass_concentration_kg_m3 + excluded.mass_concentration_kg_m3,
+            ),
+            (
+                full.mass_squared_radar_weight_kg2_m3,
+                represented.mass_squared_radar_weight_kg2_m3
+                    + excluded.mass_squared_radar_weight_kg2_m3,
+            ),
+            (
+                full.sixth_moment_m3,
+                represented.sixth_moment_m3 + excluded.sixth_moment_m3,
+            ),
+        ] {
+            assert!(relative_error(partitioned, whole) <= 1.0e-12);
+        }
+        assert!(
+            relative_error(
+                quadrature
+                    .audit
+                    .represented_mass_squared_radar_weight_kg2_m3,
+                represented.mass_squared_radar_weight_kg2_m3,
+            ) <= P3QuadratureConfig::default().maximum_quadrature_relative_error
+        );
     }
 }

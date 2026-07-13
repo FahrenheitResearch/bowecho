@@ -617,6 +617,88 @@ mod tests {
         assert!(!TMATRIX_PACK_CACHE_FAMILY.contains("simsat-cache"));
     }
 
+    /// Exact regression for a real P3 cell that previously reached the same
+    /// embedded raw evaluator used by synthetic-radar gate sampling and failed
+    /// inside the scheme-native PSD/T-matrix seam. The real fixture remains
+    /// opt-in because it is too large for the repository and normal CI.
+    #[test]
+    fn real_p3_production_cell_evaluates_embedded_raw_path() {
+        let (Some(wrf_path), Some(table_path)) = (
+            std::env::var_os("BOWECHO_WRF_PROPERTY_FIXTURE"),
+            std::env::var_os("BOWECHO_P3_TABLE_FIXTURE"),
+        ) else {
+            return;
+        };
+        let cell_index = std::env::var("BOWECHO_P3_PRODUCTION_CELL")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("BOWECHO_P3_PRODUCTION_CELL is an integer")
+            })
+            .unwrap_or(5_799_102);
+
+        let file = wrf_core::WrfFile::open(&wrf_path)
+            .expect("open BOWECHO_WRF_PROPERTY_FIXTURE for exact production cell");
+        let scheme_id = file
+            .global_attr_i32("MP_PHYSICS")
+            .expect("fixture has MP_PHYSICS");
+        let table_kind = match scheme_id {
+            50..=52 => P3OfficialTableKind::TwoMoment,
+            53 => P3OfficialTableKind::ThreeMoment,
+            other => panic!("production-cell fixture must use P3 mp_physics 50-53, got {other}"),
+        };
+        let scene = crate::wrf_property_reader::read_wrf_property_scene(
+            &file,
+            crate::wrf_scene_inventory::WrfSourceIdentity(
+                "fixture:p3-exact-production-evaluator".to_owned(),
+            ),
+            0,
+        )
+        .expect("read normalized P3 property scene for exact production cell");
+        assert!(
+            cell_index < scene.cell_count(),
+            "BOWECHO_P3_PRODUCTION_CELL {cell_index} is outside fixture cell count {}",
+            scene.cell_count()
+        );
+        let raw = scene
+            .raw_cell(cell_index)
+            .unwrap_or_else(|error| panic!("read exact production cell {cell_index}: {error}"));
+        assert!(
+            raw.categories()
+                .iter()
+                .any(|category| category.mixing_ratio_kgkg() > 0.0),
+            "exact production cell {cell_index} must retain an active P3 population"
+        );
+
+        let official_table =
+            radar_scattering::P3OfficialTableV54::load_path(table_kind, table_path)
+                .expect("load exact official BOWECHO_P3_TABLE_FIXTURE");
+        let table_spec = table_kind.asset_spec();
+        let p3 = WrfTMatrixP3Resources::projected_area_equivalent_oblate_research(Arc::new(
+            official_table,
+        ))
+        .expect("configure production P3 integration for exact cell");
+        eprintln!(
+            "P3 exact production cell: cell={cell_index}, mp_physics={scheme_id}, table_version={}, table_sha256={}, integration={:?}",
+            table_spec.table_version, table_spec.expected_sha256, p3.integration
+        );
+        let evaluator = WrfTMatrixRawEvaluator::new_with_p3(
+            embedded_luts()
+                .expect("load embedded production T-matrix tables")
+                .bundle(),
+            p3,
+        )
+        .expect("construct embedded P3 raw production evaluator");
+        let polar = evaluator.evaluate(&raw, 0.5).unwrap_or_else(|error| {
+            panic!("evaluate exact embedded raw production cell {cell_index}: {error}")
+        });
+        assert!(
+            polar.is_some(),
+            "active exact production cell {cell_index} evaluated as clear"
+        );
+    }
+
     #[test]
     fn real_p3_fixture_closes_and_evaluates_embedded_rain() {
         let (Some(wrf_path), Some(table_path)) = (

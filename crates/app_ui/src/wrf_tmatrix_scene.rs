@@ -1126,10 +1126,10 @@ impl WrfTMatrixScene {
                         shape_authority: P3ShapeAuthority::MaximumDimensionAndProjectedAreaOnly,
                         limitation: match p3.integration.shape_policy() {
                             P3TMatrixShapePolicy::StrictShapeAuthoritativeSpheres => {
-                                "only P3 regions explicitly defined as spheres are evaluated; nonspherical mass/area-only nodes are omitted under strict budgets"
+                                "analytic P3 closure is retained; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately; only regions explicitly defined as spheres are evaluated and in-source nonspherical nodes are omitted under strict budgets"
                             }
                             P3TMatrixShapePolicy::ProjectedAreaEquivalentOblateGaussian20ResearchV1 => {
-                                "lambda/mu and PSD weights are exact P3; oblate shape is projected-area-equivalent and Gaussian-20 canting is an external research assumption, not P3-predicted habit or orientation"
+                                "lambda/mu and analytic closure are exact P3; radar moments use the pinned v5.4 lookup integration domain through 80 mm with its excluded tail audited separately and without renormalization; oblate shape is projected-area-equivalent and Gaussian-20 canting is an external research assumption, not P3-predicted habit or orientation"
                             }
                         },
                     }

@@ -14,14 +14,70 @@ use std::f64::consts::PI;
 use thiserror::Error;
 
 use crate::{
-    AdditiveScattering, OutputError, P3Psd, P3PsdError, P3QuadratureAudit, P3QuadratureConfig,
-    P3QuadratureNode, PsdParticleDomain, PsdSpheroidHabit,
+    AdditiveScattering, OutputError, P3PopulationMoments, P3Psd, P3PsdError, P3QuadratureAudit,
+    P3QuadratureConfig, P3QuadratureNode, PsdParticleDomain, PsdSpheroidHabit,
 };
 
 pub const P3_SPHERICAL_INTEGRATION_REVISION: &str =
-    "wrf-p3-v5.4-shape-authoritative-spherical-integration-v3";
+    "wrf-p3-v5.4-shape-authoritative-spherical-integration-v4";
 pub const P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION: &str =
-    "wrf-p3-v5.4-projected-area-equivalent-oblate-gaussian20-research-v3";
+    "wrf-p3-v5.4-projected-area-equivalent-oblate-gaussian20-research-v4";
+
+/// Native diameter grid used by the pinned WRF source's P3-module-v4.5.2,
+/// lookup-generator-v5.4 fall-speed and reflectivity moment integrations.
+///
+/// The source evaluates 40,000 bin centres at `j * 2 um - 1 um`. The inferred
+/// bin-edge support is therefore `[0, 80 mm]`. This is source-derived
+/// provenance, not a claim encoded in (or authenticated by) a runtime table
+/// hash.
+pub const P3_WRF_LOOKUP_INTEGRATION_BIN_COUNT: u32 = 40_000;
+pub const P3_WRF_LOOKUP_INTEGRATION_BIN_WIDTH_UM: u32 = 2;
+pub const P3_WRF_LOOKUP_INTEGRATION_FIRST_CENTER_UM: u32 = 1;
+pub const P3_WRF_LOOKUP_INTEGRATION_LAST_CENTER_UM: u32 = 79_999;
+pub const P3_WRF_LOOKUP_INTEGRATION_UPPER_EDGE_UM: u32 = 80_000;
+pub const P3_WRF_LOOKUP_INTEGRATION_BIN_WIDTH_M: f64 =
+    P3_WRF_LOOKUP_INTEGRATION_BIN_WIDTH_UM as f64 * 1.0e-6;
+pub const P3_WRF_LOOKUP_INTEGRATION_FIRST_CENTER_M: f64 =
+    P3_WRF_LOOKUP_INTEGRATION_FIRST_CENTER_UM as f64 * 1.0e-6;
+pub const P3_WRF_LOOKUP_INTEGRATION_LAST_CENTER_M: f64 =
+    P3_WRF_LOOKUP_INTEGRATION_LAST_CENTER_UM as f64 * 1.0e-6;
+pub const P3_WRF_LOOKUP_INTEGRATION_MAXIMUM_DIMENSION_M: f64 =
+    P3_WRF_LOOKUP_INTEGRATION_UPPER_EDGE_UM as f64 * 1.0e-6;
+pub const P3_WRF_LOOKUP_INTEGRATION_SOURCE_PATH: &str = "run/create_p3_lookupTable_1.f90-v5.4";
+pub const P3_WRF_LOOKUP_INTEGRATION_DOMAIN_REVISION: &str =
+    "wrf-p3-v5.4-lookup-integration-grid-inferred-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum P3TMatrixSourceDomainAuthority {
+    /// Inferred from the pinned generator's 40,000-bin, 2 um numerical grid.
+    InferredPinnedWrfLookupIntegrationGridV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct P3TMatrixSourceDomainProvenance {
+    pub authority: P3TMatrixSourceDomainAuthority,
+    pub revision: &'static str,
+    pub wrf_source_commit: &'static str,
+    pub source_path: &'static str,
+    pub bin_count: u32,
+    pub bin_width_m: f64,
+    pub first_bin_center_m: f64,
+    pub last_bin_center_m: f64,
+    pub maximum_dimension_edge_m: f64,
+}
+
+pub const P3_TMATRIX_SOURCE_DOMAIN_PROVENANCE: P3TMatrixSourceDomainProvenance =
+    P3TMatrixSourceDomainProvenance {
+        authority: P3TMatrixSourceDomainAuthority::InferredPinnedWrfLookupIntegrationGridV1,
+        revision: P3_WRF_LOOKUP_INTEGRATION_DOMAIN_REVISION,
+        wrf_source_commit: crate::P3_WRF_SOURCE_COMMIT,
+        source_path: P3_WRF_LOOKUP_INTEGRATION_SOURCE_PATH,
+        bin_count: P3_WRF_LOOKUP_INTEGRATION_BIN_COUNT,
+        bin_width_m: P3_WRF_LOOKUP_INTEGRATION_BIN_WIDTH_M,
+        first_bin_center_m: P3_WRF_LOOKUP_INTEGRATION_FIRST_CENTER_M,
+        last_bin_center_m: P3_WRF_LOOKUP_INTEGRATION_LAST_CENTER_M,
+        maximum_dimension_edge_m: P3_WRF_LOOKUP_INTEGRATION_MAXIMUM_DIMENSION_M,
+    };
 
 /// Shape contract applied after exact native P3 lambda/mu reconstruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,7 +183,33 @@ pub enum P3TMatrixIntegrationConfigError {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct P3TMatrixOmissionAudit {
+pub struct P3TMatrixWeightFractions {
+    pub number: f64,
+    pub mass: f64,
+    pub mass_squared_radar_weight: f64,
+    pub sixth_moment: f64,
+}
+
+/// Analytic population excluded before any spheroid mapping because it lies
+/// beyond the pinned WRF lookup generator's inferred moment-integration
+/// domain. These values are informational source-contract audit data, not part
+/// of the in-source shape/table omission gate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct P3TMatrixSourceDomainAudit {
+    pub provenance: P3TMatrixSourceDomainProvenance,
+    pub in_source_nodes: usize,
+    pub analytic_total: P3PopulationMoments,
+    pub source_represented: P3PopulationMoments,
+    pub source_excluded: P3PopulationMoments,
+    pub source_excluded_fraction_of_analytic_psd: P3TMatrixWeightFractions,
+    pub source_quadrature_relative_error: P3TMatrixWeightFractions,
+}
+
+/// Shape/table omissions inside the inferred WRF source integration domain.
+/// Every fraction uses the corresponding in-source population as its
+/// denominator; source-excluded nodes never consume this gate's budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct P3TMatrixInSourceOmissionAudit {
     pub non_spherical_number_fraction: f64,
     pub non_spherical_mass_fraction: f64,
     pub non_spherical_radar_weight_fraction: f64,
@@ -148,7 +230,8 @@ pub struct P3TMatrixIntegrationAudit {
     pub non_spherical_nodes: usize,
     pub outside_table_nodes: usize,
     pub projected_area_equivalent_nodes: usize,
-    pub omission: P3TMatrixOmissionAudit,
+    pub source_domain: P3TMatrixSourceDomainAudit,
+    pub in_source_shape_table_omission: P3TMatrixInSourceOmissionAudit,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,7 +257,7 @@ pub enum P3TMatrixIntegrationError<E: Error + 'static> {
     #[error("construct exact P3 quadrature: {0}")]
     Psd(#[source] P3PsdError),
     #[error(
-        "P3 cannot be represented by the existing spheroidal tables without an invented shape: omitted number={number_fraction}, mass={mass_fraction}, equivalent-ice-volume-squared radar weight={radar_weight_fraction}; limits are {maximum_number}, {maximum_mass}, {maximum_radar_weight}"
+        "P3 cannot be represented inside the inferred WRF source integration domain by the existing spheroidal tables without an invented shape: in-source omitted number={number_fraction}, mass={mass_fraction}, equivalent-ice-volume-squared radar weight={radar_weight_fraction}; in-source limits are {maximum_number}, {maximum_mass}, {maximum_radar_weight}"
     )]
     ShapeOrTableOmission {
         number_fraction: f64,
@@ -294,8 +377,22 @@ where
     {
         diameter_breakpoints.extend(domain.equivolume_diameter_range_m());
     }
+    let source_upper_m = P3_WRF_LOOKUP_INTEGRATION_MAXIMUM_DIMENSION_M;
+    let analytic_total = distribution
+        .analytic_population_moments(0.0, f64::INFINITY)
+        .map_err(P3TMatrixIntegrationError::Psd)?;
+    let source_represented = distribution
+        .analytic_population_moments(0.0, source_upper_m)
+        .map_err(P3TMatrixIntegrationError::Psd)?;
+    let source_excluded = distribution
+        .analytic_population_moments(source_upper_m, f64::INFINITY)
+        .map_err(P3TMatrixIntegrationError::Psd)?;
     let quadrature = distribution
-        .quadrature_with_dimension_breakpoints(config.quadrature, &diameter_breakpoints)
+        .quadrature_bounded_with_dimension_breakpoints(
+            config.quadrature,
+            source_upper_m,
+            &diameter_breakpoints,
+        )
         .map_err(P3TMatrixIntegrationError::Psd)?;
 
     let mut non_spherical = OmittedWeights::default();
@@ -333,19 +430,21 @@ where
         }
     }
 
-    let closure = distribution.closure_audit();
-    let total_number = closure.reconstructed_number_density_m3;
-    let total_mass = closure.reconstructed_mass_concentration_kg_m3;
-    // P3's native M6 remains the quadrature/tail-closure authority. Table
-    // support, however, needs a radar omission weight that remains meaningful
-    // for variable-density particles. Sum the same scheme-native mass-squared
-    // weight over every represented node; the quadrature's independently
-    // audited number/mass/M6 tail is at most 1e-10 by production policy.
-    let total_radar_weight: f64 = quadrature.nodes.iter().map(p3_radar_weight).sum();
-    let non_spherical_fractions =
-        fractions(non_spherical, total_number, total_mass, total_radar_weight);
-    let outside_table_fractions =
-        fractions(outside_table, total_number, total_mass, total_radar_weight);
+    // Shape/table adequacy is judged only against the population represented
+    // by the pinned source moment grid. The full analytic PSD remains intact
+    // and its >80 mm population is reported independently below.
+    let non_spherical_fractions = fractions(
+        non_spherical,
+        source_represented.number_density_m3,
+        source_represented.mass_concentration_kg_m3,
+        source_represented.mass_squared_radar_weight_kg2_m3,
+    );
+    let outside_table_fractions = fractions(
+        outside_table,
+        source_represented.number_density_m3,
+        source_represented.mass_concentration_kg_m3,
+        source_represented.mass_squared_radar_weight_kg2_m3,
+    );
     let total_fractions = [
         non_spherical_fractions[0] + outside_table_fractions[0],
         non_spherical_fractions[1] + outside_table_fractions[1],
@@ -394,7 +493,26 @@ where
             non_spherical_nodes: non_spherical.nodes,
             outside_table_nodes: outside_table.nodes,
             projected_area_equivalent_nodes,
-            omission: P3TMatrixOmissionAudit {
+            source_domain: P3TMatrixSourceDomainAudit {
+                provenance: P3_TMATRIX_SOURCE_DOMAIN_PROVENANCE,
+                in_source_nodes: quadrature.nodes.len(),
+                analytic_total,
+                source_represented,
+                source_excluded,
+                source_excluded_fraction_of_analytic_psd: moment_fractions(
+                    source_excluded,
+                    analytic_total,
+                ),
+                source_quadrature_relative_error: P3TMatrixWeightFractions {
+                    number: quadrature.audit.number_quadrature_relative_error,
+                    mass: quadrature.audit.mass_quadrature_relative_error,
+                    mass_squared_radar_weight: quadrature
+                        .audit
+                        .mass_squared_radar_weight_quadrature_relative_error,
+                    sixth_moment: quadrature.audit.sixth_moment_quadrature_relative_error,
+                },
+            },
+            in_source_shape_table_omission: P3TMatrixInSourceOmissionAudit {
                 non_spherical_number_fraction: non_spherical_fractions[0],
                 non_spherical_mass_fraction: non_spherical_fractions[1],
                 non_spherical_radar_weight_fraction: non_spherical_fractions[2],
@@ -477,6 +595,19 @@ fn fractions(
     ]
 }
 
+fn moment_fractions(
+    numerator: P3PopulationMoments,
+    denominator: P3PopulationMoments,
+) -> P3TMatrixWeightFractions {
+    P3TMatrixWeightFractions {
+        number: numerator.number_density_m3 / denominator.number_density_m3,
+        mass: numerator.mass_concentration_kg_m3 / denominator.mass_concentration_kg_m3,
+        mass_squared_radar_weight: numerator.mass_squared_radar_weight_kg2_m3
+            / denominator.mass_squared_radar_weight_kg2_m3,
+        sixth_moment: numerator.sixth_moment_m3 / denominator.sixth_moment_m3,
+    }
+}
+
 fn contains(range: [f64; 2], value: f64) -> bool {
     value >= range[0] && value <= range[1]
 }
@@ -516,5 +647,51 @@ mod tests {
         assert!(omitted_fraction < 1.0e-4);
         assert!(dmax_sixth_fraction > 0.999);
         assert_eq!(p3_radar_weight(&fluffy), 10.0 * 1.0e-9_f64.powi(2));
+    }
+
+    #[test]
+    fn pinned_lookup_integration_grid_has_exact_eighty_mm_upper_edge() {
+        assert_eq!(P3_WRF_LOOKUP_INTEGRATION_BIN_COUNT, 40_000);
+        assert_eq!(P3_WRF_LOOKUP_INTEGRATION_BIN_WIDTH_UM, 2);
+        assert_eq!(P3_WRF_LOOKUP_INTEGRATION_FIRST_CENTER_UM, 1);
+        assert_eq!(P3_WRF_LOOKUP_INTEGRATION_LAST_CENTER_UM, 79_999);
+        assert_eq!(P3_WRF_LOOKUP_INTEGRATION_UPPER_EDGE_UM, 80_000);
+        assert_eq!(
+            P3_WRF_LOOKUP_INTEGRATION_BIN_COUNT * P3_WRF_LOOKUP_INTEGRATION_BIN_WIDTH_UM,
+            P3_WRF_LOOKUP_INTEGRATION_UPPER_EDGE_UM
+        );
+        assert_eq!(
+            P3_WRF_LOOKUP_INTEGRATION_LAST_CENTER_UM,
+            P3_WRF_LOOKUP_INTEGRATION_UPPER_EDGE_UM - P3_WRF_LOOKUP_INTEGRATION_BIN_WIDTH_UM / 2
+        );
+        assert_eq!(
+            P3_WRF_LOOKUP_INTEGRATION_MAXIMUM_DIMENSION_M.to_bits(),
+            0.080_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn source_exclusion_fractions_use_full_analytic_denominators() {
+        let full = P3PopulationMoments {
+            number_density_m3: 100.0,
+            mass_concentration_kg_m3: 20.0,
+            mass_squared_radar_weight_kg2_m3: 10.0,
+            sixth_moment_m3: 5.0,
+        };
+        let excluded = P3PopulationMoments {
+            number_density_m3: 10.0,
+            mass_concentration_kg_m3: 4.0,
+            mass_squared_radar_weight_kg2_m3: 1.0,
+            sixth_moment_m3: 1.0,
+        };
+        assert_eq!(
+            moment_fractions(excluded, full),
+            P3TMatrixWeightFractions {
+                number: 0.1,
+                mass: 0.2,
+                mass_squared_radar_weight: 0.1,
+                sixth_moment: 0.2,
+            }
+        );
     }
 }
