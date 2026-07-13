@@ -31,6 +31,15 @@ normalized to NaN. The official cm1r19.10 archive is
 Generated fixture SHA-256:
 `B178AA3308BDB2B5B336CBF96CE1EFBEAEBE8CAC298FD3A5687760D8C21E3D31`.
 
+`cm1out_diag_000001.nc` and `cm1out_diag_000002.nc` reproduce the official
+one-time diagnostic-file topology defined by `domaindiag.F` and
+`writeout_nc.F::writediag_nc`. They provide exact `domainlocx/domainlocy`
+positions at 0 and 60 seconds, respectively, so tests prove that fixed-world
+placement attaches by exact elapsed time rather than integrating velocity.
+Their SHA-256 hashes are
+`D79C943039E03BE54B48404788315CC21851F2384AFAA81F40F118B65A06647B` and
+`8C7425AD74AF6198B70CA984F9D13293F6FE4E1AB5FC85B8B6892395DF90823F`.
+
 The fixture includes nonzero `umove`/`vmove` and deliberately omits
 `domainlocx`/`domainlocy`, matching standard `cm1out`: moving-frame velocity is
 available, but accumulated world displacement is not. This verifies BowEcho's

@@ -208,6 +208,12 @@ pub struct Cm1MotionMetadata {
     pub domain_motion: Cm1DomainMotion,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cm1DiagnosticMotionAttachment {
+    pub diagnostic_files_used: Vec<PathBuf>,
+    pub matched_times_seconds: Vec<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cm1FileLayout {
     CompleteDomain {
@@ -250,6 +256,19 @@ pub struct Cm1Placement {
     pub mode: Cm1PlacementMode,
     pub anchor_latitude_deg: f64,
     pub anchor_longitude_deg: f64,
+}
+
+/// Latitude/longitude grid created by an explicit BowEcho placement choice.
+/// It is not presented as native CM1 geolocation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cm1GeoreferencedGrid {
+    pub nx: usize,
+    pub ny: usize,
+    pub lat_deg: Vec<f32>,
+    pub lon_deg: Vec<f32>,
+    pub time_index: usize,
+    pub placement: Cm1Placement,
+    pub provenance: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -375,6 +394,12 @@ pub enum Cm1Error {
 
     #[error("fixed-world CM1 placement is unavailable: {0}")]
     PlacementUnavailable(String),
+
+    #[error("CM1 diagnostic motion metadata is unusable: {0}")]
+    DiagnosticMotion(String),
+
+    #[error("invalid CM1 geographic anchor: {0}")]
+    InvalidAnchor(String),
 }
 
 /// Inspect a file from disk and return its native CM1 inventory.
@@ -734,6 +759,301 @@ pub fn inspect_file(nc: &NcFile, source_path: &Path) -> Result<Cm1Inventory, Cm1
         missing_value,
         physical_height_variable,
     })
+}
+
+/// Discover official `cm1out_diag_XXXXXX.nc` files in one directory.
+pub fn diagnostic_files_in_folder(folder: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_cm1_diagnostic_filename)
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+/// Attach exact accumulated moving-domain positions from official CM1
+/// diagnostic files. Samples are matched by elapsed model time; this function
+/// never integrates velocities and never interpolates across diagnostic times.
+pub fn attach_motion_diagnostics(
+    inventory: &mut Cm1Inventory,
+    diagnostic_paths: &[PathBuf],
+) -> Result<Cm1DiagnosticMotionAttachment, Cm1Error> {
+    let output_times = inventory.time.offsets_seconds.available().ok_or_else(|| {
+        Cm1Error::DiagnosticMotion(
+            "the main output time axis cannot be converted to seconds".to_string(),
+        )
+    })?;
+    let mut samples = Vec::new();
+    for path in diagnostic_paths {
+        samples.push(read_diagnostic_motion_sample(path)?);
+    }
+    let mut east_m = Vec::with_capacity(output_times.len());
+    let mut north_m = Vec::with_capacity(output_times.len());
+    let mut east_velocity = Vec::with_capacity(output_times.len());
+    let mut north_velocity = Vec::with_capacity(output_times.len());
+    let mut used = Vec::with_capacity(output_times.len());
+    for &output_time in output_times {
+        let matching = samples
+            .iter()
+            .filter(|sample| elapsed_times_match(sample.time_seconds, output_time))
+            .collect::<Vec<_>>();
+        let sample = match matching.as_slice() {
+            [sample] => *sample,
+            [] => {
+                return Err(Cm1Error::DiagnosticMotion(format!(
+                    "no diagnostic file exactly matches main-output time {output_time} s"
+                )));
+            }
+            _ => {
+                return Err(Cm1Error::DiagnosticMotion(format!(
+                    "more than one diagnostic file matches main-output time {output_time} s"
+                )));
+            }
+        };
+        east_m.push(sample.east_m);
+        north_m.push(sample.north_m);
+        east_velocity.push(sample.east_velocity_mps);
+        north_velocity.push(sample.north_velocity_mps);
+        used.push(sample.path.clone());
+    }
+    let source_list = used
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    inventory.motion.east_velocity_mps = Cm1Availability::Available(east_velocity);
+    inventory.motion.north_velocity_mps = Cm1Availability::Available(north_velocity);
+    inventory.motion.domain_motion = Cm1DomainMotion::ExplicitDisplacement {
+        east_m,
+        north_m,
+        east_source: format!("domainlocx from {source_list}"),
+        north_source: format!("domainlocy from {source_list}"),
+    };
+    Ok(Cm1DiagnosticMotionAttachment {
+        diagnostic_files_used: used,
+        matched_times_seconds: output_times.clone(),
+    })
+}
+
+/// Place the scalar CM1 x/y grid on a spherical Earth using a user-supplied
+/// domain-center anchor. CM1 provides no source map projection; this explicit
+/// local-tangent placement is BowEcho metadata and retains that provenance.
+pub fn georeference_scalar_grid(
+    inventory: &Cm1Inventory,
+    placement: &Cm1Placement,
+    time_index: usize,
+) -> Result<Cm1GeoreferencedGrid, Cm1Error> {
+    validate_anchor(placement)?;
+    let x_m = required_axis_values(&inventory.axes.xh)?;
+    let y_m = required_axis_values(&inventory.axes.yh)?;
+    let xf_m = required_axis_values(&inventory.axes.xf)?;
+    let yf_m = required_axis_values(&inventory.axes.yf)?;
+    let x_center_m = axis_bounds_center(xf_m, "xf")?;
+    let y_center_m = axis_bounds_center(yf_m, "yf")?;
+    let (domain_east_m, domain_north_m) =
+        inventory.placement_offset_m(placement.mode, time_index)?;
+    let mut lat_deg = Vec::with_capacity(x_m.len() * y_m.len());
+    let mut lon_deg = Vec::with_capacity(x_m.len() * y_m.len());
+    for &y in y_m {
+        for &x in x_m {
+            let east_m = x - x_center_m + domain_east_m;
+            let north_m = y - y_center_m + domain_north_m;
+            let (lat, lon) = spherical_destination(
+                placement.anchor_latitude_deg,
+                placement.anchor_longitude_deg,
+                east_m,
+                north_m,
+            );
+            lat_deg.push(lat as f32);
+            lon_deg.push(lon as f32);
+        }
+    }
+    Ok(Cm1GeoreferencedGrid {
+        nx: x_m.len(),
+        ny: y_m.len(),
+        lat_deg,
+        lon_deg,
+        time_index,
+        placement: placement.clone(),
+        provenance: format!(
+            "BowEcho local-tangent spherical placement; user anchor is CM1 domain center; mode={:?}; source CM1 has no map projection",
+            placement.mode
+        ),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct DiagnosticMotionSample {
+    path: PathBuf,
+    time_seconds: f64,
+    east_m: f64,
+    north_m: f64,
+    east_velocity_mps: f64,
+    north_velocity_mps: f64,
+}
+
+fn is_cm1_diagnostic_filename(name: &str) -> bool {
+    let Some(index) = name
+        .strip_prefix("cm1out_diag_")
+        .and_then(|value| value.strip_suffix(".nc"))
+    else {
+        return false;
+    };
+    index.len() == 6 && index.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn read_diagnostic_motion_sample(path: &Path) -> Result<DiagnosticMotionSample, Cm1Error> {
+    let nc = netcrust::open(path)?;
+    if !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_cm1_diagnostic_filename)
+    {
+        return Err(Cm1Error::DiagnosticMotion(format!(
+            "{} does not use the official cm1out_diag_XXXXXX.nc name",
+            path.display()
+        )));
+    }
+    let time_variable = nc.variable("time").ok_or_else(|| {
+        Cm1Error::DiagnosticMotion(format!("{} has no time variable", path.display()))
+    })?;
+    let time_units = variable_attr_string_ci(&time_variable, "units").ok_or_else(|| {
+        Cm1Error::DiagnosticMotion(format!("{} time has no units", path.display()))
+    })?;
+    let time_scale = time_scale_to_seconds(time_units).ok_or_else(|| {
+        Cm1Error::DiagnosticMotion(format!(
+            "{} time uses unsupported units `{time_units}`",
+            path.display()
+        ))
+    })?;
+    let time_seconds = read_single_numeric_value(&time_variable, path)? * time_scale;
+    let east_m = read_diagnostic_scaled_value(&nc, path, "domainlocx", length_scale_to_metres)?;
+    let north_m = read_diagnostic_scaled_value(&nc, path, "domainlocy", length_scale_to_metres)?;
+    let east_velocity_mps =
+        read_diagnostic_scaled_value(&nc, path, "umove", velocity_scale_to_mps)?;
+    let north_velocity_mps =
+        read_diagnostic_scaled_value(&nc, path, "vmove", velocity_scale_to_mps)?;
+    Ok(DiagnosticMotionSample {
+        path: path.to_path_buf(),
+        time_seconds,
+        east_m,
+        north_m,
+        east_velocity_mps,
+        north_velocity_mps,
+    })
+}
+
+fn read_diagnostic_scaled_value(
+    nc: &NcFile,
+    path: &Path,
+    name: &str,
+    unit_scale: fn(&str) -> Option<f64>,
+) -> Result<f64, Cm1Error> {
+    let variable = nc.variable(name).ok_or_else(|| {
+        Cm1Error::DiagnosticMotion(format!("{} has no `{name}` variable", path.display()))
+    })?;
+    let units = variable_attr_string_ci(&variable, "units").ok_or_else(|| {
+        Cm1Error::DiagnosticMotion(format!("{} `{name}` has no units", path.display()))
+    })?;
+    let scale = unit_scale(units).ok_or_else(|| {
+        Cm1Error::DiagnosticMotion(format!(
+            "{} `{name}` uses unsupported units `{units}`",
+            path.display()
+        ))
+    })?;
+    Ok(read_single_numeric_value(&variable, path)? * scale)
+}
+
+fn read_single_numeric_value(variable: &NcVariable, path: &Path) -> Result<f64, Cm1Error> {
+    let array = variable.array_f64()?;
+    if array.len() != 1 {
+        return Err(Cm1Error::DiagnosticMotion(format!(
+            "{} `{}` has {} values; official diagnostic files contain exactly one output time",
+            path.display(),
+            variable.name(),
+            array.len()
+        )));
+    }
+    let value = array.values()[0];
+    if !value.is_finite() {
+        return Err(Cm1Error::DiagnosticMotion(format!(
+            "{} `{}` is not finite",
+            path.display(),
+            variable.name()
+        )));
+    }
+    Ok(value)
+}
+
+fn elapsed_times_match(left: f64, right: f64) -> bool {
+    let tolerance = 1.0e-3_f64.max(f64::EPSILON * 16.0 * left.abs().max(right.abs()));
+    (left - right).abs() <= tolerance
+}
+
+fn validate_anchor(placement: &Cm1Placement) -> Result<(), Cm1Error> {
+    if !placement.anchor_latitude_deg.is_finite()
+        || !(-90.0..=90.0).contains(&placement.anchor_latitude_deg)
+    {
+        return Err(Cm1Error::InvalidAnchor(format!(
+            "latitude {} is outside [-90, 90]",
+            placement.anchor_latitude_deg
+        )));
+    }
+    if !placement.anchor_longitude_deg.is_finite()
+        || !(-180.0..=180.0).contains(&placement.anchor_longitude_deg)
+    {
+        return Err(Cm1Error::InvalidAnchor(format!(
+            "longitude {} is outside [-180, 180]",
+            placement.anchor_longitude_deg
+        )));
+    }
+    Ok(())
+}
+
+fn axis_bounds_center(values: &[f64], name: &str) -> Result<f64, Cm1Error> {
+    let (Some(first), Some(last)) = (values.first(), values.last()) else {
+        return Err(Cm1Error::UnsupportedScalar {
+            name: name.to_string(),
+            reason: "coordinate axis is empty".to_string(),
+        });
+    };
+    Ok(0.5 * (first + last))
+}
+
+fn spherical_destination(
+    anchor_lat_deg: f64,
+    anchor_lon_deg: f64,
+    east_m: f64,
+    north_m: f64,
+) -> (f64, f64) {
+    const MEAN_EARTH_RADIUS_M: f64 = 6_371_008.8;
+    let distance_m = east_m.hypot(north_m);
+    if distance_m == 0.0 {
+        return (anchor_lat_deg, anchor_lon_deg);
+    }
+    let angular_distance = distance_m / MEAN_EARTH_RADIUS_M;
+    let bearing = east_m.atan2(north_m);
+    let lat1 = anchor_lat_deg.to_radians();
+    let lon1 = anchor_lon_deg.to_radians();
+    let lat2 = (lat1.sin() * angular_distance.cos()
+        + lat1.cos() * angular_distance.sin() * bearing.cos())
+    .clamp(-1.0, 1.0)
+    .asin();
+    let lon2 = lon1
+        + (bearing.sin() * angular_distance.sin() * lat1.cos())
+            .atan2(angular_distance.cos() - lat1.sin() * lat2.sin());
+    let lon_deg = (lon2.to_degrees() + 540.0).rem_euclid(360.0) - 180.0;
+    (lat2.to_degrees(), lon_deg)
 }
 
 /// Read any inventoried native scalar field at one time and, for 3-D fields,
@@ -1545,5 +1865,47 @@ mod tests {
         assert!(parsed.is_tile);
         assert_eq!(parsed.process_index, Some(17));
         assert_eq!(parsed.output_index, Some(42));
+    }
+
+    #[test]
+    fn official_diagnostics_supply_exact_fixed_world_offsets() {
+        let path = fixture_path();
+        let nc = netcrust::open(&path).expect("open fixture");
+        let mut inventory = inspect_file(&nc, &path).expect("inspect fixture");
+        let folder = path.parent().expect("fixture folder");
+        let diagnostics = diagnostic_files_in_folder(folder);
+        assert_eq!(diagnostics.len(), 2);
+        let attachment = attach_motion_diagnostics(&mut inventory, &diagnostics)
+            .expect("attach official diagnostics");
+        assert_eq!(attachment.matched_times_seconds, vec![0.0, 60.0]);
+        assert_eq!(
+            inventory
+                .placement_offset_m(Cm1PlacementMode::FixedWorld, 1)
+                .expect("fixed-world offset"),
+            (750.0, 180.0)
+        );
+        let follow = georeference_scalar_grid(
+            &inventory,
+            &Cm1Placement {
+                mode: Cm1PlacementMode::FollowDomain,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+            1,
+        )
+        .expect("follow-domain grid");
+        let fixed = georeference_scalar_grid(
+            &inventory,
+            &Cm1Placement {
+                mode: Cm1PlacementMode::FixedWorld,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+            1,
+        )
+        .expect("fixed-world grid");
+        assert_eq!((follow.nx, follow.ny), (3, 2));
+        assert_ne!(follow.lat_deg, fixed.lat_deg);
+        assert_ne!(follow.lon_deg, fixed.lon_deg);
     }
 }

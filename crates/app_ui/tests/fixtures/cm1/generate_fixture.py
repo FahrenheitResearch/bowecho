@@ -8,6 +8,10 @@ import numpy as np
 
 OUT = Path(__file__).with_name("cm1out_schema.nc")
 LEGACY_OUT = Path(__file__).with_name("cm1out_legacy_r19.nc")
+DIAGNOSTIC_OUTPUTS = (
+    (Path(__file__).with_name("cm1out_diag_000001.nc"), 0.0, 0.0, 0.0),
+    (Path(__file__).with_name("cm1out_diag_000002.nc"), 60.0, 750.0, 180.0),
+)
 
 
 with netCDF4.Dataset(OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
@@ -188,5 +192,42 @@ with netCDF4.Dataset(LEGACY_OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
     nc.setncattr("ptype", np.int32(5))
     nc.setncattr("iorigin", np.int32(1))
 
+for diag_path, elapsed_seconds, east_m, north_m in DIAGNOSTIC_OUTPUTS:
+    with netCDF4.Dataset(diag_path, "w", format="NETCDF3_64BIT_OFFSET") as nc:
+        nc.createDimension("xh", 1)
+        nc.createDimension("yh", 1)
+        nc.createDimension("zh", 2)
+        nc.createDimension("zf", 3)
+        nc.createDimension("time", 1)
+        for name, dimension, values, long_name, units in (
+            ("xh", "xh", [0.0], "west-east location", "degree_east"),
+            ("yh", "yh", [0.0], "south-north location", "degree_north"),
+            ("zh", "zh", [500.0, 1500.0], "height of scalar levels", "m"),
+            ("zf", "zf", [0.0, 1000.0, 2000.0], "height of w levels", "m"),
+        ):
+            var = nc.createVariable(name, "f4", (dimension,))
+            var.long_name = long_name
+            var.units = units
+            var[:] = values
+        time = nc.createVariable("time", "f4", ("time",))
+        time.long_name = "time"
+        time.units = "seconds"
+        time[:] = [elapsed_seconds]
+        for name, value, long_name, units in (
+            ("umove", 12.5, "umove", "m/s"),
+            ("vmove", 3.0, "vmove", "m/s"),
+            ("domainlocx", east_m, "x location of (center of) domain", "m"),
+            ("domainlocy", north_m, "y location of (center of) domain", "m"),
+        ):
+            var = nc.createVariable(name, "f4", ("time", "yh", "xh"))
+            var.long_name = long_name
+            var.units = units
+            var[:] = value
+        nc.setncattr("CM1 version", "cm1r21.1")
+        nc.setncattr("Conventions", "CF-1.7")
+        nc.setncattr("missing_value", np.float32(-999999.9))
+
 print(OUT)
 print(LEGACY_OUT)
+for path, *_ in DIAGNOSTIC_OUTPUTS:
+    print(path)
