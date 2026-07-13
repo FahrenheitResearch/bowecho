@@ -20749,7 +20749,7 @@ impl ViewerApp {
                 (
                     dock::WorkspacePane::Simsat,
                     "SimSat",
-                    "SimSat v0.2.0: deterministic two-subcolumn Recommended rendering, improved top-down atmosphere and shadows, NOAA Natural IR, sensor/precision controls, CPU-stored loops and native plots, plus an optional non-stored GPU preview",
+                    "SimSat v0.2.1: reviewed low-sun terrain recovery, 1.10 surface lift, CPU/GPU post-light parity, recommended CIMSS IR, sensor/precision controls, CPU-stored loops and native plots, plus a non-stored GPU preview",
                 ),
                 (
                     dock::WorkspacePane::Wofs,
@@ -20937,6 +20937,31 @@ impl ViewerApp {
                 }
                 simsat_ui::SimSatAction::OpenPlot(source) => {
                     self.open_satellite_native_plot(ctx, source);
+                }
+                simsat_ui::SimSatAction::UseRecommendedThermalEnhancement { product_label } => {
+                    let enhancement = sat_worker::IrEnhancement::Cimss;
+                    if self.sat_ir_enhancement != enhancement {
+                        self.sat_ir_enhancement = enhancement;
+                        self.app_settings.sat_ir_enhancement = enhancement.slug().to_owned();
+                        self.mark_app_settings_dirty();
+                        if let Some(worker) = &self.sat {
+                            worker.send(sat_worker::SatRequest::SetIrEnhancement(enhancement));
+                            for (key, hhmm) in sat_paint::sat_enhancement_refresh_frames(
+                                &self.sat_run_listings,
+                                self.sat_player.selected_run(),
+                                self.sat_last_frame.as_ref(),
+                            ) {
+                                worker.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
+                            }
+                        }
+                        if let Some((key, hhmm)) = self.sat_map_recolor_target() {
+                            self.request_sat_map_frame(key, hhmm);
+                        }
+                    }
+                    self.status = format!(
+                        "SimSat: selected {} for {product_label}",
+                        enhancement.label()
+                    );
                 }
             }
         }

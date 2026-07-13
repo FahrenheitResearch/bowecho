@@ -710,8 +710,9 @@ impl ViewerApp {
                 .response
                 .on_hover_text(
                     "Absolute-temperature color curve for IR brightness-temperature bands \
-                     (GOES ABI and Himawari AHI 7-16): CIMSS ramp, the Dvorak BD curve, \
-                     AVN, Funktop, rainbow, or plain grayscale.",
+                     (GOES ABI and Himawari AHI 7-16): recommended CIMSS Style, Natural NOAA \
+                     heritage grayscale, the Dvorak BD curve, AVN, Funktop, rainbow, or plain \
+                     grayscale.",
                 );
         });
         // Without this hint the picker looks silently dead on a store full

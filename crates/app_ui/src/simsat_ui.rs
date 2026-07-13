@@ -28,7 +28,7 @@ use simsat::instrument_footprint::InstrumentFootprint;
 use simsat::optics::CloudOpticsMode;
 use simsat::render::{
     CLOUD_SOFTCLIP_KNEE, DEFAULT_EXPOSURE, GROUND_DAY_LIFT, LandAppearanceConfig,
-    RHO_HIGHLIGHT_MAX, SurfacePostlightToeConfig,
+    RHO_HIGHLIGHT_MAX, SurfacePostlightToeConfig, TwilightSurfaceRecoveryConfig,
 };
 use simsat::store_out::{self, IrFrame, VisibleFrame};
 use simsat::thermal_sensor::ThermalSensor;
@@ -52,6 +52,10 @@ pub(crate) enum SimSatAction {
     SatelliteFrameWritten { key: rw_ui::SatRunKey, hhmm: u16 },
     /// Open the latest retained SimSat output in the native mesh plot window.
     OpenPlot(SatellitePlotSource),
+    /// Explicitly entering an IR/WV product adopts that product's reviewed
+    /// display palette. Startup never emits this action, so a saved palette is
+    /// preserved until the user makes a product transition.
+    UseRecommendedThermalEnhancement { product_label: &'static str },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,8 +330,8 @@ impl SimSatQuickMode {
             Self::RecommendedDisplay => {
                 "Owner-reviewed visible defaults: CPU-quality rendering, model-native output, \
                  OD 0.15, exposure 1.5, AOD 0.05, fixed optics, deterministic two-subcolumn \
-                 closure, corrections, edge feathering and top-down shadow anti-aliasing on, \
-                 with experimental storage/footprints off."
+                 closure, corrections, tightly gated twilight terrain recovery, edge feathering \
+                 and top-down shadow anti-aliasing on, with experimental storage/footprints off."
             }
             Self::HighQualityVisible => {
                 "Recommended Display plus the deterministic four-subcolumn cloud reference and \
@@ -470,6 +474,7 @@ struct RenderJob {
     land_dark_toe_gamma: f32,
     land_dark_toe_max_gain: f32,
     surface_postlight_toe: SurfacePostlightToeConfig,
+    twilight_surface_recovery: TwilightSurfaceRecoveryConfig,
     clouds: bool,
     fractional_clouds: bool,
     fractional_cloud_mode: FractionalCloudMode,
@@ -624,8 +629,10 @@ struct RenderTask {
 }
 
 const LEGACY_SIMSAT_STATE_SCHEMA: u32 = 1;
-const SIMSAT_STATE_SCHEMA: u32 = 2;
+const V020_SIMSAT_STATE_SCHEMA: u32 = 2;
+const SIMSAT_STATE_SCHEMA: u32 = 3;
 const LEGACY_REVIEWED_SZA_MAX_GAIN: f32 = 1.6;
+const LEGACY_GROUND_DAY_LIFT: f32 = 1.0;
 
 /// Versioned opaque payload stored inside BowEcho's application settings. Source
 /// paths, cached-file selections, live jobs, progress, and rendered output stay
@@ -664,6 +671,10 @@ struct SimSatSavedState {
     surface_postlight_toe_knee: f32,
     surface_postlight_toe_gamma: f32,
     surface_postlight_toe_max_gain: f32,
+    twilight_surface_recovery: bool,
+    twilight_surface_recovery_knee: f32,
+    twilight_surface_recovery_gamma: f32,
+    twilight_surface_recovery_max_gain: f32,
     clouds: bool,
     fractional_clouds: bool,
     fractional_cloud_mode: String,
@@ -722,6 +733,10 @@ impl SimSatSavedState {
             surface_postlight_toe_knee: pane.surface_postlight_toe_knee,
             surface_postlight_toe_gamma: pane.surface_postlight_toe_gamma,
             surface_postlight_toe_max_gain: pane.surface_postlight_toe_max_gain,
+            twilight_surface_recovery: pane.twilight_surface_recovery,
+            twilight_surface_recovery_knee: pane.twilight_surface_recovery_knee,
+            twilight_surface_recovery_gamma: pane.twilight_surface_recovery_gamma,
+            twilight_surface_recovery_max_gain: pane.twilight_surface_recovery_max_gain,
             clouds: pane.clouds,
             fractional_clouds: pane.fractional_clouds,
             fractional_cloud_mode: pane.fractional_cloud_mode.slug().to_owned(),
@@ -804,6 +819,12 @@ impl SimSatSavedState {
         pane.surface_postlight_toe_knee = self.surface_postlight_toe_knee.clamp(0.001, 0.5);
         pane.surface_postlight_toe_gamma = self.surface_postlight_toe_gamma.clamp(0.05, 1.0);
         pane.surface_postlight_toe_max_gain = self.surface_postlight_toe_max_gain.clamp(1.0, 4.0);
+        pane.twilight_surface_recovery = self.twilight_surface_recovery;
+        pane.twilight_surface_recovery_knee = self.twilight_surface_recovery_knee.clamp(0.001, 0.5);
+        pane.twilight_surface_recovery_gamma =
+            self.twilight_surface_recovery_gamma.clamp(0.05, 1.0);
+        pane.twilight_surface_recovery_max_gain =
+            self.twilight_surface_recovery_max_gain.clamp(1.0, 4.0);
         pane.clouds = self.clouds;
         pane.fractional_clouds = self.fractional_clouds;
         pane.fractional_cloud_mode = match self.fractional_cloud_mode.as_str() {
@@ -883,6 +904,10 @@ pub(crate) struct SimSatPane {
     surface_postlight_toe_knee: f32,
     surface_postlight_toe_gamma: f32,
     surface_postlight_toe_max_gain: f32,
+    twilight_surface_recovery: bool,
+    twilight_surface_recovery_knee: f32,
+    twilight_surface_recovery_gamma: f32,
+    twilight_surface_recovery_max_gain: f32,
     clouds: bool,
     fractional_clouds: bool,
     fractional_cloud_mode: FractionalCloudMode,
@@ -924,6 +949,7 @@ impl Default for SimSatPane {
             .unwrap_or((fallback_date, fallback_cycle));
         let land = LandAppearanceConfig::default();
         let surface_postlight_toe = SurfacePostlightToeConfig::default();
+        let twilight_surface_recovery = TwilightSurfaceRecoveryConfig::shipped();
         Self {
             source_mode: SourceMode::Local,
             local_path: String::new(),
@@ -963,6 +989,10 @@ impl Default for SimSatPane {
             surface_postlight_toe_knee: surface_postlight_toe.knee as f32,
             surface_postlight_toe_gamma: surface_postlight_toe.gamma as f32,
             surface_postlight_toe_max_gain: surface_postlight_toe.max_gain as f32,
+            twilight_surface_recovery: twilight_surface_recovery.enabled,
+            twilight_surface_recovery_knee: twilight_surface_recovery.knee as f32,
+            twilight_surface_recovery_gamma: twilight_surface_recovery.gamma as f32,
+            twilight_surface_recovery_max_gain: twilight_surface_recovery.max_gain as f32,
             clouds: true,
             fractional_clouds: true,
             fractional_cloud_mode: FractionalCloudMode::Deterministic2,
@@ -998,23 +1028,45 @@ impl Default for SimSatPane {
 impl SimSatPane {
     pub(crate) fn new(saved: Option<&serde_json::Value>) -> Self {
         let mut pane = Self::default();
-        let mut migrated_legacy_state = false;
-        if let Some(saved) = saved
-            && let Ok(state) = serde_json::from_value::<SimSatSavedState>(saved.clone())
-        {
-            match state.schema {
-                SIMSAT_STATE_SCHEMA => state.apply_to(&mut pane),
-                LEGACY_SIMSAT_STATE_SCHEMA => {
-                    state.apply_to(&mut pane);
-                    pane.migrate_legacy_reviewed_defaults();
-                    migrated_legacy_state = true;
+        let mut migrated_previous_state = false;
+        if let Some(saved) = saved {
+            let had_ground_gain = saved.get("ground_gain").is_some();
+            let had_twilight_recovery = saved.get("twilight_surface_recovery").is_some();
+            if let Ok(state) = serde_json::from_value::<SimSatSavedState>(saved.clone()) {
+                match state.schema {
+                    SIMSAT_STATE_SCHEMA => state.apply_to(&mut pane),
+                    V020_SIMSAT_STATE_SCHEMA => {
+                        state.apply_to(&mut pane);
+                        // v0.2.0 had no independent twilight-recovery control and
+                        // shipped a neutral ground lift. Missing fields must retain
+                        // that exact image instead of inheriting v0.2.1 serde defaults;
+                        // an explicitly hand-authored field is still respected.
+                        if !had_ground_gain {
+                            pane.ground_gain = LEGACY_GROUND_DAY_LIFT;
+                        }
+                        if !had_twilight_recovery {
+                            pane.reset_twilight_surface_recovery(false);
+                        }
+                        pane.last_notice = Some(
+                            "Kept the saved SimSat v0.2.0 calibration. Apply Recommended to adopt the reviewed v0.2.1 ground lift and low-sun recovery."
+                                .to_owned(),
+                        );
+                        migrated_previous_state = true;
+                    }
+                    LEGACY_SIMSAT_STATE_SCHEMA => {
+                        state.apply_to(&mut pane);
+                        pane.migrate_legacy_reviewed_defaults();
+                        pane.reset_twilight_surface_recovery(false);
+                        migrated_previous_state = true;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-        // A v1 payload is rewritten once as v2. Custom controls survive, while
-        // the exact old quick-mode baselines receive the reviewed v0.2 defaults.
-        pane.persisted_state_dirty = migrated_legacy_state;
+        // Older payloads are rewritten once as v3. Custom controls survive, v2
+        // retains the exact v0.2.0 appearance, and v1 keeps its existing scoped
+        // migration before receiving an explicit identity twilight control.
+        pane.persisted_state_dirty = migrated_previous_state;
         pane
     }
 
@@ -1067,10 +1119,42 @@ impl SimSatPane {
         self.surface_postlight_toe_max_gain = toe.max_gain as f32;
     }
 
+    fn twilight_surface_recovery_config(&self) -> TwilightSurfaceRecoveryConfig {
+        TwilightSurfaceRecoveryConfig {
+            enabled: self.twilight_surface_recovery,
+            knee: f64::from(self.twilight_surface_recovery_knee),
+            gamma: f64::from(self.twilight_surface_recovery_gamma),
+            max_gain: f64::from(self.twilight_surface_recovery_max_gain),
+        }
+    }
+
+    fn twilight_surface_recovery_matches(&self, expected: TwilightSurfaceRecoveryConfig) -> bool {
+        self.twilight_surface_recovery == expected.enabled
+            && near_f32(self.twilight_surface_recovery_knee, expected.knee as f32)
+            && near_f32(self.twilight_surface_recovery_gamma, expected.gamma as f32)
+            && near_f32(
+                self.twilight_surface_recovery_max_gain,
+                expected.max_gain as f32,
+            )
+    }
+
+    fn reset_twilight_surface_recovery(&mut self, shipped: bool) {
+        let recovery = if shipped {
+            TwilightSurfaceRecoveryConfig::shipped()
+        } else {
+            TwilightSurfaceRecoveryConfig::off()
+        };
+        self.twilight_surface_recovery = recovery.enabled;
+        self.twilight_surface_recovery_knee = recovery.knee as f32;
+        self.twilight_surface_recovery_gamma = recovery.gamma as f32;
+        self.twilight_surface_recovery_max_gain = recovery.max_gain as f32;
+    }
+
     /// Migrate only settings that are provably one of the v1 quick-mode
     /// baselines. Any custom v1 state retains all of its existing values; the
-    /// two new v0.2 controls take their safe defaults through serde's struct
-    /// default (post-light toe off, top-down shadow anti-aliasing on).
+    /// v0.2.0 controls take their safe defaults. The caller separately forces
+    /// the v0.2.1 twilight control to identity so an old payload never changes
+    /// appearance merely because it was loaded by a newer BowEcho.
     fn migrate_legacy_reviewed_defaults(&mut self) {
         let legacy_recommended = self.legacy_display_baseline_matches(false);
         let legacy_high_quality = self.legacy_display_baseline_matches(true);
@@ -1109,6 +1193,7 @@ impl SimSatPane {
         self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
         self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
         self.reset_surface_postlight_toe();
+        self.reset_twilight_surface_recovery(true);
         self.clouds = true;
         self.fractional_clouds = true;
         self.fractional_cloud_mode = FractionalCloudMode::Deterministic2;
@@ -1169,6 +1254,7 @@ impl SimSatPane {
                 self.quality = RenderQuality::Final;
                 self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
                 self.reset_surface_postlight_toe();
+                self.reset_twilight_surface_recovery(false);
                 self.topdown_shadow_antialias = false;
                 match self.product {
                     SimSatProduct::Visible => {
@@ -1200,6 +1286,7 @@ impl SimSatPane {
         self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
         self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
         self.reset_surface_postlight_toe();
+        self.reset_twilight_surface_recovery(false);
         self.clouds = true;
         self.fractional_clouds = true;
         self.fractional_cloud_mode = FractionalCloudMode::EffectiveOd;
@@ -1239,6 +1326,8 @@ impl SimSatPane {
             } else {
                 FractionalCloudMode::Deterministic2
             },
+            GROUND_DAY_LIFT as f32,
+            Some(TwilightSurfaceRecoveryConfig::shipped()),
         )
     }
 
@@ -1251,6 +1340,8 @@ impl SimSatPane {
             } else {
                 FractionalCloudMode::EffectiveOd
             },
+            LEGACY_GROUND_DAY_LIFT,
+            None,
         )
     }
 
@@ -1259,6 +1350,8 @@ impl SimSatPane {
         high_quality: bool,
         expected_sza_max_gain: f32,
         expected_fractional_mode: FractionalCloudMode,
+        expected_ground_gain: f32,
+        expected_twilight_recovery: Option<TwilightSurfaceRecoveryConfig>,
     ) -> bool {
         let land = LandAppearanceConfig::default();
         self.product.is_visible_family()
@@ -1281,6 +1374,9 @@ impl SimSatPane {
             && near_f32(self.land_dark_toe_gamma, land.dark_toe_gamma as f32)
             && near_f32(self.land_dark_toe_max_gain, land.dark_toe_max_gain as f32)
             && !self.surface_postlight_toe
+            && expected_twilight_recovery
+                .map(|expected| self.twilight_surface_recovery_matches(expected))
+                .unwrap_or(true)
             && self.clouds
             && self.fractional_clouds
             && self.fractional_cloud_mode == expected_fractional_mode
@@ -1297,7 +1393,7 @@ impl SimSatPane {
             && !self.topdown_cloud_footprint
             && self.topdown_shadow_antialias
             && near_f32(self.exposure, DEFAULT_EXPOSURE as f32)
-            && near_f32(self.ground_gain, GROUND_DAY_LIFT as f32)
+            && near_f32(self.ground_gain, expected_ground_gain)
             && near_f32(
                 self.cloud_softclip,
                 if high_quality {
@@ -1312,6 +1408,7 @@ impl SimSatPane {
     fn sensor_qa_matches(&self) -> bool {
         self.sensor_qa_core_matches()
             && !self.surface_postlight_toe
+            && !self.twilight_surface_recovery
             && !self.topdown_shadow_antialias
     }
 
@@ -1667,6 +1764,15 @@ impl SimSatPane {
                         .to_owned(),
                 );
             }
+            if product_changed && self.product.thermal_band().is_some() {
+                actions.push(SimSatAction::UseRecommendedThermalEnhancement {
+                    product_label: self.product.label(),
+                });
+                self.last_notice = Some(format!(
+                    "Selected CIMSS Style for {}. Startup still preserves an explicitly saved Satellite palette.",
+                    self.product.label()
+                ));
+            }
         }
 
         ui.add_space(6.0);
@@ -1945,9 +2051,14 @@ impl SimSatPane {
                     ui.weak(
                         "GOES-16 east-west MTF is transferred to GOES-19/FM4 as an unvalidated \
                          hypothesis; north-south MTF, temporal integration, and detector variation \
-                         are not modeled.",
+                        are not modeled.",
                     );
                 }
+                ui.weak(
+                    "Thermal output stays in Kelvin. The shared Satellite enhancement picker \
+                     recolors it live; explicitly entering an IR/WV product selects the reviewed \
+                     CIMSS Style, while startup preserves a saved palette.",
+                );
             });
     }
 
@@ -1958,10 +2069,6 @@ impl SimSatPane {
             )
         } else if self.storage_profile == StorageProfile::ScienceCloudF16 {
             Some("ScienceCloudF16 is CPU-only because the GPU path consumes CompactU8 codes.")
-        } else if self.surface_postlight_toe {
-            Some(
-                "Post-light surface toe is CPU-only; turn it off for GPU preview or render the requested terrain recovery to Satellite on CPU.",
-            )
         } else if self.render_intent == RenderIntent::SensorFastGray {
             Some("Sensor Fast Gray is CPU-only so its strict operator cannot be weakened.")
         } else if self.instrument_footprint != InstrumentFootprint::Off {
@@ -2265,7 +2372,9 @@ impl SimSatPane {
                 ui.add(
                     egui::Slider::new(&mut self.ground_gain, 0.25..=4.0).text("Ground lift"),
                 )
-                .on_hover_text("Display-only daytime ground gain; 1.0 is neutral.");
+                .on_hover_text(
+                    "Display-only surface gain. The reviewed v0.2.1 value is 1.10; 1.0 is the neutral v0.2.0 override. Cloud radiance is never scaled.",
+                );
                 ui.add(
                     egui::Slider::new(&mut self.cloud_softclip, 0.05..=1.0)
                         .text("Highlight knee"),
@@ -2301,10 +2410,10 @@ impl SimSatPane {
                     );
                 });
                 ui.separator();
-                ui.label("Experimental post-lighting terrain recovery");
+                ui.label("Post-lighting terrain recovery");
                 ui.checkbox(
                     &mut self.surface_postlight_toe,
-                    "Post-light surface toe (CPU)",
+                    "Post-light surface toe",
                 )
                 .on_hover_text(
                     "Default-off display experiment. Applies a bounded scalar toe to land after \
@@ -2324,10 +2433,44 @@ impl SimSatPane {
                         egui::Slider::new(&mut self.surface_postlight_toe_max_gain, 1.0..=4.0)
                             .text("Post-light max gain"),
                     );
-                    ui.weak(
-                        "CPU finished-visible land only; GPU preview reports and temporarily disables it.",
+                });
+                ui.checkbox(
+                    &mut self.twilight_surface_recovery,
+                    "Twilight surface recovery",
+                )
+                .on_hover_text(
+                    "Shipped finished-visible low-sun terrain recovery. It fades in from -6 to \
+                     0 degrees, is full through +4, fades to identity by +12, and never affects \
+                     ocean/glint, clouds, raw/sensor products, or ordinary daylight. Turn it \
+                     off for an exact v0.2.0-style A/B.",
+                );
+                ui.add_enabled_ui(self.twilight_surface_recovery, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.twilight_surface_recovery_knee, 0.001..=0.5)
+                            .text("Twilight knee"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.twilight_surface_recovery_gamma, 0.05..=1.0)
+                            .text("Twilight gamma"),
+                    );
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.twilight_surface_recovery_max_gain,
+                            1.0..=4.0,
+                        )
+                        .text("Twilight max gain"),
                     );
                 });
+                if self.surface_postlight_toe {
+                    ui.weak(
+                        "Post-light toe affects finished-visible land only; CPU and GPU use the same post-view formula.",
+                    );
+                }
+                if self.twilight_surface_recovery {
+                    ui.weak(
+                        "Twilight recovery is active only from -6 to +12 degrees solar elevation; CPU and GPU combine it with the legacy toe by max gain.",
+                    );
+                }
                 if ui.button("Restore shipped display calibration").clicked() {
                     let land = LandAppearanceConfig::default();
                     self.exposure = DEFAULT_EXPOSURE as f32;
@@ -2341,6 +2484,7 @@ impl SimSatPane {
                     self.land_dark_toe_gamma = land.dark_toe_gamma as f32;
                     self.land_dark_toe_max_gain = land.dark_toe_max_gain as f32;
                     self.reset_surface_postlight_toe();
+                    self.reset_twilight_surface_recovery(true);
                 }
                 ui.weak(
                     "Display-only: raw visible bands, IR, water vapor, and derived fields are unchanged.",
@@ -2533,6 +2677,7 @@ impl SimSatPane {
             land_dark_toe_gamma: self.land_dark_toe_gamma,
             land_dark_toe_max_gain: self.land_dark_toe_max_gain,
             surface_postlight_toe: self.surface_postlight_toe_config(),
+            twilight_surface_recovery: self.twilight_surface_recovery_config(),
             clouds: self.clouds,
             fractional_clouds: self.fractional_clouds,
             fractional_cloud_mode: self.fractional_cloud_mode,
@@ -2816,6 +2961,7 @@ fn render_params_for(job: &RenderJob, frame: &FrameInput) -> RenderParams {
         dark_toe_max_gain: f64::from(job.land_dark_toe_max_gain),
     };
     params.surface_postlight_toe = job.surface_postlight_toe;
+    params.twilight_surface_recovery = job.twilight_surface_recovery;
     params.steps = job.quality.steps();
     params.multiscatter = job.cloud_transport == CloudMultiscatterMode::LegacyOctaves;
     params.cloud_multiscatter = Some(job.cloud_transport);
@@ -3399,6 +3545,12 @@ mod tests {
                 enabled: true,
                 ..SurfacePostlightToeConfig::default()
             },
+            twilight_surface_recovery: TwilightSurfaceRecoveryConfig {
+                enabled: true,
+                knee: 0.22,
+                gamma: 0.7,
+                max_gain: 2.5,
+            },
             clouds: true,
             fractional_clouds: false,
             fractional_cloud_mode: FractionalCloudMode::Deterministic8,
@@ -3446,6 +3598,10 @@ mod tests {
         assert!(!params.land_appearance.sza_normalization);
         assert!(!params.land_appearance.dark_toe);
         assert!(params.surface_postlight_toe.enabled);
+        assert!(params.twilight_surface_recovery.enabled);
+        assert_eq!(params.twilight_surface_recovery.knee, 0.22);
+        assert_eq!(params.twilight_surface_recovery.gamma, 0.7);
+        assert_eq!(params.twilight_surface_recovery.max_gain, 2.5);
         assert!(params.clouds);
         assert!(!params.multiscatter);
         assert_eq!(
@@ -3504,6 +3660,8 @@ mod tests {
         assert_eq!(pane.land_sza_max_gain, land.sza_max_gain as f32);
         assert_eq!(pane.land_dark_toe, land.dark_toe);
         assert!(!pane.surface_postlight_toe);
+        assert!(pane.twilight_surface_recovery_matches(TwilightSurfaceRecoveryConfig::shipped()));
+        assert_eq!(pane.ground_gain, GROUND_DAY_LIFT as f32);
         assert!(pane.clouds);
         assert!(pane.fractional_clouds);
         assert_eq!(
@@ -3687,6 +3845,7 @@ mod tests {
     fn quick_modes_apply_reviewed_values_and_refuse_mislabeled_sensor_qa() {
         let mut pane = SimSatPane {
             surface_postlight_toe: true,
+            twilight_surface_recovery: false,
             topdown_shadow_antialias: false,
             ..SimSatPane::default()
         };
@@ -3697,6 +3856,8 @@ mod tests {
             FractionalCloudMode::Deterministic2
         );
         assert!(!pane.surface_postlight_toe);
+        assert!(pane.twilight_surface_recovery_matches(TwilightSurfaceRecoveryConfig::shipped()));
+        assert_eq!(pane.ground_gain, GROUND_DAY_LIFT as f32);
         assert!(pane.topdown_shadow_antialias);
 
         pane.apply_quick_mode(SimSatQuickMode::HighQualityVisible)
@@ -3726,20 +3887,17 @@ mod tests {
         assert_eq!(pane.thermal_sensor, ThermalSensor::GoesRAbiBand13Fm4);
         assert_eq!(pane.fractional_cloud_mode, FractionalCloudMode::EffectiveOd);
         assert!(!pane.surface_postlight_toe);
+        assert!(!pane.twilight_surface_recovery);
         assert!(!pane.topdown_shadow_antialias);
     }
 
     #[test]
-    fn postlight_surface_toe_blocks_gpu_preview_instead_of_weakening_the_request() {
+    fn postlight_terrain_controls_keep_gpu_preview_available_in_v021() {
         let mut pane = SimSatPane::default();
         assert_eq!(pane.gpu_preview_unavailable_reason(), None);
         pane.surface_postlight_toe = true;
-        assert_eq!(
-            pane.gpu_preview_unavailable_reason(),
-            Some(
-                "Post-light surface toe is CPU-only; turn it off for GPU preview or render the requested terrain recovery to Satellite on CPU."
-            )
-        );
+        pane.twilight_surface_recovery = true;
+        assert_eq!(pane.gpu_preview_unavailable_reason(), None);
     }
 
     #[test]
@@ -3758,10 +3916,109 @@ mod tests {
         assert_eq!(restored.render_intent, RenderIntent::SensorFastGray);
         assert_eq!(restored.thermal_sensor, ThermalSensor::GoesRAbiBand13Fm4);
         assert!(!restored.surface_postlight_toe);
+        assert!(!restored.twilight_surface_recovery);
         assert!(!restored.topdown_shadow_antialias);
         assert!(restored.local_path.is_empty());
         assert!(restored.task.is_none());
         assert!(!restored.persisted_state_dirty);
+    }
+
+    #[test]
+    fn v3_state_round_trips_custom_twilight_recovery() {
+        let mut pane = SimSatPane {
+            twilight_surface_recovery: true,
+            twilight_surface_recovery_knee: 0.21,
+            twilight_surface_recovery_gamma: 0.67,
+            twilight_surface_recovery_max_gain: 2.75,
+            ..SimSatPane::default()
+        };
+        pane.persisted_state_dirty = true;
+        let saved = pane.take_persisted_state_if_dirty().unwrap();
+        assert_eq!(
+            saved["schema"].as_u64(),
+            Some(u64::from(SIMSAT_STATE_SCHEMA))
+        );
+
+        let restored = SimSatPane::new(Some(&saved));
+        assert!(restored.twilight_surface_recovery);
+        assert!(near_f32(restored.twilight_surface_recovery_knee, 0.21));
+        assert!(near_f32(restored.twilight_surface_recovery_gamma, 0.67));
+        assert!(near_f32(restored.twilight_surface_recovery_max_gain, 2.75));
+        assert!(!restored.persisted_state_dirty);
+    }
+
+    #[test]
+    fn v2_state_migrates_without_silently_changing_its_visible_appearance() {
+        let legacy = SimSatPane {
+            ground_gain: LEGACY_GROUND_DAY_LIFT,
+            ..SimSatPane::default()
+        };
+        let mut state = SimSatSavedState::from_pane(&legacy);
+        state.schema = V020_SIMSAT_STATE_SCHEMA;
+        let mut saved = serde_json::to_value(state).unwrap();
+        let object = saved.as_object_mut().unwrap();
+        for field in [
+            "twilight_surface_recovery",
+            "twilight_surface_recovery_knee",
+            "twilight_surface_recovery_gamma",
+            "twilight_surface_recovery_max_gain",
+        ] {
+            object.remove(field);
+        }
+
+        let mut restored = SimSatPane::new(Some(&saved));
+        assert_eq!(restored.ground_gain, LEGACY_GROUND_DAY_LIFT);
+        assert!(!restored.twilight_surface_recovery);
+        assert!(restored.persisted_state_dirty);
+        assert!(
+            restored
+                .last_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("saved SimSat v0.2.0 calibration"))
+        );
+
+        let rewritten = restored.take_persisted_state_if_dirty().unwrap();
+        assert_eq!(
+            rewritten["schema"].as_u64(),
+            Some(u64::from(SIMSAT_STATE_SCHEMA))
+        );
+        assert_eq!(
+            rewritten["ground_gain"].as_f64(),
+            Some(f64::from(LEGACY_GROUND_DAY_LIFT))
+        );
+        assert_eq!(
+            rewritten["twilight_surface_recovery"].as_bool(),
+            Some(false)
+        );
+
+        let mut missing_ground = saved.clone();
+        missing_ground
+            .as_object_mut()
+            .unwrap()
+            .remove("ground_gain");
+        let restored_missing_ground = SimSatPane::new(Some(&missing_ground));
+        assert_eq!(restored_missing_ground.ground_gain, LEGACY_GROUND_DAY_LIFT);
+
+        let mut explicit_twilight = saved;
+        let object = explicit_twilight.as_object_mut().unwrap();
+        object.insert("twilight_surface_recovery".to_owned(), true.into());
+        object.insert("twilight_surface_recovery_knee".to_owned(), 0.2.into());
+        object.insert("twilight_surface_recovery_gamma".to_owned(), 0.6.into());
+        object.insert("twilight_surface_recovery_max_gain".to_owned(), 3.0.into());
+        let restored_explicit = SimSatPane::new(Some(&explicit_twilight));
+        assert!(restored_explicit.twilight_surface_recovery);
+        assert!(near_f32(
+            restored_explicit.twilight_surface_recovery_knee,
+            0.2
+        ));
+        assert!(near_f32(
+            restored_explicit.twilight_surface_recovery_gamma,
+            0.6
+        ));
+        assert!(near_f32(
+            restored_explicit.twilight_surface_recovery_max_gain,
+            3.0
+        ));
     }
 
     fn legacy_v1_saved_value(pane: &SimSatPane) -> serde_json::Value {
@@ -3774,6 +4031,10 @@ mod tests {
             "surface_postlight_toe_knee",
             "surface_postlight_toe_gamma",
             "surface_postlight_toe_max_gain",
+            "twilight_surface_recovery",
+            "twilight_surface_recovery_knee",
+            "twilight_surface_recovery_gamma",
+            "twilight_surface_recovery_max_gain",
             "topdown_shadow_antialias",
         ] {
             object.remove(field);
@@ -3790,6 +4051,7 @@ mod tests {
             sun_override: true,
             land_sza_max_gain: LEGACY_REVIEWED_SZA_MAX_GAIN,
             fractional_cloud_mode: FractionalCloudMode::EffectiveOd,
+            ground_gain: LEGACY_GROUND_DAY_LIFT,
             ..SimSatPane::default()
         };
         assert!(legacy.legacy_display_baseline_matches(false));
@@ -3808,6 +4070,8 @@ mod tests {
             FractionalCloudMode::Deterministic2
         );
         assert!(!restored.surface_postlight_toe);
+        assert!(!restored.twilight_surface_recovery);
+        assert_eq!(restored.ground_gain, LEGACY_GROUND_DAY_LIFT);
         assert!(restored.topdown_shadow_antialias);
         assert!(restored.persisted_state_dirty);
 
@@ -3844,6 +4108,7 @@ mod tests {
             .apply_quick_mode(SimSatQuickMode::HighQualityVisible)
             .unwrap();
         legacy.land_sza_max_gain = LEGACY_REVIEWED_SZA_MAX_GAIN;
+        legacy.ground_gain = LEGACY_GROUND_DAY_LIFT;
         assert!(legacy.legacy_display_baseline_matches(true));
 
         let restored = SimSatPane::new(Some(&legacy_v1_saved_value(&legacy)));
@@ -3855,10 +4120,9 @@ mod tests {
             restored.fractional_cloud_mode,
             FractionalCloudMode::Deterministic4
         );
-        assert_eq!(
-            restored.active_quick_mode(),
-            Some(SimSatQuickMode::HighQualityVisible)
-        );
+        assert_eq!(restored.active_quick_mode(), None);
+        assert_eq!(restored.ground_gain, LEGACY_GROUND_DAY_LIFT);
+        assert!(!restored.twilight_surface_recovery);
     }
 
     #[test]

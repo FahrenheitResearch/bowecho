@@ -1775,17 +1775,17 @@ fn enhanced_anchors_for_band(band: u8) -> Option<rw_sat::palette::Anchors> {
 }
 
 /// User-selectable IR enhancement for Kelvin brightness-temperature bands
-/// (GOES ABI and Himawari AHI bands 7-16). [`Natural`](Self::Natural) is NOAA's
-/// continuous heritage longwave-window display, while `Cimss` keeps BowEcho's
-/// established persisted default and per-band behavior ([`ENHANCED_IR`] on the
-/// longwave window, production palettes elsewhere). The other choices are the
-/// classic NOAA absolute-temperature analysis curves.
+/// (GOES ABI and Himawari AHI bands 7-16). [`Cimss`](Self::Cimss) is the
+/// reviewed longwave-window display and BowEcho's persisted default, with
+/// production palettes elsewhere. [`Natural`](Self::Natural) remains NOAA's
+/// continuous heritage grayscale. The other choices are classic NOAA
+/// absolute-temperature analysis curves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IrEnhancement {
-    /// NOAA heritage continuous bi-linear longwave-IR grayscale (recommended).
+    /// NOAA heritage continuous bi-linear longwave-IR grayscale.
     /// Water-vapor bands retain their band-scaled grayscale ranges.
     Natural,
-    /// CIMSS-style rainbow on 13-15, production palettes elsewhere (default).
+    /// CIMSS-style rainbow on 13-15, production palettes elsewhere (recommended).
     #[default]
     Cimss,
     /// NESDIS BD curve — the stepped Dvorak tropical-cyclone enhancement.
@@ -1826,8 +1826,8 @@ impl IrEnhancement {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Natural => "Natural (NOAA heritage) — Recommended",
-            Self::Cimss => "CIMSS-style false color (isotherm bands)",
+            Self::Natural => "Natural (NOAA heritage)",
+            Self::Cimss => "CIMSS Style (false-color isotherm bands) — Recommended",
             Self::Bd => "BD stepped thresholds (Dvorak)",
             Self::Avn => "AVN stepped analysis palette",
             Self::Funktop => "Funktop stepped analysis palette",
@@ -7118,14 +7118,11 @@ mod tests {
     }
 
     #[test]
-    fn natural_ir_labels_match_simsat_without_changing_bowecho_default() {
-        assert_eq!(
-            IrEnhancement::Natural.label(),
-            "Natural (NOAA heritage) — Recommended"
-        );
+    fn cimss_ir_label_matches_simsat_v021_without_changing_saved_slugs() {
+        assert_eq!(IrEnhancement::Natural.label(), "Natural (NOAA heritage)");
         assert_eq!(
             IrEnhancement::Cimss.label(),
-            "CIMSS-style false color (isotherm bands)"
+            "CIMSS Style (false-color isotherm bands) — Recommended"
         );
         assert_eq!(IrEnhancement::parse("unknown"), IrEnhancement::Cimss);
     }
