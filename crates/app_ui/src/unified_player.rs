@@ -367,7 +367,8 @@ impl UnifiedPlayerState {
 
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label("Frames");
+                ui.label("Frames to load")
+                    .on_hover_text(crate::FRAMES_TO_LOAD_HELP);
                 let mut selected_limit = context.history_frame_limit;
                 egui::ComboBox::from_id_salt("unified_player_frame_limit")
                     .selected_text(context.history_frame_limit.to_string())
@@ -376,7 +377,9 @@ impl UnifiedPlayerState {
                         for limit in &context.history_frame_limit_options {
                             ui.selectable_value(&mut selected_limit, *limit, limit.to_string());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(crate::FRAMES_TO_LOAD_HELP);
                 if selected_limit != context.history_frame_limit {
                     action = Some(UnifiedPlayerAction::SetHistoryFrameLimit(selected_limit));
                 }
@@ -389,7 +392,7 @@ impl UnifiedPlayerState {
                             .speed(1.0)
                             .prefix("N "),
                     )
-                    .on_hover_text("Requested/kept radar frames for long loops")
+                    .on_hover_text(crate::FRAMES_TO_LOAD_HELP)
                     .changed()
                 {
                     action = Some(UnifiedPlayerAction::SetHistoryFrameLimit(typed_limit));
@@ -879,8 +882,8 @@ impl Default for UnifiedPlayerContext {
             history_frame_limit: 10,
             history_frame_limit_max: 2000,
             history_frame_limit_options: vec![
-                3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96, 128, 160, 200, 256, 384, 512, 768, 1000,
-                1500, 2000,
+                3, 5, 7, 10, 12, 15, 20, 24, 25, 30, 48, 72, 96, 128, 160, 200, 256, 384, 512, 768,
+                1000, 1500, 2000,
             ],
             loop_speed_percent: 100,
             loop_speed_options: vec![25, 50, 100, 200, 400, 800, 1600, 3200, 6400],

@@ -499,8 +499,13 @@ const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
 // `history_size_options_reach_96_without_changing_default`). DEFAULT/MAX
 // moved to ui_core (re-exported above).
 const HISTORY_SIZE_OPTIONS: &[usize] = &[
-    3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96, 128, 160, 200, 256, 384, 512, 768, 1000, 1500, 2000,
+    3, 5, 7, 10, 12, 15, 20, 24, 25, 30, 48, 72, 96, 128, 160, 200, 256, 384, 512, 768, 1000, 1500,
+    2000,
 ];
+pub(crate) const FRAMES_TO_LOAD_HELP: &str = "Sets how many recent radar scans the next Load Loop fetches and keeps for playback. \
+     To add more frames, raise it and press Load Loop again. This is not an export limit.";
+const VIDEO_EXPORT_SETTINGS_HELP: &str = "These controls create GIF/MP4/WebP recordings from frames already loaded above. \
+     They do not change how many radar scans Load Loop fetches.";
 const DEFAULT_ARCHIVE_FRAME_COUNT: usize = 10;
 const MAX_ARCHIVE_FRAME_COUNT: usize = MAX_HISTORY_FRAME_LIMIT;
 /// Primary radar-history memory budgets offered in Settings ▸ Memory (GiB).
@@ -12732,6 +12737,74 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    /// Apply the one persisted recent-loop request/keep limit from any compact
+    /// surface. Independent panes intentionally share the preference, while a
+    /// downward edit made for one pane trims only that pane immediately (the
+    /// established pane behavior); the next load on every source uses the new
+    /// value.
+    fn set_frames_to_load_for_target(
+        &mut self,
+        limit: usize,
+        pane_slot: Option<usize>,
+        ctx: &egui::Context,
+    ) {
+        match pane_slot {
+            None => self.set_history_frame_limit(limit, ctx),
+            Some(slot) => {
+                self.primary.limits.frame_limit = normalized_history_limit(limit);
+                self.persist_user_history_frame_limit();
+                self.retrim_extra_pane_history_to_shared_limit(slot);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// The same preset + arbitrary-value control used beside `Load Loop` and
+    /// in the loaded-loop gear. It edits `history_frame_limit`; no duplicate
+    /// UI-only count can drift away from what the loaders actually receive.
+    fn frames_to_load_rows_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pane_slot: Option<usize>,
+        id_salt: &'static str,
+    ) {
+        let current_limit = self.primary.limits.frame_limit;
+        let mut selected_limit = current_limit;
+        panel_kit::row(ui, "Frames to load", |ui| {
+            egui::ComboBox::from_id_salt((id_salt, "preset", pane_slot))
+                .selected_text(format!("{current_limit} frames"))
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    for limit in HISTORY_SIZE_OPTIONS {
+                        ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
+                    }
+                })
+                .response
+                .on_hover_text(FRAMES_TO_LOAD_HELP);
+        });
+        if selected_limit != current_limit {
+            self.set_frames_to_load_for_target(selected_limit, pane_slot, ctx);
+        }
+
+        let current_limit = self.primary.limits.frame_limit;
+        let mut typed_limit = current_limit;
+        let typed_changed = panel_kit::row(ui, "Custom count", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut typed_limit)
+                    .range(1..=MAX_HISTORY_FRAME_LIMIT)
+                    .speed(1.0)
+                    .suffix(" frames"),
+            )
+            .on_hover_text(FRAMES_TO_LOAD_HELP)
+            .changed()
+        });
+        if typed_changed {
+            self.set_frames_to_load_for_target(typed_limit, pane_slot, ctx);
+        }
+        ui.weak(FRAMES_TO_LOAD_HELP);
+    }
+
     fn persist_user_history_frame_limit(&mut self) {
         let limit = normalized_history_limit(self.primary.limits.frame_limit) as u16;
         if self.app_settings.history_frame_limit != limit {
@@ -23180,6 +23253,14 @@ impl ViewerApp {
         // Wrapped action row (the old single row ran ~600 pt — the No. 2
         // width offender): buttons + live toggles wrap at 320 pt, and the
         // two label+value knobs below become kit rows.
+        panel_kit::subgroup(ui, "Recent loop", |_| {});
+        let site_loop_ctx = ui.ctx().clone();
+        self.frames_to_load_rows_ui(
+            ui,
+            &site_loop_ctx,
+            site_control_pane,
+            "radar_site_frames_to_load",
+        );
         ui.horizontal_wrapped(|ui| {
             if fixed_action_button(ui, "Load Latest", 88.0).clicked() {
                 if let Some(slot) = site_control_pane {
@@ -23218,10 +23299,12 @@ impl ViewerApp {
                     }
                 }
             }
-            if fixed_action_button(ui, "Load Loop", 82.0)
+            let load_loop_label = format!("Load Loop ({})", self.primary.limits.frame_limit);
+            if fixed_action_button(ui, &load_loop_label, 106.0)
                 .on_hover_text(format!(
-                    "Loop of recent scans. International feeds with recent catalogs load loops \
+                    "Load up to {} recent scans for playback. International feeds with recent catalogs load loops \
                      ({}); single-frame feeds start at newest scan and grow live",
+                    self.primary.limits.frame_limit,
                     intl_recent_loop_provider_labels()
                 ))
                 .clicked()
@@ -24566,7 +24649,7 @@ impl ViewerApp {
             return;
         }
         if self.primary.history.is_empty() {
-            ui.weak("No loop — use Load Loop");
+            ui.weak("No loop — choose Frames to load under Site, then press Load Loop");
             return;
         }
 
@@ -24749,45 +24832,8 @@ impl ViewerApp {
         ctx: &egui::Context,
         pane_slot: Option<usize>,
     ) {
-        // Frame keep/request limit — shared state across primary and panes,
-        // applied through the same paths as the old inline widgets.
-        let apply_limit = |app: &mut Self, limit: usize, ctx: &egui::Context| match pane_slot {
-            None => app.set_history_frame_limit(limit, ctx),
-            Some(slot) => {
-                app.primary.limits.frame_limit = normalized_history_limit(limit);
-                app.persist_user_history_frame_limit();
-                app.retrim_extra_pane_history_to_shared_limit(slot);
-                ctx.request_repaint();
-            }
-        };
-        let mut selected_limit = self.primary.limits.frame_limit;
-        panel_kit::row(ui, "Frame limit", |ui| {
-            egui::ComboBox::from_id_salt(("loop_settings_frame_limit", pane_slot))
-                .selected_text(format!("{} frames", self.primary.limits.frame_limit))
-                .width(96.0)
-                .show_ui(ui, |ui| {
-                    for limit in HISTORY_SIZE_OPTIONS {
-                        ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
-                    }
-                });
-        });
-        if selected_limit != self.primary.limits.frame_limit {
-            apply_limit(self, selected_limit, ctx);
-        }
-        let mut typed_limit = self.primary.limits.frame_limit;
-        let typed_changed = panel_kit::row(ui, "Custom limit", |ui| {
-            ui.add(
-                egui::DragValue::new(&mut typed_limit)
-                    .range(1..=MAX_HISTORY_FRAME_LIMIT)
-                    .speed(1.0)
-                    .prefix("N "),
-            )
-            .on_hover_text("Arbitrary frame request/keep limit for long loops")
-            .changed()
-        });
-        if typed_changed {
-            apply_limit(self, typed_limit, ctx);
-        }
+        panel_kit::subgroup(ui, "Loop loading", |_| {});
+        self.frames_to_load_rows_ui(ui, ctx, pane_slot, "loop_settings_frames_to_load");
         if pane_slot.is_none() {
             // Radar-history memory budget (#20): huge super-res loops trim
             // to fit — with an honest cap indicator right below.
@@ -24826,6 +24872,7 @@ impl ViewerApp {
                 ));
             }
         }
+        panel_kit::subgroup(ui, "Playback", |_| {});
         let mut low_sweeps = self.app_settings.loop_low_sweeps;
         let low_sweeps_changed = panel_kit::row(ui, "In-scan low sweeps", |ui| {
             ui.checkbox(&mut low_sweeps, "")
@@ -24853,6 +24900,8 @@ impl ViewerApp {
                 );
             });
         }
+        panel_kit::subgroup(ui, "Video & GIF export", |_| {});
+        ui.weak(VIDEO_EXPORT_SETTINGS_HELP);
         panel_kit::row(ui, "Free recording", |ui| {
             self.record_free_button_ui(ui);
         });
@@ -59501,6 +59550,33 @@ mod tests {
 
         assert_eq!(app.primary.limits.frame_limit, 96);
         assert_eq!(app.app_settings.history_frame_limit, 96);
+    }
+
+    #[test]
+    fn frames_to_load_is_the_shared_persisted_recent_loop_request() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        app.set_frames_to_load_for_target(24, None, &ctx);
+
+        assert_eq!(app.primary.limits.frame_limit, 24);
+        assert_eq!(app.app_settings.history_frame_limit, 24);
+        let player = app.unified_player_context();
+        assert_eq!(player.history_frame_limit, 24);
+        assert!(player.history_frame_limit_options.contains(&24));
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::Loop, 0, 24, true),
+            Some(24),
+            "the value shown beside Load Loop must be the value the US recent-loop worker requests"
+        );
+    }
+
+    #[test]
+    fn loop_loading_and_export_copy_cannot_be_confused() {
+        assert!(FRAMES_TO_LOAD_HELP.contains("next Load Loop fetches"));
+        assert!(FRAMES_TO_LOAD_HELP.contains("not an export limit"));
+        assert!(VIDEO_EXPORT_SETTINGS_HELP.contains("frames already loaded"));
+        assert!(VIDEO_EXPORT_SETTINGS_HELP.contains("do not change how many radar scans"));
     }
 
     /// Dashed hazard outlines emit multiple segment shapes where the solid

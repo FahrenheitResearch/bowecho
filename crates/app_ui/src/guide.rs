@@ -363,8 +363,11 @@ fn getting_started(ui: &mut egui::Ui) {
     action(
         ui,
         "LOOP",
-        "— after Load Loop: play/pause, step buttons, a scrub slider, and the frame cap \
-         (compact controls; Unified Player supports up to 2000 frames, 64x playback, and exports).",
+        "— under Site, set Frames to load before pressing Load Loop; this persisted count controls \
+         how many recent radar scans BowEcho fetches and keeps for playback. Raise it and press \
+         Load Loop again to refill with more scans. After loading, use play/pause, step buttons, \
+         and the scrub slider. Video & GIF export settings only record already-loaded frames; they \
+         do not change the load count. Unified Player still supports the same limit up to 2000 frames.",
     );
 
     subhead(ui, "PANES & THE MAP");
@@ -3408,5 +3411,16 @@ mod tests {
         ]
         .join(" ");
         assert!(!guide_src.contains(&retired_unavailable_claim));
+    }
+
+    #[test]
+    fn guide_puts_loop_loading_before_export_controls() {
+        let guide_src = include_str!("guide.rs");
+        assert!(guide_src.contains("set Frames to load before pressing Load Loop"));
+        assert!(guide_src.contains("Raise it and press"));
+        assert!(
+            guide_src.contains("Video & GIF export settings only record already-loaded frames")
+        );
+        assert!(guide_src.contains("do not change the load count"));
     }
 }

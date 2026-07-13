@@ -440,7 +440,8 @@ fn archive_loader_window(
                     );
                     ui.end_row();
 
-                    ui.label("Frame limit");
+                    ui.label("Frames to load")
+                        .on_hover_text(crate::FRAMES_TO_LOAD_HELP);
                     let mut frames = context.frames;
                     if ui
                         .add(
@@ -449,7 +450,10 @@ fn archive_loader_window(
                                 .speed(1.0)
                                 .suffix(" frames"),
                         )
-                        .on_hover_text("Scans ending at the UTC time above")
+                        .on_hover_text(format!(
+                            "Scans ending at the UTC time above. {}",
+                            crate::FRAMES_TO_LOAD_HELP
+                        ))
                         .changed()
                     {
                         action = Some(LiveArchiveBarAction::SetFrames(frames));
