@@ -56,7 +56,7 @@ where
     on_preview(preview_overlay);
 
     let mut records = overlay.records;
-    let source_label = match load_spc_mesoscale_discussions(query_time_utc) {
+    let mut source_label = match load_spc_mesoscale_discussions(query_time_utc) {
         Ok(mut md_load) => {
             scanned_items += md_load.scanned_items;
             parsed_items += md_load.parsed_items;
@@ -69,6 +69,19 @@ where
             "NWS active alerts (SPC MD unavailable)".to_owned()
         }
     };
+    match wpc_mpd::load_live(query_time_utc) {
+        Ok(mut mpd_load) => {
+            scanned_items += mpd_load.scanned_items;
+            parsed_items += mpd_load.parsed_items;
+            error_count += mpd_load.error_count;
+            records.append(&mut mpd_load.records);
+            source_label.push_str(" + WPC precipitation discussions");
+        }
+        Err(_) => {
+            error_count += 1;
+            source_label.push_str(" (WPC MPD unavailable)");
+        }
+    }
     let mut overlay = build_live_hazard_overlay(
         source_label,
         query_time_utc,
@@ -1171,7 +1184,7 @@ fn spc_md_product_links(index_html: &str) -> Vec<String> {
 fn parse_spc_md_product_page(
     source_url: &str,
     html: &str,
-    _query_time_utc: DateTime<Utc>,
+    query_time_utc: DateTime<Utc>,
 ) -> Option<HazardRecord> {
     let text = extract_preformatted_text(html).unwrap_or(html);
     let lines = text.lines().map(str::trim_end).collect::<Vec<_>>();
@@ -1184,15 +1197,14 @@ fn parse_spc_md_product_page(
     let label = format!("MD {number}");
     let area = strip_prefixed_line(&lines, "Areas affected...");
     let concerning = strip_prefixed_line(&lines, "Concerning...");
-    let valid = find_prefixed_line(&lines, "Valid ");
+    let valid = find_prefixed_line(&lines, "Valid ")?;
+    let valid_period = parse_spc_md_valid_period(&valid, query_time_utc)?;
     let watch_probability = strip_prefixed_line(&lines, "Probability of Watch Issuance...");
     let peak_tornado = find_prefixed_line(&lines, "MOST PROBABLE PEAK TORNADO INTENSITY...");
     let peak_wind = find_prefixed_line(&lines, "MOST PROBABLE PEAK WIND GUST...");
     let peak_hail = find_prefixed_line(&lines, "MOST PROBABLE PEAK HAIL SIZE...");
     let mut details = Vec::new();
-    if let Some(valid) = valid {
-        details.push(valid);
-    }
+    details.push(valid);
     if let Some(watch_probability) = watch_probability {
         details.push(format!("Watch issuance {watch_probability}"));
     }
@@ -1211,15 +1223,20 @@ fn parse_spc_md_product_page(
         label,
         event_family: "mesoscale discussion".to_owned(),
         action: "SPC".to_owned(),
-        lifecycle_status: Some("Active".to_owned()),
+        lifecycle_status: hazard_lifecycle_status(
+            "SPC",
+            Some(valid_period.0),
+            Some(valid_period.1),
+            Some(query_time_utc),
+        ),
         office: "SPC".to_owned(),
         headline: concerning,
         source_url: Some(source_url.to_owned()),
         area,
         motion: None,
         details,
-        valid_start: None,
-        valid_end: None,
+        valid_start: Some(format_utc_seconds(valid_period.0)),
+        valid_end: Some(format_utc_seconds(valid_period.1)),
         severity: None,
         certainty: None,
         urgency: None,
@@ -1230,6 +1247,64 @@ fn parse_spc_md_product_page(
         bbox: hazard_bbox(&points),
         points,
     })
+}
+
+/// Resolve SPC's compact `Valid DDHHMMZ - DDHHMMZ` range against the live
+/// query time. The product omits month and year, so consider the adjacent
+/// months and choose the occurrence nearest the query. This also handles MDs
+/// that cross UTC month/year boundaries.
+fn parse_spc_md_valid_period(
+    valid_line: &str,
+    query_time_utc: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let tokens = valid_line
+        .split(|character: char| character.is_ascii_whitespace() || character == '-')
+        .filter_map(parse_spc_md_valid_token)
+        .take(2)
+        .collect::<Vec<_>>();
+    let [start_token, end_token] = tokens.as_slice() else {
+        return None;
+    };
+
+    let start = (-1..=1)
+        .filter_map(|month_offset| utc_in_offset_month(query_time_utc, month_offset, *start_token))
+        .min_by_key(|candidate| {
+            candidate
+                .signed_duration_since(query_time_utc)
+                .num_seconds()
+                .unsigned_abs()
+        })?;
+    let end = (0..=1)
+        .filter_map(|month_offset| utc_in_offset_month(start, month_offset, *end_token))
+        .filter(|candidate| *candidate >= start)
+        .min()?;
+    Some((start, end))
+}
+
+fn parse_spc_md_valid_token(token: &str) -> Option<(u32, u32, u32)> {
+    let token = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+    let digits = token
+        .strip_suffix('Z')
+        .or_else(|| token.strip_suffix('z'))?;
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let day = digits[0..2].parse().ok()?;
+    let hour = digits[2..4].parse().ok()?;
+    let minute = digits[4..6].parse().ok()?;
+    (day >= 1 && hour < 24 && minute < 60).then_some((day, hour, minute))
+}
+
+fn utc_in_offset_month(
+    anchor: DateTime<Utc>,
+    month_offset: i32,
+    (day, hour, minute): (u32, u32, u32),
+) -> Option<DateTime<Utc>> {
+    let month_index = anchor.year() * 12 + anchor.month0() as i32 + month_offset;
+    let year = month_index.div_euclid(12);
+    let month = month_index.rem_euclid(12) as u32 + 1;
+    Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
+        .single()
 }
 
 fn extract_preformatted_text(html: &str) -> Option<&str> {
@@ -4426,6 +4501,9 @@ mod tests {
 
         assert_eq!(record.event_family, "mesoscale discussion");
         assert_eq!(record.label, "MD 1015");
+        assert_eq!(record.lifecycle_status.as_deref(), Some("Active"));
+        assert_eq!(record.valid_start.as_deref(), Some("2026-06-07T18:59:00Z"));
+        assert_eq!(record.valid_end.as_deref(), Some("2026-06-07T21:00:00Z"));
         assert_eq!(
             record.headline.as_deref(),
             Some("Severe potential...Watch unlikely")
@@ -4456,6 +4534,41 @@ mod tests {
                 lat: 37.0
             }
         ));
+    }
+
+    #[test]
+    fn spc_md_product_parser_expires_after_compact_valid_end() {
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 7, 13, 4, 0, 0)
+            .single()
+            .expect("valid query time");
+        let record = parse_spc_md_product_page(
+            "https://www.spc.noaa.gov/products/md/md1610.html",
+            SAMPLE_EXPIRED_SPC_MD_HTML,
+            query_time,
+        )
+        .expect("spc md record");
+
+        assert_eq!(record.label, "MD 1610");
+        assert_eq!(record.lifecycle_status.as_deref(), Some("Expired"));
+        assert_eq!(record.valid_start.as_deref(), Some("2026-07-13T00:27:00Z"));
+        assert_eq!(record.valid_end.as_deref(), Some("2026-07-13T02:30:00Z"));
+    }
+
+    #[test]
+    fn spc_md_valid_period_handles_year_rollover() {
+        let query_time = Utc
+            .with_ymd_and_hms(2027, 1, 1, 0, 30, 0)
+            .single()
+            .expect("valid query time");
+
+        assert_eq!(
+            parse_spc_md_valid_period("Valid 312330Z - 010130Z", query_time),
+            Some((
+                Utc.with_ymd_and_hms(2026, 12, 31, 23, 30, 0).unwrap(),
+                Utc.with_ymd_and_hms(2027, 1, 1, 1, 30, 0).unwrap(),
+            ))
+        );
     }
 
     #[test]
@@ -4799,5 +4912,19 @@ $$
 
    MOST PROBABLE PEAK TORNADO INTENSITY...85-110 MPH
    MOST PROBABLE PEAK WIND GUST...UP TO 60 MPH
+</pre></body></html>"#;
+
+    const SAMPLE_EXPIRED_SPC_MD_HTML: &str = r#"<html><body><pre>
+   Mesoscale Discussion 1610
+   NWS Storm Prediction Center Norman OK
+   0727 PM CDT Sun Jul 12 2026
+
+   Areas affected...portions of northeastern and eastern Montana
+   Concerning...Severe potential...Watch unlikely
+   Valid 130027Z - 130230Z
+   Probability of Watch Issuance...5 percent
+
+   LAT...LON   47351203 48931016 49070973 49040499 47930620 47100805
+               46491028 46251125 46591184 47351203
 </pre></body></html>"#;
 }

@@ -120,6 +120,7 @@ mod vol3d;
 mod vwp;
 mod wofs;
 mod wofs_georef;
+mod wpc_mpd;
 mod wrf_process;
 mod wrf_radar;
 mod wrf_radar_estimator;
