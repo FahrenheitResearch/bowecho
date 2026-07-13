@@ -290,6 +290,17 @@ impl AdditiveScattering {
         for value in &mut values {
             *value *= nonnegative_weight;
         }
+        // At the extreme low-concentration tail of a quadrature, binary64 can
+        // round ZH to zero while the larger ZH*V and ZH*V^2 products remain as
+        // subnormals. Those moments no longer have a representable zeroth-
+        // moment weight and cannot contribute a derived fall speed. Collapse
+        // only that scale-underflow case; `self` was already validated, so an
+        // evaluator cannot use this path to hide intrinsically inconsistent
+        // nonzero moments paired with zero ZH.
+        if self.zh.get() > 0.0 && values[0] == 0.0 {
+            values[7] = 0.0;
+            values[8] = 0.0;
+        }
         Self::from_components(values)
     }
 
@@ -531,6 +542,35 @@ mod tests {
         assert!(matches!(
             AdditiveScattering::from_components(invalid),
             Err(OutputError::NegativeFallSpeedVariance { .. })
+        ));
+    }
+
+    #[test]
+    fn scaling_collapses_fall_moments_when_zh_underflows_to_zero() {
+        let minimum_subnormal = f64::from_bits(1);
+        let scaled = sample(0.25, 8.0, 0.0)
+            .checked_scale(minimum_subnormal)
+            .unwrap();
+        let components = scaled.components();
+        assert_eq!(components[0], 0.0);
+        assert_eq!(components[7], 0.0);
+        assert_eq!(components[8], 0.0);
+
+        // An invalid unscaled contribution remains fail-closed; the repair is
+        // deliberately confined to underflow produced by checked scaling.
+        assert!(matches!(
+            AdditiveScattering::from_components([
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                minimum_subnormal,
+                minimum_subnormal,
+            ]),
+            Err(OutputError::FallMomentsWithoutReflectivity)
         ));
     }
 
