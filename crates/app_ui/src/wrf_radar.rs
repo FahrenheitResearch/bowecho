@@ -3230,15 +3230,28 @@ fn build_synthetic_volume_reporting_inner(
         use std::fmt::Write as _;
         if let Some(service) = config.runtime_cuda_service.as_deref() {
             let report = service.report();
-            let _ = write!(
-                forward_operator_config,
-                "; tmatrix_compute_preference={}; tmatrix_execution_initial_backend=nvidia_cuda; cuda_device={}; cuda_compute={}.{}; cuda_kernel={}",
-                config.compute_preference.label(),
-                report.device.name,
-                report.device.compute_capability_major,
-                report.device.compute_capability_minor,
-                report.device.kernel_artifact,
-            );
+            if let Some(reason) = report.fallback_reason.as_ref() {
+                let _ = write!(
+                    forward_operator_config,
+                    "; tmatrix_compute_preference={}; tmatrix_execution_initial_backend=cuda_then_cpu_replay; cuda_device={}; cuda_compute={}.{}; cuda_kernel={}; cuda_nodes_completed={}; cuda_fallback={reason}",
+                    config.compute_preference.label(),
+                    report.device.name,
+                    report.device.compute_capability_major,
+                    report.device.compute_capability_minor,
+                    report.device.kernel_artifact,
+                    report.nodes_completed,
+                );
+            } else {
+                let _ = write!(
+                    forward_operator_config,
+                    "; tmatrix_compute_preference={}; tmatrix_execution_initial_backend=nvidia_cuda; cuda_device={}; cuda_compute={}.{}; cuda_kernel={}",
+                    config.compute_preference.label(),
+                    report.device.name,
+                    report.device.compute_capability_major,
+                    report.device.compute_capability_minor,
+                    report.device.kernel_artifact,
+                );
+            }
         } else {
             let _ = write!(
                 forward_operator_config,
@@ -3591,6 +3604,7 @@ fn build_synthetic_volume_reporting_inner(
             ));
             cuda_fallback_reported = true;
         }
+        refresh_in_progress_tmatrix_execution_provenance(&mut volume, config);
         if let Some(cut_completed) = cut_completed {
             cut_completed(&volume, cut_index + 1, tilt_total);
         }
@@ -8466,6 +8480,41 @@ fn append_execution_fragment(volume: &mut RadarVolume, fragment: &str) {
     }
 }
 
+/// Keep a partial first-tilt preview honest when CUDA disables after the
+/// volume metadata was initialized but before that cut is published. Final
+/// volumes receive the complete counters from `finish_tmatrix_execution_report`;
+/// this marker exists only to prevent an in-progress preview from claiming an
+/// accelerator that has already fallen back.
+fn refresh_in_progress_tmatrix_execution_provenance(
+    volume: &mut RadarVolume,
+    config: &SyntheticRadarConfig,
+) {
+    let Some(service) = config.runtime_cuda_service.as_deref() else {
+        return;
+    };
+    let report = service.report();
+    let Some(reason) = report.fallback_reason.as_ref() else {
+        return;
+    };
+    let existing = volume
+        .metadata
+        .forward_operator_config
+        .as_deref()
+        .unwrap_or_default();
+    if existing.contains("tmatrix_execution_initial_backend=cuda_then_cpu_replay")
+        || existing.contains("tmatrix_execution_progress_backend=cuda_then_cpu_replay")
+    {
+        return;
+    }
+    append_execution_fragment(
+        volume,
+        &format!(
+            "tmatrix_execution_progress_backend=cuda_then_cpu_replay; cuda_nodes_completed={}; cuda_batches_completed={}; cuda_fallback={reason}",
+            report.nodes_completed, report.batches_completed,
+        ),
+    );
+}
+
 fn finish_tmatrix_execution_report(
     output: &mut SyntheticRadarOutput,
     preference: SyntheticRadarComputePreference,
@@ -8542,6 +8591,19 @@ fn build_synthetic_from_paths(
     cancel: &AtomicBool,
 ) -> Result<SyntheticRadarOutput, String> {
     check_synthetic_radar_cancel(cancel)?;
+    // Reject malformed jobs before retaining a CUDA primary context or
+    // uploading immutable LUTs. The inner worker repeats the cheap checks at
+    // its own boundary, but accelerator startup must never precede them.
+    config.validate_science_contract()?;
+    if paths.is_empty() {
+        return Err("No WRF files selected".to_owned());
+    }
+    if !paths
+        .iter()
+        .any(|path| crate::wrf_process::is_supported_wrf_file(path))
+    {
+        return Err("No supported WRF files selected".to_owned());
+    }
     let (runtime_config, runtime) = resolve_tmatrix_execution_runtime(config, tx, cancel)?;
     let mut output = build_synthetic_from_paths_inner(paths, &runtime_config, label, tx, cancel)?;
     check_synthetic_radar_cancel(cancel)?;
