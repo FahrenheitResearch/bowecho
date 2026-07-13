@@ -139,7 +139,13 @@ impl FallSpeedMoments {
         finite("fall-speed raw second moment", raw_second)?;
         let variance = raw_second - mean * mean;
         let tolerance = RELATIVE_INVARIANT_TOLERANCE * raw_second.abs().max(1.0);
-        if variance < -tolerance {
+        if variance < -tolerance
+            && !subnormal_moment_intervals_admit_nonnegative_variance(
+                self.first,
+                self.second,
+                zh.get(),
+            )
+        {
             return Err(OutputError::NegativeFallSpeedVariance {
                 first: self.first,
                 second: self.second,
@@ -148,6 +154,32 @@ impl FallSpeedMoments {
         }
         Ok((mean, variance.max(0.0)))
     }
+}
+
+fn subnormal_moment_intervals_admit_nonnegative_variance(first: f64, second: f64, zh: f64) -> bool {
+    // Scaling a valid node by an extremely small concentration independently
+    // rounds ZH, ZH*V, and ZH*V^2 onto the fixed f64-subnormal lattice. Their
+    // ratios can then imply a small negative variance even though the exact
+    // moments were valid. Do not raise the normal tolerance or discard other
+    // scattering components: accept only when the three half-ULP intervals
+    // contain at least one valid moment triple, S*Z >= F^2.
+    let quanta = |value: f64| {
+        if value == 0.0 {
+            Some(0_u128)
+        } else if value.is_sign_positive() && value.is_subnormal() {
+            Some(u128::from(value.to_bits()))
+        } else {
+            None
+        }
+    };
+    let (Some(first), Some(second), Some(zh)) = (quanta(first), quanta(second), quanta(zh)) else {
+        return false;
+    };
+
+    let second_upper_twice = 2 * second + 1;
+    let zh_upper_twice = 2 * zh + 1;
+    let first_lower_twice = (2 * first).saturating_sub(1);
+    second_upper_twice * zh_upper_twice >= first_lower_twice * first_lower_twice
 }
 
 /// A contribution that is additive in every stored component.
@@ -477,6 +509,29 @@ mod tests {
         assert!((mixed.fall_speed_mps - 5.0).abs() < 1.0e-6);
         // Within-population variance 1 plus between-population variance 3.
         assert!((mixed.fall_speed_variance_m2s2 - 4.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn valid_fall_moments_survive_exact_reported_subnormal_node_scaling() {
+        let scaled_zh = 2.848_208_6e-316;
+        let mean = 1.950_608_138_469_241_3;
+        let scaled = sample(1.0, mean, 0.0).checked_scale(scaled_zh).unwrap();
+        let components = scaled.components();
+        assert_eq!(components[0], scaled_zh);
+        assert_eq!(components[7], 5.555_738_9e-316);
+        assert_eq!(components[8], 1.083_706_947e-315);
+        let (derived_mean, variance) = scaled.fall_speed.mean_variance(scaled.zh).unwrap();
+        assert!((derived_mean - mean).abs() < 1.0e-15);
+        assert_eq!(variance, 0.0);
+
+        // Four subnormal quanta below the reported second moment is outside
+        // even the exact half-ULP feasibility intervals and must still fail.
+        let mut invalid = components;
+        invalid[8] = f64::from_bits(invalid[8].to_bits() - 4);
+        assert!(matches!(
+            AdditiveScattering::from_components(invalid),
+            Err(OutputError::NegativeFallSpeedVariance { .. })
+        ));
     }
 
     #[test]
