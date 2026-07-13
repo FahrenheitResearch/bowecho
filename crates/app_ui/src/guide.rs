@@ -1876,7 +1876,7 @@ fn simsat(ui: &mut egui::Ui) {
     ui.heading("SimSat");
     para(
         ui,
-        "Windows \u{25be} \u{25b8} SimSat opens the embedded SimSat 0.2.0 renderer. It turns \
+        "Windows \u{25be} \u{25b8} SimSat opens the embedded SimSat 0.2.1 renderer. It turns \
          WRF or HRRR native-level model atmospheres into physically based visible, thermal, \
          water-vapor and derived satellite products. Durable CPU renders enter BowEcho's normal \
          Satellite player; a separate one-frame GPU preview is available for visual iteration.",
@@ -1923,8 +1923,9 @@ fn simsat(ui: &mut egui::Ui) {
         "— restores the reviewed visible baseline without changing source or product: CPU \
          offline quality, Model native, CompactU8, exposure 1.5, AOD 0.05, cloud OD 0.15, \
          deterministic two-subcolumn clouds, fixed particle optics, the bounded 4.0 low-sun \
-         land-normalization gain, exposed-edge feathering and top-down shadow anti-aliasing on, \
-         with experimental footprint and post-light controls off.",
+         land-normalization gain, ground lift 1.10, the tightly gated twilight recovery \
+         (0.30 / 0.50 / 4.0), exposed-edge feathering and top-down shadow anti-aliasing on. \
+         Experimental footprints and the legacy broad post-light toe remain off.",
     );
     action(
         ui,
@@ -2052,8 +2053,8 @@ fn simsat(ui: &mut egui::Ui) {
         "— a temporary visible-true-color first frame opened only in Native plot. It reports \
          every compatibility substitution, never changes saved controls, never enters the \
          satellite store, and never silently falls back to a stored CPU frame. Sensor Fast Gray, \
-         ScienceCloudF16, exact GOES-R geostationary navigation, instrument footprints and the \
-         optional post-light terrain toe are CPU-only.",
+         ScienceCloudF16, exact GOES-R geostationary navigation and instrument footprints are \
+         CPU-only. v0.2.1 keeps both post-light terrain controls visually matched on CPU/GPU.",
     );
     para(
         ui,
@@ -2157,19 +2158,21 @@ fn simsat(ui: &mut egui::Ui) {
     para(
         ui,
         "Restore shipped display calibration resets the visible display-tuning controls without \
-         changing the source or product. SimSat also shares one 0–12 degree low-sun help \
-         ramp across land normalization, dark-toe recovery, ground lift and water-albedo help; \
-         direct water sunlight is no longer artificially day-gated. The reviewed bounded land \
-         gain is 4.0 and the display cloud-shadow floor is 0.45. Post-light surface toe is a \
-         separate default-off CPU experiment over land after lighting/view attenuation and \
-         before airlight; it leaves water, glint, raw fields and Sensor Fast Gray unchanged.",
+         changing the source or product. SimSat 0.2.1 removes an unintended second \
+         limb-darkening factor from surface illumination, uses a restrained surface-only \
+         ground lift of 1.10, and enables tightly gated twilight terrain recovery: it fades in \
+         from -6 to 0 degrees, is full through +4, and returns to identity by +12. The legacy \
+         broad post-light toe remains a default-off experiment. Both post-view controls use the \
+         same formula on CPU/GPU and leave water, glint, cloud radiance, raw fields and Sensor \
+         Fast Gray unchanged.",
     );
     para(
         ui,
-        "Natural (NOAA heritage) adds NOAA's continuous bi-linear longwave-IR grayscale to the \
-         Satellite enhancement picker. BowEcho preserves its existing persisted CIMSS default \
-         instead of silently migrating users. Natural recolors the displayed Kelvin plane only; \
-         it does not change the thermal operator, and WV bands keep band-scaled grayscale ranges.",
+        "CIMSS Style is SimSat 0.2.1's recommended Band-13 false-color isotherm display. \
+         Explicitly entering an IR or WV product selects CIMSS; startup in the same persisted \
+         product preserves the saved palette. Natural (NOAA heritage) remains available as \
+         NOAA's continuous bi-linear longwave grayscale. Both recolor the displayed Kelvin \
+         plane only; neither changes the thermal operator.",
     );
 
     subhead(ui, "SENSOR & PRECISION CONTROLS");
@@ -2197,7 +2200,7 @@ fn simsat(ui: &mut egui::Ui) {
     subhead(ui, "CACHE, LOOPS & OUTPUT");
     para(
         ui,
-        "SimSat 0.2.0 keeps compact production SSB cache format v6; ScienceCloudF16 uses \
+        "SimSat 0.2.1 keeps compact production SSB cache format v6; ScienceCloudF16 uses \
          a disjoint v7 cache. This release does not force a compact-cache format bump. Older \
          bricks must be ingested once again from their original WRF/HRRR source; a \
          cached-only brick cannot be upgraded without that source. A retained wrfnat source \
@@ -2206,8 +2209,10 @@ fn simsat(ui: &mut egui::Ui) {
     para(
         ui,
         "Product, view, quick/science, atmosphere, cloud, lighting and display choices persist \
-         in BowEcho settings. Source paths, active jobs, progress, errors and rendered output \
-         are deliberately session-only.",
+         in BowEcho settings. A v0.2.0 pane payload migrates without changing its image: the \
+         saved ground lift is kept and twilight recovery remains off until Recommended is \
+         deliberately applied. Source paths, active jobs, progress, errors and rendered output \
+         are session-only.",
     );
     para(
         ui,
@@ -2240,9 +2245,10 @@ fn simsat(ui: &mut egui::Ui) {
          atmospheric chemistry model. IR and water-vapor products use documented gray, \
          band-averaged absorption rather than line-by-line radiative transfer. SimSat day/night \
          color is GeoColor-style broad RGB, not sensor-derived ABI GeoColor; its night side is \
-         IR with no city-lights layer. Natural is a display palette, shadow anti-aliasing and the \
-         4096-step cap are sampling improvements rather than new meteorology, and the optional \
-         post-light toe is a CPU display experiment. Precision, native-optics, footprint, \
+         IR with no city-lights layer. CIMSS/Natural are display palettes, and shadow \
+         anti-aliasing plus the 4096-step cap are sampling improvements rather than new \
+         meteorology. Twilight recovery is a bounded finished-visible display control, not new \
+         terrain science. Precision, native-optics, footprint, \
          granulation, delta-flux, reconstruction and sun experiments remain opt-in and labeled.",
     );
     cite(
@@ -3111,7 +3117,7 @@ mod tests {
         assert!(!guide_src.contains(&stale_psd_claim));
         assert!(!guide_src.contains(&stale_bowecho_version));
         assert!(!guide_src.contains(&stale_simsat_version));
-        assert!(guide_src.contains("embedded SimSat 0.2.0 renderer"));
+        assert!(guide_src.contains("embedded SimSat 0.2.1 renderer"));
 
         // Formula Lab must retain the explicit capability boundary rather
         // than implying every stored model has raw-WRF grid geometry.
@@ -3132,16 +3138,17 @@ mod tests {
         assert!(guide_src.contains("SSB cache format v6"));
         assert!(guide_src.contains("does not force a compact-cache format bump"));
         assert!(guide_src.contains("Deterministic 2 is the reviewed finished-display default"));
-        assert!(guide_src.contains("bounded land gain is 4.0"));
+        assert!(guide_src.contains("ground lift 1.10"));
+        assert!(guide_src.contains("tightly gated twilight recovery"));
         assert!(guide_src.contains("camera-to-cloud atmospheric column"));
         assert!(guide_src.contains("Top-down shadow anti-aliasing"));
         assert!(guide_src.contains("sun-OD march also permits up to 4096"));
-        assert!(guide_src.contains("Post-light surface toe is a"));
+        assert!(guide_src.contains("same formula on CPU/GPU"));
         assert!(guide_src.contains("Natural (NOAA heritage)"));
-        assert!(guide_src.contains("persisted CIMSS default"));
+        assert!(guide_src.contains("CIMSS Style is SimSat 0.2.1's recommended"));
         assert!(guide_src.contains("band-averaged absorption rather than line-by-line"));
         assert!(guide_src.contains("The Current label describes"));
-        assert!(guide_src.contains("0–12 degree low-sun help"));
+        assert!(guide_src.contains("fades in from -6 to 0 degrees"));
         assert!(guide_src.contains("Source paths, active jobs, progress, errors"));
         assert!(guide_src.contains("Resolution is not a separate run key"));
         assert!(guide_src.contains("not currently embedded into Satellite"));

@@ -1,6 +1,8 @@
 # SimSat in BowEcho
 
-BowEcho embeds SimSat v0.2.0 as a first-class simulated-satellite workspace.
+BowEcho embeds SimSat v0.2.1 at public release commit
+`22dd23b2b956360c53ca6b7b2b445fe76202c392` as a first-class
+simulated-satellite workspace.
 Open **Windows > SimSat** to render WRF or HRRR native-level atmospheres into
 visible, thermal, water-vapor, and derived satellite products.
 
@@ -39,9 +41,11 @@ preset-owned controls make the current mode **Custom**.
 - **Recommended Display** restores the reviewed visible baseline: CPU offline
   quality, Model native, CompactU8, exposure 1.5, AOD 0.05, cloud OD 0.15,
   the deterministic two-subcolumn fractional-cloud closure, fixed particle
-  optics, the reviewed 4.0 low-sun land-normalization bound, exposed-edge
-  feathering and top-down ground-shadow anti-aliasing on, and experimental
-  footprint/transport/post-light controls off.
+  optics, the reviewed 4.0 low-sun land-normalization bound, surface-only
+  ground lift 1.10, tightly gated twilight recovery (knee 0.30, gamma 0.50,
+  maximum gain 4.0), exposed-edge feathering and top-down ground-shadow
+  anti-aliasing on. Experimental footprint/transport and the legacy broad
+  post-light toe remain off.
 - **High Quality Visible** starts from Recommended Display, then selects the
   deterministic four-subcolumn reference and a 0.45 highlight knee. It is
   slower and is not a blanket claim of greater model accuracy.
@@ -53,8 +57,9 @@ preset-owned controls make the current mode **Custom**.
 
 The **Intent** selector remains independently available. **Display** preserves
 the reviewed SimSat look. **Sensor Fast Gray** neutralizes display-only
-exposure, land, edge, highlight, granulation, and reconstruction transforms on
-a temporary request. After a successful render the SimSat pane reports every
+exposure, land, twilight-recovery, edge, highlight, granulation, and
+reconstruction transforms on a temporary request. After a successful render
+the SimSat pane reports every
 adjustment and science warning. Those notices are not embedded in Satellite
 store frames or PNG metadata. Sensor Fast Gray requires CPU and is not a
 complete ABI/AHI channel observation operator.
@@ -128,13 +133,13 @@ frames, which keeps a loop comparable instead of rescaling each image
 independently.
 
 BowEcho recolors stored Kelvin IR/WV frames live in the Satellite window.
-SimSat v0.2.0 adds **Natural (NOAA heritage)** for longwave IR: NOAA's
-continuous bi-linear grayscale display transfer. It is available in BowEcho's
-IR-enhancement picker, while existing BowEcho settings retain their persisted
-**CIMSS** default instead of being silently migrated. Natural is a display
-palette only; the stored Band-13 brightness-temperature plane remains Kelvin.
-For water-vapor bands, Natural deliberately uses each band's scaled grayscale
-rather than forcing the Band-13 breakpoint.
+SimSat v0.2.1 makes **CIMSS Style** the reviewed Band-13 presentation. Explicitly
+entering an IR or WV product in the SimSat pane selects CIMSS; loading BowEcho
+in the same persisted product does not overwrite an explicitly saved palette.
+**Natural (NOAA heritage)** remains available as NOAA's continuous bi-linear
+longwave grayscale. Both are display transfers only: the stored brightness-
+temperature plane remains Kelvin. For water-vapor bands, Natural deliberately
+uses each band's scaled grayscale rather than forcing the Band-13 breakpoint.
 
 ## View geometry
 
@@ -262,7 +267,7 @@ Progress displays completed frames versus the discovered total. Use
 
 ### Exposure
 
-Finished-visible display gain. SimSat v0.2.0 ships at 1.5; 1.0 is neutral
+Finished-visible display gain. SimSat v0.2.1 ships at 1.5; 1.0 is neutral
 physical reflectance. Exposure does not modify raw scalar products.
 
 ### Aerosol optical depth
@@ -406,23 +411,24 @@ ground for valid date; forcing month 1-12 is a what-if surface.
 
 Ground lift, highlight knee/ceiling, solar-zenith land normalization, and the
 dark-land reflectance toe affect finished visible-family RGB. **Restore shipped
-display calibration** returns those controls to SimSat v0.2.0 defaults. The
-reviewed maximum gain for the low-sun land-normalization operator is now 4.0;
-its existing elevation ramp keeps twilight and high-sun scenes neutral.
+display calibration** returns those controls to SimSat v0.2.1 defaults. The
+reviewed whole-surface ground lift is 1.10 (1.0 remains the neutral override),
+and the maximum gain for the older low-sun land-normalization operator is 4.0.
 
-**Post-light surface toe (CPU)** is a separate, optional experiment. It applies
-a bounded color-preserving lift to land after lighting and view attenuation but
-before atmospheric airlight and cloud compositing. It is off by default, does
-not alter water/glint or raw products, and is disabled by Sensor Fast Gray. GPU
-preview cannot reproduce this experiment; use Render to Satellite for a frame
-that must include it.
+**Twilight surface recovery** is the reviewed, default-on v0.2.1 control. It
+applies only to lit/view-attenuated land from civil twilight through low sun,
+using the bounded 0.30 knee, 0.50 gamma, and 4.0 maximum gain described above.
+**Post-light surface toe** is the older, broader optional experiment and remains
+off by default. Both run after lighting and view attenuation but before airlight
+and clouds; both leave water/glint, cloud radiance, raw fields, and Sensor Fast
+Gray unchanged. v0.2.1 implements the same post-view formula on CPU and GPU.
 
 Raw visible bands, IR, water vapor, and derived products do not consume these
 display-only controls.
 
 ## Cache behavior
 
-BowEcho uses a versioned SimSat engine cache. SimSat v0.2.0 keeps the compact
+BowEcho uses a versioned SimSat engine cache. SimSat v0.2.1 keeps the compact
 production cache at **SSB v6**; this release does not force a compact-cache
 format bump. The experimental ScienceCloudF16 profile uses a disjoint v7 cache.
 
@@ -434,8 +440,11 @@ Older brick caches cannot masquerade as v6:
 
 The cache is an acceleration artifact, not the scientific source of record.
 Product, view, quick/science, atmosphere, cloud, lighting, and display control
-choices persist in BowEcho settings. Source paths, active jobs, progress,
-errors, and rendered output deliberately do not.
+choices persist in BowEcho settings. A schema-v2 (SimSat v0.2.0) pane payload
+migrates once to schema v3 without changing its picture: its saved ground lift
+is kept and twilight recovery is explicitly off. Fresh panes and a deliberate
+click on Recommended adopt the v0.2.1 calibration. Source paths, active jobs,
+progress, errors, and rendered output deliberately do not persist.
 
 ## Satellite player, map, and native plot
 
@@ -471,13 +480,16 @@ Visible true color combines:
 - Cox-Munk wind-ruffled water glint
 - an ABI-like display transform
 
-SimSat v0.2.0 also uses a shared 0--12 degree low-sun surface-help ramp for
-land normalization, dark-toe recovery, ground lift, and water-albedo
-assistance; direct water sunlight is no longer artificially day-gated. The
-reviewed land-normalization bound is 4.0, the display cloud-shadow floor is
-0.45, and finite-sun shadow softening uses the Sun's angular radius. Top-down
-ground shadows additionally use the reviewed transmittance-space anti-alias
-filter and the higher 4096-step sun-OD ceiling described above.
+SimSat v0.2.1 corrects surface sunlight normalization by removing an unintended
+second limb-darkening factor from land, water, and glint. The reviewed
+twilight terrain recovery is independent of the older land operators: it fades
+in from -6 to 0 degrees solar elevation, stays full through +4 degrees, and
+returns to exact identity by +12 degrees. It affects finished-visible land
+only; ocean/glint, cloud radiance, raw/sensor output, thermal and derived fields
+remain unchanged. CPU and GPU use the same post-view gain formula. The reviewed
+land-normalization bound remains 4.0, the display cloud-shadow floor is 0.45,
+and top-down ground shadows retain the transmittance-space anti-alias filter
+and 4096-step sun-OD ceiling introduced in v0.2.0.
 
 IR uses a gray-body emission march through the model cloud/atmosphere plus a
 surface term, then converts radiance to true-Kelvin brightness temperature.
@@ -499,14 +511,17 @@ Water-vapor bands use related band-averaged moisture weighting.
   ABI GeoColor. Its night side uses the IR composite; there is no city-lights
   layer.
 - GPU output is a visible-only preview, not a stored quality tier.
-- Natural NOAA longwave grayscale is a display transfer, not a change to the
-  Kelvin thermal operator or proof of sensor validation. BowEcho preserves an
-  existing persisted CIMSS choice until the user changes it.
+- CIMSS Style and Natural NOAA grayscale are display transfers, not changes to
+  the Kelvin thermal operator or proof of sensor validation. Startup preserves
+  an explicit saved palette; an explicit IR/WV product transition selects the
+  reviewed CIMSS default.
 - The top-down front-atmosphere march and shadow anti-aliasing improve the
   renderer's approximation; they do not add sub-grid weather, a measured
   instrument footprint, or line-by-line radiative transfer.
-- The post-light surface toe is an optional CPU-only display experiment, not a
-  scientific correction to model terrain or cloud fields.
+- The legacy post-light surface toe remains an optional display experiment,
+  not a scientific correction to model terrain or cloud fields. v0.2.1 gives
+  it CPU/GPU parity; the separate tightly gated twilight recovery is the
+  reviewed finished-visible default.
 - ScienceCloudF16, native particle optics, deterministic fractional clouds,
   the ABI MTF footprint, granulation, delta-flux transport, stratiform/cloud
   footprints, and sun override are opt-in and explicitly experimental,
@@ -540,7 +555,8 @@ cannot be upgraded.
 
 Preview requires a compatible wgpu adapter and supports Visible true color
 only. Sensor Fast Gray, ScienceCloudF16, exact GOES-R geostationary navigation,
-instrument footprints, and the optional post-light surface toe are CPU-only.
+and instrument footprints are CPU-only. Both post-light terrain controls now
+use the same formula on CPU and GPU.
 Use Render to Satellite for the normal CPU result; BowEcho will not silently
 turn a failed preview into a stored frame.
 
@@ -554,8 +570,10 @@ unresolved cloud structure.
 
 Simulated imagery is rendered by
 [FahrenheitResearch/simsat](https://github.com/FahrenheitResearch/simsat),
-licensed MIT OR Apache-2.0. Ground imagery is NASA Blue Marble Next Generation,
-courtesy NASA Earth Observatory.
+licensed MIT OR Apache-2.0. BowEcho's exact pin corresponds to the
+[public SimSat v0.2.1 release](https://github.com/FahrenheitResearch/simsat/releases/tag/v0.2.1).
+Ground imagery is NASA Blue Marble Next Generation, courtesy NASA Earth
+Observatory.
 
 Implementation lineage includes Hillaire atmosphere rendering,
 Frostbite/Nubis volumetric clouds, Wrenninge multiple-scatter approximations,

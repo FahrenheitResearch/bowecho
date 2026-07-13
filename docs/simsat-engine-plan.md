@@ -3,14 +3,17 @@
 > **Historical design document (superseded integration shape).** This records
 > the original pre-implementation engine plan and explains scientific/design
 > choices, but its statement below that SimSat is standalone-only is no longer
-> current. SimSat v0.2.0 ships both its standalone Studio and an embedded
+> current. SimSat v0.2.1 ships both its standalone Studio and an embedded
 > first-class BowEcho workspace under **Windows > SimSat**. Its reviewed display
 > baseline now uses the deterministic two-subcolumn closure, a 4.0 bounded
 > low-sun land-normalization gain, direct top-down camera-to-cloud atmosphere,
 > a transmittance-space ground-shadow anti-alias filter, and a 4096-step sun-OD
-> ceiling. The optional post-light terrain toe remains a default-off CPU display
-> experiment. NOAA heritage Natural longwave grayscale is available, while
-> BowEcho preserves an existing persisted CIMSS choice. Compact production
+> ceiling. v0.2.1 corrects surface sunlight normalization, uses a restrained
+> 1.10 surface lift, and adds the reviewed -6 to +12 degree twilight terrain
+> recovery with CPU/GPU parity; the older broad post-light toe remains off by
+> default. CIMSS Style is the recommended Band-13 presentation, while Natural
+> NOAA heritage grayscale remains available and startup preserves a saved
+> palette. Compact production
 > caches remain SSB v6. For supported inputs, controls, products, cache behavior,
 > output routing, and current limitations in BowEcho, use
 > [docs/simsat-guide.md](simsat-guide.md).
