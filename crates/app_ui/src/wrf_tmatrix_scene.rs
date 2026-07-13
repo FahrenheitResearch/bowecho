@@ -26,16 +26,19 @@ use radar_scattering::{
     P3ReconstructionConfig, P3ShapeAuthority, P3SmallSphereScatteringPolicy,
     P3TMatrixIntegrationConfig, P3TMatrixIntegrationError, P3TMatrixIntegrationResult,
     P3TMatrixParticleNode, P3TMatrixShapePolicy, P3WrfScheme, ParticleState,
-    PolarAccumulatorQuantities, PreparedP3TMatrixIntegration, PreparedTMatrixParticleNode,
-    PsdError, PsdFallSpeedProvenance, PsdIntegrationConfig, PsdIntegrationError, PsdParticleNode,
-    PsdParticleSupport, PsdSpheroidHabit, RadarViewApplicability, RadarViewGeometry,
+    PolarAccumulatorQuantities, PreparedIshmaelPsdIntegration, PreparedP3TMatrixIntegration,
+    PreparedTMatrixParticleNode, PsdError, PsdFallSpeedProvenance, PsdIntegrationConfig,
+    PsdIntegrationError, PsdIntegrationResult, PsdParticleNode, PsdParticleSupport,
+    PsdQuadratureLevel, PsdSpheroidHabit, RadarViewApplicability, RadarViewGeometry,
     ResearchTMatrixLut, SCHEME_PSD_REVISION, Sha256Digest, SpheroidConvention,
     TMatrixEvaluationRequest, TMatrixMaterial, TMatrixOdfConvention, TMatrixParticleCategory,
-    TMatrixParticleNodeQuery, TMatrixPopulationRole, integrate_ishmael_psd,
-    integrate_p3_tmatrix_psd, prepare_p3_tmatrix_psd,
+    TMatrixPopulationRole, prepare_ishmael_psd, prepare_p3_tmatrix_psd,
 };
 use rayon::prelude::*;
+use simradar_cuda::CudaPreparedTMatrixNode;
 use thiserror::Error;
+
+use crate::wrf_tmatrix_cuda::{WrfTMatrixCudaBatchService, WrfTMatrixCudaTableRole};
 
 use crate::wrf_property_reader::{
     ClosedCellCategory, ClosedPropertyCell, ClosedRainState, CoexistenceUnavailable,
@@ -750,13 +753,29 @@ impl<'a> WrfTMatrixRawEvaluator<'a> {
         raw: &RawPropertyCell,
         elevation_deg: f64,
     ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
+        self.evaluate_with_cuda(raw, elevation_deg, None)
+    }
+
+    /// Evaluate one raw property cell through the same CPU admission and
+    /// reduction path while optionally offloading admitted dry LUT nodes to a
+    /// job-scoped CUDA batching service. Any CUDA preparation or execution
+    /// failure disables that service and replays the complete affected PSD on
+    /// the CPU; no partial GPU result is mixed into a category.
+    pub fn evaluate_with_cuda(
+        &self,
+        raw: &RawPropertyCell,
+        elevation_deg: f64,
+        cuda: Option<&WrfTMatrixCudaBatchService>,
+    ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
         match raw.microphysics_scheme_id() {
             50..=53 => {
                 let p3 = self.p3.as_ref().ok_or_else(|| raw_p3_table_required(raw))?;
                 validate_raw_p3_table(raw.microphysics_scheme_id(), p3.table.as_ref())?;
-                evaluate_p3_psd_raw_cell(raw, self.tables, self.validated, p3, elevation_deg)
+                evaluate_p3_psd_raw_cell(raw, self.tables, self.validated, p3, elevation_deg, cuda)
             }
-            55 => evaluate_ishmael_psd_raw_cell(raw, self.tables, self.validated, elevation_deg),
+            55 => {
+                evaluate_ishmael_psd_raw_cell(raw, self.tables, self.validated, elevation_deg, cuda)
+            }
             scheme_id => Err(WrfTMatrixRawEvaluationError::UnsupportedScheme { scheme_id }),
         }
     }
@@ -967,7 +986,13 @@ impl WrfTMatrixScene {
         source: &WrfPropertyScene,
         tables: WrfTMatrixLutBundle<'_>,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, WrfTMatrixRainMode::FullProperty, None)
+        Self::build_internal(
+            source,
+            tables,
+            WrfTMatrixRainMode::FullProperty,
+            None,
+            None,
+        )
     }
 
     pub fn build_with_rain_mode(
@@ -975,7 +1000,16 @@ impl WrfTMatrixScene {
         tables: WrfTMatrixLutBundle<'_>,
         rain_mode: WrfTMatrixRainMode,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, None)
+        Self::build_internal(source, tables, rain_mode, None, None)
+    }
+
+    pub fn build_with_rain_mode_and_cuda(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        rain_mode: WrfTMatrixRainMode,
+        cuda: &WrfTMatrixCudaBatchService,
+    ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        Self::build_internal(source, tables, rain_mode, None, Some(cuda))
     }
 
     pub fn build_with_p3(
@@ -983,7 +1017,13 @@ impl WrfTMatrixScene {
         tables: WrfTMatrixLutBundle<'_>,
         p3: WrfTMatrixP3Resources,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, WrfTMatrixRainMode::FullProperty, Some(p3))
+        Self::build_internal(
+            source,
+            tables,
+            WrfTMatrixRainMode::FullProperty,
+            Some(p3),
+            None,
+        )
     }
 
     pub fn build_with_p3_and_rain_mode(
@@ -992,7 +1032,17 @@ impl WrfTMatrixScene {
         p3: WrfTMatrixP3Resources,
         rain_mode: WrfTMatrixRainMode,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, Some(p3))
+        Self::build_internal(source, tables, rain_mode, Some(p3), None)
+    }
+
+    pub fn build_with_p3_and_rain_mode_and_cuda(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        p3: WrfTMatrixP3Resources,
+        rain_mode: WrfTMatrixRainMode,
+        cuda: &WrfTMatrixCudaBatchService,
+    ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        Self::build_internal(source, tables, rain_mode, Some(p3), Some(cuda))
     }
 
     fn build_internal(
@@ -1000,6 +1050,7 @@ impl WrfTMatrixScene {
         tables: WrfTMatrixLutBundle<'_>,
         rain_mode: WrfTMatrixRainMode,
         p3: Option<WrfTMatrixP3Resources>,
+        cuda: Option<&WrfTMatrixCudaBatchService>,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
         let validated = validate_bundle(tables)?;
         validate_source_shape(source)?;
@@ -1031,6 +1082,7 @@ impl WrfTMatrixScene {
                                 validated,
                                 p3.as_ref(),
                                 rain_mode,
+                                cuda,
                                 output,
                             )?;
                             if !summary.retained {
@@ -1061,6 +1113,7 @@ impl WrfTMatrixScene {
                             validated,
                             p3.as_ref(),
                             rain_mode,
+                            cuda,
                             output,
                         )
                     })
@@ -1483,6 +1536,7 @@ struct CellBuildSummary {
     counts: WrfTMatrixAuditCounts,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_cell_into(
     source: &WrfPropertyScene,
     cell_index: usize,
@@ -1490,10 +1544,13 @@ fn build_cell_into(
     validated: ValidatedBundle<'_>,
     p3: Option<&WrfTMatrixP3Resources>,
     rain_mode: WrfTMatrixRainMode,
+    cuda: Option<&WrfTMatrixCudaBatchService>,
     output: &mut [f32],
 ) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
     if source.microphysics_scheme_id() == 55 {
-        build_ishmael_psd_cell_into(source, cell_index, tables, validated, rain_mode, output)
+        build_ishmael_psd_cell_into(
+            source, cell_index, tables, validated, rain_mode, cuda, output,
+        )
     } else {
         build_p3_psd_cell_into(
             source,
@@ -1502,11 +1559,13 @@ fn build_cell_into(
             validated,
             p3.expect("P3 resources validated before parallel scene build"),
             rain_mode,
+            cuda,
             output,
         )
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_p3_psd_cell_into(
     source: &WrfPropertyScene,
     cell_index: usize,
@@ -1514,6 +1573,7 @@ fn build_p3_psd_cell_into(
     validated: ValidatedBundle<'_>,
     p3: &WrfTMatrixP3Resources,
     rain_mode: WrfTMatrixRainMode,
+    cuda: Option<&WrfTMatrixCudaBatchService>,
     output: &mut [f32],
 ) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
     let elevations = validated.radar_elevations_deg;
@@ -1615,33 +1675,31 @@ fn build_p3_psd_cell_into(
             } else {
                 None
             };
-            let integration = integrate_p3_tmatrix_psd(
+            let prepared = prepare_p3_particle_integration(
                 distribution,
                 p3.integration,
                 validated.p3_particle_support,
-                |node: &P3TMatrixParticleNode| {
-                    let (table, request) = match node.habit() {
-                        PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
-                            (tables.dry_oblate, oblate_request)
-                        }
-                        PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
-                    };
-                    evaluate_p3_particle_node(
-                        table,
-                        node,
-                        dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
-                        rime_fraction,
-                        rime_density,
-                        validated.p3_fall_speed,
-                        request,
-                    )
-                },
+                tables,
+                dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
+                rime_fraction,
+                rime_density,
+                validated.p3_fall_speed,
+                oblate_request,
+                prolate_request,
             )
             .map_err(|source| WrfTMatrixSceneBuildError::P3PsdIntegration {
                 cell_index,
                 elevation_deg,
                 category: *category,
                 source,
+            })?;
+            let integration = finish_p3_particle_integration(&prepared, cuda).map_err(|source| {
+                WrfTMatrixSceneBuildError::P3PsdIntegration {
+                    cell_index,
+                    elevation_deg,
+                    category: *category,
+                    source,
+                }
             })?;
             additive = additive
                 .checked_add(integration.additive())
@@ -1940,6 +1998,7 @@ fn build_ishmael_psd_cell_into(
     tables: WrfTMatrixLutBundle<'_>,
     validated: ValidatedBundle<'_>,
     rain_mode: WrfTMatrixRainMode,
+    cuda: Option<&WrfTMatrixCudaBatchService>,
     output: &mut [f32],
 ) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
     let elevations = validated.radar_elevations_deg;
@@ -2036,29 +2095,15 @@ fn build_ishmael_psd_cell_into(
         )?;
         let mut additive = AdditiveScattering::default();
         for &(category, distribution) in &frozen {
-            let integration = integrate_ishmael_psd(
+            let prepared = prepare_ishmael_particle_integration(
                 &distribution,
                 validated.ishmael_psd_config,
                 validated.ishmael_particle_support,
                 validated.ishmael_fall_speed,
-                |node: &PsdParticleNode| {
-                    let (table, request) = match node.habit() {
-                        PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
-                            (tables.dry_oblate, oblate_request)
-                        }
-                        PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
-                    };
-                    let positive_down_speed = table.dry_particle_node_terminal_speed_m_s(node)?;
-                    let query = TMatrixParticleNodeQuery::from_psd_node(
-                        node,
-                        dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
-                        positive_down_speed,
-                        validated.ishmael_fall_speed,
-                        gaussian20_orientation(),
-                        request,
-                    )?;
-                    table.evaluate_dry_particle_node_per_m3(&query)
-                },
+                tables,
+                dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
+                oblate_request,
+                prolate_request,
             )
             .map_err(|source| WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
                 cell_index,
@@ -2066,6 +2111,14 @@ fn build_ishmael_psd_cell_into(
                 category,
                 source,
             })?;
+            let integration = finish_ishmael_particle_integration(&prepared, cuda).map_err(
+                |source| WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
+                    cell_index,
+                    elevation_deg,
+                    category,
+                    source,
+                },
+            )?;
             additive = additive
                 .checked_add(integration.additive())
                 .map_err(|source| WrfTMatrixSceneBuildError::Accumulation {
@@ -2272,30 +2325,6 @@ fn prepare_p3_particle_node<'table>(
     }
 }
 
-/// Preserve the existing scalar CPU oracle: admission and evaluation are now
-/// separate, but their order and arithmetic are unchanged.
-#[allow(clippy::too_many_arguments)]
-fn evaluate_p3_particle_node(
-    table: &ResearchTMatrixLut,
-    node: &P3TMatrixParticleNode,
-    temperature_k: f64,
-    rime_fraction: f64,
-    rime_density: Option<f64>,
-    fall_speed: PsdFallSpeedProvenance,
-    request: TMatrixEvaluationRequest,
-) -> Result<AdditiveScattering, EvaluationError> {
-    prepare_p3_particle_node(
-        table,
-        node,
-        temperature_k,
-        rime_fraction,
-        rime_density,
-        fall_speed,
-        request,
-    )?
-    .evaluate_cpu()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn evaluate_p3_rayleigh_bridge_node(
     table: &ResearchTMatrixLut,
@@ -2484,6 +2513,7 @@ fn evaluate_p3_psd_raw_cell(
     validated: ValidatedBundle<'_>,
     p3: &WrfTMatrixP3Resources,
     elevation_deg: f64,
+    cuda: Option<&WrfTMatrixCudaBatchService>,
 ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
     let scheme = P3WrfScheme::try_from(raw.microphysics_scheme_id()).map_err(|source| {
         WrfTMatrixRawEvaluationError::P3PsdReconstruction {
@@ -2544,31 +2574,27 @@ fn evaluate_p3_psd_raw_cell(
         } else {
             None
         };
-        let integration = integrate_p3_tmatrix_psd(
+        let prepared = prepare_p3_particle_integration(
             distribution,
             p3.integration,
             validated.p3_particle_support,
-            |node: &P3TMatrixParticleNode| {
-                let (table, request) = match node.habit() {
-                    PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
-                        (tables.dry_oblate, oblate_request)
-                    }
-                    PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
-                };
-                evaluate_p3_particle_node(
-                    table,
-                    node,
-                    dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
-                    rime_fraction,
-                    rime_density,
-                    validated.p3_fall_speed,
-                    request,
-                )
-            },
+            tables,
+            dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
+            rime_fraction,
+            rime_density,
+            validated.p3_fall_speed,
+            oblate_request,
+            prolate_request,
         )
         .map_err(|source| WrfTMatrixRawEvaluationError::P3PsdIntegration {
             category: *category,
             source,
+        })?;
+        let integration = finish_p3_particle_integration(&prepared, cuda).map_err(|source| {
+            WrfTMatrixRawEvaluationError::P3PsdIntegration {
+                category: *category,
+                source,
+            }
         })?;
         additive = additive
             .checked_add(integration.additive())
@@ -2596,6 +2622,88 @@ fn evaluate_p3_psd_raw_cell(
         .to_polar_accumulator_quantities()
         .map(Some)
         .map_err(WrfTMatrixRawEvaluationError::Output)
+}
+
+/// Execute every LUT-backed node of one P3 category on CUDA and then hand the
+/// ordered per-particle answers back to the established CPU population
+/// scaling/reduction. A conversion or worker error discards every answer for
+/// this category and runs the exact scalar oracle instead.
+fn finish_p3_particle_integration(
+    prepared: &PreparedP3ParticleIntegration<'_>,
+    cuda: Option<&WrfTMatrixCudaBatchService>,
+) -> Result<P3TMatrixIntegrationResult, P3TMatrixIntegrationError<EvaluationError>> {
+    let Some(cuda) = cuda else {
+        return prepared.finish_cpu();
+    };
+
+    let mut oblate_nodes = Vec::new();
+    let mut oblate_indices = Vec::new();
+    let mut prolate_nodes = Vec::new();
+    let mut prolate_indices = Vec::new();
+    for (node_index, node, table, admitted) in prepared.table_nodes() {
+        let interpolation = match table.prepare_dry_particle_lut_interpolation(admitted) {
+            Ok(interpolation) => interpolation,
+            Err(error) => {
+                cuda.disable_for_cpu_fallback(
+                    format!("prepare admitted P3 node {node_index} for CUDA: {error}"),
+                    0,
+                );
+                return prepared.finish_cpu();
+            }
+        };
+        let cuda_node = match CudaPreparedTMatrixNode::new(&interpolation, 1.0) {
+            Ok(cuda_node) => cuda_node,
+            Err(error) => {
+                cuda.disable_for_cpu_fallback(
+                    format!("stage admitted P3 node {node_index} for CUDA: {error}"),
+                    0,
+                );
+                return prepared.finish_cpu();
+            }
+        };
+        match node.habit() {
+            PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
+                oblate_indices.push(node_index);
+                oblate_nodes.push(cuda_node);
+            }
+            PsdSpheroidHabit::Prolate => {
+                prolate_indices.push(node_index);
+                prolate_nodes.push(cuda_node);
+            }
+        }
+    }
+
+    let mut outputs = std::collections::HashMap::with_capacity(
+        oblate_indices.len().saturating_add(prolate_indices.len()),
+    );
+    for (role, indices, nodes) in [
+        (
+            WrfTMatrixCudaTableRole::DryOblate,
+            oblate_indices,
+            oblate_nodes,
+        ),
+        (
+            WrfTMatrixCudaTableRole::DryProlate,
+            prolate_indices,
+            prolate_nodes,
+        ),
+    ] {
+        if nodes.is_empty() {
+            continue;
+        }
+        let evaluated = match cuda.evaluate_particles(role, nodes) {
+            Ok(evaluated) => evaluated,
+            Err(_) => return prepared.finish_cpu(),
+        };
+        debug_assert_eq!(indices.len(), evaluated.len());
+        outputs.extend(indices.into_iter().zip(evaluated));
+    }
+
+    prepared.finish_with_table_evaluator(|node_index, _, _, _| {
+        Ok(*outputs
+            .get(&node_index)
+            .expect("CUDA returned one ordered answer for every admitted P3 table node"))
+    })
 }
 
 #[allow(dead_code)]
@@ -2731,11 +2839,225 @@ fn evaluate_characteristic_raw_cell(
         .map_err(WrfTMatrixRawEvaluationError::Output)
 }
 
+struct PreparedIshmaelParticleEvaluation<'table> {
+    level: PsdQuadratureLevel,
+    node_index: usize,
+    role: WrfTMatrixCudaTableRole,
+    table: &'table ResearchTMatrixLut,
+    prepared: PreparedTMatrixParticleNode,
+}
+
+struct PreparedIshmaelParticleIntegration<'table> {
+    integration: PreparedIshmaelPsdIntegration,
+    evaluations: Vec<PreparedIshmaelParticleEvaluation<'table>>,
+}
+
+impl<'table> PreparedIshmaelParticleIntegration<'table> {
+    fn finish_with_table_evaluator<F>(
+        &self,
+        mut evaluate_table: F,
+    ) -> Result<PsdIntegrationResult, PsdIntegrationError<EvaluationError>>
+    where
+        F: FnMut(
+            usize,
+            PsdQuadratureLevel,
+            usize,
+            &PsdParticleNode,
+            &'table ResearchTMatrixLut,
+            &PreparedTMatrixParticleNode,
+        ) -> Result<AdditiveScattering, EvaluationError>,
+    {
+        let mut cursor = 0_usize;
+        let result = self.integration.finish(|level, node_index, node| {
+            let position = cursor;
+            let evaluation = self
+                .evaluations
+                .get(position)
+                .expect("prepared ISHMAEL workload matches both quadrature grids");
+            cursor += 1;
+            debug_assert_eq!((level, node_index), (evaluation.level, evaluation.node_index));
+            evaluate_table(
+                position,
+                level,
+                node_index,
+                node,
+                evaluation.table,
+                &evaluation.prepared,
+            )
+        });
+        debug_assert_eq!(cursor, self.evaluations.len());
+        result
+    }
+
+    fn finish_cpu(
+        &self,
+    ) -> Result<PsdIntegrationResult, PsdIntegrationError<EvaluationError>> {
+        self.finish_with_table_evaluator(|_, _, _, _, table, prepared| {
+            table.evaluate_prepared_dry_particle_node_per_m3(prepared)
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_ishmael_particle_integration<'table>(
+    distribution: &IshmaelPsd,
+    config: PsdIntegrationConfig,
+    support: PsdParticleSupport,
+    fall_speed: PsdFallSpeedProvenance,
+    tables: WrfTMatrixLutBundle<'table>,
+    temperature_k: f64,
+    oblate_request: TMatrixEvaluationRequest,
+    prolate_request: TMatrixEvaluationRequest,
+) -> Result<PreparedIshmaelParticleIntegration<'table>, PsdIntegrationError<EvaluationError>> {
+    let integration = prepare_ishmael_psd(distribution, config, support, fall_speed)
+        .map_err(PsdIntegrationError::<EvaluationError>::from)?;
+    let mut evaluations = Vec::with_capacity(
+        integration.node_count(PsdQuadratureLevel::Coarse)
+            + integration.node_count(PsdQuadratureLevel::Refined),
+    );
+    for (level, node_index, node) in integration.nodes() {
+        let (role, table, request) = match node.habit() {
+            PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => (
+                WrfTMatrixCudaTableRole::DryOblate,
+                tables.dry_oblate,
+                oblate_request,
+            ),
+            PsdSpheroidHabit::Prolate => (
+                WrfTMatrixCudaTableRole::DryProlate,
+                tables.dry_prolate,
+                prolate_request,
+            ),
+        };
+        let prepared = table
+            .prepare_dry_particle_geometry_per_m3(
+                temperature_k,
+                node.equivolume_diameter_m(),
+                node.bulk_density_kg_m3(),
+                node.minor_to_major_axis_ratio(),
+                node.habit(),
+                node.rime_mass_fraction(),
+                node.rime_density_kg_m3(),
+                fall_speed,
+                gaussian20_orientation(),
+                request,
+            )
+            .map_err(|source| PsdIntegrationError::NodeEvaluation {
+                level,
+                node_index,
+                source,
+            })?;
+        evaluations.push(PreparedIshmaelParticleEvaluation {
+            level,
+            node_index,
+            role,
+            table,
+            prepared,
+        });
+    }
+    Ok(PreparedIshmaelParticleIntegration {
+        integration,
+        evaluations,
+    })
+}
+
+fn finish_ishmael_particle_integration(
+    prepared: &PreparedIshmaelParticleIntegration<'_>,
+    cuda: Option<&WrfTMatrixCudaBatchService>,
+) -> Result<PsdIntegrationResult, PsdIntegrationError<EvaluationError>> {
+    let Some(cuda) = cuda else {
+        return prepared.finish_cpu();
+    };
+
+    let mut oblate_positions = Vec::new();
+    let mut oblate_nodes = Vec::new();
+    let mut prolate_positions = Vec::new();
+    let mut prolate_nodes = Vec::new();
+    for (position, evaluation) in prepared.evaluations.iter().enumerate() {
+        let interpolation = match evaluation
+            .table
+            .prepare_dry_particle_lut_interpolation(&evaluation.prepared)
+        {
+            Ok(interpolation) => interpolation,
+            Err(error) => {
+                cuda.disable_for_cpu_fallback(
+                    format!(
+                        "prepare admitted ISHMAEL {:?} node {} for CUDA: {error}",
+                        evaluation.level, evaluation.node_index
+                    ),
+                    0,
+                );
+                return prepared.finish_cpu();
+            }
+        };
+        let cuda_node = match CudaPreparedTMatrixNode::new(&interpolation, 1.0) {
+            Ok(cuda_node) => cuda_node,
+            Err(error) => {
+                cuda.disable_for_cpu_fallback(
+                    format!(
+                        "stage admitted ISHMAEL {:?} node {} for CUDA: {error}",
+                        evaluation.level, evaluation.node_index
+                    ),
+                    0,
+                );
+                return prepared.finish_cpu();
+            }
+        };
+        match evaluation.role {
+            WrfTMatrixCudaTableRole::DryOblate => {
+                oblate_positions.push(position);
+                oblate_nodes.push(cuda_node);
+            }
+            WrfTMatrixCudaTableRole::DryProlate => {
+                prolate_positions.push(position);
+                prolate_nodes.push(cuda_node);
+            }
+        }
+    }
+
+    let mut outputs = vec![None; prepared.evaluations.len()];
+    for (role, positions, nodes) in [
+        (
+            WrfTMatrixCudaTableRole::DryOblate,
+            oblate_positions,
+            oblate_nodes,
+        ),
+        (
+            WrfTMatrixCudaTableRole::DryProlate,
+            prolate_positions,
+            prolate_nodes,
+        ),
+    ] {
+        if nodes.is_empty() {
+            continue;
+        }
+        let evaluated = match cuda.evaluate_particles(role, nodes) {
+            Ok(evaluated) => evaluated,
+            Err(_) => return prepared.finish_cpu(),
+        };
+        debug_assert_eq!(positions.len(), evaluated.len());
+        for (position, output) in positions.into_iter().zip(evaluated) {
+            outputs[position] = Some(output);
+        }
+    }
+    if outputs.iter().any(Option::is_none) {
+        cuda.disable_for_cpu_fallback(
+            "CUDA omitted an admitted ISHMAEL particle output".to_owned(),
+            prepared.evaluations.len(),
+        );
+        return prepared.finish_cpu();
+    }
+
+    prepared.finish_with_table_evaluator(|position, _, _, _, _, _| {
+        Ok(outputs[position].expect("all ISHMAEL CUDA outputs were checked above"))
+    })
+}
+
 fn evaluate_ishmael_psd_raw_cell(
     raw: &RawPropertyCell,
     tables: WrfTMatrixLutBundle<'_>,
     validated: ValidatedBundle<'_>,
     elevation_deg: f64,
+    cuda: Option<&WrfTMatrixCudaBatchService>,
 ) -> Result<Option<PolarAccumulatorQuantities>, WrfTMatrixRawEvaluationError> {
     let mut frozen = Vec::with_capacity(raw.categories().len());
     for category in raw.categories() {
@@ -2790,31 +3112,20 @@ fn evaluate_ishmael_psd_raw_cell(
     )?;
     let mut additive = AdditiveScattering::default();
     for &(category, distribution) in &frozen {
-        let integration = integrate_ishmael_psd(
+        let prepared = prepare_ishmael_particle_integration(
             &distribution,
             validated.ishmael_psd_config,
             validated.ishmael_particle_support,
             validated.ishmael_fall_speed,
-            |node: &PsdParticleNode| {
-                let (table, request) = match node.habit() {
-                    PsdSpheroidHabit::Oblate | PsdSpheroidHabit::Spherical => {
-                        (tables.dry_oblate, oblate_request)
-                    }
-                    PsdSpheroidHabit::Prolate => (tables.dry_prolate, prolate_request),
-                };
-                let positive_down_speed = table.dry_particle_node_terminal_speed_m_s(node)?;
-                let query = TMatrixParticleNodeQuery::from_psd_node(
-                    node,
-                    dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
-                    positive_down_speed,
-                    validated.ishmael_fall_speed,
-                    gaussian20_orientation(),
-                    request,
-                )?;
-                table.evaluate_dry_particle_node_per_m3(&query)
-            },
+            tables,
+            dry_frozen_particle_temperature_k(raw.environment().temperature_k()),
+            oblate_request,
+            prolate_request,
         )
         .map_err(
+            |source| WrfTMatrixRawEvaluationError::IshmaelPsdIntegration { category, source },
+        )?;
+        let integration = finish_ishmael_particle_integration(&prepared, cuda).map_err(
             |source| WrfTMatrixRawEvaluationError::IshmaelPsdIntegration { category, source },
         )?;
         additive = additive

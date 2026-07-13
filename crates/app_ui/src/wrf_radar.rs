@@ -436,6 +436,12 @@ pub struct SyntheticRadarConfig {
     /// T-matrix workload. It is intentionally excluded from the scientific
     /// data fingerprint: parity-capable backends compute the same product.
     pub compute_preference: SyntheticRadarComputePreference,
+    /// Job-scoped accelerator handle. This is runtime-only: it is never
+    /// serialized, fingerprinted, or retained by installed-frame refresh
+    /// descriptors. The outer WRF worker owns the last strong reference and
+    /// therefore shuts the CUDA worker down when that job finishes.
+    pub(crate) runtime_cuda_service:
+        Option<Arc<app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>>,
     /// Physical scan definition. The historical custom ladder remains the
     /// default; a Build 24 selection owns its rows, rates, periods, waveform,
     /// moment coverage and PRF-code provenance.
@@ -614,6 +620,7 @@ impl Default for SyntheticRadarConfig {
         Self {
             simulation_mode: SimulationMode::Presentation,
             compute_preference: SyntheticRadarComputePreference::Auto,
+            runtime_cuda_service: None,
             scan_strategy: SyntheticScanStrategy::CustomLegacy,
             exact_replay_template: None,
             site_id: "WRF".to_string(),
@@ -2222,13 +2229,25 @@ fn read_wrf_radar_fields_for_config_reporting(
             ));
             fields.raw_property_scene = Some(Arc::new(property_scene));
         } else {
-            let built = app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene(
-                &property_scene,
-                maximum_owned_peak_bytes.expect("non-raw property build has a budget"),
-                table_owner,
-                config.property_tmatrix_rain_sensitivity.runtime(),
-                progress,
-            )
+            let maximum_owned_peak_bytes =
+                maximum_owned_peak_bytes.expect("non-raw property build has a budget");
+            let built = match config.runtime_cuda_service.as_deref() {
+                Some(cuda) => app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene_with_cuda(
+                    &property_scene,
+                    maximum_owned_peak_bytes,
+                    table_owner,
+                    config.property_tmatrix_rain_sensitivity.runtime(),
+                    progress,
+                    cuda,
+                ),
+                None => app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene(
+                    &property_scene,
+                    maximum_owned_peak_bytes,
+                    table_owner,
+                    config.property_tmatrix_rain_sensitivity.runtime(),
+                    progress,
+                ),
+            }
             .map_err(|error| format!("build property T-matrix scene: {error}"))?;
             let property_scattering = built.scene;
             fields.dual_pol_status = Some(format!(
@@ -2983,13 +3002,15 @@ fn build_synthetic_volume_reporting_temporal_previewing(
     )
 }
 
+type CutCompletedCallback<'a> = dyn Fn(&RadarVolume, usize, usize) + 'a;
+
 fn build_synthetic_volume_reporting_inner(
     fields: &WrfRadarFields,
     valid_time: DateTime<Utc>,
     config: &SyntheticRadarConfig,
     progress: &dyn Fn(&str),
     temporal: Option<TemporalRenderContext<'_>>,
-    cut_completed: Option<&dyn Fn(&RadarVolume, usize, usize)>,
+    cut_completed: Option<&CutCompletedCallback<'_>>,
 ) -> Result<RadarVolume, String> {
     config.validate_science_contract()?;
     if let Some(template) = config.exact_replay_template.as_deref() {
@@ -3077,6 +3098,30 @@ fn build_synthetic_volume_reporting_inner(
         config.emit_quality_fields,
         config.clamped_minimum_model_coverage_fraction(),
     );
+    if matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        use std::fmt::Write as _;
+        if let Some(service) = config.runtime_cuda_service.as_deref() {
+            let report = service.report();
+            let _ = write!(
+                forward_operator_config,
+                "; tmatrix_compute_preference={}; tmatrix_execution_initial_backend=nvidia_cuda; cuda_device={}; cuda_compute={}.{}; cuda_kernel={}",
+                config.compute_preference.label(),
+                report.device.name,
+                report.device.compute_capability_major,
+                report.device.compute_capability_minor,
+                report.device.kernel_artifact,
+            );
+        } else {
+            let _ = write!(
+                forward_operator_config,
+                "; tmatrix_compute_preference={}; tmatrix_execution_initial_backend=cpu_reference",
+                config.compute_preference.label(),
+            );
+        }
+    }
     if let Some(polar) = fields.polarimetric.as_ref() {
         use std::fmt::Write as _;
         let audit = &polar.precision_audit;
@@ -3359,7 +3404,19 @@ fn build_synthetic_volume_reporting_inner(
     let mut decoded_radials = 0usize;
     let mut cut_start_ms = 0i32;
     let tilt_total = scan_legs.len();
+    let mut cuda_fallback_reported = false;
     for (cut_index, leg) in scan_legs.iter().enumerate() {
+        if !cuda_fallback_reported
+            && let Some(reason) = config
+                .runtime_cuda_service
+                .as_deref()
+                .and_then(|service| service.report().fallback_reason)
+        {
+            progress(&format!(
+                "CUDA disabled ({reason}); replaying affected and remaining T-matrix work on CPU"
+            ));
+            cuda_fallback_reported = true;
+        }
         let elevation_deg = leg.elevation_deg;
         progress(&format!(
             "building tilt {}/{tilt_total} ({elevation_deg:.1}°)…",
@@ -3390,6 +3447,17 @@ fn build_synthetic_volume_reporting_inner(
         decoded_radials += cut.radials.len();
         volume.cuts.push(cut);
         volume.metadata.decoded_radial_count = decoded_radials;
+        if !cuda_fallback_reported
+            && let Some(reason) = config
+                .runtime_cuda_service
+                .as_deref()
+                .and_then(|service| service.report().fallback_reason)
+        {
+            progress(&format!(
+                "CUDA disabled ({reason}); replaying affected and remaining T-matrix work on CPU"
+            ));
+            cuda_fallback_reported = true;
+        }
         if let Some(cut_completed) = cut_completed {
             cut_completed(&volume, cut_index + 1, tilt_total);
         }
@@ -4262,6 +4330,7 @@ fn sample_gate_with_quality_instrument(
             elevation_deg,
             config.atmosphere_time_mode,
             config.reflectivity_sampling,
+            config.runtime_cuda_service.as_deref(),
         )?
         else {
             return Ok(());
@@ -5312,6 +5381,7 @@ fn sample_column_temporal(
     beam_elevation_deg: f64,
     atmosphere_time_mode: AtmosphereTimeMode,
     reflectivity_sampling: ReflectivitySampling,
+    cuda: Option<&app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
 ) -> Result<Option<ColumnSample>, String> {
     if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
         return Err(format!(
@@ -5328,6 +5398,7 @@ fn sample_column_temporal(
             lon,
             z_msl,
             beam_elevation_deg,
+            cuda,
         );
     }
     if alpha <= 0.0 {
@@ -5434,6 +5505,7 @@ fn sample_column_raw_state_linear(
     lon: f32,
     z_msl: f32,
     beam_elevation_deg: f64,
+    cuda: Option<&app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
 ) -> Result<Option<ColumnSample>, String> {
     let left = if alpha < 1.0 {
         raw_spatial_endpoint(fields, cells, lat, lon, z_msl)?
@@ -5481,9 +5553,10 @@ fn sample_column_raw_state_linear(
         (None, Some(right)) => right.tke_m2s2,
         (None, None) => return Ok(None),
     };
-    let polar = app_ui::wrf_tmatrix_assets::evaluate_embedded_raw_property_cell(
+    let polar = app_ui::wrf_tmatrix_assets::evaluate_embedded_raw_property_cell_with_cuda(
         &blended.property_cell,
         beam_elevation_deg,
+        cuda,
     )?;
     let polar = polar.map(|quantities| {
         let mut accumulator = crate::wrf_radar_physics::PolarAccumulator::default();
@@ -6356,6 +6429,12 @@ impl SyntheticFrameWitness {
 }
 
 impl SyntheticFrameSourceDescriptor {
+    fn retained_config(config: &SyntheticRadarConfig) -> SyntheticRadarConfig {
+        let mut retained = config.clone();
+        retained.runtime_cuda_service = None;
+        retained
+    }
+
     fn wrf(
         frame_ordinal: usize,
         volume: &RadarVolume,
@@ -6371,7 +6450,7 @@ impl SyntheticFrameSourceDescriptor {
                 neighbor,
                 temporal_plan,
             })),
-            config: config.clone(),
+            config: Self::retained_config(config),
             config_fingerprint,
             witness: SyntheticFrameWitness::from_volume(frame_ordinal, config_fingerprint, volume),
         }
@@ -6385,7 +6464,7 @@ impl SyntheticFrameSourceDescriptor {
     ) -> Self {
         Self {
             source: SyntheticFrameSource::OperationalForecast,
-            config: config.clone(),
+            config: Self::retained_config(config),
             config_fingerprint,
             witness: SyntheticFrameWitness::from_volume(frame_ordinal, config_fingerprint, volume),
         }
@@ -7314,6 +7393,7 @@ fn inspector_spatial_targets(
             elevation_deg,
             config.atmosphere_time_mode,
             config.reflectivity_sampling,
+            None,
         )
         .map_err(WhyThisGateUnavailable::WorkerFailed)?
         .is_none()
@@ -8067,7 +8147,175 @@ fn build_operational_radar(
     })
 }
 
+enum TMatrixExecutionRuntime {
+    NotApplicable,
+    CpuReference { reason: String },
+    NvidiaCuda {
+        service: Arc<app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
+    },
+}
+
+fn resolve_tmatrix_execution_runtime(
+    config: &SyntheticRadarConfig,
+    tx: &Sender<SyntheticRadarMessage>,
+) -> (SyntheticRadarConfig, TMatrixExecutionRuntime) {
+    let mut runtime_config = config.clone();
+    runtime_config.runtime_cuda_service = None;
+    if !matches!(
+        config.polarimetric_kernel,
+        PolarimetricKernel::PropertyTMatrixResearchV1
+    ) {
+        return (runtime_config, TMatrixExecutionRuntime::NotApplicable);
+    }
+    if matches!(config.compute_preference, SyntheticRadarComputePreference::Cpu) {
+        return (
+            runtime_config,
+            TMatrixExecutionRuntime::CpuReference {
+                reason: "CPU selected by user".to_owned(),
+            },
+        );
+    }
+    if !matches!(
+        config.property_tmatrix_table_source,
+        app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+    ) || config.radar_frequency_mhz != PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ
+    {
+        return (
+            runtime_config,
+            TMatrixExecutionRuntime::CpuReference {
+                reason: "CUDA v1 requires the authenticated legacy embedded 2.8 GHz dry-table pack"
+                    .to_owned(),
+            },
+        );
+    }
+
+    let _ = tx.send(SyntheticRadarMessage::Progress(
+        "Initializing NVIDIA CUDA T-matrix worker and uploading dry LUTsâ€¦".to_owned(),
+    ));
+    match app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService::open_preferred() {
+        Ok(service) => {
+            let service = Arc::new(service);
+            let report = service.report();
+            let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+                "CUDA active: {} Â· compute {}.{} Â· {}; CPU retains PSD weights and ordered reductions",
+                report.device.name,
+                report.device.compute_capability_major,
+                report.device.compute_capability_minor,
+                report.device.kernel_artifact,
+            )));
+            runtime_config.runtime_cuda_service = Some(Arc::clone(&service));
+            (
+                runtime_config,
+                TMatrixExecutionRuntime::NvidiaCuda { service },
+            )
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+                "CUDA unavailable ({reason}); continuing on the exact CPU reference path"
+            )));
+            (
+                runtime_config,
+                TMatrixExecutionRuntime::CpuReference { reason },
+            )
+        }
+    }
+}
+
+fn append_execution_fragment(volume: &mut RadarVolume, fragment: &str) {
+    match volume.metadata.forward_operator_config.as_mut() {
+        Some(config) if !config.is_empty() => {
+            config.push_str("; ");
+            config.push_str(fragment);
+        }
+        Some(config) => config.push_str(fragment),
+        None => volume.metadata.forward_operator_config = Some(fragment.to_owned()),
+    }
+}
+
+fn finish_tmatrix_execution_report(
+    output: &mut SyntheticRadarOutput,
+    preference: SyntheticRadarComputePreference,
+    runtime: &TMatrixExecutionRuntime,
+) {
+    let preference = preference.label();
+    let (note, fragment) = match runtime {
+        TMatrixExecutionRuntime::NotApplicable => return,
+        TMatrixExecutionRuntime::CpuReference { reason } => (
+            format!("T-matrix execution: CPU reference ({reason})"),
+            format!(
+                "tmatrix_compute_preference={preference}; tmatrix_execution_backend=cpu_reference; cuda_fallback={reason}"
+            ),
+        ),
+        TMatrixExecutionRuntime::NvidiaCuda { service } => {
+            let report = service.report();
+            let identity = format!(
+                "{} compute {}.{} via {}",
+                report.device.name,
+                report.device.compute_capability_major,
+                report.device.compute_capability_minor,
+                report.device.kernel_artifact,
+            );
+            if let Some(reason) = report.fallback_reason {
+                (
+                    format!(
+                        "T-matrix CUDA used {identity}; completed {} nodes in {}/{} batches before fallback ({reason}); the discarded/remaining work replayed on CPU",
+                        report.nodes_completed,
+                        report.batches_completed,
+                        report.batches_submitted,
+                    ),
+                    format!(
+                        "tmatrix_compute_preference={preference}; tmatrix_execution_backend=cuda_then_cpu_replay; cuda_device={}; cuda_compute={}.{}; cuda_kernel={}; cuda_requests={}; cuda_batches_completed={}; cuda_batches_submitted={}; cuda_nodes_completed={}; cuda_nodes_submitted={}; cuda_fallback={reason}",
+                        report.device.name,
+                        report.device.compute_capability_major,
+                        report.device.compute_capability_minor,
+                        report.device.kernel_artifact,
+                        report.requests_submitted,
+                        report.batches_completed,
+                        report.batches_submitted,
+                        report.nodes_completed,
+                        report.nodes_submitted,
+                    ),
+                )
+            } else {
+                (
+                    format!(
+                        "T-matrix CUDA used {identity}; completed {} particle nodes in {} batches ({} requests); CPU retained exact PSD reduction",
+                        report.nodes_completed, report.batches_completed, report.requests_submitted,
+                    ),
+                    format!(
+                        "tmatrix_compute_preference={preference}; tmatrix_execution_backend=nvidia_cuda; cuda_device={}; cuda_compute={}.{}; cuda_kernel={}; cuda_requests={}; cuda_batches={}; cuda_nodes={}; cuda_cpu_reduction=true",
+                        report.device.name,
+                        report.device.compute_capability_major,
+                        report.device.compute_capability_minor,
+                        report.device.kernel_artifact,
+                        report.requests_submitted,
+                        report.batches_completed,
+                        report.nodes_completed,
+                    ),
+                )
+            }
+        }
+    };
+    output.notes.push(note);
+    for volume in &mut output.volumes {
+        append_execution_fragment(Arc::make_mut(volume), &fragment);
+    }
+}
+
 fn build_synthetic_from_paths(
+    paths: &[PathBuf],
+    config: &SyntheticRadarConfig,
+    label: &str,
+    tx: &Sender<SyntheticRadarMessage>,
+) -> Result<SyntheticRadarOutput, String> {
+    let (runtime_config, runtime) = resolve_tmatrix_execution_runtime(config, tx);
+    let mut output = build_synthetic_from_paths_inner(paths, &runtime_config, label, tx)?;
+    finish_tmatrix_execution_report(&mut output, config.compute_preference, &runtime);
+    Ok(output)
+}
+
+fn build_synthetic_from_paths_inner(
     paths: &[PathBuf],
     config: &SyntheticRadarConfig,
     label: &str,
@@ -9711,6 +9959,7 @@ mod tests {
             0.5,
             AtmosphereTimeMode::LinearAdjacent,
             ReflectivitySampling::LinearZ,
+            None,
         )
         .expect("midpoint query")
         .expect("midpoint model column");
@@ -9728,6 +9977,7 @@ mod tests {
             0.5,
             AtmosphereTimeMode::LinearAdjacent,
             ReflectivitySampling::LinearZ,
+            None,
         )
         .expect("anchor query")
         .expect("exact anchor column");
@@ -12913,6 +13163,120 @@ mod tests {
         eprintln!(
             "[equiv] parallel read == serial read: {} elems x 5 fields bit-identical",
             par.dbz.len()
+        );
+    }
+
+    /// End-to-end native-property parity on a real P3/ISHMAEL wrfout. The
+    /// fixture is intentionally external because these files are multi-GB;
+    /// CI skips the body unless `BOWECHO_NATIVE_TMATRIX_WRF_FIXTURE` is set.
+    /// The test places a tiny virtual scan directly in a frozen active cell so
+    /// at least one actual PSD reaches CUDA, then requires every emitted cut,
+    /// radial, and moment bit to match the CPU reference volume.
+    #[test]
+    fn actual_native_tmatrix_cuda_volume_matches_cpu_bits() {
+        let Some(path) = std::env::var_os("BOWECHO_NATIVE_TMATRIX_WRF_FIXTURE") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let selected = inventory_selected_wrf_paths(std::slice::from_ref(&path))
+            .expect("inventory native T-matrix WRF fixture");
+        let scene = selected
+            .group
+            .scenes
+            .first()
+            .expect("fixture inventory has one timed scene");
+        let file = WrfFile::open(&scene.path).expect("open native T-matrix WRF fixture");
+        let mut cpu_config = SyntheticRadarConfig {
+            compute_preference: SyntheticRadarComputePreference::Cpu,
+            dual_pol: true,
+            polarimetric_kernel: PolarimetricKernel::PropertyTMatrixResearchV1,
+            property_tmatrix_table_source:
+                app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            property_tmatrix_rain_sensitivity: PropertyTMatrixRainSensitivity::FullProperty,
+            radar_frequency_mhz: PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ,
+            reflectivity_sampling: ReflectivitySampling::LinearZ,
+            atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
+            scan_timing: ScanTiming::InstantaneousTruth,
+            elevations_deg: vec![0.5],
+            azimuth_count: 8,
+            gate_spacing_m: 1_000.0,
+            max_range_m: 1_000.0,
+            beam_integration: BeamIntegration::Center,
+            ref_floor_dbz: -100.0,
+            ref_gate_texture: false,
+            vel_gate_texture: false,
+            propagation: true,
+            terminal_fall_speed: true,
+            emit_quality_fields: false,
+            ..SyntheticRadarConfig::default()
+        };
+        cpu_config
+            .validate_science_contract()
+            .expect("fixture CUDA parity configuration is valid");
+        let fields = read_wrf_radar_fields_for_config_reporting(
+            &file,
+            &scene.source_identity,
+            scene.time_index,
+            &cpu_config,
+            &|stage| eprintln!("[cuda-parity] {stage}"),
+            0,
+        )
+        .expect("read native property fixture");
+        let property = fields
+            .raw_property_scene
+            .as_deref()
+            .expect("RawStateLinear retained native property state");
+        let frozen_cell = property
+            .active_cell_indices()
+            .iter()
+            .copied()
+            .find(|&cell_index| {
+                property.raw_cell(cell_index as usize).is_ok_and(|raw| {
+                    raw.categories()
+                        .iter()
+                        .any(|category| category.mixing_ratio_kgkg() > 0.0)
+                })
+            })
+            .expect("fixture has a frozen active property cell") as usize;
+        let horizontal = frozen_cell % (fields.nx * fields.ny);
+        cpu_config.site_lat_deg = Some(f64::from(fields.lat[horizontal]));
+        cpu_config.site_lon_deg = Some(f64::from(fields.lon[horizontal]));
+        cpu_config.antenna_msl_m = Some(f64::from(fields.height_msl[frozen_cell]));
+        let valid_time = scene
+            .time
+            .valid_time()
+            .cloned()
+            .expect("fixture scene has a valid time");
+
+        let cpu = try_build_synthetic_volume_reporting(
+            &fields,
+            valid_time,
+            &cpu_config,
+            &|stage| eprintln!("[cuda-parity cpu] {stage}"),
+        )
+        .expect("CPU native T-matrix reference volume");
+        let service = Arc::new(
+            app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService::open_preferred()
+                .expect("open CUDA T-matrix service"),
+        );
+        let mut cuda_config = cpu_config.clone();
+        cuda_config.compute_preference = SyntheticRadarComputePreference::NvidiaCuda;
+        cuda_config.runtime_cuda_service = Some(Arc::clone(&service));
+        let cuda = try_build_synthetic_volume_reporting(
+            &fields,
+            valid_time,
+            &cuda_config,
+            &|stage| eprintln!("[cuda-parity gpu] {stage}"),
+        )
+        .expect("CUDA native T-matrix volume");
+
+        assert_eq!(cpu.cuts, cuda.cuts, "CPU/CUDA radar science differs");
+        let report = service.report();
+        assert!(report.nodes_completed > 0, "fixture submitted no CUDA nodes");
+        assert_eq!(report.fallback_reason, None, "CUDA unexpectedly fell back");
+        eprintln!(
+            "[cuda-parity] bit-identical: {} nodes in {} batches / {} requests",
+            report.nodes_completed, report.batches_completed, report.requests_submitted
         );
     }
 
