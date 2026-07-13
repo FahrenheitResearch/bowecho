@@ -156,7 +156,7 @@ with netCDF4.Dataset(OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
     ):
         nc.setncattr(name, np.int32(value))
 
-with netCDF4.Dataset(LEGACY_OUT, "w", format="NETCDF3_64BIT_OFFSET") as nc:
+with netCDF4.Dataset(LEGACY_OUT, "w", format="NETCDF4_CLASSIC") as nc:
     for name, length in (
         ("ni", 3),
         ("nj", 2),

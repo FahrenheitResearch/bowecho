@@ -822,9 +822,11 @@ pub fn detect_file(nc: &NcFile) -> Result<Cm1Detection, Cm1Error> {
         dimensions.len() == 1
             && dimensions[0].eq_ignore_ascii_case("time")
             && variable_attr_string_ci(variable, "long_name").is_some_and(|value| {
-                value.eq_ignore_ascii_case("time since beginning of simulation")
+                value
+                    .trim()
+                    .eq_ignore_ascii_case("time since beginning of simulation")
             })
-    });
+    }) || hdf5_time_axis_metadata(nc).is_some();
     if official_time {
         evidence.push("official CM1 time axis".to_string());
     } else {
@@ -2452,10 +2454,66 @@ fn read_axis(
     })
 }
 
+#[derive(Debug)]
+struct Hdf5TimeAxisMetadata {
+    name: String,
+    record_count: usize,
+    units: String,
+}
+
+/// `netcdf-reader` can omit a valid one-dimensional coordinate dataset from
+/// its NetCDF-4 index even while all record variables retain their `time`
+/// dimension. Netcrust's guarded raw-HDF5 metadata/data fallback lets us
+/// recover that coordinate only when its official CM1 name, rank, long name,
+/// and units are all present.
+fn hdf5_time_axis_metadata(nc: &NcFile) -> Option<Hdf5TimeAxisMetadata> {
+    let dataset = nc.hdf5_root_datasets().ok()?.into_iter().find(|dataset| {
+        dataset.name().eq_ignore_ascii_case("time") && dataset.shape().len() == 1
+    })?;
+    let long_name = nc.hdf5_dataset_attribute_string(dataset.name(), "long_name")?;
+    if !long_name
+        .trim()
+        .eq_ignore_ascii_case("time since beginning of simulation")
+    {
+        return None;
+    }
+    let units = nc.hdf5_dataset_attribute_string(dataset.name(), "units")?;
+    time_scale_to_seconds(&units)?;
+    Some(Hdf5TimeAxisMetadata {
+        name: dataset.name().to_string(),
+        record_count: usize::try_from(dataset.shape()[0]).ok()?,
+        units,
+    })
+}
+
 fn read_time_axis(nc: &NcFile, variables: &[NcVariable]) -> Result<Cm1TimeAxis, Cm1Error> {
-    let variable = variable_ci(variables, "time").ok_or(Cm1Error::MissingTime)?;
-    let raw = variable.array_f64()?.into_values();
-    let units = variable_attr_string_ci(variable, "units").map(ToOwned::to_owned);
+    let (variable_name, dimension, record_count, units, raw) =
+        if let Some(variable) = variable_ci(variables, "time") {
+            (
+                variable.name().to_string(),
+                variable
+                    .dimensions()
+                    .first()
+                    .map(|dimension| dimension.name().to_string())
+                    .unwrap_or_else(|| "time".to_string()),
+                variable.shape().first().copied().unwrap_or(0),
+                variable_attr_string_ci(variable, "units").map(ToOwned::to_owned),
+                variable.array_f64()?.into_values(),
+            )
+        } else {
+            let metadata = hdf5_time_axis_metadata(nc).ok_or(Cm1Error::MissingTime)?;
+            let raw = nc.read_f64(&metadata.name)?;
+            (
+                metadata.name,
+                "time".to_string(),
+                metadata.record_count,
+                Some(metadata.units),
+                raw,
+            )
+        };
+    if raw.len() != record_count {
+        return Err(Cm1Error::MissingTime);
+    }
     let offsets_seconds = match units.as_deref().and_then(time_scale_to_seconds) {
         Some(scale) => {
             Cm1Availability::Available(raw.into_iter().map(|value| value * scale).collect())
@@ -2467,15 +2525,10 @@ fn read_time_axis(nc: &NcFile, variables: &[NcVariable]) -> Result<Cm1TimeAxis, 
             },
         },
     };
-    let dimension = variable
-        .dimensions()
-        .first()
-        .map(|dimension| dimension.name().to_string())
-        .unwrap_or_else(|| "time".to_string());
     Ok(Cm1TimeAxis {
         dimension,
-        variable: variable.name().to_string(),
-        record_count: variable.shape().first().copied().unwrap_or(0),
+        variable: variable_name,
+        record_count,
         source_units: units
             .clone()
             .map(Cm1Availability::Available)
@@ -3143,6 +3196,11 @@ mod tests {
     fn legacy_r19_topology_and_minutes_are_supported() {
         let path = legacy_fixture_path();
         let nc = netcrust::open(&path).expect("open legacy fixture");
+        assert!(
+            nc.variable("time").is_none(),
+            "NetCDF-4 fixture exercises the guarded raw-HDF5 time fallback"
+        );
+        assert!(nc.has_hdf5_dataset("time"));
         let inventory = inspect_file(&nc, &path).expect("inspect legacy fixture");
         assert_eq!(inventory.topology.family, Cm1SchemaFamily::LegacyR18R19);
         assert_eq!(inventory.topology.scalar_x_dimension, "ni");

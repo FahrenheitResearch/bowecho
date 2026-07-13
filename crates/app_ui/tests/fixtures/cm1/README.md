@@ -28,15 +28,19 @@ mistake NetCDF's default fill value for vertical-coordinate data. Exact
 official-name `th/prs/qv/uinterp/vinterp` fields provide small, clearly
 synthetic inputs for unit-gating and thermodynamic-column tests.
 
-`cm1out_legacy_r19.nc` reproduces the official r18/r19 topology, whose data
+`cm1out_legacy_r19.nc` is a NetCDF-4 Classic fixture reproducing the official
+r18/r19 topology, whose data
 dimensions are `ni/nj/nk` and `nip1/njp1/nkp1` while coordinate variables are
 `xh/xf/yh/yf/z/zf`. Its elapsed time uses the supported legacy `minutes` unit,
 and one value is the official global `missing_value` sentinel to verify it is
-normalized to NaN. The official cm1r19.10 archive is
+normalized to NaN. Netcrust's NetCDF index intentionally omits its `time`
+coordinate in this representation, matching a real CM1 r19.1 file; tests
+therefore exercise BowEcho's guarded raw-HDF5 recovery of the official
+one-dimensional time dataset. The official cm1r19.10 archive is
 <https://www2.mmm.ucar.edu/people/bryan/cm1/cm1r19.10.tar.gz> (SHA-256
 `A6597D44BD291364EFF281583DAE8771B94885F93053DD46E8C9F2CC65A17B3F`).
 Generated fixture SHA-256:
-`B178AA3308BDB2B5B336CBF96CE1EFBEAEBE8CAC298FD3A5687760D8C21E3D31`.
+`2042BB101027C1DC6FD8C3D63888FAB4239AF42D8806894456E915F3DD718BBE`.
 
 `cm1out_diag_000001.nc` and `cm1out_diag_000002.nc` reproduce the official
 one-time diagnostic-file topology defined by `domaindiag.F` and
