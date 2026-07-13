@@ -1105,11 +1105,31 @@ impl P3Psd {
         let mut integrated_mass_squared = 0.0;
         let mut integrated_m6 = 0.0;
         for segment in breakpoints.windows(2) {
-            let half_width = 0.5 * (segment[1] - segment[0]);
-            let midpoint = 0.5 * (segment[1] + segment[0]);
+            // P3 permits a non-integer shape parameter between zero and one.
+            // Direct Gauss-Legendre integration of D^mu on the first panel
+            // then converges slowly because its derivative is singular at
+            // D=0. D=t^4 regularizes that endpoint while preserving the exact
+            // physical diameter domain and the original node budget. Retain
+            // direct-D quadrature for mu>=1, where the endpoint is already
+            // smooth and the transform would unnecessarily steepen D^mu.
+            let regularize_origin = segment[0] == 0.0 && self.mu < 1.0;
+            let (half_width, midpoint) = if regularize_origin {
+                let transformed_upper = segment[1].sqrt().sqrt();
+                (0.5 * transformed_upper, 0.5 * transformed_upper)
+            } else {
+                (
+                    0.5 * (segment[1] - segment[0]),
+                    0.5 * (segment[1] + segment[0]),
+                )
+            };
             for local in 0..GL8_POINTS {
-                let diameter = midpoint + half_width * GL8_ABSCISSAE[local];
-                let integration_width = half_width * GL8_WEIGHTS[local];
+                let coordinate = midpoint + half_width * GL8_ABSCISSAE[local];
+                let (diameter, jacobian) = if regularize_origin {
+                    (coordinate.powi(4), 4.0 * coordinate.powi(3))
+                } else {
+                    (coordinate, 1.0)
+                };
+                let integration_width = half_width * GL8_WEIGHTS[local] * jacobian;
                 let number_weight = self.number_density_per_m(diameter)? * integration_width;
                 let particle = self.law.particle(diameter)?;
                 integrated_number += number_weight;
@@ -2287,6 +2307,57 @@ mod tests {
                 <= 2.0e-7
         );
         assert!(quadrature.audit.sixth_moment_quadrature_relative_error <= 2.0e-7);
+    }
+
+    #[test]
+    fn origin_transform_closes_near_zero_noninteger_shape() {
+        let scheme = P3WrfScheme::Mp50OneIceFixedCloudNumber;
+        let lambda = 410.072_784_423_828_1;
+        let mu = 0.003_246_055_915_951_729;
+        let input = state_from_exact_distribution(
+            scheme,
+            lambda,
+            mu,
+            0.002_074_264_921_247_959,
+            1.029_933_929_443_359_4,
+        );
+        let psd = P3Psd::reconstruct(
+            input,
+            &fixture_table(scheme, lambda, mu),
+            P3ReconstructionConfig {
+                maximum_moment_relative_error: 1.0e-10,
+            },
+        )
+        .unwrap();
+        let quadrature = psd
+            .quadrature_bounded_with_dimension_breakpoints(
+                P3QuadratureConfig::default(),
+                0.080,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(quadrature.audit.config.panels, 64);
+        assert_eq!(
+            quadrature.audit.upper_dimension_m.to_bits(),
+            0.080_f64.to_bits()
+        );
+        assert!(
+            quadrature
+                .nodes
+                .iter()
+                .all(|node| node.maximum_dimension_m < 0.080)
+        );
+        for error in [
+            quadrature.audit.number_quadrature_relative_error,
+            quadrature.audit.mass_quadrature_relative_error,
+            quadrature
+                .audit
+                .mass_squared_radar_weight_quadrature_relative_error,
+            quadrature.audit.sixth_moment_quadrature_relative_error,
+        ] {
+            assert!(error <= quadrature.audit.config.maximum_quadrature_relative_error);
+        }
     }
 
     #[test]
