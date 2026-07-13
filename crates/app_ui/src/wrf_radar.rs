@@ -13477,6 +13477,7 @@ mod tests {
         cpu_config
             .validate_science_contract()
             .expect("fixture CUDA parity configuration is valid");
+        let field_read_started = std::time::Instant::now();
         let fields = read_wrf_radar_fields_for_config_reporting(
             &file,
             &scene.source_identity,
@@ -13487,6 +13488,7 @@ mod tests {
             None,
         )
         .expect("read native property fixture");
+        let field_read_elapsed = field_read_started.elapsed();
         let property = fields
             .raw_property_scene
             .as_deref()
@@ -13513,11 +13515,13 @@ mod tests {
             .cloned()
             .expect("fixture scene has a valid time");
 
+        let cpu_started = std::time::Instant::now();
         let cpu =
             try_build_synthetic_volume_reporting(&fields, valid_time, &cpu_config, &|stage| {
                 eprintln!("[cuda-parity cpu] {stage}")
             })
             .expect("CPU native T-matrix reference volume");
+        let cpu_elapsed = cpu_started.elapsed();
         let service = Arc::new(
             app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService::open_preferred()
                 .expect("open CUDA T-matrix service"),
@@ -13525,11 +13529,13 @@ mod tests {
         let mut cuda_config = cpu_config.clone();
         cuda_config.compute_preference = SyntheticRadarComputePreference::NvidiaCuda;
         cuda_config.runtime_cuda_service = Some(Arc::clone(&service));
+        let cuda_started = std::time::Instant::now();
         let cuda =
             try_build_synthetic_volume_reporting(&fields, valid_time, &cuda_config, &|stage| {
                 eprintln!("[cuda-parity gpu] {stage}")
             })
             .expect("CUDA native T-matrix volume");
+        let cuda_elapsed = cuda_started.elapsed();
 
         assert_eq!(cpu.cuts, cuda.cuts, "CPU/CUDA radar science differs");
         let report = service.report();
@@ -13539,8 +13545,13 @@ mod tests {
         );
         assert_eq!(report.fallback_reason, None, "CUDA unexpectedly fell back");
         eprintln!(
-            "[cuda-parity] bit-identical: {} nodes in {} batches / {} requests",
-            report.nodes_completed, report.batches_completed, report.requests_submitted
+            "[cuda-parity timing] field-read={:.3}s cpu-build={:.3}s cuda-build={:.3}s; bit-identical: {} nodes in {} batches / {} requests",
+            field_read_elapsed.as_secs_f64(),
+            cpu_elapsed.as_secs_f64(),
+            cuda_elapsed.as_secs_f64(),
+            report.nodes_completed,
+            report.batches_completed,
+            report.requests_submitted,
         );
     }
 
