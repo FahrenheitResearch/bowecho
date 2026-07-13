@@ -1699,7 +1699,7 @@ fn production_p3_integration_config(
 fn production_ishmael_psd_config() -> PsdIntegrationConfig {
     PsdIntegrationConfig::new(
         8,
-        256,
+        512,
         96.0,
         1.0e-10,
         5.0e-8,
@@ -3137,7 +3137,16 @@ impl<'table> PreparedIshmaelParticleIntegration<'table> {
                 &evaluation.prepared,
             )
         });
-        debug_assert_eq!(cursor, self.evaluations.len());
+        if let Ok(result) = &result {
+            let base_node_count = self.integration.node_count(PsdQuadratureLevel::Coarse)
+                + self.integration.node_count(PsdQuadratureLevel::Refined);
+            let expected = if result.audit().refinement_steps == 0 {
+                base_node_count
+            } else {
+                self.evaluations.len()
+            };
+            debug_assert_eq!(cursor, expected);
+        }
         result
     }
 
@@ -3163,7 +3172,8 @@ fn prepare_ishmael_particle_integration<'table>(
         .map_err(PsdIntegrationError::<EvaluationError>::from)?;
     let mut evaluations = Vec::with_capacity(
         integration.node_count(PsdQuadratureLevel::Coarse)
-            + integration.node_count(PsdQuadratureLevel::Refined),
+            + integration.node_count(PsdQuadratureLevel::Refined)
+            + integration.node_count(PsdQuadratureLevel::AdaptiveRefined),
     );
     for (level, node_index, node) in integration.nodes() {
         let (role, table, request) = match node.habit() {
@@ -5511,6 +5521,57 @@ mod tests {
         test(&prepared);
     }
 
+    fn with_reported_ishmael_planar_prepared(
+        test: impl for<'table> FnOnce(&PreparedIshmaelParticleIntegration<'table>),
+    ) {
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let tables = owner.borrowed_bundle();
+        let validated = validate_bundle(tables).expect("validate embedded table bundle");
+        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
+            radar_scattering::IshmaelIceCategory::Planar,
+            1.760_302_043_019_024_2e-10,
+            3.285_777_347_628_027e-4,
+            4.228_335_533_134_264e-16,
+            4.228_335_533_134_264e-16,
+            0.957_008_183_002_471_9,
+        ))
+        .expect("reconstruct the reported cell's native planar PSD");
+        let oblate_request = evaluation_request(
+            validated.frequency_hz,
+            -0.5,
+            SpheroidConvention::OblateMinorVertical,
+        )
+        .unwrap();
+        let prolate_request = evaluation_request(
+            validated.frequency_hz,
+            -0.5,
+            SpheroidConvention::ProlateMajorVertical,
+        )
+        .unwrap();
+        let prepared = prepare_ishmael_particle_integration(
+            &distribution,
+            validated.ishmael_psd_config,
+            validated.ishmael_particle_support,
+            validated.ishmael_fall_speed,
+            tables,
+            ICE_MELTING_TEMPERATURE_K,
+            oblate_request,
+            prolate_request,
+        )
+        .expect("prepare the reported ISHMAEL planar population");
+        assert!(
+            prepared
+                .integration
+                .node_count(PsdQuadratureLevel::AdaptiveRefined)
+                > 0
+        );
+        test(&prepared);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn embedded_ishmael_raw_batch_case<'table>(
         tables: WrfTMatrixLutBundle<'table>,
@@ -5690,6 +5751,147 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ishmael_base_success_consumes_only_the_base_ordered_prefix() {
+        with_embedded_ishmael_prepared(|prepared| {
+            let base_node_count = prepared.integration.node_count(PsdQuadratureLevel::Coarse)
+                + prepared.integration.node_count(PsdQuadratureLevel::Refined);
+            assert!(base_node_count < prepared.evaluations.len());
+            let expected = prepared
+                .evaluations
+                .iter()
+                .map(|evaluation| (evaluation.level, evaluation.node_index))
+                .collect::<Vec<_>>();
+            let mut visited = Vec::new();
+            let result = prepared
+                .finish_with_table_evaluator(|_, level, node_index, _, table, interpolation| {
+                    visited.push((level, node_index));
+                    table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(interpolation)
+                })
+                .unwrap();
+            assert_eq!(result.audit().refinement_steps, 0);
+            assert_eq!(visited, expected[..base_node_count]);
+            assert!(
+                visited
+                    .iter()
+                    .all(|(level, _)| *level != PsdQuadratureLevel::AdaptiveRefined)
+            );
+        });
+    }
+
+    #[test]
+    fn ishmael_adaptive_success_consumes_every_distinct_ordered_level() {
+        with_reported_ishmael_planar_prepared(|prepared| {
+            let expected = prepared
+                .evaluations
+                .iter()
+                .map(|evaluation| (evaluation.level, evaluation.node_index))
+                .collect::<Vec<_>>();
+            let unique = expected.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(unique.len(), expected.len());
+            assert!(
+                expected
+                    .iter()
+                    .any(|(level, _)| { *level == PsdQuadratureLevel::AdaptiveRefined })
+            );
+            assert!(expected.iter().any(|&(level, index)| {
+                level == PsdQuadratureLevel::Refined
+                    && expected.contains(&(PsdQuadratureLevel::AdaptiveRefined, index))
+            }));
+
+            let mut visited = Vec::new();
+            let result = prepared
+                .finish_with_table_evaluator(|_, level, node_index, _, table, interpolation| {
+                    visited.push((level, node_index));
+                    table.evaluate_prepared_dry_particle_lut_interpolation_per_m3(interpolation)
+                })
+                .unwrap();
+            assert_eq!(result.audit().refinement_steps, 1);
+            assert_eq!(visited, expected);
+        });
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn assert_ishmael_prepared_gpu_parity(
+        prepared: &PreparedIshmaelParticleIntegration<'_>,
+        service: &WrfTMatrixCudaBatchService,
+        expected_refinement_steps: u8,
+    ) {
+        let cpu_nodes = prepared
+            .evaluations
+            .iter()
+            .map(|evaluation| {
+                evaluation
+                    .table
+                    .evaluate_prepared_dry_particle_lut_interpolation_per_m3(&evaluation.prepared)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut gpu_nodes = vec![None; prepared.evaluations.len()];
+        for role in [
+            WrfTMatrixCudaTableRole::DryOblate,
+            WrfTMatrixCudaTableRole::DryProlate,
+        ] {
+            let positions = prepared
+                .evaluations
+                .iter()
+                .enumerate()
+                .filter_map(|(position, evaluation)| (evaluation.role == role).then_some(position))
+                .collect::<Vec<_>>();
+            let staged = positions
+                .iter()
+                .map(|&position| {
+                    let evaluation = &prepared.evaluations[position];
+                    CudaPreparedTMatrixNode::new(&evaluation.prepared, 1.0).unwrap()
+                })
+                .collect::<Vec<_>>();
+            if staged.is_empty() {
+                continue;
+            }
+            let evaluated = service.evaluate_particles(role, staged).unwrap();
+            for (position, output) in positions.into_iter().zip(evaluated) {
+                assert_eq!(
+                    output.components().map(f64::to_bits),
+                    cpu_nodes[position].components().map(f64::to_bits),
+                    "ISHMAEL particle {position} differs between CUDA and scalar CPU"
+                );
+                gpu_nodes[position] = Some(output);
+            }
+        }
+        assert!(gpu_nodes.iter().all(Option::is_some));
+
+        let cpu_category = prepared.finish_cpu().unwrap();
+        assert_eq!(
+            cpu_category.audit().refinement_steps,
+            expected_refinement_steps
+        );
+        let mut visited = Vec::new();
+        let gpu_category = prepared
+            .finish_with_table_evaluator(|position, level, node_index, _, _, _| {
+                visited.push((position, level, node_index));
+                Ok(gpu_nodes[position].expect("every prepared node has a GPU result"))
+            })
+            .unwrap();
+        let expected_consumed = if expected_refinement_steps == 0 {
+            prepared.integration.node_count(PsdQuadratureLevel::Coarse)
+                + prepared.integration.node_count(PsdQuadratureLevel::Refined)
+        } else {
+            prepared.evaluations.len()
+        };
+        assert_eq!(visited.len(), expected_consumed);
+        for (expected_position, &(position, level, node_index)) in visited.iter().enumerate() {
+            assert_eq!(position, expected_position);
+            assert_eq!(
+                (level, node_index),
+                (
+                    prepared.evaluations[position].level,
+                    prepared.evaluations[position].node_index
+                )
+            );
+        }
+        assert_psd_result_bitwise_eq(gpu_category, cpu_category);
+    }
+
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn embedded_ishmael_prepared_nodes_are_bitwise_equal_on_gpu_and_cpu() {
@@ -5705,60 +5907,10 @@ mod tests {
         .expect("open CUDA service for ISHMAEL parity");
 
         with_embedded_ishmael_prepared(|prepared| {
-            let cpu_nodes = prepared
-                .evaluations
-                .iter()
-                .map(|evaluation| {
-                    evaluation
-                        .table
-                        .evaluate_prepared_dry_particle_lut_interpolation_per_m3(
-                            &evaluation.prepared,
-                        )
-                        .unwrap()
-                })
-                .collect::<Vec<_>>();
-            let mut gpu_nodes = vec![None; prepared.evaluations.len()];
-            for role in [
-                WrfTMatrixCudaTableRole::DryOblate,
-                WrfTMatrixCudaTableRole::DryProlate,
-            ] {
-                let positions = prepared
-                    .evaluations
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(position, evaluation)| {
-                        (evaluation.role == role).then_some(position)
-                    })
-                    .collect::<Vec<_>>();
-                let staged = positions
-                    .iter()
-                    .map(|&position| {
-                        let evaluation = &prepared.evaluations[position];
-                        CudaPreparedTMatrixNode::new(&evaluation.prepared, 1.0).unwrap()
-                    })
-                    .collect::<Vec<_>>();
-                if staged.is_empty() {
-                    continue;
-                }
-                let evaluated = service.evaluate_particles(role, staged).unwrap();
-                for (position, output) in positions.into_iter().zip(evaluated) {
-                    assert_eq!(
-                        output.components().map(f64::to_bits),
-                        cpu_nodes[position].components().map(f64::to_bits),
-                        "ISHMAEL particle {position} differs between CUDA and scalar CPU"
-                    );
-                    gpu_nodes[position] = Some(output);
-                }
-            }
-            assert!(gpu_nodes.iter().all(Option::is_some));
-
-            let cpu_category = prepared.finish_cpu().unwrap();
-            let gpu_category = prepared
-                .finish_with_table_evaluator(|position, _, _, _, _, _| {
-                    Ok(gpu_nodes[position].expect("every prepared node has a GPU result"))
-                })
-                .unwrap();
-            assert_psd_result_bitwise_eq(gpu_category, cpu_category);
+            assert_ishmael_prepared_gpu_parity(prepared, &service, 0);
+        });
+        with_reported_ishmael_planar_prepared(|prepared| {
+            assert_ishmael_prepared_gpu_parity(prepared, &service, 1);
         });
 
         let report = service.report();
@@ -6512,6 +6664,155 @@ mod tests {
         assert_eq!(components, vec![3.0, 4.0, 5.0, 6.0]);
         assert_eq!(counts.source_cells, 2);
         assert_eq!(counts.dry_frozen_populations, 3);
+    }
+
+    #[test]
+    fn reported_ishmael_planar_cell_converges_with_embedded_tables() {
+        let Some(wrf_path) = std::env::var_os("BOWECHO_ISHMAEL_FIXTURE") else {
+            return;
+        };
+        let cell = std::env::var("BOWECHO_ISHMAEL_CONVERGENCE_CELL")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("cell index is an integer"))
+            .unwrap_or(3_672_172);
+
+        let file = wrf_core::WrfFile::open(&wrf_path).expect("open ISHMAEL WRF fixture");
+        assert_eq!(file.global_attr_i32("MP_PHYSICS").unwrap(), 55);
+        let source = read_wrf_property_scene(
+            &file,
+            WrfSourceIdentity("fixture:ishmael-convergence".to_owned()),
+            0,
+        )
+        .expect("read normalized ISHMAEL property scene");
+
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let tables = owner.borrowed_bundle();
+        let validated = validate_bundle(tables).expect("validate embedded table bundle");
+        let mut output = vec![
+            0.0_f32;
+            validated.radar_elevations_deg.len()
+                * AdditiveScattering::COMPONENT_COUNT
+        ];
+        build_ishmael_psd_cell_into(
+            &source,
+            cell,
+            tables,
+            validated,
+            WrfTMatrixRainMode::FrozenOnly,
+            None,
+            None,
+            &mut output,
+        )
+        .unwrap_or_else(|error| panic!("reported ISHMAEL cell {cell} failed: {error}"));
+    }
+
+    #[test]
+    fn reported_ishmael_planar_state_adaptively_refines_from_integral_magnitude() {
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let tables = owner.borrowed_bundle();
+        let validated = validate_bundle(tables).expect("validate embedded table bundle");
+        let distribution = IshmaelPsd::reconstruct(IshmaelPsdInput::new(
+            radar_scattering::IshmaelIceCategory::Planar,
+            1.760_302_043_019_024_2e-10,
+            3.285_777_347_628_027e-4,
+            4.228_335_533_134_264e-16,
+            4.228_335_533_134_264e-16,
+            0.957_008_183_002_471_9,
+        ))
+        .expect("reconstruct the reported cell's native planar PSD");
+        let oblate_request = evaluation_request(
+            validated.frequency_hz,
+            -0.5,
+            SpheroidConvention::OblateMinorVertical,
+        )
+        .unwrap();
+        let prolate_request = evaluation_request(
+            validated.frequency_hz,
+            -0.5,
+            SpheroidConvention::ProlateMajorVertical,
+        )
+        .unwrap();
+        let prepare = |config| {
+            prepare_ishmael_particle_integration(
+                &distribution,
+                config,
+                validated.ishmael_particle_support,
+                validated.ishmael_fall_speed,
+                tables,
+                ICE_MELTING_TEMPERATURE_K,
+                oblate_request,
+                prolate_request,
+            )
+            .unwrap()
+        };
+
+        let base_only = PsdIntegrationConfig::new(
+            8,
+            256,
+            96.0,
+            1.0e-10,
+            5.0e-8,
+            5.0e-3,
+            radar_scattering::DEFAULT_ADDITIVE_ABSOLUTE_TOLERANCES,
+            ISHMAEL_PSD_MAXIMUM_OMITTED_NUMBER_FRACTION,
+            ISHMAEL_PSD_MAXIMUM_OMITTED_MASS_FRACTION,
+            ISHMAEL_PSD_MAXIMUM_OMITTED_D6_FRACTION,
+        )
+        .unwrap();
+        let base_error = prepare(base_only).finish_cpu().unwrap_err();
+        let PsdIntegrationError::Psd(PsdError::AdditiveConvergence {
+            component,
+            coarse_value,
+            refined_value,
+            magnitude,
+            absolute_error,
+            relative_error,
+            ..
+        }) = base_error
+        else {
+            panic!("reported state should fail only the bounded base comparison: {base_error}");
+        };
+        assert_eq!(component, 0);
+        assert_eq!(
+            coarse_value.to_bits(),
+            0.000_341_404_441_271_602_17_f64.to_bits()
+        );
+        assert_eq!(
+            refined_value.to_bits(),
+            0.000_339_559_017_029_987_14_f64.to_bits()
+        );
+        assert_eq!(magnitude.to_bits(), coarse_value.to_bits());
+        assert_eq!(
+            absolute_error.to_bits(),
+            0.000_001_845_424_241_615_03_f64.to_bits()
+        );
+        assert_eq!(
+            relative_error.to_bits(),
+            0.005_405_390_260_131_134_f64.to_bits()
+        );
+
+        let result = prepare(production_ishmael_psd_config())
+            .finish_cpu()
+            .expect("magnitude-triggered refinement should converge");
+        let audit = result.audit();
+        assert_eq!(audit.refinement_steps, 1);
+        assert_eq!(
+            audit.quadrature,
+            radar_scattering::PsdQuadratureRule::CompositeGaussLegendre8AdaptiveRefinedV2
+        );
+        assert!(audit.refined_nodes_evaluated > audit.coarse_nodes_evaluated);
+        assert!(
+            audit.total_nodes_reduced
+                > audit.coarse_nodes_evaluated + audit.refined_nodes_evaluated
+        );
     }
 
     #[test]

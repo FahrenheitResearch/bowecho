@@ -91,12 +91,18 @@ pub enum SchemePsdRevision {
 ///
 /// The gamma-weighted integral is evaluated on a finite interval using an
 /// eight-point Gauss-Legendre rule per panel. The interval is selected from
-/// analytic gamma tails, and a second evaluation at twice the panel count is
-/// retained as the convergence audit.
+/// analytic gamma tails. A second evaluation at twice the panel count forms
+/// the base convergence audit, and a bounded third grid is available when
+/// the measured additive integral requires one further refinement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PsdQuadratureRule {
     CompositeGaussLegendre8RefinedV1,
+    /// The same bounded GL8 rules, with one further factor-of-two grid
+    /// admitted when the first coarse/refined scattering comparison exceeds
+    /// its magnitude-scaled convergence tolerance and the configured node
+    /// budget can represent the additional rule.
+    CompositeGaussLegendre8AdaptiveRefinedV2,
 }
 
 /// Whether a physical ISHMAEL node is oblate, prolate, or effectively
@@ -111,11 +117,12 @@ pub enum PsdSpheroidHabit {
 }
 
 /// Which convergence pass produced a callback failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PsdQuadratureLevel {
     Coarse,
     Refined,
+    AdaptiveRefined,
 }
 
 /// Scheme/category identity retained separately from generic node geometry.
@@ -918,7 +925,7 @@ impl PsdIntegrationConfig {
         }
         Ok(Self {
             revision: SchemePsdRevision::IshmaelGammaV1,
-            quadrature: PsdQuadratureRule::CompositeGaussLegendre8RefinedV1,
+            quadrature: PsdQuadratureRule::CompositeGaussLegendre8AdaptiveRefinedV2,
             coarse_panels,
             maximum_refined_nodes,
             maximum_scaled_a,
@@ -1025,8 +1032,16 @@ pub struct PsdIntegrationAudit {
     pub quadrature: PsdQuadratureRule,
     pub fall_speed: PsdFallSpeedProvenance,
     pub reconstruction: IshmaelReconstructionAudit,
+    /// Number of magnitude-triggered factor-of-two refinements beyond the
+    /// configured base coarse/refined pair.
+    pub refinement_steps: u8,
+    /// Node counts in the comparison pair that satisfied every convergence
+    /// gate (or would have been reported by a final fail-closed error).
     pub coarse_nodes_evaluated: usize,
     pub refined_nodes_evaluated: usize,
+    /// Total scattering callbacks consumed, including a rejected base grid
+    /// when adaptive refinement was required.
+    pub total_nodes_reduced: usize,
     pub upper_scaled_a: f64,
     pub expected_number_density_m3: f64,
     pub expected_mass_concentration_kg_m3: f64,
@@ -1087,13 +1102,11 @@ pub struct PreparedIshmaelPsdIntegration {
     fall_speed: PsdFallSpeedProvenance,
     coarse: PreparedPsdRule,
     refined: PreparedPsdRule,
+    adaptive_refined: Option<PreparedPsdRule>,
     upper_scaled_a: f64,
     represented: MomentFractions,
     omitted: MomentFractions,
     tails: MomentFractions,
-    number_closure: f64,
-    mass_closure: f64,
-    d6_closure: f64,
 }
 
 impl PreparedIshmaelPsdIntegration {
@@ -1119,15 +1132,30 @@ impl PreparedIshmaelPsdIntegration {
             .map(|node| (node.index(), node))
     }
 
-    /// Complete callback order: every coarse node, followed by every refined
-    /// node. Level and original per-grid index remain explicit even when table
-    /// support excludes intervening quadrature nodes.
+    /// Ordered supported nodes in the optional magnitude-triggered retry.
+    pub fn adaptive_refined_nodes(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (usize, PsdParticleNode)> + '_ {
+        self.adaptive_refined
+            .iter()
+            .flat_map(|rule| rule.nodes.iter())
+            .copied()
+            .map(|node| (node.index(), node))
+    }
+
+    /// Complete possible callback order: base coarse, base refined, then the
+    /// optional adaptive-refined rule. Level and original per-grid index
+    /// remain explicit even when table support excludes intervening nodes.
     pub fn nodes(&self) -> impl Iterator<Item = (PsdQuadratureLevel, usize, PsdParticleNode)> + '_ {
         self.coarse_nodes()
             .map(|(index, node)| (PsdQuadratureLevel::Coarse, index, node))
             .chain(
                 self.refined_nodes()
                     .map(|(index, node)| (PsdQuadratureLevel::Refined, index, node)),
+            )
+            .chain(
+                self.adaptive_refined_nodes()
+                    .map(|(index, node)| (PsdQuadratureLevel::AdaptiveRefined, index, node)),
             )
     }
 
@@ -1136,6 +1164,10 @@ impl PreparedIshmaelPsdIntegration {
         match level {
             PsdQuadratureLevel::Coarse => self.coarse.nodes.len(),
             PsdQuadratureLevel::Refined => self.refined.nodes.len(),
+            PsdQuadratureLevel::AdaptiveRefined => self
+                .adaptive_refined
+                .as_ref()
+                .map_or(0, |rule| rule.nodes.len()),
         }
     }
 
@@ -1148,12 +1180,12 @@ impl PreparedIshmaelPsdIntegration {
     /// configured fail-closed limits are deliberately enforced only in
     /// [`Self::finish`], matching the original post-evaluation ordering.
     #[must_use]
-    pub const fn closure_relative_errors(&self) -> [f64; 3] {
-        [self.number_closure, self.mass_closure, self.d6_closure]
+    pub fn closure_relative_errors(&self) -> [f64; 3] {
+        quadrature_closure_errors(&self.refined, self.tails)
     }
 
-    /// Consume one per-particle response for every exposed node and finish in
-    /// the exact scalar CPU order used before workload preparation existed.
+    /// Consume the base pair in scalar order, then consume the optional third
+    /// rule only when the measured base result fails its numerical audit.
     pub fn finish<F, E>(
         &self,
         mut evaluate_particle: F,
@@ -1162,31 +1194,16 @@ impl PreparedIshmaelPsdIntegration {
         F: FnMut(PsdQuadratureLevel, usize, &PsdParticleNode) -> Result<AdditiveScattering, E>,
         E: Error + 'static,
     {
-        let coarse = finish_prepared_rule(
+        let base_coarse = finish_prepared_rule(
             &self.coarse,
             PsdQuadratureLevel::Coarse,
             &mut evaluate_particle,
         )?;
-        let refined = finish_prepared_rule(
+        let base_refined = finish_prepared_rule(
             &self.refined,
             PsdQuadratureLevel::Refined,
             &mut evaluate_particle,
         )?;
-
-        for (moment, error) in [
-            ("number", self.number_closure),
-            ("mass", self.mass_closure),
-            ("equivalent-volume D6", self.d6_closure),
-        ] {
-            if error > self.config.maximum_quadrature_closure_error {
-                return Err(PsdError::QuadratureClosure {
-                    moment,
-                    relative_error: error,
-                    maximum: self.config.maximum_quadrature_closure_error,
-                }
-                .into());
-            }
-        }
 
         for (moment, omitted, maximum) in [
             (
@@ -1215,36 +1232,53 @@ impl PreparedIshmaelPsdIntegration {
             }
         }
 
-        let coarse_components = coarse.additive.components();
-        let refined_components = refined.additive.components();
-        let mut maximum_additive_convergence_error = 0.0_f64;
-        let mut maximum_additive_convergence_component = 0;
-        for index in 0..AdditiveScattering::COMPONENT_COUNT {
-            let absolute_error = (coarse_components[index] - refined_components[index]).abs();
-            let magnitude = coarse_components[index]
-                .abs()
-                .max(refined_components[index].abs());
-            let allowed = self.config.additive_absolute_tolerances[index]
-                + self.config.maximum_additive_convergence_error * magnitude;
-            let error = relative_error(
-                coarse_components[index],
-                refined_components[index],
-                self.config.additive_absolute_tolerances[index],
-            );
-            if error > maximum_additive_convergence_error {
-                maximum_additive_convergence_error = error;
-                maximum_additive_convergence_component = index;
+        // The retry is triggered only by a failed numerical audit computed
+        // from the actual integrated additive magnitudes. It neither raises a
+        // tolerance nor accepts a result that has not independently passed
+        // the same absolute-plus-relative gate on the finer pair.
+        let base_audit = quadrature_candidate_audit(
+            self.config,
+            &self.refined,
+            self.tails,
+            base_coarse,
+            base_refined,
+        );
+        let (coarse, refined, convergence, refinement_steps, total_nodes_reduced) = match base_audit
+        {
+            Ok(convergence) => (
+                base_coarse,
+                base_refined,
+                convergence,
+                0,
+                base_coarse.nodes_evaluated + base_refined.nodes_evaluated,
+            ),
+            Err(base_error) => {
+                let Some(adaptive_rule) = self.adaptive_refined.as_ref() else {
+                    return Err(base_error.into());
+                };
+                let adaptive_refined = finish_prepared_rule(
+                    adaptive_rule,
+                    PsdQuadratureLevel::AdaptiveRefined,
+                    &mut evaluate_particle,
+                )?;
+                let convergence = quadrature_candidate_audit(
+                    self.config,
+                    adaptive_rule,
+                    self.tails,
+                    base_refined,
+                    adaptive_refined,
+                )?;
+                (
+                    base_refined,
+                    adaptive_refined,
+                    convergence,
+                    1,
+                    base_coarse.nodes_evaluated
+                        + base_refined.nodes_evaluated
+                        + adaptive_refined.nodes_evaluated,
+                )
             }
-            if absolute_error > allowed {
-                return Err(PsdError::AdditiveConvergence {
-                    component: index,
-                    absolute_error,
-                    absolute_tolerance: self.config.additive_absolute_tolerances[index],
-                    relative_tolerance: self.config.maximum_additive_convergence_error,
-                }
-                .into());
-            }
-        }
+        };
 
         let accumulator = refined
             .additive
@@ -1257,8 +1291,10 @@ impl PreparedIshmaelPsdIntegration {
             quadrature: self.config.quadrature,
             fall_speed: self.fall_speed,
             reconstruction: self.distribution.reconstruction,
+            refinement_steps,
             coarse_nodes_evaluated: coarse.nodes_evaluated,
             refined_nodes_evaluated: refined.nodes_evaluated,
+            total_nodes_reduced,
             upper_scaled_a: self.upper_scaled_a,
             expected_number_density_m3: self.distribution.number_density_m3(),
             expected_mass_concentration_kg_m3: self.distribution.mass_concentration_kg_m3(),
@@ -1273,11 +1309,11 @@ impl PreparedIshmaelPsdIntegration {
             truncation_tail_number_fraction: self.tails.number,
             truncation_tail_mass_fraction: self.tails.mass,
             truncation_tail_d6_fraction: self.tails.d6,
-            number_closure_relative_error: self.number_closure,
-            mass_closure_relative_error: self.mass_closure,
-            d6_closure_relative_error: self.d6_closure,
-            maximum_additive_convergence_error,
-            maximum_additive_convergence_component,
+            number_closure_relative_error: convergence.closure_errors[0],
+            mass_closure_relative_error: convergence.closure_errors[1],
+            d6_closure_relative_error: convergence.closure_errors[2],
+            maximum_additive_convergence_error: convergence.maximum_additive_error,
+            maximum_additive_convergence_component: convergence.maximum_additive_component,
         };
         Ok(PsdIntegrationResult {
             additive: refined.additive,
@@ -1287,9 +1323,11 @@ impl PreparedIshmaelPsdIntegration {
     }
 }
 
-/// Construct both ordered ISHMAEL convergence grids without evaluating any
-/// scattering. Analytic support/tail facts and quadrature closure are frozen
-/// into the returned opaque workload for backend-independent finishing.
+/// Construct the ordered ISHMAEL convergence grids without evaluating any
+/// scattering. In addition to the required base pair, preparation retains one
+/// optional factor-of-two refinement when it fits the explicit node budget.
+/// Finishing consumes that rule only when the base pair fails its numerical
+/// audit against the actual integrated scattering magnitude.
 pub fn prepare_ishmael_psd(
     distribution: &IshmaelPsd,
     config: PsdIntegrationConfig,
@@ -1332,10 +1370,19 @@ pub fn prepare_ishmael_psd(
         &support_intervals,
         config.maximum_refined_nodes as usize,
     )?;
+    let adaptive_refined = match prepare_rule(
+        *distribution,
+        usize::from(config.coarse_panels) * REFINEMENT_FACTOR * REFINEMENT_FACTOR,
+        upper_scaled_a,
+        support,
+        &support_intervals,
+        config.maximum_refined_nodes as usize,
+    ) {
+        Ok(rule) => Some(rule),
+        Err(PsdError::NodeBudgetExceeded { .. }) => None,
+        Err(error) => return Err(error),
+    };
 
-    let number_closure = (refined.all.number + tails.number - 1.0).abs();
-    let mass_closure = (refined.all.mass + tails.mass - 1.0).abs();
-    let d6_closure = (refined.all.d6 + tails.d6 - 1.0).abs();
     Ok(PreparedIshmaelPsdIntegration {
         distribution: *distribution,
         config,
@@ -1343,13 +1390,11 @@ pub fn prepare_ishmael_psd(
         fall_speed,
         coarse,
         refined,
+        adaptive_refined,
         upper_scaled_a,
         represented,
         omitted,
         tails,
-        number_closure,
-        mass_closure,
-        d6_closure,
     })
 }
 
@@ -1423,6 +1468,83 @@ struct PreparedPsdRule {
 struct RuleAccumulation {
     additive: AdditiveScattering,
     nodes_evaluated: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QuadratureCandidateAudit {
+    closure_errors: [f64; 3],
+    maximum_additive_error: f64,
+    maximum_additive_component: usize,
+}
+
+fn quadrature_closure_errors(refined_rule: &PreparedPsdRule, tails: MomentFractions) -> [f64; 3] {
+    [
+        (refined_rule.all.number + tails.number - 1.0).abs(),
+        (refined_rule.all.mass + tails.mass - 1.0).abs(),
+        (refined_rule.all.d6 + tails.d6 - 1.0).abs(),
+    ]
+}
+
+fn quadrature_candidate_audit(
+    config: PsdIntegrationConfig,
+    refined_rule: &PreparedPsdRule,
+    tails: MomentFractions,
+    coarse: RuleAccumulation,
+    refined: RuleAccumulation,
+) -> Result<QuadratureCandidateAudit, PsdError> {
+    let closure_errors = quadrature_closure_errors(refined_rule, tails);
+    for (moment, error) in [
+        ("number", closure_errors[0]),
+        ("mass", closure_errors[1]),
+        ("equivalent-volume D6", closure_errors[2]),
+    ] {
+        if error > config.maximum_quadrature_closure_error {
+            return Err(PsdError::QuadratureClosure {
+                moment,
+                relative_error: error,
+                maximum: config.maximum_quadrature_closure_error,
+            });
+        }
+    }
+
+    let coarse_components = coarse.additive.components();
+    let refined_components = refined.additive.components();
+    let mut maximum_additive_error = 0.0_f64;
+    let mut maximum_additive_component = 0;
+    for index in 0..AdditiveScattering::COMPONENT_COUNT {
+        let absolute_error = (coarse_components[index] - refined_components[index]).abs();
+        let magnitude = coarse_components[index]
+            .abs()
+            .max(refined_components[index].abs());
+        let allowed = config.additive_absolute_tolerances[index]
+            + config.maximum_additive_convergence_error * magnitude;
+        let error = relative_error(
+            coarse_components[index],
+            refined_components[index],
+            config.additive_absolute_tolerances[index],
+        );
+        if error > maximum_additive_error {
+            maximum_additive_error = error;
+            maximum_additive_component = index;
+        }
+        if absolute_error > allowed {
+            return Err(PsdError::AdditiveConvergence {
+                component: index,
+                coarse_value: coarse_components[index],
+                refined_value: refined_components[index],
+                magnitude,
+                absolute_error,
+                relative_error: error,
+                absolute_tolerance: config.additive_absolute_tolerances[index],
+                relative_tolerance: config.maximum_additive_convergence_error,
+            });
+        }
+    }
+    Ok(QuadratureCandidateAudit {
+        closure_errors,
+        maximum_additive_error,
+        maximum_additive_component,
+    })
 }
 
 // Each argument is an independent part of quadrature construction or its
@@ -1843,11 +1965,15 @@ pub enum PsdError {
         maximum: f64,
     },
     #[error(
-        "additive component {component} coarse/refined absolute error {absolute_error} exceeds abs_tol={absolute_tolerance} + rel_tol={relative_tolerance} * magnitude"
+        "additive component {component} coarse value {coarse_value}, refined value {refined_value}, magnitude {magnitude}, absolute error {absolute_error}, relative error {relative_error} exceeds abs_tol={absolute_tolerance} + rel_tol={relative_tolerance} * magnitude"
     )]
     AdditiveConvergence {
         component: usize,
+        coarse_value: f64,
+        refined_value: f64,
+        magnitude: f64,
         absolute_error: f64,
+        relative_error: f64,
         absolute_tolerance: f64,
         relative_tolerance: f64,
     },
@@ -2127,7 +2253,7 @@ mod tests {
         assert_eq!(audit.revision, SchemePsdRevision::IshmaelGammaV1);
         assert_eq!(
             audit.quadrature,
-            PsdQuadratureRule::CompositeGaussLegendre8RefinedV1
+            PsdQuadratureRule::CompositeGaussLegendre8AdaptiveRefinedV2
         );
         assert_eq!(audit.fall_speed, synthetic_fall_speed_provenance());
         assert!(audit.number_closure_relative_error <= 5.0e-8);
@@ -2403,6 +2529,7 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.node_count(PsdQuadratureLevel::Coarse), 72);
         assert_eq!(prepared.node_count(PsdQuadratureLevel::Refined), 136);
+        assert_eq!(prepared.node_count(PsdQuadratureLevel::AdaptiveRefined), 0);
 
         let expected = prepared
             .nodes()
