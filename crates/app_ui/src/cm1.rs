@@ -3084,23 +3084,27 @@ fn hdf5_axis_metadata(
     if !expected_name.eq_ignore_ascii_case(expected_dimension) {
         return None;
     }
-    let dataset = nc.hdf5_root_datasets().ok()?.into_iter().find(|dataset| {
-        dataset.name().eq_ignore_ascii_case(expected_name) && dataset.shape().len() == 1
-    })?;
-    let dimension = nc.dimension(expected_dimension)?;
-    let len = usize::try_from(dataset.shape()[0]).ok()?;
-    if dimension.len() != len {
+    if !nc.has_hdf5_dataset(expected_name) {
         return None;
     }
-    let long_name = nc.hdf5_dataset_attribute_string(dataset.name(), "long_name")?;
+    let dimension = nc.dimension(expected_dimension)?;
+    // Look up only the coordinate itself. Enumerating all root datasets asks
+    // netcrust to apply its safe full-array allocation ceiling to every data
+    // variable; a perfectly valid multi-record CM1 output can exceed that
+    // ceiling even though BowEcho reads it one record at a time.
+    let coordinate = nc.read_array_f64(expected_name).ok()?;
+    if coordinate.shape().len() != 1 || dimension.len() != coordinate.shape()[0] {
+        return None;
+    }
+    let long_name = nc.hdf5_dataset_attribute_string(expected_name, "long_name")?;
     if !long_name.trim().eq_ignore_ascii_case(official_long_name) {
         return None;
     }
-    let units = nc.hdf5_dataset_attribute_string(dataset.name(), "units")?;
+    let units = nc.hdf5_dataset_attribute_string(expected_name, "units")?;
     length_scale_to_metres(&units)?;
     Some(Hdf5AxisMetadata {
-        name: dataset.name().to_string(),
-        len,
+        name: expected_name.to_string(),
+        len: coordinate.shape()[0],
         units,
         long_name,
     })
@@ -3119,21 +3123,26 @@ struct Hdf5TimeAxisMetadata {
 /// recover that coordinate only when its official CM1 name, rank, long name,
 /// and units are all present.
 fn hdf5_time_axis_metadata(nc: &NcFile) -> Option<Hdf5TimeAxisMetadata> {
-    let dataset = nc.hdf5_root_datasets().ok()?.into_iter().find(|dataset| {
-        dataset.name().eq_ignore_ascii_case("time") && dataset.shape().len() == 1
-    })?;
-    let long_name = nc.hdf5_dataset_attribute_string(dataset.name(), "long_name")?;
+    if !nc.has_hdf5_dataset("time") {
+        return None;
+    }
+    let dimension = nc.dimension("time")?;
+    let coordinate = nc.read_array_f64("time").ok()?;
+    if coordinate.shape().len() != 1 || dimension.len() != coordinate.shape()[0] {
+        return None;
+    }
+    let long_name = nc.hdf5_dataset_attribute_string("time", "long_name")?;
     if !long_name
         .trim()
         .eq_ignore_ascii_case("time since beginning of simulation")
     {
         return None;
     }
-    let units = nc.hdf5_dataset_attribute_string(dataset.name(), "units")?;
+    let units = nc.hdf5_dataset_attribute_string("time", "units")?;
     time_scale_to_seconds(&units)?;
     Some(Hdf5TimeAxisMetadata {
-        name: dataset.name().to_string(),
-        record_count: usize::try_from(dataset.shape()[0]).ok()?,
+        name: "time".to_string(),
+        record_count: coordinate.shape()[0],
         units,
     })
 }
@@ -3729,6 +3738,31 @@ mod tests {
         assert_eq!(scene.nx, inventory.axes.xh.raw_values.len());
         assert_eq!(scene.ny, inventory.axes.yh.raw_values.len());
         assert_eq!(scene.nz, inventory.axes.zh.raw_values.len());
+    }
+
+    #[test]
+    fn optional_large_multirecord_modern_output_is_detected_without_root_enumeration() {
+        let Some(path) = std::env::var_os("BOWECHO_CM1_R21_LARGE_FIXTURE").map(PathBuf::from)
+        else {
+            return;
+        };
+        let nc = netcrust::open(&path).expect("open large modern CM1 output");
+        assert!(
+            nc.hdf5_root_datasets().is_err(),
+            "fixture must exceed netcrust's safe full-array ceiling"
+        );
+        let inventory = inspect_file(&nc, &path).expect("inspect large modern CM1 output");
+        assert_eq!(
+            inventory.detection.confidence,
+            Cm1DetectionConfidence::Confirmed
+        );
+        assert_eq!(inventory.topology.family, Cm1SchemaFamily::ModernR20Plus);
+        assert_eq!(inventory.time.record_count, 21);
+        assert_eq!(inventory.axes.xh.raw_values.len(), 400);
+        assert_eq!(inventory.axes.yh.raw_values.len(), 400);
+        assert_eq!(inventory.axes.zh.raw_values.len(), 108);
+        assert!(inventory.variable("dbz").is_some());
+        assert!(inventory.variable("zhval").is_some());
     }
 
     #[test]
