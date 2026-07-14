@@ -203,14 +203,33 @@ impl SharppySoundingPanel {
     }
 
     pub fn set_data(&mut self, data: SoundingData) {
+        self.set_data_with_footprint(data, None);
+    }
+
+    /// Install a real area-mean sounding with the sampled grid-cell extent
+    /// that contributed to it. This is deliberately separate from point
+    /// sounding installation so a later point click always clears the box.
+    pub(crate) fn set_box_data(
+        &mut self,
+        data: SoundingData,
+        footprint: Option<sharppyrs::LocationFootprint>,
+    ) {
+        self.set_data_with_footprint(data, footprint);
+    }
+
+    fn set_data_with_footprint(
+        &mut self,
+        data: SoundingData,
+        footprint: Option<sharppyrs::LocationFootprint>,
+    ) {
         self.analysis = rw_ui::skewt::build_sounding_column(&data)
             .ok()
-            .and_then(|column| build_analysis(&data, &column));
+            .and_then(|column| build_analysis(&data, &column, footprint));
         self.inner.set_data(data);
     }
 
     pub fn set_native_column(&mut self, data: SoundingData, column: SoundingColumn) {
-        self.analysis = build_analysis(&data, &column);
+        self.analysis = build_analysis(&data, &column, None);
         self.inner.set_native_column(data, column);
     }
 
@@ -368,7 +387,11 @@ impl SharppySoundingPanel {
 
 /// Build the sharppyrs analysis from the exact column the classic panel
 /// renders (store-native units: u/v m/s -> wdir/wspd kt).
-fn build_analysis(data: &SoundingData, column: &SoundingColumn) -> Option<Box<SharppyAnalysis>> {
+fn build_analysis(
+    data: &SoundingData,
+    column: &SoundingColumn,
+    explicit_footprint: Option<sharppyrs::LocationFootprint>,
+) -> Option<Box<SharppyAnalysis>> {
     let n = column.len();
     if n < 3 {
         return None;
@@ -413,7 +436,10 @@ fn build_analysis(data: &SoundingData, column: &SoundingColumn) -> Option<Box<Sh
         station,
     )
     .ok()?;
-    let prof = sharppyrs::Profile::from_sharprs(sp);
+    let mut prof = sharppyrs::Profile::from_sharprs(sp);
+    prof.set_location_footprint(
+        explicit_footprint.or_else(|| location_footprint_from_metadata(meta)),
+    );
     let derived = sharppyrs::DerivedParams::compute(&prof);
 
     let title = sounding_title(data, meta);
@@ -425,6 +451,25 @@ fn build_analysis(data: &SoundingData, column: &SoundingColumn) -> Option<Box<Sh
         title,
         obs_adjusted_model,
     }))
+}
+
+fn location_footprint_from_metadata(
+    meta: &rustwx_sounding::SoundingMetadata,
+) -> Option<sharppyrs::LocationFootprint> {
+    let latitude = meta.latitude_deg?;
+    let longitude = meta.longitude_deg?;
+    let lat_radius = meta
+        .box_radius_lat_deg
+        .filter(|radius| radius.is_finite() && *radius >= 0.0)?;
+    let lon_radius = meta
+        .box_radius_lon_deg
+        .filter(|radius| radius.is_finite() && *radius >= 0.0)?;
+    sharppyrs::LocationFootprint::new(
+        latitude - lat_radius,
+        longitude - lon_radius,
+        latitude + lat_radius,
+        longitude + lon_radius,
+    )
 }
 
 /// Compose the SHARPpy board headline. Observation-adjusted model profiles
@@ -515,7 +560,7 @@ mod tests {
             surface: Vec::new(),
             read_ms: 0.0,
         };
-        let analysis = build_analysis(&data, &column).expect("analysis builds");
+        let analysis = build_analysis(&data, &column, None).expect("analysis builds");
         assert!(
             analysis.prof.mupcl.bplus > 0.0,
             "convective column has CAPE"
@@ -524,6 +569,32 @@ mod tests {
         assert!(analysis.derived.srh1km.is_finite(), "SRH computes");
         assert!(analysis.title.starts_with("HRRR 2026-06-25 06z F018"));
         assert!(analysis.title.contains("Valid: 2026-06-26 00z"));
+
+        let sampled = sharppyrs::LocationFootprint::new(36.3, -96.2, 37.0, -95.1).unwrap();
+        let explicit =
+            build_analysis(&data, &column, Some(sampled)).expect("sampled extent builds");
+        assert_eq!(explicit.prof.location_footprint(), Some(sampled));
+    }
+
+    #[test]
+    fn box_metadata_becomes_a_location_map_footprint() {
+        let metadata = rustwx_sounding::SoundingMetadata {
+            station_id: "BOX".to_owned(),
+            valid_time: String::new(),
+            latitude_deg: Some(36.7),
+            longitude_deg: Some(-95.7),
+            elevation_m: None,
+            sample_method: Some("MeanProfile".to_owned()),
+            box_radius_lat_deg: Some(0.5),
+            box_radius_lon_deg: Some(0.75),
+        };
+
+        let footprint = location_footprint_from_metadata(&metadata).expect("box footprint");
+
+        assert!((footprint.south - 36.2).abs() < 1e-10);
+        assert!((footprint.west + 96.45).abs() < 1e-10);
+        assert!((footprint.north - 37.2).abs() < 1e-10);
+        assert!((footprint.east + 94.95).abs() < 1e-10);
     }
 
     #[test]

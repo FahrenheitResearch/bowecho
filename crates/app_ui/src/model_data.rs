@@ -1747,10 +1747,16 @@ impl ModelDataDock {
         }
         match result {
             Ok(result) => {
+                let footprint = sharppyrs::LocationFootprint::new(
+                    result.summary.sampled.south,
+                    result.summary.sampled.west,
+                    result.summary.sampled.north,
+                    result.summary.sampled.east,
+                );
                 self.sounding_request_mode = SoundingRequestMode::BoxApplied;
                 self.box_sounding_summary = Some(result.summary);
                 self.latest_sounding = Some(std::sync::Arc::new(result.data.clone()));
-                self.sounding.set_data(result.data);
+                self.sounding.set_box_data(result.data, footprint);
             }
             Err(message) => {
                 self.sounding_request_mode = SoundingRequestMode::None;
