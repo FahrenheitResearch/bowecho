@@ -33,6 +33,11 @@ pub const ISHMAEL_PSD_REVISION: &str = "wrf-jensen-ishmael-gamma-final-check-v3"
 /// to the authenticated solid-ice constituent endpoint of the dry LUTs.
 pub const ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION: &str =
     "ishmael-mass-preserving-solid-ice-material-closure-v1";
+/// Finite audit sentinel for a source-relative projection whose ordinary
+/// `(projected - incoming) / incoming` ratio is undefined or overflows. WRF
+/// floors a nonpositive number before reconstruction, so the projection
+/// itself remains valid and is recorded separately by its boolean audit flag.
+pub const ISHMAEL_UNBOUNDED_SOURCE_PROJECTION_RELATIVE_CHANGE_SENTINEL: f64 = f64::MAX;
 /// Versioned scattering route for exact native ISHMAEL spheres below a dry
 /// T-matrix table's lower diameter coordinate.
 pub const ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION: &str =
@@ -309,7 +314,9 @@ pub struct IshmaelReconstructionAudit {
     /// Whether the 0.5 mm aggregate a-scale cap changed source number.
     #[serde(default)]
     pub source_aggregate_size_cap_applied: bool,
-    /// Signed change from source QNICE to the source-checked number.
+    /// Signed change from source QNICE to the source-checked number. This is
+    /// [`ISHMAEL_UNBOUNDED_SOURCE_PROJECTION_RELATIVE_CHANGE_SENTINEL`] when
+    /// the incoming number is nonpositive and WRF's source floor applies.
     #[serde(default)]
     pub qnice_source_projection_relative_change: f64,
     /// Whether the source QNICE floor changed the incoming number.
@@ -524,28 +531,37 @@ impl IshmaelPsd {
     /// tied to the in-step sedimentation update.
     fn reconstruct_wrf_var_checked(input: IshmaelPsdInput) -> Result<Self, PsdError> {
         positive("QICE", input.qice_kgkg)?;
-        positive("QNICE", input.qnice_per_kg)?;
+        if !input.qnice_per_kg.is_finite() {
+            return Err(PsdError::InvalidInput {
+                field: "QNICE",
+                value: input.qnice_per_kg,
+                requirement: "finite before the WRF qnsmall projection",
+            });
+        }
         positive("QVOLI", input.qvoli_m3_per_kg)?;
         positive("QAOLI", input.qaoli_m3_per_kg)?;
         positive("dry-air density", input.dry_air_density_kg_m3)?;
 
+        // WRF applies qnsmall before deriving a_n/c_n or entering var_check.
+        // Keep that order: a finite zero/negative transported number is a
+        // source-projected state, not an invalid PSD passed downstream.
+        let source_number_floor_applied = input.qnice_per_kg < ISHMAEL_MINIMUM_NUMBER_PER_KG;
+        let qnice_per_kg = input.qnice_per_kg.max(ISHMAEL_MINIMUM_NUMBER_PER_KG);
         let raw_a_scale_m = checked_positive_computation(
             "ISHMAEL raw a_n",
             (input.qvoli_m3_per_kg * input.qvoli_m3_per_kg
-                / (input.qaoli_m3_per_kg * input.qnice_per_kg))
+                / (input.qaoli_m3_per_kg * qnice_per_kg))
                 .cbrt(),
         )?;
         let raw_c_at_a_scale_m = checked_positive_computation(
             "ISHMAEL raw c_n",
             (input.qaoli_m3_per_kg * input.qaoli_m3_per_kg
-                / (input.qvoli_m3_per_kg * input.qnice_per_kg))
+                / (input.qvoli_m3_per_kg * qnice_per_kg))
                 .cbrt(),
         )?;
-        let source_number_floor_applied = input.qnice_per_kg < ISHMAEL_MINIMUM_NUMBER_PER_KG;
         let source_moment_floor_applied = input.qvoli_m3_per_kg
             < ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG
             || input.qaoli_m3_per_kg < ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG;
-        let qnice_per_kg = input.qnice_per_kg.max(ISHMAEL_MINIMUM_NUMBER_PER_KG);
         let qvoli_m3_per_kg = input
             .qvoli_m3_per_kg
             .max(ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG);
@@ -636,8 +652,10 @@ impl IshmaelPsd {
             (projected_qvoli - input.qvoli_m3_per_kg) / input.qvoli_m3_per_kg;
         audit.qaoli_source_projection_relative_change =
             (projected_qaoli - input.qaoli_m3_per_kg) / input.qaoli_m3_per_kg;
-        audit.qnice_source_projection_relative_change =
-            (source_state.qnice_per_kg - input.qnice_per_kg) / input.qnice_per_kg;
+        audit.qnice_source_projection_relative_change = ishmael_source_projection_relative_change(
+            input.qnice_per_kg,
+            source_state.qnice_per_kg,
+        );
         audit.source_number_floor_applied = source_number_floor_applied;
         audit.source_moment_floor_applied = source_moment_floor_applied;
         audit.source_axis_floor_applied = source_axis_floor_applied;
@@ -793,7 +811,7 @@ impl IshmaelPsd {
         checked_audit.source_cold_aggregate_reset_applied = cold;
         checked_audit.source_aggregate_size_cap_applied = source_aggregate_size_cap_applied;
         checked_audit.qnice_source_projection_relative_change =
-            (final_state.qnice_per_kg - input.qnice_per_kg) / input.qnice_per_kg;
+            ishmael_source_projection_relative_change(input.qnice_per_kg, final_state.qnice_per_kg);
         checked_audit.source_number_floor_applied = incoming_audit.source_number_floor_applied;
         checked_audit.source_moment_floor_applied = incoming_audit.source_moment_floor_applied;
         checked_audit.source_axis_floor_applied = incoming_audit.source_axis_floor_applied;
@@ -2982,6 +3000,16 @@ fn relative_error(left: f64, right: f64, absolute_floor: f64) -> f64 {
     (left - right).abs() / left.abs().max(right.abs()).max(absolute_floor)
 }
 
+fn ishmael_source_projection_relative_change(incoming: f64, projected: f64) -> f64 {
+    if incoming > 0.0 {
+        let change = (projected - incoming) / incoming;
+        if change.is_finite() {
+            return change;
+        }
+    }
+    ISHMAEL_UNBOUNDED_SOURCE_PROJECTION_RELATIVE_CHANGE_SENTINEL
+}
+
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PsdError {
     #[error("{field} must be {requirement}, got {value}")]
@@ -3923,6 +3951,108 @@ mod tests {
         );
         assert!(checked.aspect_power_delta() > incoming.aspect_power_delta());
         assert!(checked.c_at_a_scale_m() > incoming.c_at_a_scale_m());
+    }
+
+    fn reported_zero_number_input(
+        category: IshmaelIceCategory,
+        qnice_per_kg: f64,
+    ) -> IshmaelPsdInput {
+        let a_scale_m: f64 = 50.0e-6;
+        let c_scale_m: f64 = 25.0e-6;
+        let delta = (c_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M).ln()
+            / (a_scale_m / ISHMAEL_MONOMER_SEMI_AXIS_M).ln();
+        let mean_volume = mean_particle_volume(a_scale_m, delta, ISHMAEL_GAMMA_SHAPE).unwrap();
+        IshmaelPsdInput::new(
+            category,
+            ISHMAEL_MINIMUM_NUMBER_PER_KG * 400.0 * mean_volume,
+            qnice_per_kg,
+            ISHMAEL_MINIMUM_NUMBER_PER_KG * a_scale_m * a_scale_m * c_scale_m,
+            ISHMAEL_MINIMUM_NUMBER_PER_KG * a_scale_m * c_scale_m * c_scale_m,
+            1.2,
+        )
+    }
+
+    #[test]
+    fn wrf_source_qnsmall_precedes_geometry_for_zero_and_negative_number() {
+        for category in [IshmaelIceCategory::Planar, IshmaelIceCategory::Aggregate] {
+            for incoming_qnice in [0.0, -1.0e-9] {
+                let checked = IshmaelPsd::reconstruct_wrf_source_checked(
+                    reported_zero_number_input(category, incoming_qnice),
+                    260.0,
+                )
+                .unwrap();
+                let audit = checked.reconstruction_audit();
+                assert_eq!(
+                    checked.input().qnice_per_kg().to_bits(),
+                    ISHMAEL_MINIMUM_NUMBER_PER_KG.to_bits()
+                );
+                assert!(audit.source_number_floor_applied);
+                assert_eq!(
+                    audit.qnice_source_projection_relative_change.to_bits(),
+                    ISHMAEL_UNBOUNDED_SOURCE_PROJECTION_RELATIVE_CHANGE_SENTINEL.to_bits()
+                );
+                assert!(checked.a_scale_m().is_finite() && checked.a_scale_m() > 0.0);
+                assert!(checked.c_at_a_scale_m().is_finite() && checked.c_at_a_scale_m() > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn wrf_source_qnsmall_boundary_is_exact_and_positive_subfloor_is_audited() {
+        let exact = IshmaelPsd::reconstruct_wrf_source_checked(
+            reported_zero_number_input(IshmaelIceCategory::Planar, ISHMAEL_MINIMUM_NUMBER_PER_KG),
+            260.0,
+        )
+        .unwrap();
+        assert_eq!(
+            exact.input().qnice_per_kg().to_bits(),
+            ISHMAEL_MINIMUM_NUMBER_PER_KG.to_bits()
+        );
+        assert!(!exact.reconstruction_audit().source_number_floor_applied);
+        assert_eq!(
+            exact
+                .reconstruction_audit()
+                .qnice_source_projection_relative_change,
+            0.0
+        );
+
+        let below = f64::from_bits(ISHMAEL_MINIMUM_NUMBER_PER_KG.to_bits() - 1);
+        let projected = IshmaelPsd::reconstruct_wrf_source_checked(
+            reported_zero_number_input(IshmaelIceCategory::Planar, below),
+            260.0,
+        )
+        .unwrap();
+        let audit = projected.reconstruction_audit();
+        assert_eq!(
+            projected.input().qnice_per_kg().to_bits(),
+            ISHMAEL_MINIMUM_NUMBER_PER_KG.to_bits()
+        );
+        assert!(audit.source_number_floor_applied);
+        assert!(
+            audit.qnice_source_projection_relative_change.is_finite()
+                && audit.qnice_source_projection_relative_change > 0.0
+                && audit.qnice_source_projection_relative_change
+                    < ISHMAEL_UNBOUNDED_SOURCE_PROJECTION_RELATIVE_CHANGE_SENTINEL
+        );
+    }
+
+    #[test]
+    fn wrf_source_qnsmall_rejects_nonfinite_number_before_projection() {
+        for qnice_per_kg in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = IshmaelPsd::reconstruct_wrf_source_checked(
+                reported_zero_number_input(IshmaelIceCategory::Planar, qnice_per_kg),
+                260.0,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                PsdError::InvalidInput {
+                    field: "QNICE",
+                    requirement: "finite before the WRF qnsmall projection",
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
