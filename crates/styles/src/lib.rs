@@ -46,7 +46,7 @@ pub struct StyleSettings {
     /// "severe-thunderstorm", "flash-flood", "flood", "special-marine",
     /// "snow-squall", "watch", "mesoscale-discussion", "local-storm-report",
     /// "special-weather", "text-polygon", "other") AND escalation subkeys
-    /// ("tornado/catastrophic", "tornado/considerable",
+    /// ("tornado/catastrophic", "tornado/considerable", "tornado/observed",
     ///  "severe-thunderstorm/considerable",
     ///  "severe-thunderstorm/destructive", "flash-flood/considerable",
     ///  "flash-flood/catastrophic", "flood/considerable",
@@ -482,6 +482,7 @@ pub const HAZARD_FAMILIES: &[&str] = &[
 pub const HAZARD_ESCALATIONS: &[&str] = &[
     "tornado/catastrophic",
     "tornado/considerable",
+    "tornado/observed",
     "severe-thunderstorm/considerable",
     "severe-thunderstorm/destructive",
     "flash-flood/considerable",
@@ -509,6 +510,9 @@ pub fn default_hazard_stroke_color(key: &str) -> Rgba {
         "tornado" => [248, 62, 82, 255],
         "tornado/catastrophic" => [150, 50, 250, 255],
         "tornado/considerable" => [255, 64, 175, 255],
+        // Preserve the legacy TOR appearance until the operator explicitly
+        // chooses a separate observed-tornado border in Appearance settings.
+        "tornado/observed" => [248, 62, 82, 255],
         "severe-thunderstorm" => [246, 183, 57, 255],
         "severe-thunderstorm/considerable" => [255, 152, 42, 255],
         "severe-thunderstorm/destructive" => [252, 122, 28, 255],
@@ -1273,6 +1277,12 @@ mod tests {
                 .hazard_polygon("tornado", Some("CONSIDERABLE"))
                 .stroke_color,
             [255, 64, 175, 255]
+        );
+        assert_eq!(
+            registry
+                .hazard_polygon("tornado", Some("OBSERVED"))
+                .stroke_color,
+            [248, 62, 82, 255]
         );
         assert_eq!(
             registry

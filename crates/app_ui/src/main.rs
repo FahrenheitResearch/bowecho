@@ -111,6 +111,7 @@ mod simsat_store;
 mod simsat_ui;
 mod sites_ui;
 mod spc_layers;
+mod spc_md_image;
 mod table_editor;
 mod taiwan_cwa;
 mod tor_tracks;
@@ -160,6 +161,7 @@ use hazard_geom::hazard_style_keys;
 use hazard_geom::hazard_style_label;
 use hazard_geom::hazard_style_resolved_polygon;
 use hazard_geom::hazard_visible_label_anchor;
+use hazard_geom::hazard_watch_filter_key;
 use hazard_geom::is_convex_screen_polygon;
 use hazard_geom::load_event_loop_hazard_overlay_with_preview;
 use hazard_geom::load_hazard_overlay_from_path;
@@ -1274,6 +1276,12 @@ const HAZARD_FILTER_FAMILIES: &[(&str, &str)] = &[
     ("watch", "Watch"),
     ("mesoscale discussion", "MD"),
     ("special weather", "SPS"),
+];
+const HAZARD_WATCH_FILTERS: &[(&str, &str)] = &[
+    ("tornado", "TOR Watch"),
+    ("severe-thunderstorm", "SVR Watch"),
+    ("pds", "PDS Watch"),
+    ("other", "Other Watch"),
 ];
 const BASEMAP_US_DETAIL_BOUNDS: &[[f32; 4]] = &[
     [-125.5, 24.0, -66.0, 50.3],
@@ -8172,9 +8180,15 @@ impl ViewerApp {
         loaded_app_settings: settings::LoadedAppSettings,
     ) -> Self {
         let settings::LoadedAppSettings {
-            settings: app_settings,
+            settings: mut app_settings,
             status: app_settings_load_status,
         } = loaded_app_settings;
+        // Dedicated CIG layers duplicate the CIG regions already included in
+        // SPC's ordinary categorical/probabilistic products. Drop stale saved
+        // selections now that those duplicate controls are no longer exposed.
+        app_settings
+            .overlay_spc_outlooks
+            .retain(|kind| !spc_layers::is_legacy_cig_kind(kind));
         settings::set_storage_namespace(app_settings.brand.effective_storage_namespace());
         // Persisted chrome theme BEFORE the style document is built —
         // configure_style reads ui_theme::theme().
@@ -8253,6 +8267,14 @@ impl ViewerApp {
             app_settings.overlay_mping_reports,
         );
         let restored_obs_adjust_soundings = app_settings.overlay_obs_adjust_soundings;
+        let restored_hazards_visible = app_settings.hazards_visible;
+        let restored_hazards_active_only = app_settings.hazards_active_only;
+        let restored_live_hazard_auto_refresh = app_settings.live_hazard_auto_refresh;
+        let restored_hidden_hazard_families = app_settings
+            .hidden_hazard_families
+            .iter()
+            .map(|family| normalize_alert_family(family))
+            .collect();
         let restored_grid_layout = match app_settings.grid_pane_count {
             2 => PanelLayout::TwoVertical,
             3 => PanelLayout::ThreeStacked,
@@ -8667,16 +8689,16 @@ impl ViewerApp {
             hazard_overlay: None,
             hazard_path_text,
             hazard_status: "No hazard polygons loaded".to_owned(),
-            hazards_visible: true,
-            hazards_active_only: true,
+            hazards_visible: restored_hazards_visible,
+            hazards_active_only: restored_hazards_active_only,
             swath: max_ref_swath::SwathState::default(),
             style_settings: loaded_styles.settings,
             style_registry,
             styles_newer_schema: loaded_styles.newer_schema,
-            hidden_hazard_families: default_hidden_hazard_families(),
+            hidden_hazard_families: restored_hidden_hazard_families,
             display_live_chunk_updates: false,
             live_refresh_skip_reason: None,
-            live_hazard_auto_refresh: true,
+            live_hazard_auto_refresh: restored_live_hazard_auto_refresh,
             show_performance_stats: false,
             sidebar_tab: SidebarTab::Radar,
             last_live_hazard_refresh: None,
@@ -67334,7 +67356,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_polygon_style_infers_tornado_and_severe_watch_subtypes() {
+    fn alert_qol_watch_polygon_style_infers_watch_subtypes() {
         let mut tornado_watch = test_hazard_record(
             "KWNS.TO.A.0123",
             "WATCH 0123",
@@ -67355,6 +67377,9 @@ mod tests {
             "watch",
             square_hazard_points(-98.0, 34.0, -97.0, 35.0),
         );
+        let mut pds_watch = tornado_watch.clone();
+        pds_watch.label = "PDS TOR WATCH 0125".to_owned();
+        pds_watch.details = vec!["PARTICULARLY DANGEROUS SITUATION".to_owned()];
 
         assert_eq!(hazard_record_style_threat(&tornado_watch), Some("tornado"));
         assert_eq!(
@@ -67362,6 +67387,32 @@ mod tests {
             Some("severe-thunderstorm")
         );
         assert_eq!(hazard_record_style_threat(&generic_watch), None);
+        assert_eq!(hazard_watch_filter_key(&tornado_watch), "tornado");
+        assert_eq!(
+            hazard_watch_filter_key(&severe_watch),
+            "severe-thunderstorm"
+        );
+        assert_eq!(hazard_watch_filter_key(&pds_watch), "pds");
+        assert_eq!(hazard_watch_filter_key(&generic_watch), "other");
+    }
+
+    #[test]
+    fn alert_qol_observed_tornado_style_does_not_mask_pds() {
+        let mut observed = test_hazard_record(
+            "KOUN.TO.W.0001",
+            "TOR 0001 OBSERVED",
+            "tornado",
+            square_hazard_points(-98.0, 34.0, -97.0, 35.0),
+        );
+        observed.tornado = Some("OBSERVED".to_owned());
+        assert_eq!(hazard_record_style_threat(&observed), Some("observed"));
+
+        observed.damage_threat = Some("CONSIDERABLE".to_owned());
+        assert_eq!(
+            hazard_record_style_threat(&observed),
+            Some("CONSIDERABLE"),
+            "PDS styling remains authoritative for an observed PDS TOR"
+        );
     }
 
     #[test]

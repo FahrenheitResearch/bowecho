@@ -1335,6 +1335,8 @@ impl ViewerApp {
                 },
                 |_ui| {},
             ) {
+                self.app_settings.hazards_visible = self.hazards_visible;
+                self.mark_app_settings_dirty();
                 if fill_alpha != self.style_registry.hazard_global().fill_alpha {
                     self.style_settings.hazard_global.fill_alpha = Some(fill_alpha);
                     self.rebuild_style_registry();

@@ -390,6 +390,23 @@ pub struct AppSettings {
     /// Polygons remain visible/clickable when labels are off.
     #[serde(default = "default_true")]
     pub show_hazard_labels: bool,
+    /// Master visibility for the Alerts-tab warning/hazard layer.
+    #[serde(default = "default_true")]
+    pub hazards_visible: bool,
+    /// Hide expired/cancelled alerts outside an archive/event timeline.
+    #[serde(default = "default_true")]
+    pub hazards_active_only: bool,
+    /// Re-fetch live hazards on the configured warning cadence.
+    #[serde(default = "default_true")]
+    pub live_hazard_auto_refresh: bool,
+    /// Hazard families hidden by the Alerts-tab filter chips. The explicit
+    /// legacy default preserves BowEcho's pre-persistence first-run view.
+    #[serde(default = "default_hidden_hazard_families")]
+    pub hidden_hazard_families: Vec<String>,
+    /// Watch subtypes hidden while the parent Watch family is enabled.
+    /// Empty means every subtype is visible, preserving old configurations.
+    #[serde(default)]
+    pub hidden_hazard_watch_types: Vec<String>,
     /// Map right-click: false (default) = open the lowest-beam radar menu;
     /// true = switch straight to the closest WSR-88D, no menu (field
     /// request: "i might sometimes want right click to just load closest
@@ -952,6 +969,20 @@ fn default_model_keep_runs() -> u8 {
     2
 }
 
+fn default_hidden_hazard_families() -> Vec<String> {
+    [
+        "fire weather",
+        "special marine",
+        "snow squall",
+        "watch",
+        "mesoscale discussion",
+        "special weather",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 fn default_warning_refresh_seconds() -> u64 {
     30
 }
@@ -1011,6 +1042,11 @@ impl Default for AppSettings {
             show_radar_labels: true,
             radar_label_style: default_radar_label_style(),
             show_hazard_labels: true,
+            hazards_visible: true,
+            hazards_active_only: true,
+            live_hazard_auto_refresh: true,
+            hidden_hazard_families: default_hidden_hazard_families(),
+            hidden_hazard_watch_types: Vec::new(),
             right_click_loads_nearest: false,
             map_click_drops_coordinate_marker: false,
             gate_filter_decidbz: None,
@@ -1838,6 +1874,11 @@ mod tests {
             polling_interval_seconds: 30,
             perf_hud: true,
             map_click_drops_coordinate_marker: true,
+            hazards_visible: false,
+            hazards_active_only: false,
+            live_hazard_auto_refresh: false,
+            hidden_hazard_families: vec!["flood".to_owned(), "watch".to_owned()],
+            hidden_hazard_watch_types: vec!["pds".to_owned()],
             alert_flash_enabled: false,
             alert_flash_families: vec!["tornado".to_owned()],
             alert_sound_enabled: true,
@@ -1900,6 +1941,21 @@ mod tests {
         let back = AppSettings::from_json(&s.to_json());
         assert_eq!(back, s);
         assert_eq!(back.favorites, vec!["KTWX".to_owned()]);
+    }
+
+    #[test]
+    fn legacy_alert_layer_settings_keep_pre_persistence_defaults() {
+        let settings = AppSettings::from_json("{}");
+        assert!(settings.hazards_visible);
+        assert!(settings.hazards_active_only);
+        assert!(settings.live_hazard_auto_refresh);
+        assert!(
+            settings
+                .hidden_hazard_families
+                .iter()
+                .any(|family| family == "watch")
+        );
+        assert!(settings.hidden_hazard_watch_types.is_empty());
     }
 
     #[test]

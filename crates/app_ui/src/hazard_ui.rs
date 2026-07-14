@@ -9,9 +9,15 @@ impl ViewerApp {
     pub(crate) fn hazard_panel(&mut self, ui: &mut egui::Ui) {
         // Wrapped, not a kit row: four toggles outgrow the control column
         // at 320 pt and wrapping keeps them one visual family.
+        let mut startup_defaults_changed = false;
         ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.hazards_visible, "Show")
-                .on_hover_text("Draw warning polygons on the map (also the Map-tab Warnings row)");
+            if ui
+                .checkbox(&mut self.hazards_visible, "Show")
+                .on_hover_text("Draw warning polygons on the map (also the Map-tab Warnings row)")
+                .changed()
+            {
+                startup_defaults_changed = true;
+            }
             let mut show_labels = self.app_settings.show_hazard_labels;
             if ui
                 .checkbox(&mut show_labels, "Labels")
@@ -22,11 +28,24 @@ impl ViewerApp {
                 self.mark_app_settings_dirty();
                 ui.ctx().request_repaint();
             }
-            ui.checkbox(&mut self.hazards_active_only, "Active only")
-                .on_hover_text("Hide expired/cancelled alerts");
-            ui.checkbox(&mut self.live_hazard_auto_refresh, "Auto-refresh")
-                .on_hover_text("Re-fetch active alerts on the live cadence");
+            if ui
+                .checkbox(&mut self.hazards_active_only, "Active only")
+                .on_hover_text("Hide expired/cancelled alerts")
+                .changed()
+            {
+                startup_defaults_changed = true;
+            }
+            if ui
+                .checkbox(&mut self.live_hazard_auto_refresh, "Auto-refresh")
+                .on_hover_text("Re-fetch active alerts on the live cadence")
+                .changed()
+            {
+                startup_defaults_changed = true;
+            }
         });
+        if startup_defaults_changed {
+            self.persist_hazard_panel_settings();
+        }
         // Family filters as a kit chip grid: selected = shown on the map
         // and in the list; the hidden-family set is the same state the
         // checkboxes used to edit.
@@ -44,6 +63,7 @@ impl ViewerApp {
             if !self.hidden_hazard_families.remove(family) {
                 self.hidden_hazard_families.insert(family.to_owned());
             }
+            self.persist_hazard_panel_settings();
             if self
                 .selected_hazard_record()
                 .is_some_and(|record| !self.hazard_record_visible(record))
@@ -52,6 +72,39 @@ impl ViewerApp {
             }
             ui.ctx().request_repaint();
         }
+        ui.add_enabled_ui(!self.hidden_hazard_families.contains("watch"), |ui| {
+            ui.weak("Watch types");
+            let watch_chips = HAZARD_WATCH_FILTERS
+                .iter()
+                .map(|&(watch_type, label)| panel_kit::Chip {
+                    label,
+                    hotkey: None,
+                    selected: !self
+                        .app_settings
+                        .hidden_hazard_watch_types
+                        .iter()
+                        .any(|hidden| hidden.eq_ignore_ascii_case(watch_type)),
+                    hover: Some(format!("Show {label} polygons")),
+                })
+                .collect::<Vec<_>>();
+            if let Some(clicked) = panel_kit::chip_grid(ui, &watch_chips) {
+                let watch_type = HAZARD_WATCH_FILTERS[clicked].0;
+                if let Some(index) = self
+                    .app_settings
+                    .hidden_hazard_watch_types
+                    .iter()
+                    .position(|hidden| hidden.eq_ignore_ascii_case(watch_type))
+                {
+                    self.app_settings.hidden_hazard_watch_types.remove(index);
+                } else {
+                    self.app_settings
+                        .hidden_hazard_watch_types
+                        .push(watch_type.to_owned());
+                }
+                self.mark_app_settings_dirty();
+                ui.ctx().request_repaint();
+            }
+        });
         // The fill slider reads/writes the style registry (override on the
         // styles.json document) so it persists across launches.
         let mut fill_alpha = self.style_registry.hazard_global().fill_alpha as f32;
@@ -245,6 +298,12 @@ impl ViewerApp {
                         wrapped_label(ui, line);
                     }
                 },
+            );
+            spc_md_image::show(
+                ui,
+                &record.event_family,
+                record.source_url.as_deref(),
+                &record.event_id,
             );
         }
 
@@ -542,6 +601,15 @@ impl ViewerApp {
         });
     }
 
+    fn persist_hazard_panel_settings(&mut self) {
+        self.app_settings.hazards_visible = self.hazards_visible;
+        self.app_settings.hazards_active_only = self.hazards_active_only;
+        self.app_settings.live_hazard_auto_refresh = self.live_hazard_auto_refresh;
+        self.app_settings.hidden_hazard_families =
+            self.hidden_hazard_families.iter().cloned().collect();
+        self.mark_app_settings_dirty();
+    }
+
     fn hazard_summary_lines(&self) -> Vec<String> {
         let mut lines = vec![self.hazard_status.clone()];
         if let Some(overlay) = &self.hazard_overlay {
@@ -701,6 +769,7 @@ impl ViewerApp {
             self.hidden_hazard_families.remove(&record.event_family);
             self.app_settings.current_alert_filter = HazardListFilter::All.key().to_owned();
             self.hazards_visible = true;
+            self.persist_hazard_panel_settings();
         }
         self.focus_hazard_record(index, ctx)
     }
@@ -760,6 +829,15 @@ impl ViewerApp {
         frame_time: Option<DateTime<Utc>>,
     ) -> bool {
         if self.hidden_hazard_families.contains(&record.event_family) {
+            return false;
+        }
+        if record.event_family == "watch"
+            && self
+                .app_settings
+                .hidden_hazard_watch_types
+                .iter()
+                .any(|hidden| hidden.eq_ignore_ascii_case(hazard_watch_filter_key(record)))
+        {
             return false;
         }
         if let Some((start_utc, end_utc)) = self.event_loop_hazard_window {
@@ -1057,6 +1135,9 @@ impl ViewerApp {
         for family in &self.hidden_hazard_families {
             family.hash(&mut hasher);
         }
+        for watch_type in &self.app_settings.hidden_hazard_watch_types {
+            watch_type.hash(&mut hasher);
+        }
         let key = hasher.finish();
         let mut cache = self.hazard_shape_cache.borrow_mut();
         cache
@@ -1288,6 +1369,26 @@ fn hazard_alert_row_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alert_qol_panel_defaults_copy_into_persisted_settings() {
+        let mut app = crate::tests::test_viewer_app_with_hazards(Vec::new());
+        app.hazards_visible = false;
+        app.hazards_active_only = false;
+        app.live_hazard_auto_refresh = false;
+        app.hidden_hazard_families.clear();
+        app.hidden_hazard_families.insert("tornado".to_owned());
+
+        app.persist_hazard_panel_settings();
+
+        assert!(!app.app_settings.hazards_visible);
+        assert!(!app.app_settings.hazards_active_only);
+        assert!(!app.app_settings.live_hazard_auto_refresh);
+        assert_eq!(
+            app.app_settings.hidden_hazard_families,
+            vec!["tornado".to_owned()]
+        );
+    }
 
     #[test]
     fn until_hhmmz_reads_format_utc_seconds_only() {

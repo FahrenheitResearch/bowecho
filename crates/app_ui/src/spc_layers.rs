@@ -31,37 +31,30 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use eframe::egui;
 use std::time::Instant;
 
-pub const OUTLOOK_KINDS: [(&str, &str); 11] = [
+pub const OUTLOOK_KINDS: [(&str, &str); 8] = [
     ("cat", "Categorical"),
     ("torn", "Tornado %"),
     ("wind", "Wind %"),
     ("hail", "Hail %"),
-    ("cigtorn", "CIG Tor"),
-    ("cigwind", "CIG Wind"),
-    ("cighail", "CIG Hail"),
     ("fire_wind", "Fire wind/RH"),
     ("fire_dryt", "Fire dry T"),
     ("wpc_ero", "WPC ERO"),
     ("wpc_river_flood", "WPC river flood"),
 ];
-pub const DAY2_OUTLOOK_KINDS: [(&str, &str); 12] = [
+pub const DAY2_OUTLOOK_KINDS: [(&str, &str); 9] = [
     ("cat", "Categorical"),
     ("torn", "Tornado %"),
     ("wind", "Wind %"),
     ("hail", "Hail %"),
     ("prob", "Any Severe %"),
-    ("cigtorn", "CIG Tor"),
-    ("cigwind", "CIG Wind"),
-    ("cighail", "CIG Hail"),
     ("fire_wind", "Fire wind/RH"),
     ("fire_dryt", "Fire dry T"),
     ("wpc_ero", "WPC ERO"),
     ("wpc_river_flood", "WPC river flood"),
 ];
-pub const DAY3_OUTLOOK_KINDS: [(&str, &str); 7] = [
+pub const DAY3_OUTLOOK_KINDS: [(&str, &str); 6] = [
     ("cat", "Categorical"),
     ("prob", "Any Severe %"),
-    ("cigprob", "CIG Severe"),
     ("fire_wind", "Fire wind/RH"),
     ("fire_dryt", "Fire dry T"),
     ("wpc_ero", "WPC ERO"),
@@ -69,6 +62,13 @@ pub const DAY3_OUTLOOK_KINDS: [(&str, &str); 7] = [
 ];
 
 pub const ESTOFEX_OUTLOOK_KIND: &str = "estofex";
+
+/// Old builds exposed dedicated CIG switches even though the ordinary SPC
+/// products already contain those conditional-intensity regions. Keep this
+/// recognizer for settings migration while hiding/ignoring the duplicates.
+pub fn is_legacy_cig_kind(kind: &str) -> bool {
+    matches!(kind, "cigtorn" | "cigwind" | "cighail" | "cigprob")
+}
 
 pub fn outlook_kind_options(day: u8) -> &'static [(&'static str, &'static str)] {
     match day {
@@ -98,9 +98,6 @@ fn effective_spc_outlook_kind(day: u8, kind: &str) -> Option<&'static str> {
         (1, "torn") => Some("torn"),
         (1, "wind") => Some("wind"),
         (1, "hail") => Some("hail"),
-        (1, "cigtorn") => Some("cigtorn"),
-        (1, "cigwind") => Some("cigwind"),
-        (1, "cighail") => Some("cighail"),
         (1, "fire_wind") => Some("fire_wind"),
         (1, "fire_dryt") => Some("fire_dryt"),
         (1, "wpc_ero") => Some("wpc_ero"),
@@ -110,16 +107,12 @@ fn effective_spc_outlook_kind(day: u8, kind: &str) -> Option<&'static str> {
         (2, "wind") => Some("wind"),
         (2, "hail") => Some("hail"),
         (2, "prob") => Some("prob"),
-        (2, "cigtorn") => Some("cigtorn"),
-        (2, "cigwind") => Some("cigwind"),
-        (2, "cighail") => Some("cighail"),
         (2, "fire_wind") => Some("fire_wind"),
         (2, "fire_dryt") => Some("fire_dryt"),
         (2, "wpc_ero") => Some("wpc_ero"),
         (2, "wpc_river_flood") => Some("wpc_river_flood"),
         (3, "cat") => Some("cat"),
         (3, "prob" | "torn" | "wind" | "hail") => Some("prob"),
-        (3, "cigprob" | "cigtorn" | "cigwind" | "cighail") => Some("cigprob"),
         (3, "fire_wind") => Some("fire_wind"),
         (3, "fire_dryt") => Some("fire_dryt"),
         (3, "wpc_ero") => Some("wpc_ero"),
@@ -1942,6 +1935,21 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
                 Utc.with_ymd_and_hms(2026, 6, 16, 20, 0, 0).unwrap()
             ),
             vec!["https://www.spc.noaa.gov/products/outlook/day3otlk_prob.lyr.geojson"]
+        );
+    }
+
+    #[test]
+    fn alert_qol_cig_controls_hidden_and_legacy_selections_ignored() {
+        for day in 1..=3 {
+            assert!(
+                outlook_kind_options(day)
+                    .iter()
+                    .all(|(kind, _)| !is_legacy_cig_kind(kind))
+            );
+        }
+        assert_eq!(
+            effective_spc_outlook_kinds(1, &["cat", "torn", "cigtorn", "cigwind"]),
+            vec!["cat", "torn"]
         );
     }
 

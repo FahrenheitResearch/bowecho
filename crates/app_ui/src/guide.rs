@@ -725,6 +725,21 @@ fn layers(ui: &mut egui::Ui) {
          colors and thresholds, radar product color tables, and built-in appearance profiles \
          such as GR2-classic, Chase dark, and Accessibility.",
     );
+    subhead(ui, "ALERTS");
+    para(
+        ui,
+        "The Alerts tab remembers Show, Active only, Auto-refresh, and every family filter \
+         across restarts and upgrades. Enable Watch, then use TOR Watch, SVR Watch, PDS \
+         Watch, and Other Watch to choose the exact watch polygons shown. PDS is a separate \
+         bucket rather than being counted twice under TOR/SVR.",
+    );
+    para(
+        ui,
+        "Observed tornado warnings have their own border slot under Map > Appearance > \
+         Warning polygons. PDS and tornado-emergency styles still take priority when those \
+         stronger tags are present. SPC's CIG regions ride inside the ordinary outlook \
+         products, so duplicate standalone CIG switches are intentionally omitted.",
+    );
     action(
         ui,
         "Radar labels",
@@ -901,6 +916,20 @@ fn model_data(ui: &mut egui::Ui) {
             "technical monospace, and scale sounding text independently from 50â€“200%. Font ",
             "and size persist across model, box-mean, obs-adjusted, and RAOB soundings without ",
             "changing the panel geometry.",
+        ),
+    );
+    action(
+        ui,
+        "Correct / Corrected",
+        concat!(
+            "— opens the display-only model-sounding correction editor. Add one or more ",
+            "native levels, enter a target height AGL (BowEcho shows the exact model level ",
+            "used), then enable and override T, Td, wind direction, or wind speed. Blend ",
+            "sets a cosine-smoothed vertical transition around that level; 0 m changes only ",
+            "the anchor. The skew-T, hodograph, parcels, and every diagnostic recalculate ",
+            "immediately. MANUAL stays visible until Reset original restores the untouched ",
+            "source column. This tool never edits downloaded/model-store data and is not ",
+            "offered for observed RAOBs.",
         ),
     );
     action(

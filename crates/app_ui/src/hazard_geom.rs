@@ -2365,6 +2365,7 @@ pub(crate) fn hazard_style_label(key: &str) -> String {
         "tornado" => "Tornado warning".to_owned(),
         "tornado/catastrophic" => "Tornado emergency".to_owned(),
         "tornado/considerable" => "PDS tornado".to_owned(),
+        "tornado/observed" => "Observed tornado warning".to_owned(),
         "severe-thunderstorm" => "Severe thunderstorm warning".to_owned(),
         "severe-thunderstorm/considerable" => "Considerable severe thunderstorm".to_owned(),
         "severe-thunderstorm/destructive" => "Destructive severe thunderstorm".to_owned(),
@@ -2402,7 +2403,20 @@ pub(crate) fn hazard_style_resolved_polygon(
 
 pub(crate) fn hazard_record_style_threat(record: &HazardRecord) -> Option<&str> {
     if record.event_family != "watch" {
-        return record.damage_threat.as_deref();
+        // Keep IBW escalations (PDS / emergency) authoritative. Ordinary
+        // observed TORs get their own independently customizable border.
+        if record.damage_threat.is_some() {
+            return record.damage_threat.as_deref();
+        }
+        if record.event_family == "tornado"
+            && record
+                .tornado
+                .as_deref()
+                .is_some_and(|tag| tag.eq_ignore_ascii_case("OBSERVED"))
+        {
+            return Some("observed");
+        }
+        return None;
     }
     if hazard_record_text_contains(record, "TORNADO WATCH")
         || record.event_id.to_ascii_uppercase().contains(".TO.A.")
@@ -2415,6 +2429,38 @@ pub(crate) fn hazard_record_style_threat(record: &HazardRecord) -> Option<&str> 
         return Some("severe-thunderstorm");
     }
     record.damage_threat.as_deref()
+}
+
+/// Alerts-tab watch subtype. PDS is intentionally a distinct bucket rather
+/// than double-counting as TOR/SVR, so each chip has unambiguous behavior.
+pub(crate) fn hazard_watch_filter_key(record: &HazardRecord) -> &'static str {
+    if record.event_family != "watch" {
+        return "other";
+    }
+    if hazard_record_text_contains(record, "PARTICULARLY DANGEROUS SITUATION")
+        || hazard_record_text_has_token(record, "PDS")
+    {
+        return "pds";
+    }
+    match hazard_record_style_threat(record) {
+        Some("tornado") => "tornado",
+        Some("severe-thunderstorm") => "severe-thunderstorm",
+        _ => "other",
+    }
+}
+
+fn hazard_record_text_has_token(record: &HazardRecord, token: &str) -> bool {
+    [
+        Some(record.label.as_str()),
+        record.headline.as_deref(),
+        record.area.as_deref(),
+        record.motion.as_deref(),
+    ]
+    .into_iter()
+    .chain(record.details.iter().map(|detail| Some(detail.as_str())))
+    .flatten()
+    .flat_map(|value| value.split(|character: char| !character.is_ascii_alphanumeric()))
+    .any(|word| word.eq_ignore_ascii_case(token))
 }
 
 fn hazard_record_text_contains(record: &HazardRecord, needle: &str) -> bool {
