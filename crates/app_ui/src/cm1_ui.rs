@@ -684,7 +684,7 @@ impl Cm1ImportPanel {
             } else {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    format!("· radar unavailable (missing {})", radar_missing.join(", ")),
+                    format!("· radar unavailable ({})", radar_missing.join(", ")),
                 );
             }
             if sounding_ready {
@@ -1308,7 +1308,7 @@ impl Cm1ImportPanel {
             );
             ui.label(
                 egui::RichText::new(format!(
-                    "Missing required native output: {}. This does not prevent plotting the available horizontal fields above.",
+                    "Required native radar input unavailable: {}. This does not prevent plotting the available horizontal fields above.",
                     missing.join(", ")
                 ))
                 .small()
@@ -1445,7 +1445,7 @@ impl Cm1ImportPanel {
         let missing = cm1_radar_missing_fields(inventory);
         if !missing.is_empty() {
             return Err(format!(
-                "Native radar is unavailable for this file; missing {}.",
+                "Native radar is unavailable for this file: {}.",
                 missing.join(", ")
             ));
         }
@@ -1591,7 +1591,7 @@ fn variable_display_label(variable: &cm1::Cm1Variable) -> String {
     }
 }
 
-fn cm1_radar_missing_fields(inventory: &Cm1Inventory) -> Vec<&'static str> {
+fn cm1_radar_missing_fields(inventory: &Cm1Inventory) -> Vec<String> {
     let has_role = |name: &str, role: &Cm1VariableRole| {
         inventory
             .variable(name)
@@ -1599,31 +1599,29 @@ fn cm1_radar_missing_fields(inventory: &Cm1Inventory) -> Vec<&'static str> {
     };
     let mut missing = Vec::new();
     if !has_role("dbz", &Cm1VariableRole::NativeScalar3D) {
-        missing.push("3-D dbz");
+        missing.push("3-D dbz".to_owned());
     }
     if inventory.physical_height_variable.available().is_none() {
-        missing.push("3-D zhval heights");
+        missing.push("3-D zhval heights".to_owned());
     }
     if !has_role("uinterp", &Cm1VariableRole::NativeScalar3D)
         && !has_role("u", &Cm1VariableRole::NativeXStaggered3D)
     {
-        missing.push("3-D u wind");
+        missing.push("3-D u wind".to_owned());
     }
     if !has_role("vinterp", &Cm1VariableRole::NativeScalar3D)
         && !has_role("v", &Cm1VariableRole::NativeYStaggered3D)
     {
-        missing.push("3-D v wind");
+        missing.push("3-D v wind".to_owned());
     }
     if !has_role("winterp", &Cm1VariableRole::NativeScalar3D)
         && !has_role("w", &Cm1VariableRole::NativeZStaggered3D)
     {
-        missing.push("3-D w wind");
+        missing.push("3-D w wind".to_owned());
     }
-    if matches!(
-        &inventory.motion.domain_motion,
-        Cm1DomainMotion::Unresolved { .. }
-    ) {
-        missing.push("moving-domain wind correction");
+    let readiness = cm1::thermodynamic_readiness(inventory);
+    if let Some(reason) = readiness.wind_frame_correction.unavailable_reason() {
+        missing.push(format!("wind-frame correction: {reason}"));
     }
     missing
 }
@@ -2306,12 +2304,33 @@ mod tests {
     fn radar_scope_is_independent_and_builds_selected_or_all_record_indices() {
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc");
-        let mut inventory = cm1::inspect_path(&source_path).expect("fixture inventory");
-        // This test isolates the two independent UI time scopes. The schema
-        // fixture deliberately carries unresolved nonzero moving-frame winds;
-        // make its domain stationary so radar-readiness does not obscure the
-        // request-selection contract under test.
-        inventory.motion.domain_motion = Cm1DomainMotion::Static;
+        let inventory = cm1::inspect_path(&source_path).expect("fixture inventory");
+        assert!(matches!(
+            inventory.motion.domain_motion,
+            Cm1DomainMotion::Unresolved { .. }
+        ));
+        assert!(
+            inventory
+                .motion
+                .east_velocity_mps
+                .available()
+                .into_iter()
+                .chain(inventory.motion.north_velocity_mps.available())
+                .flatten()
+                .any(|velocity| velocity.abs() > 1.0e-9),
+            "fixture must exercise a nonzero moving frame"
+        );
+        assert!(
+            cm1::thermodynamic_readiness(&inventory)
+                .wind_frame_correction
+                .available()
+                .is_some(),
+            "complete unit-bearing umove/vmove is a valid wind-frame correction"
+        );
+        assert!(
+            cm1_radar_missing_fields(&inventory).is_empty(),
+            "Follow-domain radar must not require accumulated displacement"
+        );
         let mut panel = Cm1ImportPanel {
             source_path: Some(source_path),
             time_index: 1,
@@ -2339,6 +2358,56 @@ mod tests {
             !panel.import_all_times,
             "model import scope must stay independent"
         );
+
+        panel.placement_mode = Some(Cm1PlacementMode::FixedWorld);
+        let fixed_error = panel
+            .build_radar_request(&inventory)
+            .expect_err("Fixed world still requires exact accumulated displacement");
+        assert!(
+            fixed_error.contains("domainlocx/domainlocy"),
+            "{fixed_error}"
+        );
+    }
+
+    #[test]
+    fn moving_radar_reports_incomplete_or_missing_wind_frame_correction() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc");
+        let base = cm1::inspect_path(&source_path).expect("fixture inventory");
+        let panel = Cm1ImportPanel {
+            source_path: Some(source_path),
+            time_index: 1,
+            anchor_latitude: "35.0".to_owned(),
+            anchor_longitude: "-97.0".to_owned(),
+            placement_mode: Some(Cm1PlacementMode::FollowDomain),
+            ..Cm1ImportPanel::default()
+        };
+        let assert_blocked = |inventory: &Cm1Inventory| {
+            let issues = cm1_radar_missing_fields(inventory);
+            assert_eq!(issues.len(), 1, "unexpected radar readiness: {issues:?}");
+            assert!(
+                issues[0].contains("complete unit-bearing umove/vmove records are unavailable"),
+                "{}",
+                issues[0]
+            );
+            let user_error = panel
+                .build_radar_request(inventory)
+                .expect_err("invalid moving-frame correction must block radar");
+            assert!(
+                user_error.contains("complete unit-bearing umove/vmove records are unavailable"),
+                "{user_error}"
+            );
+        };
+
+        let mut incomplete = base.clone();
+        incomplete.motion.east_velocity_mps = Cm1Availability::Available(vec![12.0]);
+        assert_blocked(&incomplete);
+
+        let mut missing = base;
+        missing.motion.north_velocity_mps = Cm1Availability::Unavailable {
+            reason: "vmove is missing from this test file".to_owned(),
+        };
+        assert_blocked(&missing);
     }
 
     #[test]
