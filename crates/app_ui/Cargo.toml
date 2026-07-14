@@ -96,7 +96,7 @@ rev = "fe9797f86c8958b5a625a4a7682c6b6aeff6b309"
 
 [dependencies.sharppyrs]
 git = "https://github.com/FahrenheitResearch/sharppyrs"
-rev = "11384f4c0fcd2cb16fe0660b9414b9f151944d7c"
+rev = "d29429813afcbf1102391e4dad35cf373d51e930"
 
 [dependencies.sharprs]
 git = "https://github.com/FahrenheitResearch/rusty-weather"

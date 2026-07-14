@@ -23,16 +23,15 @@ const LEGACY_DEFAULT_LAYOUT_WITH_STP: &str =
     "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|indexboard,streamwiseness,stp|250";
 
 fn restored_layout_tokens(tokens: &str) -> Option<String> {
-    let layout = sharppyrs::SoundingLayout::from_tokens(tokens)?;
-    let canonical = layout.to_tokens();
-    if canonical == LEGACY_DEFAULT_LAYOUT_WITH_STP {
+    if tokens.trim() == LEGACY_DEFAULT_LAYOUT_WITH_STP {
         // v0.34 persisted the then-default STP bar. Treat that exact layout as
         // a default, not as a customization, so existing users receive the
-        // wider index board introduced with Rusty Weather v0.4 as well.
-        Some(sharppyrs::SoundingLayout::default().to_tokens())
-    } else {
-        Some(canonical)
+        // split movable index panels introduced with Rusty Weather v0.4 as
+        // well. Check the raw legacy token before upstream canonicalization,
+        // which now expands three bottom cells into the six-cell grid.
+        return Some(sharppyrs::SoundingLayout::default().to_tokens());
     }
+    Some(sharppyrs::SoundingLayout::from_tokens(tokens)?.to_tokens())
 }
 
 fn floating_sounding_canvas_size(viewport: egui::Vec2) -> egui::Vec2 {
@@ -500,6 +499,9 @@ mod tests {
     fn layout_tokens_round_trip_through_view_state() {
         let tokens =
             "hidden,advection|slinky|speed,thetae,srwinds,hazardtype|indexboard,ship,stp|180";
+        let canonical = sharppyrs::SoundingLayout::from_tokens(tokens)
+            .expect("legacy custom layout migrates")
+            .to_tokens();
         let mut panel = SharppySoundingPanel::new();
         let mut save = panel.inner.view_state_json();
         save.as_object_mut()
@@ -507,9 +509,9 @@ mod tests {
             .insert("sharppy_layout".to_owned(), serde_json::json!(tokens));
         assert!(panel.apply_view_state_json(&save));
         let mut emitted = panel.view_state_json();
-        assert_eq!(emitted["sharppy_layout"].as_str(), Some(tokens));
+        assert_eq!(emitted["sharppy_layout"].as_str(), Some(canonical.as_str()));
         crate::model_data::patch_sounding_scene_zoom(&mut emitted, 1.4);
-        assert_eq!(emitted["sharppy_layout"].as_str(), Some(tokens));
+        assert_eq!(emitted["sharppy_layout"].as_str(), Some(canonical.as_str()));
         assert!((emitted["zooms"]["scene"].as_f64().unwrap() - 1.4).abs() < 1e-6);
         // Malformed tokens are dropped rather than persisted or applied.
         let mut bad = panel.inner.view_state_json();
@@ -536,7 +538,10 @@ mod tests {
             .as_str()
             .expect("migrated layout tokens");
         assert_eq!(migrated, sharppyrs::SoundingLayout::default().to_tokens());
-        assert!(migrated.contains("indexboard,streamwiseness,hidden"));
+        assert!(
+            migrated
+                .contains("convectiveindices,kinematics,ship,severeindices,streamwiseness,hidden")
+        );
     }
 
     #[test]
@@ -616,7 +621,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut edited = sharppyrs::SoundingLayout::default();
         edited.top_height_fraction = 0.58;
-        edited.bottom_column_fractions = [0.52, 0.28, 0.20];
+        edited.bottom_column_fractions = [0.30, 0.20, 0.15, 0.15, 0.20];
         sharppyrs::store_layout(&ctx, SharppySoundingPanel::layout_memory_id(), &edited);
 
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| second.ui_docked(ui));
@@ -632,6 +637,9 @@ mod tests {
     fn pending_layout_lands_in_egui_memory_on_ui() {
         let tokens =
             "speed,advection|hodograph|slinky,thetae,srwinds,hazardtype|indexboard,ship,stp|300";
+        let canonical = sharppyrs::SoundingLayout::from_tokens(tokens)
+            .expect("legacy custom layout migrates")
+            .to_tokens();
         let mut panel = SharppySoundingPanel::new();
         let mut save = panel.inner.view_state_json();
         save.as_object_mut()
@@ -643,10 +651,10 @@ mod tests {
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| panel.ui(ui));
         let stored = sharppyrs::stored_layout(&ctx, SharppySoundingPanel::layout_memory_id())
             .expect("layout stored under the pinned id");
-        assert_eq!(stored.to_tokens(), tokens);
+        assert_eq!(stored.to_tokens(), canonical);
         assert_eq!(
             panel.view_state_json()["sharppy_layout"].as_str(),
-            Some(tokens)
+            Some(canonical.as_str())
         );
     }
 }

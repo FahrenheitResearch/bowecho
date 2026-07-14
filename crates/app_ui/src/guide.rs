@@ -899,8 +899,9 @@ fn model_data(ui: &mut egui::Ui) {
         concat!(
             "— choose which diagnostic occupies each cell, then drag the cyan shared borders ",
             "to resize the upper and bottom rows, skew-T and right side, hodograph and inset ",
-            "row, narrow strips, individual insets, and bottom cells such as Index Board and ",
-            "Streamwiseness. Every split remains aligned and persists; reset restores the default.",
+            "row, narrow strips, individual insets, and bottom cells. Parcels & thermo, ",
+            "Kinematics, SHIP, Severe indices, and Streamwiseness are separate movable panels. ",
+            "Every split remains aligned and persists; reset restores the default.",
         ),
     );
 
