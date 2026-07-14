@@ -27056,7 +27056,7 @@ impl ViewerApp {
         });
         match pane {
             dock::WorkspacePane::Map => {}
-            dock::WorkspacePane::Sounding => self.sounding_pane_body(ui),
+            dock::WorkspacePane::Sounding => self.sounding_pane_body(ui, true),
             dock::WorkspacePane::RadarOverlays => {
                 let ctx = ui.ctx().clone();
                 self.radar_overlays_pane_body(ui, &ctx);
@@ -30645,7 +30645,7 @@ impl ViewerApp {
             .resizable(true)
             .show(ctx, |ui| {
                 self.dock_toggle_row(ui, dock::WorkspacePane::Sounding);
-                self.sounding_pane_body(ui);
+                self.sounding_pane_body(ui, false);
             });
         // Closing the floating window is a full close too — same clean
         // teardown as the docked ✕, so no request/source residue lingers.
@@ -30656,19 +30656,27 @@ impl ViewerApp {
 
     /// Sounding body, window and pane alike. The docked pane outlives any
     /// single sounding, so it placeholder-prompts until one arrives.
-    fn sounding_pane_body(&mut self, ui: &mut egui::Ui) {
+    fn sounding_pane_body(&mut self, ui: &mut egui::Ui, docked: bool) {
         if self.sounding_viewer_source == SoundingViewerSource::Model
             && let Some(dock) = self.model_dock.as_mut()
             && dock.sounding_has_content()
         {
-            dock.sounding_ui(ui);
+            if docked {
+                dock.sounding_ui_docked(ui);
+            } else {
+                dock.sounding_ui(ui);
+            }
             return;
         }
 
         if self.sounding_viewer_source == SoundingViewerSource::NativeOnly
             && self.native_sounding_panel.has_content()
         {
-            self.native_sounding_panel.ui(ui);
+            if docked {
+                self.native_sounding_panel.ui_docked(ui);
+            } else {
+                self.native_sounding_panel.ui(ui);
+            }
             return;
         }
 

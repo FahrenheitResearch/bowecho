@@ -18,6 +18,7 @@ const MS_TO_KT: f64 = 1.943_844_49;
 const SHARPPY_CANVAS_MIN_WIDTH: f32 = 1_630.0;
 const SHARPPY_CANVAS_MIN_HEIGHT: f32 = 900.0;
 const SHARPPY_CANVAS_MAX_HEIGHT: f32 = 1_100.0;
+const SHARPPY_RENDER_MIN_HEIGHT: f32 = 150.0;
 const LEGACY_DEFAULT_LAYOUT_WITH_STP: &str =
     "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|indexboard,streamwiseness,stp|250";
 
@@ -34,10 +35,26 @@ fn restored_layout_tokens(tokens: &str) -> Option<String> {
     }
 }
 
-fn sounding_canvas_size(viewport: egui::Vec2) -> egui::Vec2 {
+fn floating_sounding_canvas_size(viewport: egui::Vec2) -> egui::Vec2 {
     egui::Vec2::new(
         viewport.x.max(SHARPPY_CANVAS_MIN_WIDTH),
         (viewport.y - 24.0).clamp(SHARPPY_CANVAS_MIN_HEIGHT, SHARPPY_CANVAS_MAX_HEIGHT),
+    )
+}
+
+fn docked_sounding_canvas_size(viewport: egui::Vec2) -> egui::Vec2 {
+    // The SHARPpy board is one coordinated graphic, so fit it uniformly
+    // instead of squeezing individual columns. This also makes egui's global
+    // zoom behave naturally: the dock reports its new logical size and the
+    // complete board follows it.
+    let width_scale = viewport.x.max(0.0) / SHARPPY_CANVAS_MIN_WIDTH;
+    let height_scale = viewport.y.max(0.0) / SHARPPY_CANVAS_MIN_HEIGHT;
+    let scale = width_scale
+        .min(height_scale)
+        .max(SHARPPY_RENDER_MIN_HEIGHT / SHARPPY_CANVAS_MIN_HEIGHT);
+    egui::vec2(
+        SHARPPY_CANVAS_MIN_WIDTH * scale,
+        SHARPPY_CANVAS_MIN_HEIGHT * scale,
     )
 }
 
@@ -145,6 +162,17 @@ impl SharppySoundingPanel {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        self.ui_with_host(ui, false);
+    }
+
+    /// Render responsively inside a dock pane. Floating windows deliberately
+    /// keep the full desktop board and scroll when made too small; docked
+    /// panels instead scale the complete board to the pane.
+    pub fn ui_docked(&mut self, ui: &mut egui::Ui) {
+        self.ui_with_host(ui, true);
+    }
+
+    fn ui_with_host(&mut self, ui: &mut egui::Ui, docked: bool) {
         let layout_id = Self::layout_memory_id();
         // A layout restored from saved view state lands in egui memory here,
         // on the first frame with a ctx.
@@ -162,27 +190,41 @@ impl SharppySoundingPanel {
         if !self.classic
             && let Some(analysis) = self.analysis.as_ref()
         {
-            // Keep the complete SPC board in the same desktop-width coordinate
-            // system as Rusty Weather v0.4. Narrow docks scroll instead of
-            // squeezing fixed diagnostic columns over the skew-T.
-            let size = sounding_canvas_size(ui.available_size());
-            egui::ScrollArea::both()
-                .id_salt("bowecho-sharppy-sounding-scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Frame::new()
-                        .fill(egui::Color32::BLACK)
-                        .show(ui, |ui| {
-                            ui.add(
-                                sharppyrs::SoundingView::new(&analysis.prof, &analysis.derived)
-                                    .title(analysis.title.clone())
-                                    .brand("BowEcho")
-                                    .style(sharppyrs::SkewTStyle::space_grotesk())
-                                    .layout_memory_id(layout_id)
-                                    .size(size),
-                            );
-                        });
-                });
+            let available = ui.available_size();
+            let size = if docked {
+                docked_sounding_canvas_size(available)
+            } else {
+                floating_sounding_canvas_size(available)
+            };
+            let view = || {
+                sharppyrs::SoundingView::new(&analysis.prof, &analysis.derived)
+                    .title(analysis.title.clone())
+                    .brand("BowEcho")
+                    .style(sharppyrs::SkewTStyle::space_grotesk())
+                    .layout_memory_id(layout_id)
+                    .size(size)
+            };
+            if docked {
+                egui::Frame::new()
+                    .fill(egui::Color32::BLACK)
+                    .show(ui, |ui| {
+                        ui.add(view());
+                    });
+            } else {
+                // A floating window retains Rusty Weather's desktop board.
+                // Resizing it below that board reveals scrollbars rather than
+                // silently changing the user's preferred analysis scale.
+                egui::ScrollArea::both()
+                    .id_salt("bowecho-sharppy-sounding-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::BLACK)
+                            .show(ui, |ui| {
+                                ui.add(view());
+                            });
+                    });
+            }
         } else {
             self.inner.ui(ui);
         }
@@ -406,15 +448,30 @@ mod tests {
     }
 
     #[test]
-    fn sounding_canvas_keeps_desktop_board_geometry_and_scrolls_small_hosts() {
+    fn floating_sounding_canvas_keeps_desktop_board_geometry() {
         assert_eq!(
-            sounding_canvas_size(egui::vec2(1_200.0, 700.0)),
+            floating_sounding_canvas_size(egui::vec2(1_200.0, 700.0)),
             egui::vec2(1_630.0, 900.0)
         );
         assert_eq!(
-            sounding_canvas_size(egui::vec2(1_800.0, 1_200.0)),
+            floating_sounding_canvas_size(egui::vec2(1_800.0, 1_200.0)),
             egui::vec2(1_800.0, 1_100.0)
         );
+    }
+
+    #[test]
+    fn docked_sounding_canvas_scales_uniformly_to_fit_host() {
+        let narrow = docked_sounding_canvas_size(egui::vec2(1_000.0, 850.0));
+        assert!((narrow.x - 1_000.0).abs() < 0.01);
+        assert!((narrow.y - 552.147_2).abs() < 0.01);
+        assert!(
+            (narrow.x / narrow.y - SHARPPY_CANVAS_MIN_WIDTH / SHARPPY_CANVAS_MIN_HEIGHT).abs()
+                < 0.001
+        );
+
+        let short = docked_sounding_canvas_size(egui::vec2(1_800.0, 700.0));
+        assert!((short.y - 700.0).abs() < 0.01);
+        assert!(short.x < 1_800.0);
     }
 
     /// A restored layout lands in egui memory on the next `ui()` frame under

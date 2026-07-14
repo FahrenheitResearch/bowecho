@@ -2432,6 +2432,15 @@ impl ModelDataDock {
 
     /// Render the reusable rw-ui sounding panel outside the Model Data dock.
     pub fn sounding_ui(&mut self, ui: &mut egui::Ui) {
+        self.sounding_ui_with_host(ui, false);
+    }
+
+    /// Render the reusable sounding responsively inside the workspace dock.
+    pub fn sounding_ui_docked(&mut self, ui: &mut egui::Ui) {
+        self.sounding_ui_with_host(ui, true);
+    }
+
+    fn sounding_ui_with_host(&mut self, ui: &mut egui::Ui, docked: bool) {
         self.handle_responses();
         if let Some(summary) = &self.box_sounding_summary {
             box_sounding_summary_ui(ui, summary);
@@ -2453,7 +2462,11 @@ impl ModelDataDock {
                 });
             ui.add_space(4.0);
         }
-        self.sounding.ui(ui);
+        if docked {
+            self.sounding.ui_docked(ui);
+        } else {
+            self.sounding.ui(ui);
+        }
     }
 
     /// The latest sounding belongs to the box-mean path. The app uses this to
