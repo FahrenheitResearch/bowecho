@@ -38,6 +38,10 @@ jobs:
             exit 1
           fi
 
+      - name: Release executable size guard tests
+        shell: bash
+        run: bash tools/check_release_binary_size_test.sh
+
       - name: Test
         run: cargo test --workspace --all-targets
 

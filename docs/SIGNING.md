@@ -21,6 +21,28 @@ them.
 The source of truth for a release is the GitHub Actions run attached to that
 tag. It shows whether each signing and validation step passed or failed.
 
+## Release executable size guard
+
+Every release-matrix job checks the **raw shipping executable**, after code
+signing where applicable and before any ZIP, artifact, or release upload. The
+limit is exactly **134,217,728 bytes (128 MiB)** for every Windows, Linux, and
+macOS architecture. The guard intentionally does not inspect compressed
+archive sizes, which vary by packager and can hide a large embedded payload.
+
+The cap is generous relative to the approximately 68-71 MB v0.33 executables
+and exists to catch accidental embedding of large lookup-table or scattering
+bundles. Optional scientific resources must instead ship as versioned external
+data packs that BowEcho downloads, validates, and caches at runtime. Do not
+raise the cap to accommodate an embedded data bundle; changing it requires an
+explicit release-policy decision and an updated documented baseline.
+
+Maintainers can run the same check locally:
+
+```sh
+bash tools/check_release_binary_size.sh path/to/bowecho
+bash tools/check_release_binary_size_test.sh
+```
+
 ## User verification
 
 Compare the downloaded asset with the matching `.sha256` file on the release

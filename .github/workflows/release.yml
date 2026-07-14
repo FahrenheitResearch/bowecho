@@ -185,6 +185,11 @@ jobs:
           # install costs ~1 minute per release build and cannot be poisoned.
           cache-dependencies: false
 
+      - name: Check Windows release executable size
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash tools/check_release_binary_size.sh target/release/bowecho.exe
+
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -329,12 +334,22 @@ jobs:
           xcrun stapler validate "$app"
           spctl --assess --type execute --verbose=4 "$app"
 
+      - name: Check macOS release executable size
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash tools/check_release_binary_size.sh BowEcho.app/Contents/MacOS/bowecho
+
       - name: Zip macOS app
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           ditto -c -k --sequesterRsrc --keepParent "BowEcho.app" "dist/${{ matrix.artifact_name }}.zip"
+
+      - name: Check Linux release executable size
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash tools/check_release_binary_size.sh target/release/bowecho
 
       - name: Package Linux binary
         if: runner.os == 'Linux'
