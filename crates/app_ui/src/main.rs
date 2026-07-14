@@ -69,6 +69,7 @@ mod grid_composites;
 mod guide;
 mod hazard_geom;
 mod hazard_ui;
+mod hurricane_hunters;
 mod ingest_worker;
 mod italy_dpc;
 mod layers_rail;
@@ -94,6 +95,7 @@ mod product_select;
 mod radar_band;
 mod radar_export;
 mod raster_quality;
+mod rebuildable_cache;
 mod rhi;
 mod sat_paint;
 mod sat_plot;
@@ -451,6 +453,9 @@ const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const INTERACTIVE_POLL_REPAINT_MS: u64 = 16;
 const ACTIVE_LOAD_POLL_MS: u64 = INTERACTIVE_POLL_REPAINT_MS;
 const RENDER_RESULT_POLL_MS: u64 = INTERACTIVE_POLL_REPAINT_MS;
+const REBUILDABLE_CACHE_MAINTENANCE_THROTTLE: Duration = Duration::from_secs(60);
+const REBUILDABLE_CACHE_PERIODIC_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const REBUILDABLE_CACHE_RESET_CONFIRM_WINDOW: Duration = Duration::from_secs(15);
 const LOW_ZOOM_RENDER_BACKOFF_SCALE: f32 = 48.0;
 const LOW_ZOOM_RENDER_BACKOFF_MIN_MS: u64 = 2_000;
 const LOW_ZOOM_RENDER_BACKOFF_MIN_RENDER_MS: f32 = 80.0;
@@ -1470,63 +1475,6 @@ fn cache_dir(name: &str) -> PathBuf {
         .join(sanitized_cache_segment(name))
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct CacheClearSummary {
-    files: usize,
-    dirs: usize,
-}
-
-impl CacheClearSummary {
-    fn status_text(self, root: &Path) -> String {
-        if self.files == 0 && self.dirs == 0 {
-            return format!("Map tile cache already empty: {}", root.display());
-        }
-        format!(
-            "Cleared map tile cache: {} files, {} dirs from {}",
-            self.files,
-            self.dirs,
-            root.display()
-        )
-    }
-}
-
-fn clear_map_tile_cache_dir(root: &Path) -> Result<CacheClearSummary, String> {
-    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
-        return Err("refusing to clear unnamed tile cache path".to_owned());
-    };
-    if name != "tiles" {
-        return Err(format!(
-            "refusing to clear non-tile cache path: {}",
-            root.display()
-        ));
-    }
-    if !root.exists() {
-        return Ok(CacheClearSummary::default());
-    }
-    if !root.is_dir() {
-        return Err(format!(
-            "tile cache path is not a directory: {}",
-            root.display()
-        ));
-    }
-    let mut summary = CacheClearSummary::default();
-    for entry in std::fs::read_dir(root).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|error| error.to_string())?;
-        if file_type.is_dir() {
-            std::fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
-            summary.dirs += 1;
-        } else {
-            std::fs::remove_file(&path)
-                .or_else(|_| std::fs::remove_dir(&path))
-                .map_err(|error| error.to_string())?;
-            summary.files += 1;
-        }
-    }
-    Ok(summary)
-}
-
 fn app_cache_root() -> PathBuf {
     if let Ok(path) = std::env::var("RADAR_RS_ANALYST_CACHE_DIR")
         && !path.trim().is_empty()
@@ -1564,6 +1512,74 @@ fn app_cache_root() -> PathBuf {
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(std::env::temp_dir)
         .join(format!("{storage_namespace}-cache"))
+}
+
+/// The only on-disk trees BowEcho is allowed to recycle automatically.
+/// Keep this list intentionally narrow: model/satellite stores, imports,
+/// settings, palettes, annotations, and captures are durable user data.
+fn rebuildable_cache_roots() -> Vec<PathBuf> {
+    let mut roots = vec![app_cache_root()];
+    if let Some(tile_root) = settings::tile_cache_dir()
+        && !roots.contains(&tile_root)
+    {
+        roots.push(tile_root);
+    }
+    roots
+}
+
+/// Defense-in-depth exclusions checked before every prune/reset. This makes
+/// a bad environment override fail closed if it points the radar cache at a
+/// directory that also contains durable BowEcho data.
+fn rebuildable_cache_protected_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = settings::AppSettings::config_path() {
+        paths.push(path);
+    }
+    if let Some(path) = settings::bowecho_config_dir() {
+        paths.push(path);
+    }
+    let storage_root = settings::data_dir_override().or_else(settings::active_storage_root);
+    if let Some(root) = storage_root {
+        paths.push(root.clone());
+        for leaf in [
+            "model-store",
+            "model-cache",
+            "gdex",
+            "simsat-cache",
+            "simsat-input",
+            "sat-store",
+            "glm-store",
+            "wofs-georef",
+            "annotations",
+        ] {
+            paths.push(root.join(leaf));
+        }
+    }
+    // On developer installs the model store/cache can deliberately live
+    // outside the ordinary storage root, so protect their resolved paths too.
+    paths.extend([
+        settings::color_tables_dir_path(),
+        settings::model_store_dir(),
+        settings::model_cache_dir(),
+        settings::screenshots_dir(),
+    ]);
+    paths
+}
+
+fn rebuildable_cache_limit_bytes(limit_gib: u16) -> u64 {
+    u64::from(limit_gib).saturating_mul(1024 * 1024 * 1024)
+}
+
+fn rebuildable_cache_size_label(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / GIB)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else {
+        compact_byte_label(bytes)
+    }
 }
 
 fn sanitized_cache_segment(value: &str) -> String {
@@ -2822,6 +2838,11 @@ struct ViewerApp {
     selected_site_index: usize,
     app_settings: settings::AppSettings,
     settings_persistence: settings_persistence::SettingsPersistence,
+    rebuildable_cache_rx: Option<mpsc::Receiver<RebuildableCacheJobResult>>,
+    rebuildable_cache_pending: bool,
+    rebuildable_cache_last_started: Option<Instant>,
+    rebuildable_cache_reset_confirm_until: Option<Instant>,
+    rebuildable_cache_status: String,
     radar_layers: Vec<OverlayView>,
     radar_overlays_open: bool,
     next_radar_layer_id: u64,
@@ -3488,6 +3509,11 @@ impl PaneIntlSource {
 struct AsyncLoadResult {
     label: String,
     update: AsyncLoadUpdate,
+}
+
+enum RebuildableCacheJobResult {
+    Maintenance(Result<rebuildable_cache::CacheMaintenanceSummary, String>),
+    Reset(Result<rebuildable_cache::CacheResetSummary, String>),
 }
 
 #[derive(Clone, Debug)]
@@ -8420,6 +8446,11 @@ impl ViewerApp {
             selected_site_index,
             app_settings,
             settings_persistence,
+            rebuildable_cache_rx: None,
+            rebuildable_cache_pending: false,
+            rebuildable_cache_last_started: None,
+            rebuildable_cache_reset_confirm_until: None,
+            rebuildable_cache_status: "Rebuildable cache maintenance has not run yet".to_owned(),
             radar_layers: Vec::new(),
             radar_overlays_open: false,
             next_radar_layer_id: 1,
@@ -8779,6 +8810,7 @@ impl ViewerApp {
         {
             app.model_dock = Some(app.new_model_data_dock(&cc.egui_ctx, model_store));
         }
+        app.request_rebuildable_cache_maintenance(&cc.egui_ctx, true);
         app
     }
 
@@ -13311,6 +13343,7 @@ impl ViewerApp {
                                         );
                                     }
                                     self.pending_debug_archive_case = None;
+                                    self.request_rebuildable_cache_maintenance(ctx, false);
                                 }
                                 Err(err) => {
                                     self.event_explorer.pending_autoplay = false;
@@ -16354,6 +16387,7 @@ impl ViewerApp {
                                                     format!("Loaded {}", message.label)
                                                 };
                                         }
+                                        self.request_rebuildable_cache_maintenance(ctx, false);
                                     }
                                     Err(err) => {
                                         self.extra_panes[pane_slot].engine.status =
@@ -19675,6 +19709,7 @@ impl eframe::App for ViewerApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             }
         }
+        self.poll_rebuildable_cache_job(&ctx);
         self.poll_async_site_catalog(&ctx);
         self.poll_async_load(&ctx);
         self.poll_extra_pane_loads(&ctx);
@@ -19718,6 +19753,10 @@ impl eframe::App for ViewerApp {
         self.poll_spc_reports(&ctx);
         self.tropical.maybe_refresh(&ctx);
         self.tropical.poll();
+        self.tropical
+            .hurricane_hunters
+            .maybe_refresh(&ctx, self.app_settings.show_hurricane_hunters);
+        self.tropical.hurricane_hunters.poll(Utc::now());
         if self.app_settings.show_tropical {
             self.tropical.drive_geometry(&ctx);
             if self.app_settings.show_tropical_panel {
@@ -25732,21 +25771,170 @@ impl ViewerApp {
         self.mark_style_settings_dirty();
     }
 
-    fn clear_map_tile_cache(&mut self, ctx: &egui::Context) {
-        let Some(root) = settings::tile_cache_dir() else {
-            self.status = "No map tile cache directory is available".to_owned();
+    fn request_rebuildable_cache_maintenance(&mut self, ctx: &egui::Context, force: bool) {
+        // `ViewerApp` test fixtures intentionally leave this uninitialized;
+        // the real constructor makes the one forced startup request. This
+        // prevents unit-test load simulations from touching a developer's
+        // real cache while all production follow-up requests stay active.
+        if !force && self.rebuildable_cache_last_started.is_none() {
             return;
-        };
-        match clear_map_tile_cache_dir(&root) {
-            Ok(summary) => {
-                self.tile_layer.borrow_mut().clear_memory();
-                self.status = summary.status_text(&root);
+        }
+        self.rebuildable_cache_pending = true;
+        self.maybe_start_rebuildable_cache_maintenance(ctx, force);
+    }
+
+    fn maybe_start_rebuildable_cache_maintenance(&mut self, ctx: &egui::Context, force: bool) {
+        if self.rebuildable_cache_rx.is_some() || !self.rebuildable_cache_pending {
+            return;
+        }
+        let now = Instant::now();
+        let limit_bytes =
+            rebuildable_cache_limit_bytes(self.app_settings.rebuildable_cache_limit_gib);
+        if limit_bytes == 0 {
+            self.rebuildable_cache_pending = false;
+            self.rebuildable_cache_last_started = Some(now);
+            self.rebuildable_cache_status = "Downloaded cache limit is disabled".to_owned();
+            return;
+        }
+        if !force
+            && let Some(last_started) = self.rebuildable_cache_last_started
+            && let Some(remaining) = REBUILDABLE_CACHE_MAINTENANCE_THROTTLE
+                .checked_sub(now.saturating_duration_since(last_started))
+        {
+            ctx.request_repaint_after(remaining);
+            return;
+        }
+
+        let roots = rebuildable_cache_roots();
+        let allowed_roots = roots.clone();
+        let protected_paths = rebuildable_cache_protected_paths();
+        let (sender, receiver) = mpsc::channel();
+        self.rebuildable_cache_rx = Some(receiver);
+        self.rebuildable_cache_pending = false;
+        self.rebuildable_cache_last_started = Some(now);
+        self.rebuildable_cache_status = "Checking downloaded radar/map cache…".to_owned();
+        thread::spawn(move || {
+            let result = rebuildable_cache::prune_to_limit(
+                &roots,
+                &allowed_roots,
+                &protected_paths,
+                limit_bytes,
+            );
+            let _ = sender.send(RebuildableCacheJobResult::Maintenance(result));
+        });
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn poll_rebuildable_cache_job(&mut self, ctx: &egui::Context) {
+        let message = self
+            .rebuildable_cache_rx
+            .as_ref()
+            .map(mpsc::Receiver::try_recv);
+        match message {
+            Some(Ok(RebuildableCacheJobResult::Maintenance(result))) => {
+                self.rebuildable_cache_rx = None;
+                match result {
+                    Ok(summary) => {
+                        let limit = rebuildable_cache_limit_bytes(
+                            self.app_settings.rebuildable_cache_limit_gib,
+                        );
+                        if summary.files_skipped > 0 && summary.bytes_after > limit {
+                            self.rebuildable_cache_status = format!(
+                                "Cache remains {} (limit {}): skipped {} locked/unavailable file(s)",
+                                rebuildable_cache_size_label(summary.bytes_after),
+                                rebuildable_cache_size_label(limit),
+                                summary.files_skipped
+                            );
+                        } else if summary.files_removed > 0 {
+                            let mut suffix = String::new();
+                            if summary.files_skipped > 0 {
+                                suffix = format!(
+                                    "; skipped {} locked/unavailable file(s)",
+                                    summary.files_skipped
+                                );
+                            }
+                            self.rebuildable_cache_status = format!(
+                                "Recycled {} file(s): {} → {}{suffix}",
+                                summary.files_removed,
+                                rebuildable_cache_size_label(summary.bytes_before),
+                                rebuildable_cache_size_label(summary.bytes_after),
+                            );
+                        } else {
+                            self.rebuildable_cache_status = format!(
+                                "Cache is within limit: {}",
+                                rebuildable_cache_size_label(summary.bytes_after)
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.rebuildable_cache_status =
+                            format!("Cache maintenance did not run: {error}");
+                    }
+                }
                 ctx.request_repaint();
             }
-            Err(error) => {
-                self.status = format!("Map tile cache clear failed: {error}");
+            Some(Ok(RebuildableCacheJobResult::Reset(result))) => {
+                self.rebuildable_cache_rx = None;
+                self.rebuildable_cache_last_started = Some(Instant::now());
+                match result {
+                    Ok(summary) => {
+                        self.tile_layer.borrow_mut().clear_memory();
+                        self.clear_loop_render_cache();
+                        self.clear_texture();
+                        self.rebuildable_cache_status = format!(
+                            "Reset downloaded cache: {} file(s), {} removed",
+                            summary.files_removed,
+                            rebuildable_cache_size_label(summary.bytes_removed)
+                        );
+                        self.status = self.rebuildable_cache_status.clone();
+                    }
+                    Err(error) => {
+                        self.rebuildable_cache_status = format!("Cache reset failed: {error}");
+                        self.status = self.rebuildable_cache_status.clone();
+                    }
+                }
+                ctx.request_repaint();
             }
+            Some(Err(mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.rebuildable_cache_rx = None;
+                self.rebuildable_cache_status = "Cache maintenance worker disconnected".to_owned();
+            }
+            None => {}
         }
+
+        if self.rebuildable_cache_rx.is_none()
+            && self.app_settings.rebuildable_cache_limit_gib > 0
+            && self
+                .rebuildable_cache_last_started
+                .is_some_and(|last| last.elapsed() >= REBUILDABLE_CACHE_PERIODIC_INTERVAL)
+        {
+            self.rebuildable_cache_pending = true;
+        }
+        self.maybe_start_rebuildable_cache_maintenance(ctx, false);
+    }
+
+    fn start_rebuildable_cache_reset(&mut self, ctx: &egui::Context) {
+        if self.rebuildable_cache_rx.is_some() {
+            self.rebuildable_cache_status =
+                "Wait for the current cache check to finish, then reset".to_owned();
+            return;
+        }
+        let roots = rebuildable_cache_roots();
+        let allowed_roots = roots.clone();
+        let protected_paths = rebuildable_cache_protected_paths();
+        let (sender, receiver) = mpsc::channel();
+        self.rebuildable_cache_rx = Some(receiver);
+        self.rebuildable_cache_pending = false;
+        self.rebuildable_cache_reset_confirm_until = None;
+        self.rebuildable_cache_status = "Resetting downloaded radar/map cache…".to_owned();
+        thread::spawn(move || {
+            let result = rebuildable_cache::reset_roots(&roots, &allowed_roots, &protected_paths);
+            let _ = sender.send(RebuildableCacheJobResult::Reset(result));
+        });
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 
     fn diagnostic_summary(&self) -> String {
@@ -25913,21 +26101,84 @@ impl ViewerApp {
             ui.ctx().copy_text(self.diagnostic_summary());
             self.status = "Diagnostics copied".to_owned();
         }
-        ui.horizontal(|ui| {
-            ui.label("Map tile cache");
-            if ui
-                .button("Clear")
-                .on_hover_text(
-                    "Delete cached Satellite/Streets/Topo map tiles only; radar, model, satellite, and warning data are untouched",
-                )
-                .clicked()
-            {
-                self.clear_map_tile_cache(ui.ctx());
-            }
-            if let Some(root) = settings::tile_cache_dir() {
-                ui.weak(root.display().to_string());
-            }
-        });
+        ui.separator();
+        ui.label(egui::RichText::new("Downloaded cache").strong());
+        let mut cache_limit_gib = self.app_settings.rebuildable_cache_limit_gib;
+        let limit_changed = ui
+            .horizontal(|ui| {
+                ui.label("Disk limit");
+                let changed = ui
+                    .add(
+                        egui::DragValue::new(&mut cache_limit_gib)
+                            .range(0..=2048)
+                            .speed(1)
+                            .suffix(" GiB"),
+                    )
+                    .on_hover_text(
+                        "Aggregate limit for downloaded Level-II/archive/live radar files and map tiles. Oldest files recycle first; 0 disables the limit.",
+                    )
+                    .changed();
+                if cache_limit_gib == 0 {
+                    ui.weak("unlimited");
+                } else {
+                    ui.weak("oldest first");
+                }
+                changed
+            })
+            .inner;
+        if limit_changed {
+            self.app_settings.rebuildable_cache_limit_gib = cache_limit_gib;
+            self.mark_app_settings_dirty();
+            self.request_rebuildable_cache_maintenance(ui.ctx(), true);
+        }
+        ui.weak(
+            "Only BowEcho-downloaded radar cache and map tiles. Models, satellite data, local imports, settings, palettes, annotations, and captures are never recycled.",
+        );
+        if !self.rebuildable_cache_status.is_empty() {
+            ui.label(&self.rebuildable_cache_status);
+        }
+
+        let now = Instant::now();
+        if self
+            .rebuildable_cache_reset_confirm_until
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.rebuildable_cache_reset_confirm_until = None;
+        }
+        if let Some(deadline) = self.rebuildable_cache_reset_confirm_until {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 170, 45),
+                "Confirm: delete only downloaded radar/map cache. Needed data will download again.",
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        self.rebuildable_cache_rx.is_none(),
+                        egui::Button::new("Confirm repair/reset"),
+                    )
+                    .clicked()
+                {
+                    self.start_rebuildable_cache_reset(ui.ctx());
+                }
+                if ui.button("Cancel").clicked() {
+                    self.rebuildable_cache_reset_confirm_until = None;
+                }
+            });
+            ui.ctx()
+                .request_repaint_after(deadline.saturating_duration_since(now));
+        } else if ui
+            .add_enabled(
+                self.rebuildable_cache_rx.is_none(),
+                egui::Button::new("Repair/reset downloaded cache…"),
+            )
+            .on_hover_text(
+                "Safely delete and recreate BowEcho's downloaded radar and map-tile caches. This does not alter user files or durable model/satellite stores.",
+            )
+            .clicked()
+        {
+            self.rebuildable_cache_reset_confirm_until =
+                Some(now + REBUILDABLE_CACHE_RESET_CONFIRM_WINDOW);
+        }
         ui.checkbox(&mut self.show_performance_stats, "Details");
         if let Some(render_ms) = self.render_ms {
             ui.label(format!("Render {render_ms:.1} ms"));
@@ -32151,6 +32402,7 @@ impl ViewerApp {
                 .unwrap_or_else(|| self.primary.history.len().saturating_sub(1));
         }
         self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
+        self.request_rebuildable_cache_maintenance(ctx, false);
     }
 
     /// True when the active poll source is fully specified — the condition
@@ -48310,40 +48562,6 @@ mod tests {
             "mean {mean:.1} ms p50 {p50:.1} p95 {p95:.1} max {max:.1} n{}",
             sorted.len()
         )
-    }
-
-    #[test]
-    fn clear_map_tile_cache_dir_removes_contents_but_keeps_root() {
-        let root = unique_test_dir("tile-cache-clear").join("tiles");
-        std::fs::create_dir_all(root.join("satellite").join("8")).expect("create tile dir");
-        std::fs::write(root.join("satellite").join("8").join("1_2.bin"), b"tile")
-            .expect("write tile");
-        std::fs::write(root.join("orphan.bin"), b"tile").expect("write orphan");
-
-        let summary = clear_map_tile_cache_dir(&root).expect("clear tile cache");
-
-        assert_eq!(summary, CacheClearSummary { files: 1, dirs: 1 });
-        assert!(root.is_dir());
-        assert!(
-            std::fs::read_dir(&root)
-                .expect("read root")
-                .next()
-                .is_none()
-        );
-        let _ = std::fs::remove_dir_all(root.parent().expect("test parent"));
-    }
-
-    #[test]
-    fn clear_map_tile_cache_dir_refuses_non_tiles_leaf() {
-        let root = unique_test_dir("tile-cache-refuse").join("not-tiles");
-        std::fs::create_dir_all(&root).expect("create cache dir");
-        std::fs::write(root.join("keep.bin"), b"tile").expect("write sentinel");
-
-        let err = clear_map_tile_cache_dir(&root).expect_err("wrong leaf rejected");
-
-        assert!(err.contains("non-tile cache path"));
-        assert!(root.join("keep.bin").exists());
-        let _ = std::fs::remove_dir_all(root.parent().expect("test parent"));
     }
 
     #[test]
@@ -64554,6 +64772,11 @@ mod tests {
             selected_site_index: 0,
             app_settings: settings::AppSettings::default(),
             settings_persistence: settings_persistence::SettingsPersistence::default(),
+            rebuildable_cache_rx: None,
+            rebuildable_cache_pending: false,
+            rebuildable_cache_last_started: None,
+            rebuildable_cache_reset_confirm_until: None,
+            rebuildable_cache_status: String::new(),
             radar_layers: Vec::new(),
             radar_overlays_open: false,
             next_radar_layer_id: 1,

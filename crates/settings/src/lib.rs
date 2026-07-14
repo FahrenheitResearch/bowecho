@@ -337,6 +337,11 @@ pub struct AppSettings {
     /// killing the map overlay.
     #[serde(default = "default_true")]
     pub show_tropical_panel: bool,
+    /// Live USAF/NOAA Hurricane Hunters aircraft tracks and flight-level wind
+    /// barbs from the four official NHC HDOB bulletins. Default off so BowEcho
+    /// performs no reconnaissance polling until the user asks for it.
+    #[serde(default)]
+    pub show_hurricane_hunters: bool,
     /// Show the NWS radar operational-status panel: the selected US
     /// NEXRAD/TDWR radar's RDA health (operational / degraded / DOWN) and
     /// operator alarm messages, from api.weather.gov/radar/stations. A DOWN
@@ -426,6 +431,10 @@ pub struct AppSettings {
     /// Default 2 so lightweight users never accumulate SSD bloat.
     #[serde(default = "default_model_keep_runs")]
     pub model_keep_runs: u8,
+    /// Aggregate disk cap for BowEcho's rebuildable Level-II and map-tile
+    /// caches, in GiB. Oldest files recycle first; 0 disables the cap.
+    #[serde(default = "default_rebuildable_cache_limit_gib")]
+    pub rebuildable_cache_limit_gib: u16,
     /// Perf HUD: floating per-frame timing overlay on the map (decode /
     /// render / layer raster / FPS / time-to-first-pixels). Debug aid,
     /// default off.
@@ -969,6 +978,10 @@ fn default_model_keep_runs() -> u8 {
     2
 }
 
+fn default_rebuildable_cache_limit_gib() -> u16 {
+    32
+}
+
 fn default_hidden_hazard_families() -> Vec<String> {
     [
         "fire weather",
@@ -1016,6 +1029,7 @@ impl Default for AppSettings {
             overlay_raob: false,
             show_tropical: true,
             show_tropical_panel: true,
+            show_hurricane_hunters: false,
             show_radar_status: false,
             overlay_spc_outlooks: Vec::new(),
             overlay_spc_reports: false,
@@ -1051,6 +1065,7 @@ impl Default for AppSettings {
             map_click_drops_coordinate_marker: false,
             gate_filter_decidbz: None,
             model_keep_runs: default_model_keep_runs(),
+            rebuildable_cache_limit_gib: default_rebuildable_cache_limit_gib(),
             perf_hud: false,
             alert_flash_enabled: true,
             alert_flash_families: Vec::new(),
@@ -1879,6 +1894,7 @@ mod tests {
             live_hazard_auto_refresh: false,
             hidden_hazard_families: vec!["flood".to_owned(), "watch".to_owned()],
             hidden_hazard_watch_types: vec!["pds".to_owned()],
+            rebuildable_cache_limit_gib: 96,
             alert_flash_enabled: false,
             alert_flash_families: vec!["tornado".to_owned()],
             alert_sound_enabled: true,
@@ -1956,6 +1972,17 @@ mod tests {
                 .any(|family| family == "watch")
         );
         assert!(settings.hidden_hazard_watch_types.is_empty());
+    }
+
+    #[test]
+    fn rebuildable_cache_limit_migrates_and_round_trips() {
+        assert_eq!(AppSettings::from_json("{}").rebuildable_cache_limit_gib, 32);
+        let settings = AppSettings {
+            rebuildable_cache_limit_gib: 0,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(&settings.to_json());
+        assert_eq!(restored.rebuildable_cache_limit_gib, 0);
     }
 
     #[test]
@@ -2098,15 +2125,18 @@ mod tests {
         assert!(AppSettings::default().show_tropical_panel);
         assert!(AppSettings::from_json("{}").show_tropical);
         assert!(AppSettings::from_json("{}").show_tropical_panel);
+        assert!(!AppSettings::from_json("{}").show_hurricane_hunters);
 
         let settings = AppSettings {
             show_tropical: true,
             show_tropical_panel: false, // cards window closed via [✕]
+            show_hurricane_hunters: true,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
         assert!(back.show_tropical);
         assert!(!back.show_tropical_panel);
+        assert!(back.show_hurricane_hunters);
     }
 
     #[test]

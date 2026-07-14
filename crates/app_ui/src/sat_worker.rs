@@ -291,6 +291,10 @@ pub struct HimawariCompositeSpec {
     /// Pick the newest complete scan at/before this time instead of "now" —
     /// lets proofs/backfills pin an exact scan (e.g. the last daylight pass).
     pub as_of: Option<DateTime<Utc>>,
+    /// Number of recent unique scans to ingest into the selected daily run.
+    /// General Satellite controls keep this at one; tropical cards request
+    /// ten so the storm opens as a short history loop.
+    pub frame_count: usize,
     /// Tropical-card correlation ticket: when set, the dispatcher reports
     /// this ingest's outcome on the card-outcome side channel (see
     /// [`CardOutcome`]) so the requesting storm card can clear its spinner.
@@ -311,6 +315,7 @@ impl Default for HimawariCompositeSpec {
             downsample: 4,
             window: None,
             as_of: None,
+            frame_count: 1,
             card_ticket: None,
         }
     }
@@ -340,6 +345,8 @@ pub struct GoesCompositeSpec {
     pub window: Option<SatNativeWindow>,
     /// Pick the newest all-band scan at/before this time instead of "now".
     pub as_of: Option<DateTime<Utc>>,
+    /// Recent unique scans to ingest, capped at ten by the worker.
+    pub frame_count: usize,
     /// Tropical-card correlation ticket (see [`CardOutcome`]).
     pub card_ticket: Option<u64>,
 }
@@ -354,6 +361,7 @@ impl Default for GoesCompositeSpec {
             lookback_minutes: 180,
             window: None,
             as_of: None,
+            frame_count: 1,
             card_ticket: None,
         }
     }
@@ -399,6 +407,8 @@ pub struct HimawariIrWindowSpec {
     pub lookback_minutes: i64,
     /// Pick the newest scan at/before this time instead of "now".
     pub as_of: Option<DateTime<Utc>>,
+    /// Recent unique scans to ingest, capped at ten by the worker.
+    pub frame_count: usize,
     /// Tropical-card correlation ticket (see [`CardOutcome`]).
     pub card_ticket: Option<u64>,
 }
@@ -431,6 +441,8 @@ pub struct GoesIrWindowSpec {
     pub lookback_minutes: i64,
     /// Pick the newest scan at/before this time instead of "now".
     pub as_of: Option<DateTime<Utc>>,
+    /// Recent unique scans to ingest, capped at ten by the worker.
+    pub frame_count: usize,
     /// Tropical-card correlation ticket (see [`CardOutcome`]).
     pub card_ticket: Option<u64>,
 }
@@ -2651,18 +2663,19 @@ struct HimawariScanPick {
     by_band: HashMap<u8, Vec<S3Object>>,
 }
 
-/// Newest AHI full-disk scan for which EVERY required visible band has all of
-/// segments `seg_start..seg_start+seg_count` present. All bands of one scan
-/// share the same `HS_H09_<date>_<time>` filename timestamp, so the scan keys
-/// line up exactly across bands (mirrors GOES [`latest_common_scan`]).
-fn latest_himawari_visible_scan(
+/// Recent AHI full-disk scans for which EVERY required band has all requested
+/// segments. Each scan prefix is listed exactly once, newest first. Results
+/// stop at ten and at the newest scan's UTC-day boundary so every returned
+/// frame can share one unambiguous HHMM-keyed store run.
+fn recent_himawari_visible_scans(
     satellite: HimawariSatellite,
     bands: &[u8],
     seg_start: u8,
     seg_count: u8,
     lookback_minutes: i64,
     as_of: DateTime<Utc>,
-) -> Result<HimawariScanPick, String> {
+    limit: usize,
+) -> Result<Vec<HimawariScanPick>, String> {
     let agent = build_agent();
     let product = HimawariProduct::AhiL1bFldk;
     let cadence = product.cadence_minutes();
@@ -2670,6 +2683,9 @@ fn latest_himawari_visible_scan(
     let mut scan_time = round_down_ahi_scan_time(as_of, cadence);
     let stop = scan_time - chrono::Duration::minutes(lookback);
     let wanted: Vec<u8> = (seg_start..seg_start.saturating_add(seg_count)).collect();
+    let target = limit.clamp(1, MAX_RECENT_HISTORY_FRAMES);
+    let mut picks = Vec::with_capacity(target);
+    let mut newest_day = None;
 
     while scan_time >= stop {
         let prefix = product.scan_prefix(scan_time);
@@ -2706,13 +2722,24 @@ fn latest_himawari_visible_scan(
                 segs.sort_by_key(|(idx, _)| *idx);
                 out.insert(band, segs.into_iter().map(|(_, object)| object).collect());
             }
-            return Ok(HimawariScanPick {
+            let day = *newest_day.get_or_insert(scan_time.date_naive());
+            if scan_time.date_naive() != day {
+                break;
+            }
+            picks.push(HimawariScanPick {
                 scan_time,
                 prefix,
                 by_band: out,
             });
+            if picks.len() == target {
+                break;
+            }
         }
         scan_time -= chrono::Duration::minutes(cadence);
+    }
+
+    if !picks.is_empty() {
+        return Ok(picks);
     }
 
     Err(format!(
@@ -4151,6 +4178,68 @@ fn write_himawari_composite_frame(
     })
 }
 
+const MAX_RECENT_HISTORY_FRAMES: usize = 10;
+
+struct RecentIngestFrame {
+    key: SatRunKey,
+    hhmm: u16,
+    summary: String,
+}
+
+/// Ingest a preselected bounded newest-to-oldest history while publishing the
+/// run list and selecting the newest frame only once, after every requested
+/// scan has landed. Selection happens in one source-listing pass before this
+/// function; it never re-queries the remote catalogue per frame.
+fn ingest_selected_history<P>(
+    store_root: &Path,
+    requested: usize,
+    label: &str,
+    picks: Vec<P>,
+    send: &impl Fn(SatResponse) -> bool,
+    mut ingest_one: impl FnMut(P) -> Result<RecentIngestFrame, String>,
+) -> Result<String, String> {
+    let target = requested.clamp(1, MAX_RECENT_HISTORY_FRAMES);
+    let mut frames = Vec::with_capacity(target);
+    let mut older_failure = None;
+
+    for (index, pick) in picks.into_iter().take(target).enumerate() {
+        send(SatResponse::Note(format!(
+            "{label}: loading recent frame {}/{}",
+            index + 1,
+            target
+        )));
+        let frame = match ingest_one(pick) {
+            Ok(frame) => frame,
+            Err(error) if frames.is_empty() => return Err(error),
+            Err(error) => {
+                older_failure = Some(error);
+                break;
+            }
+        };
+        frames.push(frame);
+    }
+
+    let Some(newest) = frames.first() else {
+        return Err(format!("{label}: no recent scans were selected"));
+    };
+    send(SatResponse::Runs(scan_runs(store_root)));
+    send(SatResponse::SelectFrame {
+        key: newest.key.clone(),
+        hhmm: newest.hhmm,
+    });
+    if target == 1 {
+        return Ok(newest.summary.clone());
+    }
+    Ok(format!(
+        "{} · loaded {} of {target} recent frame(s){}",
+        newest.summary,
+        frames.len(),
+        older_failure
+            .map(|error| format!(" · older history stopped: {error}"))
+            .unwrap_or_default()
+    ))
+}
+
 /// Fetch the co-registered AHI visible bands the composite needs (the newest
 /// scan that has the requested full-disk segment range for all of them),
 /// convert each to reflectance, resample onto the base band's grid, compose
@@ -4158,11 +4247,12 @@ fn write_himawari_composite_frame(
 /// This is the Himawari counterpart of [`ingest_latest_goes_composite`]; it
 /// reuses the same `rgb_r/g/b` frame storage so the frames play through the
 /// existing composite render path.
-fn ingest_latest_himawari_composite(
+fn ingest_one_himawari_composite(
     store_root: &Path,
     spec: &HimawariCompositeSpec,
+    pick: HimawariScanPick,
     send: &impl Fn(SatResponse) -> bool,
-) -> Result<String, String> {
+) -> Result<RecentIngestFrame, String> {
     let satellite = HimawariSatellite::parse(&spec.satellite)
         .ok_or_else(|| format!("unknown Himawari satellite '{}'", spec.satellite))?;
     let style = HimawariCompositeStyle::parse(&spec.style)
@@ -4199,15 +4289,6 @@ fn ingest_latest_himawari_composite(
     };
     let cache_root = store_root.join("cache");
     let source_root = store_root.join("sources").join("himawari");
-
-    let pick = latest_himawari_visible_scan(
-        satellite,
-        bands,
-        seg_start,
-        seg_count,
-        spec.lookback_minutes.max(10),
-        spec.as_of.unwrap_or_else(Utc::now),
-    )?;
 
     // Fetch + assemble each band as raw counts on its native grid, keeping the
     // per-band calibration for the reflectance conversion.
@@ -4317,17 +4398,8 @@ fn ingest_latest_himawari_composite(
             });
         }
     }
-    send(SatResponse::Runs(scan_runs(store_root)));
-    send(SatResponse::SelectFrame {
-        key: SatRunKey {
-            model: frame.model.clone(),
-            run: frame.run.clone(),
-        },
-        hhmm: frame.hhmm,
-    });
-
     let lit = r.iter().filter(|value| value.is_finite()).count();
-    Ok(format!(
+    let summary = format!(
         "Himawari {} {} {}: scan {} · S{:02}..S{:02} · {}x{} · {:.0}% lit · wrote {}/{}/t{:04}",
         satellite.platform(),
         base_scene.sector,
@@ -4341,7 +4413,57 @@ fn ingest_latest_himawari_composite(
         frame.model,
         frame.run,
         frame.hhmm
-    ))
+    );
+    Ok(RecentIngestFrame {
+        key: SatRunKey {
+            model: frame.model,
+            run: frame.run,
+        },
+        hhmm: frame.hhmm,
+        summary,
+    })
+}
+
+fn ingest_latest_himawari_composite(
+    store_root: &Path,
+    spec: &HimawariCompositeSpec,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let satellite = HimawariSatellite::parse(&spec.satellite)
+        .ok_or_else(|| format!("unknown Himawari satellite '{}'", spec.satellite))?;
+    let style = HimawariCompositeStyle::parse(&spec.style)
+        .ok_or_else(|| format!("unknown Himawari composite style '{}'", spec.style))?;
+    let window = spec.window.map(SatNativeWindow::clamped);
+    let full_disk = spec.full_disk && window.is_none();
+    let (seg_start, seg_count) = match window {
+        Some(window) => himawari_window_segments(window)?,
+        None if full_disk => (1, 10),
+        None => {
+            let start = spec.segment_start.clamp(1, 10);
+            (start, spec.segment_count.clamp(1, 11 - start))
+        }
+    };
+    let picks = recent_himawari_visible_scans(
+        satellite,
+        style.required_bands(),
+        seg_start,
+        seg_count,
+        spec.lookback_minutes.max(10),
+        spec.as_of.unwrap_or_else(Utc::now),
+        spec.frame_count,
+    )?;
+    ingest_selected_history(
+        store_root,
+        spec.frame_count,
+        "Himawari composite history",
+        picks,
+        send,
+        |pick| {
+            let mut frame_spec = spec.clone();
+            frame_spec.frame_count = 1;
+            ingest_one_himawari_composite(store_root, &frame_spec, pick, send)
+        },
+    )
 }
 
 /// Native-window single-band Himawari IR ingest (the tropical-card "🛰 IR"
@@ -4354,11 +4476,12 @@ fn ingest_latest_himawari_composite(
 /// (BD, AVN, …) recolors it live at load time; the run family carries the
 /// window token (`fulldisk_<win…>_c13_<day>`) so successive scans of the
 /// same storm window loop in the player.
-fn ingest_latest_himawari_ir_window(
+fn ingest_one_himawari_ir_window(
     store_root: &Path,
     spec: &HimawariIrWindowSpec,
+    pick: HimawariScanPick,
     send: &impl Fn(SatResponse) -> bool,
-) -> Result<String, String> {
+) -> Result<RecentIngestFrame, String> {
     let satellite = HimawariSatellite::parse(&spec.satellite)
         .ok_or_else(|| format!("unknown Himawari satellite '{}'", spec.satellite))?;
     let band = spec.band;
@@ -4368,18 +4491,9 @@ fn ingest_latest_himawari_ir_window(
         ));
     }
     let window = spec.window.clamped();
-    let (seg_start, seg_count) = himawari_window_segments(window)?;
     let cache_root = store_root.join("cache");
     let source_root = store_root.join("sources").join("himawari");
 
-    let pick = latest_himawari_visible_scan(
-        satellite,
-        &[band],
-        seg_start,
-        seg_count,
-        spec.lookback_minutes.max(10),
-        spec.as_of.unwrap_or_else(Utc::now),
-    )?;
     let objects = pick
         .by_band
         .get(&band)
@@ -4438,15 +4552,7 @@ fn ingest_latest_himawari_ir_window(
             select_live_run: false,
         });
     }
-    send(SatResponse::Runs(scan_runs(store_root)));
-    send(SatResponse::SelectFrame {
-        key: SatRunKey {
-            model: frame.model.clone(),
-            run: frame.run.clone(),
-        },
-        hhmm: frame.hhmm,
-    });
-    Ok(format!(
+    let summary = format!(
         "Himawari {} B{band:02} IR window {}: scan {} · {}x{} @ native res · wrote {}/{}/t{:04}",
         satellite.platform(),
         window.run_slug(),
@@ -4456,7 +4562,53 @@ fn ingest_latest_himawari_ir_window(
         frame.model,
         frame.run,
         frame.hhmm
-    ))
+    );
+    Ok(RecentIngestFrame {
+        key: SatRunKey {
+            model: frame.model,
+            run: frame.run,
+        },
+        hhmm: frame.hhmm,
+        summary,
+    })
+}
+
+fn ingest_latest_himawari_ir_window(
+    store_root: &Path,
+    spec: &HimawariIrWindowSpec,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let satellite = HimawariSatellite::parse(&spec.satellite)
+        .ok_or_else(|| format!("unknown Himawari satellite '{}'", spec.satellite))?;
+    let band = spec.band;
+    if !(7..=16).contains(&band) {
+        return Err(format!(
+            "AHI B{band:02} is not an IR band (7-16) — the IR window ingest stores Kelvin BT"
+        ));
+    }
+    let window = spec.window.clamped();
+    let (seg_start, seg_count) = himawari_window_segments(window)?;
+    let picks = recent_himawari_visible_scans(
+        satellite,
+        &[band],
+        seg_start,
+        seg_count,
+        spec.lookback_minutes.max(10),
+        spec.as_of.unwrap_or_else(Utc::now),
+        spec.frame_count,
+    )?;
+    ingest_selected_history(
+        store_root,
+        spec.frame_count,
+        "Himawari IR history",
+        picks,
+        send,
+        |pick| {
+            let mut frame_spec = spec.clone();
+            frame_spec.frame_count = 1;
+            ingest_one_himawari_ir_window(store_root, &frame_spec, pick, send)
+        },
+    )
 }
 
 /// ABI scan mode token in the open-data filenames (mode 6 since 2019; mode
@@ -4464,18 +4616,70 @@ fn ingest_latest_himawari_ir_window(
 /// this constant, mirroring rw-sat's follow engine.
 const GOES_ABI_SCAN_MODE: u8 = 6;
 
-/// Newest scan start time for which EVERY required band has an object under
-/// the recent hour prefixes, plus that scan's per-band object. All 16 ABI
-/// channels of one scan share the same filename `s` timestamp, so the scan
-/// keys line up exactly across bands (no fuzzy time matching needed).
-fn latest_common_scan(
+struct GoesScanPick {
+    scan_start: DateTime<Utc>,
+    objects: HashMap<u8, S3Object>,
+}
+
+/// Intersect already-listed per-band objects into a bounded, newest-first
+/// sequence. Kept separate from S3 I/O so ordering, de-duplication, the
+/// all-band contract, and the daily-run boundary are deterministic tests.
+fn select_recent_common_scans(
+    per_band: &HashMap<u8, HashMap<DateTime<Utc>, S3Object>>,
+    bands: &[u8],
+    limit: usize,
+) -> Vec<GoesScanPick> {
+    let Some(&base) = bands.first() else {
+        return Vec::new();
+    };
+    let Some(base_scans) = per_band.get(&base) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<DateTime<Utc>> = base_scans.keys().copied().collect();
+    candidates.sort_unstable();
+    let target = limit.clamp(1, MAX_RECENT_HISTORY_FRAMES);
+    let mut picks = Vec::with_capacity(target);
+    let mut newest_day = None;
+    for scan in candidates.into_iter().rev() {
+        if bands.iter().all(|band| {
+            per_band
+                .get(band)
+                .is_some_and(|scans| scans.contains_key(&scan))
+        }) {
+            let day = *newest_day.get_or_insert(scan.date_naive());
+            if scan.date_naive() != day {
+                break;
+            }
+            let objects = bands
+                .iter()
+                .map(|band| (*band, per_band[band][&scan].clone()))
+                .collect();
+            picks.push(GoesScanPick {
+                scan_start: scan,
+                objects,
+            });
+            if picks.len() == target {
+                break;
+            }
+        }
+    }
+    picks
+}
+
+/// Recent scan starts for which EVERY required band exists. Each band/hour
+/// prefix is listed once, then exact ABI filename timestamps are intersected
+/// locally—ten history frames never cause ten repeated S3 listings. Results
+/// are newest first and stop at the newest scan's UTC-day boundary because a
+/// store run uses HHMM frame keys.
+fn recent_common_scans(
     bucket: &str,
     abi_product: &str,
     satellite: &GoesSatellite,
     bands: &[u8],
     hours: &[DateTime<Utc>],
     not_after: Option<DateTime<Utc>>,
-) -> Result<(DateTime<Utc>, HashMap<u8, S3Object>), String> {
+    limit: usize,
+) -> Result<Vec<GoesScanPick>, String> {
     let agent = build_agent();
     let mut per_band: HashMap<u8, HashMap<DateTime<Utc>, S3Object>> = HashMap::new();
     for &band in bands {
@@ -4509,17 +4713,9 @@ fn latest_common_scan(
         per_band.insert(band, scans);
     }
 
-    let base = bands[0];
-    let mut candidates: Vec<DateTime<Utc>> = per_band[&base].keys().copied().collect();
-    candidates.sort_unstable();
-    for scan in candidates.into_iter().rev() {
-        if bands.iter().all(|band| per_band[band].contains_key(&scan)) {
-            let objects = bands
-                .iter()
-                .map(|band| (*band, per_band[band][&scan].clone()))
-                .collect();
-            return Ok((scan, objects));
-        }
+    let picks = select_recent_common_scans(&per_band, bands, limit);
+    if !picks.is_empty() {
+        return Ok(picks);
     }
     Err("no scan time yet has every band the composite needs".to_string())
 }
@@ -4590,18 +4786,16 @@ fn read_goes_abi_window(path: &Path, window: SatNativeWindow) -> Result<GoesAbiF
 /// Recipes and per-pixel math are rw-sat's [`compose_rgb_pixels`]; GeoColor /
 /// NaturalColor here are the daytime pseudo-true-color visible composites
 /// (CIRA/CIMSS "GeoColor" lineage; night renders dark/transparent).
-fn ingest_latest_goes_composite(
+fn ingest_one_goes_composite(
     store_root: &Path,
     spec: &GoesCompositeSpec,
+    pick: GoesScanPick,
     send: &impl Fn(SatResponse) -> bool,
-) -> Result<String, String> {
+) -> Result<RecentIngestFrame, String> {
     let style = GoesAbiRgbCompositeStyle::parse(&spec.style)
         .ok_or_else(|| format!("unknown composite style '{}'", spec.style))?;
     let bucket = bucket_for_satellite(&spec.satellite).map_err(|err| err.to_string())?;
-    let sector =
-        Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
     let satellite = GoesSatellite::parse(&spec.satellite);
-    let abi_product = sector.abi_product();
     let bands = style.required_channels().to_vec();
     let base_channel = style.base_channel();
     let window = spec.window.map(SatNativeWindow::clamped);
@@ -4613,15 +4807,10 @@ fn ingest_latest_goes_composite(
     };
     let cache_dir = store_root.join("cache");
 
-    // Recent hour prefixes to scan for the newest all-band scan.
-    let now = spec.as_of.unwrap_or_else(Utc::now);
-    let hour_span = (spec.lookback_minutes.max(20) / 60) + 2;
-    let hours: Vec<DateTime<Utc>> = (0..hour_span)
-        .map(|i| now - chrono::Duration::hours(i))
-        .collect();
-
-    let (scan_start, objects) =
-        latest_common_scan(&bucket, abi_product, &satellite, &bands, &hours, spec.as_of)?;
+    let GoesScanPick {
+        scan_start,
+        objects,
+    } = pick;
 
     // Download + decode every required band: the native window decodes only
     // its hyperslab at stride 1, the full sector decodes whole then decimates.
@@ -4707,17 +4896,8 @@ fn ingest_latest_goes_composite(
             select_live_run: false,
         });
     }
-    send(SatResponse::Runs(scan_runs(store_root)));
-    send(SatResponse::SelectFrame {
-        key: SatRunKey {
-            model: frame.model.clone(),
-            run: frame.run.clone(),
-        },
-        hhmm: frame.hhmm,
-    });
-
     let lit = rgba.iter().filter(|pixel| pixel[3] != 0).count();
-    Ok(format!(
+    let summary = format!(
         "GOES {} {} {}: scan {} · {} band(s) · {}x{} · {:.0}% lit · wrote {}/{}/t{:04}",
         satellite.as_str(),
         // Carries the window token for native-window runs.
@@ -4731,7 +4911,54 @@ fn ingest_latest_goes_composite(
         frame.model,
         frame.run,
         frame.hhmm
-    ))
+    );
+    Ok(RecentIngestFrame {
+        key: SatRunKey {
+            model: frame.model,
+            run: frame.run,
+        },
+        hhmm: frame.hhmm,
+        summary,
+    })
+}
+
+fn ingest_latest_goes_composite(
+    store_root: &Path,
+    spec: &GoesCompositeSpec,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let style = GoesAbiRgbCompositeStyle::parse(&spec.style)
+        .ok_or_else(|| format!("unknown composite style '{}'", spec.style))?;
+    let bucket = bucket_for_satellite(&spec.satellite).map_err(|err| err.to_string())?;
+    let sector =
+        Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
+    let satellite = GoesSatellite::parse(&spec.satellite);
+    let now = spec.as_of.unwrap_or_else(Utc::now);
+    let hour_span = (spec.lookback_minutes.max(20) / 60) + 2;
+    let hours: Vec<DateTime<Utc>> = (0..hour_span)
+        .map(|i| now - chrono::Duration::hours(i))
+        .collect();
+    let picks = recent_common_scans(
+        &bucket,
+        sector.abi_product(),
+        &satellite,
+        style.required_channels(),
+        &hours,
+        spec.as_of,
+        spec.frame_count,
+    )?;
+    ingest_selected_history(
+        store_root,
+        spec.frame_count,
+        "GOES composite history",
+        picks,
+        send,
+        |pick| {
+            let mut frame_spec = spec.clone();
+            frame_spec.frame_count = 1;
+            ingest_one_goes_composite(store_root, &frame_spec, pick, send)
+        },
+    )
 }
 
 /// Bake an IR-enhancement palette over a Kelvin BT plane into three
@@ -4778,12 +5005,13 @@ fn bake_ir_planes(
 ///
 /// Baked-vs-live tradeoff: see [`GoesIrWindowSpec`]. The enhancement used
 /// is stamped in the frame selector's `enhanced_ir` block.
-fn ingest_latest_goes_ir_window(
+fn ingest_one_goes_ir_window(
     store_root: &Path,
     spec: &GoesIrWindowSpec,
     enhancement: IrEnhancement,
+    pick: GoesScanPick,
     send: &impl Fn(SatResponse) -> bool,
-) -> Result<String, String> {
+) -> Result<RecentIngestFrame, String> {
     let band = spec.band;
     if !(7..=16).contains(&band) {
         return Err(format!(
@@ -4791,25 +5019,14 @@ fn ingest_latest_goes_ir_window(
         ));
     }
     let bucket = bucket_for_satellite(&spec.satellite).map_err(|err| err.to_string())?;
-    let sector =
-        Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
     let satellite = GoesSatellite::parse(&spec.satellite);
     let window = spec.window.clamped();
     let cache_dir = store_root.join("cache");
 
-    let now = spec.as_of.unwrap_or_else(Utc::now);
-    let hour_span = (spec.lookback_minutes.max(20) / 60) + 2;
-    let hours: Vec<DateTime<Utc>> = (0..hour_span)
-        .map(|i| now - chrono::Duration::hours(i))
-        .collect();
-    let (scan_start, objects) = latest_common_scan(
-        &bucket,
-        sector.abi_product(),
-        &satellite,
-        &[band],
-        &hours,
-        spec.as_of,
-    )?;
+    let GoesScanPick {
+        scan_start,
+        objects,
+    } = pick;
     let object = &objects[&band];
 
     let agent = build_agent();
@@ -4888,16 +5105,7 @@ fn ingest_latest_goes_ir_window(
         encode_ms: frame.encode_ms,
         select_live_run: false,
     });
-    send(SatResponse::Runs(scan_runs(store_root)));
-    send(SatResponse::SelectFrame {
-        key: SatRunKey {
-            model: frame.model.clone(),
-            run: frame.run.clone(),
-        },
-        hhmm: frame.hhmm,
-    });
-
-    Ok(format!(
+    let summary = format!(
         "GOES {} {} C{band:02} IR window ({}): scan {} · {}x{} @ native res · {:.0}% on-earth · wrote {}/{}/t{:04}",
         satellite.as_str(),
         sector_slug(&scene.sector),
@@ -4909,7 +5117,59 @@ fn ingest_latest_goes_ir_window(
         frame.model,
         frame.run,
         frame.hhmm
-    ))
+    );
+    Ok(RecentIngestFrame {
+        key: SatRunKey {
+            model: frame.model,
+            run: frame.run,
+        },
+        hhmm: frame.hhmm,
+        summary,
+    })
+}
+
+fn ingest_latest_goes_ir_window(
+    store_root: &Path,
+    spec: &GoesIrWindowSpec,
+    enhancement: IrEnhancement,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let band = spec.band;
+    if !(7..=16).contains(&band) {
+        return Err(format!(
+            "ABI C{band:02} is not an IR band (7-16) — the IR window ingest colors Kelvin BT"
+        ));
+    }
+    let bucket = bucket_for_satellite(&spec.satellite).map_err(|err| err.to_string())?;
+    let sector =
+        Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
+    let satellite = GoesSatellite::parse(&spec.satellite);
+    let now = spec.as_of.unwrap_or_else(Utc::now);
+    let hour_span = (spec.lookback_minutes.max(20) / 60) + 2;
+    let hours: Vec<DateTime<Utc>> = (0..hour_span)
+        .map(|i| now - chrono::Duration::hours(i))
+        .collect();
+    let picks = recent_common_scans(
+        &bucket,
+        sector.abi_product(),
+        &satellite,
+        &[band],
+        &hours,
+        spec.as_of,
+        spec.frame_count,
+    )?;
+    ingest_selected_history(
+        store_root,
+        spec.frame_count,
+        "GOES IR history",
+        picks,
+        send,
+        |pick| {
+            let mut frame_spec = spec.clone();
+            frame_spec.frame_count = 1;
+            ingest_one_goes_ir_window(store_root, &frame_spec, enhancement, pick, send)
+        },
+    )
 }
 
 /// The generic satellite selector for a baked RGB composite frame: base band
@@ -5960,6 +6220,90 @@ mod tests {
         dir
     }
 
+    fn test_s3(key: &str) -> S3Object {
+        S3Object {
+            key: key.to_owned(),
+            size_bytes: 1,
+            last_modified: String::new(),
+        }
+    }
+
+    #[test]
+    fn recent_goes_scan_selection_intersects_orders_and_stays_in_one_day() {
+        let t = |day, hour, minute| Utc.with_ymd_and_hms(2026, 7, day, hour, minute, 0).unwrap();
+        let latest = t(14, 23, 50);
+        let missing_band = t(14, 23, 40);
+        let next = t(14, 23, 30);
+        let prior_day = t(13, 23, 50);
+        let mut per_band = HashMap::new();
+        per_band.insert(
+            1,
+            [latest, missing_band, next, prior_day]
+                .into_iter()
+                .map(|scan| (scan, test_s3(&format!("c01-{scan}"))))
+                .collect(),
+        );
+        per_band.insert(
+            2,
+            [latest, next, prior_day]
+                .into_iter()
+                .map(|scan| (scan, test_s3(&format!("c02-{scan}"))))
+                .collect(),
+        );
+
+        let picks = select_recent_common_scans(&per_band, &[1, 2], 10);
+        assert_eq!(
+            picks.iter().map(|pick| pick.scan_start).collect::<Vec<_>>(),
+            vec![latest, next]
+        );
+        assert!(picks.iter().all(|pick| pick.objects.len() == 2));
+    }
+
+    #[test]
+    fn selected_history_caps_at_ten_and_selects_newest_once() {
+        let dir = test_dir("selected-history");
+        let messages = std::sync::Mutex::new(Vec::new());
+        let send = |response| {
+            messages.lock().expect("messages").push(response);
+            true
+        };
+        let processed = std::cell::RefCell::new(Vec::new());
+        let picks: Vec<u16> = (0..12).map(|offset| 1200 - offset).collect();
+        let summary = ingest_selected_history(&dir, 12, "test history", picks, &send, |hhmm| {
+            processed.borrow_mut().push(hhmm);
+            Ok(RecentIngestFrame {
+                key: SatRunKey {
+                    model: "g19".to_owned(),
+                    run: "fulldisk_rgb_test_20260714".to_owned(),
+                },
+                hhmm,
+                summary: format!("frame {hhmm}"),
+            })
+        })
+        .expect("history publishes");
+
+        assert_eq!(processed.borrow().len(), MAX_RECENT_HISTORY_FRAMES);
+        assert!(summary.contains("loaded 10 of 10"), "{summary}");
+        let messages = messages.lock().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, SatResponse::Runs(_)))
+                .count(),
+            1
+        );
+        let selections: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                SatResponse::SelectFrame { key, hhmm } => Some((key, *hhmm)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].1, 1200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn scan_lists_runs_newest_first_with_titles() {
         let dir = test_dir("scan");
@@ -6868,6 +7212,7 @@ mod tests {
             lookback_minutes: 240,
             window: None,
             as_of: None,
+            frame_count: 1,
             card_ticket: None,
         };
         let sink = |response: SatResponse| {
@@ -8020,6 +8365,7 @@ mod tests {
             downsample: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_DOWNSAMPLE", 6),
             window: None,
             as_of: None,
+            frame_count: 1,
             card_ticket: None,
         };
         let sink = |response: SatResponse| {
@@ -8166,6 +8512,7 @@ mod tests {
                 lookback_minutes: 360,
                 window: None,
                 as_of,
+                frame_count: 1,
                 card_ticket: None,
             };
             let summary =
@@ -8672,6 +9019,7 @@ mod tests {
             window: tc_card_window(25.0, -80.0),
             lookback_minutes: 60,
             as_of: None,
+            frame_count: 1,
             card_ticket: Some(41),
         }));
         worker.send(SatRequest::IngestLatestHimawariIrWindow(
@@ -8681,6 +9029,7 @@ mod tests {
                 window: tc_card_window(13.5, 144.8),
                 lookback_minutes: 60,
                 as_of: None,
+                frame_count: 1,
                 card_ticket: None,
             },
         ));
@@ -8691,6 +9040,7 @@ mod tests {
                 window: tc_card_window(13.5, 144.8),
                 lookback_minutes: 60,
                 as_of: None,
+                frame_count: 1,
                 card_ticket: Some(43),
             },
         ));
@@ -8799,6 +9149,7 @@ mod tests {
             window: tc_card_window(25.0, -80.0),
             lookback_minutes: 60,
             as_of: None,
+            frame_count: 1,
             card_ticket: None,
         };
         let err = ingest_latest_goes_ir_window(&dir, &goes, IrEnhancement::Bd, &sink)
@@ -8811,6 +9162,7 @@ mod tests {
             window: tc_card_window(13.5, 144.8),
             lookback_minutes: 60,
             as_of: None,
+            frame_count: 1,
             card_ticket: None,
         };
         let err =

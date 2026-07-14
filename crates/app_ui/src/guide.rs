@@ -281,6 +281,24 @@ fn getting_started(ui: &mut egui::Ui) {
     );
     para(ui, GUIDE_TOP_BAR_TEXT);
 
+    subhead(ui, "DISK CACHE SAFETY");
+    para(
+        ui,
+        "Settings > Performance caps BowEcho's rebuildable downloaded cache at 32 GiB by \
+         default. The cap is shared by downloaded Level-II/archive/live radar files and map \
+         tiles; when needed, the oldest files recycle first. Set the limit to 0 only when \
+         you explicitly want unlimited cache growth.",
+    );
+    action(
+        ui,
+        "Repair/reset downloaded cache…",
+        "— uses a confirmation step, then safely recreates only those radar/map cache \
+         folders. Models, satellite data, local imports, settings, palettes, annotations, \
+         screenshots, and recordings are never removed. This clears damaged downloaded \
+         copies so BowEcho can fetch them again; it does not modify or repair a user source \
+         file.",
+    );
+
     subhead(ui, "WORKFLOWS");
     action(
         ui,
@@ -2006,12 +2024,36 @@ fn satellite(ui: &mut egui::Ui) {
         ui,
         "Each tropical cyclone card carries \u{1f6f0} Vis and \u{1f6f0} IR buttons beside \
          \u{1f4cd} Focus. One press picks the covering geostationary satellite for that storm's \
-         basin (Himawari-9 / GOES-East / GOES-West), pulls a native-resolution window centered \
-         on the storm, and opens it in the Satellite window while following the frame onto the \
-         radar map — true color for Vis (daylight side only), Band-13 brightness temperature \
-         with your chosen IR enhancement for IR (day and night). One storm satellite load runs \
-         at a time.",
+         basin (Himawari-9 / GOES-East / GOES-West), pulls up to 10 recent native-resolution \
+         frames centered on the storm, and opens the loop in the Satellite window while \
+         following the newest frame onto the radar map — true color for Vis (daylight side \
+         only), Band-13 brightness temperature with your chosen IR enhancement for IR (day and \
+         night). One storm satellite load runs at a time.",
     );
+
+    subhead(ui, "HURRICANE HUNTERS (LIVE HDOB)");
+    para(
+        ui,
+        "Enable Hurricane Hunters (live HDOB) beside Tropical cyclones in Settings to show \
+         active USAF and NOAA reconnaissance. Cyan is Air Force; orange is NOAA. The line is \
+         the track accumulated during this BowEcho session, spaced meteorological barbs are \
+         30-second flight-level winds, and the aircraft glyph marks the newest report. The \
+         compact status also shows pressure and T/Td when those fields pass the bulletin's \
+         quality flags. BowEcho polls the four official Atlantic and East/Central Pacific NHC \
+         feeds every ~45 seconds only while enabled, deduplicates successive bulletins, and \
+         removes missions whose newest valid report is more than 12 hours old.",
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.hyperlink_to(
+            "NHC aircraft reconnaissance",
+            "https://www.nhc.noaa.gov/recon.php",
+        );
+        ui.label("·");
+        ui.hyperlink_to(
+            "Official HDOB specification",
+            "https://www.nhc.noaa.gov/pdf/HDOB-specification.pdf",
+        );
+    });
 
     subhead(ui, "FRAME PLAYER");
     para(

@@ -990,6 +990,28 @@ impl ViewerApp {
             });
         }
         if ui
+            .checkbox(
+                &mut self.app_settings.show_hurricane_hunters,
+                "Hurricane Hunters (live HDOB)",
+            )
+            .on_hover_text(
+                "Live USAF and NOAA reconnaissance aircraft from the four official NHC High-Density Observation feeds. Draws the current session track, spaced flight-level wind barbs, and the newest aircraft position. Polls only while enabled; bulletins older than 12 hours are rejected.",
+            )
+            .changed()
+        {
+            self.mark_app_settings_dirty();
+            ctx.request_repaint();
+        }
+        if self.app_settings.show_hurricane_hunters {
+            ui.indent("hurricane_hunters_status", |ui| {
+                self.tropical.hurricane_hunters.status_ui(ui);
+                ui.hyperlink_to(
+                    "Official NHC reconnaissance page",
+                    "https://www.nhc.noaa.gov/recon.php",
+                );
+            });
+        }
+        if ui
             .checkbox(&mut self.app_settings.show_radar_status, "Radar status / outages")
             .on_hover_text(
                 "Show the selected US NEXRAD/TDWR radar's live operational status from the NWS \

@@ -19,6 +19,7 @@ use data_source::tropical::{self, Basin, Category, StormGeometry, TropicalCyclon
 use eframe::egui;
 use ui_core::worker_slot::{SlotPoll, WorkerSlot};
 
+use crate::hurricane_hunters::HurricaneHunterState;
 use crate::sat_window::{self, SatNativeWindow};
 use crate::sat_worker;
 
@@ -150,6 +151,11 @@ pub struct TropicalState {
     /// Monotonic ticket source correlating card requests with worker
     /// outcomes (stale outcomes from superseded requests are dropped).
     sat_view_ticket: u64,
+    /// Official NHC High-Density Observations from active USAF/NOAA
+    /// reconnaissance flights. Kept beside the cyclone layer because its
+    /// controls/status share the tropical map surface, but independently
+    /// toggleable (invest missions may precede a numbered storm).
+    pub(crate) hurricane_hunters: HurricaneHunterState,
 }
 
 impl Default for TropicalState {
@@ -166,6 +172,7 @@ impl Default for TropicalState {
             sat_view_request: None,
             sat_view_inflight: None,
             sat_view_ticket: 0,
+            hurricane_hunters: HurricaneHunterState::default(),
         }
     }
 }
@@ -404,16 +411,17 @@ impl TropicalState {
                             TcSatProduct::Vis,
                             "🛰 Vis",
                             "One press: pick the covering geostationary satellite \
-                             (Himawari / GOES-East / GOES-West) and load a native-resolution \
-                             TRUE-COLOR window centered on this storm. Opens the Satellite \
-                             window and follows the frame onto the radar map. Daylight side only.",
+                             (Himawari / GOES-East / GOES-West) and load up to 10 recent \
+                             native-resolution TRUE-COLOR frames centered on this storm. Opens \
+                             the Satellite window and follows the newest frame onto the radar \
+                             map. Daylight side only.",
                         ),
                         (
                             TcSatProduct::Ir,
                             "🛰 IR",
-                            "One press: pick the covering geostationary satellite and load a \
-                             Band-13 IR window centered on this storm, colored with the \
-                             currently selected IR enhancement (BD, AVN, …). Works day and night.",
+                            "One press: pick the covering geostationary satellite and load up to \
+                             10 recent Band-13 IR frames centered on this storm, colored with \
+                             the currently selected IR enhancement (BD, AVN, …). Works day and night.",
                         ),
                     ] {
                         let response = ui
@@ -742,6 +750,7 @@ fn plan_tc_sat_view(
                 satellite: sat.satellite_slug().to_string(),
                 style: "true_color".to_string(),
                 window: Some(window),
+                frame_count: 10,
                 card_ticket: Some(ticket),
                 ..Default::default()
             })
@@ -753,6 +762,7 @@ fn plan_tc_sat_view(
                 window,
                 lookback_minutes: 180,
                 as_of: None,
+                frame_count: 10,
                 card_ticket: Some(ticket),
             })
         }
@@ -765,6 +775,7 @@ fn plan_tc_sat_view(
                 sector: "fulldisk".to_string(),
                 style: "natural_color".to_string(),
                 window: Some(window),
+                frame_count: 10,
                 card_ticket: Some(ticket),
                 ..Default::default()
             })
@@ -777,6 +788,7 @@ fn plan_tc_sat_view(
                 window,
                 lookback_minutes: 180,
                 as_of: None,
+                frame_count: 10,
                 card_ticket: Some(ticket),
             })
         }
@@ -789,6 +801,7 @@ impl crate::ViewerApp {
     /// under the current-position intensity glyph. Both map paint sites call
     /// this (single-pane and per-cell).
     pub(crate) fn draw_tropical(&self, painter: &egui::Painter, rect: egui::Rect) {
+        self.draw_hurricane_hunters(painter, rect);
         if !self.app_settings.show_tropical || self.tropical.storms.is_empty() {
             return;
         }
@@ -1523,6 +1536,7 @@ mod tests {
             TcSatPlan::HimawariVis(spec) => {
                 assert_eq!(spec.satellite, "h9");
                 assert_eq!(spec.style, "true_color");
+                assert_eq!(spec.frame_count, 10);
                 assert_eq!(spec.card_ticket, Some(7));
                 let window = spec.window.expect("native window attached");
                 assert!((window.center_lat_deg - 25.3).abs() < 1e-9);
@@ -1538,6 +1552,7 @@ mod tests {
             TcSatPlan::HimawariIr(spec) => {
                 assert_eq!(spec.satellite, "h9");
                 assert_eq!(spec.band, 13);
+                assert_eq!(spec.frame_count, 10);
                 assert_eq!(spec.card_ticket, Some(8));
                 assert!((spec.window.center_lon_deg - 131.2).abs() < 1e-9);
             }
@@ -1553,6 +1568,7 @@ mod tests {
                 assert_eq!(spec.satellite, "goes19");
                 assert_eq!(spec.sector, "fulldisk");
                 assert_eq!(spec.style, "natural_color");
+                assert_eq!(spec.frame_count, 10);
                 assert_eq!(spec.card_ticket, Some(9));
                 let window = spec.window.expect("native window attached");
                 assert!((window.center_lat_deg - 22.7).abs() < 1e-9);
@@ -1569,6 +1585,7 @@ mod tests {
                 assert_eq!(spec.satellite, "goes18");
                 assert_eq!(spec.sector, "fulldisk");
                 assert_eq!(spec.band, 13);
+                assert_eq!(spec.frame_count, 10);
                 assert_eq!(spec.card_ticket, Some(10));
                 assert!((spec.window.center_lon_deg - (-105.0)).abs() < 1e-9);
             }
