@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.33.3"
+version = "0.34.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/bowecho"
@@ -49,10 +49,10 @@ incremental = true
 strip = false
 
 [patch.crates-io]
-hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "4ae2ed76658cbd1d62e91260a0581799242c9c8c" }
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "fe9797f86c8958b5a625a4a7682c6b6aeff6b309" }
 
 # sharppyrs pulls sharprs from its standalone repo; unify it with the
 # rusty-weather-vendored sharprs every other crate here uses so the two
 # resolve to ONE crate (identical types).
 [patch."https://github.com/FahrenheitResearch/sharprs"]
-sharprs = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "4ae2ed76658cbd1d62e91260a0581799242c9c8c" }
+sharprs = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "fe9797f86c8958b5a625a4a7682c6b6aeff6b309" }
