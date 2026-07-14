@@ -884,6 +884,25 @@ fn model_data(ui: &mut egui::Ui) {
         ui,
         "Both need Model data enabled and at least one ingested run on disk.",
     );
+    action(
+        ui,
+        "Stretch / Fit",
+        concat!(
+            "— in a docked SHARPpy sounding, Stretch fills the pane independently in both ",
+            "directions as you drag the workspace dividers; Fit preserves the desktop board's ",
+            "aspect ratio. The choice persists.",
+        ),
+    );
+    action(
+        ui,
+        "⚙ Edit panel layout",
+        concat!(
+            "— choose which diagnostic occupies each cell, then drag the cyan shared borders ",
+            "to resize the upper and bottom rows, skew-T and right side, hodograph and inset ",
+            "row, narrow strips, individual insets, and bottom cells such as Index Board and ",
+            "Streamwiseness. Every split remains aligned and persists; reset restores the default.",
+        ),
+    );
 
     subhead(ui, "HAIL LEVELS FROM THE MODEL");
     action(

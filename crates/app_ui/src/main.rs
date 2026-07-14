@@ -8728,6 +8728,13 @@ impl ViewerApp {
         if !palette_misses.is_empty() {
             app.color_table_status = palette_misses.join("\n");
         }
+        // Model and observed/native soundings share one durable SHARPpy
+        // layout and dock-sizing preference. ModelDataDock restores this in
+        // its constructor; restore the native panel here too so changing
+        // sources never appears to reset the board.
+        if let Some(value) = app.app_settings.sounding_view_state.clone() {
+            app.native_sounding_panel.apply_view_state_json(&value);
+        }
         app.start_site_catalog_load(&cc.egui_ctx);
         app.load_volume(&cc.egui_ctx);
         app.load_live_hazards(&cc.egui_ctx);
@@ -26823,13 +26830,61 @@ impl ViewerApp {
         }
     }
 
+    /// Change which sounding data source owns the shared viewer without
+    /// changing its presentation. The two panel instances wrap different
+    /// data pipelines, but their SHARPpy layout and host sizing are one user
+    /// preference and must travel with every source switch.
+    fn set_sounding_viewer_source(&mut self, next: SoundingViewerSource) {
+        if self.sounding_viewer_source == next {
+            return;
+        }
+        let state = match self.sounding_viewer_source {
+            SoundingViewerSource::NativeOnly => self.native_sounding_panel.view_state_json(),
+            SoundingViewerSource::Model => self
+                .model_dock
+                .as_ref()
+                .map(model_data::ModelDataDock::sounding_view_state_json)
+                .unwrap_or_else(|| self.native_sounding_panel.view_state_json()),
+        };
+        match next {
+            SoundingViewerSource::NativeOnly => {
+                self.native_sounding_panel.apply_view_state_json(&state);
+            }
+            SoundingViewerSource::Model => {
+                if let Some(dock) = self.model_dock.as_mut() {
+                    dock.apply_sounding_view_state_json(&state);
+                }
+            }
+        }
+        self.sounding_viewer_source = next;
+    }
+
     /// Write the workspace layout (tree + tri-states + preferences) into
     /// config.json — only when the snapshot actually changed.
     fn persist_sounding_view_state(&mut self) {
-        let Some(dock) = self.model_dock.as_ref() else {
-            return;
+        let value = match self.sounding_viewer_source {
+            SoundingViewerSource::NativeOnly => self.native_sounding_panel.view_state_json(),
+            SoundingViewerSource::Model => {
+                let Some(dock) = self.model_dock.as_ref() else {
+                    return;
+                };
+                dock.sounding_view_state_json()
+            }
         };
-        let value = dock.sounding_view_state_json();
+        // Keep both render hosts synchronized before saving. Closing a model
+        // sounding resets the active-source enum to NativeOnly; without this
+        // handoff, the later app-exit flush could overwrite the just-saved
+        // model layout with stale native-panel geometry (and vice versa).
+        match self.sounding_viewer_source {
+            SoundingViewerSource::NativeOnly => {
+                if let Some(dock) = self.model_dock.as_mut() {
+                    dock.apply_sounding_view_state_json(&value);
+                }
+            }
+            SoundingViewerSource::Model => {
+                self.native_sounding_panel.apply_view_state_json(&value);
+            }
+        }
         if self.app_settings.sounding_view_state.as_ref() != Some(&value) {
             self.app_settings.sounding_view_state = Some(value);
             self.mark_app_settings_dirty();
@@ -30300,7 +30355,7 @@ impl ViewerApp {
                 return;
             }
             self.native_sounding_src = Some(Arc::clone(&data));
-            self.sounding_viewer_source = SoundingViewerSource::Model;
+            self.set_sounding_viewer_source(SoundingViewerSource::Model);
             let (sender, receiver) = mpsc::channel();
             self.native_sounding_rx = Some(receiver);
             let ctx_clone = ctx.clone();
@@ -30402,7 +30457,7 @@ impl ViewerApp {
                     // spawned from the hail-env dock reply.
                     if let Some((data, column)) = external_sounding {
                         self.native_sounding_panel.set_native_column(data, column);
-                        self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
+                        self.set_sounding_viewer_source(SoundingViewerSource::NativeOnly);
                     }
                     self.dock_model_sounding_beside_plot();
                     ctx.request_repaint();
@@ -30508,7 +30563,7 @@ impl ViewerApp {
         // set_viewer_open(false) persists the user's view-state and clears
         // native_skewt_open (marking the layout dirty when it changes).
         self.set_viewer_open(dock::WorkspacePane::Sounding, false);
-        self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
+        self.set_sounding_viewer_source(SoundingViewerSource::NativeOnly);
         self.last_sounding_request = None;
         self.workspace.mark_dirty();
     }
@@ -32784,7 +32839,7 @@ impl ViewerApp {
 
         let (sender, receiver) = mpsc::channel();
         self.native_sounding_rx = Some(receiver);
-        self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
+        self.set_sounding_viewer_source(SoundingViewerSource::NativeOnly);
         self.native_sounding_panel.set_loading();
         self.open_viewer(dock::WorkspacePane::Sounding);
         self.status = format!("Fetching RAOB {site_id}…");

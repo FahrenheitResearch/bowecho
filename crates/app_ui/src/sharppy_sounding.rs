@@ -68,6 +68,10 @@ pub struct SharppySoundingPanel {
     inner: rw_ui::SoundingPanel,
     analysis: Option<Box<SharppyAnalysis>>,
     classic: bool,
+    /// Docked SHARPpy boards fill both available axes by default. Users can
+    /// switch to aspect-fit from the inline host controls; this choice is
+    /// persisted alongside the panel layout.
+    docked_stretch: bool,
     /// Last-seen SPC-window layout tokens ([`sharppyrs::SoundingLayout::to_tokens`]),
     /// mirrored out of egui memory during `ui()` so `view_state_json` (no ctx)
     /// can persist them.
@@ -83,6 +87,7 @@ impl SharppySoundingPanel {
             inner: rw_ui::SoundingPanel::new(),
             analysis: None,
             classic: false,
+            docked_stretch: true,
             layout_tokens: None,
             pending_layout_tokens: None,
         }
@@ -113,8 +118,9 @@ impl SharppySoundingPanel {
         self.inner.has_content() || self.analysis.is_some()
     }
 
-    /// The classic panel's view-state object with one added string key,
-    /// `"sharppy_layout"`, carrying the SPC-window layout tokens
+    /// The classic panel's view-state object with SHARPpy host keys:
+    /// `"sharppy_layout"` carries the SPC-window layout tokens and
+    /// `"sharppy_docked_stretch"` carries the dock sizing preference
     /// ([`sharppyrs::SoundingLayout::to_tokens`]). Keeping the inner object's
     /// shape (rather than nesting it) preserves every key existing consumers
     /// patch directly — e.g. `model_data::patch_sounding_scene_zoom` writing
@@ -125,6 +131,12 @@ impl SharppySoundingPanel {
             obj.insert(
                 "sharppy_layout".to_owned(),
                 serde_json::Value::String(tokens.clone()),
+            );
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "sharppy_docked_stretch".to_owned(),
+                serde_json::Value::Bool(self.docked_stretch),
             );
         }
         value
@@ -140,6 +152,12 @@ impl SharppySoundingPanel {
         {
             self.layout_tokens = Some(tokens.clone());
             self.pending_layout_tokens = Some(tokens);
+        }
+        if let Some(stretch) = value
+            .get("sharppy_docked_stretch")
+            .and_then(serde_json::Value::as_bool)
+        {
+            self.docked_stretch = stretch;
         }
         self.inner.apply_view_state_json(value)
     }
@@ -174,10 +192,18 @@ impl SharppySoundingPanel {
 
     fn ui_with_host(&mut self, ui: &mut egui::Ui, docked: bool) {
         let layout_id = Self::layout_memory_id();
+        let stretch_id = layout_id.with("docked_stretch");
+        let mut docked_stretch: bool = ui
+            .ctx()
+            .data_mut(|data| data.get_temp(stretch_id))
+            .unwrap_or(self.docked_stretch);
         // A layout restored from saved view state lands in egui memory here,
-        // on the first frame with a ctx.
+        // on the first frame with a ctx. Model and native/RAOB panels share
+        // this id; a second host opening later must not replay its stale
+        // startup copy over geometry the first host has already edited.
         if let Some(tokens) = self.pending_layout_tokens.take()
             && let Some(layout) = sharppyrs::SoundingLayout::from_tokens(&tokens)
+            && sharppyrs::stored_layout(ui.ctx(), layout_id).is_none()
         {
             sharppyrs::store_layout(ui.ctx(), layout_id, &layout);
         }
@@ -185,13 +211,30 @@ impl SharppySoundingPanel {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.classic, false, "SHARPpy");
                 ui.selectable_value(&mut self.classic, true, "Classic");
+                if docked && !self.classic {
+                    ui.separator();
+                    ui.weak("Pane");
+                    ui.selectable_value(&mut docked_stretch, true, "Stretch")
+                        .on_hover_text(
+                            "Fill the dock in both directions. Drag the workspace splitters to resize the complete sounding.",
+                        );
+                    ui.selectable_value(&mut docked_stretch, false, "Fit")
+                        .on_hover_text(
+                            "Preserve the desktop board aspect ratio and leave unused space when the dock has a different shape.",
+                        );
+                }
             });
         }
         if !self.classic
             && let Some(analysis) = self.analysis.as_ref()
         {
             let available = ui.available_size();
-            let size = if docked {
+            let size = if docked && docked_stretch {
+                egui::vec2(
+                    available.x.max(200.0),
+                    available.y.max(SHARPPY_RENDER_MIN_HEIGHT),
+                )
+            } else if docked {
                 docked_sounding_canvas_size(available)
             } else {
                 floating_sounding_canvas_size(available)
@@ -233,6 +276,9 @@ impl SharppySoundingPanel {
         if let Some(layout) = sharppyrs::stored_layout(ui.ctx(), layout_id) {
             self.layout_tokens = Some(layout.to_tokens());
         }
+        self.docked_stretch = docked_stretch;
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(stretch_id, docked_stretch));
     }
 }
 
@@ -472,6 +518,65 @@ mod tests {
         let short = docked_sounding_canvas_size(egui::vec2(1_800.0, 700.0));
         assert!((short.y - 700.0).abs() < 0.01);
         assert!(short.x < 1_800.0);
+    }
+
+    #[test]
+    fn docked_stretch_choice_round_trips_in_view_state() {
+        let mut panel = SharppySoundingPanel::new();
+        assert_eq!(
+            panel.view_state_json()["sharppy_docked_stretch"].as_bool(),
+            Some(true)
+        );
+        let mut state = panel.view_state_json();
+        state["sharppy_docked_stretch"] = serde_json::json!(false);
+        assert!(panel.apply_view_state_json(&state));
+        assert_eq!(
+            panel.view_state_json()["sharppy_docked_stretch"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn model_and_native_hosts_share_docked_stretch_live() {
+        let mut first = SharppySoundingPanel::new();
+        let mut first_state = first.view_state_json();
+        first_state["sharppy_docked_stretch"] = serde_json::json!(false);
+        assert!(first.apply_view_state_json(&first_state));
+        let mut second = SharppySoundingPanel::new();
+        assert_eq!(
+            second.view_state_json()["sharppy_docked_stretch"].as_bool(),
+            Some(true)
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| first.ui_docked(ui));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| second.ui_docked(ui));
+        assert_eq!(
+            second.view_state_json()["sharppy_docked_stretch"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn unopened_second_host_cannot_replay_stale_layout_tokens() {
+        let mut second = SharppySoundingPanel::new();
+        let mut stale = second.view_state_json();
+        stale.as_object_mut().unwrap().insert(
+            "sharppy_layout".to_owned(),
+            serde_json::json!(sharppyrs::SoundingLayout::default().to_tokens()),
+        );
+        assert!(second.apply_view_state_json(&stale));
+
+        let ctx = egui::Context::default();
+        let mut edited = sharppyrs::SoundingLayout::default();
+        edited.top_height_fraction = 0.58;
+        edited.bottom_column_fractions = [0.52, 0.28, 0.20];
+        sharppyrs::store_layout(&ctx, SharppySoundingPanel::layout_memory_id(), &edited);
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| second.ui_docked(ui));
+        let stored = sharppyrs::stored_layout(&ctx, SharppySoundingPanel::layout_memory_id())
+            .expect("shared layout remains installed");
+        assert_eq!(stored, edited);
     }
 
     /// A restored layout lands in egui memory on the next `ui()` frame under
