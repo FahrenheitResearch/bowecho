@@ -2430,14 +2430,23 @@ impl ModelDataDock {
         self.sounding.has_content()
     }
 
-    /// Render the reusable rw-ui sounding panel outside the Model Data dock.
-    pub fn sounding_ui(&mut self, ui: &mut egui::Ui) {
-        self.sounding_ui_with_host(ui, false);
+    /// Render with app-owned controls in the same header row. Model-owned
+    /// actions (box sounding) are applied here; app-owned actions are returned
+    /// to the caller.
+    pub(crate) fn sounding_ui_with_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        controls: &crate::sharppy_sounding::SoundingHeaderControls,
+    ) -> crate::sharppy_sounding::SoundingHeaderActions {
+        self.sounding_ui_with_host(ui, false, controls)
     }
 
-    /// Render the reusable sounding responsively inside the workspace dock.
-    pub fn sounding_ui_docked(&mut self, ui: &mut egui::Ui) {
-        self.sounding_ui_with_host(ui, true);
+    pub(crate) fn sounding_ui_docked_with_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        controls: &crate::sharppy_sounding::SoundingHeaderControls,
+    ) -> crate::sharppy_sounding::SoundingHeaderActions {
+        self.sounding_ui_with_host(ui, true, controls)
     }
 
     /// Snapshot the model-owned map-tool state for controls rendered inside
@@ -2461,10 +2470,16 @@ impl ModelDataDock {
                 armed: self.box_sounding_armed,
                 unavailable_reason,
             }),
+            ..Default::default()
         }
     }
 
-    fn sounding_ui_with_host(&mut self, ui: &mut egui::Ui, docked: bool) {
+    fn sounding_ui_with_host(
+        &mut self,
+        ui: &mut egui::Ui,
+        docked: bool,
+        controls: &crate::sharppy_sounding::SoundingHeaderControls,
+    ) -> crate::sharppy_sounding::SoundingHeaderActions {
         self.handle_responses();
         if let Some(summary) = &self.box_sounding_summary {
             box_sounding_summary_ui(ui, summary);
@@ -2486,15 +2501,15 @@ impl ModelDataDock {
                 });
             ui.add_space(4.0);
         }
-        let controls = self.sounding_header_controls();
         let actions = if docked {
-            self.sounding.ui_docked_with_header(ui, &controls)
+            self.sounding.ui_docked_with_header(ui, controls)
         } else {
-            self.sounding.ui_with_header(ui, &controls)
+            self.sounding.ui_with_header(ui, controls)
         };
         if actions.toggle_box_sounding {
             self.set_box_sounding_armed(!self.box_sounding_armed);
         }
+        actions
     }
 
     /// The latest sounding belongs to the box-mean path. The app uses this to

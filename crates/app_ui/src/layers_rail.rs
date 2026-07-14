@@ -843,12 +843,13 @@ impl ViewerApp {
             // behind the row's ⚙ popover now (spec §2.3).
             let obs_show_metar = &mut self.obs_show_metar;
             let obs_show_mesonet = &mut self.obs_show_mesonet;
-            let obs_adjust_soundings = &mut self.obs_adjust_soundings;
+            let mut obs_adjust_soundings = self.obs_adjust_soundings;
             let obs_hour_loop_enabled = &mut self.obs_hour_loop_enabled;
             let obs_hour_loop_started_at = &mut self.obs_hour_loop_started_at;
             let obs_hour_loop_end_utc = &mut self.obs_hour_loop_end_utc;
             let obs_fetched_at = self.obs_fetched_at;
             let obs_station_count = self.surface_obs.station_count;
+            let mut obs_adjust_changed = false;
             let obs_fetching =
                 self.obs_rx.is_some() || self.nws_obs_rx.is_some() || self.mesonet_rx.is_some();
             let obs_count_text = obs_fetched_at.map(|at| {
@@ -900,12 +901,13 @@ impl ViewerApp {
                             ui.weak("Dots: white METAR, amber mesonet.");
                             ui.separator();
                             if ui
-                                        .checkbox(obs_adjust_soundings, "Obs-adjusted soundings")
+                                        .checkbox(&mut obs_adjust_soundings, "Obs-adjusted soundings")
                                         .on_hover_text(
                                             "The skew-T's surface T/Td/wind come from the nearest station (within 30 km, fresher than 60 min) instead of the model — parcels recompute from the REAL surface. The title shows which station adjusted it.",
                                         )
                                         .changed()
                                     {
+                                        obs_adjust_changed = true;
                                         ui.ctx().request_repaint();
                                     }
                             ui.separator();
@@ -921,6 +923,12 @@ impl ViewerApp {
                 },
             ) {
                 ctx.request_repaint();
+            }
+            if obs_adjust_changed {
+                // Match the top-of-sounding shortcut: adjustment depends on
+                // Surface obs, while turning adjustment back off must not
+                // unexpectedly hide that independently useful map layer.
+                self.set_obs_adjust_soundings(obs_adjust_soundings, ctx);
             }
         }
         // LIGHTNING (GLM) — promoted from a bare checkbox to the row

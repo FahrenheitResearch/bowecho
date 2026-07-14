@@ -271,6 +271,12 @@ pub struct AppSettings {
     pub overlay_obs_metar: bool,
     #[serde(default = "default_true")]
     pub overlay_obs_mesonet: bool,
+    /// Replace the lowest model-sounding level with a nearby surface
+    /// observation before recomputing parcel diagnostics. Enabling this in
+    /// the sounding header also enables `overlay_obs`; disabling it leaves
+    /// the surface-observation layer alone.
+    #[serde(default)]
+    pub overlay_obs_adjust_soundings: bool,
     #[serde(default)]
     pub overlay_glm: bool,
     /// GOES GLM display filter: draw flashes from the trailing N minutes.
@@ -965,6 +971,7 @@ impl Default for AppSettings {
             overlay_obs: false,
             overlay_obs_metar: true,
             overlay_obs_mesonet: true,
+            overlay_obs_adjust_soundings: false,
             overlay_glm: false,
             glm_show_last_minutes: default_glm_show_last_minutes(),
             sat_native_window_enabled: false,
@@ -1681,6 +1688,20 @@ mod tests {
     #[test]
     fn brand_default_stays_sparse_in_app_settings_json() {
         assert!(!AppSettings::default().to_json().contains("\"brand\""));
+    }
+
+    #[test]
+    fn obs_adjust_sounding_preference_defaults_off_and_round_trips() {
+        assert!(!AppSettings::from_json("{}").overlay_obs_adjust_soundings);
+
+        let settings = AppSettings {
+            overlay_obs: true,
+            overlay_obs_adjust_soundings: true,
+            ..AppSettings::default()
+        };
+        let restored = AppSettings::from_json(&settings.to_json());
+        assert!(restored.overlay_obs);
+        assert!(restored.overlay_obs_adjust_soundings);
     }
 
     #[test]

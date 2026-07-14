@@ -8252,6 +8252,7 @@ impl ViewerApp {
             app_settings.overlay_raob,
             app_settings.overlay_mping_reports,
         );
+        let restored_obs_adjust_soundings = app_settings.overlay_obs_adjust_soundings;
         let restored_grid_layout = match app_settings.grid_pane_count {
             2 => PanelLayout::TwoVertical,
             3 => PanelLayout::ThreeStacked,
@@ -8590,10 +8591,13 @@ impl ViewerApp {
             raob_sites_rx: None,
             raob_sites_fetch_attempted: false,
             raob_markers_enabled: restored_overlays.6,
-            obs_enabled: restored_overlays.0,
+            // An enabled adjustment depends on the observation feed. Keep a
+            // saved adjustment effective even if an older/inconsistent config
+            // recorded the layer itself as off.
+            obs_enabled: restored_overlays.0 || restored_obs_adjust_soundings,
             obs_show_metar: restored_overlays.1,
             obs_show_mesonet: restored_overlays.2,
-            obs_adjust_soundings: false,
+            obs_adjust_soundings: restored_obs_adjust_soundings,
             obs_hour_loop_enabled: false,
             obs_hour_loop_started_at: Instant::now(),
             obs_hour_loop_end_utc: Utc::now(),
@@ -20760,6 +20764,7 @@ impl ViewerApp {
         self.app_settings.overlay_obs = self.obs_enabled;
         self.app_settings.overlay_obs_metar = self.obs_show_metar;
         self.app_settings.overlay_obs_mesonet = self.obs_show_mesonet;
+        self.app_settings.overlay_obs_adjust_soundings = self.obs_adjust_soundings;
         self.app_settings.overlay_glm = self.glm_enabled;
         self.app_settings.overlay_spc_outlooks = self.spc_outlooks_enabled.clone();
         self.app_settings.overlay_spc_reports = self.spc_reports_enabled;
@@ -30722,29 +30727,104 @@ impl ViewerApp {
         }
     }
 
+    fn sounding_header_controls(&self) -> sharppy_sounding::SoundingHeaderControls {
+        let mut controls = self
+            .model_dock
+            .as_ref()
+            .map(model_data::ModelDataDock::sounding_header_controls)
+            .unwrap_or_default();
+        // Show the effective state, not merely the dependent preference: an
+        // inconsistent legacy config with Surface obs off should visibly be
+        // off until one click enables both pieces.
+        controls.obs_adjusted = Some(self.obs_adjust_soundings && self.obs_enabled);
+        controls
+    }
+
+    fn apply_sounding_header_actions(
+        &mut self,
+        actions: sharppy_sounding::SoundingHeaderActions,
+        ctx: &egui::Context,
+    ) {
+        if actions.toggle_obs_adjusted {
+            let enabled = !(self.obs_adjust_soundings && self.obs_enabled);
+            self.set_obs_adjust_soundings(enabled, ctx);
+        }
+    }
+
+    /// Apply the combined sounding-header preference. Enabling adjustment
+    /// turns on its Surface obs dependency; disabling adjustment deliberately
+    /// leaves the independently useful map layer alone.
+    fn set_obs_adjust_soundings(&mut self, enabled: bool, ctx: &egui::Context) {
+        let adjustment_changed = self.obs_adjust_soundings != enabled;
+        let surface_changed = enabled && !self.obs_enabled;
+
+        self.obs_adjust_soundings = enabled;
+        if enabled {
+            self.obs_enabled = true;
+        }
+
+        let settings_changed = self.app_settings.overlay_obs != self.obs_enabled
+            || self.app_settings.overlay_obs_adjust_soundings != self.obs_adjust_soundings;
+        self.app_settings.overlay_obs = self.obs_enabled;
+        self.app_settings.overlay_obs_adjust_soundings = self.obs_adjust_soundings;
+        if settings_changed {
+            self.mark_app_settings_dirty();
+        }
+
+        // Re-evaluate an already displayed model column immediately. RAOBs
+        // share the native panel but are intentionally excluded, so changing
+        // the future model preference can never replace an observed profile.
+        if adjustment_changed {
+            self.refresh_current_model_sounding_for_obs_adjust();
+        }
+
+        if adjustment_changed || surface_changed {
+            self.status = if enabled {
+                "Obs-adjusted model soundings on (Surface obs enabled)".to_owned()
+            } else {
+                "Obs-adjusted model soundings off (Surface obs remains enabled)".to_owned()
+            };
+            ctx.request_repaint();
+        }
+    }
+
+    fn refresh_current_model_sounding_for_obs_adjust(&mut self) {
+        let current_is_model = self.sounding_viewer_source == SoundingViewerSource::Model
+            || self.native_sounding_panel.is_obs_adjusted_model();
+        if !current_is_model {
+            return;
+        }
+        drop(self.native_sounding_rx.take());
+        self.native_sounding_src = None;
+        self.set_sounding_viewer_source(SoundingViewerSource::Model);
+    }
+
     /// Sounding body, window and pane alike. The docked pane outlives any
     /// single sounding, so it placeholder-prompts until one arrives.
     fn sounding_pane_body(&mut self, ui: &mut egui::Ui, docked: bool) {
         if self.sounding_viewer_source == SoundingViewerSource::Model
-            && let Some(dock) = self.model_dock.as_mut()
-            && dock.sounding_has_content()
+            && self
+                .model_dock
+                .as_ref()
+                .is_some_and(model_data::ModelDataDock::sounding_has_content)
         {
-            if docked {
-                dock.sounding_ui_docked(ui);
-            } else {
-                dock.sounding_ui(ui);
-            }
+            let controls = self.sounding_header_controls();
+            let actions = {
+                let dock = self.model_dock.as_mut().expect("checked above");
+                if docked {
+                    dock.sounding_ui_docked_with_header(ui, &controls)
+                } else {
+                    dock.sounding_ui_with_header(ui, &controls)
+                }
+            };
+            self.apply_sounding_header_actions(actions, ui.ctx());
             return;
         }
 
         if self.sounding_viewer_source == SoundingViewerSource::NativeOnly
             && self.native_sounding_panel.has_content()
         {
-            let controls = self
-                .model_dock
-                .as_ref()
-                .map(model_data::ModelDataDock::sounding_header_controls)
-                .unwrap_or_default();
+            let controls = self.sounding_header_controls();
             let actions = if docked {
                 self.native_sounding_panel
                     .ui_docked_with_header(ui, &controls)
@@ -30756,6 +30836,7 @@ impl ViewerApp {
             {
                 model_dock.set_box_sounding_armed(!model_dock.box_sounding_armed());
             }
+            self.apply_sounding_header_actions(actions, ui.ctx());
             return;
         }
 
@@ -32933,6 +33014,7 @@ impl ViewerApp {
         self.app_settings.overlay_obs = self.obs_enabled;
         self.app_settings.overlay_obs_metar = self.obs_show_metar;
         self.app_settings.overlay_obs_mesonet = self.obs_show_mesonet;
+        self.app_settings.overlay_obs_adjust_soundings = self.obs_adjust_soundings;
         self.app_settings.overlay_glm = self.glm_enabled;
         self.app_settings.overlay_raob = self.raob_markers_enabled;
         self.app_settings.overlay_spc_outlooks = self.spc_outlooks_enabled.clone();
@@ -33269,6 +33351,7 @@ impl ViewerApp {
     /// Surface-obs refresh: fetch the METAR cache on enable and every
     /// 5 minutes after (background thread; one in flight).
     fn poll_surface_obs(&mut self, ctx: &egui::Context) {
+        let mut observations_updated = false;
         if self.obs_enabled
             && self.obs_rx.is_none()
             && self
@@ -33326,6 +33409,7 @@ impl ViewerApp {
                 Ok(observations) => {
                     self.mesonet_rx = None;
                     self.mesonet_fetched_at = Some(Instant::now());
+                    observations_updated |= !observations.is_empty();
                     self.surface_obs.merge(observations);
                     ctx.request_repaint();
                 }
@@ -33338,6 +33422,7 @@ impl ViewerApp {
                 Ok(Ok(observations)) => {
                     self.obs_rx = None;
                     self.obs_fetched_at = Some(Instant::now());
+                    observations_updated |= !observations.is_empty();
                     self.surface_obs.merge(observations);
                     self.status =
                         format!("Surface obs: {} stations", self.surface_obs.station_count);
@@ -33359,6 +33444,7 @@ impl ViewerApp {
                     self.iem_metar_fetched_at = Some(Instant::now());
                     let updated = observations.len();
                     if updated > 0 {
+                        observations_updated = true;
                         self.surface_obs.merge(observations);
                         self.status = format!(
                             "Surface obs: {} stations (+{updated} IEM METAR rows)",
@@ -33385,6 +33471,7 @@ impl ViewerApp {
                     self.nws_obs_fetched_at = Some(Instant::now());
                     let updated = observations.len();
                     if updated > 0 {
+                        observations_updated = true;
                         self.surface_obs.merge(observations);
                         self.status = format!(
                             "Surface obs: {} stations (+{updated} NWS latest)",
@@ -33431,6 +33518,13 @@ impl ViewerApp {
                     ctx_clone.request_repaint();
                 });
             }
+        }
+        if observations_updated && self.obs_adjust_soundings {
+            // Enabling adjustment may have started these workers from an
+            // empty pool. Re-run the current model column once observations
+            // arrive so the header toggle takes effect without another map
+            // click. A RAOB is excluded by the helper's ownership check.
+            self.refresh_current_model_sounding_for_obs_adjust();
         }
     }
 
@@ -67499,6 +67593,41 @@ mod tests {
         assert!(!app.glm_enabled);
         assert!(!app.vrot_tool_armed);
         assert!(!app.show_inspector_card);
+    }
+
+    #[test]
+    fn obs_adjust_header_toggle_enables_dependency_persists_and_leaves_raob_owner_alone() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.obs_enabled = false;
+        app.obs_adjust_soundings = false;
+        app.app_settings.overlay_obs = false;
+        app.app_settings.overlay_obs_adjust_soundings = false;
+        // NativeOnly is also the RAOB owner. A preference toggle must not
+        // switch it back to a cached model sounding.
+        app.sounding_viewer_source = SoundingViewerSource::NativeOnly;
+
+        let toggle = sharppy_sounding::SoundingHeaderActions {
+            toggle_obs_adjusted: true,
+            ..Default::default()
+        };
+        app.apply_sounding_header_actions(toggle, &ctx);
+
+        assert!(app.obs_enabled);
+        assert!(app.obs_adjust_soundings);
+        assert!(app.app_settings.overlay_obs);
+        assert!(app.app_settings.overlay_obs_adjust_soundings);
+        assert_eq!(app.sounding_viewer_source, SoundingViewerSource::NativeOnly);
+        assert_eq!(app.sounding_header_controls().obs_adjusted, Some(true));
+
+        app.apply_sounding_header_actions(toggle, &ctx);
+
+        assert!(app.obs_enabled, "turning adjustment off keeps Surface obs");
+        assert!(!app.obs_adjust_soundings);
+        assert!(app.app_settings.overlay_obs);
+        assert!(!app.app_settings.overlay_obs_adjust_soundings);
+        assert_eq!(app.sounding_viewer_source, SoundingViewerSource::NativeOnly);
+        assert_eq!(app.sounding_header_controls().obs_adjusted, Some(false));
     }
 
     #[test]

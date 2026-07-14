@@ -61,6 +61,7 @@ struct SharppyAnalysis {
     prof: sharppyrs::Profile,
     derived: sharppyrs::DerivedParams,
     title: String,
+    obs_adjusted_model: bool,
 }
 
 /// Host-owned actions that sit beside the SHARPpy/Classic selector.  The
@@ -76,11 +77,16 @@ pub(crate) struct BoxSoundingHeaderControl {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SoundingHeaderControls {
     pub(crate) box_sounding: Option<BoxSoundingHeaderControl>,
+    /// Whether surface-observation adjustment is currently effective. The
+    /// app owns the setting because enabling it also enables the map's
+    /// Surface obs layer; the sounding widget only renders the control.
+    pub(crate) obs_adjusted: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SoundingHeaderActions {
     pub(crate) toggle_box_sounding: bool,
+    pub(crate) toggle_obs_adjusted: bool,
 }
 
 pub struct SharppySoundingPanel {
@@ -135,6 +141,16 @@ impl SharppySoundingPanel {
 
     pub fn has_content(&self) -> bool {
         self.inner.has_content() || self.analysis.is_some()
+    }
+
+    /// True only for a model column whose surface was replaced by an
+    /// observation. RAOBs also use this native panel, so the app uses this
+    /// distinction when a header toggle should refresh the current model
+    /// sounding without ever displacing an observed sounding.
+    pub(crate) fn is_obs_adjusted_model(&self) -> bool {
+        self.analysis
+            .as_ref()
+            .is_some_and(|analysis| analysis.obs_adjusted_model)
     }
 
     /// The classic panel's view-state object with SHARPpy host keys:
@@ -267,6 +283,17 @@ impl SharppySoundingPanel {
                         });
                     actions.toggle_box_sounding = response.clicked();
                 }
+                if let Some(obs_adjusted) = controls.obs_adjusted {
+                    ui.separator();
+                    actions.toggle_obs_adjusted = ui
+                        .add(egui::Button::selectable(obs_adjusted, "Obs adjust"))
+                        .on_hover_text(if obs_adjusted {
+                            "Observation adjustment is on for model soundings. Turn it off without hiding the Surface obs map layer."
+                        } else {
+                            "Replace a model sounding's surface T/Td/wind with the nearest eligible observation and recompute diagnostics. This also enables Surface obs."
+                        })
+                        .clicked();
+                }
                 if docked && !self.classic {
                     ui.separator();
                     ui.weak("Pane");
@@ -390,11 +417,13 @@ fn build_analysis(data: &SoundingData, column: &SoundingColumn) -> Option<Box<Sh
     let derived = sharppyrs::DerivedParams::compute(&prof);
 
     let title = sounding_title(data, meta);
+    let obs_adjusted_model = data.hour.run.contains("obs-adj");
 
     Some(Box::new(SharppyAnalysis {
         prof,
         derived,
         title,
+        obs_adjusted_model,
     }))
 }
 
