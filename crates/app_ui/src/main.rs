@@ -42,6 +42,7 @@ mod archive_browser;
 mod basemap_data;
 mod basemap_towns;
 mod batch_plots;
+mod box_sounding;
 mod brand;
 mod chrome_readouts;
 mod cm1_ui;
@@ -27298,6 +27299,18 @@ impl ViewerApp {
                 .is_some_and(|dock| dock.plot_domain_armed())
     }
 
+    fn box_sounding_arm_active(&self) -> bool {
+        self.model_dock_open
+            && self
+                .model_dock
+                .as_ref()
+                .is_some_and(|dock| dock.box_sounding_armed())
+    }
+
+    fn model_map_box_arm_active(&self) -> bool {
+        self.plot_domain_arm_active() || self.box_sounding_arm_active()
+    }
+
     /// The Ctrl+Shift+drag shortcut only engages when the box can land
     /// somewhere visible: Model window open with a loaded field. Otherwise
     /// the chord falls through to the plain pan it has always been.
@@ -27313,11 +27326,17 @@ impl ViewerApp {
     /// and the 📐 arm (Esc, right-click while armed, or a Model window that
     /// went away).
     fn cancel_plot_domain_map_box(&mut self) {
+        let box_sounding = self.box_sounding_arm_active();
         self.plot_domain_map_drag = None;
         if let Some(dock) = self.model_dock.as_mut() {
             dock.set_plot_domain_armed(false);
+            dock.set_box_sounding_armed(false);
         }
-        self.status = "Plot-box draw cancelled".to_owned();
+        self.status = if box_sounding {
+            "Box-sounding draw cancelled".to_owned()
+        } else {
+            "Plot-box draw cancelled".to_owned()
+        };
     }
 
     /// The map-side custom plot-domain box tool (v0.29.3 gesture-collision
@@ -27343,11 +27362,12 @@ impl ViewerApp {
         // drop the arm instead of keeping an invisible mode latched.
         if !self.model_dock_open
             && let Some(dock) = self.model_dock.as_mut()
-            && dock.plot_domain_armed()
+            && (dock.plot_domain_armed() || dock.box_sounding_armed())
         {
             dock.set_plot_domain_armed(false);
+            dock.set_box_sounding_armed(false);
         }
-        let armed = self.plot_domain_arm_active();
+        let armed = self.model_map_box_arm_active();
         let was_dragging = self.plot_domain_map_drag.is_some();
         let active_for_rect = self
             .plot_domain_map_drag
@@ -27437,6 +27457,28 @@ impl ViewerApp {
         let corner_a = self.screen_to_lon_lat(rect, selection.left_top());
         let corner_b = self.screen_to_lon_lat(rect, selection.right_bottom());
         let bounds = plot_domain_bounds_from_corners(corner_a, corner_b);
+        if self
+            .model_dock
+            .as_ref()
+            .is_some_and(|dock| dock.box_sounding_armed())
+        {
+            let result = self
+                .model_dock
+                .as_mut()
+                .expect("model dock checked above")
+                .request_box_sounding(bounds);
+            match result {
+                Ok(status) => {
+                    self.model_dock_open = true;
+                    self.status = status;
+                    return true;
+                }
+                Err(message) => {
+                    self.status = format!("Box sounding unavailable: {message}");
+                    return false;
+                }
+            }
+        }
         let domain = rw_ui::CustomDomain::generated(bounds);
         let label = domain.bounds_label();
         if let Some(dock) = self.model_dock.as_mut() {
@@ -27454,8 +27496,13 @@ impl ViewerApp {
     /// the blue 3D box selection. `show_hint` is true for the pane that
     /// should carry the chip (the single pane, or grid cell 0).
     fn draw_plot_domain_map_box(&self, painter: &egui::Painter, rect: egui::Rect, show_hint: bool) {
-        if show_hint && self.plot_domain_map_drag.is_none() && self.plot_domain_arm_active() {
-            let label = "drag to draw plot box — Esc to cancel";
+        if show_hint && self.plot_domain_map_drag.is_none() && self.model_map_box_arm_active() {
+            let box_sounding = self.box_sounding_arm_active();
+            let label = if box_sounding {
+                "drag a box for area-mean sounding — Esc to cancel"
+            } else {
+                "drag to draw plot box — Esc to cancel"
+            };
             let width = chip_width_for_text(label);
             let chip = egui::Rect::from_min_size(
                 egui::pos2(rect.center().x - width * 0.5, rect.top() + 10.0),
@@ -27464,7 +27511,11 @@ impl ViewerApp {
             painter.rect_filled(
                 chip,
                 4.0,
-                egui::Color32::from_rgba_unmultiplied(122, 86, 22, 235),
+                if box_sounding {
+                    egui::Color32::from_rgba_unmultiplied(24, 92, 112, 235)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(122, 86, 22, 235)
+                },
             );
             painter.text(
                 chip.center(),
@@ -27500,7 +27551,11 @@ impl ViewerApp {
         painter.text(
             selection.left_top() + egui::vec2(6.0, 6.0),
             egui::Align2::LEFT_TOP,
-            "model plot box",
+            if self.box_sounding_arm_active() {
+                "box-mean sounding"
+            } else {
+                "model plot box"
+            },
             egui::FontId::proportional(13.0),
             egui::Color32::from_rgb(255, 236, 200),
         );
@@ -27518,7 +27573,7 @@ impl ViewerApp {
             self.show_inspector_card,
             self.inspector_show_loupe,
             shift_held,
-            self.plot_domain_map_drag.is_some() || self.plot_domain_arm_active(),
+            self.plot_domain_map_drag.is_some() || self.model_map_box_arm_active(),
         )
     }
 
@@ -30203,6 +30258,11 @@ impl ViewerApp {
                     .unwrap_or(true)
             })
             .cloned();
+        let fresh_is_box = fresh.is_some()
+            && self
+                .model_dock
+                .as_ref()
+                .is_some_and(model_data::ModelDataDock::latest_sounding_is_box);
         if let Some(data) = fresh
             && self.native_sounding_rx.is_none()
         {
@@ -30213,7 +30273,7 @@ impl ViewerApp {
             let ctx_clone = ctx.clone();
             // Obs adjustment (close + fresh gates) resolved BEFORE the
             // spawn so the thread carries plain data.
-            let adjust_ob = (self.obs_adjust_soundings && self.obs_enabled)
+            let adjust_ob = (!fresh_is_box && self.obs_adjust_soundings && self.obs_enabled)
                 .then(|| {
                     let (lat, lon) = (data.lat?, data.lon?);
                     let now = Utc::now();
@@ -65517,6 +65577,33 @@ mod tests {
                 .plot_domain_armed()
         );
         assert_eq!(app.status, "Plot-box draw cancelled");
+    }
+
+    #[test]
+    fn box_sounding_cancel_clears_drag_and_its_map_arm() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("hrrr", "20260615_17z", &[0]),
+        );
+        dock.set_box_sounding_armed(true);
+        app.model_dock = Some(dock);
+        app.model_dock_open = true;
+        let rect = test_map_rect();
+        app.plot_domain_map_drag = Some(PlotDomainMapDrag {
+            start: rect.center(),
+            current: rect.center() + egui::vec2(40.0, 40.0),
+        });
+        assert!(app.box_sounding_arm_active());
+        assert!(app.model_map_box_arm_active());
+
+        app.cancel_plot_domain_map_box();
+
+        assert!(app.plot_domain_map_drag.is_none());
+        assert!(!app.box_sounding_arm_active());
+        assert!(!app.model_map_box_arm_active());
+        assert_eq!(app.status, "Box-sounding draw cancelled");
     }
 
     /// The Ctrl+Shift shortcut only engages with the Model window open and a

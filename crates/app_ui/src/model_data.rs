@@ -27,6 +27,15 @@ enum NativePlotContent {
     Satellite,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SoundingRequestMode {
+    #[default]
+    None,
+    Point,
+    BoxPending,
+    BoxApplied,
+}
+
 /// Background loader for the synthesized per-level isobaric map fields
 /// (the rw-ui worker cannot read `pressure3d` planes). Crate-visible: the
 /// batch plotter (`crate::batch_plots`) reuses `load_level_field` for its
@@ -1227,6 +1236,15 @@ pub struct ModelDataDock {
     latest_field: Option<std::sync::Arc<rw_ui::FieldData>>,
     /// Most recent sounding data (kept for the native skew-T window).
     latest_sounding: Option<std::sync::Arc<rw_ui::SoundingData>>,
+    /// Which request owns the reusable sounding surface. This prevents a
+    /// late point response from replacing a box mean (and vice versa).
+    sounding_request_mode: SoundingRequestMode,
+    /// First-class area-mean sounding: the next radar-map drag owns the
+    /// pointer while armed, then this worker reads/averages store primitives.
+    box_sounding_armed: bool,
+    box_sounding_task: Option<crate::box_sounding::BoxSoundingTask>,
+    box_sounding_pending: Option<(HourKey, crate::box_sounding::BoxBounds)>,
+    box_sounding_summary: Option<crate::box_sounding::BoxSoundingSummary>,
     /// One-shot: the user asked to put the current field on the radar map.
     map_request: Option<std::sync::Arc<rw_ui::FieldData>>,
     /// v0.2.3 custom-domain plot viewer: renders the selected field through
@@ -1372,6 +1390,11 @@ impl ModelDataDock {
             sounding: SoundingPanel::new(),
             latest_field: None,
             latest_sounding: None,
+            sounding_request_mode: SoundingRequestMode::None,
+            box_sounding_armed: false,
+            box_sounding_task: None,
+            box_sounding_pending: None,
+            box_sounding_summary: None,
             map_request: None,
             plot_viewer: PlotViewerPanel::new(),
             satellite_plot: SatellitePlotPanel::default(),
@@ -1693,6 +1716,34 @@ impl ModelDataDock {
         }
     }
 
+    fn poll_box_sounding(&mut self) {
+        let result = self
+            .box_sounding_task
+            .as_ref()
+            .and_then(crate::box_sounding::BoxSoundingTask::try_recv);
+        let Some(result) = result else {
+            return;
+        };
+        self.box_sounding_task = None;
+        self.box_sounding_pending = None;
+        if self.sounding_request_mode != SoundingRequestMode::BoxPending {
+            return;
+        }
+        match result {
+            Ok(result) => {
+                self.sounding_request_mode = SoundingRequestMode::BoxApplied;
+                self.box_sounding_summary = Some(result.summary);
+                self.latest_sounding = Some(std::sync::Arc::new(result.data.clone()));
+                self.sounding.set_data(result.data);
+            }
+            Err(message) => {
+                self.sounding_request_mode = SoundingRequestMode::None;
+                self.box_sounding_summary = None;
+                self.sounding.set_error(message);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(ctx: &egui::Context, tree: StoreTree) -> Self {
         let mut dock = Self::new(ctx, std::env::temp_dir().join("bowecho-model-dock-test"));
@@ -1713,6 +1764,7 @@ impl ModelDataDock {
         self.poll_plot_job();
         self.poll_iso_load();
         self.poll_gdex();
+        self.poll_box_sounding();
         while let Some(response) = self.worker.try_recv() {
             match response {
                 StoreResponse::Tree(tree) => {
@@ -1775,11 +1827,23 @@ impl ModelDataDock {
                     }
                 },
                 StoreResponse::Sounding(_, Ok(data)) => {
-                    self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
-                    self.sounding.set_data(data);
+                    if matches!(
+                        self.sounding_request_mode,
+                        SoundingRequestMode::None | SoundingRequestMode::Point
+                    ) {
+                        self.sounding_request_mode = SoundingRequestMode::Point;
+                        self.box_sounding_summary = None;
+                        self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
+                        self.sounding.set_data(data);
+                    }
                 }
                 StoreResponse::Sounding(_, Err(message)) => {
-                    self.sounding.set_error(message);
+                    if matches!(
+                        self.sounding_request_mode,
+                        SoundingRequestMode::None | SoundingRequestMode::Point
+                    ) {
+                        self.sounding.set_error(message);
+                    }
                 }
                 // v0.2.3: worker ack that the style overrides were applied.
                 // No-op by design — `apply_color_table_changes` already
@@ -2165,6 +2229,65 @@ impl ModelDataDock {
     /// Model window disarm through here).
     pub fn set_plot_domain_armed(&mut self, armed: bool) {
         self.plot_domain_armed = armed;
+        if armed {
+            self.box_sounding_armed = false;
+        }
+    }
+
+    /// Whether the next radar-map drag should build an area-mean sounding.
+    pub fn box_sounding_armed(&self) -> bool {
+        self.box_sounding_armed
+    }
+
+    /// Arm/disarm the map-side area-mean sounding selector. It is mutually
+    /// exclusive with the native-plot domain selector because both own a box
+    /// drag on the same map canvas.
+    pub fn set_box_sounding_armed(&mut self, armed: bool) {
+        self.box_sounding_armed = armed;
+        if armed {
+            self.plot_domain_armed = false;
+        }
+    }
+
+    /// Start an exact finite-cell area mean for the model hour currently shown
+    /// in the field viewer. All disk work stays on the dedicated worker.
+    pub fn request_box_sounding(&mut self, bounds: (f64, f64, f64, f64)) -> Result<String, String> {
+        let bounds = crate::box_sounding::BoxBounds::new(bounds)?;
+        let hour = self
+            .viewer
+            .hour()
+            .cloned()
+            .ok_or_else(|| "Load a model field before drawing a box sounding".to_owned())?;
+        let grid_ready = self.latest_field.as_ref().is_some_and(|field| {
+            field.key.hour == hour
+                && field
+                    .grid
+                    .as_ref()
+                    .is_some_and(|grid| grid.nx > 0 && grid.ny > 0)
+        });
+        if !grid_ready {
+            return Err(
+                "The displayed model frame has no compatible latitude/longitude grid".to_owned(),
+            );
+        }
+        box_sounding_readiness(&self.hour_store_var_info)?;
+
+        self.box_sounding_armed = false;
+        self.sounding_request_mode = SoundingRequestMode::BoxPending;
+        self.box_sounding_summary = None;
+        self.sounding.set_loading();
+        self.box_sounding_pending = Some((hour.clone(), bounds));
+        self.box_sounding_task = Some(crate::box_sounding::BoxSoundingTask::spawn(
+            self.store_root.clone(),
+            hour.clone(),
+            bounds,
+            self.repaint.clone(),
+        ));
+        Ok(format!(
+            "Building box-mean sounding for {} over {}",
+            hour,
+            bounds.label()
+        ))
     }
 
     /// A plot domain drawn on the RADAR MAP (📐 arm button or the
@@ -2280,7 +2403,34 @@ impl ModelDataDock {
     /// Render the reusable rw-ui sounding panel outside the Model Data dock.
     pub fn sounding_ui(&mut self, ui: &mut egui::Ui) {
         self.handle_responses();
+        if let Some(summary) = &self.box_sounding_summary {
+            box_sounding_summary_ui(ui, summary);
+            ui.add_space(4.0);
+        } else if let Some((hour, bounds)) = &self.box_sounding_pending {
+            let theme = crate::ui_theme::theme();
+            egui::Frame::new()
+                .fill(theme.faint)
+                .stroke(egui::Stroke::new(1.0, theme.hairline))
+                .corner_radius(4)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("BOX-MEAN SOUNDING").strong());
+                        ui.weak(format!("{} · {}", hour, bounds.label()));
+                    });
+                    ui.weak("Averaging primitive columns; diagnostics will run after the mean column is complete.");
+                });
+            ui.add_space(4.0);
+        }
         self.sounding.ui(ui);
+    }
+
+    /// The latest sounding belongs to the box-mean path. The app uses this to
+    /// keep point-only surface-observation adjustment away from an area mean.
+    pub fn latest_sounding_is_box(&self) -> bool {
+        self.sounding_request_mode == SoundingRequestMode::BoxApplied
+            && self.box_sounding_summary.is_some()
     }
 
     pub fn sounding_view_state_json(&self) -> serde_json::Value {
@@ -5617,15 +5767,18 @@ impl ModelDataDock {
     /// Request a sounding at storage-order grid coordinates (map click).
     pub fn request_sounding_at(&mut self, fx: f64, fy: f64) {
         if let Some(hour) = self.viewer.hour().cloned() {
-            self.sounding.set_loading();
-            self.worker
-                .send(StoreRequest::LoadSounding { hour, fx, fy });
+            self.request_sounding_for(hour, fx, fy);
         }
     }
 
     /// Request a sounding from an EXPLICIT run/hour (independent of the
     /// browser selection) — used by callers that must not be stale.
     pub fn request_sounding_for(&mut self, hour: HourKey, fx: f64, fy: f64) {
+        self.box_sounding_task = None;
+        self.box_sounding_pending = None;
+        self.box_sounding_summary = None;
+        self.box_sounding_armed = false;
+        self.sounding_request_mode = SoundingRequestMode::Point;
         self.sounding.set_loading();
         self.worker
             .send(StoreRequest::LoadSounding { hour, fx, fy });
@@ -5707,6 +5860,15 @@ impl ModelDataDock {
         if self.latest_field.is_none() {
             return;
         }
+        let box_readiness = box_sounding_readiness(&self.hour_store_var_info);
+        let box_ready = box_readiness.is_ok()
+            && self.latest_field.as_ref().is_some_and(|field| {
+                field.grid.is_some() && self.viewer.hour() == Some(&field.key.hour)
+            });
+        let box_unavailable_reason =
+            box_readiness.as_ref().err().cloned().unwrap_or_else(|| {
+                "The displayed field has no compatible geographic grid".to_owned()
+            });
         let theme = crate::ui_theme::theme();
         egui::Frame::new()
             .fill(theme.faint)
@@ -5731,6 +5893,24 @@ impl ModelDataDock {
                         self.map_request = self.latest_field.clone();
                     }
 
+                    let box_response = ui
+                        .add_enabled(
+                            box_ready,
+                            egui::Button::selectable(
+                                self.box_sounding_armed,
+                                "Box sounding",
+                            ),
+                        )
+                        .on_hover_text(if box_ready {
+                            "Arm the radar map, then drag a rectangle. BowEcho averages the model's primitive sounding columns inside it before deriving any diagnostics."
+                                .to_owned()
+                        } else {
+                            box_unavailable_reason.clone()
+                        });
+                    if box_response.clicked() {
+                        self.set_box_sounding_armed(!self.box_sounding_armed);
+                    }
+
                     let mut model_plot_open = self.show_plot_viewer
                         && self.native_plot_content == NativePlotContent::Model;
                     if ui
@@ -5747,12 +5927,17 @@ impl ModelDataDock {
 
                     // Map-side domain drawing remains explicitly armed so it
                     // cannot collide with pan, loupe, sounding, or 3-D input.
-                    ui.toggle_value(&mut self.plot_domain_armed, "Draw map domain")
+                    let plot_changed = ui
+                        .toggle_value(&mut self.plot_domain_armed, "Draw map domain")
                         .on_hover_text(
                             "Arm the radar map: the next click-drag draws the native-plot \
                              domain. Esc, right-click, or clicking this again cancels. \
                              Shortcut: Ctrl+Shift+drag the map.",
-                        );
+                        )
+                        .changed();
+                    if plot_changed && self.plot_domain_armed {
+                        self.box_sounding_armed = false;
+                    }
                     ui.toggle_value(&mut self.show_color_tables, "Color tables")
                         .on_hover_text(
                             "Edit model plot palettes and product bindings. Overrides apply \
@@ -5885,9 +6070,7 @@ impl ModelDataDock {
                 }
                 Some(FieldViewerEvent::PointClicked { fx, fy }) => {
                     if let Some(hour) = self.viewer.hour().cloned() {
-                        self.sounding.set_loading();
-                        self.worker
-                            .send(StoreRequest::LoadSounding { hour, fx, fy });
+                        self.request_sounding_for(hour, fx, fy);
                     }
                 }
                 // v0.2.3 custom-domain plot: shift-drag a box on the field
@@ -5914,6 +6097,91 @@ fn model_section_heading(title: &str) -> egui::RichText {
         .size(12.5)
         .strong()
         .color(crate::ui_theme::subhead_color())
+}
+
+fn box_sounding_readiness(vars: &[rw_ui::VarInfo]) -> Result<(), String> {
+    let has_profile = |name: &str| {
+        vars.iter()
+            .any(|var| var.name == name && var.kind == rw_ui::VarKind::Pressure3D)
+    };
+    let mut missing = ["temperature_iso", "u_iso", "v_iso", "height_iso"]
+        .into_iter()
+        .filter(|name| !has_profile(name))
+        .collect::<Vec<_>>();
+    if !has_profile("dewpoint_iso") && !has_profile("rh_iso") {
+        missing.push("dewpoint_iso or rh_iso");
+    }
+    let has_surface = |name: &str| {
+        vars.iter()
+            .any(|var| var.name == name && var.kind == rw_ui::VarKind::Surface2D)
+    };
+    for (exact, approximate) in [
+        ("temperature_2m", "approx_temperature_2m"),
+        ("dewpoint_2m", "approx_dewpoint_2m"),
+        ("u_10m", "approx_u_10m"),
+        ("v_10m", "approx_v_10m"),
+        ("surface_pressure", "approx_surface_pressure"),
+    ] {
+        if !has_surface(exact) && !has_surface(approximate) {
+            missing.push(exact);
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "This model frame cannot build a sounding; missing {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn box_sounding_summary_ui(ui: &mut egui::Ui, summary: &crate::box_sounding::BoxSoundingSummary) {
+    let theme = crate::ui_theme::theme();
+    egui::Frame::new()
+        .fill(theme.faint)
+        .stroke(egui::Stroke::new(1.0, theme.hairline))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("BOX-MEAN SOUNDING").strong());
+                ui.label(format!("{}", summary.hour));
+                ui.weak(format!("{:.0} ms", summary.read_ms));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Requested: {}", summary.requested.label()));
+                ui.separator();
+                ui.label(format!("Sampled: {}", summary.sampled.label()));
+                if summary.clipped_to_grid {
+                    ui.colored_label(theme.warn, "partly outside model coverage");
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "{} grid cells · {} complete surface cells",
+                    summary.selected_cells, summary.surface_cells
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "{} levels · {}–{} valid cells/level",
+                    summary.usable_levels, summary.min_level_cells, summary.max_level_cells
+                ));
+                if summary.missing_surface_cells() > 0 {
+                    ui.weak(format!(
+                        "missing surface coverage: {} cell(s)",
+                        summary.missing_surface_cells()
+                    ));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(summary.method_label());
+                ui.weak(format!("Moisture: {}.", summary.moisture_name));
+                if summary.used_approx_surface {
+                    ui.weak("Approximate surface fields filled unavailable exact fields.");
+                }
+            });
+        });
 }
 
 fn model_subheading(ui: &mut egui::Ui, title: &str) {
@@ -6341,6 +6609,58 @@ pub(crate) fn patch_sounding_scene_zoom(view_state: &mut serde_json::Value, zoom
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn box_sounding_and_plot_domain_arms_are_mutually_exclusive() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+
+        dock.set_box_sounding_armed(true);
+        assert!(dock.box_sounding_armed());
+        assert!(!dock.plot_domain_armed());
+
+        dock.set_plot_domain_armed(true);
+        assert!(dock.plot_domain_armed());
+        assert!(!dock.box_sounding_armed());
+    }
+
+    #[test]
+    fn box_sounding_readiness_requires_primitive_profiles_and_surface_state() {
+        let var = |name: &str, kind| rw_ui::VarInfo {
+            name: name.to_owned(),
+            units: String::new(),
+            kind,
+            levels_hpa: Vec::new(),
+        };
+        let mut vars = [
+            "temperature_iso",
+            "dewpoint_iso",
+            "u_iso",
+            "v_iso",
+            "height_iso",
+        ]
+        .into_iter()
+        .map(|name| var(name, rw_ui::VarKind::Pressure3D))
+        .collect::<Vec<_>>();
+        vars.extend(
+            [
+                "temperature_2m",
+                "dewpoint_2m",
+                "u_10m",
+                "v_10m",
+                "surface_pressure",
+            ]
+            .into_iter()
+            .map(|name| var(name, rw_ui::VarKind::Surface2D)),
+        );
+        assert!(box_sounding_readiness(&vars).is_ok());
+        vars.retain(|var| var.name != "surface_pressure");
+        assert!(
+            box_sounding_readiness(&vars)
+                .unwrap_err()
+                .contains("surface_pressure")
+        );
+    }
 
     /// The auto-plot toggle defaults ON, and a settings blob persisted
     /// BEFORE the toggle existed restores to ON too (serde default) — an
