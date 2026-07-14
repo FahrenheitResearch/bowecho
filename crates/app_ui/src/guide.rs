@@ -1519,7 +1519,7 @@ fn cm1(ui: &mut egui::Ui) {
         ui,
         "1. Open cm1out file…",
         "— inspect native axes, output records, variables, units, staggering and complete-domain \
-         status. A multi-record file opens on its final, latest evolved output; output 0 remains \
+         status. A multi-record file opens on its final, latest evolved record; record index 0 remains \
          selectable for initialization-state inspection. Unsupported shapes stay listed with a reason.",
     );
     action(
@@ -1580,12 +1580,16 @@ fn cm1(ui: &mut egui::Ui) {
          choice may use model-z = 0. The antenna is fixed at the placed CM1 domain center, so a \
          saved WRF/NEXRAD site cannot land outside the idealized grid. Compatible scan, range, \
          gate, blockage, noise and presentation controls come from the WRF simulated-radar panel. \
-         The first completed tilt opens while the remaining tilts process.",
+         Choose Selected record index for one radar frame, or All records (ordered loop) for one \
+         exact-time radar loop. The selected record is processed first and its first completed \
+         tilt opens while the remaining tilts and records process.",
     );
     para(
         ui,
-        "This release samples one frozen CM1 record on CPU with standard 4/3-Earth geometry and \
-         the file's native scalar dbz. It does not extrude 2-D cref, assemble MPI tiles, \
+        "Each radar frame samples one frozen CM1 record on CPU with standard 4/3-Earth geometry \
+         and the file's native scalar dbz. Multi-record loops read and release one full native \
+         scene at a time, then install completed radar volumes in exact CM1 time order. It does \
+         not interpolate the atmosphere between records, extrude 2-D cref, assemble MPI tiles, \
          synthesize dual-pol, run T-matrix or WRF refractivity, recompute reflectivity, or use \
          adjacent-WRF interpolation.",
     );

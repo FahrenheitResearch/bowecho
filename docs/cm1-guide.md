@@ -127,17 +127,19 @@ A radar-ready file must be one assembled complete domain and contain:
 
 Then:
 
-1. Open the file, confirm the selected output (the final output is selected by
-   default), enter the explicit center latitude/longitude, and choose Follow
+1. Open the file, confirm the **Selected record index** (the final record is
+   selected by default), enter the explicit center latitude/longitude, and choose Follow
    domain or an available Fixed-world placement.
 2. Configure scan, range, gate spacing, blockage, noise, and presentation in
    **Windows > WRF > WRF simulated radar**. CM1 reuses those compatible
    controls, but always places its virtual radar at the center of the placed
    CM1 domain; a saved WRF/NEXRAD site does not carry over.
-3. Return to **Windows > CM1** and choose **Build output N native REF/VEL in
-   Radar**.
-   BowEcho opens the first completed tilt while the rest of the volume
-   continues processing.
+3. Return to **Windows > CM1**. Under **Radar time scope**, choose **Selected
+   record index N** for one frame or **All N records (ordered loop)**, then
+   build REF/VEL. BowEcho processes the selected record first and opens its
+   first completed tilt immediately. For an all-record build, each complete
+   native scene is released before the next is read; the finished radar
+   volumes become one loop in exact CM1 time order.
 
 Flat terrain is never assumed automatically. The checkbox only replaces a
 missing `zs` field with model-z = 0; it does not replace missing `dbz`,
@@ -147,8 +149,10 @@ missing `zs` field with model-z = 0; it does not replace missing `dbz`,
 
 The CM1 radar adapter samples the file's native scalar `dbz` and earth-frame
 winds through BowEcho's existing polar geometry. It is CPU-only, uses one
-frozen CM1 record, places the antenna at the explicitly placed domain center,
-and uses standard 4/3-Earth propagation geometry. It can reuse compatible
+frozen CM1 record per radar frame, places the antenna at the explicitly placed
+domain center, and uses standard 4/3-Earth propagation geometry. Multi-record
+loops process one native scene at a time and preserve exact source valid times;
+they do not interpolate the atmosphere between records. It can reuse compatible
 scan, pulse-volume, terrain-blockage, noise, and presentation controls from the
 WRF radar panel.
 

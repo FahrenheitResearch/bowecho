@@ -2066,9 +2066,10 @@ impl ModelDataDock {
                     self.synthetic_radar_replay_source = None;
                     self.synthetic_radar_preview = None;
                     self.import_message = Some(format!(
-                        "Building CM1 native REF/VEL from {} time {}...",
+                        "Building CM1 native REF/VEL from {} across {} record(s); selected record index {} is processed first...",
                         request.source_path.display(),
-                        request.time_index
+                        request.time_indices.len(),
+                        request.display_time_index,
                     ));
                     self.import_job = Some(ImportJob::SyntheticRadar(
                         crate::wrf_radar::spawn_cm1_radar(request, config),

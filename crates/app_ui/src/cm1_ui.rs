@@ -212,6 +212,7 @@ pub struct Cm1ImportPanel {
     selected_variable: Option<String>,
     time_index: usize,
     import_all_times: bool,
+    radar_all_times: bool,
     level_index: usize,
     anchor_latitude: String,
     anchor_longitude: String,
@@ -370,6 +371,7 @@ impl Cm1ImportPanel {
             self.selected_variable = None;
             self.time_index = 0;
             self.import_all_times = false;
+            self.radar_all_times = false;
             self.level_index = 0;
             self.anchor_latitude.clear();
             self.anchor_longitude.clear();
@@ -431,7 +433,7 @@ impl Cm1ImportPanel {
                     self.time_index = default_cm1_time_index(&result.inventory);
                 }
                 self.message = Some(format!(
-                    "CM1 inventory ready: {} compatible horizontal field(s), {} output time(s); selected output {}",
+                    "CM1 inventory ready: {} compatible horizontal field(s), {} record(s); selected record index {}",
                     result.inventory.horizontal_plane_variables().count(),
                     result.inventory.time.record_count,
                     self.time_index,
@@ -749,11 +751,7 @@ impl Cm1ImportPanel {
         }
 
         ui.horizontal(|ui| {
-            ui.label(if self.import_all_times {
-                "Open after import"
-            } else {
-                "Output time"
-            });
+            ui.label("Selected record index");
             let time_label = cm1_time_label(inventory, self.time_index);
             egui::ComboBox::from_id_salt("cm1_output_time")
                 .selected_text(time_label)
@@ -792,7 +790,7 @@ impl Cm1ImportPanel {
                 );
             }
             ui.horizontal_wrapped(|ui| {
-                ui.label("Time scope");
+                ui.label("Model-field import scope");
                 ui.selectable_value(&mut self.import_all_times, false, "Selected record");
                 ui.selectable_value(
                     &mut self.import_all_times,
@@ -1315,10 +1313,34 @@ impl Cm1ImportPanel {
         }
         ui.label(
             egui::RichText::new(
-                "Build REF and radial velocity from this output record using native 3-D dbz, physical zhval model heights, and earth-relative winds. The first completed tilt appears while the rest processes.",
+                "Build REF and radial velocity from the selected CM1 record, or process every record as one exact-time radar loop. The selected record is processed first so its first completed tilt appears immediately; an all-record loop is installed in native time order when complete.",
             )
             .small(),
         );
+
+        if inventory.time.record_count > 1 {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Radar time scope");
+                ui.selectable_value(
+                    &mut self.radar_all_times,
+                    false,
+                    format!("Selected record index {}", self.time_index),
+                );
+                ui.selectable_value(
+                    &mut self.radar_all_times,
+                    true,
+                    format!(
+                        "All {} records (ordered loop)",
+                        inventory.time.record_count
+                    ),
+                )
+                .on_hover_text(
+                    "Process one CM1 record at a time, retain each completed radar volume, and install one loop ordered by exact CM1 valid time.",
+                );
+            });
+        } else {
+            self.radar_all_times = false;
+        }
 
         let native_terrain = inventory.variable("zs").is_some();
         if native_terrain {
@@ -1363,10 +1385,17 @@ impl Cm1ImportPanel {
         if ui
             .add_enabled(
                 !import_busy && validation.is_ok(),
-                egui::Button::new(format!(
-                    "Build output {} native REF/VEL in Radar",
-                    self.time_index
-                )),
+                egui::Button::new(if self.radar_all_times {
+                    format!(
+                        "Build all {} records as a REF/VEL loop",
+                        inventory.time.record_count
+                    )
+                } else {
+                    format!(
+                        "Build record index {} native REF/VEL in Radar",
+                        self.time_index
+                    )
+                }),
             )
             .clicked()
         {
@@ -1415,8 +1444,19 @@ impl Cm1ImportPanel {
                 missing.join(", ")
             ));
         }
-        exact_time(inventory, self.time_index)?;
+        let time_indices = if self.radar_all_times {
+            (0..inventory.time.record_count).collect::<Vec<_>>()
+        } else {
+            vec![self.time_index]
+        };
+        for &time_index in &time_indices {
+            exact_time(inventory, time_index)?;
+        }
         let placement = self.build_placement(inventory)?;
+        for &time_index in &time_indices {
+            cm1::georeference_scalar_grid(inventory, &placement, time_index)
+                .map_err(|error| error.to_string())?;
+        }
         let terrain_policy = if inventory.variable("zs").is_some() {
             cm1::Cm1TerrainPolicy::RequireNative
         } else if self.assume_flat_radar_terrain {
@@ -1431,7 +1471,8 @@ impl Cm1ImportPanel {
             source_path,
             inventory: inventory.clone(),
             placement,
-            time_index: self.time_index,
+            time_indices,
+            display_time_index: self.time_index,
             terrain_policy,
         })
     }
@@ -2254,6 +2295,45 @@ mod tests {
         .expect("fixture inventory");
         assert_eq!(inventory.time.record_count, 2);
         assert_eq!(default_cm1_time_index(&inventory), 1);
+    }
+
+    #[test]
+    fn radar_scope_is_independent_and_builds_selected_or_all_record_indices() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc");
+        let mut inventory = cm1::inspect_path(&source_path).expect("fixture inventory");
+        // This test isolates the two independent UI time scopes. The schema
+        // fixture deliberately carries unresolved nonzero moving-frame winds;
+        // make its domain stationary so radar-readiness does not obscure the
+        // request-selection contract under test.
+        inventory.motion.domain_motion = Cm1DomainMotion::Static;
+        let mut panel = Cm1ImportPanel {
+            source_path: Some(source_path),
+            time_index: 1,
+            import_all_times: false,
+            radar_all_times: true,
+            anchor_latitude: "35.0".to_owned(),
+            anchor_longitude: "-97.0".to_owned(),
+            placement_mode: Some(Cm1PlacementMode::FollowDomain),
+            ..Cm1ImportPanel::default()
+        };
+
+        let loop_request = panel
+            .build_radar_request(&inventory)
+            .expect("all-record radar request");
+        assert_eq!(loop_request.time_indices, vec![0, 1]);
+        assert_eq!(loop_request.display_time_index, 1);
+
+        panel.radar_all_times = false;
+        let selected_request = panel
+            .build_radar_request(&inventory)
+            .expect("selected-record radar request");
+        assert_eq!(selected_request.time_indices, vec![1]);
+        assert_eq!(selected_request.display_time_index, 1);
+        assert!(
+            !panel.import_all_times,
+            "model import scope must stay independent"
+        );
     }
 
     #[test]

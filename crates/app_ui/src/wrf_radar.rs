@@ -8372,7 +8372,13 @@ pub struct Cm1RadarRequest {
     pub source_path: PathBuf,
     pub inventory: app_ui::cm1::Cm1Inventory,
     pub placement: app_ui::cm1::Cm1Placement,
-    pub time_index: usize,
+    /// Native CM1 record indices in the exact order required for the finished
+    /// radar loop. A selected-record build contains exactly one index.
+    pub time_indices: Vec<usize>,
+    /// The record selected in the CM1 window. It is processed first so its
+    /// first tilt can stream immediately, even when the final loop starts at
+    /// the earliest record.
+    pub display_time_index: usize,
     pub terrain_policy: app_ui::cm1::Cm1TerrainPolicy,
 }
 
@@ -8618,10 +8624,14 @@ pub fn spawn_cm1_radar(
     request: Cm1RadarRequest,
     config: SyntheticRadarConfig,
 ) -> SyntheticRadarTask {
+    let scope = if request.time_indices.len() == 1 {
+        format!("record index {}", request.display_time_index)
+    } else {
+        format!("{} ordered records", request.time_indices.len())
+    };
     let label = format!(
-        "CM1 native REF/VEL from {} time {}",
-        display_name(&request.source_path),
-        request.time_index
+        "CM1 native REF/VEL from {} ({scope})",
+        display_name(&request.source_path)
     );
     let (tx, rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -8708,84 +8718,212 @@ fn build_cm1_radar(
     )));
     let nc = netcrust::open(&request.source_path)
         .map_err(|error| format!("open CM1 radar source: {error}"))?;
-    let progress = |message: &str| {
-        let _ = tx.send(SyntheticRadarMessage::Progress(message.to_owned()));
-    };
-    let scene = app_ui::cm1::read_radar_scene_reporting(
-        &nc,
-        &request.inventory,
-        &request.placement,
-        request.time_index,
-        request.terrain_policy,
-        &progress,
-    )
-    .map_err(|error| error.to_string())?;
-    check_synthetic_radar_cancel(cancel)?;
-    let valid_time = scene.valid_time_utc;
-    let config_fingerprint = cm1_radar_fingerprint(config, &request, &scene);
-    let fields = cm1_radar_fields(scene)?;
+    let plan = cm1_radar_time_plan(&request)?;
+    let config_fingerprint = cm1_radar_fingerprint(config, &request);
+    let mut completed = (0..plan.output_indices.len())
+        .map(|_| None)
+        .collect::<Vec<Option<Arc<RadarVolume>>>>();
+    let mut notes = Vec::with_capacity(plan.output_indices.len() + 1);
     let preview_sent = AtomicBool::new(false);
-    let cut_completed = |partial: &RadarVolume, completed_cuts: usize, total_cuts: usize| {
-        if completed_cuts == 1 && !preview_sent.swap(true, Ordering::AcqRel) {
-            send_cm1_first_cut_preview(
-                tx,
-                label,
-                config_fingerprint,
-                &request.source_path,
-                partial,
-                completed_cuts,
-                total_cuts,
-            );
-        }
-    };
-    let mut volume = try_build_synthetic_volume_reporting_previewing_cancellable(
-        &fields,
-        valid_time,
-        config,
-        &progress,
-        &cut_completed,
-        cancel,
-    )?;
-    volume.metadata.source_path = Some(request.source_path.display().to_string());
-    volume.metadata.archive_version = Some("simulated-cm1-native-dbz-v1".to_owned());
-    volume.metadata.scan_name = Some(format!(
-        "CM1 native scalar REF/VEL (time {})",
-        request.time_index
+    for (processing_slot, &time_index) in plan.processing_indices.iter().enumerate() {
+        check_synthetic_radar_cancel(cancel)?;
+        let output_slot = plan
+            .output_indices
+            .iter()
+            .position(|&candidate| candidate == time_index)
+            .expect("validated CM1 processing record belongs to output order");
+        let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+            "CM1 radar: record index {time_index} ({}/{})",
+            processing_slot + 1,
+            plan.processing_indices.len()
+        )));
+        let progress = |message: &str| {
+            let _ = tx.send(SyntheticRadarMessage::Progress(format!(
+                "CM1 record index {time_index}: {message}"
+            )));
+        };
+        // The scene and its large native 3-D arrays are deliberately scoped to
+        // this iteration. Only the completed polar RadarVolume survives into
+        // the next record, keeping source-scene memory bounded to one record.
+        let scene = app_ui::cm1::read_radar_scene_reporting(
+            &nc,
+            &request.inventory,
+            &request.placement,
+            time_index,
+            request.terrain_policy,
+            &progress,
+        )
+        .map_err(|error| format!("record index {time_index}: {error}"))?;
+        check_synthetic_radar_cancel(cancel)?;
+        let valid_time = scene.valid_time_utc;
+        let fields = cm1_radar_fields(scene)?;
+        let stream_selected_record = time_index == request.display_time_index;
+        let cut_completed = |partial: &RadarVolume, completed_cuts: usize, total_cuts: usize| {
+            if stream_selected_record
+                && completed_cuts == 1
+                && !preview_sent.swap(true, Ordering::AcqRel)
+            {
+                send_cm1_first_cut_preview(
+                    tx,
+                    label,
+                    config_fingerprint,
+                    &request.source_path,
+                    time_index,
+                    partial,
+                    completed_cuts,
+                    total_cuts,
+                );
+            }
+        };
+        let mut volume = try_build_synthetic_volume_reporting_previewing_cancellable(
+            &fields,
+            valid_time,
+            config,
+            &progress,
+            &cut_completed,
+            cancel,
+        )?;
+        volume.metadata.source_path = Some(request.source_path.display().to_string());
+        volume.metadata.archive_version = Some("simulated-cm1-native-dbz-v1".to_owned());
+        volume.metadata.scan_name = Some(format!(
+            "CM1 native scalar REF/VEL (record index {time_index})"
+        ));
+        notes.push(format!(
+            "CM1 {} record index {time_index} at {}: {} radials; native 3-D dbz; model-z datum undeclared; dual-pol/T-matrix/WRF interpolation disabled",
+            request
+                .inventory
+                .version
+                .as_deref()
+                .unwrap_or("version undeclared"),
+            valid_time.to_rfc3339(),
+            volume.metadata.decoded_radial_count,
+        ));
+        completed[output_slot] = Some(Arc::new(volume));
+    }
+    let volumes = completed
+        .into_iter()
+        .enumerate()
+        .map(|(slot, volume)| {
+            volume.ok_or_else(|| {
+                format!(
+                    "CM1 radar record index {} did not produce a volume",
+                    plan.output_indices[slot]
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if volumes
+        .windows(2)
+        .any(|pair| pair[0].volume_time >= pair[1].volume_time)
+    {
+        return Err("CM1 radar loop valid times are not strictly increasing".to_owned());
+    }
+    notes.push(format!(
+        "CM1 radar run contains {} record(s) in exact native-time order; selected record index {} was processed first for tilt streaming",
+        volumes.len(), request.display_time_index
     ));
-    let notes = vec![format!(
-        "CM1 {} time {}: {} radials; native 3-D dbz; model-z datum undeclared; dual-pol/T-matrix/WRF interpolation disabled",
-        request
-            .inventory
-            .version
-            .as_deref()
-            .unwrap_or("version undeclared"),
-        request.time_index,
-        volume.metadata.decoded_radial_count,
-    )];
     Ok(SyntheticRadarOutput {
         label: label.to_owned(),
-        volumes: vec![Arc::new(volume)],
+        volumes,
         notes,
         config_fingerprint,
         frame_sources: Vec::new(),
     })
 }
 
-fn cm1_radar_fingerprint(
-    config: &SyntheticRadarConfig,
-    request: &Cm1RadarRequest,
-    scene: &app_ui::cm1::Cm1RadarScene,
-) -> u64 {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cm1RadarTimePlan {
+    output_indices: Vec<usize>,
+    processing_indices: Vec<usize>,
+}
+
+fn cm1_radar_time_plan(request: &Cm1RadarRequest) -> Result<Cm1RadarTimePlan, String> {
+    if request.time_indices.is_empty() {
+        return Err("CM1 radar time scope selected no records".to_owned());
+    }
+    if request
+        .time_indices
+        .iter()
+        .any(|&index| index >= request.inventory.time.record_count)
+    {
+        return Err(format!(
+            "CM1 radar selection exceeds the {}-record native time axis",
+            request.inventory.time.record_count
+        ));
+    }
+    if request
+        .time_indices
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err("CM1 radar record indices must be unique and strictly increasing".to_owned());
+    }
+    let display_slot = request
+        .time_indices
+        .iter()
+        .position(|&index| index == request.display_time_index)
+        .ok_or_else(|| {
+            format!(
+                "selected CM1 record index {} is outside the radar time scope",
+                request.display_time_index
+            )
+        })?;
+    if let Some(offsets) = request.inventory.time.offsets_seconds.available() {
+        let selected_offsets = request
+            .time_indices
+            .iter()
+            .map(|&index| offsets.get(index).copied())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "CM1 radar time offset is missing".to_owned())?;
+        if selected_offsets
+            .iter()
+            .any(|offset| !offset.is_finite() || *offset < 0.0)
+            || selected_offsets.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(
+                "CM1 radar selected times must be finite and strictly increasing".to_owned(),
+            );
+        }
+    }
+    let mut processing_indices = Vec::with_capacity(request.time_indices.len());
+    processing_indices.push(request.time_indices[display_slot]);
+    processing_indices.extend(
+        request
+            .time_indices
+            .iter()
+            .copied()
+            .filter(|&index| index != request.display_time_index),
+    );
+    Ok(Cm1RadarTimePlan {
+        output_indices: request.time_indices.clone(),
+        processing_indices,
+    })
+}
+
+fn cm1_radar_fingerprint(config: &SyntheticRadarConfig, request: &Cm1RadarRequest) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     config.data_fingerprint().hash(&mut hasher);
     request.source_path.hash(&mut hasher);
-    request.time_index.hash(&mut hasher);
-    scene.valid_time_utc.timestamp_millis().hash(&mut hasher);
-    scene.nx.hash(&mut hasher);
-    scene.ny.hash(&mut hasher);
-    scene.nz.hash(&mut hasher);
+    request.time_indices.hash(&mut hasher);
+    request.inventory.axes.xh.raw_values.len().hash(&mut hasher);
+    request.inventory.axes.yh.raw_values.len().hash(&mut hasher);
+    request.inventory.axes.zh.raw_values.len().hash(&mut hasher);
+    request
+        .inventory
+        .time
+        .simulation_start_utc
+        .available()
+        .hash(&mut hasher);
+    if let Some(offsets) = request.inventory.time.offsets_seconds.available() {
+        for &time_index in &request.time_indices {
+            offsets
+                .get(time_index)
+                .map(|offset| offset.to_bits())
+                .hash(&mut hasher);
+        }
+    }
     request
         .placement
         .anchor_latitude_deg
@@ -8814,6 +8952,7 @@ fn send_cm1_first_cut_preview(
     label: &str,
     config_fingerprint: u64,
     source_path: &Path,
+    time_index: usize,
     partial: &RadarVolume,
     completed_cuts: usize,
     total_cuts: usize,
@@ -8822,7 +8961,7 @@ fn send_cm1_first_cut_preview(
     volume.metadata.source_path = Some(source_path.display().to_string());
     volume.metadata.archive_version = Some("simulated-cm1-partial-preview".to_owned());
     volume.metadata.scan_name = Some(format!(
-        "CM1 native scalar REF/VEL (processing: tilt {completed_cuts}/{total_cuts})"
+        "CM1 native scalar REF/VEL (record index {time_index}; processing tilt {completed_cuts}/{total_cuts})"
     ));
     let preview_fragment = format!(
         "build_complete=false; completed_tilts={completed_cuts}; planned_tilts={total_cuts}"
@@ -8835,7 +8974,9 @@ fn send_cm1_first_cut_preview(
         None => volume.metadata.forward_operator_config = Some(preview_fragment),
     }
     let _ = tx.send(SyntheticRadarMessage::Preview(SyntheticRadarPreview {
-        label: format!("{label} - tilt {completed_cuts}/{total_cuts} preview"),
+        label: format!(
+            "{label} - record index {time_index} tilt {completed_cuts}/{total_cuts} preview"
+        ),
         volume: Arc::new(volume),
         config_fingerprint,
         completed_cuts,
@@ -10641,6 +10782,142 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("model-z datum undeclared")
+        );
+    }
+
+    #[test]
+    fn cm1_loop_plan_processes_selected_record_first_but_outputs_native_time_order() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc");
+        let inventory = app_ui::cm1::inspect_path(&source_path).expect("fixture inventory");
+        let request = Cm1RadarRequest {
+            source_path,
+            inventory,
+            placement: app_ui::cm1::Cm1Placement {
+                mode: app_ui::cm1::Cm1PlacementMode::FollowDomain,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+            time_indices: vec![0, 1],
+            display_time_index: 1,
+            terrain_policy: app_ui::cm1::Cm1TerrainPolicy::RequireNative,
+        };
+        let plan = cm1_radar_time_plan(&request).expect("CM1 radar time plan");
+        assert_eq!(plan.output_indices, vec![0, 1]);
+        assert_eq!(plan.processing_indices, vec![1, 0]);
+    }
+
+    #[test]
+    fn cm1_loop_plan_rejects_duplicate_or_reversed_record_indices() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc");
+        let inventory = app_ui::cm1::inspect_path(&source_path).expect("fixture inventory");
+        let mut request = Cm1RadarRequest {
+            source_path,
+            inventory,
+            placement: app_ui::cm1::Cm1Placement {
+                mode: app_ui::cm1::Cm1PlacementMode::FollowDomain,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+            time_indices: vec![1, 0],
+            display_time_index: 1,
+            terrain_policy: app_ui::cm1::Cm1TerrainPolicy::RequireNative,
+        };
+        assert!(
+            cm1_radar_time_plan(&request)
+                .unwrap_err()
+                .contains("strictly increasing")
+        );
+        request.time_indices = vec![0, 0];
+        request.display_time_index = 0;
+        assert!(
+            cm1_radar_time_plan(&request)
+                .unwrap_err()
+                .contains("strictly increasing")
+        );
+    }
+
+    #[test]
+    fn cm1_worker_builds_one_exact_time_loop_while_streaming_selected_record_first() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cm1/cm1out_schema.nc");
+        let mut inventory = app_ui::cm1::inspect_path(&source_path).expect("fixture inventory");
+        inventory.motion.domain_motion = app_ui::cm1::Cm1DomainMotion::Static;
+        let request = Cm1RadarRequest {
+            source_path,
+            inventory,
+            placement: app_ui::cm1::Cm1Placement {
+                mode: app_ui::cm1::Cm1PlacementMode::FollowDomain,
+                anchor_latitude_deg: 35.0,
+                anchor_longitude_deg: -97.0,
+            },
+            time_indices: vec![0, 1],
+            display_time_index: 1,
+            terrain_policy: app_ui::cm1::Cm1TerrainPolicy::RequireNative,
+        };
+        let config = SyntheticRadarConfig {
+            site_id: "CM1".to_owned(),
+            site_name: Some("Focused CM1 loop radar".to_owned()),
+            site_lat_deg: None,
+            site_lon_deg: None,
+            max_range_m: 2_000.0,
+            gate_spacing_m: 1_000.0,
+            elevations_deg: vec![0.5],
+            ref_gate_texture: false,
+            vel_gate_texture: false,
+            instrument_noise: false,
+            ..SyntheticRadarConfig::default()
+        };
+        let (tx, rx) = channel();
+        let cancel = AtomicBool::new(false);
+        let output = build_cm1_radar(request, &config, "focused CM1 loop", &tx, &cancel)
+            .expect("build focused CM1 radar loop");
+        assert_eq!(output.volumes.len(), 2);
+        assert!(output.volumes[0].volume_time < output.volumes[1].volume_time);
+        assert_eq!(
+            output.volumes[1].volume_time - output.volumes[0].volume_time,
+            chrono::TimeDelta::seconds(60)
+        );
+        assert!(
+            output.volumes[0]
+                .metadata
+                .scan_name
+                .as_deref()
+                .is_some_and(|name| name.contains("record index 0"))
+        );
+        assert!(
+            output.volumes[1]
+                .metadata
+                .scan_name
+                .as_deref()
+                .is_some_and(|name| name.contains("record index 1"))
+        );
+
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        let processing_order = messages
+            .iter()
+            .filter_map(|message| match message {
+                SyntheticRadarMessage::Progress(message)
+                    if message.starts_with("CM1 radar: record index ") =>
+                {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(processing_order[0].contains("record index 1"));
+        assert!(processing_order[1].contains("record index 0"));
+        let preview = messages.iter().find_map(|message| match message {
+            SyntheticRadarMessage::Preview(preview) => Some(preview),
+            _ => None,
+        });
+        assert_eq!(
+            preview
+                .expect("selected-record first-tilt preview")
+                .volume
+                .volume_time,
+            output.volumes[1].volume_time
         );
     }
 
