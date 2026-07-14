@@ -252,10 +252,18 @@ mod tests {
     /// come out finite for a convective column.
     #[test]
     fn column_converts_to_analysis() {
-        let pres = [1000.0, 925.0, 850.0, 700.0, 500.0, 400.0, 300.0, 250.0, 200.0, 150.0];
-        let hght = [110.0, 780.0, 1500.0, 3100.0, 5800.0, 7500.0, 9600.0, 10900.0, 12300.0, 14100.0];
-        let tmpc = [27.0, 22.0, 17.5, 8.0, -8.5, -20.0, -36.0, -46.0, -55.0, -60.0];
-        let dwpc = [22.0, 19.0, 15.0, 4.0, -15.0, -30.0, -48.0, -58.0, -68.0, -75.0];
+        let pres = [
+            1000.0, 925.0, 850.0, 700.0, 500.0, 400.0, 300.0, 250.0, 200.0, 150.0,
+        ];
+        let hght = [
+            110.0, 780.0, 1500.0, 3100.0, 5800.0, 7500.0, 9600.0, 10900.0, 12300.0, 14100.0,
+        ];
+        let tmpc = [
+            27.0, 22.0, 17.5, 8.0, -8.5, -20.0, -36.0, -46.0, -55.0, -60.0,
+        ];
+        let dwpc = [
+            22.0, 19.0, 15.0, 4.0, -15.0, -30.0, -48.0, -58.0, -68.0, -75.0,
+        ];
         let u = [2.0, 6.0, 9.0, 13.0, 18.0, 22.0, 27.0, 30.0, 32.0, 30.0];
         let v = [8.0, 10.0, 11.0, 12.0, 14.0, 15.0, 16.0, 16.0, 15.0, 14.0];
         let column = SoundingColumn {
@@ -293,7 +301,10 @@ mod tests {
             read_ms: 0.0,
         };
         let analysis = build_analysis(&data, &column).expect("analysis builds");
-        assert!(analysis.prof.mupcl.bplus > 0.0, "convective column has CAPE");
+        assert!(
+            analysis.prof.mupcl.bplus > 0.0,
+            "convective column has CAPE"
+        );
         assert!(analysis.derived.pwat.is_finite(), "PWAT computes");
         assert!(analysis.derived.srh1km.is_finite(), "SRH computes");
         assert!(analysis.title.starts_with("HRRR 2026-06-25 06z F018"));
@@ -361,10 +372,12 @@ mod tests {
 
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| panel.ui(ui));
-        let stored =
-            sharppyrs::stored_layout(&ctx, SharppySoundingPanel::layout_memory_id())
-                .expect("layout stored under the pinned id");
+        let stored = sharppyrs::stored_layout(&ctx, SharppySoundingPanel::layout_memory_id())
+            .expect("layout stored under the pinned id");
         assert_eq!(stored.to_tokens(), tokens);
-        assert_eq!(panel.view_state_json()["sharppy_layout"].as_str(), Some(tokens));
+        assert_eq!(
+            panel.view_state_json()["sharppy_layout"].as_str(),
+            Some(tokens)
+        );
     }
 }
