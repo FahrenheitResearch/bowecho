@@ -30637,7 +30637,10 @@ impl ViewerApp {
         let mut open = self.native_skewt_open;
         egui::Window::new("Sounding (native)")
             .open(&mut open)
-            .default_size([1265.0, 950.0])
+            // Rusty Weather v0.4 gives the complete SPC board a desktop-width
+            // canvas. Mirror that first-open geometry here; egui still clamps
+            // it to smaller displays and the user can resize or dock it.
+            .default_size([1680.0, 1000.0])
             .min_size([480.0, 360.0])
             .resizable(true)
             .show(ctx, |ui| {
