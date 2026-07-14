@@ -2405,6 +2405,14 @@ impl ModelDataDock {
         self.latest_sounding.as_ref()
     }
 
+    /// Test-only: install a dock "latest sounding" so app tests can exercise
+    /// `poll_native_sounding`'s freshness/supersede logic without a worker
+    /// round-trip.
+    #[cfg(test)]
+    pub(crate) fn set_latest_sounding_for_test(&mut self, data: rw_ui::SoundingData) {
+        self.latest_sounding = Some(std::sync::Arc::new(data));
+    }
+
     /// Whether the reusable rw-ui sounding panel has model sounding content
     /// ready for an external host pane/window.
     pub fn sounding_has_content(&self) -> bool {
@@ -5803,6 +5811,20 @@ impl ModelDataDock {
     pub fn request_sounding_at(&mut self, fx: f64, fy: f64) {
         if let Some(hour) = self.viewer.hour().cloned() {
             self.request_sounding_for(hour, fx, fy);
+        }
+    }
+
+    /// A newer explicit sounding request OUTSIDE the dock (the app's RAOB
+    /// path) supersedes a still-averaging box-mean request the same way a
+    /// new point request does: drop the task so a box that completes AFTER
+    /// the newer request can never install as `latest_sounding` and stomp
+    /// the viewer. The pending spinner state clears with it; an already
+    /// APPLIED box sounding is left untouched.
+    pub fn abandon_pending_box_sounding(&mut self) {
+        self.box_sounding_task = None;
+        self.box_sounding_pending = None;
+        if self.sounding_request_mode == SoundingRequestMode::BoxPending {
+            self.sounding_request_mode = SoundingRequestMode::None;
         }
     }
 

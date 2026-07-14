@@ -32731,6 +32731,30 @@ impl ViewerApp {
         self.start_raob_sounding_for(nearest, Some(distance), ctx);
     }
 
+    /// An explicit RAOB request must WIN over the model-sounding flow: mark
+    /// the model dock's current latest sounding as already consumed, so
+    /// [`Self::poll_native_sounding`]'s freshness filter (`Arc::ptr_eq`
+    /// against this pointer) drops it. The pre-fix code CLEARED
+    /// `native_sounding_src` instead, which made the dock's cached sounding
+    /// look fresh again — the frame after the RAOB landed, the poll
+    /// re-spawned a model compute and re-asserted
+    /// `SoundingViewerSource::Model`, stomping the RAOB after ~0.1 s. This
+    /// also supersedes a sounding the poll is still HOLDING un-consumed
+    /// behind the archive-obs gate, and drops a still-averaging box-mean
+    /// request (which would otherwise mint a NEW dock sounding seconds after
+    /// the RAOB click). A later Alt-click mints a NEW Arc in the dock, so
+    /// the model path is untouched.
+    fn supersede_pending_model_sounding(&mut self) {
+        if let Some(dock) = self.model_dock.as_mut() {
+            dock.abandon_pending_box_sounding();
+        }
+        self.native_sounding_src = self
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.latest_sounding())
+            .cloned();
+    }
+
     /// Fetch + render ONE station's RAOB launch nearest the displayed
     /// radar time (specials included — scrub the loop to 21z, get the 21z
     /// special) through the native skew-T channel; the poll installs the
@@ -32753,7 +32777,7 @@ impl ViewerApp {
             .unwrap_or_else(Utc::now);
         let (sender, receiver) = mpsc::channel();
         self.native_sounding_rx = Some(receiver);
-        self.native_sounding_src = None;
+        self.supersede_pending_model_sounding();
         self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
         self.native_sounding_panel.set_loading();
         self.open_viewer(dock::WorkspacePane::Sounding);
@@ -42198,7 +42222,18 @@ fn build_native_sounding_for_request(
             column.u_ms[0] = -speed_ms * dir_rad.sin();
             column.v_ms[0] = -speed_ms * dir_rad.cos();
         }
-        tag = Some(format!("{} obs-adj {:.0}km", ob.station_id, distance_km));
+        // The ob's UTC time rides in the tag so an archive-date sounding
+        // visibly proves it was adjusted with a HISTORIC report, not a live
+        // one. Both selection paths only pick timestamped obs; a timeless
+        // one degrades to the bare tag.
+        let at = ob
+            .time_utc
+            .map(|t| format!(" @ {}", t.format("%Y-%m-%d %H:%MZ")))
+            .unwrap_or_default();
+        tag = Some(format!(
+            "{} obs-adj {:.0}km{at}",
+            ob.station_id, distance_km
+        ));
     }
     let native = if build_profile {
         let mut native =
@@ -45251,7 +45286,7 @@ mod tests {
     fn test_adjusting_surface_ob() -> obs::SurfaceOb {
         obs::SurfaceOb {
             station_id: "KOUN".to_owned(),
-            time_utc: None,
+            time_utc: Some(Utc.with_ymd_and_hms(2026, 6, 24, 22, 55, 0).unwrap()),
             lat: 35.24,
             lon: -97.47,
             temp_c: Some(33.0),
@@ -45359,13 +45394,22 @@ mod tests {
         // be the adjusting ob's, not the model's.
         assert_eq!(column.temperature_c[0], 33.0);
         assert_eq!(column.dewpoint_c[0], 21.5);
+        // Station, distance, AND the ob's UTC time — the time is how the
+        // user verifies an archive sounding was adjusted with a HISTORIC
+        // report, not a live one.
         assert!(
-            display_data.hour.run.contains("KOUN obs-adj 12km"),
+            display_data
+                .hour
+                .run
+                .contains("KOUN obs-adj 12km @ 2026-06-24 22:55Z"),
             "{}",
             display_data.hour.run
         );
         assert!(
-            native.metadata.station_id.contains("KOUN obs-adj 12km"),
+            native
+                .metadata
+                .station_id
+                .contains("KOUN obs-adj 12km @ 2026-06-24 22:55Z"),
             "{}",
             native.metadata.station_id
         );
@@ -45396,7 +45440,10 @@ mod tests {
         assert_eq!(column.temperature_c[0], 33.0);
         assert_eq!(column.dewpoint_c[0], 21.5);
         assert!(
-            display_data.hour.run.contains("KOUN obs-adj 12km"),
+            display_data
+                .hour
+                .run
+                .contains("KOUN obs-adj 12km @ 2026-06-24 22:55Z"),
             "{}",
             display_data.hour.run
         );
@@ -66860,6 +66907,77 @@ mod tests {
         assert!(!app.workspace.is_docked(dock::WorkspacePane::Sounding));
         assert_eq!(app.sounding_viewer_source, SoundingViewerSource::NativeOnly);
         assert!(app.last_sounding_request.is_none());
+    }
+
+    /// Regression: with a model sounding already shown (Alt-click), clicking
+    /// a RAOB site flashed the RAOB for one frame and then flipped the pane
+    /// back to the model sounding. `start_raob_sounding_for` CLEARED
+    /// `native_sounding_src`, so the model dock's cached latest sounding
+    /// looked fresh again and `poll_native_sounding` re-spawned a model
+    /// compute that re-asserted `SoundingViewerSource::Model` over the RAOB
+    /// the user just asked for. The RAOB request now marks that pending model
+    /// sounding as consumed (covering both a displayed sounding and one still
+    /// held un-consumed behind the archive-obs gate), while a LATER Alt-click
+    /// — a NEW Arc in the dock — still reads as fresh.
+    #[test]
+    fn raob_request_supersedes_pending_model_sounding() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("hrrr", "20260624_22z", &[1]),
+        );
+        dock.set_latest_sounding_for_test(test_model_sounding_data());
+        app.model_dock = Some(dock);
+        // The state a RAOB click found pre-fix: model sounding displayed (or
+        // still HELD un-consumed by the archive-obs gate — src None models
+        // the worst case of both).
+        app.native_sounding_src = None;
+        app.sounding_viewer_source = SoundingViewerSource::Model;
+
+        // The RAOB request path's supersede + source flip (the fetch thread
+        // itself is network and stays un-spawned here).
+        app.supersede_pending_model_sounding();
+        app.sounding_viewer_source = SoundingViewerSource::NativeOnly;
+
+        let latest = app
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.latest_sounding())
+            .cloned()
+            .expect("dock holds a latest sounding");
+        assert!(
+            app.native_sounding_src
+                .as_ref()
+                .is_some_and(|src| Arc::ptr_eq(src, &latest)),
+            "the dock's pending sounding is marked consumed"
+        );
+
+        // The frame after the RAOB lands: the poll must NOT re-spawn a model
+        // compute or re-assert the Model source over the RAOB.
+        app.poll_native_sounding(&ctx);
+        assert!(
+            app.native_sounding_rx.is_none(),
+            "no model compute respawned from the superseded sounding"
+        );
+        assert_eq!(
+            app.sounding_viewer_source,
+            SoundingViewerSource::NativeOnly,
+            "the RAOB keeps the pane"
+        );
+
+        // A later Alt-click mints a NEW Arc in the dock — that one must still
+        // read as fresh, so the model flow is untouched.
+        app.model_dock
+            .as_mut()
+            .unwrap()
+            .set_latest_sounding_for_test(test_model_sounding_data());
+        app.poll_native_sounding(&ctx);
+        assert!(
+            app.native_sounding_rx.is_some(),
+            "a genuinely new model sounding still spawns its compute"
+        );
+        assert_eq!(app.sounding_viewer_source, SoundingViewerSource::Model);
     }
 
     #[test]
