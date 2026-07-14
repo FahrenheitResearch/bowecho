@@ -3243,6 +3243,7 @@ struct ViewerApp {
     /// un-adjusted instead of refetching every click.
     historical_obs: Option<(DateTime<Utc>, Vec<obs::SurfaceOb>)>,
     /// One historical-window fetch in flight, tagged with its hour key.
+    #[allow(clippy::type_complexity)]
     historical_obs_rx: Option<(
         DateTime<Utc>,
         mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>,

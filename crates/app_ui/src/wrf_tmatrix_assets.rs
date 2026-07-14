@@ -526,6 +526,7 @@ pub fn build_property_tmatrix_scene_with_cancel(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_property_tmatrix_scene_with_policy_and_cancel(
     source: &WrfPropertyScene,
     maximum_owned_peak_bytes: usize,
@@ -548,6 +549,7 @@ pub fn build_property_tmatrix_scene_with_policy_and_cancel(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_property_tmatrix_scene_internal(
     source: &WrfPropertyScene,
     maximum_owned_peak_bytes: usize,

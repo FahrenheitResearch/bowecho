@@ -1041,7 +1041,10 @@ pub struct WrfTMatrixSceneProvenance {
 }
 
 /// Frozen-particle representation used by this source scene.
+// This Copy provenance value is held once per scene audit; the large scheme
+// variants carry pinned revision records and are never stored in bulk.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum WrfTMatrixFrozenScatteringAudit {
     /// Legacy audit value retained for serialized/in-memory compatibility.
     /// New P3 production dispatch never emits this variant.
@@ -7257,9 +7260,9 @@ mod tests {
             643.411_45,
         ]);
         let nearest = source.components().map(|value| value as f32);
-        assert_eq!(nearest[0], 29.762_805_938_720_703_f32);
-        assert_eq!(nearest[7], 138.382_553_100_585_94_f32);
-        assert_eq!(nearest[8], 643.411_437_988_281_3_f32);
+        assert_eq!(nearest[0], 29.762_806_f32);
+        assert_eq!(nearest[7], 138.382_55_f32);
+        assert_eq!(nearest[8], 643.411_44_f32);
         assert!(matches!(
             decode_components(&nearest),
             Err(WrfTMatrixSceneQueryError::Output(

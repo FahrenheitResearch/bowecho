@@ -134,10 +134,9 @@ impl SharppySoundingPanel {
                 ui.selectable_value(&mut self.classic, true, "Classic");
             });
         }
-        if self.classic || self.analysis.is_none() {
-            self.inner.ui(ui);
-        } else {
-            let analysis = self.analysis.as_ref().expect("checked above");
+        if !self.classic
+            && let Some(analysis) = self.analysis.as_ref()
+        {
             // The SPC window is composed for a roughly 3:2 canvas; keep the
             // aspect sane inside arbitrary panes and let it scale with the pane.
             let avail = ui.available_size();
@@ -154,6 +153,8 @@ impl SharppySoundingPanel {
                             .size(size),
                     );
                 });
+        } else {
+            self.inner.ui(ui);
         }
         // Mirror the (possibly gear-edited) layout back out so the ctx-less
         // `view_state_json` can persist it.

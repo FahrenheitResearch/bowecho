@@ -9045,6 +9045,7 @@ fn cm1_radar_fingerprint(config: &SyntheticRadarConfig, request: &Cm1RadarReques
     hasher.finish()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_cm1_first_cut_preview(
     tx: &Sender<SyntheticRadarMessage>,
     label: &str,
@@ -9942,11 +9943,11 @@ fn build_temporal_synthetic_from_scenes(
         } else {
             "single-scene held"
         };
-        let property_suffix = config
-            .polarimetric_kernel
-            .is_property_tmatrix()
-            .then_some(" minimum; exact sparse T-matrix cache is checked after each scene read")
-            .unwrap_or_default();
+        let property_suffix = if config.polarimetric_kernel.is_property_tmatrix() {
+            " minimum; exact sparse T-matrix cache is checked after each scene read"
+        } else {
+            ""
+        };
         notes.push(format!(
             "Temporal {scene_label} preflight: {:.2} GiB estimated peak within {:.2} GiB budget{property_suffix}",
             required_bytes as f64 / 1024.0_f64.powi(3),

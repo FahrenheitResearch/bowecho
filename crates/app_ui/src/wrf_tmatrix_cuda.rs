@@ -1686,12 +1686,12 @@ mod tests {
         const HOST_COLUMN_BUDGET: usize = 8 * 27;
         const HOST_GATE_CAP: usize = 64;
         const GATES_PER_CHUNK: usize = HOST_GATE_CAP;
-        const HOST_CHUNKS: usize = (GATES + GATES_PER_CHUNK - 1) / GATES_PER_CHUNK;
+        const HOST_CHUNKS: usize = GATES.div_ceil(GATES_PER_CHUNK);
         const POPULATIONS: usize = GATES * POPULATIONS_PER_GATE;
         const NODE_COUNT: usize = POPULATIONS * NODES_PER_POPULATION;
 
         assert_eq!(GATES_PER_CHUNK, 64);
-        assert!(GATES_PER_CHUNK * CENTER_BEAM_SAMPLE_POINTS <= HOST_COLUMN_BUDGET);
+        const { assert!(GATES_PER_CHUNK * CENTER_BEAM_SAMPLE_POINTS <= HOST_COLUMN_BUDGET) };
 
         let availability = probe_cuda_cached();
         let Some(device) = availability.preferred_device() else {

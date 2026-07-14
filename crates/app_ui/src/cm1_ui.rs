@@ -28,7 +28,10 @@ pub struct Cm1ImportTask {
     pub rx: Receiver<Cm1ImportMessage>,
 }
 
+// This short-lived channel message is consumed once per poll; the summary
+// payload is never stored in a collection.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Cm1ImportMessage {
     Progress(String),
     Done(Result<Cm1ImportSummary, String>),
@@ -143,9 +146,11 @@ impl Cm1PlaneStatistics {
             ),
             (Some(minimum), Some(maximum)) => {
                 let missing = self.total_values.saturating_sub(self.finite_values);
-                let missing_note = (missing > 0)
-                    .then(|| format!("; {missing} missing cell(s)"))
-                    .unwrap_or_default();
+                let missing_note = if missing > 0 {
+                    format!("; {missing} missing cell(s)")
+                } else {
+                    String::new()
+                };
                 format!(
                     "range {} to {}{suffix}{missing_note}",
                     format_plot_value(minimum),

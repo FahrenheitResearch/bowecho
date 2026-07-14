@@ -517,6 +517,7 @@ fn build_box_sounding(
         ));
     }
 
+    #[allow(clippy::type_complexity)]
     let mut best_profile: Option<(usize, usize, String, Vec<ProfileVar>, Vec<usize>)> = None;
     for moisture in moisture_candidates {
         let names = ["temperature_iso", moisture, "u_iso", "v_iso", "height_iso"];

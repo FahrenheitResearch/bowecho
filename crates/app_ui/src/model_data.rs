@@ -2429,7 +2429,7 @@ impl ModelDataDock {
             let theme = crate::ui_theme::theme();
             egui::Frame::new()
                 .fill(theme.faint)
-                .stroke(egui::Stroke::new(1.0, theme.hairline))
+                .stroke(egui::Stroke::new(1.0_f32, theme.hairline))
                 .corner_radius(4)
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
@@ -2569,7 +2569,10 @@ impl ModelDataDock {
     /// an import finishes and refreshes even while the dock window is closed.
     fn poll_import(&mut self) {
         // What to do once the borrow of `import_job` is released. `rescan` is
-        // set on any completion so a partially-written run still shows.
+        // set on any completion so a partially-written run still shows. This
+        // value lives for one poll; the completion payloads are moved out
+        // immediately, so the variant size spread is harmless.
+        #[allow(clippy::large_enum_variant)]
         enum PollResult {
             Idle,
             Progress(String),
@@ -6197,7 +6200,7 @@ fn box_sounding_summary_ui(ui: &mut egui::Ui, summary: &crate::box_sounding::Box
     let theme = crate::ui_theme::theme();
     egui::Frame::new()
         .fill(theme.faint)
-        .stroke(egui::Stroke::new(1.0, theme.hairline))
+        .stroke(egui::Stroke::new(1.0_f32, theme.hairline))
         .corner_radius(4)
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
