@@ -27371,7 +27371,10 @@ impl ViewerApp {
     }
 
     fn box_sounding_arm_active(&self) -> bool {
-        self.model_dock_open
+        // The arm is exposed in both the Model field toolbar and the shared
+        // Sounding header. Keep it alive while either visible host remains;
+        // closing both must never leave an invisible map mode latched.
+        (self.model_dock_open || self.native_skewt_open)
             && self
                 .model_dock
                 .as_ref()
@@ -27429,14 +27432,16 @@ impl ViewerApp {
         response: &egui::Response,
         allowed: bool,
     ) -> bool {
-        // The arm button lives in the Model window: with that window gone,
-        // drop the arm instead of keeping an invisible mode latched.
-        if !self.model_dock_open
-            && let Some(dock) = self.model_dock.as_mut()
-            && (dock.plot_domain_armed() || dock.box_sounding_armed())
-        {
-            dock.set_plot_domain_armed(false);
-            dock.set_box_sounding_armed(false);
+        // Each map arm stays live only while at least one host that exposes
+        // its toggle is visible. Plot-domain remains Model-only; box sounding
+        // is also exposed by the shared Sounding header.
+        if let Some(dock) = self.model_dock.as_mut() {
+            if !self.model_dock_open && dock.plot_domain_armed() {
+                dock.set_plot_domain_armed(false);
+            }
+            if !self.model_dock_open && !self.native_skewt_open && dock.box_sounding_armed() {
+                dock.set_box_sounding_armed(false);
+            }
         }
         let armed = self.model_map_box_arm_active();
         let was_dragging = self.plot_domain_map_drag.is_some();
@@ -30735,10 +30740,21 @@ impl ViewerApp {
         if self.sounding_viewer_source == SoundingViewerSource::NativeOnly
             && self.native_sounding_panel.has_content()
         {
-            if docked {
-                self.native_sounding_panel.ui_docked(ui);
+            let controls = self
+                .model_dock
+                .as_ref()
+                .map(model_data::ModelDataDock::sounding_header_controls)
+                .unwrap_or_default();
+            let actions = if docked {
+                self.native_sounding_panel
+                    .ui_docked_with_header(ui, &controls)
             } else {
-                self.native_sounding_panel.ui(ui);
+                self.native_sounding_panel.ui_with_header(ui, &controls)
+            };
+            if actions.toggle_box_sounding
+                && let Some(model_dock) = self.model_dock.as_mut()
+            {
+                model_dock.set_box_sounding_armed(!model_dock.box_sounding_armed());
             }
             return;
         }
@@ -65933,6 +65949,33 @@ mod tests {
         assert!(!app.box_sounding_arm_active());
         assert!(!app.model_map_box_arm_active());
         assert_eq!(app.status, "Box-sounding draw cancelled");
+    }
+
+    #[test]
+    fn box_sounding_arm_accepts_model_or_sounding_header_as_visible_host() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("hrrr", "20260615_17z", &[0]),
+        );
+        dock.set_box_sounding_armed(true);
+        app.model_dock = Some(dock);
+
+        app.model_dock_open = false;
+        app.native_skewt_open = false;
+        assert!(!app.box_sounding_arm_active());
+
+        app.native_skewt_open = true;
+        assert!(
+            app.box_sounding_arm_active(),
+            "the top-of-sounding control remains an active, visible arm host"
+        );
+        assert!(app.model_map_box_arm_active());
+
+        app.native_skewt_open = false;
+        app.model_dock_open = true;
+        assert!(app.box_sounding_arm_active());
     }
 
     /// The Ctrl+Shift shortcut only engages with the Model window open and a

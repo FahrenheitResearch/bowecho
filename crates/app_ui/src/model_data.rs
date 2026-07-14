@@ -2440,6 +2440,30 @@ impl ModelDataDock {
         self.sounding_ui_with_host(ui, true);
     }
 
+    /// Snapshot the model-owned map-tool state for controls rendered inside
+    /// the shared sounding header.  The same snapshot is used whether a
+    /// model, adjusted-model, or observed sounding currently owns the pane.
+    pub(crate) fn sounding_header_controls(
+        &self,
+    ) -> crate::sharppy_sounding::SoundingHeaderControls {
+        let box_readiness = box_sounding_readiness(&self.hour_store_var_info);
+        let box_ready = box_readiness.is_ok()
+            && self.latest_field.as_ref().is_some_and(|field| {
+                field.grid.is_some() && self.viewer.hour() == Some(&field.key.hour)
+            });
+        let unavailable_reason =
+            box_readiness.as_ref().err().cloned().unwrap_or_else(|| {
+                "The displayed field has no compatible geographic grid".to_owned()
+            });
+        crate::sharppy_sounding::SoundingHeaderControls {
+            box_sounding: Some(crate::sharppy_sounding::BoxSoundingHeaderControl {
+                ready: box_ready,
+                armed: self.box_sounding_armed,
+                unavailable_reason,
+            }),
+        }
+    }
+
     fn sounding_ui_with_host(&mut self, ui: &mut egui::Ui, docked: bool) {
         self.handle_responses();
         if let Some(summary) = &self.box_sounding_summary {
@@ -2462,10 +2486,14 @@ impl ModelDataDock {
                 });
             ui.add_space(4.0);
         }
-        if docked {
-            self.sounding.ui_docked(ui);
+        let controls = self.sounding_header_controls();
+        let actions = if docked {
+            self.sounding.ui_docked_with_header(ui, &controls)
         } else {
-            self.sounding.ui(ui);
+            self.sounding.ui_with_header(ui, &controls)
+        };
+        if actions.toggle_box_sounding {
+            self.set_box_sounding_armed(!self.box_sounding_armed);
         }
     }
 
@@ -5956,15 +5984,10 @@ impl ModelDataDock {
         if self.latest_field.is_none() {
             return;
         }
-        let box_readiness = box_sounding_readiness(&self.hour_store_var_info);
-        let box_ready = box_readiness.is_ok()
-            && self.latest_field.as_ref().is_some_and(|field| {
-                field.grid.is_some() && self.viewer.hour() == Some(&field.key.hour)
-            });
-        let box_unavailable_reason =
-            box_readiness.as_ref().err().cloned().unwrap_or_else(|| {
-                "The displayed field has no compatible geographic grid".to_owned()
-            });
+        let box_control = self
+            .sounding_header_controls()
+            .box_sounding
+            .expect("model sounding header always supplies its box control");
         let theme = crate::ui_theme::theme();
         egui::Frame::new()
             .fill(theme.faint)
@@ -5991,17 +6014,17 @@ impl ModelDataDock {
 
                     let box_response = ui
                         .add_enabled(
-                            box_ready,
+                            box_control.ready,
                             egui::Button::selectable(
                                 self.box_sounding_armed,
                                 "Box sounding",
                             ),
                         )
-                        .on_hover_text(if box_ready {
+                        .on_hover_text(if box_control.ready {
                             "Arm the radar map, then drag a rectangle. BowEcho averages the model's primitive sounding columns inside it before deriving any diagnostics."
                                 .to_owned()
                         } else {
-                            box_unavailable_reason.clone()
+                            box_control.unavailable_reason.clone()
                         });
                     if box_response.clicked() {
                         self.set_box_sounding_armed(!self.box_sounding_armed);

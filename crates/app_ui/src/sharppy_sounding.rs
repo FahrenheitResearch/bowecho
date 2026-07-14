@@ -63,6 +63,26 @@ struct SharppyAnalysis {
     title: String,
 }
 
+/// Host-owned actions that sit beside the SHARPpy/Classic selector.  The
+/// sounding widget owns the row and its visual grammar, while BowEcho keeps
+/// ownership of map tools and model readiness.
+#[derive(Clone, Debug)]
+pub(crate) struct BoxSoundingHeaderControl {
+    pub(crate) ready: bool,
+    pub(crate) armed: bool,
+    pub(crate) unavailable_reason: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SoundingHeaderControls {
+    pub(crate) box_sounding: Option<BoxSoundingHeaderControl>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SoundingHeaderActions {
+    pub(crate) toggle_box_sounding: bool,
+}
+
 pub struct SharppySoundingPanel {
     inner: rw_ui::SoundingPanel,
     analysis: Option<Box<SharppyAnalysis>>,
@@ -179,17 +199,39 @@ impl SharppySoundingPanel {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        self.ui_with_host(ui, false);
+        self.ui_with_host(ui, false, &SoundingHeaderControls::default());
     }
 
     /// Render responsively inside a dock pane. Floating windows deliberately
     /// keep the full desktop board and scroll when made too small; docked
     /// panels instead scale the complete board to the pane.
     pub fn ui_docked(&mut self, ui: &mut egui::Ui) {
-        self.ui_with_host(ui, true);
+        self.ui_with_host(ui, true, &SoundingHeaderControls::default());
     }
 
-    fn ui_with_host(&mut self, ui: &mut egui::Ui, docked: bool) {
+    pub(crate) fn ui_with_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        controls: &SoundingHeaderControls,
+    ) -> SoundingHeaderActions {
+        self.ui_with_host(ui, false, controls)
+    }
+
+    pub(crate) fn ui_docked_with_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        controls: &SoundingHeaderControls,
+    ) -> SoundingHeaderActions {
+        self.ui_with_host(ui, true, controls)
+    }
+
+    fn ui_with_host(
+        &mut self,
+        ui: &mut egui::Ui,
+        docked: bool,
+        controls: &SoundingHeaderControls,
+    ) -> SoundingHeaderActions {
+        let mut actions = SoundingHeaderActions::default();
         let layout_id = Self::layout_memory_id();
         let stretch_id = layout_id.with("docked_stretch");
         let mut docked_stretch: bool = ui
@@ -210,6 +252,21 @@ impl SharppySoundingPanel {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.classic, false, "SHARPpy");
                 ui.selectable_value(&mut self.classic, true, "Classic");
+                if let Some(box_sounding) = &controls.box_sounding {
+                    ui.separator();
+                    let response = ui
+                        .add_enabled(
+                            box_sounding.ready,
+                            egui::Button::selectable(box_sounding.armed, "Box sounding"),
+                        )
+                        .on_hover_text(if box_sounding.ready {
+                            "Arm the radar map, then drag a rectangle. BowEcho averages the model's primitive sounding columns inside it before deriving diagnostics."
+                                .to_owned()
+                        } else {
+                            box_sounding.unavailable_reason.clone()
+                        });
+                    actions.toggle_box_sounding = response.clicked();
+                }
                 if docked && !self.classic {
                     ui.separator();
                     ui.weak("Pane");
@@ -278,6 +335,7 @@ impl SharppySoundingPanel {
         self.docked_stretch = docked_stretch;
         ui.ctx()
             .data_mut(|data| data.insert_temp(stretch_id, docked_stretch));
+        actions
     }
 }
 
