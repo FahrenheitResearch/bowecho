@@ -332,6 +332,20 @@ fn build_analysis(data: &SoundingData, column: &SoundingColumn) -> Option<Box<Sh
     let prof = sharppyrs::Profile::from_sharprs(sp);
     let derived = sharppyrs::DerivedParams::compute(&prof);
 
+    let title = sounding_title(data, meta);
+
+    Some(Box::new(SharppyAnalysis {
+        prof,
+        derived,
+        title,
+    }))
+}
+
+/// Compose the SHARPpy board headline. Observation-adjusted model profiles
+/// already carry the observation station and time in `hour.run`; repeating
+/// the model valid time after that makes the useful coordinates disappear in
+/// narrower docks.
+fn sounding_title(data: &SoundingData, meta: &rustwx_sounding::SoundingMetadata) -> String {
     // "HRRR 2026-06-25 06z F018  Valid: ... @36.68°N 95.66°W" style title.
     let mut title = format!(
         "{} {} F{:03}",
@@ -339,7 +353,7 @@ fn build_analysis(data: &SoundingData, column: &SoundingColumn) -> Option<Box<Sh
         data.hour.run,
         data.hour.hour
     );
-    if !meta.valid_time.is_empty() {
+    if !data.hour.run.contains("obs-adj") && !meta.valid_time.is_empty() {
         title.push_str(&format!("  Valid: {}", meta.valid_time));
     }
     if let (Some(lat), Some(lon)) = (
@@ -355,11 +369,7 @@ fn build_analysis(data: &SoundingData, column: &SoundingColumn) -> Option<Box<Sh
         ));
     }
 
-    Some(Box::new(SharppyAnalysis {
-        prof,
-        derived,
-        title,
-    }))
+    title
 }
 
 #[cfg(test)]
@@ -427,6 +437,42 @@ mod tests {
         assert!(analysis.derived.pwat.is_finite(), "PWAT computes");
         assert!(analysis.derived.srh1km.is_finite(), "SRH computes");
         assert!(analysis.title.starts_with("HRRR 2026-06-25 06z F018"));
+        assert!(analysis.title.contains("Valid: 2026-06-26 00z"));
+    }
+
+    #[test]
+    fn obs_adjusted_title_omits_redundant_valid_time_but_keeps_coordinates() {
+        let data = SoundingData {
+            hour: rw_ui::HourKey {
+                model: "hrrr".to_owned(),
+                run: "20260702_22z · OH074 obs-adj 7km @ 2026-07-14 20:20Z".to_owned(),
+                hour: 6,
+                exact_time: None,
+            },
+            fx: 0.0,
+            fy: 0.0,
+            lat: Some(39.97),
+            lon: Some(-81.48),
+            vars: Vec::new(),
+            surface: Vec::new(),
+            read_ms: 0.0,
+        };
+        let metadata = rustwx_sounding::SoundingMetadata {
+            station_id: "OH074 obs-adj 7km".to_owned(),
+            valid_time: "20260702 22z F006".to_owned(),
+            latitude_deg: Some(39.97),
+            longitude_deg: Some(-81.48),
+            elevation_m: None,
+            sample_method: None,
+            box_radius_lat_deg: None,
+            box_radius_lon_deg: None,
+        };
+
+        let title = sounding_title(&data, &metadata);
+
+        assert!(title.contains("OH074 obs-adj 7km @ 2026-07-14 20:20Z F006"));
+        assert!(!title.contains("Valid:"), "{title}");
+        assert!(title.ends_with("@39.97°N 81.48°W"), "{title}");
     }
 
     /// Old saves (plain classic-panel state, no `sharppy_layout` key) still
