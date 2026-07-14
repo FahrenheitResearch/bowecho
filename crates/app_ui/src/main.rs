@@ -32741,19 +32741,44 @@ impl ViewerApp {
     /// re-spawned a model compute and re-asserted
     /// `SoundingViewerSource::Model`, stomping the RAOB after ~0.1 s. This
     /// also supersedes a sounding the poll is still HOLDING un-consumed
-    /// behind the archive-obs gate, and drops a still-averaging box-mean
-    /// request (which would otherwise mint a NEW dock sounding seconds after
-    /// the RAOB click). A later Alt-click mints a NEW Arc in the dock, so
-    /// the model path is untouched.
+    /// behind the archive-obs gate, a store-worker point reply not yet
+    /// delivered to the dock, and a still-averaging box mean. Any of those
+    /// could otherwise mint a NEW dock sounding after the RAOB click. A later
+    /// explicit model request restores model ownership and mints a new Arc.
     fn supersede_pending_model_sounding(&mut self) {
         if let Some(dock) = self.model_dock.as_mut() {
-            dock.abandon_pending_box_sounding();
+            dock.supersede_with_external_sounding();
         }
         self.native_sounding_src = self
             .model_dock
             .as_ref()
             .and_then(|dock| dock.latest_sounding())
             .cloned();
+    }
+
+    /// Transfer the shared native-result channel to an explicit RAOB request.
+    /// Dropping the previous receiver is intentional: the producer may finish,
+    /// but its stale model/hail/older-RAOB result can no longer install after
+    /// this click. Returning the new sender keeps the state transition itself
+    /// deterministic and network-free for regression tests.
+    fn begin_raob_sounding_request(
+        &mut self,
+        site_id: &str,
+        ctx: &egui::Context,
+    ) -> mpsc::Sender<std::result::Result<NativeSoundingResult, String>> {
+        drop(self.native_sounding_rx.take());
+        self.hail_env_pending = false;
+        self.last_sounding_request = None;
+        self.supersede_pending_model_sounding();
+
+        let (sender, receiver) = mpsc::channel();
+        self.native_sounding_rx = Some(receiver);
+        self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
+        self.native_sounding_panel.set_loading();
+        self.open_viewer(dock::WorkspacePane::Sounding);
+        self.status = format!("Fetching RAOB {site_id}…");
+        ctx.request_repaint();
+        sender
     }
 
     /// Fetch + render ONE station's RAOB launch nearest the displayed
@@ -32768,23 +32793,14 @@ impl ViewerApp {
         distance_km: Option<f32>,
         ctx: &egui::Context,
     ) {
-        if self.native_sounding_rx.is_some() {
-            return;
-        }
         let when = self
             .volume
             .as_ref()
             .map(|volume| volume.volume_time.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let (sender, receiver) = mpsc::channel();
-        self.native_sounding_rx = Some(receiver);
-        self.supersede_pending_model_sounding();
-        self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
-        self.native_sounding_panel.set_loading();
-        self.open_viewer(dock::WorkspacePane::Sounding);
-        self.status = format!("Fetching RAOB {}…", site.id);
-        let ctx_clone = ctx.clone();
         let time_zone = self.time_zone();
+        let sender = self.begin_raob_sounding_request(&site.id, ctx);
+        let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let compute_start = Instant::now();
             let result = (|| -> std::result::Result<NativeSoundingResult, String> {
@@ -58117,14 +58133,12 @@ mod tests {
         assert!(app.status.contains("ARMOR"));
     }
 
-    /// RAOB marker plumbing, offline: the layer toggle gates the point
-    /// pass (no markers, no hit-testing while off), the catalog resolves
-    /// marker indices to stations, and an in-flight native-sounding build
-    /// blocks a click dispatch instead of racing it (the
-    /// `start_raob_sounding_for` guard — no fetch thread is spawned, so
-    /// this test never touches the network).
+    /// RAOB marker plumbing, offline: the layer toggle gates the point pass
+    /// (no markers or hit-testing while off), and every emitted catalog index
+    /// resolves to a station. Request takeover is covered separately without
+    /// spawning a network fetch.
     #[test]
-    fn raob_marker_layer_gates_points_and_respects_the_inflight_guard() {
+    fn raob_marker_layer_gates_points_and_resolves_catalog_entries() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         // Center the viewport on Lincoln IL (the field request's station).
         app.map_center_lat = 40.15;
@@ -58140,28 +58154,6 @@ mod tests {
         for (index, _) in &points {
             assert!(app.raob_marker_sites().get(*index).is_some());
         }
-
-        // Occupy the native-sounding channel: a marker click must not
-        // replace the in-flight build.
-        let (_keep_alive, receiver) = mpsc::channel();
-        app.native_sounding_rx = Some(receiver);
-        let ilx_index = obs_soundings::static_sites()
-            .iter()
-            .position(|site| site.id == "KILX")
-            .expect("KILX in the static table");
-        let raob_points = vec![(ilx_index, egui::pos2(100.0, 100.0))];
-        let ctx = egui::Context::default();
-        let status_before = app.status.clone();
-        app.handle_marker_click(
-            &[],
-            &[],
-            &[],
-            &[],
-            &raob_points,
-            egui::pos2(103.0, 100.0),
-            &ctx,
-        );
-        assert_eq!(app.status, status_before, "in-flight guard must hold");
     }
 
     #[test]
@@ -66910,18 +66902,15 @@ mod tests {
         assert!(app.last_sounding_request.is_none());
     }
 
-    /// Regression: with a model sounding already shown (Alt-click), clicking
-    /// a RAOB site flashed the RAOB for one frame and then flipped the pane
-    /// back to the model sounding. `start_raob_sounding_for` CLEARED
-    /// `native_sounding_src`, so the model dock's cached latest sounding
-    /// looked fresh again and `poll_native_sounding` re-spawned a model
-    /// compute that re-asserted `SoundingViewerSource::Model` over the RAOB
-    /// the user just asked for. The RAOB request now marks that pending model
-    /// sounding as consumed (covering both a displayed sounding and one still
-    /// held un-consumed behind the archive-obs gate), while a LATER Alt-click
-    /// — a NEW Arc in the dock — still reads as fresh.
+    /// Regression: update polls native results before the map handles marker
+    /// clicks. With HRRR displayed and its native/obs-adjust compute still in
+    /// flight, the old RAOB path returned early because the shared receiver
+    /// was occupied; the click was consumed but HRRR stayed visible. An
+    /// explicit RAOB now replaces that receiver, clears hail interception,
+    /// consumes the current model Arc, installs its own result, and remains
+    /// selected. A later explicit model request still takes ownership back.
     #[test]
-    fn raob_request_supersedes_pending_model_sounding() {
+    fn raob_request_replaces_inflight_model_compute_and_keeps_viewer() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
         let mut dock = model_data::ModelDataDock::new_for_test(
@@ -66930,45 +66919,68 @@ mod tests {
         );
         dock.set_latest_sounding_for_test(test_model_sounding_data());
         app.model_dock = Some(dock);
-        // The state a RAOB click found pre-fix: model sounding displayed (or
-        // still HELD un-consumed by the archive-obs gate — src None models
-        // the worst case of both).
-        app.native_sounding_src = None;
-        app.sounding_viewer_source = SoundingViewerSource::Model;
-
-        // The RAOB request path's supersede + source flip (the fetch thread
-        // itself is network and stays un-spawned here).
-        app.supersede_pending_model_sounding();
-        app.sounding_viewer_source = SoundingViewerSource::NativeOnly;
-
         let latest = app
             .model_dock
             .as_ref()
             .and_then(|dock| dock.latest_sounding())
             .cloned()
-            .expect("dock holds a latest sounding");
+            .expect("dock holds an HRRR sounding");
+        app.native_sounding_src = Some(Arc::clone(&latest));
+        app.sounding_viewer_source = SoundingViewerSource::Model;
+        app.last_sounding_request = Some(42);
+        app.hail_env_pending = true;
+
+        // Model/native work is still in flight when the marker click arrives.
+        // Keep its sender so the test proves takeover dropped the old receiver.
+        let (old_sender, old_receiver) =
+            mpsc::channel::<std::result::Result<NativeSoundingResult, String>>();
+        app.native_sounding_rx = Some(old_receiver);
+        let raob_sender = app.begin_raob_sounding_request("KILX", &ctx);
+
+        assert!(
+            old_sender.send(Ok((None, 1.0, None))).is_err(),
+            "the stale model result receiver was dropped"
+        );
+        assert!(
+            !app.hail_env_pending,
+            "RAOB must not be consumed as hail env"
+        );
+        assert!(app.last_sounding_request.is_none());
+        assert!(app.native_sounding_rx.is_some());
+        assert_eq!(app.sounding_viewer_source, SoundingViewerSource::NativeOnly);
+        assert!(app.status.contains("Fetching RAOB KILX"));
         assert!(
             app.native_sounding_src
                 .as_ref()
                 .is_some_and(|src| Arc::ptr_eq(src, &latest)),
-            "the dock's pending sounding is marked consumed"
+            "the displayed model sounding is marked consumed"
         );
 
-        // The frame after the RAOB lands: the poll must NOT re-spawn a model
-        // compute or re-assert the Model source over the RAOB.
+        // Feed a synthetic observed column through the exact result channel;
+        // no archive/network work is involved in this regression test.
+        let mut raob_data = test_model_sounding_data();
+        raob_data.hour.model = "KILX RAOB".to_owned();
+        let raob_column =
+            rw_ui::skewt::build_sounding_column(&raob_data).expect("test RAOB column");
+        let raob_native = rustwx_sounding::NativeSounding::from_column(&raob_column)
+            .expect("test RAOB native analysis");
+        raob_sender
+            .send(Ok((Some(raob_native), 2.0, Some((raob_data, raob_column)))))
+            .expect("deliver synthetic RAOB");
         app.poll_native_sounding(&ctx);
-        assert!(
-            app.native_sounding_rx.is_none(),
-            "no model compute respawned from the superseded sounding"
-        );
+        assert!(app.native_sounding_rx.is_none());
+        assert!(app.native_sounding_panel.has_content());
         assert_eq!(
             app.sounding_viewer_source,
             SoundingViewerSource::NativeOnly,
             "the RAOB keeps the pane"
         );
+        // One more frame proves the consumed HRRR Arc cannot re-spawn.
+        app.poll_native_sounding(&ctx);
+        assert!(app.native_sounding_rx.is_none());
+        assert_eq!(app.sounding_viewer_source, SoundingViewerSource::NativeOnly);
 
-        // A later Alt-click mints a NEW Arc in the dock — that one must still
-        // read as fresh, so the model flow is untouched.
+        // A later model click mints a new Arc and explicitly takes ownership.
         app.model_dock
             .as_mut()
             .unwrap()

@@ -34,6 +34,11 @@ enum SoundingRequestMode {
     Point,
     BoxPending,
     BoxApplied,
+    /// An explicit sounding owned outside the model dock (currently a RAOB)
+    /// has superseded every model request outstanding at the handoff.
+    /// Late store-worker point replies are ignored until a new model request
+    /// moves ownership back to `Point` or `BoxPending`.
+    External,
 }
 
 /// Background loader for the synthesized per-level isobaric map fields
@@ -1837,25 +1842,7 @@ impl ModelDataDock {
                         }
                     }
                 },
-                StoreResponse::Sounding(_, Ok(data)) => {
-                    if matches!(
-                        self.sounding_request_mode,
-                        SoundingRequestMode::None | SoundingRequestMode::Point
-                    ) {
-                        self.sounding_request_mode = SoundingRequestMode::Point;
-                        self.box_sounding_summary = None;
-                        self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
-                        self.sounding.set_data(data);
-                    }
-                }
-                StoreResponse::Sounding(_, Err(message)) => {
-                    if matches!(
-                        self.sounding_request_mode,
-                        SoundingRequestMode::None | SoundingRequestMode::Point
-                    ) {
-                        self.sounding.set_error(message);
-                    }
-                }
+                StoreResponse::Sounding(_, result) => self.apply_point_sounding_response(result),
                 // v0.2.3: worker ack that the style overrides were applied.
                 // No-op by design — `apply_color_table_changes` already
                 // reloads the field, and that reload is what repaints.
@@ -2405,11 +2392,35 @@ impl ModelDataDock {
         self.latest_sounding.as_ref()
     }
 
+    /// Apply one store-worker point-sounding reply only while the model dock
+    /// still owns the request. An explicit external sounding can change the
+    /// mode to [`SoundingRequestMode::External`] while the worker is reading;
+    /// that late reply must not become `latest_sounding` and reclaim the
+    /// shared viewer on the next app frame.
+    fn apply_point_sounding_response(&mut self, result: Result<rw_ui::SoundingData, String>) {
+        if !matches!(
+            self.sounding_request_mode,
+            SoundingRequestMode::None | SoundingRequestMode::Point
+        ) {
+            return;
+        }
+        match result {
+            Ok(data) => {
+                self.sounding_request_mode = SoundingRequestMode::Point;
+                self.box_sounding_summary = None;
+                self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
+                self.sounding.set_data(data);
+            }
+            Err(message) => self.sounding.set_error(message),
+        }
+    }
+
     /// Test-only: install a dock "latest sounding" so app tests can exercise
     /// `poll_native_sounding`'s freshness/supersede logic without a worker
     /// round-trip.
     #[cfg(test)]
     pub(crate) fn set_latest_sounding_for_test(&mut self, data: rw_ui::SoundingData) {
+        self.sounding_request_mode = SoundingRequestMode::Point;
         self.latest_sounding = Some(std::sync::Arc::new(data));
     }
 
@@ -5817,18 +5828,15 @@ impl ModelDataDock {
         }
     }
 
-    /// A newer explicit sounding request OUTSIDE the dock (the app's RAOB
-    /// path) supersedes a still-averaging box-mean request the same way a
-    /// new point request does: drop the task so a box that completes AFTER
-    /// the newer request can never install as `latest_sounding` and stomp
-    /// the viewer. The pending spinner state clears with it; an already
-    /// APPLIED box sounding is left untouched.
-    pub fn abandon_pending_box_sounding(&mut self) {
+    /// Give the shared sounding viewer to a newer explicit request outside
+    /// the dock (the app's RAOB path). Drop a still-averaging box task and
+    /// reject any point reply already queued in the store worker; otherwise
+    /// either can land after the RAOB and reclaim the viewer. A later model
+    /// point/box request explicitly restores model ownership.
+    pub fn supersede_with_external_sounding(&mut self) {
         self.box_sounding_task = None;
         self.box_sounding_pending = None;
-        if self.sounding_request_mode == SoundingRequestMode::BoxPending {
-            self.sounding_request_mode = SoundingRequestMode::None;
-        }
+        self.sounding_request_mode = SoundingRequestMode::External;
     }
 
     /// Request a sounding from an EXPLICIT run/hour (independent of the
@@ -6669,6 +6677,43 @@ pub(crate) fn patch_sounding_scene_zoom(view_state: &mut serde_json::Value, zoom
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn external_sounding_rejects_late_point_reply_until_new_model_request() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+        let data = |model: &str| rw_ui::SoundingData {
+            hour: HourKey {
+                model: model.to_owned(),
+                run: "20260714_00z".to_owned(),
+                hour: 0,
+                exact_time: None,
+            },
+            fx: 0.0,
+            fy: 0.0,
+            lat: None,
+            lon: None,
+            vars: Vec::new(),
+            surface: Vec::new(),
+            read_ms: 0.0,
+        };
+
+        dock.sounding_request_mode = SoundingRequestMode::Point;
+        dock.supersede_with_external_sounding();
+        dock.apply_point_sounding_response(Ok(data("stale-hrrr")));
+        assert!(
+            dock.latest_sounding().is_none(),
+            "the pre-RAOB worker reply must be discarded"
+        );
+
+        // A later explicit model request restores ownership before its reply.
+        dock.sounding_request_mode = SoundingRequestMode::Point;
+        dock.apply_point_sounding_response(Ok(data("new-hrrr")));
+        assert_eq!(
+            dock.latest_sounding().map(|data| data.hour.model.as_str()),
+            Some("new-hrrr")
+        );
+    }
 
     #[test]
     fn box_sounding_and_plot_domain_arms_are_mutually_exclusive() {
