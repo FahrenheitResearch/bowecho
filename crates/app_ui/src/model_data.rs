@@ -9,7 +9,7 @@
 use eframe::egui;
 use rw_ui::{
     ColorTableEditorPanel, CustomDomain, FieldViewerEvent, FieldViewerPanel, HourKey,
-    PlotViewerPanel, RunBrowserPanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree,
+    PlotViewerPanel, RunBrowserPanel, StoreRequest, StoreResponse, StoreTree,
     StoreView, StoreWorker, StyleOverrideSettings,
 };
 use std::path::{Path, PathBuf};

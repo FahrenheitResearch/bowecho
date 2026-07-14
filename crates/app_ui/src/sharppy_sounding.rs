@@ -63,6 +63,7 @@ impl SharppySoundingPanel {
         self.inner.apply_view_state_json(value)
     }
 
+    #[allow(dead_code)] // parity with rw_ui::SoundingPanel's surface
     pub fn last_timings(&self) -> Option<(f32, f32)> {
         self.inner.last_timings()
     }
