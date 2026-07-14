@@ -36,6 +36,11 @@ const CDN: &str = "https://ep-wofs-postv2-dndma2fqexfhexfs.a01.azurefd.net/prima
 const SND_CDN: &str = "https://ep-wofs-sounding-etb5awe5cdfqawe8.a01.azurefd.net/api/sounding";
 /// The stations endpoint and the sounding frame grid key off this product.
 const SND_REF_PRODUCT: &str = "comp_dz__paintballs_thresh_40";
+/// The run endpoint retains a much deeper and occasionally stale history than
+/// the image CDN.  Keep the picker compact and, more importantly, prove every
+/// exposed run has at least one posted analysis image before presenting it as
+/// loadable.
+const MAX_PICKER_RUNS: usize = 20;
 pub const CREDIT: &str =
     "WoFS data courtesy of the National Severe Storms Laboratory using federal funding";
 
@@ -137,22 +142,28 @@ pub fn fetch_catalog() -> Result<WofsCatalog, String> {
     if runs.is_empty() {
         return Err("no WoFS runs".to_owned());
     }
-    // Live runs appear in the catalog BEFORE their imagery posts (field
-    // report: newest init 404'd). Demote inits whose f000 isn't up yet.
-    if let Some(newest) = runs.first_mut() {
-        let mut keep = newest.inits.clone();
-        while keep.len() > 1 {
-            let (init_date, init_hhmm) = init_date_and_hhmm(&newest.rundate, &keep[0]);
-            let probe = format!(
-                "{CDN}/{}/{}/{}/img/comp_dz__paintballs_thresh_40_f000.png",
-                newest.id, init_date, init_hhmm
-            );
-            if data_source::fetch_bytes(&probe).is_ok() {
+    // The API advertises live cycles before the CDN posts their imagery, and
+    // it also retains stale run records after their files disappear.  The old
+    // code checked only the first run and still kept its final 404 cycle.  A
+    // cheap HEAD against f000 makes every picker entry an actually loadable
+    // run.  Once one cycle is posted, older cycles in that run are monotonic
+    // on this archive and can remain available without hundreds of probes.
+    let mut posted_runs = Vec::with_capacity(MAX_PICKER_RUNS);
+    for run in runs {
+        let checked = retain_posted_inits(run, |url| {
+            data_source::url_exists(url).map_err(|error| error.to_string())
+        })
+        .map_err(|error| format!("availability check: {error}"))?;
+        if let Some(run) = checked {
+            posted_runs.push(run);
+            if posted_runs.len() == MAX_PICKER_RUNS {
                 break;
             }
-            keep.remove(0);
         }
-        newest.inits = keep;
+    }
+    let runs = posted_runs;
+    if runs.is_empty() {
+        return Err("no posted WoFS imagery is currently available".to_owned());
     }
     // Menu tree + per-product time grids for the newest run.
     let newest = &runs[0];
@@ -200,11 +211,49 @@ pub fn fetch_catalog() -> Result<WofsCatalog, String> {
             }
         }
     }
+    // `hierarchy` is a capability tree, not an availability response. It
+    // contains products with no files for this run as well as transparent
+    // overlay-only images. Present only metadata-backed base products here;
+    // transparent products remain in the dedicated Overlays menu, which is
+    // built from `times`.
+    retain_available_base_products(&mut groups, &times);
     Ok(WofsCatalog {
         runs,
         groups,
         times,
     })
+}
+
+fn retain_available_base_products(
+    groups: &mut Vec<(String, Vec<String>)>,
+    times: &HashMap<String, Vec<u32>>,
+) {
+    for (_, slugs) in groups.iter_mut() {
+        slugs.retain(|slug| times.contains_key(slug) && !slug.contains("_overlay_"));
+    }
+    groups.retain(|(_, slugs)| !slugs.is_empty());
+}
+
+/// Drop leading live cycles that the API has announced but the image CDN has
+/// not posted yet.  A run with no verified cycle is omitted entirely, so the
+/// run picker never promises a black/unloadable selection.
+fn retain_posted_inits(
+    mut run: WofsRun,
+    mut exists: impl FnMut(&str) -> Result<bool, String>,
+) -> Result<Option<WofsRun>, String> {
+    let mut first_posted = None;
+    for (index, init) in run.inits.iter().enumerate() {
+        let probe = image_url(&run, init, SND_REF_PRODUCT, 0);
+        if exists(&probe)? {
+            first_posted = Some(index);
+            break;
+        }
+    }
+    let Some(first_posted) = first_posted else {
+        return Ok(None);
+    };
+    run.inits.drain(..first_posted);
+    Ok(Some(run))
 }
 
 /// Depth-first slug collection through the hierarchy's nested maps
@@ -237,6 +286,48 @@ pub fn image_url(run: &WofsRun, init: &str, product: &str, minute: u32) -> Strin
         "{CDN}/{}/{}/{}/img/{}_f{minute:03}.png",
         run.id, init_date, init_hhmm, product
     )
+}
+
+fn availability_key(run: &WofsRun, init: &str, product: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        run.id,
+        canonical_init_token(&run.rundate, init),
+        product
+    )
+}
+
+/// Find the posted edge of the otherwise-theoretical metadata time grid.
+/// WoFS publishes frames contiguously from f000, so a binary search proves the
+/// live edge in at most eight HEAD requests instead of walking all 73 frames.
+fn latest_posted_minute(
+    run: &WofsRun,
+    init: &str,
+    product: &str,
+    candidates: &[u32],
+    mut exists: impl FnMut(&str) -> Result<bool, String>,
+) -> Result<u32, String> {
+    let mut minutes = candidates.to_vec();
+    minutes.sort_unstable();
+    minutes.dedup();
+    let Some(&first) = minutes.first() else {
+        return Err("product has no advertised forecast times".to_owned());
+    };
+    if !exists(&image_url(run, init, product, first))? {
+        return Err("product has no posted analysis frame for this run/cycle".to_owned());
+    }
+
+    let mut low = 0usize;
+    let mut high = minutes.len() - 1;
+    while low < high {
+        let middle = (low + high + 1) / 2;
+        if exists(&image_url(run, init, product, minutes[middle]))? {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(minutes[low])
 }
 
 pub fn product_label(slug: &str) -> String {
@@ -407,6 +498,7 @@ pub fn fetch_image(url: &str) -> Result<egui::ColorImage, String> {
 /// Station-lattice worker message: the "{run_id}/{init}" key it was
 /// fetched for + the result.
 pub type StationsMsg = (String, Result<Vec<WofsStation>, String>);
+type AvailabilityMsg = (String, Result<u32, String>);
 
 /// Disk cache path for one run's georef (run ids are CDN-safe already;
 /// sanitize anyway).
@@ -473,6 +565,13 @@ pub struct WofsState {
     /// URLs that 404'd (imagery not posted yet for a live run) — retried
     /// only after the backoff so the fetcher never spams.
     pub missing: HashMap<String, Instant>,
+    /// Highest CDN-posted forecast minute for each run/init/product. The WoFS
+    /// metadata endpoint advertises the complete theoretical grid even while
+    /// a live cycle has only posted part of it. Partial live edges are
+    /// refreshed once per minute until the complete grid lands.
+    max_posted_minutes: HashMap<String, (u32, Instant)>,
+    availability_rx: Option<mpsc::Receiver<AvailabilityMsg>>,
+    availability_failed: HashMap<String, Instant>,
     pub status: String,
     /// Soundings mode: station lattice overlay + per-station skew-T window.
     pub soundings_mode: bool,
@@ -516,6 +615,9 @@ impl Default for WofsState {
             image_rx: None,
             pending_urls: Vec::new(),
             missing: HashMap::new(),
+            max_posted_minutes: HashMap::new(),
+            availability_rx: None,
+            availability_failed: HashMap::new(),
             status: String::new(),
             soundings_mode: false,
             stations: Vec::new(),
@@ -535,6 +637,135 @@ impl Default for WofsState {
 }
 
 impl WofsState {
+    fn current_base_url(&self) -> Option<String> {
+        let catalog = self.catalog.as_ref()?;
+        let run = catalog.runs.get(self.run_index)?;
+        (!self.init.is_empty()).then(|| image_url(run, &self.init, &self.product, self.minute))
+    }
+
+    fn current_availability_key(&self) -> Option<String> {
+        let catalog = self.catalog.as_ref()?;
+        let run = catalog.runs.get(self.run_index)?;
+        (!self.init.is_empty()).then(|| availability_key(run, &self.init, &self.product))
+    }
+
+    fn clamp_minute_to_posted_edge(&mut self) -> bool {
+        let Some(key) = self.current_availability_key() else {
+            return false;
+        };
+        let Some(&(max_posted, _)) = self.max_posted_minutes.get(&key) else {
+            return false;
+        };
+        if self.minute <= max_posted {
+            return false;
+        }
+        let clamped = self
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.times.get(&self.product))
+            .into_iter()
+            .flatten()
+            .map(|seconds| seconds / 60)
+            .filter(|minute| *minute <= max_posted)
+            .max()
+            .unwrap_or(max_posted);
+        self.minute = clamped;
+        true
+    }
+
+    fn pump_availability(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.availability_rx {
+            match rx.try_recv() {
+                Ok((key, Ok(max_posted))) => {
+                    self.availability_rx = None;
+                    self.availability_failed.remove(&key);
+                    self.max_posted_minutes
+                        .insert(key.clone(), (max_posted, Instant::now()));
+                    if self.current_availability_key().as_deref() == Some(key.as_str())
+                        && self.clamp_minute_to_posted_edge()
+                    {
+                        self.status = format!(
+                            "live cycle currently posted through f+{} min; selection adjusted",
+                            self.minute
+                        );
+                    }
+                }
+                Ok((key, Err(error))) => {
+                    self.availability_rx = None;
+                    self.availability_failed.insert(key.clone(), Instant::now());
+                    if self.current_availability_key().as_deref() == Some(key.as_str()) {
+                        self.status = format!("WoFS availability: {error}");
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.availability_rx = None,
+            }
+        }
+
+        // Cached selections still need clamping when radar-time sync advances
+        // past the live CDN edge.
+        self.clamp_minute_to_posted_edge();
+        if self.availability_rx.is_some() {
+            return;
+        }
+        let Some(catalog) = &self.catalog else {
+            return;
+        };
+        let Some(run) = catalog.runs.get(self.run_index).cloned() else {
+            return;
+        };
+        if self.init.is_empty() {
+            return;
+        }
+        let init = self.init.clone();
+        let product = self.product.clone();
+        let key = availability_key(&run, &init, &product);
+        let advertised_max = catalog
+            .times
+            .get(&product)
+            .into_iter()
+            .flatten()
+            .map(|seconds| seconds / 60)
+            .max()
+            .unwrap_or(0);
+        if self
+            .max_posted_minutes
+            .get(&key)
+            .is_some_and(|(posted, checked)| {
+                *posted >= advertised_max || checked.elapsed().as_secs() <= 60
+            })
+        {
+            return;
+        }
+        if self
+            .availability_failed
+            .get(&key)
+            .is_some_and(|at| at.elapsed().as_secs() <= 60)
+        {
+            return;
+        }
+        let Some(candidates) = catalog.times.get(&product).map(|seconds| {
+            seconds
+                .iter()
+                .map(|seconds| seconds / 60)
+                .collect::<Vec<_>>()
+        }) else {
+            self.availability_failed.insert(key, Instant::now());
+            self.status = "WoFS availability: product has no forecast grid".to_owned();
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.availability_rx = Some(rx);
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let result = latest_posted_minute(&run, &init, &product, &candidates, |url| {
+                data_source::url_exists(url).map_err(|error| error.to_string())
+            });
+            let _ = tx.send((key, result));
+            ctx_clone.request_repaint();
+        });
+    }
+
     /// Nearest available forecast minute for the current product.
     pub fn snap_minute(&self, target_min: u32) -> u32 {
         let Some(catalog) = &self.catalog else {
@@ -604,6 +835,10 @@ impl WofsState {
         let Some(run) = catalog.runs.get(self.run_index) else {
             return Vec::new();
         };
+        let availability = availability_key(run, &self.init, &self.product);
+        if !self.max_posted_minutes.contains_key(&availability) {
+            return Vec::new();
+        }
         let mut urls = vec![image_url(run, &self.init, &self.product, self.minute)];
         for overlay in &self.overlays {
             urls.push(image_url(run, &self.init, overlay, self.minute));
@@ -659,26 +894,37 @@ impl WofsState {
                 Err(mpsc::TryRecvError::Disconnected) => self.catalog_rx = None,
             }
         }
+        self.pump_availability(ctx);
         if let Some(rx) = &self.image_rx {
             match rx.try_recv() {
                 Ok((url, Ok(image))) => {
+                    let is_current_base = self.current_base_url().as_deref() == Some(url.as_str());
                     self.image_rx = None;
                     self.pending_urls.retain(|u| u != &url);
+                    self.missing.remove(&url);
                     if self.textures.len() > 72 {
                         self.textures.clear(); // simple bound; refetch is cheap
                     }
                     let handle = ctx.load_texture(url.clone(), image, egui::TextureOptions::LINEAR);
                     self.textures.insert(url, handle);
+                    if is_current_base {
+                        self.status = "WoFS frame ready".to_owned();
+                    }
                 }
                 Ok((url, Err(e))) => {
+                    let is_current_base = self.current_base_url().as_deref() == Some(url.as_str());
                     self.image_rx = None;
                     self.pending_urls.retain(|u| u != &url);
-                    // Short, layout-safe status: live runs post imagery a
-                    // few minutes behind the catalog — a 404 just means
-                    // "not yet" (the sounding service says 500 for the
-                    // same thing: frames past the posted edge).
-                    self.status = if e.contains("404") || e.contains("500") {
-                        "frame not posted yet (live run) — retrying shortly".to_owned()
+                    // A missing file can mean posting lag, a product absent
+                    // from this domain, or archive expiry. Do not call every
+                    // historical 404 a live-run delay.
+                    self.status = if e.contains("404") || e.contains("410") || e.contains("500") {
+                        if is_current_base {
+                            "frame unavailable at NSSL (not posted or no longer retained)"
+                                .to_owned()
+                        } else {
+                            "WoFS overlay unavailable for this frame".to_owned()
+                        }
                     } else {
                         let mut msg = e;
                         msg.truncate(90);
@@ -826,6 +1072,20 @@ impl WofsState {
                     .text("opacity")
                     .show_value(false),
             );
+            if let Some(url) = self.current_base_url() {
+                if self.missing.contains_key(&url) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 150, 90),
+                        "map drape paused: selected frame is unavailable",
+                    );
+                    return;
+                }
+                if !self.textures.contains_key(&url) {
+                    ui.spinner();
+                    ui.weak("map drape waiting for the selected frame");
+                    return;
+                }
+            }
             let Some(run_id) = self
                 .catalog
                 .as_ref()
@@ -891,10 +1151,18 @@ impl WofsState {
         let Some(run) = catalog.runs.get(self.run_index) else {
             return;
         };
+        let base_url = image_url(run, &self.init, &self.product, self.minute);
+        // Never draw transparent overlays by themselves after the base
+        // request fails. That looked like an active but black/stale WoFS
+        // layer. The window reports that the drape is paused until this exact
+        // selection has a valid base texture.
+        if self.missing.contains_key(&base_url) || !self.textures.contains_key(&base_url) {
+            return;
+        }
         let Some(georef) = self.georef_cache.get(&run.id) else {
             return;
         };
-        let mut urls = vec![image_url(run, &self.init, &self.product, self.minute)];
+        let mut urls = vec![base_url];
         for overlay in &self.overlays {
             urls.push(image_url(run, &self.init, overlay, self.minute));
         }
@@ -1185,6 +1453,134 @@ mod tests {
         assert_eq!(
             product_label("uh_2to5__prob_thresh_75"),
             "2-5 km updraft helicity (probability >=75)"
+        );
+    }
+
+    #[test]
+    fn picker_drops_announced_cycles_until_first_posted_frame() {
+        let run = WofsRun {
+            id: "WOFSRun20260714-test".to_owned(),
+            name: "Test domain".to_owned(),
+            rundate: "20260714".to_owned(),
+            inits: vec![
+                "202607142100".to_owned(),
+                "202607142030".to_owned(),
+                "202607142000".to_owned(),
+            ],
+        };
+        let mut probes = Vec::new();
+        let filtered = retain_posted_inits(run, |url| {
+            probes.push(url.to_owned());
+            Ok(url.contains("/2030/"))
+        })
+        .unwrap()
+        .expect("an older posted cycle should keep the run");
+
+        assert_eq!(
+            filtered.inits,
+            ["202607142030".to_owned(), "202607142000".to_owned()]
+        );
+        assert_eq!(probes.len(), 2, "stop probing after the first posted init");
+        assert!(probes[0].ends_with("_f000.png"));
+    }
+
+    #[test]
+    fn picker_omits_run_when_no_cycle_has_a_posted_frame() {
+        let run = WofsRun {
+            id: "WOFSRun20260715-unposted".to_owned(),
+            name: "Future domain".to_owned(),
+            rundate: "20260715".to_owned(),
+            inits: vec!["202607150500".to_owned()],
+        };
+        assert!(
+            retain_posted_inits(run, |_| Ok(false)).unwrap().is_none(),
+            "an API-only run must not appear loadable"
+        );
+    }
+
+    #[test]
+    fn posted_edge_probe_clamps_the_theoretical_time_grid() {
+        let run = WofsRun {
+            id: "WOFSRun20260714-live".to_owned(),
+            name: "Live domain".to_owned(),
+            rundate: "20260714".to_owned(),
+            inits: vec!["202607142100".to_owned()],
+        };
+        let candidates = (0..=360).step_by(5).collect::<Vec<_>>();
+        let mut probes = 0usize;
+        let edge = latest_posted_minute(&run, &run.inits[0], SND_REF_PRODUCT, &candidates, |url| {
+            probes += 1;
+            let minute = url
+                .rsplit_once("_f")
+                .and_then(|(_, suffix)| suffix.strip_suffix(".png"))
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap();
+            Ok(minute <= 215)
+        })
+        .unwrap();
+
+        assert_eq!(edge, 215);
+        assert!(probes <= 8, "binary probe should remain cheap: {probes}");
+    }
+
+    #[test]
+    fn live_posted_edge_clamps_a_minute_carried_from_an_older_run() {
+        let run = WofsRun {
+            id: "WOFSRun20260714-live".to_owned(),
+            name: "Live domain".to_owned(),
+            rundate: "20260714".to_owned(),
+            inits: vec!["202607142100".to_owned()],
+        };
+        let product = SND_REF_PRODUCT.to_owned();
+        let key = availability_key(&run, &run.inits[0], &product);
+        let mut state = WofsState {
+            catalog: Some(WofsCatalog {
+                runs: vec![run.clone()],
+                groups: Vec::new(),
+                times: HashMap::from([(
+                    product.clone(),
+                    (0..=360).step_by(5).map(|minute| minute * 60).collect(),
+                )]),
+            }),
+            init: run.inits[0].clone(),
+            product,
+            minute: 360,
+            ..WofsState::default()
+        };
+        state.max_posted_minutes.insert(key, (215, Instant::now()));
+
+        assert!(state.clamp_minute_to_posted_edge());
+        assert_eq!(state.minute, 215);
+    }
+
+    #[test]
+    fn base_product_groups_exclude_missing_and_overlay_only_images() {
+        let mut groups = vec![
+            (
+                "Thermodynamics".to_owned(),
+                vec!["t_2__ens_mean".to_owned(), "missing".to_owned()],
+            ),
+            (
+                "Overlays".to_owned(),
+                vec!["comp_dz_overlay__paintballs_thresh_40".to_owned()],
+            ),
+        ];
+        let times = HashMap::from([
+            ("t_2__ens_mean".to_owned(), vec![0, 300]),
+            (
+                "comp_dz_overlay__paintballs_thresh_40".to_owned(),
+                vec![0, 300],
+            ),
+        ]);
+
+        retain_available_base_products(&mut groups, &times);
+
+        assert_eq!(
+            groups,
+            vec![(
+                "Thermodynamics".to_owned(),
+                vec!["t_2__ens_mean".to_owned()]
+            )]
         );
     }
 
