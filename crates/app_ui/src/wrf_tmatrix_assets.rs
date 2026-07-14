@@ -17,7 +17,7 @@ use crate::wrf_tmatrix_band_assets::{
 };
 use crate::wrf_tmatrix_scene::{
     WrfTMatrixBuildPeakEstimate, WrfTMatrixLutBundle, WrfTMatrixP3Resources, WrfTMatrixRainMode,
-    WrfTMatrixRawBatchRequest, WrfTMatrixRawEvaluator, WrfTMatrixScene,
+    WrfTMatrixRawBatchRequest, WrfTMatrixRawEvaluator, WrfTMatrixScatteringPolicy, WrfTMatrixScene,
 };
 
 const ASSET_ROOT: &str = "../../../research_only_assets/tmatrix/pytmatrix-0.3.3";
@@ -275,6 +275,7 @@ pub struct PropertyTMatrixSceneBuild {
     pub table_source: PropertyTMatrixTableSourceKind,
     pub exact_frequency_hz: f64,
     pub rain_mode: WrfTMatrixRainMode,
+    pub scattering_policy: WrfTMatrixScatteringPolicy,
 }
 
 pub type EmbeddedPropertySceneBuild = PropertyTMatrixSceneBuild;
@@ -427,6 +428,29 @@ pub fn build_property_tmatrix_scene(
         maximum_owned_peak_bytes,
         table_owner,
         rain_mode,
+        WrfTMatrixScatteringPolicy::StrictFailClosed,
+        progress,
+        None,
+        None,
+    )
+}
+
+/// Build with an explicit scattering policy. Hybrid use is never inferred
+/// from a failed strict build or from the selected table source.
+pub fn build_property_tmatrix_scene_with_policy(
+    source: &WrfPropertyScene,
+    maximum_owned_peak_bytes: usize,
+    table_owner: PropertyTMatrixTables,
+    rain_mode: WrfTMatrixRainMode,
+    scattering_policy: WrfTMatrixScatteringPolicy,
+    progress: &(impl Fn(&str) + ?Sized),
+) -> Result<PropertyTMatrixSceneBuild, String> {
+    build_property_tmatrix_scene_internal(
+        source,
+        maximum_owned_peak_bytes,
+        table_owner,
+        rain_mode,
+        scattering_policy,
         progress,
         None,
         None,
@@ -450,6 +474,28 @@ pub fn build_property_tmatrix_scene_with_cuda(
         maximum_owned_peak_bytes,
         table_owner,
         rain_mode,
+        WrfTMatrixScatteringPolicy::StrictFailClosed,
+        progress,
+        Some(cuda),
+        None,
+    )
+}
+
+pub fn build_property_tmatrix_scene_with_policy_and_cuda(
+    source: &WrfPropertyScene,
+    maximum_owned_peak_bytes: usize,
+    table_owner: PropertyTMatrixTables,
+    rain_mode: WrfTMatrixRainMode,
+    scattering_policy: WrfTMatrixScatteringPolicy,
+    progress: &(impl Fn(&str) + ?Sized),
+    cuda: &crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService,
+) -> Result<PropertyTMatrixSceneBuild, String> {
+    build_property_tmatrix_scene_internal(
+        source,
+        maximum_owned_peak_bytes,
+        table_owner,
+        rain_mode,
+        scattering_policy,
         progress,
         Some(cuda),
         None,
@@ -473,6 +519,29 @@ pub fn build_property_tmatrix_scene_with_cancel(
         maximum_owned_peak_bytes,
         table_owner,
         rain_mode,
+        WrfTMatrixScatteringPolicy::StrictFailClosed,
+        progress,
+        cuda,
+        Some(cancel),
+    )
+}
+
+pub fn build_property_tmatrix_scene_with_policy_and_cancel(
+    source: &WrfPropertyScene,
+    maximum_owned_peak_bytes: usize,
+    table_owner: PropertyTMatrixTables,
+    rain_mode: WrfTMatrixRainMode,
+    scattering_policy: WrfTMatrixScatteringPolicy,
+    progress: &(impl Fn(&str) + ?Sized),
+    cuda: Option<&crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
+    cancel: &AtomicBool,
+) -> Result<PropertyTMatrixSceneBuild, String> {
+    build_property_tmatrix_scene_internal(
+        source,
+        maximum_owned_peak_bytes,
+        table_owner,
+        rain_mode,
+        scattering_policy,
         progress,
         cuda,
         Some(cancel),
@@ -484,6 +553,7 @@ fn build_property_tmatrix_scene_internal(
     maximum_owned_peak_bytes: usize,
     table_owner: PropertyTMatrixTables,
     rain_mode: WrfTMatrixRainMode,
+    scattering_policy: WrfTMatrixScatteringPolicy,
     progress: &(impl Fn(&str) + ?Sized),
     cuda: Option<&crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService>,
     cancel: Option<&AtomicBool>,
@@ -505,28 +575,15 @@ fn build_property_tmatrix_scene_internal(
             maximum_owned_peak_bytes as f64 / 1024.0_f64.powi(3),
         ));
     }
-    let scene = match (p3, cuda, cancel) {
-        (Some(p3), cuda, Some(cancel)) => {
-            WrfTMatrixScene::build_with_p3_and_rain_mode_and_cuda_and_cancel(
-                source, tables, p3, rain_mode, cuda, cancel,
-            )
-        }
-        (None, cuda, Some(cancel)) => {
-            WrfTMatrixScene::build_with_rain_mode_and_optional_cuda_and_cancel(
-                source, tables, rain_mode, cuda, cancel,
-            )
-        }
-        (Some(p3), Some(cuda), None) => WrfTMatrixScene::build_with_p3_and_rain_mode_and_cuda(
-            source, tables, p3, rain_mode, cuda,
-        ),
-        (Some(p3), None, None) => {
-            WrfTMatrixScene::build_with_p3_and_rain_mode(source, tables, p3, rain_mode)
-        }
-        (None, Some(cuda), None) => {
-            WrfTMatrixScene::build_with_rain_mode_and_cuda(source, tables, rain_mode, cuda)
-        }
-        (None, None, None) => WrfTMatrixScene::build_with_rain_mode(source, tables, rain_mode),
-    }
+    let scene = WrfTMatrixScene::build_with_scattering_policy(
+        source,
+        tables,
+        rain_mode,
+        scattering_policy,
+        p3,
+        cuda,
+        cancel,
+    )
     .map_err(|error| format!("evaluate selected property-scattering tables: {error}"))?;
     Ok(PropertyTMatrixSceneBuild {
         scene,
@@ -535,6 +592,7 @@ fn build_property_tmatrix_scene_internal(
         table_source,
         exact_frequency_hz,
         rain_mode,
+        scattering_policy,
     })
 }
 

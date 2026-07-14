@@ -4,6 +4,7 @@ pub mod cm1;
 pub mod vcp_catalog;
 pub mod wrf_p3_assets;
 pub mod wrf_property_reader;
+pub mod wrf_radar_physics;
 pub mod wrf_radar_validation;
 pub mod wrf_scene_adapter;
 pub mod wrf_scene_inventory;

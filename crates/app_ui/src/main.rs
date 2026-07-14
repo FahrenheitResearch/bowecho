@@ -127,7 +127,7 @@ mod wrf_namelist;
 mod wrf_process;
 mod wrf_radar;
 mod wrf_radar_estimator;
-mod wrf_radar_physics;
+pub use app_ui::wrf_radar_physics;
 mod wrf_refractivity;
 mod wrf_volumes;
 

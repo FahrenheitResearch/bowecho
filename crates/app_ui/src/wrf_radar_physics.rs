@@ -392,13 +392,21 @@ impl PolarimetricScatteringKernel for BulkRayleighSbandV1 {
     }
 
     fn contribution(&self, input: BulkSpeciesInput, scheme: &SchemeProfile) -> BulkContribution {
-        bulk_sband_contribution_impl(input, scheme)
+        bulk_sband_contribution_impl(input, scheme.capability, scheme.assumption_heavy)
     }
 }
 
 pub fn bulk_sband_model_id() -> &'static str {
     BulkRayleighSbandV1.identifier()
 }
+
+/// Versioned policy identifier for the explicit P3/ISHMAEL hybrid seam.
+///
+/// The default bulk dispatch continues to reject property schemes. Callers may
+/// use this policy only after a native property/T-matrix cell has failed for a
+/// narrowly classified table-domain omission, and must retain audit counts.
+pub const PROPERTY_HYBRID_BULK_RAYLEIGH_REVISION: &str =
+    "bowecho-p3-ishmael-hybrid-bulk-rayleigh-v1";
 
 /// Compute one species' intrinsic S-band bulk scattering contribution through
 /// the default kernel. Frozen-particle dielectric and wetness factors are
@@ -411,11 +419,22 @@ pub fn bulk_sband_contribution(
     BulkRayleighSbandV1.contribution(input, scheme)
 }
 
+/// Evaluate one explicitly audited P3/ISHMAEL frozen population through the
+/// existing bulk Rayleigh v1 operator.
+///
+/// This does not alter the default unsupported-scheme behavior above. The
+/// caller supplies native mass, number, and (when it is a true total particle
+/// volume) volume moments and records the hybrid policy in scene provenance.
+pub fn property_hybrid_bulk_rayleigh_contribution(input: BulkSpeciesInput) -> BulkContribution {
+    bulk_sband_contribution_impl(input, MicrophysicsCapability::FullTwoMoment, true)
+}
+
 fn bulk_sband_contribution_impl(
     input: BulkSpeciesInput,
-    scheme: &SchemeProfile,
+    capability: MicrophysicsCapability,
+    assumption_heavy: bool,
 ) -> BulkContribution {
-    if scheme.capability == MicrophysicsCapability::Unsupported {
+    if capability == MicrophysicsCapability::Unsupported {
         return BulkContribution::default();
     }
 
@@ -432,7 +451,7 @@ fn bulk_sband_contribution_impl(
     let zdr_db = intrinsic_zdr_db(input.kind, diameter_mm, wet_fraction);
     let zv = (zh / 10.0_f64.powf(zdr_db / 10.0)).clamp(0.0, MAX_LINEAR_Z);
 
-    let rho_penalty = if scheme.assumption_heavy { 0.01 } else { 0.0 };
+    let rho_penalty = if assumption_heavy { 0.01 } else { 0.0 };
     let rho = (intrinsic_rho_hv(input.kind, wet_fraction) - rho_penalty).clamp(0.0, 1.0);
     let covariance = rho * (zh * zv).sqrt();
     let phase = covariance_phase_rad(input.kind, wet_fraction);
@@ -445,7 +464,7 @@ fn bulk_sband_contribution_impl(
         wet_fraction,
         zdr_db,
     );
-    let (fall_speed, fall_variance) = fall_speed_moments(psd, parameters, scheme);
+    let (fall_speed, fall_variance) = fall_speed_moments(psd, parameters, assumption_heavy);
 
     BulkContribution {
         zh: finite_nonnegative(zh, MAX_LINEAR_Z),
@@ -573,7 +592,7 @@ fn propagation_terms(
 fn fall_speed_moments(
     psd: PsdClosure,
     parameters: SpeciesParameters,
-    scheme: &SchemeProfile,
+    assumption_heavy: bool,
 ) -> (f64, f64) {
     let density_correction = (1.225 / psd.air_density_kg_m3).powf(0.4).clamp(0.7, 2.0);
     let scale = parameters.fall_a * 1_000.0_f64.powf(parameters.fall_b) * density_correction;
@@ -589,7 +608,7 @@ fn fall_speed_moments(
     };
     let mean = raw_mean * cap_scale;
     let mut variance = raw_variance * cap_scale.powi(2);
-    if scheme.assumption_heavy {
+    if assumption_heavy {
         variance += (0.15 * mean).powi(2);
     }
     (mean, variance)
@@ -851,6 +870,32 @@ mod tests {
             temperature_k: 290.0,
             air_density_kgm3: 1.0,
         }
+    }
+
+    #[test]
+    fn property_hybrid_seam_is_explicit_and_default_dispatch_stays_unsupported() {
+        let p3 = detect_scheme(Some(50), ["QICE", "QNICE"]);
+        assert_eq!(p3.capability, MicrophysicsCapability::Unsupported);
+        let input = BulkSpeciesInput {
+            kind: HydrometeorKind::CloudIce,
+            q_kgkg: 1.0e-4,
+            number_per_kg: Some(2.0e5),
+            volume_m3_per_kg: None,
+            temperature_k: 260.0,
+            air_density_kgm3: 1.0,
+        };
+
+        assert_eq!(
+            bulk_sband_contribution(input, &p3),
+            BulkContribution::default()
+        );
+        let hybrid = property_hybrid_bulk_rayleigh_contribution(input);
+        assert!(hybrid.zh > 0.0);
+        assert!(hybrid.zv > 0.0);
+        assert_eq!(
+            PROPERTY_HYBRID_BULK_RAYLEIGH_REVISION,
+            "bowecho-p3-ishmael-hybrid-bulk-rayleigh-v1"
+        );
     }
 
     #[test]

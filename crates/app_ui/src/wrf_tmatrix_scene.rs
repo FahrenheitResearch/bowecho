@@ -1,12 +1,12 @@
-//! Fail-closed property-aware T-matrix cache for one WRF model instant.
+//! Property-aware T-matrix cache for one WRF model instant.
 //!
 //! The cache retains only sparse source-cell indices and nine additive f32
 //! components at every validated radar-elevation LUT node.  Query-time
 //! elevation interpolation happens component by component; nonlinear radar
-//! products are derived only after interpolation. These research tables are
-//! never substituted with the bulk Rayleigh operator when a lookup fails;
-//! the separately versioned sub-floor exact-sphere Rayleigh limit is selected
-//! before lookup and cannot handle any other miss.
+//! products are derived only after interpolation. Strict policy is fail-closed.
+//! The separately named Hybrid policy may replace a complete frozen cell with
+//! the versioned bulk Rayleigh operator only for narrowly classified table-
+//! domain/shape omissions; every such cell and population is audited.
 
 use std::collections::BTreeSet;
 use std::f64::consts::PI;
@@ -19,11 +19,11 @@ use radar_scattering::{
     DIAGNOSTIC_COEXISTENCE_COLD_K, DIAGNOSTIC_COEXISTENCE_WARM_K, DiagnosticWetCategory,
     EvaluationError, FallMomentPolicy, ICE_MATERIAL_DENSITY_KG_M3, ISHMAEL_PSD_REVISION,
     ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION, ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION,
-    IshmaelParticleScatteringRoute, IshmaelPsd, IshmaelPsdInput, IshmaelScatteringParticleNode,
-    IshmaelSmallSphereScatteringPolicy, MixtureTopology, OrientationDefinition, OrientationModel,
-    OutputError, P3_MODULE_VERSION, P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION,
-    P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION, P3_PSD_REVISION,
-    P3_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION, P3_SOLID_ICE_DENSITY_KG_M3,
+    InterpolationError, IshmaelParticleScatteringRoute, IshmaelPsd, IshmaelPsdInput,
+    IshmaelScatteringParticleNode, IshmaelSmallSphereScatteringPolicy, MixtureTopology,
+    OrientationDefinition, OrientationModel, OutputError, P3_MODULE_VERSION,
+    P3_PROJECTED_AREA_EQUIVALENT_OBLATE_REVISION, P3_PROJECTED_AREA_EQUIVALENT_SPHEROID_REVISION,
+    P3_PSD_REVISION, P3_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION, P3_SOLID_ICE_DENSITY_KG_M3,
     P3_SPHERICAL_INTEGRATION_REVISION, P3_TABLE_READER_REVISION, P3_WRF_SOURCE_COMMIT,
     P3IceMomentInput, P3LookupTableV54, P3OfficialTableKind, P3OfficialTableV54, P3ParticleRegion,
     P3ParticleScatteringRoute, P3Psd, P3PsdError, P3PsdInput, P3QuadratureNode,
@@ -44,6 +44,11 @@ use simradar_cuda::CudaPreparedTMatrixNode;
 use thiserror::Error;
 
 use crate::wrf_tmatrix_cuda::{WrfTMatrixCudaBatchService, WrfTMatrixCudaTableRole};
+
+use crate::wrf_radar_physics::{
+    BulkSpeciesInput, HydrometeorKind, PROPERTY_HYBRID_BULK_RAYLEIGH_REVISION,
+    property_hybrid_bulk_rayleigh_contribution,
+};
 
 use crate::wrf_property_reader::{
     ClosedCellCategory, ClosedPropertyCell, ClosedRainState, CoexistenceUnavailable,
@@ -941,6 +946,26 @@ pub enum WrfTMatrixRainMode {
     FrozenOnly,
 }
 
+/// Frozen-scattering runtime policy. Strict mode never falls back. Hybrid is
+/// an explicit, versioned cell-level policy and is always visible in scene
+/// provenance and audit counts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WrfTMatrixScatteringPolicy {
+    #[default]
+    StrictFailClosed,
+    HybridBulkRayleighV1,
+}
+
+impl WrfTMatrixScatteringPolicy {
+    #[must_use]
+    pub const fn identifier(self) -> &'static str {
+        match self {
+            Self::StrictFailClosed => "full-property-tmatrix-strict-fail-closed-v1",
+            Self::HybridBulkRayleighV1 => PROPERTY_HYBRID_BULK_RAYLEIGH_REVISION,
+        }
+    }
+}
+
 /// Additive-population counts, independent of the number of elevation nodes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WrfTMatrixAuditCounts {
@@ -954,6 +979,11 @@ pub struct WrfTMatrixAuditCounts {
     pub wet_frozen_populations: u64,
     pub residual_rain_populations: u64,
     pub standalone_rain_populations: u64,
+    /// Complete frozen cells rebuilt through the explicit Hybrid policy after
+    /// a native table-domain/shape omission.
+    pub hybrid_bulk_rayleigh_cells: u64,
+    /// Positive native frozen categories represented by those rebuilt cells.
+    pub hybrid_bulk_rayleigh_populations: u64,
 }
 
 impl WrfTMatrixAuditCounts {
@@ -978,6 +1008,12 @@ impl WrfTMatrixAuditCounts {
             standalone_rain_populations: self
                 .standalone_rain_populations
                 .checked_add(other.standalone_rain_populations)?,
+            hybrid_bulk_rayleigh_cells: self
+                .hybrid_bulk_rayleigh_cells
+                .checked_add(other.hybrid_bulk_rayleigh_cells)?,
+            hybrid_bulk_rayleigh_populations: self
+                .hybrid_bulk_rayleigh_populations
+                .checked_add(other.hybrid_bulk_rayleigh_populations)?,
         })
     }
 }
@@ -997,6 +1033,7 @@ pub struct WrfTMatrixSceneProvenance {
     pub frozen_scattering: WrfTMatrixFrozenScatteringAudit,
     pub fall_moment_policy: WrfTMatrixFallMomentAudit,
     pub rain_mode: WrfTMatrixRainMode,
+    pub scattering_policy: WrfTMatrixScatteringPolicy,
     pub tables: [WrfTMatrixTableAudit; 5],
     pub counts: WrfTMatrixAuditCounts,
 }
@@ -1141,6 +1178,7 @@ impl WrfTMatrixScene {
             source,
             tables,
             WrfTMatrixRainMode::FullProperty,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
             None,
             None,
             None,
@@ -1152,7 +1190,15 @@ impl WrfTMatrixScene {
         tables: WrfTMatrixLutBundle<'_>,
         rain_mode: WrfTMatrixRainMode,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, None, None, None)
+        Self::build_internal(
+            source,
+            tables,
+            rain_mode,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn build_with_rain_mode_and_cuda(
@@ -1161,7 +1207,15 @@ impl WrfTMatrixScene {
         rain_mode: WrfTMatrixRainMode,
         cuda: &WrfTMatrixCudaBatchService,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, None, Some(cuda), None)
+        Self::build_internal(
+            source,
+            tables,
+            rain_mode,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
+            None,
+            Some(cuda),
+            None,
+        )
     }
 
     pub fn build_with_rain_mode_and_cuda_and_cancel(
@@ -1171,7 +1225,15 @@ impl WrfTMatrixScene {
         cuda: &WrfTMatrixCudaBatchService,
         cancel: &AtomicBool,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, None, Some(cuda), Some(cancel))
+        Self::build_internal(
+            source,
+            tables,
+            rain_mode,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
+            None,
+            Some(cuda),
+            Some(cancel),
+        )
     }
 
     pub fn build_with_rain_mode_and_optional_cuda_and_cancel(
@@ -1181,7 +1243,15 @@ impl WrfTMatrixScene {
         cuda: Option<&WrfTMatrixCudaBatchService>,
         cancel: &AtomicBool,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, None, cuda, Some(cancel))
+        Self::build_internal(
+            source,
+            tables,
+            rain_mode,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
+            None,
+            cuda,
+            Some(cancel),
+        )
     }
 
     pub fn build_with_p3(
@@ -1193,6 +1263,7 @@ impl WrfTMatrixScene {
             source,
             tables,
             WrfTMatrixRainMode::FullProperty,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
             Some(p3),
             None,
             None,
@@ -1205,7 +1276,15 @@ impl WrfTMatrixScene {
         p3: WrfTMatrixP3Resources,
         rain_mode: WrfTMatrixRainMode,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, Some(p3), None, None)
+        Self::build_internal(
+            source,
+            tables,
+            rain_mode,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
+            Some(p3),
+            None,
+            None,
+        )
     }
 
     pub fn build_with_p3_and_rain_mode_and_cuda(
@@ -1215,7 +1294,15 @@ impl WrfTMatrixScene {
         rain_mode: WrfTMatrixRainMode,
         cuda: &WrfTMatrixCudaBatchService,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, Some(p3), Some(cuda), None)
+        Self::build_internal(
+            source,
+            tables,
+            rain_mode,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
+            Some(p3),
+            Some(cuda),
+            None,
+        )
     }
 
     pub fn build_with_p3_and_rain_mode_and_cuda_and_cancel(
@@ -1226,13 +1313,45 @@ impl WrfTMatrixScene {
         cuda: Option<&WrfTMatrixCudaBatchService>,
         cancel: &AtomicBool,
     ) -> Result<Self, WrfTMatrixSceneBuildError> {
-        Self::build_internal(source, tables, rain_mode, Some(p3), cuda, Some(cancel))
+        Self::build_internal(
+            source,
+            tables,
+            rain_mode,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
+            Some(p3),
+            cuda,
+            Some(cancel),
+        )
+    }
+
+    /// Build with an explicit runtime scattering policy. This is the sole
+    /// production seam that can enable the audited Hybrid bulk fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_scattering_policy(
+        source: &WrfPropertyScene,
+        tables: WrfTMatrixLutBundle<'_>,
+        rain_mode: WrfTMatrixRainMode,
+        scattering_policy: WrfTMatrixScatteringPolicy,
+        p3: Option<WrfTMatrixP3Resources>,
+        cuda: Option<&WrfTMatrixCudaBatchService>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self, WrfTMatrixSceneBuildError> {
+        Self::build_internal(
+            source,
+            tables,
+            rain_mode,
+            scattering_policy,
+            p3,
+            cuda,
+            cancel,
+        )
     }
 
     fn build_internal(
         source: &WrfPropertyScene,
         tables: WrfTMatrixLutBundle<'_>,
         rain_mode: WrfTMatrixRainMode,
+        scattering_policy: WrfTMatrixScatteringPolicy,
         p3: Option<WrfTMatrixP3Resources>,
         cuda: Option<&WrfTMatrixCudaBatchService>,
         cancel: Option<&AtomicBool>,
@@ -1268,6 +1387,7 @@ impl WrfTMatrixScene {
                                 validated,
                                 p3.as_ref(),
                                 rain_mode,
+                                scattering_policy,
                                 cuda,
                                 cancel,
                                 output,
@@ -1300,6 +1420,7 @@ impl WrfTMatrixScene {
                             validated,
                             p3.as_ref(),
                             rain_mode,
+                            scattering_policy,
                             cuda,
                             cancel,
                             output,
@@ -1405,6 +1526,7 @@ impl WrfTMatrixScene {
                         FallMomentPolicy::DiagnosticWetCategoryPositiveDownZeroWithinCategoryVariance,
                 },
                 rain_mode,
+                scattering_policy,
                 tables: table_audits,
                 counts,
             },
@@ -1743,12 +1865,13 @@ fn build_cell_into(
     validated: ValidatedBundle<'_>,
     p3: Option<&WrfTMatrixP3Resources>,
     rain_mode: WrfTMatrixRainMode,
+    scattering_policy: WrfTMatrixScatteringPolicy,
     cuda: Option<&WrfTMatrixCudaBatchService>,
     cancel: Option<&AtomicBool>,
     output: &mut [f32],
 ) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
     check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
-    if source.microphysics_scheme_id() == 55 {
+    let strict = if source.microphysics_scheme_id() == 55 {
         build_ishmael_psd_cell_into(
             source, cell_index, tables, validated, rain_mode, cuda, cancel, output,
         )
@@ -1764,7 +1887,260 @@ fn build_cell_into(
             cancel,
             output,
         )
+    };
+    match strict {
+        Err(error)
+            if scattering_policy == WrfTMatrixScatteringPolicy::HybridBulkRayleighV1
+                && hybrid_eligible_table_omission(&error) =>
+        {
+            build_hybrid_bulk_rayleigh_cell_into(
+                source, cell_index, tables, validated, rain_mode, cancel, output,
+            )
+        }
+        result => result,
     }
+}
+
+fn hybrid_eligible_table_omission(error: &WrfTMatrixSceneBuildError) -> bool {
+    matches!(
+        error,
+        WrfTMatrixSceneBuildError::P3PsdIntegration {
+            source: P3TMatrixIntegrationError::ShapeOrTableOmission { .. },
+            ..
+        } | WrfTMatrixSceneBuildError::P3PsdIntegration {
+            source: P3TMatrixIntegrationError::Evaluation {
+                source: EvaluationError::Interpolation(InterpolationError::OutsideAxis { .. }),
+                ..
+            },
+            ..
+        } | WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
+            source: PsdIntegrationError::Psd(PsdError::DomainOmission { .. }),
+            ..
+        } | WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
+            source: PsdIntegrationError::NodeEvaluation {
+                source: EvaluationError::Interpolation(InterpolationError::OutsideAxis { .. }),
+                ..
+            },
+            ..
+        }
+    )
+}
+
+fn hybrid_positive_f32(
+    cell_index: usize,
+    category: WrfPropertyCategory,
+    field: &'static str,
+    value: f64,
+) -> Result<f32, WrfTMatrixSceneBuildError> {
+    let narrowed = value as f32;
+    if value.is_finite() && value > 0.0 && narrowed.is_finite() && narrowed > 0.0 {
+        Ok(narrowed)
+    } else {
+        Err(WrfTMatrixSceneBuildError::HybridBulkRayleighMoment {
+            cell_index,
+            category,
+            field,
+            value,
+        })
+    }
+}
+
+fn hybrid_bulk_to_additive(
+    cell_index: usize,
+    category: WrfPropertyCategory,
+    input: BulkSpeciesInput,
+) -> Result<AdditiveScattering, WrfTMatrixSceneBuildError> {
+    let contribution = property_hybrid_bulk_rayleigh_contribution(input);
+    if !contribution.zh.is_finite() || contribution.zh <= 0.0 {
+        return Err(WrfTMatrixSceneBuildError::HybridBulkRayleighClear {
+            cell_index,
+            category,
+        });
+    }
+    let zh = f64::from(contribution.zh);
+    let fall_speed = f64::from(contribution.fall_speed_mps);
+    let fall_variance = f64::from(contribution.fall_speed_variance_m2s2);
+    AdditiveScattering::from_components([
+        zh,
+        f64::from(contribution.zv),
+        f64::from(contribution.cov_re),
+        f64::from(contribution.cov_im),
+        f64::from(contribution.kdp_deg_km),
+        f64::from(contribution.ah_db_km),
+        f64::from(contribution.av_db_km),
+        zh * fall_speed,
+        zh * (fall_variance + fall_speed.powi(2)),
+    ])
+    .map_err(
+        |source| WrfTMatrixSceneBuildError::HybridBulkRayleighOutput {
+            cell_index,
+            category,
+            source,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_hybrid_bulk_rayleigh_cell_into(
+    source: &WrfPropertyScene,
+    cell_index: usize,
+    tables: WrfTMatrixLutBundle<'_>,
+    validated: ValidatedBundle<'_>,
+    rain_mode: WrfTMatrixRainMode,
+    cancel: Option<&AtomicBool>,
+    output: &mut [f32],
+) -> Result<CellBuildSummary, WrfTMatrixSceneBuildError> {
+    check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
+    let expected_components = validated
+        .radar_elevations_deg
+        .len()
+        .checked_mul(AdditiveScattering::COMPONENT_COUNT)
+        .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+    if output.len() != expected_components {
+        return Err(WrfTMatrixSceneBuildError::InternalRowLength {
+            cell_index,
+            expected: expected_components,
+            actual: output.len(),
+        });
+    }
+    output.fill(0.0);
+
+    let raw = source
+        .raw_cell(cell_index)
+        .map_err(|source| WrfTMatrixSceneBuildError::RawSourceCell { cell_index, source })?;
+    let temperature_k = raw.environment().temperature_k();
+    let air_density_kg_m3 = raw.dry_air_density_kg_m3();
+    let mut frozen = AdditiveScattering::default();
+    let mut frozen_populations = 0_usize;
+    for category in raw.categories() {
+        if category.mixing_ratio_kgkg() == 0.0 {
+            continue;
+        }
+        let category_id = category.category();
+        let (qice_kgkg, qnice_per_kg, volume_m3_per_kg) = match category {
+            RawPropertyCategory::P3(value) => (value.qice_kgkg, value.qnice_per_kg, None),
+            RawPropertyCategory::Ishmael(value) => (
+                value.qice_kgkg,
+                value.qnice_per_kg,
+                Some(value.qvoli_m3_per_kg),
+            ),
+        };
+        let input = BulkSpeciesInput {
+            kind: HydrometeorKind::CloudIce,
+            q_kgkg: hybrid_positive_f32(cell_index, category_id, "frozen mixing ratio", qice_kgkg)?,
+            number_per_kg: Some(hybrid_positive_f32(
+                cell_index,
+                category_id,
+                "frozen number concentration",
+                qnice_per_kg,
+            )?),
+            volume_m3_per_kg: volume_m3_per_kg
+                .map(|volume| {
+                    hybrid_positive_f32(
+                        cell_index,
+                        category_id,
+                        "total frozen particle volume",
+                        volume,
+                    )
+                })
+                .transpose()?,
+            temperature_k: hybrid_positive_f32(
+                cell_index,
+                category_id,
+                "temperature",
+                temperature_k,
+            )?,
+            air_density_kgm3: hybrid_positive_f32(
+                cell_index,
+                category_id,
+                "dry-air density",
+                air_density_kg_m3,
+            )?,
+        };
+        let contribution = hybrid_bulk_to_additive(cell_index, category_id, input)?;
+        frozen = frozen.checked_add(contribution).map_err(|source| {
+            WrfTMatrixSceneBuildError::HybridBulkRayleighOutput {
+                cell_index,
+                category: category_id,
+                source,
+            }
+        })?;
+        frozen_populations += 1;
+    }
+
+    if rain_mode == WrfTMatrixRainMode::FrozenOnly && frozen_populations == 0 {
+        return Ok(CellBuildSummary {
+            retained: false,
+            counts: WrfTMatrixAuditCounts::default(),
+        });
+    }
+    let rain = if rain_mode == WrfTMatrixRainMode::FullProperty {
+        match close_raw_rain_state(&raw, OrientationDefinition::Gaussian20Research)
+            .map_err(|source| WrfTMatrixSceneBuildError::RawRainClosure { cell_index, source })?
+        {
+            ClosedRainState::Clear => None,
+            ClosedRainState::Closed(rain) => Some(rain),
+            ClosedRainState::Unavailable(reason) => {
+                return Err(WrfTMatrixSceneBuildError::RainUnavailable { cell_index, reason });
+            }
+        }
+    } else {
+        None
+    };
+    if frozen_populations == 0 && rain.is_none() {
+        return Err(WrfTMatrixSceneBuildError::UnexpectedClearActiveCell { cell_index });
+    }
+
+    for (elevation_index, &elevation_deg) in validated.radar_elevations_deg.iter().enumerate() {
+        check_cancel(cancel).map_err(|()| WrfTMatrixSceneBuildError::Cancelled)?;
+        let mut additive = frozen;
+        if let Some(rain) = rain.as_deref() {
+            let request = evaluation_request(
+                validated.frequency_hz,
+                elevation_deg,
+                SpheroidConvention::OblateMinorVertical,
+            )?;
+            let rain_contribution = tables
+                .rain_standalone_and_residual
+                .evaluate(rain, request)
+                .map_err(|source| WrfTMatrixSceneBuildError::Evaluation {
+                    cell_index,
+                    elevation_deg,
+                    contribution: WrfTMatrixContribution::StandaloneRain,
+                    source,
+                })?;
+            additive = additive.checked_add(rain_contribution).map_err(|source| {
+                WrfTMatrixSceneBuildError::Accumulation {
+                    cell_index,
+                    elevation_deg,
+                    contribution: WrfTMatrixContribution::StandaloneRain,
+                    source,
+                }
+            })?;
+        }
+        let compact =
+            compact_components(additive).map_err(|source| WrfTMatrixSceneBuildError::Compact {
+                cell_index,
+                elevation_deg,
+                source,
+            })?;
+        let start = elevation_index
+            .checked_mul(AdditiveScattering::COMPONENT_COUNT)
+            .ok_or(WrfTMatrixSceneBuildError::SizeOverflow)?;
+        output[start..start + AdditiveScattering::COMPONENT_COUNT].copy_from_slice(&compact);
+    }
+
+    Ok(CellBuildSummary {
+        retained: true,
+        counts: WrfTMatrixAuditCounts {
+            source_cells: 1,
+            dry_frozen_populations: usize_to_u64(frozen_populations)?,
+            standalone_rain_populations: u64::from(rain.is_some()),
+            hybrid_bulk_rayleigh_cells: 1,
+            hybrid_bulk_rayleigh_populations: usize_to_u64(frozen_populations)?,
+            ..WrfTMatrixAuditCounts::default()
+        },
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5479,6 +5855,31 @@ pub enum WrfTMatrixSceneBuildError {
         #[source]
         source: PsdIntegrationError<EvaluationError>,
     },
+    #[error(
+        "hybrid bulk Rayleigh input {field} for {category} at cell {cell_index} must remain finite and positive when narrowed to f32, got {value}"
+    )]
+    HybridBulkRayleighMoment {
+        cell_index: usize,
+        category: WrfPropertyCategory,
+        field: &'static str,
+        value: f64,
+    },
+    #[error(
+        "hybrid bulk Rayleigh produced clear scattering for positive {category} at cell {cell_index}"
+    )]
+    HybridBulkRayleighClear {
+        cell_index: usize,
+        category: WrfPropertyCategory,
+    },
+    #[error(
+        "form or accumulate hybrid bulk Rayleigh additive output for {category} at cell {cell_index}: {source}"
+    )]
+    HybridBulkRayleighOutput {
+        cell_index: usize,
+        category: WrfPropertyCategory,
+        #[source]
+        source: OutputError,
+    },
     #[error("close rain-only state at ISHMAEL cell {cell_index}: {source}")]
     RawRainClosure {
         cell_index: usize,
@@ -6913,6 +7314,7 @@ mod tests {
                         FallMomentPolicy::DiagnosticWetCategoryPositiveDownZeroWithinCategoryVariance,
                 },
                 rain_mode: WrfTMatrixRainMode::FullProperty,
+                scattering_policy: WrfTMatrixScatteringPolicy::StrictFailClosed,
                 tables: [
                     WrfTMatrixTableAudit {
                         role: WrfTMatrixTableRole::DryOblate,
@@ -7553,6 +7955,78 @@ mod tests {
             &mut output,
         )
         .unwrap_or_else(|error| panic!("reported ISHMAEL cell {cell} failed: {error}"));
+    }
+
+    #[test]
+    fn reported_ishmael_domain_omission_is_strictly_rejected_and_hybrid_is_audited() {
+        let Some(wrf_path) = std::env::var_os("BOWECHO_ISHMAEL_FIXTURE") else {
+            return;
+        };
+        let cell = std::env::var("BOWECHO_ISHMAEL_HYBRID_CELL")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("cell index is an integer"))
+            .unwrap_or(4_293_607);
+        let file = wrf_core::WrfFile::open(&wrf_path).expect("open ISHMAEL WRF fixture");
+        assert_eq!(file.global_attr_i32("MP_PHYSICS").unwrap(), 55);
+        let source = read_wrf_property_scene(
+            &file,
+            WrfSourceIdentity("fixture:ishmael-hybrid".to_owned()),
+            0,
+        )
+        .expect("read normalized ISHMAEL property scene");
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let tables = owner.borrowed_bundle();
+        let validated = validate_bundle(tables).expect("validate embedded table bundle");
+        let mut output = vec![
+            0.0_f32;
+            validated.radar_elevations_deg.len()
+                * AdditiveScattering::COMPONENT_COUNT
+        ];
+
+        let strict = build_cell_into(
+            &source,
+            cell,
+            tables,
+            validated,
+            None,
+            WrfTMatrixRainMode::FrozenOnly,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
+            None,
+            None,
+            &mut output,
+        )
+        .expect_err("captured unsupported cell must remain fail-closed in strict mode");
+        assert!(matches!(
+            strict,
+            WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
+                source: PsdIntegrationError::Psd(PsdError::DomainOmission { .. }),
+                ..
+            }
+        ));
+
+        let hybrid = build_cell_into(
+            &source,
+            cell,
+            tables,
+            validated,
+            None,
+            WrfTMatrixRainMode::FrozenOnly,
+            WrfTMatrixScatteringPolicy::HybridBulkRayleighV1,
+            None,
+            None,
+            &mut output,
+        )
+        .expect("explicit Hybrid policy rebuilds the captured unsupported cell");
+        assert!(hybrid.retained);
+        assert_eq!(hybrid.counts.source_cells, 1);
+        assert_eq!(hybrid.counts.scheme_native_psd_populations, 0);
+        assert_eq!(hybrid.counts.hybrid_bulk_rayleigh_cells, 1);
+        assert!(hybrid.counts.hybrid_bulk_rayleigh_populations > 0);
+        assert!(output.iter().any(|value| *value > 0.0));
     }
 
     #[test]
