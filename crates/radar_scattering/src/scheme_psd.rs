@@ -1275,8 +1275,8 @@ impl IshmaelSolidIceMaterialClosure {
             });
         }
         if !(source_bulk_density_kg_m3.is_finite()
-            && ISHMAEL_DENSITY_RANGE_KG_M3[0] <= source_bulk_density_kg_m3
-            && source_bulk_density_kg_m3 <= ISHMAEL_DENSITY_RANGE_KG_M3[1])
+            && (ISHMAEL_DENSITY_RANGE_KG_M3[0]..=ISHMAEL_DENSITY_RANGE_KG_M3[1])
+                .contains(&source_bulk_density_kg_m3))
         {
             return Err(PsdError::OutsideReconstructionBound {
                 field: "ISHMAEL solid-ice material-closure source density",
