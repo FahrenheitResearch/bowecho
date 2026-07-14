@@ -19,8 +19,56 @@ const SHARPPY_CANVAS_MIN_WIDTH: f32 = 1_630.0;
 const SHARPPY_CANVAS_MIN_HEIGHT: f32 = 900.0;
 const SHARPPY_CANVAS_MAX_HEIGHT: f32 = 1_100.0;
 const SHARPPY_RENDER_MIN_HEIGHT: f32 = 150.0;
+const SHARPPY_TEXT_SCALE_MIN: f32 = 0.5;
+const SHARPPY_TEXT_SCALE_MAX: f32 = 2.0;
+const SHARPPY_TEXT_SCALE_DEFAULT: f32 = 1.0;
 const LEGACY_DEFAULT_LAYOUT_WITH_STP: &str =
     "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|indexboard,streamwiseness,stp|250";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SoundingFontChoice {
+    #[default]
+    SpaceGrotesk,
+    CleanSans,
+    TechnicalMono,
+}
+
+impl SoundingFontChoice {
+    const ALL: [Self; 3] = [Self::SpaceGrotesk, Self::CleanSans, Self::TechnicalMono];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::SpaceGrotesk => "space-grotesk",
+            Self::CleanSans => "clean-sans",
+            Self::TechnicalMono => "technical-mono",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "space-grotesk" | "space_grotesk" | "spacegrotesk" => Some(Self::SpaceGrotesk),
+            "clean-sans" | "clean_sans" | "proportional" => Some(Self::CleanSans),
+            "technical-mono" | "technical_mono" | "monospace" => Some(Self::TechnicalMono),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SpaceGrotesk => "Space Grotesk",
+            Self::CleanSans => "Clean Sans",
+            Self::TechnicalMono => "Technical Mono",
+        }
+    }
+
+    fn preset(self) -> sharppyrs::SoundingFontPreset {
+        match self {
+            Self::SpaceGrotesk => sharppyrs::SoundingFontPreset::SpaceGrotesk,
+            Self::CleanSans => sharppyrs::SoundingFontPreset::CleanProportional,
+            Self::TechnicalMono => sharppyrs::SoundingFontPreset::TechnicalMonospace,
+        }
+    }
+}
 
 fn restored_layout_tokens(tokens: &str) -> Option<String> {
     if tokens.trim() == LEGACY_DEFAULT_LAYOUT_WITH_STP {
@@ -97,6 +145,9 @@ pub struct SharppySoundingPanel {
     /// switch to aspect-fit from the inline host controls; this choice is
     /// persisted alongside the panel layout.
     docked_stretch: bool,
+    /// Sounding-only typography, independent from BowEcho's global egui zoom.
+    font_choice: SoundingFontChoice,
+    text_scale: f32,
     /// Last-seen SPC-window layout tokens ([`sharppyrs::SoundingLayout::to_tokens`]),
     /// mirrored out of egui memory during `ui()` so `view_state_json` (no ctx)
     /// can persist them.
@@ -113,6 +164,8 @@ impl SharppySoundingPanel {
             analysis: None,
             classic: false,
             docked_stretch: true,
+            font_choice: SoundingFontChoice::default(),
+            text_scale: SHARPPY_TEXT_SCALE_DEFAULT,
             layout_tokens: None,
             pending_layout_tokens: None,
         }
@@ -155,7 +208,9 @@ impl SharppySoundingPanel {
 
     /// The classic panel's view-state object with SHARPpy host keys:
     /// `"sharppy_layout"` carries the SPC-window layout tokens and
-    /// `"sharppy_docked_stretch"` carries the dock sizing preference
+    /// `"sharppy_docked_stretch"` carries the dock sizing preference;
+    /// `"sharppy_font_preset"` / `"sharppy_text_scale"` carry independent
+    /// sounding typography
     /// ([`sharppyrs::SoundingLayout::to_tokens`]). Keeping the inner object's
     /// shape (rather than nesting it) preserves every key existing consumers
     /// patch directly — e.g. `model_data::patch_sounding_scene_zoom` writing
@@ -172,6 +227,14 @@ impl SharppySoundingPanel {
             obj.insert(
                 "sharppy_docked_stretch".to_owned(),
                 serde_json::Value::Bool(self.docked_stretch),
+            );
+            obj.insert(
+                "sharppy_font_preset".to_owned(),
+                serde_json::Value::String(self.font_choice.key().to_owned()),
+            );
+            obj.insert(
+                "sharppy_text_scale".to_owned(),
+                serde_json::json!(self.text_scale),
             );
         }
         value
@@ -194,7 +257,28 @@ impl SharppySoundingPanel {
         {
             self.docked_stretch = stretch;
         }
+        if let Some(choice) = value
+            .get("sharppy_font_preset")
+            .and_then(serde_json::Value::as_str)
+            .and_then(SoundingFontChoice::from_key)
+        {
+            self.font_choice = choice;
+        }
+        if let Some(scale) = value
+            .get("sharppy_text_scale")
+            .and_then(serde_json::Value::as_f64)
+            .map(|scale| scale as f32)
+            .filter(|scale| scale.is_finite())
+        {
+            self.text_scale = scale.clamp(SHARPPY_TEXT_SCALE_MIN, SHARPPY_TEXT_SCALE_MAX);
+        }
         self.inner.apply_view_state_json(value)
+    }
+
+    fn sharppy_style(&self) -> sharppyrs::SkewTStyle {
+        sharppyrs::SkewTStyle::space_grotesk()
+            .with_font_preset(self.font_choice.preset())
+            .with_text_scale(self.text_scale)
     }
 
     #[allow(dead_code)] // parity with rw_ui::SoundingPanel's surface
@@ -287,6 +371,38 @@ impl SharppySoundingPanel {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.classic, false, "SHARPpy");
                 ui.selectable_value(&mut self.classic, true, "Classic");
+                if !self.classic {
+                    ui.menu_button("Text", |ui| {
+                        ui.set_min_width(230.0);
+                        ui.label(egui::RichText::new("FONT").small().strong());
+                        for choice in SoundingFontChoice::ALL {
+                            ui.selectable_value(&mut self.font_choice, choice, choice.label());
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Size");
+                            let mut percent = self.text_scale * 100.0;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut percent, 50.0..=200.0)
+                                        .suffix("%")
+                                        .integer(),
+                                )
+                                .changed()
+                            {
+                                self.text_scale = (percent / 100.0)
+                                    .clamp(SHARPPY_TEXT_SCALE_MIN, SHARPPY_TEXT_SCALE_MAX);
+                            }
+                            if ui.small_button("Reset").on_hover_text("Reset size to 100%").clicked()
+                            {
+                                self.text_scale = SHARPPY_TEXT_SCALE_DEFAULT;
+                            }
+                        });
+                        ui.weak("Changes sounding text only; panel geometry stays independent.");
+                    })
+                    .response
+                    .on_hover_text("Sounding font family and independent text size");
+                }
                 if let Some(box_sounding) = &controls.box_sounding {
                     ui.separator();
                     let response = ui
@@ -330,6 +446,7 @@ impl SharppySoundingPanel {
         if !self.classic
             && let Some(analysis) = self.analysis.as_ref()
         {
+            let render_style = self.sharppy_style();
             let available = ui.available_size();
             let size = if docked && docked_stretch {
                 egui::vec2(
@@ -345,7 +462,7 @@ impl SharppySoundingPanel {
                 sharppyrs::SoundingView::new(&analysis.prof, &analysis.derived)
                     .title(analysis.title.clone())
                     .brand("BowEcho")
-                    .style(sharppyrs::SkewTStyle::space_grotesk())
+                    .style(render_style.clone())
                     .layout_memory_id(layout_id)
                     .size(size)
             };
@@ -649,6 +766,78 @@ mod tests {
         );
         // The augmented shape must still be valid input for the classic panel.
         assert!(panel.inner.apply_view_state_json(&back));
+    }
+
+    #[test]
+    fn typography_defaults_are_backward_compatible_and_persisted() {
+        let mut panel = SharppySoundingPanel::new();
+        let old_save = panel.inner.view_state_json();
+        assert!(panel.apply_view_state_json(&old_save));
+
+        let state = panel.view_state_json();
+        assert_eq!(state["sharppy_font_preset"].as_str(), Some("space-grotesk"));
+        assert_eq!(state["sharppy_text_scale"].as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn typography_round_trips_and_clamps_persisted_scale() {
+        let mut panel = SharppySoundingPanel::new();
+        let mut state = panel.view_state_json();
+        state["sharppy_font_preset"] = serde_json::json!("technical-mono");
+        state["sharppy_text_scale"] = serde_json::json!(1.35);
+        assert!(panel.apply_view_state_json(&state));
+
+        let emitted = panel.view_state_json();
+        assert_eq!(
+            emitted["sharppy_font_preset"].as_str(),
+            Some("technical-mono")
+        );
+        assert!((emitted["sharppy_text_scale"].as_f64().unwrap() - 1.35).abs() < 1e-5);
+
+        state["sharppy_text_scale"] = serde_json::json!(9.0);
+        assert!(panel.apply_view_state_json(&state));
+        assert_eq!(
+            panel.view_state_json()["sharppy_text_scale"].as_f64(),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn typography_selection_reaches_the_render_style() {
+        let mut panel = SharppySoundingPanel::new();
+        panel.font_choice = SoundingFontChoice::CleanSans;
+        panel.text_scale = 1.25;
+        let clean = panel.sharppy_style().regular_font(10.0);
+        assert_eq!(clean.family, egui::FontFamily::Proportional);
+        assert!((clean.size - 12.5).abs() < 0.001);
+
+        panel.font_choice = SoundingFontChoice::TechnicalMono;
+        let mono = panel.sharppy_style().bold_font(10.0);
+        assert_eq!(mono.family, egui::FontFamily::Monospace);
+        assert!((mono.size - 12.5).abs() < 0.001);
+
+        panel.font_choice = SoundingFontChoice::SpaceGrotesk;
+        let space = panel.sharppy_style().regular_font(10.0);
+        assert_eq!(
+            space.family,
+            egui::FontFamily::Name(sharppyrs::FONT_FAMILY.into())
+        );
+    }
+
+    #[test]
+    fn model_and_native_hosts_share_typography_through_view_state_handoff() {
+        let mut model = SharppySoundingPanel::new();
+        model.font_choice = SoundingFontChoice::TechnicalMono;
+        model.text_scale = 1.6;
+
+        let mut native = SharppySoundingPanel::new();
+        assert!(native.apply_view_state_json(&model.view_state_json()));
+        assert_eq!(native.font_choice, SoundingFontChoice::TechnicalMono);
+        assert!((native.text_scale - 1.6).abs() < f32::EPSILON);
+        assert_eq!(
+            native.view_state_json()["sharppy_font_preset"].as_str(),
+            Some("technical-mono")
+        );
     }
 
     /// The SPC-window layout tokens ride along in the view-state JSON and

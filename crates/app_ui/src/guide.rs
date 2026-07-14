@@ -895,6 +895,16 @@ fn model_data(ui: &mut egui::Ui) {
     );
     action(
         ui,
+        "Text",
+        concat!(
+            "â€” choose the bundled Space Grotesk face, egui's clean proportional sans, or ",
+            "technical monospace, and scale sounding text independently from 50â€“200%. Font ",
+            "and size persist across model, box-mean, obs-adjusted, and RAOB soundings without ",
+            "changing the panel geometry.",
+        ),
+    );
+    action(
+        ui,
         "⚙ Edit panel layout",
         concat!(
             "— choose which diagnostic occupies each cell, then drag the cyan shared borders ",
