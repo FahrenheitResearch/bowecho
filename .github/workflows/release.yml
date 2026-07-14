@@ -360,6 +360,36 @@ jobs:
           cp "target/release/${BIN_NAME}" "dist/${{ matrix.artifact_name }}"
           chmod +x "dist/${{ matrix.artifact_name }}"
 
+      # v0.34.1 carries the optional research data once, on the Linux x64
+      # matrix leg. It is deliberately a separate release asset rather than
+      # part of any executable, and later releases must not silently duplicate
+      # this immutable pack.
+      - name: Package v0.34.1 property T-matrix research data
+        if: runner.os == 'Linux' && matrix.artifact_name == 'bowecho-linux-x64' && github.ref == 'refs/tags/v0.34.1'
+        shell: bash
+        env:
+          PACK_NAME: bowecho-property-tmatrix-sband-pytmatrix-0.3.3-research-v1.zip
+          EXPECTED_PACK_BYTES: "191400602"
+          EXPECTED_PACK_SHA256: 80b3a2c65ead59c0a951d491e966694e80bb0c49eeb1d3b1fc532bcadbcf507e
+        run: |
+          set -euo pipefail
+          pack_path="target/research-packs/${PACK_NAME}"
+          python3 tools/package_legacy_property_tmatrix.py --output "$pack_path"
+
+          actual_bytes="$(wc -c < "$pack_path")"
+          actual_bytes="${actual_bytes//[[:space:]]/}"
+          actual_sha256="$(sha256sum "$pack_path" | awk '{print $1}')"
+          if [[ "$actual_bytes" != "$EXPECTED_PACK_BYTES" ]]; then
+            echo "::error title=Property T-matrix pack size mismatch::Expected ${EXPECTED_PACK_BYTES} bytes, got ${actual_bytes} bytes for ${PACK_NAME}."
+            exit 1
+          fi
+          if [[ "$actual_sha256" != "$EXPECTED_PACK_SHA256" ]]; then
+            echo "::error title=Property T-matrix pack checksum mismatch::Expected SHA-256 ${EXPECTED_PACK_SHA256}, got ${actual_sha256} for ${PACK_NAME}."
+            exit 1
+          fi
+
+          cp "$pack_path" "dist/${PACK_NAME}"
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
