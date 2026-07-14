@@ -30464,7 +30464,15 @@ impl ViewerApp {
                 }
                 Ok(Err(err)) => {
                     self.native_sounding_rx = None;
-                    self.status = format!("Sounding compute failed: {err}");
+                    let message = format!("Sounding compute failed: {err}");
+                    // A RAOB owns the native-only host. Surface an archive
+                    // failure in that pane too instead of leaving the prior
+                    // model analysis apparently unchanged while the only
+                    // error sits in the global status line.
+                    if self.sounding_viewer_source == SoundingViewerSource::NativeOnly {
+                        self.native_sounding_panel.set_error(message.clone());
+                    }
+                    self.status = message;
                     ctx.request_repaint();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -32840,6 +32848,14 @@ impl ViewerApp {
         let (sender, receiver) = mpsc::channel();
         self.native_sounding_rx = Some(receiver);
         self.set_sounding_viewer_source(SoundingViewerSource::NativeOnly);
+        // `SoundingPanel::set_loading` deliberately keeps a Ready scene on
+        // screen during an ordinary refresh. That is wrong for this source
+        // handoff: an observation-adjusted HRRR profile already lives in the
+        // SAME native panel, so keeping it installed makes the RAOB click
+        // look like a no-op (and it stays forever if the archive fetch
+        // fails). Clear first so loading, error, and success visibly belong
+        // to the RAOB request that just won ownership.
+        self.native_sounding_panel.clear();
         self.native_sounding_panel.set_loading();
         self.open_viewer(dock::WorkspacePane::Sounding);
         self.status = format!("Fetching RAOB {site_id}…");
@@ -67057,6 +67073,86 @@ mod tests {
             "a genuinely new model sounding still spawns its compute"
         );
         assert_eq!(app.sounding_viewer_source, SoundingViewerSource::Model);
+    }
+
+    /// The real owner repro differs from the source-enum-only case above:
+    /// an observation-adjusted HRRR sounding is already rendered by the
+    /// native panel, so both the old model profile and the incoming RAOB use
+    /// `NativeOnly`. The click must visibly leave the old scene immediately,
+    /// then the successful result must replace the panel's installed data.
+    #[test]
+    fn raob_result_replaces_adjusted_model_already_in_native_host() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("hrrr", "20260702_22z", &[6]),
+        );
+        dock.set_latest_sounding_for_test(test_model_sounding_data());
+        app.model_dock = Some(dock);
+        let latest = app
+            .model_dock
+            .as_ref()
+            .and_then(model_data::ModelDataDock::latest_sounding)
+            .cloned()
+            .expect("dock holds the adjusted HRRR source");
+        app.native_sounding_src = Some(latest);
+
+        let mut adjusted_model = test_model_sounding_data();
+        adjusted_model.hour.run = "20260702_22z · OH074 obs-adj 7km".to_owned();
+        adjusted_model.read_ms = 111.0;
+        let adjusted_column = rw_ui::skewt::build_sounding_column(&adjusted_model)
+            .expect("adjusted model display column");
+        app.native_sounding_panel
+            .set_native_column(adjusted_model, adjusted_column);
+        app.sounding_viewer_source = SoundingViewerSource::NativeOnly;
+        assert_eq!(
+            app.native_sounding_panel
+                .last_timings()
+                .map(|(read_ms, _)| read_ms),
+            Some(111.0),
+            "the adjusted HRRR is the panel's installed scene before the click"
+        );
+
+        let raob_sender = app.begin_raob_sounding_request("KILX", &ctx);
+        assert_eq!(
+            app.native_sounding_panel.last_timings(),
+            None,
+            "the old adjusted-model scene must not impersonate a loading RAOB"
+        );
+        assert!(
+            app.native_sounding_panel.has_content(),
+            "the cleared panel now owns a visible loading state"
+        );
+
+        let mut raob_data = test_model_sounding_data();
+        raob_data.hour.model = "KILX RAOB".to_owned();
+        raob_data.read_ms = 222.0;
+        let raob_column =
+            rw_ui::skewt::build_sounding_column(&raob_data).expect("test RAOB column");
+        let raob_native = rustwx_sounding::NativeSounding::from_column(&raob_column)
+            .expect("test RAOB native analysis");
+        raob_sender
+            .send(Ok((Some(raob_native), 2.0, Some((raob_data, raob_column)))))
+            .expect("deliver synthetic RAOB");
+        app.poll_native_sounding(&ctx);
+
+        assert_eq!(app.sounding_viewer_source, SoundingViewerSource::NativeOnly);
+        assert_eq!(
+            app.native_sounding_panel
+                .last_timings()
+                .map(|(read_ms, _)| read_ms),
+            Some(222.0),
+            "the displayed native panel must contain the RAOB result, not the adjusted HRRR"
+        );
+        app.poll_native_sounding(&ctx);
+        assert_eq!(
+            app.native_sounding_panel
+                .last_timings()
+                .map(|(read_ms, _)| read_ms),
+            Some(222.0),
+            "the cached model Arc must not reclaim the panel next frame"
+        );
     }
 
     #[test]
