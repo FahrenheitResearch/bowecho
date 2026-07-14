@@ -22,6 +22,8 @@ const SHARPPY_RENDER_MIN_HEIGHT: f32 = 150.0;
 const SHARPPY_TEXT_SCALE_MIN: f32 = 0.5;
 const SHARPPY_TEXT_SCALE_MAX: f32 = 2.0;
 const SHARPPY_TEXT_SCALE_DEFAULT: f32 = 1.0;
+const MANUAL_BLEND_DEFAULT_M: f64 = 500.0;
+const MANUAL_BLEND_MAX_M: f64 = 5_000.0;
 const LEGACY_DEFAULT_LAYOUT_WITH_STP: &str =
     "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|indexboard,streamwiseness,stp|250";
 
@@ -112,6 +114,49 @@ struct SharppyAnalysis {
     obs_adjusted_model: bool,
 }
 
+/// One display-only correction anchored to the nearest native model level.
+/// Absolute values are intentional: an analyst can type the observed value
+/// they trust, while BowEcho derives the required increment from the untouched
+/// source column. A cosine taper avoids a discontinuity at the edge of the
+/// selected blend layer.
+#[derive(Clone, Debug, PartialEq)]
+struct ManualSoundingCorrection {
+    target_agl_m: f64,
+    blend_depth_m: f64,
+    temperature_c: Option<f64>,
+    dewpoint_c: Option<f64>,
+    wind_direction_deg: Option<f64>,
+    wind_speed_kt: Option<f64>,
+}
+
+impl ManualSoundingCorrection {
+    fn surface() -> Self {
+        Self {
+            target_agl_m: 0.0,
+            blend_depth_m: MANUAL_BLEND_DEFAULT_M,
+            temperature_c: None,
+            dewpoint_c: None,
+            wind_direction_deg: None,
+            wind_speed_kt: None,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.temperature_c.is_some()
+            || self.dewpoint_c.is_some()
+            || self.wind_direction_deg.is_some()
+            || self.wind_speed_kt.is_some()
+    }
+}
+
+#[derive(Clone)]
+struct SoundingSource {
+    data: SoundingData,
+    column: SoundingColumn,
+    footprint: Option<sharppyrs::LocationFootprint>,
+    manual_editable: bool,
+}
+
 /// Host-owned actions that sit beside the SHARPpy/Classic selector.  The
 /// sounding widget owns the row and its visual grammar, while BowEcho keeps
 /// ownership of map tools and model readiness.
@@ -155,6 +200,12 @@ pub struct SharppySoundingPanel {
     /// Tokens applied from a saved view state, waiting for the next `ui()`
     /// (which has the ctx) to store them into egui memory.
     pending_layout_tokens: Option<String>,
+    /// Untouched input retained for the lifetime of the displayed sounding.
+    /// Manual correction always rebuilds from this copy, never from a prior
+    /// edited result, so Reset is exact and the model store is never mutated.
+    source: Option<SoundingSource>,
+    manual_editor_open: bool,
+    manual_corrections: Vec<ManualSoundingCorrection>,
 }
 
 impl SharppySoundingPanel {
@@ -168,6 +219,9 @@ impl SharppySoundingPanel {
             text_scale: SHARPPY_TEXT_SCALE_DEFAULT,
             layout_tokens: None,
             pending_layout_tokens: None,
+            source: None,
+            manual_editor_open: false,
+            manual_corrections: Vec::new(),
         }
     }
 
@@ -179,16 +233,23 @@ impl SharppySoundingPanel {
     }
 
     pub fn set_loading(&mut self) {
+        self.source = None;
+        self.manual_corrections.clear();
         self.inner.set_loading();
     }
 
     pub fn set_error(&mut self, message: String) {
         self.analysis = None;
+        self.source = None;
+        self.manual_corrections.clear();
         self.inner.set_error(message);
     }
 
     pub fn clear(&mut self) {
         self.analysis = None;
+        self.source = None;
+        self.manual_corrections.clear();
+        self.manual_editor_open = false;
         self.inner.clear();
     }
 
@@ -306,15 +367,240 @@ impl SharppySoundingPanel {
         data: SoundingData,
         footprint: Option<sharppyrs::LocationFootprint>,
     ) {
-        self.analysis = rw_ui::skewt::build_sounding_column(&data)
-            .ok()
-            .and_then(|column| build_analysis(&data, &column, footprint));
-        self.inner.set_data(data);
+        match rw_ui::skewt::build_sounding_column(&data) {
+            Ok(column) => self.install_source(data, column, footprint),
+            Err(_) => {
+                self.source = None;
+                self.manual_corrections.clear();
+                self.analysis = None;
+                self.inner.set_data(data);
+            }
+        }
     }
 
     pub fn set_native_column(&mut self, data: SoundingData, column: SoundingColumn) {
-        self.analysis = build_analysis(&data, &column, None);
-        self.inner.set_native_column(data, column);
+        self.install_source(data, column, None);
+    }
+
+    fn install_source(
+        &mut self,
+        data: SoundingData,
+        column: SoundingColumn,
+        footprint: Option<sharppyrs::LocationFootprint>,
+    ) {
+        // Observed RAOBs share this panel with model soundings, but manual
+        // model-bias correction must never masquerade as an observation edit.
+        let manual_editable = !data.hour.model.to_ascii_uppercase().contains("RAOB");
+        self.source = Some(SoundingSource {
+            data,
+            column,
+            footprint,
+            manual_editable,
+        });
+        self.manual_corrections.clear();
+        if !manual_editable {
+            self.manual_editor_open = false;
+        }
+        self.rebuild_from_source();
+    }
+
+    fn active_manual_correction_count(&self) -> usize {
+        self.manual_corrections
+            .iter()
+            .filter(|correction| correction.is_active())
+            .count()
+    }
+
+    fn rebuild_from_source(&mut self) {
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        let active = source.manual_editable && self.active_manual_correction_count() > 0;
+        let column = if active {
+            apply_manual_corrections(&source.column, &self.manual_corrections)
+        } else {
+            source.column.clone()
+        };
+        self.analysis = build_analysis(&source.data, &column, source.footprint);
+        if active && let Some(analysis) = self.analysis.as_mut() {
+            analysis.title.push_str("  [MANUAL CORRECTION]");
+        }
+        // The classic plot receives the same corrected copy as SHARPpy. This
+        // remains panel-local: `source.column` and the Rusty Weather store are
+        // untouched, and Reset restores their exact values.
+        self.inner.set_native_column(source.data, column);
+    }
+
+    /// Inline rather than a popup: numerical drag fields and checkboxes stay
+    /// open while the user experiments, and every edit updates the plot and
+    /// all diagnostics in the same frame.
+    fn manual_correction_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(source) = self.source.as_ref().filter(|source| source.manual_editable) else {
+            return false;
+        };
+        let column = source.column.clone();
+        let surface_m = column.height_m_msl.first().copied().unwrap_or(0.0);
+        let max_agl_m = column.height_m_msl.last().copied().unwrap_or(surface_m) - surface_m;
+        let max_agl_m = max_agl_m.max(0.0);
+        let mut changed = false;
+        let mut remove = None;
+
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().faint_bg_color)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Manual model correction")
+                            .strong()
+                            .color(egui::Color32::from_rgb(255, 190, 70)),
+                    );
+                    ui.weak(
+                        "display only · native levels · diagnostics recalculate immediately",
+                    );
+                    if ui.small_button("+ Level").clicked() {
+                        let target_agl_m = self
+                            .manual_corrections
+                            .last()
+                            .map(|correction| correction.target_agl_m + 500.0)
+                            .unwrap_or(0.0)
+                            .min(max_agl_m);
+                        self.manual_corrections.push(ManualSoundingCorrection {
+                            target_agl_m,
+                            ..ManualSoundingCorrection::surface()
+                        });
+                    }
+                    let active = self.active_manual_correction_count() > 0;
+                    if ui
+                        .add_enabled(active, egui::Button::new("Reset original"))
+                        .on_hover_text("Remove all manual edits and restore the exact source column")
+                        .clicked()
+                    {
+                        self.manual_corrections.clear();
+                        self.manual_corrections
+                            .push(ManualSoundingCorrection::surface());
+                        changed = true;
+                    }
+                });
+
+                for (row, correction) in self.manual_corrections.iter_mut().enumerate() {
+                    ui.separator();
+                    let mut target_changed = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(format!("Level {}", row + 1)).strong());
+                        ui.label("target");
+                        target_changed = ui
+                            .add(
+                                egui::DragValue::new(&mut correction.target_agl_m)
+                                    .range(0.0..=max_agl_m)
+                                    .speed(25.0)
+                                    .suffix(" m AGL"),
+                            )
+                            .on_hover_text("Snaps to the nearest native model level")
+                            .changed();
+                        changed |= target_changed;
+                        ui.label("blend");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut correction.blend_depth_m)
+                                    .range(0.0..=MANUAL_BLEND_MAX_M)
+                                    .speed(25.0)
+                                    .suffix(" m"),
+                            )
+                            .on_hover_text(
+                                "Cosine-taper this level's increment through the surrounding depth; 0 changes only the anchor level",
+                            )
+                            .changed();
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(row);
+                        }
+                    });
+
+                    let anchor = nearest_native_level(&column, correction.target_agl_m)
+                        .unwrap_or(0)
+                        .min(column.len().saturating_sub(1));
+                    let actual_agl_m = column.height_m_msl[anchor] - surface_m;
+                    let (native_direction, native_speed) =
+                        uv_to_direction_speed_kt(column.u_ms[anchor], column.v_ms[anchor]);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak(format!("native {:.0} m:", actual_agl_m));
+
+                        let mut temperature_enabled = correction.temperature_c.is_some();
+                        if ui.checkbox(&mut temperature_enabled, "T").changed() {
+                            correction.temperature_c =
+                                temperature_enabled.then_some(column.temperature_c[anchor]);
+                            changed = true;
+                        }
+                        if let Some(value) = correction.temperature_c.as_mut() {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(value)
+                                        .range(-100.0..=60.0)
+                                        .speed(0.1)
+                                        .suffix(" °C"),
+                                )
+                                .changed();
+                        }
+
+                        let mut dewpoint_enabled = correction.dewpoint_c.is_some();
+                        if ui.checkbox(&mut dewpoint_enabled, "Td").changed() {
+                            correction.dewpoint_c =
+                                dewpoint_enabled.then_some(column.dewpoint_c[anchor]);
+                            changed = true;
+                        }
+                        if let Some(value) = correction.dewpoint_c.as_mut() {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(value)
+                                        .range(-120.0..=60.0)
+                                        .speed(0.1)
+                                        .suffix(" °C"),
+                                )
+                                .on_hover_text("Values above T are safely limited to saturation")
+                                .changed();
+                        }
+
+                        let mut direction_enabled = correction.wind_direction_deg.is_some();
+                        if ui.checkbox(&mut direction_enabled, "Dir").changed() {
+                            correction.wind_direction_deg =
+                                direction_enabled.then_some(native_direction);
+                            changed = true;
+                        }
+                        if let Some(value) = correction.wind_direction_deg.as_mut() {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(value)
+                                        .range(0.0..=360.0)
+                                        .speed(1.0)
+                                        .suffix("°"),
+                                )
+                                .changed();
+                        }
+
+                        let mut speed_enabled = correction.wind_speed_kt.is_some();
+                        if ui.checkbox(&mut speed_enabled, "Speed").changed() {
+                            correction.wind_speed_kt = speed_enabled.then_some(native_speed);
+                            changed = true;
+                        }
+                        if let Some(value) = correction.wind_speed_kt.as_mut() {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(value)
+                                        .range(0.0..=250.0)
+                                        .speed(0.5)
+                                        .suffix(" kt"),
+                                )
+                                .changed();
+                        }
+                    });
+                }
+            });
+
+        if let Some(row) = remove {
+            self.manual_corrections.remove(row);
+            changed = true;
+        }
+        changed
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -403,6 +689,40 @@ impl SharppySoundingPanel {
                     .response
                     .on_hover_text("Sounding font family and independent text size");
                 }
+                let manual_editable = self
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.manual_editable);
+                if manual_editable {
+                    ui.separator();
+                    let active = self.active_manual_correction_count();
+                    let label = if active > 0 {
+                        format!("Corrected ({active})")
+                    } else {
+                        "Correct".to_owned()
+                    };
+                    if ui
+                        .add(egui::Button::selectable(self.manual_editor_open, label))
+                        .on_hover_text(
+                            "Override model T, Td, wind direction, or wind speed at native levels with an optional smooth vertical blend. Source files are never changed.",
+                        )
+                        .clicked()
+                    {
+                        self.manual_editor_open = !self.manual_editor_open;
+                        if self.manual_editor_open && self.manual_corrections.is_empty() {
+                            self.manual_corrections
+                                .push(ManualSoundingCorrection::surface());
+                        }
+                    }
+                    if active > 0 {
+                        ui.label(
+                            egui::RichText::new("MANUAL")
+                                .small()
+                                .strong()
+                                .color(egui::Color32::from_rgb(255, 190, 70)),
+                        );
+                    }
+                }
                 if let Some(box_sounding) = &controls.box_sounding {
                     ui.separator();
                     let response = ui
@@ -442,6 +762,9 @@ impl SharppySoundingPanel {
                         );
                 }
             });
+        }
+        if self.manual_editor_open && self.manual_correction_ui(ui) {
+            self.rebuild_from_source();
         }
         if !self.classic
             && let Some(analysis) = self.analysis.as_ref()
@@ -500,6 +823,126 @@ impl SharppySoundingPanel {
             .data_mut(|data| data.insert_temp(stretch_id, docked_stretch));
         actions
     }
+}
+
+fn nearest_native_level(column: &SoundingColumn, target_agl_m: f64) -> Option<usize> {
+    let surface_m = *column.height_m_msl.first()?;
+    let target_msl = surface_m + target_agl_m.max(0.0);
+    column
+        .height_m_msl
+        .iter()
+        .enumerate()
+        .filter(|(_, height)| height.is_finite())
+        .min_by(|(_, left), (_, right)| {
+            (*left - target_msl)
+                .abs()
+                .total_cmp(&(*right - target_msl).abs())
+        })
+        .map(|(index, _)| index)
+}
+
+fn uv_to_direction_speed_kt(u_ms: f64, v_ms: f64) -> (f64, f64) {
+    let mut direction = (-u_ms).atan2(-v_ms).to_degrees();
+    if direction < 0.0 {
+        direction += 360.0;
+    }
+    (direction, u_ms.hypot(v_ms) * MS_TO_KT)
+}
+
+fn direction_speed_kt_to_uv(direction_deg: f64, speed_kt: f64) -> (f64, f64) {
+    let radians = direction_deg.rem_euclid(360.0).to_radians();
+    let speed_ms = speed_kt.max(0.0) / MS_TO_KT;
+    (-speed_ms * radians.sin(), -speed_ms * radians.cos())
+}
+
+fn correction_weight(distance_m: f64, blend_depth_m: f64) -> f64 {
+    let depth = blend_depth_m.clamp(0.0, MANUAL_BLEND_MAX_M);
+    if depth <= f64::EPSILON {
+        return (distance_m <= f64::EPSILON).then_some(1.0).unwrap_or(0.0);
+    }
+    let fraction = (distance_m / depth).clamp(0.0, 1.0);
+    if fraction >= 1.0 {
+        0.0
+    } else {
+        0.5 * (1.0 + (std::f64::consts::PI * fraction).cos())
+    }
+}
+
+/// Apply absolute analyst overrides to a copy of a model column. Each edit is
+/// resolved against the nearest real model level, then tapered in physical
+/// height. Edits are applied in listed order so the most recently added edit
+/// owns its anchor when blend layers overlap.
+fn apply_manual_corrections(
+    source: &SoundingColumn,
+    corrections: &[ManualSoundingCorrection],
+) -> SoundingColumn {
+    let mut corrected = source.clone();
+    for correction in corrections
+        .iter()
+        .filter(|correction| correction.is_active())
+    {
+        let Some(anchor) = nearest_native_level(source, correction.target_agl_m) else {
+            continue;
+        };
+        let anchor_height = source.height_m_msl[anchor];
+        let weights: Vec<f64> = source
+            .height_m_msl
+            .iter()
+            .map(|height| {
+                correction_weight((height - anchor_height).abs(), correction.blend_depth_m)
+            })
+            .collect();
+
+        if let Some(target) = correction.temperature_c.filter(|value| value.is_finite()) {
+            let delta = target - corrected.temperature_c[anchor];
+            for (value, weight) in corrected.temperature_c.iter_mut().zip(&weights) {
+                *value += delta * weight;
+            }
+        }
+        if let Some(target) = correction.dewpoint_c.filter(|value| value.is_finite()) {
+            let delta = target - corrected.dewpoint_c[anchor];
+            for (value, weight) in corrected.dewpoint_c.iter_mut().zip(&weights) {
+                *value += delta * weight;
+            }
+        }
+        if correction.wind_direction_deg.is_some() || correction.wind_speed_kt.is_some() {
+            let (current_direction, current_speed) =
+                uv_to_direction_speed_kt(corrected.u_ms[anchor], corrected.v_ms[anchor]);
+            let target_direction = correction
+                .wind_direction_deg
+                .filter(|value| value.is_finite())
+                .unwrap_or(current_direction);
+            let target_speed = correction
+                .wind_speed_kt
+                .filter(|value| value.is_finite())
+                .unwrap_or(current_speed)
+                .max(0.0);
+            let (target_u, target_v) = direction_speed_kt_to_uv(target_direction, target_speed);
+            let delta_u = target_u - corrected.u_ms[anchor];
+            let delta_v = target_v - corrected.v_ms[anchor];
+            for ((u, v), weight) in corrected
+                .u_ms
+                .iter_mut()
+                .zip(&mut corrected.v_ms)
+                .zip(&weights)
+            {
+                *u += delta_u * weight;
+                *v += delta_v * weight;
+            }
+        }
+    }
+
+    // The native sounding bridge correctly rejects supersaturation. Keep the
+    // editor responsive and physical when an analyst cools T below the prior
+    // Td or types a Td above T; the displayed Td is saturated at T.
+    for (temperature, dewpoint) in corrected
+        .temperature_c
+        .iter()
+        .zip(&mut corrected.dewpoint_c)
+    {
+        *dewpoint = dewpoint.min(*temperature);
+    }
+    corrected
 }
 
 /// Build the sharppyrs analysis from the exact column the classic panel
@@ -747,6 +1190,115 @@ mod tests {
         assert!(title.contains("OH074 obs-adj 7km @ 2026-07-14 20:20Z F006"));
         assert!(!title.contains("Valid:"), "{title}");
         assert!(title.ends_with("@39.97°N 81.48°W"), "{title}");
+    }
+
+    fn manual_test_column() -> SoundingColumn {
+        SoundingColumn {
+            pressure_hpa: vec![1000.0, 950.0, 900.0, 850.0, 800.0],
+            height_m_msl: vec![100.0, 600.0, 1100.0, 1600.0, 2100.0],
+            temperature_c: vec![20.0, 16.0, 12.0, 8.0, 4.0],
+            dewpoint_c: vec![12.0, 9.0, 6.0, 3.0, 0.0],
+            u_ms: vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            v_ms: vec![-5.0, -6.0, -7.0, -8.0, -9.0],
+            omega_pa_s: vec![0.0; 5],
+            metadata: rustwx_sounding::SoundingMetadata::default(),
+        }
+    }
+
+    fn manual_test_data(model: &str) -> SoundingData {
+        SoundingData {
+            hour: rw_ui::HourKey {
+                model: model.to_owned(),
+                run: "test".to_owned(),
+                hour: 0,
+                exact_time: None,
+            },
+            fx: 0.0,
+            fy: 0.0,
+            lat: Some(35.0),
+            lon: Some(-97.0),
+            vars: Vec::new(),
+            surface: Vec::new(),
+            read_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn manual_overrides_are_smooth_physical_and_non_destructive() {
+        let source = manual_test_column();
+        let original = source.clone();
+        let correction = ManualSoundingCorrection {
+            target_agl_m: 0.0,
+            blend_depth_m: 1_000.0,
+            temperature_c: Some(30.0),
+            dewpoint_c: Some(35.0),
+            wind_direction_deg: Some(90.0),
+            wind_speed_kt: Some(20.0),
+        };
+
+        let corrected = apply_manual_corrections(&source, &[correction]);
+
+        assert_eq!(
+            source, original,
+            "source column must stay byte-for-byte intact"
+        );
+        assert!((corrected.temperature_c[0] - 30.0).abs() < 1e-10);
+        assert_eq!(
+            corrected.dewpoint_c[0], corrected.temperature_c[0],
+            "supersaturated manual Td is limited to saturation"
+        );
+        assert!(
+            corrected.temperature_c[1] > source.temperature_c[1]
+                && corrected.temperature_c[1] < corrected.temperature_c[0],
+            "mid-blend level receives a tapered increment"
+        );
+        assert_eq!(
+            corrected.temperature_c[2], source.temperature_c[2],
+            "cosine taper reaches zero at its declared depth"
+        );
+        let (direction, speed) = uv_to_direction_speed_kt(corrected.u_ms[0], corrected.v_ms[0]);
+        assert!((direction - 90.0).abs() < 1e-8);
+        assert!((speed - 20.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn zero_blend_changes_only_nearest_native_level() {
+        let source = manual_test_column();
+        let corrected = apply_manual_corrections(
+            &source,
+            &[ManualSoundingCorrection {
+                target_agl_m: 620.0,
+                blend_depth_m: 0.0,
+                temperature_c: Some(25.0),
+                ..ManualSoundingCorrection::surface()
+            }],
+        );
+
+        assert_eq!(nearest_native_level(&source, 620.0), Some(1));
+        assert_eq!(corrected.temperature_c[1], 25.0);
+        assert_eq!(corrected.temperature_c[0], source.temperature_c[0]);
+        assert_eq!(corrected.temperature_c[2], source.temperature_c[2]);
+    }
+
+    #[test]
+    fn model_correction_source_is_kept_but_raob_is_not_editable() {
+        let mut panel = SharppySoundingPanel::new();
+        let model_column = manual_test_column();
+        panel.install_source(manual_test_data("wrf"), model_column.clone(), None);
+        assert!(panel.source.as_ref().unwrap().manual_editable);
+        assert_eq!(panel.source.as_ref().unwrap().column, model_column);
+
+        panel.manual_corrections.push(ManualSoundingCorrection {
+            temperature_c: Some(25.0),
+            ..ManualSoundingCorrection::surface()
+        });
+        panel.rebuild_from_source();
+        assert_eq!(panel.source.as_ref().unwrap().column, model_column);
+
+        panel.install_source(manual_test_data("KOUN RAOB"), manual_test_column(), None);
+        assert!(!panel.source.as_ref().unwrap().manual_editable);
+        assert!(panel.manual_corrections.is_empty());
+        assert!(!panel.manual_editor_open);
     }
 
     /// Old saves (plain classic-panel state, no `sharppy_layout` key) still
