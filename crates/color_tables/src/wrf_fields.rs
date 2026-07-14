@@ -245,11 +245,11 @@ static WRF_FIELD_CATALOG: &[(&str, WrfFieldInfo)] = &[
     ("wrf_mu6cape",     info("MUCAPE 0–6 km", "Most-unstable CAPE below 6 km", F::Cape)),
     ("wrf_cape",        info("CAPE (generic)", "Convective available potential energy", F::Cape)),
     ("wrf_cin",         info("CIN (generic)", "Convective inhibition", F::Unassigned)),
-    ("wrf_ncape",       info("Normalized CAPE", "CAPE per metre of free-convective depth", F::Sequential { lo: 0.0, hi: 0.5 })),
+    ("wrf_ncape",       info("Analytic NCAPE", "NCAPE paired with the standard analytic ECAPE calculation", F::Sequential { lo: 0.0, hi: 0.5 })),
     ("wrf_effective_cape", info("Effective-layer CAPE", "CAPE of the effective inflow layer", F::Cape)),
-    ("wrf_ecape",       info("Entraining CAPE", "Entrainment-adjusted CAPE", F::Cape)),
-    ("wrf_ecape_cape",  info("ECAPE — CAPE component", "CAPE component of the entrainment-CAPE set", F::Cape)),
-    ("wrf_ecape_cin",   info("ECAPE — CIN component", "CIN component of the entrainment-CAPE set", F::Unassigned)),
+    ("wrf_ecape",       info("Analytic ECAPE", "Standard Peters-style analytic ECAPE", F::Cape)),
+    ("wrf_ecape_cape",  info("Entraining parcel CAPE", "CAPE integrated along the explicit entraining parcel path", F::Cape)),
+    ("wrf_ecape_cin",   info("Entraining parcel CIN", "CIN integrated along the explicit entraining parcel path", F::Unassigned)),
     ("wrf_effective_srh", info("Effective-layer SRH", "Storm-relative helicity of the effective inflow layer", F::Helicity)),
     ("wrf_ebwd",        info("Effective bulk wind difference", "Bulk shear across the effective inflow layer", F::WindSpeed)),
     ("wrf_bulk_shear",  info("Bulk shear (generic)", "Bulk wind difference magnitude", F::WindSpeed)),
@@ -409,6 +409,29 @@ mod tests {
                 "{var}: uppercase lookup"
             );
         }
+    }
+
+    #[test]
+    fn ecape_fields_name_the_quantity_the_wrf_bridge_stores() {
+        let analytic = wrf_field_info("wrf_ecape").expect("wrf_ecape catalog entry");
+        assert_eq!(analytic.label, "Analytic ECAPE");
+        assert!(analytic.description.contains("analytic ECAPE"));
+
+        let path_cape = wrf_field_info("wrf_ecape_cape").expect("wrf_ecape_cape catalog entry");
+        assert_eq!(path_cape.label, "Entraining parcel CAPE");
+        assert!(
+            path_cape
+                .description
+                .contains("explicit entraining parcel path")
+        );
+
+        let path_cin = wrf_field_info("wrf_ecape_cin").expect("wrf_ecape_cin catalog entry");
+        assert_eq!(path_cin.label, "Entraining parcel CIN");
+        assert!(
+            path_cin
+                .description
+                .contains("explicit entraining parcel path")
+        );
     }
 
     /// Genuinely unknown names — raw passthroughs the catalog does not cover

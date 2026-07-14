@@ -49,4 +49,4 @@ incremental = true
 strip = false
 
 [patch.crates-io]
-hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "9753f554930e682e50d715aea63d1a76b224ea27" }
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "4ae2ed76658cbd1d62e91260a0581799242c9c8c" }
