@@ -15,6 +15,9 @@ use rustwx_sounding::SoundingColumn;
 use rw_ui::SoundingData;
 
 const MS_TO_KT: f64 = 1.943_844_49;
+const SHARPPY_CANVAS_MIN_WIDTH: f32 = 1_630.0;
+const SHARPPY_CANVAS_MIN_HEIGHT: f32 = 900.0;
+const SHARPPY_CANVAS_MAX_HEIGHT: f32 = 1_100.0;
 const LEGACY_DEFAULT_LAYOUT_WITH_STP: &str =
     "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|indexboard,streamwiseness,stp|250";
 
@@ -29,6 +32,13 @@ fn restored_layout_tokens(tokens: &str) -> Option<String> {
     } else {
         Some(canonical)
     }
+}
+
+fn sounding_canvas_size(viewport: egui::Vec2) -> egui::Vec2 {
+    egui::Vec2::new(
+        viewport.x.max(SHARPPY_CANVAS_MIN_WIDTH),
+        (viewport.y - 24.0).clamp(SHARPPY_CANVAS_MIN_HEIGHT, SHARPPY_CANVAS_MAX_HEIGHT),
+    )
 }
 
 struct SharppyAnalysis {
@@ -152,21 +162,26 @@ impl SharppySoundingPanel {
         if !self.classic
             && let Some(analysis) = self.analysis.as_ref()
         {
-            // The SPC window is composed for a roughly 3:2 canvas; keep the
-            // aspect sane inside arbitrary panes and let it scale with the pane.
-            let avail = ui.available_size();
-            let size = egui::Vec2::new(avail.x.max(480.0), avail.y.max(360.0));
-            egui::Frame::new()
-                .fill(egui::Color32::BLACK)
+            // Keep the complete SPC board in the same desktop-width coordinate
+            // system as Rusty Weather v0.4. Narrow docks scroll instead of
+            // squeezing fixed diagnostic columns over the skew-T.
+            let size = sounding_canvas_size(ui.available_size());
+            egui::ScrollArea::both()
+                .id_salt("bowecho-sharppy-sounding-scroll")
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.add(
-                        sharppyrs::SoundingView::new(&analysis.prof, &analysis.derived)
-                            .title(analysis.title.clone())
-                            .brand("BowEcho")
-                            .style(sharppyrs::SkewTStyle::space_grotesk())
-                            .layout_memory_id(layout_id)
-                            .size(size),
-                    );
+                    egui::Frame::new()
+                        .fill(egui::Color32::BLACK)
+                        .show(ui, |ui| {
+                            ui.add(
+                                sharppyrs::SoundingView::new(&analysis.prof, &analysis.derived)
+                                    .title(analysis.title.clone())
+                                    .brand("BowEcho")
+                                    .style(sharppyrs::SkewTStyle::space_grotesk())
+                                    .layout_memory_id(layout_id)
+                                    .size(size),
+                            );
+                        });
                 });
         } else {
             self.inner.ui(ui);
@@ -388,6 +403,18 @@ mod tests {
             .expect("migrated layout tokens");
         assert_eq!(migrated, sharppyrs::SoundingLayout::default().to_tokens());
         assert!(migrated.contains("indexboard,streamwiseness,hidden"));
+    }
+
+    #[test]
+    fn sounding_canvas_keeps_desktop_board_geometry_and_scrolls_small_hosts() {
+        assert_eq!(
+            sounding_canvas_size(egui::vec2(1_200.0, 700.0)),
+            egui::vec2(1_630.0, 900.0)
+        );
+        assert_eq!(
+            sounding_canvas_size(egui::vec2(1_800.0, 1_200.0)),
+            egui::vec2(1_800.0, 1_100.0)
+        );
     }
 
     /// A restored layout lands in egui memory on the next `ui()` frame under
