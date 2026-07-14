@@ -14,7 +14,7 @@
 //! high zoom. A screen-grid declutter keeps roughly one station per
 //! cell, preferring fuller reports.
 
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use std::io::Read;
 
 const METAR_CACHE_URL: &str = "https://aviationweather.gov/data/cache/metars.cache.csv.gz";
@@ -62,13 +62,50 @@ pub fn fetch_surface_obs() -> Result<Vec<SurfaceOb>, String> {
 /// and intentionally excludes high-frequency one-minute ASOS reports so
 /// it behaves like a global METAR history/backfill source.
 pub fn fetch_iem_global_metar_obs() -> Result<Vec<SurfaceOb>, String> {
+    fetch_iem_asos_window("hours=2")
+}
+
+/// Fetch the IEM global ASOS/AWOS/METAR archive around a HISTORICAL
+/// valid time: the window [when − 90 min, when + 30 min], wide enough
+/// that every station's hourly report (plus specials) lands inside for
+/// an ob pick gated to ±60 min of `when`. Same request/parse path as
+/// the live trailing-window fetch, with asos.py's explicit
+/// year1…minute2 UTC range params replacing `hours=2`.
+pub fn fetch_iem_asos_obs_at(when: DateTime<Utc>) -> Result<Vec<SurfaceOb>, String> {
+    let start = when - chrono::Duration::minutes(90);
+    let end = when + chrono::Duration::minutes(30);
+    fetch_iem_asos_window(&iem_asos_range_params(start, end))
+}
+
+/// One bounded asos.py CSV request. `window_params` is either the live
+/// `hours=N` trailing window or an explicit year1…minute2 UTC range.
+fn fetch_iem_asos_window(window_params: &str) -> Result<Vec<SurfaceOb>, String> {
     let url = format!(
         "{IEM_ASOS_URL}?data=tmpf&data=dwpf&data=drct&data=sknt&data=gust&data=alti&data=metar\
-         &hours=2&tz=Etc%2FUTC&format=onlycomma&latlon=yes&elev=yes&missing=empty&trace=T\
+         &{window_params}&tz=Etc%2FUTC&format=onlycomma&latlon=yes&elev=yes&missing=empty&trace=T\
          &report_type=3&report_type=4"
     );
     let text = data_source::fetch_listing_text(&url).map_err(|err| err.to_string())?;
     parse_iem_asos_csv(&text)
+}
+
+/// asos.py historical range params (UTC, inclusive start / exclusive
+/// end per the IEM download form's semantics).
+fn iem_asos_range_params(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
+    format!(
+        "year1={}&month1={}&day1={}&hour1={}&minute1={}\
+         &year2={}&month2={}&day2={}&hour2={}&minute2={}",
+        start.year(),
+        start.month(),
+        start.day(),
+        start.hour(),
+        start.minute(),
+        end.year(),
+        end.month(),
+        end.day(),
+        end.hour(),
+        end.minute()
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -769,6 +806,23 @@ mod tests {
         assert_eq!(lithuania.station_id, "EYKA");
         assert!((lithuania.temp_c.unwrap() - 22.0).abs() < 0.01);
         assert_eq!(lithuania.elevation_m, Some(77.0));
+    }
+
+    #[test]
+    fn iem_asos_range_params_span_the_historical_window() {
+        use chrono::TimeZone;
+        // The archive-sounding window around 2020-05-16 22Z:
+        // [when − 90 min, when + 30 min].
+        let when = Utc.with_ymd_and_hms(2020, 5, 16, 22, 0, 0).unwrap();
+        let params = iem_asos_range_params(
+            when - chrono::Duration::minutes(90),
+            when + chrono::Duration::minutes(30),
+        );
+        assert_eq!(
+            params,
+            "year1=2020&month1=5&day1=16&hour1=20&minute1=30\
+             &year2=2020&month2=5&day2=16&hour2=22&minute2=30"
+        );
     }
 
     #[test]

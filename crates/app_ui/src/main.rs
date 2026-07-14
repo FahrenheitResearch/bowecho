@@ -3235,6 +3235,18 @@ struct ViewerApp {
     nws_obs_rx: Option<mpsc::Receiver<Vec<obs::SurfaceOb>>>,
     mesonet_fetched_at: Option<Instant>,
     mesonet_rx: Option<mpsc::Receiver<Vec<obs::SurfaceOb>>>,
+    /// Archive-time obs-adjust source: the IEM ASOS window around the
+    /// displayed volume's hour, keyed by that rounded hour. The live
+    /// `surface_obs` pool prunes against the wall clock, so a historical
+    /// ob can never live there. A cached EMPTY window records a fetch
+    /// failure (or a genuinely obless hour): the sounding degrades to
+    /// un-adjusted instead of refetching every click.
+    historical_obs: Option<(DateTime<Utc>, Vec<obs::SurfaceOb>)>,
+    /// One historical-window fetch in flight, tagged with its hour key.
+    historical_obs_rx: Option<(
+        DateTime<Utc>,
+        mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>,
+    )>,
     /// Inspector card customization: which sections render.
     inspector_show_raw_vel: bool,
     inspector_show_range_az: bool,
@@ -8593,6 +8605,8 @@ impl ViewerApp {
             nws_obs_rx: None,
             mesonet_fetched_at: None,
             mesonet_rx: None,
+            historical_obs: None,
+            historical_obs_rx: None,
             last_sounding_request: None,
             hail_env_pending: false,
             inspector_show_raw_vel: true,
@@ -30267,6 +30281,23 @@ impl ViewerApp {
         if let Some(data) = fresh
             && self.native_sounding_rx.is_none()
         {
+            let adjust_wanted = !fresh_is_box && self.obs_adjust_soundings && self.obs_enabled;
+            // Archive case: a displayed volume more than RETAIN (3 h) from
+            // the wall clock can never find its ob in the live pool (merge
+            // prunes against Utc::now), so the adjusting ob comes from a
+            // fetched IEM archive window around the volume's hour. Hold the
+            // sounding un-consumed until that window is cached — the fetch
+            // worker repaints and this poll re-runs; a failed fetch caches
+            // an empty window, so the sounding proceeds un-adjusted.
+            let historical_valid = (adjust_wanted && data.lat.is_some() && data.lon.is_some())
+                .then(|| self.displayed_timeline_time_utc())
+                .flatten()
+                .filter(|valid| (Utc::now() - *valid).num_minutes().abs() > 180);
+            if let Some(valid) = historical_valid
+                && !self.ensure_historical_obs(round_to_hour_utc(valid), ctx)
+            {
+                return;
+            }
             self.native_sounding_src = Some(Arc::clone(&data));
             self.sounding_viewer_source = SoundingViewerSource::Model;
             let (sender, receiver) = mpsc::channel();
@@ -30274,28 +30305,39 @@ impl ViewerApp {
             let ctx_clone = ctx.clone();
             // Obs adjustment (close + fresh gates) resolved BEFORE the
             // spawn so the thread carries plain data.
-            let adjust_ob = (!fresh_is_box && self.obs_adjust_soundings && self.obs_enabled)
-                .then(|| {
-                    let (lat, lon) = (data.lat?, data.lon?);
-                    let now = Utc::now();
-                    self.surface_obs
-                        .frame_obs(now)
-                        .filter(|ob| {
-                            let is_metar = ob.network == "METAR";
-                            (is_metar && self.obs_show_metar)
-                                || (!is_metar && self.obs_show_mesonet)
-                        })
-                        .filter(|ob| ob.temp_c.is_some() && ob.dewpoint_c.is_some())
-                        .filter(|ob| {
-                            ob.time_utc
-                                .map(|t| (now - t).num_minutes() <= 60)
-                                .unwrap_or(false)
-                        })
-                        .map(|ob| (haversine_km(lat, lon, ob.lat, ob.lon), ob.clone()))
-                        .filter(|(d, _)| *d <= 30.0)
-                        .min_by(|a, b| a.0.total_cmp(&b.0))
+            let adjust_ob = if let Some(valid) = historical_valid {
+                data.lat.zip(data.lon).and_then(|(lat, lon)| {
+                    let window = self
+                        .historical_obs
+                        .as_ref()
+                        .map(|(_, window)| window.as_slice())
+                        .unwrap_or(&[]);
+                    select_historical_adjust_ob(window, valid, lat, lon)
                 })
-                .flatten();
+            } else {
+                adjust_wanted
+                    .then(|| {
+                        let (lat, lon) = (data.lat?, data.lon?);
+                        let now = Utc::now();
+                        self.surface_obs
+                            .frame_obs(now)
+                            .filter(|ob| {
+                                let is_metar = ob.network == "METAR";
+                                (is_metar && self.obs_show_metar)
+                                    || (!is_metar && self.obs_show_mesonet)
+                            })
+                            .filter(|ob| ob.temp_c.is_some() && ob.dewpoint_c.is_some())
+                            .filter(|ob| {
+                                ob.time_utc
+                                    .map(|t| (now - t).num_minutes() <= 60)
+                                    .unwrap_or(false)
+                            })
+                            .map(|ob| (haversine_km(lat, lon, ob.lat, ob.lon), ob.clone()))
+                            .filter(|(d, _)| *d <= 30.0)
+                            .min_by(|a, b| a.0.total_cmp(&b.0))
+                    })
+                    .flatten()
+            };
             // The sharprs parcel math is only consumed by the hail-env
             // H0/H−20 extraction below — a plain model click just needs the
             // (possibly obs-adjusted) display column, so skip that build.
@@ -30373,6 +30415,61 @@ impl ViewerApp {
                 Err(mpsc::TryRecvError::Disconnected) => self.native_sounding_rx = None,
             }
         }
+    }
+
+    /// True once `historical_obs` caches the IEM archive window for
+    /// `hour_key` (the displayed volume's rounded hour); otherwise make it
+    /// so — poll the in-flight fetch worker, or spawn one (one in flight,
+    /// mirroring poll_surface_obs; a request for a DIFFERENT hour waits its
+    /// turn and respawns once the current fetch lands). A failed fetch
+    /// caches an empty window so the caller degrades to the un-adjusted
+    /// sounding instead of refetching every frame.
+    fn ensure_historical_obs(&mut self, hour_key: DateTime<Utc>, ctx: &egui::Context) -> bool {
+        if let Some((in_flight_key, receiver)) = &self.historical_obs_rx {
+            let in_flight_key = *in_flight_key;
+            match receiver.try_recv() {
+                Ok(Ok(window)) => {
+                    self.historical_obs_rx = None;
+                    self.status = format!(
+                        "Archive surface obs: {} reports around {}",
+                        window.len(),
+                        in_flight_key.format("%Y-%m-%d %H:%MZ")
+                    );
+                    self.historical_obs = Some((in_flight_key, window));
+                    ctx.request_repaint();
+                }
+                Ok(Err(err)) => {
+                    self.historical_obs_rx = None;
+                    self.status = format!("Archive surface obs fetch failed: {err}");
+                    self.historical_obs = Some((in_flight_key, Vec::new()));
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.historical_obs_rx = None,
+            }
+        }
+        if self
+            .historical_obs
+            .as_ref()
+            .is_some_and(|(cached_key, _)| *cached_key == hour_key)
+        {
+            return true;
+        }
+        if self.historical_obs_rx.is_none() {
+            let (sender, receiver) = mpsc::channel();
+            self.historical_obs_rx = Some((hour_key, receiver));
+            self.status = format!(
+                "Fetching archive surface obs for {}…",
+                hour_key.format("%Y-%m-%d %H:%MZ")
+            );
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let result = obs::fetch_iem_asos_obs_at(hour_key);
+                let _ = sender.send(result);
+                ctx_clone.request_repaint();
+            });
+        }
+        false
     }
 
     /// The model-sounding click default: show the skew-T DOCKED to the RIGHT
@@ -41984,6 +42081,46 @@ fn with_synthesized_dewpoint(data: &rw_ui::SoundingData) -> Option<rw_ui::Soundi
     Some(out)
 }
 
+/// Round to the nearest whole hour — the historical obs window's cache
+/// key, so soundings scrubbed within the same hour reuse one IEM fetch.
+fn round_to_hour_utc(time: DateTime<Utc>) -> DateTime<Utc> {
+    let floor = time
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(time);
+    if time.minute() >= 30 {
+        floor + chrono::Duration::hours(1)
+    } else {
+        floor
+    }
+}
+
+/// The archive-time analogue of poll_native_sounding's live ob pick:
+/// nearest station within 30 km of the sounding point whose report has
+/// T and Td and sits within 60 min of the sounding's VALID time (the
+/// live path gates freshness against the wall clock instead). Distance
+/// ties — multiple reports from one station inside the window — prefer
+/// the report closest in time.
+fn select_historical_adjust_ob(
+    window: &[obs::SurfaceOb],
+    valid: DateTime<Utc>,
+    lat: f32,
+    lon: f32,
+) -> Option<(f32, obs::SurfaceOb)> {
+    window
+        .iter()
+        .filter(|ob| ob.temp_c.is_some() && ob.dewpoint_c.is_some())
+        .filter_map(|ob| {
+            let minutes_off = (valid - ob.time_utc?).num_minutes().abs();
+            (minutes_off <= 60).then_some((ob, minutes_off))
+        })
+        .map(|(ob, minutes_off)| (haversine_km(lat, lon, ob.lat, ob.lon), minutes_off, ob))
+        .filter(|(distance_km, ..)| *distance_km <= 30.0)
+        .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+        .map(|(distance_km, _, ob)| (distance_km, ob.clone()))
+}
+
 /// Build the native sounding, optionally swapping the model surface for
 /// a nearby fresh observation (T/Td clamped sane, wind kt -> m/s) before
 /// the sharprs parcel math runs — "obs-adjusted sounding". The title
@@ -45127,6 +45264,73 @@ mod tests {
             network: "METAR".to_owned(),
             elevation_m: None,
         }
+    }
+
+    /// Historical (archive-date) obs-adjust ob selection: from a fetched
+    /// IEM window, the adjusting ob is the nearest station within 30 km
+    /// whose report has T/Td and falls within 60 min of the sounding's
+    /// VALID time — far, time-distant, or dewpoint-less reports never
+    /// qualify, and an empty window degrades to None (un-adjusted).
+    #[test]
+    fn historical_adjust_ob_is_nearest_close_station_near_valid_time() {
+        let valid = Utc.with_ymd_and_hms(2020, 5, 16, 22, 7, 0).unwrap();
+        // Sounding point ~KOUN.
+        let (lat, lon) = (35.24_f32, -97.47_f32);
+        let ob = |station: &str, minutes_off: i64, lat: f32, lon: f32| {
+            let mut ob = test_adjusting_surface_ob();
+            ob.station_id = station.to_owned();
+            ob.time_utc = Some(valid + chrono::Duration::minutes(minutes_off));
+            ob.lat = lat;
+            ob.lon = lon;
+            ob
+        };
+
+        let near = ob("KNEAR", -20, 35.30, -97.40); // ~9 km, in window
+        let nearest = ob("KNRST", 25, 35.26, -97.45); // ~3 km, in window
+        let far = ob("KFAR", 0, 35.24, -96.90); // ~52 km — outside 30 km
+        let stale = ob("KOLD", -75, 35.24, -97.47); // 0 km but 75 min off
+        let mut dry = ob("KDRY", 0, 35.24, -97.47); // 0 km but no dewpoint
+        dry.dewpoint_c = None;
+
+        let window = vec![far, stale, near, dry, nearest];
+        let (distance_km, picked) =
+            select_historical_adjust_ob(&window, valid, lat, lon).expect("adjusting ob");
+        assert_eq!(picked.station_id, "KNRST");
+        assert!(distance_km < 5.0, "{distance_km}");
+
+        assert!(select_historical_adjust_ob(&[], valid, lat, lon).is_none());
+    }
+
+    /// Same station reporting twice inside the window: the distance tie
+    /// breaks toward the report closest to the valid time.
+    #[test]
+    fn historical_adjust_ob_distance_tie_prefers_time_proximity() {
+        let valid = Utc.with_ymd_and_hms(2020, 5, 16, 22, 7, 0).unwrap();
+        let report = |minutes_off: i64| {
+            let mut ob = test_adjusting_surface_ob();
+            ob.time_utc = Some(valid + chrono::Duration::minutes(minutes_off));
+            ob
+        };
+        let window = vec![report(-55), report(5), report(45)];
+        let (_, picked) =
+            select_historical_adjust_ob(&window, valid, 35.24, -97.47).expect("adjusting ob");
+        assert_eq!(picked.time_utc, Some(valid + chrono::Duration::minutes(5)));
+    }
+
+    /// The historical-window cache key: valid times round to the nearest
+    /// whole hour so scrubbing within an hour reuses one IEM fetch.
+    #[test]
+    fn historical_obs_hour_key_rounds_to_nearest_hour() {
+        let hour = Utc.with_ymd_and_hms(2020, 5, 16, 22, 0, 0).unwrap();
+        assert_eq!(round_to_hour_utc(hour), hour);
+        assert_eq!(
+            round_to_hour_utc(hour + chrono::Duration::minutes(29)),
+            hour
+        );
+        assert_eq!(
+            round_to_hour_utc(hour + chrono::Duration::minutes(31)),
+            hour + chrono::Duration::hours(1)
+        );
     }
 
     /// The "Obs-adjusted soundings" toggle must reach the DISPLAYED skew-T:
@@ -64305,6 +64509,8 @@ mod tests {
             nws_obs_rx: None,
             mesonet_fetched_at: None,
             mesonet_rx: None,
+            historical_obs: None,
+            historical_obs_rx: None,
             last_sounding_request: None,
             hail_env_pending: false,
             inspector_show_raw_vel: true,
