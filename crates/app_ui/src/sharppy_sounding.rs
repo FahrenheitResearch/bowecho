@@ -26,6 +26,13 @@ pub struct SharppySoundingPanel {
     inner: rw_ui::SoundingPanel,
     analysis: Option<Box<SharppyAnalysis>>,
     classic: bool,
+    /// Last-seen SPC-window layout tokens ([`sharppyrs::SoundingLayout::to_tokens`]),
+    /// mirrored out of egui memory during `ui()` so `view_state_json` (no ctx)
+    /// can persist them.
+    layout_tokens: Option<String>,
+    /// Tokens applied from a saved view state, waiting for the next `ui()`
+    /// (which has the ctx) to store them into egui memory.
+    pending_layout_tokens: Option<String>,
 }
 
 impl SharppySoundingPanel {
@@ -34,7 +41,16 @@ impl SharppySoundingPanel {
             inner: rw_ui::SoundingPanel::new(),
             analysis: None,
             classic: false,
+            layout_tokens: None,
+            pending_layout_tokens: None,
         }
+    }
+
+    /// Stable egui-memory key for the SPC-window panel layout, pinned so the
+    /// layout survives the widget moving between panes and so it can be
+    /// read/written outside the widget for persistence.
+    fn layout_memory_id() -> egui::Id {
+        egui::Id::new("bowecho_sharppy_layout")
     }
 
     pub fn set_loading(&mut self) {
@@ -55,11 +71,34 @@ impl SharppySoundingPanel {
         self.inner.has_content() || self.analysis.is_some()
     }
 
+    /// The classic panel's view-state object with one added string key,
+    /// `"sharppy_layout"`, carrying the SPC-window layout tokens
+    /// ([`sharppyrs::SoundingLayout::to_tokens`]). Keeping the inner object's
+    /// shape (rather than nesting it) preserves every key existing consumers
+    /// patch directly — e.g. `model_data::patch_sounding_scene_zoom` writing
+    /// `["zooms"]["scene"]` — and keeps old saves loadable as-is.
     pub fn view_state_json(&self) -> serde_json::Value {
-        self.inner.view_state_json()
+        let mut value = self.inner.view_state_json();
+        if let (Some(obj), Some(tokens)) = (value.as_object_mut(), &self.layout_tokens) {
+            obj.insert(
+                "sharppy_layout".to_owned(),
+                serde_json::Value::String(tokens.clone()),
+            );
+        }
+        value
     }
 
+    /// Accepts both shapes: a plain classic-panel state (old saves) and one
+    /// carrying the added `"sharppy_layout"` key (the classic panel ignores
+    /// unknown keys). Layout tokens take effect on the next `ui()` frame,
+    /// which has the ctx to write egui memory.
     pub fn apply_view_state_json(&mut self, value: &serde_json::Value) -> bool {
+        if let Some(tokens) = value.get("sharppy_layout").and_then(|v| v.as_str())
+            && sharppyrs::SoundingLayout::from_tokens(tokens).is_some()
+        {
+            self.layout_tokens = Some(tokens.to_owned());
+            self.pending_layout_tokens = Some(tokens.to_owned());
+        }
         self.inner.apply_view_state_json(value)
     }
 
@@ -81,6 +120,14 @@ impl SharppySoundingPanel {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let layout_id = Self::layout_memory_id();
+        // A layout restored from saved view state lands in egui memory here,
+        // on the first frame with a ctx.
+        if let Some(tokens) = self.pending_layout_tokens.take()
+            && let Some(layout) = sharppyrs::SoundingLayout::from_tokens(&tokens)
+        {
+            sharppyrs::store_layout(ui.ctx(), layout_id, &layout);
+        }
         if self.analysis.is_some() {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.classic, false, "SHARPpy");
@@ -89,24 +136,30 @@ impl SharppySoundingPanel {
         }
         if self.classic || self.analysis.is_none() {
             self.inner.ui(ui);
-            return;
+        } else {
+            let analysis = self.analysis.as_ref().expect("checked above");
+            // The SPC window is composed for a roughly 3:2 canvas; keep the
+            // aspect sane inside arbitrary panes and let it scale with the pane.
+            let avail = ui.available_size();
+            let size = egui::Vec2::new(avail.x.max(480.0), avail.y.max(360.0));
+            egui::Frame::new()
+                .fill(egui::Color32::BLACK)
+                .show(ui, |ui| {
+                    ui.add(
+                        sharppyrs::SoundingView::new(&analysis.prof, &analysis.derived)
+                            .title(analysis.title.clone())
+                            .brand("BowEcho")
+                            .style(sharppyrs::SkewTStyle::space_grotesk())
+                            .layout_memory_id(layout_id)
+                            .size(size),
+                    );
+                });
         }
-        let analysis = self.analysis.as_ref().expect("checked above");
-        // The SPC window is composed for a roughly 3:2 canvas; keep the
-        // aspect sane inside arbitrary panes and let it scale with the pane.
-        let avail = ui.available_size();
-        let size = egui::Vec2::new(avail.x.max(480.0), avail.y.max(360.0));
-        egui::Frame::new()
-            .fill(egui::Color32::BLACK)
-            .show(ui, |ui| {
-                ui.add(
-                    sharppyrs::SoundingView::new(&analysis.prof, &analysis.derived)
-                        .title(analysis.title.clone())
-                        .brand("BowEcho")
-                        .style(sharppyrs::SkewTStyle::space_grotesk())
-                        .size(size),
-                );
-            });
+        // Mirror the (possibly gear-edited) layout back out so the ctx-less
+        // `view_state_json` can persist it.
+        if let Some(layout) = sharppyrs::stored_layout(ui.ctx(), layout_id) {
+            self.layout_tokens = Some(layout.to_tokens());
+        }
     }
 }
 
@@ -244,5 +297,74 @@ mod tests {
         assert!(analysis.derived.pwat.is_finite(), "PWAT computes");
         assert!(analysis.derived.srh1km.is_finite(), "SRH computes");
         assert!(analysis.title.starts_with("HRRR 2026-06-25 06z F018"));
+    }
+
+    /// Old saves (plain classic-panel state, no `sharppy_layout` key) still
+    /// apply, and the emitted view state keeps the classic keys the app
+    /// patches directly (`["zooms"]["scene"]`).
+    #[test]
+    fn view_state_stays_compatible_with_old_saves() {
+        let mut panel = SharppySoundingPanel::new();
+        let mut old_save = panel.inner.view_state_json();
+        crate::model_data::patch_sounding_scene_zoom(&mut old_save, 1.25);
+        assert!(panel.apply_view_state_json(&old_save));
+        let back = panel.view_state_json();
+        assert!((back["zooms"]["scene"].as_f64().unwrap() - 1.25).abs() < 1e-6);
+        assert!(
+            back.get("sharppy_layout").is_none(),
+            "no layout seen yet, none emitted"
+        );
+        // The augmented shape must still be valid input for the classic panel.
+        assert!(panel.inner.apply_view_state_json(&back));
+    }
+
+    /// The SPC-window layout tokens ride along in the view-state JSON and
+    /// survive an apply -> emit round trip, without disturbing zoom patching.
+    #[test]
+    fn layout_tokens_round_trip_through_view_state() {
+        let tokens =
+            "hidden,advection|slinky|speed,thetae,srwinds,hazardtype|indexboard,ship,stp|180";
+        let mut panel = SharppySoundingPanel::new();
+        let mut save = panel.inner.view_state_json();
+        save.as_object_mut()
+            .unwrap()
+            .insert("sharppy_layout".to_owned(), serde_json::json!(tokens));
+        assert!(panel.apply_view_state_json(&save));
+        let mut emitted = panel.view_state_json();
+        assert_eq!(emitted["sharppy_layout"].as_str(), Some(tokens));
+        crate::model_data::patch_sounding_scene_zoom(&mut emitted, 1.4);
+        assert_eq!(emitted["sharppy_layout"].as_str(), Some(tokens));
+        assert!((emitted["zooms"]["scene"].as_f64().unwrap() - 1.4).abs() < 1e-6);
+        // Malformed tokens are dropped rather than persisted or applied.
+        let mut bad = panel.inner.view_state_json();
+        bad.as_object_mut()
+            .unwrap()
+            .insert("sharppy_layout".to_owned(), serde_json::json!("gibberish"));
+        let mut fresh = SharppySoundingPanel::new();
+        assert!(fresh.apply_view_state_json(&bad));
+        assert!(fresh.view_state_json().get("sharppy_layout").is_none());
+    }
+
+    /// A restored layout lands in egui memory on the next `ui()` frame under
+    /// the pinned id, and `ui()` mirrors the in-memory layout back into the
+    /// tokens the ctx-less `view_state_json` emits.
+    #[test]
+    fn pending_layout_lands_in_egui_memory_on_ui() {
+        let tokens =
+            "speed,advection|hodograph|slinky,thetae,srwinds,hazardtype|indexboard,ship,stp|300";
+        let mut panel = SharppySoundingPanel::new();
+        let mut save = panel.inner.view_state_json();
+        save.as_object_mut()
+            .unwrap()
+            .insert("sharppy_layout".to_owned(), serde_json::json!(tokens));
+        assert!(panel.apply_view_state_json(&save));
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| panel.ui(ui));
+        let stored =
+            sharppyrs::stored_layout(&ctx, SharppySoundingPanel::layout_memory_id())
+                .expect("layout stored under the pinned id");
+        assert_eq!(stored.to_tokens(), tokens);
+        assert_eq!(panel.view_state_json()["sharppy_layout"].as_str(), Some(tokens));
     }
 }

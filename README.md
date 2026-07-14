@@ -256,4 +256,7 @@ During severe weather, follow your local NWS office and emergency management.
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+Dual-licensed under MIT or Apache-2.0, at your option. License and
+attribution notices for derived and embedded third-party work (SHARPpy and
+the sounding-window port, fonts, basemap data) are collected in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
