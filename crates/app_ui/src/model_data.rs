@@ -180,16 +180,18 @@ enum SyntheticRadarRecipe {
     CleanDualPol,
     RealRadar,
     MaximumFidelity,
+    PropertyTMatrixHybrid,
     PropertyTMatrixResearch,
 }
 
 impl SyntheticRadarRecipe {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::StormView,
         Self::CleanTruth,
         Self::CleanDualPol,
         Self::RealRadar,
         Self::MaximumFidelity,
+        Self::PropertyTMatrixHybrid,
         Self::PropertyTMatrixResearch,
     ];
 
@@ -200,7 +202,8 @@ impl SyntheticRadarRecipe {
             Self::CleanDualPol => "Clean dual-pol",
             Self::RealRadar => "Real radar (balanced) - recommended",
             Self::MaximumFidelity => "Maximum fidelity (slow)",
-            Self::PropertyTMatrixResearch => "P3/ISHMAEL T-matrix (research)",
+            Self::PropertyTMatrixHybrid => "P3 Hybrid - recommended",
+            Self::PropertyTMatrixResearch => "Full P3/ISHMAEL T-matrix (experimental)",
         }
     }
 
@@ -221,8 +224,11 @@ impl SyntheticRadarRecipe {
             Self::MaximumFidelity => {
                 "The full virtual instrument with 27-point pulse-volume integration and adjacent-time atmosphere interpolation. Best for a short loop; source-model resolution still limits detail."
             }
+            Self::PropertyTMatrixHybrid => {
+                "Production-friendly P3/ISHMAEL dual-pol: native property T-matrix for supported cells and the versioned bulk Rayleigh operator only for audited table-domain omissions. Defaults to embedded 2.8 GHz S and a frozen atmosphere."
+            }
             Self::PropertyTMatrixResearch => {
-                "Opt-in, fail-closed property T-matrix for exact supported P3/ISHMAEL files. Defaults to embedded 2.8 GHz S with a frozen atmosphere; experts can opt into full-stencil raw-state temporal interpolation or validated local S/C/X packs."
+                "Experimental full property T-matrix for exact supported P3/ISHMAEL files. It is strictly fail-closed, defaults to embedded 2.8 GHz S, and permits expert raw-state temporal interpolation or validated local S/C/X packs."
             }
         }
     }
@@ -233,6 +239,7 @@ impl SyntheticRadarRecipe {
             Self::CleanDualPol
             | Self::RealRadar
             | Self::MaximumFidelity
+            | Self::PropertyTMatrixHybrid
             | Self::PropertyTMatrixResearch => {
                 "REF / VEL / SW / ZDR / CC / KDP / PHI + attenuation/corrected fields"
             }
@@ -332,9 +339,8 @@ struct SyntheticRadarUiState {
     spectrum_width_floor_mps: f32,
     #[serde(default)]
     dual_pol: bool,
-    /// Polarimetric forward operator. The research T-matrix path has a strict
-    /// table/property applicability contract and never falls back to the bulk
-    /// Rayleigh operator when that contract is not met.
+    /// Polarimetric forward operator. Full T-matrix is fail-closed; Hybrid has
+    /// a separately named, audited bulk-Rayleigh policy for table omissions.
     #[serde(default)]
     polarimetric_kernel: crate::wrf_radar::PolarimetricKernel,
     #[serde(default)]
@@ -852,10 +858,15 @@ impl SyntheticRadarUiState {
                 self.missing_neighbor_policy =
                     app_ui::wrf_temporal::MissingNeighborPolicy::HoldAnchor;
             }
-            SyntheticRadarRecipe::PropertyTMatrixResearch => {
+            SyntheticRadarRecipe::PropertyTMatrixHybrid
+            | SyntheticRadarRecipe::PropertyTMatrixResearch => {
                 self.apply_mode_preset(crate::wrf_radar::SimulationMode::Instrument);
                 self.polarimetric_kernel =
-                    crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1;
+                    if matches!(recipe, SyntheticRadarRecipe::PropertyTMatrixHybrid) {
+                        crate::wrf_radar::PolarimetricKernel::PropertyTMatrixHybridV1
+                    } else {
+                        crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
+                    };
                 self.property_tmatrix_table_source =
                     app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1;
                 self.property_tmatrix_rain_sensitivity =
@@ -3956,10 +3967,7 @@ impl ModelDataDock {
                 work_text.push_str(" · fallback spacing shown; source DX sets the final gate count");
             }
             ui.label(egui::RichText::new(work_text).small().weak());
-            if !matches!(
-                state.polarimetric_kernel,
-                crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
-            ) {
+            if !state.polarimetric_kernel.is_property_tmatrix() {
                 ui.label(
                     egui::RichText::new(
                         "CUDA applies to native P3/ISHMAEL property T-matrix processing; this preset uses CPU.",
@@ -3988,10 +3996,18 @@ impl ModelDataDock {
                         .small()
                         .weak(),
                     );
+                } else if matches!(recipe, SyntheticRadarRecipe::PropertyTMatrixHybrid) {
+                    ui.label(
+                        egui::RichText::new(
+                            "P3 Hybrid uses native property T-matrix where the exact tables support the complete cell. Only explicit table-domain/shape omissions use versioned bulk Rayleigh v1, with policy and cell/population counts stamped into the output.",
+                        )
+                        .small()
+                        .weak(),
+                    );
                 } else if matches!(recipe, SyntheticRadarRecipe::PropertyTMatrixResearch) {
                     ui.label(
                         egui::RichText::new(
-                            "Research T-matrix requires exact P3 50-53 or ISHMAEL 55 property tuples and matching LUT axes. Any unsupported field, particle, temperature, beam, or table stops the run; it never substitutes Rayleigh.",
+                            "Experimental Full P3 T-matrix requires exact P3 50-53 or ISHMAEL 55 property tuples and matching LUT axes. Any unsupported field, particle, temperature, beam, or table stops the run; it never substitutes Rayleigh.",
                         )
                         .small()
                         .weak(),
@@ -4965,17 +4981,27 @@ impl ModelDataDock {
                                     .on_hover_text(
                                         "Fast scheme-aware bulk approximation used by BowEcho v0.33.0. Unsupported schemes are explicitly labeled scalar fallbacks.",
                                     );
-                                    if ui
+                                    let hybrid_clicked = ui
+                                        .selectable_value(
+                                            &mut state.polarimetric_kernel,
+                                            crate::wrf_radar::PolarimetricKernel::PropertyTMatrixHybridV1,
+                                            "P3 Hybrid (recommended)",
+                                        )
+                                        .on_hover_text(
+                                            "Native property T-matrix for supported P3/ISHMAEL cells; explicit versioned bulk Rayleigh v1 only for audited table-domain/shape omissions.",
+                                        )
+                                        .clicked();
+                                    let strict_clicked = ui
                                         .selectable_value(
                                             &mut state.polarimetric_kernel,
                                             crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1,
-                                            "Property T-matrix (research)",
+                                            "Full P3 T-matrix (experimental)",
                                         )
                                         .on_hover_text(
-                                            "Opt-in research operator for exact supported P3/ISHMAEL property tuples. It uses versioned offline T-matrix tables and fails closed on any scheme, field, frequency, geometry, or table mismatch.",
+                                            "Experimental full property operator for exact supported P3/ISHMAEL tuples. It fails closed on every scheme, field, particle, frequency, geometry, or table mismatch.",
                                         )
-                                        .clicked()
-                                    {
+                                        .clicked();
+                                    if hybrid_clicked || strict_clicked {
                                         // Keep the coherent legacy recipe at 2.8 GHz while
                                         // preserving an explicit external exact-band choice.
                                         if matches!(
@@ -4986,6 +5012,15 @@ impl ModelDataDock {
                                         }
                                         state.reflectivity_sampling =
                                             crate::wrf_radar::ReflectivitySampling::LinearZ;
+                                        if hybrid_clicked
+                                            && matches!(
+                                                state.atmosphere_time_mode,
+                                                app_ui::wrf_temporal::AtmosphereTimeMode::RawStateLinear
+                                            )
+                                        {
+                                            state.atmosphere_time_mode =
+                                                app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart;
+                                        }
                                     }
                                 });
                             });
@@ -4993,15 +5028,15 @@ impl ModelDataDock {
                                 crate::wrf_radar::PolarimetricKernel::BulkRayleighV1 => {
                                     "Scheme-aware bulk S-band Rayleigh operator. Unsupported or incomplete conventional schemes fall back explicitly to REF/VEL."
                                 }
+                                crate::wrf_radar::PolarimetricKernel::PropertyTMatrixHybridV1 => {
+                                    "Recommended P3/ISHMAEL operator. Native property T-matrix is retained for supported cells; only table-domain/shape omissions use versioned bulk Rayleigh v1, with explicit policy and audit counts."
+                                }
                                 crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1 => {
-                                    "Research-only, not independently validated for operational use. Requires an exact supported P3/ISHMAEL raw-property contract and an exact selected S/C/X table pack; no silent source, band, Rayleigh, or LUT fallback."
+                                    "Experimental full property T-matrix, not independently validated for operational use. Requires an exact supported P3/ISHMAEL contract and exact S/C/X table pack; strict fail-closed with no Rayleigh fallback."
                                 }
                             };
                             ui.label(egui::RichText::new(kernel_note).small().weak());
-                            if matches!(
-                                state.polarimetric_kernel,
-                                crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
-                            ) {
+                            if state.polarimetric_kernel.is_property_tmatrix() {
                                 ui.separator();
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label("Table source:");
@@ -5104,9 +5139,11 @@ impl ModelDataDock {
                                     );
                                 }
                                 ui.label(
-                                    egui::RichText::new(
-                                        "Raw-state pre-closure is currently limited to legacy embedded S · 2.8 GHz · Full property. External S/C/X uses Frozen or additive adjacent-scene timing.",
-                                    )
+                                    egui::RichText::new(if state.polarimetric_kernel.is_hybrid() {
+                                        "Hybrid is cell-audited and currently uses Frozen or additive adjacent-scene timing; Raw-state pre-closure is disabled."
+                                    } else {
+                                        "Raw-state pre-closure is limited to experimental Full P3/ISHMAEL, legacy embedded S · 2.8 GHz · Full property. External S/C/X uses Frozen or additive adjacent-scene timing."
+                                    })
                                     .small()
                                     .weak(),
                                 );
@@ -5149,10 +5186,8 @@ impl ModelDataDock {
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("Frequency:");
-                                let research_tmatrix = matches!(
-                                    state.polarimetric_kernel,
-                                    crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1
-                                );
+                                let research_tmatrix =
+                                    state.polarimetric_kernel.is_property_tmatrix();
                                 ui.add_enabled(
                                     !research_tmatrix,
                                     egui::DragValue::new(&mut state.radar_frequency_mhz)
@@ -8456,6 +8491,22 @@ mod tests {
             maximum.atmosphere_time_mode,
             app_ui::wrf_temporal::AtmosphereTimeMode::LinearAdjacent
         );
+
+        state.apply_recipe(SyntheticRadarRecipe::PropertyTMatrixHybrid);
+        let hybrid = state.to_config().unwrap();
+        assert_eq!(
+            hybrid.polarimetric_kernel,
+            crate::wrf_radar::PolarimetricKernel::PropertyTMatrixHybridV1
+        );
+        assert_eq!(
+            hybrid.atmosphere_time_mode,
+            app_ui::wrf_temporal::AtmosphereTimeMode::FrozenAtVolumeStart
+        );
+        assert_eq!(
+            hybrid.polarimetric_kernel.scattering_policy(),
+            app_ui::wrf_tmatrix_scene::WrfTMatrixScatteringPolicy::HybridBulkRayleighV1
+        );
+        assert!(hybrid.validate_science_contract().is_ok());
 
         state.apply_recipe(SyntheticRadarRecipe::PropertyTMatrixResearch);
         let research = state.to_config().unwrap();

@@ -157,13 +157,34 @@ pub const PROPERTY_TMATRIX_C_BAND_SOURCE: &str =
     "P3/ISHMAEL property-aware C-band T-matrix ZH (research)";
 pub const PROPERTY_TMATRIX_X_BAND_SOURCE: &str =
     "P3/ISHMAEL property-aware X-band T-matrix ZH (research)";
+pub const PROPERTY_HYBRID_S_BAND_SOURCE: &str =
+    "P3 Hybrid S-band ZH (property T-matrix + audited bulk Rayleigh v1)";
+pub const PROPERTY_HYBRID_C_BAND_SOURCE: &str =
+    "P3 Hybrid C-band ZH (property T-matrix + audited bulk Rayleigh v1)";
+pub const PROPERTY_HYBRID_X_BAND_SOURCE: &str =
+    "P3 Hybrid X-band ZH (property T-matrix + audited bulk Rayleigh v1)";
 
-fn property_tmatrix_ref_source(frequency_mhz: u32) -> Result<&'static str, String> {
-    match frequency_mhz {
-        2_800 => Ok(PROPERTY_TMATRIX_S_BAND_SOURCE),
-        5_600 => Ok(PROPERTY_TMATRIX_C_BAND_SOURCE),
-        9_400 => Ok(PROPERTY_TMATRIX_X_BAND_SOURCE),
-        other => Err(format!(
+fn property_tmatrix_ref_source(
+    kernel: PolarimetricKernel,
+    frequency_mhz: u32,
+) -> Result<&'static str, String> {
+    match (kernel, frequency_mhz) {
+        (PolarimetricKernel::PropertyTMatrixHybridV1, 2_800) => Ok(PROPERTY_HYBRID_S_BAND_SOURCE),
+        (PolarimetricKernel::PropertyTMatrixHybridV1, 5_600) => Ok(PROPERTY_HYBRID_C_BAND_SOURCE),
+        (PolarimetricKernel::PropertyTMatrixHybridV1, 9_400) => Ok(PROPERTY_HYBRID_X_BAND_SOURCE),
+        (PolarimetricKernel::PropertyTMatrixResearchV1, 2_800) => {
+            Ok(PROPERTY_TMATRIX_S_BAND_SOURCE)
+        }
+        (PolarimetricKernel::PropertyTMatrixResearchV1, 5_600) => {
+            Ok(PROPERTY_TMATRIX_C_BAND_SOURCE)
+        }
+        (PolarimetricKernel::PropertyTMatrixResearchV1, 9_400) => {
+            Ok(PROPERTY_TMATRIX_X_BAND_SOURCE)
+        }
+        (PolarimetricKernel::BulkRayleighV1, _) => {
+            Err("bulk Rayleigh does not have a property T-matrix reflectivity source".to_owned())
+        }
+        (_, other) => Err(format!(
             "unsupported exact property T-matrix frequency {other} MHz"
         )),
     }
@@ -210,7 +231,35 @@ pub enum ReflectivitySampling {
 pub enum PolarimetricKernel {
     #[default]
     BulkRayleighV1,
+    /// Native property/T-matrix where the pinned tables support the complete
+    /// cell; explicit audited bulk Rayleigh v1 for table-domain omissions.
+    PropertyTMatrixHybridV1,
+    /// Full native property/T-matrix; experimental and always fail-closed.
     PropertyTMatrixResearchV1,
+}
+
+impl PolarimetricKernel {
+    pub const fn is_property_tmatrix(self) -> bool {
+        matches!(
+            self,
+            Self::PropertyTMatrixHybridV1 | Self::PropertyTMatrixResearchV1
+        )
+    }
+
+    pub const fn is_hybrid(self) -> bool {
+        matches!(self, Self::PropertyTMatrixHybridV1)
+    }
+
+    pub const fn scattering_policy(self) -> app_ui::wrf_tmatrix_scene::WrfTMatrixScatteringPolicy {
+        match self {
+            Self::BulkRayleighV1 | Self::PropertyTMatrixResearchV1 => {
+                app_ui::wrf_tmatrix_scene::WrfTMatrixScatteringPolicy::StrictFailClosed
+            }
+            Self::PropertyTMatrixHybridV1 => {
+                app_ui::wrf_tmatrix_scene::WrfTMatrixScatteringPolicy::HybridBulkRayleighV1
+            }
+        }
+    }
 }
 
 /// Beam-path geometry used to map slant range/elevation into model latitude,
@@ -784,10 +833,7 @@ impl SyntheticRadarConfig {
         if self.coupled_single_prf_estimator {
             validate_coupled_estimator_inputs(self)?;
         }
-        let property_tmatrix = matches!(
-            self.polarimetric_kernel,
-            PolarimetricKernel::PropertyTMatrixResearchV1
-        );
+        let property_tmatrix = self.polarimetric_kernel.is_property_tmatrix();
         if matches!(
             self.atmosphere_time_mode,
             AtmosphereTimeMode::RawStateLinear
@@ -800,6 +846,16 @@ impl SyntheticRadarConfig {
         }
         if !property_tmatrix {
             return Ok(());
+        }
+        if matches!(
+            self.atmosphere_time_mode,
+            AtmosphereTimeMode::RawStateLinear
+        ) && self.polarimetric_kernel.is_hybrid()
+        {
+            return Err(
+                "P3 Hybrid currently requires Frozen or additive adjacent-scene timing; RawStateLinear is available only with experimental Full P3/ISHMAEL T-matrix strict mode"
+                    .to_owned(),
+            );
         }
         if !self.dual_pol {
             return Err("Property T-matrix research mode requires dual polarization".to_string());
@@ -2150,10 +2206,7 @@ fn read_wrf_radar_fields_for_config_reporting(
     if let Some(cancel) = cancel {
         check_synthetic_radar_cancel(cancel)?;
     }
-    let property_tmatrix = matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    );
+    let property_tmatrix = config.polarimetric_kernel.is_property_tmatrix();
     let mut fields = read_wrf_radar_fields_reporting_inner(
         file,
         timeidx,
@@ -2199,6 +2252,12 @@ fn read_wrf_radar_fields_for_config_reporting(
             config.atmosphere_time_mode,
             AtmosphereTimeMode::RawStateLinear
         );
+        if raw_state_linear && config.polarimetric_kernel.is_hybrid() {
+            return Err(
+                "P3 Hybrid does not support RawStateLinear; choose Frozen/additive adjacent-scene timing or experimental Full P3/ISHMAEL T-matrix strict mode"
+                    .to_owned(),
+            );
+        }
         let table_owner = app_ui::wrf_tmatrix_assets::load_property_tmatrix_tables_exact(
             config.property_tmatrix_table_source,
             f64::from(config.radar_frequency_mhz) * 1.0e6,
@@ -2250,7 +2309,8 @@ fn read_wrf_radar_fields_for_config_reporting(
         } else {
             progress("evaluating property T-matrix scene…");
         }
-        fields.ref_source = property_tmatrix_ref_source(config.radar_frequency_mhz)?;
+        fields.ref_source =
+            property_tmatrix_ref_source(config.polarimetric_kernel, config.radar_frequency_mhz)?;
         fields.property_table_identity = Some(table_identity.clone());
         fields.property_table_resident_bytes = table_resident_bytes;
         if raw_state_linear {
@@ -2273,12 +2333,14 @@ fn read_wrf_radar_fields_for_config_reporting(
         } else {
             let maximum_owned_peak_bytes =
                 maximum_owned_peak_bytes.expect("non-raw property build has a budget");
+            let scattering_policy = config.polarimetric_kernel.scattering_policy();
             let built = if let Some(cancel) = cancel {
-                app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene_with_cancel(
+                app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene_with_policy_and_cancel(
                     &property_scene,
                     maximum_owned_peak_bytes,
                     table_owner,
                     config.property_tmatrix_rain_sensitivity.runtime(),
+                    scattering_policy,
                     progress,
                     config.runtime_cuda_service.as_deref(),
                     cancel,
@@ -2286,20 +2348,22 @@ fn read_wrf_radar_fields_for_config_reporting(
             } else {
                 match config.runtime_cuda_service.as_deref() {
                     Some(cuda) => {
-                        app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene_with_cuda(
+                        app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene_with_policy_and_cuda(
                             &property_scene,
                             maximum_owned_peak_bytes,
                             table_owner,
                             config.property_tmatrix_rain_sensitivity.runtime(),
+                            scattering_policy,
                             progress,
                             cuda,
                         )
                     }
-                    None => app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene(
+                    None => app_ui::wrf_tmatrix_assets::build_property_tmatrix_scene_with_policy(
                         &property_scene,
                         maximum_owned_peak_bytes,
                         table_owner,
                         config.property_tmatrix_rain_sensitivity.runtime(),
+                        scattering_policy,
                         progress,
                     ),
                 }
@@ -2309,13 +2373,18 @@ fn read_wrf_radar_fields_for_config_reporting(
                 check_synthetic_radar_cancel(cancel)?;
             }
             let property_scattering = built.scene;
+            let counts = property_scattering.provenance().counts;
             fields.dual_pol_status = Some(format!(
-                "property-aware T-matrix research input (mp_physics={}; table={}; source={:?}; frequency={:.0} Hz; rain={:?}; raw fields={fields_read}; build peak {:.2} GiB)",
+                "property-aware scattering input (mp_physics={}; policy={}; table={}; source={:?}; frequency={:.0} Hz; rain={:?}; native PSD populations={}; hybrid bulk cells={}; hybrid bulk populations={}; raw fields={fields_read}; build peak {:.2} GiB)",
                 property_scattering.microphysics_scheme_id(),
+                built.scattering_policy.identifier(),
                 built.table_identity.pack_id(),
                 built.table_source,
                 built.exact_frequency_hz,
                 built.rain_mode,
+                counts.scheme_native_psd_populations,
+                counts.hybrid_bulk_rayleigh_cells,
+                counts.hybrid_bulk_rayleigh_populations,
                 built.peak.estimated_peak_bytes as f64 / 1024.0_f64.powi(3),
             ));
             fields.property_scattering = Some(Arc::new(property_scattering));
@@ -3319,11 +3388,23 @@ fn build_synthetic_volume_reporting_inner(
         config.emit_quality_fields,
         config.clamped_minimum_model_coverage_fraction(),
     );
-    if matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
+    if config.polarimetric_kernel.is_property_tmatrix() {
         use std::fmt::Write as _;
+        let _ = write!(
+            forward_operator_config,
+            "; tmatrix_scattering_policy={}",
+            config.polarimetric_kernel.scattering_policy().identifier(),
+        );
+        if let Some(scene) = fields.property_scattering.as_ref() {
+            let counts = scene.provenance().counts;
+            let _ = write!(
+                forward_operator_config,
+                "; tmatrix_native_psd_populations={}; tmatrix_hybrid_bulk_cells={}; tmatrix_hybrid_bulk_populations={}",
+                counts.scheme_native_psd_populations,
+                counts.hybrid_bulk_rayleigh_cells,
+                counts.hybrid_bulk_rayleigh_populations,
+            );
+        }
         if let Some(service) = config.runtime_cuda_service.as_deref() {
             let report = service.report();
             if let Some(reason) = report.fallback_reason.as_ref() {
@@ -3601,6 +3682,27 @@ fn build_synthetic_volume_reporting_inner(
                     "{} (scheme-aware bulk S-band Rayleigh; not T-matrix)",
                     crate::wrf_radar_physics::bulk_sband_model_id()
                 ),
+                PolarimetricKernel::PropertyTMatrixHybridV1 => {
+                    let identity = fields
+                        .property_table_identity
+                        .as_ref()
+                        .map(|identity| identity.pack_id())
+                        .unwrap_or("unresolved");
+                    let counts = fields
+                        .property_scattering
+                        .as_ref()
+                        .map(|scene| scene.provenance().counts)
+                        .unwrap_or_default();
+                    format!(
+                        "P3 Hybrid ({identity}; {} MHz; {:?}; policy={}; native_psd_populations={}; hybrid_bulk_cells={}; hybrid_bulk_populations={}; research_only_unvalidated)",
+                        config.radar_frequency_mhz,
+                        config.property_tmatrix_rain_sensitivity,
+                        app_ui::wrf_tmatrix_scene::WrfTMatrixScatteringPolicy::HybridBulkRayleighV1.identifier(),
+                        counts.scheme_native_psd_populations,
+                        counts.hybrid_bulk_rayleigh_cells,
+                        counts.hybrid_bulk_rayleigh_populations,
+                    )
+                }
                 PolarimetricKernel::PropertyTMatrixResearchV1 => {
                     let identity = fields
                         .property_table_identity
@@ -3608,7 +3710,7 @@ fn build_synthetic_volume_reporting_inner(
                         .map(|identity| identity.pack_id())
                         .unwrap_or("unresolved");
                     format!(
-                        "Property-aware PSD T-matrix ({identity}; {} MHz; {:?}; research_only_unvalidated)",
+                        "Full P3/ISHMAEL property-aware PSD T-matrix ({identity}; {} MHz; {:?}; experimental; strict_fail_closed; research_only_unvalidated)",
                         config.radar_frequency_mhz,
                         config.property_tmatrix_rain_sensitivity,
                     )
@@ -7571,10 +7673,7 @@ fn explain_selected_gate(
         ));
         provenance.push(format!("neighbor_time_index={}", neighbor.time_index));
     }
-    if matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
+    if config.polarimetric_kernel.is_property_tmatrix() {
         provenance.push(
             "hydrometeor_decomposition=unavailable_without_qualified_property_category_seam"
                 .to_owned(),
@@ -8553,11 +8652,12 @@ pub fn spawn_synthetic_radar(
     } else {
         format!("Simulated radar from {} WRF files", paths.len())
     };
-    if matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
-        label.push_str(" [T-matrix research]");
+    if config.polarimetric_kernel.is_property_tmatrix() {
+        label.push_str(if config.polarimetric_kernel.is_hybrid() {
+            " [P3 Hybrid]"
+        } else {
+            " [Full P3 T-matrix experimental]"
+        });
     }
     let (tx, rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -8653,10 +8753,7 @@ fn validate_cm1_scalar_radar_config(config: &SyntheticRadarConfig) -> Result<(),
     if config.dual_pol {
         unavailable.push("dual-pol");
     }
-    if matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
+    if config.polarimetric_kernel.is_property_tmatrix() {
         unavailable.push("property T-matrix");
     }
     if config.terminal_fall_speed {
@@ -9294,10 +9391,7 @@ fn resolve_tmatrix_execution_runtime(
     check_synthetic_radar_cancel(cancel)?;
     let mut runtime_config = config.clone();
     runtime_config.runtime_cuda_service = None;
-    if !matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
+    if !config.polarimetric_kernel.is_property_tmatrix() {
         return Ok((runtime_config, TMatrixExecutionRuntime::NotApplicable));
     }
     if matches!(
@@ -9530,10 +9624,7 @@ fn build_synthetic_from_paths_inner(
     check_synthetic_radar_cancel(cancel)?;
     let scenes = selected.group.scenes.clone();
     let config_fingerprint = scene_build_fingerprint(config, &selected.group);
-    let property_build_reservation_bytes = if matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
+    let property_build_reservation_bytes = if config.polarimetric_kernel.is_property_tmatrix() {
         let estimate = temporal_memory_estimate(&selected.group, config, scenes.len())?;
         estimate
             .shared_static_bytes
@@ -9548,18 +9639,20 @@ fn build_synthetic_from_paths_inner(
         .into_iter()
         .map(|note| format!("{}: {}", note.source_name, note.message))
         .collect::<Vec<_>>();
-    if matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
-        notes.push(if matches!(
+    if config.polarimetric_kernel.is_property_tmatrix() {
+        notes.push(if config.polarimetric_kernel.is_hybrid() {
+            format!(
+                "P3 Hybrid output is research_only_unvalidated; native P3/ISHMAEL PSD T-matrix is used for supported cells and only table-domain/shape omissions use audited {}; policy and fallback counts are retained in scene/volume metadata",
+                app_ui::wrf_tmatrix_scene::WrfTMatrixScatteringPolicy::HybridBulkRayleighV1.identifier(),
+            )
+        } else if matches!(
             config.atmosphere_time_mode,
             AtmosphereTimeMode::RawStateLinear
         ) {
-            "T-matrix output is research_only_unvalidated; raw_state_linear blends full spatial/temporal P3/ISHMAEL state before one closure/scattering evaluation"
+            "Experimental Full P3/ISHMAEL T-matrix output is research_only_unvalidated and strict fail-closed; raw_state_linear blends full spatial/temporal state before one closure/scattering evaluation"
                 .to_string()
         } else {
-            "T-matrix output is research_only_unvalidated; P3/ISHMAEL use scheme-native PSD integration with the exact selected table pack; not operational calibration"
+            "Experimental Full P3/ISHMAEL T-matrix output is research_only_unvalidated and strict fail-closed; scheme-native PSD integration uses the exact selected table pack; not operational calibration"
                 .to_string()
         });
     }
@@ -9786,10 +9879,7 @@ fn record_or_propagate_scene_failure(
     notes: &mut Vec<String>,
     message: String,
 ) -> Result<(), String> {
-    if matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
+    if config.polarimetric_kernel.is_property_tmatrix() {
         Err(message)
     } else {
         notes.push(message);
@@ -9851,12 +9941,11 @@ fn build_temporal_synthetic_from_scenes(
         } else {
             "single-scene held"
         };
-        let property_suffix = matches!(
-            config.polarimetric_kernel,
-            PolarimetricKernel::PropertyTMatrixResearchV1
-        )
-        .then_some(" minimum; exact sparse T-matrix cache is checked after each scene read")
-        .unwrap_or_default();
+        let property_suffix = config
+            .polarimetric_kernel
+            .is_property_tmatrix()
+            .then_some(" minimum; exact sparse T-matrix cache is checked after each scene read")
+            .unwrap_or_default();
         notes.push(format!(
             "Temporal {scene_label} preflight: {:.2} GiB estimated peak within {:.2} GiB budget{property_suffix}",
             required_bytes as f64 / 1024.0_f64.powi(3),
@@ -10191,10 +10280,7 @@ fn temporal_memory_estimate(
     let mut compact_bytes_per_scene = horizontal_cells
         .checked_mul(28)
         .ok_or_else(|| "WRF geolocation memory estimate overflowed".to_string())?;
-    if matches!(
-        config.polarimetric_kernel,
-        PolarimetricKernel::PropertyTMatrixResearchV1
-    ) {
+    if config.polarimetric_kernel.is_property_tmatrix() {
         // RawStateLinear retains dense temperature, pressure, moist density,
         // and dry density. LinearAdjacent retains the compact scene's dense
         // full-cell -> sparse-row lookup. Sparse category/output bytes are
@@ -12486,6 +12572,35 @@ mod tests {
             ..supported.clone()
         };
         assert!(raw_state.validate_science_contract().is_ok());
+        let hybrid = SyntheticRadarConfig {
+            polarimetric_kernel: PolarimetricKernel::PropertyTMatrixHybridV1,
+            atmosphere_time_mode: AtmosphereTimeMode::FrozenAtVolumeStart,
+            ..supported.clone()
+        };
+        assert!(hybrid.validate_science_contract().is_ok());
+        assert_eq!(
+            hybrid.polarimetric_kernel.scattering_policy(),
+            app_ui::wrf_tmatrix_scene::WrfTMatrixScatteringPolicy::HybridBulkRayleighV1
+        );
+        let raw_hybrid = SyntheticRadarConfig {
+            atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
+            scan_timing: ScanTiming::TimedVolume,
+            ..hybrid
+        };
+        assert!(
+            raw_hybrid
+                .validate_science_contract()
+                .unwrap_err()
+                .contains("RawStateLinear is available only with experimental Full")
+        );
+        let hybrid_json = serde_json::to_string(&PolarimetricKernel::PropertyTMatrixHybridV1)
+            .expect("serialize Hybrid kernel");
+        assert_eq!(hybrid_json, "\"property_t_matrix_hybrid_v1\"");
+        assert_eq!(
+            serde_json::from_str::<PolarimetricKernel>(&hybrid_json)
+                .expect("deserialize Hybrid kernel"),
+            PolarimetricKernel::PropertyTMatrixHybridV1
+        );
         let raw_with_bulk = SyntheticRadarConfig {
             atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
             scan_timing: ScanTiming::TimedVolume,
