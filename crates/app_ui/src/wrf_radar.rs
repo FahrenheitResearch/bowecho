@@ -9421,14 +9421,14 @@ fn resolve_tmatrix_execution_runtime(
     }
 
     let _ = tx.send(SyntheticRadarMessage::Progress(
-        "Initializing NVIDIA CUDA T-matrix worker and uploading dry LUTsâ€¦".to_owned(),
+        "Initializing NVIDIA CUDA T-matrix worker and uploading dry LUTs…".to_owned(),
     ));
     match app_ui::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService::open_preferred() {
         Ok(service) => {
             let service = Arc::new(service);
             let report = service.report();
             let _ = tx.send(SyntheticRadarMessage::Progress(format!(
-                "CUDA active: {} Â· compute {}.{} Â· {}; CPU retains PSD weights and ordered reductions",
+                "CUDA active: {} · compute {}.{} · {}; CPU retains PSD weights and ordered reductions",
                 report.device.name,
                 report.device.compute_capability_major,
                 report.device.compute_capability_minor,
@@ -10453,7 +10453,7 @@ fn cached_temporal_fields(
         return Ok(Arc::clone(fields));
     }
     progress(&format!(
-        "reading WRF atmosphere at {}â€¦",
+        "reading WRF atmosphere at {}…",
         scene
             .time
             .valid_time()
