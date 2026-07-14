@@ -7493,7 +7493,11 @@ mod tests {
             ),
             (
                 WrfTMatrixTableRole::RainStandaloneAndResidual,
-                &[44, 4, 7, 1, 9][..],
+                // 03f2edb ("Cover complete native P3 rain domain") expanded the
+                // standalone/residual rain axes: RAIN_DIAMETER_M 44 -> 72 and
+                // RAIN_TEMPERATURE_K 4 -> 6, regenerating the v2 rain LUT to
+                // match. The frozen counts here lagged behind that commit.
+                &[72, 6, 7, 1, 9][..],
             ),
         ] {
             let kinds = match role {
