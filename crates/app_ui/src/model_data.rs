@@ -225,7 +225,7 @@ impl SyntheticRadarRecipe {
                 "The full virtual instrument with 27-point pulse-volume integration and adjacent-time atmosphere interpolation. Best for a short loop; source-model resolution still limits detail."
             }
             Self::PropertyTMatrixHybrid => {
-                "Production-friendly P3/ISHMAEL dual-pol: native property T-matrix for supported cells and the versioned bulk Rayleigh operator only for audited table-domain omissions. Defaults to embedded 2.8 GHz S and a frozen atmosphere."
+                "Production-friendly P3/ISHMAEL dual-pol: native property T-matrix for supported cells and versioned bulk Rayleigh only for audited table-domain/shape omissions or the typed WRF 2 µm source-state mass gap. Defaults to embedded 2.8 GHz S and a frozen atmosphere."
             }
             Self::PropertyTMatrixResearch => {
                 "Experimental full property T-matrix for exact supported P3/ISHMAEL files. It is strictly fail-closed, defaults to embedded 2.8 GHz S, and permits expert raw-state temporal interpolation or validated local S/C/X packs."
@@ -3999,7 +3999,7 @@ impl ModelDataDock {
                 } else if matches!(recipe, SyntheticRadarRecipe::PropertyTMatrixHybrid) {
                     ui.label(
                         egui::RichText::new(
-                            "P3 Hybrid uses native property T-matrix where the exact tables support the complete cell. Only explicit table-domain/shape omissions use versioned bulk Rayleigh v1, with policy and cell/population counts stamped into the output.",
+                            "P3 Hybrid uses native property T-matrix where the exact tables and source state support the complete cell. Only explicit table-domain/shape omissions or the typed WRF 2 µm source-state mass gap use versioned bulk Rayleigh v1, with policy and cell/population counts stamped into the output.",
                         )
                         .small()
                         .weak(),
@@ -4988,7 +4988,7 @@ impl ModelDataDock {
                                             "P3 Hybrid (recommended)",
                                         )
                                         .on_hover_text(
-                                            "Native property T-matrix for supported P3/ISHMAEL cells; explicit versioned bulk Rayleigh v1 only for audited table-domain/shape omissions.",
+                                            "Native property T-matrix for supported P3/ISHMAEL cells; explicit versioned bulk Rayleigh v1 only for audited table-domain/shape omissions or the typed WRF 2 µm source-state mass gap.",
                                         )
                                         .clicked();
                                     let strict_clicked = ui
@@ -5029,7 +5029,7 @@ impl ModelDataDock {
                                     "Scheme-aware bulk S-band Rayleigh operator. Unsupported or incomplete conventional schemes fall back explicitly to REF/VEL."
                                 }
                                 crate::wrf_radar::PolarimetricKernel::PropertyTMatrixHybridV1 => {
-                                    "Recommended P3/ISHMAEL operator. Native property T-matrix is retained for supported cells; only table-domain/shape omissions use versioned bulk Rayleigh v1, with explicit policy and audit counts."
+                                    "Recommended P3/ISHMAEL operator. Native property T-matrix is retained for supported cells; only table-domain/shape omissions or the typed WRF 2 µm source-state mass gap use versioned bulk Rayleigh v1, with explicit policy and audit counts."
                                 }
                                 crate::wrf_radar::PolarimetricKernel::PropertyTMatrixResearchV1 => {
                                     "Experimental full property T-matrix, not independently validated for operational use. Requires an exact supported P3/ISHMAEL contract and exact S/C/X table pack; strict fail-closed with no Rayleigh fallback."

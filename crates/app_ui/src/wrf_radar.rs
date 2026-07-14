@@ -231,8 +231,9 @@ pub enum ReflectivitySampling {
 pub enum PolarimetricKernel {
     #[default]
     BulkRayleighV1,
-    /// Native property/T-matrix where the pinned tables support the complete
-    /// cell; explicit audited bulk Rayleigh v1 for table-domain omissions.
+    /// Native property/T-matrix where the pinned tables and source state
+    /// support the complete cell; explicit audited bulk Rayleigh v1 for
+    /// table-domain/shape omissions or the typed WRF 2 µm source-state mass gap.
     PropertyTMatrixHybridV1,
     /// Full native property/T-matrix; experimental and always fail-closed.
     PropertyTMatrixResearchV1,
@@ -9642,7 +9643,7 @@ fn build_synthetic_from_paths_inner(
     if config.polarimetric_kernel.is_property_tmatrix() {
         notes.push(if config.polarimetric_kernel.is_hybrid() {
             format!(
-                "P3 Hybrid output is research_only_unvalidated; native P3/ISHMAEL PSD T-matrix is used for supported cells and only table-domain/shape omissions use audited {}; policy and fallback counts are retained in scene/volume metadata",
+                "P3 Hybrid output is research_only_unvalidated; native P3/ISHMAEL PSD T-matrix is used for supported cells and only table-domain/shape omissions or the typed WRF 2 µm source-state mass gap use audited {}; policy and fallback counts are retained in scene/volume metadata",
                 app_ui::wrf_tmatrix_scene::WrfTMatrixScatteringPolicy::HybridBulkRayleighV1.identifier(),
             )
         } else if matches!(

@@ -404,7 +404,8 @@ pub fn bulk_sband_model_id() -> &'static str {
 ///
 /// The default bulk dispatch continues to reject property schemes. Callers may
 /// use this policy only after a native property/T-matrix cell has failed for a
-/// narrowly classified table-domain omission, and must retain audit counts.
+/// narrowly classified table-domain/shape omission or typed native ISHMAEL
+/// source-state mass-closure gap, and must retain audit counts.
 pub const PROPERTY_HYBRID_BULK_RAYLEIGH_REVISION: &str =
     "bowecho-p3-ishmael-hybrid-bulk-rayleigh-v1";
 

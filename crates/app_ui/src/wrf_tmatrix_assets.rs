@@ -897,6 +897,103 @@ mod tests {
         );
     }
 
+    /// Full, all-active-cell acceptance probe for the explicit Hybrid policy.
+    /// The multi-GB P3/ISHMAEL fixtures stay external and CI returns early.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn real_property_fixture_builds_all_active_cells_with_hybrid_policy() {
+        let Some(wrf_path) = std::env::var_os("BOWECHO_PROPERTY_HYBRID_SCENE_FIXTURE") else {
+            return;
+        };
+        let total_started = std::time::Instant::now();
+        let file = wrf_core::WrfFile::open(&wrf_path)
+            .expect("open BOWECHO_PROPERTY_HYBRID_SCENE_FIXTURE for full Hybrid scene build");
+        let scheme_id = file
+            .global_attr_i32("MP_PHYSICS")
+            .expect("Hybrid fixture has MP_PHYSICS");
+        assert!(
+            matches!(scheme_id, 50..=53 | 55),
+            "Hybrid acceptance fixture must use P3 50-53 or ISHMAEL 55, got {scheme_id}"
+        );
+
+        let read_started = std::time::Instant::now();
+        let source = crate::wrf_property_reader::read_wrf_property_scene(
+            &file,
+            crate::wrf_scene_inventory::WrfSourceIdentity(format!(
+                "fixture:hybrid-full-scene-mp{scheme_id}"
+            )),
+            0,
+        )
+        .expect("read complete native property scene");
+        let read_elapsed = read_started.elapsed();
+        assert!(
+            !source.active_cell_indices().is_empty(),
+            "Hybrid fixture has no active property cells"
+        );
+
+        let table_owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load exact embedded S-band property tables");
+        let cuda = crate::wrf_tmatrix_cuda::WrfTMatrixCudaBatchService::open_preferred().ok();
+        let build_started = std::time::Instant::now();
+        let built = match cuda.as_ref() {
+            Some(cuda) => build_property_tmatrix_scene_with_policy_and_cuda(
+                &source,
+                usize::MAX,
+                table_owner,
+                WrfTMatrixRainMode::FullProperty,
+                WrfTMatrixScatteringPolicy::HybridBulkRayleighV1,
+                &|stage| eprintln!("[hybrid-scene mp{scheme_id}] {stage}"),
+                cuda,
+            ),
+            None => build_property_tmatrix_scene_with_policy(
+                &source,
+                usize::MAX,
+                table_owner,
+                WrfTMatrixRainMode::FullProperty,
+                WrfTMatrixScatteringPolicy::HybridBulkRayleighV1,
+                &|stage| eprintln!("[hybrid-scene mp{scheme_id}] {stage}"),
+            ),
+        }
+        .unwrap_or_else(|error| {
+            panic!("build every active mp_physics={scheme_id} Hybrid cell: {error}")
+        });
+        let build_elapsed = build_started.elapsed();
+        let provenance = built.scene.provenance();
+        assert_eq!(
+            provenance.scattering_policy,
+            WrfTMatrixScatteringPolicy::HybridBulkRayleighV1
+        );
+        assert_eq!(
+            provenance.counts.source_cells as usize,
+            source.active_cell_indices().len(),
+            "full-property Hybrid build did not audit every active source cell"
+        );
+        assert_eq!(
+            built.scene.active_cell_indices(),
+            source.active_cell_indices(),
+            "full-property Hybrid build did not retain the exact active-cell set"
+        );
+        eprintln!(
+            "[hybrid-scene complete] mp_physics={scheme_id} read={:.3}s build={:.3}s total={:.3}s source_cells={} active_cells={} native_psd_populations={} hybrid_bulk_cells={} hybrid_bulk_populations={} estimated_peak_bytes={} cuda={}",
+            read_elapsed.as_secs_f64(),
+            build_elapsed.as_secs_f64(),
+            total_started.elapsed().as_secs_f64(),
+            built.scene.source_cell_count(),
+            built.scene.active_cell_indices().len(),
+            provenance.counts.scheme_native_psd_populations,
+            provenance.counts.hybrid_bulk_rayleigh_cells,
+            provenance.counts.hybrid_bulk_rayleigh_populations,
+            built.peak.estimated_peak_bytes,
+            cuda.is_some(),
+        );
+        if let Some(cuda) = cuda {
+            eprintln!("[hybrid-scene cuda] {:?}", cuda.report());
+        }
+    }
+
     /// Exact regression for a real P3 cell that previously reached the same
     /// embedded raw evaluator used by synthetic-radar gate sampling and failed
     /// inside the scheme-native PSD/T-matrix seam. The real fixture remains

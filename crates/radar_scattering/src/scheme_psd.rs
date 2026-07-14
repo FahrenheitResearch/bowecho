@@ -35,7 +35,7 @@ pub const ISHMAEL_SOLID_ICE_MATERIAL_CLOSURE_REVISION: &str =
     "ishmael-mass-preserving-solid-ice-material-closure-v1";
 /// Finite audit sentinel for a source-relative projection whose ordinary
 /// `(projected - incoming) / incoming` ratio is undefined or overflows. WRF
-/// floors a nonpositive number before reconstruction, so the projection
+/// floors a nonpositive number or volume moment before reconstruction, so the projection
 /// itself remains valid and is recorded separately by its boolean audit flag.
 pub const ISHMAEL_UNBOUNDED_SOURCE_PROJECTION_RELATIVE_CHANGE_SENTINEL: f64 = f64::MAX;
 /// Versioned scattering route for exact native ISHMAEL spheres below a dry
@@ -299,10 +299,12 @@ pub struct IshmaelReconstructionAudit {
     /// retaining mass, number, and habit while re-diagnosing both axes.
     #[serde(default)]
     pub source_density_state_projected: bool,
-    /// Signed change from source QVOLI to the projected `a^2 c` moment.
+    /// Signed change from source QVOLI to the projected `a^2 c` moment. This
+    /// uses the finite unbounded sentinel when incoming QVOLI is nonpositive.
     #[serde(default)]
     pub qvoli_source_projection_relative_change: f64,
-    /// Signed change from source QAOLI to the projected `c^2 a` moment.
+    /// Signed change from source QAOLI to the projected `c^2 a` moment. This
+    /// uses the finite unbounded sentinel when incoming QAOLI is nonpositive.
     #[serde(default)]
     pub qaoli_source_projection_relative_change: f64,
     /// Whether WRF's aggregate-only final state check was reproduced.
@@ -538,27 +540,25 @@ impl IshmaelPsd {
                 requirement: "finite before the WRF qnsmall projection",
             });
         }
-        positive("QVOLI", input.qvoli_m3_per_kg)?;
-        positive("QAOLI", input.qaoli_m3_per_kg)?;
+        for (field, value) in [
+            ("QVOLI", input.qvoli_m3_per_kg),
+            ("QAOLI", input.qaoli_m3_per_kg),
+        ] {
+            if !value.is_finite() {
+                return Err(PsdError::InvalidInput {
+                    field,
+                    value,
+                    requirement: "finite before the WRF qasmall projection",
+                });
+            }
+        }
         positive("dry-air density", input.dry_air_density_kg_m3)?;
 
-        // WRF applies qnsmall before deriving a_n/c_n or entering var_check.
-        // Keep that order: a finite zero/negative transported number is a
-        // source-projected state, not an invalid PSD passed downstream.
+        // WRF applies qnsmall and qasmall before deriving a_n/c_n or entering
+        // var_check. Keep that order: finite zero/negative transported values
+        // are source-projected states, not invalid PSDs passed downstream.
         let source_number_floor_applied = input.qnice_per_kg < ISHMAEL_MINIMUM_NUMBER_PER_KG;
         let qnice_per_kg = input.qnice_per_kg.max(ISHMAEL_MINIMUM_NUMBER_PER_KG);
-        let raw_a_scale_m = checked_positive_computation(
-            "ISHMAEL raw a_n",
-            (input.qvoli_m3_per_kg * input.qvoli_m3_per_kg
-                / (input.qaoli_m3_per_kg * qnice_per_kg))
-                .cbrt(),
-        )?;
-        let raw_c_at_a_scale_m = checked_positive_computation(
-            "ISHMAEL raw c_n",
-            (input.qaoli_m3_per_kg * input.qaoli_m3_per_kg
-                / (input.qvoli_m3_per_kg * qnice_per_kg))
-                .cbrt(),
-        )?;
         let source_moment_floor_applied = input.qvoli_m3_per_kg
             < ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG
             || input.qaoli_m3_per_kg < ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG;
@@ -568,14 +568,16 @@ impl IshmaelPsd {
         let qaoli_m3_per_kg = input
             .qaoli_m3_per_kg
             .max(ISHMAEL_MINIMUM_VOLUME_MOMENT_M3_PER_KG);
-        let mut a_scale_m = checked_positive_computation(
+        let source_incoming_a_scale_m = checked_positive_computation(
             "ISHMAEL source incoming a_n",
             (qvoli_m3_per_kg * qvoli_m3_per_kg / (qaoli_m3_per_kg * qnice_per_kg)).cbrt(),
         )?;
-        let mut c_at_a_scale_m = checked_positive_computation(
+        let source_incoming_c_at_a_scale_m = checked_positive_computation(
             "ISHMAEL source incoming c_n",
             (qaoli_m3_per_kg * qaoli_m3_per_kg / (qvoli_m3_per_kg * qnice_per_kg)).cbrt(),
         )?;
+        let mut a_scale_m = source_incoming_a_scale_m;
+        let mut c_at_a_scale_m = source_incoming_c_at_a_scale_m;
         let source_axis_floor_applied = a_scale_m < ISHMAEL_MINIMUM_AXIS_SCALE_M
             || c_at_a_scale_m < ISHMAEL_MINIMUM_AXIS_SCALE_M;
         a_scale_m = a_scale_m.max(ISHMAEL_MINIMUM_AXIS_SCALE_M);
@@ -636,22 +638,28 @@ impl IshmaelPsd {
         )?;
         let audit = &mut checked.reconstruction;
         audit.qvoli_relative_error = relative_error(
-            input.qnice_per_kg * raw_a_scale_m * raw_a_scale_m * raw_c_at_a_scale_m,
-            input.qvoli_m3_per_kg,
+            qnice_per_kg
+                * source_incoming_a_scale_m
+                * source_incoming_a_scale_m
+                * source_incoming_c_at_a_scale_m,
+            qvoli_m3_per_kg,
             0.0,
         );
         audit.qaoli_relative_error = relative_error(
-            input.qnice_per_kg * raw_a_scale_m * raw_c_at_a_scale_m * raw_c_at_a_scale_m,
-            input.qaoli_m3_per_kg,
+            qnice_per_kg
+                * source_incoming_a_scale_m
+                * source_incoming_c_at_a_scale_m
+                * source_incoming_c_at_a_scale_m,
+            qaoli_m3_per_kg,
             0.0,
         );
         audit.delta_bound_excursion = source_state.delta_bound_excursion;
         audit.density_bound_excursion_kg_m3 = source_state.density_bound_excursion_kg_m3;
         audit.source_density_state_projected = source_state.source_density_state_projected;
         audit.qvoli_source_projection_relative_change =
-            (projected_qvoli - input.qvoli_m3_per_kg) / input.qvoli_m3_per_kg;
+            ishmael_source_projection_relative_change(input.qvoli_m3_per_kg, projected_qvoli);
         audit.qaoli_source_projection_relative_change =
-            (projected_qaoli - input.qaoli_m3_per_kg) / input.qaoli_m3_per_kg;
+            ishmael_source_projection_relative_change(input.qaoli_m3_per_kg, projected_qaoli);
         audit.qnice_source_projection_relative_change = ishmael_source_projection_relative_change(
             input.qnice_per_kg,
             source_state.qnice_per_kg,
@@ -820,9 +828,15 @@ impl IshmaelPsd {
         checked_audit.source_var_check_large_ice_applied =
             incoming_audit.source_var_check_large_ice_applied || final_state.large_ice_applied;
         checked_audit.qvoli_source_projection_relative_change =
-            (checked_input.qvoli_m3_per_kg - input.qvoli_m3_per_kg) / input.qvoli_m3_per_kg;
+            ishmael_source_projection_relative_change(
+                input.qvoli_m3_per_kg,
+                checked_input.qvoli_m3_per_kg,
+            );
         checked_audit.qaoli_source_projection_relative_change =
-            (checked_input.qaoli_m3_per_kg - input.qaoli_m3_per_kg) / input.qaoli_m3_per_kg;
+            ishmael_source_projection_relative_change(
+                input.qaoli_m3_per_kg,
+                checked_input.qaoli_m3_per_kg,
+            );
         Ok(checked)
     }
 
@@ -2169,6 +2183,56 @@ fn prepare_ishmael_psd_impl(
     material_closure: IshmaelSolidIceMaterialClosure,
 ) -> Result<PreparedIshmaelPsdIntegration, PsdError> {
     material_closure.validate_for(*distribution)?;
+    // WRF's `var_check` can leave a narrowly defined source state internally
+    // inconsistent: when an incoming a/c axis is floored to exactly 2 um it
+    // assigns solid-ice density, but it only re-diagnoses number when the
+    // separately computed equivalent-radius scale is below 2 um.  The native
+    // particle geometry can therefore represent a different mean mass from
+    // QICE/QNICE.  Detect that source-state limitation analytically here so it
+    // is not mislabeled later as a numerical quadrature failure.
+    let geometry_mean_particle_mass_kg = checked_positive_computation(
+        "ISHMAEL source-state geometry mean particle mass",
+        distribution.mass_preserving_bulk_density_kg_m3
+            * mean_particle_volume(
+                distribution.a_scale_m,
+                distribution.aspect_power_delta,
+                ISHMAEL_GAMMA_SHAPE,
+            )?,
+    )?;
+    // This is source-relative because the later quadrature closure is exactly
+    // geometry_mass / (QICE / QNICE) - 1, rather than the symmetric helper
+    // used for pairwise numerical comparisons elsewhere in this module.
+    let source_state_mass_error =
+        (geometry_mean_particle_mass_kg / distribution.mean_particle_mass_kg - 1.0).abs();
+    if source_state_mass_error > config.maximum_quadrature_closure_error {
+        let audit = distribution.reconstruction;
+        // This intentionally covers the exact source-code pathology family,
+        // not just a tuple whose explicit axis-floor audit fired. WRF keys its
+        // solid-density branch on `ani <= 2 um`; qnsmall/qasmall can land
+        // exactly on that boundary without changing the post-floor a value,
+        // and c may legitimately exceed 2 um while the same gap persists.
+        let exact_wrf_two_micron_gap = !audit.source_density_state_projected
+            && !audit.source_var_check_small_ice_applied
+            && !audit.source_var_check_large_ice_applied
+            && distribution.a_scale_m.to_bits() == ISHMAEL_MINIMUM_AXIS_SCALE_M.to_bits()
+            && distribution.bulk_density_kg_m3.to_bits()
+                == ISHMAEL_DENSITY_RANGE_KG_M3[1].to_bits()
+            && distribution.mass_preserving_bulk_density_kg_m3.to_bits()
+                == ISHMAEL_DENSITY_RANGE_KG_M3[1].to_bits();
+        if exact_wrf_two_micron_gap {
+            return Err(PsdError::SourceStateMassClosure {
+                expected_mean_particle_mass_kg: distribution.mean_particle_mass_kg,
+                geometry_mean_particle_mass_kg,
+                relative_error: source_state_mass_error,
+                maximum: config.maximum_quadrature_closure_error,
+            });
+        }
+        return Err(PsdError::ReconstructionClosure {
+            moment: "ISHMAEL source-state particle-geometry mass",
+            relative_error: source_state_mass_error,
+            maximum: config.maximum_quadrature_closure_error,
+        });
+    }
     let upper_scaled_a = tail_cutoff(*distribution, config)?;
     let support_intervals = distribution.support_intervals(
         support,
@@ -3045,6 +3109,15 @@ pub enum PsdError {
     #[error("native {moment} reconstruction relative error {relative_error} exceeds {maximum}")]
     ReconstructionClosure {
         moment: &'static str,
+        relative_error: f64,
+        maximum: f64,
+    },
+    #[error(
+        "native ISHMAEL source-state mean mass {expected_mean_particle_mass_kg} kg is inconsistent with its particle-geometry mean mass {geometry_mean_particle_mass_kg} kg; relative error {relative_error} exceeds {maximum}"
+    )]
+    SourceStateMassClosure {
+        expected_mean_particle_mass_kg: f64,
+        geometry_mean_particle_mass_kg: f64,
         relative_error: f64,
         maximum: f64,
     },
@@ -4055,6 +4128,78 @@ mod tests {
         }
     }
 
+    fn reported_zero_moment_input(
+        category: IshmaelIceCategory,
+        qvoli_m3_per_kg: f64,
+        qaoli_m3_per_kg: f64,
+    ) -> IshmaelPsdInput {
+        IshmaelPsdInput::new(
+            category,
+            3.057_796_460_481_654_3e-9,
+            687.408_264_160_156_3,
+            qvoli_m3_per_kg,
+            qaoli_m3_per_kg,
+            0.584_030_389_785_766_6,
+        )
+    }
+
+    #[test]
+    fn wrf_source_qasmall_precedes_geometry_for_zero_and_negative_moments() {
+        for category in [IshmaelIceCategory::Planar, IshmaelIceCategory::Aggregate] {
+            for (qvoli, qaoli) in [(0.0, 0.0), (-1.0e-30, 0.0), (0.0, -1.0e-30)] {
+                let checked = IshmaelPsd::reconstruct_wrf_source_checked(
+                    reported_zero_moment_input(category, qvoli, qaoli),
+                    260.0,
+                )
+                .expect("WRF qasmall projects finite nonpositive source moments");
+                let audit = checked.reconstruction_audit();
+                assert!(audit.source_moment_floor_applied);
+                assert!(checked.input().qvoli_m3_per_kg() > 0.0);
+                assert!(checked.input().qaoli_m3_per_kg() > 0.0);
+                assert!(checked.a_scale_m().is_finite() && checked.a_scale_m() > 0.0);
+                assert!(checked.c_at_a_scale_m().is_finite() && checked.c_at_a_scale_m() > 0.0);
+                if qvoli <= 0.0 {
+                    assert_eq!(
+                        audit.qvoli_source_projection_relative_change.to_bits(),
+                        ISHMAEL_UNBOUNDED_SOURCE_PROJECTION_RELATIVE_CHANGE_SENTINEL.to_bits()
+                    );
+                }
+                if qaoli <= 0.0 {
+                    assert_eq!(
+                        audit.qaoli_source_projection_relative_change.to_bits(),
+                        ISHMAEL_UNBOUNDED_SOURCE_PROJECTION_RELATIVE_CHANGE_SENTINEL.to_bits()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrf_source_qasmall_rejects_nonfinite_moments_before_projection() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for (field, input) in [
+                (
+                    "QVOLI",
+                    reported_zero_moment_input(IshmaelIceCategory::Planar, value, 1.0e-24),
+                ),
+                (
+                    "QAOLI",
+                    reported_zero_moment_input(IshmaelIceCategory::Planar, 1.0e-24, value),
+                ),
+            ] {
+                let error = IshmaelPsd::reconstruct_wrf_source_checked(input, 260.0).unwrap_err();
+                assert!(matches!(
+                    error,
+                    PsdError::InvalidInput {
+                        field: actual,
+                        requirement: "finite before the WRF qasmall projection",
+                        ..
+                    } if actual == field
+                ));
+            }
+        }
+    }
+
     #[test]
     fn wrf_source_checked_centralizes_shared_var_check_branches() {
         let low_delta = input_from_scales(
@@ -4091,6 +4236,156 @@ mod tests {
         assert!(
             large.a_scale_m().max(large.c_at_a_scale_m()) <= ISHMAEL_VAR_CHECK_MAXIMUM_AXIS_SCALE_M
         );
+    }
+
+    #[test]
+    fn wrf_two_micron_mass_gap_is_typed_before_quadrature() {
+        // Exact transported values from MP55 cell 5,557,733. WRF var_check
+        // floors both axes to 2 um and assigns rho=920 kg m^-3, while the
+        // independently retained QICE/QNICE mean mass is 16.8% larger than
+        // that geometry can represent.
+        let distribution = IshmaelPsd::reconstruct_wrf_source_checked(
+            IshmaelPsdInput::new(
+                IshmaelIceCategory::Planar,
+                3.057_796_460_481_654_3e-9,
+                687.408_264_160_156_3,
+                5.499_265_695_325_505e-15,
+                5.499_265_695_325_505e-15,
+                0.584_030_389_785_766_6,
+            ),
+            245.118_225_097_656_25,
+        )
+        .expect("replay the exact WRF source state");
+        assert!(
+            distribution
+                .reconstruction_audit()
+                .source_axis_floor_applied
+        );
+        assert!(
+            !distribution
+                .reconstruction_audit()
+                .source_var_check_small_ice_applied
+        );
+        assert!(
+            !distribution
+                .reconstruction_audit()
+                .source_var_check_large_ice_applied
+        );
+        assert!(
+            !distribution
+                .reconstruction_audit()
+                .source_density_state_projected
+        );
+        assert_eq!(
+            distribution.a_scale_m().to_bits(),
+            ISHMAEL_MINIMUM_AXIS_SCALE_M.to_bits()
+        );
+        assert_eq!(
+            distribution.c_at_a_scale_m().to_bits(),
+            ISHMAEL_MINIMUM_AXIS_SCALE_M.to_bits()
+        );
+        assert_eq!(
+            distribution.bulk_density_kg_m3().to_bits(),
+            ISHMAEL_DENSITY_RANGE_KG_M3[1].to_bits()
+        );
+        assert_eq!(
+            distribution.mass_preserving_bulk_density_kg_m3().to_bits(),
+            ISHMAEL_DENSITY_RANGE_KG_M3[1].to_bits()
+        );
+
+        let error = prepare_ishmael_psd(
+            &distribution,
+            PsdIntegrationConfig::default(),
+            PsdParticleSupport::default(),
+            synthetic_fall_speed_provenance(),
+        )
+        .expect_err("internally inconsistent source geometry must fail before quadrature");
+        match error {
+            PsdError::SourceStateMassClosure {
+                expected_mean_particle_mass_kg,
+                geometry_mean_particle_mass_kg,
+                relative_error,
+                maximum,
+            } => {
+                assert_relative(
+                    expected_mean_particle_mass_kg,
+                    distribution.mean_particle_mass_kg(),
+                    1.0e-15,
+                );
+                assert!(geometry_mean_particle_mass_kg < expected_mean_particle_mass_kg);
+                assert_relative(relative_error, 0.168_324_620_409_223_64, 2.0e-14);
+                assert_eq!(
+                    maximum.to_bits(),
+                    PsdIntegrationConfig::default()
+                        .maximum_quadrature_closure_error()
+                        .to_bits()
+                );
+            }
+            other => panic!("unexpected source-state failure: {other}"),
+        }
+    }
+
+    #[test]
+    fn qnsmall_qasmall_two_micron_mass_gap_is_typed_before_quadrature() {
+        // Exact frozen tuple from MP55 cell 6,800,160. All three transported
+        // shape/number moments are zero while QICE remains just above qsmall;
+        // qnsmall/qasmall land at WRF's exact 2 um solid-density boundary.
+        let distribution = IshmaelPsd::reconstruct_wrf_source_checked(
+            IshmaelPsdInput::new(
+                IshmaelIceCategory::Planar,
+                1.072_647_613_092_892e-12,
+                0.0,
+                0.0,
+                0.0,
+                0.5,
+            ),
+            245.0,
+        )
+        .expect("replay exact qnsmall/qasmall source state");
+        let audit = distribution.reconstruction_audit();
+        assert!(audit.source_number_floor_applied);
+        assert!(audit.source_moment_floor_applied);
+        assert_eq!(
+            distribution.a_scale_m().to_bits(),
+            ISHMAEL_MINIMUM_AXIS_SCALE_M.to_bits()
+        );
+        assert_eq!(
+            distribution.bulk_density_kg_m3().to_bits(),
+            ISHMAEL_DENSITY_RANGE_KG_M3[1].to_bits()
+        );
+        assert!(!audit.source_density_state_projected);
+        assert!(!audit.source_var_check_small_ice_applied);
+        assert!(!audit.source_var_check_large_ice_applied);
+
+        assert!(matches!(
+            prepare_ishmael_psd(
+                &distribution,
+                PsdIntegrationConfig::default(),
+                PsdParticleSupport::default(),
+                synthetic_fall_speed_provenance(),
+            ),
+            Err(PsdError::SourceStateMassClosure { .. })
+        ));
+    }
+
+    #[test]
+    fn unrelated_geometry_mass_gap_is_not_typed_as_wrf_two_micron_gap() {
+        let mut distribution = oblate_distribution();
+        distribution.mean_particle_mass_kg *= 1.25;
+        let error = prepare_ishmael_psd(
+            &distribution,
+            PsdIntegrationConfig::default(),
+            PsdParticleSupport::default(),
+            synthetic_fall_speed_provenance(),
+        )
+        .expect_err("an artificial reconstruction bug must remain fail-closed");
+        assert!(matches!(
+            error,
+            PsdError::ReconstructionClosure {
+                moment: "ISHMAEL source-state particle-geometry mass",
+                ..
+            }
+        ));
     }
 
     #[derive(Debug)]

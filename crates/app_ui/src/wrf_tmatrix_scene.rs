@@ -6,7 +6,8 @@
 //! products are derived only after interpolation. Strict policy is fail-closed.
 //! The separately named Hybrid policy may replace a complete frozen cell with
 //! the versioned bulk Rayleigh operator only for narrowly classified table-
-//! domain/shape omissions; every such cell and population is audited.
+//! domain/shape omissions or a typed native ISHMAEL source-state mass-closure
+//! gap; every such cell and population is audited.
 
 use std::collections::BTreeSet;
 use std::f64::consts::PI;
@@ -980,7 +981,8 @@ pub struct WrfTMatrixAuditCounts {
     pub residual_rain_populations: u64,
     pub standalone_rain_populations: u64,
     /// Complete frozen cells rebuilt through the explicit Hybrid policy after
-    /// a native table-domain/shape omission.
+    /// a native table-domain/shape omission or typed ISHMAEL source-state
+    /// mass-closure gap.
     pub hybrid_bulk_rayleigh_cells: u64,
     /// Positive native frozen categories represented by those rebuilt cells.
     pub hybrid_bulk_rayleigh_populations: u64,
@@ -1891,7 +1893,7 @@ fn build_cell_into(
     match strict {
         Err(error)
             if scattering_policy == WrfTMatrixScatteringPolicy::HybridBulkRayleighV1
-                && hybrid_eligible_table_omission(&error) =>
+                && hybrid_eligible_unsupported_cell(&error) =>
         {
             build_hybrid_bulk_rayleigh_cell_into(
                 source, cell_index, tables, validated, rain_mode, cancel, output,
@@ -1901,7 +1903,7 @@ fn build_cell_into(
     }
 }
 
-fn hybrid_eligible_table_omission(error: &WrfTMatrixSceneBuildError) -> bool {
+fn hybrid_eligible_unsupported_cell(error: &WrfTMatrixSceneBuildError) -> bool {
     matches!(
         error,
         WrfTMatrixSceneBuildError::P3PsdIntegration {
@@ -1915,6 +1917,9 @@ fn hybrid_eligible_table_omission(error: &WrfTMatrixSceneBuildError) -> bool {
             ..
         } | WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
             source: PsdIntegrationError::Psd(PsdError::DomainOmission { .. }),
+            ..
+        } | WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
+            source: PsdIntegrationError::Psd(PsdError::SourceStateMassClosure { .. }),
             ..
         } | WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
             source: PsdIntegrationError::NodeEvaluation {
@@ -2019,11 +2024,44 @@ fn build_hybrid_bulk_rayleigh_cell_into(
         let category_id = category.category();
         let (qice_kgkg, qnice_per_kg, volume_m3_per_kg) = match category {
             RawPropertyCategory::P3(value) => (value.qice_kgkg, value.qnice_per_kg, None),
-            RawPropertyCategory::Ishmael(value) => (
-                value.qice_kgkg,
-                value.qnice_per_kg,
-                Some(value.qvoli_m3_per_kg),
-            ),
+            RawPropertyCategory::Ishmael(value) => {
+                // Hybrid receives the same WRF-source-checked state as the
+                // native PSD path. In particular, a transported zero/negative
+                // QNICE is projected through the source qnsmall branch before
+                // the versioned bulk operator sees it; using the raw number
+                // here would make an explicitly supported native source
+                // projection fail only after the Hybrid decision.
+                let ishmael_category = value.category.ishmael_category().ok_or(
+                    WrfTMatrixSceneBuildError::IshmaelCategoryLayout {
+                        cell_index,
+                        category: value.category,
+                    },
+                )?;
+                let distribution = IshmaelPsd::reconstruct_wrf_source_checked(
+                    IshmaelPsdInput::new(
+                        ishmael_category,
+                        value.qice_kgkg,
+                        value.qnice_per_kg,
+                        value.qvoli_m3_per_kg,
+                        value.qaoli_m3_per_kg,
+                        air_density_kg_m3,
+                    ),
+                    temperature_k,
+                )
+                .map_err(|source| {
+                    WrfTMatrixSceneBuildError::IshmaelPsdReconstruction {
+                        cell_index,
+                        category: value.category,
+                        source,
+                    }
+                })?;
+                let source_checked = distribution.input();
+                (
+                    source_checked.qice_kgkg(),
+                    source_checked.qnice_per_kg(),
+                    Some(source_checked.qvoli_m3_per_kg()),
+                )
+            }
         };
         let input = BulkSpeciesInput {
             kind: HydrometeorKind::CloudIce,
@@ -8021,6 +8059,78 @@ mod tests {
             &mut output,
         )
         .expect("explicit Hybrid policy rebuilds the captured unsupported cell");
+        assert!(hybrid.retained);
+        assert_eq!(hybrid.counts.source_cells, 1);
+        assert_eq!(hybrid.counts.scheme_native_psd_populations, 0);
+        assert_eq!(hybrid.counts.hybrid_bulk_rayleigh_cells, 1);
+        assert!(hybrid.counts.hybrid_bulk_rayleigh_populations > 0);
+        assert!(output.iter().any(|value| *value > 0.0));
+    }
+
+    #[test]
+    fn reported_ishmael_source_mass_gap_is_strictly_rejected_and_hybrid_is_audited() {
+        let Some(wrf_path) = std::env::var_os("BOWECHO_ISHMAEL_FIXTURE") else {
+            return;
+        };
+        let cell = std::env::var("BOWECHO_ISHMAEL_MASS_GAP_CELL")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("cell index is an integer"))
+            .unwrap_or(5_557_733);
+        let file = wrf_core::WrfFile::open(&wrf_path).expect("open ISHMAEL WRF fixture");
+        assert_eq!(file.global_attr_i32("MP_PHYSICS").unwrap(), 55);
+        let source = read_wrf_property_scene(
+            &file,
+            WrfSourceIdentity("fixture:ishmael-source-mass-gap".to_owned()),
+            0,
+        )
+        .expect("read normalized ISHMAEL property scene");
+        let owner = load_property_tmatrix_tables_exact(
+            PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
+            S_BAND_RESEARCH_FREQUENCY_HZ,
+        )
+        .expect("load authenticated embedded T-matrix tables");
+        let tables = owner.borrowed_bundle();
+        let validated = validate_bundle(tables).expect("validate embedded table bundle");
+        let mut output = vec![
+            0.0_f32;
+            validated.radar_elevations_deg.len()
+                * AdditiveScattering::COMPONENT_COUNT
+        ];
+
+        let strict = build_cell_into(
+            &source,
+            cell,
+            tables,
+            validated,
+            None,
+            WrfTMatrixRainMode::FrozenOnly,
+            WrfTMatrixScatteringPolicy::StrictFailClosed,
+            None,
+            None,
+            &mut output,
+        )
+        .expect_err("captured source-state mass gap must remain fail-closed in strict mode");
+        assert!(matches!(
+            strict,
+            WrfTMatrixSceneBuildError::IshmaelPsdIntegration {
+                source: PsdIntegrationError::Psd(PsdError::SourceStateMassClosure { .. }),
+                ..
+            }
+        ));
+
+        let hybrid = build_cell_into(
+            &source,
+            cell,
+            tables,
+            validated,
+            None,
+            WrfTMatrixRainMode::FrozenOnly,
+            WrfTMatrixScatteringPolicy::HybridBulkRayleighV1,
+            None,
+            None,
+            &mut output,
+        )
+        .expect("explicit Hybrid policy rebuilds the captured source-state mass-gap cell");
         assert!(hybrid.retained);
         assert_eq!(hybrid.counts.source_cells, 1);
         assert_eq!(hybrid.counts.scheme_native_psd_populations, 0);
