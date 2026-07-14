@@ -474,7 +474,7 @@ pub const UNFOLDED_NYQUIST_MPS: f32 = 320.0;
 /// around here (roughly 8–33 m/s depending on VCP/PRF).
 pub const DEFAULT_FOLD_NYQUIST_MPS: f32 = 25.0;
 
-/// Exact transmit frequency of the coherent legacy embedded-S recipe.
+/// Exact transmit frequency of the coherent BowEcho S research-pack recipe.
 pub const PROPERTY_TMATRIX_RESEARCH_FREQUENCY_MHZ: u32 = 2_800;
 pub const PROPERTY_TMATRIX_EXACT_FREQUENCIES_MHZ: [u32; 3] = [2_800, 5_600, 9_400];
 
@@ -609,8 +609,9 @@ pub struct SyntheticRadarConfig {
     /// fail-closed when the file/category/table applicability contract does
     /// not match exactly; it never silently falls back to Rayleigh.
     pub polarimetric_kernel: PolarimetricKernel,
-    /// Exact property-table source. Legacy embedded is the coherent default;
-    /// external selection never falls back or chooses a nearest band.
+    /// Exact property-table source. The on-demand BowEcho S research pack is
+    /// the coherent default; external selection never falls back or chooses a
+    /// nearest band.
     pub property_tmatrix_table_source: app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind,
     /// Whether the property operator includes rain/melting sensitivity.
     pub property_tmatrix_rain_sensitivity: PropertyTMatrixRainSensitivity,
@@ -881,14 +882,13 @@ impl SyntheticRadarConfig {
             ))
         {
             return Err(
-                "RawStateLinear currently requires legacy embedded S at exactly 2800 MHz with Full property rain/melting; external packs and Frozen-only use Frozen or additive adjacent-scene timing"
+                "RawStateLinear currently requires the BowEcho S research pack at exactly 2800 MHz with Full property rain/melting; external packs and Frozen-only use Frozen or additive adjacent-scene timing"
                     .to_owned(),
             );
         }
-        // Resolve the exact source now so an external selection fails before
-        // the multi-gigabyte WRF read, with the deterministic pack directory
-        // included in the actionable error. The validated result is cached.
-        app_ui::wrf_tmatrix_assets::load_property_tmatrix_tables_exact(
+        // Keep validation pure: first-use pack acquisition belongs to the
+        // worker where progress reaches the UI before the heavy WRF read.
+        app_ui::wrf_tmatrix_assets::validate_property_tmatrix_table_source_frequency(
             self.property_tmatrix_table_source,
             exact_frequency_hz,
         )?;
@@ -2259,10 +2259,12 @@ fn read_wrf_radar_fields_for_config_reporting(
                     .to_owned(),
             );
         }
-        let table_owner = app_ui::wrf_tmatrix_assets::load_property_tmatrix_tables_exact(
-            config.property_tmatrix_table_source,
-            f64::from(config.radar_frequency_mhz) * 1.0e6,
-        )?;
+        let table_owner =
+            app_ui::wrf_tmatrix_assets::load_property_tmatrix_tables_exact_with_progress(
+                config.property_tmatrix_table_source,
+                f64::from(config.radar_frequency_mhz) * 1.0e6,
+                progress,
+            )?;
         let table_identity = table_owner.identity();
         let table_resident_bytes = table_owner.retained_source_bytes();
         let maximum_owned_peak_bytes = if raw_state_linear {
@@ -9415,7 +9417,7 @@ fn resolve_tmatrix_execution_runtime(
         return Ok((
             runtime_config,
             TMatrixExecutionRuntime::CpuReference {
-                reason: "CUDA v1 requires the authenticated legacy embedded 2.8 GHz dry-table pack"
+                reason: "CUDA v1 requires the authenticated BowEcho 2.8 GHz S research pack"
                     .to_owned(),
             },
         ));
@@ -9590,6 +9592,19 @@ fn build_synthetic_from_paths(
         .any(|path| crate::wrf_process::is_supported_wrf_file(path))
     {
         return Err("No supported WRF files selected".to_owned());
+    }
+    if config.polarimetric_kernel.is_property_tmatrix() {
+        let pack_progress = |stage: &str| {
+            let _ = tx.send(SyntheticRadarMessage::Progress(stage.to_owned()));
+        };
+        app_ui::wrf_tmatrix_assets::load_property_tmatrix_tables_exact_with_progress(
+            config.property_tmatrix_table_source,
+            f64::from(config.radar_frequency_mhz) * 1.0e6,
+            &pack_progress,
+        )
+        .map(drop)
+        .map_err(|error| format!("prepare property T-matrix research data pack: {error}"))?;
+        check_synthetic_radar_cancel(cancel)?;
     }
     let (runtime_config, runtime) = resolve_tmatrix_execution_runtime(config, tx, cancel)?;
     let mut output = build_synthetic_from_paths_inner(paths, &runtime_config, label, tx, cancel)?;
@@ -12633,7 +12648,7 @@ mod tests {
             legacy_c_band
                 .validate_science_contract()
                 .unwrap_err()
-                .contains("legacy embedded S research v1 exists only")
+                .contains("BowEcho S research data pack exists only")
         );
         let raw_external = SyntheticRadarConfig {
             atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,
@@ -12646,7 +12661,7 @@ mod tests {
             raw_external
                 .validate_science_contract()
                 .unwrap_err()
-                .contains("RawStateLinear currently requires legacy embedded S")
+                .contains("RawStateLinear currently requires the BowEcho S research pack")
         );
         let raw_frozen_only = SyntheticRadarConfig {
             atmosphere_time_mode: AtmosphereTimeMode::RawStateLinear,

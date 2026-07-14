@@ -345,6 +345,7 @@ dependencies = [
  "winresource",
  "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=9874474d9566a7536a90f457a48be30caa5f973a)",
  "wrf-formula",
+ "zip 8.6.0",
 ]
 
 [[package]]

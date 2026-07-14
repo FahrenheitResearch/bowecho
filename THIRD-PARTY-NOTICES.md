@@ -1,9 +1,9 @@
 # Third-party notices
 
 BowEcho itself is dual-licensed under MIT or Apache-2.0 (see the README).
-This file collects the license and attribution notices for third-party work
-that BowEcho's SHARPpy-style sounding window derives from or embeds. Data
-sources and contributed graphics work are credited in the
+This file collects license and attribution notices for third-party work that
+BowEcho derives from, embeds, or offers as a separately downloaded research
+data pack. Data sources and contributed graphics work are credited in the
 [README's Credits section](README.md#credits). Full license texts live in the
 linked repositories and bundled asset files noted below.
 
@@ -65,3 +65,17 @@ ships alongside the fonts at `sharppyrs/assets/fonts/OFL.txt`.
 The sounding window's locator basemap lines (CONUS state boundaries and
 coastline) are simplified from Natural Earth 1:50m vector data, as bundled by
 SHARPpy-Reimagined.
+
+## PyTMatrix-derived property T-matrix research pack
+
+- **License:** MIT
+- **Copyright:** Copyright (c) 2013-2023
+- **Author:** Jussi Leinonen
+- **Source:** <https://github.com/jleinonen/pytmatrix>
+
+BowEcho can optionally download a separately versioned, PyTMatrix 0.3.3-derived
+S-band lookup-table pack when the property T-matrix simulated-radar mode is
+first used. The exact upstream MIT notice is included inside that downloaded
+pack as `PYTMATRIX-LICENSE.txt`. These derived lookup tables are a research
+product, have not been independently validated by BowEcho, and must not be
+treated as an operational radar calibration.

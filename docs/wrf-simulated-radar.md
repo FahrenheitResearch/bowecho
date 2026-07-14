@@ -129,11 +129,11 @@ range, and gate geometry:
 - **Real radar (balanced)** is the recommended practical S-band simulation.
 - **Maximum fidelity (slow)** uses the 27-point pulse-volume rule for one file
   or a short loop.
-- **P3/ISHMAEL T-matrix (research)** selects the shipped legacy embedded
-  2.8 GHz S-band, Full-property, property-aware research operator without
-  changing the chosen antenna or scan geometry. Expert controls can instead
-  request a validated local exact-frequency pack, but never silently change
-  the source or band.
+- **P3/ISHMAEL T-matrix (research)** selects BowEcho's on-demand 2.8 GHz
+  S-band research pack and the Full-property operator without changing the
+  chosen antenna or scan geometry. The first use downloads and hash-qualifies
+  an optional 182.5 MiB pack. Expert controls can instead request a validated
+  local exact-frequency pack, but never silently change the source or band.
 
 Changing an advanced control after applying a recipe labels the setup as
 `Custom tuning`. Selecting a recipe again resets all interacting physics,
@@ -144,7 +144,7 @@ The recipes also choose coherent temporal defaults. **Storm view**, **Clean
 model truth**, and **Clean dual-pol** start Frozen. **Real radar** and
 **Maximum fidelity** start with Timed volume, fast derived/additive adjacent
 sampling, and Hold last. **P3/ISHMAEL T-matrix** starts with the slower
-Raw-state pre-closure reference, legacy embedded 2.8 GHz S tables,
+Raw-state pre-closure reference, the BowEcho 2.8 GHz S research pack,
 Full-property sensitivity, and Hold last. These remain editable after applying
 the recipe, subject to the exact table/time compatibility rules below.
 
@@ -183,8 +183,8 @@ reports the cached hardware probe: the detected device and compute capability,
 or why no qualified CUDA device is available.
 
 The current CUDA backend is deliberately narrow. It accelerates admitted dry
-oblate/prolate particle-node interpolation for the shipped, authenticated
-legacy embedded **2.8 GHz S-band** tables. WRF reads, raw-state blending,
+oblate/prolate particle-node interpolation for the authenticated on-demand
+**2.8 GHz S-band** research tables. WRF reads, raw-state blending,
 microphysical closure, P3/ISHMAEL PSD construction, particle admission,
 population weights, and ordered category reductions remain on CPU. Rain,
 wet-frozen coexistence, propagation, instrument effects, geometry, and final
@@ -394,7 +394,7 @@ purpose of the reference mode; neither creates extra forecast frames or claims
 to integrate WRF forward in time.
 
 The current Raw-state implementation is deliberately narrower than the
-ordinary compact-scene path: it requires the legacy embedded S source at
+ordinary compact-scene path: it requires the BowEcho S research pack at
 exactly 2.8 GHz with **Full property** rain/melting sensitivity. A validated
 local S/C/X pack or **Frozen-only** sensitivity must use Frozen or **Linear
 adjacent (derived/additive)** timing. The UI disables new incompatible
@@ -493,19 +493,31 @@ inapplicable asset is an error, never a silent fallback to Rayleigh.
 
 The T-matrix controls separate **Table source** from **Exact band**:
 
-- **Legacy embedded S** is the shipped research-v1 five-table bundle and is
-  valid only at exactly **2.8 GHz**. Selecting it makes C and X unavailable.
+- **BowEcho S research pack** is the byte-exact research-v1 five-table bundle
+  and is valid only at exactly **2.8 GHz**. It is downloaded only when this
+  mode is selected; selecting it makes C and X unavailable.
 - **Validated local pack** requests one manifest-qualified five-role pack at
   exactly **2.8 GHz S**, **5.6 GHz C**, or **9.4 GHz X**. Selection never uses
-  a nearest frequency, substitutes another band, or falls back to the embedded
+  a nearest frequency, substitutes another band, or falls back to the BowEcho
   source. A missing, ambiguous, corrupt, or `unvalidated_research` pack stops
   the build before the large WRF read.
 
 No validated C- or X-band packs ship with BowEcho. Therefore the C and X UI
 choices are capability gates, not bundled science: they remain unavailable
 until an evidence-backed local pack is installed. BowEcho also ships no
-validated-local replacement S pack; the usable bundled S source remains the
-explicitly research-only legacy embedded bundle.
+validated-local replacement S pack; the usable BowEcho S source remains the
+explicitly research-only on-demand bundle.
+
+The exact first-use asset is
+`bowecho-property-tmatrix-sband-pytmatrix-0.3.3-research-v1.zip` on the
+BowEcho `v0.34.1` release. Its fixed size is 191,400,602 bytes and its SHA-256
+is `80b3a2c65ead59c0a951d491e966694e80bb0c49eeb1d3b1fc532bcadbcf507e`.
+BowEcho streams it to a temporary file, validates the whole archive and every
+declared LUT/config path, extracts through a temporary directory, atomically
+installs the qualified files below `bowecho-simradar/tmatrix-packs`, and then
+deletes the ZIP. PyTMatrix 0.3.3 is MIT-licensed and its notice is included in
+the pack. The derived tables remain research-only and not independently
+validated; licensing and byte integrity do not create an operational claim.
 
 Each local pack is a directory below the deterministic, override-aware model
 cache path `bowecho-simradar/tmatrix-packs`. The UI shows the fully resolved
@@ -634,7 +646,7 @@ effective-medium topology; Frozen-only is an explicit omission. Both choices
 are recorded in the configuration fingerprint, progress/provenance, and
 scattering-model label.
 
-The shipped legacy embedded research tables use PyTMatrix at exactly
+The on-demand BowEcho S research tables use PyTMatrix at exactly
 **2.8 GHz**, with distinct oblate and prolate spheroids and a symmetric
 Bruggeman effective-medium mixture of air, ice, and liquid water. Their
 radar-view axis covers pulse-volume offsets around all 19 custom/named cut
@@ -677,7 +689,7 @@ an unresolved, solver-sensitive KDP resonance exposed by the next 36.126 mm
 node; higher isolated passes are not bridged. A particle outside its own
 phase/shape envelope fails closed instead of being clamped.
 
-The five embedded property tables contain **2,640,848 grid points**: 616,000
+The five on-demand property tables contain **2,640,848 grid points**: 616,000
 dry-oblate, 132,160 dry-prolate, 1,017,600 wet-oblate, 864,000 wet-prolate,
 and 11,088 residual-rain points. The frozen solver contract is
 `ddelt=0.001`, `ndgs=14`. The v9 12-to-14 convergence report (SHA-256
@@ -695,11 +707,11 @@ affected diameter cells and implicated non-diameter intervals; it does not
 copy held-out coordinates, extend a physical domain, change a threshold, or
 reroll a seed. The one frozen held-out request (SHA-256
 `2b4d143d86aaf78913df165b329ae62f6076e2574f34c1d393b6b9ddd90a45c5`)
-then passed all **30 of 30** selected nodes across the five embedded property
+then passed all **30 of 30** selected nodes across the five on-demand property
 tables. Its shared eight-table report (SHA-256
 `82f07bc736f6b5f20c7a59117204b69d97b9cbcb9f915cc54be394b0d8b742ce`)
-is not an all-eight pass: two of six nodes failed in the separate,
-non-embedded conventional dry-ice fixture. Exact table/config hashes and the
+is not an all-eight pass: two of six nodes failed in the separate conventional
+dry-ice fixture. Exact table/config hashes and the
 scope boundary are recorded in
 `validation/tmatrix/refined_grid_v10_property_bundle_acceptance.json`.
 
@@ -847,12 +859,13 @@ variables.
   area/mass spheroid mapping, 900 kg m^-3 solid-ice constraint, Gaussian-20
   canting, and exact-small-sphere sub-floor route remain explicit external
   assumptions. None is operational calibration or a general table fallback.
-- The legacy embedded 2.8 GHz S bundle is the only shipped property-table
-  source. No validated C- or X-band pack ships; selecting those exact bands
+- The on-demand BowEcho 2.8 GHz S research bundle is the only first-party
+  property-table source. No validated C- or X-band pack ships; selecting those
+  exact bands
   requires a separately installed, evidence-backed `validated_research` pack
   and otherwise fails closed.
 - NVIDIA CUDA is an optional execution backend for admitted dry nodes in that
-  embedded 2.8 GHz bundle. It does not accelerate every simulated-radar stage,
+  on-demand 2.8 GHz bundle. It does not accelerate every simulated-radar stage,
   expand table support, or change the fail-closed property-science contract.
 - Symmetric Bruggeman air/ice/water mixing represents a declared effective
   medium; it is not a complete prognostic melting-layer microphysics model.

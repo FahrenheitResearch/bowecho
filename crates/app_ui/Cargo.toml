@@ -38,6 +38,7 @@ simsat = { git = "https://github.com/FahrenheitResearch/simsat.git", rev = "fd2b
 reqwest.workspace = true
 sha2 = "0.10"
 tiff.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 # B3 (docs/miniderecho-spec.md §1): the shared slots' `inject_for_test`

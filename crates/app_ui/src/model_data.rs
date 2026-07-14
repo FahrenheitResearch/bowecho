@@ -230,10 +230,10 @@ impl SyntheticRadarRecipe {
                 "The full virtual instrument with 27-point pulse-volume integration and adjacent-time atmosphere interpolation. Best for a short loop; source-model resolution still limits detail."
             }
             Self::PropertyTMatrixHybrid => {
-                "Production-friendly P3/ISHMAEL dual-pol: native property T-matrix for supported cells and versioned bulk Rayleigh only for audited table-domain/shape omissions or the typed WRF 2 µm source-state mass gap. Defaults to embedded 2.8 GHz S and a frozen atmosphere."
+                "Production-friendly P3/ISHMAEL dual-pol: native property T-matrix for supported cells and versioned bulk Rayleigh only for audited table-domain/shape omissions or the typed WRF 2 µm source-state mass gap. Defaults to the on-demand BowEcho 2.8 GHz S research pack and a frozen atmosphere."
             }
             Self::PropertyTMatrixResearch => {
-                "Experimental full property T-matrix for exact supported P3/ISHMAEL files. It is strictly fail-closed, defaults to embedded 2.8 GHz S, and permits expert raw-state temporal interpolation or validated local S/C/X packs."
+                "Experimental full property T-matrix for exact supported P3/ISHMAEL files. It is strictly fail-closed, defaults to the on-demand BowEcho 2.8 GHz S research pack, and permits expert raw-state temporal interpolation or validated local S/C/X packs."
             }
         }
     }
@@ -5066,10 +5066,10 @@ impl ModelDataDock {
                                         .selectable_value(
                                             &mut state.property_tmatrix_table_source,
                                             app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1,
-                                            "Legacy embedded S",
+                                            "BowEcho S research pack",
                                         )
                                         .on_hover_text(
-                                            "The shipped research-v1 tables. They exist only at exactly 2.8 GHz.",
+                                            "On first use, BowEcho downloads and SHA-256 verifies the optional ~183 MiB PyTMatrix-derived research pack into the displayed cache. It exists only at exactly 2.8 GHz and is research-only, not independently validated.",
                                         )
                                         .clicked()
                                     {
@@ -5146,6 +5146,21 @@ impl ModelDataDock {
                                 });
                                 if matches!(
                                     state.property_tmatrix_table_source,
+                                    app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::LegacyEmbeddedSResearchV1
+                                ) {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "First-use pack cache: {}",
+                                            app_ui::wrf_tmatrix_assets::property_tmatrix_pack_cache_dir().display()
+                                        ))
+                                        .small()
+                                        .monospace(),
+                                    )
+                                    .on_hover_text(
+                                        "BowEcho downloads the optional ~183 MiB versioned ZIP here only when this property T-matrix mode is first used, verifies every fixed hash and size, installs the exact files, then deletes the ZIP. PyTMatrix is MIT-licensed; the resulting lookup tables remain a research product and are not independently validated.",
+                                    );
+                                } else if matches!(
+                                    state.property_tmatrix_table_source,
                                     app_ui::wrf_tmatrix_assets::PropertyTMatrixTableSourceKind::ExternalValidatedPack
                                 ) {
                                     ui.label(
@@ -5164,7 +5179,7 @@ impl ModelDataDock {
                                     egui::RichText::new(if state.polarimetric_kernel.is_hybrid() {
                                         "Hybrid is cell-audited and currently uses Frozen or additive adjacent-scene timing; Raw-state pre-closure is disabled."
                                     } else {
-                                        "Raw-state pre-closure is limited to experimental Full P3/ISHMAEL, legacy embedded S · 2.8 GHz · Full property. External S/C/X uses Frozen or additive adjacent-scene timing."
+                                        "Raw-state pre-closure is limited to experimental Full P3/ISHMAEL, BowEcho S research pack · 2.8 GHz · Full property. External S/C/X uses Frozen or additive adjacent-scene timing."
                                     })
                                     .small()
                                     .weak(),

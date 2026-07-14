@@ -174,7 +174,7 @@ pub enum WrfTMatrixCudaServiceOpenError {
     UnsupportedPlatform,
     #[error("CUDA acceleration unavailable: {0}")]
     Unavailable(String),
-    #[error("load or validate embedded T-matrix tables before CUDA startup: {0}")]
+    #[error("load or validate the on-demand T-matrix research pack before CUDA startup: {0}")]
     Tables(String),
     #[error("initialize CUDA T-matrix executor and preload dry tables: {0}")]
     Executor(String),

@@ -1138,7 +1138,7 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "Raw-state pre-closure currently requires Legacy embedded S at exactly 2.8 GHz with \
+        "Raw-state pre-closure currently requires the BowEcho S research pack at exactly 2.8 GHz with \
          Full property rain/melting sensitivity. A validated local S/C/X pack or Frozen-only \
          sensitivity must use Frozen or Linear adjacent (derived/additive); the UI and backend \
          disable new incompatible Raw-state selection, and backend validation rejects any \
@@ -1187,7 +1187,7 @@ fn wrf(ui: &mut egui::Ui) {
     action(
         ui,
         "P3/ISHMAEL T-matrix (research)",
-        "— opt-in property-aware dual-pol using the shipped legacy embedded 2.8 GHz S tables, \
+        "— opt-in property-aware dual-pol using the on-demand BowEcho 2.8 GHz S research tables, \
          Full property sensitivity and Raw-state pre-closure. Exact supported inputs are \
          required; it never substitutes another table source or band. The only Rayleigh-limit \
          route is the named, audited bridge for exact P3 small dense spheres below the table \
@@ -1334,11 +1334,22 @@ fn wrf(ui: &mut egui::Ui) {
     subhead(ui, "T-MATRIX TABLE SOURCE & SENSITIVITY");
     para(
         ui,
-        "Legacy embedded S is the shipped research-v1 five-table source and works only at \
-         exactly 2.8 GHz. Validated local pack requests one exact manifest-qualified pack at \
+        "BowEcho S research pack is the byte-exact research-v1 five-table source and works only at \
+         exactly 2.8 GHz. Its first use downloads and hash-qualifies an optional 182.5 MiB asset. \
+         Validated local pack requests one exact manifest-qualified pack at \
          2.8 GHz S, 5.6 GHz C or 9.4 GHz X; it never chooses a nearest band or falls back. No \
          validated C- or X-band pack ships with BowEcho, so those choices remain unavailable \
          until an evidence-backed local pack exists.",
+    );
+    para(
+        ui,
+        "The optional asset is bowecho-property-tmatrix-sband-pytmatrix-0.3.3-research-v1.zip \
+         from the BowEcho v0.34.1 release (191,400,602 bytes; SHA-256 \
+         80b3a2c65ead59c0a951d491e966694e80bb0c49eeb1d3b1fc532bcadbcf507e). BowEcho \
+         streams it into the displayed bowecho-simradar/tmatrix-packs cache, validates the ZIP \
+         and every exact member, atomically installs the extracted files, then deletes the ZIP. \
+         PyTMatrix 0.3.3 is MIT-licensed and its notice is included. These derived tables remain \
+         research-only, not independently validated, and not an operational calibration.",
     );
     para(
         ui,
@@ -1359,7 +1370,7 @@ fn wrf(ui: &mut egui::Ui) {
     para(
         ui,
         "The opt-in property-aware T-matrix research contract accepts \
-         P3 50–53 and ISHMAEL 55 raw tuples. The shipped legacy PyTMatrix tables use exactly 2.8 GHz, \
+         P3 50–53 and ISHMAEL 55 raw tuples. The on-demand BowEcho PyTMatrix tables use exactly 2.8 GHz, \
          symmetric Bruggeman air/ice/water mixing, separate oblate/prolate shapes, and a fixed \
          mean-zero Gaussian canting distribution with 20\u{00b0} standard deviation and \
          deterministic 50-node (5 by 10) orientation integration. Solver-complete diameter \
@@ -1438,10 +1449,10 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "The embedded property bundle contains 2,640,848 grid points across five tables. Its \
+        "The on-demand BowEcho S research pack contains 2,640,848 grid points across five tables. Its \
          one frozen held-out request passed all 30 of 30 selected property-table nodes. The \
          shared eight-table report is not an all-eight pass: two nodes failed only in a \
-         separate conventional dry-ice fixture that this path does not embed. The bounded \
+         separate conventional dry-ice fixture that this path does not use. The bounded \
          depth-three design audit also remained failed, and the older all-node solver report \
          applies by exact hash only to the unchanged dry-prolate, wet-oblate, and wet-prolate \
          configs. These are transparent software/interpolation checks, not independent \
@@ -1486,7 +1497,7 @@ fn wrf(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "The legacy embedded 2.8 GHz S bundle is the only shipped property table source. \
+        "The on-demand BowEcho 2.8 GHz S research bundle is the only first-party property table source. \
          BowEcho ships no validated C/X packs; exact 5.6/9.4 GHz selection fails closed until a \
          separately installed evidence-backed pack satisfies the validated local contract.",
     );
@@ -3174,7 +3185,12 @@ mod tests {
         assert!(guide_src.contains("SAILS, MRLE, AVSET, Add-MPDA"));
         assert!(guide_src.contains("Linear adjacent is the fast path"));
         assert!(guide_src.contains("Raw-state pre-closure is the slower"));
-        assert!(guide_src.contains("Raw-state pre-closure currently requires Legacy embedded S"));
+        assert!(
+            guide_src
+                .contains("Raw-state pre-closure currently requires the BowEcho S research pack")
+        );
+        assert!(guide_src.contains("191,400,602 bytes"));
+        assert!(guide_src.contains("PyTMatrix 0.3.3 is MIT-licensed"));
         assert!(guide_src.contains("retained incompatible combination"));
         assert!(guide_src.contains("Both adjacent modes never extrapolate"));
         assert!(guide_src.contains("hold, drop or error"));
