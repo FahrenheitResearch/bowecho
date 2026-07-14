@@ -35,6 +35,7 @@ pub(crate) fn install_cjk_fallback(ctx: &egui::Context) {
             .or_default()
             .push(FALLBACK_FONT_NAME.to_owned());
     }
+    sharppyrs::add_fonts(&mut fonts);
     ctx.set_fonts(fonts);
 }
 

@@ -93,6 +93,9 @@ rev = "4ae2ed76658cbd1d62e91260a0581799242c9c8c"
 git = "https://github.com/FahrenheitResearch/rusty-weather"
 rev = "4ae2ed76658cbd1d62e91260a0581799242c9c8c"
 
+[dependencies.sharppyrs]
+path = "../../../sharppyrs"
+
 [dependencies.sharprs]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
 rev = "4ae2ed76658cbd1d62e91260a0581799242c9c8c"

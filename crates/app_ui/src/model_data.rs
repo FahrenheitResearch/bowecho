@@ -1242,7 +1242,7 @@ pub struct ModelDataDock {
     tree: Option<StoreTree>,
     browser: RunBrowserPanel,
     viewer: FieldViewerPanel,
-    sounding: SoundingPanel,
+    sounding: crate::sharppy_sounding::SharppySoundingPanel,
     /// Most recent loaded field (kept for the map layer).
     latest_field: Option<std::sync::Arc<rw_ui::FieldData>>,
     /// Most recent sounding data (kept for the native skew-T window).
@@ -1398,7 +1398,7 @@ impl ModelDataDock {
             tree: None,
             browser: RunBrowserPanel::new(),
             viewer: FieldViewerPanel::new(),
-            sounding: SoundingPanel::new(),
+            sounding: crate::sharppy_sounding::SharppySoundingPanel::new(),
             latest_field: None,
             latest_sounding: None,
             sounding_request_mode: SoundingRequestMode::None,

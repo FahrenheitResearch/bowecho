@@ -43,6 +43,7 @@ mod basemap_data;
 mod basemap_towns;
 mod batch_plots;
 mod box_sounding;
+mod sharppy_sounding;
 mod brand;
 mod chrome_readouts;
 mod cm1_ui;
@@ -3272,7 +3273,7 @@ struct ViewerApp {
     native_sounding_src: Option<Arc<rw_ui::SoundingData>>,
     /// Reusable Rusty Weather sounding scene for native-only sources such
     /// as observed RAOBs.
-    native_sounding_panel: rw_ui::SoundingPanel,
+    native_sounding_panel: sharppy_sounding::SharppySoundingPanel,
     sounding_viewer_source: SoundingViewerSource,
     native_skewt_open: bool,
     /// Experimental vertical wind profile derived from the loaded volume's
@@ -8612,7 +8613,7 @@ impl ViewerApp {
             frame_ms_avg: 0.0,
             native_sounding_rx: None,
             native_sounding_src: None,
-            native_sounding_panel: rw_ui::SoundingPanel::new(),
+            native_sounding_panel: sharppy_sounding::SharppySoundingPanel::new(),
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
             vwp_open: false,
@@ -64324,7 +64325,7 @@ mod tests {
             frame_ms_avg: 0.0,
             native_sounding_rx: None,
             native_sounding_src: None,
-            native_sounding_panel: rw_ui::SoundingPanel::new(),
+            native_sounding_panel: sharppy_sounding::SharppySoundingPanel::new(),
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
             vwp_open: false,

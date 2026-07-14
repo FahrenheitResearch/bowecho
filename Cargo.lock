@@ -333,6 +333,7 @@ dependencies = [
  "serde_json",
  "settings",
  "sha2",
+ "sharppyrs",
  "sharprs",
  "simradar_cuda",
  "simsat",
@@ -1467,22 +1468,22 @@ dependencies = [
 [[package]]
 name = "ecape-rs"
 version = "0.1.4"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=4ae2ed76658cbd1d62e91260a0581799242c9c8c#4ae2ed76658cbd1d62e91260a0581799242c9c8c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=4ae2ed76658cbd1d62e91260a0581799242c9c8c)",
+]
+
+[[package]]
+name = "ecape-rs"
+version = "0.1.4"
 source = "git+https://github.com/FahrenheitResearch/ecape-rs?rev=82922534c02a888e773c50463b5a49d535606276#82922534c02a888e773c50463b5a49d535606276"
 dependencies = [
  "metrust 0.3.9",
  "serde",
  "serde_json",
  "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
-]
-
-[[package]]
-name = "ecape-rs"
-version = "0.1.4"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=4ae2ed76658cbd1d62e91260a0581799242c9c8c#4ae2ed76658cbd1d62e91260a0581799242c9c8c"
-dependencies = [
- "serde",
- "serde_json",
- "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=4ae2ed76658cbd1d62e91260a0581799242c9c8c)",
 ]
 
 [[package]]
@@ -5603,6 +5604,14 @@ checksum = "c318c0e76bc2d54086b2d936ae0ca92eab5b84eb73f5704c1d14dba33be643e3"
 dependencies = [
  "byteorder",
  "dbase",
+]
+
+[[package]]
+name = "sharppyrs"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "sharprs",
 ]
 
 [[package]]
