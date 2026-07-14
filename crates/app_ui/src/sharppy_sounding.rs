@@ -15,6 +15,21 @@ use rustwx_sounding::SoundingColumn;
 use rw_ui::SoundingData;
 
 const MS_TO_KT: f64 = 1.943_844_49;
+const LEGACY_DEFAULT_LAYOUT_WITH_STP: &str =
+    "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|indexboard,streamwiseness,stp|250";
+
+fn restored_layout_tokens(tokens: &str) -> Option<String> {
+    let layout = sharppyrs::SoundingLayout::from_tokens(tokens)?;
+    let canonical = layout.to_tokens();
+    if canonical == LEGACY_DEFAULT_LAYOUT_WITH_STP {
+        // v0.34 persisted the then-default STP bar. Treat that exact layout as
+        // a default, not as a customization, so existing users receive the
+        // wider index board introduced with Rusty Weather v0.4 as well.
+        Some(sharppyrs::SoundingLayout::default().to_tokens())
+    } else {
+        Some(canonical)
+    }
+}
 
 struct SharppyAnalysis {
     prof: sharppyrs::Profile,
@@ -94,10 +109,10 @@ impl SharppySoundingPanel {
     /// which has the ctx to write egui memory.
     pub fn apply_view_state_json(&mut self, value: &serde_json::Value) -> bool {
         if let Some(tokens) = value.get("sharppy_layout").and_then(|v| v.as_str())
-            && sharppyrs::SoundingLayout::from_tokens(tokens).is_some()
+            && let Some(tokens) = restored_layout_tokens(tokens)
         {
-            self.layout_tokens = Some(tokens.to_owned());
-            self.pending_layout_tokens = Some(tokens.to_owned());
+            self.layout_tokens = Some(tokens.clone());
+            self.pending_layout_tokens = Some(tokens);
         }
         self.inner.apply_view_state_json(value)
     }
@@ -355,6 +370,24 @@ mod tests {
         let mut fresh = SharppySoundingPanel::new();
         assert!(fresh.apply_view_state_json(&bad));
         assert!(fresh.view_state_json().get("sharppy_layout").is_none());
+    }
+
+    #[test]
+    fn legacy_default_stp_layout_migrates_to_wider_index_board() {
+        let mut panel = SharppySoundingPanel::new();
+        let mut save = panel.inner.view_state_json();
+        save.as_object_mut().unwrap().insert(
+            "sharppy_layout".to_owned(),
+            serde_json::json!(LEGACY_DEFAULT_LAYOUT_WITH_STP),
+        );
+        assert!(panel.apply_view_state_json(&save));
+
+        let state = panel.view_state_json();
+        let migrated = state["sharppy_layout"]
+            .as_str()
+            .expect("migrated layout tokens");
+        assert_eq!(migrated, sharppyrs::SoundingLayout::default().to_tokens());
+        assert!(migrated.contains("indexboard,streamwiseness,hidden"));
     }
 
     /// A restored layout lands in egui memory on the next `ui()` frame under
