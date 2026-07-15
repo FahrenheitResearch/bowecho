@@ -952,6 +952,26 @@ fn model_data(ui: &mut egui::Ui) {
     );
     action(
         ui,
+        "Tables / Tables · Custom",
+        concat!(
+            "— opens a persistent editor for the Parcels & thermo, Kinematics, and Severe ",
+            "indices tables. Rename each table and section; replace, duplicate, reorder, ",
+            "blank, or remove individual rows; and add your own rows or sections. The ",
+            "searchable picker includes every supported sounding diagnostic plus compatible ",
+            "Formula Lab results for the current model sounding. Unknown or temporarily ",
+            "unavailable saved formulas remain in the layout as unavailable instead of being ",
+            "silently deleted. Opening customization alone does not change the plot: each table ",
+            "continues using the exact native SHARPpy renderer. Ordinary diagnostic, label, or ",
+            "blank substitutions are sparse in-place edits that preserve native rows, columns, ",
+            "order, and geometry. Only structural edits — adding or removing rows or sections, ",
+            "or renaming or restructuring sections or panels — switch that panel to the ",
+            "freeform layout. Use the chevrons to collapse panels and sections while arranging ",
+            "a large board. Restore panel returns that table to its exact native renderer; Reset all ",
+            "to default removes every override.",
+        ),
+    );
+    action(
+        ui,
         "⚙ Edit panel layout",
         concat!(
             "— choose which diagnostic occupies each cell, then drag the cyan shared borders ",

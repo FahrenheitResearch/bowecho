@@ -1306,6 +1306,15 @@ pub struct ModelDataDock {
     /// rw-ui intentionally drops its generated cache when another hour is
     /// selected; this copy lets Formula Lab reinstall exactly from raw values.
     formula_result_raw_field: Option<rw_ui::FieldData>,
+    /// Whether `formula_result_raw_field` was evaluated through the exact
+    /// selected rw-store source. Raw-WRF results use a display `HourKey` too,
+    /// but may never be sampled into a stored model sounding merely because
+    /// those labels happen to compare equal.
+    formula_result_store_backed: bool,
+    /// Content-aware, source-time-independent Formula identity derived from
+    /// the completed evaluator provenance before that metadata leaves the
+    /// result pump.
+    formula_result_sounding_identity: Option<crate::formula_sounding::FormulaSoundingIdentity>,
     /// Explicit raw-WRF file staged for formulas that need WRF grid metrics,
     /// physical height, vectors, or horizontal calculus. The unrestricted
     /// picker accepts extensionless `wrfout_*` files from every domain.
@@ -1425,6 +1434,8 @@ impl ModelDataDock {
             formula_lab_open_models_requested: false,
             formula_result_field: None,
             formula_result_raw_field: None,
+            formula_result_store_backed: false,
+            formula_result_sounding_identity: None,
             formula_raw_path: None,
             wrf_options: WrfProcessUiState::default(),
             synth_radar: SyntheticRadarUiState::default(),
@@ -1631,10 +1642,19 @@ impl ModelDataDock {
             return;
         }
 
-        self.install_formula_field(result.field, raw_result);
+        let sounding_identity = crate::formula_sounding::FormulaSoundingIdentity::from_provenance(
+            &result.field.key.var,
+            &result.provenance,
+        );
+        self.install_formula_field(result.field, raw_result, Some(sounding_identity));
     }
 
-    fn install_formula_field(&mut self, field: rw_ui::FieldData, raw_result: bool) {
+    fn install_formula_field(
+        &mut self,
+        field: rw_ui::FieldData,
+        raw_result: bool,
+        sounding_identity: Option<crate::formula_sounding::FormulaSoundingIdentity>,
+    ) {
         self.plot_viewer.clear();
         self.native_plot_content = NativePlotContent::Model;
         self.native_plot_seeded_run = None;
@@ -1644,6 +1664,8 @@ impl ModelDataDock {
         }
         let settings = self.color_tables.settings().clone().normalized();
         self.formula_result_raw_field = Some(field.clone());
+        self.formula_result_store_backed = !raw_result;
+        self.formula_result_sounding_identity = sounding_identity;
         self.viewer.install_generated_field(field, &settings);
         // Keep the styled/display-unit field as the external map/native-plot
         // source. `install_generated_field` retains the raw scientific values
@@ -2398,6 +2420,40 @@ impl ModelDataDock {
         self.latest_sounding.as_ref()
     }
 
+    /// Last completed Formula Lab output as a selectable sounding-table
+    /// value. The descriptor is retained when it is unavailable so persisted
+    /// table layouts do not silently replace the user's formula selection.
+    pub(crate) fn formula_sounding_diagnostic(
+        &self,
+        sounding: Option<&rw_ui::SoundingData>,
+    ) -> Option<crate::formula_sounding::FormulaSoundingDiagnostic> {
+        self.formula_result_raw_field.as_ref().map(|field| {
+            if self.sounding_request_mode == SoundingRequestMode::BoxApplied
+                && let Some(summary) = &self.box_sounding_summary
+            {
+                crate::formula_sounding::formula_diagnostic_for_box_sounding(
+                    field,
+                    self.formula_result_sounding_identity.as_ref(),
+                    self.formula_result_store_backed,
+                    sounding,
+                    (
+                        summary.sampled.west,
+                        summary.sampled.east,
+                        summary.sampled.south,
+                        summary.sampled.north,
+                    ),
+                )
+            } else {
+                crate::formula_sounding::formula_diagnostic_for_sounding(
+                    field,
+                    self.formula_result_sounding_identity.as_ref(),
+                    self.formula_result_store_backed,
+                    sounding,
+                )
+            }
+        })
+    }
+
     /// Apply one store-worker point-sounding reply only while the model dock
     /// still owns the request. An explicit external sounding can change the
     /// mode to [`SoundingRequestMode::External`] while the worker is reading;
@@ -2476,6 +2532,7 @@ impl ModelDataDock {
                 armed: self.box_sounding_armed,
                 unavailable_reason,
             }),
+            formula_diagnostic: self.formula_sounding_diagnostic(self.latest_sounding.as_deref()),
             ..Default::default()
         }
     }
@@ -7526,6 +7583,7 @@ mod tests {
                 style: None,
             },
             false,
+            None,
         );
         assert_eq!(dock.native_plot_content, NativePlotContent::Model);
         let installed = dock.latest_field().expect("external Formula field");
@@ -7562,6 +7620,7 @@ mod tests {
                 style: None,
             },
             false,
+            None,
         );
         assert!(
             store_named_current_field(

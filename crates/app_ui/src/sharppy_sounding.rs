@@ -14,6 +14,14 @@ use eframe::egui;
 use rustwx_sounding::SoundingColumn;
 use rw_ui::SoundingData;
 
+use crate::formula_sounding::FormulaSoundingDiagnostic;
+use crate::sounding_table_config::{
+    SoundingTableConfig, SoundingTableEditor, config_from_view_state, write_config_to_view_state,
+};
+
+#[path = "sounding_table_builtin.rs"]
+mod sounding_table_builtin;
+
 const MS_TO_KT: f64 = 1.943_844_49;
 const SHARPPY_CANVAS_MIN_WIDTH: f32 = 1_630.0;
 const SHARPPY_CANVAS_MIN_HEIGHT: f32 = 900.0;
@@ -174,6 +182,10 @@ pub(crate) struct SoundingHeaderControls {
     /// app owns the setting because enabling it also enables the map's
     /// Surface obs layer; the sounding widget only renders the control.
     pub(crate) obs_adjusted: Option<bool>,
+    /// Last completed store-backed Formula Lab field sampled for the model
+    /// sounding. The panel independently verifies exact HourKey ownership and
+    /// refuses it for RAOB/native sources before offering or rendering it.
+    pub(crate) formula_diagnostic: Option<FormulaSoundingDiagnostic>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -206,6 +218,8 @@ pub struct SharppySoundingPanel {
     source: Option<SoundingSource>,
     manual_editor_open: bool,
     manual_corrections: Vec<ManualSoundingCorrection>,
+    table_config: SoundingTableConfig,
+    table_editor: SoundingTableEditor,
 }
 
 impl SharppySoundingPanel {
@@ -222,6 +236,8 @@ impl SharppySoundingPanel {
             source: None,
             manual_editor_open: false,
             manual_corrections: Vec::new(),
+            table_config: SoundingTableConfig::default(),
+            table_editor: SoundingTableEditor::default(),
         }
     }
 
@@ -298,6 +314,7 @@ impl SharppySoundingPanel {
                 serde_json::json!(self.text_scale),
             );
         }
+        let _ = write_config_to_view_state(&mut value, &self.table_config);
         value
     }
 
@@ -306,6 +323,7 @@ impl SharppySoundingPanel {
     /// unknown keys). Layout tokens take effect on the next `ui()` frame,
     /// which has the ctx to write egui memory.
     pub fn apply_view_state_json(&mut self, value: &serde_json::Value) -> bool {
+        self.table_config = config_from_view_state(value).unwrap_or_default();
         if let Some(tokens) = value.get("sharppy_layout").and_then(|v| v.as_str())
             && let Some(tokens) = restored_layout_tokens(tokens)
         {
@@ -334,6 +352,15 @@ impl SharppySoundingPanel {
             self.text_scale = scale.clamp(SHARPPY_TEXT_SCALE_MIN, SHARPPY_TEXT_SCALE_MAX);
         }
         self.inner.apply_view_state_json(value)
+    }
+
+    fn compatible_formula<'a>(
+        &self,
+        controls: &'a SoundingHeaderControls,
+    ) -> Option<&'a FormulaSoundingDiagnostic> {
+        let source = self.source.as_ref()?;
+        let formula = controls.formula_diagnostic.as_ref()?;
+        (source.manual_editable && source.data.hour == formula.source_hour).then_some(formula)
     }
 
     fn sharppy_style(&self) -> sharppyrs::SkewTStyle {
@@ -688,6 +715,8 @@ impl SharppySoundingPanel {
                     })
                     .response
                     .on_hover_text("Sounding font family and independent text size");
+                    ui.separator();
+                    self.table_editor.header_button(ui, &self.table_config);
                 }
                 let manual_editable = self
                     .source
@@ -763,12 +792,22 @@ impl SharppySoundingPanel {
                 }
             });
         }
+        if !self.classic {
+            let formula = self.compatible_formula(controls).cloned();
+            let catalog = sounding_table_builtin::catalog(formula.as_ref());
+            let defaults = sounding_table_builtin::default_config();
+            self.table_editor
+                .show(ui.ctx(), &mut self.table_config, &defaults, &catalog);
+        }
         if self.manual_editor_open && self.manual_correction_ui(ui) {
             self.rebuild_from_source();
         }
         if !self.classic
             && let Some(analysis) = self.analysis.as_ref()
         {
+            let formula = self.compatible_formula(controls);
+            let diagnostic_table_overrides =
+                sounding_table_builtin::build_board(&self.table_config, analysis, formula);
             let render_style = self.sharppy_style();
             let available = ui.available_size();
             let size = if docked && docked_stretch {
@@ -782,12 +821,25 @@ impl SharppySoundingPanel {
                 floating_sounding_canvas_size(available)
             };
             let view = || {
-                sharppyrs::SoundingView::new(&analysis.prof, &analysis.derived)
+                let view = sharppyrs::SoundingView::new(&analysis.prof, &analysis.derived)
                     .title(analysis.title.clone())
                     .brand("BowEcho")
                     .style(render_style.clone())
                     .layout_memory_id(layout_id)
-                    .size(size)
+                    .size(size);
+                let Some(overrides) = diagnostic_table_overrides.as_ref() else {
+                    return view;
+                };
+                let view = if overrides.generic.panels.is_empty() {
+                    view
+                } else {
+                    view.diagnostic_tables(&overrides.generic)
+                };
+                if overrides.native_patches.patches.is_empty() {
+                    view
+                } else {
+                    view.native_diagnostic_patches(&overrides.native_patches)
+                }
             };
             if docked {
                 egui::Frame::new()
@@ -1299,6 +1351,58 @@ mod tests {
         assert!(!panel.source.as_ref().unwrap().manual_editable);
         assert!(panel.manual_corrections.is_empty());
         assert!(!panel.manual_editor_open);
+    }
+
+    #[test]
+    fn formula_table_value_requires_exact_model_hour_and_never_reaches_raob() {
+        let mut panel = SharppySoundingPanel::new();
+        let model = manual_test_data("wrf");
+        panel.install_source(model.clone(), manual_test_column(), None);
+        let mut controls = SoundingHeaderControls {
+            formula_diagnostic: Some(FormulaSoundingDiagnostic {
+                id: "formula_lab:test".to_owned(),
+                label: "Test".to_owned(),
+                units: "K".to_owned(),
+                source_hour: model.hour.clone(),
+                value: Some(300.0),
+                unavailable_reason: None,
+            }),
+            ..Default::default()
+        };
+        assert!(panel.compatible_formula(&controls).is_some());
+
+        controls
+            .formula_diagnostic
+            .as_mut()
+            .unwrap()
+            .source_hour
+            .hour += 1;
+        assert!(panel.compatible_formula(&controls).is_none());
+
+        let raob = manual_test_data("KOUN RAOB");
+        controls.formula_diagnostic.as_mut().unwrap().source_hour = raob.hour.clone();
+        panel.install_source(raob, manual_test_column(), None);
+        assert!(panel.compatible_formula(&controls).is_none());
+    }
+
+    #[test]
+    fn custom_table_board_round_trips_through_sounding_view_state() {
+        let mut panel = SharppySoundingPanel::new();
+        panel.table_config = sounding_table_builtin::default_config();
+        let state = panel.view_state_json();
+        assert!(state.get("sharppy_table_board").is_some());
+
+        let mut restored = SharppySoundingPanel::new();
+        assert!(restored.apply_view_state_json(&state));
+        assert_eq!(restored.table_config, panel.table_config);
+
+        restored.table_config.reset_to_canonical();
+        assert!(
+            restored
+                .view_state_json()
+                .get("sharppy_table_board")
+                .is_none()
+        );
     }
 
     /// Old saves (plain classic-panel state, no `sharppy_layout` key) still
