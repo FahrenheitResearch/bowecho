@@ -1068,18 +1068,12 @@ impl ViewerApp {
                         ui.set_min_width(inner_width);
                         ui.set_max_width(inner_width);
                         ui.horizontal(|ui| {
-                            let count = cards.len();
-                            let heading = if count == 1 {
-                                "Warning at this point".to_owned()
-                            } else {
-                                format!("{count} warnings at this point")
-                            };
                             let heading_width =
                                 (ui.available_width() - 26.0 - ui.spacing().item_spacing.x)
                                     .max(72.0);
                             ui.add_sized(
                                 [heading_width, ui.spacing().interact_size.y],
-                                egui::Label::new(egui::RichText::new(heading).strong()),
+                                egui::Label::new(egui::RichText::new("Current warnings").strong()),
                             );
                             if ui
                                 .small_button("X")

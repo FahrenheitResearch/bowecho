@@ -805,14 +805,7 @@ impl ViewerApp {
                     ..Default::default()
                 },
                 |ui| {
-                    if ui
-                        .selectable_label(*high_visibility, "Hi")
-                        .on_hover_text(
-                            "High visibility: lift the WoFS PNG's low source alpha without changing its RGB palette or georeference. Lower Radar opacity to compare where observed radar overlaps it",
-                        )
-                        .clicked()
-                    {
-                        *high_visibility = !*high_visibility;
+                    if crate::wofs::drape_visibility_ui(ui, high_visibility, true) {
                         visibility_mode_changed = true;
                     }
                 },

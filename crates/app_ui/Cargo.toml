@@ -94,9 +94,12 @@ rev = "fe9797f86c8958b5a625a4a7682c6b6aeff6b309"
 git = "https://github.com/FahrenheitResearch/rusty-weather"
 rev = "fe9797f86c8958b5a625a4a7682c6b6aeff6b309"
 
+# BowEcho-compatible SHARPpy v0.3.2 parity line: retains the configurable
+# native table/layout APIs after the verified parity + ECAPE-EL corrections,
+# canonical MPL column, and squared streamwiseness formulation.
 [dependencies.sharppyrs]
 git = "https://github.com/FahrenheitResearch/sharppyrs"
-rev = "ca0eab725fda1752d331fbf10b25e087a5d050bf"
+rev = "5d66575a0ad1ab9d740945b7a8bbd4ec8e8eed54"
 
 [dependencies.sharprs]
 git = "https://github.com/FahrenheitResearch/rusty-weather"

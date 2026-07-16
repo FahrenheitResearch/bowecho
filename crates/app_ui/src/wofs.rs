@@ -58,12 +58,56 @@ pub const PRODUCT_PNG_SIZE: (f32, f32) = (900.0, 800.0);
 
 /// WoFS product PNGs deliberately encode much of their guidance with low
 /// source alpha (paintball pixels commonly arrive around 15% opacity). The
-/// map also paints WoFS below the observed-radar rasters, so a single 70%
-/// pass was easy to lose. High visibility repeats the exact same textured
-/// mesh: alpha coverage increases, while fully transparent pixels, RGB
-/// palette values, UVs, and georeferencing remain untouched.
-const HIGH_VISIBILITY_PASSES: usize = 2;
+/// map also paints WoFS below the observed-radar rasters, so even the former
+/// two-pass lift was easy to lose. High visibility repeats the exact same
+/// textured mesh six times: at the default 85% drape opacity, a representative
+/// 15%-alpha pixel rises from about 13% effective coverage to about 56%.
+/// Fully transparent pixels, RGB palette values, UVs, and georeferencing
+/// remain untouched.
+const HIGH_VISIBILITY_PASSES: usize = 6;
 const DEFAULT_DRAPE_OPACITY: f32 = 0.85;
+
+const DRAPE_VISIBILITY_HOVER: &str = "Standard draws the published WoFS texture once. High draws that exact texture six times, \
+     lifting only its low source alpha (a typical 15%-alpha pixel is about 13% visible at the \
+     default drape opacity in Standard and about 56% in High). Fully transparent pixels stay \
+     transparent; published RGB colors, UVs, and georeference are unchanged. Observed radar \
+     still draws above WoFS; lower Radar opacity when comparing overlap.";
+
+/// Source-over coverage after drawing the same texture `passes` times. This
+/// models only alpha; every pass samples the original, unmodified RGB texture.
+#[cfg(test)]
+fn repeated_source_over_alpha(source_alpha: f32, opacity: f32, passes: usize) -> f32 {
+    let pass_alpha = (source_alpha * opacity).clamp(0.0, 1.0);
+    (0..passes).fold(0.0, |coverage, _| {
+        pass_alpha + coverage * (1.0 - pass_alpha)
+    })
+}
+
+/// The same small two-choice visibility control is used in the WoFS window
+/// and the Layers rail. It intentionally keeps the existing session-state
+/// bool: Standard is the published single pass; High is the stronger alpha-
+/// only lift and remains the default.
+pub(crate) fn drape_visibility_ui(
+    ui: &mut egui::Ui,
+    high_visibility: &mut bool,
+    compact: bool,
+) -> bool {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let standard = ui
+            .selectable_value(
+                high_visibility,
+                false,
+                if compact { "Std" } else { "Standard" },
+            )
+            .on_hover_text(DRAPE_VISIBILITY_HOVER);
+        let high = ui
+            .selectable_value(high_visibility, true, "High")
+            .on_hover_text(DRAPE_VISIBILITY_HOVER);
+        standard.changed() || high.changed()
+    })
+    .inner
+}
 
 #[derive(Clone)]
 pub struct WofsRun {
@@ -1203,13 +1247,8 @@ impl WofsState {
                     .text("opacity")
                     .show_value(true),
             );
-            ui.checkbox(&mut self.drape_high_visibility, "High visibility")
-                .on_hover_text(
-                    "Lift the WoFS PNG's intentionally low source alpha by drawing the exact \
-                     same texture twice. Fully transparent pixels stay transparent; published \
-                     RGB product colors and the georeference are unchanged. Observed radar \
-                     intentionally draws above WoFS; lower Radar opacity to compare overlap.",
-                );
+            ui.label("visibility").on_hover_text(DRAPE_VISIBILITY_HOVER);
+            drape_visibility_ui(ui, &mut self.drape_high_visibility, false);
 
             match self.drape_readiness() {
                 WofsDrapeReadiness::Off => {}
@@ -1343,7 +1382,9 @@ impl WofsState {
             });
             if bounds.intersects(rect) {
                 // Repeating a source-over pass raises only coverage from the
-                // PNG's low alpha. It does not alter RGB, UV, or vertex data.
+                // PNG's low alpha. Every submitted mesh is byte-for-byte the
+                // same clone: RGB, UV, and vertex/georeference data do not
+                // change, and source-alpha zero remains zero on every pass.
                 for _ in 0..self.drape_passes() {
                     painter.add(egui::Shape::mesh(mesh.clone()));
                 }
@@ -1786,10 +1827,30 @@ mod tests {
         let mut state = WofsState::default();
         assert_eq!(state.drape_opacity, DEFAULT_DRAPE_OPACITY);
         assert!(state.drape_high_visibility);
+        assert_eq!(HIGH_VISIBILITY_PASSES, 6);
         assert_eq!(state.drape_passes(), HIGH_VISIBILITY_PASSES);
 
         state.drape_high_visibility = false;
         assert_eq!(state.drape_passes(), 1);
+    }
+
+    #[test]
+    fn high_visibility_is_a_substantial_alpha_only_lift() {
+        let standard = repeated_source_over_alpha(0.15, DEFAULT_DRAPE_OPACITY, 1);
+        let high = repeated_source_over_alpha(0.15, DEFAULT_DRAPE_OPACITY, HIGH_VISIBILITY_PASSES);
+
+        assert!((standard - 0.1275).abs() < 1.0e-6);
+        assert!((high - 0.558_844).abs() < 1.0e-6);
+        assert!(high > standard * 4.0, "High must be plainly stronger");
+        assert!(high < 1.0, "the lift must not force faint pixels opaque");
+    }
+
+    #[test]
+    fn repeated_visibility_passes_preserve_transparent_source_pixels() {
+        for passes in [1, HIGH_VISIBILITY_PASSES] {
+            assert_eq!(repeated_source_over_alpha(0.0, 1.0, passes), 0.0);
+            assert_eq!(repeated_source_over_alpha(0.75, 0.0, passes), 0.0);
+        }
     }
 
     #[test]

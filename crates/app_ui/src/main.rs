@@ -3346,6 +3346,10 @@ struct ViewerApp {
     /// frames progressively; this is what keeps long downloads from feeling
     /// like dead clicks.
     archive_load_progress: Option<ArchiveLoadProgress>,
+    /// The in-flight explicit US archive load entered timeline-owned warning
+    /// mode. A zero-frame failure must return to current-warning refresh;
+    /// partial archive histories remain timeline-owned and sync normally.
+    archive_load_owns_warning_sync: bool,
     /// Archive click mode: true = loop ending at the chosen scan.
     archive_load_loop: bool,
     /// A plain Archive Load click should list first, then load the newest
@@ -8374,6 +8378,16 @@ fn safe_brand_link(value: &str) -> Option<&str> {
         .then_some(value)
 }
 
+fn sidebar_edge_toggle_visible(
+    visible_map_rect: Option<egui::Rect>,
+    map_side_probe: egui::Pos2,
+    handle_rect: egui::Rect,
+    floating_sounding_rect: Option<egui::Rect>,
+) -> bool {
+    visible_map_rect.is_some_and(|rect| rect.contains(map_side_probe))
+        && !floating_sounding_rect.is_some_and(|rect| rect.intersects(handle_rect))
+}
+
 impl ViewerApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
@@ -8874,6 +8888,7 @@ impl ViewerApp {
             archive_frame_count: restored_archive_frame_count,
             archive_loaded_range: None,
             archive_load_progress: None,
+            archive_load_owns_warning_sync: false,
             archive_load_loop: restored_archive_load_loop,
             archive_load_after_listing: false,
             archive_date_input: String::new(),
@@ -11255,6 +11270,45 @@ impl ViewerApp {
         self.live_hazard_auto_refresh = false;
     }
 
+    /// Enter timeline-owned warning mode for an explicit US archive load.
+    ///
+    /// The full archive browser bypasses the Unified Player actions that
+    /// normally arm warning sync. Cancel any live warning request here and do
+    /// not leave its current-only overlay painted while historical radar is
+    /// loading. An already-installed archive overlay is safe to retain until
+    /// the replacement window lands because its own timeline window continues
+    /// to gate every polygon.
+    fn arm_archive_timeline_warning_sync(&mut self) {
+        self.hazard_receiver = None;
+        self.pending_event_loop_hazard_window = None;
+        self.last_live_hazard_refresh = None;
+
+        if self.event_loop_hazard_window.is_none() {
+            let cleared_overlay = self.hazard_overlay.take().is_some();
+            self.selected_hazard_index = None;
+            self.hazard_map_popup = None;
+            self.unacknowledged_hazard_event_ids.clear();
+            if cleared_overlay {
+                self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
+            }
+        }
+
+        self.unified_player.auto_sync_warnings = true;
+        self.arm_unified_player_timeline_warning_sync();
+    }
+
+    /// Close the warning-sync ownership carried by an explicit archive load.
+    /// Any archive frames that landed remain timeline-owned even if a later
+    /// frame failed; a terminal outcome with no history returns to current
+    /// warnings because there is no archive timeline left to synchronize.
+    fn finish_archive_load_warning_sync(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.archive_load_owns_warning_sync)
+            && self.primary.history.is_empty()
+        {
+            self.release_timeline_warning_sync(ctx);
+        }
+    }
+
     fn sync_active_timeline_side_effects(&mut self, ctx: &egui::Context) {
         self.maybe_sync_satellite_map_to_timeline(ctx);
         self.maybe_sync_model_to_timeline(ctx);
@@ -13549,6 +13603,7 @@ impl ViewerApp {
                             self.pending_data_pack_scene = None;
                             self.live_refresh_skip_reason = Some(reason.clone());
                             self.status = format!("Current {} ({reason})", message.label);
+                            self.finish_archive_load_warning_sync(ctx);
                             ctx.request_repaint_after(Duration::from_secs(1));
                             return;
                         }
@@ -13590,6 +13645,7 @@ impl ViewerApp {
                                         format!("Load failed for {}: {err}", message.label);
                                 }
                             }
+                            self.finish_archive_load_warning_sync(ctx);
                             ctx.request_repaint();
                             return;
                         }
@@ -13611,6 +13667,7 @@ impl ViewerApp {
                     self.pending_debug_archive_case = None;
                     self.pending_data_pack_scene = None;
                     self.status = "L2 load worker disconnected".to_owned();
+                    self.finish_archive_load_warning_sync(ctx);
                     return;
                 }
             }
@@ -18161,6 +18218,8 @@ impl ViewerApp {
             self.status = "Wait for the current load to finish".to_owned();
             return false;
         }
+        self.archive_load_owns_warning_sync = true;
+        self.arm_archive_timeline_warning_sync();
         let requested = normalized_archive_frame_count(requested);
         self.archive_date_input = target_utc.format("%Y-%m-%d").to_string();
         self.archive_frame_count = requested;
@@ -19354,19 +19413,23 @@ impl ViewerApp {
         let total_frames = (end - start + 1).min(MAX_HISTORY_FRAME_LIMIT);
         let start = end + 1 - total_frames;
         let selected = selected.clamp(start, end);
-        if total_frames > self.primary.limits.frame_limit {
-            self.primary.limits.frame_limit = total_frames;
-        }
-        self.archive_loaded_range = Some((start, end));
         let objects: Vec<(usize, data_source::S3Object)> = volumes[start..=end]
             .iter()
             .enumerate()
             .map(|(offset, (object, _))| (start + offset, object.clone()))
             .collect();
-        let site_id = site.level2_id.clone();
-        if history_contains_other_site(&self.primary.history, &site_id) {
-            self.clear_frame_history();
+        self.archive_load_owns_warning_sync = true;
+        self.arm_archive_timeline_warning_sync();
+        if total_frames > self.primary.limits.frame_limit {
+            self.primary.limits.frame_limit = total_frames;
         }
+        self.archive_loaded_range = Some((start, end));
+        let site_id = site.level2_id.clone();
+        // A manual archive selection replaces the prior timeline even when it
+        // is the same site. Retaining a live frame made the mixed history look
+        // like live-follow playback, which immediately released historical
+        // warning sync and painted current warnings over the archive scan.
+        self.clear_frame_history();
         self.primary.live.enabled = false;
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
@@ -20153,6 +20216,7 @@ impl eframe::App for ViewerApp {
         if self.chrome_hidden && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.chrome_hidden = false;
         }
+        let mut sidebar_edge_x = None;
         if !self.chrome_hidden {
             egui::Panel::top("top_bar")
                 .exact_size(44.0)
@@ -20172,7 +20236,7 @@ impl eframe::App for ViewerApp {
             // written back through the debounced settings lane.
             let saved_width =
                 panel_kit::sidebar_width_from_settings(self.app_settings.sidebar_width_pt);
-            let sidebar_edge_x = if self.sidebar_hidden {
+            sidebar_edge_x = Some(if self.sidebar_hidden {
                 ctx.content_rect().right()
             } else {
                 let panel_response = egui::Panel::right("product_tilt_panel")
@@ -20188,8 +20252,7 @@ impl eframe::App for ViewerApp {
                     self.mark_app_settings_dirty();
                 }
                 panel_response.response.rect.left()
-            };
-            self.sidebar_edge_toggle(&ctx, sidebar_edge_x);
+            });
 
             egui::Panel::bottom("status_bar")
                 .exact_size(30.0)
@@ -20418,7 +20481,13 @@ impl eframe::App for ViewerApp {
         self.simradar_gate_inspector.show_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
 
-        self.sounding_window(&ctx);
+        let floating_sounding_rect = self.sounding_window(&ctx);
+        if let Some(sidebar_edge_x) = sidebar_edge_x {
+            // The workspace pass populated the visible-pane rectangles, and
+            // the floating Sounding now supplied its actual window rectangle.
+            // Draw only on exposed map chrome, never through sounding content.
+            self.sidebar_edge_toggle(&ctx, sidebar_edge_x, floating_sounding_rect);
+        }
 
         if self.media.capture_overlay_visible()
             && let Some(map_rect) = self.media.last_map_rect
@@ -22619,6 +22688,7 @@ impl ViewerApp {
         if !self.warning_source_supports_timeline()
             || !self.unified_player.auto_sync_warnings
             || !self.hazards_visible
+            || self.load_receiver.is_some()
             || self.hazard_receiver.is_some()
             || self.active_loop_timeline_is_live_follow()
         {
@@ -22627,7 +22697,7 @@ impl ViewerApp {
         let target = self.active_loop_timeline_target();
         let step_count = self.loop_timeline_step_count_for_target(target);
         let loop_window = self.loaded_loop_summary_time_window_for_target(target);
-        step_count > 1
+        step_count > 0
             && !self.timeline_warning_window_covers_window(loop_window.as_ref())
             && loop_window.is_some()
     }
@@ -22719,7 +22789,12 @@ impl ViewerApp {
     /// A narrow, always-reachable handle at the map/sidebar boundary. This
     /// collapses only the ordinary right sidebar; clean-screen mode remains a
     /// separate whole-chrome command.
-    fn sidebar_edge_toggle(&mut self, ctx: &egui::Context, edge_x: f32) {
+    fn sidebar_edge_toggle(
+        &mut self,
+        ctx: &egui::Context,
+        edge_x: f32,
+        floating_sounding_rect: Option<egui::Rect>,
+    ) {
         let content = ctx.content_rect();
         let button_size = egui::vec2(20.0, 48.0);
         let x = if self.sidebar_hidden {
@@ -22727,9 +22802,31 @@ impl ViewerApp {
         } else {
             edge_x - button_size.x * 0.5
         };
+        let handle_rect = egui::Rect::from_min_size(
+            egui::pos2(x, content.center().y - button_size.y * 0.5),
+            button_size,
+        );
+        let visible_map_rect = self
+            .workspace
+            .tree
+            .tiles
+            .find_pane(&dock::WorkspacePane::Map)
+            .and_then(|tile| self.workspace.tree.tiles.rect(tile));
+        // Probe one handle-width into the workspace. This tolerates panel
+        // frame/gap pixels while still distinguishing a right-hand Sounding
+        // (or any other viewer) from a map that actually meets the sidebar.
+        let map_side_probe = egui::pos2(edge_x - button_size.x, content.center().y);
+        if !sidebar_edge_toggle_visible(
+            visible_map_rect,
+            map_side_probe,
+            handle_rect,
+            floating_sounding_rect,
+        ) {
+            return;
+        }
         egui::Area::new(egui::Id::new("sidebar_edge_toggle"))
             .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(x, content.center().y - button_size.y * 0.5))
+            .fixed_pos(handle_rect.min)
             .show(ctx, |ui| {
                 let (label, hover) = if self.sidebar_hidden {
                     ("<", "Show the main sidebar")
@@ -24179,48 +24276,72 @@ impl ViewerApp {
             .iter()
             .map(|(key, label)| (label.clone(), key.clone()))
             .collect();
-        // Full-name product browser. The old 52 pt abbreviation chips made
-        // a large derived catalog nearly impossible to scan; category folds
-        // keep it compact while every visible row says what the product is.
         let mut clicked_product = None;
-        for group in ProductPickerGroup::ALL {
-            let products = product_buttons
+        if self.app_settings.classic_product_picker {
+            // Compatibility layout: the compact pre-v0.34.2 chip grid. This
+            // intentionally changes presentation only; product availability,
+            // lazy advanced computation, hotkeys, and switching are shared
+            // with the modern browser.
+            let chips = product_buttons
                 .iter()
-                .filter(|(product, _)| product_picker_group(product) == group)
-                .collect::<Vec<_>>();
-            if products.is_empty() {
-                continue;
-            }
-            let contains_selection = products
-                .iter()
-                .any(|(product, _)| product == editing_product);
-            egui::CollapsingHeader::new(format!("{} ({})", group.label(), products.len()))
-                .id_salt(("radar_product_group", group, editing_pane))
-                .default_open(group.default_open() || contains_selection)
-                .show(ui, |ui| {
-                    for (product, _) in products {
-                        let stable_label = product.label();
-                        let full_label = product_picker_long_label(product);
-                        let hotkey = hotkey_for_label.get(stable_label);
-                        let row_text = hotkey
-                            .map(|key| format!("{key}  {full_label}"))
-                            .unwrap_or_else(|| full_label.clone());
-                        let hover = hotkey
-                            .map(|key| format!("{full_label}\nHotkey: {key}"))
-                            .unwrap_or_else(|| full_label.clone());
-                        if panel_kit::select_row(
-                            ui,
-                            editing_product == product,
-                            true,
-                            &row_text,
-                            Some(&hover),
-                        )
-                        .clicked()
-                        {
-                            clicked_product = Some(product.clone());
-                        }
+                .map(|(product, _)| {
+                    let stable_label = product.label();
+                    let hotkey = hotkey_for_label.get(stable_label).map(String::as_str);
+                    panel_kit::Chip {
+                        label: product_display_label(product),
+                        hotkey,
+                        selected: editing_product == product,
+                        hover: hotkey.map(|key| format!("hotkey {key}")),
                     }
-                });
+                })
+                .collect::<Vec<_>>();
+            if let Some(index) = panel_kit::chip_grid(ui, &chips)
+                && let Some((product, _)) = product_buttons.get(index)
+            {
+                clicked_product = Some(product.clone());
+            }
+        } else {
+            // Full-name product browser. Category folds keep a large catalog
+            // scan-friendly while every visible row states what the product is.
+            for group in ProductPickerGroup::ALL {
+                let products = product_buttons
+                    .iter()
+                    .filter(|(product, _)| product_picker_group(product) == group)
+                    .collect::<Vec<_>>();
+                if products.is_empty() {
+                    continue;
+                }
+                let contains_selection = products
+                    .iter()
+                    .any(|(product, _)| product == editing_product);
+                egui::CollapsingHeader::new(format!("{} ({})", group.label(), products.len()))
+                    .id_salt(("radar_product_group", group, editing_pane))
+                    .default_open(group.default_open() || contains_selection)
+                    .show(ui, |ui| {
+                        for (product, _) in products {
+                            let stable_label = product.label();
+                            let full_label = product_picker_long_label(product);
+                            let hotkey = hotkey_for_label.get(stable_label);
+                            let row_text = hotkey
+                                .map(|key| format!("{key}  {full_label}"))
+                                .unwrap_or_else(|| full_label.clone());
+                            let hover = hotkey
+                                .map(|key| format!("{full_label}\nHotkey: {key}"))
+                                .unwrap_or_else(|| full_label.clone());
+                            if panel_kit::select_row(
+                                ui,
+                                editing_product == product,
+                                true,
+                                &row_text,
+                                Some(&hover),
+                            )
+                            .clicked()
+                            {
+                                clicked_product = Some(product.clone());
+                            }
+                        }
+                    });
+            }
         }
         if let Some(product) = clicked_product {
             if let Some(slot) = editing_pane {
@@ -31316,14 +31437,14 @@ impl ViewerApp {
                 .is_some_and(|ms| ms >= LOW_ZOOM_RENDER_BACKOFF_MIN_RENDER_MS)
     }
 
-    fn sounding_window(&mut self, ctx: &egui::Context) {
+    fn sounding_window(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
         // No has-a-sounding gate: the body placeholder explains how to
         // launch one, which beats a window that silently refuses to open.
         if !self.native_skewt_open || self.workspace.is_docked(dock::WorkspacePane::Sounding) {
-            return;
+            return None;
         }
         let mut open = self.native_skewt_open;
-        egui::Window::new("Sounding (native)")
+        let response = egui::Window::new("Sounding (native)")
             .open(&mut open)
             // Rusty Weather v0.4 gives the complete SPC board a desktop-width
             // canvas. Mirror that first-open geometry here; egui still clamps
@@ -31340,6 +31461,7 @@ impl ViewerApp {
         if !open {
             self.close_sounding_view();
         }
+        response.map(|response| response.response.rect)
     }
 
     fn sounding_header_controls(&self) -> sharppy_sounding::SoundingHeaderControls {
@@ -45483,6 +45605,48 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_edge_handle_only_appears_where_visible_map_meets_boundary() {
+        let map_left_of_sounding =
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(760.0, 900.0));
+        let boundary_probe = egui::pos2(1_180.0, 450.0);
+        let handle_rect =
+            egui::Rect::from_min_size(egui::pos2(1_180.0, 426.0), egui::vec2(20.0, 48.0));
+        assert!(
+            !sidebar_edge_toggle_visible(
+                Some(map_left_of_sounding),
+                boundary_probe,
+                handle_rect,
+                None,
+            ),
+            "a right-hand Sounding owns the boundary, so the map handle must not cover it"
+        );
+
+        let map_at_boundary =
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1_200.0, 900.0));
+        assert!(sidebar_edge_toggle_visible(
+            Some(map_at_boundary),
+            boundary_probe,
+            handle_rect,
+            None,
+        ));
+        assert!(
+            !sidebar_edge_toggle_visible(None, boundary_probe, handle_rect, None),
+            "the handle is map chrome and must stay hidden without a visible map"
+        );
+        let floating_sounding =
+            egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(1_190.0, 800.0));
+        assert!(
+            !sidebar_edge_toggle_visible(
+                Some(map_at_boundary),
+                boundary_probe,
+                handle_rect,
+                Some(floating_sounding),
+            ),
+            "the foreground handle must not paint through a floating Sounding window"
+        );
+    }
+
+    #[test]
     fn adaptive_startup_size_near_fills_a_16_9_monitor() {
         let size = adaptive_startup_inner_size(egui::vec2(1920.0, 1080.0)).unwrap();
         assert_eq!(size.y, 1080.0 * 0.85);
@@ -52325,6 +52489,173 @@ mod tests {
     }
 
     #[test]
+    fn archive_warning_arm_removes_current_only_overlay_while_radar_loads() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (_sender, receiver) = mpsc::channel::<AsyncHazardResult>();
+        app.hazard_receiver = Some(receiver);
+        app.selected_hazard_index = Some(0);
+        app.unacknowledged_hazard_event_ids
+            .insert("current-warning".to_owned());
+        app.hazards_visible = false;
+        app.hazards_active_only = true;
+        app.live_hazard_auto_refresh = true;
+        let generation = app.hazard_overlay_generation;
+
+        app.arm_archive_timeline_warning_sync();
+
+        assert!(app.hazard_receiver.is_none());
+        assert!(app.hazard_overlay.is_none());
+        assert!(app.selected_hazard_index.is_none());
+        assert!(app.unacknowledged_hazard_event_ids.is_empty());
+        assert_eq!(app.hazard_overlay_generation, generation.wrapping_add(1));
+        assert!(app.unified_player.auto_sync_warnings);
+        assert!(app.hazards_visible);
+        assert!(!app.hazards_active_only);
+        assert!(!app.live_hazard_auto_refresh);
+    }
+
+    #[test]
+    fn empty_failed_archive_load_restores_current_warning_refresh() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.archive_load_owns_warning_sync = true;
+        app.arm_archive_timeline_warning_sync();
+        let (sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.load_receiver = Some(receiver);
+        sender
+            .send(AsyncLoadResult {
+                label: "L2 KTLX archive".to_owned(),
+                update: AsyncLoadUpdate::Final(Err("simulated archive failure".to_owned())),
+            })
+            .expect("queue archive failure");
+
+        app.poll_async_load(&egui::Context::default());
+
+        assert!(!app.archive_load_owns_warning_sync);
+        assert!(app.primary.history.is_empty());
+        assert!(!app.unified_player.auto_sync_warnings);
+        assert!(app.hazards_active_only);
+        assert!(app.live_hazard_auto_refresh);
+        assert!(app.load_receiver.is_none());
+        assert!(app.status.contains("simulated archive failure"));
+    }
+
+    #[test]
+    fn empty_terminal_archive_outcomes_restore_current_warning_refresh() {
+        let cases = [
+            (
+                "unchanged",
+                AsyncLoadUpdate::Unchanged {
+                    timings: None,
+                    reason: "no new archive frame".to_owned(),
+                },
+            ),
+            (
+                "empty success",
+                AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+                    frames: Vec::new(),
+                    selected_index: 0,
+                })),
+            ),
+        ];
+
+        for (case, update) in cases {
+            let mut app = test_viewer_app_with_hazards(Vec::new());
+            app.archive_load_owns_warning_sync = true;
+            app.arm_archive_timeline_warning_sync();
+            let (sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+            app.load_receiver = Some(receiver);
+            sender
+                .send(AsyncLoadResult {
+                    label: "L2 KTLX archive".to_owned(),
+                    update,
+                })
+                .expect("queue terminal archive outcome");
+
+            app.poll_async_load(&egui::Context::default());
+
+            assert!(!app.archive_load_owns_warning_sync, "{case}");
+            assert!(app.primary.history.is_empty(), "{case}");
+            assert!(!app.unified_player.auto_sync_warnings, "{case}");
+            assert!(app.hazards_active_only, "{case}");
+            assert!(app.live_hazard_auto_refresh, "{case}");
+        }
+    }
+
+    #[test]
+    fn failed_archive_load_with_partial_history_keeps_timeline_warning_sync() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+        let volume = Arc::new(test_volume_with_site_time("KTLX", scan_time));
+        app.volume = Some(Arc::clone(&volume));
+        app.primary.history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("partial-archive-warning-sync"),
+            volume,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test archive".to_owned(),
+        });
+        app.archive_load_owns_warning_sync = true;
+        app.arm_archive_timeline_warning_sync();
+        let (sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.load_receiver = Some(receiver);
+        sender
+            .send(AsyncLoadResult {
+                label: "L2 KTLX archive".to_owned(),
+                update: AsyncLoadUpdate::Final(Err("later archive frame failed".to_owned())),
+            })
+            .expect("queue partial archive failure");
+
+        app.poll_async_load(&egui::Context::default());
+
+        assert!(!app.archive_load_owns_warning_sync);
+        assert_eq!(app.primary.history.len(), 1);
+        assert!(app.unified_player.auto_sync_warnings);
+        assert!(!app.hazards_active_only);
+        assert!(!app.live_hazard_auto_refresh);
+        assert!(app.hazard_receiver.is_none());
+    }
+
+    #[test]
+    fn single_archive_scan_requests_warnings_after_radar_load_finishes() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites.push(RadarSite::new("KTLX"));
+        app.app_settings.warning_source = "nws".to_owned();
+        app.unified_player.auto_sync_warnings = true;
+        app.hazards_visible = true;
+        let scan_time = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+        let volume = Arc::new(test_volume_with_site_time("KTLX", scan_time));
+        app.volume = Some(Arc::clone(&volume));
+        app.primary.history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("single-archive-warning-sync"),
+            volume,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test archive".to_owned(),
+        });
+
+        let (_sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.load_receiver = Some(receiver);
+        assert!(
+            !app.should_auto_sync_timeline_warnings(),
+            "warning fetch waits for the archive's final frame window"
+        );
+
+        app.load_receiver = None;
+        assert!(
+            app.should_auto_sync_timeline_warnings(),
+            "a one-scan archive still needs warnings valid at that scan"
+        );
+
+        app.primary.history[0].status = FrameStatus::LiveComplete;
+        assert!(
+            !app.should_auto_sync_timeline_warnings(),
+            "a live frame must continue using the current-warning path"
+        );
+    }
+
+    #[test]
     fn unified_player_archive_window_builds_event_loop_plan() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.sites.push(RadarSite::new("KTLX"));
@@ -52603,6 +52934,7 @@ mod tests {
     #[test]
     fn auto_warning_sync_predicate_tracks_visible_loaded_loop_coverage() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites.push(RadarSite::new("TEST"));
         app.unified_player.auto_sync_warnings = true;
         app.hazards_visible = true;
 
@@ -52634,6 +52966,7 @@ mod tests {
     #[test]
     fn auto_warning_sync_uses_focused_independent_pane_timeline() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites.push(RadarSite::new("KIND"));
         app.unified_player.auto_sync_warnings = true;
         app.hazards_visible = true;
         app.app_settings.independent_panels = true;
@@ -52688,6 +53021,7 @@ mod tests {
     #[test]
     fn auto_warning_sync_uses_low_sweep_only_timeline_steps() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites.push(RadarSite::new("TEST"));
         app.unified_player.auto_sync_warnings = true;
         app.hazards_visible = true;
         app.app_settings.loop_low_sweeps = true;
@@ -65613,6 +65947,7 @@ mod tests {
             archive_frame_count: 10,
             archive_loaded_range: None,
             archive_load_progress: None,
+            archive_load_owns_warning_sync: false,
             archive_load_loop: true,
             archive_load_after_listing: false,
             archive_date_input: String::new(),

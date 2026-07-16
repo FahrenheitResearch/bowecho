@@ -369,8 +369,9 @@ fn getting_started(ui: &mut egui::Ui) {
     action(
         ui,
         "Products browser",
-        "— a categorized, full-name list of every currently available radar product. Base and \
-         velocity products stay compact; More products reveals volume, dual-pol, precipitation, \
+        "— every currently available radar product. The default Modern layout groups full names \
+         by category; Classic restores the compact pre-v0.34.2 chip grid. Choose either under \
+         Settings > Radar products. More products reveals volume, dual-pol, precipitation, \
          texture, quality, and simulation diagnostics. Advanced products compute only when \
          selected. Assigned number-key hotkeys appear before their product; \u{2190}/\u{2192} also \
          step through visible products.",
@@ -500,8 +501,9 @@ fn products(ui: &mut egui::Ui) {
     subhead(ui, "ADVANCED ON-DEMAND SWEEP PRODUCTS");
     para(
         ui,
-        "The Products section uses full names grouped by base moments, velocity, volume/hail, \
-         dual-pol, precipitation, texture/quality, and simulation fields. Turn on More products \
+        "The Modern Products layout uses full names grouped by base moments, velocity, \
+         volume/hail, dual-pol, precipitation, texture/quality, and simulation fields. Choose \
+         Classic under Settings > Radar products for the compact chip grid. Turn on More products \
          to expose the extended catalog. An advanced per-tilt product computes lazily when you \
          select it; KDP remains automatic when its source metadata are trustworthy.",
     );
@@ -742,8 +744,8 @@ fn layers(ui: &mut egui::Ui) {
     );
     action(
         ui,
-        "WoFS Hi",
-        "— turns on High visibility for the WoFS drape. It repeats the published low-alpha \
+        "WoFS Std / High",
+        "— selects standard or High visibility for the WoFS drape. High repeats the published low-alpha \
          texture without recoloring or moving it; transparent background pixels stay \
          transparent, and the opacity slider remains available. The WoFS state dot says \
          ready only when the exact base frame and its validated georeference are present; \
@@ -996,6 +998,16 @@ fn model_data(ui: &mut egui::Ui) {
             "a large board. Restore panel returns that table to its exact native renderer; Reset all ",
             "to default removes every override.",
         ),
+    );
+    action(
+        ui,
+        "MPL — Maximum Parcel Level",
+        "— the greatest height an ascending parcel can reach after crossing its equilibrium level, using its remaining upward kinetic energy before buoyancy finally stops it. BowEcho reports the canonical SHARPpy SFC, ML, forecast-surface, and MU parcel MPLs in metres AGL; unavailable or non-finite results display as --.",
+    );
+    action(
+        ui,
+        "Streamwiseness",
+        "— the squared fraction of horizontal vorticity aligned with the storm-relative wind: (streamwise vorticity / total horizontal vorticity)² × 100. The inset keeps the streamwise-vorticity sign for cyclonic/anticyclonic shading; the displayed magnitude remains a percentage.",
     );
     action(
         ui,
@@ -2705,8 +2717,11 @@ fn unified_player(ui: &mut egui::Ui) {
     para(
         ui,
         "Warning sync, SPC reports, mPING, GLM lightning, satellite frames, and model fields \
-         can follow the player time. Archive warning sync is explicit so live warning mode \
-         stays live until you ask for historical warnings.",
+         can follow the player time. Loading an ordinary US radar archive automatically swaps \
+         current NWS polygons for warnings valid at the displayed scan time, including a single \
+         archived scan; returning to live radar restores current-warning refresh. Historical \
+         coverage depends on the NWS public text-product archive (typically about seven days and \
+         supported warning products only). MeteoAlarm and custom warning feeds remain current-only.",
     );
 
     subhead(ui, "CAMERA FOLLOW");

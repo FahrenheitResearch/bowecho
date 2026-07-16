@@ -1135,6 +1135,85 @@ impl ViewerApp {
         panel_kit::status_block(ui, &path_line, None);
     }
 
+    /// Radar-product browser preferences. Kept in its own Settings section so
+    /// presentation choices can grow without crowding the operational Radar
+    /// panel or changing which products are scientifically available.
+    fn radar_product_settings_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        panel_kit::row(ui, "Browser layout", |ui| {
+            let selected = if self.app_settings.classic_product_picker {
+                "Classic compact"
+            } else {
+                "Modern categorized"
+            };
+            let mut picked = None;
+            egui::ComboBox::from_id_salt("radar_product_browser_layout")
+                .selected_text(selected)
+                .width(158.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(
+                            !self.app_settings.classic_product_picker,
+                            "Modern categorized",
+                        )
+                        .on_hover_text("Full product names grouped into collapsible families")
+                        .clicked()
+                    {
+                        picked = Some(false);
+                    }
+                    if ui
+                        .selectable_label(
+                            self.app_settings.classic_product_picker,
+                            "Classic compact",
+                        )
+                        .on_hover_text("Pre-v0.34.2 abbreviation chips in a wrapping grid")
+                        .clicked()
+                    {
+                        picked = Some(true);
+                    }
+                });
+            if let Some(classic) = picked
+                && classic != self.app_settings.classic_product_picker
+            {
+                self.app_settings.classic_product_picker = classic;
+                self.mark_app_settings_dirty();
+                ctx.request_repaint();
+            }
+        });
+        ui.weak(
+            "Layout changes presentation only; product availability, hotkeys, lazy computation, and pane selections remain identical.",
+        );
+
+        let mut show_more = self.app_settings.show_derived_products;
+        if ui
+            .checkbox(&mut show_more, "Show extended products")
+            .on_hover_text(
+                "Include volume, motion-analysis, dual-pol, precipitation, texture, and quality products in the selected browser layout",
+            )
+            .changed()
+        {
+            self.app_settings.show_derived_products = show_more;
+            self.sanitize_selection();
+            self.clear_texture();
+            self.mark_app_settings_dirty();
+            ctx.request_repaint();
+        }
+
+        let mut remember_tilts = self.app_settings.remember_product_tilts;
+        if ui
+            .checkbox(&mut remember_tilts, "Restore last tilt per product")
+            .on_hover_text(
+                "Remember separate selected tilts for REF, VEL, CC, ZDR, and other products",
+            )
+            .changed()
+        {
+            self.app_settings.remember_product_tilts = remember_tilts;
+            if !remember_tilts {
+                self.product_cut_memory.clear();
+            }
+            self.mark_app_settings_dirty();
+        }
+    }
+
     /// Radar raster quality (Settings ▸ Display): the supersample resolution
     /// the frame you're viewing is rasterized at, plus the power-user whole-loop
     /// toggle and its memory estimate. Standard + toggle-off is bit-identical to
@@ -1847,6 +1926,15 @@ impl ViewerApp {
         self.remembered_section(ui, "settings_display", "Display", true, |app, ui| {
             app.display_settings_section(ui, ctx);
         });
+        self.remembered_section(
+            ui,
+            "settings_radar_products",
+            "Radar products",
+            false,
+            |app, ui| {
+                app.radar_product_settings_section(ui, ctx);
+            },
+        );
         self.remembered_section(
             ui,
             "settings_brand",

@@ -55,24 +55,28 @@ fn specs() -> &'static [BuiltInSpec] {
         spec!("parcel.sfc.li", "SFC LI", "Parcels", "°C"),
         spec!("parcel.sfc.lfc", "SFC LFC", "Parcels", "m AGL"),
         spec!("parcel.sfc.el", "SFC EL", "Parcels", "m AGL"),
+        spec!("parcel.sfc.mpl", "SFC MPL", "Parcels", "m AGL"),
         spec!("parcel.ml.cape", "ML CAPE", "Parcels", "J/kg"),
         spec!("parcel.ml.cinh", "ML CINH", "Parcels", "J/kg"),
         spec!("parcel.ml.lcl", "ML LCL", "Parcels", "m AGL"),
         spec!("parcel.ml.li", "ML LI", "Parcels", "°C"),
         spec!("parcel.ml.lfc", "ML LFC", "Parcels", "m AGL"),
         spec!("parcel.ml.el", "ML EL", "Parcels", "m AGL"),
+        spec!("parcel.ml.mpl", "ML MPL", "Parcels", "m AGL"),
         spec!("parcel.fcst.cape", "FCST CAPE", "Parcels", "J/kg"),
         spec!("parcel.fcst.cinh", "FCST CINH", "Parcels", "J/kg"),
         spec!("parcel.fcst.lcl", "FCST LCL", "Parcels", "m AGL"),
         spec!("parcel.fcst.li", "FCST LI", "Parcels", "°C"),
         spec!("parcel.fcst.lfc", "FCST LFC", "Parcels", "m AGL"),
         spec!("parcel.fcst.el", "FCST EL", "Parcels", "m AGL"),
+        spec!("parcel.fcst.mpl", "FCST MPL", "Parcels", "m AGL"),
         spec!("parcel.mu.cape", "MU CAPE", "Parcels", "J/kg"),
         spec!("parcel.mu.cinh", "MU CINH", "Parcels", "J/kg"),
         spec!("parcel.mu.lcl", "MU LCL", "Parcels", "m AGL"),
         spec!("parcel.mu.li", "MU LI", "Parcels", "°C"),
         spec!("parcel.mu.lfc", "MU LFC", "Parcels", "m AGL"),
         spec!("parcel.mu.el", "MU EL", "Parcels", "m AGL"),
+        spec!("parcel.mu.mpl", "MU MPL", "Parcels", "m AGL"),
         spec!("thermo.pwat", "PWAT", "Thermodynamics", "in"),
         spec!("thermo.mean_mixr", "MeanW", "Thermodynamics", "g/kg"),
         spec!("thermo.low_rh", "LowRH", "Thermodynamics", "%"),
@@ -319,12 +323,17 @@ pub(super) fn catalog(
     let mut catalog = specs()
         .iter()
         .map(|spec| {
+            let description = if spec.id.ends_with(".mpl") {
+                "Maximum Parcel Level: height AGL where the selected parcel's remaining positive-buoyancy energy is exhausted above its equilibrium level."
+            } else {
+                "Native SHARP sounding diagnostic; recalculated from the displayed profile."
+            };
             SoundingDiagnosticOption::built_in(
                 spec.id,
                 spec.label,
                 spec.category,
                 (!spec.unit.is_empty()).then_some(spec.unit),
-                "Native SHARP sounding diagnostic; recalculated from the displayed profile.",
+                description,
             )
         })
         .collect::<Vec<_>>();
@@ -375,24 +384,28 @@ pub(super) fn default_config() -> SoundingTableConfig {
                         "parcel.sfc.li",
                         "parcel.sfc.lfc",
                         "parcel.sfc.el",
+                        "parcel.sfc.mpl",
                         "parcel.ml.cape",
                         "parcel.ml.cinh",
                         "parcel.ml.lcl",
                         "parcel.ml.li",
                         "parcel.ml.lfc",
                         "parcel.ml.el",
+                        "parcel.ml.mpl",
                         "parcel.fcst.cape",
                         "parcel.fcst.cinh",
                         "parcel.fcst.lcl",
                         "parcel.fcst.li",
                         "parcel.fcst.lfc",
                         "parcel.fcst.el",
+                        "parcel.fcst.mpl",
                         "parcel.mu.cape",
                         "parcel.mu.cinh",
                         "parcel.mu.lcl",
                         "parcel.mu.li",
                         "parcel.mu.lfc",
                         "parcel.mu.el",
+                        "parcel.mu.mpl",
                     ],
                 ),
                 section(
@@ -713,6 +726,7 @@ fn resolve_parcel(analysis: &SharppyAnalysis, id: &str) -> Option<Resolved> {
         ),
         "lfc" => (i0(parcel.lfchght), "m AGL", None),
         "el" => (i0(parcel.elhght), "m AGL", None),
+        "mpl" => (i0(parcel.mplhght), "m AGL", None),
         _ => return None,
     };
     Some(Resolved {
@@ -1204,6 +1218,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn mu_mpl_is_selectable_and_uses_the_existing_parcel_height() {
+        let option = catalog(None)
+            .into_iter()
+            .find(|option| option.diagnostic == SoundingDiagnosticRef::built_in("parcel.mu.mpl"))
+            .expect("MU MPL appears in the custom-table picker");
+        assert_eq!(option.label, "MU MPL");
+        assert_eq!(option.unit.as_deref(), Some("m AGL"));
+        assert!(option.description.contains("Maximum Parcel Level"));
+
+        let mut analysis = sample_analysis();
+        analysis.prof.mupcl.mplhght = 12_345.6;
+        let resolved = resolve_builtin(&analysis, "parcel.mu.mpl").expect("MPL resolver");
+        assert_eq!(resolved.value, "12346");
+        assert_eq!(resolved.unit, "m AGL");
+
+        analysis.prof.mupcl.mplhght = f64::NAN;
+        assert_eq!(
+            resolve_builtin(&analysis, "parcel.mu.mpl")
+                .expect("non-finite MPL remains a known diagnostic")
+                .value,
+            "--"
+        );
     }
 
     #[test]
