@@ -8267,16 +8267,18 @@ mod tests {
             "reported planar refined value",
         );
         assert_eq!(magnitude.to_bits(), coarse_value.to_bits());
+        // These two diagnostics subtract nearly equal quadrature estimates;
+        // that cancellation magnifies the same <=32-ULP operand variation.
         assert_f64_bits_within_ulps(
             absolute_error.to_bits(),
             0.000_001_845_424_241_615_03_f64.to_bits(),
-            32,
+            1_024,
             "reported planar absolute error",
         );
         assert_f64_bits_within_ulps(
             relative_error.to_bits(),
             0.005_405_390_260_131_134_f64.to_bits(),
-            32,
+            1_024,
             "reported planar relative error",
         );
 
