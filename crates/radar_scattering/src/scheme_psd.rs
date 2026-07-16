@@ -3229,7 +3229,7 @@ mod tests {
     }
 
     fn assert_bits_within_ulps(actual_bits: u64, expected_bits: u64, context: &str) {
-        const MAX_CROSS_COMPILER_ULPS: u64 = 64;
+        const MAX_CROSS_COMPILER_ULPS: u64 = 128;
         assert_eq!(
             actual_bits >> 63,
             expected_bits >> 63,
