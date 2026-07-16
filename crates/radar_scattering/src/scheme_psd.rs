@@ -3228,6 +3228,22 @@ mod tests {
         );
     }
 
+    fn assert_bits_within_ulps(actual_bits: u64, expected_bits: u64, context: &str) {
+        const MAX_CROSS_COMPILER_ULPS: u64 = 16;
+        assert_eq!(
+            actual_bits >> 63,
+            expected_bits >> 63,
+            "{context}: floating-point sign changed"
+        );
+        let ulps = actual_bits.abs_diff(expected_bits);
+        assert!(
+            ulps <= MAX_CROSS_COMPILER_ULPS,
+            "{context}: {ulps} ULPs exceeds {MAX_CROSS_COMPILER_ULPS} (actual {}, expected {})",
+            f64::from_bits(actual_bits),
+            f64::from_bits(expected_bits)
+        );
+    }
+
     fn input_from_scales(
         category: IshmaelIceCategory,
         a_scale_m: f64,
@@ -3995,24 +4011,40 @@ mod tests {
         assert!(!audit.source_axis_floor_applied);
         assert!(!audit.source_var_check_small_ice_applied);
         assert!(!audit.source_var_check_large_ice_applied);
-        assert_eq!(checked.a_scale_m().to_bits(), 0x3f12_abe1_2cdc_d7cc);
-        assert_eq!(checked.c_at_a_scale_m().to_bits(), 0x3ef6_312b_b658_2af7);
-        assert_eq!(
+        assert_bits_within_ulps(
+            checked.a_scale_m().to_bits(),
+            0x3f12_abe1_2cdc_d7cc,
+            "cold aggregate a scale",
+        );
+        assert_bits_within_ulps(
+            checked.c_at_a_scale_m().to_bits(),
+            0x3ef6_312b_b658_2af7,
+            "cold aggregate c scale",
+        );
+        assert_bits_within_ulps(
             checked.aspect_power_delta().to_bits(),
-            0x3fea_167c_939e_a245
+            0x3fea_167c_939e_a245,
+            "cold aggregate aspect power",
         );
-        assert_eq!(checked.bulk_density_kg_m3().to_bits(), 50.0_f64.to_bits());
-        assert_eq!(
+        assert_bits_within_ulps(
+            checked.bulk_density_kg_m3().to_bits(),
+            50.0_f64.to_bits(),
+            "cold aggregate bulk density",
+        );
+        assert_bits_within_ulps(
             audit.qvoli_source_projection_relative_change.to_bits(),
-            0xbfc4_ad7e_02a2_1f1c
+            0xbfc4_ad7e_02a2_1f1c,
+            "cold aggregate qvoli projection",
         );
-        assert_eq!(
+        assert_bits_within_ulps(
             audit.qaoli_source_projection_relative_change.to_bits(),
-            0x3fe6_c292_f813_1077
+            0x3fe6_c292_f813_1077,
+            "cold aggregate qaoli projection",
         );
-        assert_eq!(
+        assert_bits_within_ulps(
             checked.mean_equivolume_diameter_sixth_m6().to_bits(),
-            0x3bd7_1749_cab5_af82
+            0x3bd7_1749_cab5_af82,
+            "cold aggregate sixth moment",
         );
         assert_eq!(
             checked.input().qice_kgkg().to_bits(),
@@ -4532,22 +4564,40 @@ mod tests {
         let direct = prepared
             .finish(|_, _, node| Ok::<_, Infallible>(synthetic_per_particle(node)))
             .unwrap();
-        assert_eq!(
-            direct.additive().components().map(f64::to_bits),
-            EXPECTED_COMPONENT_BITS
-        );
+        for (index, (actual_bits, expected_bits)) in direct
+            .additive()
+            .components()
+            .map(f64::to_bits)
+            .into_iter()
+            .zip(EXPECTED_COMPONENT_BITS)
+            .enumerate()
+        {
+            assert_bits_within_ulps(
+                actual_bits,
+                expected_bits,
+                &format!("frozen additive component {index}"),
+            );
+        }
         let audit = direct.audit();
-        assert_eq!(
-            [
-                audit.number_closure_relative_error.to_bits(),
-                audit.mass_closure_relative_error.to_bits(),
-                audit.d6_closure_relative_error.to_bits(),
-            ],
-            EXPECTED_CLOSURE_BITS
-        );
-        assert_eq!(
+        for (index, (actual_bits, expected_bits)) in [
+            audit.number_closure_relative_error.to_bits(),
+            audit.mass_closure_relative_error.to_bits(),
+            audit.d6_closure_relative_error.to_bits(),
+        ]
+        .into_iter()
+        .zip(EXPECTED_CLOSURE_BITS)
+        .enumerate()
+        {
+            assert_bits_within_ulps(
+                actual_bits,
+                expected_bits,
+                &format!("frozen closure component {index}"),
+            );
+        }
+        assert_bits_within_ulps(
             audit.maximum_additive_convergence_error.to_bits(),
-            EXPECTED_CONVERGENCE_BITS
+            EXPECTED_CONVERGENCE_BITS,
+            "frozen maximum additive convergence error",
         );
         assert_eq!(audit.maximum_additive_convergence_component, 4);
 
