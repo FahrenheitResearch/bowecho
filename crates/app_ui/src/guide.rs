@@ -1480,7 +1480,7 @@ fn wrf(ui: &mut egui::Ui) {
     para(
         ui,
         "The optional asset is bowecho-property-tmatrix-sband-pytmatrix-0.3.3-research-v1.zip \
-         from the BowEcho v0.34.1 release (191,400,602 bytes; SHA-256 \
+         from release tag v0.34.1 (191,400,602 bytes; SHA-256 \
          80b3a2c65ead59c0a951d491e966694e80bb0c49eeb1d3b1fc532bcadbcf507e). BowEcho \
          streams it into the displayed bowecho-simradar/tmatrix-packs cache, validates the ZIP \
          and every exact member, atomically installs the extracted files, then deletes the ZIP. \
