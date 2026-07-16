@@ -46681,7 +46681,7 @@ mod tests {
 
     /// v0.29 Phase 3: the ranking runs over the REAL union catalog
     /// (`sites_near`), so the fixture is the compiled-in world itself —
-    /// `self.sites` no longer feeds it and `BeamTarget::Conus(usize)` is
+    /// the raw US catalog no longer feeds it and `BeamTarget::Conus(usize)` is
     /// gone. Next to Oklahoma City the nearest 88D (KTLX) ranks first by
     /// beam height and the colocated TOKC TDWR never competes.
     #[test]
