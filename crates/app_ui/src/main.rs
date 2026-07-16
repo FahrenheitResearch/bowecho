@@ -1273,6 +1273,7 @@ pub(crate) use ui_theme::{
     LAYER_ROW_SLIDER_WIDTH, READOUT_FONT_SIZE, ROW_SPACING_X, SIDEBAR_DEFAULT_WIDTH,
     SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, accent_color, live_color, subhead_color,
 };
+#[allow(dead_code)]
 const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] =
     &["tornado", "severe thunderstorm", "flash flood", "flood"];
 const COMMUNITY_FEED_SITE_NAME_SUFFIX: &str = " (research feed)";
@@ -1645,6 +1646,7 @@ fn derivation_config_for_volume(
     product_engine::DerivationConfig::with_products(radar_band::resolve(volume).band, products)
 }
 
+#[allow(dead_code)]
 fn derive_advanced_products_for_volume_cut_arc(
     volume: &Arc<RadarVolume>,
     cut_index: usize,
@@ -1728,6 +1730,7 @@ fn derive_advanced_products_for_volume_cut_arc_with_config(
     })
 }
 
+#[allow(dead_code)]
 fn advanced_derivation_status(
     inserted: usize,
     changed: bool,
@@ -9632,6 +9635,7 @@ impl ViewerApp {
             .is_some()
     }
 
+    #[allow(dead_code)]
     fn derive_advanced_products_for_products_panel(
         &mut self,
         editing_pane: Option<usize>,
@@ -9647,6 +9651,7 @@ impl ViewerApp {
         }
     }
 
+    #[allow(dead_code)]
     fn derive_advanced_products_for_primary(&mut self, ctx: &egui::Context) {
         let Some(active) = self.volume.clone() else {
             self.status = "Load radar data before deriving advanced products".to_owned();
@@ -9677,6 +9682,7 @@ impl ViewerApp {
         }
     }
 
+    #[allow(dead_code)]
     fn derive_advanced_products_for_pane(&mut self, slot: usize, ctx: &egui::Context) {
         let Some(pane) = self.extra_panes.get_mut(slot) else {
             return;
@@ -9716,6 +9722,7 @@ impl ViewerApp {
         }
     }
 
+    #[allow(dead_code)]
     fn finish_advanced_derivation(
         &mut self,
         inserted: usize,
@@ -40691,6 +40698,7 @@ fn gate_center_range_km(grid: &MomentGrid, gate: usize) -> f32 {
     (first_gate_m + spacing_m * gate as f32) / 1000.0
 }
 
+#[allow(dead_code)]
 fn default_hidden_hazard_families() -> BTreeSet<String> {
     HAZARD_FILTER_FAMILIES
         .iter()

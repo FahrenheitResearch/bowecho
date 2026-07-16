@@ -52,18 +52,17 @@ impl SoundingTablePanelId {
 /// added without invalidating old binaries, and Formula Lab recipes can use a
 /// content-derived stable ID. Empty/unknown IDs remain representable and are
 /// surfaced as unavailable by the renderer/editor instead of being dropped.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub(crate) enum SoundingDiagnosticRef {
-    BuiltIn { id: String },
-    Formula { id: String },
+    BuiltIn {
+        id: String,
+    },
+    Formula {
+        id: String,
+    },
+    #[default]
     Blank,
-}
-
-impl Default for SoundingDiagnosticRef {
-    fn default() -> Self {
-        Self::Blank
-    }
 }
 
 impl SoundingDiagnosticRef {
@@ -520,6 +519,7 @@ impl SoundingTableEditor {
         changed
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn editor_body(
         ui: &mut egui::Ui,
         selected_panel: &mut SoundingTablePanelId,

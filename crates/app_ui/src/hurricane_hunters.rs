@@ -716,7 +716,7 @@ impl crate::ViewerApp {
             crate::push_solid_open_line(
                 &mut shapes,
                 &path,
-                egui::Stroke::new(2.0, color.gamma_multiply(0.82)),
+                egui::Stroke::new(2.0_f32, color.gamma_multiply(0.82)),
                 rect,
                 jump_px,
             );
@@ -754,7 +754,7 @@ impl crate::ViewerApp {
                 continue;
             }
             painter.circle_filled(pos, 8.0, egui::Color32::BLACK.gamma_multiply(0.78));
-            painter.circle_stroke(pos, 8.0, egui::Stroke::new(1.8, color));
+            painter.circle_stroke(pos, 8.0, egui::Stroke::new(1.8_f32, color));
             crate::draw_halo_text(
                 painter,
                 pos,

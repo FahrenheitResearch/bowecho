@@ -2317,14 +2317,14 @@ fn custom_curve_editor(
     painter.rect_stroke(
         plot,
         3.0,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
         egui::StrokeKind::Inside,
     );
     for step in 0..=4 {
         let fraction = step as f32 / 4.0;
         let x = egui::lerp(plot.left()..=plot.right(), fraction);
         let y = egui::lerp(plot.bottom()..=plot.top(), fraction);
-        let grid = egui::Stroke::new(0.5, ui.visuals().faint_bg_color);
+        let grid = egui::Stroke::new(0.5_f32, ui.visuals().faint_bg_color);
         painter.line_segment(
             [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
             grid,
@@ -2356,7 +2356,7 @@ fn custom_curve_editor(
         .collect::<Vec<_>>();
     painter.add(egui::Shape::line(
         line,
-        egui::Stroke::new(2.0, egui::Color32::from_rgb(55, 210, 205)),
+        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(55, 210, 205)),
     ));
 
     let base_id = ui.make_persistent_id(id_salt);

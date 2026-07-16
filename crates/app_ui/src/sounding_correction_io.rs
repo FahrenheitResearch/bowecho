@@ -281,14 +281,13 @@ impl SoundingCorrectionBundle {
                 "source profile fingerprint is not a SHA-256 hex digest".to_owned(),
             ));
         }
-        if let Some(application) = &self.application {
-            if !is_sha256_hex(&application.recipe_sha256)
-                || !is_sha256_hex(&application.corrected_profile_sha256)
-            {
-                return Err(CorrectionIoError::InvalidBundle(
-                    "application provenance contains an invalid SHA-256 digest".to_owned(),
-                ));
-            }
+        if let Some(application) = &self.application
+            && (!is_sha256_hex(&application.recipe_sha256)
+                || !is_sha256_hex(&application.corrected_profile_sha256))
+        {
+            return Err(CorrectionIoError::InvalidBundle(
+                "application provenance contains an invalid SHA-256 digest".to_owned(),
+            ));
         }
         Ok(())
     }

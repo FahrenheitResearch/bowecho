@@ -1246,7 +1246,7 @@ impl ViewerApp {
                 egui::Order::Foreground,
                 egui::Id::new("hazard_map_popup"),
             ));
-            painter.line_segment([anchor, edge], egui::Stroke::new(2.0, color));
+            painter.line_segment([anchor, edge], egui::Stroke::new(2.0_f32, color));
             painter.circle_filled(anchor, 3.0, color);
         }
 

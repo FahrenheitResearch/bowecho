@@ -373,7 +373,7 @@ fn latest_posted_minute(
     let mut low = 0usize;
     let mut high = minutes.len() - 1;
     while low < high {
-        let middle = (low + high + 1) / 2;
+        let middle = (low + high).div_ceil(2);
         if exists(&image_url(run, init, product, minutes[middle]))? {
             low = middle;
         } else {

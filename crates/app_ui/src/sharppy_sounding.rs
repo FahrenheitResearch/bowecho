@@ -498,12 +498,14 @@ impl SharppySoundingPanel {
         self.correction_result = result;
     }
 
+    #[allow(dead_code)]
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.ui_with_host(ui, false, &SoundingHeaderControls::default());
     }
 
     /// Render responsively inside a dock pane. Floating and docked hosts both
     /// size the complete board from their current content rectangle.
+    #[allow(dead_code)]
     pub fn ui_docked(&mut self, ui: &mut egui::Ui) {
         self.ui_with_host(ui, true, &SoundingHeaderControls::default());
     }
@@ -1424,9 +1426,11 @@ mod tests {
         assert!(second.apply_view_state_json(&stale));
 
         let ctx = egui::Context::default();
-        let mut edited = sharppyrs::SoundingLayout::default();
-        edited.top_height_fraction = 0.58;
-        edited.bottom_column_fractions = [0.30, 0.20, 0.15, 0.15, 0.20];
+        let edited = sharppyrs::SoundingLayout {
+            top_height_fraction: 0.58,
+            bottom_column_fractions: [0.30, 0.20, 0.15, 0.15, 0.20],
+            ..Default::default()
+        };
         sharppyrs::store_layout(&ctx, SharppySoundingPanel::layout_memory_id(), &edited);
 
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| second.ui_docked(ui));

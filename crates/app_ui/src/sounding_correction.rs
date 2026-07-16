@@ -127,8 +127,9 @@ impl BlendControlPoint {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) enum BlendShape {
+    #[default]
     Cosine,
     Linear,
     /// Unit weight through the lower part of the domain, with a half-cosine
@@ -141,12 +142,6 @@ pub(crate) enum BlendShape {
     Custom {
         points: Vec<BlendControlPoint>,
     },
-}
-
-impl Default for BlendShape {
-    fn default() -> Self {
-        Self::Cosine
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -946,7 +941,7 @@ fn moisture_target_to_specific_humidity(target: MoistureTarget, pressure_hpa: f6
             specific_humidity_g_kg / 1_000.0
         }
     };
-    (q.is_finite() && q >= 0.0 && q < 1.0).then_some(q)
+    (q.is_finite() && (0.0..1.0).contains(&q)).then_some(q)
 }
 
 fn specific_humidity_to_moisture_target(
@@ -1065,11 +1060,13 @@ fn mixing_ratio_g_kg_to_specific_humidity(mixing_ratio_g_kg: f64) -> Option<f64>
     }
     let mixing_ratio = mixing_ratio_g_kg / 1_000.0;
     let specific_humidity = mixing_ratio / (1.0 + mixing_ratio);
-    (specific_humidity >= 0.0 && specific_humidity < 1.0).then_some(specific_humidity)
+    (0.0..1.0)
+        .contains(&specific_humidity)
+        .then_some(specific_humidity)
 }
 
 fn specific_humidity_to_mixing_ratio_g_kg(specific_humidity: f64) -> Option<f64> {
-    if !specific_humidity.is_finite() || specific_humidity < 0.0 || specific_humidity >= 1.0 {
+    if !specific_humidity.is_finite() || !(0.0..1.0).contains(&specific_humidity) {
         return None;
     }
     Some(specific_humidity / (1.0 - specific_humidity) * 1_000.0)
@@ -1178,9 +1175,8 @@ fn reconstruct_dewpoint(
     specific_humidity: &[f64],
     issues: &mut Vec<QcIssue>,
 ) {
-    for index in 0..column.len() {
-        match dewpoint_from_specific_humidity(column.pressure_hpa[index], specific_humidity[index])
-        {
+    for (index, &specific_humidity) in specific_humidity.iter().enumerate().take(column.len()) {
+        match dewpoint_from_specific_humidity(column.pressure_hpa[index], specific_humidity) {
             Some(dewpoint) => column.dewpoint_c[index] = dewpoint,
             None => {
                 column.dewpoint_c[index] = f64::NAN;
@@ -1190,7 +1186,7 @@ fn reconstruct_dewpoint(
                     index,
                     format!(
                         "Specific humidity at level {index} is not representable (q={})",
-                        specific_humidity[index]
+                        specific_humidity
                     ),
                 ));
             }
@@ -1489,7 +1485,7 @@ fn run_quality_control(
         return;
     }
 
-    for index in 0..n {
+    for (index, &q) in specific_humidity.iter().enumerate().take(n) {
         let structural_values = [
             corrected.pressure_hpa[index],
             corrected.height_m_msl[index],
@@ -1506,8 +1502,7 @@ fn run_quality_control(
                 format!("Corrected sounding has a non-finite value at level {index}"),
             ));
         }
-        let q = specific_humidity[index];
-        if !q.is_finite() || q < 0.0 || q >= 1.0 {
+        if !q.is_finite() || !(0.0..1.0).contains(&q) {
             if !issues.iter().any(|issue| {
                 issue.kind == QcIssueKind::InvalidMoisture && issue.level_index == Some(index)
             }) {
