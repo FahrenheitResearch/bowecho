@@ -6196,6 +6196,32 @@ mod tests {
         AdditiveScattering::from_components(values).unwrap()
     }
 
+    /// Keep captured floating-point regressions strict without requiring
+    /// bit-identical instruction selection across supported compilers and
+    /// architectures. Production closure/error bounds remain independently
+    /// asserted by the callers of this helper.
+    fn assert_f64_bits_within_ulps(
+        actual_bits: u64,
+        expected_bits: u64,
+        max_ulps: u64,
+        context: &str,
+    ) {
+        assert_eq!(
+            actual_bits >> 63,
+            expected_bits >> 63,
+            "{context}: sign changed (actual {}, expected {})",
+            f64::from_bits(actual_bits),
+            f64::from_bits(expected_bits)
+        );
+        let ulps = actual_bits.abs_diff(expected_bits);
+        assert!(
+            ulps <= max_ulps,
+            "{context}: {ulps} ULPs exceeds {max_ulps} (actual {}, expected {})",
+            f64::from_bits(actual_bits),
+            f64::from_bits(expected_bits)
+        );
+    }
+
     fn with_embedded_ishmael_prepared(
         test: impl for<'table> FnOnce(&PreparedIshmaelParticleIntegration<'table>),
     ) {
@@ -6858,11 +6884,21 @@ mod tests {
                 ],
                 _ => panic!("unexpected captured population label {label}"),
             };
-            assert_eq!(
-                result.additive().components().map(f64::to_bits),
-                expected_component_bits,
-                "{label}"
-            );
+            for (index, (actual_bits, expected_bits)) in result
+                .additive()
+                .components()
+                .map(f64::to_bits)
+                .into_iter()
+                .zip(expected_component_bits)
+                .enumerate()
+            {
+                assert_f64_bits_within_ulps(
+                    actual_bits,
+                    expected_bits,
+                    32,
+                    &format!("{label} component {index}"),
+                );
+            }
             assert_eq!(
                 result.audit().small_sphere_scattering_revision,
                 Some(ISHMAEL_SMALL_SPHERE_RAYLEIGH_BRIDGE_REVISION),
@@ -8218,22 +8254,30 @@ mod tests {
             panic!("reported state should fail only the bounded base comparison: {base_error}");
         };
         assert_eq!(component, 0);
-        assert_eq!(
+        assert_f64_bits_within_ulps(
             coarse_value.to_bits(),
-            0.000_341_404_441_271_602_17_f64.to_bits()
+            0.000_341_404_441_271_602_17_f64.to_bits(),
+            32,
+            "reported planar coarse value",
         );
-        assert_eq!(
+        assert_f64_bits_within_ulps(
             refined_value.to_bits(),
-            0.000_339_559_017_029_987_14_f64.to_bits()
+            0.000_339_559_017_029_987_14_f64.to_bits(),
+            32,
+            "reported planar refined value",
         );
         assert_eq!(magnitude.to_bits(), coarse_value.to_bits());
-        assert_eq!(
+        assert_f64_bits_within_ulps(
             absolute_error.to_bits(),
-            0.000_001_845_424_241_615_03_f64.to_bits()
+            0.000_001_845_424_241_615_03_f64.to_bits(),
+            32,
+            "reported planar absolute error",
         );
-        assert_eq!(
+        assert_f64_bits_within_ulps(
             relative_error.to_bits(),
-            0.005_405_390_260_131_134_f64.to_bits()
+            0.005_405_390_260_131_134_f64.to_bits(),
+            32,
+            "reported planar relative error",
         );
 
         let result = prepare(production_ishmael_psd_config())
