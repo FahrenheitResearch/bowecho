@@ -498,12 +498,9 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
         if pane == WorkspacePane::Map {
             return button_response;
         }
-        // The Sounding is dock-or-closed — it never floats, so its ✕ and menu
-        // simply close it (no "Float as window", which would only strand a
-        // ghost window). Every other viewer keeps the float/hide pair.
         let sounding = pane == WorkspacePane::Sounding;
         button_response.context_menu(|ui| {
-            if !sounding && ui.button("Float as window").clicked() {
+            if ui.button("Float as window").clicked() {
                 self.app.workspace.requests.push(DockRequest::Float(pane));
                 ui.close();
             }
@@ -513,7 +510,7 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
             }
         });
         button_response.on_hover_text(if sounding {
-            "Drag to rearrange · right-click or × to close the sounding"
+            "Drag to rearrange · right-click to float/close · × floats as a window"
         } else {
             "Drag to rearrange · right-click to float/hide · × floats as a window"
         })

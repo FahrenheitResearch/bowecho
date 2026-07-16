@@ -27469,20 +27469,15 @@ impl ViewerApp {
         for request in std::mem::take(&mut self.workspace.requests) {
             match request {
                 dock::DockRequest::Float(pane) => {
-                    // The Sounding is dock-or-closed: its ✕ (and body/menu
-                    // dismiss) fully tears down instead of resurrecting the
-                    // floating "Sounding (native)" window (owner: "bad
-                    // hiding"). Every other viewer keeps close→float.
-                    if pane == dock::WorkspacePane::Sounding {
-                        self.close_sounding_view();
-                    } else {
-                        // Tab-close already removed the tile; undock is then a
-                        // no-op. The viewer reopens as a floating window.
-                        self.workspace.undock(pane);
-                        self.workspace.prefer_docked.remove(&pane);
-                        self.set_viewer_open(pane, true);
-                        self.workspace.mark_dirty();
-                    }
+                    // Tab-close may already have removed the tile; undock is
+                    // then a no-op. Keep the viewer open and render it as a
+                    // floating window. Sounding has a separate Hide/Close
+                    // request so floating it cannot be confused with closing
+                    // it and cannot resurrect after an actual close.
+                    self.workspace.undock(pane);
+                    self.workspace.prefer_docked.remove(&pane);
+                    self.set_viewer_open(pane, true);
+                    self.workspace.mark_dirty();
                 }
                 dock::DockRequest::Hide(pane) => {
                     if pane == dock::WorkspacePane::Sounding {
@@ -27827,33 +27822,29 @@ impl ViewerApp {
         // with the two buttons floating mid-void).
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // The Sounding is dock-or-closed (it never floats), so it gets
-                // a single honest Close instead of the Float/Hide pair.
-                if pane == dock::WorkspacePane::Sounding {
-                    if ui
-                        .small_button("Close ×")
-                        .on_hover_text(
-                            "Close the sounding — Alt-click the map (with model data) to relaunch",
-                        )
-                        .clicked()
-                    {
-                        self.workspace.requests.push(dock::DockRequest::Hide(pane));
-                    }
+                let close_label = if pane == dock::WorkspacePane::Sounding {
+                    "Close ×"
                 } else {
-                    if ui
-                        .small_button("Float ⧉")
-                        .on_hover_text("Pop this pane back out as a floating window")
-                        .clicked()
-                    {
-                        self.workspace.requests.push(dock::DockRequest::Float(pane));
-                    }
-                    if ui
-                        .small_button("Hide")
-                        .on_hover_text("Close this pane — its top-bar button reopens it here")
-                        .clicked()
-                    {
-                        self.workspace.requests.push(dock::DockRequest::Hide(pane));
-                    }
+                    "Hide"
+                };
+                let close_help = if pane == dock::WorkspacePane::Sounding {
+                    "Close the sounding — Alt-click the map (with model data) to relaunch"
+                } else {
+                    "Close this pane — its top-bar button reopens it here"
+                };
+                if ui
+                    .small_button(close_label)
+                    .on_hover_text(close_help)
+                    .clicked()
+                {
+                    self.workspace.requests.push(dock::DockRequest::Hide(pane));
+                }
+                if ui
+                    .small_button("Float ⧉")
+                    .on_hover_text("Pop this pane back out as a floating window")
+                    .clicked()
+                {
+                    self.workspace.requests.push(dock::DockRequest::Float(pane));
                 }
             });
         });
@@ -68309,10 +68300,8 @@ mod tests {
     /// surface (the docked pane, never also the floating window), a repeat
     /// click must refresh that one surface instead of stacking a second, and
     /// closing it must fully tear down — no ghost floating window, no stale
-    /// request/source residue. Pre-fix this failed: the tab ✕ (DockRequest
-    /// ::Float) left `native_skewt_open` true, resurrecting the floating
-    /// "Sounding (native)" window (the owner's "bad hiding"), and left
-    /// `last_sounding_request` set so a same-point re-click was a silent no-op.
+    /// request/source residue. Float and Close are deliberately separate:
+    /// Float preserves the sounding; Hide performs the full teardown.
     #[test]
     fn alt_click_model_sounding_opens_one_surface_and_closes_cleanly() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
@@ -68355,12 +68344,10 @@ mod tests {
             "repeat sounding click reuses the one pane, never stacks another"
         );
 
-        // The owner closes the sounding via the docked tab ✕. on_tab_close
-        // pushes DockRequest::Float; that gesture must FULLY close the
-        // sounding, not re-float it.
+        // The owner closes the sounding using the explicit Close action.
         app.workspace
             .requests
-            .push(dock::DockRequest::Float(dock::WorkspacePane::Sounding));
+            .push(dock::DockRequest::Hide(dock::WorkspacePane::Sounding));
         app.apply_dock_requests();
 
         assert!(
@@ -68385,6 +68372,30 @@ mod tests {
             app.last_sounding_request.is_none(),
             "per-point request guard cleared so the same point can relaunch"
         );
+    }
+
+    #[test]
+    fn sounding_float_request_preserves_view_and_opens_window() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.model_dock_open = true;
+        app.sounding_viewer_source = SoundingViewerSource::Model;
+        app.last_sounding_request = Some(42);
+        app.dock_model_sounding_beside_plot();
+        assert!(app.workspace.is_docked(dock::WorkspacePane::Sounding));
+
+        app.workspace
+            .requests
+            .push(dock::DockRequest::Float(dock::WorkspacePane::Sounding));
+        app.apply_dock_requests();
+
+        assert!(app.native_skewt_open);
+        assert!(!app.workspace.is_docked(dock::WorkspacePane::Sounding));
+        assert_eq!(
+            app.viewer_mode(dock::WorkspacePane::Sounding),
+            dock::ViewerMode::Floating
+        );
+        assert_eq!(app.sounding_viewer_source, SoundingViewerSource::Model);
+        assert_eq!(app.last_sounding_request, Some(42));
     }
 
     /// The other dismiss affordances (the docked body's Close button and the
