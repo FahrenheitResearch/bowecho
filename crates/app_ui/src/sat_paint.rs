@@ -661,7 +661,20 @@ impl ViewerApp {
         if self.sat_last_frame.is_some() || self.sat_layer.is_some() {
             let mut map_request: Option<(rw_ui::SatRunKey, u16)> = None;
             let mut plot_request: Option<(rw_ui::SatRunKey, u16)> = None;
+            let mut center_on_satellite = false;
             let frame_available = self.sat_last_frame.is_some();
+            let center_action_available = self
+                .sat_layer
+                .as_ref()
+                .zip(self.sat_layer_texture.as_ref())
+                .is_some_and(|(layer, (_, generation, _, has_visible_pixels))| {
+                    layer.generation == *generation
+                        && !*has_visible_pixels
+                        && layer
+                            .lut
+                            .lookup(self.map_center_lat, self.map_center_lon)
+                            .is_none()
+                });
             let button_label = if self.sat_layer.is_some() {
                 "Refresh map frame"
             } else {
@@ -702,6 +715,16 @@ impl ViewerApp {
                 {
                     plot_request = self.sat_last_frame.clone();
                 }
+                if center_action_available
+                    && ui
+                    .button("Center on satellite coverage")
+                    .on_hover_text(
+                        "Move the radar map to a visible, geolocated pixel in the current satellite frame.",
+                    )
+                    .clicked()
+                {
+                    center_on_satellite = true;
+                }
                 if let Some(layer) = &mut self.sat_layer {
                     ui.checkbox(&mut layer.visible, "show");
                     ui.weak(format!("{} {:04}Z", layer.key, layer.hhmm));
@@ -716,6 +739,23 @@ impl ViewerApp {
                 self.sat_panel
                     .apply_note(format!("Loading native plot for {key} {hhmm:04}Z"));
                 sat.send(sat_worker::SatRequest::LoadFrameForPlot { key, hhmm });
+            }
+            if center_on_satellite {
+                let target = self.sat_layer.as_ref().and_then(|layer| {
+                    satellite_visible_coverage_point(
+                        layer.image.as_ref(),
+                        layer.grid.as_ref(),
+                        layer.flip_rows,
+                    )
+                });
+                if let Some((lat, lon)) = target {
+                    self.center_map_on(lat, lon);
+                    self.status = format!("Satellite map centered on {lat:.2}°, {lon:.2}°");
+                    ui.ctx().request_repaint();
+                } else {
+                    self.status =
+                        "Satellite frame has no visible geolocated pixel to center on".to_owned();
+                }
             }
         }
         let mut selected_enhancement = self.sat_ir_enhancement;
@@ -811,15 +851,9 @@ impl ViewerApp {
     }
 
     pub(crate) fn satellite_run_key_matches_current_spec(&self, key: &rw_ui::SatRunKey) -> bool {
-        if satellite_run_key_is_other_source(key) || satellite_run_key_is_composite(key) {
-            return true;
-        }
         sat_worker::run_filters_for_spec(self.sat_panel.spec())
             .map(|(model, prefixes)| {
-                key.model == model
-                    && prefixes
-                        .iter()
-                        .any(|prefix| key.run.starts_with(prefix.as_str()))
+                satellite_run_key_matches_resolved_spec(key, &model, &prefixes)
             })
             .unwrap_or(true)
     }
@@ -832,14 +866,7 @@ impl ViewerApp {
             return runs;
         };
         runs.into_iter()
-            .filter(|run| {
-                satellite_run_key_is_other_source(&run.key)
-                    || satellite_run_key_is_composite(&run.key)
-                    || run.key.model == model
-                        && prefixes
-                            .iter()
-                            .any(|prefix| run.key.run.starts_with(prefix.as_str()))
-            })
+            .filter(|run| satellite_run_key_matches_resolved_spec(&run.key, &model, &prefixes))
             .collect()
     }
 
@@ -1358,14 +1385,18 @@ impl ViewerApp {
                         .filter(|layer| layer.generation == generation)
                     {
                         let has_visible_pixels = satellite_render_has_visible_pixels(&image);
+                        let outside_coverage =
+                            layer.lut.lookup(key.center_lat, key.center_lon).is_none();
                         let texture =
                             ctx.load_texture("sat-layer", image, egui::TextureOptions::LINEAR);
                         self.sat_layer_texture =
                             Some((texture, generation, key, has_visible_pixels));
                         self.status = if has_visible_pixels {
                             format!("Satellite map: {:04}Z", layer.hhmm)
+                        } else if outside_coverage {
+                            "Satellite map: current view is outside this sector — use Center on satellite coverage".to_owned()
                         } else {
-                            "Satellite map: no visible pixels in this view (outside the selected sector or transparent IR)".to_owned()
+                            "Satellite map: frame is transparent in this view — try an IR layer at night".to_owned()
                         };
                     }
                     ctx.request_repaint();
@@ -1464,7 +1495,11 @@ impl ViewerApp {
                 painter.image(texture.id(), rect, uv, tint);
             }
             if !has_visible_pixels && !model_layer_view_needs_rerender(rendered, &view) {
-                draw_satellite_no_visible_notice(painter, rect);
+                draw_satellite_no_visible_notice(
+                    painter,
+                    rect,
+                    layer.lut.lookup(view.center_lat, view.center_lon).is_none(),
+                );
             }
         }
         if layer.key.model == "mtg_i1" {
@@ -1511,6 +1546,59 @@ fn satellite_render_has_visible_pixels(image: &egui::ColorImage) -> bool {
     image.pixels.iter().any(|pixel| pixel.a() > 0)
 }
 
+/// Pick an actual visible, geolocated source pixel near the frame center for
+/// the explicit "Center on satellite coverage" action. Sampling keeps the
+/// common multi-million-pixel path cheap; a full fallback handles tiny or
+/// unusually sparse windows without inventing a bbox center (which is wrong
+/// for antimeridian-crossing grids).
+fn satellite_visible_coverage_point(
+    image: &egui::ColorImage,
+    grid: &rw_store::grid::GridFile,
+    flip_rows: bool,
+) -> Option<(f32, f32)> {
+    let (nx, ny) = (grid.nx, grid.ny);
+    let len = nx.checked_mul(ny)?;
+    if nx == 0
+        || ny == 0
+        || grid.lat.len() != len
+        || grid.lon.len() != len
+        || image.size != [nx, ny]
+        || image.pixels.len() != len
+    {
+        return None;
+    }
+    let center_row = ny / 2;
+    let center_col = nx / 2;
+    let candidate = |index: usize| {
+        let (lat, lon) = (*grid.lat.get(index)?, *grid.lon.get(index)?);
+        if !lat.is_finite()
+            || !lon.is_finite()
+            || sat_map_grid_color(image, index, nx, ny, flip_rows)?.a() == 0
+        {
+            return None;
+        }
+        let row = index / nx;
+        let col = index % nx;
+        let distance =
+            (row.abs_diff(center_row) as u64).pow(2) + (col.abs_diff(center_col) as u64).pow(2);
+        Some((distance, lat, lon))
+    };
+    let center_index = center_row * nx + center_col;
+    if let Some((_, lat, lon)) = candidate(center_index) {
+        return Some((lat, lon));
+    }
+
+    let stride = (len / 65_536).max(1);
+    let nearest = |stride: usize| {
+        (0..len)
+            .step_by(stride)
+            .filter_map(&candidate)
+            .min_by_key(|(distance, _, _)| *distance)
+            .map(|(_, lat, lon)| (lat, lon))
+    };
+    nearest(stride).or_else(|| (stride > 1).then(|| nearest(1)).flatten())
+}
+
 fn satellite_frame_written_refresh_request(
     model: String,
     run: String,
@@ -1527,8 +1615,16 @@ fn satellite_frame_written_refresh_request(
     }
 }
 
-fn draw_satellite_no_visible_notice(painter: &egui::Painter, rect: egui::Rect) {
-    let text = "No visible satellite pixels in this map view\nTry the matching satellite/sector, or an IR layer at night";
+fn draw_satellite_no_visible_notice(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    outside_coverage: bool,
+) {
+    let text = if outside_coverage {
+        "No visible satellite pixels in this map view\nCurrent map is outside this satellite sector\nUse Center on satellite coverage in the Satellite panel"
+    } else {
+        "No visible satellite pixels in this map view\nThis frame is transparent here; try an IR layer at night"
+    };
     let style = painter.ctx().global_style();
     let visuals = &style.visuals;
     let galley = painter.layout(
@@ -1630,9 +1726,44 @@ fn satellite_run_key_is_other_source(key: &rw_ui::SatRunKey) -> bool {
     !matches!(key.model.as_str(), "g16" | "g17" | "g18" | "g19")
 }
 
+/// Match one stored run against the resolved GOES spec. Non-GOES sources
+/// remain available in the shared player. GOES RGB composites are exempt
+/// from only the single-band part of the prefix check, never from the selected
+/// satellite or sector: admitting a cached GOES-West/other-sector composite
+/// can show a healthy preview whose coverage is entirely outside the map.
+fn satellite_run_key_matches_resolved_spec(
+    key: &rw_ui::SatRunKey,
+    model: &str,
+    prefixes: &[String],
+) -> bool {
+    satellite_run_key_is_other_source(key)
+        || key.model == model
+            && if satellite_run_key_is_composite(key) {
+                let run_sector = key.run.split_once("_rgb_").map(|(sector, _)| sector);
+                prefixes.iter().any(|prefix| {
+                    prefix
+                        .rsplit_once("_c")
+                        .map(|(sector, _)| {
+                            run_sector.is_some_and(|run_sector| {
+                                run_sector == sector
+                                    || run_sector
+                                        .strip_prefix(sector)
+                                        .is_some_and(|suffix| suffix.starts_with("_win"))
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+            } else {
+                prefixes
+                    .iter()
+                    .any(|prefix| key.run.starts_with(prefix.as_str()))
+            }
+}
+
 /// True/natural-color RGB composite runs (`<sector>_rgb_<style>_<YYYYMMDD>`)
-/// are shown in the player/map regardless of the follow spec's band filter —
-/// they belong to a GOES model dir but carry no single `c<band>` prefix.
+/// are exempt from the follow spec's BAND filter — they belong to a GOES
+/// model dir but carry no single `c<band>` prefix. The selected satellite and
+/// sector are still enforced by [`satellite_run_key_matches_resolved_spec`].
 pub(crate) fn satellite_run_key_is_composite(key: &rw_ui::SatRunKey) -> bool {
     key.run.contains("_rgb_")
 }
@@ -1934,6 +2065,75 @@ mod tests {
 
         assert!(!satellite_render_has_visible_pixels(&empty));
         assert!(satellite_render_has_visible_pixels(&covered));
+    }
+
+    #[test]
+    fn satellite_coverage_center_uses_a_visible_geolocated_pixel() {
+        let mut pixels = vec![egui::Color32::TRANSPARENT; 9];
+        // Grid index 7 is row 2/col 1. With flipped display rows, that lands
+        // at image row 0/col 1.
+        pixels[1] = egui::Color32::WHITE;
+        let image = egui::ColorImage::new([3, 3], pixels);
+        let grid = rw_store::grid::GridFile {
+            nx: 3,
+            ny: 3,
+            lat: (0..9).map(|index| 30.0 + index as f32).collect(),
+            lon: (0..9).map(|index| -120.0 + index as f32).collect(),
+            projection: None,
+            hash: String::new(),
+        };
+
+        assert_eq!(
+            satellite_visible_coverage_point(&image, &grid, true),
+            Some((37.0, -113.0))
+        );
+    }
+
+    #[test]
+    fn goes_composites_ignore_band_but_not_satellite_or_sector_filters() {
+        let model = "g19";
+        let prefixes = vec!["conus_c13_".to_owned()];
+        let key = |model: &str, run: &str| rw_ui::SatRunKey {
+            model: model.to_owned(),
+            run: run.to_owned(),
+        };
+
+        assert!(satellite_run_key_matches_resolved_spec(
+            &key("g19", "conus_rgb_natural_color_20260713"),
+            model,
+            &prefixes,
+        ));
+        assert!(satellite_run_key_matches_resolved_spec(
+            &key("g19", "conus_win295n954w600_rgb_natural_color_20260713"),
+            model,
+            &prefixes,
+        ));
+        assert!(
+            !satellite_run_key_matches_resolved_spec(
+                &key("g19", "fulldisk_rgb_natural_color_20260713"),
+                model,
+                &prefixes,
+            ),
+            "a composite must not bypass the selected sector"
+        );
+        assert!(
+            !satellite_run_key_matches_resolved_spec(
+                &key("g18", "conus_rgb_natural_color_20260713"),
+                model,
+                &prefixes,
+            ),
+            "a cached GOES-West composite must not appear under a GOES-East spec"
+        );
+        assert!(!satellite_run_key_matches_resolved_spec(
+            &key("g19", "conus_c02_20260713"),
+            model,
+            &prefixes,
+        ));
+        assert!(satellite_run_key_matches_resolved_spec(
+            &key("h9", "fulldisk_rgb_true_color_20260713"),
+            model,
+            &prefixes,
+        ));
     }
 
     #[test]

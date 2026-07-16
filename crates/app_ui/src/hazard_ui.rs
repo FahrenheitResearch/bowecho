@@ -7,26 +7,122 @@ use crate::*;
 
 impl ViewerApp {
     pub(crate) fn hazard_panel(&mut self, ui: &mut egui::Ui) {
-        // Wrapped, not a kit row: four toggles outgrow the control column
-        // at 320 pt and wrapping keeps them one visual family.
+        let mut source_changed = false;
+        panel_kit::row(ui, "Source", |ui| {
+            let mut mode =
+                meteoalarm::WarningSourceMode::from_key(&self.app_settings.warning_source);
+            egui::ComboBox::from_id_salt("live_warning_source")
+                .selected_text(mode.label())
+                .width(174.0)
+                .show_ui(ui, |ui| {
+                    for option in meteoalarm::WarningSourceMode::ALL {
+                        ui.selectable_value(&mut mode, option, option.label());
+                    }
+                });
+            if mode.key() != self.app_settings.warning_source {
+                self.app_settings.warning_source = mode.key().to_owned();
+                source_changed = true;
+            }
+        });
+
+        let mode = meteoalarm::WarningSourceMode::from_key(&self.app_settings.warning_source);
+        let radar_country = data_source::sites::resolve(&self.display_owner_site())
+            .and_then(|site| meteoalarm::country_feed_for_label(&site.country));
+        if mode == meteoalarm::WarningSourceMode::Europe {
+            panel_kit::row(ui, "Country", |ui| {
+                let selected =
+                    meteoalarm::country_feed_by_slug(self.app_settings.meteoalarm_country.trim());
+                let selected_label = selected
+                    .map(|country| country.label)
+                    .unwrap_or("Auto (radar country)");
+                egui::ComboBox::from_id_salt("meteoalarm_country")
+                    .selected_text(selected_label)
+                    .width(174.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(selected.is_none(), "Auto (radar country)")
+                            .clicked()
+                        {
+                            self.app_settings.meteoalarm_country = "auto".to_owned();
+                            source_changed = true;
+                        }
+                        for country in meteoalarm::COUNTRY_FEEDS {
+                            if ui
+                                .selectable_label(selected == Some(*country), country.label)
+                                .clicked()
+                            {
+                                self.app_settings.meteoalarm_country = country.slug.to_owned();
+                                source_changed = true;
+                            }
+                        }
+                    });
+            });
+        } else if mode == meteoalarm::WarningSourceMode::Auto
+            && let Some(country) = radar_country
+        {
+            ui.weak(format!("Auto source: MeteoAlarm {}", country.label));
+        }
+        if source_changed {
+            self.mark_app_settings_dirty();
+            self.reload_warning_source(ui.ctx());
+            return;
+        }
+
+        let resolved_source = self.resolved_warning_source();
+        if let meteoalarm::ResolvedWarningSource::Unavailable(reason) = &resolved_source {
+            panel_kit::status_block(
+                ui,
+                reason,
+                Some("Change Source above, or select a radar in the matching warning network."),
+            );
+            return;
+        }
+        let europe_list_only = matches!(
+            resolved_source,
+            meteoalarm::ResolvedWarningSource::MeteoAlarm(_)
+        );
+        if europe_list_only {
+            panel_kit::status_block(
+                ui,
+                "Official MeteoAlarm country warnings · list and details",
+                Some(
+                    "MeteoAlarm's anonymous Atom/CAP feed carries area names and region codes but no public polygon geometry. BowEcho does not invent placement, so these entries are intentionally not drawn on the map.",
+                ),
+            );
+            ui.weak("Data provided by EUMETNET members via MeteoAlarm · CC BY 4.0.");
+            ui.horizontal_wrapped(|ui| {
+                ui.hyperlink_to("Official MeteoAlarm feeds", "https://feeds.meteoalarm.org/");
+                ui.weak("·");
+                ui.hyperlink_to(
+                    "CC BY 4.0 license",
+                    "https://creativecommons.org/licenses/by/4.0/",
+                );
+            });
+        }
+
+        // Wrapped rather than a kit row: these live controls must fit the
+        // narrow sidebar. Map geometry controls are NWS-only; active/refresh
+        // semantics apply to both sources.
         let mut startup_defaults_changed = false;
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .checkbox(&mut self.hazards_visible, "Show")
-                .on_hover_text("Draw warning polygons on the map (also the Map-tab Warnings row)")
-                .changed()
-            {
-                startup_defaults_changed = true;
-            }
-            let mut show_labels = self.app_settings.show_hazard_labels;
-            if ui
-                .checkbox(&mut show_labels, "Labels")
-                .on_hover_text("Draw compact warning labels such as SVR 0653 on the map")
-                .changed()
-            {
-                self.app_settings.show_hazard_labels = show_labels;
-                self.mark_app_settings_dirty();
-                ui.ctx().request_repaint();
+            if !europe_list_only {
+                if ui
+                    .checkbox(&mut self.hazards_visible, "Show on map")
+                    .on_hover_text("Draw NWS warning polygons on the map")
+                    .changed()
+                {
+                    startup_defaults_changed = true;
+                }
+                let mut show_labels = self.app_settings.show_hazard_labels;
+                if ui
+                    .checkbox(&mut show_labels, "Labels")
+                    .on_hover_text("Draw compact warning labels such as SVR 0653 on the map")
+                    .changed()
+                {
+                    self.app_settings.show_hazard_labels = show_labels;
+                    self.mark_app_settings_dirty();
+                    ui.ctx().request_repaint();
+                }
             }
             if ui
                 .checkbox(&mut self.hazards_active_only, "Active only")
@@ -46,80 +142,83 @@ impl ViewerApp {
         if startup_defaults_changed {
             self.persist_hazard_panel_settings();
         }
-        // Family filters as a kit chip grid: selected = shown on the map
-        // and in the list; the hidden-family set is the same state the
-        // checkboxes used to edit.
-        let family_chips = HAZARD_FILTER_FAMILIES
-            .iter()
-            .map(|&(family, label)| panel_kit::Chip {
-                label,
-                hotkey: None,
-                selected: !self.hidden_hazard_families.contains(family),
-                hover: Some(format!("Show {family} alerts on the map and in the list")),
-            })
-            .collect::<Vec<_>>();
-        if let Some(clicked) = panel_kit::chip_grid(ui, &family_chips) {
-            let (family, _) = HAZARD_FILTER_FAMILIES[clicked];
-            if !self.hidden_hazard_families.remove(family) {
-                self.hidden_hazard_families.insert(family.to_owned());
-            }
-            self.persist_hazard_panel_settings();
-            if self
-                .selected_hazard_record()
-                .is_some_and(|record| !self.hazard_record_visible(record))
-            {
-                self.selected_hazard_index = None;
-            }
-            ui.ctx().request_repaint();
-        }
-        ui.add_enabled_ui(!self.hidden_hazard_families.contains("watch"), |ui| {
-            ui.weak("Watch types");
-            let watch_chips = HAZARD_WATCH_FILTERS
+        if !europe_list_only {
+            // Family filters as a kit chip grid: selected = shown on the map
+            // and in the list; the hidden-family set is the same state the
+            // checkboxes used to edit.
+            let family_chips = HAZARD_FILTER_FAMILIES
                 .iter()
-                .map(|&(watch_type, label)| panel_kit::Chip {
+                .map(|&(family, label)| panel_kit::Chip {
                     label,
                     hotkey: None,
-                    selected: !self
+                    selected: !self.hidden_hazard_families.contains(family),
+                    hover: Some(format!("Show {family} alerts on the map and in the list")),
+                })
+                .collect::<Vec<_>>();
+            if let Some(clicked) = panel_kit::chip_grid(ui, &family_chips) {
+                let (family, _) = HAZARD_FILTER_FAMILIES[clicked];
+                if !self.hidden_hazard_families.remove(family) {
+                    self.hidden_hazard_families.insert(family.to_owned());
+                }
+                self.persist_hazard_panel_settings();
+                if self
+                    .selected_hazard_record()
+                    .is_some_and(|record| !self.hazard_record_visible(record))
+                {
+                    self.selected_hazard_index = None;
+                }
+                ui.ctx().request_repaint();
+            }
+            ui.add_enabled_ui(!self.hidden_hazard_families.contains("watch"), |ui| {
+                ui.weak("Watch types");
+                let watch_chips = HAZARD_WATCH_FILTERS
+                    .iter()
+                    .map(|&(watch_type, label)| panel_kit::Chip {
+                        label,
+                        hotkey: None,
+                        selected: !self
+                            .app_settings
+                            .hidden_hazard_watch_types
+                            .iter()
+                            .any(|hidden| hidden.eq_ignore_ascii_case(watch_type)),
+                        hover: Some(format!("Show {label} polygons")),
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(clicked) = panel_kit::chip_grid(ui, &watch_chips) {
+                    let watch_type = HAZARD_WATCH_FILTERS[clicked].0;
+                    if let Some(index) = self
                         .app_settings
                         .hidden_hazard_watch_types
                         .iter()
-                        .any(|hidden| hidden.eq_ignore_ascii_case(watch_type)),
-                    hover: Some(format!("Show {label} polygons")),
-                })
-                .collect::<Vec<_>>();
-            if let Some(clicked) = panel_kit::chip_grid(ui, &watch_chips) {
-                let watch_type = HAZARD_WATCH_FILTERS[clicked].0;
-                if let Some(index) = self
-                    .app_settings
-                    .hidden_hazard_watch_types
-                    .iter()
-                    .position(|hidden| hidden.eq_ignore_ascii_case(watch_type))
-                {
-                    self.app_settings.hidden_hazard_watch_types.remove(index);
-                } else {
-                    self.app_settings
-                        .hidden_hazard_watch_types
-                        .push(watch_type.to_owned());
+                        .position(|hidden| hidden.eq_ignore_ascii_case(watch_type))
+                    {
+                        self.app_settings.hidden_hazard_watch_types.remove(index);
+                    } else {
+                        self.app_settings
+                            .hidden_hazard_watch_types
+                            .push(watch_type.to_owned());
+                    }
+                    self.mark_app_settings_dirty();
+                    ui.ctx().request_repaint();
                 }
-                self.mark_app_settings_dirty();
+            });
+            // The fill slider reads/writes the style registry (override on the
+            // styles.json document) so it persists across launches.
+            let mut fill_alpha = self.style_registry.hazard_global().fill_alpha as f32;
+            let fill_response =
+                panel_kit::slider_row(ui, "Fill", &mut fill_alpha, 0.0..=80.0, 0.0, |value| {
+                    format!("{value:.0}")
+                })
+                .on_hover_text("Warning-polygon fill opacity (0-80)");
+            if fill_response.changed() {
+                self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.round() as u8);
+                self.rebuild_style_registry();
                 ui.ctx().request_repaint();
             }
-        });
-        // The fill slider reads/writes the style registry (override on the
-        // styles.json document) so it persists across launches.
-        let mut fill_alpha = self.style_registry.hazard_global().fill_alpha as f32;
-        let fill_response =
-            panel_kit::slider_row(ui, "Fill", &mut fill_alpha, 0.0..=80.0, 0.0, |value| {
-                format!("{value:.0}")
-            })
-            .on_hover_text("Warning-polygon fill opacity (0-80)");
-        if fill_response.changed() {
-            self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.round() as u8);
-            self.rebuild_style_registry();
-            ui.ctx().request_repaint();
-        }
-        if fill_response.drag_stopped() || (fill_response.changed() && !fill_response.dragged()) {
-            self.save_styles();
+            if fill_response.drag_stopped() || (fill_response.changed() && !fill_response.dragged())
+            {
+                self.save_styles();
+            }
         }
         ui.horizontal(|ui| {
             let loading = self.hazard_receiver.is_some();
@@ -131,7 +230,11 @@ impl ViewerApp {
                 self.hazard_overlay = None;
                 self.selected_hazard_index = None;
                 self.unacknowledged_hazard_event_ids.clear();
-                self.hazard_status = "No hazard polygons loaded".to_owned();
+                self.hazard_status = if europe_list_only {
+                    "No MeteoAlarm warning entries loaded".to_owned()
+                } else {
+                    "No hazard polygons loaded".to_owned()
+                };
             }
         });
 
@@ -154,7 +257,11 @@ impl ViewerApp {
                     });
                 }
                 if total == 0 {
-                    ui.weak("No hazard polygons loaded");
+                    ui.weak(if europe_list_only {
+                        "No active warnings returned for this country"
+                    } else {
+                        "No hazard polygons loaded"
+                    });
                     return;
                 }
                 panel_kit::row(ui, "Type", |ui| {
@@ -265,6 +372,22 @@ impl ViewerApp {
                                 row.unacknowledged,
                                 max_chars,
                             );
+                            let accent = app
+                                .hazard_overlay
+                                .as_ref()
+                                .and_then(|overlay| overlay.records.get(row.index))
+                                .map(|record| {
+                                    meteoalarm::record_accent_color(record).unwrap_or_else(|| {
+                                        style_color32(
+                                            app.style_registry
+                                                .hazard_polygon(
+                                                    &record.event_family,
+                                                    hazard_record_style_threat(record),
+                                                )
+                                                .stroke_color,
+                                        )
+                                    })
+                                });
                             let response = panel_kit::select_row(
                                 ui,
                                 row.selected,
@@ -272,6 +395,19 @@ impl ViewerApp {
                                 &text,
                                 Some(row.hover.as_str()),
                             );
+                            if let Some(accent) = accent {
+                                let accent_rect = egui::Rect::from_min_max(
+                                    egui::pos2(
+                                        response.rect.left() + 1.0,
+                                        response.rect.top() + 1.0,
+                                    ),
+                                    egui::pos2(
+                                        response.rect.left() + 4.0,
+                                        response.rect.bottom() - 1.0,
+                                    ),
+                                );
+                                ui.painter().rect_filled(accent_rect, 1.0, accent);
+                            }
                             if response.clicked() {
                                 focus_index = Some(row.index);
                             }
@@ -305,6 +441,11 @@ impl ViewerApp {
                 record.source_url.as_deref(),
                 &record.event_id,
             );
+            if meteoalarm::is_meteoalarm_record(record)
+                && let Some(source_url) = record.source_url.as_deref()
+            {
+                ui.hyperlink_to("Open official CAP warning", source_url);
+            }
         }
 
         let summary_lines = self.hazard_summary_lines();
@@ -550,9 +691,9 @@ impl ViewerApp {
                                 .suffix(" s"),
                         )
                         .on_hover_text(
-                            "How often BowEcho re-fetches live warnings (NWS active alerts plus any \
-                             custom feed). NWS guidance is 30 s; a fast local or relay feed can poll \
-                             down to 5 s.",
+                            "How often BowEcho re-fetches the selected built-in warning source. \
+                             NWS guidance is 30 s; MeteoAlarm and custom/relay feeds use the same \
+                             operator-controlled cadence.",
                         )
                         .changed()
                     {
@@ -562,28 +703,37 @@ impl ViewerApp {
                         ui.ctx().request_repaint();
                     }
                 });
-                ui.label("Custom provider (poll URL)").on_hover_text(
-                "Optional http(s) URL BowEcho polls alongside NWS active alerts and merges into \
-                 the warnings layer. Accepts the NWS CAP/GeoJSON alert FeatureCollection (same \
-                 shape as api.weather.gov/alerts/active) or the NWS text/VTEC + lat/lon polygon \
-                 format.",
-            );
-                // The URL input truncates its content instead of forcing the
-                // panel wider (320 pt rule).
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut app.app_settings.warning_provider_url)
-                        .desired_width(ui.available_width())
-                        .hint_text("https://host/warnings.geojson"),
-                );
-                if response.lost_focus() {
-                    app.mark_app_settings_dirty();
-                }
-                if !app.app_settings.warning_provider_url.trim().is_empty()
-                    && custom_warning_provider_url(&app.app_settings.warning_provider_url).is_none()
-                {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 170, 80),
-                        "Provider URL must start with http:// or https://",
+                if matches!(
+                    app.resolved_warning_source(),
+                    meteoalarm::ResolvedWarningSource::Nws
+                ) {
+                    ui.label("Custom provider (poll URL)").on_hover_text(
+                        "Optional http(s) URL BowEcho polls alongside NWS active alerts and merges \
+                         into the warnings layer. Accepts the NWS CAP/GeoJSON alert FeatureCollection \
+                         or NWS text/VTEC + lat/lon polygon format.",
+                    );
+                    // The URL input truncates its content instead of forcing
+                    // the panel wider (320 pt rule).
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut app.app_settings.warning_provider_url)
+                            .desired_width(ui.available_width())
+                            .hint_text("https://host/warnings.geojson"),
+                    );
+                    if response.lost_focus() {
+                        app.mark_app_settings_dirty();
+                    }
+                    if !app.app_settings.warning_provider_url.trim().is_empty()
+                        && custom_warning_provider_url(&app.app_settings.warning_provider_url)
+                            .is_none()
+                    {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 170, 80),
+                            "Provider URL must start with http:// or https://",
+                        );
+                    }
+                } else {
+                    ui.weak(
+                        "Custom GeoJSON providers are only merged with the NWS source; MeteoAlarm uses its official country feed directly.",
                     );
                 }
             },
@@ -613,10 +763,17 @@ impl ViewerApp {
     fn hazard_summary_lines(&self) -> Vec<String> {
         let mut lines = vec![self.hazard_status.clone()];
         if let Some(overlay) = &self.hazard_overlay {
-            lines.push(format!(
-                "{} scanned, {} parsed, {} polygons",
-                overlay.scanned_items, overlay.parsed_items, overlay.polygon_records
-            ));
+            if meteoalarm::is_meteoalarm_overlay(overlay) {
+                lines.push(format!(
+                    "{} scanned, {} active warning entries · list only",
+                    overlay.scanned_items, overlay.parsed_items
+                ));
+            } else {
+                lines.push(format!(
+                    "{} scanned, {} parsed, {} polygons",
+                    overlay.scanned_items, overlay.parsed_items, overlay.polygon_records
+                ));
+            }
             lines.push(overlay.source_label.clone());
             if overlay.error_count > 0 {
                 let issue_label = if overlay.error_count == 1 {
@@ -643,7 +800,9 @@ impl ViewerApp {
             .iter()
             .enumerate()
             .filter(|(_, record)| {
-                self.hazard_record_visible(record) && hazard_points_renderable(&record.points)
+                self.hazard_record_visible(record)
+                    && (hazard_points_renderable(&record.points)
+                        || meteoalarm::is_meteoalarm_record(record))
             })
             .filter(|(_, record)| filter.matches_record(record))
             .map(|(index, record)| self.hazard_list_row(index, record))
@@ -703,6 +862,19 @@ impl ViewerApp {
     }
 
     pub(crate) fn focus_hazard_record(&mut self, index: usize, ctx: &egui::Context) -> bool {
+        if let Some(record) = self
+            .hazard_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.records.get(index))
+            && self.hazard_record_visible(record)
+            && meteoalarm::is_meteoalarm_record(record)
+        {
+            let label = record.label.clone();
+            self.select_hazard_index(index);
+            self.status = format!("Selected {label} · MeteoAlarm list-only warning");
+            ctx.request_repaint();
+            return true;
+        }
         let Some((bbox, label)) = self
             .hazard_overlay
             .as_ref()
@@ -739,6 +911,374 @@ impl ViewerApp {
     pub(crate) fn select_hazard_index(&mut self, index: usize) {
         self.selected_hazard_index = Some(index);
         self.acknowledge_hazard_index(index);
+    }
+
+    /// Map-polygon selection keeps ordinary warning clicks lightweight, but
+    /// an SPC mesoscale discussion has substantial text and an official
+    /// graphic in the Alerts detail view. Route that click directly there
+    /// and reveal a collapsed sidebar so the selection is immediately useful.
+    pub(crate) fn select_hazard_from_map(&mut self, index: usize) {
+        let opens_alert_details = self
+            .hazard_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.records.get(index))
+            .is_some_and(|record| record.event_family == "mesoscale discussion");
+        self.select_hazard_index(index);
+        if opens_alert_details {
+            self.sidebar_tab = SidebarTab::Severe;
+            self.sidebar_hidden = false;
+        }
+    }
+
+    /// Open the compact warning stack for a map click. Mesoscale discussions
+    /// preserve their established direct-to-Alerts behavior; the card stack is
+    /// for warning/watch polygons and can contain every exact overlap.
+    pub(crate) fn open_hazard_popup_from_map(
+        &mut self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+    ) -> bool {
+        let hits = self.hazards_at_position(rect, position);
+        let Some(&first_hit) = hits.first() else {
+            self.hazard_map_popup = None;
+            return false;
+        };
+        let warning_hits = self
+            .hazard_overlay
+            .as_ref()
+            .map(|overlay| {
+                hits.into_iter()
+                    .filter(|&index| {
+                        overlay
+                            .records
+                            .get(index)
+                            .is_some_and(|record| record.event_family != "mesoscale discussion")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if warning_hits.is_empty() {
+            self.hazard_map_popup = None;
+            self.select_hazard_from_map(first_hit);
+            return true;
+        }
+
+        let event_ids = self
+            .hazard_overlay
+            .as_ref()
+            .map(|overlay| {
+                warning_hits
+                    .iter()
+                    .filter_map(|&index| overlay.records.get(index))
+                    .map(|record| base_hazard_event_id(&record.event_id).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let (lon, lat) = self.screen_to_lon_lat(rect, position);
+        self.select_hazard_from_map(warning_hits[0]);
+        self.hazard_map_popup = Some(HazardMapPopup {
+            anchor: HazardPoint { lon, lat },
+            event_ids,
+            pane_index: if self.grid_layout == PanelLayout::One {
+                0
+            } else {
+                self.active_pane
+            },
+            screen_rect: None,
+            #[cfg(test)]
+            layout_probe: None,
+        });
+        true
+    }
+
+    pub(crate) fn hazard_popup_owns_pointer(&self, position: egui::Pos2) -> bool {
+        self.hazard_map_popup
+            .as_ref()
+            .and_then(|popup| popup.screen_rect)
+            .is_some_and(|rect| rect.expand(2.0).contains(position))
+    }
+
+    /// Foreground, geo-anchored warning cards. The map rectangle is the pane
+    /// that owns the clicked polygon, so the pointer tracks pan/zoom and the
+    /// whole stack remains clamped to that view.
+    pub(crate) fn show_hazard_map_popup(&mut self, ctx: &egui::Context, map_rect: egui::Rect) {
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.hazard_map_popup = None;
+            return;
+        }
+        let Some(popup) = self.hazard_map_popup.as_ref() else {
+            return;
+        };
+        let anchor_geo = popup.anchor;
+        let wanted_ids = popup.event_ids.clone();
+        let mut cards = Vec::<(usize, String, HazardRecord, styles::PolygonStyle)>::new();
+        if let Some(overlay) = &self.hazard_overlay {
+            for wanted_id in &wanted_ids {
+                if let Some((index, record)) =
+                    overlay.records.iter().enumerate().find(|(_, record)| {
+                        base_hazard_event_id(&record.event_id) == wanted_id
+                            && record.event_family != "mesoscale discussion"
+                            && self.hazard_record_visible(record)
+                            && hazard_points_renderable(&record.points)
+                    })
+                {
+                    let style = self
+                        .style_registry
+                        .hazard_polygon(&record.event_family, hazard_record_style_threat(record))
+                        .clone();
+                    cards.push((index, wanted_id.clone(), record.clone(), style));
+                }
+            }
+        }
+        if cards.is_empty() {
+            self.hazard_map_popup = None;
+            return;
+        }
+        // Drop expired/removed/hidden records from the live stack immediately.
+        if let Some(popup) = self.hazard_map_popup.as_mut() {
+            popup.event_ids = cards.iter().map(|(_, id, _, _)| id.clone()).collect();
+        }
+
+        let anchor = self.lon_lat_to_screen(map_rect, anchor_geo.lon, anchor_geo.lat);
+        if !map_rect.expand(28.0).contains(anchor) {
+            self.hazard_map_popup = None;
+            return;
+        }
+        let layout = hazard_popup_layout(map_rect, anchor, cards.len());
+        let global = self.style_registry.hazard_global().clone();
+        let archive_timeline = self.event_loop_hazard_window.is_some();
+        let now = Utc::now();
+        let mut close_all = false;
+        let mut dismiss_id = None::<String>;
+        let mut details_index = None::<usize>;
+        #[cfg(test)]
+        let mut layout_probe = HazardMapPopupLayoutProbe::default();
+
+        let area = egui::Area::new(egui::Id::new("hazard_map_popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(layout.position)
+            .show(ctx, |ui| {
+                ui.set_width(layout.width);
+                ui.set_min_width(layout.width);
+                ui.set_max_width(layout.width);
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::same(7))
+                    .show(ui, |ui| {
+                        let inner_width = ui.available_width().max(120.0);
+                        ui.set_min_width(inner_width);
+                        ui.set_max_width(inner_width);
+                        ui.horizontal(|ui| {
+                            let count = cards.len();
+                            let heading = if count == 1 {
+                                "Warning at this point".to_owned()
+                            } else {
+                                format!("{count} warnings at this point")
+                            };
+                            let heading_width =
+                                (ui.available_width() - 26.0 - ui.spacing().item_spacing.x)
+                                    .max(72.0);
+                            ui.add_sized(
+                                [heading_width, ui.spacing().interact_size.y],
+                                egui::Label::new(egui::RichText::new(heading).strong()),
+                            );
+                            if ui
+                                .small_button("X")
+                                .on_hover_text("Dismiss warning cards")
+                                .clicked()
+                            {
+                                close_all = true;
+                            }
+                        });
+                        ui.add_space(3.0);
+                        let _scroll = egui::ScrollArea::vertical()
+                            .id_salt("hazard_map_popup_scroll")
+                            .auto_shrink([false, true])
+                            .max_height(layout.body_height)
+                            .show(ui, |ui| {
+                                let scroll_width = ui.available_width().max(112.0);
+                                ui.set_min_width(scroll_width);
+                                ui.set_max_width(scroll_width);
+                                for (card_number, (index, event_id, record, style)) in
+                                    cards.iter().enumerate()
+                                {
+                                    if card_number > 0 {
+                                        ui.add_space(5.0);
+                                    }
+                                    let fill = hazard_popup_card_fill(
+                                        ui.visuals().window_fill(),
+                                        style.fill_color,
+                                        style.fill_alpha.unwrap_or(global.fill_alpha),
+                                    );
+                                    let card = egui::Frame::new()
+                                        .fill(fill)
+                                        .corner_radius(egui::CornerRadius::same(4))
+                                        .inner_margin(egui::Margin::symmetric(9, 7))
+                                        .show(ui, |ui| {
+                                            let card_width = ui.available_width().max(96.0);
+                                            ui.set_width(card_width);
+                                            ui.set_min_width(card_width);
+                                            ui.set_max_width(card_width);
+                                            ui.horizontal(|ui| {
+                                                let title_width = (ui.available_width()
+                                                    - 26.0
+                                                    - ui.spacing().item_spacing.x)
+                                                    .max(64.0);
+                                                let _title = ui
+                                                    .vertical(|ui| {
+                                                        ui.set_width(title_width);
+                                                        ui.set_min_width(title_width);
+                                                        ui.set_max_width(title_width);
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(
+                                                                    hazard_popup_title(record),
+                                                                )
+                                                                .strong()
+                                                                .size(15.0),
+                                                            )
+                                                            .wrap(),
+                                                        )
+                                                    })
+                                                    .inner;
+                                                #[cfg(test)]
+                                                if card_number == 0 {
+                                                    layout_probe.title = Some(_title.rect);
+                                                }
+                                                if ui
+                                                    .small_button("X")
+                                                    .on_hover_text("Dismiss this warning")
+                                                    .clicked()
+                                                {
+                                                    dismiss_id = Some(event_id.clone());
+                                                }
+                                            });
+                                            let metrics = hazard_popup_metric_lines(record);
+                                            for metric in metrics {
+                                                let _response = ui.label(&metric);
+                                                #[cfg(test)]
+                                                if card_number == 0 {
+                                                    if metric.starts_with("Wind:") {
+                                                        layout_probe.wind = Some(_response.rect);
+                                                    } else if metric.starts_with("Hail:") {
+                                                        layout_probe.hail = Some(_response.rect);
+                                                    }
+                                                }
+                                            }
+                                            let mut footer_text = hazard_popup_expiry_text(
+                                                record,
+                                                now,
+                                                archive_timeline,
+                                            );
+                                            let office = hazard_popup_office(record);
+                                            if !office.is_empty() {
+                                                footer_text
+                                                    .push_str(&format!(" \u{00b7} WFO {office}"));
+                                            }
+                                            ui.horizontal(|ui| {
+                                                let details_width = 58.0;
+                                                let footer_width = (ui.available_width()
+                                                    - details_width
+                                                    - ui.spacing().item_spacing.x)
+                                                    .max(54.0);
+                                                let _footer = ui
+                                                    .vertical(|ui| {
+                                                        ui.set_width(footer_width);
+                                                        ui.set_min_width(footer_width);
+                                                        ui.set_max_width(footer_width);
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(&footer_text)
+                                                                    .weak(),
+                                                            )
+                                                            .wrap(),
+                                                        )
+                                                    })
+                                                    .inner;
+                                                let details = ui.small_button("Details");
+                                                #[cfg(test)]
+                                                if card_number == 0 {
+                                                    layout_probe.footer = Some(_footer.rect);
+                                                    layout_probe.details = Some(details.rect);
+                                                }
+                                                if details.clicked() {
+                                                    details_index = Some(*index);
+                                                }
+                                            });
+                                        });
+                                    #[cfg(test)]
+                                    if card_number == 0 {
+                                        layout_probe.card = Some(card.response.rect);
+                                    }
+                                    paint_hazard_popup_card_border(
+                                        ui.painter(),
+                                        card.response.rect,
+                                        style,
+                                        &global,
+                                        ui.clip_rect(),
+                                    );
+                                }
+                                // ScrollArea's auto-sized viewport rounds a
+                                // framed child a few pixels short in egui
+                                // 0.34. Keep the card's bottom border inside
+                                // the natural viewport without forcing a tall
+                                // fixed-height empty body.
+                                ui.add_space(4.0);
+                            });
+                        #[cfg(test)]
+                        {
+                            layout_probe.viewport = Some(_scroll.inner_rect);
+                        }
+                    });
+            });
+
+        // A short leader makes the popup's geographic attachment explicit
+        // without covering the warning contents. It moves with the anchor as
+        // the operator pans or zooms.
+        if let Some((_, _, _, first_style)) = cards.first() {
+            let card_rect = area.response.rect;
+            let edge_x = if anchor.x < card_rect.center().x {
+                card_rect.left()
+            } else {
+                card_rect.right()
+            };
+            let edge = egui::pos2(
+                edge_x,
+                anchor
+                    .y
+                    .clamp(card_rect.top() + 8.0, card_rect.bottom() - 8.0),
+            );
+            let color = style_color32(first_style.stroke_color);
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("hazard_map_popup"),
+            ));
+            painter.line_segment([anchor, edge], egui::Stroke::new(2.0, color));
+            painter.circle_filled(anchor, 3.0, color);
+        }
+
+        if let Some(popup) = self.hazard_map_popup.as_mut() {
+            popup.screen_rect = Some(area.response.rect);
+            #[cfg(test)]
+            {
+                popup.layout_probe = Some(layout_probe);
+            }
+        }
+        if close_all {
+            self.hazard_map_popup = None;
+        } else if let Some(dismiss_id) = dismiss_id
+            && let Some(popup) = self.hazard_map_popup.as_mut()
+        {
+            popup.event_ids.retain(|event_id| event_id != &dismiss_id);
+            if popup.event_ids.is_empty() {
+                self.hazard_map_popup = None;
+            }
+        }
+        if let Some(index) = details_index {
+            self.select_hazard_index(index);
+            self.sidebar_tab = SidebarTab::Severe;
+            self.sidebar_hidden = false;
+        }
+        ctx.request_repaint_after(Duration::from_secs(1));
     }
 
     pub(crate) fn first_unacknowledged_hazard_index(&self) -> Option<usize> {
@@ -876,20 +1416,32 @@ impl ViewerApp {
         hasher.finish()
     }
 
+    #[cfg(test)]
     pub(crate) fn hazard_at_position(
         &self,
         rect: egui::Rect,
         position: egui::Pos2,
     ) -> Option<usize> {
+        self.hazards_at_position(rect, position).into_iter().next()
+    }
+
+    /// All exact warning polygons beneath a map click, ordered with the
+    /// smallest (most specific) polygon first. Edge/label tolerance remains a
+    /// single best hit: stacking several nearby-but-not-containing warnings is
+    /// noisy and can imply the click was inside polygons it was not.
+    pub(crate) fn hazards_at_position(&self, rect: egui::Rect, position: egui::Pos2) -> Vec<usize> {
         if !self.hazards_visible {
-            return None;
+            return Vec::new();
         }
-        let overlay = self.hazard_overlay.as_ref()?;
+        let Some(overlay) = self.hazard_overlay.as_ref() else {
+            return Vec::new();
+        };
         let (lon, lat) = self.screen_to_lon_lat(rect, position);
         let point = HazardPoint { lon, lat };
-        let mut best_containing = None::<(usize, f32, u8)>;
+        let mut containing = Vec::<(usize, f32, u8, String)>::new();
         let mut best_near = None::<(usize, f32, f32, u8)>;
         let mut best_label = None::<(usize, f32, f32, u8)>;
+        let mut seen_exact = BTreeSet::<String>::new();
         for (index, record) in overlay.records.iter().enumerate() {
             if !self.hazard_record_visible(record) || !hazard_points_renderable(&record.points) {
                 continue;
@@ -899,15 +1451,9 @@ impl ViewerApp {
             if bbox_contains(record.bbox, point.lon, point.lat)
                 && hazard_polygon_contains_point(&record.points, point)
             {
-                let candidate = (index, screen_area, family_order);
-                if best_containing.is_none_or(|best| {
-                    candidate
-                        .1
-                        .total_cmp(&best.1)
-                        .then_with(|| candidate.2.cmp(&best.2))
-                        .is_lt()
-                }) {
-                    best_containing = Some(candidate);
+                let base_id = base_hazard_event_id(&record.event_id).to_owned();
+                if seen_exact.insert(base_id.clone()) {
+                    containing.push((index, screen_area, family_order, base_id));
                 }
                 continue;
             }
@@ -945,10 +1491,22 @@ impl ViewerApp {
                 }
             }
         }
-        best_containing
-            .map(|(index, _, _)| index)
-            .or_else(|| best_near.map(|(index, _, _, _)| index))
-            .or_else(|| best_label.map(|(index, _, _, _)| index))
+        if !containing.is_empty() {
+            containing.sort_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.2.cmp(&right.2))
+                    .then_with(|| left.3.cmp(&right.3))
+            });
+            return containing
+                .into_iter()
+                .map(|(index, _, _, _)| index)
+                .collect();
+        }
+        best_near
+            .map(|(index, _, _, _)| vec![index])
+            .or_else(|| best_label.map(|(index, _, _, _)| vec![index]))
+            .unwrap_or_default()
     }
 
     fn hazard_screen_area(&self, rect: egui::Rect, points: &[HazardPoint]) -> f32 {
@@ -1306,6 +1864,250 @@ impl ViewerApp {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HazardPopupLayout {
+    position: egui::Pos2,
+    width: f32,
+    body_height: f32,
+}
+
+fn hazard_popup_layout(
+    map_rect: egui::Rect,
+    anchor: egui::Pos2,
+    card_count: usize,
+) -> HazardPopupLayout {
+    let margin = 8.0;
+    let gap = 14.0;
+    let width = 300.0_f32.min((map_rect.width() - margin * 2.0).max(150.0));
+    let available_height = (map_rect.height() - margin * 2.0).max(92.0);
+    let body_height = (card_count.max(1) as f32 * 132.0).min((available_height - 42.0).max(52.0));
+    let estimated_height = body_height + 42.0;
+    let preferred_x = if anchor.x + gap + width <= map_rect.right() - margin {
+        anchor.x + gap
+    } else {
+        anchor.x - gap - width
+    };
+    let max_x = (map_rect.right() - margin - width).max(map_rect.left() + margin);
+    let x = preferred_x.clamp(map_rect.left() + margin, max_x);
+    let max_y = (map_rect.bottom() - margin - estimated_height).max(map_rect.top() + margin);
+    let y = (anchor.y - estimated_height * 0.5).clamp(map_rect.top() + margin, max_y);
+    HazardPopupLayout {
+        position: egui::pos2(x, y),
+        width,
+        body_height,
+    }
+}
+
+fn hazard_popup_card_fill(
+    panel: egui::Color32,
+    fill_rgb: styles::Rgba,
+    resolved_alpha: u8,
+) -> egui::Color32 {
+    // Map fills may intentionally be faint. A solid card surface keeps the
+    // exact resolved/custom RGB while bounding its blend for readable text.
+    let mix = (resolved_alpha as f32 / 255.0).clamp(0.24, 0.44);
+    let channel =
+        |base: u8, overlay: u8| (base as f32 * (1.0 - mix) + overlay as f32 * mix).round() as u8;
+    egui::Color32::from_rgb(
+        channel(panel.r(), fill_rgb[0]),
+        channel(panel.g(), fill_rgb[1]),
+        channel(panel.b(), fill_rgb[2]),
+    )
+}
+
+fn hazard_popup_title(record: &HazardRecord) -> String {
+    let canonical = match record.event_family.as_str() {
+        "tornado" => Some("Tornado Warning"),
+        "severe thunderstorm" => Some("Severe Thunderstorm Warning"),
+        "flash flood" => Some("Flash Flood Warning"),
+        "flood" => Some("Flood Warning"),
+        "special marine" => Some("Special Marine Warning"),
+        "snow squall" => Some("Snow Squall Warning"),
+        "fire weather" => Some("Fire Weather Warning"),
+        "special weather" => Some("Special Weather Statement"),
+        _ => None,
+    };
+    if let Some(canonical) = canonical {
+        return canonical.to_owned();
+    }
+    if let Some(headline) = record
+        .headline
+        .as_deref()
+        .map(str::trim)
+        .filter(|headline| !headline.is_empty())
+    {
+        let first_line = headline.lines().next().unwrap_or(headline).trim();
+        if first_line.chars().count() <= 70 {
+            return first_line.to_owned();
+        }
+    }
+    let family = title_case_tag(&record.event_family);
+    if family.to_ascii_lowercase().contains("warning") {
+        family
+    } else {
+        format!("{family} warning")
+    }
+}
+
+fn hazard_popup_metric_lines(record: &HazardRecord) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(wind) = record.wind_mph.filter(|wind| *wind > 0) {
+        lines.push(format!("Wind: {wind} mph"));
+    }
+    if let Some(hail) = record
+        .hail_inches
+        .filter(|hail| hail.is_finite() && *hail > 0.0)
+    {
+        lines.push(format!("Hail: {hail:.2} in"));
+    }
+    if let Some(tornado) = record.tornado.as_deref().and_then(normalized_tornado_tag) {
+        lines.push(tornado);
+    }
+    if let Some(tag) = record
+        .damage_threat
+        .as_deref()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+    {
+        lines.push(format!("Tag: {}", title_case_tag(tag)));
+    }
+    lines
+}
+
+fn normalized_tornado_tag(raw: &str) -> Option<String> {
+    let normalized = raw
+        .trim()
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    match normalized.as_str() {
+        "" | "NONE" | "NO" => None,
+        "POSSIBLE" => Some("Tornado possible".to_owned()),
+        "RADAR INDICATED" => Some("Tornado possible · radar indicated".to_owned()),
+        "OBSERVED" => Some("Tornado observed".to_owned()),
+        _ => Some(format!("Tornado: {}", title_case_tag(&normalized))),
+    }
+}
+
+fn title_case_tag(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|word| {
+            let lower = word.to_ascii_lowercase();
+            let mut chars = lower.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + chars.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn hazard_popup_office(record: &HazardRecord) -> String {
+    let base_id = base_hazard_event_id(&record.event_id);
+    let vtec = base_id.split('.').next().unwrap_or_default().trim();
+    if vtec.len() == 4 && vtec.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return vtec.to_ascii_uppercase();
+    }
+    record.office.trim().to_owned()
+}
+
+fn hazard_popup_expiry_text(
+    record: &HazardRecord,
+    now: DateTime<Utc>,
+    archive_timeline: bool,
+) -> String {
+    let Some(end) = parse_hazard_record_time(&record.valid_end) else {
+        return "Valid time unavailable".to_owned();
+    };
+    let clock = end.format("%H:%MZ");
+    if archive_timeline {
+        return format!("Valid until {} {clock}", end.format("%Y-%m-%d"));
+    }
+    let seconds = (end - now).num_seconds();
+    if seconds >= 0 {
+        let minutes = (seconds + 59) / 60;
+        if minutes >= 60 {
+            format!(
+                "Expires in {}h {:02}m · {clock}",
+                minutes / 60,
+                minutes % 60
+            )
+        } else {
+            format!("Expires in {minutes} min · {clock}")
+        }
+    } else {
+        let minutes = ((-seconds) + 59) / 60;
+        format!("Expired {minutes} min ago · {clock}")
+    }
+}
+
+fn paint_hazard_popup_card_border(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    style: &styles::PolygonStyle,
+    global: &styles::HazardGlobalStyle,
+    clip_rect: egui::Rect,
+) {
+    let base = style_color32(style.stroke_color);
+    let color = egui::Color32::from_rgba_unmultiplied(
+        base.r(),
+        base.g(),
+        base.b(),
+        global.stroke_alpha_selected.max(180),
+    );
+    let stroke = egui::Stroke::new(
+        (style.stroke_width * global.stroke_width_scale).max(1.5),
+        color,
+    );
+    let inset = rect.shrink(stroke.width * 0.5);
+    match style.dash {
+        styles::DashPattern::Solid => {
+            painter.rect_stroke(inset, 4.0, stroke, egui::StrokeKind::Inside);
+        }
+        dash => {
+            let points = vec![
+                inset.left_top(),
+                inset.right_top(),
+                inset.right_bottom(),
+                inset.left_bottom(),
+            ];
+            let mut shapes = Vec::new();
+            match dash {
+                styles::DashPattern::Solid => unreachable!("solid handled above"),
+                styles::DashPattern::Dashed { dash, gap } => push_dashed_closed_line(
+                    &mut shapes,
+                    &points,
+                    stroke,
+                    dash,
+                    gap,
+                    clip_rect,
+                    100_000.0,
+                ),
+                styles::DashPattern::Dotted => {
+                    let dot = stroke.width.max(1.0);
+                    push_dashed_closed_line(
+                        &mut shapes,
+                        &points,
+                        stroke,
+                        dot,
+                        dot * 2.0,
+                        clip_rect,
+                        100_000.0,
+                    );
+                }
+            }
+            painter.extend(shapes);
+        }
+    }
+    painter.rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 3.0)),
+        2.0,
+        color,
+    );
+}
+
 /// `hazard_geom::format_utc_seconds` output ("2026-07-08T22:45:00Z") →
 /// the alert row's compact expiry ("22:45Z"). Anything else → None (the
 /// full string still lives in the row hover's detail lines).
@@ -1370,6 +2172,57 @@ fn hazard_alert_row_text(
 mod tests {
     use super::*;
 
+    fn popup_test_record(
+        event_id: &str,
+        family: &str,
+        west: f32,
+        south: f32,
+        east: f32,
+        north: f32,
+    ) -> HazardRecord {
+        HazardRecord {
+            event_id: event_id.to_owned(),
+            label: event_id.to_owned(),
+            event_family: family.to_owned(),
+            action: "NEW".to_owned(),
+            lifecycle_status: Some("Active".to_owned()),
+            office: "NWS Test".to_owned(),
+            headline: None,
+            source_url: None,
+            area: None,
+            motion: None,
+            details: Vec::new(),
+            valid_start: Some("2026-07-15T19:00:00Z".to_owned()),
+            valid_end: Some("2026-07-15T20:30:00Z".to_owned()),
+            severity: None,
+            certainty: None,
+            urgency: None,
+            tornado: None,
+            hail_inches: None,
+            wind_mph: None,
+            damage_threat: None,
+            points: vec![
+                HazardPoint {
+                    lon: west,
+                    lat: south,
+                },
+                HazardPoint {
+                    lon: east,
+                    lat: south,
+                },
+                HazardPoint {
+                    lon: east,
+                    lat: north,
+                },
+                HazardPoint {
+                    lon: west,
+                    lat: north,
+                },
+            ],
+            bbox: [west, south, east, north],
+        }
+    }
+
     #[test]
     fn alert_qol_panel_defaults_copy_into_persisted_settings() {
         let mut app = crate::tests::test_viewer_app_with_hazards(Vec::new());
@@ -1388,6 +2241,228 @@ mod tests {
             app.app_settings.hidden_hazard_families,
             vec!["tornado".to_owned()]
         );
+    }
+
+    #[test]
+    fn exact_overlap_stacks_all_unique_events_smallest_first() {
+        let broad = popup_test_record(
+            "KTLX.SV.W.0001",
+            "severe thunderstorm",
+            -2.0,
+            -2.0,
+            2.0,
+            2.0,
+        );
+        let narrow = popup_test_record("KTLX.TO.W.0002", "tornado", -0.5, -0.5, 0.5, 0.5);
+        let duplicate_part = popup_test_record("KTLX.TO.W.0002#1", "tornado", -0.4, -0.4, 0.4, 0.4);
+        let mut app =
+            crate::tests::test_viewer_app_with_hazards(vec![broad, narrow, duplicate_part]);
+        app.hazards_active_only = false;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let hits = app.hazards_at_position(rect, rect.center());
+
+        assert_eq!(hits, vec![1, 0], "multipart pieces must dedupe by base id");
+    }
+
+    #[test]
+    fn map_popup_stores_stable_event_ids_and_geographic_anchor() {
+        let warning = popup_test_record(
+            "KTLX.SV.W.0001#0",
+            "severe thunderstorm",
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+        );
+        let mut app = crate::tests::test_viewer_app_with_hazards(vec![warning]);
+        app.hazards_active_only = false;
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.active_pane = 1;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let pointer = rect.center();
+        let expected = app.screen_to_lon_lat(rect, pointer);
+
+        assert!(app.open_hazard_popup_from_map(rect, pointer));
+        let popup = app.hazard_map_popup.as_ref().expect("warning stack opens");
+        assert_eq!(popup.event_ids, vec!["KTLX.SV.W.0001"]);
+        assert_eq!(
+            popup.pane_index, 1,
+            "popup must retain its owning grid pane"
+        );
+        assert!((popup.anchor.lon - expected.0).abs() < 0.001);
+        assert!((popup.anchor.lat - expected.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn warning_card_metrics_suppress_zeroes_and_normalize_tags() {
+        let mut record = popup_test_record(
+            "KTLX.SV.W.0001",
+            "severe thunderstorm",
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+        );
+        record.wind_mph = Some(0);
+        record.hail_inches = Some(0.0);
+        record.tornado = Some("RADAR_INDICATED".to_owned());
+        record.damage_threat = Some("DESTRUCTIVE".to_owned());
+
+        assert_eq!(
+            hazard_popup_metric_lines(&record),
+            vec![
+                "Tornado possible · radar indicated".to_owned(),
+                "Tag: Destructive".to_owned()
+            ]
+        );
+
+        record.wind_mph = Some(80);
+        record.hail_inches = Some(2.0);
+        let metrics = hazard_popup_metric_lines(&record);
+        assert!(metrics.contains(&"Wind: 80 mph".to_owned()));
+        assert!(metrics.contains(&"Hail: 2.00 in".to_owned()));
+    }
+
+    #[test]
+    fn popup_office_prefers_vtec_letters_and_falls_back_to_sender() {
+        let mut vtec = popup_test_record(
+            "KSGF.SV.W.0042",
+            "severe thunderstorm",
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+        );
+        vtec.office = "NWS Springfield MO".to_owned();
+        assert_eq!(hazard_popup_office(&vtec), "KSGF");
+
+        vtec.event_id = "2026-europe-alert".to_owned();
+        assert_eq!(hazard_popup_office(&vtec), "NWS Springfield MO");
+    }
+
+    #[test]
+    fn expiry_countdown_is_live_but_archive_is_absolute() {
+        let record = popup_test_record(
+            "KTLX.SV.W.0001",
+            "severe thunderstorm",
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+        );
+        let now = Utc.with_ymd_and_hms(2026, 7, 15, 20, 16, 0).unwrap();
+
+        assert_eq!(
+            hazard_popup_expiry_text(&record, now, false),
+            "Expires in 14 min · 20:30Z"
+        );
+        assert_eq!(
+            hazard_popup_expiry_text(&record, now, true),
+            "Valid until 2026-07-15 20:30Z"
+        );
+    }
+
+    #[test]
+    fn popup_layout_stays_inside_map_and_caps_overlap_stack() {
+        let rect = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(700.0, 450.0));
+        let layout = hazard_popup_layout(rect, egui::pos2(695.0, 445.0), 12);
+        let estimated = egui::Rect::from_min_size(
+            layout.position,
+            egui::vec2(layout.width, layout.body_height + 42.0),
+        );
+        assert!(rect.shrink(7.9).contains_rect(estimated));
+        assert_eq!(layout.width, 300.0, "desktop popup must stay compact");
+        assert!(
+            layout.body_height < 12.0 * 132.0,
+            "large stacks must scroll"
+        );
+    }
+
+    #[test]
+    fn popup_title_uses_compact_event_name_instead_of_long_nws_headline() {
+        let mut record = popup_test_record(
+            "KDTX.SV.W.0042",
+            "severe thunderstorm",
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+        );
+        record.headline = Some(
+            "Severe Thunderstorm Warning issued July 15 at 7:22PM EDT until July 15 at 7:45PM EDT by NWS Detroit/Pontiac MI"
+                .to_owned(),
+        );
+
+        assert_eq!(hazard_popup_title(&record), "Severe Thunderstorm Warning");
+    }
+
+    #[test]
+    fn rendered_popup_is_compact_and_every_standard_field_is_visible() {
+        let mut record = popup_test_record(
+            "KDTX.SV.W.0042",
+            "severe thunderstorm",
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+        );
+        record.headline = Some(
+            "Severe Thunderstorm Warning issued July 15 at 7:22PM EDT until July 15 at 7:45PM EDT by NWS Detroit/Pontiac MI"
+                .to_owned(),
+        );
+        record.wind_mph = Some(60);
+        record.hail_inches = Some(1.5);
+        let mut app = crate::tests::test_viewer_app_with_hazards(vec![record]);
+        app.hazards_active_only = false;
+        let map_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        assert!(app.open_hazard_popup_from_map(map_rect, map_rect.center()));
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(map_rect),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                app.show_hazard_map_popup(ui.ctx(), map_rect);
+            });
+        }
+        let popup = app
+            .hazard_map_popup
+            .as_ref()
+            .expect("popup remains open after rendering");
+        let rendered = popup.screen_rect.expect("popup was rendered");
+        assert!(
+            rendered.width() <= 302.0,
+            "popup expanded past compact bound: {rendered:?}"
+        );
+        let probe = popup
+            .layout_probe
+            .as_ref()
+            .expect("test layout probe was recorded");
+        let viewport = probe.viewport.expect("scroll viewport exists");
+        let card = probe.card.expect("card frame exists");
+        assert!(
+            viewport.expand(0.5).contains_rect(card),
+            "standard warning card is clipped by its viewport: viewport={viewport:?}, card={card:?}"
+        );
+        for (name, rect) in [
+            ("title", probe.title),
+            ("Wind", probe.wind),
+            ("Hail", probe.hail),
+            ("expiry/WFO", probe.footer),
+            ("Details", probe.details),
+        ] {
+            let rect = rect.unwrap_or_else(|| panic!("{name} widget was not rendered"));
+            assert!(
+                rect.width() > 0.0 && rect.height() > 0.0,
+                "{name}: {rect:?}"
+            );
+            assert!(
+                card.expand(0.5).contains_rect(rect),
+                "{name} escaped the card: card={card:?}, widget={rect:?}"
+            );
+        }
     }
 
     #[test]

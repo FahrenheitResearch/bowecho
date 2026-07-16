@@ -372,8 +372,9 @@ pub trait IntlProvider: Send + Sync {
 /// Single-file ODIM PVOL feeds (one HDF5 download per frame): SMHI Sweden,
 /// DMI Denmark, GeoSphere Austria, FMI Finland. Split-volume assembly
 /// feeds (one frame = several ODIM files merged with
-/// `radar_core::merge_radar_volumes`): SHMU Slovakia, DWD Germany (REF+VEL
-/// by default), CHMI Czechia, ANM Romania (dual-pol per-moment PVOLs, see
+/// `radar_core::merge_radar_volumes`): SHMU Slovakia, DWD Germany
+/// (quality-controlled REF+VEL plus every dual-pol moment available at the
+/// station), CHMI Czechia, ANM Romania (dual-pol per-moment PVOLs, see
 /// [`MeteoRomaniaProvider`]). Multi-station tar feed (site-filtered decode, see
 /// [`JmaProvider`]): JMA Japan. Single-site KAIA bridge for Estonia's Harku
 /// radar, which is not currently present in ORD's rolling cache:
@@ -388,7 +389,7 @@ pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
         Box::new(GeoSphereProvider::new()),
         Box::new(FmiProvider::new()),
         Box::new(ShmuProvider::new()),
-        Box::new(DwdProvider::new()),
+        Box::new(DwdProvider::with_dual_pol()),
         Box::new(ChmiProvider::new()),
         Box::new(PiemonteProvider::new()),
         Box::new(LombardiaProvider::new()),
@@ -486,7 +487,7 @@ pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
                 "dwd" => (
                     "newest N 5-minute sweep cycles",
                     "rolling ~2 days",
-                    "recent loop from timestamped sweep files",
+                    "recent loop from quality-controlled reflectivity and every available dual-pol sweep",
                     "add date/window picker over the rolling days",
                 ),
                 "shmu" => (

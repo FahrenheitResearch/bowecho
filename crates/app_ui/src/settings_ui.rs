@@ -92,6 +92,10 @@ impl ViewerApp {
         self.radar_age_style_panel(ui, ctx);
         ui.separator();
         ui.label(egui::RichText::new("Color tables").strong());
+        ui.weak("Active radar product");
+        let active_product = self.selected_product.clone();
+        self.active_product_color_picker(ui, ctx, &active_product);
+        ui.separator();
         self.color_table_panel(ui, ctx);
     }
 
@@ -824,7 +828,7 @@ impl ViewerApp {
                     note.as_str(),
                     "A velocity palette's declared Units: header (kt, mph, km/h, m/s) drives the \
                      velocity readout, colorbar ticks, and unit chip — GR2Analyst semantics. Pick or \
-                     edit the table under Map > Color tables to change it.",
+                     edit the table under Custom > Appearance > Color tables to change it.",
                 ],
             );
         }

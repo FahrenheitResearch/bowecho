@@ -306,8 +306,8 @@ fn getting_started(ui: &mut egui::Ui) {
         "\u{2014} applies one of the built-in operating setups: warning desk, \
          velocity & rotation, model & WRF, satellite & tropical, or archive review. \
          The current workflow marker is only a label for the latest preset; manual tweaks \
-         stay yours, Restore previous setup undoes the latest preset's setup changes, and Clear \
-         marker hides only the label.",
+         stay yours. The direct \u{21b6} Undo button (or Restore previous setup inside the menu) \
+         reverses the latest preset's setup changes; Clear marker hides only the label.",
     );
 
     subhead(ui, "PICK A RADAR");
@@ -368,9 +368,12 @@ fn getting_started(ui: &mut egui::Ui) {
     subhead(ui, "PRODUCTS, TILT, LOOP");
     action(
         ui,
-        "PRODUCTS grid",
-        "— every moment and derived product the loaded volume supports. Buttons are prefixed \
-         with their number-key hotkey; \u{2190}/\u{2192} also step through products.",
+        "Products browser",
+        "— a categorized, full-name list of every currently available radar product. Base and \
+         velocity products stay compact; More products reveals volume, dual-pol, precipitation, \
+         texture, quality, and simulation diagnostics. Advanced products compute only when \
+         selected. Assigned number-key hotkeys appear before their product; \u{2190}/\u{2192} also \
+         step through visible products.",
     );
     action(
         ui,
@@ -497,9 +500,10 @@ fn products(ui: &mut egui::Ui) {
     subhead(ui, "ADVANCED ON-DEMAND SWEEP PRODUCTS");
     para(
         ui,
-        "The PRODUCTS row's Derive advanced button computes extra per-tilt products for the \
-         current visible tilt. KDP is still automatic; these products are computed only when \
-         requested, then stay selectable as live/loop frames advance.",
+        "The Products section uses full names grouped by base moments, velocity, volume/hail, \
+         dual-pol, precipitation, texture/quality, and simulation fields. Turn on More products \
+         to expose the extended catalog. An advanced per-tilt product computes lazily when you \
+         select it; KDP remains automatic when its source metadata are trustworthy.",
     );
     product_entry(
         ui,
@@ -581,7 +585,7 @@ fn products(ui: &mut egui::Ui) {
         ui,
         "Computed from the whole volume and drawn on the lowest tilt (CREF, ET, VIL, VILD, \
          MEHS, POSH, POH, MARC, Gust) or computed per-tilt (AzShr, Div). All are in the \
-         product grid whenever their source moment exists.",
+         categorized product browser when More products is enabled and their source moment exists.",
     );
     product_entry(
         ui,
@@ -734,11 +738,22 @@ fn layers(ui: &mut egui::Ui) {
         "— opens the layer's owning surface: the Model/Satellite/WoFS/FARM window for window \
          layers, the Alerts tab for SPC and warnings, or a small popover for layers with \
          only a few options (surface-obs networks, lightning). Broader appearance controls \
-         live in Map > Appearance.",
+         live in Custom > Appearance.",
+    );
+    action(
+        ui,
+        "WoFS Hi",
+        "— turns on High visibility for the WoFS drape. It repeats the published low-alpha \
+         texture without recoloring or moving it; transparent background pixels stay \
+         transparent, and the opacity slider remains available. The WoFS state dot says \
+         ready only when the exact base frame and its validated georeference are present; \
+         loading, unavailable, and calibration failures do not masquerade as an active layer. \
+         Observed radar intentionally draws above forecast guidance; lower the Radar row's \
+         opacity when you want to compare their overlap.",
     );
     para(
         ui,
-        "Map \u{25b8} Appearance also owns deep visual tuning: map backdrop, warning-polygon \
+        "Custom \u{25b8} Appearance also owns deep visual tuning: map backdrop, warning-polygon \
          fill/width, per-family polygon colors and dash style, radar-age ring/marker arc/chip \
          colors and thresholds, radar product color tables, and built-in appearance profiles \
          such as GR2-classic, Chase dark, and Accessibility.",
@@ -753,7 +768,7 @@ fn layers(ui: &mut egui::Ui) {
     );
     para(
         ui,
-        "Observed tornado warnings have their own border slot under Map > Appearance > \
+        "Observed tornado warnings have their own border slot under Custom > Appearance > \
          Warning polygons. PDS and tornado-emergency styles still take priority when those \
          stronger tags are present. SPC's CIG regions ride inside the ordinary outlook \
          products, so duplicate standalone CIG switches are intentionally omitted.",
@@ -930,8 +945,8 @@ fn model_data(ui: &mut egui::Ui) {
         ui,
         "Text",
         concat!(
-            "â€” choose the bundled Space Grotesk face, egui's clean proportional sans, or ",
-            "technical monospace, and scale sounding text independently from 50â€“200%. Font ",
+            "— choose the bundled Space Grotesk face, egui's clean proportional sans, or ",
+            "technical monospace, and scale sounding text independently from 50–200%. Font ",
             "and size persist across model, box-mean, obs-adjusted, and RAOB soundings without ",
             "changing the panel geometry.",
         ),
@@ -940,14 +955,26 @@ fn model_data(ui: &mut egui::Ui) {
         ui,
         "Correct / Corrected",
         concat!(
-            "— opens the display-only model-sounding correction editor. Add one or more ",
-            "native levels, enter a target height AGL (BowEcho shows the exact model level ",
-            "used), then enable and override T, Td, wind direction, or wind speed. Blend ",
-            "sets a cosine-smoothed vertical transition around that level; 0 m changes only ",
-            "the anchor. The skew-T, hodograph, parcels, and every diagnostic recalculate ",
-            "immediately. MANUAL stays visible until Reset original restores the untouched ",
-            "source column. This tool never edits downloaded/model-store data and is not ",
-            "offered for observed RAOBs.",
+            "— opens a separate resizable correction lab, so a long list of edits never ",
+            "shrinks the sounding plot. Add native anchor levels and independently correct ",
+            "thermal, moisture, and wind profiles. Thermal input can use T or potential ",
+            "temperature (theta, the mixed-layer default); moisture can use Td, mixing ratio, ",
+            "or specific humidity but is always blended in specific-humidity space; wind is ",
+            "always blended as earth-relative U/V even when entered as direction and speed. ",
+            "Each variable has its own depth, domain, and cosine, linear, constant-core/top-",
+            "cosine, or draggable custom W(z) blend. QC visibly flags supersaturation, dry ",
+            "instability, invalid states, and wind-seam kinks without silently clipping Td. ",
+            "The optional Dry convective adjustment is previewed, reversible, and conserves ",
+            "pressure-mass-weighted sensible enthalpy; it aborts if its affected layer would ",
+            "become saturated. The skew-T, hodograph, parcels, and diagnostics recalculate ",
+            "from a panel-local copy. Reset original restores the exact untouched source. ",
+            "The lab's File menu saves fingerprint-bound project JSON, exports the current ",
+            "corrected column as CSV or SPC/SHARPpy RAW, and imports RAW as a new native ",
+            "editable sounding; a project for another physical source is refused. Expand ",
+            "Batch experiment to vary 1–4 numeric fields on one correction row (up to 256 ",
+            "deterministic Cartesian members), rebuild every member, and inspect/export real ",
+            "finite min/median/max parcel, thermodynamic, kinematic, and severe diagnostics. ",
+            "Downloaded/model-store data is never modified, and observed RAOBs are not editable.",
         ),
     );
     action(
@@ -3080,6 +3107,15 @@ fn sources(ui: &mut egui::Ui) {
          convective day (spc.noaa.gov/climo/reports). Tornado tracks: the SPC WCM \
          severe-weather database (spc.noaa.gov/wcm, \"onetor\" format; Schaefer & Edwards \
          1999, 11th Conf. Applied Climatology).",
+    );
+
+    para(
+        ui,
+        "European warnings use MeteoAlarm's official anonymous country Atom/CAP feeds. \
+         Data is provided by EUMETNET members via MeteoAlarm and licensed CC BY 4.0 \
+         (feeds.meteoalarm.org). The anonymous feed supplies warning details, area names, \
+         and region codes but not public polygon geometry, so BowEcho presents these as an \
+         attributed list/detail source and does not invent map placement.",
     );
 
     para(

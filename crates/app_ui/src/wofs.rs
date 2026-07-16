@@ -56,6 +56,15 @@ pub const AXES_BOX: (f32, f32, f32, f32) = (12.0, 43.0, 759.0, 790.0);
 /// Product PNG pixel dimensions (the axes box sits inside this canvas).
 pub const PRODUCT_PNG_SIZE: (f32, f32) = (900.0, 800.0);
 
+/// WoFS product PNGs deliberately encode much of their guidance with low
+/// source alpha (paintball pixels commonly arrive around 15% opacity). The
+/// map also paints WoFS below the observed-radar rasters, so a single 70%
+/// pass was easy to lose. High visibility repeats the exact same textured
+/// mesh: alpha coverage increases, while fully transparent pixels, RGB
+/// palette values, UVs, and georeferencing remain untouched.
+const HIGH_VISIBILITY_PASSES: usize = 2;
+const DEFAULT_DRAPE_OPACITY: f32 = 0.85;
+
 #[derive(Clone)]
 pub struct WofsRun {
     pub id: String,
@@ -571,7 +580,10 @@ pub struct WofsState {
     /// refreshed once per minute until the complete grid lands.
     max_posted_minutes: HashMap<String, (u32, Instant)>,
     availability_rx: Option<mpsc::Receiver<AvailabilityMsg>>,
-    availability_failed: HashMap<String, Instant>,
+    /// Last availability failure by selection: timestamp + diagnostic. The
+    /// message lets the UI distinguish a proved-missing frame from a network
+    /// error where availability is merely unknown.
+    availability_failed: HashMap<String, (Instant, String)>,
     pub status: String,
     /// Soundings mode: station lattice overlay + per-station skew-T window.
     pub soundings_mode: bool,
@@ -589,6 +601,9 @@ pub struct WofsState {
     /// Drape the current product onto the radar map (georeferenced).
     pub drape_on_map: bool,
     pub drape_opacity: f32,
+    /// Repeat the source-texture pass to lift WoFS's intentionally faint PNG
+    /// alpha. This never recolors or reprojects the published imagery.
+    pub drape_high_visibility: bool,
     /// Georef cache by RUN id (the domain is per-run, not per-frame).
     pub georef_cache: HashMap<String, Arc<WofsGeoref>>,
     /// Runs whose calibration failed (message) — drape disabled for them.
@@ -597,6 +612,56 @@ pub struct WofsState {
     pub georef_rx: Option<(String, mpsc::Receiver<Result<WofsGeoref, String>>)>,
     /// Stations processed by the in-flight calibration (status line).
     pub georef_progress: Arc<AtomicUsize>,
+}
+
+/// Honest map-layer readiness. Keeping this separate from `drape_on_map`
+/// prevents the rail from calling a selected-but-undrawable frame "live".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WofsDrapeReadiness {
+    Off,
+    WaitingForCatalog,
+    CheckingAvailability,
+    FrameUnavailable,
+    AvailabilityError,
+    LoadingFrame,
+    InvalidFrame,
+    CalibratingGeoref,
+    GeorefFailed,
+    Ready,
+}
+
+impl WofsDrapeReadiness {
+    pub(crate) fn rail_state(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::WaitingForCatalog
+            | Self::CheckingAvailability
+            | Self::LoadingFrame
+            | Self::CalibratingGeoref => "loading",
+            Self::FrameUnavailable | Self::InvalidFrame => "unavailable",
+            Self::AvailabilityError | Self::GeorefFailed => "error",
+            Self::Ready => "ready",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Off => "not selected for the map",
+            Self::WaitingForCatalog => "waiting for the WoFS catalog and run selection",
+            Self::CheckingAvailability => "checking whether this exact product frame is posted",
+            Self::FrameUnavailable => "this exact product frame is unavailable at NSSL",
+            Self::AvailabilityError => "could not verify this frame's availability",
+            Self::LoadingFrame => "loading the selected base-product texture",
+            Self::InvalidFrame => "the selected image is not the standard georeferenceable size",
+            Self::CalibratingGeoref => "calibrating this run's map georeference",
+            Self::GeorefFailed => "this run's map georeference failed validation",
+            Self::Ready => "current base texture and validated georeference are ready",
+        }
+    }
+
+    fn is_ready(self) -> bool {
+        self == Self::Ready
+    }
 }
 
 impl Default for WofsState {
@@ -627,7 +692,8 @@ impl Default for WofsState {
             selected_station: None,
             snd_frame: None,
             drape_on_map: false,
-            drape_opacity: 0.7,
+            drape_opacity: DEFAULT_DRAPE_OPACITY,
+            drape_high_visibility: true,
             georef_cache: HashMap::new(),
             georef_failed: HashMap::new(),
             georef_rx: None,
@@ -647,6 +713,65 @@ impl WofsState {
         let catalog = self.catalog.as_ref()?;
         let run = catalog.runs.get(self.run_index)?;
         (!self.init.is_empty()).then(|| availability_key(run, &self.init, &self.product))
+    }
+
+    /// Whether the current selection can produce pixels on the map now.
+    /// A checked visibility box is only intent; this method also requires a
+    /// posted base frame, the standard PNG shape, and a validated georef.
+    pub(crate) fn drape_readiness(&self) -> WofsDrapeReadiness {
+        if !self.drape_on_map {
+            return WofsDrapeReadiness::Off;
+        }
+        let Some(catalog) = &self.catalog else {
+            return WofsDrapeReadiness::WaitingForCatalog;
+        };
+        let Some(run) = catalog.runs.get(self.run_index) else {
+            return WofsDrapeReadiness::WaitingForCatalog;
+        };
+        if self.init.is_empty() {
+            return WofsDrapeReadiness::WaitingForCatalog;
+        }
+
+        let availability = availability_key(run, &self.init, &self.product);
+        if !self.max_posted_minutes.contains_key(&availability) {
+            return match self.availability_failed.get(&availability) {
+                Some((_, error))
+                    if error.contains("no posted")
+                        || error.contains("no forecast grid")
+                        || error.contains("no advertised") =>
+                {
+                    WofsDrapeReadiness::FrameUnavailable
+                }
+                Some(_) => WofsDrapeReadiness::AvailabilityError,
+                None => WofsDrapeReadiness::CheckingAvailability,
+            };
+        }
+
+        let base_url = image_url(run, &self.init, &self.product, self.minute);
+        if self.missing.contains_key(&base_url) {
+            return WofsDrapeReadiness::FrameUnavailable;
+        }
+        let Some(texture) = self.textures.get(&base_url) else {
+            return WofsDrapeReadiness::LoadingFrame;
+        };
+        if texture.size() != [PRODUCT_PNG_SIZE.0 as usize, PRODUCT_PNG_SIZE.1 as usize] {
+            return WofsDrapeReadiness::InvalidFrame;
+        }
+        if self.georef_failed.contains_key(&run.id) {
+            return WofsDrapeReadiness::GeorefFailed;
+        }
+        if !self.georef_cache.contains_key(&run.id) {
+            return WofsDrapeReadiness::CalibratingGeoref;
+        }
+        WofsDrapeReadiness::Ready
+    }
+
+    fn drape_passes(&self) -> usize {
+        if self.drape_high_visibility {
+            HIGH_VISIBILITY_PASSES
+        } else {
+            1
+        }
     }
 
     fn clamp_minute_to_posted_edge(&mut self) -> bool {
@@ -692,10 +817,11 @@ impl WofsState {
                 }
                 Ok((key, Err(error))) => {
                     self.availability_rx = None;
-                    self.availability_failed.insert(key.clone(), Instant::now());
                     if self.current_availability_key().as_deref() == Some(key.as_str()) {
                         self.status = format!("WoFS availability: {error}");
                     }
+                    self.availability_failed
+                        .insert(key, (Instant::now(), error));
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.availability_rx = None,
@@ -740,7 +866,7 @@ impl WofsState {
         if self
             .availability_failed
             .get(&key)
-            .is_some_and(|at| at.elapsed().as_secs() <= 60)
+            .is_some_and(|(at, _)| at.elapsed().as_secs() <= 60)
         {
             return;
         }
@@ -750,11 +876,16 @@ impl WofsState {
                 .map(|seconds| seconds / 60)
                 .collect::<Vec<_>>()
         }) else {
-            self.availability_failed.insert(key, Instant::now());
-            self.status = "WoFS availability: product has no forecast grid".to_owned();
+            let error = "product has no forecast grid".to_owned();
+            self.availability_failed
+                .insert(key, (Instant::now(), error.clone()));
+            self.status = format!("WoFS availability: {error}");
             return;
         };
         let (tx, rx) = mpsc::channel();
+        // A backoff-expired failure is now being retried; expose "checking"
+        // instead of leaving the stale error state visible during the probe.
+        self.availability_failed.remove(&key);
         self.availability_rx = Some(rx);
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
@@ -1057,7 +1188,7 @@ impl WofsState {
     /// "Show on map" toggle + opacity + calibration status, rendered inside
     /// the WoFS window.
     pub fn drape_controls_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.drape_on_map, "Show on map")
                 .on_hover_text(
                     "Drape the current product onto the radar map. The georeference is \
@@ -1070,61 +1201,93 @@ impl WofsState {
             ui.add(
                 egui::Slider::new(&mut self.drape_opacity, 0.05..=1.0)
                     .text("opacity")
-                    .show_value(false),
+                    .show_value(true),
             );
-            if let Some(url) = self.current_base_url() {
-                if self.missing.contains_key(&url) {
+            ui.checkbox(&mut self.drape_high_visibility, "High visibility")
+                .on_hover_text(
+                    "Lift the WoFS PNG's intentionally low source alpha by drawing the exact \
+                     same texture twice. Fully transparent pixels stay transparent; published \
+                     RGB product colors and the georeference are unchanged. Observed radar \
+                     intentionally draws above WoFS; lower Radar opacity to compare overlap.",
+                );
+
+            match self.drape_readiness() {
+                WofsDrapeReadiness::Off => {}
+                WofsDrapeReadiness::WaitingForCatalog => {
+                    ui.spinner();
+                    ui.weak("waiting for catalog…");
+                }
+                WofsDrapeReadiness::CheckingAvailability => {
+                    ui.spinner();
+                    ui.weak("checking selected frame…");
+                }
+                WofsDrapeReadiness::FrameUnavailable => {
                     ui.colored_label(
                         egui::Color32::from_rgb(230, 150, 90),
-                        "map drape paused: selected frame is unavailable",
+                        "map drape unavailable for this exact frame",
                     );
-                    return;
                 }
-                if !self.textures.contains_key(&url) {
+                WofsDrapeReadiness::AvailabilityError => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 150, 90),
+                        "map drape paused: availability check failed",
+                    );
+                }
+                WofsDrapeReadiness::LoadingFrame => {
                     ui.spinner();
-                    ui.weak("map drape waiting for the selected frame");
-                    return;
+                    ui.weak("loading selected frame…");
                 }
-            }
-            let Some(run_id) = self
-                .catalog
-                .as_ref()
-                .and_then(|c| c.runs.get(self.run_index))
-                .map(|r| r.id.clone())
-            else {
-                return;
-            };
-            if let Some(georef) = self.georef_cache.get(&run_id) {
-                ui.weak(format!(
-                    "georef OK · {} lat / {} lon inliers · max resid {:.2}/{:.2}°",
-                    georef.lat_inliers,
-                    georef.lon_inliers,
-                    georef.lat_max_resid,
-                    georef.lon_max_resid
-                ));
-            } else if let Some(error) = self.georef_failed.get(&run_id).cloned() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(230, 150, 90),
-                    format!("drape disabled for this run: {error}"),
-                );
-                if ui
-                    .small_button("Retry")
-                    .on_hover_text("Retry this run's sounding-title calibration")
-                    .clicked()
-                {
-                    self.retry_georef_for_run(&run_id);
+                WofsDrapeReadiness::InvalidFrame => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 150, 90),
+                        "map drape disabled: unexpected image dimensions",
+                    );
                 }
-            } else if self.georef_rx.as_ref().is_some_and(|(id, _)| *id == run_id) {
-                ui.spinner();
-                ui.weak(format!(
-                    "calibrating georef… {}/{} soundings",
-                    self.georef_progress
-                        .load(Ordering::Relaxed)
-                        .min(wofs_georef::CALIBRATION_TOTAL),
-                    wofs_georef::CALIBRATION_TOTAL
-                ));
-            } else {
-                ui.weak("waiting for catalog…");
+                WofsDrapeReadiness::CalibratingGeoref => {
+                    ui.spinner();
+                    ui.weak(format!(
+                        "calibrating georef… {}/{} soundings",
+                        self.georef_progress
+                            .load(Ordering::Relaxed)
+                            .min(wofs_georef::CALIBRATION_TOTAL),
+                        wofs_georef::CALIBRATION_TOTAL
+                    ));
+                }
+                WofsDrapeReadiness::GeorefFailed => {
+                    let run_id = self
+                        .catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.runs.get(self.run_index))
+                        .map(|run| run.id.clone())
+                        .unwrap_or_default();
+                    let error = self
+                        .georef_failed
+                        .get(&run_id)
+                        .cloned()
+                        .unwrap_or_else(|| "validation failed".to_owned());
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 150, 90),
+                        format!("drape disabled for this run: {error}"),
+                    );
+                    if ui
+                        .small_button("Retry")
+                        .on_hover_text("Retry this run's sounding-title calibration")
+                        .clicked()
+                    {
+                        self.retry_georef_for_run(&run_id);
+                    }
+                }
+                WofsDrapeReadiness::Ready => {
+                    if let Some(georef) = self.catalog.as_ref().and_then(|catalog| {
+                        let run = catalog.runs.get(self.run_index)?;
+                        self.georef_cache.get(&run.id)
+                    }) {
+                        ui.weak(format!(
+                            "map ready · georef resid {:.2}/{:.2}°",
+                            georef.lat_max_resid, georef.lon_max_resid
+                        ));
+                    }
+                }
             }
         });
     }
@@ -1142,7 +1305,10 @@ impl WofsState {
         rect: egui::Rect,
         project: &dyn Fn(f32, f32) -> egui::Pos2,
     ) {
-        if !self.drape_on_map {
+        // Do not paint a stale texture or a transparent overlay by itself.
+        // The same readiness gate feeds the layer rail, so its status and
+        // actual map pixels cannot disagree.
+        if !self.drape_readiness().is_ready() {
             return;
         }
         let Some(catalog) = &self.catalog else {
@@ -1152,13 +1318,6 @@ impl WofsState {
             return;
         };
         let base_url = image_url(run, &self.init, &self.product, self.minute);
-        // Never draw transparent overlays by themselves after the base
-        // request fails. That looked like an active but black/stale WoFS
-        // layer. The window reports that the drape is paused until this exact
-        // selection has a valid base texture.
-        if self.missing.contains_key(&base_url) || !self.textures.contains_key(&base_url) {
-            return;
-        }
         let Some(georef) = self.georef_cache.get(&run.id) else {
             return;
         };
@@ -1183,7 +1342,11 @@ impl WofsState {
                 acc.union(egui::Rect::from_min_max(v.pos, v.pos))
             });
             if bounds.intersects(rect) {
-                painter.add(egui::Shape::mesh(mesh));
+                // Repeating a source-over pass raises only coverage from the
+                // PNG's low alpha. It does not alter RGB, UV, or vertex data.
+                for _ in 0..self.drape_passes() {
+                    painter.add(egui::Shape::mesh(mesh.clone()));
+                }
             }
         }
     }
@@ -1593,6 +1756,111 @@ mod tests {
             .insert(run_id.to_owned(), "temporary CDN timeout".to_owned());
         state.retry_georef_for_run(run_id);
         assert!(!state.georef_failed.contains_key(run_id));
+    }
+
+    fn selected_test_drape() -> (WofsState, WofsRun, String) {
+        let run = WofsRun {
+            id: "WOFSRun20260715-test".to_owned(),
+            name: "Test domain".to_owned(),
+            rundate: "20260715".to_owned(),
+            inits: vec!["202607152100".to_owned()],
+        };
+        let product = SND_REF_PRODUCT.to_owned();
+        let state = WofsState {
+            catalog: Some(WofsCatalog {
+                runs: vec![run.clone()],
+                groups: Vec::new(),
+                times: HashMap::from([(product.clone(), vec![0, 300])]),
+            }),
+            init: run.inits[0].clone(),
+            product: product.clone(),
+            minute: 0,
+            drape_on_map: true,
+            ..WofsState::default()
+        };
+        (state, run, product)
+    }
+
+    #[test]
+    fn drape_defaults_lift_low_alpha_but_keep_an_explicit_standard_mode() {
+        let mut state = WofsState::default();
+        assert_eq!(state.drape_opacity, DEFAULT_DRAPE_OPACITY);
+        assert!(state.drape_high_visibility);
+        assert_eq!(state.drape_passes(), HIGH_VISIBILITY_PASSES);
+
+        state.drape_high_visibility = false;
+        assert_eq!(state.drape_passes(), 1);
+    }
+
+    #[test]
+    fn unavailable_selection_never_reports_a_ready_map_layer() {
+        let (mut state, run, product) = selected_test_drape();
+        let key = availability_key(&run, &state.init, &product);
+
+        assert_eq!(
+            state.drape_readiness(),
+            WofsDrapeReadiness::CheckingAvailability
+        );
+        state.availability_failed.insert(
+            key,
+            (
+                Instant::now(),
+                "product has no posted analysis frame for this run/cycle".to_owned(),
+            ),
+        );
+        let readiness = state.drape_readiness();
+        assert_eq!(readiness, WofsDrapeReadiness::FrameUnavailable);
+        assert_eq!(readiness.rail_state(), "unavailable");
+    }
+
+    #[test]
+    fn failed_availability_check_is_not_mislabeled_as_proved_unavailable() {
+        let (mut state, run, product) = selected_test_drape();
+        let key = availability_key(&run, &state.init, &product);
+        state
+            .availability_failed
+            .insert(key, (Instant::now(), "request timed out".to_owned()));
+
+        let readiness = state.drape_readiness();
+        assert_eq!(readiness, WofsDrapeReadiness::AvailabilityError);
+        assert_eq!(readiness.rail_state(), "error");
+    }
+
+    #[test]
+    fn drape_readiness_requires_both_current_texture_and_georef() {
+        let (mut state, run, product) = selected_test_drape();
+        let key = availability_key(&run, &state.init, &product);
+        state.max_posted_minutes.insert(key, (0, Instant::now()));
+        assert_eq!(state.drape_readiness(), WofsDrapeReadiness::LoadingFrame);
+
+        let ctx = egui::Context::default();
+        let base_url = image_url(&run, &state.init, &product, 0);
+        let texture = ctx.load_texture(
+            "wofs-readiness-test",
+            egui::ColorImage::filled(
+                [PRODUCT_PNG_SIZE.0 as usize, PRODUCT_PNG_SIZE.1 as usize],
+                egui::Color32::TRANSPARENT,
+            ),
+            egui::TextureOptions::NEAREST,
+        );
+        state.textures.insert(base_url, texture);
+        assert_eq!(
+            state.drape_readiness(),
+            WofsDrapeReadiness::CalibratingGeoref
+        );
+
+        state.georef_cache.insert(
+            run.id.clone(),
+            Arc::new(WofsGeoref::from_coeffs(
+                [37.2, 0.3, 7.95, 0.0, -0.3, 0.0],
+                [-94.4, 10.1, 0.05, 0.0, 0.9, 0.0],
+                20,
+                20,
+                0.05,
+                0.003,
+            )),
+        );
+        assert_eq!(state.drape_readiness(), WofsDrapeReadiness::Ready);
     }
 
     /// Live round-trip against the running WoFS: catalog -> station

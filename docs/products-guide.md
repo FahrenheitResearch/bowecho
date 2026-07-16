@@ -38,10 +38,10 @@ usable reflectivity tilt.
 
 ### Advanced on-demand sweep products
 
-The **Derive advanced** button in the PRODUCTS row computes additional
-per-tilt products for the current visible tilt. KDP remains automatic; these
-fields are intentionally on-demand so live loops do not precompute every
-diagnostic for every incoming scan.
+Turn on **More products** in the Products section to expose the categorized
+extended catalog. Each per-tilt field computes lazily when selected. KDP
+remains automatic; live loops do not precompute every diagnostic for every
+incoming scan.
 
 | Product | Method | Units | How to read it |
 |---|---|---|---|

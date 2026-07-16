@@ -52,10 +52,14 @@ const GIF_QUANTIZER_SPEED: i32 = 10;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Tag attached to each screenshot request so replies can be routed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum CaptureKind {
     FullWindow,
     MapOnly,
+    Sounding {
+        rect: egui::Rect,
+        pixels_per_point: f32,
+    },
     RecordFrame,
     FreeRecordFrame,
 }
@@ -376,8 +380,28 @@ impl ViewerApp {
         for (kind, image) in captures {
             self.media.capture_overlay_visible = false;
             match kind {
-                CaptureKind::FullWindow => self.finish_still_capture(ctx, &image, false),
-                CaptureKind::MapOnly => self.finish_still_capture(ctx, &image, true),
+                CaptureKind::FullWindow => {
+                    self.finish_still_capture(ctx, &image, None, true, "screenshot")
+                }
+                CaptureKind::MapOnly => self.finish_still_capture(
+                    ctx,
+                    &image,
+                    self.media
+                        .last_map_rect
+                        .map(|rect| (rect, ctx.pixels_per_point())),
+                    true,
+                    "map screenshot",
+                ),
+                CaptureKind::Sounding {
+                    rect,
+                    pixels_per_point,
+                } => self.finish_still_capture(
+                    ctx,
+                    &image,
+                    Some((rect, pixels_per_point)),
+                    false,
+                    "sounding image",
+                ),
                 CaptureKind::RecordFrame => self.record_frame_captured(ctx, image),
                 CaptureKind::FreeRecordFrame => self.free_record_frame_captured(ctx, image),
             }
@@ -388,28 +412,47 @@ impl ViewerApp {
     }
 
     fn request_screenshot(&mut self, ctx: &egui::Context, kind: CaptureKind) {
-        self.media.capture_overlay_visible = true;
+        // The generic share overlay belongs on full/map captures. A sounding
+        // crop can overlap the map, so painting that card while its screenshot
+        // is in flight would burn it into the exported sounding.
+        self.media.capture_overlay_visible = !matches!(kind, CaptureKind::Sounding { .. });
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(kind)));
         ctx.request_repaint();
+    }
+
+    pub(crate) fn request_sounding_screenshot(&mut self, ctx: &egui::Context, rect: egui::Rect) {
+        self.request_screenshot(
+            ctx,
+            CaptureKind::Sounding {
+                rect,
+                pixels_per_point: ctx.pixels_per_point(),
+            },
+        );
     }
 
     fn finish_still_capture(
         &mut self,
         ctx: &egui::Context,
         image: &egui::ColorImage,
-        map_only: bool,
+        crop: Option<(egui::Rect, f32)>,
+        apply_layout: bool,
+        subject: &'static str,
     ) {
-        let image = if map_only && let Some(rect) = self.media.last_map_rect {
-            crop_color_image(image, rect, ctx.pixels_per_point())
+        let image = if let Some((rect, pixels_per_point)) = crop {
+            crop_color_image(image, rect, pixels_per_point)
         } else {
             image.clone()
         };
         let brand_config = self.app_settings.brand.clone();
-        let image = apply_share_layout(
-            &image,
-            brand_config.sharing.layout,
-            brand_config.resolved_palette().surface,
-        );
+        let image = if apply_layout {
+            apply_share_layout(
+                &image,
+                brand_config.sharing.layout,
+                brand_config.resolved_palette().surface,
+            )
+        } else {
+            image
+        };
         ctx.copy_image(image.clone());
 
         let result_tx = self.media.result_tx.clone();
@@ -418,19 +461,19 @@ impl ViewerApp {
         thread::spawn(move || {
             let message = match save_capture_png(&image, &brand_config) {
                 Ok(path) => format!(
-                    "{short_name} screenshot copied to clipboard + saved {}",
+                    "{short_name} {subject} copied to clipboard + saved {}",
                     path.display()
                 ),
                 Err(err) => {
-                    format!("{short_name} screenshot copied to clipboard; PNG save failed: {err}")
+                    format!("{short_name} {subject} copied to clipboard; PNG save failed: {err}")
                 }
             };
             let _ = result_tx.send(MediaResult { message });
             repaint_ctx.request_repaint();
         });
         self.status = format!(
-            "{} screenshot copied to clipboard; saving PNG...",
-            self.app_settings.brand.resolved_short_name()
+            "{} {subject} copied to clipboard; saving PNG...",
+            self.app_settings.brand.resolved_short_name(),
         );
     }
 

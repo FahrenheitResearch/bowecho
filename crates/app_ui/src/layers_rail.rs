@@ -45,6 +45,25 @@ fn model_map_layer_opacity_hover(grid_composite: bool) -> &'static str {
 }
 
 impl ViewerApp {
+    /// Add a community URL or downloaded placefile through one slot path.
+    /// Selecting an existing source is a useful explicit reload instead of
+    /// silently doing nothing.
+    fn add_or_reload_placefile_source(&mut self, source: String, show_text_default: bool) {
+        if let Some(slot) = self
+            .placefile_slots
+            .iter_mut()
+            .find(|slot| slot.url == source)
+        {
+            slot.enabled = true;
+            slot.next_refresh = Some(Instant::now());
+            slot.status = "reload queued".to_owned();
+            return;
+        }
+        let mut slot = PlacefileSlot::new(source, true);
+        slot.show_text = show_text_default;
+        self.placefile_slots.push(slot);
+    }
+
     /// Honest layer count for the rail header (ui-refresh proposal §1.3.3):
     /// everything the rail shows as an enabled row.
     pub(crate) fn rail_layer_count(&self) -> usize {
@@ -384,7 +403,7 @@ impl ViewerApp {
                                 if ui
                                     .button(format!("Edit {}", edit_family.label()))
                                     .on_hover_text(
-                                        "Open Map > Appearance > Color tables for this family",
+                                        "Open Custom > Appearance > Color tables for this family",
                                     )
                                     .clicked()
                                 {
@@ -728,13 +747,14 @@ impl ViewerApp {
         }
         // WoFS DRAPE — the row is born from the WoFS window's "Show on map"
         // (the Sat/Model convention) and lives here like every other layer
-        // (spec §2.3). The drape only draws while the window is open (its
-        // pump + radar-time sync run there).
+        // (spec §2.3). Its pump and radar-time sync continue while the window
+        // is closed, and the state dot reports actual draw readiness.
         if self.wofs.drape_on_map {
             let minute = self.wofs.minute;
             let init = self.wofs.init.clone();
+            let readiness = self.wofs.drape_readiness();
             let name_hover = format!(
-                "WoFS ensemble drape: {} · init {}z · f+{}m{}\nGeoreferenced onto the radar map; product/run/minute live in the WoFS window.{}",
+                "WoFS ensemble drape: {} · init {}z · f+{}m{}\nGeoreferenced onto the radar map; product/run/minute live in the WoFS window.\nMap status: {}",
                 self.wofs.product,
                 if init.is_empty() { "??" } else { &init },
                 minute,
@@ -743,16 +763,22 @@ impl ViewerApp {
                 } else {
                     ""
                 },
-                if self.wofs.open {
-                    ""
-                } else {
-                    "\nWindow closed — the drape is paused until it reopens."
-                },
+                readiness.description(),
             );
             let mut open_wofs = false;
             let mut remove_drape = false;
-            let wofs_count = (!init.is_empty()).then(|| format!("{init}z+{minute}m"));
-            if layer_row(
+            let mut visibility_mode_changed = false;
+            let high_visibility = &mut self.wofs.drape_high_visibility;
+            let selection = (!init.is_empty()).then(|| format!("{init}z+{minute}m"));
+            let wofs_count = if readiness == crate::wofs::WofsDrapeReadiness::Ready {
+                selection
+            } else {
+                Some(match selection {
+                    Some(selection) => format!("{} · {selection}", readiness.rail_state()),
+                    None => readiness.rail_state().to_owned(),
+                })
+            };
+            let row_changed = layer_row(
                 ui,
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
@@ -761,7 +787,7 @@ impl ViewerApp {
                     },
                     name: "WoFS drape",
                     name_hover: &name_hover,
-                    state: Some(if self.wofs.open { "live" } else { "paused" }),
+                    state: Some(readiness.rail_state()),
                     count: wofs_count.as_deref(),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut self.wofs.drape_opacity,
@@ -778,8 +804,20 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |_ui| {},
-            ) {
+                |ui| {
+                    if ui
+                        .selectable_label(*high_visibility, "Hi")
+                        .on_hover_text(
+                            "High visibility: lift the WoFS PNG's low source alpha without changing its RGB palette or georeference. Lower Radar opacity to compare where observed radar overlaps it",
+                        )
+                        .clicked()
+                    {
+                        *high_visibility = !*high_visibility;
+                        visibility_mode_changed = true;
+                    }
+                },
+            );
+            if row_changed || visibility_mode_changed {
                 ctx.request_repaint();
             }
             if open_wofs {
@@ -1363,18 +1401,37 @@ impl ViewerApp {
             }
             if ui.button("Add").clicked() {
                 let url = self.placefile_url_input.trim().to_owned();
-                if url.starts_with("http")
-                    && !self.placefile_slots.iter().any(|slot| slot.url == url)
-                {
-                    let mut slot = PlacefileSlot::new(url, true);
-                    slot.show_text = self.style_registry.placefiles().default_show_text;
-                    self.placefile_slots.push(slot);
+                if crate::placefiles::is_remote_source(&url) {
+                    let show_text = self.style_registry.placefiles().default_show_text;
+                    self.add_or_reload_placefile_source(url, show_text);
                     self.placefile_url_input.clear();
                     self.save_placefile_settings();
                     ctx.request_repaint();
                 }
             }
         });
+        if ui
+            .button("Import downloaded placefile…")
+            .on_hover_text(
+                "Open one or more local GR-style placefiles. The picker shows every file, including extensionless and uncommon downloaded names. Local files remain in this layer list and can be refreshed or removed like URL feeds.",
+            )
+            .clicked()
+            && let Some(paths) = rfd::FileDialog::new()
+                .set_title("Import downloaded placefile")
+                // Deliberately no extension filter: downloaded placefiles
+                // commonly use .txt, .placefile, .pf, or no extension.
+                .pick_files()
+        {
+            let show_text = self.style_registry.placefiles().default_show_text;
+            for path in paths {
+                self.add_or_reload_placefile_source(
+                    crate::placefiles::persistent_local_source(&path),
+                    show_text,
+                );
+            }
+            self.save_placefile_settings();
+            ctx.request_repaint();
+        }
         let mut remove: Option<usize> = None;
         let mut changed = false;
         let mut placefiles_dirty = false;
@@ -1384,12 +1441,22 @@ impl ViewerApp {
                 .as_ref()
                 .map(|p| p.title.clone())
                 .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| slot.url.clone());
+                .unwrap_or_else(|| crate::placefiles::source_display_name(&slot.url));
             let hover = format!(
                 "{}
 {}",
                 slot.url, slot.status
             );
+            let compact_status = compact_layer_status(&slot.status, 22);
+            let state = if slot.receiver.is_some() {
+                "loading"
+            } else if slot.status.starts_with("load failed") {
+                "error"
+            } else if slot.data.is_some() {
+                "live"
+            } else {
+                "queued"
+            };
             // Field-split the slot so the row's vis toggle and the
             // trailing refresh button can borrow disjoint fields.
             let enabled = &mut slot.enabled;
@@ -1405,6 +1472,8 @@ impl ViewerApp {
                     },
                     name: &title,
                     name_hover: &hover,
+                    state: Some(state),
+                    count: Some(&compact_status),
                     gear: Some(LayerRowGear::Menu {
                         hover: "Placefile options",
                         content: Box::new(|ui| {
@@ -2718,14 +2787,6 @@ impl ViewerApp {
                     {
                         self.obs_enabled = true;
                         ctx.request_repaint();
-                        ui.close();
-                    }
-                    if ui
-                        .button("Placefile URL…")
-                        .on_hover_text("Paste a GR-style placefile URL (box above)")
-                        .clicked()
-                    {
-                        self.placefile_input_focus = true;
                         ui.close();
                     }
                 });

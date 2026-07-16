@@ -2293,6 +2293,9 @@ pub(crate) fn hazard_family_order(family: &str) -> u8 {
 }
 
 pub(crate) fn hazard_family_menu_label(family: &str) -> String {
+    if family == "meteoalarm" {
+        return "EU".to_owned();
+    }
     HAZARD_FILTER_FAMILIES
         .iter()
         .find_map(|(known_family, label)| (*known_family == family).then_some((*label).to_owned()))

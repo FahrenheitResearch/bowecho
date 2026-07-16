@@ -81,6 +81,7 @@ mod map_paint;
 mod max_ref_swath;
 mod media;
 mod mesoanalysis;
+mod meteoalarm;
 mod model_data;
 mod model_layer;
 mod mping;
@@ -113,6 +114,9 @@ mod simsat_hrrr;
 mod simsat_store;
 mod simsat_ui;
 mod sites_ui;
+mod sounding_correction;
+mod sounding_correction_io;
+mod sounding_correction_ui;
 mod sounding_table_config;
 mod spc_layers;
 mod spc_md_image;
@@ -3039,6 +3043,9 @@ struct ViewerApp {
     /// Clean-screen mode: hide ALL chrome (top bar, sidebar, status) so
     /// captures are pure radar. Tab toggles, Esc restores.
     chrome_hidden: bool,
+    /// Session-only one-click collapse for the ordinary right sidebar.
+    /// Unlike clean-screen mode, the top/status bars and docked viewers stay.
+    sidebar_hidden: bool,
     /// One-shot: the next multi-frame batch install came from a local
     /// folder/zip open — fit the whole sequence in history and roll it.
     pending_local_autoplay: bool,
@@ -3412,6 +3419,7 @@ struct ViewerApp {
     sidebar_tab: SidebarTab,
     last_live_hazard_refresh: Option<Instant>,
     selected_hazard_index: Option<usize>,
+    hazard_map_popup: Option<HazardMapPopup>,
     /// Hazard event ids added by a later refresh and not yet clicked. This is
     /// a session latch for live documentation: it survives auto-refreshes but
     /// clears when the user selects the warning row/polygon.
@@ -6423,6 +6431,35 @@ struct HazardPoint {
     lat: f32,
 }
 
+/// A warning-card stack opened by clicking the map. Stable event ids keep the
+/// stack attached to the same warnings when a live refresh reorders records.
+#[derive(Clone, Debug, PartialEq)]
+struct HazardMapPopup {
+    anchor: HazardPoint,
+    event_ids: Vec<String>,
+    /// Grid pane whose map transform owns `anchor` (0 = primary).
+    pane_index: usize,
+    /// Previous-frame interactive bounds, used to keep card clicks from
+    /// falling through to the map surface underneath.
+    screen_rect: Option<egui::Rect>,
+    #[cfg(test)]
+    layout_probe: Option<HazardMapPopupLayoutProbe>,
+}
+
+/// Actual egui response rectangles captured by the warning-card regression.
+/// This is test-only so production popup state stays minimal.
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq)]
+struct HazardMapPopupLayoutProbe {
+    viewport: Option<egui::Rect>,
+    card: Option<egui::Rect>,
+    title: Option<egui::Rect>,
+    wind: Option<egui::Rect>,
+    hail: Option<egui::Rect>,
+    footer: Option<egui::Rect>,
+    details: Option<egui::Rect>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct HazardListRow {
     index: usize,
@@ -7306,6 +7343,22 @@ impl DerivedProduct {
         }
     }
 
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::CompositeReflectivity => "Composite reflectivity",
+            Self::EchoTops => "Echo tops",
+            Self::Vil => "Vertically integrated liquid",
+            Self::VilDensity => "VIL density",
+            Self::Mehs => "Maximum estimated hail size",
+            Self::Posh => "Probability of severe hail",
+            Self::Poh => "Probability of hail",
+            Self::Marc => "Mid-altitude radial convergence",
+            Self::GustProxy => "Low-level gust proxy",
+            Self::AzimuthalShear => "Azimuthal shear",
+            Self::Divergence => "Radial divergence",
+        }
+    }
+
     fn color_family(self) -> ColorTableFamily {
         match self {
             Self::CompositeReflectivity => ColorTableFamily::Reflectivity,
@@ -7457,6 +7510,127 @@ impl DisplayProduct {
             Self::Derived(d) => d.color_family(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum ProductPickerGroup {
+    Base,
+    Velocity,
+    Volume,
+    DualPol,
+    Precipitation,
+    TextureQuality,
+    Simulation,
+    Other,
+}
+
+impl ProductPickerGroup {
+    const ALL: [Self; 8] = [
+        Self::Base,
+        Self::Velocity,
+        Self::Volume,
+        Self::DualPol,
+        Self::Precipitation,
+        Self::TextureQuality,
+        Self::Simulation,
+        Self::Other,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Base => "Base moments",
+            Self::Velocity => "Velocity & motion",
+            Self::Volume => "Volume & hail",
+            Self::DualPol => "Dual-pol processing",
+            Self::Precipitation => "Precipitation & hydrometeors",
+            Self::TextureQuality => "Texture, quality & signatures",
+            Self::Simulation => "Simulation & validation",
+            Self::Other => "Other native fields",
+        }
+    }
+
+    fn default_open(self) -> bool {
+        matches!(self, Self::Base | Self::Velocity)
+    }
+}
+
+fn product_picker_group(product: &DisplayProduct) -> ProductPickerGroup {
+    use product_engine::DerivedSweepProduct as Sweep;
+
+    if validation_product_label(product).is_some() {
+        return ProductPickerGroup::Simulation;
+    }
+    if let Some(derived) = advanced_derived_product_for_display_product(product) {
+        return match derived {
+            Sweep::RainRateReflectivity
+            | Sweep::RainRateKdp
+            | Sweep::RainRateHybrid
+            | Sweep::LiquidWaterContent
+            | Sweep::HailKineticEnergy => ProductPickerGroup::Precipitation,
+            Sweep::ReflectivityTexture
+            | Sweep::VelocityTexture
+            | Sweep::SpectrumWidthTexture
+            | Sweep::DifferentialReflectivityTexture
+            | Sweep::CorrelationCoefficientTexture
+            | Sweep::DifferentialPhaseTexture
+            | Sweep::KdpTexture
+            | Sweep::ReflectivityRangeGradient
+            | Sweep::VelocityRangeGradient
+            | Sweep::MeteorologicalQuality
+            | Sweep::MeteorologicalGateMask
+            | Sweep::TdsConfidence
+            | Sweep::HailSignature
+            | Sweep::TurbulenceProxy => ProductPickerGroup::TextureQuality,
+            _ => ProductPickerGroup::DualPol,
+        };
+    }
+    match product {
+        DisplayProduct::Moment(MomentType::Velocity)
+        | DisplayProduct::DealiasedVelocity
+        | DisplayProduct::StormRelativeVelocity
+        | DisplayProduct::StormRelativeDealiasedVelocity => ProductPickerGroup::Velocity,
+        DisplayProduct::Moment(MomentType::Unknown(_)) => ProductPickerGroup::Other,
+        DisplayProduct::Moment(_) => ProductPickerGroup::Base,
+        DisplayProduct::Derived(
+            DerivedProduct::Marc
+            | DerivedProduct::GustProxy
+            | DerivedProduct::AzimuthalShear
+            | DerivedProduct::Divergence,
+        ) => ProductPickerGroup::Velocity,
+        DisplayProduct::Derived(_) => ProductPickerGroup::Volume,
+    }
+}
+
+fn product_picker_long_label(product: &DisplayProduct) -> String {
+    if let Some(label) = validation_product_label(product) {
+        return label.to_owned();
+    }
+    if let Some(derived) = advanced_derived_product_for_display_product(product) {
+        return format!("{} ({})", derived.display_name(), derived.id());
+    }
+    let (name, code) = match product {
+        DisplayProduct::Moment(MomentType::Reflectivity) => ("Base reflectivity", "REF"),
+        DisplayProduct::Moment(MomentType::Velocity) => ("Base radial velocity", "VEL"),
+        DisplayProduct::Moment(MomentType::SpectrumWidth) => ("Spectrum width", "SW"),
+        DisplayProduct::Moment(MomentType::DifferentialReflectivity) => {
+            ("Differential reflectivity", "ZDR")
+        }
+        DisplayProduct::Moment(MomentType::CorrelationCoefficient) => {
+            ("Correlation coefficient", "RHO")
+        }
+        DisplayProduct::Moment(MomentType::DifferentialPhase) => ("Differential phase", "PHI"),
+        DisplayProduct::Moment(MomentType::SpecificDifferentialPhase) => {
+            ("Specific differential phase", "KDP")
+        }
+        DisplayProduct::Moment(MomentType::Unknown(name)) => return name.clone(),
+        DisplayProduct::DealiasedVelocity => ("Dealiased radial velocity", "DVEL"),
+        DisplayProduct::StormRelativeVelocity => ("Storm-relative velocity", "SRV"),
+        DisplayProduct::StormRelativeDealiasedVelocity => {
+            ("Storm-relative dealiased velocity", "DSRV")
+        }
+        DisplayProduct::Derived(derived) => (derived.display_name(), derived.label()),
+    };
+    format!("{name} ({code})")
 }
 
 fn sweep_product_group(product: &DisplayProduct) -> SweepProductGroup {
@@ -8545,6 +8719,7 @@ impl ViewerApp {
             current_workflow: None,
             previous_workflow_snapshot: None,
             chrome_hidden: false,
+            sidebar_hidden: false,
             pending_local_autoplay: false,
             workspace: dock::Workspace::default(),
             model_dock: None,
@@ -8736,6 +8911,7 @@ impl ViewerApp {
             sidebar_tab: SidebarTab::Radar,
             last_live_hazard_refresh: None,
             selected_hazard_index: None,
+            hazard_map_popup: None,
             unacknowledged_hazard_event_ids: BTreeSet::new(),
             alert_watch: AlertWatchHandle::spawned(),
             last_radar_sound_frame_time: None,
@@ -8833,6 +9009,26 @@ impl ViewerApp {
         self.event_loop_hazard_window = None;
         self.pending_event_loop_hazard_window = None;
         let query_time_utc = Utc::now();
+        let source = self.resolved_warning_source();
+        if let meteoalarm::ResolvedWarningSource::Unavailable(reason) = &source {
+            self.last_live_hazard_refresh = Some(Instant::now());
+            self.hazard_status = reason.clone();
+            return;
+        }
+        if let meteoalarm::ResolvedWarningSource::MeteoAlarm(country) = source {
+            let (sender, receiver) = mpsc::channel();
+            self.hazard_receiver = Some(receiver);
+            self.last_live_hazard_refresh = Some(Instant::now());
+            self.hazard_status = format!("Loading MeteoAlarm {} warnings", country.label);
+            thread::spawn(move || {
+                let result = meteoalarm::load_live(country, query_time_utc);
+                let _ = sender.send(AsyncHazardResult {
+                    update: AsyncHazardUpdate::Final(result),
+                });
+            });
+            ctx.request_repaint_after(Duration::from_millis(25));
+            return;
+        }
         let preview_records = self
             .hazard_overlay
             .as_ref()
@@ -8901,12 +9097,32 @@ impl ViewerApp {
         self.load_live_hazards(ctx);
     }
 
+    /// A warning-source or MeteoAlarm-country change must never leave the old
+    /// provider's records/polygons on screen while the replacement loads.
+    fn reload_warning_source(&mut self, ctx: &egui::Context) {
+        self.hazard_receiver = None;
+        self.hazard_overlay = None;
+        self.selected_hazard_index = None;
+        self.unacknowledged_hazard_event_ids.clear();
+        self.app_settings.current_alert_filter = "all".to_owned();
+        self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
+        self.switch_to_live_hazard_mode();
+        self.load_live_hazards(ctx);
+    }
+
     fn load_event_loop_hazards(
         &mut self,
         start_utc: DateTime<Utc>,
         end_utc: DateTime<Utc>,
         ctx: &egui::Context,
     ) {
+        if !self.warning_source_supports_timeline() {
+            self.pending_event_loop_hazard_window = None;
+            self.hazard_status =
+                "Historical warning sync is available for NWS only; MeteoAlarm's public feed contains current warnings."
+                    .to_owned();
+            return;
+        }
         let replaced_active_load = self.hazard_receiver.take().is_some();
         self.pending_event_loop_hazard_window = Some((start_utc, end_utc));
         self.last_live_hazard_refresh = None;
@@ -9312,7 +9528,7 @@ impl ViewerApp {
     fn displayable_products_for_picker(&self, volume: &RadarVolume) -> Vec<DisplayProduct> {
         global_displayable_products_for_picker(
             volume,
-            self.advanced_products_enabled,
+            self.advanced_products_enabled || self.app_settings.show_derived_products,
             self.app_settings.show_derived_products,
         )
     }
@@ -13121,8 +13337,13 @@ impl ViewerApp {
                         || self.hazard_status.starts_with("Preview ")
                         || event_loop_window_changed
                     {
+                        let noun = if meteoalarm::is_meteoalarm_overlay(&overlay) {
+                            "warning entries"
+                        } else {
+                            "polygons"
+                        };
                         self.hazard_status = format!(
-                            "{} polygons from {} items in {:.1} ms",
+                            "{} {noun} from {} items in {:.1} ms",
                             overlay.records.len(),
                             overlay.parsed_items,
                             overlay.load_ms
@@ -13159,8 +13380,13 @@ impl ViewerApp {
                     .filter(|change| !change.is_empty())
                     .map(|change| format!("; {}", change.status_text()))
                     .unwrap_or_default();
+                let noun = if meteoalarm::is_meteoalarm_overlay(&overlay) {
+                    "warning entries"
+                } else {
+                    "polygons"
+                };
                 self.hazard_status = format!(
-                    "{}{} polygons from {} items in {:.1} ms{}",
+                    "{}{} {noun} from {} items in {:.1} ms{}",
                     phase,
                     overlay.records.len(),
                     overlay.parsed_items,
@@ -13194,8 +13420,17 @@ impl ViewerApp {
             Err(err) => {
                 self.pending_event_loop_hazard_window = None;
                 if self.hazard_overlay.is_some() {
+                    let noun = if self
+                        .hazard_overlay
+                        .as_ref()
+                        .is_some_and(meteoalarm::is_meteoalarm_overlay)
+                    {
+                        "warning entries"
+                    } else {
+                        "polygons"
+                    };
                     self.hazard_status =
-                        format!("Hazard refresh failed; keeping current polygons: {err}");
+                        format!("Hazard refresh failed; keeping current {noun}: {err}");
                     return true;
                 }
                 self.hazard_status = err;
@@ -13406,7 +13641,7 @@ impl ViewerApp {
         self.selected_cut = self.selected_cut.min(volume.cuts.len() - 1);
         let primary_volume = self.volume.clone();
         let show_derived_products = self.app_settings.show_derived_products;
-        let advanced_products_enabled = self.advanced_products_enabled;
+        let advanced_products_enabled = self.advanced_products_enabled || show_derived_products;
         for pane in &mut self.extra_panes {
             if let Some(pane_volume) = pane.volume.clone().or_else(|| primary_volume.clone()) {
                 if !pane.owns_radar()
@@ -15782,7 +16017,7 @@ impl ViewerApp {
             _ => site_id.clone().map(|level2_id| SiteRef::Us { level2_id }),
         };
         let show_derived_products = self.app_settings.show_derived_products;
-        let advanced_products_enabled = self.advanced_products_enabled;
+        let advanced_products_enabled = self.advanced_products_enabled || show_derived_products;
         let primary_live = self.primary.live.enabled;
 
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
@@ -19937,18 +20172,24 @@ impl eframe::App for ViewerApp {
             // written back through the debounced settings lane.
             let saved_width =
                 panel_kit::sidebar_width_from_settings(self.app_settings.sidebar_width_pt);
-            let panel_response = egui::Panel::right("product_tilt_panel")
-                .resizable(true)
-                .default_size(saved_width.unwrap_or(SIDEBAR_DEFAULT_WIDTH))
-                .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
-                .show_inside(ui, |ui| self.side_panel(ui, &ctx));
-            if let Some(width) =
-                panel_kit::sidebar_width_to_settings(panel_response.response.rect.width())
-                && self.app_settings.sidebar_width_pt != Some(width)
-            {
-                self.app_settings.sidebar_width_pt = Some(width);
-                self.mark_app_settings_dirty();
-            }
+            let sidebar_edge_x = if self.sidebar_hidden {
+                ctx.content_rect().right()
+            } else {
+                let panel_response = egui::Panel::right("product_tilt_panel")
+                    .resizable(true)
+                    .default_size(saved_width.unwrap_or(SIDEBAR_DEFAULT_WIDTH))
+                    .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
+                    .show_inside(ui, |ui| self.side_panel(ui, &ctx));
+                if let Some(width) =
+                    panel_kit::sidebar_width_to_settings(panel_response.response.rect.width())
+                    && self.app_settings.sidebar_width_pt != Some(width)
+                {
+                    self.app_settings.sidebar_width_pt = Some(width);
+                    self.mark_app_settings_dirty();
+                }
+                panel_response.response.rect.left()
+            };
+            self.sidebar_edge_toggle(&ctx, sidebar_edge_x);
 
             egui::Panel::bottom("status_bar")
                 .exact_size(30.0)
@@ -20272,6 +20513,13 @@ impl ViewerApp {
             }
             self.view_menu(ui);
             self.workflow_menu(ui);
+            if self.previous_workflow_snapshot.is_some()
+                && toolbar_action_button(ui, "↶ Undo", 66.0)
+                    .on_hover_text("Restore the setup from before the latest workflow preset")
+                    .clicked()
+            {
+                self.restore_previous_workflow(ui.ctx());
+            }
             self.media_top_bar_ui(ui);
             self.annotate_top_bar_ui(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -20321,7 +20569,15 @@ impl ViewerApp {
                         self.farm.select_sensor(id);
                     }
                 }
-                let groups = self.unacknowledged_hazard_menu_groups();
+                // This is a current-radar NWS affordance, not a global
+                // international warning service. Keep the background watcher
+                // and settings intact, but do not present the chip while an
+                // international/research radar owns the display.
+                let groups = if self.nws_alert_context_available() {
+                    self.unacknowledged_hazard_menu_groups()
+                } else {
+                    Vec::new()
+                };
                 let new_alert_count = groups.iter().map(|(_, rows)| rows.len()).sum::<usize>();
                 if new_alert_count > 0 {
                     ui.ctx().request_repaint_after(Duration::from_millis(500));
@@ -22303,6 +22559,10 @@ impl ViewerApp {
     }
 
     fn sync_warnings_to_loaded_loop(&mut self, ctx: &egui::Context) -> String {
+        if !self.warning_source_supports_timeline() {
+            return "Historical warning sync is available for NWS only; MeteoAlarm provides current warnings"
+                .to_owned();
+        }
         let Some((start_utc, end_utc)) = self.loaded_loop_time_window() else {
             return "Load a radar loop first".to_owned();
         };
@@ -22356,7 +22616,8 @@ impl ViewerApp {
     }
 
     fn should_auto_sync_timeline_warnings(&self) -> bool {
-        if !self.unified_player.auto_sync_warnings
+        if !self.warning_source_supports_timeline()
+            || !self.unified_player.auto_sync_warnings
             || !self.hazards_visible
             || self.hazard_receiver.is_some()
             || self.active_loop_timeline_is_live_follow()
@@ -22402,6 +22663,88 @@ impl ViewerApp {
             SlotPoll::Ready(newer) => self.update_available = newer,
             SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
+    }
+
+    /// The warning/alert panel is backed by US NWS products. Keep it
+    /// available for the operational WSR-88D/TDWR catalog, but do not imply
+    /// that an international or community/research radar has a matching NWS
+    /// alert service.
+    fn nws_alert_context_available(&self) -> bool {
+        if !matches!(self.display_owner_site(), SiteRef::Us { .. }) {
+            return false;
+        }
+        let site_id = self
+            .volume
+            .as_ref()
+            .map(|volume| volume.site.id.as_str())
+            .or_else(|| self.selected_site().map(|site| site.level2_id.as_str()));
+        let Some(site) = site_id.and_then(|site_id| {
+            self.sites
+                .iter()
+                .find(|site| site.level2_id.eq_ignore_ascii_case(site_id))
+        }) else {
+            return false;
+        };
+        matches!(us_site_kind(site), SiteKind::Wsr88d | SiteKind::Tdwr)
+    }
+
+    /// Resolve the persisted warning-source preference against the radar that
+    /// currently owns the display. `Auto` means NWS for operational US radar
+    /// and the matching official MeteoAlarm country feed for supported
+    /// European international radar. It never silently assigns European
+    /// warnings to Australia/Japan or NWS warnings to an international site.
+    fn resolved_warning_source(&self) -> meteoalarm::ResolvedWarningSource {
+        use meteoalarm::WarningSourceMode;
+
+        let mode = WarningSourceMode::from_key(&self.app_settings.warning_source);
+        let radar_country = data_source::sites::resolve(&self.display_owner_site())
+            .and_then(|site| meteoalarm::country_feed_for_label(&site.country));
+        let selected_country =
+            meteoalarm::country_feed_by_slug(self.app_settings.meteoalarm_country.trim());
+        meteoalarm::resolve_warning_source(
+            mode,
+            selected_country,
+            radar_country,
+            self.nws_alert_context_available(),
+        )
+    }
+
+    fn warning_source_supports_timeline(&self) -> bool {
+        matches!(
+            self.resolved_warning_source(),
+            meteoalarm::ResolvedWarningSource::Nws
+        )
+    }
+
+    /// A narrow, always-reachable handle at the map/sidebar boundary. This
+    /// collapses only the ordinary right sidebar; clean-screen mode remains a
+    /// separate whole-chrome command.
+    fn sidebar_edge_toggle(&mut self, ctx: &egui::Context, edge_x: f32) {
+        let content = ctx.content_rect();
+        let button_size = egui::vec2(20.0, 48.0);
+        let x = if self.sidebar_hidden {
+            content.right() - button_size.x - 2.0
+        } else {
+            edge_x - button_size.x * 0.5
+        };
+        egui::Area::new(egui::Id::new("sidebar_edge_toggle"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(x, content.center().y - button_size.y * 0.5))
+            .show(ctx, |ui| {
+                let (label, hover) = if self.sidebar_hidden {
+                    ("<", "Show the main sidebar")
+                } else {
+                    (">", "Hide the main sidebar")
+                };
+                if ui
+                    .add_sized(button_size, egui::Button::new(label))
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    self.sidebar_hidden = !self.sidebar_hidden;
+                    ctx.request_repaint();
+                }
+            });
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -22686,6 +23029,11 @@ impl ViewerApp {
                 ((ui.available_width() - gear_width - gaps) / text_tab_count).max(60.0);
             for tab in SIDEBAR_TABS {
                 let selected = self.sidebar_tab == *tab;
+                // Alerts is global because the panel owns the explicit
+                // NWS/MeteoAlarm source selector. NWS controls themselves
+                // remain unavailable outside an operational US radar, while
+                // supported European radar resolves to its country feed.
+                let enabled = true;
                 let width = if *tab == SidebarTab::Settings {
                     gear_width
                 } else {
@@ -22693,11 +23041,14 @@ impl ViewerApp {
                 };
                 let label = sidebar_tab_label(*tab, &self.app_settings.brand);
                 let response = ui
-                    .add_sized(
-                        egui::vec2(width, PANEL_BUTTON_HEIGHT),
-                        egui::Button::selectable(selected, label),
-                    )
-                    .on_hover_text(sidebar_tab_tooltip(*tab));
+                    .add_enabled_ui(enabled, |ui| {
+                        ui.add_sized(
+                            egui::vec2(width, PANEL_BUTTON_HEIGHT),
+                            egui::Button::selectable(selected, label),
+                        )
+                    })
+                    .inner;
+                let response = response.on_hover_text(sidebar_tab_tooltip(*tab));
                 if response.clicked() {
                     self.sidebar_tab = *tab;
                 }
@@ -23808,9 +24159,9 @@ impl ViewerApp {
             }
             let mut show_derived_products = self.app_settings.show_derived_products;
             if ui
-                .checkbox(&mut show_derived_products, "Show derived products")
+                .checkbox(&mut show_derived_products, "More products")
                 .on_hover_text(
-                    "Off hides CREF, ET, VIL, AzShr, Div, and computed advanced products from this product row and product cycling.",
+                    "Show volume, motion-analysis, dual-pol, precipitation, texture, and quality products. Advanced products compute only when selected.",
                 )
                 .changed()
             {
@@ -23828,25 +24179,50 @@ impl ViewerApp {
             .iter()
             .map(|(key, label)| (label.clone(), key.clone()))
             .collect();
-        // Product picker as a kit chip grid: weak hotkey prefix + label,
-        // chips wrap and split each row evenly (320 pt rule).
-        let chips: Vec<panel_kit::Chip<'_>> = product_buttons
-            .iter()
-            .map(|(product, _target_cut)| {
-                let stable_label = product.label();
-                let label = product_display_label(product);
-                let hotkey = hotkey_for_label.get(stable_label).map(String::as_str);
-                panel_kit::Chip {
-                    label,
-                    hotkey,
-                    selected: editing_product == product,
-                    hover: hotkey.map(|key| format!("hotkey {key}")),
-                }
-            })
-            .collect();
-        if let Some(index) = panel_kit::chip_grid(ui, &chips)
-            && let Some((product, _target_cut)) = product_buttons.get(index)
-        {
+        // Full-name product browser. The old 52 pt abbreviation chips made
+        // a large derived catalog nearly impossible to scan; category folds
+        // keep it compact while every visible row says what the product is.
+        let mut clicked_product = None;
+        for group in ProductPickerGroup::ALL {
+            let products = product_buttons
+                .iter()
+                .filter(|(product, _)| product_picker_group(product) == group)
+                .collect::<Vec<_>>();
+            if products.is_empty() {
+                continue;
+            }
+            let contains_selection = products
+                .iter()
+                .any(|(product, _)| product == editing_product);
+            egui::CollapsingHeader::new(format!("{} ({})", group.label(), products.len()))
+                .id_salt(("radar_product_group", group, editing_pane))
+                .default_open(group.default_open() || contains_selection)
+                .show(ui, |ui| {
+                    for (product, _) in products {
+                        let stable_label = product.label();
+                        let full_label = product_picker_long_label(product);
+                        let hotkey = hotkey_for_label.get(stable_label);
+                        let row_text = hotkey
+                            .map(|key| format!("{key}  {full_label}"))
+                            .unwrap_or_else(|| full_label.clone());
+                        let hover = hotkey
+                            .map(|key| format!("{full_label}\nHotkey: {key}"))
+                            .unwrap_or_else(|| full_label.clone());
+                        if panel_kit::select_row(
+                            ui,
+                            editing_product == product,
+                            true,
+                            &row_text,
+                            Some(&hover),
+                        )
+                        .clicked()
+                        {
+                            clicked_product = Some(product.clone());
+                        }
+                    }
+                });
+        }
+        if let Some(product) = clicked_product {
             if let Some(slot) = editing_pane {
                 if self.switch_pane_product(slot, product.clone()) {
                     ctx.request_repaint();
@@ -23882,34 +24258,6 @@ impl ViewerApp {
                 }
             });
         }
-        let advanced_visible_count = product_buttons
-            .iter()
-            .filter(|(product, _)| {
-                matches!(
-                    product,
-                    DisplayProduct::Moment(moment)
-                        if advanced_derived_product_for_moment(moment).is_some()
-                )
-            })
-            .count();
-        ui.horizontal_wrapped(|ui| {
-            if fixed_action_button(ui, "Derive advanced", 126.0)
-                .on_hover_text(
-                    "Compute extended dual-pol/sweep products for the current visible tilt only. \
-                     KDP derives automatically when PHI and trustworthy radar-band metadata are \
-                     available; this adds products like PHIF, RATE, REF_TEX, TDS_SCORE, \
-                     HAIL_SCORE, and TURB when their source data are available.",
-                )
-                .clicked()
-            {
-                self.derive_advanced_products_for_products_panel(editing_pane, ctx);
-            }
-            if advanced_visible_count > 0 {
-                ui.weak(format!(
-                    "{advanced_visible_count} advanced products visible"
-                ));
-            }
-        });
         let has_kdp = product_buttons.iter().any(|(product, _)| {
             *product == DisplayProduct::Moment(MomentType::SpecificDifferentialPhase)
         });
@@ -24148,7 +24496,6 @@ impl ViewerApp {
         }
 
         let editing_family = editing_product.color_family();
-        self.active_product_color_picker(ui, ctx, editing_product);
 
         // Display threshold ("hide below"): declutters weak returns at render
         // time; diverging families (VEL, shear) hide |v| < threshold instead.
@@ -24924,9 +25271,9 @@ impl ViewerApp {
         ctx: &egui::Context,
         pane_slot: Option<usize>,
     ) {
-        panel_kit::subgroup(ui, "Loop loading", |_| {});
-        self.frames_to_load_rows_ui(ui, ctx, pane_slot, "loop_settings_frames_to_load");
         if pane_slot.is_none() {
+            panel_kit::subgroup(ui, "Loaded-loop memory", |_| {});
+            ui.weak("Frame count is chosen beside Load Loop under Site.");
             // Radar-history memory budget (#20): huge super-res loops trim
             // to fit — with an honest cap indicator right below.
             let mut budget_gib = self.app_settings.radar_history_budget_gib;
@@ -27447,6 +27794,26 @@ impl ViewerApp {
         // Brand Kit option and therefore cannot be disabled with watermark or
         // share-card settings.
         self.draw_imgw_attribution(&painter, rect);
+        let popup_pane = self
+            .hazard_map_popup
+            .as_ref()
+            .map(|popup| popup.pane_index)
+            .unwrap_or(self.active_pane);
+        let popup_rect = if self.grid_layout == PanelLayout::One {
+            rect
+        } else {
+            pane_cell_rects(self.grid_layout, rect, 2.0)
+                .get(popup_pane)
+                .copied()
+                .unwrap_or(rect)
+        };
+        let popup_context = (popup_pane > 0)
+            .then(|| self.begin_extra_pane_context(popup_pane - 1))
+            .flatten();
+        self.show_hazard_map_popup(ui.ctx(), popup_rect);
+        if let Some(snapshot) = popup_context {
+            self.end_extra_pane_context(popup_pane - 1, snapshot);
+        }
     }
 
     fn draw_imgw_attribution(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -28181,7 +28548,12 @@ impl ViewerApp {
             && plain_click
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
+            && !self.hazard_popup_owns_pointer(pointer)
         {
+            // A plain click outside the foreground cards closes the previous
+            // stack. A warning hit below immediately replaces it at the new
+            // geographic anchor.
+            self.hazard_map_popup = None;
             // Site/feed markers keep priority (their 12 px halo is the
             // established click grammar — RAOB diamonds included); a
             // report dots and track overlays only take the click when no marker is in
@@ -28200,8 +28572,7 @@ impl ViewerApp {
                     self.jump_to_event_track(&hit, ui.ctx());
                 } else if let Some(hit) = self.storm_track_at(rect, pointer) {
                     self.start_storm_track_follow(hit, ui.ctx());
-                } else if let Some(index) = self.hazard_at_position(rect, pointer) {
-                    self.select_hazard_index(index);
+                } else if self.open_hazard_popup_from_map(rect, pointer) {
                 } else if !self.handle_marker_click(
                     &site_points,
                     &intl_points,
@@ -28640,7 +29011,10 @@ impl ViewerApp {
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                if self.app_settings.independent_panels && cell_index > 0 {
+                if self.hazard_popup_owns_pointer(pointer) {
+                    // Foreground warning-card controls own this click.
+                } else if self.app_settings.independent_panels && cell_index > 0 {
+                    self.hazard_map_popup = None;
                     let handled = self.handle_extra_pane_marker_click(
                         cell_index - 1,
                         &site_points,
@@ -28651,10 +29025,14 @@ impl ViewerApp {
                         pointer,
                         ui.ctx(),
                     );
-                    if !handled && self.app_settings.map_click_drops_coordinate_marker {
+                    if !handled && self.open_hazard_popup_from_map(cell, pointer) {
+                        // Exact warning hit: the popup is tied to this pane's
+                        // transform before the pane context is restored.
+                    } else if !handled && self.app_settings.map_click_drops_coordinate_marker {
                         self.drop_coordinate_marker_at_screen_point(cell, pointer, ui.ctx());
                     }
                 } else if owns_cell_radar {
+                    self.hazard_map_popup = None;
                     self.status =
                         "Focused pane owns its radar; use the pane SITE controls to retarget it"
                             .to_owned();
@@ -29110,8 +29488,8 @@ impl ViewerApp {
         }
     }
 
-    /// Fetch/refresh placefiles on background threads and install results.
-    /// The UI thread never blocks on the network.
+    /// Fetch/read/refresh placefiles on background threads and install results.
+    /// The UI thread never blocks on network or filesystem I/O.
     fn poll_placefiles(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         for slot in &mut self.placefile_slots {
@@ -29124,103 +29502,57 @@ impl ViewerApp {
                                 u64::from(placefile.refresh_minutes.clamp(1, 60)) * 60,
                             ),
                         );
-                        // Fetch any icon sheets we don't already have (cap 4).
-                        let missing: Vec<placefiles::IconSheetSpec> = placefile
-                            .icon_sheets
-                            .iter()
-                            .filter(|spec| !slot.sheets.iter().any(|s| s.spec == **spec))
-                            .take(4)
-                            .cloned()
-                            .collect();
-                        if !missing.is_empty() && slot.sheets_receiver.is_none() {
-                            let (tx, rx) = mpsc::channel();
-                            slot.sheets_receiver = Some(rx);
-                            let ctx_clone = ctx.clone();
-                            thread::spawn(move || {
-                                let mut decoded = Vec::new();
-                                for spec in missing {
-                                    let Ok(bytes) = data_source::fetch_bytes(&spec.url) else {
-                                        continue;
-                                    };
-                                    let Ok(img) = image::load_from_memory(&bytes) else {
-                                        continue;
-                                    };
-                                    let rgba = img.to_rgba8();
-                                    decoded.push((
-                                        spec.index,
-                                        rgba.width(),
-                                        rgba.height(),
-                                        rgba.into_raw(),
-                                    ));
-                                }
-                                let _ = tx.send(decoded);
-                                ctx_clone.request_repaint();
-                            });
-                        }
-                        slot.status = format!(
-                            "{} object(s){}",
-                            placefile.objects.len(),
-                            if placefile.skipped > 0 {
-                                format!(" · {} skipped", placefile.skipped)
-                            } else {
-                                String::new()
-                            }
-                        );
+                        // An in-flight sheet batch belongs to the previous
+                        // parsed text. Drop its receiver and schedule this
+                        // exact source generation/spec set.
+                        slot.sheets_receiver = None;
+                        slot.sheets_generation = None;
+                        slot.source_generation = slot.source_generation.wrapping_add(1);
+                        slot.sheets.retain(|sheet| {
+                            placefile.icon_sheets.iter().any(|spec| spec == &sheet.spec)
+                        });
+                        slot.status = placefile_parse_status(&placefile);
                         slot.data = Some(placefile);
                         slot.generation = slot.generation.wrapping_add(1);
+                        schedule_placefile_sheets(slot, ctx);
                         ctx.request_repaint();
                     }
                     Ok(Err(error)) => {
                         slot.receiver = None;
                         slot.next_refresh = Some(now + Duration::from_secs(120));
-                        slot.status = format!("fetch failed: {error}");
+                        slot.status = format!("load failed: {error}");
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
                         slot.receiver = None;
                         slot.next_refresh = Some(now + Duration::from_secs(120));
+                        slot.status = "load failed: placefile worker stopped".to_owned();
                     }
                 }
                 continue;
             }
-            if let Some(rx) = &slot.sheets_receiver {
-                match rx.try_recv() {
-                    Ok(decoded) => {
-                        slot.sheets_receiver = None;
-                        if let Some(placefile) = &slot.data {
-                            for (index, w, h, rgba) in decoded {
-                                let Some(spec) = placefile
-                                    .icon_sheets
-                                    .iter()
-                                    .find(|s| s.index == index)
-                                    .cloned()
-                                else {
-                                    continue;
-                                };
-                                let image = egui::ColorImage::from_rgba_unmultiplied(
-                                    [w as usize, h as usize],
-                                    &rgba,
-                                );
-                                let texture = ctx.load_texture(
-                                    format!("placefile-sheet-{index}"),
-                                    image,
-                                    egui::TextureOptions::LINEAR,
-                                );
-                                slot.sheets.retain(|s| s.spec.index != index);
-                                slot.sheets.push(PlacefileSheet {
-                                    spec,
-                                    size: (w, h),
-                                    texture,
-                                });
-                            }
-                            slot.generation = slot.generation.wrapping_add(1);
-                            ctx.request_repaint();
-                        }
+            let sheet_result = slot
+                .sheets_receiver
+                .as_ref()
+                .map(|receiver| receiver.try_recv());
+            match sheet_result {
+                Some(Ok(batch)) => {
+                    slot.sheets_receiver = None;
+                    if install_placefile_sheet_batch(slot, ctx, batch) {
+                        ctx.request_repaint();
                     }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => slot.sheets_receiver = None,
+                }
+                Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    slot.sheets_receiver = None;
+                    slot.status
+                        .push_str(" · icon load failed: placefile icon worker stopped");
                 }
             }
+            // A stale batch clears the scheduled generation; immediately
+            // start the exact current generation instead of waiting for the
+            // next placefile refresh interval.
+            schedule_placefile_sheets(slot, ctx);
             if !slot.enabled {
                 continue;
             }
@@ -29233,19 +29565,27 @@ impl ViewerApp {
             }
             let (sender, receiver) = mpsc::channel();
             slot.receiver = Some(receiver);
-            slot.status = "fetching…".to_owned();
+            slot.status = if placefiles::is_remote_source(&slot.url) {
+                "fetching…".to_owned()
+            } else {
+                "reading local file…".to_owned()
+            };
             slot.next_refresh = Some(now + Duration::from_secs(120));
             let url = slot.url.clone();
             let ctx = ctx.clone();
             thread::spawn(move || {
-                // GR clients append these; some placefile servers require
-                // them (and scale icon hints by dpi).
-                let sep = if url.contains('?') { '&' } else { '?' };
-                let fetch_url = format!("{url}{sep}version=1.5&dpi=96");
-                let result = data_source::fetch_text(&fetch_url)
-                    .or_else(|_| data_source::fetch_text(&url))
-                    .map(|text| placefiles::parse_placefile(&text, &url))
-                    .map_err(|error| error.to_string());
+                let text = if placefiles::is_remote_source(&url) {
+                    // GR clients append these; some placefile servers require
+                    // them (and scale icon hints by dpi).
+                    let sep = if url.contains('?') { '&' } else { '?' };
+                    let fetch_url = format!("{url}{sep}version=1.5&dpi=96");
+                    data_source::fetch_text(&fetch_url)
+                        .or_else(|_| data_source::fetch_text(&url))
+                        .map_err(|error| error.to_string())
+                } else {
+                    placefiles::read_local_placefile(&url)
+                };
+                let result = text.map(|text| placefiles::parse_placefile(&text, &url));
                 let _ = sender.send(result);
                 ctx.request_repaint();
             });
@@ -31023,6 +31363,9 @@ impl ViewerApp {
         if actions.toggle_obs_adjusted {
             let enabled = !(self.obs_adjust_soundings && self.obs_enabled);
             self.set_obs_adjust_soundings(enabled, ctx);
+        }
+        if let Some(rect) = actions.capture_sounding {
+            self.request_sounding_screenshot(ctx, rect);
         }
     }
 
@@ -38439,6 +38782,10 @@ impl ViewerApp {
         pointer: egui::Pos2,
         ctx: &egui::Context,
     ) {
+        if self.hazard_popup_owns_pointer(pointer) {
+            return;
+        }
+        self.hazard_map_popup = None;
         // Site/feed markers keep priority (their 12 px halo is the
         // established click grammar, RAOB diamonds included); SPC report
         // dots and track overlays take the click only when no marker is in
@@ -38465,8 +38812,7 @@ impl ViewerApp {
                 self.start_storm_track_follow(hit, ctx);
                 return;
             }
-            if let Some(index) = self.hazard_at_position(rect, pointer) {
-                self.select_hazard_index(index);
+            if self.open_hazard_popup_from_map(rect, pointer) {
                 return;
             }
         }
@@ -39246,7 +39592,7 @@ fn us_detail_visible(bounds: GeoBounds) -> bool {
         .any(|us_bounds| bounds.intersects_bbox(*us_bounds))
 }
 
-/// A loaded placefile overlay: URL + parsed content + refresh bookkeeping.
+/// A loaded placefile overlay: URL/local source + parsed content + refresh bookkeeping.
 /// Fetch + parse run on background threads; the UI polls a channel.
 struct PlacefileSlot {
     url: String,
@@ -39256,17 +39602,31 @@ struct PlacefileSlot {
     data: Option<placefiles::Placefile>,
     /// Bumped on every successful install — exact shape-cache invalidation.
     generation: u64,
+    /// Bumped only when newly parsed placefile text is installed. Icon-sheet
+    /// workers carry this token so bytes from an older refresh cannot attach
+    /// to a newer file that reuses the same numeric sheet index.
+    source_generation: u64,
     next_refresh: Option<Instant>,
     status: String,
     receiver: Option<mpsc::Receiver<std::result::Result<placefiles::Placefile, String>>>,
     /// Loaded icon sprite sheets (fetched + decoded off-thread, texture
     /// created on install).
     sheets: Vec<PlacefileSheet>,
-    sheets_receiver: Option<mpsc::Receiver<Vec<DecodedSheet>>>,
+    sheets_receiver: Option<mpsc::Receiver<PlacefileSheetBatch>>,
+    /// Source generation already scheduled/completed. A stale result clears
+    /// this marker so the current generation is scheduled immediately.
+    sheets_generation: Option<u64>,
 }
 
-/// (sheet index, width, height, rgba) from the fetch/decode thread.
-type DecodedSheet = (u32, u32, u32, Vec<u8>);
+struct PlacefileSheetBatch {
+    source_generation: u64,
+    decoded: Vec<DecodedPlacefileSheet>,
+}
+
+struct DecodedPlacefileSheet {
+    spec: placefiles::IconSheetSpec,
+    pixels: Result<(u32, u32, Vec<u8>), String>,
+}
 
 struct PlacefileSheet {
     spec: placefiles::IconSheetSpec,
@@ -39282,13 +39642,175 @@ impl PlacefileSlot {
             show_text: true,
             data: None,
             generation: 0,
+            source_generation: 0,
             next_refresh: None,
             status: "queued".to_owned(),
             receiver: None,
             sheets: Vec::new(),
             sheets_receiver: None,
+            sheets_generation: None,
         }
     }
+}
+
+fn placefile_parse_status(placefile: &placefiles::Placefile) -> String {
+    format!(
+        "parsed: {} object(s){}",
+        placefile.objects.len(),
+        if placefile.skipped > 0 {
+            format!(" · {} skipped", placefile.skipped)
+        } else {
+            String::new()
+        }
+    )
+}
+
+fn placefile_sheet_specs_to_load(slot: &PlacefileSlot) -> Vec<placefiles::IconSheetSpec> {
+    let Some(placefile) = slot.data.as_ref() else {
+        return Vec::new();
+    };
+    let reload_local_sheets = !placefiles::is_remote_source(&slot.url);
+    placefile
+        .icon_sheets
+        .iter()
+        .filter(|spec| reload_local_sheets || !slot.sheets.iter().any(|sheet| sheet.spec == **spec))
+        // Preserve the existing defensive sprite-sheet ceiling.
+        .take(4)
+        .cloned()
+        .collect()
+}
+
+fn schedule_placefile_sheets(slot: &mut PlacefileSlot, ctx: &egui::Context) {
+    if slot.data.is_none()
+        || slot.sheets_receiver.is_some()
+        || slot.sheets_generation == Some(slot.source_generation)
+    {
+        return;
+    }
+    let specs = placefile_sheet_specs_to_load(slot);
+    let source_generation = slot.source_generation;
+    slot.sheets_generation = Some(source_generation);
+    if specs.is_empty() {
+        return;
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    slot.sheets_receiver = Some(receiver);
+    let ctx = ctx.clone();
+    thread::spawn(move || {
+        let decoded = specs
+            .into_iter()
+            .map(|spec| {
+                let bytes = if placefiles::is_remote_source(&spec.url) {
+                    data_source::fetch_bytes(&spec.url).map_err(|error| {
+                        format!(
+                            "read icon {}: {error}",
+                            placefiles::source_display_name(&spec.url)
+                        )
+                    })
+                } else {
+                    placefiles::read_local_icon(&spec.url)
+                };
+                let pixels = bytes.and_then(|bytes| {
+                    image::load_from_memory(&bytes)
+                        .map_err(|error| {
+                            format!(
+                                "decode icon {}: {error}",
+                                placefiles::source_display_name(&spec.url)
+                            )
+                        })
+                        .map(|image| {
+                            let rgba = image.to_rgba8();
+                            (rgba.width(), rgba.height(), rgba.into_raw())
+                        })
+                });
+                DecodedPlacefileSheet { spec, pixels }
+            })
+            .collect();
+        let _ = sender.send(PlacefileSheetBatch {
+            source_generation,
+            decoded,
+        });
+        ctx.request_repaint();
+    });
+}
+
+/// Install only bytes produced for the exact currently parsed placefile and
+/// exact IconFile spec. Returning false marks a stale/spec-mismatched batch;
+/// the poller immediately schedules the current generation afterward.
+fn install_placefile_sheet_batch(
+    slot: &mut PlacefileSlot,
+    ctx: &egui::Context,
+    batch: PlacefileSheetBatch,
+) -> bool {
+    if batch.source_generation != slot.source_generation {
+        slot.sheets_generation = None;
+        return false;
+    }
+    let Some(placefile) = slot.data.as_ref() else {
+        slot.sheets_generation = None;
+        return false;
+    };
+
+    let mut matched = 0usize;
+    let mut errors = Vec::new();
+    for decoded in batch.decoded {
+        if !placefile
+            .icon_sheets
+            .iter()
+            .any(|spec| spec == &decoded.spec)
+        {
+            continue;
+        }
+        matched += 1;
+        // Atomic replacement contract: the old texture remains usable until
+        // this exact result arrives, then is removed whether decode succeeded
+        // or failed. A failed local reload therefore cannot display stale art.
+        slot.sheets
+            .retain(|sheet| sheet.spec.index != decoded.spec.index);
+        match decoded.pixels {
+            Ok((width, height, rgba)) => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [width as usize, height as usize],
+                    &rgba,
+                );
+                let texture = ctx.load_texture(
+                    format!(
+                        "placefile-sheet-{}-{}-{}",
+                        batch.source_generation, decoded.spec.index, decoded.spec.url
+                    ),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                slot.sheets.push(PlacefileSheet {
+                    spec: decoded.spec,
+                    size: (width, height),
+                    texture,
+                });
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+
+    if matched == 0 {
+        slot.sheets_generation = None;
+        return false;
+    }
+    slot.status = placefile_parse_status(placefile);
+    if let Some(first) = errors.first() {
+        let extra = errors
+            .len()
+            .checked_sub(1)
+            .filter(|count| *count > 0)
+            .map(|count| format!(" (+{count} more)"))
+            .unwrap_or_default();
+        slot.status.push_str(&format!(
+            " · icon load failed: {}{extra}",
+            compact_layer_status(first, 80)
+        ));
+    }
+    slot.generation = slot.generation.wrapping_add(1);
+    true
 }
 
 /// Cached placefile draw geometry: shapes plus live-drawn text labels
@@ -61009,6 +61531,36 @@ mod tests {
     }
 
     #[test]
+    fn radar_product_browser_uses_full_names_and_stable_categories() {
+        let reflectivity = DisplayProduct::Moment(MomentType::Reflectivity);
+        let storm_relative = DisplayProduct::StormRelativeDealiasedVelocity;
+        let rain_rate = DisplayProduct::Moment(MomentType::Unknown("RATE".to_owned()));
+        let texture = DisplayProduct::Moment(MomentType::Unknown("REF_TEX".to_owned()));
+
+        assert_eq!(
+            product_picker_group(&reflectivity),
+            ProductPickerGroup::Base
+        );
+        assert_eq!(
+            product_picker_group(&storm_relative),
+            ProductPickerGroup::Velocity
+        );
+        assert_eq!(
+            product_picker_group(&rain_rate),
+            ProductPickerGroup::Precipitation
+        );
+        assert_eq!(
+            product_picker_group(&texture),
+            ProductPickerGroup::TextureQuality
+        );
+        assert_eq!(
+            product_picker_long_label(&reflectivity),
+            "Base reflectivity (REF)"
+        );
+        assert!(product_picker_long_label(&rain_rate).contains("Hybrid Polarimetric Rain Rate"));
+    }
+
+    #[test]
     fn advanced_product_picker_order_stays_stable_after_materializing_product() {
         let volume = Arc::new(test_advanced_source_volume(Utc::now()));
         let advanced_labels = |volume: &RadarVolume| {
@@ -61616,6 +62168,44 @@ mod tests {
         let app = test_viewer_app_with_hazards(vec![warning, discussion]);
 
         assert_eq!(app.hazard_at_position(rect, rect.center()), Some(0));
+    }
+
+    #[test]
+    fn spc_md_map_selection_opens_alert_details_and_reveals_sidebar() {
+        let discussion = test_hazard_record(
+            "spc-md-1014",
+            "MD 1014",
+            "mesoscale discussion",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![discussion]);
+        app.sidebar_tab = SidebarTab::Radar;
+        app.sidebar_hidden = true;
+
+        app.select_hazard_from_map(0);
+
+        assert_eq!(app.selected_hazard_index, Some(0));
+        assert_eq!(app.sidebar_tab, SidebarTab::Severe);
+        assert!(!app.sidebar_hidden);
+    }
+
+    #[test]
+    fn warning_map_selection_does_not_yank_the_active_sidebar_tab() {
+        let warning = test_hazard_record(
+            "KTLX.TO.W.0001",
+            "TOR 0001",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![warning]);
+        app.sidebar_tab = SidebarTab::Layers;
+        app.sidebar_hidden = true;
+
+        app.select_hazard_from_map(0);
+
+        assert_eq!(app.selected_hazard_index, Some(0));
+        assert_eq!(app.sidebar_tab, SidebarTab::Layers);
+        assert!(app.sidebar_hidden);
     }
 
     #[test]
@@ -64871,6 +65461,7 @@ mod tests {
             current_workflow: None,
             previous_workflow_snapshot: None,
             chrome_hidden: false,
+            sidebar_hidden: false,
             pending_local_autoplay: false,
             workspace: dock::Workspace::default(),
             model_dock: None,
@@ -65059,6 +65650,7 @@ mod tests {
             sidebar_tab: SidebarTab::Radar,
             last_live_hazard_refresh: None,
             selected_hazard_index: None,
+            hazard_map_popup: None,
             unacknowledged_hazard_event_ids: BTreeSet::new(),
             alert_watch: AlertWatchHandle::default(),
             last_radar_sound_frame_time: None,
@@ -66776,12 +67368,101 @@ mod tests {
         );
         app.placefile_slots[0].receiver = None;
 
-        let (_sender, receiver) = mpsc::channel::<Vec<DecodedSheet>>();
+        let (_sender, receiver) = mpsc::channel::<PlacefileSheetBatch>();
         app.placefile_slots[0].sheets_receiver = Some(receiver);
         assert_eq!(
             app.active_background_activity(),
             Some(BackgroundActivity::indeterminate("Loading placefile icons"))
         );
+    }
+
+    fn test_placefile_icon_spec(index: u32, url: String) -> placefiles::IconSheetSpec {
+        placefiles::IconSheetSpec {
+            index,
+            icon_w: 16,
+            icon_h: 16,
+            hot_x: 8.0,
+            hot_y: 8.0,
+            url,
+        }
+    }
+
+    #[test]
+    fn stale_placefile_sheet_batch_is_rejected_and_current_generation_is_scheduled() {
+        let source = std::env::temp_dir().join("bowecho-current-placefile");
+        let icon = std::env::temp_dir().join("bowecho-current-icon.png");
+        let spec = test_placefile_icon_spec(1, icon.to_string_lossy().into_owned());
+        let mut slot = PlacefileSlot::new(source.to_string_lossy().into_owned(), true);
+        slot.source_generation = 2;
+        slot.sheets_generation = Some(1);
+        slot.data = Some(placefiles::Placefile {
+            title: "Current".to_owned(),
+            refresh_minutes: 5,
+            objects: Vec::new(),
+            icon_sheets: vec![spec.clone()],
+            skipped: 0,
+        });
+        let stale = PlacefileSheetBatch {
+            source_generation: 1,
+            decoded: vec![DecodedPlacefileSheet {
+                spec,
+                pixels: Err("old worker result".to_owned()),
+            }],
+        };
+        let ctx = egui::Context::default();
+
+        assert!(!install_placefile_sheet_batch(&mut slot, &ctx, stale));
+        assert_eq!(slot.sheets_generation, None);
+        schedule_placefile_sheets(&mut slot, &ctx);
+        assert_eq!(slot.sheets_generation, Some(2));
+        assert!(
+            slot.sheets_receiver.is_some(),
+            "current generation must start immediately after stale rejection"
+        );
+    }
+
+    #[test]
+    fn failed_local_placefile_icon_reload_clears_old_texture_and_reports_error() {
+        let source = std::env::temp_dir().join("bowecho-local-placefile");
+        let icon = std::env::temp_dir().join("bowecho-local-icon.png");
+        let spec = test_placefile_icon_spec(3, icon.to_string_lossy().into_owned());
+        let ctx = egui::Context::default();
+        let old_texture = ctx.load_texture(
+            "old-local-placefile-icon",
+            egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 0, 0, 255]),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut slot = PlacefileSlot::new(source.to_string_lossy().into_owned(), true);
+        slot.source_generation = 4;
+        slot.sheets_generation = Some(4);
+        slot.status = "parsed: 1 object(s)".to_owned();
+        slot.data = Some(placefiles::Placefile {
+            title: "Local".to_owned(),
+            refresh_minutes: 5,
+            objects: Vec::new(),
+            icon_sheets: vec![spec.clone()],
+            skipped: 0,
+        });
+        slot.sheets.push(PlacefileSheet {
+            spec: spec.clone(),
+            size: (1, 1),
+            texture: old_texture,
+        });
+        let failed = PlacefileSheetBatch {
+            source_generation: 4,
+            decoded: vec![DecodedPlacefileSheet {
+                spec,
+                pixels: Err("decode icon: corrupt PNG".to_owned()),
+            }],
+        };
+
+        assert!(install_placefile_sheet_batch(&mut slot, &ctx, failed));
+        assert!(
+            slot.sheets.is_empty(),
+            "failed exact replacement must not leave the previous texture visible"
+        );
+        assert!(slot.status.contains("icon load failed"), "{}", slot.status);
+        assert!(slot.status.contains("corrupt PNG"), "{}", slot.status);
     }
 
     #[test]
@@ -67086,6 +67767,32 @@ mod tests {
         assert!(SATELLITE_MAP_LAYER_HOVER.contains("Map"));
         assert!(!SATELLITE_MAP_LAYER_HOVER.contains("Custom"));
         assert!(!SATELLITE_MAP_LAYER_HOVER.contains("Layers"));
+    }
+
+    #[test]
+    fn nws_alert_controls_follow_the_operational_radar_context() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        assert!(app.nws_alert_context_available());
+
+        app.sites = vec![RadarSite::new("TOKC")];
+        assert!(
+            app.nws_alert_context_available(),
+            "TDWR sites retain NWS alert controls"
+        );
+
+        app.sites = vec![RadarSite::new("KCRI")];
+        assert!(
+            !app.nws_alert_context_available(),
+            "US research feeds do not imply NWS alert coverage"
+        );
+
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
+            provider_id: "dwd".to_owned(),
+            site_id: "memmingen".to_owned(),
+        });
+        assert!(!app.nws_alert_context_available());
     }
 
     #[test]

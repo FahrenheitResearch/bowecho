@@ -40,6 +40,13 @@ const MIN_BIN_DEG: f32 = 0.0001;
 /// size the old fixed 0.03° floor produced, so their memory profile is
 /// unchanged.
 const MAX_LUT_BINS: f32 = 16_000_000.0;
+/// Per-axis ceiling for the inverse index. The allocation has always been
+/// capped to this size, but the bin spacing must honor the same ceiling: if
+/// `width.min(MAX_LUT_AXIS_BINS)` truncates a long, narrow domain without
+/// increasing `bin`, every longitude beyond the retained western bins becomes
+/// unaddressable. Reserve one bin below the ceiling to absorb f32 rounding at
+/// the maximum coordinate.
+const MAX_LUT_AXIS_BINS: usize = 8192;
 const HOLE_FILL_PASSES: usize = 3;
 
 impl InverseLut {
@@ -125,12 +132,16 @@ impl InverseLut {
         // huge domain cannot allocate an unbounded index. The budget floor —
         // not a fixed degree floor — is what lets a 250 m grid index at native
         // resolution while a full-disk satellite grid stays ~64 MB.
-        let budget_floor = (((lat_max - lat_min) * (lon_max - lon_min)) / MAX_LUT_BINS).sqrt();
+        let lat_span = lat_max - lat_min;
+        let lon_span = lon_max - lon_min;
+        let budget_floor = ((lat_span * lon_span) / MAX_LUT_BINS).sqrt();
+        let axis_floor = lat_span.max(lon_span) / (MAX_LUT_AXIS_BINS - 2) as f32;
         let bin = (spacing * if shape.is_some() { 1.25 } else { 1.1 })
             .max(budget_floor)
+            .max(axis_floor)
             .max(MIN_BIN_DEG);
-        let width = (((lon_max - lon_min) / bin).ceil() as usize + 1).min(8192);
-        let height = (((lat_max - lat_min) / bin).ceil() as usize + 1).min(8192);
+        let width = ((lon_span / bin).ceil() as usize + 1).min(MAX_LUT_AXIS_BINS);
+        let height = ((lat_span / bin).ceil() as usize + 1).min(MAX_LUT_AXIS_BINS);
         let mut index = vec![u32::MAX; width * height];
         for (i, (&la, &lo)) in lat.iter().zip(lon.iter()).enumerate() {
             if !la.is_finite() || !lo.is_finite() {
@@ -560,6 +571,77 @@ pub(crate) fn unwrap_lon_near(mut lon: f64, target: f64) -> f64 {
 mod tests {
     use super::*;
     use rw_store::grid::GridFile;
+
+    #[test]
+    fn cached_antimeridian_satellite_grid_keeps_both_longitude_sides_when_env_is_set() {
+        let Some(path) = std::env::var_os("BOWECHO_SAT_ANTIMERIDIAN_GRID") else {
+            return;
+        };
+        let grid =
+            GridFile::open(std::path::Path::new(&path)).expect("cached satellite grid opens");
+        eprintln!(
+            "cached sat grid {}x{}, lat descending {:?}, finite {} / {}",
+            grid.nx,
+            grid.ny,
+            grid.lat_descending(),
+            grid.lat
+                .iter()
+                .zip(&grid.lon)
+                .filter(|(lat, lon)| lat.is_finite() && lon.is_finite())
+                .count(),
+            grid.lat.len()
+        );
+        let lut = InverseLut::build_with_shape(&grid.lat, &grid.lon, grid.nx, grid.ny)
+            .expect("cached satellite LUT builds");
+        let positive_lon_point = grid
+            .lat
+            .iter()
+            .zip(&grid.lon)
+            .find(|(lat, lon)| lat.is_finite() && lon.is_finite() && **lon > 150.0)
+            .map(|(&lat, &lon)| (lat, lon))
+            .expect("cached GOES-West grid crosses onto positive longitudes");
+        eprintln!(
+            "LUT {}x{} ({} MiB), positive-longitude point {positive_lon_point:?} -> {:?}, California {:?}",
+            lut.width,
+            lut.height,
+            lut.retained_bytes() / (1024 * 1024),
+            lut.lookup(positive_lon_point.0, positive_lon_point.1),
+            lut.lookup(36.7, -119.4),
+        );
+        assert!(
+            lut.lookup(positive_lon_point.0, positive_lon_point.1)
+                .is_some(),
+            "the per-axis cap must not truncate the positive-longitude side"
+        );
+        assert!(lut.lookup(36.7, -119.4).is_some());
+    }
+
+    #[test]
+    fn axis_limited_lut_keeps_the_far_edge_of_a_long_narrow_grid() {
+        // Regression fixture for GOES CONUS: native-spaced bins can require
+        // more than 8192 longitude bins while the short latitude axis keeps
+        // the total comfortably below MAX_LUT_BINS. Capping only `width`
+        // used to discard the far end of the domain.
+        let (nx, ny) = (12_001usize, 11usize);
+        let mut lat = Vec::with_capacity(nx * ny);
+        let mut lon = Vec::with_capacity(nx * ny);
+        for y in 0..ny {
+            for x in 0..nx {
+                lat.push(y as f32 * 0.01);
+                lon.push(-160.0 + x as f32 * 0.01);
+            }
+        }
+
+        let lut = InverseLut::build_with_shape(&lat, &lon, nx, ny).expect("panoramic LUT");
+
+        assert!(lut.width <= MAX_LUT_AXIS_BINS);
+        for lon in [-159.0, -100.0, -41.0] {
+            assert!(
+                lut.lookup(0.05, lon).is_some(),
+                "longitude {lon} must remain addressable"
+            );
+        }
+    }
 
     #[test]
     fn lut_round_trips_a_regular_grid() {

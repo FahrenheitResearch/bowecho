@@ -261,7 +261,8 @@ pub struct AppSettings {
     /// New key only — a v0.29 file opened by v0.28 ignores it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_pane_pins: BTreeMap<u8, String>,
-    /// Placefile URLs (GRLevelX-style overlays) with per-file enable flags.
+    /// Placefile sources (community URLs or absolute downloaded-file paths)
+    /// with per-file enable flags.
     pub placefiles: Vec<PlacefileEntry>,
     /// Default overlay toggles, restored at startup (user request: "let
     /// people save what overlays they want default").
@@ -484,6 +485,17 @@ pub struct AppSettings {
     /// format. Empty = disabled.
     #[serde(default)]
     pub warning_provider_url: String,
+    /// Built-in live warning source: `auto` follows the active radar country,
+    /// `nws` uses US NWS active alerts, and `europe` uses the official public
+    /// MeteoAlarm country Atom feed. String storage preserves unknown values
+    /// across mixed-version installs; the UI safely treats them as `auto`.
+    #[serde(default = "default_warning_source")]
+    pub warning_source: String,
+    /// MeteoAlarm country-feed slug, or `auto` to follow the active
+    /// international radar's catalog country. The feed list is maintained by
+    /// MeteoAlarm; an unknown/stale slug falls back to radar-country auto.
+    #[serde(default = "default_meteoalarm_country")]
+    pub meteoalarm_country: String,
     /// Current-alert list sort mode in the Alerts tab. Kept as a string so
     /// older/newer builds can preserve unknown operator preferences.
     #[serde(default = "default_current_alert_sort")]
@@ -943,10 +955,12 @@ pub struct CustomPollLinkEntry {
     pub poll_url: String,
 }
 
-/// A persisted placefile reference.
+/// A persisted placefile reference. `url` retains its historical field name
+/// for settings compatibility, but may also hold an absolute local path.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlacefileEntry {
+    /// HTTP(S) community feed or absolute path to a downloaded placefile.
     pub url: String,
     pub enabled: bool,
     /// Draw the file's Text/Place statements (names above icons). Off =
@@ -998,6 +1012,14 @@ fn default_hidden_hazard_families() -> Vec<String> {
 
 fn default_warning_refresh_seconds() -> u64 {
     30
+}
+
+fn default_warning_source() -> String {
+    "auto".to_owned()
+}
+
+fn default_meteoalarm_country() -> String {
+    "auto".to_owned()
 }
 
 fn default_style_profile() -> String {
@@ -1076,6 +1098,8 @@ impl Default for AppSettings {
             radar_update_sound_path: String::new(),
             warning_refresh_seconds: default_warning_refresh_seconds(),
             warning_provider_url: String::new(),
+            warning_source: default_warning_source(),
+            meteoalarm_country: default_meteoalarm_country(),
             current_alert_sort: default_current_alert_sort(),
             current_alert_filter: default_current_alert_filter(),
             storm_track_max_tracks: default_storm_track_max_tracks(),
@@ -2058,14 +2082,19 @@ mod tests {
 
     #[test]
     fn warning_feed_settings_default_and_round_trip() {
-        // Old configs (no keys) keep the historical 30 s cadence and an
-        // empty custom feed.
-        assert_eq!(AppSettings::from_json("{}").warning_refresh_seconds, 30);
-        assert!(AppSettings::from_json("{}").warning_provider_url.is_empty());
+        // Old configs (no keys) keep the historical cadence/custom feed and
+        // gain safe radar-country source selection.
+        let old = AppSettings::from_json("{}");
+        assert_eq!(old.warning_refresh_seconds, 30);
+        assert!(old.warning_provider_url.is_empty());
+        assert_eq!(old.warning_source, "auto");
+        assert_eq!(old.meteoalarm_country, "auto");
 
         let settings = AppSettings {
             warning_refresh_seconds: 5,
             warning_provider_url: "https://relay.example.org/cap.json".to_owned(),
+            warning_source: "europe".to_owned(),
+            meteoalarm_country: "germany".to_owned(),
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
@@ -2074,6 +2103,8 @@ mod tests {
             back.warning_provider_url,
             "https://relay.example.org/cap.json"
         );
+        assert_eq!(back.warning_source, "europe");
+        assert_eq!(back.meteoalarm_country, "germany");
     }
 
     #[test]

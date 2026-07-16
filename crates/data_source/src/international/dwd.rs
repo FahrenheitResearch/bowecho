@@ -5,10 +5,11 @@
 //!
 //! ```text
 //! sites/
-//!   sweep_vol_z/asb/unfiltered/        product / station / variant
+//!   sweep_vol_z/asb/hdf5/filter_polarimetric/
+//!     ras07-vol5minng01_sweeph5onem_dbzh_00-2026061206455700-asb-10103-hd5
+//!     ... (quality-controlled reflectivity; one file per sweep index 00..09)
+//!   sweep_vol_z/asb/unfiltered/        product / station / raw fallback
 //!     ras07-vol5minng01_sweeph5onem_th_00-2026061206455700-asb-10103-hd5
-//!     ras07-vol5minng01_sweeph5onem_th_00-LATEST-asb-10103-hd5
-//!     ... (one file per sweep index 00..09, ~2-day retention)
 //!   sweep_vol_v/asb/hdf5/filter_polarimetric/   (no unfiltered variant)
 //!     ras07-vol5minng01_sweeph5onem_vradh_00-2026061206455700-asb-10103-hd5
 //! ```
@@ -18,22 +19,19 @@
 //! quantity, so a full volume is 10 sweeps x N products merged with
 //! `radar_core::merge_radar_volumes`.
 //!
-//! LATEST naming, confirmed against the live `sweep_vol_z/asb/unfiltered/`
-//! listing: for every unfiltered quantity and sweep index there is exactly
-//! one `..._NN-LATEST-...` alias whose content is rewritten to the newest
-//! sweep each ~5-minute cycle. The filtered velocity directories
-//! (`hdf5/filter_polarimetric/`, `hdf5/filter_simple/`) carry NO LATEST
-//! aliases at all — timestamped files only. This provider therefore pins
-//! explicit timestamped files for every part instead of downloading the
-//! LATEST aliases: it keeps all parts of a [`FramePlan`] immutable and
-//! cycle-consistent (a LATEST alias downloaded mid-cycle can already point
-//! at the next scan for low sweep indices), while the resolved cycle
-//! timestamp from the listing provides the frame identity.
+//! DWD publishes the operational reflectivity in three variants. BowEcho
+//! prefers `filter_polarimetric`, then `filter_simple`, and uses
+//! `unfiltered` only as a compatibility fallback. The filtered directories
+//! are the already quality-controlled products; their ODIM data plane has
+//! the clutter decisions applied directly and does not require a separate
+//! quality-mask decode. The provider pins explicit timestamped files for
+//! every part instead of following mutable LATEST aliases, keeping every
+//! [`FramePlan`] immutable and cycle-consistent.
 //!
 //! Cycle resolution: file timestamps are sweep start times
 //! (`YYYYMMDDHHMMSScc`, centisecond suffix). Within one `vol5minng01` cycle
 //! the sweeps run in ascending index order over ~3 minutes (live capture:
-//! `th_00` 06:40:57 ... `th_09` 06:44:02, repeating every 5 minutes), so
+//! `dbzh_00` 06:40:57 ... `dbzh_09` 06:44:02, repeating every 5 minutes), so
 //! the newest timestamp of the HIGHEST sweep index marks the most recent
 //! complete cycle, and every sweep's file for that cycle is the newest one
 //! within the trailing 5-minute window.
@@ -124,9 +122,8 @@ const DWD_STATIONS: [(&str, &str, f32, f32); 17] = [
 /// Germany's DWD open-data sweep feed (one file per sweep per product).
 #[derive(Clone, Copy, Debug)]
 pub struct DwdProvider {
-    /// Also assemble ZDR/RhoHV/PhiDP. Off by default: each extra product
-    /// costs a ~2 MB listing fetch per poll plus ten sweep downloads per
-    /// frame, and reflectivity+velocity already make a working display.
+    /// Also assemble every ZDR/RhoHV/PhiDP product available at the selected
+    /// radar. Individual optional products may be absent at a station.
     include_dual_pol: bool,
 }
 
@@ -137,7 +134,7 @@ impl DwdProvider {
         }
     }
 
-    /// Assemble ZDR, RhoHV, and PhiDP sweeps too (more bandwidth).
+    /// Assemble every available ZDR, RhoHV, and PhiDP sweep too.
     pub fn with_dual_pol() -> Self {
         Self {
             include_dual_pol: true,
@@ -165,11 +162,14 @@ impl DwdProvider {
                 Err(_) => continue,
             };
             let sweeps = parse_dwd_sweeps(&resolved.entries, resolved.quantity);
-            if product.required && sweeps.is_empty() {
-                return Err(format!(
-                    "DWD {}/{site_id}: no timestamped '{}' sweep files in {}",
-                    product.dir, resolved.quantity, resolved.dir_url
-                ));
+            if sweeps.is_empty() {
+                if product.required {
+                    return Err(format!(
+                        "DWD {}/{site_id}: no timestamped '{}' sweep files in {}",
+                        product.dir, resolved.quantity, resolved.dir_url
+                    ));
+                }
+                continue;
             }
             products.push(DwdProductSweeps {
                 dir: product.dir,
@@ -382,57 +382,95 @@ struct ResolvedProductDir {
     quantity: &'static str,
 }
 
-/// Resolve `sites/{product}/{site}/` to its data directory: `unfiltered/`
-/// when present (LATEST-bearing raw quantities), else `hdf5/` descending
-/// into `filter_polarimetric/` over `filter_simple/` (filtered quantities,
-/// timestamped files only).
+/// Return the available variant URLs in scientific preference order.
+///
+/// DWD's `filter_polarimetric` reflectivity has the dual-polarization clutter
+/// classification applied; `filter_simple` is the less capable filtered
+/// fallback. Raw `unfiltered` TH/UZDR/URHOHV/UPHIDP remains useful where a
+/// station does not publish a filtered version of that moment.
+fn variant_dir_urls(
+    station_url: &str,
+    station_entries: &[ListingEntry],
+    hdf5_entries: Option<&[ListingEntry]>,
+) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(hdf5_entries) = hdf5_entries {
+        for filter in ["filter_polarimetric", "filter_simple"] {
+            if has_dir(hdf5_entries, filter) {
+                urls.push(format!("{station_url}hdf5/{filter}/"));
+            }
+        }
+    }
+    if has_dir(station_entries, "unfiltered") {
+        urls.push(format!("{station_url}unfiltered/"));
+    }
+    urls
+}
+
+/// Resolve `sites/{product}/{site}/` to the first variant that actually
+/// carries one of the product's supported quantities. A temporarily absent
+/// or empty preferred directory falls through to the next variant instead
+/// of taking the whole station offline.
 fn resolve_product_dir(site_id: &str, product: &DwdProduct) -> Result<ResolvedProductDir, String> {
     let station_url = format!("{DWD_SITES_ROOT}{}/{site_id}/", product.dir);
     let station_html =
         fetch_text(&station_url).map_err(|err| format!("DWD station dir {station_url}: {err}"))?;
     let station_entries = parse_autoindex(&station_html);
 
-    let dir_url = if has_dir(&station_entries, "unfiltered") {
-        format!("{station_url}unfiltered/")
-    } else if has_dir(&station_entries, "hdf5") {
+    let mut attempts = Vec::new();
+    let hdf5_entries = if has_dir(&station_entries, "hdf5") {
         let hdf5_url = format!("{station_url}hdf5/");
-        let hdf5_html =
-            fetch_text(&hdf5_url).map_err(|err| format!("DWD filter dir {hdf5_url}: {err}"))?;
-        let hdf5_entries = parse_autoindex(&hdf5_html);
-        let filter = ["filter_polarimetric", "filter_simple"]
-            .into_iter()
-            .find(|name| has_dir(&hdf5_entries, name))
-            .ok_or_else(|| format!("DWD filter dir {hdf5_url}: no filter_* subdirectory"))?;
-        format!("{hdf5_url}{filter}/")
+        match fetch_text(&hdf5_url) {
+            Ok(html) => Some(parse_autoindex(&html)),
+            Err(err) => {
+                attempts.push(format!("filter catalog {hdf5_url}: {err}"));
+                None
+            }
+        }
     } else {
-        return Err(format!(
-            "DWD station dir {station_url}: neither unfiltered/ nor hdf5/ present"
-        ));
+        None
     };
 
-    // Sweep listings run ~2 MB (full retention, no server gzip): use the
-    // long-timeout listing fetch.
-    let html = fetch_listing_text(&dir_url)
-        .map_err(|err| format!("DWD sweep listing {dir_url}: {err}"))?;
-    let entries = parse_autoindex(&html);
-    let quantity = product
-        .quantities
-        .iter()
-        .find(|quantity| {
-            let marker = quantity_marker(quantity);
-            entries.iter().any(|entry| entry.name.contains(&marker))
-        })
-        .ok_or_else(|| {
-            format!(
-                "DWD sweep listing {dir_url}: none of the quantities {:?} present",
-                product.quantities
-            )
-        })?;
-    Ok(ResolvedProductDir {
-        dir_url,
-        entries,
-        quantity,
-    })
+    let dir_urls = variant_dir_urls(&station_url, &station_entries, hdf5_entries.as_deref());
+    if dir_urls.is_empty() {
+        attempts.push(format!(
+            "station dir {station_url}: no filter_polarimetric, filter_simple, or unfiltered variant"
+        ));
+    }
+
+    for dir_url in dir_urls {
+        // Sweep listings run ~2 MB (full retention, no server gzip): use the
+        // long-timeout listing fetch.
+        let html = match fetch_listing_text(&dir_url) {
+            Ok(html) => html,
+            Err(err) => {
+                attempts.push(format!("sweep listing {dir_url}: {err}"));
+                continue;
+            }
+        };
+        let entries = parse_autoindex(&html);
+        let quantity = product
+            .quantities
+            .iter()
+            .find(|quantity| !parse_dwd_sweeps(&entries, quantity).is_empty());
+        if let Some(&quantity) = quantity {
+            return Ok(ResolvedProductDir {
+                dir_url,
+                entries,
+                quantity,
+            });
+        }
+        attempts.push(format!(
+            "sweep listing {dir_url}: no timestamped sweeps for quantities {:?}",
+            product.quantities
+        ));
+    }
+
+    Err(format!(
+        "DWD {}/{site_id}: no usable product variant ({})",
+        product.dir,
+        attempts.join("; ")
+    ))
 }
 
 fn quantity_marker(quantity: &str) -> String {
@@ -538,17 +576,57 @@ mod tests {
 
     #[test]
     fn station_variant_dirs_match_the_live_layout() {
-        // sweep_vol_z/asb has BOTH unfiltered/ and hdf5/ -> unfiltered wins.
+        // sweep_vol_z/asb has BOTH unfiltered/ and hdf5/. The provider must
+        // use DWD's quality-controlled variants before raw TH; the old order
+        // selected unfiltered first and exposed the Memmingen clutter.
         let z_entries = parse_autoindex(Z_STATION_DIR);
         assert!(has_dir(&z_entries, "unfiltered"));
         assert!(has_dir(&z_entries, "hdf5"));
-        // sweep_vol_v/asb has only hdf5/, which holds the filter variants.
-        let v_entries = parse_autoindex(V_STATION_DIR);
-        assert!(!has_dir(&v_entries, "unfiltered"));
-        assert!(has_dir(&v_entries, "hdf5"));
         let v_hdf5 = parse_autoindex(V_HDF5_DIR);
         assert!(has_dir(&v_hdf5, "filter_polarimetric"));
         assert!(has_dir(&v_hdf5, "filter_simple"));
+        assert_eq!(
+            variant_dir_urls(
+                "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z/asb/",
+                &z_entries,
+                Some(&v_hdf5),
+            ),
+            [
+                "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z/asb/hdf5/\
+                 filter_polarimetric/",
+                "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z/asb/hdf5/\
+                 filter_simple/",
+                "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z/asb/unfiltered/",
+            ]
+        );
+
+        // sweep_vol_v/asb has only hdf5/, so it never invents an unfiltered
+        // fallback that the official tree does not expose.
+        let v_entries = parse_autoindex(V_STATION_DIR);
+        assert!(!has_dir(&v_entries, "unfiltered"));
+        assert!(has_dir(&v_entries, "hdf5"));
+        assert_eq!(
+            variant_dir_urls(
+                "https://opendata.dwd.de/weather/radar/sites/sweep_vol_v/asb/",
+                &v_entries,
+                Some(&v_hdf5),
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn raw_variant_remains_a_fallback_when_filtered_catalog_is_unavailable() {
+        let z_entries = parse_autoindex(Z_STATION_DIR);
+        assert_eq!(
+            variant_dir_urls(
+                "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z/asb/",
+                &z_entries,
+                None,
+            ),
+            ["https://opendata.dwd.de/weather/radar/sites/sweep_vol_z/asb/unfiltered/"]
+        );
     }
 
     #[test]
@@ -719,6 +797,24 @@ mod tests {
                 && err.contains("missing expected sweep indices 04"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn unavailable_optional_dual_pol_product_does_not_block_the_base_volume() {
+        let mut products = fixture_products();
+        products.push(DwdProductSweeps {
+            dir: "sweep_vol_zdr",
+            required: false,
+            dir_url: "https://opendata.dwd.de/weather/radar/sites/sweep_vol_zdr/asb/unfiltered/"
+                .to_owned(),
+            quantity: "uzdr",
+            sweeps: Vec::new(),
+        });
+
+        let plan = assemble_cycle("asb", timestamp("20260612064402"), &products)
+            .expect("missing optional ZDR must not block REF+VEL");
+        assert_eq!(plan.parts.len(), 20);
+        assert!(plan.identity.starts_with("asb_20260612064402_p20_h"));
     }
 
     #[test]

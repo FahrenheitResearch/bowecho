@@ -6695,6 +6695,50 @@ mod tests {
     }
 
     #[test]
+    fn cached_goes18_composite_is_renderable_inside_its_sector_when_env_is_set() {
+        let Some(store) = std::env::var_os("BOWECHO_SAT_REPRO_STORE").map(PathBuf::from) else {
+            return;
+        };
+        let key = SatRunKey {
+            model: "g18".to_owned(),
+            run: "conus_rgb_natural_color_20260713".to_owned(),
+        };
+        let mut state = WorkerState::default();
+        let frame = load_frame_for_map(&mut state, &store, &key, 1836)
+            .expect("reported cached composite loads through the map path");
+        assert!(
+            frame.image.pixels.iter().any(|pixel| pixel.a() > 0),
+            "the cached source image itself is not transparent"
+        );
+
+        let lut = crate::model_layer::InverseLut::build_with_shape(
+            &frame.grid.lat,
+            &frame.grid.lon,
+            frame.grid.nx,
+            frame.grid.ny,
+        )
+        .expect("reported cached grid indexes");
+        let california = lut
+            .lookup(36.7, -119.4)
+            .expect("California is inside GOES-West CONUS");
+        let row = california / frame.grid.nx;
+        let col = california % frame.grid.nx;
+        let image_row = if frame.flip_rows {
+            frame.grid.ny - 1 - row
+        } else {
+            row
+        };
+        assert!(
+            frame.image.pixels[image_row * frame.grid.nx + col].a() > 0,
+            "an in-sector daylight map sample is visible"
+        );
+        assert!(
+            lut.lookup(42.88, -85.52).is_none(),
+            "KGRR is outside this GOES-West CONUS frame; it needs GOES-East"
+        );
+    }
+
+    #[test]
     fn himawari_ir_is_colorized_not_grayscale() {
         // Kelvin brightness temps: NaN, warm surface, a -60 C top, a -40 C top.
         let values = vec![f32::NAN, 300.0, 213.0, 233.0];

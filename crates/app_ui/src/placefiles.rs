@@ -10,6 +10,101 @@
 //! and `Object:` blocks (statements inside draw at pixel offsets from the
 //! anchor, +x east / +y north, per the GR convention).
 
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+/// Downloaded placefiles are small text overlays. Keep a local file typo or
+/// accidental binary selection from consuming unbounded memory.
+const MAX_LOCAL_PLACEFILE_BYTES: usize = 8 * 1024 * 1024;
+/// Match `data_source::fetch_bytes`' remote sprite-sheet ceiling.
+const MAX_LOCAL_ICON_BYTES: usize = 4 * 1024 * 1024;
+
+/// HTTP(S) sources use the existing community-feed client; everything else
+/// is treated as a literal local filesystem path. Local paths are persisted
+/// exactly as ordinary absolute paths rather than converted to fragile
+/// `file://` URLs (notably important for Windows drive and UNC paths).
+pub fn is_remote_source(source: &str) -> bool {
+    let source = source.trim();
+    source
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || source
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+/// Normalize a file-picker result into the absolute path stored in settings.
+/// Canonicalization is best-effort so network shares and temporarily
+/// unavailable removable media can still remain in the user's layer list.
+pub fn persistent_local_source(path: &Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    absolute
+        .canonicalize()
+        .unwrap_or(absolute)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Compact pre-parse label for the layer rail. Parsed `Title:` replaces it
+/// after load; local files should not expose an entire absolute path as the
+/// row title (the full source remains in the hover).
+pub fn source_display_name(source: &str) -> String {
+    if is_remote_source(source) {
+        return source.to_owned();
+    }
+    Path::new(source)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(source)
+        .to_owned()
+}
+
+/// Read a downloaded placefile with a hard cap and text-file sanity check.
+/// GR placefiles are overwhelmingly ASCII; lossy UTF-8 also keeps older
+/// Windows-encoded labels usable without making the map layer fail.
+pub fn read_local_placefile(source: &str) -> Result<String, String> {
+    let bytes = read_local_bytes_capped(source, MAX_LOCAL_PLACEFILE_BYTES, "placefile")?;
+    if bytes.contains(&0) {
+        return Err(format!(
+            "local placefile contains NUL bytes (expected text): {source}"
+        ));
+    }
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Read a sprite sheet referenced by a downloaded placefile. Relative paths
+/// have already been resolved beside the text file by `resolve_url`.
+pub fn read_local_icon(source: &str) -> Result<Vec<u8>, String> {
+    read_local_bytes_capped(source, MAX_LOCAL_ICON_BYTES, "placefile icon")
+}
+
+fn read_local_bytes_capped(source: &str, max_bytes: usize, kind: &str) -> Result<Vec<u8>, String> {
+    let mut file = File::open(source).map_err(|error| format!("read {kind} {source}: {error}"))?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {kind} {source}: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "{kind} is larger than the supported {} MiB limit: {source}",
+            max_bytes / (1024 * 1024)
+        ));
+    }
+    Ok(bytes)
+}
+
 /// One parsed placefile.
 #[derive(Clone, Debug, Default)]
 pub struct Placefile {
@@ -212,7 +307,7 @@ pub fn parse_placefile(text: &str, base_url: &str) -> Placefile {
                     let hot_x = parts[3].trim().parse::<f32>().unwrap_or(0.0);
                     let hot_y = parts[4].trim().parse::<f32>().unwrap_or(0.0);
                     let url = resolve_url(base_url, &unquote(parts[5]));
-                    if w > 0 && h > 0 && url.starts_with("http") {
+                    if w > 0 && h > 0 && (is_remote_source(&url) || Path::new(&url).is_absolute()) {
                         out.icon_sheets.retain(|sheet| sheet.index != index);
                         out.icon_sheets.push(IconSheetSpec {
                             index,
@@ -472,10 +567,12 @@ fn push_item(out: &mut Placefile, in_time_window: bool, object: PlacefileObject)
 /// Resolve a possibly-relative IconFile URL against the placefile URL
 /// (Supercell-Wx parity: "icons/x.png" loads from the placefile's host).
 fn resolve_url(base_url: &str, raw: &str) -> String {
-    if raw.starts_with("http://") || raw.starts_with("https://") || base_url.is_empty() {
+    if is_remote_source(raw) || base_url.is_empty() {
         return raw.to_owned();
     }
-    if let Some(scheme_end) = base_url.find("://") {
+    if is_remote_source(base_url)
+        && let Some(scheme_end) = base_url.find("://")
+    {
         let host_start = scheme_end + 3;
         if raw.starts_with('/') {
             // Host-absolute path.
@@ -492,7 +589,20 @@ fn resolve_url(base_url: &str, raw: &str) -> String {
         }
         return format!("{base_url}/{raw}");
     }
-    raw.to_owned()
+
+    // A downloaded placefile may keep its IconFile beside the text file.
+    // Resolve that reference with platform-native path rules; absolute drive,
+    // UNC, POSIX, and already-rooted paths pass through unchanged.
+    let raw_path = Path::new(raw);
+    if raw_path.is_absolute() {
+        return raw_path.to_string_lossy().into_owned();
+    }
+    Path::new(base_url)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(raw_path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ---- HSLuv -> sRGB (reference implementation; www.hsluv.org) ----
@@ -728,5 +838,50 @@ second line from wrapped feed"
         );
         assert_eq!(pf.title, "x");
         assert!(pf.objects.is_empty());
+    }
+
+    #[test]
+    fn downloaded_placefile_resolves_relative_icon_beside_source() {
+        let base = std::env::temp_dir()
+            .join("bowecho-placefile-test")
+            .join("storm.placefile");
+        let source = base.to_string_lossy();
+        let pf = parse_placefile("IconFile: 1, 16, 16, 8, 8, \"icons/sheet.png\"\n", &source);
+        assert_eq!(pf.icon_sheets.len(), 1);
+        assert_eq!(
+            PathBuf::from(&pf.icon_sheets[0].url),
+            base.parent().unwrap().join("icons/sheet.png")
+        );
+    }
+
+    #[test]
+    fn local_reader_accepts_extensionless_text_and_rejects_binary() {
+        let unique = format!(
+            "bowecho-placefile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::write(&path, b"\xEF\xBB\xBFTitle: Local\nPlace: 35, -97, Home\n").unwrap();
+        let source = path.to_string_lossy();
+        let text = read_local_placefile(&source).unwrap();
+        assert!(text.starts_with("Title: Local"));
+
+        std::fs::write(&path, b"not\0a text placefile").unwrap();
+        let error = read_local_placefile(&source).unwrap_err();
+        assert!(error.contains("NUL bytes"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn source_dispatch_only_treats_http_and_https_as_remote() {
+        assert!(is_remote_source("HTTP://example.test/layer.txt"));
+        assert!(is_remote_source("https://example.test/layer.txt"));
+        assert!(!is_remote_source("C:\\downloads\\storm.txt"));
+        assert!(!is_remote_source("/tmp/storm"));
+        assert!(!is_remote_source("å downloaded placefile"));
     }
 }
