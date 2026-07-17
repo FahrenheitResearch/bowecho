@@ -8385,10 +8385,55 @@ fn sidebar_edge_toggle_visible(
     visible_map_rect: Option<egui::Rect>,
     map_side_probe: egui::Pos2,
     handle_rect: egui::Rect,
+    active_docked_sounding_rect: Option<egui::Rect>,
     floating_sounding_rect: Option<egui::Rect>,
 ) -> bool {
     visible_map_rect.is_some_and(|rect| rect.contains(map_side_probe))
+        && !active_docked_sounding_rect.is_some_and(|rect| rect.intersects(handle_rect))
         && !floating_sounding_rect.is_some_and(|rect| rect.intersects(handle_rect))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FloatingSoundingWindowGeometry {
+    bounds: egui::Rect,
+    default_size: egui::Vec2,
+    min_size: egui::Vec2,
+    max_size: egui::Vec2,
+}
+
+fn floating_sounding_window_geometry(content_rect: egui::Rect) -> FloatingSoundingWindowGeometry {
+    // `Window::default_size` and `max_size` describe the content area, while
+    // the title bar, frame, and resize shadow live outside it. Reserve that
+    // chrome explicitly instead of asking for a desktop-sized 1680x1000
+    // content rect and trusting the position-only screen constraint to make
+    // it fit. The renderer below already scales from `ui.available_size()`.
+    const OUTER_MARGIN: f32 = 8.0;
+    const WINDOW_CHROME_RESERVE: egui::Vec2 = egui::vec2(24.0, 48.0);
+    const PREFERRED_SIZE: egui::Vec2 = egui::vec2(1680.0, 1000.0);
+    const MIN_SIZE: egui::Vec2 = egui::vec2(480.0, 360.0);
+    const DEFAULT_FRACTION: f32 = 0.9;
+
+    let bounds = content_rect.shrink(OUTER_MARGIN);
+    let max_size = egui::vec2(
+        (bounds.width() - WINDOW_CHROME_RESERVE.x).max(1.0),
+        (bounds.height() - WINDOW_CHROME_RESERVE.y).max(1.0),
+    );
+    let min_size = egui::vec2(MIN_SIZE.x.min(max_size.x), MIN_SIZE.y.min(max_size.y));
+    let default_size = egui::vec2(
+        (max_size.x * DEFAULT_FRACTION)
+            .min(PREFERRED_SIZE.x)
+            .max(min_size.x),
+        (max_size.y * DEFAULT_FRACTION)
+            .min(PREFERRED_SIZE.y)
+            .max(min_size.y),
+    );
+
+    FloatingSoundingWindowGeometry {
+        bounds,
+        default_size,
+        min_size,
+        max_size,
+    }
 }
 
 impl ViewerApp {
@@ -20488,12 +20533,26 @@ impl eframe::App for ViewerApp {
         self.simradar_gate_inspector.show_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
 
+        let active_tiles = self.workspace.tree.active_tiles();
+        let active_docked_sounding_rect = self
+            .workspace
+            .tree
+            .tiles
+            .find_pane(&dock::WorkspacePane::Sounding)
+            .filter(|tile| active_tiles.contains(tile))
+            .and_then(|tile| self.workspace.tree.tiles.rect(tile));
         let floating_sounding_rect = self.sounding_window(&ctx);
         if let Some(sidebar_edge_x) = sidebar_edge_x {
             // The workspace pass populated the visible-pane rectangles, and
             // the floating Sounding now supplied its actual window rectangle.
-            // Draw only on exposed map chrome, never through sounding content.
-            self.sidebar_edge_toggle(&ctx, sidebar_edge_x, floating_sounding_rect);
+            // Draw only on exposed map chrome, never through either sounding
+            // surface (including an active tab whose map rect was stale).
+            self.sidebar_edge_toggle(
+                &ctx,
+                sidebar_edge_x,
+                active_docked_sounding_rect,
+                floating_sounding_rect,
+            );
         }
 
         if self.media.capture_overlay_visible()
@@ -22800,6 +22859,7 @@ impl ViewerApp {
         &mut self,
         ctx: &egui::Context,
         edge_x: f32,
+        active_docked_sounding_rect: Option<egui::Rect>,
         floating_sounding_rect: Option<egui::Rect>,
     ) {
         let content = ctx.content_rect();
@@ -22827,6 +22887,7 @@ impl ViewerApp {
             visible_map_rect,
             map_side_probe,
             handle_rect,
+            active_docked_sounding_rect,
             floating_sounding_rect,
         ) {
             return;
@@ -31441,14 +31502,17 @@ impl ViewerApp {
         if !self.native_skewt_open || self.workspace.is_docked(dock::WorkspacePane::Sounding) {
             return None;
         }
+        let geometry = floating_sounding_window_geometry(ctx.content_rect());
         let mut open = self.native_skewt_open;
         let response = egui::Window::new("Sounding (native)")
             .open(&mut open)
-            // Rusty Weather v0.4 gives the complete SPC board a desktop-width
-            // canvas. Mirror that first-open geometry here; egui still clamps
-            // it to smaller displays and the user can resize or dock it.
-            .default_size([1680.0, 1000.0])
-            .min_size([480.0, 360.0])
+            // Keep the full board roomy on large desktops, but size it from
+            // this viewport and cap even an in-session remembered size. The
+            // SHARPpy canvas itself consumes the resulting available rect.
+            .default_size(geometry.default_size)
+            .min_size(geometry.min_size)
+            .max_size(geometry.max_size)
+            .constrain_to(geometry.bounds)
             .resizable(true)
             .show(ctx, |ui| {
                 self.dock_toggle_row(ui, dock::WorkspacePane::Sounding);
@@ -45616,6 +45680,7 @@ mod tests {
                 boundary_probe,
                 handle_rect,
                 None,
+                None,
             ),
             "a right-hand Sounding owns the boundary, so the map handle must not cover it"
         );
@@ -45627,10 +45692,23 @@ mod tests {
             boundary_probe,
             handle_rect,
             None,
+            None,
         ));
         assert!(
-            !sidebar_edge_toggle_visible(None, boundary_probe, handle_rect, None),
+            !sidebar_edge_toggle_visible(None, boundary_probe, handle_rect, None, None),
             "the handle is map chrome and must stay hidden without a visible map"
+        );
+        let docked_sounding =
+            egui::Rect::from_min_max(egui::pos2(100.0, 70.0), egui::pos2(1_200.0, 900.0));
+        assert!(
+            !sidebar_edge_toggle_visible(
+                Some(map_at_boundary),
+                boundary_probe,
+                handle_rect,
+                Some(docked_sounding),
+                None,
+            ),
+            "the map-only handle must not paint over the active docked Sounding"
         );
         let floating_sounding =
             egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(1_190.0, 800.0));
@@ -45639,10 +45717,47 @@ mod tests {
                 Some(map_at_boundary),
                 boundary_probe,
                 handle_rect,
+                None,
                 Some(floating_sounding),
             ),
             "the foreground handle must not paint through a floating Sounding window"
         );
+    }
+
+    #[test]
+    fn floating_sounding_window_geometry_fits_desktop_viewport() {
+        let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let geometry = floating_sounding_window_geometry(content);
+
+        assert_eq!(geometry.bounds.min, egui::pos2(8.0, 8.0));
+        assert_eq!(geometry.bounds.max, egui::pos2(1912.0, 1072.0));
+        assert_eq!(geometry.min_size, egui::vec2(480.0, 360.0));
+        assert_eq!(geometry.max_size, egui::vec2(1880.0, 1016.0));
+        assert_eq!(geometry.default_size.x, 1680.0);
+        assert!(geometry.default_size.y < geometry.max_size.y);
+        assert!(geometry.default_size.x <= geometry.max_size.x);
+    }
+
+    #[test]
+    fn floating_sounding_window_geometry_scales_down_and_keeps_bounds_ordered() {
+        let laptop = floating_sounding_window_geometry(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 720.0),
+        ));
+        assert_eq!(laptop.max_size, egui::vec2(1240.0, 656.0));
+        assert!(laptop.default_size.x < 1680.0);
+        assert!(laptop.default_size.y < 1000.0);
+        assert!(laptop.default_size.x >= laptop.min_size.x);
+        assert!(laptop.default_size.y >= laptop.min_size.y);
+
+        let tiny = floating_sounding_window_geometry(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(400.0, 300.0),
+        ));
+        assert_eq!(tiny.default_size, tiny.max_size);
+        assert_eq!(tiny.min_size, tiny.max_size);
+        assert!(tiny.max_size.x <= tiny.bounds.width());
+        assert!(tiny.max_size.y <= tiny.bounds.height());
     }
 
     #[test]
