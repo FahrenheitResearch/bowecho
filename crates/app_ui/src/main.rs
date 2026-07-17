@@ -1242,7 +1242,9 @@ const RADAR_OPERATIONAL_STATUS_CLICK_KM: f32 = 35.0;
 const RADAR_OPERATIONAL_STATUS_CACHE_SECONDS: u64 = 300;
 const RADAR_OPERATIONAL_STATUS_ERROR_SECONDS: u64 = 60;
 const RADAR_OPERATIONAL_STATUS_LOADING_SECONDS: u64 = 30;
-const RADAR_OPERATIONAL_STATUS_DISPLAY_ROWS: usize = 8;
+const RADAR_OPERATIONAL_STATUS_DISPLAY_ROWS: usize = 16;
+const RADAR_OPERATIONAL_STATUS_SCROLL_HEIGHT: f32 = 128.0;
+const RADAR_OPERATOR_NOTICE_CANDIDATES: usize = 12;
 /// NWS canonical radar page (per-station operational status + imagery). The
 /// machine feed we consume is `api.weather.gov/radar/stations`; this is the
 /// human "link out" surfaced next to the in-app status.
@@ -4810,6 +4812,13 @@ struct RadarOperationalStatus {
     operability_status: Option<String>,
     rda_timestamp: Option<DateTime<Utc>>,
     alarms: Vec<RadarOperationalAlarm>,
+    /// Latest WFO-issued FTM radar status notification for this site. This is
+    /// a separate official NWS feed from the RDA hardware alarms above.
+    operator_notice: Option<RadarOperatorNotice>,
+    /// An FTM lookup is supplemental: keep RDA status usable if the point or
+    /// product endpoint is temporarily unavailable, but retain the reason for
+    /// an honest source/freshness hint in the UI.
+    operator_notice_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4817,6 +4826,13 @@ struct RadarOperationalAlarm {
     status: String,
     message: String,
     timestamp: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RadarOperatorNotice {
+    issuance_time: DateTime<Utc>,
+    product_name: String,
+    product_text: String,
 }
 
 /// Coarse operational health of a NEXRAD/TDWR radar, derived from the NWS
@@ -4915,6 +4931,18 @@ struct WeatherGovRadarAlarmRecord {
     status: Option<String>,
     message: Option<String>,
     timestamp: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WeatherGovPointResponse {
+    properties: WeatherGovPointProperties,
+}
+
+#[derive(Deserialize)]
+struct WeatherGovPointProperties {
+    cwa: Option<String>,
+    #[serde(rename = "gridId")]
+    grid_id: Option<String>,
 }
 
 /// (generation, view key, raster, render ms) from the model-layer render thread.
@@ -20139,7 +20167,11 @@ impl eframe::App for ViewerApp {
             // double borrow of `self` (the body closure also borrows self).
             let mut open = true;
             egui::Window::new("📡 Radar Status")
-                .default_width(320.0)
+                .default_width(380.0)
+                .default_height(280.0)
+                .max_height(460.0)
+                .resizable(true)
+                .vscroll(true)
                 .default_pos(egui::pos2(60.0, 130.0))
                 .open(&mut open)
                 .show(&ctx, |ui| self.radar_status_panel_ui(ui));
@@ -30595,8 +30627,10 @@ impl ViewerApp {
             RadarOperationalStatusCacheEntry::Loading { started_at: now },
         );
         let fallback_name = site.name.clone();
+        let location = site_location(site);
         self.radar_operational_status_rx.spawn(ctx, move |tx| {
-            let result = fetch_radar_operational_status(&site_id, fallback_name.as_deref());
+            let result =
+                fetch_radar_operational_status(&site_id, fallback_name.as_deref(), location);
             let _ = tx.send(RadarOperationalStatusLoad { site_id, result });
         });
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -30638,7 +30672,7 @@ impl ViewerApp {
                 RadarOperationalStatusCacheEntry::Ready { status, fetched_at } => {
                     let age = Instant::now().duration_since(*fetched_at).as_secs();
                     ui.horizontal(|ui| {
-                        ui.weak(format!("NWS radar API - cached {age}s"));
+                        ui.weak(format!("NWS radar + FTM APIs - cached {age}s"));
                         if ui.small_button("Refresh").clicked() {
                             refresh = true;
                         }
@@ -30663,8 +30697,7 @@ impl ViewerApp {
     fn radar_status_panel_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(
-                "NWS RDA operational status + operator alarm messages \
-                 (api.weather.gov/radar/stations).",
+                "Official NWS RDA telemetry, hardware alarms, and WFO status notices.",
             )
             .small()
             .weak(),
@@ -30712,7 +30745,7 @@ impl ViewerApp {
                 draw_radar_operational_status_rows(ui, status);
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.weak(format!("NWS radar API · cached {age}s"));
+                    ui.weak(format!("NWS radar + FTM APIs · cached {age}s"));
                     if ui.small_button("Refresh").clicked() {
                         refresh = true;
                     }
@@ -43602,6 +43635,7 @@ fn normalize_radar_station_id(site_id: &str) -> Option<String> {
 fn fetch_radar_operational_status(
     site_id: &str,
     fallback_name: Option<&str>,
+    location: Option<(f32, f32)>,
 ) -> Result<RadarOperationalStatus, String> {
     let site_id = normalize_radar_station_id(site_id)
         .ok_or_else(|| format!("invalid radar station id '{site_id}'"))?;
@@ -43611,7 +43645,99 @@ fn fetch_radar_operational_status(
         .map_err(|err| format!("station status fetch failed: {err}"))?;
     let alarms_text = data_source::fetch_text(&alarms_url)
         .map_err(|err| format!("station alarms fetch failed: {err}"))?;
-    parse_radar_operational_status(&site_id, fallback_name, &station_text, &alarms_text)
+    let mut status =
+        parse_radar_operational_status(&site_id, fallback_name, &station_text, &alarms_text)?;
+    if let Some(location) = location {
+        match fetch_latest_radar_operator_notice(&site_id, location) {
+            Ok(notice) => status.operator_notice = notice,
+            Err(error) => status.operator_notice_error = Some(error),
+        }
+    }
+    Ok(status)
+}
+
+/// Fetch the latest WFO-authored FTM status notice for a radar.
+///
+/// `/radar/stations/{id}` and `/alarms` expose the machine/RDA state only.
+/// Outage duration, technician updates, and alternate sites are published as
+/// a separate FTM text product by the responsible forecast office. Resolve
+/// that office from the radar coordinate, then inspect only its newest FTM
+/// products and require the four-letter radar id in the product body.
+fn fetch_latest_radar_operator_notice(
+    site_id: &str,
+    (latitude_deg, longitude_deg): (f32, f32),
+) -> Result<Option<RadarOperatorNotice>, String> {
+    let site_id = normalize_radar_station_id(site_id)
+        .ok_or_else(|| format!("invalid radar station id '{site_id}'"))?;
+    let point_url = format!("https://api.weather.gov/points/{latitude_deg:.4},{longitude_deg:.4}");
+    let point_text = data_source::fetch_text(&point_url)
+        .map_err(|err| format!("forecast-office lookup failed: {err}"))?;
+    let point: WeatherGovPointResponse = serde_json::from_str(&point_text)
+        .map_err(|err| format!("forecast-office JSON parse failed: {err}"))?;
+    let office = point
+        .properties
+        .cwa
+        .as_deref()
+        .or(point.properties.grid_id.as_deref())
+        .map(str::trim)
+        .filter(|office| {
+            office.len() == 3 && office.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .ok_or_else(|| "forecast-office lookup returned no valid gridId".to_owned())?
+        .to_ascii_uppercase();
+
+    let collection_url = format!("https://api.weather.gov/products/types/FTM/locations/{office}");
+    let collection_text = data_source::fetch_text(&collection_url)
+        .map_err(|err| format!("FTM status list failed: {err}"))?;
+    let mut collection: NwsProductCollection = serde_json::from_str(&collection_text)
+        .map_err(|err| format!("FTM status-list JSON parse failed: {err}"))?;
+    collection
+        .products
+        .sort_by_key(|summary| std::cmp::Reverse(summary.issuance_time));
+
+    let mut detail_successes = 0usize;
+    let mut last_detail_error = None;
+    for summary in collection
+        .products
+        .into_iter()
+        .take(RADAR_OPERATOR_NOTICE_CANDIDATES)
+    {
+        let detail_text = match data_source::fetch_text(&summary.url) {
+            Ok(text) => text,
+            Err(error) => {
+                last_detail_error = Some(format!("FTM status detail failed: {error}"));
+                continue;
+            }
+        };
+        let detail: NwsProductDetail = match serde_json::from_str(&detail_text) {
+            Ok(detail) => detail,
+            Err(error) => {
+                last_detail_error = Some(format!("FTM status-detail JSON parse failed: {error}"));
+                continue;
+            }
+        };
+        detail_successes += 1;
+        if radar_operator_notice_mentions_site(&detail.product_text, &site_id) {
+            return Ok(Some(RadarOperatorNotice {
+                issuance_time: detail.issuance_time,
+                product_name: detail.product_name,
+                product_text: detail.product_text.trim().to_owned(),
+            }));
+        }
+    }
+    if detail_successes == 0
+        && let Some(error) = last_detail_error
+    {
+        return Err(error);
+    }
+    Ok(None)
+}
+
+fn radar_operator_notice_mentions_site(product_text: &str, site_id: &str) -> bool {
+    let site_id = site_id.trim().to_ascii_uppercase();
+    product_text
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case(&site_id))
 }
 
 fn parse_radar_operational_status(
@@ -43681,6 +43807,8 @@ fn parse_radar_operational_status(
             .and_then(|props| non_empty_string(&props.operability_status)),
         rda_timestamp,
         alarms: alarm_rows,
+        operator_notice: None,
+        operator_notice_error: None,
     })
 }
 
@@ -43767,7 +43895,13 @@ fn draw_radar_health_chip(ui: &mut egui::Ui, health: RadarHealth) {
 fn draw_radar_operational_status_rows(ui: &mut egui::Ui, status: &RadarOperationalStatus) {
     let rda_time = status
         .rda_timestamp
-        .map(format_utc_seconds)
+        .map(|timestamp| {
+            format!(
+                "{} · {}",
+                format_utc_seconds(timestamp),
+                compact_status_age(timestamp, Utc::now())
+            )
+        })
         .unwrap_or_else(|| "time unknown".to_owned());
     let (health, reason) = radar_operational_health(status);
     ui.horizontal(|ui| {
@@ -43790,26 +43924,128 @@ fn draw_radar_operational_status_rows(ui: &mut egui::Ui, status: &RadarOperation
         state_parts.push(rda_status.as_str());
     }
     if !state_parts.is_empty() {
-        ui.weak(format!("{} - {rda_time}", state_parts.join(" | ")));
+        ui.weak(format!("{} · RDA {rda_time}", state_parts.join(" | ")));
+    }
+
+    if let Some(notice) = &status.operator_notice {
+        ui.separator();
+        let notice_time = format_utc_seconds(notice.issuance_time);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("NWS operator notice").strong());
+            ui.weak(format!(
+                "{notice_time} · {}",
+                compact_status_age(notice.issuance_time, Utc::now())
+            ));
+        });
+        if let Some(summary) = radar_operator_notice_summary(&notice.product_text, &status.site_id)
+        {
+            ui.add(egui::Label::new(summary).wrap())
+                .on_hover_text(&notice.product_name);
+        }
+        egui::CollapsingHeader::new("Full WFO status notice")
+            .id_salt(("radar_operator_notice", &status.site_id))
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(("radar_operator_notice_text", &status.site_id))
+                    .max_height(RADAR_OPERATIONAL_STATUS_SCROLL_HEIGHT)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&notice.product_text)
+                                    .monospace()
+                                    .small(),
+                            )
+                            .wrap(),
+                        );
+                    });
+            });
+    } else if let Some(error) = &status.operator_notice_error {
+        ui.weak("WFO status notice unavailable")
+            .on_hover_text(error);
     }
 
     let alarms =
         radar_operational_display_alarms(&status.alarms, RADAR_OPERATIONAL_STATUS_DISPLAY_ROWS);
     if alarms.is_empty() {
-        ui.weak("No recent alarm messages");
+        ui.weak("No recent RDA hardware alarms");
         return;
     }
-    for alarm in alarms {
-        let timestamp = alarm
-            .timestamp
-            .map(format_utc_seconds)
-            .unwrap_or_else(|| "time unknown".to_owned());
-        let line = format!("{} ({timestamp})", alarm.message);
-        let response = ui.monospace(line);
-        if !alarm.status.trim().is_empty() {
-            response.on_hover_text(format!("status: {}", alarm.status));
-        }
+    let latest = alarms[0];
+    let latest_time = latest
+        .timestamp
+        .map(format_utc_seconds)
+        .unwrap_or_else(|| "time unknown".to_owned());
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Latest hardware alarm").strong());
+        ui.weak(latest_time);
+    });
+    ui.add(egui::Label::new(egui::RichText::new(&latest.message).monospace().small()).wrap())
+        .on_hover_text(format!("RDA alarm status: {}", latest.status));
+
+    egui::CollapsingHeader::new(format!("Recent RDA hardware alarms ({})", alarms.len()))
+        .id_salt(("radar_operational_alarms", &status.site_id))
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(("radar_operational_alarm_rows", &status.site_id))
+                .max_height(RADAR_OPERATIONAL_STATUS_SCROLL_HEIGHT)
+                .show(ui, |ui| {
+                    for alarm in alarms {
+                        let timestamp = alarm
+                            .timestamp
+                            .map(format_utc_seconds)
+                            .unwrap_or_else(|| "time unknown".to_owned());
+                        let line = format!("{} ({timestamp})", alarm.message);
+                        let response = ui.add(
+                            egui::Label::new(egui::RichText::new(line).monospace().small()).wrap(),
+                        );
+                        if !alarm.status.trim().is_empty() {
+                            response.on_hover_text(format!("status: {}", alarm.status));
+                        }
+                    }
+                });
+        });
+}
+
+fn compact_status_age(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(timestamp).num_seconds();
+    if seconds < 0 {
+        return "clock ahead".to_owned();
     }
+    if seconds < 60 {
+        return "just now".to_owned();
+    }
+    if seconds < 3_600 {
+        return format!("{}m old", seconds / 60);
+    }
+    if seconds < 86_400 {
+        return format!("{}h {}m old", seconds / 3_600, (seconds % 3_600) / 60);
+    }
+    format!("{}d {}h old", seconds / 86_400, (seconds % 86_400) / 3_600)
+}
+
+fn radar_operator_notice_summary(product_text: &str, site_id: &str) -> Option<String> {
+    let site_id = site_id.trim().to_ascii_uppercase();
+    let candidates = product_text.lines().map(str::trim).filter(|line| {
+        if line.is_empty() || *line == "$$" || line.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        let upper = line.to_ascii_uppercase();
+        !upper.starts_with("NOUS")
+            && !upper.starts_with("FTM")
+            && !upper.starts_with("NATIONAL WEATHER SERVICE")
+            && upper != "WSR-88D STATUS NOTIFICATION"
+    });
+    candidates
+        .clone()
+        .find(|line| {
+            radar_operator_notice_mentions_site(line, &site_id)
+                && line.to_ascii_uppercase().contains("RADAR")
+        })
+        .or_else(|| candidates.into_iter().find(|line| line.len() >= 12))
+        .map(str::to_owned)
 }
 
 fn radar_operational_display_alarms(
@@ -67017,6 +67253,43 @@ mod tests {
         assert_eq!(rows[1].status, "cleared");
     }
 
+    #[test]
+    fn radar_ftm_notice_match_is_a_complete_station_token() {
+        let text = "NOUS63 KDTX 161958\nFTMDTX\nTHE KDTX WSR-88D RADAR REMAINS OUT OF SERVICE.";
+        assert!(radar_operator_notice_mentions_site(text, "KDTX"));
+        assert!(radar_operator_notice_mentions_site(text, "kdtx"));
+        assert!(!radar_operator_notice_mentions_site(text, "KTLX"));
+        assert!(!radar_operator_notice_mentions_site("KDTX2 test", "KDTX"));
+    }
+
+    #[test]
+    fn radar_ftm_notice_summary_skips_wmo_and_awips_headers() {
+        let text = "\n000\nNOUS63 KDTX 161958\nFTMDTX\n\nWSR-88D STATUS NOTIFICATION\nNATIONAL WEATHER SERVICE DETROIT/PONTIAC MI\n358 PM EDT WED JUL 16 2026\n\nTHE KDTX WSR-88D RADAR REMAINS OUT OF SERVICE THROUGH FRIDAY 7/17.\nTECHNICIANS ARE AWAITING REPLACEMENT PARTS.\n$$\n";
+        assert_eq!(
+            radar_operator_notice_summary(text, "KDTX").as_deref(),
+            Some("THE KDTX WSR-88D RADAR REMAINS OUT OF SERVICE THROUGH FRIDAY 7/17.")
+        );
+    }
+
+    #[test]
+    fn radar_status_age_is_compact_but_exposes_stale_telemetry() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 16, 16, 21, 0).unwrap();
+        assert_eq!(
+            compact_status_age(
+                timestamp,
+                Utc.with_ymd_and_hms(2026, 7, 16, 19, 58, 0).unwrap()
+            ),
+            "3h 37m old"
+        );
+        assert_eq!(
+            compact_status_age(
+                timestamp,
+                Utc.with_ymd_and_hms(2026, 7, 16, 16, 21, 20).unwrap()
+            ),
+            "just now"
+        );
+    }
+
     /// Health classifier pinned to the LIVE `api.weather.gov/radar/stations`
     /// value space (sampled 2026-07 across all 208 reporting sites).
     #[test]
@@ -67035,6 +67308,8 @@ mod tests {
                 operability_status: operability.map(str::to_owned),
                 rda_timestamp: None,
                 alarms: Vec::new(),
+                operator_notice: None,
+                operator_notice_error: None,
             }
         }
 
