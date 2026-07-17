@@ -28669,7 +28669,7 @@ impl ViewerApp {
                 self.context_menu_lonlat = Some(self.screen_to_lon_lat(rect, pointer));
                 self.context_menu_gate = self.cursor_readout_at(rect, pointer);
             }
-            show_context_menu_with_disclosures(&response, |ui| self.best_radar_context_menu(ui));
+            show_context_menu_with_disclosures(response, |ui| self.best_radar_context_menu(ui));
         }
 
         let basemap_start = Instant::now();
@@ -29352,9 +29352,7 @@ impl ViewerApp {
                     self.app_settings.right_click_loads_nearest,
                 )
             {
-                show_context_menu_with_disclosures(&response, |ui| {
-                    self.best_radar_context_menu(ui)
-                });
+                show_context_menu_with_disclosures(response, |ui| self.best_radar_context_menu(ui));
             }
 
             if cross_section_handle_owns_pointer {

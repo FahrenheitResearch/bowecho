@@ -2103,7 +2103,7 @@ fn paint_hazard_popup_card_border(
         }
     }
     if let Some(accent) = hazard_popup_card_top_accent(rect) {
-        painter.line_segment(accent, egui::Stroke::new(3.0, color));
+        painter.line_segment(accent, egui::Stroke::new(3.0_f32, color));
     }
 }
 
