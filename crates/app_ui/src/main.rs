@@ -13453,11 +13453,25 @@ impl ViewerApp {
     ) -> bool {
         match result {
             Ok(overlay) => {
-                if updating {
+                // Live-load previews deliberately stay non-authoritative: a
+                // partial live snapshot must never remove warnings from the
+                // last completed refresh. Archive previews are different.
+                // The historical loader fans out across several NWS product
+                // types and can spend tens of seconds waiting for the slowest
+                // source after it has already reconstructed useful polygons.
+                // Install those cumulative previews against the pending
+                // timeline window so manual Archive loads and Unified Player
+                // loads paint warnings as soon as the first source finishes.
+                let timeline_preview = updating && self.pending_event_loop_hazard_window.is_some();
+                if updating && !timeline_preview {
                     return false;
                 }
                 let previous_event_loop_window = self.event_loop_hazard_window;
-                let pending_event_loop_window = self.pending_event_loop_hazard_window.take();
+                let pending_event_loop_window = if timeline_preview {
+                    self.pending_event_loop_hazard_window
+                } else {
+                    self.pending_event_loop_hazard_window.take()
+                };
                 let event_loop_window_changed = pending_event_loop_window
                     .as_ref()
                     .is_some_and(|window| previous_event_loop_window.as_ref() != Some(window));
@@ -63952,6 +63966,65 @@ mod tests {
 
         assert!(!app.install_hazard_result(Ok(test_hazard_overlay(vec![incoming])), true));
         assert!(app.hazard_overlay.is_none());
+    }
+
+    #[test]
+    fn archive_hazard_preview_installs_without_consuming_final_window() {
+        let incoming = test_hazard_record(
+            "KSGF.SV.W.0324",
+            "SVR 0324",
+            "severe thunderstorm",
+            square_hazard_points(0.3, 0.3, 0.5, 0.5),
+        );
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.hazard_overlay = None;
+        let window = (
+            Utc.with_ymd_and_hms(2026, 7, 14, 20, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 14, 21, 0, 1).unwrap(),
+        );
+        app.pending_event_loop_hazard_window = Some(window);
+        let generation = app.hazard_overlay_generation;
+
+        assert!(app.install_hazard_result(Ok(test_hazard_overlay(vec![incoming])), true));
+        assert_eq!(app.event_loop_hazard_window, Some(window));
+        assert_eq!(app.pending_event_loop_hazard_window, Some(window));
+        assert_eq!(app.hazard_overlay.as_ref().unwrap().records.len(), 1);
+        assert_eq!(app.hazard_overlay_generation, generation.wrapping_add(1));
+        assert!(app.hazard_status.starts_with("Preview "));
+        assert!(app.unacknowledged_hazard_event_ids.is_empty());
+    }
+
+    #[test]
+    fn archive_hazard_final_replaces_preview_and_completes_window() {
+        let preview = test_hazard_record(
+            "KSGF.SV.W.0324",
+            "SVR 0324",
+            "severe thunderstorm",
+            square_hazard_points(0.3, 0.3, 0.5, 0.5),
+        );
+        let final_record = test_hazard_record(
+            "KSGF.TO.W.0045",
+            "TOR 0045",
+            "tornado",
+            square_hazard_points(-0.1, -0.1, 0.1, 0.1),
+        );
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.hazard_overlay = None;
+        let window = (
+            Utc.with_ymd_and_hms(2026, 7, 14, 20, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 14, 21, 0, 1).unwrap(),
+        );
+        app.pending_event_loop_hazard_window = Some(window);
+
+        assert!(app.install_hazard_result(Ok(test_hazard_overlay(vec![preview.clone()])), true));
+        assert!(
+            app.install_hazard_result(Ok(test_hazard_overlay(vec![preview, final_record])), false)
+        );
+
+        assert_eq!(app.event_loop_hazard_window, Some(window));
+        assert!(app.pending_event_loop_hazard_window.is_none());
+        assert_eq!(app.hazard_overlay.as_ref().unwrap().records.len(), 2);
+        assert!(!app.hazard_status.starts_with("Preview "));
     }
 
     #[test]
