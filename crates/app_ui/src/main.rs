@@ -28669,7 +28669,7 @@ impl ViewerApp {
                 self.context_menu_lonlat = Some(self.screen_to_lon_lat(rect, pointer));
                 self.context_menu_gate = self.cursor_readout_at(rect, pointer);
             }
-            response.context_menu(|ui| self.best_radar_context_menu(ui));
+            show_context_menu_with_disclosures(&response, |ui| self.best_radar_context_menu(ui));
         }
 
         let basemap_start = Instant::now();
@@ -29352,7 +29352,9 @@ impl ViewerApp {
                     self.app_settings.right_click_loads_nearest,
                 )
             {
-                response.context_menu(|ui| self.best_radar_context_menu(ui));
+                show_context_menu_with_disclosures(&response, |ui| {
+                    self.best_radar_context_menu(ui)
+                });
             }
 
             if cross_section_handle_owns_pointer {
@@ -41962,6 +41964,20 @@ fn plain_map_click_allowed(modifiers: egui::Modifiers, model_soundings_available
 
 fn plain_context_menu_allowed(modifiers: egui::Modifiers, right_click_loads_nearest: bool) -> bool {
     !modifiers.ctrl && !right_click_loads_nearest
+}
+
+/// A map context menu contains disclosure controls for the full WFO notice
+/// and recent RDA alarms. The normal egui context-menu policy closes after
+/// every click, so expanding either disclosure used to dismiss the menu in
+/// the same frame. Keep clicks inside alive; actual menu actions still call
+/// `ui.close()` explicitly.
+fn show_context_menu_with_disclosures<R>(
+    response: &egui::Response,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<egui::InnerResponse<R>> {
+    egui::Popup::context_menu(response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(add_contents)
 }
 
 /// The map-side plot-domain shortcut chord: Ctrl+Shift (+ primary drag).
@@ -67230,6 +67246,92 @@ mod tests {
             ..Default::default()
         };
         assert!(!plain_map_click_allowed(shift, true));
+    }
+
+    #[test]
+    fn radar_context_disclosure_click_keeps_parent_menu_open() {
+        #[derive(Default)]
+        struct FrameState {
+            anchor: Option<egui::Rect>,
+            disclosure: Option<egui::Rect>,
+            popup_open: bool,
+        }
+
+        fn input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn pointer_input(
+            position: egui::Pos2,
+            button: egui::PointerButton,
+            pressed: bool,
+        ) -> egui::RawInput {
+            input(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ])
+        }
+
+        fn frame(ctx: &egui::Context, input: egui::RawInput) -> FrameState {
+            let mut state = FrameState::default();
+            let mut popup_id = None;
+            let _ = ctx.run_ui(input, |ui| {
+                let anchor = ui.button("Map context target");
+                state.anchor = Some(anchor.rect);
+                popup_id = Some(egui::Popup::default_response_id(&anchor));
+                show_context_menu_with_disclosures(&anchor, |ui| {
+                    let disclosure = egui::CollapsingHeader::new("Full WFO status notice")
+                        .id_salt("radar-context-disclosure-test")
+                        .show(ui, |ui| {
+                            ui.label("Full status text");
+                        });
+                    state.disclosure = Some(disclosure.header_response.rect);
+                });
+            });
+            state.popup_open =
+                popup_id.is_some_and(|popup_id| egui::Popup::is_id_open(ctx, popup_id));
+            state
+        }
+
+        fn click(
+            ctx: &egui::Context,
+            position: egui::Pos2,
+            button: egui::PointerButton,
+        ) -> FrameState {
+            let _ = frame(ctx, pointer_input(position, button, true));
+            frame(ctx, pointer_input(position, button, false))
+        }
+
+        let ctx = egui::Context::default();
+        let initial = frame(&ctx, input(Vec::new()));
+        let anchor = initial.anchor.expect("context target must be laid out");
+        let opened = click(&ctx, anchor.center(), egui::PointerButton::Secondary);
+        assert!(opened.popup_open, "secondary click must open the menu");
+        let disclosure = opened
+            .disclosure
+            .expect("open menu must lay out the WFO disclosure");
+
+        let expanded = click(&ctx, disclosure.center(), egui::PointerButton::Primary);
+        assert!(
+            expanded.popup_open,
+            "expanding a status disclosure must not close its context menu"
+        );
+        assert!(
+            expanded.disclosure.is_some(),
+            "the status menu must still render after the disclosure click"
+        );
     }
 
     /// v0.29.3 gesture audit, encoded: Ctrl+Shift+drag is the ONE free
