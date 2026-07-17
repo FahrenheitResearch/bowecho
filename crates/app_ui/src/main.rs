@@ -4876,7 +4876,7 @@ enum RadarOperationalStatusCacheEntry {
         started_at: Instant,
     },
     Ready {
-        status: RadarOperationalStatus,
+        status: Box<RadarOperationalStatus>,
         fetched_at: Instant,
     },
     Error {
@@ -30566,7 +30566,7 @@ impl ViewerApp {
                     .unwrap_or_else(|| load.site_id.to_ascii_uppercase());
                 let entry = match load.result {
                     Ok(status) => RadarOperationalStatusCacheEntry::Ready {
-                        status,
+                        status: Box::new(status),
                         fetched_at: Instant::now(),
                     },
                     Err(message) => RadarOperationalStatusCacheEntry::Error {
