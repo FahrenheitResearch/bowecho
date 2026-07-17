@@ -4933,18 +4933,6 @@ struct WeatherGovRadarAlarmRecord {
     timestamp: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct WeatherGovPointResponse {
-    properties: WeatherGovPointProperties,
-}
-
-#[derive(Deserialize)]
-struct WeatherGovPointProperties {
-    cwa: Option<String>,
-    #[serde(rename = "gridId")]
-    grid_id: Option<String>,
-}
-
 /// (generation, view key, raster, render ms) from the model-layer render thread.
 /// GOES frame as a radar-map layer: palette-colored image + inverse
 /// geolocation (same world-anchored draw as the model layer; sat sits
@@ -30641,10 +30629,8 @@ impl ViewerApp {
             RadarOperationalStatusCacheEntry::Loading { started_at: now },
         );
         let fallback_name = site.name.clone();
-        let location = site_location(site);
         self.radar_operational_status_rx.spawn(ctx, move |tx| {
-            let result =
-                fetch_radar_operational_status(&site_id, fallback_name.as_deref(), location);
+            let result = fetch_radar_operational_status(&site_id, fallback_name.as_deref());
             let _ = tx.send(RadarOperationalStatusLoad { site_id, result });
         });
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -43649,7 +43635,6 @@ fn normalize_radar_station_id(site_id: &str) -> Option<String> {
 fn fetch_radar_operational_status(
     site_id: &str,
     fallback_name: Option<&str>,
-    location: Option<(f32, f32)>,
 ) -> Result<RadarOperationalStatus, String> {
     let site_id = normalize_radar_station_id(site_id)
         .ok_or_else(|| format!("invalid radar station id '{site_id}'"))?;
@@ -43661,11 +43646,9 @@ fn fetch_radar_operational_status(
         .map_err(|err| format!("station alarms fetch failed: {err}"))?;
     let mut status =
         parse_radar_operational_status(&site_id, fallback_name, &station_text, &alarms_text)?;
-    if let Some(location) = location {
-        match fetch_latest_radar_operator_notice(&site_id, location) {
-            Ok(notice) => status.operator_notice = notice,
-            Err(error) => status.operator_notice_error = Some(error),
-        }
+    match fetch_latest_radar_operator_notice(&site_id) {
+        Ok(notice) => status.operator_notice = notice,
+        Err(error) => status.operator_notice_error = Some(error),
     }
     Ok(status)
 }
@@ -43674,33 +43657,19 @@ fn fetch_radar_operational_status(
 ///
 /// `/radar/stations/{id}` and `/alarms` expose the machine/RDA state only.
 /// Outage duration, technician updates, and alternate sites are published as
-/// a separate FTM text product by the responsible forecast office. Resolve
-/// that office from the radar coordinate, then inspect only its newest FTM
-/// products and require the four-letter radar id in the product body.
+/// a separate FTM text product. The NWS product API indexes those collections
+/// by the radar/AWIPS suffix (KGRK -> GRK), not by the issuing WFO/CWA (FWD).
+/// Product bodies use either the full four-letter id or that three-letter
+/// suffix, so accept either only as a complete token.
 fn fetch_latest_radar_operator_notice(
     site_id: &str,
-    (latitude_deg, longitude_deg): (f32, f32),
 ) -> Result<Option<RadarOperatorNotice>, String> {
     let site_id = normalize_radar_station_id(site_id)
         .ok_or_else(|| format!("invalid radar station id '{site_id}'"))?;
-    let point_url = format!("https://api.weather.gov/points/{latitude_deg:.4},{longitude_deg:.4}");
-    let point_text = data_source::fetch_text(&point_url)
-        .map_err(|err| format!("forecast-office lookup failed: {err}"))?;
-    let point: WeatherGovPointResponse = serde_json::from_str(&point_text)
-        .map_err(|err| format!("forecast-office JSON parse failed: {err}"))?;
-    let office = point
-        .properties
-        .cwa
-        .as_deref()
-        .or(point.properties.grid_id.as_deref())
-        .map(str::trim)
-        .filter(|office| {
-            office.len() == 3 && office.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        })
-        .ok_or_else(|| "forecast-office lookup returned no valid gridId".to_owned())?
-        .to_ascii_uppercase();
+    let location = radar_ftm_location(&site_id)
+        .ok_or_else(|| format!("no FTM product location for radar '{site_id}'"))?;
 
-    let collection_url = format!("https://api.weather.gov/products/types/FTM/locations/{office}");
+    let collection_url = format!("https://api.weather.gov/products/types/FTM/locations/{location}");
     let collection_text = data_source::fetch_text(&collection_url)
         .map_err(|err| format!("FTM status list failed: {err}"))?;
     let mut collection: NwsProductCollection = serde_json::from_str(&collection_text)
@@ -43747,11 +43716,24 @@ fn fetch_latest_radar_operator_notice(
     Ok(None)
 }
 
+fn radar_ftm_location(site_id: &str) -> Option<String> {
+    let site_id = normalize_radar_station_id(site_id)?;
+    matches!(site_id.as_bytes()[0], b'K' | b'P' | b'T').then(|| site_id[1..].to_owned())
+}
+
 fn radar_operator_notice_mentions_site(product_text: &str, site_id: &str) -> bool {
-    let site_id = site_id.trim().to_ascii_uppercase();
+    let Some(site_id) = normalize_radar_station_id(site_id) else {
+        return false;
+    };
+    let suffix = radar_ftm_location(&site_id);
     product_text
         .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|word| word.eq_ignore_ascii_case(&site_id))
+        .any(|word| {
+            word.eq_ignore_ascii_case(&site_id)
+                || suffix
+                    .as_deref()
+                    .is_some_and(|suffix| word.eq_ignore_ascii_case(suffix))
+        })
 }
 
 fn parse_radar_operational_status(
@@ -44049,15 +44031,13 @@ fn radar_operator_notice_summary(product_text: &str, site_id: &str) -> Option<St
         let upper = line.to_ascii_uppercase();
         !upper.starts_with("NOUS")
             && !upper.starts_with("FTM")
+            && !upper.starts_with("MESSAGE DATE:")
             && !upper.starts_with("NATIONAL WEATHER SERVICE")
             && upper != "WSR-88D STATUS NOTIFICATION"
     });
     candidates
         .clone()
-        .find(|line| {
-            radar_operator_notice_mentions_site(line, &site_id)
-                && line.to_ascii_uppercase().contains("RADAR")
-        })
+        .find(|line| radar_operator_notice_mentions_site(line, &site_id))
         .or_else(|| candidates.into_iter().find(|line| line.len() >= 12))
         .map(str::to_owned)
 }
@@ -67333,6 +67313,19 @@ mod tests {
         assert!(radar_operator_notice_mentions_site(text, "kdtx"));
         assert!(!radar_operator_notice_mentions_site(text, "KTLX"));
         assert!(!radar_operator_notice_mentions_site("KDTX2 test", "KDTX"));
+        assert!(radar_operator_notice_mentions_site(
+            "HDX RADAR DATA IS NOT DISSEMINATING",
+            "KHDX"
+        ));
+    }
+
+    #[test]
+    fn radar_ftm_location_uses_radar_suffix_not_forecast_office() {
+        assert_eq!(radar_ftm_location("KGRK").as_deref(), Some("GRK"));
+        assert_eq!(radar_ftm_location("KHDX").as_deref(), Some("HDX"));
+        assert_eq!(radar_ftm_location("PGUA").as_deref(), Some("GUA"));
+        assert_eq!(radar_ftm_location("TATL").as_deref(), Some("ATL"));
+        assert_eq!(radar_ftm_location("XXXX"), None);
     }
 
     #[test]
@@ -67341,6 +67334,12 @@ mod tests {
         assert_eq!(
             radar_operator_notice_summary(text, "KDTX").as_deref(),
             Some("THE KDTX WSR-88D RADAR REMAINS OUT OF SERVICE THROUGH FRIDAY 7/17.")
+        );
+
+        let intermittent = "NOUS64 KFWD 121830\nFTMGRK\nMESSAGE DATE: JUL 12 2026\nKGRK WILL CONTINUE TO BE INTERMITTENTLY DOWN FOR MAINTENANCE.";
+        assert_eq!(
+            radar_operator_notice_summary(intermittent, "KGRK").as_deref(),
+            Some("KGRK WILL CONTINUE TO BE INTERMITTENTLY DOWN FOR MAINTENANCE.")
         );
     }
 
