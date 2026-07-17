@@ -1105,7 +1105,9 @@ impl ViewerApp {
                                     );
                                     let card = egui::Frame::new()
                                         .fill(fill)
-                                        .corner_radius(egui::CornerRadius::same(4))
+                                        .corner_radius(egui::CornerRadius::same(
+                                            HAZARD_POPUP_CARD_RADIUS,
+                                        ))
                                         .inner_margin(egui::Margin::symmetric(9, 7))
                                         .show(ui, |ui| {
                                             let card_width = ui.available_width().max(96.0);
@@ -2058,7 +2060,12 @@ fn paint_hazard_popup_card_border(
     let inset = rect.shrink(stroke.width * 0.5);
     match style.dash {
         styles::DashPattern::Solid => {
-            painter.rect_stroke(inset, 4.0, stroke, egui::StrokeKind::Inside);
+            painter.rect_stroke(
+                inset,
+                f32::from(HAZARD_POPUP_CARD_RADIUS),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
         }
         dash => {
             let points = vec![
@@ -2095,11 +2102,28 @@ fn paint_hazard_popup_card_border(
             painter.extend(shapes);
         }
     }
-    painter.rect_filled(
-        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 3.0)),
-        2.0,
-        color,
-    );
+    if let Some(accent) = hazard_popup_card_top_accent(rect) {
+        painter.line_segment(accent, egui::Stroke::new(3.0, color));
+    }
+}
+
+const HAZARD_POPUP_CARD_RADIUS: u8 = 4;
+
+/// Keep the emphasized top rule inside the card's rounded silhouette.
+///
+/// A rectangular strip spanning `rect.left()..=rect.right()` protrudes at the
+/// two top corners because the card itself does not occupy those pixels.  The
+/// rule therefore runs only between the rounded-rectangle tangent points.
+fn hazard_popup_card_top_accent(rect: egui::Rect) -> Option<[egui::Pos2; 2]> {
+    let radius = f32::from(HAZARD_POPUP_CARD_RADIUS);
+    if rect.width() <= radius * 2.0 || rect.height() < 3.0 {
+        return None;
+    }
+    let y = rect.top() + 1.5;
+    Some([
+        egui::pos2(rect.left() + radius, y),
+        egui::pos2(rect.right() - radius, y),
+    ])
 }
 
 /// `hazard_geom::format_utc_seconds` output ("2026-07-08T22:45:00Z") →
@@ -2370,6 +2394,26 @@ mod tests {
         assert!(
             layout.body_height < 12.0 * 132.0,
             "large stacks must scroll"
+        );
+    }
+
+    #[test]
+    fn popup_card_top_accent_stays_inside_rounded_corner_tangents() {
+        let rect = egui::Rect::from_min_max(egui::pos2(9.0, 20.0), egui::pos2(292.0, 120.0));
+        let [left, right] =
+            hazard_popup_card_top_accent(rect).expect("normal warning card has a top accent");
+        let radius = f32::from(HAZARD_POPUP_CARD_RADIUS);
+
+        assert_eq!(left.x, rect.left() + radius);
+        assert_eq!(right.x, rect.right() - radius);
+        assert_eq!(left.y, rect.top() + 1.5);
+        assert_eq!(right.y, left.y);
+        assert!(
+            hazard_popup_card_top_accent(egui::Rect::from_min_size(
+                rect.min,
+                egui::vec2(radius * 2.0, 2.0),
+            ))
+            .is_none()
         );
     }
 
