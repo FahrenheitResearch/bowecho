@@ -392,7 +392,11 @@ const DEFAULT_MAP_SCALE: f32 = 115.0;
 /// the antipode smear that turned the basemap into sheared slabs at the
 /// old floor of 2 (field screenshot, 2026-06-13).
 const MIN_MAP_SCALE: f32 = 7.0;
-const MAX_MAP_SCALE: f32 = 8_000.0;
+/// Close enough to inspect individual radar gates without making ordinary
+/// wheel zoom feel different: 32,000 px/degree is about 3.5 m per logical
+/// point (a ~5 km-wide view on a 1440-point map). The basemap selector's
+/// existing z16 ceiling still covers this range, including normal HiDPI.
+const MAX_MAP_SCALE: f32 = 32_000.0;
 const DEFAULT_RADAR_RANGE_KM: f32 = 460.0;
 const SURFACE_OBS_LOOP_WINDOW_MS: i64 = 60 * 60 * 1000;
 const SURFACE_OBS_LOOP_PLAYBACK_MS: u128 = 30 * 1000;
@@ -56546,6 +56550,26 @@ mod tests {
         // Degenerate settings are clamped, never zero/negative/runaway.
         assert!(scroll_zoom_factor(600.0, 0) > 1.0);
         assert!(scroll_zoom_factor(600.0, u16::MAX) < 4.0);
+    }
+
+    #[test]
+    fn map_zoom_range_supports_close_gate_inspection() {
+        let max_map_scale = std::hint::black_box(MAX_MAP_SCALE);
+        assert!(max_map_scale >= 32_000.0);
+        assert!(
+            111.32 / max_map_scale <= 0.0035,
+            "maximum zoom should resolve about 3.5 m per logical point"
+        );
+        assert_eq!(
+            tiles::zoom_for_km_per_px(111.32 / max_map_scale, 0.0, 2.0),
+            16,
+            "the existing basemap tile ceiling covers the new range at 2x HiDPI"
+        );
+        assert_eq!(
+            (max_map_scale * 2.0).clamp(MIN_MAP_SCALE, max_map_scale),
+            max_map_scale,
+            "wheel and restored-camera paths must retain a finite upper bound"
+        );
     }
 
     #[test]
