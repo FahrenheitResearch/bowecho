@@ -216,7 +216,11 @@ impl LoopEngine {
         }
         self.history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
-        self.trim_history_to_limits();
+        if matches!(policy, SelectionPolicy::BackfillPreservingActive) {
+            self.trim_history_to_limits_preserving(active_identity.as_ref());
+        } else {
+            self.trim_history_to_limits();
+        }
 
         let selection = self.apply_selection_policy(
             policy,
@@ -312,7 +316,9 @@ impl LoopEngine {
                     self.backfill_selection(active_identity)
                 }
             }
-            SelectionPolicy::Backfill => self.backfill_selection(active_identity),
+            SelectionPolicy::Backfill | SelectionPolicy::BackfillPreservingActive => {
+                self.backfill_selection(active_identity)
+            }
             SelectionPolicy::KeepCursor => InstallSelection::CursorUnchanged,
         }
     }
@@ -384,9 +390,17 @@ impl LoopEngine {
     /// here (its `trim_frame_history` is a delegating shim), which is what
     /// activates the primary byte budget the stage-(i) wiring left inert.
     pub fn trim_history_to_limits(&mut self) {
+        self.trim_history_to_limits_preserving(None);
+    }
+
+    /// Apply the normal count and byte limits while retaining one displayed
+    /// identity when possible. The limits remain hard: a non-pinned frame is
+    /// evicted in its place, and a single oversized pinned frame is treated
+    /// exactly like the normal single-frame exception.
+    pub fn trim_history_to_limits_preserving(&mut self, preserved: Option<&FrameIdentity>) {
         self.limits.frame_limit = HistoryLimits::normalized_frame_limit(self.limits.frame_limit);
         while self.history.len() > self.limits.frame_limit {
-            self.history.remove(0);
+            self.remove_oldest_unpreserved(preserved);
         }
         if let Some(budget) = self.limits.byte_budget {
             // Recomputed per drop: trims past the budget are rare and the
@@ -399,10 +413,19 @@ impl LoopEngine {
                     .sum::<usize>()
                     > budget
             {
-                self.history.remove(0);
+                self.remove_oldest_unpreserved(preserved);
             }
         }
         self.cursor.index = self.cursor.index.min(self.history.len().saturating_sub(1));
+    }
+
+    fn remove_oldest_unpreserved(&mut self, preserved: Option<&FrameIdentity>) {
+        let index = self
+            .history
+            .iter()
+            .position(|frame| preserved != Some(&frame.identity))
+            .unwrap_or(0);
+        self.history.remove(index);
     }
 
     /// Estimated resident bytes of the whole frame history — the same metric

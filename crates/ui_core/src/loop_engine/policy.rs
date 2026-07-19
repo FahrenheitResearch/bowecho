@@ -168,6 +168,13 @@ pub enum SelectionPolicy {
     /// shift. The reposition is engine-common (census D5c), not a
     /// per-role behavior.
     Backfill,
+    /// A display-tool backfill: identical to [`Self::Backfill`], except the
+    /// displayed frame is pinned through the count/byte trim. This is for
+    /// tools such as a cross-section whose result must keep referring to the
+    /// exact volume the user clicked even while a live feed adds newer
+    /// scans. If limits require an eviction, the oldest non-pinned frame is
+    /// removed instead.
+    BackfillPreservingActive,
     /// The overlay timeline-sync route: hold the raw cursor; the timeline
     /// sync re-selects by time afterwards (`select_frame_nearest`, an
     /// adoption-stage method). Trims still clamp the cursor into range.

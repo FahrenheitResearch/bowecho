@@ -9922,8 +9922,9 @@ impl ViewerApp {
             .as_ref()
             .map(|hold| hold.identity.clone());
         // Background live auto-refresh must NOT yank the display while a
-        // history loop is playing. The newest realtime volume is often a
-        // reflectivity-only Stale/live partial (typhoon-latency archive
+        // history loop is playing OR while the user is drawing a cross-
+        // section through the displayed volume. The newest realtime volume
+        // is often a reflectivity-only Stale/live partial (typhoon-latency archive
         // fallback); selecting it here would flip `selected_product` to
         // reflectivity for a frame — the BAVI-26 field trace
         // `FLIP vel->refl @install_volume_arc status=Stale playing=true
@@ -9934,14 +9935,21 @@ impl ViewerApp {
         // playing guard (the polled/international route). Live follow-newest
         // when NOT playing is unchanged (still selects the newest frame), so
         // the non-looping live view keeps up with the feed.
-        let auto_refresh_while_playing =
-            self.primary_load_is_auto_refresh && self.primary.cursor.playing;
-        let policy = if select_loaded_frame && !auto_refresh_while_playing {
+        let cross_section_holds_auto_refresh = self.primary_load_is_auto_refresh
+            && self.cross_section_armed
+            && active_identity
+                .as_ref()
+                .is_some_and(|active| active.site_id == selected_identity.site_id);
+        let auto_refresh_while_display_locked = self.primary_load_is_auto_refresh
+            && (self.primary.cursor.playing || cross_section_holds_auto_refresh);
+        let policy = if select_loaded_frame && !auto_refresh_while_display_locked {
             // Census D5b: the blank-display browsing escape is
             // Primary-role-only.
             SelectionPolicy::SelectAnchor {
                 blank_display_overrides_browsing: true,
             }
+        } else if cross_section_holds_auto_refresh {
+            SelectionPolicy::BackfillPreservingActive
         } else {
             SelectionPolicy::Backfill
         };
@@ -32922,6 +32930,17 @@ impl ViewerApp {
     /// 12 s COW sequence is useless as single frames), then onto the map.
     fn install_polled_volume(&mut self, name: &str, volume: Arc<RadarVolume>, ctx: &egui::Context) {
         let identity = frame_identity_for_volume(&volume);
+        let displayed_identity = self.volume.as_deref().map(frame_identity_for_volume);
+        // Drawing a section is an explicit request to interrogate the volume
+        // currently on screen. Keep accepting newer polled/international
+        // scans into history, but do not let the repaint caused by an endpoint
+        // click swap the displayed volume underneath the tool. A growing
+        // update of the SAME scan is still allowed so a live partial can gain
+        // its later tilts.
+        let cross_section_holds_displayed_frame = self.cross_section_armed
+            && displayed_identity.as_ref().is_some_and(|displayed| {
+                displayed.site_id == identity.site_id && displayed != &identity
+            });
         if self
             .volume
             .as_ref()
@@ -32951,7 +32970,26 @@ impl ViewerApp {
         self.primary
             .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
-        self.trim_frame_history();
+        if cross_section_holds_displayed_frame {
+            self.primary
+                .trim_history_to_limits_preserving(displayed_identity.as_ref());
+        } else {
+            self.trim_frame_history();
+        }
+        if cross_section_holds_displayed_frame {
+            if let Some(displayed_identity) = displayed_identity
+                && let Some(index) = self
+                    .primary
+                    .history
+                    .iter()
+                    .position(|frame| frame.identity == displayed_identity)
+            {
+                self.primary.cursor.index = index;
+            }
+            self.request_rebuildable_cache_maintenance(ctx, false);
+            ctx.request_repaint();
+            return;
+        }
         // Follow the feed unless the user is looping history (the cursor holds
         // while playing — census D5a). The display still takes the newest
         // volume (census D9, "LIVE WINS"); if it is a reflectivity-only live
@@ -56009,6 +56047,60 @@ mod tests {
     }
 
     #[test]
+    fn armed_cross_section_holds_historical_frame_during_polled_refresh() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        app.primary.limits.frame_limit = 3;
+
+        let first = test_decoded_live_partial(PathBuf::from("FWLX-0130"), "FWLX", scan_time, 10);
+        app.install_polled_volume("FWLX20260608_0130", first.volume, &ctx);
+        for (minute, label) in [(3, "FWLX-0133"), (6, "FWLX-0136")] {
+            let frame = test_decoded_live_partial(
+                PathBuf::from(label),
+                "FWLX",
+                scan_time + chrono::Duration::minutes(minute),
+                10,
+            );
+            app.install_polled_volume(label, frame.volume, &ctx);
+        }
+
+        app.select_history_frame(0, false, &ctx);
+        let held_volume = Arc::clone(app.volume.as_ref().expect("historical volume"));
+        app.primary.cursor.browsing = false;
+        app.cross_section_armed = true;
+
+        let fourth = test_decoded_live_partial(
+            PathBuf::from("FWLX-0139"),
+            "FWLX",
+            scan_time + chrono::Duration::minutes(9),
+            10,
+        );
+        app.install_polled_volume("FWLX20260608_0139", fourth.volume, &ctx);
+
+        assert_eq!(app.primary.history.len(), 3, "frame cap remains enforced");
+        assert_eq!(
+            app.primary.history[app.primary.cursor.index]
+                .identity
+                .scan_time_utc,
+            scan_time,
+            "the cross-section keeps the historical cursor frame"
+        );
+        assert!(
+            app.volume
+                .as_ref()
+                .is_some_and(|volume| Arc::ptr_eq(volume, &held_volume)),
+            "the repaint must not replace the cross-section's displayed volume"
+        );
+        assert!(
+            app.primary.history.iter().any(|frame| {
+                frame.identity.scan_time_utc == scan_time + chrono::Duration::minutes(9)
+            }),
+            "new scan still backfills while the oldest displayed scan is pinned"
+        );
+    }
+
+    #[test]
     fn custom_poll_links_matching_built_in_community_feeds_are_deduped() {
         let entry = settings::CustomPollLinkEntry {
             label: "FWLX duplicate".to_owned(),
@@ -56152,6 +56244,71 @@ mod tests {
                 .as_ref()
                 .is_some_and(|volume| Arc::ptr_eq(volume, &cursor_volume)),
             "displayed volume stays on the cursor frame, not the newest partial"
+        );
+    }
+
+    #[test]
+    fn armed_cross_section_holds_historical_frame_during_us_auto_refresh() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        app.primary.limits.frame_limit = 3;
+
+        for (minute, label) in [(0, "KTLX-0130"), (3, "KTLX-0133"), (6, "KTLX-0136")] {
+            upsert_primary_history_frame(
+                &mut app,
+                test_decoded_live_partial(
+                    PathBuf::from(label),
+                    "KTLX",
+                    scan_time + chrono::Duration::minutes(minute),
+                    10,
+                ),
+            );
+        }
+        app.primary
+            .history
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
+        app.primary.cursor.index = 0;
+        let held_volume = Arc::clone(&app.primary.history[0].volume);
+        app.volume = Some(Arc::clone(&held_volume));
+        app.primary.cursor.browsing = false;
+        app.cross_section_armed = true;
+        app.primary_load_is_auto_refresh = true;
+
+        app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_live_partial(
+                    PathBuf::from("KTLX-0139"),
+                    "KTLX",
+                    scan_time + chrono::Duration::minutes(9),
+                    10,
+                )],
+                selected_index: 0,
+            },
+            true,
+            true,
+            &ctx,
+        );
+
+        assert_eq!(app.primary.history.len(), 3, "frame cap remains enforced");
+        assert_eq!(
+            app.primary.history[app.primary.cursor.index]
+                .identity
+                .scan_time_utc,
+            scan_time,
+            "the cross-section keeps the historical cursor frame"
+        );
+        assert!(
+            app.volume
+                .as_ref()
+                .is_some_and(|volume| Arc::ptr_eq(volume, &held_volume)),
+            "US auto-refresh must not replace the cross-section's displayed volume"
+        );
+        assert!(
+            app.primary.history.iter().any(|frame| {
+                frame.identity.scan_time_utc == scan_time + chrono::Duration::minutes(9)
+            }),
+            "new scan still backfills while the oldest displayed scan is pinned"
         );
     }
 
