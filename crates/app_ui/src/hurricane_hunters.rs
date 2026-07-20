@@ -3,12 +3,13 @@
 //!
 //! HDOB records are 30-second flight-level observations. BowEcho polls only
 //! while the user enables the layer, rejects stale bulletins, and accumulates
-//! the current session's successive 20-record bulletins into bounded tracks.
+//! successive 20-record bulletins into bounded tracks that survive restarts.
 //! The parser follows NHC's official HDOB Tables G-4/G-5; questionable fields
 //! are withheld according to their two quality-control flags rather than being
 //! drawn as if nominal.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Days, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
@@ -22,8 +23,11 @@ const HUNTER_FUTURE_TOLERANCE_MINUTES: i64 = 15;
 const HUNTER_MAX_TRACKS: usize = 8;
 const HUNTER_MAX_POINTS_PER_TRACK: usize = 1_500;
 const HUNTER_BARB_SPACING_PX: f32 = 54.0;
+const HUNTER_CACHE_VERSION: u8 = 1;
+const HUNTER_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum HunterAgency {
     AirForce,
     Noaa,
@@ -45,7 +49,8 @@ impl HunterAgency {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum HunterBasin {
     Atlantic,
     Pacific,
@@ -95,7 +100,7 @@ const HDOB_FEEDS: [HdobFeed; 4] = [
     },
 ];
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HunterObservation {
     pub(crate) time: DateTime<Utc>,
     pub(crate) lat: f32,
@@ -123,7 +128,7 @@ struct HunterBulletin {
     observations: Vec<HunterObservation>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HunterTrack {
     key: String,
     pub(crate) mission_id: String,
@@ -132,6 +137,12 @@ pub(crate) struct HunterTrack {
     basin: HunterBasin,
     last_observation_number: u8,
     pub(crate) observations: Vec<HunterObservation>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct HunterTrackCache {
+    version: u8,
+    tracks: Vec<HunterTrack>,
 }
 
 impl HunterTrack {
@@ -158,14 +169,15 @@ struct HunterFetch {
 
 type HunterFetchResult = Result<HunterFetch, String>;
 
-/// Session-owned live reconnaissance state. No polling occurs while the
-/// persisted overlay toggle is off.
+/// Live reconnaissance state. No polling occurs while the persisted overlay
+/// toggle is off; recent tracks are restored from a bounded local cache.
 pub(crate) struct HurricaneHunterState {
     fetch_rx: WorkerSlot<HunterFetchResult>,
     tracks: HashMap<String, HunterTrack>,
     pub(crate) status: String,
     last_refresh: Option<Instant>,
     last_fetch_ok: Option<bool>,
+    cache_loaded: bool,
 }
 
 impl Default for HurricaneHunterState {
@@ -176,6 +188,7 @@ impl Default for HurricaneHunterState {
             status: "Hurricane Hunters off".to_owned(),
             last_refresh: None,
             last_fetch_ok: None,
+            cache_loaded: false,
         }
     }
 }
@@ -184,6 +197,9 @@ impl HurricaneHunterState {
     pub(crate) fn maybe_refresh(&mut self, ctx: &egui::Context, enabled: bool) {
         if !enabled {
             return;
+        }
+        if !self.cache_loaded {
+            self.load_cache(Utc::now());
         }
         let interval = if self.last_fetch_ok == Some(true) {
             Duration::from_secs(HUNTER_REFRESH_SECONDS)
@@ -217,6 +233,10 @@ impl HurricaneHunterState {
             SlotPoll::Ready(Ok(fetch)) => {
                 self.last_fetch_ok = Some(true);
                 self.ingest(fetch, now);
+                if let Err(error) = self.save_cache() {
+                    self.status
+                        .push_str(&format!(" · track cache unavailable: {error}"));
+                }
             }
             SlotPoll::Ready(Err(err)) => {
                 self.last_fetch_ok = Some(false);
@@ -284,6 +304,49 @@ impl HurricaneHunterState {
         };
     }
 
+    fn load_cache(&mut self, now: DateTime<Utc>) {
+        self.cache_loaded = true;
+        let path = hunter_cache_path();
+        let text = match settings::read_text_capped(&path, HUNTER_CACHE_MAX_BYTES) {
+            Ok(text) => text,
+            Err(error) if error.is_not_found() => return,
+            Err(error) => {
+                self.status = format!("Could not restore Hurricane Hunters track cache: {error}");
+                return;
+            }
+        };
+        match decode_track_cache(&text) {
+            Ok(tracks) => {
+                self.tracks = tracks;
+                self.prune(now);
+                let active = self.active_tracks(now).len();
+                if active > 0 {
+                    self.status = format!(
+                        "Restored {active} live reconnaissance track{}; checking NHC for updates…",
+                        if active == 1 { "" } else { "s" }
+                    );
+                }
+            }
+            Err(error) => {
+                self.status = format!("Hurricane Hunters track cache ignored: {error}");
+            }
+        }
+    }
+
+    fn save_cache(&self) -> Result<(), String> {
+        let mut tracks: Vec<HunterTrack> = self.tracks.values().cloned().collect();
+        tracks.sort_by(|left, right| left.key.cmp(&right.key));
+        settings::atomic_write_json(
+            &hunter_cache_path(),
+            &HunterTrackCache {
+                version: HUNTER_CACHE_VERSION,
+                tracks,
+            },
+            HUNTER_CACHE_MAX_BYTES,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     fn prune(&mut self, now: DateTime<Utc>) {
         let cutoff = now - chrono::Duration::hours(HUNTER_MAX_AGE_HOURS);
         for track in self.tracks.values_mut() {
@@ -327,12 +390,19 @@ impl HurricaneHunterState {
         tracks
     }
 
+    pub(crate) fn newest_position(&self, now: DateTime<Utc>) -> Option<(f32, f32)> {
+        self.active_tracks(now)
+            .first()
+            .and_then(|track| track.newest())
+            .map(|observation| (observation.lat, observation.lon))
+    }
+
     pub(crate) fn status_ui(&self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new(&self.status).small().weak());
         ui.horizontal_wrapped(|ui| {
             legend_swatch(ui, HunterAgency::AirForce);
             legend_swatch(ui, HunterAgency::Noaa);
-            ui.weak("line = session track · barbs = flight-level wind · ✈ = newest");
+            ui.weak("line = recent flight track · barbs = flight-level wind · ✈ = newest");
         });
         for track in self.active_tracks(Utc::now()) {
             let Some(latest) = track.newest() else {
@@ -357,6 +427,53 @@ impl HurricaneHunterState {
                 .on_hover_text(format!("Mission {}", track.mission_id));
         }
     }
+}
+
+fn hunter_cache_path() -> PathBuf {
+    settings::data_dir_override()
+        .or_else(settings::active_storage_root)
+        .unwrap_or_else(|| PathBuf::from("bowecho-data"))
+        .join("hurricane-hunters")
+        .join("tracks.json")
+}
+
+fn decode_track_cache(text: &str) -> Result<HashMap<String, HunterTrack>, String> {
+    let cache: HunterTrackCache = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    if cache.version != HUNTER_CACHE_VERSION {
+        return Err(format!(
+            "unsupported cache version {} (expected {HUNTER_CACHE_VERSION})",
+            cache.version
+        ));
+    }
+    let mut tracks = HashMap::new();
+    for mut track in cache.tracks {
+        if track.key.trim().is_empty()
+            || track.aircraft.trim().is_empty()
+            || track.mission_id.trim().is_empty()
+        {
+            continue;
+        }
+        track.observations.retain(|observation| {
+            observation.lat.is_finite()
+                && observation.lon.is_finite()
+                && (-90.0..=90.0).contains(&observation.lat)
+                && (-180.0..=180.0).contains(&observation.lon)
+        });
+        track
+            .observations
+            .sort_by_key(|observation| observation.time);
+        track
+            .observations
+            .dedup_by_key(|observation| observation.time);
+        if track.observations.len() > HUNTER_MAX_POINTS_PER_TRACK {
+            let remove = track.observations.len() - HUNTER_MAX_POINTS_PER_TRACK;
+            track.observations.drain(..remove);
+        }
+        if !track.observations.is_empty() {
+            tracks.insert(track.key.clone(), track);
+        }
+    }
+    Ok(tracks)
 }
 
 fn legend_swatch(ui: &mut egui::Ui, agency: HunterAgency) {
@@ -994,5 +1111,32 @@ $$
         state.maybe_refresh(&ctx, false);
         assert!(state.last_refresh.is_none());
         assert!(!state.fetch_rx.in_flight());
+    }
+
+    #[test]
+    fn recent_track_cache_round_trips_observations() {
+        let now = Utc.with_ymd_and_hms(2005, 9, 28, 15, 0, 0).unwrap();
+        let bulletin = parse_hdob_page(SAMPLE, atlantic_usaf(), now)
+            .unwrap()
+            .unwrap();
+        let key = "USAF|Atlantic|AF302|AF302 1712A KATRINA".to_owned();
+        let document = HunterTrackCache {
+            version: HUNTER_CACHE_VERSION,
+            tracks: vec![HunterTrack {
+                key: key.clone(),
+                mission_id: bulletin.mission_id,
+                aircraft: bulletin.aircraft,
+                agency: bulletin.agency,
+                basin: bulletin.basin,
+                last_observation_number: bulletin.observation_number,
+                observations: bulletin.observations,
+            }],
+        };
+        let json = serde_json::to_string(&document).expect("serialize track cache");
+        let restored = decode_track_cache(&json).expect("decode track cache");
+
+        let track = restored.get(&key).expect("restored track");
+        assert_eq!(track.observations.len(), 3);
+        assert_eq!(track.newest().unwrap().wind_speed_kt, Some(121.0));
     }
 }

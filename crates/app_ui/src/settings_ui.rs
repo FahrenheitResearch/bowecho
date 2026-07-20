@@ -999,7 +999,7 @@ impl ViewerApp {
                 "Hurricane Hunters (live HDOB)",
             )
             .on_hover_text(
-                "Live USAF and NOAA reconnaissance aircraft from the four official NHC High-Density Observation feeds. Draws the current session track, spaced flight-level wind barbs, and the newest aircraft position. Polls only while enabled; bulletins older than 12 hours are rejected.",
+                "Live USAF and NOAA reconnaissance aircraft from the four official NHC High-Density Observation feeds. Draws a restart-safe recent flight track, spaced flight-level wind barbs, and the newest aircraft position. Polls only while enabled; bulletins older than 12 hours are rejected.",
             )
             .changed()
         {
@@ -1009,6 +1009,24 @@ impl ViewerApp {
         if self.app_settings.show_hurricane_hunters {
             ui.indent("hurricane_hunters_status", |ui| {
                 self.tropical.hurricane_hunters.status_ui(ui);
+                let newest_position = self
+                    .tropical
+                    .hurricane_hunters
+                    .newest_position(chrono::Utc::now());
+                if ui
+                    .add_enabled(
+                        newest_position.is_some(),
+                        egui::Button::new("✈ Find newest aircraft"),
+                    )
+                    .on_hover_text(
+                        "Center the main map on the newest live Hurricane Hunters observation",
+                    )
+                    .clicked()
+                    && let Some((latitude, longitude)) = newest_position
+                {
+                    self.center_map_on(latitude, longitude);
+                    ctx.request_repaint();
+                }
                 ui.hyperlink_to(
                     "Official NHC reconnaissance page",
                     "https://www.nhc.noaa.gov/recon.php",

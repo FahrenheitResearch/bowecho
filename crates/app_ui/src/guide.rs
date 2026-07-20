@@ -111,6 +111,46 @@ impl GuideSection {
             Self::Sources => "Data sources & credits",
         }
     }
+
+    fn search_terms(self) -> &'static str {
+        match self {
+            Self::GettingStarted => {
+                "install update live radar first run windows mac linux interface"
+            }
+            Self::Products => {
+                "reflectivity velocity correlation coefficient zdr dual pol derived gust hail tornado"
+            }
+            Self::Layers => {
+                "map warnings alerts placefiles metar observations wofs tropical hurricane hunters recon"
+            }
+            Self::ModelData => {
+                "models hrrr gfs sounding box download import plot color table formula"
+            }
+            Self::Wrf => {
+                "wrf processing simulated radar dual pol p3 tmatrix namelist interpolation cuda"
+            }
+            Self::Cm1 => "cm1 native output simulated radar moving domain placement",
+            Self::FormulaLab => "formula lab expression diagnostics units custom fields equations",
+            Self::Satellite => "goes himawari meteosat mtg eumetsat lightning loops imagery",
+            Self::SimSat => {
+                "simsat synthetic satellite hrrr wrf atmosphere visible infrared water vapor"
+            }
+            Self::Archive => "archive old historical radar frames events browser warnings",
+            Self::Player => "loop frames playback load export video gif unified player",
+            Self::Tools => "cross section inspector vwp annotate workflows dealiasing",
+            Self::Volume3d => "3d volume rendering isosurface camera",
+            Self::CaptureBrand => "screenshot save image png branding attribution recording",
+            Self::Shortcuts => "keyboard hotkeys controls",
+            Self::Sources => "sources credits attribution license nws noaa nhc eumetsat",
+        }
+    }
+
+    fn matches_search(self, query: &str) -> bool {
+        let query = query.trim().to_ascii_lowercase();
+        query.is_empty()
+            || self.label().to_ascii_lowercase().contains(&query)
+            || self.search_terms().contains(&query)
+    }
 }
 
 /// The Guide window. Pure function of `open`; the selected section lives in
@@ -120,7 +160,9 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
         return;
     }
     let section_id = egui::Id::new("bowecho_guide_section");
+    let query_id = egui::Id::new("bowecho_guide_search");
     let mut section: GuideSection = ctx.data(|d| d.get_temp(section_id)).unwrap_or_default();
+    let mut query: String = ctx.data(|d| d.get_temp(query_id)).unwrap_or_default();
     egui::Window::new("Guide")
         .open(open)
         .default_size([840.0, 600.0])
@@ -129,14 +171,36 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
         .show(ctx, |ui| {
             egui::Panel::left("guide_nav")
                 .resizable(false)
-                .exact_size(172.0)
+                .exact_size(190.0)
                 .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let changed = ui
+                            .add_sized(
+                                [158.0, 24.0],
+                                egui::TextEdit::singleline(&mut query).hint_text("🔎 Search guide"),
+                            )
+                            .changed();
+                        if ui.small_button("×").on_hover_text("Clear search").clicked() {
+                            query.clear();
+                        }
+                        if changed
+                            && let Some(first_match) = GuideSection::ALL
+                                .into_iter()
+                                .find(|candidate| candidate.matches_search(&query))
+                        {
+                            section = first_match;
+                        }
+                    });
+                    ui.separator();
                     egui::ScrollArea::vertical()
                         .id_salt("guide_nav_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.add_space(4.0);
                             for candidate in GuideSection::ALL {
+                                if !candidate.matches_search(&query) {
+                                    continue;
+                                }
                                 if ui
                                     .selectable_label(section == candidate, candidate.label())
                                     .clicked()
@@ -183,6 +247,7 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
             });
         });
     ctx.data_mut(|d| d.insert_temp(section_id, section));
+    ctx.data_mut(|d| d.insert_temp(query_id, query));
 }
 
 // ---------------------------------------------------------------------------
@@ -2095,12 +2160,15 @@ fn satellite(ui: &mut egui::Ui) {
         ui,
         "Enable Hurricane Hunters (live HDOB) beside Tropical cyclones in Settings to show \
          active USAF and NOAA reconnaissance. Cyan is Air Force; orange is NOAA. The line is \
-         the track accumulated during this BowEcho session, spaced meteorological barbs are \
+         the recent track accumulated from each bulletin BowEcho receives; it is cached so an \
+         app restart does not erase the flight history. Spaced meteorological barbs are \
          30-second flight-level winds, and the aircraft glyph marks the newest report. The \
          compact status also shows pressure and T/Td when those fields pass the bulletin's \
          quality flags. BowEcho polls the four official Atlantic and East/Central Pacific NHC \
          feeds every ~45 seconds only while enabled, deduplicates successive bulletins, and \
-         removes missions whose newest valid report is more than 12 hours old.",
+         removes missions whose newest valid report is more than 12 hours old. Use Windows > \
+         Hurricane Hunters or Find newest aircraft in the layer status to jump straight to the \
+         latest position.",
     );
     ui.horizontal_wrapped(|ui| {
         ui.hyperlink_to(
@@ -3614,5 +3682,14 @@ mod tests {
             guide_src.contains("Video & GIF export settings only record already-loaded frames")
         );
         assert!(guide_src.contains("do not change the load count"));
+    }
+
+    #[test]
+    fn guide_search_routes_common_feature_terms() {
+        assert!(GuideSection::Layers.matches_search("hurricane hunters"));
+        assert!(GuideSection::Satellite.matches_search("meteosat"));
+        assert!(GuideSection::Wrf.matches_search("cuda"));
+        assert!(GuideSection::Archive.matches_search("historical"));
+        assert!(!GuideSection::Shortcuts.matches_search("simulated radar"));
     }
 }

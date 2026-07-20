@@ -21419,6 +21419,29 @@ impl ViewerApp {
                     ui.close();
                 }
             }
+            if ui
+                .button("✈ Hurricane Hunters")
+                .on_hover_text(
+                    "Enable the live NHC reconnaissance overlay and center on the newest aircraft observation when one is available",
+                )
+                .clicked()
+            {
+                self.app_settings.show_hurricane_hunters = true;
+                self.sidebar_tab = SidebarTab::Layers;
+                self.mark_app_settings_dirty();
+                if let Some((latitude, longitude)) = self
+                    .tropical
+                    .hurricane_hunters
+                    .newest_position(Utc::now())
+                {
+                    self.center_map_on(latitude, longitude);
+                    self.status = "Centered on newest Hurricane Hunters observation".to_owned();
+                } else {
+                    self.status =
+                        "Hurricane Hunters enabled · checking official NHC HDOB feeds…".to_owned();
+                }
+                ui.close();
+            }
             ui.separator();
             if ui
                 .selectable_label(
