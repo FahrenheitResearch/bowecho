@@ -1085,7 +1085,13 @@ impl ViewerApp {
                     egui::pos2(card.left() + 7.0, strip_top),
                     egui::vec2(width - 14.0, timeline_height),
                 );
-                draw_obs_history_timeline(painter, timeline_rect, history, self.units());
+                draw_obs_history_timeline(
+                    painter,
+                    timeline_rect,
+                    history,
+                    self.units(),
+                    self.time_zone(),
+                );
                 strip_top = timeline_rect.bottom() + 4.0;
             }
             if history_height > 0.0 {
@@ -1099,6 +1105,7 @@ impl ViewerApp {
                     history,
                     history_rows_shown,
                     self.units(),
+                    self.time_zone(),
                 );
             }
         }

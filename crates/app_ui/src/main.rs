@@ -43089,6 +43089,7 @@ fn draw_obs_history_timeline(
     rect: egui::Rect,
     history: &ObsHistoryData,
     unit_system: units::Units,
+    time_zone: DisplayTimeZone,
 ) {
     if rect.width() < 220.0 || rect.height() < 60.0 {
         return;
@@ -43337,28 +43338,72 @@ fn draw_obs_history_timeline(
     );
     let axis_font = egui::FontId::monospace(9.0);
     let weak = egui::Color32::from_rgb(150, 160, 172);
-    painter.text(
-        egui::pos2(plot_left, axis_y + 1.0),
-        egui::Align2::LEFT_TOP,
-        start.format("%H:%MZ").to_string(),
-        axis_font.clone(),
-        weak,
-    );
-    painter.text(
-        egui::pos2(plot_right, axis_y + 1.0),
-        egui::Align2::RIGHT_TOP,
-        end.format("%H:%MZ").to_string(),
-        axis_font.clone(),
-        weak,
-    );
+    let axis_labels = obs_history_axis_labels(start, end, frame_time, time_zone);
+    if let Some(start_label) = axis_labels.start {
+        painter.text(
+            egui::pos2(plot_left, axis_y + 1.0),
+            egui::Align2::LEFT_TOP,
+            start_label,
+            axis_font.clone(),
+            weak,
+        );
+    }
+    if let Some(end_label) = axis_labels.end {
+        painter.text(
+            egui::pos2(plot_right, axis_y + 1.0),
+            egui::Align2::RIGHT_TOP,
+            end_label,
+            axis_font.clone(),
+            weak,
+        );
+    }
     let frame_label_x = marker_x.clamp(plot_left + 22.0, plot_right - 22.0);
     painter.text(
         egui::pos2(frame_label_x, axis_y + 1.0),
         egui::Align2::CENTER_TOP,
-        frame_time.format("%H:%MZ").to_string(),
+        axis_labels.frame,
         axis_font,
         marker_color,
     );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ObsHistoryAxisLabels {
+    start: Option<String>,
+    end: Option<String>,
+    frame: String,
+}
+
+/// Format the pinned-observation time bar in the operator's configured
+/// display zone. The selected frame is normally the window endpoint, so do
+/// not paint a second endpoint label at the same x coordinate.
+fn obs_history_axis_labels(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    frame: DateTime<Utc>,
+    time_zone: DisplayTimeZone,
+) -> ObsHistoryAxisLabels {
+    let coincides =
+        |left: DateTime<Utc>, right: DateTime<Utc>| (left - right).num_seconds().abs() <= 1;
+    ObsHistoryAxisLabels {
+        start: (!coincides(frame, start)).then(|| time_zone.format_hm(start)),
+        end: (!coincides(frame, end)).then(|| time_zone.format_hm(end)),
+        frame: time_zone.format_hm(frame),
+    }
+}
+
+fn obs_history_table_time_label(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    frame: DateTime<Utc>,
+    time_zone: DisplayTimeZone,
+) -> String {
+    format!(
+        "{} to {} - frame {}",
+        time_zone.format_hm(start),
+        time_zone.format_hm(end),
+        time_zone.format_hm(frame)
+    )
 }
 
 fn draw_obs_history_table(
@@ -43367,6 +43412,7 @@ fn draw_obs_history_table(
     history: &ObsHistoryData,
     max_rows: usize,
     unit_system: units::Units,
+    time_zone: DisplayTimeZone,
 ) {
     if rect.width() < 220.0 || rect.height() < 44.0 || max_rows == 0 {
         return;
@@ -43396,11 +43442,11 @@ fn draw_obs_history_table(
     painter.text(
         egui::pos2(left, y),
         egui::Align2::LEFT_TOP,
-        format!(
-            "{} to {} - frame {}",
-            history.start_time.format("%H:%MZ"),
-            history.end_time.format("%H:%MZ"),
-            history.frame_time.format("%H:%MZ")
+        obs_history_table_time_label(
+            history.start_time,
+            history.end_time,
+            history.frame_time,
+            time_zone,
         ),
         header_font.clone(),
         weak_color,
@@ -70134,6 +70180,26 @@ mod tests {
         );
         assert_eq!(DisplayTimeZone::Central.format_hm(summer), "20:30 CDT");
         assert_eq!(DisplayTimeZone::Pacific.format_hms(winter), "17:30:00 PST");
+    }
+
+    #[test]
+    fn pinned_obs_axis_uses_display_zone_and_deduplicates_frame_endpoint() {
+        let frame = Utc.with_ymd_and_hms(2026, 7, 20, 2, 0, 0).unwrap();
+        let start = frame - chrono::Duration::hours(3);
+
+        let eastern = obs_history_axis_labels(start, frame, frame, DisplayTimeZone::Eastern);
+        assert_eq!(eastern.start.as_deref(), Some("19:00 EDT"));
+        assert_eq!(eastern.end, None);
+        assert_eq!(eastern.frame, "22:00 EDT");
+        assert_eq!(
+            obs_history_table_time_label(start, frame, frame, DisplayTimeZone::Eastern),
+            "19:00 EDT to 22:00 EDT - frame 22:00 EDT"
+        );
+
+        let utc = obs_history_axis_labels(start, frame, frame, DisplayTimeZone::Utc);
+        assert_eq!(utc.start.as_deref(), Some("23:00Z"));
+        assert_eq!(utc.end, None);
+        assert_eq!(utc.frame, "02:00Z");
     }
 
     #[test]
