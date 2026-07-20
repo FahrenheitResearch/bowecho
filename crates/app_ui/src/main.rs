@@ -21563,7 +21563,7 @@ impl ViewerApp {
             }
         });
         button.on_hover_text(
-            "Data windows: Formula Lab · WRF · Models · Algorithm Truth Lab · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding",
+            "Data windows: Formula Lab · WRF · Models · Algorithm Truth Lab · VWP · Satellite · SimSat · WoFS · FARM · 3D · Sounding · Hurricane Hunters",
         );
     }
 
