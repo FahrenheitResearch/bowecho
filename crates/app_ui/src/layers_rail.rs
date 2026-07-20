@@ -1455,6 +1455,8 @@ impl ViewerApp {
             let enabled = &mut slot.enabled;
             let next_refresh = &mut slot.next_refresh;
             let show_text = &mut slot.show_text;
+            let visibility_range_percent = &mut slot.visibility_range_percent;
+            let mut visibility_changed = false;
             let mut remove_this = false;
             if layer_row(
                 ui,
@@ -1470,8 +1472,32 @@ impl ViewerApp {
                     gear: Some(LayerRowGear::Menu {
                         hover: "Placefile options",
                         content: Box::new(|ui| {
-                            ui.weak("Appearance controls (icon/font/line");
-                            ui.weak("scales) land here next.");
+                            ui.weak("Visibility when zoomed out");
+                            egui::ComboBox::from_id_salt(("placefile_visibility_range", index))
+                                .selected_text(crate::placefile_visibility_range_label(
+                                    *visibility_range_percent,
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for (percent, label) in [
+                                        (100, "Source range"),
+                                        (200, "2x farther"),
+                                        (400, "4x farther"),
+                                        (800, "8x farther"),
+                                        (u16::MAX, "Always visible"),
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                visibility_range_percent,
+                                                percent,
+                                                label,
+                                            )
+                                            .changed()
+                                        {
+                                            visibility_changed = true;
+                                        }
+                                    }
+                                });
+                            ui.weak("Source range respects the file's Threshold statements.");
                         }),
                     }),
                     remove: Some(LayerRowRemove {
@@ -1495,6 +1521,9 @@ impl ViewerApp {
                 },
             ) {
                 changed = true;
+            }
+            if visibility_changed {
+                placefiles_dirty = true;
             }
             if remove_this {
                 remove = Some(index);

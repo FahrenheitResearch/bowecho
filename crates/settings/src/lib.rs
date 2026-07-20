@@ -505,6 +505,11 @@ pub struct AppSettings {
     /// one-control narrowing such as TOR-only newest-first.
     #[serde(default = "default_current_alert_filter")]
     pub current_alert_filter: String,
+    /// Draw SCIT storm tracks on the radar map. This is an operator display
+    /// preference, so a restart or in-place update must not silently turn a
+    /// layer the user enabled back off.
+    #[serde(default)]
+    pub storm_tracks_enabled: bool,
     /// Maximum SCIT storm cells fed into the storm-track associator each scan.
     /// Lower values reduce linear-mode clutter without touching radar render
     /// resolution or algorithm caches.
@@ -962,7 +967,7 @@ pub struct CustomPollLinkEntry {
 
 /// A persisted placefile reference. `url` retains its historical field name
 /// for settings compatibility, but may also hold an absolute local path.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlacefileEntry {
     /// HTTP(S) community feed or absolute path to a downloaded placefile.
@@ -972,6 +977,26 @@ pub struct PlacefileEntry {
     /// dots only (the SpotterNetwork preference).
     #[serde(default = "default_true")]
     pub show_text: bool,
+    /// Percentage applied to every GR placefile object's source visibility
+    /// threshold. 100 preserves the file, 200 shows it twice as far out, and
+    /// `u16::MAX` means always visible.
+    #[serde(default = "default_placefile_visibility_range_percent")]
+    pub visibility_range_percent: u16,
+}
+
+fn default_placefile_visibility_range_percent() -> u16 {
+    100
+}
+
+impl Default for PlacefileEntry {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            enabled: false,
+            show_text: true,
+            visibility_range_percent: default_placefile_visibility_range_percent(),
+        }
+    }
 }
 
 /// Default number-row bindings (the classic analyst loadout).
@@ -1107,6 +1132,7 @@ impl Default for AppSettings {
             meteoalarm_country: default_meteoalarm_country(),
             current_alert_sort: default_current_alert_sort(),
             current_alert_filter: default_current_alert_filter(),
+            storm_tracks_enabled: false,
             storm_track_max_tracks: default_storm_track_max_tracks(),
             storm_track_min_dbz_tenths: default_storm_track_min_dbz_tenths(),
             product_hotkeys: default_product_hotkeys(),
@@ -2385,18 +2411,42 @@ mod tests {
     #[test]
     fn storm_track_filters_default_and_round_trip() {
         let old = AppSettings::from_json("{}");
+        assert!(!old.storm_tracks_enabled);
         assert_eq!(old.storm_track_max_tracks, 16);
         assert_eq!(old.storm_track_min_dbz_tenths, 350);
 
         let settings = AppSettings {
+            storm_tracks_enabled: true,
             storm_track_max_tracks: 24,
             storm_track_min_dbz_tenths: 420,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
 
+        assert!(back.storm_tracks_enabled);
         assert_eq!(back.storm_track_max_tracks, 24);
         assert_eq!(back.storm_track_min_dbz_tenths, 420);
+    }
+
+    #[test]
+    fn placefile_visibility_range_defaults_and_round_trips() {
+        let legacy = AppSettings::from_json(
+            r#"{"placefiles":[{"url":"https://example.test/feed.txt","enabled":true,"show_text":false}]}"#,
+        );
+        assert_eq!(legacy.placefiles[0].visibility_range_percent, 100);
+
+        let settings = AppSettings {
+            placefiles: vec![PlacefileEntry {
+                url: "https://example.test/feed.txt".to_owned(),
+                enabled: true,
+                show_text: true,
+                visibility_range_percent: 400,
+            }],
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.placefiles[0].visibility_range_percent, 400);
     }
 
     #[test]

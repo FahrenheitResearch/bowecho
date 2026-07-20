@@ -713,6 +713,38 @@ pub fn drape_mesh(
     mesh
 }
 
+/// Project the curved perimeter of the WoFS axes box. Sampling the same grid
+/// edges as the drape keeps the visible outline attached to the georeferenced
+/// texture under azimuthal map projection instead of connecting four corners
+/// with misleading straight chords.
+pub fn drape_outline(
+    georef: &WofsGeoref,
+    project: &dyn Fn(f32, f32) -> egui::Pos2,
+) -> Vec<egui::Pos2> {
+    let n = DRAPE_GRID;
+    let mut points = Vec::with_capacity(4 * n + 1);
+    let mut push = |u: f32, v: f32| {
+        let (lon, lat) = georef.lonlat_of(u, v);
+        points.push(project(lon, lat));
+    };
+    for i in 0..=n {
+        push(i as f32 / n as f32, 0.0);
+    }
+    for j in 1..=n {
+        push(1.0, j as f32 / n as f32);
+    }
+    for i in (0..n).rev() {
+        push(i as f32 / n as f32, 1.0);
+    }
+    for j in (1..n).rev() {
+        push(0.0, j as f32 / n as f32);
+    }
+    if let Some(first) = points.first().copied() {
+        points.push(first);
+    }
+    points
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +907,24 @@ mod tests {
         // Vertex positions follow lonlat_of (identity projection here):
         // north (higher lat) at the top row of the mesh.
         assert!(mesh.vertices[0].pos.y > mesh.vertices.last().unwrap().pos.y);
+    }
+
+    #[test]
+    fn drape_outline_is_closed_and_tracks_every_mesh_edge() {
+        let georef = WofsGeoref::from_coeffs(
+            [35.0, 0.0, 8.0, 0.0, 0.0, 0.0],
+            [-100.0, 12.0, 0.0, 0.0, 0.0, 0.0],
+            20,
+            20,
+            0.01,
+            0.01,
+        );
+        let outline = drape_outline(&georef, &|lon, lat| egui::pos2(lon, lat));
+
+        assert_eq!(outline.len(), 4 * DRAPE_GRID + 1);
+        assert_eq!(outline.first(), outline.last());
+        assert_eq!(outline[0], egui::pos2(-100.0, 43.0));
+        assert_eq!(outline[DRAPE_GRID], egui::pos2(-88.0, 43.0));
     }
 
     /// Live end-to-end calibration of the validated reference run. Network.

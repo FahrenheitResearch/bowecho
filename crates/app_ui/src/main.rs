@@ -8592,6 +8592,8 @@ impl ViewerApp {
             .map(|entry| {
                 let mut slot = PlacefileSlot::new(entry.url.clone(), entry.enabled);
                 slot.show_text = entry.show_text;
+                slot.visibility_range_percent =
+                    normalized_placefile_visibility_range_percent(entry.visibility_range_percent);
                 slot
             })
             .collect();
@@ -8638,6 +8640,7 @@ impl ViewerApp {
             normalized_storm_track_max_tracks(usize::from(app_settings.storm_track_max_tracks));
         let restored_storm_track_min_dbz =
             normalized_storm_track_min_dbz(app_settings.storm_track_min_dbz_tenths as f32 / 10.0);
+        let restored_show_storm_tracks = app_settings.storm_tracks_enabled;
         let mut app = Self {
             source_path,
             renderer_backend,
@@ -8744,7 +8747,7 @@ impl ViewerApp {
             storm_cells_receiver: None,
             storm_cells_cache: BTreeMap::new(),
             storm_cells_cache_order: VecDeque::new(),
-            show_storm_tracks: false,
+            show_storm_tracks: restored_show_storm_tracks,
             storm_track_max_tracks: restored_storm_track_max_tracks,
             storm_track_min_dbz: restored_storm_track_min_dbz,
             storm_track_follow: None,
@@ -10765,7 +10768,7 @@ impl ViewerApp {
     }
 
     fn auto_follow_strongest_storm_track(&mut self, ctx: &egui::Context) -> String {
-        self.show_storm_tracks = true;
+        self.set_storm_tracks_visible(true);
         let time_utc = self.displayed_timeline_time_utc().unwrap_or_else(Utc::now);
         if let Some(hit) = self.best_storm_track_for_follow_at_time(time_utc) {
             self.start_storm_track_follow(hit, ctx);
@@ -13313,6 +13316,18 @@ impl ViewerApp {
         self.storm_track_follow = None;
         self.storm_cells_volume_ptr = 0;
         ctx.request_repaint();
+    }
+
+    fn set_storm_tracks_visible(&mut self, enabled: bool) {
+        self.show_storm_tracks = enabled;
+        if self.app_settings.storm_tracks_enabled != enabled {
+            self.app_settings.storm_tracks_enabled = enabled;
+            self.mark_app_settings_dirty();
+        }
+        if !enabled && self.storm_track_follow.is_none() {
+            self.storm_tracker.clear();
+        }
+        self.storm_cells_volume_ptr = 0;
     }
 
     fn storm_track_cells_for_settings(&self, cells: &[StormCell]) -> Vec<StormCell> {
@@ -19453,7 +19468,7 @@ impl ViewerApp {
         self.spc_reports_enabled = true;
         self.spc_last_key = None;
         self.show_rotation_markers = true;
-        self.show_storm_tracks = true;
+        self.set_storm_tracks_visible(true);
         self.show_inspector_card = true;
         self.vrot_tool_armed = false;
         self.vrot_points.clear();
@@ -21053,7 +21068,7 @@ impl ViewerApp {
                 self.obs_show_mesonet = true;
                 self.glm_enabled = true;
                 self.show_rotation_markers = true;
-                self.show_storm_tracks = true;
+                self.set_storm_tracks_visible(true);
                 self.show_inspector_card = true;
                 self.vrot_tool_armed = false;
                 self.vrot_points.clear();
@@ -21067,7 +21082,7 @@ impl ViewerApp {
                 self.hazards_visible = true;
                 self.hazards_active_only = true;
                 self.show_rotation_markers = true;
-                self.show_storm_tracks = true;
+                self.set_storm_tracks_visible(true);
                 self.show_inspector_card = true;
                 self.vrot_tool_armed = true;
                 self.vrot_points.clear();
@@ -21257,7 +21272,7 @@ impl ViewerApp {
         self.app_settings.show_tropical = snapshot.show_tropical;
         self.app_settings.show_tropical_panel = snapshot.show_tropical_panel;
         self.show_rotation_markers = snapshot.show_rotation_markers;
-        self.show_storm_tracks = snapshot.show_storm_tracks;
+        self.set_storm_tracks_visible(snapshot.show_storm_tracks);
         self.show_inspector_card = snapshot.show_inspector_card;
         self.vrot_tool_armed = snapshot.vrot_tool_armed;
         self.vrot_points = snapshot.vrot_points;
@@ -22263,11 +22278,7 @@ impl ViewerApp {
                 }
             }
             Some(unified_player::UnifiedPlayerAction::SetStormTracksEnabled(enabled)) => {
-                self.show_storm_tracks = enabled;
-                if !self.show_storm_tracks && self.storm_track_follow.is_none() {
-                    self.storm_tracker.clear();
-                }
-                self.storm_cells_volume_ptr = 0;
+                self.set_storm_tracks_visible(enabled);
                 self.unified_player.mark_status(if enabled {
                     "Storm tracks enabled for camera follow"
                 } else {
@@ -29971,6 +29982,7 @@ impl ViewerApp {
                 url: slot.url.clone(),
                 enabled: slot.enabled,
                 show_text: slot.show_text,
+                visibility_range_percent: slot.visibility_range_percent,
             })
             .collect();
         let _ = self.app_settings.save();
@@ -29995,6 +30007,7 @@ impl ViewerApp {
             index.hash(&mut hasher);
             slot.generation.hash(&mut hasher);
             slot.show_text.hash(&mut hasher);
+            slot.visibility_range_percent.hash(&mut hasher);
             // Style multipliers bake into the shapes — edits must rebuild.
             self.style_registry.signature().hash(&mut hasher);
             let key = hasher.finish();
@@ -30006,6 +30019,7 @@ impl ViewerApp {
                     &slot.sheets,
                     rect,
                     viewport_nm,
+                    slot.visibility_range_percent,
                 )
             });
             painter.extend(built.shapes.iter().cloned());
@@ -30063,6 +30077,7 @@ impl ViewerApp {
         sheets: &[PlacefileSheet],
         rect: egui::Rect,
         viewport_nm: f32,
+        visibility_range_percent: u16,
     ) -> PlacefileDrawList {
         let mut out = PlacefileDrawList {
             shapes: Vec::new(),
@@ -30085,7 +30100,9 @@ impl ViewerApp {
             }
         };
         for object in &placefile.objects {
-            if viewport_nm > object.threshold_nm() {
+            if viewport_nm
+                > effective_placefile_threshold_nm(object.threshold_nm(), visibility_range_percent)
+            {
                 continue;
             }
             match object {
@@ -37422,59 +37439,67 @@ impl ViewerApp {
                     feature.stroke.b(),
                     spc_style.outlook_stroke_alpha,
                 );
-                for ring in &feature.rings {
-                    let screen: Vec<egui::Pos2> = ring
+                let mut visible_outer_screens = Vec::new();
+                for polygon in &feature.polygons {
+                    let outer_screen: Vec<egui::Pos2> = polygon
+                        .outer
                         .iter()
                         .map(|(lon, lat)| self.lon_lat_to_screen(rect, *lon, *lat))
                         .collect();
                     // Bounding-box overlap, NOT vertex containment: a
-                    // CONUS-scale ring covers the view while every vertex
+                    // CONUS-scale polygon covers the view while every vertex
                     // sits far off-screen (field report: outlooks never
                     // drew at storm zoom).
-                    let (mut min_x, mut min_y, mut max_x, mut max_y) =
-                        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-                    for p in &screen {
-                        min_x = min_x.min(p.x);
-                        min_y = min_y.min(p.y);
-                        max_x = max_x.max(p.x);
-                        max_y = max_y.max(p.y);
-                    }
-                    let bbox = egui::Rect::from_min_max(
-                        egui::pos2(min_x, min_y),
-                        egui::pos2(max_x, max_y),
-                    );
-                    if !bbox.intersects(rect) {
+                    if !screen_polygon_bbox_intersects(&outer_screen, rect) {
                         continue;
                     }
                     let stroke = egui::Stroke::new(spc_style.outlook_stroke_width, stroke_color);
-                    draw_outlook_ring(painter, &screen, stroke, rect);
+                    draw_outlook_ring(painter, &outer_screen, stroke, rect);
+                    let hole_screens = polygon
+                        .holes
+                        .iter()
+                        .map(|ring| {
+                            ring.iter()
+                                .map(|(lon, lat)| self.lon_lat_to_screen(rect, *lon, *lat))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    for hole in &hole_screens {
+                        draw_outlook_ring(painter, hole, stroke, rect);
+                    }
                     // Translucent interior wash: PROPER ear-clip tessellation
                     // (the warning-polygon path's own) — outlook rings are
                     // deeply concave, and a centroid fan sprays triangles
                     // across the map ("spokes" field report). The cleaner
                     // also absorbs SPC's unclosed/degenerate ring edge cases.
+                    // All SPC kinds now use the same hole-aware treatment.
                     if feature.fill_enabled
-                        && !screen_polyline_has_jump(&screen, true, rect, 0.0)
-                        && let Some(mesh) = filled_polygon_mesh(&screen, fill)
+                        && !screen_polyline_has_jump(&outer_screen, true, rect, 0.0)
+                        && hole_screens
+                            .iter()
+                            .all(|hole| !screen_polyline_has_jump(hole, true, rect, 0.0))
+                        && let Some(mesh) =
+                            filled_polygon_with_holes_mesh(&outer_screen, &hole_screens, fill)
                     {
                         painter.add(egui::Shape::mesh(mesh));
                     }
-                    let centroid = polygon_screen_centroid(&screen);
-                    let label_position = egui::pos2(
-                        centroid.x.clamp(rect.left() + 8.0, rect.right() - 8.0),
-                        centroid.y.clamp(rect.top() + 8.0, rect.bottom() - 8.0),
+                    visible_outer_screens.push(outer_screen);
+                }
+                // A MultiPolygon is one logical outlook feature. Label it
+                // once, outside the polygon loop: close zoom used to clamp
+                // several ring labels onto the exact same screen point.
+                if let Some(label_position) =
+                    outlook_feature_label_position(&visible_outer_screens, rect)
+                {
+                    draw_halo_text(
+                        painter,
+                        label_position,
+                        egui::Align2::CENTER_CENTER,
+                        &feature.label,
+                        egui::FontId::proportional(12.0),
+                        stroke_color,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
                     );
-                    if rect.contains(label_position) {
-                        draw_halo_text(
-                            painter,
-                            label_position,
-                            egui::Align2::CENTER_CENTER,
-                            &feature.label,
-                            egui::FontId::proportional(12.0),
-                            stroke_color,
-                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
-                        );
-                    }
                 }
             }
         }
@@ -40002,6 +40027,9 @@ struct PlacefileSlot {
     enabled: bool,
     /// Draw Text/Place statements (off = icons/lines only).
     show_text: bool,
+    /// Percent multiplier for each object's GR visibility threshold. The
+    /// sentinel `u16::MAX` keeps every object visible at any map scale.
+    visibility_range_percent: u16,
     data: Option<placefiles::Placefile>,
     /// Bumped on every successful install — exact shape-cache invalidation.
     generation: u64,
@@ -40043,6 +40071,7 @@ impl PlacefileSlot {
             url,
             enabled,
             show_text: true,
+            visibility_range_percent: 100,
             data: None,
             generation: 0,
             source_generation: 0,
@@ -40054,6 +40083,61 @@ impl PlacefileSlot {
             sheets_generation: None,
         }
     }
+}
+
+fn normalized_placefile_visibility_range_percent(percent: u16) -> u16 {
+    if percent == u16::MAX {
+        u16::MAX
+    } else {
+        percent.clamp(100, 800)
+    }
+}
+
+fn placefile_visibility_range_label(percent: u16) -> &'static str {
+    match normalized_placefile_visibility_range_percent(percent) {
+        100 => "Source range",
+        200 => "2x farther",
+        400 => "4x farther",
+        800 => "8x farther",
+        u16::MAX => "Always visible",
+        _ => "Custom range",
+    }
+}
+
+fn effective_placefile_threshold_nm(source_threshold_nm: f32, percent: u16) -> f32 {
+    let percent = normalized_placefile_visibility_range_percent(percent);
+    if percent == u16::MAX {
+        f32::INFINITY
+    } else {
+        source_threshold_nm * f32::from(percent) / 100.0
+    }
+}
+
+/// Select one readable label anchor for a logical SPC outlook feature, even
+/// when its GeoJSON geometry contains several visible polygons. Prefer an
+/// actual on-screen centroid; otherwise keep one clamped edge anchor.
+fn outlook_feature_label_position(
+    visible_outer_screens: &[Vec<egui::Pos2>],
+    rect: egui::Rect,
+) -> Option<egui::Pos2> {
+    let label_rect = rect.shrink(8.0);
+    let mut fallback = None;
+    for screen in visible_outer_screens {
+        if !screen_polygon_bbox_intersects(screen, rect) {
+            continue;
+        }
+        let centroid = polygon_screen_centroid(screen);
+        if label_rect.contains(centroid) {
+            return Some(centroid);
+        }
+        fallback.get_or_insert_with(|| {
+            egui::pos2(
+                centroid.x.clamp(label_rect.left(), label_rect.right()),
+                centroid.y.clamp(label_rect.top(), label_rect.bottom()),
+            )
+        });
+    }
+    fallback
 }
 
 fn placefile_parse_status(placefile: &placefiles::Placefile) -> String {
@@ -53363,6 +53447,30 @@ mod tests {
         assert_eq!(context.manual_camera_keyframes, 2);
         assert!(context.manual_camera_can_follow);
         assert!(context.hide_camera_guides);
+    }
+
+    #[test]
+    fn unified_player_storm_track_toggle_updates_persisted_preference() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        app.handle_unified_player_action(
+            Some(unified_player::UnifiedPlayerAction::SetStormTracksEnabled(
+                true,
+            )),
+            &ctx,
+        );
+        assert!(app.show_storm_tracks);
+        assert!(app.app_settings.storm_tracks_enabled);
+
+        app.handle_unified_player_action(
+            Some(unified_player::UnifiedPlayerAction::SetStormTracksEnabled(
+                false,
+            )),
+            &ctx,
+        );
+        assert!(!app.show_storm_tracks);
+        assert!(!app.app_settings.storm_tracks_enabled);
     }
 
     #[test]
@@ -68642,6 +68750,38 @@ mod tests {
             app.active_background_activity(),
             Some(BackgroundActivity::indeterminate("Loading placefile icons"))
         );
+    }
+
+    #[test]
+    fn placefile_visibility_range_expands_source_threshold_or_forces_visibility() {
+        assert_eq!(effective_placefile_threshold_nm(100.0, 100), 100.0);
+        assert_eq!(effective_placefile_threshold_nm(100.0, 400), 400.0);
+        assert!(effective_placefile_threshold_nm(100.0, u16::MAX).is_infinite());
+        assert_eq!(normalized_placefile_visibility_range_percent(0), 100);
+    }
+
+    #[test]
+    fn outlook_multipolygon_selects_only_one_label_anchor() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 120.0));
+        let polygons = vec![
+            vec![
+                egui::pos2(-40.0, -30.0),
+                egui::pos2(240.0, -30.0),
+                egui::pos2(240.0, 150.0),
+                egui::pos2(-40.0, 150.0),
+            ],
+            vec![
+                egui::pos2(80.0, 30.0),
+                egui::pos2(120.0, 30.0),
+                egui::pos2(120.0, 70.0),
+                egui::pos2(80.0, 70.0),
+            ],
+        ];
+
+        let anchor = outlook_feature_label_position(&polygons, rect).expect("visible feature");
+
+        assert!(rect.contains(anchor));
+        assert_eq!(anchor, egui::pos2(100.0, 60.0));
     }
 
     fn test_placefile_icon_spec(index: u32, url: String) -> placefiles::IconSheetSpec {

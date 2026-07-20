@@ -1364,6 +1364,7 @@ impl WofsState {
         for overlay in &self.overlays {
             urls.push(image_url(run, &self.init, overlay, self.minute));
         }
+        let mut drew_drape = false;
         for url in urls {
             let Some(texture) = self.textures.get(&url) else {
                 continue;
@@ -1388,7 +1389,21 @@ impl WofsState {
                 for _ in 0..self.drape_passes() {
                     painter.add(egui::Shape::mesh(mesh.clone()));
                 }
+                drew_drape = true;
             }
+        }
+        if drew_drape {
+            let outline = wofs_georef::drape_outline(georef, project);
+            // A dark under-stroke plus a pale-cyan core stays legible over
+            // both satellite imagery and BowEcho's dark vector basemap.
+            painter.add(egui::Shape::line(
+                outline.clone(),
+                egui::Stroke::new(4.5, egui::Color32::from_rgba_unmultiplied(2, 7, 12, 235)),
+            ));
+            painter.add(egui::Shape::line(
+                outline,
+                egui::Stroke::new(2.25, egui::Color32::from_rgb(188, 239, 255)),
+            ));
         }
     }
 
