@@ -944,6 +944,23 @@ fn model_data(ui: &mut egui::Ui) {
          return here for maps, native plots, PNG output, and color-table work.",
     );
 
+    subhead(ui, "OBSERVED AIRCRAFT SOUNDINGS");
+    action(
+        ui,
+        "Layers \u{25b8} Aircraft soundings (AMDAR/ACARS)",
+        concat!(
+            "- polls the anonymous public NOAA/NWS MADIS acarsProfiles hourly feed and puts ",
+            "a cyan ascent/descent marker at each airport with a QC-usable profile. Click a ",
+            "marker to open it in the native sounding panel. This is the limited public ",
+            "real-time subset (primarily WVSS-II-equipped aircraft), not unrestricted global ",
+            "AMDAR/ACARS; restricted airline observations are delayed before public release, ",
+            "so coverage is sparse and uneven. MADIS supplies pressure altitude, not observed ",
+            "pressure, so BowEcho derives display pressure using the standard atmosphere and ",
+            "labels the sounding as pressure-altitude-derived. Source and QC: NOAA/NWS ",
+            "Meteorological Assimilation Data Ingest System (MADIS).",
+        ),
+    );
+
     subhead(ui, "UPPER-AIR (ISOBARIC) FIELDS");
     para(
         ui,
@@ -2898,6 +2915,17 @@ fn tools(ui: &mut egui::Ui) {
          bottom panel (heights to 18 km, 4/3-Earth beam geometry). Velocity products slice \
          velocity; everything else slices reflectivity. Right-click resets the endpoints; \
          Clear XS removes the panel.",
+    );
+
+    subhead(ui, "VERTICAL WIND PROFILE (VWP)");
+    action(
+        ui,
+        "Radar > Tools > Open VWP",
+        "— opens the dockable VWP viewer and retrieves environmental winds from the selected \
+         volume's dealiased radial velocity with a VAD fit. The panel shows the vertical wind \
+         staff, hodograph, accepted/marginal/rejected QC, 0–1/0–3/0–6 km bulk shear, a \
+         retrieved-level 0–6 km mean wind, and the selected SRV motion vector. Product 48 VWP \
+         files can also be opened directly. Treat the result as experimental and inspect its QC.",
     );
 
     subhead(ui, "ALGORITHM OVERLAYS");

@@ -510,6 +510,127 @@ impl ViewerApp {
                     ui.spinner();
                 }
             });
+            if app.spc_day == 1 {
+                let outlook_date = app.spc_outlook_date();
+                let now = Utc::now();
+                panel_kit::row(ui, "Issuance", |ui| {
+                    let selected_future = app
+                        .spc_day1_issue
+                        .is_not_yet_issued(outlook_date, now);
+                    let selected_text = if selected_future {
+                        format!("{} - not yet issued", app.spc_day1_issue.label())
+                    } else {
+                        app.spc_day1_issue.label().to_owned()
+                    };
+                    egui::ComboBox::from_id_salt("severe_spc_day1_issue")
+                        .selected_text(selected_text)
+                        .width(ui.available_width().clamp(120.0, 220.0))
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(
+                                    &mut app.spc_day1_issue,
+                                    spc_layers::SpcDay1Issue::Auto,
+                                    "Auto / latest",
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            for issue in spc_layers::SPC_DAY1_FIXED_ISSUES {
+                                let not_yet_issued =
+                                    issue.is_not_yet_issued(outlook_date, now);
+                                let label = if not_yet_issued {
+                                    format!("{} - not yet issued", issue.label())
+                                } else {
+                                    issue.label().to_owned()
+                                };
+                                let response = ui
+                                    .add_enabled_ui(!not_yet_issued, |ui| {
+                                        ui.selectable_value(
+                                            &mut app.spc_day1_issue,
+                                            issue,
+                                            label,
+                                        )
+                                    })
+                                    .inner;
+                                if response.changed() {
+                                    changed = true;
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Auto preserves the current/live behavior. A fixed issue loads one official SPC Day-1 archive slot for the displayed date; SPC's 06Z issue is stored in its 12Z-valid archive file.",
+                        );
+                });
+
+                let issue_status = if app.spc_rx.is_some() {
+                    format!(
+                        "SPC {} {}: fetching official GeoJSON",
+                        outlook_date,
+                        app.spc_day1_issue.label()
+                    )
+                } else {
+                    match app.spc_data.day1_issue_status.as_ref() {
+                        Some(spc_layers::SpcDay1IssueStatus::AutoArchiveLoaded {
+                            date,
+                            issue,
+                            loaded,
+                            requested,
+                        }) => {
+                            let coverage = if loaded == requested {
+                                String::new()
+                            } else {
+                                format!(" ({loaded}/{requested} selected products available)")
+                            };
+                            format!(
+                                "Auto: {date} {} was the latest available archive issue{coverage}",
+                                issue.label()
+                            )
+                        }
+                        Some(spc_layers::SpcDay1IssueStatus::AutoArchiveMissing { date }) => {
+                            format!("Auto: no official Day-1 archive issue was found for {date}")
+                        }
+                        Some(spc_layers::SpcDay1IssueStatus::SelectedLoaded {
+                            date,
+                            issue,
+                            loaded,
+                            requested,
+                        }) => {
+                            let coverage = if loaded == requested {
+                                String::new()
+                            } else {
+                                format!(" - {loaded}/{requested} selected products available")
+                            };
+                            format!(
+                                "Showing official {date} {} issuance{coverage}",
+                                issue.label()
+                            )
+                        }
+                        Some(spc_layers::SpcDay1IssueStatus::SelectedNotYetIssued {
+                            date,
+                            issue,
+                        }) => format!("{date} {} has not been issued yet", issue.label()),
+                        Some(spc_layers::SpcDay1IssueStatus::SelectedMissing {
+                            date,
+                            issue,
+                        }) => format!(
+                            "Official {date} {} archive file is missing or unavailable",
+                            issue.label()
+                        ),
+                        Some(spc_layers::SpcDay1IssueStatus::NoStandardProductSelected) => {
+                            "Select Categorical, Tornado, Wind, or Hail to load this SPC issuance"
+                                .to_owned()
+                        }
+                        None if app.spc_day1_issue == spc_layers::SpcDay1Issue::Auto => {
+                            "Auto uses SPC's current headline outlook for today's live view"
+                                .to_owned()
+                        }
+                        None => "Waiting to fetch the selected official issuance".to_owned(),
+                    }
+                };
+                ui.weak(issue_status);
+            }
             // Outlook kinds + the Reports / ESTOFEX toggles as one kit chip
             // grid — same enable state the checkboxes used to edit.
             let kinds = spc_layers::outlook_kind_options(app.spc_day);
@@ -1911,6 +2032,11 @@ fn hazard_popup_title(record: &HazardRecord) -> String {
         "snow squall" => Some("Snow Squall Warning"),
         "fire weather" => Some("Fire Weather Warning"),
         "special weather" => Some("Special Weather Statement"),
+        "watch" => match hazard_record_style_threat(record) {
+            Some("tornado") => Some("Tornado Watch"),
+            Some("severe-thunderstorm") => Some("Severe Thunderstorm Watch"),
+            _ => None,
+        },
         _ => None,
     };
     if let Some(canonical) = canonical {
@@ -1928,6 +2054,9 @@ fn hazard_popup_title(record: &HazardRecord) -> String {
         }
     }
     let family = title_case_tag(&record.event_family);
+    if record.event_family == "watch" {
+        return family;
+    }
     if family.to_ascii_lowercase().contains("warning") {
         family
     } else {
@@ -1946,7 +2075,11 @@ fn hazard_popup_metric_lines(record: &HazardRecord) -> Vec<String> {
     {
         lines.push(format!("Hail: {hail:.2} in"));
     }
-    if let Some(tornado) = record.tornado.as_deref().and_then(normalized_tornado_tag) {
+    if let Some(tornado) = record
+        .tornado
+        .as_deref()
+        .and_then(|tag| normalized_tornado_tag(tag, record.event_family.as_str()))
+    {
         lines.push(tornado);
     }
     if let Some(tag) = record
@@ -1960,7 +2093,7 @@ fn hazard_popup_metric_lines(record: &HazardRecord) -> Vec<String> {
     lines
 }
 
-fn normalized_tornado_tag(raw: &str) -> Option<String> {
+fn normalized_tornado_tag(raw: &str, event_family: &str) -> Option<String> {
     let normalized = raw
         .trim()
         .replace(['_', '-'], " ")
@@ -1971,6 +2104,7 @@ fn normalized_tornado_tag(raw: &str) -> Option<String> {
     match normalized.as_str() {
         "" | "NONE" | "NO" => None,
         "POSSIBLE" => Some("Tornado possible".to_owned()),
+        "RADAR INDICATED" if event_family == "tornado" => Some("Radar indicated".to_owned()),
         "RADAR INDICATED" => Some("Tornado possible · radar indicated".to_owned()),
         "OBSERVED" => Some("Tornado observed".to_owned()),
         _ => Some(format!("Tornado: {}", title_case_tag(&normalized))),
@@ -2420,6 +2554,27 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_tornado_and_severe_cards_keep_detection_phrasing_separate() {
+        let mut tornado = popup_test_record("KGRB.TO.W.0033", "tornado", -1.0, -1.0, 1.0, 1.0);
+        tornado.tornado = Some("RADAR INDICATED".to_owned());
+        let mut severe = popup_test_record(
+            "KGRB.SV.W.0034",
+            "severe thunderstorm",
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+        );
+        severe.tornado = Some("RADAR INDICATED".to_owned());
+
+        assert_eq!(hazard_popup_metric_lines(&tornado), vec!["Radar indicated"]);
+        assert_eq!(
+            hazard_popup_metric_lines(&severe),
+            vec!["Tornado possible · radar indicated"]
+        );
+    }
+
+    #[test]
     fn popup_office_prefers_vtec_letters_and_falls_back_to_sender() {
         let mut vtec = popup_test_record(
             "KSGF.SV.W.0042",
@@ -2526,6 +2681,25 @@ mod tests {
         );
 
         assert_eq!(hazard_popup_title(&record), "Severe Thunderstorm Warning");
+    }
+
+    #[test]
+    fn popup_title_names_tornado_and_severe_thunderstorm_watches() {
+        let tornado_watch = popup_test_record("KGRB.TO.A.0501", "watch", -1.0, -1.0, 1.0, 1.0);
+        let severe_watch = popup_test_record("KOUN.SV.A.0502", "watch", -1.0, -1.0, 1.0, 1.0);
+
+        assert_eq!(hazard_popup_title(&tornado_watch), "Tornado Watch");
+        assert_eq!(
+            hazard_popup_title(&severe_watch),
+            "Severe Thunderstorm Watch"
+        );
+    }
+
+    #[test]
+    fn popup_title_never_calls_an_unknown_watch_a_warning() {
+        let watch = popup_test_record("SPC.WW.0503", "watch", -1.0, -1.0, 1.0, 1.0);
+
+        assert_eq!(hazard_popup_title(&watch), "Watch");
     }
 
     #[test]

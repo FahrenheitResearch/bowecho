@@ -3561,6 +3561,25 @@ impl ViewerApp {
             .collect()
     }
 
+    /// Screen positions for the newest QC-usable public MADIS aircraft
+    /// profile at each airport. Profiles only exist after the background
+    /// hourly-file worker lands; this pass is network-free.
+    pub(crate) fn aircraft_profile_points(&self, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
+        if !self.aircraft_soundings_enabled {
+            return Vec::new();
+        }
+        self.aircraft_profiles
+            .iter()
+            .enumerate()
+            .filter_map(|(index, profile)| {
+                let position = self.lon_lat_to_screen(rect, profile.longitude, profile.latitude);
+                rect.expand(18.0)
+                    .contains(position)
+                    .then_some((index, position))
+            })
+            .collect()
+    }
+
     /// International site markers: the same visual grammar as
     /// [`Self::draw_site_markers`] (dot + selected halo + label, identical
     /// culling and label restraint) but hollow and warm-hued so the two
@@ -3939,6 +3958,62 @@ impl ViewerApp {
         }
     }
 
+    /// Public MADIS aircraft profiles: a small cyan chevron whose direction
+    /// distinguishes ascent from descent. Clicking opens the profile in the
+    /// native observed-sounding panel.
+    pub(crate) fn draw_aircraft_profile_markers(
+        &self,
+        painter: &egui::Painter,
+        points: &[(usize, egui::Pos2)],
+        hovered: Option<usize>,
+    ) {
+        const IDLE: egui::Color32 = egui::Color32::from_rgb(88, 190, 210);
+        const LIT: egui::Color32 = egui::Color32::from_rgb(150, 238, 250);
+        for (index, position) in points {
+            let Some(profile) = self.aircraft_profiles.get(*index) else {
+                continue;
+            };
+            let is_hovered = hovered == Some(*index);
+            let radius = if is_hovered { 6.0 } else { 4.5 };
+            let color = if is_hovered { LIT } else { IDLE };
+            let vertical = if profile.ascending { -radius } else { radius };
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    *position + egui::vec2(0.0, vertical),
+                    *position + egui::vec2(radius, -vertical),
+                    *position + egui::vec2(-radius, -vertical),
+                ],
+                egui::Stroke::new(1.5_f32, color),
+            ));
+            if is_hovered {
+                let text = format!(
+                    "{} MADIS aircraft {} - {}Z - {} levels - pressure-altitude p",
+                    profile.airport,
+                    profile.direction_label(),
+                    profile.valid_time.format("%H:%M"),
+                    profile.column.len()
+                );
+                let width = 12.0 + text.chars().count() as f32 * 6.6;
+                let chip = egui::Rect::from_min_size(
+                    *position + egui::vec2(10.0, -26.0),
+                    egui::vec2(width, 18.0),
+                );
+                painter.rect_filled(
+                    chip,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(16, 22, 30, 230),
+                );
+                painter.text(
+                    chip.center(),
+                    egui::Align2::CENTER_CENTER,
+                    text,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(210, 246, 250),
+                );
+            }
+        }
+    }
+
     pub(crate) fn draw_loaded_volume_marker(&self, painter: &egui::Painter, rect: egui::Rect) {
         let Some(volume) = &self.volume else {
             return;
@@ -4168,11 +4243,17 @@ pub(crate) fn resolve_marker_click(
     community: Option<(usize, f32)>,
     custom_poll: Option<(usize, f32)>,
     raob: Option<(usize, f32)>,
+    aircraft: Option<(usize, f32)>,
 ) -> Option<(MarkerFamily, usize)> {
     if let Some((index, distance)) = raob
         && distance <= RAOB_MARKER_PRIORITY_RADIUS_PX
     {
         return Some((MarkerFamily::Raob, index));
+    }
+    if let Some((index, distance)) = aircraft
+        && distance <= 6.0
+    {
+        return Some((MarkerFamily::Aircraft, index));
     }
 
     [
@@ -4181,6 +4262,7 @@ pub(crate) fn resolve_marker_click(
         community.map(|(index, distance)| (MarkerFamily::Community, index, distance)),
         custom_poll.map(|(index, distance)| (MarkerFamily::CustomPoll, index, distance)),
         raob.map(|(index, distance)| (MarkerFamily::Raob, index, distance)),
+        aircraft.map(|(index, distance)| (MarkerFamily::Aircraft, index, distance)),
     ]
     .into_iter()
     .flatten()

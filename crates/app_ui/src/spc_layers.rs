@@ -63,6 +63,120 @@ pub const DAY3_OUTLOOK_KINDS: [(&str, &str); 6] = [
 
 pub const ESTOFEX_OUTLOOK_KIND: &str = "estofex";
 
+/// Operator-selectable SPC Day-1 issuance.  SPC's 06Z Day-1 outlook is
+/// archived under the product's 12Z valid-time slot (`_1200_`), while the
+/// other archive slots match their issue times.  Keeping that distinction in
+/// one typed value prevents the UI from presenting `_1200_` as a noon issue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SpcDay1Issue {
+    /// Existing behavior: current headline outlook for live data, or the
+    /// newest available archive slot for a dated view.
+    #[default]
+    Auto,
+    At0100,
+    At0600,
+    At1300,
+    At1630,
+    At2000,
+}
+
+pub const SPC_DAY1_FIXED_ISSUES: [SpcDay1Issue; 5] = [
+    SpcDay1Issue::At0100,
+    SpcDay1Issue::At0600,
+    SpcDay1Issue::At1300,
+    SpcDay1Issue::At1630,
+    SpcDay1Issue::At2000,
+];
+
+const SPC_DAY1_AUTO_ARCHIVE_ORDER: [SpcDay1Issue; 5] = [
+    SpcDay1Issue::At2000,
+    SpcDay1Issue::At1630,
+    SpcDay1Issue::At1300,
+    SpcDay1Issue::At0600,
+    SpcDay1Issue::At0100,
+];
+
+impl SpcDay1Issue {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto / latest",
+            Self::At0100 => "01:00Z",
+            Self::At0600 => "06:00Z",
+            Self::At1300 => "13:00Z",
+            Self::At1630 => "16:30Z",
+            Self::At2000 => "20:00Z",
+        }
+    }
+
+    /// Filename slot used by SPC's official archived GeoJSON.
+    pub fn archive_slot(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::At0100 => Some("0100"),
+            // The 06Z issuance becomes valid at 12Z and is archived as 1200.
+            Self::At0600 => Some("1200"),
+            Self::At1300 => Some("1300"),
+            Self::At1630 => Some("1630"),
+            Self::At2000 => Some("2000"),
+        }
+    }
+
+    fn from_archive_slot(slot: &str) -> Option<Self> {
+        match slot {
+            "0100" => Some(Self::At0100),
+            "1200" => Some(Self::At0600),
+            "1300" => Some(Self::At1300),
+            "1630" => Some(Self::At1630),
+            "2000" => Some(Self::At2000),
+            _ => None,
+        }
+    }
+
+    pub fn scheduled_at(self, date: NaiveDate) -> Option<DateTime<Utc>> {
+        let (hour, minute) = match self {
+            Self::Auto => return None,
+            Self::At0100 => (1, 0),
+            Self::At0600 => (6, 0),
+            Self::At1300 => (13, 0),
+            Self::At1630 => (16, 30),
+            Self::At2000 => (20, 0),
+        };
+        date.and_hms_opt(hour, minute, 0).map(|time| time.and_utc())
+    }
+
+    pub fn is_not_yet_issued(self, date: NaiveDate, now: DateTime<Utc>) -> bool {
+        self.scheduled_at(date).is_some_and(|issue| issue > now)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpcDay1IssueStatus {
+    AutoArchiveLoaded {
+        date: NaiveDate,
+        issue: SpcDay1Issue,
+        loaded: usize,
+        requested: usize,
+    },
+    AutoArchiveMissing {
+        date: NaiveDate,
+    },
+    SelectedLoaded {
+        date: NaiveDate,
+        issue: SpcDay1Issue,
+        loaded: usize,
+        requested: usize,
+    },
+    SelectedNotYetIssued {
+        date: NaiveDate,
+        issue: SpcDay1Issue,
+    },
+    SelectedMissing {
+        date: NaiveDate,
+        issue: SpcDay1Issue,
+    },
+    NoStandardProductSelected,
+}
+
 /// Old builds exposed dedicated CIG switches even though the ordinary SPC
 /// products already contain those conditional-intensity regions. Keep this
 /// recognizer for settings migration while hiding/ignoring the duplicates.
@@ -165,6 +279,9 @@ pub struct SpcData {
     /// products we rendered. UI polling uses this to retry quickly while
     /// staying on official GeoJSON geometry.
     pub outlook_geojson_lagging: bool,
+    /// Result of the Day-1 issuance choice, used to distinguish a future
+    /// scheduled issue from an archive file that is genuinely missing.
+    pub day1_issue_status: Option<SpcDay1IssueStatus>,
 }
 
 #[derive(Clone)]
@@ -1606,53 +1723,115 @@ fn live_outlook_urls(day: u8, kind: &str, now: DateTime<Utc>) -> Vec<String> {
     }
 }
 
+/// Exact official SPC GeoJSON archive URL for one filename slot.
+fn archived_outlook_url(date: NaiveDate, day: u8, archive_slot: &str, kind: &str) -> String {
+    format!(
+        "https://www.spc.noaa.gov/products/outlook/archive/{}/day{day}otlk_{}_{archive_slot}_{kind}.lyr.geojson",
+        date.year(),
+        date.format("%Y%m%d")
+    )
+}
+
+fn selected_day1_archive_url(date: NaiveDate, issue: SpcDay1Issue, kind: &str) -> Option<String> {
+    Some(archived_outlook_url(date, 1, issue.archive_slot()?, kind))
+}
+
 /// Blocking fetch of everything enabled — worker thread only.
 /// `archive_date`: when viewing archive data, fetch THAT day's outlook
 /// from SPC's archive (latest issuance found, walking 2000 -> 1630 ->
 /// 1300 -> 1200 -> 0100); None = the live outlook. `day`: 1-3.
+/// A fixed `day1_issue` uses exactly that official archive slot even for
+/// today's live view; `Auto` retains the existing live/latest behavior.
 pub fn fetch_spc(
     outlook_kinds: &[&str],
     want_reports: bool,
     day: u8,
     archive_date: Option<(i32, u32, u32)>,
+    day1_issue: SpcDay1Issue,
 ) -> SpcData {
     let mut data = SpcData {
         fetched_at: Some(Instant::now()),
         ..Default::default()
     };
     let now = Utc::now();
+    let archive_date_naive =
+        archive_date.and_then(|(year, month, day)| NaiveDate::from_ymd_opt(year, month, day));
+    let target_date = archive_date_naive.unwrap_or_else(|| now.date_naive());
+    let day1_issue = if day == 1 {
+        day1_issue
+    } else {
+        SpcDay1Issue::Auto
+    };
+    let fixed_issue_not_yet_issued = day1_issue.is_not_yet_issued(target_date, now);
     let spc_kinds = effective_spc_outlook_kinds(day, outlook_kinds);
     let wants_estofex = outlook_kinds.contains(&ESTOFEX_OUTLOOK_KIND);
     let wants_standard_spc = spc_kinds.iter().any(|kind| standard_spc_outlook_kind(kind));
-    let live_pts = if archive_date.is_none() && wants_standard_spc {
-        live_pts_url(day).and_then(|url| data_source::fetch_text(url).ok())
-    } else {
-        None
-    };
+    let live_pts =
+        if archive_date.is_none() && day1_issue == SpcDay1Issue::Auto && wants_standard_spc {
+            live_pts_url(day).and_then(|url| data_source::fetch_text(url).ok())
+        } else {
+            None
+        };
     let live_pts_issue = live_pts
         .as_deref()
         .and_then(|text| pts_issue_time(text, now));
     let mut latest_geojson_issue: Option<DateTime<Utc>> = None;
     let mut missing_geojson_outlook = false;
+    let mut standard_requested = 0usize;
+    let mut standard_loaded = 0usize;
+    // Resolve an archive Auto slot once with the first selected standard
+    // product, then reuse that exact slot for the remaining kinds. This keeps
+    // all enabled fields on one issuance without walking all five URLs for
+    // every field.
+    let mut auto_archive_resolved = false;
+    let mut auto_archive_slot: Option<&'static str> = None;
     for kind in &spc_kinds {
         let kind = *kind;
-        let text = match archive_date {
-            None => live_outlook_urls(day, kind, now)
-                .into_iter()
-                .find_map(|url| data_source::fetch_text(&url).ok()),
-            Some(_) if !standard_spc_outlook_kind(kind) => None,
-            Some((y, m, d)) => ["2000", "1630", "1300", "1200", "0100"]
-                .iter()
-                .find_map(|issue| {
-                    data_source::fetch_text(&format!(
-                        "https://www.spc.noaa.gov/products/outlook/archive/{y}/day{day}otlk_{y}{m:02}{d:02}_{issue}_{kind}.lyr.geojson"
-                    ))
-                    .ok()
+        let standard = standard_spc_outlook_kind(kind);
+        if standard {
+            standard_requested += 1;
+        }
+        let text = if day == 1 && day1_issue != SpcDay1Issue::Auto && standard {
+            if fixed_issue_not_yet_issued {
+                None
+            } else {
+                selected_day1_archive_url(target_date, day1_issue, kind)
+                    .and_then(|url| data_source::fetch_text(&url).ok())
+            }
+        } else {
+            match archive_date_naive {
+                None => live_outlook_urls(day, kind, now)
+                    .into_iter()
+                    .find_map(|url| data_source::fetch_text(&url).ok()),
+                Some(_) if !standard => None,
+                Some(date) if auto_archive_resolved => auto_archive_slot.and_then(|slot| {
+                    data_source::fetch_text(&archived_outlook_url(date, day, slot, kind)).ok()
                 }),
+                Some(date) => {
+                    let mut found = None;
+                    for issue in SPC_DAY1_AUTO_ARCHIVE_ORDER {
+                        let slot = issue
+                            .archive_slot()
+                            .expect("fixed Day-1 archive issue has a filename slot");
+                        if let Ok(text) =
+                            data_source::fetch_text(&archived_outlook_url(date, day, slot, kind))
+                        {
+                            auto_archive_slot = Some(slot);
+                            found = Some(text);
+                            break;
+                        }
+                    }
+                    auto_archive_resolved = true;
+                    found
+                }
+            }
         };
         if let Some(mut text) = text {
+            if standard {
+                standard_loaded += 1;
+            }
             let mut geojson_issue = geojson_issue_time(&text);
-            if archive_date.is_none() {
+            if archive_date.is_none() && day1_issue == SpcDay1Issue::Auto {
                 let pts_is_ahead = live_pts_issue
                     .zip(geojson_issue)
                     .map(|(pts_issue, geojson_issue)| {
@@ -1690,6 +1869,7 @@ pub fn fetch_spc(
                 );
             }
             let overlay_pts = archive_date.is_none()
+                && day1_issue == SpcDay1Issue::Auto
                 && standard_spc_outlook_kind(kind)
                 && live_pts_issue
                     .zip(geojson_issue)
@@ -1713,7 +1893,10 @@ pub fn fetch_spc(
             if standard_spc_outlook_kind(kind) {
                 missing_geojson_outlook = true;
             }
-            if archive_date.is_none() && standard_spc_outlook_kind(kind) {
+            if archive_date.is_none()
+                && day1_issue == SpcDay1Issue::Auto
+                && standard_spc_outlook_kind(kind)
+            {
                 let pts_features = live_pts
                     .as_deref()
                     .map(|pts_text| parse_pts_outlook(pts_text, kind))
@@ -1727,7 +1910,46 @@ pub fn fetch_spc(
     if wants_estofex {
         data.estofex_issues = fetch_estofex_issues();
     }
+    data.day1_issue_status = if day != 1 {
+        None
+    } else if day1_issue == SpcDay1Issue::Auto {
+        archive_date_naive.and_then(|date| {
+            if standard_requested == 0 {
+                Some(SpcDay1IssueStatus::NoStandardProductSelected)
+            } else if let Some(issue) = auto_archive_slot.and_then(SpcDay1Issue::from_archive_slot)
+            {
+                Some(SpcDay1IssueStatus::AutoArchiveLoaded {
+                    date,
+                    issue,
+                    loaded: standard_loaded,
+                    requested: standard_requested,
+                })
+            } else {
+                Some(SpcDay1IssueStatus::AutoArchiveMissing { date })
+            }
+        })
+    } else if standard_requested == 0 {
+        Some(SpcDay1IssueStatus::NoStandardProductSelected)
+    } else if fixed_issue_not_yet_issued {
+        Some(SpcDay1IssueStatus::SelectedNotYetIssued {
+            date: target_date,
+            issue: day1_issue,
+        })
+    } else if standard_loaded > 0 {
+        Some(SpcDay1IssueStatus::SelectedLoaded {
+            date: target_date,
+            issue: day1_issue,
+            loaded: standard_loaded,
+            requested: standard_requested,
+        })
+    } else {
+        Some(SpcDay1IssueStatus::SelectedMissing {
+            date: target_date,
+            issue: day1_issue,
+        })
+    };
     data.outlook_geojson_lagging = archive_date.is_none()
+        && day1_issue == SpcDay1Issue::Auto
         && wants_standard_spc
         && live_pts_issue
             .map(|pts_issue| {
@@ -1974,6 +2196,42 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
                 "https://mapservices.weather.noaa.gov/vector/rest/services/hazards/wpc_precip_hazards/MapServer/0/query?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
             ]
         );
+    }
+
+    #[test]
+    fn day1_issue_selector_maps_issue_times_to_official_archive_slots() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 19).unwrap();
+        assert_eq!(
+            selected_day1_archive_url(date, SpcDay1Issue::At0100, "cat").as_deref(),
+            Some(
+                "https://www.spc.noaa.gov/products/outlook/archive/2026/day1otlk_20260719_0100_cat.lyr.geojson"
+            )
+        );
+        assert_eq!(
+            selected_day1_archive_url(date, SpcDay1Issue::At0600, "torn").as_deref(),
+            Some(
+                "https://www.spc.noaa.gov/products/outlook/archive/2026/day1otlk_20260719_1200_torn.lyr.geojson"
+            ),
+            "SPC archives the 06Z issuance under its 12Z valid-time slot"
+        );
+        assert_eq!(
+            selected_day1_archive_url(date, SpcDay1Issue::Auto, "cat"),
+            None,
+            "Auto remains a resolver, never a fabricated archive filename"
+        );
+    }
+
+    #[test]
+    fn day1_issue_selector_distinguishes_future_from_available_slots() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let before_06z = Utc.with_ymd_and_hms(2026, 7, 20, 5, 59, 59).unwrap();
+        let at_06z = Utc.with_ymd_and_hms(2026, 7, 20, 6, 0, 0).unwrap();
+
+        assert!(SpcDay1Issue::At0600.is_not_yet_issued(date, before_06z));
+        assert!(!SpcDay1Issue::At0600.is_not_yet_issued(date, at_06z));
+        assert!(!SpcDay1Issue::Auto.is_not_yet_issued(date, before_06z));
+        assert_eq!(SpcDay1Issue::At0600.label(), "06:00Z");
+        assert_eq!(SpcDay1Issue::At0600.archive_slot(), Some("1200"));
     }
 
     #[test]

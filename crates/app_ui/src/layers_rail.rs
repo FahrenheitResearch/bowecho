@@ -21,7 +21,7 @@ use ui_core::loop_engine::FeedSource;
 use crate::{
     GLM_LIVE_MAX_AGE_MINUTES, ItalyDpcMapProduct, LayerRowGear, LayerRowOpacity, LayerRowOrder,
     LayerRowRemove, LayerRowSpec, LayerRowVis, PlacefileSlot, RadarSite, SidebarTab, ViewerApp,
-    compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
+    aircraft_soundings, compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
     custom_poll_links_from_gis, dock, eumetsat, format_site_label, glm_latest_age_minutes,
     glm_latest_is_live, glm_satellite_label, grid_composites, intl_provider_label, layer_row,
     mesoanalysis, normalized_poll_url, oa_derived, panel_kit, parse_custom_poll_marker_inputs,
@@ -75,6 +75,7 @@ impl ViewerApp {
             + usize::from(self.sat_layer.is_some())
             + self.model_layers.len()
             + usize::from(self.obs_enabled)
+            + usize::from(self.app_settings.overlay_river_gauges)
             + usize::from(self.glm_enabled)
             + usize::from(self.raob_markers_enabled)
             + usize::from(!self.spc_outlooks_enabled.is_empty())
@@ -962,6 +963,55 @@ impl ViewerApp {
                 self.set_obs_adjust_soundings(obs_adjust_soundings, ctx);
             }
         }
+        // Official NOAA/NWS National Water Prediction Service gauges. Map
+        // summaries are viewport-tiled; details and hydrographs load only
+        // after a marker click.
+        {
+            let status = self.river_gauges.status_line();
+            let fetching = self.river_gauges.is_fetching();
+            let mut refresh = false;
+            let changed = layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut self.app_settings.overlay_river_gauges,
+                        hover: "Official NOAA/NWS NWPS river gauges. Markers show observed or forecast flood category; click one for stage, flow, thresholds, forecast crest, impacts, and hydrograph.",
+                    },
+                    name: "River gauges",
+                    name_hover: "National Water Prediction Service observations and official NWS river forecasts (anonymous, no key)",
+                    count: Some(status.as_str()),
+                    gear: Some(LayerRowGear::Menu {
+                        hover: "NWPS source, legend, and refresh",
+                        content: Box::new(|ui| {
+                            ui.strong("NOAA/NWS National Water Prediction Service");
+                            ui.weak("Viewport-cached; visible map tiles refresh every 5 minutes.");
+                            ui.weak("Blue no flooding - yellow action - orange minor - red moderate - magenta major.");
+                            ui.weak("An amber outer ring means the displayed category comes from the forecast.");
+                            ui.weak("Gray means stale, not current, or unavailable. Values can be provisional.");
+                            ui.hyperlink_to("Official NWPS", "https://water.noaa.gov/");
+                            if ui.button("Refresh visible gauges").clicked() {
+                                refresh = true;
+                                ui.close();
+                            }
+                        }),
+                    }),
+                    ..Default::default()
+                },
+                |ui| {
+                    if fetching {
+                        ui.spinner();
+                    }
+                },
+            );
+            if refresh {
+                self.river_gauges.request_refresh();
+                ctx.request_repaint();
+            }
+            if changed {
+                self.save_overlay_defaults();
+                ctx.request_repaint();
+            }
+        }
         // LIGHTNING (GLM) — promoted from a bare checkbox to the row
         // grammar (spec §2.3). No opacity in v1: age-fade is
         // intrinsic to the layer.
@@ -1204,6 +1254,55 @@ impl ViewerApp {
                     }
                 },
             ) {
+                self.save_overlay_defaults();
+                ctx.request_repaint();
+            }
+        }
+        // Anonymous NOAA/NWS MADIS aircraft profiles. This is intentionally
+        // named as the limited public MADIS subset, not unrestricted AMDAR.
+        {
+            let profile_count = self.aircraft_profiles.len();
+            let fetching = self.aircraft_profiles_rx.is_some();
+            let status = self.aircraft_profiles_status.clone();
+            let source_file = self.aircraft_profiles_file.clone();
+            if layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut self.aircraft_soundings_enabled,
+                        hover: "Latest QC-usable airport ascent/descent profiles from the anonymous public NOAA/NWS MADIS aircraft subset. Click a cyan profile marker to open the native sounding.",
+                    },
+                    name: "Aircraft soundings (AMDAR/ACARS)",
+                    name_hover: "MADIS aircraft profiles - limited anonymous public real-time subset",
+                    gear: Some(LayerRowGear::Menu {
+                        hover: "MADIS aircraft-profile source and coverage",
+                        content: Box::new(move |ui| {
+                            ui.strong(format!("{profile_count} current airport profiles"));
+                            ui.weak(&status);
+                            if let Some(file) = &source_file {
+                                ui.weak(format!("Hourly source file: {file}"));
+                            }
+                            ui.separator();
+                            ui.label(format!("Source: {}.", aircraft_soundings::SOURCE_NAME));
+                            ui.hyperlink_to(
+                                "Official MADIS aircraft documentation",
+                                aircraft_soundings::SOURCE_URL,
+                            );
+                            ui.weak("Coverage is the anonymous public acarsProfiles subset (primarily WVSS-II-equipped aircraft), not unrestricted global AMDAR/ACARS. Restricted airline observations are delayed before public release, so live coverage is sparse and uneven.");
+                            ui.weak("MADIS pressure is not present in this feed. BowEcho derives display pressure from the transmitted pressure altitude using the standard atmosphere and labels it as derived.");
+                        }),
+                    }),
+                    ..Default::default()
+                },
+                |ui| {
+                    if fetching {
+                        ui.spinner();
+                    }
+                },
+            ) {
+                if self.aircraft_soundings_enabled {
+                    self.aircraft_profiles_next_poll = None;
+                }
                 self.save_overlay_defaults();
                 ctx.request_repaint();
             }

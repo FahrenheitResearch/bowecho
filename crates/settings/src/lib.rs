@@ -268,6 +268,10 @@ pub struct AppSettings {
     /// people save what overlays they want default").
     #[serde(default)]
     pub overlay_obs: bool,
+    /// Official NOAA/NWS NWPS river-gauge markers and flood status.
+    /// Default off; catalogue polling occurs only while the layer is enabled.
+    #[serde(default)]
+    pub overlay_river_gauges: bool,
     #[serde(default = "default_true")]
     pub overlay_obs_metar: bool,
     #[serde(default = "default_true")]
@@ -326,6 +330,10 @@ pub struct AppSettings {
     /// the displayed radar time.
     #[serde(default)]
     pub overlay_raob: bool,
+    /// Anonymous public NOAA/NWS MADIS aircraft-profile markers. This is the
+    /// limited real-time acarsProfiles subset, not unrestricted AMDAR/ACARS.
+    #[serde(default)]
+    pub overlay_aircraft_soundings: bool,
     /// Draw the tropical-cyclone layer: active storm positions, forecast
     /// track, quadrant wind radii / 34-kt danger area (NHC + JTWC), and cone
     /// of uncertainty (GDACS basins). Default ON — the map layer draws
@@ -1065,6 +1073,7 @@ impl Default for AppSettings {
         Self {
             brand: BrandConfig::default(),
             overlay_obs: false,
+            overlay_river_gauges: false,
             overlay_obs_metar: true,
             overlay_obs_mesonet: true,
             overlay_obs_adjust_soundings: false,
@@ -1079,6 +1088,7 @@ impl Default for AppSettings {
             eumetsat_product: default_eumetsat_product(),
             eumetsat_loop_frames: default_eumetsat_loop_frames(),
             overlay_raob: false,
+            overlay_aircraft_soundings: false,
             show_tropical: true,
             show_tropical_panel: true,
             show_hurricane_hunters: false,
@@ -1809,6 +1819,16 @@ mod tests {
         let restored = AppSettings::from_json(&settings.to_json());
         assert!(restored.overlay_obs);
         assert!(restored.overlay_obs_adjust_soundings);
+    }
+
+    #[test]
+    fn river_gauge_preference_defaults_off_and_round_trips() {
+        assert!(!AppSettings::from_json("{}").overlay_river_gauges);
+        let settings = AppSettings {
+            overlay_river_gauges: true,
+            ..AppSettings::default()
+        };
+        assert!(AppSettings::from_json(&settings.to_json()).overlay_river_gauges);
     }
 
     #[test]
@@ -2745,6 +2765,16 @@ mod tests {
             ..Default::default()
         };
         assert!(AppSettings::from_json(&s.to_json()).overlay_raob);
+    }
+
+    #[test]
+    fn overlay_aircraft_soundings_defaults_off_and_round_trips() {
+        assert!(!AppSettings::from_json("{}").overlay_aircraft_soundings);
+        let settings = AppSettings {
+            overlay_aircraft_soundings: true,
+            ..Default::default()
+        };
+        assert!(AppSettings::from_json(&settings.to_json()).overlay_aircraft_soundings);
     }
 
     #[test]

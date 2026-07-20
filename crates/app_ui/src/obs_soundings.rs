@@ -23,9 +23,8 @@
 //! launch nearest BEFORE it (+90 min grace for transmission), specials
 //! included.
 //!
-//! (ACARS/AMDAR aircraft profiles are MADIS-gated — the public GSL text
-//! server is gone — so aircraft soundings wait on a bring-your-own
-//! credentials integration.)
+//! Public MADIS aircraft-profile soundings are implemented separately in
+//! `aircraft_soundings`; this module remains dedicated to radiosondes.
 
 use std::sync::OnceLock;
 

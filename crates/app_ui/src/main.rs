@@ -37,6 +37,7 @@ use render2d::{
 use serde::Deserialize;
 use settings::{LoopSweepControl, SweepPolicy, SweepPolicyMode, SweepPolicySet, SweepProductGroup};
 
+mod aircraft_soundings;
 mod annotate;
 mod archive_browser;
 mod basemap_data;
@@ -99,6 +100,7 @@ mod radar_export;
 mod raster_quality;
 mod rebuildable_cache;
 mod rhi;
+mod river_gauges;
 mod sat_paint;
 mod sat_plot;
 mod sat_rgb_store;
@@ -616,6 +618,10 @@ mod alert_audio {
 /// window still cues quickly, but slow enough to never busy-loop or hammer
 /// the API. The watcher sleeps this long between polls (no CPU spin).
 const ALERT_WATCH_INTERVAL: Duration = Duration::from_secs(20);
+/// Anonymous MADIS aircraft profiles are hourly; a five-minute probe finds a
+/// newly published hour promptly without treating the public archive like a
+/// high-frequency feed.
+const AIRCRAFT_PROFILE_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Snapshot of the alert-sound settings the background watcher reads each
 /// cycle. The foreground copies the current settings here every frame so
@@ -3213,6 +3219,7 @@ struct ViewerApp {
     spc_kinds_memory: Vec<String>,
     spc_reports_enabled: bool,
     spc_day: u8,
+    spc_day1_issue: spc_layers::SpcDay1Issue,
     spc_last_key: Option<SpcFetchKey>,
     spc_rx: Option<mpsc::Receiver<spc_layers::SpcData>>,
     mping_reports: Vec<mping::MpingReport>,
@@ -3263,6 +3270,17 @@ struct ViewerApp {
     /// RAOB station markers on the map (the Layers rail OBS row): click
     /// one for that station's observed sounding at the displayed time.
     raob_markers_enabled: bool,
+    /// Latest anonymous public MADIS aircraft profiles and their map markers.
+    aircraft_profiles: Vec<aircraft_soundings::AircraftProfile>,
+    aircraft_profiles_rx:
+        Option<mpsc::Receiver<std::result::Result<aircraft_soundings::AircraftSnapshot, String>>>,
+    aircraft_profiles_next_poll: Option<Instant>,
+    aircraft_profiles_file: Option<String>,
+    aircraft_profiles_status: String,
+    aircraft_soundings_enabled: bool,
+    /// Viewport-cached official NOAA/NWS NWPS river gauges. The persisted
+    /// visibility toggle lives directly in `app_settings`.
+    river_gauges: river_gauges::RiverGaugeState,
     /// Surface observations layer (METAR station plots).
     obs_enabled: bool,
     /// Source-class QC toggles: METAR = airport-grade; mesonet = IEM
@@ -5380,7 +5398,7 @@ fn intl_recent_loop_provider_labels() -> &'static str {
     })
 }
 /// SPC fetch identity: (day, archive date) — refetch when it changes.
-type SpcFetchKey = (u8, Option<(i32, u32, u32)>);
+type SpcFetchKey = (u8, Option<(i32, u32, u32)>, spc_layers::SpcDay1Issue);
 type ModelLayerRender = (u64, ModelLayerView, egui::ColorImage, f32);
 
 /// One SPC storm report (tornado) — the archive events browser entry.
@@ -8567,6 +8585,7 @@ impl ViewerApp {
             app_settings.overlay_mping_reports,
         );
         let restored_obs_adjust_soundings = app_settings.overlay_obs_adjust_soundings;
+        let restored_aircraft_soundings = app_settings.overlay_aircraft_soundings;
         let restored_hazards_visible = app_settings.hazards_visible;
         let restored_hazards_active_only = app_settings.hazards_active_only;
         let restored_live_hazard_auto_refresh = app_settings.live_hazard_auto_refresh;
@@ -8892,6 +8911,7 @@ impl ViewerApp {
             estofex_issue_id: None,
             spc_reports_enabled: restored_overlays.5,
             spc_day: 1,
+            spc_day1_issue: spc_layers::SpcDay1Issue::Auto,
             spc_last_key: None,
             glm: None,
             glm_secondary: None,
@@ -8923,6 +8943,13 @@ impl ViewerApp {
             raob_sites_rx: None,
             raob_sites_fetch_attempted: false,
             raob_markers_enabled: restored_overlays.6,
+            aircraft_profiles: Vec::new(),
+            aircraft_profiles_rx: None,
+            aircraft_profiles_next_poll: None,
+            aircraft_profiles_file: None,
+            aircraft_profiles_status: "Enable to load the public MADIS subset".to_owned(),
+            aircraft_soundings_enabled: restored_aircraft_soundings,
+            river_gauges: river_gauges::RiverGaugeState::default(),
             // An enabled adjustment depends on the observation feed. Keep a
             // saved adjustment effective even if an older/inconsistent config
             // recorded the layer itself as off.
@@ -17952,7 +17979,13 @@ impl ViewerApp {
     }
 
     fn vwp_pane_body(&mut self, ui: &mut egui::Ui) {
-        let action = self.vwp_panel.ui(ui);
+        let action = self.vwp_panel.ui(
+            ui,
+            Some(vwp::VwpMotionVector {
+                direction_deg: self.storm_motion_direction_deg,
+                speed_kt: self.storm_motion_speed_kt,
+            }),
+        );
         if action.recompute_requested {
             self.vwp_product48_hold = None;
             self.vwp_requested_key = None;
@@ -20229,6 +20262,7 @@ impl eframe::App for ViewerApp {
                 let _ = self.app_settings.save();
             }
         }
+        self.show_river_gauge_details(&ctx);
         if self.gbvtd.panel_open {
             // Local `open` so the title-bar [✕] can close the panel without a
             // double borrow of `self` (the body closure also borrows self).
@@ -20279,6 +20313,7 @@ impl eframe::App for ViewerApp {
         // stall progress reporting until reopened.
         self.pump_ingest_responses();
         self.poll_surface_obs(&ctx);
+        self.river_gauges.poll();
         if self.obs_hour_loop_enabled {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -20322,6 +20357,7 @@ impl eframe::App for ViewerApp {
         self.poll_intl_sites();
         self.poll_coverage_probe(&ctx);
         self.poll_raob_sites(&ctx);
+        self.poll_aircraft_profiles(&ctx);
         self.poll_native_sounding(&ctx);
         self.poll_dealias_env(&ctx);
         self.poll_vwp(&ctx);
@@ -25230,6 +25266,16 @@ impl ViewerApp {
 
     /// TOOLS section body — inspector, Vrot, cross-section.
     fn radar_tools_section_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if fixed_action_button(ui, "Open VWP", 92.0)
+            .on_hover_text(
+                "Open the vertical wind profile retrieved from this volume's dealiased radial velocity",
+            )
+            .clicked()
+        {
+            self.open_viewer(dock::WorkspacePane::Vwp);
+            self.status = "Opened vertical wind profile from the selected radar volume".to_owned();
+            ctx.request_repaint();
+        }
         let mut show_center_crosshair = self.app_settings.show_center_crosshair;
         if ui
             .checkbox(&mut show_center_crosshair, "Center crosshair")
@@ -27557,6 +27603,11 @@ impl ViewerApp {
         if self.raob_sites_rx.is_some() {
             return Some(BackgroundActivity::indeterminate("Loading RAOB sites"));
         }
+        if self.aircraft_profiles_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                "Refreshing MADIS aircraft profiles",
+            ));
+        }
         if self.obs_rx.is_some()
             || self.iem_metar_rx.is_some()
             || self.nws_obs_rx.is_some()
@@ -28897,6 +28948,9 @@ impl ViewerApp {
         let community_points = self.community_site_points(rect);
         let custom_poll_points = self.custom_poll_points(rect);
         let raob_points = self.raob_site_points(rect);
+        let aircraft_points = self.aircraft_profile_points(rect);
+        self.drive_river_gauges_for_view(ui.ctx(), rect);
+        let river_gauge_points = self.river_gauge_marker_points(rect);
 
         let modifiers = ui.input(|input| input.modifiers);
         let model_soundings_available = self.model_soundings_available();
@@ -28937,14 +28991,20 @@ impl ViewerApp {
             // established click grammar — RAOB diamonds included); a
             // report dots and track overlays only take the click when no marker is in
             // reach.
-            let marker_hit = self
+            let established_marker_hit = self
                 .nearest_site_marker_within(&site_points, pointer)
                 .is_some()
                 || nearest_marker_within(&intl_points, pointer).is_some()
                 || nearest_marker_within(&community_points, pointer).is_some()
                 || nearest_marker_within(&custom_poll_points, pointer).is_some()
-                || nearest_marker_within(&raob_points, pointer).is_some();
-            if !marker_hit {
+                || nearest_marker_within(&raob_points, pointer).is_some()
+                || nearest_marker_within(&aircraft_points, pointer).is_some();
+            let river_marker_hit =
+                river_gauges::nearest_marker(&river_gauge_points, pointer).is_some();
+            let marker_hit = established_marker_hit || river_marker_hit;
+            if river_marker_hit && !established_marker_hit {
+                self.select_river_gauge_marker(&river_gauge_points, pointer, ui.ctx());
+            } else if !marker_hit {
                 if let Some(report) = self.spc_report_at_position(rect, pointer) {
                     self.jump_to_storm_report(&report, ui.ctx());
                 } else if let Some(hit) = self.event_track_at(rect, pointer) {
@@ -28958,6 +29018,7 @@ impl ViewerApp {
                     &community_points,
                     &custom_poll_points,
                     &raob_points,
+                    &aircraft_points,
                     pointer,
                     ui.ctx(),
                 ) && self.app_settings.map_click_drops_coordinate_marker
@@ -28971,6 +29032,7 @@ impl ViewerApp {
                     &community_points,
                     &custom_poll_points,
                     &raob_points,
+                    &aircraft_points,
                     pointer,
                     ui.ctx(),
                 );
@@ -28996,6 +29058,7 @@ impl ViewerApp {
                     &intl_points,
                     &community_points,
                     &custom_poll_points,
+                    &[],
                     &[],
                     pointer,
                     ui.ctx(),
@@ -29150,6 +29213,16 @@ impl ViewerApp {
             .and_then(|pointer| nearest_marker_within(&raob_points, pointer))
             .map(|(index, _)| index);
         self.draw_raob_site_markers(painter, &raob_points, hovered_raob);
+        let hovered_aircraft = response
+            .hover_pos()
+            .and_then(|pointer| nearest_marker_within(&aircraft_points, pointer))
+            .map(|(index, _)| index);
+        self.draw_aircraft_profile_markers(painter, &aircraft_points, hovered_aircraft);
+        let hovered_river = response
+            .hover_pos()
+            .and_then(|pointer| river_gauges::nearest_marker(&river_gauge_points, pointer))
+            .map(|point| point.lid.as_str());
+        self.draw_river_gauge_markers(painter, &river_gauge_points, hovered_river);
         self.draw_radar_layer_markers(painter, rect);
         self.draw_loaded_volume_marker(painter, rect);
         self.draw_coordinate_marker(painter, rect);
@@ -29316,6 +29389,9 @@ impl ViewerApp {
             let community_points = self.community_site_points(cell);
             let custom_poll_points = self.custom_poll_points(cell);
             let raob_points = self.raob_site_points(cell);
+            let aircraft_points = self.aircraft_profile_points(cell);
+            self.drive_river_gauges_for_view(ui.ctx(), cell);
+            let river_gauge_points = self.river_gauge_marker_points(cell);
 
             let modifiers = ui.input(|input| input.modifiers);
             let model_soundings_available = self.model_soundings_available();
@@ -29390,7 +29466,20 @@ impl ViewerApp {
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                if self.hazard_popup_owns_pointer(pointer) {
+                let established_marker_hit = self
+                    .nearest_site_marker_within(&site_points, pointer)
+                    .is_some()
+                    || nearest_marker_within(&intl_points, pointer).is_some()
+                    || nearest_marker_within(&community_points, pointer).is_some()
+                    || nearest_marker_within(&custom_poll_points, pointer).is_some()
+                    || nearest_marker_within(&raob_points, pointer).is_some()
+                    || nearest_marker_within(&aircraft_points, pointer).is_some();
+                let river_marker_hit =
+                    river_gauges::nearest_marker(&river_gauge_points, pointer).is_some();
+                if river_marker_hit && !established_marker_hit {
+                    self.hazard_map_popup = None;
+                    self.select_river_gauge_marker(&river_gauge_points, pointer, ui.ctx());
+                } else if self.hazard_popup_owns_pointer(pointer) {
                     // Foreground warning-card controls own this click.
                 } else if self.app_settings.independent_panels && cell_index > 0 {
                     self.hazard_map_popup = None;
@@ -29401,6 +29490,7 @@ impl ViewerApp {
                         &community_points,
                         &custom_poll_points,
                         &raob_points,
+                        &aircraft_points,
                         pointer,
                         ui.ctx(),
                     );
@@ -29423,6 +29513,7 @@ impl ViewerApp {
                         &community_points,
                         &custom_poll_points,
                         &raob_points,
+                        &aircraft_points,
                         pointer,
                         ui.ctx(),
                     );
@@ -29462,6 +29553,7 @@ impl ViewerApp {
                             &community_points,
                             &custom_poll_points,
                             &[],
+                            &[],
                             pointer,
                             ui.ctx(),
                         )
@@ -29473,6 +29565,7 @@ impl ViewerApp {
                             &intl_points,
                             &community_points,
                             &custom_poll_points,
+                            &[],
                             &[],
                             pointer,
                             ui.ctx(),
@@ -29652,6 +29745,22 @@ impl ViewerApp {
                 .and_then(|pointer| nearest_marker_within(&raob_points, pointer))
                 .map(|(index, _)| index);
             self.draw_raob_site_markers(&cell_painter, &raob_points, hovered_raob);
+            let aircraft_points = self.aircraft_profile_points(cell);
+            let hovered_aircraft = hovers
+                .get(cell_index)
+                .copied()
+                .flatten()
+                .and_then(|pointer| nearest_marker_within(&aircraft_points, pointer))
+                .map(|(index, _)| index);
+            self.draw_aircraft_profile_markers(&cell_painter, &aircraft_points, hovered_aircraft);
+            let river_gauge_points = self.river_gauge_marker_points(cell);
+            let hovered_river = hovers
+                .get(cell_index)
+                .copied()
+                .flatten()
+                .and_then(|pointer| river_gauges::nearest_marker(&river_gauge_points, pointer))
+                .map(|point| point.lid.as_str());
+            self.draw_river_gauge_markers(&cell_painter, &river_gauge_points, hovered_river);
             self.draw_radar_layer_markers(&cell_painter, cell);
             self.draw_loaded_volume_marker(&cell_painter, cell);
             self.draw_coordinate_marker(&cell_painter, cell);
@@ -33921,6 +34030,58 @@ impl ViewerApp {
         }
     }
 
+    /// Poll the anonymous public MADIS aircraft-profile subset on a bounded
+    /// cadence. The worker owns the small hourly gzip cache; the UI thread
+    /// only swaps a completed snapshot.
+    fn poll_aircraft_profiles(&mut self, ctx: &egui::Context) {
+        if !self.aircraft_soundings_enabled {
+            return;
+        }
+        let due = self
+            .aircraft_profiles_next_poll
+            .is_none_or(|deadline| Instant::now() >= deadline);
+        if due && self.aircraft_profiles_rx.is_none() {
+            self.aircraft_profiles_next_poll =
+                Some(Instant::now() + AIRCRAFT_PROFILE_POLL_INTERVAL);
+            self.aircraft_profiles_status =
+                "Refreshing public MADIS aircraft profiles...".to_owned();
+            let (sender, receiver) = mpsc::channel();
+            self.aircraft_profiles_rx = Some(receiver);
+            let ctx_clone = ctx.clone();
+            let cache = aircraft_soundings::cache_dir(&app_cache_root());
+            thread::spawn(move || {
+                let _ = sender.send(aircraft_soundings::fetch_latest(&cache, Utc::now()));
+                ctx_clone.request_repaint();
+            });
+        }
+        let Some(receiver) = &self.aircraft_profiles_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(snapshot)) => {
+                self.aircraft_profiles_rx = None;
+                self.aircraft_profiles_file = Some(snapshot.file_name.clone());
+                self.aircraft_profiles_status = format!(
+                    "{} usable airport profiles from {}",
+                    snapshot.profiles.len(),
+                    snapshot.file_hour.format("%Y-%m-%d %H00Z")
+                );
+                self.aircraft_profiles = snapshot.profiles;
+            }
+            Ok(Err(error)) => {
+                self.aircraft_profiles_rx = None;
+                self.aircraft_profiles_status = format!("MADIS aircraft refresh failed: {error}");
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.aircraft_profiles_rx = None;
+                self.aircraft_profiles_status = "MADIS aircraft refresh worker stopped".to_owned();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+            }
+        }
+    }
+
     /// Fetch + render the RAOB launch nearest the map center through the
     /// native skew-T channel — the Analysis (OA) button path, now one
     /// caller of the station-parameterized fetch.
@@ -33966,14 +34127,15 @@ impl ViewerApp {
             .cloned();
     }
 
-    /// Transfer the shared native-result channel to an explicit RAOB request.
+    /// Transfer the shared native-result channel to an explicit observed
+    /// sounding request (RAOB or MADIS aircraft profile).
     /// Dropping the previous receiver is intentional: the producer may finish,
-    /// but its stale model/hail/older-RAOB result can no longer install after
+    /// but its stale model/hail/older-observation result can no longer install after
     /// this click. Returning the new sender keeps the state transition itself
     /// deterministic and network-free for regression tests.
-    fn begin_raob_sounding_request(
+    fn begin_observed_sounding_request(
         &mut self,
-        site_id: &str,
+        label: &str,
         ctx: &egui::Context,
     ) -> mpsc::Sender<std::result::Result<NativeSoundingResult, String>> {
         drop(self.native_sounding_rx.take());
@@ -33990,13 +34152,21 @@ impl ViewerApp {
         // SAME native panel, so keeping it installed makes the RAOB click
         // look like a no-op (and it stays forever if the archive fetch
         // fails). Clear first so loading, error, and success visibly belong
-        // to the RAOB request that just won ownership.
+        // to the observed sounding request that just won ownership.
         self.native_sounding_panel.clear();
         self.native_sounding_panel.set_loading();
         self.open_viewer(dock::WorkspacePane::Sounding);
-        self.status = format!("Fetching RAOB {site_id}…");
+        self.status = format!("Fetching {label}...");
         ctx.request_repaint();
         sender
+    }
+
+    fn begin_raob_sounding_request(
+        &mut self,
+        site_id: &str,
+        ctx: &egui::Context,
+    ) -> mpsc::Sender<std::result::Result<NativeSoundingResult, String>> {
+        self.begin_observed_sounding_request(&format!("RAOB {site_id}"), ctx)
     }
 
     /// Fetch + render ONE station's RAOB launch nearest the displayed
@@ -34048,6 +34218,42 @@ impl ViewerApp {
         });
     }
 
+    /// Open an already-downloaded public MADIS aircraft profile through the
+    /// same native observed-sounding panel and ownership handoff as a RAOB.
+    fn start_aircraft_sounding_for(
+        &mut self,
+        profile: aircraft_soundings::AircraftProfile,
+        ctx: &egui::Context,
+    ) {
+        let display_id = profile.display_id();
+        let sender = self
+            .begin_observed_sounding_request(&format!("MADIS aircraft profile {display_id}"), ctx);
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let compute_start = Instant::now();
+            let result = (|| -> std::result::Result<NativeSoundingResult, String> {
+                let column = profile.column.clone();
+                let mut native = rustwx_sounding::NativeSounding::from_column(&column)
+                    .map_err(|error| error.to_string())?;
+                native.metadata.station_id = format!(
+                    "{} MADIS aircraft {} - pressure derived from pressure altitude",
+                    profile.airport,
+                    profile.direction_label()
+                );
+                native.metadata.latitude_deg = Some(f64::from(profile.latitude));
+                native.metadata.longitude_deg = Some(f64::from(profile.longitude));
+                let sounding_data = aircraft_column_to_rw_sounding_data(&profile, &column)?;
+                Ok((
+                    Some(native),
+                    compute_start.elapsed().as_secs_f32() * 1000.0,
+                    Some((sounding_data, column)),
+                ))
+            })();
+            let _ = sender.send(result);
+            ctx_clone.request_repaint();
+        });
+    }
+
     /// Persist the current overlay toggles as the startup defaults.
     fn save_overlay_defaults(&mut self) {
         self.app_settings.overlay_obs = self.obs_enabled;
@@ -34056,6 +34262,9 @@ impl ViewerApp {
         self.app_settings.overlay_obs_adjust_soundings = self.obs_adjust_soundings;
         self.app_settings.overlay_glm = self.glm_enabled;
         self.app_settings.overlay_raob = self.raob_markers_enabled;
+        self.app_settings.overlay_aircraft_soundings = self.aircraft_soundings_enabled;
+        // River gauges use AppSettings as their live source of truth, so no
+        // separate mirror assignment is needed here.
         self.app_settings.overlay_spc_outlooks = self.spc_outlooks_enabled.clone();
         self.app_settings.overlay_spc_reports = self.spc_reports_enabled;
         self.app_settings.overlay_mping_reports = self.mping_enabled;
@@ -34194,20 +34403,35 @@ impl ViewerApp {
     }
 
     /// SPC outlooks + reports: fetch when enabled, refresh every 5 min.
+    pub(crate) fn spc_outlook_date(&self) -> chrono::NaiveDate {
+        self.event_explorer
+            .pinned_day
+            .or_else(|| {
+                self.volume
+                    .as_ref()
+                    .map(|volume| volume.volume_time.date_naive())
+            })
+            .unwrap_or_else(|| Utc::now().date_naive())
+    }
+
+    fn spc_outlook_archive_date(&self) -> Option<(i32, u32, u32)> {
+        use chrono::Datelike;
+        let when = self.spc_outlook_date();
+        let today = Utc::now().date_naive();
+        (when != today).then(|| (when.year(), when.month(), when.day()))
+    }
+
     fn poll_spc(&mut self, ctx: &egui::Context) {
         let wants = !self.spc_outlooks_enabled.is_empty() || self.spc_reports_enabled;
         // Archive-aware: the Event-day pin wins, else the displayed
         // volume's day — show THAT day's outlook (latest issuance).
-        let archive_date = {
-            use chrono::Datelike;
-            let when = self
-                .event_explorer
-                .pinned_day
-                .or_else(|| self.volume.as_ref().map(|v| v.volume_time.date_naive()));
-            let today = Utc::now().date_naive();
-            when.and_then(|when| (when != today).then(|| (when.year(), when.month(), when.day())))
+        let archive_date = self.spc_outlook_archive_date();
+        let day1_issue = if self.spc_day == 1 {
+            self.spc_day1_issue
+        } else {
+            spc_layers::SpcDay1Issue::Auto
         };
-        let current_key = Some((self.spc_day, archive_date));
+        let current_key = Some((self.spc_day, archive_date, day1_issue));
         let key_changed = wants && self.spc_last_key != current_key;
         let refresh_after = if archive_date.is_none() && self.spc_data.outlook_geojson_lagging {
             Duration::from_secs(20)
@@ -34230,11 +34454,12 @@ impl ViewerApp {
             // the live filtered CSVs — skip the redundant live fetch.
             let want_reports = self.spc_reports_enabled && self.event_followed_day().is_none();
             let day = self.spc_day;
-            self.spc_last_key = Some((day, archive_date));
+            self.spc_last_key = Some((day, archive_date, day1_issue));
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
                 let kind_refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
-                let data = spc_layers::fetch_spc(&kind_refs, want_reports, day, archive_date);
+                let data =
+                    spc_layers::fetch_spc(&kind_refs, want_reports, day, archive_date, day1_issue);
                 let _ = sender.send(data);
                 ctx_clone.request_repaint();
             });
@@ -39002,6 +39227,7 @@ impl ViewerApp {
         community_points: &[(usize, egui::Pos2)],
         custom_poll_points: &[(usize, egui::Pos2)],
         raob_points: &[(usize, egui::Pos2)],
+        aircraft_points: &[(usize, egui::Pos2)],
         pointer: egui::Pos2,
         ctx: &egui::Context,
     ) -> bool {
@@ -39013,6 +39239,7 @@ impl ViewerApp {
                 community_points,
                 custom_poll_points,
                 raob_points,
+                aircraft_points,
                 pointer,
                 ctx,
             );
@@ -39027,6 +39254,7 @@ impl ViewerApp {
             nearest_marker_within(community_points, pointer),
             nearest_marker_within(custom_poll_points, pointer),
             nearest_marker_within(raob_points, pointer),
+            nearest_marker_within(aircraft_points, pointer),
         ) {
             Some((MarkerFamily::Conus, index)) => {
                 let Some(site) = self.sites.get(index).cloned() else {
@@ -39082,6 +39310,13 @@ impl ViewerApp {
                 self.start_raob_sounding_for(site, None, ctx);
                 true
             }
+            Some((MarkerFamily::Aircraft, index)) => {
+                let Some(profile) = self.aircraft_profiles.get(index).cloned() else {
+                    return false;
+                };
+                self.start_aircraft_sounding_for(profile, ctx);
+                true
+            }
             None => false,
         }
     }
@@ -39095,6 +39330,7 @@ impl ViewerApp {
         community_points: &[(usize, egui::Pos2)],
         custom_poll_points: &[(usize, egui::Pos2)],
         raob_points: &[(usize, egui::Pos2)],
+        aircraft_points: &[(usize, egui::Pos2)],
         pointer: egui::Pos2,
         ctx: &egui::Context,
     ) -> bool {
@@ -39104,6 +39340,7 @@ impl ViewerApp {
             nearest_marker_within(community_points, pointer),
             nearest_marker_within(custom_poll_points, pointer),
             nearest_marker_within(raob_points, pointer),
+            nearest_marker_within(aircraft_points, pointer),
         ) {
             Some((MarkerFamily::Conus, index)) => {
                 let Some(site) = self.sites.get(index).cloned() else {
@@ -39175,6 +39412,13 @@ impl ViewerApp {
                 self.start_raob_sounding_for(site, None, ctx);
                 true
             }
+            Some((MarkerFamily::Aircraft, index)) => {
+                let Some(profile) = self.aircraft_profiles.get(index).cloned() else {
+                    return false;
+                };
+                self.start_aircraft_sounding_for(profile, ctx);
+                true
+            }
             None => false,
         }
     }
@@ -39207,6 +39451,7 @@ impl ViewerApp {
         community_points: &[(usize, egui::Pos2)],
         custom_poll_points: &[(usize, egui::Pos2)],
         raob_points: &[(usize, egui::Pos2)],
+        aircraft_points: &[(usize, egui::Pos2)],
         pointer: egui::Pos2,
         ctx: &egui::Context,
     ) {
@@ -39226,7 +39471,8 @@ impl ViewerApp {
                 .is_some()
             || nearest_marker_within(community_points, pointer).is_some()
             || nearest_marker_within(custom_poll_points, pointer).is_some()
-            || nearest_marker_within(raob_points, pointer).is_some();
+            || nearest_marker_within(raob_points, pointer).is_some()
+            || nearest_marker_within(aircraft_points, pointer).is_some();
         if !marker_hit {
             if let Some(report) = self.spc_report_at_position(rect, pointer) {
                 self.jump_to_storm_report(&report, ctx);
@@ -39250,6 +39496,7 @@ impl ViewerApp {
             community_points,
             custom_poll_points,
             raob_points,
+            aircraft_points,
             pointer,
             ctx,
         );
@@ -40844,6 +41091,9 @@ enum MarkerFamily {
     /// the topmost click target; outside that core it ranks after radar/feed
     /// markers.
     Raob,
+    /// Latest anonymous public MADIS profile at an airport (click opens the
+    /// native observed-sounding panel).
+    Aircraft,
 }
 
 fn site_is_terminal_radar(site: &RadarSite) -> bool {
@@ -43917,6 +44167,35 @@ fn raob_column_to_rw_sounding_data(
         ],
         read_ms: 0.0,
     })
+}
+
+fn aircraft_column_to_rw_sounding_data(
+    aircraft: &aircraft_soundings::AircraftProfile,
+    column: &rustwx_sounding::SoundingColumn,
+) -> std::result::Result<rw_ui::SoundingData, String> {
+    let surrogate_site = obs_soundings::RaobSite {
+        id: aircraft.airport.clone(),
+        name: "MADIS aircraft profile".to_owned(),
+        lat: aircraft.latitude,
+        lon: aircraft.longitude,
+        synop: None,
+    };
+    let mut data = raob_column_to_rw_sounding_data(
+        &surrogate_site,
+        aircraft.valid_time,
+        column,
+        String::new(),
+    )?;
+    data.hour.model = format!("{} MADIS aircraft", aircraft.airport);
+    data.hour.run = format!(
+        "{} {} - pressure derived from pressure altitude - {}",
+        aircraft.valid_time.format("%Y-%m-%d %H:%MZ"),
+        aircraft.direction_label(),
+        aircraft.source
+    );
+    data.lat = Some(aircraft.latitude);
+    data.lon = Some(aircraft.longitude);
+    Ok(data)
 }
 
 /// Light-by-default download spec: sounding profile, NO heavy ECAPE.
@@ -53632,13 +53911,25 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.spc_reports_enabled = false;
         app.app_settings.overlay_spc_reports = false;
-        app.spc_last_key = Some((app.spc_day, None));
+        app.spc_last_key = Some((app.spc_day, None, spc_layers::SpcDay1Issue::Auto));
 
         app.apply_unified_player_spc_reports_enabled_state(true);
 
         assert!(app.spc_reports_enabled);
         assert!(app.app_settings.overlay_spc_reports);
         assert_eq!(app.spc_last_key, None);
+    }
+
+    #[test]
+    fn spc_fetch_key_distinguishes_day1_issuance_without_affecting_auto() {
+        let date = Some((2026, 7, 19));
+        let auto: SpcFetchKey = (1, date, spc_layers::SpcDay1Issue::Auto);
+        let early: SpcFetchKey = (1, date, spc_layers::SpcDay1Issue::At0600);
+        let later: SpcFetchKey = (1, date, spc_layers::SpcDay1Issue::At1630);
+
+        assert_ne!(auto, early);
+        assert_ne!(early, later);
+        assert_eq!(auto, (1, date, spc_layers::SpcDay1Issue::Auto));
     }
 
     #[test]
@@ -60100,11 +60391,18 @@ mod tests {
         use MarkerFamily::*;
         // Nearest across families wins regardless of declaration order.
         assert_eq!(
-            resolve_marker_click(Some((1, 9.0)), Some((2, 4.0)), Some((3, 6.0)), None, None),
+            resolve_marker_click(
+                Some((1, 9.0)),
+                Some((2, 4.0)),
+                Some((3, 6.0)),
+                None,
+                None,
+                None,
+            ),
             Some((Intl, 2))
         );
         assert_eq!(
-            resolve_marker_click(Some((1, 9.0)), None, Some((3, 2.0)), None, None),
+            resolve_marker_click(Some((1, 9.0)), None, Some((3, 2.0)), None, None, None,),
             Some((Community, 3))
         );
         // Exact ties outside the RAOB diamond keep the historical
@@ -60115,19 +60413,23 @@ mod tests {
                 Some((2, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
                 Some((3, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
                 Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
-                Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1))
+                Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
+                None,
             ),
             Some((Conus, 1))
         );
         assert_eq!(
-            resolve_marker_click(None, Some((2, 5.0)), Some((3, 5.0)), None, None),
+            resolve_marker_click(None, Some((2, 5.0)), Some((3, 5.0)), None, None, None),
             Some((Intl, 2))
         );
         assert_eq!(
-            resolve_marker_click(None, None, None, Some((7, 2.0)), None),
+            resolve_marker_click(None, None, None, Some((7, 2.0)), None, None),
             Some((CustomPoll, 7))
         );
-        assert_eq!(resolve_marker_click(None, None, None, None, None), None);
+        assert_eq!(
+            resolve_marker_click(None, None, None, None, None, None),
+            None
+        );
     }
 
     /// A click inside the visible RAOB diamond selects it even when any
@@ -60142,6 +60444,7 @@ mod tests {
                 None,
                 None,
                 Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX)),
+                None,
             ),
             resolve_marker_click(
                 None,
@@ -60149,6 +60452,7 @@ mod tests {
                 None,
                 None,
                 Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX)),
+                None,
             ),
             resolve_marker_click(
                 None,
@@ -60156,6 +60460,7 @@ mod tests {
                 Some((3, 0.0)),
                 None,
                 Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX)),
+                None,
             ),
             resolve_marker_click(
                 None,
@@ -60163,6 +60468,7 @@ mod tests {
                 None,
                 Some((5, 0.0)),
                 Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX)),
+                None,
             ),
         ] {
             assert_eq!(overlap, Some((Raob, 4)));
@@ -60183,21 +60489,22 @@ mod tests {
                 None,
                 None,
                 Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
+                None,
             ),
             Some((Conus, 1))
         );
         // Nearest-marker behavior outside the core is otherwise unchanged.
         assert_eq!(
-            resolve_marker_click(Some((1, 2.0)), None, None, None, Some((4, 8.0))),
+            resolve_marker_click(Some((1, 2.0)), None, None, None, Some((4, 8.0)), None),
             Some((Conus, 1))
         );
         assert_eq!(
-            resolve_marker_click(Some((1, 9.0)), None, None, None, Some((4, 8.0))),
+            resolve_marker_click(Some((1, 9.0)), None, None, None, Some((4, 8.0)), None),
             Some((Raob, 4))
         );
         // An unaccompanied RAOB hit still resolves normally anywhere in its halo.
         assert_eq!(
-            resolve_marker_click(None, None, None, None, Some((4, 10.0))),
+            resolve_marker_click(None, None, None, None, Some((4, 10.0)), None),
             Some((Raob, 4))
         );
     }
@@ -60217,12 +60524,12 @@ mod tests {
         let pointer = egui::pos2(103.0, 100.0);
         let ctx = egui::Context::default();
 
-        app.handle_marker_click(&[], &[], &community_points, &[], &[], pointer, &ctx);
+        app.handle_marker_click(&[], &[], &community_points, &[], &[], &[], pointer, &ctx);
         assert_eq!(app.community_menu, Some(cluster_index));
         // The picker, not the poll, owns a cluster click.
         assert!(!app.poll_active);
 
-        app.handle_marker_click(&[], &[], &community_points, &[], &[], pointer, &ctx);
+        app.handle_marker_click(&[], &[], &community_points, &[], &[], &[], pointer, &ctx);
         assert_eq!(app.community_menu, None, "re-click toggles the picker");
 
         // A click elsewhere on the map dismisses an open picker.
@@ -60231,6 +60538,7 @@ mod tests {
             &[],
             &[],
             &community_points,
+            &[],
             &[],
             &[],
             egui::pos2(500.0, 500.0),
@@ -60260,6 +60568,7 @@ mod tests {
 
         app.handle_marker_click(
             &[(1, egui::pos2(100.0, 100.0))],
+            &[],
             &[],
             &[],
             &[],
@@ -60294,6 +60603,7 @@ mod tests {
             &[],
             &[],
             &custom_points,
+            &[],
             &[],
             egui::pos2(101.0, 100.0),
             &ctx,
@@ -66809,6 +67119,7 @@ mod tests {
             spc_kinds_memory: Vec::new(),
             spc_reports_enabled: false,
             spc_day: 1,
+            spc_day1_issue: spc_layers::SpcDay1Issue::Auto,
             spc_last_key: None,
             glm: None,
             glm_secondary: None,
@@ -66840,6 +67151,13 @@ mod tests {
             raob_sites_rx: None,
             raob_sites_fetch_attempted: false,
             raob_markers_enabled: false,
+            aircraft_profiles: Vec::new(),
+            aircraft_profiles_rx: None,
+            aircraft_profiles_next_poll: None,
+            aircraft_profiles_file: None,
+            aircraft_profiles_status: String::new(),
+            aircraft_soundings_enabled: false,
+            river_gauges: river_gauges::RiverGaugeState::default(),
             obs_enabled: false,
             obs_show_metar: true,
             obs_show_mesonet: true,
@@ -68085,12 +68403,22 @@ mod tests {
         let pointer = rect.center();
         let ctx = egui::Context::default();
 
-        app.handle_plain_map_click(rect, &[], &[], &[], &[], &[], pointer, &ctx);
+        app.handle_plain_map_click(rect, &[], &[], &[], &[], &[], &[], pointer, &ctx);
 
         assert_eq!(app.status, "No radar within 460 km of that event");
 
         app.status.clear();
-        app.handle_plain_map_click(rect, &[(0, pointer)], &[], &[], &[], &[], pointer, &ctx);
+        app.handle_plain_map_click(
+            rect,
+            &[(0, pointer)],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            pointer,
+            &ctx,
+        );
 
         assert_eq!(app.status, "");
     }
@@ -68107,7 +68435,7 @@ mod tests {
         let (expected_lon, expected_lat) = app.screen_to_lon_lat(rect, pointer);
         let ctx = egui::Context::default();
 
-        app.handle_plain_map_click(rect, &[], &[], &[], &[], &[], pointer, &ctx);
+        app.handle_plain_map_click(rect, &[], &[], &[], &[], &[], &[], pointer, &ctx);
 
         let marker = app.coordinate_marker.expect("empty click drops marker");
         assert!((marker.lat - expected_lat).abs() < 0.001);
@@ -68129,7 +68457,7 @@ mod tests {
         let pointer = rect.center() + egui::vec2(42.0, -26.0);
         let ctx = egui::Context::default();
 
-        app.handle_plain_map_click(rect, &[], &[], &[], &[], &[], pointer, &ctx);
+        app.handle_plain_map_click(rect, &[], &[], &[], &[], &[], &[], pointer, &ctx);
 
         assert_eq!(app.coordinate_marker, None);
         assert_eq!(app.place_search_query, "");
@@ -69638,6 +69966,44 @@ mod tests {
             "a genuinely new model sounding still spawns its compute"
         );
         assert_eq!(app.sounding_viewer_source, SoundingViewerSource::Model);
+    }
+
+    #[test]
+    fn madis_aircraft_request_owns_native_panel_over_stale_model_work() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let (stale_sender, stale_receiver) =
+            mpsc::channel::<std::result::Result<NativeSoundingResult, String>>();
+        app.native_sounding_rx = Some(stale_receiver);
+        app.sounding_viewer_source = SoundingViewerSource::Model;
+        app.last_sounding_request = Some(17);
+
+        let aircraft_sender =
+            app.begin_observed_sounding_request("MADIS aircraft profile STL ascent", &ctx);
+
+        assert!(stale_sender.send(Ok((None, 0.0, None))).is_err());
+        assert_eq!(app.sounding_viewer_source, SoundingViewerSource::NativeOnly);
+        assert!(app.last_sounding_request.is_none());
+        assert!(app.status.contains("MADIS aircraft profile STL ascent"));
+
+        let mut aircraft_data = test_model_sounding_data();
+        aircraft_data.hour.model = "STL MADIS aircraft".to_owned();
+        let aircraft_column = rw_ui::skewt::build_sounding_column(&aircraft_data)
+            .expect("test aircraft sounding column");
+        let aircraft_native = rustwx_sounding::NativeSounding::from_column(&aircraft_column)
+            .expect("test aircraft native analysis");
+        aircraft_sender
+            .send(Ok((
+                Some(aircraft_native),
+                1.0,
+                Some((aircraft_data, aircraft_column)),
+            )))
+            .expect("deliver synthetic MADIS aircraft sounding");
+        app.poll_native_sounding(&ctx);
+
+        assert!(app.native_sounding_rx.is_none());
+        assert!(app.native_sounding_panel.has_content());
+        assert_eq!(app.sounding_viewer_source, SoundingViewerSource::NativeOnly);
     }
 
     /// The real owner repro differs from the source-enum-only case above:

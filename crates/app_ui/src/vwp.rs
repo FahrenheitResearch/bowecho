@@ -46,6 +46,15 @@ pub(crate) struct VwpPanelAction {
     pub(crate) save_csv_requested: bool,
 }
 
+/// The operator-selected storm-motion vector used by SRV and related tools.
+/// Keeping it separate from the retrieved environmental profile prevents the
+/// VWP from presenting a user setting as a measured wind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VwpMotionVector {
+    pub(crate) direction_deg: f32,
+    pub(crate) speed_kt: f32,
+}
+
 /// Decoder-neutral quality for an imported NEXRAD Level III Product 48 wind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Product48DisplayQuality {
@@ -167,7 +176,11 @@ impl VwpPanelState {
     }
 
     /// Render the pane body and return work for the owning application.
-    pub(crate) fn ui(&self, ui: &mut egui::Ui) -> VwpPanelAction {
+    pub(crate) fn ui(
+        &self,
+        ui: &mut egui::Ui,
+        storm_motion: Option<VwpMotionVector>,
+    ) -> VwpPanelAction {
         let mut action = VwpPanelAction::default();
         let plot = self.profile.as_ref().map(PlotProfile::from_panel);
 
@@ -251,7 +264,7 @@ impl VwpPanelState {
                     .color(ui.visuals().weak_text_color()),
                 );
             }
-            (PanelStatus::Ready, Some(plot)) => profile_body(ui, &plot),
+            (PanelStatus::Ready, Some(plot)) => profile_body(ui, &plot, storm_motion),
         }
 
         action
@@ -284,7 +297,7 @@ fn experimental_banner(ui: &mut egui::Ui) {
         });
 }
 
-fn profile_body(ui: &mut egui::Ui, profile: &PlotProfile) {
+fn profile_body(ui: &mut egui::Ui, profile: &PlotProfile, storm_motion: Option<VwpMotionVector>) {
     ui.horizontal_wrapped(|ui| {
         ui.label(&profile.source_label);
         if let Some(detail) = &profile.detail_label {
@@ -323,6 +336,7 @@ fn profile_body(ui: &mut egui::Ui, profile: &PlotProfile) {
     }
     ui.add_space(5.0);
     quality_summary(ui, profile);
+    wind_parameter_summary(ui, profile, storm_motion);
     ui.add_space(6.0);
 
     let wide = ui.available_width() >= WIDE_LAYOUT_MIN_WIDTH;
@@ -334,12 +348,12 @@ fn profile_body(ui: &mut egui::Ui, profile: &PlotProfile) {
                 let chart_height = available_height.clamp(MIN_CHART_HEIGHT, MAX_CHART_HEIGHT);
                 ui.columns(2, |columns| {
                     profile_chart(&mut columns[0], profile, chart_height);
-                    hodograph_chart(&mut columns[1], profile, chart_height);
+                    hodograph_chart(&mut columns[1], profile, storm_motion, chart_height);
                 });
             } else {
                 profile_chart(ui, profile, NARROW_CHART_HEIGHT);
                 ui.add_space(8.0);
-                hodograph_chart(ui, profile, NARROW_CHART_HEIGHT);
+                hodograph_chart(ui, profile, storm_motion, NARROW_CHART_HEIGHT);
             }
         });
 }
@@ -368,15 +382,67 @@ fn quality_summary(ui: &mut egui::Ui, profile: &PlotProfile) {
     });
 }
 
+fn wind_parameter_summary(
+    ui: &mut egui::Ui,
+    profile: &PlotProfile,
+    storm_motion: Option<VwpMotionVector>,
+) {
+    let Some(lowest) = lowest_retrieved_vector(profile) else {
+        return;
+    };
+    let mean_0_6 = mean_retrieved_vector(profile, 6_000.0);
+
+    ui.horizontal_wrapped(|ui| {
+        if let Some((direction, speed_kt)) = mean_0_6.map(vector_direction_speed_kt) {
+            ui.label(format!("0-6 km level-mean {direction:03.0}/{speed_kt:.0} kt"))
+                .on_hover_text(
+                    "Component mean of the retrieved VWP winds through 6 km AGL; this is not a pressure- or density-weighted model mean wind",
+                );
+        }
+        for (height_m, label) in [
+            (1_000.0, "0-1 km shear"),
+            (3_000.0, "0-3 km shear"),
+            (6_000.0, "0-6 km shear"),
+        ] {
+            if let Some(upper) = retrieved_vector_at_height(profile, height_m) {
+                let speed_kt = (upper - lowest).length() * MPS_TO_KT;
+                ui.separator();
+                ui.label(format!("{label} {speed_kt:.0} kt")).on_hover_text(
+                    "Bulk vector difference from the lowest accepted VWP level to the named height; the VWP normally begins near 250 m AGL",
+                );
+            }
+        }
+        if let Some(motion) = storm_motion.filter(valid_motion_vector) {
+            ui.separator();
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "SRV motion {:03.0}/{:.0} kt",
+                    motion.direction_deg.rem_euclid(360.0),
+                    motion.speed_kt
+                ),
+            )
+            .on_hover_text(
+                "The operator-selected storm-motion vector used by storm-relative velocity; plotted as a diamond on the hodograph",
+            );
+        }
+    });
+}
+
 fn profile_chart(ui: &mut egui::Ui, profile: &PlotProfile, height: f32) {
     chart_frame(ui, "PROFILE - km AGL", height, |ui, rect, response| {
         draw_profile_chart(ui, rect, response, profile);
     });
 }
 
-fn hodograph_chart(ui: &mut egui::Ui, profile: &PlotProfile, height: f32) {
+fn hodograph_chart(
+    ui: &mut egui::Ui,
+    profile: &PlotProfile,
+    storm_motion: Option<VwpMotionVector>,
+    height: f32,
+) {
     chart_frame(ui, "HODOGRAPH - knots", height, |ui, rect, _response| {
-        draw_hodograph(ui, rect, profile);
+        draw_hodograph(ui, rect, profile, storm_motion);
     });
 }
 
@@ -635,7 +701,12 @@ fn level_hover_ui(ui: &mut egui::Ui, level: &PlotLevel) {
     }
 }
 
-fn draw_hodograph(ui: &mut egui::Ui, rect: egui::Rect, profile: &PlotProfile) {
+fn draw_hodograph(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    profile: &PlotProfile,
+    storm_motion: Option<VwpMotionVector>,
+) {
     let visuals = ui.visuals().clone();
     let painter = ui.painter_at(rect);
     let winds = profile
@@ -654,7 +725,12 @@ fn draw_hodograph(ui: &mut egui::Ui, rect: egui::Rect, profile: &PlotProfile) {
         .iter()
         .map(|(_, wind)| wind.speed_mps * MPS_TO_KT)
         .filter(|speed| speed.is_finite())
-        .fold(0.0_f32, f32::max);
+        .fold(0.0_f32, f32::max)
+        .max(
+            storm_motion
+                .filter(valid_motion_vector)
+                .map_or(0.0, |motion| motion.speed_kt),
+        );
     let ring_step_kt = if maximum_wind_kt <= 40.0 {
         10.0
     } else if maximum_wind_kt <= 80.0 {
@@ -757,6 +833,37 @@ fn draw_hodograph(ui: &mut egui::Ui, rect: egui::Rect, profile: &PlotProfile) {
         painter.circle_filled(wind_position(wind), 2.8, color);
     }
 
+    if let Some(motion) = storm_motion.filter(valid_motion_vector) {
+        let direction_rad = motion.direction_deg.to_radians();
+        let u_kt = -motion.speed_kt * direction_rad.sin();
+        let v_kt = -motion.speed_kt * direction_rad.cos();
+        let position = center + egui::vec2(u_kt / scale_kt * radius, -v_kt / scale_kt * radius);
+        let color = visuals.warn_fg_color;
+        painter.line_segment([center, position], egui::Stroke::new(1.3, color));
+        let diamond = [
+            position + egui::vec2(0.0, -5.0),
+            position + egui::vec2(5.0, 0.0),
+            position + egui::vec2(0.0, 5.0),
+            position + egui::vec2(-5.0, 0.0),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            diamond.to_vec(),
+            color,
+            egui::Stroke::new(1.0, visuals.extreme_bg_color),
+        ));
+        painter.text(
+            position + egui::vec2(7.0, -7.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!(
+                "SRV {:03.0}/{:.0}",
+                motion.direction_deg.rem_euclid(360.0),
+                motion.speed_kt
+            ),
+            egui::FontId::monospace(9.0),
+            color,
+        );
+    }
+
     if maximum_wind_kt <= f32::EPSILON {
         painter.text(
             center,
@@ -766,6 +873,76 @@ fn draw_hodograph(ui: &mut egui::Ui, rect: egui::Rect, profile: &PlotProfile) {
             weak,
         );
     }
+}
+
+fn valid_motion_vector(motion: &VwpMotionVector) -> bool {
+    motion.direction_deg.is_finite() && motion.speed_kt.is_finite() && motion.speed_kt >= 0.0
+}
+
+fn lowest_retrieved_vector(profile: &PlotProfile) -> Option<egui::Vec2> {
+    profile
+        .levels
+        .iter()
+        .find_map(|level| match &level.outcome {
+            PlotOutcome::Retrieved(wind) => Some(egui::vec2(wind.u_mps, wind.v_mps)),
+            PlotOutcome::Rejected { .. } => None,
+        })
+}
+
+fn retrieved_vector_at_height(profile: &PlotProfile, target_height_m: f32) -> Option<egui::Vec2> {
+    let winds = profile
+        .levels
+        .iter()
+        .filter_map(|level| match &level.outcome {
+            PlotOutcome::Retrieved(wind) => Some((
+                level.target_height_m_agl,
+                egui::vec2(wind.u_mps, wind.v_mps),
+            )),
+            PlotOutcome::Rejected { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    for pair in winds.windows(2) {
+        let (lower_height, lower) = pair[0];
+        let (upper_height, upper) = pair[1];
+        if target_height_m < lower_height || target_height_m > upper_height {
+            continue;
+        }
+        // Do not silently interpolate through a deep rejected layer.
+        if upper_height - lower_height > 1_000.0 {
+            return None;
+        }
+        let fraction = if upper_height > lower_height {
+            (target_height_m - lower_height) / (upper_height - lower_height)
+        } else {
+            0.0
+        };
+        return Some(lower + (upper - lower) * fraction);
+    }
+    winds
+        .into_iter()
+        .find(|(height, _)| (*height - target_height_m).abs() <= 1.0)
+        .map(|(_, wind)| wind)
+}
+
+fn mean_retrieved_vector(profile: &PlotProfile, maximum_height_m: f32) -> Option<egui::Vec2> {
+    let (sum, count) = profile
+        .levels
+        .iter()
+        .filter(|level| level.target_height_m_agl <= maximum_height_m)
+        .filter_map(|level| match &level.outcome {
+            PlotOutcome::Retrieved(wind) => Some(egui::vec2(wind.u_mps, wind.v_mps)),
+            PlotOutcome::Rejected { .. } => None,
+        })
+        .fold((egui::Vec2::ZERO, 0_u32), |(sum, count), wind| {
+            (sum + wind, count + 1)
+        });
+    (count >= 2).then(|| sum / count as f32)
+}
+
+fn vector_direction_speed_kt(vector: egui::Vec2) -> (f32, f32) {
+    let speed_mps = vector.length();
+    let direction_deg = (-vector.x).atan2(-vector.y).to_degrees().rem_euclid(360.0);
+    (direction_deg, speed_mps * MPS_TO_KT)
 }
 
 fn height_color(fraction: f32) -> egui::Color32 {
@@ -1190,5 +1367,57 @@ mod tests {
         state.begin_compute("computing");
         state.clear();
         assert!(state.export_csv().is_none());
+    }
+
+    fn parameter_test_profile(levels: &[(f32, f32, f32)]) -> PlotProfile {
+        PlotProfile {
+            site_id: "KTLX".to_owned(),
+            valid_time: Utc.timestamp_millis_opt(0).single().unwrap(),
+            radar_elevation_m: None,
+            source_label: "test".to_owned(),
+            detail_label: None,
+            product48_metadata: None,
+            levels: levels
+                .iter()
+                .map(|(height, u_mps, v_mps)| PlotLevel {
+                    target_height_m_agl: *height,
+                    outcome: PlotOutcome::Retrieved(PlotWind {
+                        height_m_msl: None,
+                        u_mps: *u_mps,
+                        v_mps: *v_mps,
+                        direction_deg: 0.0,
+                        speed_mps: u_mps.hypot(*v_mps),
+                        rms_mps: None,
+                        product48_divergence: None,
+                        quality: PlotQuality::Good,
+                        samples_used: None,
+                        azimuth_sectors: None,
+                        max_azimuth_gap_deg: None,
+                        slant_range_m: None,
+                        elevation_deg: None,
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn vwp_parameter_vectors_interpolate_components_and_report_direction() {
+        let profile =
+            parameter_test_profile(&[(250.0, 0.0, 5.0), (750.0, 5.0, 5.0), (1_250.0, 10.0, 5.0)]);
+
+        let at_one_km = retrieved_vector_at_height(&profile, 1_000.0).unwrap();
+        assert!((at_one_km.x - 7.5).abs() < 0.001);
+        assert!((at_one_km.y - 5.0).abs() < 0.001);
+        let (direction, speed_kt) = vector_direction_speed_kt(egui::vec2(0.0, 10.0));
+        assert!((direction - 180.0).abs() < 0.001);
+        assert!((speed_kt - 19.438_444).abs() < 0.001);
+    }
+
+    #[test]
+    fn vwp_parameter_vectors_do_not_bridge_deep_qc_gaps() {
+        let profile = parameter_test_profile(&[(250.0, 0.0, 5.0), (2_000.0, 10.0, 5.0)]);
+
+        assert!(retrieved_vector_at_height(&profile, 1_000.0).is_none());
     }
 }
