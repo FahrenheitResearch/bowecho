@@ -1047,9 +1047,17 @@ impl ViewerApp {
         let layout = hazard_popup_layout(map_rect, anchor, cards.len());
         let global = self.style_registry.hazard_global().clone();
         let archive_timeline = self.event_loop_hazard_window.is_some();
+        let time_zone = self.time_zone();
+        let heading = if archive_timeline {
+            self.active_loop_timeline_scan_time_utc().map_or_else(
+                || "Warnings at selected time".to_owned(),
+                |time| format!("Warnings at {}", time_zone.format_hm(time)),
+            )
+        } else {
+            "Current warnings".to_owned()
+        };
         let now = Utc::now();
         let mut close_all = false;
-        let mut dismiss_id = None::<String>;
         let mut details_index = None::<usize>;
         #[cfg(test)]
         let mut layout_probe = HazardMapPopupLayoutProbe::default();
@@ -1073,7 +1081,7 @@ impl ViewerApp {
                                     .max(72.0);
                             ui.add_sized(
                                 [heading_width, ui.spacing().interact_size.y],
-                                egui::Label::new(egui::RichText::new("Current warnings").strong()),
+                                egui::Label::new(egui::RichText::new(&heading).strong()),
                             );
                             if ui
                                 .small_button("X")
@@ -1092,7 +1100,7 @@ impl ViewerApp {
                                 let scroll_width = ui.available_width().max(112.0);
                                 ui.set_min_width(scroll_width);
                                 ui.set_max_width(scroll_width);
-                                for (card_number, (index, event_id, record, style)) in
+                                for (card_number, (index, _event_id, record, style)) in
                                     cards.iter().enumerate()
                                 {
                                     if card_number > 0 {
@@ -1114,40 +1122,28 @@ impl ViewerApp {
                                             ui.set_width(card_width);
                                             ui.set_min_width(card_width);
                                             ui.set_max_width(card_width);
-                                            ui.horizontal(|ui| {
-                                                let title_width = (ui.available_width()
-                                                    - 26.0
-                                                    - ui.spacing().item_spacing.x)
-                                                    .max(64.0);
-                                                let _title = ui
-                                                    .vertical(|ui| {
-                                                        ui.set_width(title_width);
-                                                        ui.set_min_width(title_width);
-                                                        ui.set_max_width(title_width);
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                egui::RichText::new(
-                                                                    hazard_popup_title(record),
-                                                                )
-                                                                .strong()
-                                                                .size(15.0),
+                                            let title_width = ui.available_width().max(64.0);
+                                            let _title = ui
+                                                .vertical(|ui| {
+                                                    ui.set_width(title_width);
+                                                    ui.set_min_width(title_width);
+                                                    ui.set_max_width(title_width);
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(
+                                                                hazard_popup_title(record),
                                                             )
-                                                            .wrap(),
+                                                            .strong()
+                                                            .size(15.0),
                                                         )
-                                                    })
-                                                    .inner;
-                                                #[cfg(test)]
-                                                if card_number == 0 {
-                                                    layout_probe.title = Some(_title.rect);
-                                                }
-                                                if ui
-                                                    .small_button("X")
-                                                    .on_hover_text("Dismiss this warning")
-                                                    .clicked()
-                                                {
-                                                    dismiss_id = Some(event_id.clone());
-                                                }
-                                            });
+                                                        .wrap(),
+                                                    )
+                                                })
+                                                .inner;
+                                            #[cfg(test)]
+                                            if card_number == 0 {
+                                                layout_probe.title = Some(_title.rect);
+                                            }
                                             let metrics = hazard_popup_metric_lines(record);
                                             for metric in metrics {
                                                 let _response = ui.label(&metric);
@@ -1164,6 +1160,7 @@ impl ViewerApp {
                                                 record,
                                                 now,
                                                 archive_timeline,
+                                                time_zone,
                                             );
                                             let office = hazard_popup_office(record);
                                             if !office.is_empty() {
@@ -1261,13 +1258,6 @@ impl ViewerApp {
         }
         if close_all {
             self.hazard_map_popup = None;
-        } else if let Some(dismiss_id) = dismiss_id
-            && let Some(popup) = self.hazard_map_popup.as_mut()
-        {
-            popup.event_ids.retain(|event_id| event_id != &dismiss_id);
-            if popup.event_ids.is_empty() {
-                self.hazard_map_popup = None;
-            }
         }
         if let Some(index) = details_index {
             self.select_hazard_index(index);
@@ -2013,14 +2003,15 @@ fn hazard_popup_expiry_text(
     record: &HazardRecord,
     now: DateTime<Utc>,
     archive_timeline: bool,
+    time_zone: DisplayTimeZone,
 ) -> String {
     let Some(end) = parse_hazard_record_time(&record.valid_end) else {
         return "Valid time unavailable".to_owned();
     };
-    let clock = end.format("%H:%MZ");
     if archive_timeline {
-        return format!("Valid until {} {clock}", end.format("%Y-%m-%d"));
+        return format!("Valid until {}", time_zone.format_date_hm(end));
     }
+    let clock = time_zone.format_hm(end);
     let seconds = (end - now).num_seconds();
     if seconds >= 0 {
         let minutes = (seconds + 59) / 60;
@@ -2068,12 +2059,10 @@ fn paint_hazard_popup_card_border(
             );
         }
         dash => {
-            let points = vec![
-                inset.left_top(),
-                inset.right_top(),
-                inset.right_bottom(),
-                inset.left_bottom(),
-            ];
+            // Follow the card's rounded silhouette. The old square path met
+            // the inset top accent at different coordinates, leaving the
+            // dashed/dotted side rails visibly short of the top edge.
+            let points = hazard_popup_card_outline(rect, stroke.width);
             let mut shapes = Vec::new();
             match dash {
                 styles::DashPattern::Solid => unreachable!("solid handled above"),
@@ -2102,7 +2091,7 @@ fn paint_hazard_popup_card_border(
             painter.extend(shapes);
         }
     }
-    if let Some(accent) = hazard_popup_card_top_accent(rect) {
+    if let Some(accent) = hazard_popup_card_top_accent(rect, stroke.width) {
         painter.line_segment(accent, egui::Stroke::new(3.0_f32, color));
     }
 }
@@ -2114,16 +2103,104 @@ const HAZARD_POPUP_CARD_RADIUS: u8 = 4;
 /// A rectangular strip spanning `rect.left()..=rect.right()` protrudes at the
 /// two top corners because the card itself does not occupy those pixels.  The
 /// rule therefore runs only between the rounded-rectangle tangent points.
-fn hazard_popup_card_top_accent(rect: egui::Rect) -> Option<[egui::Pos2; 2]> {
-    let radius = f32::from(HAZARD_POPUP_CARD_RADIUS);
-    if rect.width() <= radius * 2.0 || rect.height() < 3.0 {
+fn hazard_popup_card_top_accent(rect: egui::Rect, stroke_width: f32) -> Option<[egui::Pos2; 2]> {
+    let inset = rect.shrink(stroke_width.max(0.0) * 0.5);
+    let radius = (f32::from(HAZARD_POPUP_CARD_RADIUS) - stroke_width.max(0.0) * 0.5)
+        .max(0.0)
+        .min(inset.width() * 0.5)
+        .min(inset.height() * 0.5);
+    if inset.width() <= radius * 2.0 || inset.height() <= 0.0 {
         return None;
     }
-    let y = rect.top() + 1.5;
     Some([
-        egui::pos2(rect.left() + radius, y),
-        egui::pos2(rect.right() - radius, y),
+        egui::pos2(inset.left() + radius, inset.top()),
+        egui::pos2(inset.right() - radius, inset.top()),
     ])
+}
+
+/// Clockwise rounded-rectangle centerline used by dashed/dotted warning
+/// cards. Its first two points are exactly the top-accent endpoints, so the
+/// side outline and emphasized top rule share one continuous geometry.
+fn hazard_popup_card_outline(rect: egui::Rect, stroke_width: f32) -> Vec<egui::Pos2> {
+    let inset = rect.shrink(stroke_width.max(0.0) * 0.5);
+    if inset.width() <= 0.0 || inset.height() <= 0.0 {
+        return Vec::new();
+    }
+    let radius = (f32::from(HAZARD_POPUP_CARD_RADIUS) - stroke_width.max(0.0) * 0.5)
+        .max(0.0)
+        .min(inset.width() * 0.5)
+        .min(inset.height() * 0.5);
+    if radius <= f32::EPSILON {
+        return vec![
+            inset.left_top(),
+            inset.right_top(),
+            inset.right_bottom(),
+            inset.left_bottom(),
+        ];
+    }
+
+    const ARC_STEPS: usize = 4;
+    let mut points = Vec::with_capacity(ARC_STEPS * 4 + 4);
+
+    points.push(egui::pos2(inset.left() + radius, inset.top()));
+    points.push(egui::pos2(inset.right() - radius, inset.top()));
+    push_hazard_popup_card_arc(
+        &mut points,
+        egui::pos2(inset.right() - radius, inset.top() + radius),
+        -std::f32::consts::FRAC_PI_2,
+        0.0,
+        radius,
+        ARC_STEPS,
+        true,
+    );
+    points.push(egui::pos2(inset.right(), inset.bottom() - radius));
+    push_hazard_popup_card_arc(
+        &mut points,
+        egui::pos2(inset.right() - radius, inset.bottom() - radius),
+        0.0,
+        std::f32::consts::FRAC_PI_2,
+        radius,
+        ARC_STEPS,
+        true,
+    );
+    points.push(egui::pos2(inset.left() + radius, inset.bottom()));
+    push_hazard_popup_card_arc(
+        &mut points,
+        egui::pos2(inset.left() + radius, inset.bottom() - radius),
+        std::f32::consts::FRAC_PI_2,
+        std::f32::consts::PI,
+        radius,
+        ARC_STEPS,
+        true,
+    );
+    points.push(egui::pos2(inset.left(), inset.top() + radius));
+    push_hazard_popup_card_arc(
+        &mut points,
+        egui::pos2(inset.left() + radius, inset.top() + radius),
+        std::f32::consts::PI,
+        std::f32::consts::PI * 1.5,
+        radius,
+        ARC_STEPS,
+        false,
+    );
+    points
+}
+
+fn push_hazard_popup_card_arc(
+    points: &mut Vec<egui::Pos2>,
+    center: egui::Pos2,
+    start: f32,
+    end: f32,
+    radius: f32,
+    steps: usize,
+    include_end: bool,
+) {
+    let last = if include_end { steps + 1 } else { steps };
+    for step in 1..last {
+        let fraction = step as f32 / steps as f32;
+        let angle = start + (end - start) * fraction;
+        points.push(center + egui::vec2(angle.cos(), angle.sin()) * radius);
+    }
 }
 
 /// `hazard_geom::format_utc_seconds` output ("2026-07-08T22:45:00Z") →
@@ -2360,7 +2437,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_countdown_is_live_but_archive_is_absolute() {
+    fn expiry_countdown_and_archive_clock_honor_display_time_zone() {
         let record = popup_test_record(
             "KTLX.SV.W.0001",
             "severe thunderstorm",
@@ -2372,12 +2449,20 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 15, 20, 16, 0).unwrap();
 
         assert_eq!(
-            hazard_popup_expiry_text(&record, now, false),
+            hazard_popup_expiry_text(&record, now, false, DisplayTimeZone::Utc),
             "Expires in 14 min · 20:30Z"
         );
         assert_eq!(
-            hazard_popup_expiry_text(&record, now, true),
+            hazard_popup_expiry_text(&record, now, true, DisplayTimeZone::Utc),
             "Valid until 2026-07-15 20:30Z"
+        );
+        assert_eq!(
+            hazard_popup_expiry_text(&record, now, false, DisplayTimeZone::Eastern),
+            "Expires in 14 min · 16:30 EDT"
+        );
+        assert_eq!(
+            hazard_popup_expiry_text(&record, now, true, DisplayTimeZone::Eastern),
+            "Valid until 2026-07-15 16:30 EDT"
         );
     }
 
@@ -2400,19 +2485,27 @@ mod tests {
     #[test]
     fn popup_card_top_accent_stays_inside_rounded_corner_tangents() {
         let rect = egui::Rect::from_min_max(egui::pos2(9.0, 20.0), egui::pos2(292.0, 120.0));
-        let [left, right] =
-            hazard_popup_card_top_accent(rect).expect("normal warning card has a top accent");
+        let stroke_width = 3.0;
+        let [left, right] = hazard_popup_card_top_accent(rect, stroke_width)
+            .expect("normal warning card has a top accent");
         let radius = f32::from(HAZARD_POPUP_CARD_RADIUS);
 
         assert_eq!(left.x, rect.left() + radius);
         assert_eq!(right.x, rect.right() - radius);
         assert_eq!(left.y, rect.top() + 1.5);
         assert_eq!(right.y, left.y);
+        let outline = hazard_popup_card_outline(rect, stroke_width);
+        assert_eq!(outline.first().copied(), Some(left));
+        assert_eq!(outline.get(1).copied(), Some(right));
         assert!(
-            hazard_popup_card_top_accent(egui::Rect::from_min_size(
-                rect.min,
-                egui::vec2(radius * 2.0, 2.0),
-            ))
+            outline.iter().all(|point| rect.contains(*point)),
+            "rounded dashed outline must remain inside the card"
+        );
+        assert!(
+            hazard_popup_card_top_accent(
+                egui::Rect::from_min_size(rect.min, egui::vec2(radius * 2.0, 2.0),),
+                stroke_width
+            )
             .is_none()
         );
     }

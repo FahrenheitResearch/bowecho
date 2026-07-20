@@ -3241,6 +3241,10 @@ struct ViewerApp {
     /// Archive-window warning load requested but not installed yet. Keep the
     /// current overlay/window visible until the replacement is complete.
     pending_event_loop_hazard_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The warning timeline was entered automatically because an operator is
+    /// browsing an older frame in a live-follow history. Returning to the
+    /// newest frame releases this temporary ownership back to live warnings.
+    historical_frame_warning_sync: bool,
     /// GLM lightning layer (in-process rw-glm follow + time-synced draw).
     glm: Option<glm_layer::GlmWorker>,
     glm_secondary: Option<glm_layer::GlmWorker>,
@@ -7937,6 +7941,18 @@ impl DisplayTimeZone {
         )
     }
 
+    fn format_date_hm(self, time_utc: DateTime<Utc>) -> String {
+        if self == Self::Utc {
+            return time_utc.format("%Y-%m-%d %H:%MZ").to_string();
+        }
+        let local = time_utc.with_timezone(&self.fixed_offset(time_utc));
+        format!(
+            "{} {}",
+            local.format("%Y-%m-%d %H:%M"),
+            self.abbreviation(time_utc)
+        )
+    }
+
     fn format_date_hms(self, time_utc: DateTime<Utc>) -> String {
         if self == Self::Utc {
             return time_utc.format("%Y-%m-%d %H:%M:%S UTC").to_string();
@@ -8890,6 +8906,7 @@ impl ViewerApp {
             sweep_controls_open: false,
             event_loop_hazard_window: None,
             pending_event_loop_hazard_window: None,
+            historical_frame_warning_sync: false,
             glm_enabled: restored_overlays.3,
             oa_rx: None,
             oa_last_summary: None,
@@ -9089,6 +9106,7 @@ impl ViewerApp {
         if self.hazard_receiver.is_some() {
             return;
         }
+        self.historical_frame_warning_sync = false;
         self.event_loop_hazard_window = None;
         self.pending_event_loop_hazard_window = None;
         let query_time_utc = Utc::now();
@@ -9161,6 +9179,7 @@ impl ViewerApp {
                     || overlay.source_label.contains("window")
             });
         self.unified_player.auto_sync_warnings = false;
+        self.historical_frame_warning_sync = false;
         self.event_loop_hazard_window = None;
         self.pending_event_loop_hazard_window = None;
         self.hazards_active_only = true;
@@ -11359,6 +11378,7 @@ impl ViewerApp {
     /// the replacement window lands because its own timeline window continues
     /// to gate every polygon.
     fn arm_archive_timeline_warning_sync(&mut self) {
+        self.historical_frame_warning_sync = false;
         self.hazard_receiver = None;
         self.pending_event_loop_hazard_window = None;
         self.last_live_hazard_refresh = None;
@@ -22770,6 +22790,7 @@ impl ViewerApp {
         let Some((start_utc, end_utc)) = self.loaded_loop_time_window() else {
             return "Load a radar loop first".to_owned();
         };
+        self.historical_frame_warning_sync = false;
         self.hazards_visible = true;
         self.hazards_active_only = false;
         self.live_hazard_auto_refresh = false;
@@ -22819,6 +22840,100 @@ impl ViewerApp {
             })
     }
 
+    /// A live-follow history is historical only while playback is walking the
+    /// loop or its displayed cursor is behind the newest decoded frame. This
+    /// is independent from `cursor.browsing`: several selectors update that
+    /// latch after installing the volume, while the index already identifies
+    /// the correct displayed frame.
+    fn active_loop_timeline_is_historical_live_view(&self) -> bool {
+        if !self.active_loop_timeline_is_live_follow() {
+            return false;
+        }
+        let target = self.active_loop_timeline_target();
+        let Some(frame_count) = self
+            .loop_timeline_frames_for_target(target)
+            .map(<[FrameHistoryEntry]>::len)
+        else {
+            return false;
+        };
+        let (index, playing) = match target {
+            LoopTimelineTarget::Primary => (self.primary.cursor.index, self.primary.cursor.playing),
+            LoopTimelineTarget::ExtraPane(slot) => {
+                let Some(pane) = self.extra_panes.get(slot) else {
+                    return false;
+                };
+                (pane.engine.cursor.index, pane.engine.cursor.playing)
+            }
+        };
+        playing || index.saturating_add(1) < frame_count
+    }
+
+    fn pending_timeline_warning_window_covers_window(
+        &self,
+        loop_window: &(DateTime<Utc>, DateTime<Utc>),
+    ) -> bool {
+        let (target_start, target_end) = loop_window;
+        self.pending_event_loop_hazard_window
+            .is_some_and(|(start, end)| start <= *target_start && end >= *target_end)
+    }
+
+    /// Live radar normally owns current warnings. Temporarily switch to the
+    /// NWS archive product only while the user is looking at an older frame,
+    /// then return to the authoritative live feed at the newest frame.
+    fn maybe_sync_historical_live_frame_warnings(&mut self, ctx: &egui::Context) -> bool {
+        if !self.active_loop_timeline_is_live_follow() {
+            return false;
+        }
+        if !self.active_loop_timeline_is_historical_live_view() {
+            if self.historical_frame_warning_sync {
+                self.release_timeline_warning_sync(ctx);
+                self.unified_player
+                    .mark_status("Newest radar frame selected; warnings returned to current mode");
+            }
+            return true;
+        }
+        if !self.hazards_visible || !self.warning_source_supports_timeline() {
+            if self.historical_frame_warning_sync {
+                self.release_timeline_warning_sync(ctx);
+            }
+            return true;
+        }
+        let Some(window) = self.loaded_loop_time_window() else {
+            return true;
+        };
+
+        if !self.historical_frame_warning_sync {
+            // Do not paint a current-only polygon over an older scan while
+            // the first archive source returns. Preview results then populate
+            // the stack incrementally through the normal hazard worker path.
+            self.hazard_receiver = None;
+            self.hazard_overlay = None;
+            self.selected_hazard_index = None;
+            self.hazard_map_popup = None;
+            self.unacknowledged_hazard_event_ids.clear();
+            self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
+            self.event_loop_hazard_window = None;
+            self.pending_event_loop_hazard_window = None;
+            self.last_live_hazard_refresh = None;
+            self.hazards_active_only = false;
+            self.live_hazard_auto_refresh = false;
+            self.historical_frame_warning_sync = true;
+        }
+
+        if self.hazard_receiver.is_none()
+            && !self.timeline_warning_window_covers_window(Some(&window))
+            && !self.pending_timeline_warning_window_covers_window(&window)
+        {
+            self.load_event_loop_hazards(window.0, window.1, ctx);
+            self.unified_player.mark_status(format!(
+                "Loading warnings for selected radar history {} to {}",
+                window.0.format("%H:%MZ"),
+                window.1.format("%H:%MZ")
+            ));
+        }
+        true
+    }
+
     fn should_auto_sync_timeline_warnings(&self) -> bool {
         if !self.warning_source_supports_timeline()
             || !self.unified_player.auto_sync_warnings
@@ -22838,13 +22953,17 @@ impl ViewerApp {
     }
 
     fn maybe_auto_sync_timeline_warnings(&mut self, ctx: &egui::Context) {
-        if self.unified_player.auto_sync_warnings && self.active_loop_timeline_is_live_follow() {
-            // A user can move from an archive loop back into a live-follow
-            // history without reopening the player. Never let the old archive
-            // mode survive that transition.
-            self.release_timeline_warning_sync(ctx);
-            self.unified_player
-                .mark_status("Live radar detected; warnings returned to current mode");
+        if self.maybe_sync_historical_live_frame_warnings(ctx) {
+            if self.unified_player.auto_sync_warnings
+                && !self.active_loop_timeline_is_historical_live_view()
+            {
+                // Preserve the existing archive-only contract for the
+                // Unified Player checkbox. Historical live browsing above is
+                // automatic and temporary, not a persistent Auto setting.
+                self.release_timeline_warning_sync(ctx);
+                self.unified_player
+                    .mark_status("Live radar detected; warnings returned to current mode");
+            }
             return;
         }
         if !self.should_auto_sync_timeline_warnings() {
@@ -52854,6 +52973,52 @@ mod tests {
     }
 
     #[test]
+    fn live_history_warning_mode_tracks_old_frames_and_playback() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        add_two_test_history_frames(&mut app);
+
+        app.primary.cursor.index = 0;
+        app.primary.cursor.playing = false;
+        assert!(app.active_loop_timeline_is_historical_live_view());
+
+        app.primary.cursor.index = 1;
+        assert!(!app.active_loop_timeline_is_historical_live_view());
+
+        app.primary.cursor.playing = true;
+        assert!(
+            app.active_loop_timeline_is_historical_live_view(),
+            "playing a live history must retain one warning timeline across the loop"
+        );
+
+        for frame in &mut app.primary.history {
+            frame.status = FrameStatus::Complete;
+        }
+        assert!(
+            !app.active_loop_timeline_is_historical_live_view(),
+            "archive histories continue through the existing archive warning-sync path"
+        );
+    }
+
+    #[test]
+    fn newest_live_frame_releases_temporary_historical_warning_ownership() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        add_two_test_history_frames(&mut app);
+        app.primary.cursor.index = 1;
+        app.historical_frame_warning_sync = true;
+        app.hazards_active_only = false;
+        app.live_hazard_auto_refresh = false;
+        let start = Utc.with_ymd_and_hms(2026, 6, 17, 21, 0, 0).unwrap();
+        let end = start + chrono::Duration::minutes(6);
+        app.event_loop_hazard_window = Some((start, end));
+
+        assert!(app.maybe_sync_historical_live_frame_warnings(&egui::Context::default()));
+        assert!(!app.historical_frame_warning_sync);
+        assert!(app.event_loop_hazard_window.is_none());
+        assert!(app.hazards_active_only);
+        assert!(app.live_hazard_auto_refresh);
+    }
+
+    #[test]
     fn unified_player_archive_reports_warning_sync_needed_even_when_overlay_hidden() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.hazards_visible = false;
@@ -66507,6 +66672,7 @@ mod tests {
             sweep_controls_open: false,
             event_loop_hazard_window: None,
             pending_event_loop_hazard_window: None,
+            historical_frame_warning_sync: false,
             glm_enabled: false,
             oa_rx: None,
             oa_last_summary: None,
