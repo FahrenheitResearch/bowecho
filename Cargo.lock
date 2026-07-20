@@ -294,7 +294,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app_ui"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "chrono",
  "color_tables",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "bowecho-bench"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "chrono",
  "color_tables",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.34.3"
+version = "0.34.4"
 
 [[package]]
 name = "cairo-sys-rs"
@@ -1093,7 +1093,7 @@ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
 name = "color_tables"
-version = "0.34.3"
+version = "0.34.4"
 
 [[package]]
 name = "colorchoice"
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "data_source"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "chrono",
  "nexrad_io",
@@ -3239,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "mini_ui"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "cache",
  "chrono",
@@ -3427,7 +3427,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nexrad_io"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "byteorder",
  "bzip2 0.6.1",
@@ -4413,7 +4413,7 @@ dependencies = [
 
 [[package]]
 name = "product_engine"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "radar_core",
 ]
@@ -4546,7 +4546,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radar_core"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "chrono",
  "serde",
@@ -4554,7 +4554,7 @@ dependencies = [
 
 [[package]]
 name = "radar_scattering"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4759,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "render2d"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "chrono",
  "color_tables",
@@ -5579,7 +5579,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -5685,7 +5685,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simradar_cuda"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "cudarc",
  "radar_scattering",
@@ -5696,7 +5696,7 @@ dependencies = [
 
 [[package]]
 name = "simradar_validation"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "chrono",
  "nexrad_io",
@@ -5907,7 +5907,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "styles"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -6359,7 +6359,7 @@ dependencies = [
 
 [[package]]
 name = "ui_core"
-version = "0.34.3"
+version = "0.34.4"
 dependencies = [
  "chrono",
  "data_source",
