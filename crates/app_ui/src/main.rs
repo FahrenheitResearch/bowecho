@@ -47,6 +47,7 @@ mod box_sounding;
 mod brand;
 mod chrome_readouts;
 mod cm1_ui;
+mod cross_section_ui;
 mod data_packs;
 mod dealias_env;
 /// Phase 4e stage (ii): the differential suite gating the primary unify
@@ -3070,6 +3071,11 @@ struct ViewerApp {
     hazard_shape_cache: std::cell::RefCell<ShapeCache<Arc<HazardOverlayShapes>>>,
     // Cross-section (RHI) draw mode + rendered section.
     cross_section_armed: bool,
+    /// Session visibility of the cross-section viewer. A/B endpoints and the
+    /// persisted bottom-vs-floating preference are deliberately separate:
+    /// Hide keeps the completed section available for Show XS, while a new
+    /// launch never resurrects an empty viewer.
+    cross_section_view_open: bool,
     /// Last right-click location (for the context menu's best-radar list).
     context_menu_lonlat: Option<(f32, f32)>,
     /// Exact gate captured with the right-click, stable while the pointer moves
@@ -8398,6 +8404,7 @@ struct WorkflowSnapshot {
     vrot_tool_armed: bool,
     vrot_points: Vec<(f32, f32, f32, f32)>,
     cross_section_armed: bool,
+    cross_section_view_open: bool,
     cross_section_a_lonlat: Option<(f32, f32)>,
     cross_section_b_lonlat: Option<(f32, f32)>,
     cross_section_status: String,
@@ -8940,6 +8947,7 @@ impl ViewerApp {
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
+            cross_section_view_open: false,
             context_menu_lonlat: None,
             context_menu_gate: None,
             radar_operational_status_cache: BTreeMap::new(),
@@ -14165,12 +14173,31 @@ impl ViewerApp {
     }
 
     fn handle_keyboard_navigation(&mut self, ctx: &egui::Context) {
-        if ctx.text_edit_focused() {
+        if ctx.text_edit_focused() || egui::Popup::is_any_open(ctx) || self.community_menu.is_some()
+        {
             return;
         }
 
-        if self.handle_product_hotkeys(ctx) {
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::X)) {
+            self.toggle_cross_section_armed();
             ctx.request_repaint();
+            return;
+        }
+
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Home)) {
+            self.reset_view();
+            ctx.request_repaint();
+            return;
+        }
+
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::End)) {
+            let target = self
+                .independent_editing_pane()
+                .map(LoopTimelineTarget::ExtraPane)
+                .unwrap_or(LoopTimelineTarget::Primary);
+            if self.select_newest_timeline_step_for_target(target, ctx) {
+                ctx.request_repaint();
+            }
             return;
         }
 
@@ -14182,6 +14209,14 @@ impl ViewerApp {
                 "Lat/lon grid hidden".to_owned()
             };
             let _ = self.app_settings.save();
+            ctx.request_repaint();
+            return;
+        }
+
+        // Annotation owns its letter keys while active. Timeline, map, and
+        // modified shortcuts above remain available, but configurable product
+        // letters must not steal an annotation command.
+        if self.annotations.active_tool.is_none() && self.handle_product_hotkeys(ctx) {
             ctx.request_repaint();
             return;
         }
@@ -14198,9 +14233,13 @@ impl ViewerApp {
         }
 
         let frame_delta = ctx.input_mut(|input| {
-            if input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown)
+                || input.consume_key(egui::Modifiers::NONE, egui::Key::CloseBracket)
+            {
                 1
-            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp)
+                || input.consume_key(egui::Modifiers::NONE, egui::Key::OpenBracket)
+            {
                 -1
             } else {
                 0
@@ -14276,16 +14315,16 @@ impl ViewerApp {
             let Some(key) = product_hotkey_egui_key(&name) else {
                 continue;
             };
-            if !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
-                continue;
-            }
             let Some(product) = self
                 .displayable_products_for_picker(volume.as_ref())
                 .into_iter()
                 .find(|product| product.label().eq_ignore_ascii_case(&label))
             else {
-                return false;
+                continue;
             };
+            if !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
+                continue;
+            }
             match focused_slot {
                 Some(slot) => {
                     return self.switch_pane_product(slot, product);
@@ -14449,23 +14488,6 @@ impl ViewerApp {
         }
         let _ = self.materialize_extra_pane_advanced_product_at_cut(slot, next_cut);
         self.extra_panes[slot].cut = Some(next_cut);
-        true
-    }
-
-    #[cfg(test)]
-    fn step_history_frame(&mut self, delta: isize, ctx: &egui::Context) -> bool {
-        let frame_count = self.primary.history.len();
-        if frame_count <= 1 {
-            return false;
-        }
-        let next_index =
-            (self.primary.cursor.index as isize + delta).rem_euclid(frame_count as isize) as usize;
-        if next_index == self.primary.cursor.index {
-            return false;
-        }
-        self.primary.cursor.playing = false;
-        self.select_history_frame(next_index, false, ctx);
-        self.primary.cursor.browsing = next_index + 1 < self.primary.history.len();
         true
     }
 
@@ -20674,12 +20696,14 @@ impl eframe::App for ViewerApp {
             self.mark_app_settings_dirty();
         }
 
-        if self.cross_section_armed || self.cross_section_a_lonlat.is_some() {
+        if self.cross_section_surface() == cross_section_ui::CrossSectionSurface::Bottom {
             egui::Panel::bottom("cross_section_panel")
                 .resizable(true)
                 .default_size(240.0)
                 .size_range(120.0..=520.0)
-                .show_inside(ui, |ui| self.cross_section_panel(ui));
+                .show_inside(ui, |ui| {
+                    self.cross_section_panel(ui, cross_section_ui::CrossSectionSurface::Bottom)
+                });
         }
 
         // Mobile-radar RHI sweeps (fixed azimuth, elevation sweep) get a
@@ -20733,6 +20757,7 @@ impl eframe::App for ViewerApp {
         self.sweep_control_window(&ctx);
         self.event_loop_builder_window(&ctx);
         self.vol3d_window(&ctx);
+        self.show_cross_section_floating_window(&ctx);
         self.wofs_window(&ctx);
         self.farm_window(&ctx);
         self.table_editor_window(&ctx);
@@ -21242,6 +21267,7 @@ impl ViewerApp {
         self.previous_workflow_snapshot = Some(self.capture_workflow_snapshot());
         self.chrome_hidden = false;
         self.cross_section_armed = false;
+        self.cross_section_view_open = false;
         self.annotations.active_tool = None;
         match preset {
             WorkflowPreset::WarningDesk => {
@@ -21397,6 +21423,7 @@ impl ViewerApp {
             vrot_tool_armed: self.vrot_tool_armed,
             vrot_points: self.vrot_points.clone(),
             cross_section_armed: self.cross_section_armed,
+            cross_section_view_open: self.cross_section_view_open,
             cross_section_a_lonlat: self.cross_section_a_lonlat,
             cross_section_b_lonlat: self.cross_section_b_lonlat,
             cross_section_status: self.cross_section_status.clone(),
@@ -21480,6 +21507,7 @@ impl ViewerApp {
         self.vrot_tool_armed = snapshot.vrot_tool_armed;
         self.vrot_points = snapshot.vrot_points;
         self.cross_section_armed = snapshot.cross_section_armed;
+        self.cross_section_view_open = snapshot.cross_section_view_open;
         self.cross_section_a_lonlat = snapshot.cross_section_a_lonlat;
         self.cross_section_b_lonlat = snapshot.cross_section_b_lonlat;
         self.cross_section_status = snapshot.cross_section_status;
@@ -22910,6 +22938,21 @@ impl ViewerApp {
             .min(steps.len() - 1) as isize;
         let next = (current + delta).rem_euclid(steps.len() as isize) as usize;
         let Some(step) = steps.get(next).copied() else {
+            return false;
+        };
+        self.select_loop_timeline_step_for_target(target, step, ctx);
+        true
+    }
+
+    /// Jump to the newest posted timeline edge without wrapping. This is the
+    /// End-key counterpart to relative PgUp/PgDn and bracket stepping.
+    fn select_newest_timeline_step_for_target(
+        &mut self,
+        target: LoopTimelineTarget,
+        ctx: &egui::Context,
+    ) -> bool {
+        let steps = self.loop_timeline_steps_for_target(target);
+        let Some(step) = steps.last().copied() else {
             return false;
         };
         self.select_loop_timeline_step_for_target(target, step, ctx);
@@ -25480,20 +25523,14 @@ impl ViewerApp {
             }
         });
         ui.horizontal(|ui| {
-            let was_armed = self.cross_section_armed;
-            ui.checkbox(&mut self.cross_section_armed, "Cross-section")
+            let mut cross_section_armed = self.cross_section_armed;
+            let arm_response = ui
+                .checkbox(&mut cross_section_armed, "Cross-section")
                 .on_hover_text(
-                    "Arm, then left-click two points on the map to draw a vertical cross-section below (right-click clears). Uses velocity when a velocity product is selected, else reflectivity.",
+                    "Arm, then left-click two points on the map to draw a vertical cross-section (Shift+X toggles; right-click clears). Uses velocity when a velocity product is selected, else reflectivity.",
                 );
-            // Disarming with only endpoint A placed drops the dangling point so
-            // the rubber band + panel don't linger; a completed A→B section stays.
-            if was_armed
-                && !self.cross_section_armed
-                && self.cross_section_a_lonlat.is_some()
-                && self.cross_section_b_lonlat.is_none()
-            {
-                self.cross_section_a_lonlat = None;
-                self.cross_section_signature = None;
+            if arm_response.changed() {
+                self.set_cross_section_armed(cross_section_armed);
             }
             if fixed_action_button(ui, "Clear XS", 64.0).clicked() {
                 self.cross_section_a_lonlat = None;
@@ -25502,6 +25539,18 @@ impl ViewerApp {
                 self.cross_section_signature = None;
                 self.cross_section_readout = None;
                 self.cross_section_status = "Cross-section: arm, then click endpoint A then B".to_owned();
+                self.cross_section_view_open = self.cross_section_armed;
+            }
+            if !self.cross_section_view_open
+                && self.cross_section_a_lonlat.is_some()
+                && fixed_action_button(ui, "Show XS", 66.0)
+                    .on_hover_text(
+                        "Reopen the completed cross-section without clearing or re-arming it",
+                    )
+                    .clicked()
+            {
+                self.cross_section_view_open = true;
+                ctx.request_repaint();
             }
         });
         panel_kit::row(ui, "XS smoothing", |ui| {
@@ -29261,6 +29310,7 @@ impl ViewerApp {
                         self.cross_section_status = "Click endpoint B".to_owned();
                     }
                 }
+                self.cross_section_view_open = true;
                 self.cross_section_signature = None;
             }
             if response.secondary_clicked() {
@@ -29796,6 +29846,7 @@ impl ViewerApp {
                             self.cross_section_status = "Click endpoint B".to_owned();
                         }
                     }
+                    self.cross_section_view_open = true;
                     self.cross_section_signature = None;
                 }
                 if response.secondary_clicked() {
@@ -39246,15 +39297,17 @@ impl ViewerApp {
         );
     }
 
-    /// The resizable bottom cross-section panel: header + the rendered section
-    /// with height (km) and distance (km) axis labels.
-    fn cross_section_panel(&mut self, ui: &mut egui::Ui) {
+    /// Shared bottom/floating cross-section body: host controls plus the
+    /// rendered section with height (km) and distance (km) axis labels.
+    fn cross_section_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        surface: cross_section_ui::CrossSectionSurface,
+    ) {
         self.update_cross_section_texture(ui.ctx());
-        ui.horizontal(|ui| {
-            ui.strong("Cross-Section");
-            ui.separator();
-            ui.label(&self.cross_section_status);
-        });
+        if !self.cross_section_header_ui(ui, surface) {
+            return;
+        }
         let avail = ui.available_size();
         if avail.y < 24.0 {
             return;
@@ -58992,6 +59045,25 @@ mod tests {
 
     #[test]
     fn keyboard_frame_step_selects_history_and_updates_browse_state() {
+        fn press_key(
+            app: &mut ViewerApp,
+            ctx: &egui::Context,
+            key: egui::Key,
+            modifiers: egui::Modifiers,
+        ) {
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| app.handle_keyboard_navigation(ui.ctx()));
+        }
+
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
         let mut first = test_ref_then_velocity_volume();
@@ -59018,7 +59090,12 @@ mod tests {
         app.map_scale = 812.5;
         let ctx = egui::Context::default();
 
-        assert!(app.step_history_frame(1, &ctx));
+        press_key(
+            &mut app,
+            &ctx,
+            egui::Key::CloseBracket,
+            egui::Modifiers::NONE,
+        );
         assert_eq!(app.primary.cursor.index, 1);
         assert!(!app.primary.cursor.playing);
         assert!(!app.primary.cursor.browsing);
@@ -59028,13 +59105,32 @@ mod tests {
             "stepping an archive/history frame must not reset pan or zoom"
         );
 
-        assert!(app.step_history_frame(-1, &ctx));
+        press_key(
+            &mut app,
+            &ctx,
+            egui::Key::OpenBracket,
+            egui::Modifiers::NONE,
+        );
         assert_eq!(app.primary.cursor.index, 0);
         assert!(app.primary.cursor.browsing);
         assert_eq!(
             (app.map_center_lat, app.map_center_lon, app.map_scale),
             (40.25, -101.75, 812.5)
         );
+
+        app.primary.cursor.playing = true;
+        press_key(&mut app, &ctx, egui::Key::End, egui::Modifiers::NONE);
+        assert_eq!(app.primary.cursor.index, 1);
+        assert!(!app.primary.cursor.playing);
+        assert!(!app.primary.cursor.browsing);
+
+        app.map_scale = 812.5;
+        press_key(&mut app, &ctx, egui::Key::Home, egui::Modifiers::NONE);
+        assert_eq!(app.map_scale, DEFAULT_MAP_SCALE);
+
+        press_key(&mut app, &ctx, egui::Key::X, egui::Modifiers::SHIFT);
+        assert!(app.cross_section_armed);
+        assert!(app.cross_section_view_open);
     }
 
     #[test]
@@ -67448,6 +67544,7 @@ mod tests {
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
+            cross_section_view_open: false,
             context_menu_lonlat: None,
             context_menu_gate: None,
             radar_operational_status_cache: BTreeMap::new(),
@@ -68454,6 +68551,27 @@ mod tests {
         );
         assert_eq!(annotation_target_cell(&cells, None, 99), Some(2));
         assert_eq!(annotation_target_cell(&[], None, 0), None);
+    }
+
+    #[test]
+    fn cross_section_arm_transition_preserves_only_completed_sections() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.set_cross_section_armed(true);
+        assert!(app.cross_section_armed);
+        assert!(app.cross_section_view_open);
+
+        app.cross_section_a_lonlat = Some((-97.0, 35.0));
+        app.set_cross_section_armed(false);
+        assert!(app.cross_section_a_lonlat.is_none());
+        assert!(!app.cross_section_view_open);
+
+        app.set_cross_section_armed(true);
+        app.cross_section_a_lonlat = Some((-97.0, 35.0));
+        app.cross_section_b_lonlat = Some((-96.5, 35.5));
+        app.set_cross_section_armed(false);
+        assert_eq!(app.cross_section_a_lonlat, Some((-97.0, 35.0)));
+        assert_eq!(app.cross_section_b_lonlat, Some((-96.5, 35.5)));
+        assert!(app.cross_section_view_open);
     }
 
     #[test]

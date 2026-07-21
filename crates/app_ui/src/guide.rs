@@ -2913,9 +2913,10 @@ fn tools(ui: &mut egui::Ui) {
         ui,
         "Cross-section",
         "(TOOLS) — arm it, click endpoint A then B on the map: a vertical slice opens in a \
-         bottom panel (heights to 18 km, 4/3-Earth beam geometry). Velocity products slice \
-         velocity; everything else slices reflectivity. Right-click resets the endpoints; \
-         Clear XS removes the panel.",
+         resizable panel (heights to 18 km, 4/3-Earth beam geometry). Use Float window to pop \
+         the same interactive section above the map, Dock below map to return it, or Hide to \
+         keep a completed A/B slice for later. Velocity products slice velocity; everything \
+         else slices reflectivity. Right-click resets the endpoints; Clear XS removes it.",
     );
 
     subhead(ui, "VERTICAL WIND PROFILE (VWP)");
@@ -3094,12 +3095,15 @@ fn shortcuts(ui: &mut egui::Ui) {
     key_row(ui, "Space", "play / pause the loaded loop");
     key_row(
         ui,
-        "PgUp / PgDn",
-        "previous / next frame in the loaded loop",
+        "PgUp / PgDn or [ / ]",
+        "previous / next timeline step (a low sweep when in-scan sweeps are enabled)",
     );
+    key_row(ui, "Home", "reset the map center and zoom");
+    key_row(ui, "End", "jump to the newest loaded timeline step");
     key_row(ui, "\u{2190} / \u{2192}", "previous / next product");
     key_row(ui, "\u{2191} / \u{2193}", "step up / down the tilt list");
     key_row(ui, "G", "show / hide the lat-lon grid");
+    key_row(ui, "Shift+X", "arm / disarm the cross-section tool");
     key_row(
         ui,
         "1 \u{2026} 9, 0",

@@ -560,6 +560,13 @@ pub struct AppSettings {
     /// samples. Smoothed is the historical/default behavior.
     #[serde(default = "default_cross_section_smoothing")]
     pub cross_section_smoothing: String,
+    /// Preferred host for the vertical cross-section viewer. False keeps the
+    /// historical resizable panel below the map; true opens the same viewer
+    /// as a resizable floating window. The active section itself is
+    /// session-only, so this preference never resurrects a blank window at
+    /// startup.
+    #[serde(default)]
+    pub cross_section_floating: bool,
     /// Loop playback speed in percent of the 700 ms/frame baseline
     /// (100 = baseline, 200 = twice as fast). Screen playback only —
     /// media exports have their own speed control.
@@ -1165,6 +1172,7 @@ impl Default for AppSettings {
             smooth_display: false,
             smooth_display_mode: String::new(),
             cross_section_smoothing: default_cross_section_smoothing(),
+            cross_section_floating: false,
             loop_speed_percent: default_loop_speed_percent(),
             history_frame_limit: default_history_frame_limit(),
             zoom_speed_percent: default_zoom_speed_percent(),
@@ -2389,6 +2397,19 @@ mod tests {
         let back = AppSettings::from_json(&json);
 
         assert_eq!(back.floating_window_accent_rgb, Some([42, 135, 220]));
+    }
+
+    #[test]
+    fn cross_section_host_defaults_below_map_and_round_trips_floating() {
+        assert!(!AppSettings::from_json("{}").cross_section_floating);
+
+        let settings = AppSettings {
+            cross_section_floating: true,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert!(back.cross_section_floating);
     }
 
     #[test]
