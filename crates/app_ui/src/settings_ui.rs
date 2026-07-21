@@ -781,7 +781,44 @@ impl ViewerApp {
                 ui_theme::set_active_theme(option);
                 // Rebuild the egui style document — theme() feeds
                 // configure_style, per-frame accessors pick it up anyway.
-                configure_style(ctx, &self.app_settings.brand);
+                configure_style(ctx, &self.app_settings);
+                self.mark_app_settings_dirty();
+                ctx.request_repaint();
+            }
+        });
+        panel_kit::row(ui, "Floating windows", |ui| {
+            let reset = ui
+                .add_enabled(
+                    self.app_settings.floating_window_accent_rgb.is_some(),
+                    egui::Button::new("Reset"),
+                )
+                .on_hover_text("Follow the active Theme or Brand Kit accent");
+            let mut changed = false;
+            if reset.clicked() {
+                self.app_settings.floating_window_accent_rgb = None;
+                changed = true;
+            }
+
+            let [r, g, b, _] = resolved_floating_window_accent(&self.app_settings).to_array();
+            let mut accent = [r, g, b];
+            if ui
+                .color_edit_button_srgb(&mut accent)
+                .on_hover_text(
+                    "Color used for floating-window outlines, active title bars, and a restrained window-surface tint so collapsed windows remain visible against the sidebar",
+                )
+                .changed()
+            {
+                self.app_settings.floating_window_accent_rgb = Some(accent);
+                changed = true;
+            }
+            ui.weak(if self.app_settings.floating_window_accent_rgb.is_some() {
+                "custom"
+            } else {
+                "theme default"
+            });
+
+            if changed {
+                configure_style(ctx, &self.app_settings);
                 self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
@@ -1895,7 +1932,7 @@ impl ViewerApp {
             let update_source_changed = original.repo_url != edited.repo_url
                 || original.releases_url != edited.releases_url;
             self.app_settings.brand = edited;
-            configure_style(ctx, &self.app_settings.brand);
+            configure_style(ctx, &self.app_settings);
             self.brand_assets.clear();
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(brand::window_title(
                 &self.app_settings.brand,

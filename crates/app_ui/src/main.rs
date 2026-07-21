@@ -8511,7 +8511,7 @@ impl ViewerApp {
         // Persisted chrome theme BEFORE the style document is built —
         // configure_style reads ui_theme::theme().
         ui_theme::set_active_theme(ui_theme::ThemeChoice::from_slug(&app_settings.ui_theme));
-        configure_style(&cc.egui_ctx, &app_settings.brand);
+        configure_style(&cc.egui_ctx, &app_settings);
         // CJK fallback before the first frame: Japanese site names render
         // as glyphs, not tofu (appended LAST — Latin text is untouched).
         fonts::install_cjk_fallback(&cc.egui_ctx);
@@ -46301,7 +46301,7 @@ fn display_cut_for_product(
     }
 }
 
-fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
+fn configure_style(ctx: &egui::Context, app_settings: &settings::AppSettings) {
     use egui::{Color32, CornerRadius, FontFamily, FontId, TextStyle};
     let mut style = (*ctx.global_style()).clone();
     // Snappy = fast: no widget animations (the app's identity is speed).
@@ -46334,14 +46334,17 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
 
     // GR2 "warning-desk" look: near-black, low-chroma neutral panels so the
     // saturated REF/VEL/CC/ZDR palettes pop.
+    let brand_config = &app_settings.brand;
     let palette = brand_config.resolved_palette();
     let stock_default = settings::BrandPalette::default();
+    let default_window_accent;
     if palette == stock_default.resolved(&stock_default) {
         // Stock BowEcho: the ui_theme ramp drives the chrome — the user's
         // Settings > Display > Theme pick (slate default or graphite+amber,
         // see ui_theme.rs). Three deliberate neutral levels, ONE accent
         // (selection + live emphasis), status colors only for meaning.
         let theme = ui_theme::theme();
+        default_window_accent = theme.accent;
         style.visuals.panel_fill = theme.bg;
         style.visuals.window_fill = theme.bg;
         style.visuals.extreme_bg_color = theme.inset; // text edits, slider troughs
@@ -46382,6 +46385,7 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
         let panel = brand::color32(palette.surface);
         let raised = brand::color32(palette.surface_alt);
         let sunken = Color32::from_rgb(9, 10, 12);
+        default_window_accent = brand::color32(palette.accent);
         style.visuals.panel_fill = panel;
         style.visuals.window_fill = panel;
         style.visuals.extreme_bg_color = sunken; // text edits, sliders troughs
@@ -46403,6 +46407,12 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
         w.active.weak_bg_fill = brand::color32(palette.primary);
         w.open.bg_fill = raised;
     }
+
+    let floating_window_accent = app_settings
+        .floating_window_accent_rgb
+        .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+        .unwrap_or(default_window_accent);
+    apply_floating_window_accent(&mut style.visuals, floating_window_accent);
 
     // Restrained rounding (spec §4): 2 px widgets, 3 px windows/menus.
     {
@@ -46428,6 +46438,45 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
     style.spacing.indent = 16.0;
     style.spacing.interact_size.y = 18.0;
     ctx.set_global_style(style);
+}
+
+/// Give every floating egui window a shared, configurable identity. Egui
+/// paints an active title bar from `widgets.open.weak_bg_fill`; inactive
+/// collapsed bars mostly expose the window frame itself, so the outline
+/// carries the full accent and the common surface receives only a restrained
+/// tint. Egui intentionally shares these visual slots with a few open-state
+/// widgets and BowEcho map cards, keeping their emphasis in the same family.
+fn apply_floating_window_accent(visuals: &mut egui::Visuals, accent: egui::Color32) {
+    let base_fill = visuals.window_fill;
+    visuals.window_fill = mix_srgba(base_fill, accent, 0.12);
+    visuals.window_stroke = egui::Stroke::new(1.5_f32, accent);
+    visuals.widgets.open.weak_bg_fill = mix_srgba(base_fill, accent, 0.42);
+}
+
+fn resolved_floating_window_accent(app_settings: &settings::AppSettings) -> egui::Color32 {
+    if let Some([r, g, b]) = app_settings.floating_window_accent_rgb {
+        return egui::Color32::from_rgb(r, g, b);
+    }
+    let palette = app_settings.brand.resolved_palette();
+    let stock_default = settings::BrandPalette::default();
+    if palette == stock_default.resolved(&stock_default) {
+        ui_theme::theme().accent
+    } else {
+        brand::color32(palette.accent)
+    }
+}
+
+fn mix_srgba(base: egui::Color32, accent: egui::Color32, amount: f32) -> egui::Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let mix = |base: u8, accent: u8| {
+        (f32::from(base) + (f32::from(accent) - f32::from(base)) * amount).round() as u8
+    };
+    egui::Color32::from_rgba_unmultiplied(
+        mix(base.r(), accent.r()),
+        mix(base.g(), accent.g()),
+        mix(base.b(), accent.b()),
+        base.a(),
+    )
 }
 
 fn radar_texture_options() -> egui::TextureOptions {
@@ -46493,6 +46542,36 @@ fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_window_accent_tints_surface_and_owns_title_and_outline() {
+        let mut visuals = egui::Visuals::dark();
+        let base = visuals.window_fill;
+        let accent = egui::Color32::from_rgb(42, 135, 220);
+
+        apply_floating_window_accent(&mut visuals, accent);
+
+        assert_eq!(visuals.window_stroke.color, accent);
+        assert_eq!(visuals.window_stroke.width, 1.5);
+        assert_eq!(visuals.window_fill, mix_srgba(base, accent, 0.12));
+        assert_eq!(
+            visuals.widgets.open.weak_bg_fill,
+            mix_srgba(base, accent, 0.42)
+        );
+    }
+
+    #[test]
+    fn custom_floating_window_accent_uses_saved_rgb() {
+        let settings = settings::AppSettings {
+            floating_window_accent_rgb: Some([9, 88, 177]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolved_floating_window_accent(&settings),
+            egui::Color32::from_rgb(9, 88, 177)
+        );
+    }
 
     #[test]
     fn sidebar_tab_slugs_round_trip_and_unknown_falls_back_to_none() {

@@ -775,6 +775,12 @@ pub struct AppSettings {
     /// as a string so `AppSettings` stays UI-crate-free, like `sidebar_tab`.
     #[serde(default)]
     pub ui_theme: String,
+    /// Optional RGB accent for floating egui windows. `None` follows the
+    /// active BowEcho theme (or Brand Kit) accent. The app uses this for the
+    /// window outline, a restrained surface tint, and the active title-bar
+    /// highlight so collapsed windows remain distinct from panel chrome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floating_window_accent_rgb: Option<[u8; 3]>,
     /// Satellite IR enhancement slug applied to Kelvin brightness-temperature
     /// bands (GOES ABI / Himawari AHI 7-16): "cimss" (default rainbow),
     /// "bd" (Dvorak BD curve), "avn", "funktop", "rainbow", "gray".
@@ -1194,6 +1200,7 @@ impl Default for AppSettings {
             sidebar_width_pt: None,
             sidebar_tab: String::new(),
             ui_theme: String::new(),
+            floating_window_accent_rgb: None,
             sat_ir_enhancement: default_sat_ir_enhancement(),
             model_slug: default_model_slug(),
             units: default_units(),
@@ -2355,6 +2362,23 @@ mod tests {
         let back = AppSettings::from_json(&settings.to_json());
 
         assert_eq!(back.ui_theme, "graphite");
+    }
+
+    #[test]
+    fn floating_window_accent_defaults_to_theme_and_round_trips() {
+        assert_eq!(
+            AppSettings::from_json("{}").floating_window_accent_rgb,
+            None
+        );
+
+        let settings = AppSettings {
+            floating_window_accent_rgb: Some([42, 135, 220]),
+            ..Default::default()
+        };
+        let json = settings.to_json();
+        let back = AppSettings::from_json(&json);
+
+        assert_eq!(back.floating_window_accent_rgb, Some([42, 135, 220]));
     }
 
     #[test]
