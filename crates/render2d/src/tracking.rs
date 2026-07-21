@@ -14,6 +14,7 @@
 //! Pure module: no UI, no I/O — unit-testable and probe-able offline.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 use crate::cells::StormCell;
@@ -53,7 +54,7 @@ const SPEED_SANITY_MPS: f64 = 60.0;
 /// SCIT's 0 and Lakshmanan & Smith 2008's 3).
 const COAST_VOLUMES: u32 = 2;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StormTrack {
     pub id: u32,
     /// Observed fixes (time, east_km, north_km), newest last. Coasting adds
@@ -104,7 +105,7 @@ impl StormTrack {
 }
 
 /// The tracker state the app holds per site.
-#[derive(Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct StormTracker {
     pub tracks: Vec<StormTrack>,
     next_id: u32,

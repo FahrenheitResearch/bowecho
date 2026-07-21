@@ -23,13 +23,20 @@
 //! (spc.noaa.gov/wcm/data/{yyyy}_torn.csv, "onetor" format; Schaefer &
 //! Edwards 1999, 11th Conf. Applied Climatology — the same database
 //! behind SPC's tornado climatology pages). The daily climo CSVs carry a
-//! single point per report; the WCM database is where surveyed begin/end
-//! paths live. The current year's file does not exist yet, so for recent
-//! days the torn reports stand in as zero-length segments.
+//! single point per report. Because SPC's current-year WCM file is not
+//! published yet, that one missing year falls back to NOAA NCEI's
+//! preliminary Storm Events details export, which also carries begin/end
+//! coordinates. Days newer than that preliminary export still use the
+//! report point as an explicitly zero-length event.
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use eframe::egui;
+use flate2::read::GzDecoder;
+use std::io::Read;
 use std::time::Instant;
+
+const NCEI_STORM_EVENTS_BASE: &str = "https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles";
+const NCEI_STORM_EVENTS_DECODED_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 pub const OUTLOOK_KINDS: [(&str, &str); 8] = [
     ("cat", "Categorical"),
@@ -1390,14 +1397,15 @@ pub fn parse_reports_combined(convective: NaiveDate, text: &str) -> Vec<StormRep
 }
 
 /// One tornado track segment for the event-day map: a surveyed begin/end
-/// path from the SPC WCM database, or a zero-length stand-in synthesized
-/// from a torn report when the year's database file is not published yet.
+/// path from the SPC WCM database or preliminary NOAA NCEI Storm Events
+/// export, or a zero-length stand-in synthesized from a torn report when
+/// neither track source has reached the day yet.
 #[derive(Clone, Debug)]
 pub struct TornadoSegment {
     pub time_utc: DateTime<Utc>,
     /// "EF3" / "F2" / "EF?" (rating -9 = unknown).
     pub ef_label: String,
-    /// County/state for synthesized segments, state for WCM rows.
+    /// County/state for synthesized and NCEI segments, state for WCM rows.
     pub location: String,
     pub begin_lat: f32,
     pub begin_lon: f32,
@@ -1551,6 +1559,311 @@ pub fn parse_wcm_torn_segments(convective: NaiveDate, text: &str) -> Vec<Tornado
     out
 }
 
+/// Records from NOAA NCEI's preliminary Storm Events details export.
+///
+/// The export is ordinary RFC-4180-style CSV, including quoted narratives
+/// that may contain commas or newlines. This iterator therefore finds record
+/// boundaries outside quotes instead of using `str::lines`.
+struct CsvRecords<'a> {
+    remaining: &'a str,
+}
+
+impl<'a> CsvRecords<'a> {
+    fn new(text: &'a str) -> Self {
+        Self { remaining: text }
+    }
+}
+
+impl Iterator for CsvRecords<'_> {
+    type Item = Vec<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining.is_empty() {
+            return None;
+        }
+        let bytes = self.remaining.as_bytes();
+        let mut in_quotes = false;
+        let mut index = 0usize;
+        let mut end = bytes.len();
+        while index < bytes.len() {
+            match bytes[index] {
+                b'"' if in_quotes && bytes.get(index + 1) == Some(&b'"') => index += 1,
+                b'"' => in_quotes = !in_quotes,
+                b'\n' if !in_quotes => {
+                    end = index;
+                    break;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        let record = self.remaining[..end].trim_end_matches('\r');
+        self.remaining = if end < bytes.len() {
+            &self.remaining[end + 1..]
+        } else {
+            ""
+        };
+        Some(parse_csv_record(record))
+    }
+}
+
+fn parse_csv_record(record: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let bytes = record.as_bytes();
+    let mut in_quotes = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' if in_quotes && bytes.get(index + 1) == Some(&b'"') => {
+                field.push('"');
+                index += 1;
+            }
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                fields.push(std::mem::take(&mut field));
+            }
+            byte if byte.is_ascii() => field.push(char::from(byte)),
+            _ => {
+                let tail = &record[index..];
+                let ch = tail.chars().next().expect("nonempty UTF-8 tail");
+                field.push(ch);
+                index += ch.len_utf8() - 1;
+            }
+        }
+        index += 1;
+    }
+    fields.push(field);
+    fields
+}
+
+#[derive(Clone, Copy)]
+struct NceiStormEventColumns {
+    begin_yearmonth: usize,
+    begin_day: usize,
+    begin_time: usize,
+    end_yearmonth: usize,
+    end_day: usize,
+    end_time: usize,
+    event_type: usize,
+    state: usize,
+    county_zone_name: usize,
+    timezone: usize,
+    begin_location: usize,
+    begin_lat: usize,
+    begin_lon: usize,
+    end_lat: usize,
+    end_lon: usize,
+    rating: usize,
+    length: usize,
+    width: usize,
+}
+
+impl NceiStormEventColumns {
+    fn from_header(header: &[String]) -> Option<Self> {
+        let find = |name: &str| header.iter().position(|field| field.trim() == name);
+        Some(Self {
+            begin_yearmonth: find("BEGIN_YEARMONTH")?,
+            begin_day: find("BEGIN_DAY")?,
+            begin_time: find("BEGIN_TIME")?,
+            end_yearmonth: find("END_YEARMONTH")?,
+            end_day: find("END_DAY")?,
+            end_time: find("END_TIME")?,
+            event_type: find("EVENT_TYPE")?,
+            state: find("STATE")?,
+            county_zone_name: find("CZ_NAME")?,
+            timezone: find("CZ_TIMEZONE")?,
+            begin_location: find("BEGIN_LOCATION")?,
+            begin_lat: find("BEGIN_LAT")?,
+            begin_lon: find("BEGIN_LON")?,
+            end_lat: find("END_LAT")?,
+            end_lon: find("END_LON")?,
+            rating: find("TOR_F_SCALE")?,
+            length: find("TOR_LENGTH")?,
+            width: find("TOR_WIDTH")?,
+        })
+    }
+
+    fn max_index(self) -> usize {
+        [
+            self.begin_yearmonth,
+            self.begin_day,
+            self.begin_time,
+            self.end_yearmonth,
+            self.end_day,
+            self.end_time,
+            self.event_type,
+            self.state,
+            self.county_zone_name,
+            self.timezone,
+            self.begin_location,
+            self.begin_lat,
+            self.begin_lon,
+            self.end_lat,
+            self.end_lon,
+            self.rating,
+            self.length,
+            self.width,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+    }
+}
+
+fn ncei_utc_time(yearmonth: &str, day: &str, hhmm: &str, timezone: &str) -> Option<DateTime<Utc>> {
+    let yearmonth = yearmonth.trim().parse::<i32>().ok()?;
+    let year = yearmonth / 100;
+    let month = u32::try_from(yearmonth % 100).ok()?;
+    let day = day.trim().parse::<u32>().ok()?;
+    let hhmm = hhmm.trim().parse::<u32>().ok()?;
+    let hour = hhmm / 100;
+    let minute = hhmm % 100;
+    let local = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, 0)?;
+    let offset_start = timezone
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| (index > 0 && matches!(ch, '+' | '-')).then_some(index))?;
+    let local_offset_hours = timezone[offset_start..].trim().parse::<i64>().ok()?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(
+        local - Duration::hours(local_offset_hours),
+        Utc,
+    ))
+}
+
+/// Parse preliminary NOAA NCEI Storm Events tornado rows for one SPC
+/// convective day. NCEI publishes the current-year file before SPC publishes
+/// its annual WCM `onetor` file, closing the current-year track gap while
+/// retaining surveyed begin/end coordinates and clearly preliminary ratings.
+pub fn parse_ncei_tornado_segments(convective: NaiveDate, text: &str) -> Vec<TornadoSegment> {
+    let mut records = CsvRecords::new(text);
+    let Some(header) = records.next() else {
+        return Vec::new();
+    };
+    let Some(columns) = NceiStormEventColumns::from_header(&header) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for fields in records {
+        if fields.len() <= columns.max_index()
+            || !fields[columns.event_type]
+                .trim()
+                .eq_ignore_ascii_case("Tornado")
+        {
+            continue;
+        }
+        let Some(time_utc) = ncei_utc_time(
+            &fields[columns.begin_yearmonth],
+            &fields[columns.begin_day],
+            &fields[columns.begin_time],
+            &fields[columns.timezone],
+        ) else {
+            continue;
+        };
+        if spc_convective_date(time_utc) != convective {
+            continue;
+        }
+        let parse_coord = |index: usize| fields[index].trim().parse::<f32>().ok();
+        let (Some(begin_lat), Some(begin_lon)) = (
+            parse_coord(columns.begin_lat),
+            parse_coord(columns.begin_lon),
+        ) else {
+            continue;
+        };
+        if !(-90.0..=90.0).contains(&begin_lat)
+            || !(-180.0..=180.0).contains(&begin_lon)
+            || begin_lat == 0.0
+            || begin_lon == 0.0
+        {
+            continue;
+        }
+        let end = match (parse_coord(columns.end_lat), parse_coord(columns.end_lon)) {
+            (Some(lat), Some(lon))
+                if (-90.0..=90.0).contains(&lat)
+                    && (-180.0..=180.0).contains(&lon)
+                    && lat != 0.0
+                    && lon != 0.0
+                    && (lat, lon) != (begin_lat, begin_lon) =>
+            {
+                Some((lat, lon))
+            }
+            _ => None,
+        };
+        let end_time_utc = ncei_utc_time(
+            &fields[columns.end_yearmonth],
+            &fields[columns.end_day],
+            &fields[columns.end_time],
+            &fields[columns.timezone],
+        )
+        .filter(|end_time| *end_time >= time_utc);
+        let rating = fields[columns.rating].trim().to_ascii_uppercase();
+        let ef_label = if rating.is_empty() {
+            "EF?".to_owned()
+        } else {
+            rating
+        };
+        let state = fields[columns.state].trim();
+        let place = fields[columns.begin_location].trim();
+        let county_zone = fields[columns.county_zone_name].trim();
+        let location = if !place.is_empty() {
+            format!("{place}, {state}")
+        } else if !county_zone.is_empty() {
+            format!("{county_zone}, {state}")
+        } else {
+            state.to_owned()
+        };
+        out.push(TornadoSegment {
+            time_utc,
+            ef_label,
+            location,
+            begin_lat,
+            begin_lon,
+            end,
+            end_time_utc,
+            length_mi: fields[columns.length].trim().parse().unwrap_or(0.0),
+            width_yd: fields[columns.width].trim().parse().unwrap_or(0.0),
+        });
+    }
+    out.sort_by_key(|segment| segment.time_utc);
+    out
+}
+
+fn latest_ncei_storm_events_file(year: i32, listing: &str) -> Option<String> {
+    let prefix = format!("StormEvents_details-ftp_v1.0_d{year}_c");
+    listing
+        .match_indices(&prefix)
+        .filter_map(|(start, _)| {
+            let tail = &listing[start..];
+            let end = tail.find(".csv.gz")? + ".csv.gz".len();
+            Some(tail[..end].to_owned())
+        })
+        .max()
+}
+
+fn fetch_ncei_tornado_segments(
+    year: i32,
+    convective: NaiveDate,
+) -> Result<Vec<TornadoSegment>, String> {
+    let listing = data_source::fetch_listing_text(&format!("{NCEI_STORM_EVENTS_BASE}/"))
+        .map_err(|error| error.to_string())?;
+    let file = latest_ncei_storm_events_file(year, &listing)
+        .ok_or_else(|| format!("no preliminary NCEI Storm Events details file for {year}"))?;
+    // The guarded long-budget downloader is shared with radar volumes because
+    // this annual gzip can exceed the 4 MiB small-resource cap late in a year.
+    let gzip = data_source::fetch_volume_bytes(&format!("{NCEI_STORM_EVENTS_BASE}/{file}"))
+        .map_err(|error| error.to_string())?;
+    let decoder = GzDecoder::new(gzip.as_slice());
+    let mut text = String::new();
+    decoder
+        .take(NCEI_STORM_EVENTS_DECODED_MAX_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("decode {file}: {error}"))?;
+    if text.len() as u64 > NCEI_STORM_EVENTS_DECODED_MAX_BYTES {
+        return Err(format!("decoded {file} exceeds the 256 MiB safety cap"));
+    }
+    Ok(parse_ncei_tornado_segments(convective, &text))
+}
+
 /// Everything the Event Explorer knows about one convective day.
 #[derive(Default)]
 pub struct EventDayData {
@@ -1600,10 +1913,10 @@ pub fn fetch_event_day(convective: NaiveDate) -> Result<EventDayData, String> {
     let mut missing_years = Vec::new();
     for year in &years {
         // A missing year file (per-year files exist ~2008 onward and not
-        // for the unpublished current year) falls to the consolidated
-        // database below; transport failures fall through to the
-        // zero-length stand-ins rather than discarding the reports
-        // already in hand.
+        // for the unpublished current year) falls to NOAA NCEI preliminary
+        // tracks and then the consolidated database below; transport
+        // failures fall through to the zero-length stand-ins rather than
+        // discarding the reports already in hand.
         if let Ok(text) = data_source::fetch_text(&format!(
             "https://www.spc.noaa.gov/wcm/data/{year}_torn.csv"
         )) {
@@ -1613,16 +1926,25 @@ pub fn fetch_event_day(convective: NaiveDate) -> Result<EventDayData, String> {
             missing_years.push(*year);
         }
     }
+    let current_year = Utc::now().year();
+    for year in missing_years
+        .iter()
+        .copied()
+        .filter(|year| *year == current_year)
+    {
+        if let Ok(segments) = fetch_ncei_tornado_segments(year, convective) {
+            data.segments.extend(segments);
+        }
+    }
     if !missing_years.is_empty() {
         // Consolidated fallback (1950-{Y}_actual_tornadoes.csv, ~9 MB on
         // the long-budget client; it also carries the surveyed END
         // times). Per-year files only exist from ~2008 on. A candidate
         // is only valid when it spans EVERY year of the window — then it
         // supersedes whatever the per-year files gave (same database),
-        // so replace, never mix. Days newer than the last compiled year
-        // (the current year) get no candidate and fall through to the
-        // zero-length stand-ins.
-        let current_year = Utc::now().year();
+        // so replace, never mix. Current-year coverage is supplied by the
+        // NCEI preliminary export above; dates newer than its latest revision
+        // fall through to zero-length report stand-ins.
         for end_year in [current_year - 1, current_year - 2] {
             if years.iter().any(|year| *year > end_year) {
                 continue;
@@ -2720,14 +3042,55 @@ VALID TIME 141200Z - 151200Z\n";
         assert_eq!(parsed[0].ef_label, "F5");
     }
 
+    #[test]
+    fn ncei_current_year_rows_preserve_tracks_quoted_fields_and_local_time() {
+        let day = NaiveDate::from_ymd_opt(2026, 6, 11).unwrap();
+        let csv = "BEGIN_YEARMONTH,BEGIN_DAY,BEGIN_TIME,END_YEARMONTH,END_DAY,END_TIME,EVENT_TYPE,STATE,CZ_NAME,CZ_TIMEZONE,BEGIN_LOCATION,BEGIN_LAT,BEGIN_LON,END_LAT,END_LON,TOR_F_SCALE,TOR_LENGTH,TOR_WIDTH,EVENT_NARRATIVE\n\
+                   202606,11,2242,202606,11,2310,Tornado,ILLINOIS,\"LIVINGSTON, EAST\",CST-6,\"2 S, STREATOR\",41.09,-88.84,41.20,-88.60,EF2,13.2,800,\"line one,\nline two\"\n\
+                   202606,11,2242,202606,11,2310,Hail,ILLINOIS,LIVINGSTON,CST-6,STREATOR,41.09,-88.84,41.20,-88.60,,,0,ignored\n\
+                   202606,12,1300,202606,12,1310,Tornado,ILLINOIS,LIVINGSTON,CST-6,STREATOR,41.09,-88.84,41.20,-88.60,EF0,2.0,50,wrong_day\n";
+        let parsed = parse_ncei_tornado_segments(day, csv);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].ef_label, "EF2");
+        assert_eq!(parsed[0].location, "2 S, STREATOR, ILLINOIS");
+        assert_eq!(parsed[0].end, Some((41.20, -88.60)));
+        assert_eq!(parsed[0].length_mi, 13.2);
+        assert_eq!(parsed[0].width_yd, 800.0);
+        // 22:42 CST (UTC-6) is 04:42Z the following calendar day, but
+        // remains part of the June 11 SPC convective day.
+        assert_eq!(
+            parsed[0].time_utc,
+            Utc.with_ymd_and_hms(2026, 6, 12, 4, 42, 0).unwrap()
+        );
+        assert_eq!(
+            parsed[0].end_time_utc,
+            Some(Utc.with_ymd_and_hms(2026, 6, 12, 5, 10, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn ncei_listing_chooses_latest_revision_for_requested_year() {
+        let listing = r#"
+            <a href="StormEvents_details-ftp_v1.0_d2025_c20260424.csv.gz">old year</a>
+            <a href="StormEvents_details-ftp_v1.0_d2026_c20260601.csv.gz">older revision</a>
+            <a href="StormEvents_details-ftp_v1.0_d2026_c20260625.csv.gz">newest revision</a>
+        "#;
+        assert_eq!(
+            latest_ncei_storm_events_file(2026, listing).as_deref(),
+            Some("StormEvents_details-ftp_v1.0_d2026_c20260625.csv.gz")
+        );
+        assert_eq!(latest_ncei_storm_events_file(2024, listing), None);
+    }
+
     /// Live validation against SPC — network required, run with
     /// `cargo test -p app_ui -- --ignored spc_live`.
     #[test]
-    #[ignore = "network: fetches live SPC report + WCM files"]
+    #[ignore = "network: fetches live SPC, WCM, and NOAA NCEI files"]
     fn spc_live_event_days_fetch() {
         // 2026-06-11: the Illinois derecho day — dense reports, and no
-        // WCM file for 2026 yet, so torn reports stand in as zero-length
-        // segments.
+        // WCM file for 2026 yet. NOAA NCEI tracks load when its preliminary
+        // annual revision has reached the day; otherwise torn reports remain
+        // clickable zero-length segments.
         let derecho = NaiveDate::from_ymd_opt(2026, 6, 11).unwrap();
         let data = fetch_event_day(derecho).expect("fetch 2026-06-11");
         assert!(!data.reports_file_missing);

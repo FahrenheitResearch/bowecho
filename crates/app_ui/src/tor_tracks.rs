@@ -29,6 +29,10 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
+const TRACK_CACHE_MAGIC: &[u8; 8] = b"BETRK001";
+const TRACK_CACHE_MAX_CELLS: usize = 1_000_000;
+const TRACK_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 /// One processed history frame: its Cartesian low-level shear grid and TDS
 /// gates, keyed by scan time + the volume allocation that produced them (a
 /// replaced live-partial volume re-processes).
@@ -38,6 +42,138 @@ struct TrackFrame {
     context: crate::DealiasContextKey,
     grid: Vec<f32>,
     tds: Vec<TdsGate>,
+    /// A clean-exit max composite restored from disk. It is retained while
+    /// newly loaded volume-backed frames reconcile, then participates as the
+    /// accumulation baseline until Reset or a radar-site switch.
+    persisted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RotationTrackCache {
+    site_id: String,
+    site_lat: f32,
+    site_lon: f32,
+    spec: TracksGridSpec,
+    upto: DateTime<Utc>,
+    grid: Vec<f32>,
+}
+
+fn rotation_track_cache_path() -> std::path::PathBuf {
+    crate::track_accumulation_cache_dir().join("rotation-tracks.bin")
+}
+
+fn encode_rotation_track_cache(cache: &RotationTrackCache) -> Option<Vec<u8>> {
+    let site = cache.site_id.as_bytes();
+    if site.is_empty()
+        || site.len() > u16::MAX as usize
+        || cache.grid.len() != cache.spec.cell_count()
+        || cache.grid.len() > TRACK_CACHE_MAX_CELLS
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(42 + site.len() + cache.grid.len() * 4);
+    out.extend_from_slice(TRACK_CACHE_MAGIC);
+    out.extend_from_slice(&(site.len() as u16).to_le_bytes());
+    out.extend_from_slice(site);
+    for value in [
+        cache.site_lat,
+        cache.site_lon,
+        cache.spec.half_extent_km,
+        cache.spec.cell_km,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&cache.upto.timestamp_millis().to_le_bytes());
+    out.extend_from_slice(&(cache.grid.len() as u32).to_le_bytes());
+    for value in &cache.grid {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    (out.len() <= TRACK_CACHE_MAX_BYTES).then_some(out)
+}
+
+fn decode_rotation_track_cache(bytes: &[u8]) -> Option<RotationTrackCache> {
+    if bytes.len() > TRACK_CACHE_MAX_BYTES || bytes.get(..8)? != TRACK_CACHE_MAGIC {
+        return None;
+    }
+    let mut cursor = 8usize;
+    let take = |cursor: &mut usize, count: usize| -> Option<&[u8]> {
+        let end = cursor.checked_add(count)?;
+        let slice = bytes.get(*cursor..end)?;
+        *cursor = end;
+        Some(slice)
+    };
+    let site_len = u16::from_le_bytes(take(&mut cursor, 2)?.try_into().ok()?) as usize;
+    let site_id = std::str::from_utf8(take(&mut cursor, site_len)?)
+        .ok()?
+        .trim()
+        .to_owned();
+    if site_id.is_empty() {
+        return None;
+    }
+    let mut read_f32 = || Some(f32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?));
+    let site_lat = read_f32()?;
+    let site_lon = read_f32()?;
+    let half_extent_km = read_f32()?;
+    let cell_km = read_f32()?;
+    let upto_ms = i64::from_le_bytes(take(&mut cursor, 8)?.try_into().ok()?);
+    let grid_len = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?) as usize;
+    let spec = TracksGridSpec {
+        half_extent_km,
+        cell_km,
+    };
+    if !site_lat.is_finite()
+        || !site_lon.is_finite()
+        || !half_extent_km.is_finite()
+        || !cell_km.is_finite()
+        || half_extent_km <= 0.0
+        || cell_km <= 0.0
+        || grid_len == 0
+        || grid_len > TRACK_CACHE_MAX_CELLS
+        || grid_len != spec.cell_count()
+    {
+        return None;
+    }
+    let raw_grid = take(&mut cursor, grid_len.checked_mul(4)?)?;
+    if cursor != bytes.len() {
+        return None;
+    }
+    let grid = raw_grid
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .collect();
+    Some(RotationTrackCache {
+        site_id,
+        site_lat,
+        site_lon,
+        spec,
+        upto: DateTime::from_timestamp_millis(upto_ms)?,
+        grid,
+    })
+}
+
+fn load_rotation_track_cache(expected_site: &str) -> Option<RotationTrackCache> {
+    let bytes = std::fs::read(rotation_track_cache_path()).ok()?;
+    let cache = decode_rotation_track_cache(&bytes)?;
+    cache
+        .site_id
+        .eq_ignore_ascii_case(expected_site)
+        .then_some(cache)
+}
+
+fn write_rotation_track_cache(cache: &RotationTrackCache) -> Result<(), String> {
+    let bytes = encode_rotation_track_cache(cache)
+        .ok_or_else(|| "rotation-track cache is invalid or too large".to_owned())?;
+    let path = rotation_track_cache_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "rotation-track cache path has no parent".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("bin.tmp");
+    std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(temporary, path).map_err(|error| error.to_string())
 }
 
 struct TrackJobResult {
@@ -104,6 +240,62 @@ impl Default for TorTracksState {
 }
 
 impl TorTracksState {
+    pub(crate) fn with_persisted(expected_site: &str, show_tracks: bool, show_tds: bool) -> Self {
+        let mut state = Self {
+            show_tracks,
+            show_tds,
+            ..Self::default()
+        };
+        if let Some(cache) = load_rotation_track_cache(expected_site) {
+            state.spec = cache.spec;
+            state.site_id = Some(cache.site_id);
+            state.site_lat = cache.site_lat;
+            state.site_lon = cache.site_lon;
+            state.frames.push(TrackFrame {
+                scan_time: cache.upto,
+                volume_ptr: 0,
+                context: crate::DealiasContextKey::new(crate::DealiasEngine::Region, None, None),
+                grid: cache.grid,
+                tds: Vec::new(),
+                persisted: true,
+            });
+            state.generation = 1;
+        }
+        state
+    }
+
+    pub(crate) fn save_persisted_cache(&self) {
+        let Some(site_id) = self.site_id.as_deref() else {
+            return;
+        };
+        let Some(upto) = self
+            .frames
+            .iter()
+            .filter(|frame| self.in_window(frame.scan_time))
+            .map(|frame| frame.scan_time)
+            .max()
+        else {
+            return;
+        };
+        let mut grid = vec![f32::NAN; self.spec.cell_count()];
+        for frame in &self.frames {
+            if frame.scan_time <= upto && self.in_window(frame.scan_time) {
+                max_composite_into(&mut grid, &frame.grid);
+            }
+        }
+        if !grid.iter().any(|value| value.is_finite()) {
+            return;
+        }
+        let _ = write_rotation_track_cache(&RotationTrackCache {
+            site_id: site_id.to_owned(),
+            site_lat: self.site_lat,
+            site_lon: self.site_lon,
+            spec: self.spec,
+            upto,
+            grid,
+        });
+    }
+
     fn in_window(&self, scan_time: DateTime<Utc>) -> bool {
         self.reset_floor.is_none_or(|floor| scan_time >= floor)
     }
@@ -193,9 +385,9 @@ impl crate::ViewerApp {
             })
             .collect();
         let before = self.tor_tracks.frames.len();
-        self.tor_tracks
-            .frames
-            .retain(|frame| valid.contains(&(frame.scan_time, frame.volume_ptr, frame.context)));
+        self.tor_tracks.frames.retain(|frame| {
+            frame.persisted || valid.contains(&(frame.scan_time, frame.volume_ptr, frame.context))
+        });
         if self.tor_tracks.frames.len() != before {
             self.tor_tracks.generation = self.tor_tracks.generation.wrapping_add(1);
         }
@@ -212,7 +404,7 @@ impl crate::ViewerApp {
                 state.site_lon = result.site_lon;
                 state
                     .frames
-                    .retain(|frame| frame.scan_time != result.scan_time);
+                    .retain(|frame| frame.persisted || frame.scan_time != result.scan_time);
                 let at = state
                     .frames
                     .partition_point(|frame| frame.scan_time < result.scan_time);
@@ -224,6 +416,7 @@ impl crate::ViewerApp {
                         context: result.context,
                         grid: result.grid,
                         tds: result.tds,
+                        persisted: false,
                     },
                 );
                 state.generation = state.generation.wrapping_add(1);
@@ -516,6 +709,8 @@ impl crate::ViewerApp {
     /// (wave 2: the inline 50 pt button outgrew the middle zone at 320 pt).
     pub(crate) fn tor_tracks_rail_rows(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         use crate::{LayerRowGear, LayerRowOpacity, LayerRowSpec, LayerRowVis, layer_row};
+        let previous_show_tracks = self.tor_tracks.show_tracks;
+        let previous_show_tds = self.tor_tracks.show_tds;
         let newest = self
             .primary
             .history
@@ -565,7 +760,9 @@ impl crate::ViewerApp {
         if reset {
             state.reset_floor = newest;
             if let Some(floor) = state.reset_floor {
-                state.frames.retain(|frame| frame.scan_time >= floor);
+                state
+                    .frames
+                    .retain(|frame| !frame.persisted && frame.scan_time >= floor);
             }
             state.display = None;
             state.generation = state.generation.wrapping_add(1);
@@ -617,5 +814,75 @@ impl crate::ViewerApp {
             };
             crate::panel_kit::status_block(ui, &label, None);
         }
+        let show_tracks = state.show_tracks;
+        let show_tds = state.show_tds;
+        if previous_show_tracks != show_tracks || previous_show_tds != show_tds {
+            self.app_settings.rotation_tracks_enabled = show_tracks;
+            self.app_settings.tds_tracks_enabled = show_tds;
+            self.mark_app_settings_dirty();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_rotation_accumulation_binary_round_trips() {
+        let spec = TracksGridSpec {
+            half_extent_km: 1.0,
+            cell_km: 0.5,
+        };
+        let cache = RotationTrackCache {
+            site_id: "KTLX".to_owned(),
+            site_lat: 35.333,
+            site_lon: -97.278,
+            spec,
+            upto: DateTime::from_timestamp_millis(1_750_000_123_456).unwrap(),
+            grid: (0..spec.cell_count())
+                .map(|index| {
+                    if index % 3 == 0 {
+                        f32::NAN
+                    } else {
+                        index as f32
+                    }
+                })
+                .collect(),
+        };
+
+        let bytes = encode_rotation_track_cache(&cache).expect("encode cache");
+        let decoded = decode_rotation_track_cache(&bytes).expect("decode cache");
+
+        assert_eq!(decoded.site_id, cache.site_id);
+        assert_eq!(decoded.site_lat.to_bits(), cache.site_lat.to_bits());
+        assert_eq!(decoded.site_lon.to_bits(), cache.site_lon.to_bits());
+        assert_eq!(decoded.spec, cache.spec);
+        assert_eq!(decoded.upto, cache.upto);
+        assert_eq!(decoded.grid.len(), cache.grid.len());
+        for (actual, expected) in decoded.grid.iter().zip(&cache.grid) {
+            assert!(
+                (actual.is_nan() && expected.is_nan()) || actual.to_bits() == expected.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_rotation_accumulation_rejects_truncation() {
+        let spec = TracksGridSpec {
+            half_extent_km: 1.0,
+            cell_km: 1.0,
+        };
+        let cache = RotationTrackCache {
+            site_id: "KOUN".to_owned(),
+            site_lat: 35.2,
+            site_lon: -97.4,
+            spec,
+            upto: Utc::now(),
+            grid: vec![0.01; spec.cell_count()],
+        };
+        let mut bytes = encode_rotation_track_cache(&cache).unwrap();
+        bytes.pop();
+        assert!(decode_rotation_track_cache(&bytes).is_none());
     }
 }

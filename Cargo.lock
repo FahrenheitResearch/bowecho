@@ -4767,6 +4767,7 @@ dependencies = [
  "nexrad_io",
  "radar_core",
  "rayon",
+ "serde",
  "thiserror 2.0.18",
 ]
 

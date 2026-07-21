@@ -34,7 +34,7 @@ use render2d::{
     velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{LoopSweepControl, SweepPolicy, SweepPolicyMode, SweepPolicySet, SweepProductGroup};
 
 mod aircraft_soundings;
@@ -1533,6 +1533,97 @@ fn app_cache_root() -> PathBuf {
         .join(format!("{storage_namespace}-cache"))
 }
 
+const TRACK_ACCUMULATION_CACHE_VERSION: u8 = 1;
+const TRACK_ACCUMULATION_CACHE_MAX_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct PersistedStormTrackBase {
+    site_id: String,
+    upto: DateTime<Utc>,
+    tracker: StormTracker,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StormTrackCacheFile {
+    version: u8,
+    site_id: String,
+    upto: DateTime<Utc>,
+    tracker: StormTracker,
+}
+
+fn track_accumulation_cache_dir() -> PathBuf {
+    settings::data_dir_override()
+        .or_else(settings::active_storage_root)
+        .unwrap_or_else(|| app_cache_root().join("durable"))
+        .join("track-accumulation")
+}
+
+fn storm_track_cache_path() -> PathBuf {
+    track_accumulation_cache_dir().join("storm-tracks.json")
+}
+
+fn storm_tracker_upto(tracker: &StormTracker) -> Option<DateTime<Utc>> {
+    tracker
+        .tracks
+        .iter()
+        .filter_map(|track| track.history.back().map(|(time, ..)| *time))
+        .max()
+}
+
+fn valid_storm_track_cache(cache: &StormTrackCacheFile) -> bool {
+    cache.version == TRACK_ACCUMULATION_CACHE_VERSION
+        && !cache.site_id.trim().is_empty()
+        && cache.tracker.tracks.len() <= 256
+        && cache.tracker.tracks.iter().all(|track| {
+            track.history.len() <= 16
+                && track.max_dbz.is_finite()
+                && track.eq_radius_km.is_finite()
+                && track.history.iter().all(|(_, east_km, north_km)| {
+                    east_km.is_finite()
+                        && north_km.is_finite()
+                        && east_km.abs() <= 1_000.0
+                        && north_km.abs() <= 1_000.0
+                })
+        })
+        && storm_tracker_upto(&cache.tracker).is_some_and(|time| time == cache.upto)
+}
+
+fn load_storm_track_cache(expected_site: &str) -> Option<PersistedStormTrackBase> {
+    let bytes = std::fs::read(storm_track_cache_path()).ok()?;
+    if bytes.len() as u64 > TRACK_ACCUMULATION_CACHE_MAX_BYTES {
+        return None;
+    }
+    let cache: StormTrackCacheFile = serde_json::from_slice(&bytes).ok()?;
+    if !valid_storm_track_cache(&cache) || !cache.site_id.eq_ignore_ascii_case(expected_site) {
+        return None;
+    }
+    Some(PersistedStormTrackBase {
+        site_id: cache.site_id,
+        upto: cache.upto,
+        tracker: cache.tracker,
+    })
+}
+
+fn save_storm_track_cache(site_id: &str, tracker: &StormTracker) -> Result<(), String> {
+    let Some(upto) = storm_tracker_upto(tracker) else {
+        return Ok(());
+    };
+    let cache = StormTrackCacheFile {
+        version: TRACK_ACCUMULATION_CACHE_VERSION,
+        site_id: site_id.to_ascii_uppercase(),
+        upto,
+        tracker: tracker.clone(),
+    };
+    let path = storm_track_cache_path();
+    std::fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| "storm-track cache path has no parent".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    settings::atomic_write_json(&path, &cache, TRACK_ACCUMULATION_CACHE_MAX_BYTES)
+        .map_err(|error| error.to_string())
+}
+
 /// The only on-disk trees BowEcho is allowed to recycle automatically.
 /// Keep this list intentionally narrow: model/satellite stores, imports,
 /// settings, palettes, annotations, and captures are durable user data.
@@ -2889,6 +2980,10 @@ struct ViewerApp {
     /// SCIT-style storm tracks: identification runs per volume on a
     /// background thread; association + motion fits are O(cells) on install.
     storm_tracker: StormTracker,
+    /// Last clean-exit SCIT state for the startup radar. Rebuilds begin from
+    /// this base and add only newer loaded scans, so reopening BowEcho does not
+    /// erase a still-current track before the first loop finishes loading.
+    storm_tracker_persisted_base: Option<PersistedStormTrackBase>,
     storm_tracks_site: String,
     storm_cells_volume_ptr: usize,
     storm_cells_receiver: Option<mpsc::Receiver<StormCellsResult>>,
@@ -3942,6 +4037,9 @@ fn previous_dealias_reference_volume(
 struct LowSweepCutKey {
     identity: FrameIdentity,
     cut_index: usize,
+    /// Disabled-cut controls use a radar-session scope so the choice survives
+    /// frame stepping. Manual cut holds keep their exact-frame identity.
+    session_wide: bool,
 }
 
 impl LowSweepCutKey {
@@ -3949,7 +4047,27 @@ impl LowSweepCutKey {
         Self {
             identity: identity.clone(),
             cut_index,
+            session_wide: false,
         }
+    }
+
+    fn session(identity: &FrameIdentity, cut_index: usize) -> Self {
+        Self {
+            identity: identity.clone(),
+            cut_index,
+            session_wide: true,
+        }
+    }
+
+    fn applies_to(&self, identity: &FrameIdentity, cut_index: usize) -> bool {
+        self.cut_index == cut_index
+            && if self.session_wide {
+                self.identity
+                    .site_id
+                    .eq_ignore_ascii_case(&identity.site_id)
+            } else {
+                self.identity == *identity
+            }
     }
 }
 
@@ -8631,6 +8749,25 @@ impl ViewerApp {
             .get(selected_site_index)
             .and_then(site_location)
             .unwrap_or((35.33305, -97.27775));
+        let restored_storm_track_base = sites
+            .get(selected_site_index)
+            .and_then(|site| load_storm_track_cache(&site.level2_id));
+        let restored_storm_tracker = restored_storm_track_base
+            .as_ref()
+            .map(|base| base.tracker.clone())
+            .unwrap_or_default();
+        let restored_storm_tracks_site = restored_storm_track_base
+            .as_ref()
+            .map(|base| base.site_id.clone())
+            .unwrap_or_default();
+        let restored_tor_tracks = tor_tracks::TorTracksState::with_persisted(
+            sites
+                .get(selected_site_index)
+                .map(|site| site.level2_id.as_str())
+                .unwrap_or("KTLX"),
+            app_settings.rotation_tracks_enabled,
+            app_settings.tds_tracks_enabled,
+        );
         let (render_sender, render_receiver, render_recycle_sender) = spawn_render_worker();
         let loop_prewarm = spawn_loop_prewarm_render_workers();
         let (overlay_render_recycle_sender, overlay_render_recycle_receiver) =
@@ -8760,8 +8897,9 @@ impl ViewerApp {
             placefile_url_input: String::new(),
             placefile_input_focus: false,
             placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
-            storm_tracker: StormTracker::default(),
-            storm_tracks_site: String::new(),
+            storm_tracker: restored_storm_tracker,
+            storm_tracker_persisted_base: restored_storm_track_base,
+            storm_tracks_site: restored_storm_tracks_site,
             storm_cells_volume_ptr: 0,
             storm_cells_receiver: None,
             storm_cells_cache: BTreeMap::new(),
@@ -8778,7 +8916,7 @@ impl ViewerApp {
             rotation_markers_cache: BTreeMap::new(),
             rotation_markers_cache_order: VecDeque::new(),
             show_rotation_markers: true,
-            tor_tracks: tor_tracks::TorTracksState::default(),
+            tor_tracks: restored_tor_tracks,
             gate_filter_dbz: None,
             dealias_engine: DealiasEngine::Region,
             dealias_env: dealias_env::DealiasEnvCache::default(),
@@ -13049,7 +13187,7 @@ impl ViewerApp {
         ui.horizontal_wrapped(|ui| {
             ui.weak("Sweep cuts");
             for cut in candidates {
-                let key = LowSweepCutKey::new(&identity, cut);
+                let key = LowSweepCutKey::session(&identity, cut);
                 let mut enabled = !self.low_sweep_disabled_cuts.contains(&key);
                 if ui
                     .checkbox(&mut enabled, low_sweep_cut_label(volume.as_ref(), cut))
@@ -13066,7 +13204,7 @@ impl ViewerApp {
             }
             if ui
                 .small_button("All")
-                .on_hover_text("Enable all cuts in this scan")
+                .on_hover_text("Enable all cuts for this radar while the loop is loaded")
                 .clicked()
             {
                 reset_all = true;
@@ -13074,7 +13212,7 @@ impl ViewerApp {
         });
         if reset_all {
             self.low_sweep_disabled_cuts
-                .retain(|key| key.identity != identity);
+                .retain(|key| !key.identity.site_id.eq_ignore_ascii_case(&identity.site_id));
             changed = true;
         }
         if changed {
@@ -13125,7 +13263,7 @@ impl ViewerApp {
         ui.horizontal_wrapped(|ui| {
             ui.weak("Sweep cuts");
             for cut in candidates {
-                let key = LowSweepCutKey::new(&identity, cut);
+                let key = LowSweepCutKey::session(&identity, cut);
                 let mut enabled = !self.low_sweep_disabled_cuts.contains(&key);
                 if ui
                     .checkbox(&mut enabled, low_sweep_cut_label(volume.as_ref(), cut))
@@ -13142,7 +13280,7 @@ impl ViewerApp {
             }
             if ui
                 .small_button("All")
-                .on_hover_text("Enable all cuts in this scan")
+                .on_hover_text("Enable all cuts for this radar while the loop is loaded")
                 .clicked()
             {
                 reset_all = true;
@@ -13150,7 +13288,7 @@ impl ViewerApp {
         });
         if reset_all {
             self.low_sweep_disabled_cuts
-                .retain(|key| key.identity != identity);
+                .retain(|key| !key.identity.site_id.eq_ignore_ascii_case(&identity.site_id));
             changed = true;
         }
         if changed {
@@ -13340,6 +13478,7 @@ impl ViewerApp {
         self.app_settings.storm_track_min_dbz_tenths = (min_dbz * 10.0).round() as u16;
         self.mark_app_settings_dirty();
         self.storm_tracker.clear();
+        self.storm_tracker_persisted_base = None;
         self.storm_track_follow = None;
         self.storm_cells_volume_ptr = 0;
         ctx.request_repaint();
@@ -13351,9 +13490,9 @@ impl ViewerApp {
             self.app_settings.storm_tracks_enabled = enabled;
             self.mark_app_settings_dirty();
         }
-        if !enabled && self.storm_track_follow.is_none() {
-            self.storm_tracker.clear();
-        }
+        // Visibility is presentation, not ownership. Keep the compact track
+        // state warm while hidden so toggling the layer (or reopening the app)
+        // does not throw away the accumulated path.
         self.storm_cells_volume_ptr = 0;
     }
 
@@ -20721,6 +20860,10 @@ impl eframe::App for ViewerApp {
         self.persist_wrf_synth_radar();
         self.persist_formula_lab_state();
         self.persist_simsat_state();
+        if !self.storm_tracks_site.is_empty() {
+            let _ = save_storm_track_cache(&self.storm_tracks_site, &self.storm_tracker);
+        }
+        self.tor_tracks.save_persisted_cache();
         if self.workspace.dirty {
             self.persist_workspace_layout();
         }
@@ -22344,10 +22487,7 @@ impl ViewerApp {
             }
             Some(unified_player::UnifiedPlayerAction::StopStormFollow) => {
                 self.storm_track_follow = None;
-                if !self.show_storm_tracks {
-                    self.storm_tracker.clear();
-                    self.storm_cells_volume_ptr = 0;
-                }
+                self.storm_cells_volume_ptr = 0;
                 self.unified_player
                     .mark_status("Storm camera follow stopped");
                 ctx.request_repaint();
@@ -25116,17 +25256,15 @@ impl ViewerApp {
         // layers with opacity/order needs; spec §2.3 + lane directive.)
         // Wrapped: checkbox + track buttons + follow combo hold at 320 pt.
         ui.horizontal_wrapped(|ui| {
+            let mut show_storm_tracks = self.show_storm_tracks;
             if ui
-                .checkbox(&mut self.show_storm_tracks, "Storm tracks")
+                .checkbox(&mut show_storm_tracks, "Storm tracks")
                 .on_hover_text(
                     "SCIT-style cell tracking (Johnson et al. 1998): composite-reflectivity cells identified per volume on a background thread, tracked across volumes with a least-squares motion fit; dots extrapolate +15/+30/+45 min.",
                 )
                 .changed()
             {
-                if !self.show_storm_tracks && self.storm_track_follow.is_none() {
-                    self.storm_tracker.clear();
-                }
-                self.storm_cells_volume_ptr = 0;
+                self.set_storm_tracks_visible(show_storm_tracks);
                 ctx.request_repaint();
             }
             if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
@@ -25171,10 +25309,7 @@ impl ViewerApp {
                     .clicked()
                 {
                     self.storm_track_follow = None;
-                    if !self.show_storm_tracks {
-                        self.storm_tracker.clear();
-                        self.storm_cells_volume_ptr = 0;
-                    }
+                    self.storm_cells_volume_ptr = 0;
                     ctx.request_repaint();
                 }
             }
@@ -30415,12 +30550,29 @@ impl ViewerApp {
             })
             .collect();
 
-        self.storm_tracker = StormTracker::default();
+        let persisted_base = self.storm_tracker_persisted_base.as_ref().filter(|base| {
+            if !base.site_id.eq_ignore_ascii_case(&site_id) {
+                return false;
+            }
+            let gap_seconds = current_key
+                .identity
+                .scan_time_utc
+                .signed_duration_since(base.upto)
+                .num_seconds();
+            (0..=TIME_GATE_S as i64).contains(&gap_seconds)
+        });
+        let persisted_upto = persisted_base.map(|base| base.upto);
+        self.storm_tracker = persisted_base
+            .map(|base| base.tracker.clone())
+            .unwrap_or_default();
         self.storm_tracks_site = site_id;
         let user_motion = self.storm_track_user_motion();
-        let mut installed_current = false;
+        let mut installed_current = persisted_upto == Some(current_key.identity.scan_time_utc);
         for (key, status) in frames {
             if status == FrameStatus::LivePartial {
+                continue;
+            }
+            if persisted_upto.is_some_and(|upto| key.identity.scan_time_utc <= upto) {
                 continue;
             }
             let Some(cells) = self.storm_cells_cache.get(&key).cloned() else {
@@ -30490,6 +30642,7 @@ impl ViewerApp {
         // Site change resets the history (tracks are radar-relative).
         if self.storm_tracks_site != volume.site.id {
             self.storm_tracker.clear();
+            self.storm_tracker_persisted_base = None;
             self.storm_track_follow = None;
             self.storm_tracks_site = volume.site.id.clone();
             self.storm_cells_cache.clear();
@@ -35819,21 +35972,9 @@ impl ViewerApp {
         // Radar-time sync: pick the forecast minute nearest the displayed
         // frame (init + minute ≈ frame time).
         if self.wofs.sync_to_radar
-            && let Some(volume) = &self.volume
-            && let Some(catalog) = &self.wofs.catalog
-            && let Some(run) = catalog.runs.get(self.wofs.run_index)
-            && !self.wofs.init.is_empty()
+            && let Some(frame) = self.displayed_timeline_time_utc()
         {
-            let frame = volume.volume_time.with_timezone(&Utc);
-            if let Some(init_time) = wofs::init_time_utc(run, &self.wofs.init) {
-                let delta_min = (frame - init_time).num_minutes();
-                if delta_min >= 0 {
-                    let snapped = self.wofs.snap_minute(delta_min.min(600) as u32);
-                    if snapped != self.wofs.minute {
-                        self.wofs.minute = snapped;
-                    }
-                }
-            }
+            self.wofs.sync_to_displayed_time(frame);
         }
         self.wofs.pump(ctx);
         if !self.wofs.open {
@@ -35954,15 +36095,36 @@ impl ViewerApp {
                             }
                         });
                 });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                     ui.label("f+min");
-                    let mut minute = self.wofs.minute as i32;
+                    let can_step_back = self.wofs.can_step_minute(false);
                     if ui
-                        .add(egui::Slider::new(&mut minute, 0..=360).step_by(5.0))
+                        .add_enabled(can_step_back, egui::Button::new("◀").small())
+                        .on_hover_text("Previous posted WoFS frame")
+                        .clicked()
+                    {
+                        self.wofs.step_minute(false);
+                    }
+                    let mut minute = self.wofs.minute as i32;
+                    let max_minute = self.wofs.timeline_max_minute().max(5) as i32;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut minute, 0..=max_minute)
+                                .step_by(5.0)
+                                .show_value(true),
+                        )
                         .changed()
                     {
                         self.wofs.minute = self.wofs.snap_minute(minute as u32);
                         self.wofs.sync_to_radar = false;
+                    }
+                    let can_step_forward = self.wofs.can_step_minute(true);
+                    if ui
+                        .add_enabled(can_step_forward, egui::Button::new("▶").small())
+                        .on_hover_text("Next posted WoFS frame")
+                        .clicked()
+                    {
+                        self.wofs.step_minute(true);
                     }
                     ui.checkbox(&mut self.wofs.sync_to_radar, "Sync to radar")
                         .on_hover_text(
@@ -35973,6 +36135,8 @@ impl ViewerApp {
                             "-> {}z + {} min",
                             wofs::init_hhmm(&self.wofs.init), self.wofs.minute
                         ));
+                    } else if let Some(edge) = self.wofs.posted_edge_minute() {
+                        ui.weak(format!("posted through +{edge}m"));
                     }
                     self.wofs.soundings_toggle_ui(ui);
                     if self.wofs.image_rx.is_some() {
@@ -58683,6 +58847,29 @@ mod tests {
         assert_eq!(cells[0].max_dbz, 62.0);
     }
 
+    #[test]
+    fn storm_track_accumulation_cache_round_trips() {
+        let upto = Utc.with_ymd_and_hms(2026, 7, 21, 18, 0, 0).unwrap();
+        let mut tracker = StormTracker::default();
+        tracker
+            .tracks
+            .push(test_storm_track(7, upto, 12.5, -3.0, Some((8.0, 2.0))));
+        let cache = StormTrackCacheFile {
+            version: TRACK_ACCUMULATION_CACHE_VERSION,
+            site_id: "KTLX".to_owned(),
+            upto,
+            tracker,
+        };
+
+        let json = serde_json::to_vec(&cache).expect("encode track cache");
+        let decoded: StormTrackCacheFile =
+            serde_json::from_slice(&json).expect("decode track cache");
+
+        assert!(valid_storm_track_cache(&decoded));
+        assert_eq!(decoded.site_id, "KTLX");
+        assert_eq!(decoded.tracker.tracks[0].history.back().unwrap().0, upto);
+    }
+
     fn cached_storm_key_for_frame(app: &ViewerApp, index: usize) -> FrameWorkKey {
         let frame = &app.primary.history[index];
         FrameWorkKey::new(&frame.volume, Arc::as_ptr(&frame.volume) as usize)
@@ -64058,6 +64245,7 @@ mod tests {
         app.hidden_hazard_families
             .insert("severe thunderstorm".to_owned());
         app.app_settings.current_alert_filter = HazardListFilter::Tornado.key().to_owned();
+        app.app_settings.current_alert_sort = HazardListSort::Oldest.key().to_owned();
 
         assert_eq!(app.visible_hazard_list_rows().len(), 1);
         assert!(
@@ -64077,7 +64265,13 @@ mod tests {
         assert_eq!(app.selected_hazard_index, Some(1));
         assert_eq!(
             app.app_settings.current_alert_filter,
-            HazardListFilter::All.key()
+            HazardListFilter::Tornado.key(),
+            "opening a newly issued alert must preserve the user's type filter"
+        );
+        assert_eq!(
+            app.app_settings.current_alert_sort,
+            HazardListSort::Oldest.key(),
+            "opening a newly issued alert must preserve the user's sort"
         );
         assert!(!app.hidden_hazard_families.contains("severe thunderstorm"));
         assert!(!app.unacknowledged_hazard_event_ids.contains("new"));
@@ -64380,6 +64574,47 @@ mod tests {
             end,
             Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 1).unwrap(),
             "disabled low-sweep cuts should not expand the warning/report sync window"
+        );
+    }
+
+    #[test]
+    fn disabled_low_sweep_cut_stays_disabled_when_stepping_frames() {
+        let first_volume = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (0.5, 60_000)],
+            720,
+        ));
+        let mut second_volume =
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (0.5, 60_000)], 720);
+        second_volume.volume_time = first_volume.volume_time + chrono::Duration::minutes(3);
+        let second_volume = Arc::new(second_volume);
+        let first = FrameHistoryEntry {
+            identity: frame_identity_for_volume(first_volume.as_ref()),
+            path: PathBuf::from("sweep-pref-first"),
+            volume: first_volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        };
+        let second = FrameHistoryEntry {
+            identity: frame_identity_for_volume(second_volume.as_ref()),
+            path: PathBuf::from("sweep-pref-second"),
+            volume: second_volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        };
+        let disabled = BTreeSet::from([LowSweepCutKey::session(&first.identity, 1)]);
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let policy = SweepPolicy::default();
+
+        assert_eq!(
+            sweep_cuts_for_history_entry(&first, &product, policy, &disabled),
+            vec![0]
+        );
+        assert_eq!(
+            sweep_cuts_for_history_entry(&second, &product, policy, &disabled),
+            vec![0],
+            "a cut hidden on one scan must stay hidden on the next scan"
         );
     }
 
@@ -67048,6 +67283,7 @@ mod tests {
             placefile_input_focus: false,
             placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             storm_tracker: StormTracker::default(),
+            storm_tracker_persisted_base: None,
             storm_tracks_site: String::new(),
             storm_cells_volume_ptr: 0,
             storm_cells_receiver: None,

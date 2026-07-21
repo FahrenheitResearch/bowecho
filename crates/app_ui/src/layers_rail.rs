@@ -44,6 +44,35 @@ fn model_map_layer_opacity_hover(grid_composite: bool) -> &'static str {
     }
 }
 
+const PLACEFILE_VISIBILITY_RANGE_PERCENTS: [u16; 5] = [100, 200, 400, 800, u16::MAX];
+
+/// Draw the visibility range as direct choices in the placefile gear menu.
+///
+/// Do not replace these with a `ComboBox`: both the gear menu and a combo are
+/// egui popups, and opening the nested combo closes its owning menu before a
+/// range can be selected.
+fn placefile_visibility_range_menu(
+    ui: &mut egui::Ui,
+    visibility_range_percent: &mut u16,
+) -> (
+    bool,
+    [(u16, egui::Response); PLACEFILE_VISIBILITY_RANGE_PERCENTS.len()],
+) {
+    ui.weak("Visibility when zoomed out");
+    let mut changed = false;
+    let choices = PLACEFILE_VISIBILITY_RANGE_PERCENTS.map(|percent| {
+        let response = ui.selectable_value(
+            visibility_range_percent,
+            percent,
+            crate::placefile_visibility_range_label(percent),
+        );
+        changed |= response.changed();
+        (percent, response)
+    });
+    ui.weak("Source range respects the file's Threshold statements.");
+    (changed, choices)
+}
+
 impl ViewerApp {
     /// Add a community URL or downloaded placefile through one slot path.
     /// Selecting an existing source is a useful explicit reload instead of
@@ -1571,32 +1600,9 @@ impl ViewerApp {
                     gear: Some(LayerRowGear::Menu {
                         hover: "Placefile options",
                         content: Box::new(|ui| {
-                            ui.weak("Visibility when zoomed out");
-                            egui::ComboBox::from_id_salt(("placefile_visibility_range", index))
-                                .selected_text(crate::placefile_visibility_range_label(
-                                    *visibility_range_percent,
-                                ))
-                                .show_ui(ui, |ui| {
-                                    for (percent, label) in [
-                                        (100, "Source range"),
-                                        (200, "2x farther"),
-                                        (400, "4x farther"),
-                                        (800, "8x farther"),
-                                        (u16::MAX, "Always visible"),
-                                    ] {
-                                        if ui
-                                            .selectable_value(
-                                                visibility_range_percent,
-                                                percent,
-                                                label,
-                                            )
-                                            .changed()
-                                        {
-                                            visibility_changed = true;
-                                        }
-                                    }
-                                });
-                            ui.weak("Source range respects the file's Threshold statements.");
+                            let (changed, _) =
+                                placefile_visibility_range_menu(ui, visibility_range_percent);
+                            visibility_changed |= changed;
                         }),
                     }),
                     remove: Some(LayerRowRemove {
@@ -2947,6 +2953,88 @@ mod tests {
         assert_eq!(
             model_map_layer_opacity_hover(true),
             "Gridded radar/composite layer opacity"
+        );
+    }
+
+    #[test]
+    fn placefile_visibility_range_is_selectable_inside_gear_menu() {
+        #[derive(Default)]
+        struct FrameState {
+            gear_rect: Option<egui::Rect>,
+            second_choice_rect: Option<egui::Rect>,
+            menu_rendered: bool,
+        }
+
+        fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn pointer_input(position: egui::Pos2, pressed: bool) -> egui::RawInput {
+            raw_input(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ])
+        }
+
+        fn frame(ctx: &egui::Context, input: egui::RawInput, selection: &mut u16) -> FrameState {
+            let mut state = FrameState::default();
+            let _ = ctx.run_ui(input, |ui| {
+                let menu = ui.menu_button("⚙", |ui| {
+                    state.menu_rendered = true;
+                    let (_, choices) = placefile_visibility_range_menu(ui, selection);
+                    state.second_choice_rect = choices
+                        .into_iter()
+                        .find_map(|(percent, response)| (percent == 200).then_some(response.rect));
+                });
+                state.gear_rect = Some(menu.response.rect);
+            });
+            state
+        }
+
+        fn click(ctx: &egui::Context, position: egui::Pos2, selection: &mut u16) -> FrameState {
+            let _ = frame(ctx, pointer_input(position, true), selection);
+            frame(ctx, pointer_input(position, false), selection)
+        }
+
+        let ctx = egui::Context::default();
+        let mut selection = 100;
+
+        let initial = frame(&ctx, raw_input(Vec::new()), &mut selection);
+        assert!(!initial.menu_rendered);
+        let gear_center = initial
+            .gear_rect
+            .expect("gear button must be laid out")
+            .center();
+
+        let opened = click(&ctx, gear_center, &mut selection);
+        assert!(opened.menu_rendered, "gear click must open the range menu");
+        let settled = frame(&ctx, raw_input(Vec::new()), &mut selection);
+        assert!(
+            settled.menu_rendered,
+            "range choices must remain visible after the menu opens"
+        );
+        let second_choice_center = settled
+            .second_choice_rect
+            .expect("2x range choice must be laid out directly in the menu")
+            .center();
+
+        let selected = click(&ctx, second_choice_center, &mut selection);
+        assert_eq!(selection, 200, "the direct range choice must be clickable");
+        assert!(
+            selected.menu_rendered,
+            "selecting a range must not make the placefile options disappear"
         );
     }
 }

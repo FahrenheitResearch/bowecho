@@ -563,7 +563,11 @@ fn sweep_cuts_for_volume_identity(
 ) -> Vec<usize> {
     sweep_cuts_for_product(volume, product, policy)
         .into_iter()
-        .filter(|cut| !disabled_cuts.contains(&LowSweepCutKey::new(identity, *cut)))
+        .filter(|cut| {
+            !disabled_cuts
+                .iter()
+                .any(|disabled| disabled.applies_to(identity, *cut))
+        })
         .collect()
 }
 

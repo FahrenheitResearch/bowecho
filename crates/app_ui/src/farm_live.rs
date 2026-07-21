@@ -238,8 +238,10 @@ pub const TICK_CHOICES: &[f64] = &[10.0, 15.0, 20.0, 25.0, 30.0, 50.0];
 const ECHO_CHROMA: u8 = 45;
 /// Drape "echoes only" mask keeps pixels at least this chromatic.
 const MASK_CHROMA: u8 = 35;
-/// Cached drape frames (half-res CPU images; ~0.8 MB each).
-const DRAPE_CACHE_FRAMES: usize = 48;
+/// Cached full-resolution drape crops.  Thirty-two frames preserve a useful
+/// loop while bounding the CPU cache to roughly 80 MiB for the observed
+/// 790x798 FARM plot area.
+const DRAPE_CACHE_FRAMES: usize = 32;
 /// Fallback radar anchor when no echo is on the plot: every sampled
 /// frame (two deployments, two image scales) put the radar at this pixel.
 const EMPIRICAL_RADAR_PX: (f64, f64) = (447.0, 419.0);
@@ -827,77 +829,58 @@ pub fn analyze_frame(img: &egui::ColorImage, scan_id: &str) -> AnalysisOutcome {
     }
 }
 
-/// One cached drape frame: half-res crop of the axes area, in both a
-/// plain variant and an "echoes only" variant (alpha from the fraction
-/// of chromatic source pixels per 2x2 block).
+/// One cached drape frame at the quicklook's native plot resolution.  The old
+/// path box-filtered every 2x2 block before upload; that erased small gates,
+/// softened velocity boundaries, and made the echoes-only mask translucent.
+/// Keep one exact crop and derive the optional mask only when it is uploaded.
 struct DrapeImage {
-    plain: egui::ColorImage,
-    echoes: egui::ColorImage,
+    source: egui::ColorImage,
     crop_left: usize,
     crop_top: usize,
-    /// Crop size in FULL-image pixels (even; = 2x the half-res size).
+    /// Crop size in full-image pixels.
     full_w: usize,
     full_h: usize,
 }
 
 fn build_drape_image(img: &egui::ColorImage, axes: AxesRect) -> DrapeImage {
     let [w, _h] = img.size;
-    let half_w = (axes.right - axes.left).div_ceil(2);
-    let half_h = (axes.bottom - axes.top).div_ceil(2);
-    let mut plain = vec![egui::Color32::TRANSPARENT; half_w * half_h];
-    let mut echoes = vec![egui::Color32::TRANSPARENT; half_w * half_h];
-    for oy in 0..half_h {
-        for ox in 0..half_w {
-            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
-            let (mut er, mut eg, mut eb, mut en) = (0u32, 0u32, 0u32, 0u32);
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let sx = axes.left + ox * 2 + dx;
-                    let sy = axes.top + oy * 2 + dy;
-                    let c = img.pixels[sy * w + sx];
-                    r += c.r() as u32;
-                    g += c.g() as u32;
-                    b += c.b() as u32;
-                    if chroma(c) >= MASK_CHROMA {
-                        er += c.r() as u32;
-                        eg += c.g() as u32;
-                        eb += c.b() as u32;
-                        en += 1;
-                    }
-                }
-            }
-            let out = oy * half_w + ox;
-            plain[out] = egui::Color32::from_rgb((r / 4) as u8, (g / 4) as u8, (b / 4) as u8);
-            // max(1) keeps the divisor provably nonzero (== en inside the
-            // guard), sidestepping clippy 1.96's manual_checked_ops.
-            let echo_count = en.max(1);
-            if en > 0 {
-                echoes[out] = egui::Color32::from_rgba_unmultiplied(
-                    (er / echo_count) as u8,
-                    (eg / echo_count) as u8,
-                    (eb / echo_count) as u8,
-                    (en * 255 / 4) as u8,
-                );
-            }
-        }
+    let crop_w = axes.right.saturating_sub(axes.left);
+    let crop_h = axes.bottom.saturating_sub(axes.top);
+    let mut pixels = Vec::with_capacity(crop_w * crop_h);
+    for y in axes.top..axes.bottom {
+        let start = y * w + axes.left;
+        pixels.extend_from_slice(&img.pixels[start..start + crop_w]);
     }
-    let size = [half_w, half_h];
-    let source_size = egui::vec2(half_w as f32, half_h as f32);
+    let size = [crop_w, crop_h];
     DrapeImage {
-        plain: egui::ColorImage {
+        source: egui::ColorImage {
             size,
-            source_size,
-            pixels: plain,
-        },
-        echoes: egui::ColorImage {
-            size,
-            source_size,
-            pixels: echoes,
+            source_size: egui::vec2(crop_w as f32, crop_h as f32),
+            pixels,
         },
         crop_left: axes.left,
         crop_top: axes.top,
-        full_w: half_w * 2,
-        full_h: half_h * 2,
+        full_w: crop_w,
+        full_h: crop_h,
+    }
+}
+
+fn echoes_only_image(source: &egui::ColorImage) -> egui::ColorImage {
+    let pixels = source
+        .pixels
+        .iter()
+        .map(|color| {
+            if chroma(*color) >= MASK_CHROMA {
+                *color
+            } else {
+                egui::Color32::TRANSPARENT
+            }
+        })
+        .collect();
+    egui::ColorImage {
+        size: source.size,
+        source_size: source.source_size,
+        pixels,
     }
 }
 
@@ -1147,9 +1130,9 @@ impl DrapeState {
             return;
         };
         let image = if self.echoes_only {
-            di.echoes.clone()
+            echoes_only_image(&di.source)
         } else {
-            di.plain.clone()
+            di.source.clone()
         };
         let handle = ctx.load_texture("farm-drape", image, egui::TextureOptions::LINEAR);
         self.texture = Some(DrapeTexture {
@@ -1758,6 +1741,47 @@ mod tests {
     fn synthetic_axes_detected() {
         let (image, _) = synth_quicklook();
         assert_eq!(detect_axes(&image), Some(SYN_AXES));
+    }
+
+    #[test]
+    fn drape_crop_preserves_native_pixels_and_opaque_echoes() {
+        let background = egui::Color32::from_rgb(70, 65, 60);
+        let echo = egui::Color32::from_rgb(20, 210, 45);
+        let mut pixels = vec![background; 6 * 6];
+        pixels[2 * 6 + 3] = echo;
+        let image = egui::ColorImage {
+            size: [6, 6],
+            source_size: egui::vec2(6.0, 6.0),
+            pixels,
+        };
+        let axes = AxesRect {
+            left: 1,
+            top: 1,
+            right: 5,
+            bottom: 5,
+        };
+
+        let drape = build_drape_image(&image, axes);
+        assert_eq!(drape.source.size, [4, 4]);
+        assert_eq!((drape.full_w, drape.full_h), (4, 4));
+        assert_eq!(
+            drape.source.pixels[1 * 4 + 2],
+            echo,
+            "the crop must retain the exact native quicklook pixel"
+        );
+
+        let masked = echoes_only_image(&drape.source);
+        assert_eq!(masked.pixels[1 * 4 + 2], echo);
+        assert_eq!(
+            masked.pixels[0],
+            egui::Color32::TRANSPARENT,
+            "low-chroma basemap pixels must remain absent"
+        );
+        assert_eq!(
+            masked.pixels[1 * 4 + 2].a(),
+            255,
+            "a one-pixel gate must not be diluted by a 2x2 box filter"
+        );
     }
 
     #[test]

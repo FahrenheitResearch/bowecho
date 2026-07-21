@@ -41,6 +41,13 @@ const SND_REF_PRODUCT: &str = "comp_dz__paintballs_thresh_40";
 /// exposed run has at least one posted analysis image before presenting it as
 /// loadable.
 const MAX_PICKER_RUNS: usize = 20;
+/// The run endpoint gains a new initialization every 30 minutes while WoFS
+/// is operating.  Refreshing in the background keeps a long-running BowEcho
+/// session on the live cycle instead of leaving its timeline pinned to the
+/// cycle that happened to exist when the window was first opened.
+const CATALOG_REFRESH_SECS: u64 = 120;
+/// Initial catalog failures retry sooner than the normal live refresh.
+const CATALOG_RETRY_SECS: u64 = 30;
 pub const CREDIT: &str =
     "WoFS data courtesy of the National Severe Storms Laboratory using federal funding";
 
@@ -604,6 +611,9 @@ pub struct WofsState {
     pub open: bool,
     pub catalog: Option<WofsCatalog>,
     pub catalog_rx: Option<mpsc::Receiver<Result<WofsCatalog, String>>>,
+    /// When the current catalog request was started.  The public run list is
+    /// live data, not immutable startup configuration.
+    last_catalog_fetch: Option<Instant>,
     pub run_index: usize,
     pub init: String,
     pub product: String,
@@ -714,6 +724,7 @@ impl Default for WofsState {
             open: false,
             catalog: None,
             catalog_rx: None,
+            last_catalog_fetch: None,
             run_index: 0,
             init: String::new(),
             product: "comp_dz__paintballs_thresh_40".to_owned(),
@@ -747,6 +758,65 @@ impl Default for WofsState {
 }
 
 impl WofsState {
+    /// Install a refreshed catalog without surprising a user who deliberately
+    /// selected an older run/cycle.  When radar sync is enabled and the old
+    /// selection was the live edge, advance to the new live edge as new
+    /// 30-minute initializations appear.
+    fn apply_catalog(&mut self, catalog: WofsCatalog) {
+        let previous_selection = self.catalog.as_ref().and_then(|old| {
+            let run = old.runs.get(self.run_index)?;
+            Some((run.id.clone(), self.init.clone()))
+        });
+        let followed_previous_live_edge = self.sync_to_radar
+            && self.catalog.as_ref().is_some_and(|old| {
+                old.runs.first().is_some_and(|run| {
+                    self.run_index == 0 && run.inits.first().is_some_and(|init| init == &self.init)
+                })
+            });
+
+        if self.init.is_empty() || followed_previous_live_edge {
+            self.run_index = 0;
+            self.init = catalog
+                .runs
+                .first()
+                .and_then(|run| run.inits.first())
+                .cloned()
+                .unwrap_or_default();
+            if followed_previous_live_edge {
+                self.snd_frame = None;
+            }
+        } else if let Some((run_id, init)) = previous_selection {
+            if let Some(index) = catalog.runs.iter().position(|run| run.id == run_id) {
+                self.run_index = index;
+                let run = &catalog.runs[index];
+                self.init = if run.inits.contains(&init) {
+                    init
+                } else {
+                    run.inits.first().cloned().unwrap_or_default()
+                };
+            } else {
+                self.run_index = 0;
+                self.init = catalog
+                    .runs
+                    .first()
+                    .and_then(|run| run.inits.first())
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+
+        self.status = format!(
+            "{} runs · {}",
+            catalog.runs.len(),
+            catalog
+                .runs
+                .get(self.run_index)
+                .map(|run| run.name.clone())
+                .unwrap_or_default()
+        );
+        self.catalog = Some(catalog);
+    }
+
     fn current_base_url(&self) -> Option<String> {
         let catalog = self.catalog.as_ref()?;
         let run = catalog.runs.get(self.run_index)?;
@@ -955,6 +1025,102 @@ impl WofsState {
             .unwrap_or(target_min)
     }
 
+    /// Track the actual frame shown by the unified radar timeline.  Keeping
+    /// this here makes the time mapping directly testable and prevents callers
+    /// from accidentally using the newest background volume instead.
+    pub fn sync_to_displayed_time(&mut self, frame: chrono::DateTime<chrono::Utc>) -> bool {
+        let Some(catalog) = &self.catalog else {
+            return false;
+        };
+        let Some(run) = catalog.runs.get(self.run_index) else {
+            return false;
+        };
+        let Some(init_time) = init_time_utc(run, &self.init) else {
+            return false;
+        };
+        let delta_min = (frame - init_time).num_minutes();
+        if delta_min < 0 {
+            return false;
+        }
+        let target = u32::try_from(delta_min).unwrap_or(u32::MAX);
+        let snapped = self.snap_minute(target);
+        if snapped == self.minute {
+            return false;
+        }
+        self.minute = snapped;
+        true
+    }
+
+    fn timeline_minutes(&self) -> Vec<u32> {
+        let Some(catalog) = &self.catalog else {
+            return Vec::new();
+        };
+        let mut minutes = catalog
+            .times
+            .get(&self.product)
+            .into_iter()
+            .flatten()
+            .map(|seconds| seconds / 60)
+            .collect::<Vec<_>>();
+        minutes.sort_unstable();
+        minutes.dedup();
+        if let Some(edge) = self.posted_edge_minute() {
+            minutes.retain(|minute| *minute <= edge);
+        }
+        minutes
+    }
+
+    pub fn posted_edge_minute(&self) -> Option<u32> {
+        let key = self.current_availability_key()?;
+        self.max_posted_minutes.get(&key).map(|(minute, _)| *minute)
+    }
+
+    pub fn timeline_max_minute(&self) -> u32 {
+        self.timeline_minutes()
+            .last()
+            .copied()
+            .or_else(|| {
+                self.catalog
+                    .as_ref()?
+                    .times
+                    .get(&self.product)?
+                    .iter()
+                    .map(|seconds| seconds / 60)
+                    .max()
+            })
+            .unwrap_or(360)
+    }
+
+    pub fn can_step_minute(&self, forward: bool) -> bool {
+        let minutes = self.timeline_minutes();
+        if forward {
+            minutes.iter().any(|minute| *minute > self.minute)
+        } else {
+            minutes.iter().any(|minute| *minute < self.minute)
+        }
+    }
+
+    /// Move exactly one posted WoFS frame.  Manual stepping intentionally
+    /// releases radar sync so the next UI frame cannot immediately undo the
+    /// user's choice.
+    pub fn step_minute(&mut self, forward: bool) -> bool {
+        let minutes = self.timeline_minutes();
+        let next = if forward {
+            minutes.into_iter().find(|minute| *minute > self.minute)
+        } else {
+            minutes
+                .into_iter()
+                .rev()
+                .find(|minute| *minute < self.minute)
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        self.minute = next;
+        self.sync_to_radar = false;
+        true
+    }
+
     /// The sounding frame grid (seconds): the reference product's
     /// `times_available` — soundings post on the same 5-min grid.
     fn snd_grid(&self) -> Option<&Vec<u32>> {
@@ -1044,22 +1210,7 @@ impl WofsState {
             match rx.try_recv() {
                 Ok(Ok(catalog)) => {
                     self.catalog_rx = None;
-                    if self.init.is_empty()
-                        && let Some(run) = catalog.runs.first()
-                        && let Some(init) = run.inits.first()
-                    {
-                        self.init = init.clone();
-                    }
-                    self.status = format!(
-                        "{} runs · {}",
-                        catalog.runs.len(),
-                        catalog
-                            .runs
-                            .first()
-                            .map(|r| r.name.clone())
-                            .unwrap_or_default()
-                    );
-                    self.catalog = Some(catalog);
+                    self.apply_catalog(catalog);
                 }
                 Ok(Err(e)) => {
                     self.catalog_rx = None;
@@ -1175,6 +1326,9 @@ impl WofsState {
             });
         }
         self.pump_georef(ctx);
+        // WoFS adds live cycles throughout the day.  The old one-shot catalog
+        // left the init picker and radar sync permanently pinned until restart.
+        self.start_catalog(ctx);
     }
 
     /// Drape calibration lifecycle: collect a finished build, and kick off
@@ -1411,9 +1565,23 @@ impl WofsState {
         if self.catalog_rx.is_some() {
             return;
         }
+        let retry_after = if self.catalog.is_some() {
+            CATALOG_REFRESH_SECS
+        } else {
+            CATALOG_RETRY_SECS
+        };
+        if self
+            .last_catalog_fetch
+            .is_some_and(|at| at.elapsed().as_secs() < retry_after)
+        {
+            return;
+        }
+        self.last_catalog_fetch = Some(Instant::now());
         let (tx, rx) = mpsc::channel();
         self.catalog_rx = Some(rx);
-        self.status = "loading WoFS catalog…".to_owned();
+        if self.catalog.is_none() {
+            self.status = "loading WoFS catalog…".to_owned();
+        }
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let result = fetch_catalog();
@@ -1770,6 +1938,114 @@ mod tests {
 
         assert!(state.clamp_minute_to_posted_edge());
         assert_eq!(state.minute, 215);
+    }
+
+    fn timeline_test_catalog(inits: &[&str]) -> WofsCatalog {
+        WofsCatalog {
+            runs: vec![WofsRun {
+                id: "WOFSRun20260721-live".to_owned(),
+                name: "Live domain".to_owned(),
+                rundate: "20260721".to_owned(),
+                inits: inits.iter().map(|init| (*init).to_owned()).collect(),
+            }],
+            groups: Vec::new(),
+            times: HashMap::from([(
+                SND_REF_PRODUCT.to_owned(),
+                (0..=360).step_by(5).map(|minute| minute * 60).collect(),
+            )]),
+        }
+    }
+
+    #[test]
+    fn displayed_radar_time_drives_wofs_minute() {
+        let mut state = WofsState {
+            catalog: Some(timeline_test_catalog(&["202607211700"])),
+            init: "202607211700".to_owned(),
+            product: SND_REF_PRODUCT.to_owned(),
+            minute: 0,
+            ..WofsState::default()
+        };
+        let displayed = chrono::DateTime::parse_from_rfc3339("2026-07-21T18:12:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert!(state.sync_to_displayed_time(displayed));
+        assert_eq!(state.minute, 70, "72 minutes snaps to the 5-minute grid");
+
+        let before_init = chrono::DateTime::parse_from_rfc3339("2026-07-21T16:55:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!state.sync_to_displayed_time(before_init));
+        assert_eq!(state.minute, 70);
+    }
+
+    #[test]
+    fn live_catalog_refresh_advances_only_a_followed_live_cycle() {
+        let mut following = WofsState {
+            catalog: Some(timeline_test_catalog(&[
+                "202607211900",
+                "202607211830",
+                "202607211800",
+            ])),
+            init: "202607211900".to_owned(),
+            product: SND_REF_PRODUCT.to_owned(),
+            sync_to_radar: true,
+            ..WofsState::default()
+        };
+        following.apply_catalog(timeline_test_catalog(&[
+            "202607211930",
+            "202607211900",
+            "202607211830",
+        ]));
+        assert_eq!(following.init, "202607211930");
+
+        let mut manual = WofsState {
+            catalog: Some(timeline_test_catalog(&[
+                "202607211900",
+                "202607211830",
+                "202607211800",
+            ])),
+            init: "202607211800".to_owned(),
+            product: SND_REF_PRODUCT.to_owned(),
+            sync_to_radar: true,
+            ..WofsState::default()
+        };
+        manual.apply_catalog(timeline_test_catalog(&[
+            "202607211930",
+            "202607211900",
+            "202607211830",
+            "202607211800",
+        ]));
+        assert_eq!(
+            manual.init, "202607211800",
+            "a deliberately selected older cycle must stay selected"
+        );
+    }
+
+    #[test]
+    fn frame_buttons_step_only_through_posted_minutes() {
+        let catalog = timeline_test_catalog(&["202607211900"]);
+        let run = catalog.runs[0].clone();
+        let product = SND_REF_PRODUCT.to_owned();
+        let key = availability_key(&run, &run.inits[0], &product);
+        let mut state = WofsState {
+            catalog: Some(catalog),
+            init: run.inits[0].clone(),
+            product,
+            minute: 5,
+            sync_to_radar: true,
+            ..WofsState::default()
+        };
+        state.max_posted_minutes.insert(key, (15, Instant::now()));
+
+        assert!(state.step_minute(true));
+        assert_eq!(state.minute, 10);
+        assert!(!state.sync_to_radar);
+        assert!(state.step_minute(true));
+        assert_eq!(state.minute, 15);
+        assert!(!state.can_step_minute(true));
+        assert!(state.step_minute(false));
+        assert_eq!(state.minute, 10);
     }
 
     #[test]

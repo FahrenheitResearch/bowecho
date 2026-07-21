@@ -15,8 +15,9 @@
 //! the live `today_filtered` path untouched.
 //!
 //! Data sources (cited in `spc_layers`): SPC climo filtered/raw report
-//! CSVs (per convective day, 2004+) and the SPC WCM tornado database
-//! per-year files (begin/end track coordinates; Schaefer & Edwards 1999).
+//! CSVs (per convective day, 2004+), the SPC WCM tornado database per-year
+//! files, and NOAA NCEI's preliminary Storm Events details export for the
+//! current year while SPC's annual WCM file is not yet published.
 
 use crate::panel_kit;
 use crate::spc_layers::{self, EventDayData};

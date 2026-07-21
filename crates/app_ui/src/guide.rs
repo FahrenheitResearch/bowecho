@@ -2720,8 +2720,9 @@ fn archive(ui: &mut egui::Ui) {
          dots FOLLOW the displayed radar time's convective day (12Z\u{2013}12Z — a 03Z report \
          belongs to the previous day's file) whenever you browse the archive, exactly like \
          the outlooks do. Tornado TRACKS draw as red begin\u{2192}end lines with a direction \
-         arrowhead — surveyed paths from the SPC WCM tornado database; days the database \
-         hasn't reached yet (the current year) show the torn report points instead.",
+         arrowhead — surveyed paths from the SPC WCM tornado database, with NOAA NCEI's \
+         preliminary Storm Events tracks filling the current year before SPC publishes its \
+         annual file. Dates newer than NCEI's latest revision show report points instead.",
     );
     action(
         ui,
@@ -3217,7 +3218,8 @@ fn sources(ui: &mut egui::Ui) {
          mesoscale discussions. Storm reports: SPC filtered storm-report CSVs, live and per \
          convective day (spc.noaa.gov/climo/reports). Tornado tracks: the SPC WCM \
          severe-weather database (spc.noaa.gov/wcm, \"onetor\" format; Schaefer & Edwards \
-         1999, 11th Conf. Applied Climatology).",
+         1999, 11th Conf. Applied Climatology), plus the preliminary current-year NOAA NCEI \
+         Storm Events details export (ncei.noaa.gov/pub/data/swdi/stormevents).",
     );
 
     para(

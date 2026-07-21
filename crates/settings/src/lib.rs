@@ -518,6 +518,14 @@ pub struct AppSettings {
     /// layer the user enabled back off.
     #[serde(default)]
     pub storm_tracks_enabled: bool,
+    /// Draw the accumulated low-level azimuthal-shear swath. Kept separate
+    /// from SCIT storm tracks because each layer can be expensive and useful
+    /// independently.
+    #[serde(default)]
+    pub rotation_tracks_enabled: bool,
+    /// Draw deterministic tornado-debris-signature gates/trails.
+    #[serde(default)]
+    pub tds_tracks_enabled: bool,
     /// Maximum SCIT storm cells fed into the storm-track associator each scan.
     /// Lower values reduce linear-mode clutter without touching radar render
     /// resolution or algorithm caches.
@@ -1149,6 +1157,8 @@ impl Default for AppSettings {
             current_alert_sort: default_current_alert_sort(),
             current_alert_filter: default_current_alert_filter(),
             storm_tracks_enabled: false,
+            rotation_tracks_enabled: false,
+            tds_tracks_enabled: false,
             storm_track_max_tracks: default_storm_track_max_tracks(),
             storm_track_min_dbz_tenths: default_storm_track_min_dbz_tenths(),
             product_hotkeys: default_product_hotkeys(),
@@ -2456,11 +2466,15 @@ mod tests {
     fn storm_track_filters_default_and_round_trip() {
         let old = AppSettings::from_json("{}");
         assert!(!old.storm_tracks_enabled);
+        assert!(!old.rotation_tracks_enabled);
+        assert!(!old.tds_tracks_enabled);
         assert_eq!(old.storm_track_max_tracks, 16);
         assert_eq!(old.storm_track_min_dbz_tenths, 350);
 
         let settings = AppSettings {
             storm_tracks_enabled: true,
+            rotation_tracks_enabled: true,
+            tds_tracks_enabled: true,
             storm_track_max_tracks: 24,
             storm_track_min_dbz_tenths: 420,
             ..Default::default()
@@ -2468,6 +2482,8 @@ mod tests {
         let back = AppSettings::from_json(&settings.to_json());
 
         assert!(back.storm_tracks_enabled);
+        assert!(back.rotation_tracks_enabled);
+        assert!(back.tds_tracks_enabled);
         assert_eq!(back.storm_track_max_tracks, 24);
         assert_eq!(back.storm_track_min_dbz_tenths, 420);
     }

@@ -1414,7 +1414,6 @@ impl ViewerApp {
             .and_then(|overlay| overlay.records.get(index))
         {
             self.hidden_hazard_families.remove(&record.event_family);
-            self.app_settings.current_alert_filter = HazardListFilter::All.key().to_owned();
             self.hazards_visible = true;
             self.persist_hazard_panel_settings();
         }
