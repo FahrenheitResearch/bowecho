@@ -10100,6 +10100,21 @@ impl ViewerApp {
         let selected_index = batch.selected_index.min(batch.frames.len() - 1);
         let selected_identity = frame_identity_for_volume(&batch.frames[selected_index].volume);
         let active_volume = self.volume.clone();
+        // Installing another frame from the same radar is a timeline/data
+        // refresh, not a navigation command. Archive providers are commonly
+        // absent from the US site catalog, so the generic volume installer
+        // can otherwise mistake them for a moved mobile deployment and snap
+        // the map back to the radar coordinates. Preserve the operator's
+        // current pan/zoom for same-radar reloads and every archive batch;
+        // explicit site changes and Reset View retain their own centering
+        // paths.
+        let preserve_map_view_for_selection =
+            active_volume.as_ref().is_some_and(|active| {
+                active
+                    .site
+                    .id
+                    .eq_ignore_ascii_case(&selected_identity.site_id)
+            }) || batch.frames.iter().any(decoded_load_is_archive_frame);
         let active_identity = active_volume
             .as_ref()
             .map(|volume| frame_identity_for_volume(volume.as_ref()));
@@ -10216,6 +10231,7 @@ impl ViewerApp {
                     index,
                     record_final_decode,
                     select_first_low_sweep,
+                    preserve_map_view_for_selection,
                     ctx,
                 );
                 if preserve_active_frame_cut
@@ -10650,7 +10666,7 @@ impl ViewerApp {
         record_final_decode: bool,
         ctx: &egui::Context,
     ) {
-        self.select_history_frame_with_options(index, record_final_decode, true, ctx);
+        self.select_history_frame_with_options(index, record_final_decode, true, true, ctx);
     }
 
     fn select_history_frame_with_options(
@@ -10658,6 +10674,7 @@ impl ViewerApp {
         index: usize,
         record_final_decode: bool,
         select_first_low_sweep: bool,
+        preserve_map_view: bool,
         ctx: &egui::Context,
     ) {
         let Some(frame) = self.primary.history.get(index).cloned() else {
@@ -10667,6 +10684,8 @@ impl ViewerApp {
         self.primary.cursor.index = index;
         self.primary.cursor.playing &= self.primary_history_loop_can_step();
         self.source_path = Some(frame.path.clone());
+        let map_view =
+            preserve_map_view.then_some((self.map_center_lat, self.map_center_lon, self.map_scale));
         self.install_volume_arc(
             Arc::clone(&frame.volume),
             frame.timings,
@@ -10675,6 +10694,11 @@ impl ViewerApp {
             frame.status,
             ctx,
         );
+        if let Some((center_lat, center_lon, scale)) = map_view {
+            self.map_center_lat = center_lat;
+            self.map_center_lon = center_lon;
+            self.map_scale = scale;
+        }
         if select_first_low_sweep {
             self.select_first_history_low_sweep_if_enabled(ctx);
         }
@@ -12146,7 +12170,7 @@ impl ViewerApp {
         // velocity product — see `loop_step_hold_display_on_product_fallback`.
         // Scoped tightly to this one install: set before, clear after.
         self.loop_step_hold_display_on_product_fallback = true;
-        self.select_history_frame_with_options(next_index, false, false, ctx);
+        self.select_history_frame_with_options(next_index, false, false, true, ctx);
         self.loop_step_hold_display_on_product_fallback = false;
         self.sync_owned_extra_panes_to_primary_timeline_frame(next_index, ctx);
         self.select_first_history_low_sweep_if_enabled(ctx);
@@ -22913,7 +22937,7 @@ impl ViewerApp {
             return;
         }
         self.primary.cursor.playing = false;
-        self.select_history_frame_with_options(step.frame_index, false, false, ctx);
+        self.select_history_frame_with_options(step.frame_index, false, false, true, ctx);
         if step.low_sweep_rank.is_some() {
             self.set_shared_low_sweep_step(step, ctx);
         } else {
@@ -46214,6 +46238,15 @@ fn decoded_load_is_ord_archive_frame(frame: &DecodedLoad) -> bool {
         .is_some_and(|path| path.starts_with("ord-archive:"))
 }
 
+fn decoded_load_is_archive_frame(frame: &DecodedLoad) -> bool {
+    decoded_load_is_ord_archive_frame(frame)
+        || frame.source_label.to_ascii_lowercase().contains("archive")
+        || frame.path.to_str().is_some_and(|path| {
+            path.to_ascii_lowercase().contains("-archive:")
+                || path.to_ascii_lowercase().starts_with("archive:")
+        })
+}
+
 pub(crate) fn normalized_event_pad_frames(count: u16) -> u16 {
     count.min(MAX_EVENT_PAD_FRAMES)
 }
@@ -58980,16 +59013,28 @@ mod tests {
         app.volume = Some(Arc::clone(&app.primary.history[0].volume));
         app.primary.cursor.playing = true;
         app.primary.cursor.browsing = true;
+        app.map_center_lat = 40.25;
+        app.map_center_lon = -101.75;
+        app.map_scale = 812.5;
         let ctx = egui::Context::default();
 
         assert!(app.step_history_frame(1, &ctx));
         assert_eq!(app.primary.cursor.index, 1);
         assert!(!app.primary.cursor.playing);
         assert!(!app.primary.cursor.browsing);
+        assert_eq!(
+            (app.map_center_lat, app.map_center_lon, app.map_scale),
+            (40.25, -101.75, 812.5),
+            "stepping an archive/history frame must not reset pan or zoom"
+        );
 
         assert!(app.step_history_frame(-1, &ctx));
         assert_eq!(app.primary.cursor.index, 0);
         assert!(app.primary.cursor.browsing);
+        assert_eq!(
+            (app.map_center_lat, app.map_center_lon, app.map_scale),
+            (40.25, -101.75, 812.5)
+        );
     }
 
     #[test]
@@ -59332,6 +59377,84 @@ mod tests {
         assert_eq!(app.map_center_lat, 41.25);
         assert_eq!(app.map_center_lon, -101.75);
         assert_eq!(app.map_scale, 432.1);
+    }
+
+    #[test]
+    fn archive_install_preserves_view_for_radar_outside_us_catalog() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.map_center_lat = 50.25;
+        app.map_center_lon = 7.75;
+        app.map_scale = 678.5;
+
+        let mut volume = test_ref_then_velocity_volume();
+        volume.site = radar_core::RadarSite::new("dehnr");
+        volume.site.name = Some("Hannover".to_owned());
+        volume.site.latitude_deg = Some(52.4601);
+        volume.site.longitude_deg = Some(9.6945);
+        volume.volume_time = Utc.with_ymd_and_hms(2026, 7, 21, 18, 0, 0).unwrap();
+        let mut decoded = test_decoded_from_volume(
+            PathBuf::from("dwd-archive:dehnr-20260721T1800"),
+            volume,
+            FrameStatus::Complete,
+        );
+        decoded.source_label = "DWD archive dehnr".to_owned();
+
+        let selected = app.install_decoded_load_batch(
+            DecodedLoadBatch::single(decoded),
+            true,
+            true,
+            &egui::Context::default(),
+        );
+
+        assert!(selected);
+        assert_eq!(
+            (app.map_center_lat, app.map_center_lon, app.map_scale),
+            (50.25, 7.75, 678.5),
+            "loading an archive frame must not navigate back to its radar"
+        );
+    }
+
+    #[test]
+    fn same_radar_reload_preserves_view_when_frame_coordinates_shift() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites.clear();
+        let scan_time = Utc.with_ymd_and_hms(2026, 7, 21, 18, 0, 0).unwrap();
+        let mut current = test_ref_then_velocity_volume();
+        current.site = radar_core::RadarSite::new("RESEARCH");
+        current.site.name = Some("Research radar".to_owned());
+        current.site.latitude_deg = Some(35.0);
+        current.site.longitude_deg = Some(-97.0);
+        current.volume_time = scan_time;
+        app.volume = Some(Arc::new(current));
+        app.map_center_lat = 35.8;
+        app.map_center_lon = -96.2;
+        app.map_scale = 935.0;
+
+        let mut reloaded = test_ref_then_velocity_volume();
+        reloaded.site = radar_core::RadarSite::new("RESEARCH");
+        reloaded.site.name = Some("Research radar".to_owned());
+        reloaded.site.latitude_deg = Some(35.08);
+        reloaded.site.longitude_deg = Some(-97.08);
+        reloaded.volume_time = scan_time + chrono::Duration::minutes(3);
+
+        let selected = app.install_decoded_load_batch(
+            DecodedLoadBatch::single(test_decoded_from_volume(
+                PathBuf::from("research-reload"),
+                reloaded,
+                FrameStatus::Complete,
+            )),
+            true,
+            true,
+            &egui::Context::default(),
+        );
+
+        assert!(selected);
+        assert_eq!(
+            (app.map_center_lat, app.map_center_lon, app.map_scale),
+            (35.8, -96.2, 935.0),
+            "same-radar reloads must preserve the operator's viewport"
+        );
     }
 
     #[test]

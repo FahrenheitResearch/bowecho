@@ -1390,7 +1390,7 @@ impl ViewerApp {
             self.select_extra_pane_timeline_step(slot, step, ctx);
             return;
         }
-        self.select_history_frame_with_options(step.frame_index, false, false, ctx);
+        self.select_history_frame_with_options(step.frame_index, false, false, true, ctx);
         let Some(cut_index) = step.cut_index else {
             return;
         };
