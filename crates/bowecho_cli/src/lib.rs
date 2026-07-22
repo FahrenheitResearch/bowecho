@@ -1,10 +1,10 @@
 //! Headless BowEcho command infrastructure.
 //!
 //! Parsing and machine-readable contracts live here so command families can be
-//! reused without initializing eframe.  GUI-owned science pipelines remain in
-//! the application host: future `wrf render` and `wrf watch` commands should
-//! delegate to BowEcho's existing WRF -> rw-store -> Rusty Weather pipeline,
-//! rather than introducing another decoder or renderer in this crate.
+//! reused without initializing eframe. GUI-owned science pipelines remain in
+//! the application host: `wrf render` and `wrf watch` delegate to BowEcho's
+//! existing WRF -> rw-store -> Rusty Weather pipeline rather than introducing
+//! another decoder or renderer in this crate.
 
 pub mod artifact;
 mod command;

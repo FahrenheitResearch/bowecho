@@ -6,7 +6,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use netcrust::{AttributeValue, DataType};
 use serde::{Deserialize, Serialize};
 
-use crate::artifact::{ArtifactManifest, BuildIdentity};
+use crate::artifact::{ArtifactManifest, ArtifactStatus, BuildIdentity};
 use crate::fs::{expand_input_files, resolve_receipt_path, sha256_file, sha256_reader};
 use crate::{CliError, ExitCode, RuntimeContext};
 
@@ -888,6 +888,11 @@ pub struct ReceiptVerification {
 pub struct VerifyReport {
     pub schema_version: String,
     pub artifact_schema_version: String,
+    pub artifact_status: ArtifactStatus,
+    /// True only for a complete processing receipt with at least one product.
+    /// Hash integrity alone must not authorize transfer/deletion of a partial
+    /// or empty run.
+    pub processing_complete: bool,
     pub manifest_path: PathBuf,
     pub manifest_bytes: u64,
     pub manifest_sha256: String,
@@ -933,6 +938,18 @@ pub fn verify(manifest_path: &Path) -> Result<(VerifyReport, ExitCode), CliError
         ))
     })?;
     let mut contract_failures = manifest.validate_contract();
+    let processing_complete = manifest.status == ArtifactStatus::Complete
+        && !manifest.products.is_empty()
+        && manifest.failures.is_empty();
+    if manifest.status != ArtifactStatus::Complete {
+        contract_failures.push(format!(
+            "artifact status is {:?}; only complete manifests pass verification",
+            manifest.status
+        ));
+    }
+    if manifest.products.is_empty() {
+        contract_failures.push("artifact manifest declares no generated products".into());
+    }
     let manifest_directory = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let mut receipts = Vec::with_capacity(manifest.sources.len() + manifest.products.len());
     let mut declared_artifacts = BTreeSet::new();
@@ -956,7 +973,7 @@ pub fn verify(manifest_path: &Path) -> Result<(VerifyReport, ExitCode), CliError
                 declared.display()
             ));
         }
-        receipts.push(verify_receipt(
+        let mut receipt = verify_receipt(
             ReceiptKind::Artifact,
             product.name.clone(),
             declared,
@@ -964,12 +981,16 @@ pub fn verify(manifest_path: &Path) -> Result<(VerifyReport, ExitCode), CliError
             &product.artifact.sha256,
             manifest_directory,
             false,
-        ));
+        );
+        verify_artifact_image(product, &mut receipt);
+        receipts.push(receipt);
     }
     let verified = contract_failures.is_empty() && receipts.iter().all(|receipt| receipt.verified);
     let report = VerifyReport {
         schema_version: VERIFY_SCHEMA_VERSION.into(),
         artifact_schema_version: manifest.schema_version,
+        artifact_status: manifest.status,
+        processing_complete,
         manifest_path: manifest_path.to_path_buf(),
         manifest_bytes: manifest_hash.bytes,
         manifest_sha256: manifest_hash.sha256,
@@ -1017,6 +1038,41 @@ fn verify_receipt(
         }
     };
     receipt.resolved_path = Some(path.clone());
+    if !allow_absolute {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                receipt
+                    .failures
+                    .push(format!("cannot inspect declared artifact: {error}"));
+                return receipt;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            receipt
+                .failures
+                .push("artifact receipt resolves through a symbolic link".into());
+            return receipt;
+        }
+        let canonical_root = fs::canonicalize(manifest_directory);
+        let canonical_path = fs::canonicalize(&path);
+        match (canonical_root, canonical_path) {
+            (Ok(root), Ok(resolved)) if resolved.starts_with(&root) => {}
+            (Ok(_), Ok(resolved)) => {
+                receipt.failures.push(format!(
+                    "artifact receipt resolves outside the manifest directory: {}",
+                    resolved.display()
+                ));
+                return receipt;
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                receipt.failures.push(format!(
+                    "cannot canonicalize artifact containment boundary: {error}"
+                ));
+                return receipt;
+            }
+        }
+    }
     receipt.exists = path.is_file();
     if !receipt.exists {
         receipt
@@ -1065,6 +1121,66 @@ fn verify_receipt(
     receipt
 }
 
+fn verify_artifact_image(
+    product: &crate::artifact::ProductReceipt,
+    receipt: &mut ReceiptVerification,
+) {
+    if !receipt.verified {
+        return;
+    }
+    let Some(path) = receipt.resolved_path.as_ref() else {
+        return;
+    };
+    let expected_format = match product.artifact.mime_type.as_str() {
+        "image/png" => image::ImageFormat::Png,
+        "image/webp" => image::ImageFormat::WebP,
+        other => {
+            receipt.failures.push(format!(
+                "unsupported artifact MIME type for image verification: {other}"
+            ));
+            receipt.verified = false;
+            return;
+        }
+    };
+    let reader =
+        match image::ImageReader::open(path).and_then(|reader| reader.with_guessed_format()) {
+            Ok(reader) => reader,
+            Err(error) => {
+                receipt
+                    .failures
+                    .push(format!("cannot inspect artifact image header: {error}"));
+                receipt.verified = false;
+                return;
+            }
+        };
+    if reader.format() != Some(expected_format) {
+        receipt.failures.push(format!(
+            "artifact encoding does not match declared MIME type {}",
+            product.artifact.mime_type
+        ));
+        receipt.verified = false;
+        return;
+    }
+    match reader.into_dimensions() {
+        Ok((width, height))
+            if product.artifact.width == Some(width) && product.artifact.height == Some(height) => {
+        }
+        Ok((width, height)) => {
+            receipt.failures.push(format!(
+                "artifact dimensions mismatch: declared {:?}x{:?}, decoded {width}x{height}",
+                product.artifact.width, product.artifact.height
+            ));
+            receipt.verified = false;
+        }
+        Err(error) => {
+            receipt
+                .failures
+                .push(format!("cannot decode artifact image dimensions: {error}"));
+            receipt.verified = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1094,13 +1210,15 @@ mod tests {
     fn verify_recalculates_source_and_artifact_receipts() {
         let root = tempfile::tempdir().unwrap();
         let source_path = root.path().join("wrfout_d01");
-        let artifact_path = root.path().join("plots").join("ref.webp");
+        let artifact_path = root.path().join("plots").join("ref.png");
         fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         fs::write(&source_path, b"source").unwrap();
-        fs::write(&artifact_path, b"artifact").unwrap();
+        image::RgbaImage::from_pixel(2, 3, image::Rgba([1, 2, 3, 255]))
+            .save(&artifact_path)
+            .unwrap();
         let source_hash = sha256_file(&source_path).unwrap();
         let artifact_hash = sha256_file(&artifact_path).unwrap();
-        let manifest = ArtifactManifest {
+        let mut manifest = ArtifactManifest {
             schema_version: ARTIFACT_SCHEMA_VERSION.into(),
             status: ArtifactStatus::Complete,
             case_id: "case".into(),
@@ -1126,18 +1244,18 @@ mod tests {
             products: vec![ProductReceipt {
                 name: "reflectivity".into(),
                 domain: Some("d01".into()),
-                initialization_time: None,
-                valid_time: None,
+                initialization_time: Some("2026-07-22T00:00:00Z".into()),
+                valid_time: Some("2026-07-22T00:00:00Z".into()),
                 storage_slot: Some(0),
                 lead_seconds: Some(0),
                 units: "dBZ".into(),
                 source_variables: vec!["REFL_10CM".into()],
                 derivation: DerivationMethod::Direct,
                 artifact: ArtifactFileReceipt {
-                    relative_path: PathBuf::from("plots/ref.webp"),
-                    mime_type: "image/webp".into(),
-                    width: Some(100),
-                    height: Some(100),
+                    relative_path: PathBuf::from("plots/ref.png"),
+                    mime_type: "image/png".into(),
+                    width: Some(2),
+                    height: Some(3),
                     bytes: artifact_hash.bytes,
                     sha256: artifact_hash.sha256,
                 },
@@ -1155,11 +1273,90 @@ mod tests {
         assert!(report.verified);
         assert_eq!(report.receipts.len(), 2);
 
+        manifest.products[0].artifact.width = Some(99);
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+        let (report, code) = verify(&manifest_path).unwrap();
+        assert_eq!(code, ExitCode::Verification);
+        assert!(
+            report.receipts[1]
+                .failures
+                .iter()
+                .any(|failure| failure.contains("dimensions mismatch"))
+        );
+
+        manifest.products[0].artifact.width = Some(2);
+        manifest.products[0].artifact.mime_type = "image/webp".into();
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+        let (report, code) = verify(&manifest_path).unwrap();
+        assert_eq!(code, ExitCode::Verification);
+        assert!(
+            report.receipts[1]
+                .failures
+                .iter()
+                .any(|failure| failure.contains("encoding does not match"))
+        );
+
+        manifest.products[0].artifact.mime_type = "image/png".into();
+        write_json_atomic(&manifest_path, &manifest).unwrap();
         fs::write(&artifact_path, b"tampered").unwrap();
         let (report, code) = verify(&manifest_path).unwrap();
         assert_eq!(code, ExitCode::Verification);
         assert!(!report.verified);
         assert!(!report.receipts[1].sha256_matches);
+    }
+
+    #[test]
+    fn verify_does_not_certify_partial_or_empty_processing_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("wrfout_d01");
+        fs::write(&source_path, b"source").unwrap();
+        let source_hash = sha256_file(&source_path).unwrap();
+        let base = ArtifactManifest {
+            schema_version: ARTIFACT_SCHEMA_VERSION.into(),
+            status: ArtifactStatus::Partial,
+            case_id: "case".into(),
+            run_id: "run".into(),
+            member_id: None,
+            experiment_track: ExperimentTrack::WrfParity,
+            model: "WRF".into(),
+            microphysics_scheme: None,
+            provenance: ProvenanceHashes::default(),
+            bowecho: BuildIdentity {
+                version: "test".into(),
+                commit: "test".into(),
+            },
+            sources: vec![SourceReceipt {
+                path: PathBuf::from("wrfout_d01"),
+                bytes: source_hash.bytes,
+                sha256: source_hash.sha256,
+                domain: Some("d01".into()),
+                initialization_time: Some("2026-07-22T00:00:00Z".into()),
+                valid_times: vec!["2026-07-22T00:00:00Z".into()],
+                grid: GridReceipt::default(),
+            }],
+            products: vec![],
+            warnings: vec![],
+            unavailable_products: vec![],
+            failures: vec![crate::artifact::FailureRecord {
+                stage: "render".into(),
+                path: None,
+                reason: "no products rendered".into(),
+            }],
+        };
+        let manifest_path = root.path().join("artifact-manifest.json");
+        write_json_atomic(&manifest_path, &base).unwrap();
+
+        let (report, code) = verify(&manifest_path).unwrap();
+        assert_eq!(code, ExitCode::Verification);
+        assert!(!report.verified);
+        assert!(!report.processing_complete);
+        assert_eq!(report.artifact_status, ArtifactStatus::Partial);
+        assert!(
+            report
+                .contract_failures
+                .iter()
+                .any(|failure| failure.contains("no generated products"))
+        );
     }
 
     #[test]

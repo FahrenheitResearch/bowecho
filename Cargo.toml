@@ -49,10 +49,10 @@ incremental = true
 strip = false
 
 [patch.crates-io]
-hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "d6a89546bb69e5c4d52de10e651e0fe53aca3d82" }
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "791806f5f4798fe05c1204c165c92f174f9d222e" }
 
 # sharppyrs pulls sharprs from its standalone repo; unify it with the
 # rusty-weather-vendored sharprs every other crate here uses so the two
 # resolve to ONE crate (identical types).
 [patch."https://github.com/FahrenheitResearch/sharprs"]
-sharprs = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "d6a89546bb69e5c4d52de10e651e0fe53aca3d82" }
+sharprs = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "791806f5f4798fe05c1204c165c92f174f9d222e" }

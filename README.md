@@ -135,7 +135,9 @@ resource limits, and provenance. The
 moments, refresh behavior, dual-pol physics, CfRadial output, and current
 limitations. The [SimSat guide](docs/simsat-guide.md) covers WRF/HRRR inputs,
 products, atmosphere/cloud controls, caches, plotting, and its honest
-radiative-rendering boundaries.
+radiative-rendering boundaries. The [WRF command-line guide](docs/wrf-cli.md)
+covers deterministic inspect/render/watch/verify workflows for humans,
+automation agents, and GPUWM forecast runners.
 
 **Storm analysis:** NSSL-style mesocyclone/TVS detection (Stumpf et al.
 1998; Mitchell et al. 1998) with time-association (CPLT → MESO), SCIT storm

@@ -136,6 +136,8 @@ mod vwp;
 mod wofs;
 mod wofs_georef;
 mod wpc_mpd;
+mod wrf_cli_host;
+mod wrf_cli_watch;
 mod wrf_namelist;
 mod wrf_process;
 mod wrf_radar;
@@ -1470,8 +1472,27 @@ fn dispatch_headless_command() -> HeadlessStartup {
             );
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let result =
-                bowecho_cli::execute(command, &context, &mut stdout.lock(), &mut stderr.lock());
+            let result = match command {
+                bowecho_cli::CliCommand::Wrf(bowecho_cli::WrfCommand::Render(options)) => {
+                    wrf_cli_host::execute_render(
+                        &options,
+                        &context,
+                        &mut stdout.lock(),
+                        &mut stderr.lock(),
+                    )
+                }
+                bowecho_cli::CliCommand::Wrf(bowecho_cli::WrfCommand::Watch(options)) => {
+                    wrf_cli_watch::execute_watch(
+                        &options,
+                        &context,
+                        &mut stdout.lock(),
+                        &mut stderr.lock(),
+                    )
+                }
+                command => {
+                    bowecho_cli::execute(command, &context, &mut stdout.lock(), &mut stderr.lock())
+                }
+            };
             match result {
                 Ok(bowecho_cli::ExitCode::Success) => HeadlessStartup::Complete,
                 Ok(code) => std::process::exit(code.as_i32()),
