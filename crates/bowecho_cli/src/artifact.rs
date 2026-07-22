@@ -88,10 +88,16 @@ pub enum DerivationMethod {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FiniteStatistics {
+    /// False means statistics could not be obtained for the plotted primary
+    /// scalar; zero counts must not be misread as "no missing values".
+    #[serde(default)]
+    pub available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum: Option<f64>,
+    #[serde(default)]
+    pub finite_value_count: u64,
     pub missing_value_count: u64,
 }
 
