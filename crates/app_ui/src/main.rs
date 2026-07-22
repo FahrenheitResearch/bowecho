@@ -63208,7 +63208,6 @@ mod tests {
         // This is above the former 240 px/deg cliff that enabled every fill
         // at once even while the same dense scene remained visible.
         app.map_scale = 520.0;
-        app.selected_hazard_index = Some(0);
 
         let built = app.build_hazard_overlay_shapes(test_map_rect(), None);
 
@@ -63223,6 +63222,13 @@ mod tests {
         assert_eq!(
             built.outline_shapes.len(),
             HAZARD_HEAVY_LAYER_FILL_LIMIT + 1
+        );
+
+        app.selected_hazard_index = Some(0);
+        let selected = app.build_hazard_overlay_shapes(test_map_rect(), None);
+        assert!(
+            selected.fill_shapes.is_empty(),
+            "selection must not make one dense-family polygon the lone fill"
         );
     }
 
