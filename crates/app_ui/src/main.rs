@@ -18038,12 +18038,16 @@ impl ViewerApp {
         (previous_volume, dealias_env, context)
     }
 
-    /// Drain the single VWP worker and, while the viewer is open, start work
-    /// for the latest selected volume. A changed frame never drops an active
+    /// Drain the single VWP worker and, while the viewer is visible, start work
+    /// for the latest selected volume. A covered dock tab is suspended without
+    /// dropping an active receiver. A changed frame never drops an active
     /// receiver: the old worker finishes, its Arc witness rejects it as stale,
     /// and the then-current frame starts next. This bounds expensive
     /// full-volume dealias/VAD work to one background thread.
     fn poll_vwp(&mut self, ctx: &egui::Context) {
+        let viewer_visible = self.vwp_open
+            && (!self.workspace.is_docked(dock::WorkspacePane::Vwp)
+                || self.workspace.is_pane_active(dock::WorkspacePane::Vwp));
         let message = self.vwp_compute_rx.as_ref().map(mpsc::Receiver::try_recv);
         let mut disconnected = false;
         let completed = match message {
@@ -18110,7 +18114,7 @@ impl ViewerApp {
             ctx.request_repaint();
         }
 
-        if !self.vwp_open {
+        if !viewer_visible {
             return;
         }
         let Some((volume, previous_volume, dealias_env, key)) = current else {
@@ -36925,8 +36929,56 @@ impl ViewerApp {
         self.set_viewer_open(dock::WorkspacePane::Vol3d, open);
     }
 
+    /// Drain a resample that was already requested by the operator. Closing
+    /// the viewer or covering its dock tab suspends new presentation work, but
+    /// never cancels or strands work already in flight.
+    fn poll_vol3d_resample(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.vol3d.resample_rx {
+            match receiver.try_recv() {
+                Ok(Some(volume_box)) => {
+                    self.vol3d.resample_rx = None;
+                    self.vol3d.velocity_color_active = volume_box.color_data.is_some();
+                    let echo_cells = volume_box.data.iter().filter(|&&value| value > 0).count();
+                    let floor_label = volume_box
+                        .floor_elevation_deg
+                        .map(|elevation| {
+                            format!(" · floor {elevation:.1}° {}", self.vol3d.product_label)
+                        })
+                        .unwrap_or_else(|| " · no floor sweep".to_owned());
+                    self.vol3d.status = format!(
+                        "{} {} km box · {} non-empty voxels{floor_label}",
+                        self.vol3d.product_label,
+                        (self.vol3d.box_half_km * 2.0) as i32,
+                        echo_cells
+                    );
+                    if let Ok(mut pending) = self.vol3d.pending.lock() {
+                        pending.volume = Some(volume_box);
+                    }
+                    ctx.request_repaint();
+                }
+                Ok(None) => {
+                    self.vol3d.resample_rx = None;
+                    self.vol3d.volume_key = None;
+                    self.clear_vol3d_texture();
+                    self.vol3d.status = "no volume data in the box".to_owned();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.vol3d.resample_rx = None;
+                    self.vol3d.status = "3D resample worker disconnected".to_owned();
+                }
+            }
+        }
+    }
+
     fn vol3d_window(&mut self, ctx: &egui::Context) {
+        self.poll_vol3d_resample(ctx);
         if !self.vol3d.open {
+            return;
+        }
+        let viewer_visible = !self.workspace.is_docked(dock::WorkspacePane::Vol3d)
+            || self.workspace.is_pane_active(dock::WorkspacePane::Vol3d);
+        if !viewer_visible {
             return;
         }
         let vol3d_product = self.selected_product.clone();
@@ -37134,40 +37186,6 @@ impl ViewerApp {
                         let _ = sender.send(result);
                         ctx_clone.request_repaint();
                     });
-                }
-            }
-        }
-
-        if let Some(receiver) = &self.vol3d.resample_rx {
-            match receiver.try_recv() {
-                Ok(Some(volume_box)) => {
-                    self.vol3d.resample_rx = None;
-                    self.vol3d.velocity_color_active = volume_box.color_data.is_some();
-                    let echo_cells = volume_box.data.iter().filter(|&&value| value > 0).count();
-                    let floor_label = volume_box
-                        .floor_elevation_deg
-                        .map(|elevation| format!(" · floor {elevation:.1}° {product_label}"))
-                        .unwrap_or_else(|| " · no floor sweep".to_owned());
-                    self.vol3d.status = format!(
-                        "{product_label} {} km box · {} non-empty voxels{floor_label}",
-                        (self.vol3d.box_half_km * 2.0) as i32,
-                        echo_cells
-                    );
-                    if let Ok(mut pending) = self.vol3d.pending.lock() {
-                        pending.volume = Some(volume_box);
-                    }
-                    ctx.request_repaint();
-                }
-                Ok(None) => {
-                    self.vol3d.resample_rx = None;
-                    self.vol3d.volume_key = None;
-                    self.clear_vol3d_texture();
-                    self.vol3d.status = "no volume data in the box".to_owned();
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.vol3d.resample_rx = None;
-                    self.vol3d.status = "3D resample worker disconnected".to_owned();
                 }
             }
         }
@@ -58218,6 +58236,47 @@ mod tests {
                 .is_ok()
         );
         assert!(app.vwp_compute_rx.is_some());
+    }
+
+    #[test]
+    fn vwp_inactive_docked_tab_waits_to_start_expensive_compute() {
+        let time = Utc.with_ymd_and_hms(2026, 7, 10, 20, 0, 0).unwrap();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_volume_with_site_time("KTLX", time)));
+        app.vwp_open = true;
+        app.workspace.dock(dock::WorkspacePane::Vwp);
+        app.workspace.dock(dock::WorkspacePane::Vol3d);
+        assert!(!app.workspace.is_pane_active(dock::WorkspacePane::Vwp));
+
+        app.poll_vwp(&egui::Context::default());
+
+        assert!(app.vwp_compute_rx.is_none());
+        assert!(app.vwp_requested_key.is_none());
+
+        assert!(app.workspace.activate_pane(dock::WorkspacePane::Vwp));
+        app.poll_vwp(&egui::Context::default());
+
+        assert!(app.vwp_compute_rx.is_some());
+        assert!(app.vwp_requested_key.is_some());
+    }
+
+    #[test]
+    fn vol3d_inactive_docked_tab_drains_worker_without_resyncing() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.vol3d.open = true;
+        app.vol3d.product_label = "in-flight sentinel".to_owned();
+        app.workspace.dock(dock::WorkspacePane::Vol3d);
+        app.workspace.dock(dock::WorkspacePane::Vwp);
+        assert!(!app.workspace.is_pane_active(dock::WorkspacePane::Vol3d));
+        let (sender, receiver) = mpsc::channel();
+        sender.send(None).unwrap();
+        app.vol3d.resample_rx = Some(receiver);
+
+        app.vol3d_window(&egui::Context::default());
+
+        assert!(app.vol3d.resample_rx.is_none());
+        assert_eq!(app.vol3d.status, "no volume data in the box");
+        assert_eq!(app.vol3d.product_label, "in-flight sentinel");
     }
 
     #[test]
