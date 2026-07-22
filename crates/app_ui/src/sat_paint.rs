@@ -55,7 +55,7 @@ impl ViewerApp {
             return;
         }
         self.ensure_satellite_worker(ctx);
-        if let Some(source) = self.pump_sat_responses() {
+        if let Some(source) = self.pump_sat_responses(ctx) {
             self.open_satellite_native_plot(ctx, source);
         }
         self.maybe_sync_satellite_map_to_timeline(ctx);
@@ -923,13 +923,17 @@ impl ViewerApp {
     /// clears `sat_map_inflight`, so a response already in flight at
     /// remove time must not resurrect the layer. A non-matching response
     /// (superseded request) is dropped without touching the latch.
-    pub(crate) fn apply_sat_map_frame_response(&mut self, frame: sat_worker::SatMapFrame) {
+    pub(crate) fn apply_sat_map_frame_response(
+        &mut self,
+        frame: sat_worker::SatMapFrame,
+        ctx: &egui::Context,
+    ) {
         if !sat_map_request_matches(&self.sat_map_inflight, &frame.key, frame.hhmm) {
             return;
         }
         self.sat_map_inflight = None;
         if self.satellite_run_key_matches_current_spec(&frame.key) {
-            self.install_sat_layer(frame);
+            self.install_sat_layer(frame, ctx);
         }
     }
 
@@ -981,7 +985,10 @@ impl ViewerApp {
         }
     }
 
-    pub(crate) fn pump_sat_responses(&mut self) -> Option<sat_plot::SatellitePlotSource> {
+    pub(crate) fn pump_sat_responses(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<sat_plot::SatellitePlotSource> {
         let mut plot_source = None;
         // Transient borrow per message so handlers can take &mut self.
         while let Some(response) = self.sat.as_ref().and_then(|sat| sat.try_recv()) {
@@ -1104,7 +1111,7 @@ impl ViewerApp {
                 }
                 sat_worker::SatResponse::MapFrame(result) => match *result {
                     Ok(frame) => {
-                        self.apply_sat_map_frame_response(frame);
+                        self.apply_sat_map_frame_response(frame, ctx);
                         self.flush_pending_sat_map_request();
                     }
                     Err(message) => {
@@ -1230,7 +1237,7 @@ impl ViewerApp {
         self.sat_lut_cache.truncate(SAT_LUT_CACHE_CAP);
     }
 
-    fn install_sat_layer(&mut self, frame: sat_worker::SatMapFrame) {
+    fn install_sat_layer(&mut self, frame: sat_worker::SatMapFrame, ctx: &egui::Context) {
         if self.sat_layer_build_rx.is_some() {
             self.sat_map_pending = Some((frame.key, frame.hhmm));
             return;
@@ -1317,6 +1324,7 @@ impl ViewerApp {
             .as_ref()
             .map(|layer| layer.visible)
             .unwrap_or(true);
+        let ctx = ctx.clone();
         thread::spawn(move || {
             let layer =
                 model_layer::InverseLut::build_with_shape(&frame.grid.lat, &frame.grid.lon, nx, ny)
@@ -1334,6 +1342,7 @@ impl ViewerApp {
                         generation,
                     });
             let _ = sender.send(layer);
+            ctx.request_repaint();
         });
         self.status = format!("Building satellite layer {key} {hhmm:04}Z");
     }
@@ -1438,6 +1447,7 @@ impl ViewerApp {
             let center_lon = view.center_lon as f64;
             let km_per_pt = 111.32 / view.map_scale as f64;
             let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+            let ctx = painter.ctx().clone();
             thread::spawn(move || {
                 let render_start = Instant::now();
                 let w = w_pts.max(8.0) as usize;
@@ -1475,6 +1485,7 @@ impl ViewerApp {
                     image,
                     render_start.elapsed().as_secs_f32() * 1000.0,
                 ));
+                ctx.request_repaint();
             });
         }
         if let Some((texture, _, rendered, has_visible_pixels)) = &self.sat_layer_texture {

@@ -20552,7 +20552,7 @@ impl eframe::App for ViewerApp {
         self.poll_model_layer(&ctx);
         self.poll_simsat(&ctx);
         if self.sat.is_some() {
-            if let Some(source) = self.pump_sat_responses() {
+            if let Some(source) = self.pump_sat_responses(&ctx) {
                 self.open_satellite_native_plot(&ctx, source);
             }
             self.maybe_sync_satellite_map_to_timeline(&ctx);
@@ -35955,6 +35955,7 @@ impl ViewerApp {
                 let center_lon = view.center_lon as f64;
                 let km_per_pt = 111.32 / view.map_scale as f64;
                 let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+                let ctx = painter.ctx().clone();
                 thread::spawn(move || {
                     let render_start = Instant::now();
                     let w = w_pts.max(8.0) as usize;
@@ -36002,6 +36003,7 @@ impl ViewerApp {
                         image,
                         render_start.elapsed().as_secs_f32() * 1000.0,
                     ));
+                    ctx.request_repaint();
                 });
             }
             if let Some((texture, _, rendered)) = &slot.texture {
@@ -57834,7 +57836,7 @@ mod tests {
         // cleared sat_map_inflight, so the landing frame must be dropped
         // instead of resurrecting the layer.
         app.sat_map_inflight = None;
-        app.apply_sat_map_frame_response(frame());
+        app.apply_sat_map_frame_response(frame(), &egui::Context::default());
         assert!(app.sat_layer.is_none());
         assert!(
             app.sat_layer_build_rx.is_none(),
@@ -57843,7 +57845,7 @@ mod tests {
 
         // The same frame while still requested installs (starts the build).
         app.sat_map_inflight = Some((key.clone(), 1755));
-        app.apply_sat_map_frame_response(frame());
+        app.apply_sat_map_frame_response(frame(), &egui::Context::default());
         assert!(app.sat_map_inflight.is_none(), "request consumed");
         assert!(
             app.sat_layer_build_rx.is_some(),
@@ -57931,7 +57933,7 @@ mod tests {
         // First frame of run A: no thread build — the layer is live at once.
         let generation_before = app.sat_layer_generation;
         app.sat_map_inflight = Some((run_a.clone(), 2350));
-        app.apply_sat_map_frame_response(frame(&run_a, 2350));
+        app.apply_sat_map_frame_response(frame(&run_a, 2350), &egui::Context::default());
         assert!(
             app.sat_layer_build_rx.is_none(),
             "cached grid identity must skip the background LUT build"
@@ -57951,7 +57953,7 @@ mod tests {
             layer.visible = false;
         }
         app.sat_map_inflight = Some((run_b.clone(), 0));
-        app.apply_sat_map_frame_response(frame(&run_b, 0));
+        app.apply_sat_map_frame_response(frame(&run_b, 0), &egui::Context::default());
         assert!(app.sat_layer_build_rx.is_none());
         let layer = app.sat_layer.as_ref().expect("rollover layer installed");
         assert_eq!(layer.key, run_b);
@@ -57967,7 +57969,7 @@ mod tests {
         app.clear_satellite_display_for_spec_change();
         assert!(app.sat_layer.is_none());
         app.sat_map_inflight = Some((run_a.clone(), 2350));
-        app.apply_sat_map_frame_response(frame(&run_a, 2350));
+        app.apply_sat_map_frame_response(frame(&run_a, 2350), &egui::Context::default());
         assert!(app.sat_layer_build_rx.is_none());
         assert!(
             app.sat_layer.is_some(),

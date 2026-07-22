@@ -4553,6 +4553,7 @@ impl ViewerApp {
             let km_per_pt = 111.32 / view.map_scale as f64;
             let render_scale = italy_dpc::ITALY_DPC_RENDER_SCALE.clamp(0.25, 1.0) as f64;
             let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+            let ctx = painter.ctx().clone();
             thread::spawn(move || {
                 let render_start = Instant::now();
                 let w = (w_pts * render_scale).max(8.0) as usize;
@@ -4588,6 +4589,7 @@ impl ViewerApp {
                     image,
                     render_start.elapsed().as_secs_f32() * 1000.0,
                 ));
+                ctx.request_repaint();
             });
         }
         if let Some((texture, _, rendered)) = &self.italy_dpc_texture {
@@ -4647,6 +4649,7 @@ impl ViewerApp {
             let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
             let render_scale =
                 taiwan_cwa::render_scale_for_viewport(rect.width(), rect.height()) as f64;
+            let ctx = painter.ctx().clone();
             thread::spawn(move || {
                 let render_start = Instant::now();
                 let w = (w_pts * render_scale).max(8.0) as usize;
@@ -4675,6 +4678,7 @@ impl ViewerApp {
                     image,
                     render_start.elapsed().as_secs_f32() * 1000.0,
                 ));
+                ctx.request_repaint();
             });
         }
         if let Some((texture, _, rendered)) = &self.taiwan_cwa_texture {
