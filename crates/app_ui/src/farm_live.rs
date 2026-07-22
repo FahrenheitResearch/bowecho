@@ -1115,7 +1115,7 @@ impl DrapeState {
 
     /// Start a retained candidate only while the FARM drape is actually
     /// visible on the map.
-    fn schedule_analysis(&mut self) {
+    fn schedule_analysis(&mut self, ctx: &egui::Context) {
         if !self.enabled || self.analysis_rx.is_some() {
             return;
         }
@@ -1136,8 +1136,10 @@ impl DrapeState {
         self.status = "locating deployment…".to_owned();
         let (tx, rx) = mpsc::channel();
         self.analysis_rx = Some(rx);
+        let ctx = ctx.clone();
         thread::spawn(move || {
             let _ = tx.send(analyze_frame(&image, &scan));
+            ctx.request_repaint();
         });
     }
 
@@ -1145,7 +1147,7 @@ impl DrapeState {
     /// from receiver draining so a covered Map tab cannot upload textures or
     /// start georeference work.
     fn update_visible_texture(&mut self, ctx: &egui::Context, current_url: Option<&str>) {
-        self.schedule_analysis();
+        self.schedule_analysis(ctx);
         if !self.enabled || self.georef.is_none() {
             return;
         }
