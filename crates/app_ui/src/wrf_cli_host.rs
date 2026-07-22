@@ -837,6 +837,7 @@ fn render_group(
         .collect::<HashMap<_, _>>();
     let mut kind_by_slug = BTreeMap::<String, BatchProductKind>::new();
     let mut render_slugs = BTreeSet::<String>::new();
+    let mut unavailable_render_coordinates = BTreeSet::<(u16, String)>::new();
 
     for scene in &processed.scenes {
         let catalog = inspect_renderable_products(
@@ -863,6 +864,8 @@ fn render_group(
                     .entry(product.render_slug.clone())
                     .or_insert(available.kind);
             } else {
+                unavailable_render_coordinates
+                    .insert((scene.storage_slot, product.render_slug.clone()));
                 manifest.unavailable_products.push(UnavailableProduct {
                     name: product.receipt_name.clone(),
                     domain: Some(domain.to_owned()),
@@ -879,6 +882,8 @@ fn render_group(
             if let Some(available) = options_by_slug.get(&render_slug) {
                 render_slugs.insert(render_slug.clone());
                 kind_by_slug.entry(render_slug).or_insert(available.kind);
+            } else {
+                unavailable_render_coordinates.insert((scene.storage_slot, render_slug));
             }
         }
         for (name, sources, reason) in [
@@ -1010,6 +1015,10 @@ fn render_group(
             BatchRenderEvent::ItemFailed {
                 time, slug, error, ..
             } => {
+                if render_failure_is_expected_absence(time, &slug, &unavailable_render_coordinates)
+                {
+                    continue;
+                }
                 let valid = time
                     .and_then(|time| scene_by_slot.get(&time.storage_slot).copied())
                     .map(|scene| scene.valid_time.as_str())
@@ -1033,6 +1042,14 @@ fn render_group(
         }
     }
     Ok(())
+}
+
+fn render_failure_is_expected_absence(
+    time: Option<BatchRenderTime>,
+    slug: &str,
+    unavailable: &BTreeSet<(u16, String)>,
+) -> bool {
+    time.is_some_and(|time| unavailable.contains(&(time.storage_slot, slug.to_owned())))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1753,6 +1770,34 @@ mod tests {
         );
         let empty = manifest();
         assert_eq!(manifest_status(&empty), ArtifactStatus::Failed);
+    }
+
+    #[test]
+    fn cross_time_render_failure_is_ignored_only_for_catalogued_absence() {
+        let unavailable = BTreeSet::from([(0, "var:precip_interval".to_owned())]);
+        let first = BatchRenderTime {
+            storage_slot: 0,
+            exact_time: None,
+        };
+        let second = BatchRenderTime {
+            storage_slot: 1,
+            exact_time: None,
+        };
+        assert!(render_failure_is_expected_absence(
+            Some(first),
+            "var:precip_interval",
+            &unavailable
+        ));
+        assert!(!render_failure_is_expected_absence(
+            Some(second),
+            "var:precip_interval",
+            &unavailable
+        ));
+        assert!(!render_failure_is_expected_absence(
+            None,
+            "var:precip_interval",
+            &unavailable
+        ));
     }
 
     #[test]
