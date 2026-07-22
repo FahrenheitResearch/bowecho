@@ -188,6 +188,19 @@ impl Workspace {
         self.tree.tiles.find_pane(&pane).is_some()
     }
 
+    /// Whether a docked pane is part of the tree's currently visible tile set.
+    ///
+    /// `is_docked` deliberately includes inactive tabs because it describes
+    /// layout membership. Background presentation work needs the narrower
+    /// answer so an open-but-covered tab does not keep animating or scheduling
+    /// expensive viewer work.
+    pub fn is_pane_active(&self, pane: WorkspacePane) -> bool {
+        let Some(tile) = self.tree.tiles.find_pane(&pane) else {
+            return false;
+        };
+        self.tree.active_tiles().contains(&tile)
+    }
+
     /// Layout changed: queue a (debounced) persist.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
@@ -621,6 +634,22 @@ mod tests {
         assert!(workspace.activate_pane(WorkspacePane::Model));
         assert_eq!(active(&workspace), Some(model));
         assert!(!workspace.activate_pane(WorkspacePane::Model));
+    }
+
+    #[test]
+    fn pane_activity_excludes_covered_tabs() {
+        let mut workspace = Workspace::default();
+        workspace.dock(WorkspacePane::Model);
+        workspace.dock(WorkspacePane::FormulaLab);
+
+        assert!(workspace.is_pane_active(WorkspacePane::Map));
+        assert!(!workspace.is_pane_active(WorkspacePane::Model));
+        assert!(workspace.is_pane_active(WorkspacePane::FormulaLab));
+        assert!(!workspace.is_pane_active(WorkspacePane::Wofs));
+
+        assert!(workspace.activate_pane(WorkspacePane::Model));
+        assert!(workspace.is_pane_active(WorkspacePane::Model));
+        assert!(!workspace.is_pane_active(WorkspacePane::FormulaLab));
     }
 
     /// The tab strip (Tabs container) that directly wraps a docked pane.
