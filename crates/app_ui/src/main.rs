@@ -1512,6 +1512,22 @@ fn dispatch_headless_command() -> HeadlessStartup {
                     &mut stdout.lock(),
                     &mut stderr.lock(),
                 ),
+                bowecho_cli::CliCommand::Satellite(bowecho_cli::SatelliteCommand::List(
+                    options,
+                )) => satellite_cli_host::execute_list(
+                    &options,
+                    &context,
+                    &mut stdout.lock(),
+                    &mut stderr.lock(),
+                ),
+                bowecho_cli::CliCommand::Satellite(bowecho_cli::SatelliteCommand::Fetch(
+                    options,
+                )) => satellite_cli_host::execute_fetch(
+                    &options,
+                    &context,
+                    &mut stdout.lock(),
+                    &mut stderr.lock(),
+                ),
                 bowecho_cli::CliCommand::Satellite(bowecho_cli::SatelliteCommand::Render(
                     options,
                 )) => satellite_cli_host::execute_render(

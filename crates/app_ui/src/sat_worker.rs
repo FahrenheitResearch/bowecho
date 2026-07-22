@@ -13,7 +13,7 @@
 //! shared `AtomicBool` the follow engine observes at poll/frame
 //! boundaries.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,11 +45,11 @@ use rw_sat::mtg::{EumetsatCredentials, request_access_token};
 use rw_sat::palette::{anchor_color, band_anchors};
 use rw_sat::s3::{
     S3Object, Sector, abi_filename_product_matches_request, band_hour_prefix, bucket_for_satellite,
-    build_agent, download_object, list_s3_objects, object_filename, object_url,
+    build_agent, download_object, goes_hour_prefix, list_s3_objects, object_filename, object_url,
 };
 use rw_sat::store::{
     SatelliteGridField, SatelliteGridScene, SatelliteProjection, WrittenFrame, downsample_field,
-    frame_file_name, frame_time, run_day, sector_slug, selector_band,
+    frame_file_name, frame_time, run_day, sector_slug, selector_band, write_band_frame,
 };
 use rw_sat::window::WindowConfig;
 use rw_store::format::RwsWriterInfo;
@@ -5666,6 +5666,702 @@ fn ingest_meteosat_wms(
     ))
 }
 
+/// Provider-neutral frame descriptor used by the headless archive CLI.  The
+/// payload keeps the already-listed immutable provider objects so `fetch`
+/// never performs a second, potentially different catalogue lookup.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeSatelliteArchiveFrame {
+    pub scan_start_utc: DateTime<Utc>,
+    pub scan_end_utc: Option<DateTime<Utc>>,
+    pub source_ids: Vec<String>,
+    pub source_urls: Vec<String>,
+    pub source_bytes: Option<u64>,
+    payload: NativeSatelliteArchivePayload,
+}
+
+#[derive(Clone, Debug)]
+enum NativeSatelliteArchivePayload {
+    Goes {
+        satellite: String,
+        sector: String,
+        band: Option<u8>,
+        style: Option<String>,
+        objects: HashMap<u8, S3Object>,
+    },
+    Himawari {
+        satellite: HimawariSatellite,
+        band: Option<u8>,
+        style: Option<String>,
+        prefix: String,
+        by_band: HashMap<u8, Vec<S3Object>>,
+    },
+    Meteosat {
+        product: crate::eumetsat::MtgProduct,
+        bounds: crate::eumetsat::WmsBounds,
+        width: u32,
+        height: u32,
+        cadence_minutes: i64,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NativeSatelliteArchiveBounds {
+    pub first_time_utc: Option<DateTime<Utc>>,
+    pub latest_time_utc: Option<DateTime<Utc>>,
+    pub cadence_seconds: Option<u64>,
+    pub west_degrees: Option<f64>,
+    pub south_degrees: Option<f64>,
+    pub east_degrees: Option<f64>,
+    pub north_degrees: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeSatelliteArchiveCatalog {
+    pub provider_bounds: Option<NativeSatelliteArchiveBounds>,
+    pub frames: Vec<NativeSatelliteArchiveFrame>,
+    pub truncated: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeSatelliteStoredFrame {
+    pub model: String,
+    pub run: String,
+    pub hhmm: u16,
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+const ARCHIVE_PREFIX_REQUEST_LIMIT: usize = 50_000;
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn catalog_native_satellite_archive(
+    source: &str,
+    satellite: &str,
+    product: &str,
+    sector: Option<&str>,
+    start_utc: DateTime<Utc>,
+    end_utc: DateTime<Utc>,
+    limit: usize,
+) -> Result<NativeSatelliteArchiveCatalog, String> {
+    if limit == 0 {
+        return Err("satellite archive result limit must be positive".to_owned());
+    }
+    if end_utc < start_utc {
+        return Err("satellite archive end precedes start".to_owned());
+    }
+    let source = source.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match source.as_str() {
+        "goes" | "noaa_goes" | "abi" => {
+            catalog_goes_archive(satellite, product, sector, start_utc, end_utc, limit)
+        }
+        "himawari" | "noaa_himawari" | "ahi" => {
+            catalog_himawari_archive(satellite, product, sector, start_utc, end_utc, limit)
+        }
+        "meteosat" | "mtg" | "eumetsat" => {
+            catalog_meteosat_archive(satellite, product, sector, start_utc, end_utc, limit)
+        }
+        _ => Err(format!(
+            "unknown satellite archive source '{source}'; use goes, himawari, or meteosat"
+        )),
+    }
+}
+
+fn archive_hour(time: DateTime<Utc>) -> DateTime<Utc> {
+    time.with_minute(0)
+        .and_then(|time| time.with_second(0))
+        .and_then(|time| time.with_nanosecond(0))
+        .unwrap_or(time)
+}
+
+fn parse_archive_band(product: &str, prefix: char) -> Option<u8> {
+    let normalized = product.trim().to_ascii_lowercase().replace(['-', '_'], "");
+    normalized
+        .strip_prefix(prefix)?
+        .parse::<u8>()
+        .ok()
+        .filter(|band| (1..=16).contains(band))
+}
+
+fn catalog_goes_archive(
+    satellite_raw: &str,
+    product_raw: &str,
+    sector_raw: Option<&str>,
+    start_utc: DateTime<Utc>,
+    end_utc: DateTime<Utc>,
+    limit: usize,
+) -> Result<NativeSatelliteArchiveCatalog, String> {
+    let satellite = GoesSatellite::parse(satellite_raw);
+    if matches!(satellite, GoesSatellite::Other(_)) {
+        return Err(format!("unknown GOES satellite '{satellite_raw}'"));
+    }
+    let sector_raw = sector_raw.ok_or("GOES archive selection requires --sector")?;
+    let sector =
+        Sector::parse(sector_raw).ok_or_else(|| format!("unknown GOES sector '{sector_raw}'"))?;
+    let style = GoesAbiRgbCompositeStyle::parse(product_raw);
+    let band = parse_archive_band(product_raw, 'c');
+    if style.is_none() && band.is_none() {
+        return Err(format!(
+            "unknown GOES product '{product_raw}'; use c01..c16 or a native RGB style slug"
+        ));
+    }
+    let bands = style
+        .map(|style| style.required_channels().to_vec())
+        .unwrap_or_else(|| vec![band.expect("validated")]);
+    let bucket = bucket_for_satellite(satellite_raw).map_err(|error| error.to_string())?;
+    let agent = build_agent();
+    let wanted = limit.saturating_add(1);
+    let first_hour = archive_hour(start_utc);
+    let mut hour = archive_hour(end_utc);
+    let mut requests = 0usize;
+    let mut frames = Vec::new();
+
+    while hour >= first_hour && frames.len() < wanted {
+        requests += 1;
+        if requests > ARCHIVE_PREFIX_REQUEST_LIMIT {
+            return Err(format!(
+                "GOES archive range needs more than {ARCHIVE_PREFIX_REQUEST_LIMIT} hourly catalogue requests; query it in smaller UTC ranges"
+            ));
+        }
+        // Intentionally mode-agnostic. Historical ABI uses both M3 and M6,
+        // so the filename parser (not a hard-coded mode token) is truth.
+        let prefix = goes_hour_prefix(sector.abi_product(), hour);
+        let objects = list_s3_objects(&agent, &bucket, &prefix, None)
+            .map_err(|error| format!("list GOES {prefix}: {error}"))?;
+        let mut scans: BTreeMap<DateTime<Utc>, (DateTime<Utc>, HashMap<u8, S3Object>)> =
+            BTreeMap::new();
+        for object in objects {
+            if !object.key.ends_with(".nc") {
+                continue;
+            }
+            let Ok(parsed) = parse_goes_abi_filename(object_filename(&object.key)) else {
+                continue;
+            };
+            let Some(channel) = parsed.channel else {
+                continue;
+            };
+            if parsed.satellite != satellite
+                || !bands.contains(&channel)
+                || !abi_filename_product_matches_request(&parsed.product, sector.abi_product())
+                || parsed.start_time_utc < start_utc
+                || parsed.start_time_utc > end_utc
+            {
+                continue;
+            }
+            let entry = scans
+                .entry(parsed.start_time_utc)
+                .or_insert_with(|| (parsed.end_time_utc, HashMap::new()));
+            entry.0 = entry.0.max(parsed.end_time_utc);
+            entry.1.insert(channel, object);
+        }
+        for (scan_start, (scan_end, objects)) in scans.into_iter().rev() {
+            if !bands
+                .iter()
+                .all(|candidate| objects.contains_key(candidate))
+            {
+                continue;
+            }
+            let mut ordered = bands
+                .iter()
+                .filter_map(|candidate| objects.get(candidate).cloned())
+                .collect::<Vec<_>>();
+            ordered.sort_by(|left, right| left.key.cmp(&right.key));
+            let source_ids = ordered.iter().map(|object| object.key.clone()).collect();
+            let source_urls = ordered
+                .iter()
+                .map(|object| object_url(&bucket, &object.key))
+                .collect();
+            let source_bytes = Some(
+                ordered
+                    .iter()
+                    .fold(0_u64, |sum, object| sum.saturating_add(object.size_bytes)),
+            );
+            frames.push(NativeSatelliteArchiveFrame {
+                scan_start_utc: scan_start,
+                scan_end_utc: Some(scan_end),
+                source_ids,
+                source_urls,
+                source_bytes,
+                payload: NativeSatelliteArchivePayload::Goes {
+                    satellite: satellite_raw.to_owned(),
+                    sector: sector.slug().to_owned(),
+                    band,
+                    style: style.map(|style| style.slug().to_owned()),
+                    objects,
+                },
+            });
+            if frames.len() >= wanted {
+                break;
+            }
+        }
+        let Some(previous) = hour.checked_sub_signed(chrono::Duration::hours(1)) else {
+            break;
+        };
+        hour = previous;
+    }
+    frames.sort_by_key(|frame| frame.scan_start_utc);
+    let truncated = frames.len() > limit;
+    if truncated {
+        frames.remove(0);
+    }
+    Ok(NativeSatelliteArchiveCatalog {
+        provider_bounds: Some(NativeSatelliteArchiveBounds {
+            cadence_seconds: Some(sector.cadence_secs()),
+            ..Default::default()
+        }),
+        frames,
+        truncated,
+        warnings: Vec::new(),
+    })
+}
+
+fn catalog_himawari_archive(
+    satellite_raw: &str,
+    product_raw: &str,
+    sector: Option<&str>,
+    start_utc: DateTime<Utc>,
+    end_utc: DateTime<Utc>,
+    limit: usize,
+) -> Result<NativeSatelliteArchiveCatalog, String> {
+    if sector.is_some_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "full" | "fulldisk" | "full_disk" | "fd"
+        )
+    }) {
+        return Err("Himawari native archive currently supports the full disk sector".to_owned());
+    }
+    let satellite = HimawariSatellite::parse(satellite_raw)
+        .ok_or_else(|| format!("unknown Himawari satellite '{satellite_raw}'"))?;
+    let style = HimawariCompositeStyle::parse(product_raw);
+    let band = parse_archive_band(product_raw, 'b');
+    if style.is_none() && band.is_none() {
+        return Err(format!(
+            "unknown Himawari product '{product_raw}'; use b01..b16 or true_color"
+        ));
+    }
+    let bands = style
+        .map(|style| style.required_bands().to_vec())
+        .unwrap_or_else(|| vec![band.expect("validated")]);
+    let product = HimawariProduct::AhiL1bFldk;
+    let cadence = product.cadence_minutes();
+    let mut scan = round_down_ahi_scan_time(end_utc, cadence);
+    let wanted = limit.saturating_add(1);
+    let agent = build_agent();
+    let mut requests = 0usize;
+    let mut frames = Vec::new();
+    while scan >= start_utc && frames.len() < wanted {
+        requests += 1;
+        if requests > ARCHIVE_PREFIX_REQUEST_LIMIT {
+            return Err(format!(
+                "Himawari archive range needs more than {ARCHIVE_PREFIX_REQUEST_LIMIT} scan catalogue requests; query it in smaller UTC ranges"
+            ));
+        }
+        let prefix = product.scan_prefix(scan);
+        let objects = list_s3_objects(&agent, satellite.bucket(), &prefix, None)
+            .map_err(|error| format!("list Himawari {prefix}: {error}"))?;
+        let mut by_band: HashMap<u8, Vec<(u8, u8, S3Object)>> = HashMap::new();
+        for object in objects {
+            let Some(name) = parse_segment_name(object_filename(&object.key)) else {
+                continue;
+            };
+            if name.satellite == satellite && name.scan_time == scan && bands.contains(&name.band) {
+                by_band.entry(name.band).or_default().push((
+                    name.segment_index,
+                    name.segment_count,
+                    object,
+                ));
+            }
+        }
+        let complete = bands.iter().all(|candidate| {
+            by_band.get(candidate).is_some_and(|segments| {
+                let count = segments.first().map(|segment| segment.1).unwrap_or(0);
+                count > 0
+                    && segments.len() == usize::from(count)
+                    && (1..=count).all(|index| segments.iter().any(|segment| segment.0 == index))
+            })
+        });
+        if complete {
+            let mut payload_bands = HashMap::new();
+            let mut ordered = Vec::new();
+            for candidate in &bands {
+                let mut segments = by_band.remove(candidate).expect("complete band");
+                segments.sort_by_key(|segment| segment.0);
+                let objects = segments
+                    .into_iter()
+                    .map(|segment| segment.2)
+                    .collect::<Vec<_>>();
+                ordered.extend(objects.iter().cloned());
+                payload_bands.insert(*candidate, objects);
+            }
+            let source_ids = ordered.iter().map(|object| object.key.clone()).collect();
+            let source_urls = ordered
+                .iter()
+                .map(|object| object_url(satellite.bucket(), &object.key))
+                .collect();
+            let source_bytes = Some(
+                ordered
+                    .iter()
+                    .fold(0_u64, |sum, object| sum.saturating_add(object.size_bytes)),
+            );
+            frames.push(NativeSatelliteArchiveFrame {
+                scan_start_utc: scan,
+                scan_end_utc: scan.checked_add_signed(chrono::Duration::minutes(cadence)),
+                source_ids,
+                source_urls,
+                source_bytes,
+                payload: NativeSatelliteArchivePayload::Himawari {
+                    satellite,
+                    band,
+                    style: style.map(|style| style.slug().to_owned()),
+                    prefix,
+                    by_band: payload_bands,
+                },
+            });
+        }
+        let Some(previous) = scan.checked_sub_signed(chrono::Duration::minutes(cadence)) else {
+            break;
+        };
+        scan = previous;
+    }
+    frames.sort_by_key(|frame| frame.scan_start_utc);
+    let truncated = frames.len() > limit;
+    if truncated {
+        frames.remove(0);
+    }
+    Ok(NativeSatelliteArchiveCatalog {
+        provider_bounds: Some(NativeSatelliteArchiveBounds {
+            cadence_seconds: Some((cadence * 60) as u64),
+            ..Default::default()
+        }),
+        frames,
+        truncated,
+        warnings: Vec::new(),
+    })
+}
+
+fn catalog_meteosat_archive(
+    satellite_raw: &str,
+    product_raw: &str,
+    sector: Option<&str>,
+    start_utc: DateTime<Utc>,
+    end_utc: DateTime<Utc>,
+    limit: usize,
+) -> Result<NativeSatelliteArchiveCatalog, String> {
+    let satellite = satellite_raw
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], "");
+    if !matches!(satellite.as_str(), "mtgi1" | "meteosat12" | "m12") {
+        return Err(format!("unknown Meteosat satellite '{satellite_raw}'"));
+    }
+    if sector.is_some_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "full" | "fulldisk" | "full_disk" | "fd"
+        )
+    }) {
+        return Err(
+            "Meteosat archive currently supports the advertised full-disk WMS extent".to_owned(),
+        );
+    }
+    let product = crate::eumetsat::MtgProduct::parse(product_raw)
+        .ok_or_else(|| format!("unknown Meteosat product '{product_raw}'"))?;
+    let client = crate::eumetsat::EumetViewClient::new()?;
+    let layer = client
+        .capabilities()?
+        .into_iter()
+        .find(|layer| layer.product == product)
+        .ok_or_else(|| format!("EUMETView does not advertise {}", product.label()))?;
+    let cadence = layer.cadence_minutes.max(1);
+    let clipped_start = start_utc.max(layer.first_time);
+    let clipped_end = end_utc.min(layer.latest_time);
+    let (width, height) = crate::eumetsat::image_size_for_bounds(layer.bounds, 1_600);
+    let mut frames = Vec::new();
+    if clipped_end >= clipped_start {
+        let cadence_seconds = cadence * 60;
+        let first_offset = (clipped_start - layer.first_time).num_seconds();
+        let first_index = first_offset.div_ceil(cadence_seconds).max(0);
+        let last_index = ((clipped_end - layer.first_time).num_seconds() / cadence_seconds).max(0);
+        let count = last_index.saturating_sub(first_index).saturating_add(1) as usize;
+        let take = count.min(limit.saturating_add(1));
+        let start_index = last_index.saturating_sub(take.saturating_sub(1) as i64);
+        for index in start_index..=last_index {
+            let time = layer.first_time + chrono::Duration::seconds(index * cadence_seconds);
+            let request = crate::eumetsat::GetMapRequest {
+                product,
+                time,
+                bounds: layer.bounds,
+                width,
+                height,
+            };
+            let url = request.url()?.to_string();
+            frames.push(NativeSatelliteArchiveFrame {
+                scan_start_utc: time,
+                scan_end_utc: time.checked_add_signed(chrono::Duration::minutes(cadence)),
+                source_ids: vec![format!("{}@{}", product.layer(), time.to_rfc3339())],
+                source_urls: vec![url],
+                source_bytes: None,
+                payload: NativeSatelliteArchivePayload::Meteosat {
+                    product,
+                    bounds: layer.bounds,
+                    width,
+                    height,
+                    cadence_minutes: cadence,
+                },
+            });
+        }
+    }
+    let truncated = frames.len() > limit;
+    if truncated {
+        frames.remove(0);
+    }
+    Ok(NativeSatelliteArchiveCatalog {
+        provider_bounds: Some(NativeSatelliteArchiveBounds {
+            first_time_utc: Some(layer.first_time),
+            latest_time_utc: Some(layer.latest_time),
+            cadence_seconds: Some((cadence * 60) as u64),
+            west_degrees: Some(layer.bounds.west_deg),
+            south_degrees: Some(layer.bounds.south_deg),
+            east_degrees: Some(layer.bounds.east_deg),
+            north_degrees: Some(layer.bounds.north_deg),
+        }),
+        frames,
+        truncated,
+        warnings: Vec::new(),
+    })
+}
+
+pub(crate) fn fetch_native_satellite_archive_frame(
+    store_root: &Path,
+    frame: NativeSatelliteArchiveFrame,
+    note: &impl Fn(String),
+) -> Result<NativeSatelliteStoredFrame, String> {
+    let written = match frame.payload {
+        NativeSatelliteArchivePayload::Goes {
+            satellite,
+            sector,
+            band,
+            style,
+            objects,
+        } => {
+            if let Some(style) = style {
+                let spec = GoesCompositeSpec {
+                    satellite,
+                    sector,
+                    style,
+                    downsample: 4,
+                    lookback_minutes: 1,
+                    window: None,
+                    as_of: Some(frame.scan_start_utc),
+                    frame_count: 1,
+                    card_ticket: None,
+                };
+                let pick = GoesScanPick {
+                    scan_start: frame.scan_start_utc,
+                    objects,
+                };
+                let send = |response: SatResponse| {
+                    if let SatResponse::Note(message) = response {
+                        note(message);
+                    }
+                    true
+                };
+                let recent = ingest_one_goes_composite(store_root, &spec, pick, &send)?;
+                stored_from_recent(store_root, recent)?
+            } else {
+                let band = band.ok_or("GOES archive payload has no band")?;
+                let object = objects
+                    .get(&band)
+                    .ok_or_else(|| format!("GOES archive payload is missing C{band:02}"))?;
+                note(format!("Downloading {}", object.key));
+                let bucket = bucket_for_satellite(&satellite).map_err(|error| error.to_string())?;
+                let downloaded = download_object(
+                    &build_agent(),
+                    &bucket,
+                    &store_root.join("cache"),
+                    object,
+                    true,
+                )
+                .map_err(|error| error.to_string())?;
+                let field = downsample_field(
+                    read_goes_abi_field(&downloaded.path, "CMI")
+                        .map_err(|error| error.to_string())?,
+                    4,
+                );
+                native_stored(
+                    write_band_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)
+                        .map_err(|error| error.to_string())?,
+                )
+            }
+        }
+        NativeSatelliteArchivePayload::Himawari {
+            satellite,
+            band,
+            style,
+            prefix,
+            by_band,
+        } => {
+            if let Some(style) = style {
+                let spec = HimawariCompositeSpec {
+                    satellite: satellite.slug().to_owned(),
+                    style,
+                    segment_start: 1,
+                    segment_count: 10,
+                    full_disk: true,
+                    lookback_minutes: 10,
+                    downsample: 4,
+                    window: None,
+                    as_of: Some(frame.scan_start_utc),
+                    frame_count: 1,
+                    card_ticket: None,
+                };
+                let pick = HimawariScanPick {
+                    scan_time: frame.scan_start_utc,
+                    prefix,
+                    by_band,
+                };
+                let send = |response: SatResponse| {
+                    if let SatResponse::Note(message) = response {
+                        note(message);
+                    }
+                    true
+                };
+                let recent = ingest_one_himawari_composite(store_root, &spec, pick, &send)?;
+                stored_from_recent(store_root, recent)?
+            } else {
+                let band = band.ok_or("Himawari archive payload has no band")?;
+                let objects = by_band
+                    .get(&band)
+                    .ok_or_else(|| format!("Himawari archive payload is missing B{band:02}"))?;
+                let send = |response: SatResponse| {
+                    if let SatResponse::Note(message) = response {
+                        note(message);
+                    }
+                    true
+                };
+                let (mut field, calibration) = fetch_himawari_band_counts(
+                    satellite,
+                    frame.scan_start_utc,
+                    &prefix,
+                    band,
+                    objects,
+                    &store_root.join("cache"),
+                    &store_root.join("sources").join("himawari"),
+                    4,
+                    None,
+                    true,
+                    &send,
+                )?;
+                if band <= 6 {
+                    field.values = ahi_counts_to_reflectance(&field.values, &calibration);
+                    field.units = "1".to_owned();
+                } else {
+                    field.values =
+                        ahi_counts_to_brightness_temperature(&field.values, &calibration)?;
+                    field.units = "K".to_owned();
+                }
+                native_stored(write_himawari_grid_frame(
+                    store_root,
+                    &field,
+                    Utc::now().timestamp().max(0) as u64,
+                    None,
+                )?)
+            }
+        }
+        NativeSatelliteArchivePayload::Meteosat {
+            product,
+            bounds,
+            width,
+            height,
+            cadence_minutes,
+        } => {
+            let client = crate::eumetsat::EumetViewClient::new()?;
+            note(format!(
+                "Fetching EUMETView {} at {}",
+                product.label(),
+                frame.scan_start_utc.to_rfc3339()
+            ));
+            let image = client.fetch_map(&crate::eumetsat::GetMapRequest {
+                product,
+                time: frame.scan_start_utc,
+                bounds,
+                width,
+                height,
+            })?;
+            native_stored(crate::sat_rgb_store::write_regular_lonlat_rgb_frame(
+                store_root,
+                crate::sat_rgb_store::RegularLonLatRgb {
+                    width: image.width,
+                    height: image.height,
+                    bounds: crate::sat_rgb_store::LonLatBounds {
+                        west_deg: bounds.west_deg,
+                        south_deg: bounds.south_deg,
+                        east_deg: bounds.east_deg,
+                        north_deg: bounds.north_deg,
+                    },
+                    rgb: &image.rgb,
+                    alpha: Some(&image.alpha),
+                },
+                &crate::sat_rgb_store::RgbSatelliteMetadata {
+                    source_id: "mtg_fd".to_owned(),
+                    provider: "eumetsat".to_owned(),
+                    instrument: if product == crate::eumetsat::MtgProduct::LightningAfa {
+                        "li".to_owned()
+                    } else {
+                        "fci".to_owned()
+                    },
+                    satellite: "Meteosat-12 / MTG-I1".to_owned(),
+                    model: "mtg-i1".to_owned(),
+                    product_id: product.slug().to_owned(),
+                    product_title: product.label().to_owned(),
+                    sector: "fulldisk".to_owned(),
+                    scan_start_utc: frame.scan_start_utc,
+                    scan_end_utc: frame.scan_start_utc
+                        + chrono::Duration::minutes(cadence_minutes.max(1)),
+                    extra_metadata: serde_json::json!({
+                        "service": "EUMETView",
+                        "wms_layer": product.layer(),
+                        "attribution": format!("Contains modified EUMETSAT Meteosat data {}.", frame.scan_start_utc.format("%Y")),
+                    }),
+                },
+                Utc::now().timestamp().max(0) as u64,
+            )?)
+        }
+    };
+    Ok(written)
+}
+
+fn native_stored(frame: WrittenFrame) -> NativeSatelliteStoredFrame {
+    NativeSatelliteStoredFrame {
+        model: frame.model,
+        run: frame.run,
+        hhmm: frame.hhmm,
+        path: frame.path,
+        bytes: frame.bytes,
+    }
+}
+
+fn stored_from_recent(
+    store_root: &Path,
+    frame: RecentIngestFrame,
+) -> Result<NativeSatelliteStoredFrame, String> {
+    let path = store_root
+        .join(&frame.key.model)
+        .join(&frame.key.run)
+        .join(frame_file_name(frame.hhmm));
+    let bytes = std::fs::metadata(&path)
+        .map_err(|error| format!("inspect stored satellite frame {}: {error}", path.display()))?
+        .len();
+    Ok(NativeSatelliteStoredFrame {
+        model: frame.key.model,
+        run: frame.key.run,
+        hhmm: frame.hhmm,
+        path,
+        bytes,
+    })
+}
+
 fn worker_loop(
     store_root: PathBuf,
     requests: &Receiver<SatRequest>,
@@ -9301,5 +9997,36 @@ mod tests {
             "{title}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_band_parser_accepts_only_native_band_range() {
+        assert_eq!(parse_archive_band("C01", 'c'), Some(1));
+        assert_eq!(parse_archive_band("b_16", 'b'), Some(16));
+        assert_eq!(parse_archive_band("c00", 'c'), None);
+        assert_eq!(parse_archive_band("c17", 'c'), None);
+        assert_eq!(parse_archive_band("true_color", 'b'), None);
+    }
+
+    #[test]
+    fn archive_catalog_rejects_invalid_requests_before_network_access() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 22, 18, 0, 0).unwrap();
+        let end = start - chrono::Duration::minutes(1);
+        let error =
+            catalog_native_satellite_archive("goes", "goes19", "c13", Some("conus"), start, end, 1)
+                .unwrap_err();
+        assert!(error.contains("end precedes start"));
+
+        let error = catalog_native_satellite_archive(
+            "invented",
+            "satellite",
+            "product",
+            None,
+            start,
+            start,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown satellite archive source"));
     }
 }

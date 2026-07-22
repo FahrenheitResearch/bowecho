@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
+
 use crate::input::InputSet;
 use crate::radar;
 use crate::watch::WatchPolicy;
@@ -59,6 +61,8 @@ pub enum HelpTopic {
     RadarVerify,
     Satellite,
     SatelliteInspect,
+    SatelliteList,
+    SatelliteFetch,
     SatelliteRender,
     SatelliteVerify,
 }
@@ -155,9 +159,49 @@ pub struct SatelliteRenderOptions {
     pub json: bool,
 }
 
+/// Provider-neutral selector for one native satellite product family.
+///
+/// The application host owns the authoritative source/satellite/product
+/// catalog. Keeping these as normalized strings lets the CLI expose new
+/// native providers without teaching the parser their scientific rules.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SatelliteArchiveSelector {
+    pub source: String,
+    pub satellite: String,
+    pub product: String,
+    pub sector: Option<String>,
+}
+
+/// Inclusive UTC interval used for native archive catalog and acquisition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SatelliteArchiveRange {
+    pub selector: SatelliteArchiveSelector,
+    pub start_utc: DateTime<Utc>,
+    pub end_utc: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SatelliteListOptions {
+    pub range: SatelliteArchiveRange,
+    /// Explicit caller safety cap. Listing never silently exceeds this count.
+    pub limit: usize,
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SatelliteFetchOptions {
+    pub range: SatelliteArchiveRange,
+    pub store_root: PathBuf,
+    /// Explicit caller safety cap. Fetch never silently exceeds this count.
+    pub max_frames: usize,
+    pub json: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SatelliteCommand {
     Inspect { run_directory: PathBuf, json: bool },
+    List(Box<SatelliteListOptions>),
+    Fetch(Box<SatelliteFetchOptions>),
     Render(Box<SatelliteRenderOptions>),
     Verify { manifest: PathBuf },
 }
@@ -242,7 +286,7 @@ pub const fn help_text() -> &'static str {
         "Command families:\n",
         "  wrf       Inspect, render, watch, and verify WRF/GPUWM data\n",
         "  radar     Inspect, render, and verify Level-II radar data\n",
-        "  satellite Inspect, render, and verify canonical satellite-store runs\n\n",
+        "  satellite List/fetch native history; inspect, render, and verify store runs\n\n",
         "Global options:\n",
         "  -h, --help       Show this help\n",
         "  -V, --version    Show the BowEcho version\n\n",
@@ -265,10 +309,11 @@ Source radar files are read-only. BowEcho never uploads or deletes them.\n"
 }
 
 pub const fn satellite_help_text() -> &'static str {
-    "BowEcho satellite rw-store inspection and deterministic rendering\n\n\
-Usage:\n  bowecho satellite inspect <RW-STORE-RUN-DIRECTORY> --json\n  bowecho satellite render <RW-STORE-RUN-DIRECTORY> --out <DIRECTORY> [OPTIONS]\n  bowecho satellite verify <ARTIFACT-MANIFEST.JSON>\n\n\
-Commands:\n  inspect    Report stored frames, products, grids, times, and source receipts\n  render     Render frames through BowEcho's production native plotter\n  verify     Recalculate every source/artifact size and SHA-256 receipt\n\n\
-Source satellite runs are read-only. BowEcho never uploads or deletes them.\n"
+    "BowEcho native satellite archive, rw-store inspection, and deterministic rendering\n\n\
+Usage:\n  bowecho satellite list [OPTIONS]\n  bowecho satellite fetch [OPTIONS]\n  bowecho satellite inspect <RW-STORE-RUN-DIRECTORY> --json\n  bowecho satellite render <RW-STORE-RUN-DIRECTORY> --out <DIRECTORY> [OPTIONS]\n  bowecho satellite verify <ARTIFACT-MANIFEST.JSON>\n\n\
+Commands:\n  list       List native-provider frames in an inclusive UTC interval\n  fetch      Acquire native-provider frames into a canonical rw-store\n  inspect    Report stored frames, products, grids, times, and source receipts\n  render     Render frames through BowEcho's production native plotter\n  verify     Recalculate every source/artifact size and SHA-256 receipt\n\n\
+Provider holdings determine the earliest available history. BowEcho never invents or\n\
+extrapolates missing scans, and existing satellite runs remain read-only.\n"
 }
 
 const WRF_INSPECT_HELP: &str = "Usage: bowecho wrf inspect <FILE-OR-DIRECTORY> --json\n\n\
@@ -305,6 +350,16 @@ A machine-readable verification report is written to stdout.\n";
 const SATELLITE_INSPECT_HELP: &str = "Usage: bowecho satellite inspect <RW-STORE-RUN-DIRECTORY> --json\n\n\
 Reports stored frames, products, grids, times, and source receipts. JSON is written\n\
 to stdout; diagnostics are written to stderr. The source run is never modified.\n";
+
+const SATELLITE_LIST_HELP: &str = "Usage: bowecho satellite list --source <SOURCE> --satellite <ID> --product <ID> --start <UTC> --end <UTC> --limit <N> [OPTIONS]\n\n\
+Options:\n  --source <SOURCE>       Native source family (for example goes, himawari, or meteosat)\n  --satellite <ID>        Native satellite ID (for example goes19, h9, or mtg_i1)\n  --product <ID>          Native product ID (for example c13, true_color, or geo_colour)\n  --sector <ID>           Optional native sector ID (for example conus or fulldisk)\n  --start <UTC>           Inclusive RFC3339 UTC start timestamp (required)\n  --end <UTC>             Inclusive RFC3339 UTC end timestamp (required)\n  --limit <N>             Explicit positive result cap (required)\n  --json                  Write the versioned catalog report to stdout\n  -h, --help              Show this help\n\n\
+The application host validates native selector combinations and reports provider holding\n\
+limits. The parser imposes no artificial earliest date. UTC offsets other than zero are refused.\n";
+
+const SATELLITE_FETCH_HELP: &str = "Usage: bowecho satellite fetch --source <SOURCE> --satellite <ID> --product <ID> --start <UTC> --end <UTC> --store-root <DIRECTORY> --max-frames <N> [OPTIONS]\n\n\
+Options:\n  --source <SOURCE>       Native source family (for example goes, himawari, or meteosat)\n  --satellite <ID>        Native satellite ID (for example goes19, h9, or mtg_i1)\n  --product <ID>          Native product ID (for example c13, true_color, or geo_colour)\n  --sector <ID>           Optional native sector ID (for example conus or fulldisk)\n  --start <UTC>           Inclusive RFC3339 UTC start timestamp (required)\n  --end <UTC>             Inclusive RFC3339 UTC end timestamp (required)\n  --store-root <DIRECTORY> Canonical rw-store destination root (required)\n  --max-frames <N>        Explicit positive download safety cap (required)\n  --json                  Write the versioned acquisition report to stdout\n  -h, --help              Show this help\n\n\
+The native provider catalog decides which scans exist in the requested interval. Fetch does\n\
+not synthesize missing times and never exceeds --max-frames.\n";
 
 const SATELLITE_RENDER_HELP: &str = "Usage: bowecho satellite render <RW-STORE-RUN-DIRECTORY> --out <DIRECTORY> [OPTIONS]\n\n\
 Options:\n  --out <DIRECTORY>       Artifact output root (required)\n  --frame <SELECTOR>      latest, all, or UTC HHMM; repeat HHMM to select several (default: latest)\n  --ir-enhancement <NAME> natural, cimss, bd, avn, funktop, rainbow, or gray (default: cimss)\n  --width <PX>            Image width, 64-4096 (default: 1600)\n  --height <PX>           Image height, 64-4096 (default: 1200)\n  --json                  Write the final artifact manifest to stdout\n  -h, --help              Show this help\n\n\
@@ -434,6 +489,12 @@ fn parse_satellite(args: Vec<OsString>) -> Result<CliCommand, CliError> {
         return Ok(CliCommand::Help(HelpTopic::Satellite));
     }
     match subcommand.to_str() {
+        Some("list") if args[1..].iter().any(|arg| arg == "--help" || arg == "-h") => {
+            Ok(CliCommand::Help(HelpTopic::SatelliteList))
+        }
+        Some("fetch") if args[1..].iter().any(|arg| arg == "--help" || arg == "-h") => {
+            Ok(CliCommand::Help(HelpTopic::SatelliteFetch))
+        }
         Some("inspect") if args[1..].iter().any(|arg| arg == "--help" || arg == "-h") => {
             Ok(CliCommand::Help(HelpTopic::SatelliteInspect))
         }
@@ -455,6 +516,8 @@ fn parse_satellite(args: Vec<OsString>) -> Result<CliCommand, CliError> {
                 json,
             }))
         }
+        Some("list") => parse_satellite_list(&args[1..]).map(CliCommand::Satellite),
+        Some("fetch") => parse_satellite_fetch(&args[1..]).map(CliCommand::Satellite),
         Some("render") => parse_satellite_render(&args[1..]).map(CliCommand::Satellite),
         Some("verify") => parse_verify_manifest(&args[1..], SATELLITE_VERIFY_HELP, "satellite")
             .map(|manifest| CliCommand::Satellite(SatelliteCommand::Verify { manifest })),
@@ -633,6 +696,225 @@ fn parse_radar_render(args: &[OsString]) -> Result<RadarCommand, CliError> {
         height: height.unwrap_or(1_200),
         json,
     })))
+}
+
+#[derive(Clone, Copy)]
+enum SatelliteArchiveCommandKind {
+    List,
+    Fetch,
+}
+
+impl SatelliteArchiveCommandKind {
+    const fn help(self) -> &'static str {
+        match self {
+            Self::List => SATELLITE_LIST_HELP,
+            Self::Fetch => SATELLITE_FETCH_HELP,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::List => "satellite list",
+            Self::Fetch => "satellite fetch",
+        }
+    }
+}
+
+#[derive(Default)]
+struct SatelliteArchiveParseState {
+    source: Option<String>,
+    satellite: Option<String>,
+    product: Option<String>,
+    sector: Option<String>,
+    start_utc: Option<DateTime<Utc>>,
+    end_utc: Option<DateTime<Utc>>,
+    limit: Option<usize>,
+    store_root: Option<PathBuf>,
+    max_frames: Option<usize>,
+    json: bool,
+}
+
+fn parse_satellite_list(args: &[OsString]) -> Result<SatelliteCommand, CliError> {
+    let state = parse_satellite_archive_args(args, SatelliteArchiveCommandKind::List)?;
+    let range = finish_satellite_archive_range(&state, SATELLITE_LIST_HELP)?;
+    Ok(SatelliteCommand::List(Box::new(SatelliteListOptions {
+        range,
+        limit: state.limit.ok_or_else(|| {
+            CliError::usage("satellite list requires --limit", SATELLITE_LIST_HELP)
+        })?,
+        json: state.json,
+    })))
+}
+
+fn parse_satellite_fetch(args: &[OsString]) -> Result<SatelliteCommand, CliError> {
+    let state = parse_satellite_archive_args(args, SatelliteArchiveCommandKind::Fetch)?;
+    let range = finish_satellite_archive_range(&state, SATELLITE_FETCH_HELP)?;
+    Ok(SatelliteCommand::Fetch(Box::new(SatelliteFetchOptions {
+        range,
+        store_root: state.store_root.ok_or_else(|| {
+            CliError::usage(
+                "satellite fetch requires --store-root",
+                SATELLITE_FETCH_HELP,
+            )
+        })?,
+        max_frames: state.max_frames.ok_or_else(|| {
+            CliError::usage(
+                "satellite fetch requires --max-frames",
+                SATELLITE_FETCH_HELP,
+            )
+        })?,
+        json: state.json,
+    })))
+}
+
+fn parse_satellite_archive_args(
+    args: &[OsString],
+    kind: SatelliteArchiveCommandKind,
+) -> Result<SatelliteArchiveParseState, CliError> {
+    let help = kind.help();
+    let mut state = SatelliteArchiveParseState::default();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.to_str() {
+            Some("--source") => {
+                let value = option_value(args, &mut index, "--source", help)?;
+                set_once(
+                    &mut state.source,
+                    parse_satellite_archive_id(value, "--source", help)?,
+                    "--source",
+                    help,
+                )?;
+            }
+            Some("--satellite") => {
+                let value = option_value(args, &mut index, "--satellite", help)?;
+                set_once(
+                    &mut state.satellite,
+                    parse_satellite_archive_id(value, "--satellite", help)?,
+                    "--satellite",
+                    help,
+                )?;
+            }
+            Some("--product") => {
+                let value = option_value(args, &mut index, "--product", help)?;
+                set_once(
+                    &mut state.product,
+                    parse_satellite_archive_id(value, "--product", help)?,
+                    "--product",
+                    help,
+                )?;
+            }
+            Some("--sector") => {
+                let value = option_value(args, &mut index, "--sector", help)?;
+                set_once(
+                    &mut state.sector,
+                    parse_satellite_archive_id(value, "--sector", help)?,
+                    "--sector",
+                    help,
+                )?;
+            }
+            Some("--start") => {
+                let value = option_value(args, &mut index, "--start", help)?;
+                set_once(
+                    &mut state.start_utc,
+                    parse_satellite_archive_utc(value, "--start", help)?,
+                    "--start",
+                    help,
+                )?;
+            }
+            Some("--end") => {
+                let value = option_value(args, &mut index, "--end", help)?;
+                set_once(
+                    &mut state.end_utc,
+                    parse_satellite_archive_utc(value, "--end", help)?,
+                    "--end",
+                    help,
+                )?;
+            }
+            Some("--limit") if matches!(kind, SatelliteArchiveCommandKind::List) => {
+                let value = option_value(args, &mut index, "--limit", help)?;
+                set_once(
+                    &mut state.limit,
+                    parse_positive_usize(value, "--limit", help)?,
+                    "--limit",
+                    help,
+                )?;
+            }
+            Some("--store-root") if matches!(kind, SatelliteArchiveCommandKind::Fetch) => {
+                let value = option_value(args, &mut index, "--store-root", help)?;
+                set_once(
+                    &mut state.store_root,
+                    PathBuf::from(value),
+                    "--store-root",
+                    help,
+                )?;
+            }
+            Some("--max-frames") if matches!(kind, SatelliteArchiveCommandKind::Fetch) => {
+                let value = option_value(args, &mut index, "--max-frames", help)?;
+                set_once(
+                    &mut state.max_frames,
+                    parse_positive_usize(value, "--max-frames", help)?,
+                    "--max-frames",
+                    help,
+                )?;
+            }
+            Some("--json") => state.json = true,
+            Some(value) if value.starts_with('-') => {
+                return Err(CliError::usage(
+                    format!("unknown {} option '{value}'", kind.name()),
+                    help,
+                ));
+            }
+            Some(value) => {
+                return Err(CliError::usage(
+                    format!(
+                        "{} does not accept positional argument '{value}'",
+                        kind.name()
+                    ),
+                    help,
+                ));
+            }
+            None => {
+                return Err(CliError::usage(
+                    format!("{} arguments must be valid Unicode", kind.name()),
+                    help,
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(state)
+}
+
+fn finish_satellite_archive_range(
+    state: &SatelliteArchiveParseState,
+    help: &'static str,
+) -> Result<SatelliteArchiveRange, CliError> {
+    let start_utc = state
+        .start_utc
+        .ok_or_else(|| CliError::usage("satellite archive range requires --start", help))?;
+    let end_utc = state
+        .end_utc
+        .ok_or_else(|| CliError::usage("satellite archive range requires --end", help))?;
+    if end_utc < start_utc {
+        return Err(CliError::usage("--end must be at or after --start", help));
+    }
+    Ok(SatelliteArchiveRange {
+        selector: SatelliteArchiveSelector {
+            source: state.source.clone().ok_or_else(|| {
+                CliError::usage("satellite archive selection requires --source", help)
+            })?,
+            satellite: state.satellite.clone().ok_or_else(|| {
+                CliError::usage("satellite archive selection requires --satellite", help)
+            })?,
+            product: state.product.clone().ok_or_else(|| {
+                CliError::usage("satellite archive selection requires --product", help)
+            })?,
+            sector: state.sector.clone(),
+        },
+        start_utc,
+        end_utc,
+    })
 }
 
 fn parse_satellite_render(args: &[OsString]) -> Result<SatelliteCommand, CliError> {
@@ -1185,6 +1467,74 @@ fn parse_radar_moment(value: &OsString) -> Result<String, CliError> {
     Ok(value.to_ascii_uppercase())
 }
 
+fn parse_satellite_archive_id(
+    value: &OsString,
+    option: &str,
+    help: &'static str,
+) -> Result<String, CliError> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| CliError::usage(format!("{option} must be valid Unicode"), help))?
+        .trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(CliError::usage(
+            format!(
+                "{option} must contain 1-128 ASCII letters, digits, underscores, hyphens, dots, or colons"
+            ),
+            help,
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn parse_satellite_archive_utc(
+    value: &OsString,
+    option: &str,
+    help: &'static str,
+) -> Result<DateTime<Utc>, CliError> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| CliError::usage(format!("{option} must be valid Unicode"), help))?;
+    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| {
+        CliError::usage(
+            format!("{option} must be an RFC3339 timestamp with a UTC offset"),
+            help,
+        )
+    })?;
+    if parsed.offset().local_minus_utc() != 0 {
+        return Err(CliError::usage(
+            format!("{option} must use UTC (Z or +00:00), not a local offset"),
+            help,
+        ));
+    }
+    Ok(parsed.with_timezone(&Utc))
+}
+
+fn parse_positive_usize(
+    value: &OsString,
+    option: &str,
+    help: &'static str,
+) -> Result<usize, CliError> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| CliError::usage(format!("{option} must be valid Unicode"), help))?;
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| CliError::usage(format!("{option} must be a positive integer"), help))?;
+    if value == 0 {
+        return Err(CliError::usage(
+            format!("{option} must be greater than zero"),
+            help,
+        ));
+    }
+    Ok(value)
+}
+
 fn parse_satellite_hhmm(value: &str) -> Result<u16, CliError> {
     if value.len() != 4 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(CliError::usage(
@@ -1296,6 +1646,8 @@ pub fn execute(
                 HelpTopic::RadarVerify => RADAR_VERIFY_HELP,
                 HelpTopic::Satellite => satellite_help_text(),
                 HelpTopic::SatelliteInspect => SATELLITE_INSPECT_HELP,
+                HelpTopic::SatelliteList => SATELLITE_LIST_HELP,
+                HelpTopic::SatelliteFetch => SATELLITE_FETCH_HELP,
                 HelpTopic::SatelliteRender => SATELLITE_RENDER_HELP,
                 HelpTopic::SatelliteVerify => SATELLITE_VERIFY_HELP,
             };
@@ -1368,6 +1720,12 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Invocation, CliError> {
         parse_invocation(args.iter().map(OsString::from))
+    }
+
+    fn utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("valid test RFC3339")
+            .with_timezone(&Utc)
     }
 
     #[test]
@@ -1713,6 +2071,180 @@ mod tests {
     }
 
     #[test]
+    fn parses_bounded_satellite_archive_list_without_a_date_floor() {
+        assert_eq!(
+            parse(&[
+                "bowecho",
+                "satellite",
+                "list",
+                "--source",
+                "GOES",
+                "--satellite",
+                "GOES16",
+                "--product",
+                "C13",
+                "--sector",
+                "CONUS",
+                "--start",
+                "2017-01-01T00:00:00Z",
+                "--end",
+                "2026-07-22T12:30:00+00:00",
+                "--limit",
+                "250000",
+                "--json",
+            ])
+            .unwrap(),
+            Invocation::Cli(CliCommand::Satellite(SatelliteCommand::List(Box::new(
+                SatelliteListOptions {
+                    range: SatelliteArchiveRange {
+                        selector: SatelliteArchiveSelector {
+                            source: "goes".to_owned(),
+                            satellite: "goes16".to_owned(),
+                            product: "c13".to_owned(),
+                            sector: Some("conus".to_owned()),
+                        },
+                        start_utc: utc("2017-01-01T00:00:00Z"),
+                        end_utc: utc("2026-07-22T12:30:00Z"),
+                    },
+                    limit: 250_000,
+                    json: true,
+                }
+            ))))
+        );
+    }
+
+    #[test]
+    fn parses_satellite_archive_fetch_with_explicit_destination_and_cap() {
+        assert_eq!(
+            parse(&[
+                "bowecho",
+                "satellite",
+                "fetch",
+                "--source",
+                "METEOSAT",
+                "--satellite",
+                "MTG_I1",
+                "--product",
+                "mtg_fd:ir105_hrfi",
+                "--start",
+                "2026-07-21T00:00:00Z",
+                "--end",
+                "2026-07-22T00:00:00Z",
+                "--store-root",
+                "sat-store",
+                "--max-frames",
+                "145",
+                "--json",
+            ])
+            .unwrap(),
+            Invocation::Cli(CliCommand::Satellite(SatelliteCommand::Fetch(Box::new(
+                SatelliteFetchOptions {
+                    range: SatelliteArchiveRange {
+                        selector: SatelliteArchiveSelector {
+                            source: "meteosat".to_owned(),
+                            satellite: "mtg_i1".to_owned(),
+                            product: "mtg_fd:ir105_hrfi".to_owned(),
+                            sector: None,
+                        },
+                        start_utc: utc("2026-07-21T00:00:00Z"),
+                        end_utc: utc("2026-07-22T00:00:00Z"),
+                    },
+                    store_root: PathBuf::from("sat-store"),
+                    max_frames: 145,
+                    json: true,
+                }
+            ))))
+        );
+    }
+
+    #[test]
+    fn rejects_unbounded_or_non_utc_satellite_archive_requests() {
+        let base = [
+            "bowecho",
+            "satellite",
+            "list",
+            "--source",
+            "himawari",
+            "--satellite",
+            "h9",
+            "--product",
+            "true_color",
+            "--start",
+            "2026-07-21T00:00:00Z",
+            "--end",
+            "2026-07-22T00:00:00Z",
+        ];
+        let missing_limit = parse(&base).unwrap_err();
+        assert_eq!(missing_limit.code, ExitCode::Usage);
+
+        let zero_limit =
+            parse(&base.into_iter().chain(["--limit", "0"]).collect::<Vec<_>>()).unwrap_err();
+        assert_eq!(zero_limit.code, ExitCode::Usage);
+
+        let local_offset = parse(&[
+            "bowecho",
+            "satellite",
+            "list",
+            "--source",
+            "goes",
+            "--satellite",
+            "goes19",
+            "--product",
+            "c13",
+            "--start",
+            "2026-07-21T00:00:00-04:00",
+            "--end",
+            "2026-07-22T00:00:00Z",
+            "--limit",
+            "100",
+        ])
+        .unwrap_err();
+        assert_eq!(local_offset.code, ExitCode::Usage);
+
+        let reversed = parse(&[
+            "bowecho",
+            "satellite",
+            "fetch",
+            "--source",
+            "goes",
+            "--satellite",
+            "goes19",
+            "--product",
+            "c13",
+            "--start",
+            "2026-07-22T00:00:00Z",
+            "--end",
+            "2026-07-21T00:00:00Z",
+            "--store-root",
+            "sat-store",
+            "--max-frames",
+            "10",
+        ])
+        .unwrap_err();
+        assert_eq!(reversed.code, ExitCode::Usage);
+
+        let missing_fetch_cap = parse(&[
+            "bowecho",
+            "satellite",
+            "fetch",
+            "--source",
+            "goes",
+            "--satellite",
+            "goes19",
+            "--product",
+            "c13",
+            "--start",
+            "2026-07-21T00:00:00Z",
+            "--end",
+            "2026-07-22T00:00:00Z",
+            "--store-root",
+            "sat-store",
+        ])
+        .unwrap_err();
+        assert_eq!(missing_fetch_cap.code, ExitCode::Usage);
+    }
+
+    #[test]
     fn parses_satellite_explicit_frames_and_render_options() {
         assert_eq!(
             parse(&[
@@ -1867,6 +2399,14 @@ mod tests {
         assert_eq!(
             parse(&["bowecho", "satellite", "inspect", "--help"]).unwrap(),
             Invocation::Cli(CliCommand::Help(HelpTopic::SatelliteInspect))
+        );
+        assert_eq!(
+            parse(&["bowecho", "satellite", "list", "--help"]).unwrap(),
+            Invocation::Cli(CliCommand::Help(HelpTopic::SatelliteList))
+        );
+        assert_eq!(
+            parse(&["bowecho", "satellite", "fetch", "--help"]).unwrap(),
+            Invocation::Cli(CliCommand::Help(HelpTopic::SatelliteFetch))
         );
         assert_eq!(
             parse(&["bowecho", "satellite", "render", "--help"]).unwrap(),

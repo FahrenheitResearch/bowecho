@@ -18,7 +18,8 @@ pub mod wrf;
 
 pub use command::{
     CliCommand, CliError, ExitCode, HelpTopic, Invocation, RadarCommand, RadarCutSelection,
-    RadarRenderOptions, RenderOptions, RenderPreset, RuntimeContext, SatelliteCommand,
-    SatelliteFrameSelection, SatelliteRenderOptions, WatchOptions, WrfCommand, execute, help_text,
+    RadarRenderOptions, RenderOptions, RenderPreset, RuntimeContext, SatelliteArchiveRange,
+    SatelliteArchiveSelector, SatelliteCommand, SatelliteFetchOptions, SatelliteFrameSelection,
+    SatelliteListOptions, SatelliteRenderOptions, WatchOptions, WrfCommand, execute, help_text,
     parse_invocation, radar_help_text, satellite_help_text, wrf_help_text,
 };

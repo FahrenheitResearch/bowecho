@@ -1,4 +1,4 @@
-//! Headless host for `bowecho satellite inspect/render/verify`.
+//! Headless host for `bowecho satellite list/fetch/inspect/render/verify`.
 //!
 //! Satellite science and presentation stay single-sourced: stored frames are
 //! opened by [`crate::sat_worker::load_frame_for_cli`] and rendered by
@@ -12,7 +12,8 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use bowecho_cli::{
-    CliError, ExitCode, RuntimeContext, SatelliteFrameSelection, SatelliteRenderOptions,
+    CliError, ExitCode, RuntimeContext, SatelliteArchiveRange, SatelliteArchiveSelector,
+    SatelliteFetchOptions, SatelliteFrameSelection, SatelliteListOptions, SatelliteRenderOptions,
 };
 use chrono::{DateTime, Utc};
 use rw_sat::store::frame_file_name;
@@ -23,9 +24,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::sat_plot::{SatellitePlotRaster, SatellitePlotSource};
-use crate::sat_worker::IrEnhancement;
+use crate::sat_worker::{
+    IrEnhancement, NativeSatelliteArchiveBounds, NativeSatelliteArchiveCatalog,
+    NativeSatelliteArchiveFrame, catalog_native_satellite_archive,
+    fetch_native_satellite_archive_frame,
+};
 
 pub(crate) const SATELLITE_INSPECT_SCHEMA_VERSION: &str = "bowecho.satellite.inspect.v1";
+pub(crate) const SATELLITE_CATALOG_SCHEMA_VERSION: &str = "bowecho.satellite.catalog.v1";
+pub(crate) const SATELLITE_FETCH_SCHEMA_VERSION: &str = "bowecho.satellite.fetch.v1";
 pub(crate) const SATELLITE_ARTIFACT_SCHEMA_VERSION: &str = "bowecho.satellite.artifacts.v1";
 pub(crate) const SATELLITE_VERIFY_SCHEMA_VERSION: &str = "bowecho.satellite.verify.v1";
 const RUSTY_WEATHER_COMMIT: &str = "791806f5f4798fe05c1204c165c92f174f9d222e";
@@ -59,6 +66,228 @@ impl SatelliteRasterKind {
 pub(crate) struct SatelliteBuildIdentity {
     pub version: String,
     pub commit: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SatelliteArchiveSelectorReport {
+    pub source: String,
+    pub satellite: String,
+    pub product: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sector: Option<String>,
+}
+
+impl From<&SatelliteArchiveSelector> for SatelliteArchiveSelectorReport {
+    fn from(selector: &SatelliteArchiveSelector) -> Self {
+        Self {
+            source: selector.source.clone(),
+            satellite: selector.satellite.clone(),
+            product: selector.product.clone(),
+            sector: selector.sector.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SatelliteArchiveRangeReport {
+    pub start_utc: String,
+    pub end_utc: String,
+}
+
+impl From<&SatelliteArchiveRange> for SatelliteArchiveRangeReport {
+    fn from(range: &SatelliteArchiveRange) -> Self {
+        Self {
+            start_utc: archive_time(range.start_utc),
+            end_utc: archive_time(range.end_utc),
+        }
+    }
+}
+
+/// Provider-advertised limits. `None` means that provider has no reliable
+/// capabilities endpoint for that field; it never means an unbounded archive.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SatelliteProviderBounds {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_time_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_time_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub west_degrees: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub south_degrees: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub east_degrees: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub north_degrees: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SatelliteArchiveFrameReport {
+    pub scan_start_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_end_utc: Option<String>,
+    /// Exact immutable provider identifiers needed to reacquire this scan.
+    /// A composite has one identifier per required native band/segment.
+    pub source_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SatelliteCatalogReport {
+    pub schema_version: String,
+    pub status: SatelliteStatus,
+    pub bowecho: SatelliteBuildIdentity,
+    pub selector: SatelliteArchiveSelectorReport,
+    pub requested_range: SatelliteArchiveRangeReport,
+    pub result_limit: usize,
+    /// True when the provider has additional matching scans beyond `frames`.
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_bounds: Option<SatelliteProviderBounds>,
+    pub frame_count: usize,
+    #[serde(default)]
+    pub frames: Vec<SatelliteArchiveFrameReport>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub failures: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SatelliteFetchedFrameReport {
+    pub scan_start_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_end_utc: Option<String>,
+    pub source_ids: Vec<String>,
+    pub status: SatelliteStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_directory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hhmm: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub failures: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SatelliteFetchReport {
+    pub schema_version: String,
+    pub status: SatelliteStatus,
+    pub bowecho: SatelliteBuildIdentity,
+    pub selector: SatelliteArchiveSelectorReport,
+    pub requested_range: SatelliteArchiveRangeReport,
+    pub store_root: PathBuf,
+    pub max_frames: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_bounds: Option<SatelliteProviderBounds>,
+    pub catalogued_frame_count: usize,
+    pub attempted_frame_count: usize,
+    pub fetched_frame_count: usize,
+    #[serde(default)]
+    pub run_directories: Vec<PathBuf>,
+    #[serde(default)]
+    pub frames: Vec<SatelliteFetchedFrameReport>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub failures: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveCliFailureKind {
+    Usage,
+    Unavailable,
+    Data,
+    Store,
+}
+
+impl ArchiveCliFailureKind {
+    const fn exit_code(self) -> ExitCode {
+        match self {
+            Self::Usage => ExitCode::Usage,
+            Self::Unavailable => ExitCode::Unavailable,
+            Self::Data | Self::Store => ExitCode::Data,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ArchiveCliFailure {
+    kind: ArchiveCliFailureKind,
+    message: String,
+}
+
+#[derive(Clone, Debug)]
+struct NativeArchiveFrame {
+    scan_start_utc: DateTime<Utc>,
+    scan_end_utc: Option<DateTime<Utc>>,
+    source_ids: Vec<String>,
+    source_urls: Vec<String>,
+    source_bytes: Option<u64>,
+    native: NativeSatelliteArchiveFrame,
+}
+
+impl NativeArchiveFrame {
+    fn report(&self) -> SatelliteArchiveFrameReport {
+        SatelliteArchiveFrameReport {
+            scan_start_utc: archive_time(self.scan_start_utc),
+            scan_end_utc: self.scan_end_utc.map(archive_time),
+            source_ids: self.source_ids.clone(),
+            source_urls: self.source_urls.clone(),
+            source_bytes: self.source_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NativeArchiveCatalog {
+    provider_bounds: Option<SatelliteProviderBounds>,
+    frames: Vec<NativeArchiveFrame>,
+    truncated: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeFetchedFrame {
+    source: NativeArchiveFrame,
+    run_directory: PathBuf,
+    model: String,
+    run: String,
+    hhmm: u16,
+    stored_bytes: u64,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeFetchFailure {
+    source: NativeArchiveFrame,
+    error: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NativeFetchResult {
+    stored: Vec<NativeFetchedFrame>,
+    failed: Vec<NativeFetchFailure>,
+    warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -337,6 +566,443 @@ pub(crate) fn execute_inspect(
     Ok(match report.status {
         SatelliteStatus::Complete => ExitCode::Success,
         SatelliteStatus::Partial | SatelliteStatus::Failed => ExitCode::Data,
+    })
+}
+
+pub(crate) fn execute_list(
+    options: &SatelliteListOptions,
+    context: &RuntimeContext,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<ExitCode, CliError> {
+    let (report, code) = list_archive(options, context);
+    serde_json::to_writer_pretty(&mut *stdout, &report)
+        .map_err(|error| CliError::internal(format!("serialize satellite catalog: {error}")))?;
+    writeln!(stdout)
+        .map_err(|error| CliError::internal(format!("write satellite catalog: {error}")))?;
+    writeln!(
+        stderr,
+        "BowEcho satellite list: {} frame(s), truncated={}, status {:?}",
+        report.frame_count, report.truncated, report.status
+    )
+    .map_err(|error| CliError::internal(format!("write satellite catalog status: {error}")))?;
+    Ok(code)
+}
+
+pub(crate) fn execute_fetch(
+    options: &SatelliteFetchOptions,
+    context: &RuntimeContext,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<ExitCode, CliError> {
+    let (report, code) = fetch_archive(options, context, stderr)?;
+    serde_json::to_writer_pretty(&mut *stdout, &report).map_err(|error| {
+        CliError::internal(format!("serialize satellite fetch report: {error}"))
+    })?;
+    writeln!(stdout)
+        .map_err(|error| CliError::internal(format!("write satellite fetch report: {error}")))?;
+    writeln!(
+        stderr,
+        "BowEcho satellite fetch: {} of {} frame(s), status {:?}",
+        report.fetched_frame_count, report.catalogued_frame_count, report.status
+    )
+    .map_err(|error| CliError::internal(format!("write satellite fetch status: {error}")))?;
+    Ok(code)
+}
+
+fn list_archive(
+    options: &SatelliteListOptions,
+    context: &RuntimeContext,
+) -> (SatelliteCatalogReport, ExitCode) {
+    match catalog_native_archive(&options.range, options.limit) {
+        Ok(catalog) => {
+            let frames = catalog
+                .frames
+                .iter()
+                .map(NativeArchiveFrame::report)
+                .collect::<Vec<_>>();
+            let status = if catalog.warnings.is_empty() {
+                SatelliteStatus::Complete
+            } else {
+                SatelliteStatus::Partial
+            };
+            let code = if status == SatelliteStatus::Complete {
+                ExitCode::Success
+            } else {
+                ExitCode::Data
+            };
+            (
+                SatelliteCatalogReport {
+                    schema_version: SATELLITE_CATALOG_SCHEMA_VERSION.to_owned(),
+                    status,
+                    bowecho: build_identity(context),
+                    selector: (&options.range.selector).into(),
+                    requested_range: (&options.range).into(),
+                    result_limit: options.limit,
+                    truncated: catalog.truncated,
+                    provider_bounds: catalog.provider_bounds,
+                    frame_count: frames.len(),
+                    frames,
+                    warnings: catalog.warnings,
+                    failures: Vec::new(),
+                },
+                code,
+            )
+        }
+        Err(error) => (
+            failed_catalog_report(options, context, error.message),
+            error.kind.exit_code(),
+        ),
+    }
+}
+
+fn fetch_archive(
+    options: &SatelliteFetchOptions,
+    context: &RuntimeContext,
+    stderr: &mut dyn Write,
+) -> Result<(SatelliteFetchReport, ExitCode), CliError> {
+    let probe_limit = options.max_frames.saturating_add(1);
+    let catalog = match catalog_native_archive(&options.range, probe_limit) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let code = error.kind.exit_code();
+            return Ok((
+                failed_fetch_report(options, context, None, 0, error.message),
+                code,
+            ));
+        }
+    };
+
+    // This check happens before store-root creation and, more importantly,
+    // before the provider fetch adapter is called. A caller can therefore
+    // safely use --max-frames as a hard network and disk budget boundary.
+    if selection_exceeds_fetch_cap(catalog.frames.len(), catalog.truncated, options.max_frames) {
+        let found = if catalog.truncated {
+            format!("more than {}", catalog.frames.len())
+        } else {
+            catalog.frames.len().to_string()
+        };
+        return Ok((
+            failed_fetch_report(
+                options,
+                context,
+                catalog.provider_bounds,
+                catalog.frames.len(),
+                format!(
+                    "satellite archive selection contains {found} frame(s), above --max-frames {}",
+                    options.max_frames
+                ),
+            ),
+            ExitCode::Data,
+        ));
+    }
+    if catalog.frames.is_empty() {
+        return Ok((
+            failed_fetch_report(
+                options,
+                context,
+                catalog.provider_bounds,
+                0,
+                "satellite archive selection contains no native frames".to_owned(),
+            ),
+            ExitCode::Data,
+        ));
+    }
+
+    let store_root = prepare_archive_store_root(&options.store_root)?;
+    let fetched =
+        match fetch_native_archive(&store_root, &catalog.frames, options.max_frames, stderr) {
+            Ok(result) => result,
+            Err(error) => {
+                let code = error.kind.exit_code();
+                return Ok((
+                    failed_fetch_report(
+                        options,
+                        context,
+                        catalog.provider_bounds,
+                        catalog.frames.len(),
+                        error.message,
+                    ),
+                    code,
+                ));
+            }
+        };
+
+    let mut frames = Vec::with_capacity(fetched.stored.len() + fetched.failed.len());
+    let mut run_directories = BTreeSet::new();
+    for stored in fetched.stored {
+        run_directories.insert(stored.run_directory.clone());
+        frames.push(SatelliteFetchedFrameReport {
+            scan_start_utc: archive_time(stored.source.scan_start_utc),
+            scan_end_utc: stored.source.scan_end_utc.map(archive_time),
+            source_ids: stored.source.source_ids,
+            status: SatelliteStatus::Complete,
+            run_directory: Some(stored.run_directory),
+            model: Some(stored.model),
+            run: Some(stored.run),
+            hhmm: Some(stored.hhmm),
+            stored_bytes: Some(stored.stored_bytes),
+            warnings: stored.warnings,
+            failures: Vec::new(),
+        });
+    }
+    let mut failures = Vec::with_capacity(fetched.failed.len());
+    for failed in fetched.failed {
+        failures.push(format!(
+            "{}: {}",
+            archive_time(failed.source.scan_start_utc),
+            failed.error
+        ));
+        frames.push(SatelliteFetchedFrameReport {
+            scan_start_utc: archive_time(failed.source.scan_start_utc),
+            scan_end_utc: failed.source.scan_end_utc.map(archive_time),
+            source_ids: failed.source.source_ids,
+            status: SatelliteStatus::Failed,
+            run_directory: None,
+            model: None,
+            run: None,
+            hhmm: None,
+            stored_bytes: None,
+            warnings: Vec::new(),
+            failures: vec![failed.error],
+        });
+    }
+    frames.sort_by(|left, right| left.scan_start_utc.cmp(&right.scan_start_utc));
+    let fetched_frame_count = frames
+        .iter()
+        .filter(|frame| frame.status == SatelliteStatus::Complete)
+        .count();
+    let status = if failures.is_empty() && fetched_frame_count == catalog.frames.len() {
+        SatelliteStatus::Complete
+    } else if fetched_frame_count == 0 {
+        SatelliteStatus::Failed
+    } else {
+        SatelliteStatus::Partial
+    };
+    let code = if status == SatelliteStatus::Complete {
+        ExitCode::Success
+    } else {
+        ExitCode::Data
+    };
+    Ok((
+        SatelliteFetchReport {
+            schema_version: SATELLITE_FETCH_SCHEMA_VERSION.to_owned(),
+            status,
+            bowecho: build_identity(context),
+            selector: (&options.range.selector).into(),
+            requested_range: (&options.range).into(),
+            store_root,
+            max_frames: options.max_frames,
+            provider_bounds: catalog.provider_bounds,
+            catalogued_frame_count: catalog.frames.len(),
+            attempted_frame_count: frames.len(),
+            fetched_frame_count,
+            run_directories: run_directories.into_iter().collect(),
+            frames,
+            warnings: fetched.warnings,
+            failures,
+        },
+        code,
+    ))
+}
+
+fn failed_catalog_report(
+    options: &SatelliteListOptions,
+    context: &RuntimeContext,
+    failure: String,
+) -> SatelliteCatalogReport {
+    SatelliteCatalogReport {
+        schema_version: SATELLITE_CATALOG_SCHEMA_VERSION.to_owned(),
+        status: SatelliteStatus::Failed,
+        bowecho: build_identity(context),
+        selector: (&options.range.selector).into(),
+        requested_range: (&options.range).into(),
+        result_limit: options.limit,
+        truncated: false,
+        provider_bounds: None,
+        frame_count: 0,
+        frames: Vec::new(),
+        warnings: Vec::new(),
+        failures: vec![failure],
+    }
+}
+
+fn failed_fetch_report(
+    options: &SatelliteFetchOptions,
+    context: &RuntimeContext,
+    provider_bounds: Option<SatelliteProviderBounds>,
+    catalogued_frame_count: usize,
+    failure: String,
+) -> SatelliteFetchReport {
+    SatelliteFetchReport {
+        schema_version: SATELLITE_FETCH_SCHEMA_VERSION.to_owned(),
+        status: SatelliteStatus::Failed,
+        bowecho: build_identity(context),
+        selector: (&options.range.selector).into(),
+        requested_range: (&options.range).into(),
+        store_root: options.store_root.clone(),
+        max_frames: options.max_frames,
+        provider_bounds,
+        catalogued_frame_count,
+        attempted_frame_count: 0,
+        fetched_frame_count: 0,
+        run_directories: Vec::new(),
+        frames: Vec::new(),
+        warnings: Vec::new(),
+        failures: vec![failure],
+    }
+}
+
+fn archive_time(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn selection_exceeds_fetch_cap(frame_count: usize, truncated: bool, max_frames: usize) -> bool {
+    frame_count > max_frames || truncated
+}
+
+fn catalog_native_archive(
+    range: &SatelliteArchiveRange,
+    limit: usize,
+) -> Result<NativeArchiveCatalog, ArchiveCliFailure> {
+    let catalog = catalog_native_satellite_archive(
+        &range.selector.source,
+        &range.selector.satellite,
+        &range.selector.product,
+        range.selector.sector.as_deref(),
+        range.start_utc,
+        range.end_utc,
+        limit,
+    )
+    .map_err(|message| ArchiveCliFailure {
+        kind: classify_catalog_failure(&message),
+        message,
+    })?;
+    Ok(convert_native_catalog(catalog))
+}
+
+fn convert_native_catalog(catalog: NativeSatelliteArchiveCatalog) -> NativeArchiveCatalog {
+    NativeArchiveCatalog {
+        provider_bounds: catalog.provider_bounds.map(convert_native_bounds),
+        frames: catalog
+            .frames
+            .into_iter()
+            .map(|frame| NativeArchiveFrame {
+                scan_start_utc: frame.scan_start_utc,
+                scan_end_utc: frame.scan_end_utc,
+                source_ids: frame.source_ids.clone(),
+                source_urls: frame.source_urls.clone(),
+                source_bytes: frame.source_bytes,
+                native: frame,
+            })
+            .collect(),
+        truncated: catalog.truncated,
+        warnings: catalog.warnings,
+    }
+}
+
+fn convert_native_bounds(bounds: NativeSatelliteArchiveBounds) -> SatelliteProviderBounds {
+    SatelliteProviderBounds {
+        first_time_utc: bounds.first_time_utc.map(archive_time),
+        latest_time_utc: bounds.latest_time_utc.map(archive_time),
+        cadence_seconds: bounds.cadence_seconds,
+        west_degrees: bounds.west_degrees,
+        south_degrees: bounds.south_degrees,
+        east_degrees: bounds.east_degrees,
+        north_degrees: bounds.north_degrees,
+    }
+}
+
+fn classify_catalog_failure(message: &str) -> ArchiveCliFailureKind {
+    if message.starts_with("unknown ")
+        || message.contains("requires --sector")
+        || message.contains("supports the full disk sector")
+        || message.contains("supports the advertised full-disk")
+        || message.contains("result limit must be positive")
+        || message.contains("end precedes start")
+    {
+        ArchiveCliFailureKind::Usage
+    } else {
+        ArchiveCliFailureKind::Unavailable
+    }
+}
+
+fn fetch_native_archive(
+    store_root: &Path,
+    frames: &[NativeArchiveFrame],
+    max_frames: usize,
+    stderr: &mut dyn Write,
+) -> Result<NativeFetchResult, ArchiveCliFailure> {
+    if frames.len() > max_frames {
+        return Err(ArchiveCliFailure {
+            kind: ArchiveCliFailureKind::Data,
+            message: format!(
+                "satellite archive selection contains {} frame(s), above --max-frames {max_frames}",
+                frames.len()
+            ),
+        });
+    }
+
+    let mut result = NativeFetchResult::default();
+    for source in frames.iter().cloned() {
+        let notes = std::cell::RefCell::new(Vec::new());
+        let note = |message: String| notes.borrow_mut().push(message);
+        let fetched =
+            fetch_native_satellite_archive_frame(store_root, source.native.clone(), &note);
+        let frame_notes = notes.into_inner();
+        for message in &frame_notes {
+            writeln!(stderr, "BowEcho satellite fetch: {message}").map_err(|error| {
+                ArchiveCliFailure {
+                    kind: ArchiveCliFailureKind::Store,
+                    message: format!("write satellite fetch progress: {error}"),
+                }
+            })?;
+        }
+        match fetched {
+            Ok(stored) => {
+                result.stored.push(NativeFetchedFrame {
+                    source,
+                    run_directory: store_root.join(&stored.model).join(&stored.run),
+                    model: stored.model,
+                    run: stored.run,
+                    hhmm: stored.hhmm,
+                    stored_bytes: stored.bytes,
+                    warnings: Vec::new(),
+                });
+            }
+            Err(error) => result.failed.push(NativeFetchFailure { source, error }),
+        }
+    }
+    Ok(result)
+}
+
+fn prepare_archive_store_root(store_root: &Path) -> Result<PathBuf, CliError> {
+    let store_root = absolute_output_path(store_root, "satellite archive store root")?;
+    reject_linked_path_components(&store_root, "satellite archive store root")?;
+    fs::create_dir_all(&store_root).map_err(|error| {
+        CliError::input(format!(
+            "create satellite archive store root {}: {error}",
+            store_root.display()
+        ))
+    })?;
+    reject_linked_path_components(&store_root, "satellite archive store root")?;
+    let metadata = fs::symlink_metadata(&store_root).map_err(|error| {
+        CliError::input(format!(
+            "inspect satellite archive store root {}: {error}",
+            store_root.display()
+        ))
+    })?;
+    if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(CliError::input(format!(
+            "satellite archive store root must be a non-linked directory: {}",
+            store_root.display()
+        )));
+    }
+    fs::canonicalize(&store_root).map_err(|error| {
+        CliError::input(format!(
+            "canonicalize satellite archive store root {}: {error}",
+            store_root.display()
+        ))
     })
 }
 
@@ -2199,5 +2865,60 @@ mod tests {
         assert_eq!(parse_ir_enhancement("cimss").unwrap(), IrEnhancement::Cimss);
         assert_eq!(parse_ir_enhancement("CIMSS").unwrap(), IrEnhancement::Cimss);
         assert!(parse_ir_enhancement("cmiss").is_err());
+    }
+
+    #[test]
+    fn archive_bounds_preserve_unknowns_and_exact_times() {
+        let bounds = convert_native_bounds(NativeSatelliteArchiveBounds {
+            first_time_utc: Some(Utc.with_ymd_and_hms(2026, 7, 22, 18, 0, 0).unwrap()),
+            latest_time_utc: Some(Utc.with_ymd_and_hms(2026, 7, 22, 18, 10, 0).unwrap()),
+            cadence_seconds: Some(600),
+            west_degrees: None,
+            south_degrees: None,
+            east_degrees: None,
+            north_degrees: None,
+        });
+        assert_eq!(
+            bounds.first_time_utc.as_deref(),
+            Some("2026-07-22T18:00:00.000Z")
+        );
+        assert_eq!(
+            bounds.latest_time_utc.as_deref(),
+            Some("2026-07-22T18:10:00.000Z")
+        );
+        assert_eq!(bounds.cadence_seconds, Some(600));
+        assert_eq!(bounds.west_degrees, None);
+    }
+
+    #[test]
+    fn fetch_cap_rejects_truncated_or_oversized_catalogs() {
+        assert!(!selection_exceeds_fetch_cap(4, false, 4));
+        assert!(selection_exceeds_fetch_cap(5, false, 4));
+        assert!(selection_exceeds_fetch_cap(4, true, 4));
+    }
+
+    #[test]
+    fn archive_store_root_is_canonical_and_refuses_files() {
+        let parent = tempfile::tempdir().unwrap();
+        let fresh = parent.path().join("store");
+        let canonical = prepare_archive_store_root(&fresh).unwrap();
+        assert_eq!(canonical, fs::canonicalize(&fresh).unwrap());
+
+        let file = parent.path().join("not-a-directory");
+        fs::write(&file, b"data").unwrap();
+        assert!(prepare_archive_store_root(&file).is_err());
+        assert!(prepare_archive_store_root(&parent.path().join("..").join("escape")).is_err());
+    }
+
+    #[test]
+    fn catalog_failures_distinguish_usage_from_provider_unavailability() {
+        assert_eq!(
+            classify_catalog_failure("unknown GOES product 'wat'"),
+            ArchiveCliFailureKind::Usage
+        );
+        assert_eq!(
+            classify_catalog_failure("list GOES prefix: connection refused"),
+            ArchiveCliFailureKind::Unavailable
+        );
     }
 }
