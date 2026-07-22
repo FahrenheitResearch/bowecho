@@ -124,6 +124,12 @@ pub struct CandidateRecord {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProcessedSourceRecord {
     pub source: SourceReceipt,
+    /// Exact size+mtime observed when the source hash was accepted. This lets
+    /// a long-running watcher ignore an unchanged completed file without
+    /// hashing it again on every poll. Older journals omit it and safely fall
+    /// back to a new proof/hash pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<FileFingerprint>,
     pub artifact_manifest_path: PathBuf,
     pub artifact_manifest_bytes: u64,
     pub artifact_manifest_sha256: String,
@@ -179,6 +185,14 @@ impl WatchJournal {
             if !valid_sha256(&record.artifact_manifest_sha256) {
                 failures.push(format!(
                     "processed source {key} has an invalid artifact-manifest SHA-256"
+                ));
+            }
+            if record
+                .fingerprint
+                .is_some_and(|fingerprint| fingerprint.bytes != record.source.bytes)
+            {
+                failures.push(format!(
+                    "processed source {key} fingerprint byte count does not match its SHA-256 receipt"
                 ));
             }
         }
@@ -260,6 +274,13 @@ impl WatchJournal {
 
     pub fn is_processed(&self, source: &SourceReceipt) -> bool {
         self.processed_sources.contains_key(&processed_key(source))
+    }
+
+    pub fn is_unchanged_processed_source(&self, path: &Path, fingerprint: FileFingerprint) -> bool {
+        let key = path_key(path);
+        self.processed_sources.values().any(|record| {
+            path_key(&record.source.path) == key && record.fingerprint == Some(fingerprint)
+        })
     }
 
     pub fn mark_processed(&mut self, record: ProcessedSourceRecord) -> MarkProcessedResult {
@@ -599,6 +620,7 @@ mod tests {
         let source = source(Path::new("wrfout_d01"));
         let record = ProcessedSourceRecord {
             source: source.clone(),
+            fingerprint: Some(fingerprint(10, 1)),
             artifact_manifest_path: "artifact-manifest.json".into(),
             artifact_manifest_bytes: 100,
             artifact_manifest_sha256: "b".repeat(64),
@@ -614,6 +636,10 @@ mod tests {
         );
         assert_eq!(journal.processed_sources.len(), 1);
         assert!(journal.is_processed(&source));
+        assert!(journal.is_unchanged_processed_source(Path::new("wrfout_d01"), fingerprint(10, 1)));
+        assert!(
+            !journal.is_unchanged_processed_source(Path::new("wrfout_d01"), fingerprint(10, 2))
+        );
     }
 
     #[test]
