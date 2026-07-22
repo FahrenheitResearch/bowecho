@@ -1662,6 +1662,10 @@ fn weather_alert_family(event: &str) -> String {
         "flash flood".to_owned()
     } else if upper.contains("FLOOD") {
         "flood".to_owned()
+    } else if upper.contains("TROPICAL STORM") || upper.contains("INLAND TROPICAL") {
+        "tropical storm".to_owned()
+    } else if upper.contains("HURRICANE") || upper.contains("TYPHOON") {
+        "hurricane".to_owned()
     } else if upper.contains("SPECIAL MARINE") {
         "special marine".to_owned()
     } else if upper.contains("SNOW SQUALL") {
@@ -2305,6 +2309,11 @@ fn hazard_family_from_phenomenon(phenomenon: &str) -> &'static str {
         "SQ" => "snow squall",
         "FW" => "fire weather",
         "FL" | "FA" => "flood",
+        // Coastal tropical-cyclone products overlap flood polygons heavily.
+        // Keep them canonical so they never fall through to the yellow
+        // generic-alert style while archive/live feeds converge.
+        "TR" | "TI" => "tropical storm",
+        "HU" | "HI" | "TY" | "HF" => "hurricane",
         _ => "warning",
     }
 }
@@ -2315,14 +2324,16 @@ pub(crate) fn hazard_family_order(family: &str) -> u8 {
         "severe thunderstorm" => 1,
         "flash flood" => 2,
         "flood" => 3,
-        "fire weather" => 4,
-        "special marine" => 5,
-        "snow squall" => 6,
-        "watch" => 7,
-        "mesoscale discussion" => 8,
-        "local storm report" => 9,
-        "special weather" => 10,
-        _ => 9,
+        "tropical storm" => 4,
+        "hurricane" => 5,
+        "fire weather" => 6,
+        "special marine" => 7,
+        "snow squall" => 8,
+        "watch" => 9,
+        "mesoscale discussion" => 10,
+        "local storm report" => 11,
+        "special weather" => 12,
+        _ => 11,
     }
 }
 
@@ -2369,6 +2380,8 @@ fn hazard_label(
             _ => "FFW",
         },
         "flood" => "FLW",
+        "tropical storm" => "TRW",
+        "hurricane" => "HUW",
         "fire weather" => "FIRE",
         "special marine" => "SMW",
         "snow squall" => "SQW",
@@ -2412,6 +2425,8 @@ pub(crate) fn hazard_style_label(key: &str) -> String {
         "flood" => "Flood warning".to_owned(),
         "flood/considerable" => "Considerable flood".to_owned(),
         "flood/catastrophic" => "Catastrophic flood".to_owned(),
+        "tropical-storm" => "Tropical storm warning".to_owned(),
+        "hurricane" => "Hurricane / typhoon warning".to_owned(),
         "fire-weather" => "Fire weather warning/watch".to_owned(),
         "special-marine" => "Special marine warning".to_owned(),
         "snow-squall" => "Snow squall warning".to_owned(),

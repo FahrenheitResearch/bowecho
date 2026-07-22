@@ -467,6 +467,8 @@ pub const HAZARD_FAMILIES: &[&str] = &[
     "severe-thunderstorm",
     "flash-flood",
     "flood",
+    "tropical-storm",
+    "hurricane",
     "fire-weather",
     "special-marine",
     "snow-squall",
@@ -522,6 +524,10 @@ pub fn default_hazard_stroke_color(key: &str) -> Rgba {
         "flood" => [76, 190, 124, 255],
         "flood/considerable" => [50, 205, 160, 255],
         "flood/catastrophic" => [24, 160, 130, 255],
+        // Tropical cyclone warnings remain visually distinct from the green
+        // flood polygons they commonly overlap and from yellow generic alerts.
+        "tropical-storm" => [80, 190, 255, 255],
+        "hurricane" => [255, 72, 180, 255],
         "fire-weather" => [255, 126, 46, 255],
         "special-marine" => [70, 190, 238, 255],
         "snow-squall" => [170, 210, 255, 255],

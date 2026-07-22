@@ -1327,14 +1327,22 @@ pub(crate) use ui_theme::{
     SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, accent_color, live_color, subhead_color,
 };
 #[allow(dead_code)]
-const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] =
-    &["tornado", "severe thunderstorm", "flash flood", "flood"];
+const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] = &[
+    "tornado",
+    "severe thunderstorm",
+    "flash flood",
+    "flood",
+    "tropical storm",
+    "hurricane",
+];
 const COMMUNITY_FEED_SITE_NAME_SUFFIX: &str = " (research feed)";
 const HAZARD_FILTER_FAMILIES: &[(&str, &str)] = &[
     ("tornado", "TOR"),
     ("severe thunderstorm", "SVR"),
     ("flash flood", "FFW"),
     ("flood", "Flood"),
+    ("tropical storm", "TSW"),
+    ("hurricane", "HUW"),
     ("fire weather", "Fire Wx"),
     ("special marine", "SMW"),
     ("snow squall", "SQW"),
@@ -64332,6 +64340,43 @@ mod tests {
         assert_eq!(records[0].event_family, "flood");
         assert_eq!(records[0].event_id, "KLIX.FL.W.0012");
         assert_eq!(records[0].label, "FLW 0012");
+    }
+
+    #[test]
+    fn weather_gov_alert_parser_keeps_tropical_storm_warning_out_of_generic_family() {
+        let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
+            "id": "https://api.weather.gov/alerts/urn:oid:tropical-storm",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-90.5, 29.0], [-89.5, 29.0], [-89.5, 30.0],
+                    [-90.5, 30.0], [-90.5, 29.0]
+                ]]
+            },
+            "properties": {
+                "id": "urn:oid:tropical-storm",
+                "event": "Weather Alert",
+                "senderName": "NWS New Orleans LA",
+                "onset": "2026-07-21T18:00:00+00:00",
+                "expires": "2026-07-22T01:00:00+00:00",
+                "parameters": {
+                    "VTEC": ["/O.NEW.KLIX.TR.W.0001.260721T1800Z-260722T0100Z/"]
+                }
+            }
+        }))
+        .expect("generic tropical-storm CAP feature");
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 7, 21, 20, 0, 0)
+            .single()
+            .expect("valid query time");
+
+        let records = parse_weather_alert_feature(&feature, query_time)
+            .expect("tropical-storm warning should parse from VTEC");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_family, "tropical storm");
+        assert_eq!(records[0].event_id, "KLIX.TR.W.0001");
+        assert_eq!(records[0].label, "TRW 0001");
     }
 
     #[test]
