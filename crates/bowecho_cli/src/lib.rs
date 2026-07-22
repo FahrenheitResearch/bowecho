@@ -9,9 +9,13 @@
 pub mod artifact;
 mod command;
 pub mod fs;
+pub mod input;
+pub mod paths;
+pub mod run_manifest;
+pub mod watch;
 pub mod wrf;
 
 pub use command::{
-    CliCommand, CliError, ExitCode, HelpTopic, Invocation, RuntimeContext, WrfCommand, execute,
-    help_text, parse_invocation, wrf_help_text,
+    CliCommand, CliError, ExitCode, HelpTopic, Invocation, RenderOptions, RenderPreset,
+    RuntimeContext, WatchOptions, WrfCommand, execute, help_text, parse_invocation, wrf_help_text,
 };

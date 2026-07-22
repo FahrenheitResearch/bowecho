@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+glob = "0.3"
 netcrust = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "d6a89546bb69e5c4d52de10e651e0fe53aca3d82" }
 serde.workspace = true
 serde_json.workspace = true

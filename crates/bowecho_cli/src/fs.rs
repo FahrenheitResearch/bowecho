@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::CliError;
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
-const MAX_DISCOVERED_INPUTS: usize = 100_000;
+pub(crate) const MAX_DISCOVERED_INPUTS: usize = 100_000;
 const MAX_DISCOVERY_DEPTH: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +61,40 @@ pub fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> 
 
     // Persisting the directory entry before returning matters for manifests
     // used as deletion authorization after a crash.
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Publish an already-rendered staging file through a temporary file in the
+/// destination directory. Copying into that directory before the final rename
+/// keeps publication atomic even when the renderer's staging path is on a
+/// different filesystem. The caller retains ownership of `staged`.
+pub fn publish_file_atomic(staged: &Path, destination: &Path) -> io::Result<()> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut source = File::open(staged)?;
+    if !source.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "staged artifact is not a regular file: {}",
+                staged.display()
+            ),
+        ));
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    io::copy(&mut source, &mut temporary)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    drop(source);
+    temporary
+        .persist(destination)
+        .map_err(|error| error.error)?;
+
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;
     Ok(())
@@ -145,7 +179,7 @@ fn visit_directory(
     Ok(())
 }
 
-fn is_netcdf_candidate(path: &Path) -> bool {
+pub(crate) fn is_netcdf_candidate(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -265,6 +299,21 @@ mod tests {
         write_json_atomic(&path, &serde_json::json!({"complete": true})).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(value["complete"], true);
+    }
+
+    #[test]
+    fn atomic_file_publish_replaces_destination_and_preserves_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("render-staging.png");
+        let destination = root.path().join("published").join("plot.png");
+        fs::write(&staged, b"new complete image").unwrap();
+        fs::create_dir(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"old image").unwrap();
+
+        publish_file_atomic(&staged, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new complete image");
+        assert_eq!(fs::read(&staged).unwrap(), b"new complete image");
     }
 
     #[test]

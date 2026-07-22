@@ -787,6 +787,7 @@ name = "bowecho_cli"
 version = "0.34.5"
 dependencies = [
  "chrono",
+ "glob",
  "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=d6a89546bb69e5c4d52de10e651e0fe53aca3d82)",
  "serde",
  "serde_json",
@@ -2250,6 +2251,12 @@ dependencies = [
  "libc",
  "system-deps",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "glow"
