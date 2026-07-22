@@ -1258,6 +1258,11 @@ const HAZARD_MAX_RENDER_LAT_SPAN_DEG: f32 = 30.0;
 const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
 const HAZARD_GENERIC_ALERT_SPIKY_MIN_POINTS: usize = 8;
 const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
+/// Maximum simultaneously visible warnings before the map becomes
+/// outline-first.  The guard is intentionally independent of zoom: a fixed
+/// zoom cutoff used to turn an entire TC-adjacent Flood Warning field into
+/// fill meshes in one frame and made every subsequent zoom rebuild expensive
+/// geometry.
 const HAZARD_HEAVY_LAYER_FILL_LIMIT: usize = 80;
 /// Per-polygon projected-vertex ceiling for the O(n^2) ear-clip fill. A
 /// coastline-traced polygon — an Alaska marine SPS (e.g. around PACG), or a
@@ -22500,10 +22505,10 @@ impl ViewerApp {
             .map(|slot| {
                 let key = &slot.layer.field.key;
                 format!(
-                    "map {} {} f{:03} {}",
+                    "map {} {} {} {}",
                     key.hour.model.to_uppercase(),
                     key.var,
-                    key.hour.hour,
+                    key.hour.time_label(),
                     key.hour.run
                 )
             })
@@ -22511,9 +22516,9 @@ impl ViewerApp {
                 self.model_dock.as_ref().and_then(|dock| {
                     dock.selected_hour().map(|key| {
                         format!(
-                            "selected {} f{:03} {}",
+                            "selected {} {} {}",
                             key.model.to_uppercase(),
-                            key.hour,
+                            key.time_label(),
                             key.run
                         )
                     })
@@ -26897,6 +26902,24 @@ impl ViewerApp {
     /// signature repaint on the next frame.
     fn rebuild_style_registry(&mut self) {
         self.style_registry = styles::StyleRegistry::from_settings(&self.style_settings);
+    }
+
+    /// Apply the ordinary warning-fill control to every warning family.
+    ///
+    /// Per-family alpha is an advanced override. Leaving one behind made all
+    /// three user-facing "Fill" sliders move in sync while the corresponding
+    /// polygon ignored them; only resetting that family appeared to fix it.
+    /// A deliberate global adjustment therefore clears family alpha alone
+    /// while preserving each family's colors, width, and dash customizations.
+    fn set_all_hazard_fill_alpha(&mut self, fill_alpha: u8) {
+        self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.min(80));
+        for style in self.style_settings.hazards.values_mut() {
+            style.fill_alpha = None;
+        }
+        self.style_settings
+            .hazards
+            .retain(|_, style| *style != styles::PolygonStyleOverride::default());
+        self.rebuild_style_registry();
     }
 
     fn reset_style_overrides_in_memory(&mut self) {
@@ -35249,9 +35272,9 @@ impl ViewerApp {
             self.model_timeline_last_key = Some(key.clone());
             let time_zone = self.time_zone();
             self.status = format!(
-                "Model timeline: {} f{:03} valid {}",
+                "Model timeline: {} {} valid {}",
                 key.model.to_uppercase(),
-                key.hour,
+                key.lead_label(),
                 time_zone.format_date_hms(valid)
             );
             ctx.request_repaint();
@@ -63137,6 +63160,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dense_warning_scene_stays_outline_first_above_old_zoom_cutoff() {
+        let records = (0..=HAZARD_HEAVY_LAYER_FILL_LIMIT)
+            .map(|index| {
+                let column = (index % 9) as f32;
+                let row = (index / 9) as f32;
+                let west = -0.45 + column * 0.1;
+                let south = -0.45 + row * 0.1;
+                test_hazard_record(
+                    &format!("FLW-{index}"),
+                    &format!("FLW {index}"),
+                    "flood",
+                    square_hazard_points(west, south, west + 0.08, south + 0.08),
+                )
+            })
+            .collect();
+        let mut app = test_viewer_app_with_hazards(records);
+        app.map_center_lat = 0.0;
+        app.map_center_lon = 0.0;
+        // This is above the former 240 px/deg cliff that enabled every fill
+        // at once even while the same dense scene remained visible.
+        app.map_scale = 520.0;
+
+        let built = app.build_hazard_overlay_shapes(test_map_rect(), None);
+
+        assert!(
+            built.fill_shapes.is_empty(),
+            "dense scene stays outline-first"
+        );
+        assert!(
+            built.labels.is_empty(),
+            "dense scene also suppresses label churn"
+        );
+        assert_eq!(
+            built.outline_shapes.len(),
+            HAZARD_HEAVY_LAYER_FILL_LIMIT + 1
+        );
+    }
+
+    #[test]
+    fn zero_warning_fill_alpha_skips_fill_geometry() {
+        let mut app = test_viewer_app_with_hazards(vec![test_hazard_record(
+            "FFW-1",
+            "FFW 1",
+            "flash flood",
+            square_hazard_points(-0.5, -0.5, 0.5, 0.5),
+        )]);
+        app.style_settings.hazard_global.fill_alpha = Some(0);
+        app.style_registry = styles::StyleRegistry::from_settings(&app.style_settings);
+
+        let built = app.build_hazard_overlay_shapes(test_map_rect(), None);
+
+        assert!(built.fill_shapes.is_empty());
+        assert_eq!(built.outline_shapes.len(), 1);
+    }
+
     /// Field report (v0.28.x): warning outlines BROKE when zoomed far
     /// in — every legitimate edge crossing the screen exceeded the
     /// viewport-relative jump limit, so the chunker dropped it and the
@@ -64219,6 +64298,43 @@ mod tests {
     }
 
     #[test]
+    fn weather_gov_alert_parser_uses_vtec_for_generic_flood_event_identity() {
+        let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
+            "id": "https://api.weather.gov/alerts/urn:oid:generic-flood",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-90.5, 29.0], [-89.5, 29.0], [-89.5, 30.0],
+                    [-90.5, 30.0], [-90.5, 29.0]
+                ]]
+            },
+            "properties": {
+                "id": "urn:oid:generic-flood",
+                "event": "Weather Alert",
+                "senderName": "NWS New Orleans LA",
+                "onset": "2026-07-21T18:00:00+00:00",
+                "expires": "2026-07-22T01:00:00+00:00",
+                "parameters": {
+                    "VTEC": ["/O.NEW.KLIX.FL.W.0012.260721T1800Z-260722T0100Z/"]
+                }
+            }
+        }))
+        .expect("generic flood CAP feature");
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 7, 21, 20, 0, 0)
+            .single()
+            .expect("valid query time");
+
+        let records = parse_weather_alert_feature(&feature, query_time)
+            .expect("generic CAP feature should parse from its VTEC");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_family, "flood");
+        assert_eq!(records[0].event_id, "KLIX.FL.W.0012");
+        assert_eq!(records[0].label, "FLW 0012");
+    }
+
+    #[test]
     fn active_alert_cancel_tombstone_drops_matching_product_record() {
         let query_time = Utc
             .with_ymd_and_hms(2026, 6, 27, 18, 0, 0)
@@ -64406,6 +64522,65 @@ mod tests {
         assert_eq!(overlay.records.len(), 1);
         assert_eq!(overlay.records[0].event_id, "KLSX.TO.W.0075#0");
         assert_eq!(overlay.records[0].label, "PDS TOR 0075 OBSERVED");
+    }
+
+    #[test]
+    fn event_loop_preview_drops_generic_alerts_but_keeps_supported_archive_families() {
+        let window_start = Utc.with_ymd_and_hms(2026, 7, 21, 18, 0, 0).unwrap();
+        let window_end = Utc.with_ymd_and_hms(2026, 7, 21, 21, 0, 0).unwrap();
+        let mut records = vec![
+            test_hazard_record(
+                "generic-alert",
+                "ALERT",
+                "alert",
+                square_hazard_points(-90.0, 29.0, -89.0, 30.0),
+            ),
+            test_hazard_record(
+                "KLIX.FL.W.0012",
+                "FLW 0012",
+                "flood",
+                square_hazard_points(-91.0, 29.0, -90.0, 30.0),
+            ),
+            test_hazard_record(
+                "spc-md-1610",
+                "MD 1610",
+                "mesoscale discussion",
+                square_hazard_points(-92.0, 29.0, -91.0, 30.0),
+            ),
+            test_hazard_record(
+                "lsr-1",
+                "LSR",
+                "local storm report",
+                square_hazard_points(-93.0, 29.0, -92.0, 30.0),
+            ),
+        ];
+        for record in &mut records {
+            record.valid_start = Some("2026-07-21T18:30:00Z".to_owned());
+            record.valid_end = Some("2026-07-21T20:30:00Z".to_owned());
+        }
+
+        // The cumulative archive preview and final result both flow through
+        // this builder, so neither may expose an unfilterable generic card.
+        let overlay = build_event_loop_hazard_overlay(
+            "preview".to_owned(),
+            (window_start, window_end),
+            records.len(),
+            records.len(),
+            0,
+            Instant::now(),
+            records,
+        );
+
+        let ids = overlay
+            .records
+            .iter()
+            .map(|record| record.event_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 3);
+        assert!(!ids.contains("generic-alert"));
+        assert!(ids.contains("KLIX.FL.W.0012"));
+        assert!(ids.contains("spc-md-1610"));
+        assert!(ids.contains("lsr-1"));
     }
 
     #[test]
@@ -71088,6 +71263,37 @@ mod tests {
         let emergency = hazard_style_resolved_polygon(&app.style_registry, "tornado/catastrophic");
         assert_eq!(emergency.stroke_color, [70, 80, 90, 255]);
         assert_eq!(emergency.fill_color, [40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn ordinary_warning_fill_control_clears_only_family_alpha_overrides() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.style_settings.hazards.insert(
+            "flood".to_owned(),
+            styles::PolygonStyleOverride {
+                stroke_color: Some([10, 20, 30, 255]),
+                fill_alpha: Some(73),
+                dash: Some(styles::DashPattern::Dotted),
+                ..Default::default()
+            },
+        );
+        app.rebuild_style_registry();
+        assert_eq!(
+            app.style_registry.hazard_polygon("flood", None).fill_alpha,
+            Some(73)
+        );
+
+        app.set_all_hazard_fill_alpha(11);
+
+        let stored = &app.style_settings.hazards["flood"];
+        assert_eq!(stored.fill_alpha, None);
+        assert_eq!(stored.stroke_color, Some([10, 20, 30, 255]));
+        assert_eq!(stored.dash, Some(styles::DashPattern::Dotted));
+        assert_eq!(app.style_registry.hazard_global().fill_alpha, 11);
+        assert_eq!(
+            app.style_registry.hazard_polygon("flood", None).fill_alpha,
+            None
+        );
     }
 
     #[test]

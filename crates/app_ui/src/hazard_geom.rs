@@ -471,6 +471,7 @@ pub(crate) fn build_event_loop_hazard_overlay(
     dedupe_hazard_records(&mut records);
     records.retain(|record| {
         !matches!(record.action.as_str(), "CAN" | "EXP")
+            && event_loop_hazard_family_is_supported(&record.event_family)
             && !hazard_record_shadowed_by_active_alert(record, &active_alert_event_ids)
             && event_loop_hazard_record_intersects_window(record, start_utc, end_utc)
     });
@@ -490,6 +491,16 @@ pub(crate) fn build_event_loop_hazard_overlay(
         load_ms: start.elapsed().as_secs_f32() * 1000.0,
         records,
     }
+}
+
+/// Archive loads publish cumulative previews as each source finishes, so the
+/// preview and final overlay must apply the same display-family contract.
+/// Otherwise a generic CAP `Weather Alert` can flash as a yellow polygon/card
+/// before a later product-text source supplies its canonical warning family.
+/// LSRs remain valid archive content even though they do not have a sidebar
+/// family toggle of their own.
+fn event_loop_hazard_family_is_supported(event_family: &str) -> bool {
+    hazard_family_has_user_filter(event_family) || event_family == "local storm report"
 }
 
 pub(crate) fn load_hazard_overlay_from_path(
@@ -1341,7 +1352,9 @@ pub(crate) fn parse_weather_alert_feature_with_zones(
         .event
         .as_deref()
         .unwrap_or("Weather Alert");
-    let event_family = weather_alert_family(event);
+    let parsed_vtec = weather_alert_parameter(&feature.properties.parameters, "VTEC")
+        .and_then(|vtec| parse_vtec_alert(&vtec));
+    let event_family = weather_alert_family_with_vtec(event, parsed_vtec.as_ref());
     let rings = weather_alert_feature_rings(feature, zone_geometries)?;
     let tags = parse_weather_alert_tags(&feature.properties.parameters);
     let valid_start = parse_alert_time(
@@ -1358,8 +1371,6 @@ pub(crate) fn parse_weather_alert_feature_with_zones(
             .as_deref()
             .or(feature.properties.expires.as_deref()),
     );
-    let parsed_vtec = weather_alert_parameter(&feature.properties.parameters, "VTEC")
-        .and_then(|vtec| parse_vtec_alert(&vtec));
     let action = parsed_vtec
         .as_ref()
         .map(|vtec| vtec.action.as_str())
@@ -1503,7 +1514,9 @@ fn weather_alert_zone_urls(
             .event
             .as_deref()
             .unwrap_or("Weather Alert");
-        let event_family = weather_alert_family(event);
+        let parsed_vtec = weather_alert_parameter(&feature.properties.parameters, "VTEC")
+            .and_then(|vtec| parse_vtec_alert(&vtec));
+        let event_family = weather_alert_family_with_vtec(event, parsed_vtec.as_ref());
         if !zone_geometry_scope_includes(scope, &event_family) {
             continue;
         }
@@ -1657,6 +1670,27 @@ fn weather_alert_family(event: &str) -> String {
         "special weather".to_owned()
     } else {
         "alert".to_owned()
+    }
+}
+
+/// Classify CAP alerts from their canonical VTEC identity when available.
+/// The free-form CAP `event` text is not reliable enough to drive rendering:
+/// some feeds temporarily publish a generic `Weather Alert` even though the
+/// VTEC already identifies a Flood Warning. Watches intentionally stay in the
+/// shared watch family, and unknown VTEC phenomena fall back to the useful CAP
+/// event name instead of discarding a recognized non-VTEC family.
+fn weather_alert_family_with_vtec(event: &str, parsed_vtec: Option<&ParsedWarningVtec>) -> String {
+    let Some(vtec) = parsed_vtec else {
+        return weather_alert_family(event);
+    };
+    if vtec.significance == "A" {
+        return "watch".to_owned();
+    }
+    let vtec_family = hazard_family_from_phenomenon(&vtec.phenomenon);
+    if vtec_family == "warning" {
+        weather_alert_family(event)
+    } else {
+        vtec_family.to_owned()
     }
 }
 
@@ -2667,7 +2701,11 @@ fn screen_polyline_chunks(
 }
 
 pub(crate) fn hazard_fill_alpha(base_alpha: u8, selected: bool) -> u8 {
-    if selected {
+    // Zero is an explicit master disable. Selection still gets its thicker
+    // outline, but must not resurrect a fill the operator turned off.
+    if base_alpha == 0 {
+        0
+    } else if selected {
         base_alpha.saturating_add(20).min(100)
     } else {
         base_alpha
@@ -3646,6 +3684,7 @@ mod tests {
         assert_eq!(hazard_fill_alpha(50, false), 50);
         assert_eq!(hazard_fill_alpha(50, true), 70);
         assert_eq!(hazard_fill_alpha(90, true), 100);
+        assert_eq!(hazard_fill_alpha(0, true), 0);
     }
 
     #[test]

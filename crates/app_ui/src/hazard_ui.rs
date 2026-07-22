@@ -202,17 +202,19 @@ impl ViewerApp {
                     ui.ctx().request_repaint();
                 }
             });
-            // The fill slider reads/writes the style registry (override on the
-            // styles.json document) so it persists across launches.
+            // The ordinary fill slider is authoritative for every family;
+            // per-family alpha remains available in Appearance for advanced
+            // customization after this global control is used.
             let mut fill_alpha = self.style_registry.hazard_global().fill_alpha as f32;
             let fill_response =
-                panel_kit::slider_row(ui, "Fill", &mut fill_alpha, 0.0..=80.0, 0.0, |value| {
+                panel_kit::slider_row(ui, "All fills", &mut fill_alpha, 0.0..=80.0, 0.0, |value| {
                     format!("{value:.0}")
                 })
-                .on_hover_text("Warning-polygon fill opacity (0-80)");
+                .on_hover_text(
+                    "Set warning-polygon fill opacity for every family (0 disables fills)",
+                );
             if fill_response.changed() {
-                self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.round() as u8);
-                self.rebuild_style_registry();
+                self.set_all_hazard_fill_alpha(fill_alpha.round() as u8);
                 ui.ctx().request_repaint();
             }
             if fill_response.drag_stopped() || (fill_response.changed() && !fill_response.dragged())
@@ -1834,7 +1836,14 @@ impl ViewerApp {
                     && bounds.intersects_bbox(record.bbox)
             })
             .count();
-        let heavy_layer = visible_count > HAZARD_HEAVY_LAYER_FILL_LIMIT && self.map_scale < 240.0;
+        // Dense warning scenes stay outline-first until the viewport contains
+        // fewer records.  This must be driven by visible complexity, not a
+        // fixed zoom threshold: the old `map_scale < 240` guard switched every
+        // Gulf-coast Flood Warning on at once as the user crossed that zoom,
+        // forcing the same-family fill flattener to rebuild a large union on
+        // every wheel tick. Zooming farther naturally reduces `visible_count`
+        // and brings fills/labels back when the scene is cheap enough to draw.
+        let heavy_layer = visible_count > HAZARD_HEAVY_LAYER_FILL_LIMIT;
         let mut label_rects = Vec::<egui::Rect>::new();
         let mut labeled_events = BTreeSet::<String>::new();
         let mut fill_candidates = Vec::<HazardFillCandidate>::new();
@@ -1899,7 +1908,11 @@ impl ViewerApp {
             // self-intersect. Normal polygons (the overwhelming majority) are
             // well under the limit and unchanged.
             let fill_ok = points.len() <= HAZARD_FILL_VERTEX_LIMIT;
-            if (!heavy_layer || selected) && !has_screen_jump && fill_ok {
+            // Alpha zero is a rendering disable, not merely transparent ink.
+            // Avoid all tessellation/union work when there is nothing to
+            // paint; this also makes the user-facing Fill=0 setting an actual
+            // performance escape hatch.
+            if fill_alpha > 0 && (!heavy_layer || selected) && !has_screen_jump && fill_ok {
                 // Fills are not pushed directly: same-family same-color fills
                 // are flattened after the loop so overlaps paint once
                 // (selection boosts alpha, giving the selected record its own

@@ -350,13 +350,12 @@ impl ViewerApp {
 
         let mut fill_alpha = global.fill_alpha as f32;
         let fill_response =
-            panel_kit::slider_row(ui, "Fill", &mut fill_alpha, 0.0..=80.0, 0.0, |value| {
+            panel_kit::slider_row(ui, "All fills", &mut fill_alpha, 0.0..=80.0, 0.0, |value| {
                 format!("{value:.0}")
             })
-            .on_hover_text("Warning-polygon fill opacity (0-80)");
+            .on_hover_text("Set warning-polygon fill opacity for every family (0 disables fills)");
         if fill_response.changed() {
-            self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.round() as u8);
-            self.rebuild_style_registry();
+            self.set_all_hazard_fill_alpha(fill_alpha.round() as u8);
             ctx.request_repaint();
         }
         if fill_response.drag_stopped() || (fill_response.changed() && !fill_response.dragged()) {
