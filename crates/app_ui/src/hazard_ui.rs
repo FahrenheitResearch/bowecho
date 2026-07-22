@@ -1839,13 +1839,11 @@ impl ViewerApp {
             }
         }
         let heavy_layer =
-            visible_family_counts.values().sum::<usize>() > HAZARD_HEAVY_LAYER_FILL_LIMIT;
-        // Dense warning families stay outline-first until the viewport holds
-        // fewer records of that type. Keeping the guard family-scoped retains
-        // the user's warning-type grouping: a large Flood Warning field cannot
-        // suppress fills for a small, independently styled tropical/tornado
-        // family. The selected record stays outline-only with its wider stroke
-        // instead of becoming the misleading lone filled polygon.
+            visible_family_counts.values().sum::<usize>() > HAZARD_HEAVY_LAYER_LABEL_LIMIT;
+        // Labels remain suppressed in a dense scene, but fills never switch
+        // off at a record-count threshold. Each family instead shares a fixed
+        // vertex budget, so zooming changes fill detail smoothly rather than
+        // crossing an outline-only/fill-and-stall cliff.
         let mut label_rects = Vec::<egui::Rect>::new();
         let mut labeled_events = BTreeSet::<String>::new();
         let mut fill_candidates = Vec::<HazardFillCandidate>::new();
@@ -1865,9 +1863,10 @@ impl ViewerApp {
                 continue;
             }
             let selected = self.selected_hazard_index == Some(index);
-            let heavy_family = visible_family_counts
+            let family_count = visible_family_counts
                 .get(record.event_family.as_str())
-                .is_some_and(|count| *count > HAZARD_HEAVY_LAYER_FILL_LIMIT);
+                .copied()
+                .unwrap_or(1);
             let style = self
                 .style_registry
                 .hazard_polygon(&record.event_family, hazard_record_style_threat(record));
@@ -1913,9 +1912,9 @@ impl ViewerApp {
             // paint; this also makes the user-facing Fill=0 setting an actual
             // performance escape hatch.
             if fill_alpha > 0
-                && !heavy_family
                 && !has_screen_jump
-                && let Some(fill_points) = bounded_hazard_fill_points(&points)
+                && let Some(fill_points) =
+                    bounded_hazard_fill_points(&points, hazard_fill_vertex_limit(family_count))
             {
                 // Fills are not pushed directly: same-family same-color fills
                 // are flattened after the loop so overlaps paint once

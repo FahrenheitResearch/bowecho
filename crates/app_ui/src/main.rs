@@ -160,9 +160,11 @@ use hazard_geom::filled_polygon_with_holes_mesh;
 use hazard_geom::format_utc_seconds;
 use hazard_geom::hazard_bbox_segment_allowance_px;
 use hazard_geom::hazard_dash_label;
+use hazard_geom::hazard_family_has_user_filter;
 use hazard_geom::hazard_family_menu_label;
 use hazard_geom::hazard_family_order;
 use hazard_geom::hazard_fill_alpha;
+use hazard_geom::hazard_fill_vertex_limit;
 use hazard_geom::hazard_label_screen_rect;
 use hazard_geom::hazard_map_label;
 use hazard_geom::hazard_overlay_change;
@@ -209,8 +211,6 @@ use hazard_geom::dedupe_hazard_records;
 use hazard_geom::hazard_bbox;
 #[cfg(test)]
 use hazard_geom::hazard_color;
-#[cfg(test)]
-use hazard_geom::hazard_family_has_user_filter;
 #[cfg(test)]
 use hazard_geom::load_custom_warning_provider;
 #[cfg(test)]
@@ -522,6 +522,10 @@ const MAX_SAT_PLAYER_TEXTURE_DIM: usize = 4096;
 /// still blocked by `hazard_receiver.is_some()`.
 const MIN_LIVE_HAZARD_REFRESH_SECONDS: u64 = 5;
 const MAX_ACTIVE_ALERT_ZONE_GEOMETRIES: usize = 320;
+/// Bound the cold-cache NWS zone fan-out. Sequential zone GETs made a large
+/// national alert set take minutes; eight shared-client requests keep the
+/// follow-up enrichment finite without an unbounded burst at api.weather.gov.
+const ACTIVE_ALERT_ZONE_FETCH_CONCURRENCY: usize = 8;
 /// Screen-pixel radius for the Shift+click "pin this station's 3h obs
 /// timeline" gesture and its hover-card hint. Matches the pinned-inspector
 /// release radius so the pin and release gestures share one feel.
@@ -1259,18 +1263,21 @@ const HAZARD_MAX_RENDER_LAT_SPAN_DEG: f32 = 30.0;
 const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
 const HAZARD_GENERIC_ALERT_SPIKY_MIN_POINTS: usize = 8;
 const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
-/// Maximum simultaneously visible warnings before the map becomes
-/// outline-first.  The guard is intentionally independent of zoom: a fixed
-/// zoom cutoff used to turn an entire TC-adjacent Flood Warning field into
-/// fill meshes in one frame and made every subsequent zoom rebuild expensive
-/// geometry.
-const HAZARD_HEAVY_LAYER_FILL_LIMIT: usize = 80;
+/// Maximum simultaneously visible warnings before labels are suppressed.
+/// Fills no longer use an all-or-nothing count threshold: that threshold made
+/// flood fills suddenly appear (and stall) as zooming crossed the count.
+const HAZARD_HEAVY_LAYER_LABEL_LIMIT: usize = 80;
 /// Per-polygon projected-vertex ceiling for fill tessellation. A coastline-
 /// traced zone can carry thousands of vertices and drop the map to single-
 /// digit FPS during shape-cache rebuilds. Above this count only the translucent
 /// fill copy is simplified to the ceiling; outlines and hit testing retain the
 /// exact source ring. Ordinary warning polygons remain pixel-identical.
-const HAZARD_FILL_VERTEX_LIMIT: usize = 600;
+const HAZARD_FILL_VERTEX_LIMIT: usize = 256;
+/// Constant work budget for every visible warning family. As family density
+/// grows, each fill gets a coarser screen-space copy instead of disappearing;
+/// the exact outline remains unchanged and masks the translucent approximation.
+const HAZARD_FILL_FAMILY_VERTEX_BUDGET: usize = 8_192;
+const HAZARD_FILL_MIN_VERTEX_LIMIT: usize = 24;
 const SCREEN_POLYGON_MAX_SEGMENT_DIAGONAL_FRACTION: f32 = 0.35;
 const SCREEN_POLYGON_MIN_MAX_SEGMENT_PX: f32 = 110.0;
 // Outlook-ring wraparound cull: ring neighbors project near each other, so
@@ -13871,17 +13878,14 @@ impl ViewerApp {
     ) -> bool {
         match result {
             Ok(overlay) => {
-                // Live-load previews deliberately stay non-authoritative: a
-                // partial live snapshot must never remove warnings from the
-                // last completed refresh. Archive previews are different.
-                // The historical loader fans out across several NWS product
-                // types and can spend tens of seconds waiting for the slowest
-                // source after it has already reconstructed useful polygons.
-                // Install those cumulative previews against the pending
-                // timeline window so manual Archive loads and Unified Player
-                // loads paint warnings as soon as the first source finishes.
+                // Live previews contain the previous completed records plus
+                // newly parsed priority alerts, so they can paint short-fuse
+                // warnings without deleting anything while slower zone
+                // enrichment runs. Empty live previews remain ignored.
+                // Archive previews are cumulative across product workers and
+                // install against the pending timeline window.
                 let timeline_preview = updating && self.pending_event_loop_hazard_window.is_some();
-                if updating && !timeline_preview {
+                if updating && !timeline_preview && overlay.records.is_empty() {
                     return false;
                 }
                 let previous_event_loop_window = self.event_loop_hazard_window;
@@ -42056,8 +42060,8 @@ fn preview_retained_hazard_records(overlay: &HazardOverlay) -> Vec<HazardRecord>
     overlay
         .records
         .iter()
-        .filter(|record| record.event_family == "mesoscale discussion")
         .filter(|record| live_hazard_record_is_current(record))
+        .filter(|record| hazard_family_has_user_filter(&record.event_family))
         .cloned()
         .collect()
 }
@@ -45297,6 +45301,11 @@ struct WeatherAlertProperties {
 /// only pays for the families it actually needs.
 #[derive(Clone, Copy, Debug)]
 enum ZoneGeometryScope<'a> {
+    /// First-paint safety pass: only short-fuse tornado, severe-thunderstorm,
+    /// and flash-flood warnings. Most carry direct CAP polygons; resolving the
+    /// rare zone-only cases here still stays small and finishes before the
+    /// nationwide flood/watch/tropical enrichment pass.
+    Priority,
     /// Foreground hazards layer: every zone-based family the layer renders
     /// (watches, floods, fire weather, marine, ...).
     Display,
@@ -45357,14 +45366,14 @@ struct HazardFillCandidate {
 /// scanline union in [`scanline_fill_mesh`] runs an all-pairs edge-crossing
 /// scan (~E²/2 tests) BEFORE any output-size valve can trip, and the whole
 /// hazard shape cache rebuilds on every pan/zoom — so the bound has to hold
-/// before any quadratic work starts. At 3,000 edges the scan is ~4.5M pair
-/// tests, comfortably sub-frame; an unbounded stacked-warning cluster (40+
-/// transitively-overlapping SVR fills × up to [`HAZARD_FILL_VERTEX_LIMIT`]
-/// vertices each) reaches ~24,000 edges → ~288M tests per interaction frame,
-/// which freezes the map. Components over budget paint per record through
+/// before any quadratic work starts. At 1,024 edges the scan is ~0.5M pair
+/// tests; an unbounded stacked-warning cluster (40+ transitively-overlapping
+/// fills × up to [`HAZARD_FILL_VERTEX_LIMIT`] vertices each) would otherwise
+/// rebuild thousands of edges during every map interaction and freeze the
+/// map. Components over budget paint per record through
 /// the bounded legacy path instead: alpha stacking returns for that extreme
 /// cluster — a mild visual regression that beats a frozen map.
-const HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET: usize = 3_000;
+const HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET: usize = 1_024;
 
 /// Safety valve for [`scanline_fill_mesh`]: a pathological band structure
 /// falls back to the caller's per-ring path instead of building a huge mesh.
@@ -63186,8 +63195,17 @@ mod tests {
     }
 
     #[test]
-    fn dense_warning_scene_stays_outline_first_above_old_zoom_cutoff() {
-        let records = (0..=HAZARD_HEAVY_LAYER_FILL_LIMIT)
+    fn warning_fill_vertex_budget_scales_without_disabling_dense_families() {
+        assert_eq!(hazard_fill_vertex_limit(0), HAZARD_FILL_VERTEX_LIMIT);
+        assert_eq!(hazard_fill_vertex_limit(1), HAZARD_FILL_VERTEX_LIMIT);
+        assert_eq!(hazard_fill_vertex_limit(32), HAZARD_FILL_VERTEX_LIMIT);
+        assert_eq!(hazard_fill_vertex_limit(80), 102);
+        assert_eq!(hazard_fill_vertex_limit(400), HAZARD_FILL_MIN_VERTEX_LIMIT);
+    }
+
+    #[test]
+    fn dense_warning_scene_keeps_bounded_fills_across_zoom() {
+        let records = (0..=HAZARD_HEAVY_LAYER_LABEL_LIMIT)
             .map(|index| {
                 let column = (index % 9) as f32;
                 let row = (index / 9) as f32;
@@ -63204,15 +63222,14 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(records);
         app.map_center_lat = 0.0;
         app.map_center_lon = 0.0;
-        // This is above the former 240 px/deg cliff that enabled every fill
-        // at once even while the same dense scene remained visible.
         app.map_scale = 520.0;
 
         let built = app.build_hazard_overlay_shapes(test_map_rect(), None);
 
-        assert!(
-            built.fill_shapes.is_empty(),
-            "dense scene stays outline-first"
+        assert_eq!(
+            built.fill_shapes.len(),
+            HAZARD_HEAVY_LAYER_LABEL_LIMIT + 1,
+            "dense families keep a bounded fill for every visible warning"
         );
         assert!(
             built.labels.is_empty(),
@@ -63220,20 +63237,29 @@ mod tests {
         );
         assert_eq!(
             built.outline_shapes.len(),
-            HAZARD_HEAVY_LAYER_FILL_LIMIT + 1
+            HAZARD_HEAVY_LAYER_LABEL_LIMIT + 1
+        );
+
+        app.map_scale = 260.0;
+        let zoomed_out = app.build_hazard_overlay_shapes(test_map_rect(), None);
+        assert_eq!(
+            zoomed_out.fill_shapes.len(),
+            built.fill_shapes.len(),
+            "zooming must not cross a fill-disabled threshold"
         );
 
         app.selected_hazard_index = Some(0);
         let selected = app.build_hazard_overlay_shapes(test_map_rect(), None);
-        assert!(
-            selected.fill_shapes.is_empty(),
-            "selection must not make one dense-family polygon the lone fill"
+        assert_eq!(
+            selected.fill_shapes.len(),
+            built.fill_shapes.len(),
+            "selection changes styling without enabling or disabling peers"
         );
     }
 
     #[test]
-    fn dense_warning_guard_is_scoped_by_family() {
-        let mut records = (0..=HAZARD_HEAVY_LAYER_FILL_LIMIT)
+    fn dense_warning_budget_keeps_each_family_filled() {
+        let mut records = (0..=HAZARD_HEAVY_LAYER_LABEL_LIMIT)
             .map(|index| {
                 let column = (index % 9) as f32;
                 let row = (index / 9) as f32;
@@ -63268,20 +63294,20 @@ mod tests {
 
         assert_eq!(
             built.fill_shapes.len(),
-            1,
-            "dense floods must not suppress the independently styled tropical family"
+            HAZARD_HEAVY_LAYER_LABEL_LIMIT + 2,
+            "dense floods and the independently styled tropical family must all fill"
         );
         assert_eq!(
             built.outline_shapes.len(),
-            HAZARD_HEAVY_LAYER_FILL_LIMIT + 3
+            HAZARD_HEAVY_LAYER_LABEL_LIMIT + 3
         );
 
-        app.selected_hazard_index = Some(HAZARD_HEAVY_LAYER_FILL_LIMIT + 2);
+        app.selected_hazard_index = Some(HAZARD_HEAVY_LAYER_LABEL_LIMIT + 2);
         let selected = app.build_hazard_overlay_shapes(test_map_rect(), None);
         assert_eq!(
             selected.fill_shapes.len(),
-            2,
-            "selection may highlight one tropical polygon without suppressing its family peer"
+            HAZARD_HEAVY_LAYER_LABEL_LIMIT + 3,
+            "selection may split its color group without suppressing any family peer"
         );
     }
 
@@ -65888,7 +65914,7 @@ mod tests {
     }
 
     #[test]
-    fn hazard_refresh_preview_does_not_mutate_existing_overlay() {
+    fn live_hazard_preview_adds_priority_without_removing_existing() {
         let existing = test_hazard_record(
             "KSGF.TO.W.0045",
             "TOR 0045",
@@ -65901,16 +65927,17 @@ mod tests {
             "severe thunderstorm",
             square_hazard_points(0.3, 0.3, 0.5, 0.5),
         );
-        let mut app = test_viewer_app_with_hazards(vec![existing]);
+        let mut app = test_viewer_app_with_hazards(vec![existing.clone()]);
         let generation = app.hazard_overlay_generation;
 
-        assert!(!app.install_hazard_result(Ok(test_hazard_overlay(vec![incoming])), true));
-        assert_eq!(app.hazard_overlay.as_ref().unwrap().records.len(), 1);
-        assert_eq!(app.hazard_overlay_generation, generation);
+        assert!(app.install_hazard_result(Ok(test_hazard_overlay(vec![existing, incoming])), true));
+        assert_eq!(app.hazard_overlay.as_ref().unwrap().records.len(), 2);
+        assert_eq!(app.hazard_overlay_generation, generation.wrapping_add(1));
+        assert!(app.unacknowledged_hazard_event_ids.is_empty());
     }
 
     #[test]
-    fn hazard_preview_does_not_seed_empty_overlay() {
+    fn live_hazard_priority_preview_seeds_empty_overlay() {
         let incoming = test_hazard_record(
             "KSGF.SV.W.0324",
             "SVR 0324",
@@ -65920,8 +65947,25 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.hazard_overlay = None;
 
-        assert!(!app.install_hazard_result(Ok(test_hazard_overlay(vec![incoming])), true));
-        assert!(app.hazard_overlay.is_none());
+        assert!(app.install_hazard_result(Ok(test_hazard_overlay(vec![incoming])), true));
+        assert_eq!(app.hazard_overlay.as_ref().unwrap().records.len(), 1);
+        assert!(app.hazard_status.starts_with("Preview "));
+    }
+
+    #[test]
+    fn empty_live_hazard_preview_does_not_clear_overlay() {
+        let existing = test_hazard_record(
+            "KSGF.TO.W.0045",
+            "TOR 0045",
+            "tornado",
+            square_hazard_points(-0.1, -0.1, 0.1, 0.1),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![existing]);
+        let generation = app.hazard_overlay_generation;
+
+        assert!(!app.install_hazard_result(Ok(test_hazard_overlay(Vec::new())), true));
+        assert_eq!(app.hazard_overlay.as_ref().unwrap().records.len(), 1);
+        assert_eq!(app.hazard_overlay_generation, generation);
     }
 
     #[test]
@@ -66759,7 +66803,8 @@ mod tests {
             .map(|point| app.lon_lat_to_screen(rect, point.lon, point.lat))
             .collect::<Vec<_>>();
         assert!(tropical_screen.len() > HAZARD_FILL_VERTEX_LIMIT);
-        let bounded = bounded_hazard_fill_points(&tropical_screen).expect("bounded fill ring");
+        let bounded = bounded_hazard_fill_points(&tropical_screen, HAZARD_FILL_VERTEX_LIMIT)
+            .expect("bounded fill ring");
         assert_eq!(bounded.len(), HAZARD_FILL_VERTEX_LIMIT);
         let overlap_point = app.lon_lat_to_screen(rect, 0.13, 0.17);
         assert!(
@@ -66783,6 +66828,20 @@ mod tests {
             fill_paint_multiplicity(&built.fill_shapes, overlap_point),
             2,
             "cross-family overlap must paint both translucent layers"
+        );
+
+        app.map_scale = 260.0;
+        let zoomed_out = app.build_hazard_overlay_shapes(rect, None);
+        let zoomed_out_overlap = app.lon_lat_to_screen(rect, 0.13, 0.17);
+        assert_eq!(
+            zoomed_out.fill_shapes.len(),
+            2,
+            "coastline-heavy flood/tropical fills must not disappear at wider zoom"
+        );
+        assert_eq!(
+            fill_paint_multiplicity(&zoomed_out.fill_shapes, zoomed_out_overlap),
+            2,
+            "wider zoom must keep both cross-family translucent layers"
         );
     }
 
@@ -66849,10 +66908,10 @@ mod tests {
                 .collect()
         };
 
-        // Six 600-vertex rings: 3,600 edges in one transitive component —
-        // over HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET, under the per-record
-        // HAZARD_FILL_VERTEX_LIMIT. Every record must still paint, each as
-        // its own shape (alpha stacking returns for this extreme cluster).
+        // Six synthetic 600-vertex rings: 3,600 edges in one transitive
+        // component, well over HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET. This
+        // calls the post-bounding flattener directly to prove its independent
+        // pre-flight valve; every record must still paint as its own shape.
         let candidates = overlapping_rings(6, 600);
         assert!(
             candidates.iter().map(|c| c.points.len()).sum::<usize>()
@@ -67940,7 +67999,7 @@ mod tests {
     }
 
     #[test]
-    fn hazard_refresh_preview_retains_existing_mesoscale_discussions() {
+    fn hazard_refresh_preview_retains_all_current_supported_records() {
         let overlay = test_hazard_overlay(vec![
             test_hazard_record(
                 "spc-md-1357",
@@ -67958,9 +68017,9 @@ mod tests {
 
         let retained = preview_retained_hazard_records(&overlay);
 
-        assert_eq!(retained.len(), 1);
+        assert_eq!(retained.len(), 2);
         assert_eq!(retained[0].event_id, "spc-md-1357");
-        assert_eq!(retained[0].event_family, "mesoscale discussion");
+        assert_eq!(retained[1].event_id, "KOUN.TO.W.0001");
     }
 
     fn test_decoded_live_partial(

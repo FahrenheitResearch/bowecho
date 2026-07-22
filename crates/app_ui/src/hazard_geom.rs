@@ -15,14 +15,74 @@ where
     A: FnOnce(&HazardOverlay),
     F: FnMut(HazardOverlay),
 {
-    // Live warning latency must be governed by the authoritative current-alert
-    // endpoint, not by dozens of optional text-product enrichment requests.
-    // The CAP/GeoJSON alert already carries geometry, lifecycle, VTEC,
-    // observed/radar-indicated tags, damage threat, hail, wind, headline, and
-    // description. Historical warning reconstruction keeps using the richer
-    // text-product path below.
+    // Fetch the national CAP collection exactly once. Direct-geometry
+    // short-fuse warnings paint immediately; zone-only short-fuse warnings
+    // follow in a small priority pass. The large flood/watch/tropical zone
+    // catalog continues afterward without holding the first useful frame.
     let start = Instant::now();
-    let load = load_weather_gov_active_alerts(query_time_utc, ZoneGeometryScope::Display)?;
+    let collection = fetch_weather_gov_active_alert_collection()?;
+    let build_priority_preview = |load: &SpcMdLoad, source_label: &str| {
+        if load.records.is_empty() {
+            return None;
+        }
+        let mut records = load.records.clone();
+        records.extend(preview_records.iter().cloned());
+        let overlay = build_live_hazard_overlay(
+            source_label.to_owned(),
+            query_time_utc,
+            load.scanned_items,
+            load.parsed_items,
+            load.error_count,
+            start,
+            records,
+        );
+        (!overlay.records.is_empty()).then_some(overlay)
+    };
+
+    let no_zone_geometries = HashMap::new();
+    let priority_direct = parse_weather_alert_features_with_zones(
+        &collection.features,
+        query_time_utc,
+        &no_zone_geometries,
+        priority_live_hazard_family,
+    );
+    let mut last_priority_preview = build_priority_preview(
+        &priority_direct,
+        "Priority NWS tornado/severe/flash-flood alerts; remaining alerts loading",
+    );
+    if let Some(preview) = last_priority_preview.as_ref() {
+        on_preview(preview.clone());
+    }
+
+    let priority_zone_geometries =
+        fetch_weather_alert_zone_geometries(&collection.features, ZoneGeometryScope::Priority);
+    if !priority_zone_geometries.is_empty() {
+        let priority_enriched = parse_weather_alert_features_with_zones(
+            &collection.features,
+            query_time_utc,
+            &priority_zone_geometries,
+            priority_live_hazard_family,
+        );
+        if let Some(preview) = build_priority_preview(
+            &priority_enriched,
+            "Priority NWS tornado/severe/flash-flood alerts; remaining alerts loading",
+        ) && last_priority_preview
+            .as_ref()
+            .is_none_or(|previous| !hazard_overlay_records_match(previous, &preview))
+        {
+            on_preview(preview.clone());
+            last_priority_preview = Some(preview);
+        }
+    }
+
+    let zone_geometries =
+        fetch_weather_alert_zone_geometries(&collection.features, ZoneGeometryScope::Display);
+    let load = parse_weather_alert_features_with_zones(
+        &collection.features,
+        query_time_utc,
+        &zone_geometries,
+        |_| true,
+    );
     let mut scanned_items = load.scanned_items;
     let mut parsed_items = load.parsed_items;
     let mut error_count = load.error_count;
@@ -44,7 +104,7 @@ where
         let mut preview_combined = preview_overlay.records;
         preview_combined.extend(preview_records);
         preview_overlay = build_live_hazard_overlay(
-            "NWS active alerts + cached SPC mesoscale discussions".to_owned(),
+            "NWS active alerts + retained completed-refresh records".to_owned(),
             query_time_utc,
             scanned_items,
             parsed_items,
@@ -53,7 +113,12 @@ where
             preview_combined,
         );
     }
-    on_preview(preview_overlay);
+    if last_priority_preview
+        .as_ref()
+        .is_none_or(|priority| !hazard_overlay_records_match(priority, &preview_overlay))
+    {
+        on_preview(preview_overlay);
+    }
 
     let mut records = overlay.records;
     let mut source_label = match load_spc_mesoscale_discussions(query_time_utc) {
@@ -392,21 +457,33 @@ fn send_live_hazard_source_load<F>(
     });
 }
 
-pub(crate) fn load_weather_gov_active_alerts(
-    query_time_utc: DateTime<Utc>,
-    zone_scope: ZoneGeometryScope<'_>,
-) -> Result<SpcMdLoad, String> {
+fn fetch_weather_gov_active_alert_collection() -> Result<WeatherAlertFeatureCollection, String> {
     let text = data_source::fetch_text(ACTIVE_ALERTS_URL)
         .map_err(|err| format!("Live hazard fetch failed: {err}"))?;
-    let collection: WeatherAlertFeatureCollection = serde_json::from_str(&text)
-        .map_err(|err| format!("Live hazard JSON parse failed: {err}"))?;
-    let zone_geometries = fetch_weather_alert_zone_geometries(&collection.features, zone_scope);
+    serde_json::from_str(&text).map_err(|err| format!("Live hazard JSON parse failed: {err}"))
+}
+
+fn parse_weather_alert_features_with_zones<F>(
+    features: &[WeatherAlertFeature],
+    query_time_utc: DateTime<Utc>,
+    zone_geometries: &HashMap<String, Vec<Vec<HazardPoint>>>,
+    include_family: F,
+) -> SpcMdLoad
+where
+    F: Fn(&str) -> bool,
+{
     let mut records = Vec::new();
+    let mut scanned_items = 0usize;
     let mut parsed_items = 0usize;
     let mut error_count = 0usize;
 
-    for feature in &collection.features {
-        match parse_weather_alert_feature_with_zones(feature, query_time_utc, &zone_geometries) {
+    for feature in features {
+        let event_family = weather_alert_feature_family(feature);
+        if !include_family(&event_family) {
+            continue;
+        }
+        scanned_items += 1;
+        match parse_weather_alert_feature_with_zones(feature, query_time_utc, zone_geometries) {
             Ok(mut feature_records) => {
                 if !feature_records.is_empty() {
                     parsed_items += 1;
@@ -419,12 +496,26 @@ pub(crate) fn load_weather_gov_active_alerts(
         }
     }
 
-    Ok(SpcMdLoad {
-        scanned_items: collection.features.len(),
+    SpcMdLoad {
+        scanned_items,
         parsed_items,
         error_count,
         records,
-    })
+    }
+}
+
+pub(crate) fn load_weather_gov_active_alerts(
+    query_time_utc: DateTime<Utc>,
+    zone_scope: ZoneGeometryScope<'_>,
+) -> Result<SpcMdLoad, String> {
+    let collection = fetch_weather_gov_active_alert_collection()?;
+    let zone_geometries = fetch_weather_alert_zone_geometries(&collection.features, zone_scope);
+    Ok(parse_weather_alert_features_with_zones(
+        &collection.features,
+        query_time_utc,
+        &zone_geometries,
+        |_| true,
+    ))
 }
 
 pub(crate) fn build_live_hazard_overlay(
@@ -1342,6 +1433,24 @@ pub(crate) fn parse_weather_alert_feature(
     parse_weather_alert_feature_with_zones(feature, query_time_utc, &HashMap::new())
 }
 
+fn weather_alert_feature_family(feature: &WeatherAlertFeature) -> String {
+    let event = feature
+        .properties
+        .event
+        .as_deref()
+        .unwrap_or("Weather Alert");
+    let parsed_vtec = weather_alert_parameter(&feature.properties.parameters, "VTEC")
+        .and_then(|vtec| parse_vtec_alert(&vtec));
+    weather_alert_family_with_vtec(event, parsed_vtec.as_ref())
+}
+
+fn priority_live_hazard_family(event_family: &str) -> bool {
+    matches!(
+        event_family,
+        "tornado" | "severe thunderstorm" | "flash flood"
+    )
+}
+
 pub(crate) fn parse_weather_alert_feature_with_zones(
     feature: &WeatherAlertFeature,
     query_time_utc: DateTime<Utc>,
@@ -1495,6 +1604,7 @@ fn zone_geometry_scope_includes(scope: ZoneGeometryScope<'_>, event_family: &str
             | "special weather"
     );
     match scope {
+        ZoneGeometryScope::Priority => display && priority_live_hazard_family(event_family),
         ZoneGeometryScope::Display => display,
         ZoneGeometryScope::AlertSound(families) => {
             display && alert_family_enabled(families, event_family)
@@ -1544,14 +1654,7 @@ fn weather_alert_zone_urls(
         if feature.geometry.is_some() {
             continue;
         }
-        let event = feature
-            .properties
-            .event
-            .as_deref()
-            .unwrap_or("Weather Alert");
-        let parsed_vtec = weather_alert_parameter(&feature.properties.parameters, "VTEC")
-            .and_then(|vtec| parse_vtec_alert(&vtec));
-        let event_family = weather_alert_family_with_vtec(event, parsed_vtec.as_ref());
+        let event_family = weather_alert_feature_family(feature);
         if !zone_geometry_scope_includes(scope, &event_family) {
             continue;
         }
@@ -1582,32 +1685,62 @@ fn resolve_zone_geometries<F>(
     fetch: F,
 ) -> HashMap<String, Vec<Vec<HazardPoint>>>
 where
-    F: Fn(&str) -> Result<Vec<Vec<HazardPoint>>, String>,
+    F: Fn(&str) -> Result<Vec<Vec<HazardPoint>>, String> + Sync,
 {
     let mut resolved = HashMap::new();
+    let mut pending = Vec::new();
     for zone_url in zone_urls {
         let memoized = zone_geometry_memo()
             .lock()
             .ok()
             .and_then(|memo| memo.get(zone_url).cloned());
-        let rings = match memoized {
-            Some(rings) => rings,
-            None => match fetch(zone_url) {
-                Ok(rings) => {
-                    if let Ok(mut memo) = zone_geometry_memo().lock()
-                        && memo.len() < ZONE_GEOMETRY_MEMO_MAX_ZONES
-                    {
-                        memo.insert(zone_url.clone(), rings.clone());
-                    }
-                    rings
-                }
-                Err(_) => continue,
-            },
-        };
-        if !rings.is_empty() {
-            resolved.insert(zone_url.clone(), rings);
+        if let Some(rings) = memoized {
+            if !rings.is_empty() {
+                resolved.insert(zone_url.clone(), rings);
+            }
+        } else {
+            pending.push(zone_url.clone());
         }
     }
+
+    let worker_count = pending.len().min(ACTIVE_ALERT_ZONE_FETCH_CONCURRENCY);
+    if worker_count == 0 {
+        return resolved;
+    }
+
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let pending = &pending;
+            let fetch = &fetch;
+            let cursor = &cursor;
+            scope.spawn(move || {
+                loop {
+                    let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(zone_url) = pending.get(index) else {
+                        break;
+                    };
+                    let _ = sender.send((zone_url.clone(), fetch(zone_url)));
+                }
+            });
+        }
+        drop(sender);
+        for (zone_url, result) in receiver {
+            let Ok(rings) = result else {
+                continue;
+            };
+            if let Ok(mut memo) = zone_geometry_memo().lock()
+                && memo.len() < ZONE_GEOMETRY_MEMO_MAX_ZONES
+            {
+                memo.insert(zone_url.clone(), rings.clone());
+            }
+            if !rings.is_empty() {
+                resolved.insert(zone_url, rings);
+            }
+        }
+    });
     resolved
 }
 
@@ -3445,15 +3578,25 @@ fn simplify_closed_screen_ring(points: &[egui::Pos2], max_points: usize) -> Vec<
         .collect()
 }
 
-/// Return a tessellation-safe fill ring. Ordinary warnings remain pixel
-/// identical; only rings above [`HAZARD_FILL_VERTEX_LIMIT`] are simplified,
-/// and the result is always bounded by that same performance budget.
-pub(crate) fn bounded_hazard_fill_points(points: &[egui::Pos2]) -> Option<Vec<egui::Pos2>> {
+/// Allocate a constant screen-space tessellation budget across one visible
+/// warning family. More polygons reduce detail per translucent fill rather
+/// than disabling the family or allowing work to grow without bound.
+pub(crate) fn hazard_fill_vertex_limit(family_count: usize) -> usize {
+    (HAZARD_FILL_FAMILY_VERTEX_BUDGET / family_count.max(1))
+        .clamp(HAZARD_FILL_MIN_VERTEX_LIMIT, HAZARD_FILL_VERTEX_LIMIT)
+}
+
+/// Return a tessellation-safe fill ring bounded to `max_points`. The exact
+/// source ring remains available to the outline and hit-testing paths.
+pub(crate) fn bounded_hazard_fill_points(
+    points: &[egui::Pos2],
+    max_points: usize,
+) -> Option<Vec<egui::Pos2>> {
     let cleaned = cleaned_screen_polygon(points);
     if cleaned.len() < 3 {
         return None;
     }
-    let bounded = simplify_closed_screen_ring(&cleaned, HAZARD_FILL_VERTEX_LIMIT);
+    let bounded = simplify_closed_screen_ring(&cleaned, max_points);
     (bounded.len() >= 3).then_some(bounded)
 }
 
@@ -4488,6 +4631,13 @@ mod tests {
             "default (empty-families) watcher scope must equal the display scope"
         );
 
+        let priority = weather_alert_zone_urls(&features, ZoneGeometryScope::Priority);
+        assert_eq!(
+            priority,
+            vec!["https://api.weather.gov/zones/county/OKC109".to_owned()],
+            "first paint resolves short-fuse warning zones before watch/tropical zones"
+        );
+
         let tor_only = vec!["tornado".to_owned()];
         let narrowed = weather_alert_zone_urls(&features, ZoneGeometryScope::AlertSound(&tor_only));
         assert_eq!(
@@ -4495,6 +4645,16 @@ mod tests {
             vec!["https://api.weather.gov/zones/county/OKC109".to_owned()],
             "a watch cannot sound when only tornado is enabled, so its zone fetch is shed"
         );
+    }
+
+    #[test]
+    fn priority_live_hazard_families_are_short_fuse_warnings() {
+        for family in ["tornado", "severe thunderstorm", "flash flood"] {
+            assert!(priority_live_hazard_family(family));
+        }
+        for family in ["flood", "tropical storm", "hurricane", "watch"] {
+            assert!(!priority_live_hazard_family(family));
+        }
     }
 
     #[test]
@@ -4579,9 +4739,9 @@ mod tests {
                         )
                     })
                     .collect::<Vec<_>>();
-                bounded_hazard_fill_points(&screen).is_some_and(|bounded| {
-                    filled_polygon_mesh(&bounded, egui::Color32::WHITE).is_some()
-                })
+                bounded_hazard_fill_points(&screen, HAZARD_FILL_VERTEX_LIMIT).is_some_and(
+                    |bounded| filled_polygon_mesh(&bounded, egui::Color32::WHITE).is_some(),
+                )
             })
             .count();
 
@@ -4635,9 +4795,9 @@ mod tests {
             "https://api.weather.gov/zones/forecast/TEST-MEMO-EMPTY".to_owned(),
             "https://api.weather.gov/zones/forecast/TEST-MEMO-FAIL".to_owned(),
         ];
-        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let calls = Mutex::new(Vec::<String>::new());
         let fetch = |url: &str| {
-            calls.borrow_mut().push(url.to_owned());
+            calls.lock().unwrap().push(url.to_owned());
             if url.ends_with("OK") {
                 Ok(ring.clone())
             } else if url.ends_with("EMPTY") {
@@ -4652,14 +4812,18 @@ mod tests {
         let first = resolve_zone_geometries(&urls, fetch);
         assert_eq!(first.len(), 1, "only non-empty geometry is usable");
         assert!(first.contains_key(&urls[0]));
-        assert_eq!(calls.borrow().len(), 3, "cold pass fetches every zone");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "cold pass fetches every zone"
+        );
 
-        calls.borrow_mut().clear();
+        calls.lock().unwrap().clear();
         let second = resolve_zone_geometries(&urls, fetch);
         assert_eq!(second.len(), 1, "memoized geometry still resolves");
         assert!(second.contains_key(&urls[0]));
         assert_eq!(
-            calls.borrow().as_slice(),
+            calls.lock().unwrap().as_slice(),
             std::slice::from_ref(&urls[2]),
             "successes (including the legitimately empty zone) come from the \
              process-wide memo; only the FAILED zone is retried"
