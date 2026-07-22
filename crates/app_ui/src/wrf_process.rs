@@ -1,7 +1,8 @@
 //! Full WRF processing — ported verbatim from rusty-weather's
 //! `rusty-weather-ui` shell (rev edb9d277). Computes the model's 2D
 //! diagnostics (CAPE/severe/etc.) and the isobaric sounding volumes through
-//! `wrf-core`'s `getvar`, then writes each WRF time as one forecast-hour slot.
+//! `wrf-core`'s `getvar`, then writes native raw-WRF times as exact-time store
+//! slots. The legacy writer remains available for postprocessed archives.
 //! Heavier than `local_import`, but produces the full model field set.
 #![allow(dead_code)]
 
@@ -10,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
@@ -19,7 +21,8 @@ use rw_store::{
 };
 use serde::{Deserialize, Serialize};
 
-use app_ui::wrf_scene_inventory::{WrfSceneGroup, WrfSceneTime, parse_wrf_internal_time};
+use app_ui::wrf_scene_adapter::inventory_selected_wrf_paths;
+use app_ui::wrf_scene_inventory::{WrfScene, WrfSceneGroup, WrfSceneTime, parse_wrf_internal_time};
 
 use crate::wrf_volumes::{IsoVolume, SurfaceFallback, build_iso_volumes};
 use wrf_core::variables::{VARS, VarDim};
@@ -301,18 +304,68 @@ pub fn spawn_process_paths(
             let label = label.clone();
             move || {
                 lower_import_thread_priority();
-                let result = process_paths(&paths, &store_root, &options, &tx).map_err(|err| {
-                    if err.trim().is_empty() {
-                        format!("{label} failed")
-                    } else {
-                        err
-                    }
-                });
+                let result =
+                    process_desktop_paths(&paths, &store_root, &options, &tx).map_err(|err| {
+                        if err.trim().is_empty() {
+                            format!("{label} failed")
+                        } else {
+                            err
+                        }
+                    });
                 let _ = tx.send(WrfProcessMessage::Done(result));
             }
         })
         .expect("spawn WRF processing worker");
     WrfProcessTask { label, rx }
+}
+
+/// Desktop full/bulk import prefers the exact-time scene pipeline for native
+/// raw WRF. The established processor remains the compatibility fallback for
+/// postprocessed archives (which `WrfFile` cannot inventory) and for legacy
+/// selections that do not have one authoritative run/domain/grid time axis.
+fn process_desktop_paths(
+    paths: &[PathBuf],
+    store_root: &Path,
+    options: &WrfProcessOptions,
+    tx: &Sender<WrfProcessMessage>,
+) -> Result<WrfProcessSummary, String> {
+    let mut files = paths
+        .iter()
+        .filter(|path| is_supported_wrf_file(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    if files.is_empty() {
+        return Err("No supported WRF files selected".to_owned());
+    }
+
+    if let Ok(selected) = inventory_selected_wrf_paths(&files)
+        && selected
+            .group
+            .scenes
+            .iter()
+            .all(|scene| scene.time.is_authoritative())
+        && parse_wrf_internal_time(&selected.group.key.run_domain.run.0).is_some()
+    {
+        let run = process_run_name(&files);
+        let mut progress = |message: String| {
+            let _ = tx.send(WrfProcessMessage::Progress(message));
+        };
+        let mut summary =
+            process_scene_group_exact(&selected.group, store_root, &run, options, &mut progress)?
+                .process;
+        summary.notes.extend(
+            selected
+                .notes
+                .into_iter()
+                .map(|note| format!("{}: {}", note.source_name, note.message)),
+        );
+        summary.notes.sort();
+        summary.notes.dedup();
+        return Ok(summary);
+    }
+
+    process_paths(&files, store_root, options, tx)
 }
 
 /// Large-grid imports grind for minutes with heavy allocation churn; run the
@@ -626,35 +679,9 @@ pub fn process_scene_group_exact(
                 scene.time_index
             ));
         }
-        let valid_time = match &scene.time {
-            WrfSceneTime::InternalTimes { valid_time, .. } => *valid_time,
-            WrfSceneTime::FilenameFallback { .. } => {
-                return Err(format!(
-                    "WRF scene {} time {} only has a filename fallback; exact processing requires internal Times",
-                    scene.path.display(),
-                    scene.time_index
-                ));
-            }
-            WrfSceneTime::Unavailable { .. } => {
-                return Err(format!(
-                    "WRF scene {} time {} has no valid time",
-                    scene.path.display(),
-                    scene.time_index
-                ));
-            }
-        };
-        let lead_seconds_signed = valid_time
-            .signed_duration_since(initialization)
-            .num_seconds();
-        let lead_seconds = u64::try_from(lead_seconds_signed).map_err(|_| {
-            format!(
-                "WRF valid time {} precedes initialization {}",
-                valid_time.to_rfc3339(),
-                initialization.to_rfc3339()
-            )
-        })?;
+        let (valid_time, exact_time) = scene_exact_time(scene, initialization)?;
+        let lead_seconds = exact_time.lead_seconds;
         let storage_slot = u16::try_from(index).expect("scene count checked above");
-        let exact_time = RwsExactTime::new(lead_seconds, valid_time.timestamp());
         progress(format!(
             "Computing WRF {} time {} -> slot {storage_slot:05} ({})",
             display_name(&scene.path),
@@ -777,6 +804,43 @@ pub fn process_scene_group_exact(
         },
         scenes: processed_scenes,
     })
+}
+
+fn scene_exact_time(
+    scene: &WrfScene,
+    initialization: DateTime<Utc>,
+) -> Result<(DateTime<Utc>, RwsExactTime), String> {
+    let valid_time = match &scene.time {
+        WrfSceneTime::InternalTimes { valid_time, .. } => *valid_time,
+        WrfSceneTime::FilenameFallback { .. } => {
+            return Err(format!(
+                "WRF scene {} time {} only has a filename fallback; exact processing requires internal Times",
+                scene.path.display(),
+                scene.time_index
+            ));
+        }
+        WrfSceneTime::Unavailable { .. } => {
+            return Err(format!(
+                "WRF scene {} time {} has no valid time",
+                scene.path.display(),
+                scene.time_index
+            ));
+        }
+    };
+    let lead_seconds_signed = valid_time
+        .signed_duration_since(initialization)
+        .num_seconds();
+    let lead_seconds = u64::try_from(lead_seconds_signed).map_err(|_| {
+        format!(
+            "WRF valid time {} precedes initialization {}",
+            valid_time.to_rfc3339(),
+            initialization.to_rfc3339()
+        )
+    })?;
+    Ok((
+        valid_time,
+        RwsExactTime::new(lead_seconds, valid_time.timestamp()),
+    ))
 }
 
 fn read_wrf_products(
@@ -1770,6 +1834,9 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app_ui::wrf_scene_inventory::{
+        WrfDomainId, WrfGridSignature, WrfRunDomain, WrfRunId, WrfSourceIdentity,
+    };
 
     #[test]
     fn parses_wrf_timestamp_with_colons_or_underscores() {
@@ -1796,6 +1863,47 @@ mod tests {
         assert_eq!(d03_run, "local_19740403131500_d03");
         assert_ne!(d02_run, d03_run);
         assert_eq!(process_run_name(&[d02_first]), d02_run);
+    }
+
+    #[test]
+    fn non_hourly_second_slot_keeps_exact_time_for_native_plot_label() {
+        let initialization = parse_wrf_internal_time("1974-04-03_13:15:00").unwrap();
+        let valid_time = parse_wrf_internal_time("1974-04-03_13:20:00").unwrap();
+        let scene = WrfScene {
+            path: PathBuf::from("wrfout_d03_1974-04-03_13_20_00"),
+            time_index: 0,
+            run_domain: WrfRunDomain {
+                run: WrfRunId("1974-04-03_13:15:00".to_owned()),
+                domain: WrfDomainId(3),
+            },
+            grid_signature: WrfGridSignature::from_meters(
+                8,
+                8,
+                Some(4),
+                Some(1_000.0),
+                Some(1_000.0),
+                "test-grid",
+                42,
+            ),
+            source_identity: WrfSourceIdentity("test:second-slot".to_owned()),
+            time: WrfSceneTime::InternalTimes {
+                valid_time,
+                raw: "1974-04-03_13:20:00".to_owned(),
+            },
+        };
+
+        let (_, exact) = scene_exact_time(&scene, initialization).unwrap();
+        assert_eq!(exact.lead_seconds, 5 * 60);
+        assert_eq!(exact.valid_unix, valid_time.timestamp());
+
+        let native_key = rw_ui::HourKey {
+            model: "wrf".to_owned(),
+            run: "local_19740403131500_d03".to_owned(),
+            hour: 1,
+            exact_time: Some(exact),
+        };
+        assert_eq!(native_key.time_label(), "+00:05:00 · 1974-04-03 13:20:00Z");
+        assert!(!native_key.time_label().contains("f001"));
     }
 
     #[test]
