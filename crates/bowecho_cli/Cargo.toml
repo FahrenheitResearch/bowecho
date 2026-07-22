@@ -9,6 +9,9 @@ chrono.workspace = true
 glob = "0.3"
 image = { workspace = true, features = ["webp"] }
 netcrust = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "791806f5f4798fe05c1204c165c92f174f9d222e" }
+nexrad_io = { path = "../nexrad_io" }
+radar_core = { path = "../radar_core" }
+render2d = { path = "../render2d" }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

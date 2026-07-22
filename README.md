@@ -137,7 +137,11 @@ limitations. The [SimSat guide](docs/simsat-guide.md) covers WRF/HRRR inputs,
 products, atmosphere/cloud controls, caches, plotting, and its honest
 radiative-rendering boundaries. The [WRF command-line guide](docs/wrf-cli.md)
 covers deterministic inspect/render/watch/verify workflows for humans,
-automation agents, and GPUWM forecast runners.
+automation agents, and GPUWM forecast runners. The
+[radar command-line guide](docs/radar-cli.md) documents reproducible Level-II
+inspection, rendering, and receipt verification, while the
+[satellite command-line guide](docs/satellite-cli.md) covers the equivalent
+headless workflow for BowEcho satellite-store and SimSat frames.
 
 **Storm analysis:** NSSL-style mesocyclone/TVS detection (Stumpf et al.
 1998; Mitchell et al. 1998) with time-association (CPLT → MESO), SCIT storm

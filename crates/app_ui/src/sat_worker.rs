@@ -1412,6 +1412,86 @@ fn load_frame_for_plot(
     )
 }
 
+/// Synchronous, headless entry point for the satellite CLI.
+///
+/// `run_directory` must be one canonical rw-store satellite run directory:
+/// `<store-root>/<model>/<run>`. The persisted `run.json` identity is checked
+/// against those two path components before the existing production native-
+/// plot loader is called. This deliberately avoids driving [`SatWorker`]'s
+/// asynchronous UI protocol from a command-line process while still using
+/// the exact same scalar/RGB decode, grid-hash gate, legacy-AHI handling, and
+/// palette selection as the desktop Satellite window.
+pub(crate) fn load_frame_for_cli(
+    run_directory: &Path,
+    hhmm: u16,
+    ir_enhancement: IrEnhancement,
+) -> Result<SatellitePlotSource, String> {
+    let run = run_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "satellite run directory {} has no valid Unicode run component",
+                run_directory.display()
+            )
+        })?;
+    let model_directory = run_directory.parent().ok_or_else(|| {
+        format!(
+            "satellite run directory {} has no model parent",
+            run_directory.display()
+        )
+    })?;
+    let model = model_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "satellite model directory {} has no valid Unicode model component",
+                model_directory.display()
+            )
+        })?;
+    let store_root = model_directory.parent().ok_or_else(|| {
+        format!(
+            "satellite model directory {} has no store root",
+            model_directory.display()
+        )
+    })?;
+    let manifest_path = run_directory.join("run.json");
+    let manifest = RwsRunManifest::load_for_run(&manifest_path, model, run)
+        .map_err(|error| format!("open satellite run manifest: {error}"))?;
+    let entry = manifest.hours.get(&hhmm).ok_or_else(|| {
+        format!(
+            "satellite run {model}/{run} has no t{hhmm:04} frame; available: {}",
+            manifest
+                .hours
+                .keys()
+                .map(|frame| format!("{frame:04}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    })?;
+    let expected_file = frame_file_name(hhmm);
+    if entry.file != expected_file {
+        return Err(format!(
+            "satellite run {model}/{run} frame {hhmm:04} declares '{}' instead of '{expected_file}'",
+            entry.file
+        ));
+    }
+    let mut state = WorkerState {
+        ir_enhancement,
+        ..WorkerState::default()
+    };
+    load_frame_for_plot(
+        &mut state,
+        store_root,
+        &SatRunKey {
+            model: model.to_owned(),
+            run: run.to_owned(),
+        },
+        hhmm,
+    )
+}
+
 /// Read one stored frame and color it with its band's production palette
 /// (NaN off-earth pixels stay transparent).
 fn load_frame(

@@ -11,11 +11,14 @@ mod command;
 pub mod fs;
 pub mod input;
 pub mod paths;
+pub mod radar;
 pub mod run_manifest;
 pub mod watch;
 pub mod wrf;
 
 pub use command::{
-    CliCommand, CliError, ExitCode, HelpTopic, Invocation, RenderOptions, RenderPreset,
-    RuntimeContext, WatchOptions, WrfCommand, execute, help_text, parse_invocation, wrf_help_text,
+    CliCommand, CliError, ExitCode, HelpTopic, Invocation, RadarCommand, RadarCutSelection,
+    RadarRenderOptions, RenderOptions, RenderPreset, RuntimeContext, SatelliteCommand,
+    SatelliteFrameSelection, SatelliteRenderOptions, WatchOptions, WrfCommand, execute, help_text,
+    parse_invocation, radar_help_text, satellite_help_text, wrf_help_text,
 };

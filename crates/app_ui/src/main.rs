@@ -107,6 +107,7 @@ mod sat_plot;
 mod sat_rgb_store;
 mod sat_window;
 mod sat_worker;
+mod satellite_cli_host;
 mod self_update;
 mod settings_persistence;
 mod settings_ui;
@@ -1489,6 +1490,30 @@ fn dispatch_headless_command() -> HeadlessStartup {
                         &mut stderr.lock(),
                     )
                 }
+                bowecho_cli::CliCommand::Satellite(bowecho_cli::SatelliteCommand::Inspect {
+                    run_directory,
+                    ..
+                }) => satellite_cli_host::execute_inspect(
+                    &run_directory,
+                    &context,
+                    &mut stdout.lock(),
+                    &mut stderr.lock(),
+                ),
+                bowecho_cli::CliCommand::Satellite(bowecho_cli::SatelliteCommand::Render(
+                    options,
+                )) => satellite_cli_host::execute_render(
+                    &options,
+                    &context,
+                    &mut stdout.lock(),
+                    &mut stderr.lock(),
+                ),
+                bowecho_cli::CliCommand::Satellite(bowecho_cli::SatelliteCommand::Verify {
+                    manifest,
+                }) => satellite_cli_host::execute_verify(
+                    &manifest,
+                    &mut stdout.lock(),
+                    &mut stderr.lock(),
+                ),
                 command => {
                     bowecho_cli::execute(command, &context, &mut stdout.lock(), &mut stderr.lock())
                 }
