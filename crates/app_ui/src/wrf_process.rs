@@ -46,6 +46,11 @@ pub struct WrfProcessOptions {
     /// the severe headless preset enables it explicitly.
     #[serde(default)]
     pub vertical_extrema: bool,
+    /// Explicit native/computed WRF variables requested by a headless caller.
+    /// Each must resolve to a mass-grid 2-D plane; unsupported or 3-D values
+    /// are reported as unavailable instead of being reshaped or invented.
+    #[serde(default)]
+    pub extra_variables: Vec<String>,
     #[serde(default)]
     pub only: Vec<String>,
     #[serde(default)]
@@ -60,6 +65,7 @@ impl Default for WrfProcessOptions {
             heavy_ecape: false,
             raw_extras: true,
             vertical_extrema: false,
+            extra_variables: Vec::new(),
             only: Vec::new(),
             skip: Vec::new(),
         }
@@ -70,6 +76,7 @@ impl WrfProcessOptions {
     pub fn normalized(mut self) -> Self {
         self.only = normalize_filter_tokens(self.only);
         self.skip = normalize_filter_tokens(self.skip);
+        self.extra_variables = normalize_requested_variables(self.extra_variables);
         self
     }
 
@@ -126,6 +133,11 @@ impl WrfProcessOptions {
         {
             names.push("max_vertical_velocity".to_owned());
         }
+        names.extend(
+            self.extra_variables
+                .iter()
+                .map(|name| requested_store_variable_name(name)),
+        );
         names.sort();
         names.dedup();
         names
@@ -994,6 +1006,21 @@ fn read_wrf_products(
         }
     }
 
+    for requested in &options.extra_variables {
+        let store_name = requested_store_variable_name(requested);
+        let already_present = fields.canonical.iter().any(|(name, _)| name == &store_name)
+            || fields.derived.iter().any(|field| field.name == store_name);
+        if already_present {
+            continue;
+        }
+        match compute_var(file, requested, timeidx, None) {
+            Ok(output) => push_derived_output(&mut fields, requested, output, shape.len()),
+            Err(error) => fields.notes.push(format!(
+                "requested variable {requested} unavailable: {error}"
+            )),
+        }
+    }
+
     // Isobaric sounding volumes (temperature_iso/dewpoint_iso/u_iso/v_iso/
     // height_iso) so imported WRF runs produce skew-T soundings like the
     // downloaded models. Failure here never fails the hour — the 2D fields
@@ -1419,6 +1446,13 @@ fn derived_name(wrf_name: &str, split_index: Option<usize>) -> String {
         .unwrap_or_else(|| format!("wrf_{base}"))
 }
 
+/// Store slug used for an explicitly requested WRF variable. The headless
+/// host uses this same rule to select the `var:<slug>` renderer entry written
+/// here instead of maintaining a second naming table.
+pub fn requested_store_variable_name(wrf_name: &str) -> String {
+    derived_name(wrf_name, None)
+}
+
 /// `pub(crate)`: `postproc_severe` asserts every slug it emits is one of
 /// these, so the post-processed suite can never drift from the heavy path's
 /// store names (and the labels/styles keyed on them).
@@ -1621,6 +1655,17 @@ fn normalize_filter_tokens(tokens: Vec<String>) -> Vec<String> {
         .collect::<Vec<_>>();
     normalized.sort();
     normalized.dedup();
+    normalized
+}
+
+fn normalize_requested_variables(variables: Vec<String>) -> Vec<String> {
+    let mut normalized = variables
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort_by_key(|value| value.to_ascii_lowercase());
+    normalized.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     normalized
 }
 
@@ -2081,6 +2126,19 @@ mod tests {
         assert!(filtered.should_process("srh1", Some("srh_0_1km"), WrfProductGroup::Diagnostic));
         assert!(!filtered.should_process("srh3", Some("srh_0_3km"), WrfProductGroup::Diagnostic));
         assert!(!filtered.should_process("t2", Some("temperature_2m"), WrfProductGroup::Core));
+    }
+
+    #[test]
+    fn explicit_variables_keep_native_lookup_names_and_share_store_slugs() {
+        let options = WrfProcessOptions {
+            extra_variables: vec![" Q2 ".into(), "q2".into(), "CUSTOM_FIELD".into()],
+            ..WrfProcessOptions::default()
+        }
+        .normalized();
+        assert_eq!(options.extra_variables, vec!["CUSTOM_FIELD", "Q2"]);
+        let plan = options.planned_store_fields();
+        assert!(plan.contains(&"wrf_custom_field".to_owned()));
+        assert!(plan.contains(&requested_store_variable_name("Q2")));
     }
 
     #[test]
