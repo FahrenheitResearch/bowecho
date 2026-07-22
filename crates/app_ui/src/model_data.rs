@@ -1280,6 +1280,11 @@ pub struct ModelDataDock {
     /// panel's own domain controls (including its "Full grid" choice) are
     /// never fought.
     native_plot_seeded_run: Option<(String, String)>,
+    /// Domain last installed automatically from a modest native model grid.
+    /// This distinguishes a generated d03/d04 crop from a box the user
+    /// deliberately selected, so changing WRF domains replaces only the
+    /// former and never tramples the latter.
+    native_plot_auto_domain: Option<CustomDomain>,
     /// v0.29.3 gesture-collision fix: while true, the NEXT drag on the radar
     /// map draws the plot domain — no modifiers, and none of the map's other
     /// gestures (pan, loupe, soundings, 3D box) fire. Armed by the 📐 button
@@ -1426,6 +1431,7 @@ impl ModelDataDock {
             native_plot_content: NativePlotContent::Model,
             show_plot_viewer: false,
             native_plot_seeded_run: None,
+            native_plot_auto_domain: None,
             plot_domain_armed: false,
             color_tables: ColorTableEditorPanel::new(),
             show_color_tables: false,
@@ -1658,6 +1664,7 @@ impl ModelDataDock {
         self.plot_viewer.clear();
         self.native_plot_content = NativePlotContent::Model;
         self.native_plot_seeded_run = None;
+        self.native_plot_auto_domain = None;
         if raw_result {
             self.sounding.clear();
             self.latest_sounding = None;
@@ -1737,12 +1744,17 @@ impl ModelDataDock {
                 self.repaint.clone(),
             ));
         }
-        let display = display_field_key(key, &self.hour_store_vars);
-        if self.viewer.wanted_field().as_ref() != Some(&display) {
+        let display = display_field_key(key.clone(), &self.hour_store_vars);
+        if self.browser.selected() != Some(&key.hour)
+            || self.viewer.wanted_field().as_ref() != Some(&display)
+        {
             return; // stale — the selection moved on while we read
         }
         match result {
             Ok(mut field) => {
+                if field.key != key {
+                    return;
+                }
                 attach_solar_fallback_style(&mut field, &self.hour_store_vars);
                 self.latest_field = Some(std::sync::Arc::new(field.clone()));
                 field.key = display;
@@ -1798,7 +1810,52 @@ impl ModelDataDock {
     fn select_hour(&mut self, key: HourKey) {
         self.hour_store_vars.clear();
         self.hour_store_var_info.clear();
+        // Keep map consumers on their last complete field while the new
+        // frame loads, but never leave the native plot's old texture visible.
+        // `current_native_plot_field` also suppresses that field until the
+        // exact selected HourKey has landed.
+        self.plot_viewer.clear();
+        self.iso_load_pending = None;
         self.worker.send(StoreRequest::LoadHour(key));
+    }
+
+    /// Translate a store-worker response to the viewer key only when the
+    /// response still belongs to the exact selected model/run/time/variable.
+    /// `HourKey` includes the run identity, so nested WRF d02 and d03 outputs
+    /// at the same valid time cannot accept one another's late result.
+    fn current_field_response_key(&self, key: &rw_ui::FieldKey) -> Option<rw_ui::FieldKey> {
+        if self.browser.selected() != Some(&key.hour) || self.viewer.hour() != Some(&key.hour) {
+            return None;
+        }
+        let display = display_field_key(key.clone(), &self.hour_store_vars);
+        (self.viewer.wanted_field().as_ref() == Some(&display)).then_some(display)
+    }
+
+    fn apply_store_field_response(
+        &mut self,
+        key: rw_ui::FieldKey,
+        result: Result<rw_ui::FieldData, String>,
+    ) {
+        let Some(display) = self.current_field_response_key(&key) else {
+            return;
+        };
+        match result {
+            Ok(mut field) => {
+                // The response envelope is the request identity. A malformed
+                // worker result must not smuggle another run into latest_field.
+                if field.key != key {
+                    return;
+                }
+                // `latest_field` keeps the STORE name: every consumer outside
+                // the dock stays keyed by real store variables. Only the
+                // viewer's copy carries the display label.
+                attach_solar_fallback_style(&mut field, &self.hour_store_vars);
+                self.latest_field = Some(std::sync::Arc::new(field.clone()));
+                field.key = display;
+                self.viewer.set_field(field);
+            }
+            Err(message) => self.viewer.set_error(message),
+        }
     }
 
     /// Drain worker responses into panel state (mirrors the rusty-weather
@@ -1850,26 +1907,9 @@ impl ModelDataDock {
                         self.viewer.set_error(message);
                     }
                 }
-                StoreResponse::Field(key, boxed) => match *boxed {
-                    Ok(mut field) => {
-                        // `latest_field` keeps the STORE name: every consumer
-                        // outside the dock (map layers, Solar palette
-                        // resolution, 🎨 bindings, OA) stays keyed by real
-                        // store variables. Only the viewer's copy carries the
-                        // display label, so its stale-check matches the
-                        // label-named selection.
-                        attach_solar_fallback_style(&mut field, &self.hour_store_vars);
-                        self.latest_field = Some(std::sync::Arc::new(field.clone()));
-                        field.key = display_field_key(field.key, &self.hour_store_vars);
-                        self.viewer.set_field(field);
-                    }
-                    Err(message) => {
-                        let key = display_field_key(key, &self.hour_store_vars);
-                        if self.viewer.wanted_field().as_ref() == Some(&key) {
-                            self.viewer.set_error(message);
-                        }
-                    }
-                },
+                StoreResponse::Field(key, boxed) => {
+                    self.apply_store_field_response(key, *boxed);
+                }
                 StoreResponse::Sounding(_, result) => self.apply_point_sounding_response(result),
                 // v0.2.3: worker ack that the style overrides were applied.
                 // No-op by design — `apply_color_table_changes` already
@@ -2184,16 +2224,7 @@ impl ModelDataDock {
         if self.show_plot_viewer {
             let model_plot = self.native_plot_content == NativePlotContent::Model;
             let field: Option<std::sync::Arc<rw_ui::FieldData>> = model_plot
-                .then(|| {
-                    store_named_current_field(
-                        &self.viewer,
-                        self.latest_field.as_deref(),
-                        &self.hour_store_vars,
-                    )
-                    .is_some()
-                    .then(|| self.latest_field.clone())
-                    .flatten()
-                })
+                .then(|| self.current_native_plot_field())
                 .flatten();
             if let Some(field) = &field {
                 self.seed_native_plot_domain(field);
@@ -2324,6 +2355,7 @@ impl ModelDataDock {
         self.plot_domain_armed = false;
         self.native_plot_content = NativePlotContent::Model;
         self.show_plot_viewer = true;
+        self.native_plot_auto_domain = None;
         self.plot_viewer.set_active_domain(domain);
     }
 
@@ -2376,12 +2408,43 @@ impl ModelDataDock {
         if self.native_plot_seeded_run.as_ref() == Some(&run) {
             return;
         }
+
+        let active = self.plot_viewer.active_domain();
+        let active_was_auto = active.is_some() && self.native_plot_auto_domain.as_ref() == active;
+        let may_seed = active.is_none() || active_was_auto;
         self.native_plot_seeded_run = Some(run);
-        if self.plot_viewer.active_domain().is_none()
-            && let Some(domain) = native_plot_domain(field)
-        {
-            self.plot_viewer.set_active_domain(domain);
+        if !may_seed {
+            self.native_plot_auto_domain = None;
+            return;
         }
+
+        match native_plot_domain(field) {
+            Some(domain) => {
+                self.plot_viewer.set_active_domain(domain.clone());
+                self.native_plot_auto_domain = Some(domain);
+            }
+            None => {
+                if active_was_auto {
+                    self.plot_viewer.show_full_grid();
+                }
+                self.native_plot_auto_domain = None;
+            }
+        }
+    }
+
+    /// Exact selected model field eligible for the native plot. During a
+    /// d03 -> d02 switch, the viewer can still hold d03 until d02's variable
+    /// inventory arrives; do not render that stale field under the new run.
+    fn current_native_plot_field(&self) -> Option<std::sync::Arc<rw_ui::FieldData>> {
+        let selected = self.browser.selected()?;
+        let field = store_named_current_field(
+            &self.viewer,
+            self.latest_field.as_deref(),
+            &self.hour_store_vars,
+        )?;
+        (field.key.hour == *selected)
+            .then(|| self.latest_field.clone())
+            .flatten()
     }
 
     #[cfg(test)]
@@ -6276,11 +6339,13 @@ impl ModelDataDock {
                 Some(FieldViewerEvent::DomainSelected(domain)) => {
                     self.native_plot_content = NativePlotContent::Model;
                     self.show_plot_viewer = true;
+                    self.native_plot_auto_domain = None;
                     self.plot_viewer.set_active_domain(domain);
                 }
                 Some(FieldViewerEvent::DomainRotationChanged { rotation_deg }) => {
                     self.native_plot_content = NativePlotContent::Model;
                     self.show_plot_viewer = true;
+                    self.native_plot_auto_domain = None;
                     self.plot_viewer.set_active_domain_rotation(rotation_deg);
                 }
                 None => {}
@@ -8036,6 +8101,122 @@ mod tests {
             wide_dock.plot_viewer.active_domain().is_none(),
             "CONUS-scale native plots stay on the domain-less path"
         );
+    }
+
+    /// A nested WRF domain is encoded in the run identity. The plot viewer's
+    /// automatically generated crop must follow that run instead of leaving
+    /// d03's bounds active when d02 is selected at the same valid time.
+    #[test]
+    fn native_plot_auto_seed_moves_from_wrf_d03_to_d02() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(
+            &ctx,
+            tree_with_runs("wrf", &[("local_d03", &[0]), ("local_d02", &[0])]),
+        );
+        let d03 = plot_seed_field("wrf", "local_d03", (-99.0, -98.0, 38.0, 39.0));
+        let d02 = plot_seed_field("wrf", "local_d02", (-102.0, -95.0, 35.0, 42.0));
+
+        dock.seed_native_plot_domain(&d03);
+        assert_eq!(
+            dock.plot_viewer.active_domain().expect("d03 crop").bounds,
+            (-99.0, -98.0, 38.0, 39.0)
+        );
+
+        dock.seed_native_plot_domain(&d02);
+        assert_eq!(
+            dock.plot_viewer.active_domain().expect("d02 crop").bounds,
+            (-102.0, -95.0, 35.0, 42.0),
+            "the old auto-seeded d03 crop must be replaced"
+        );
+    }
+
+    #[test]
+    fn native_plot_auto_seed_returns_to_full_grid_for_wide_run() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(
+            &ctx,
+            tree_with_runs("wrf", &[("local_d03", &[0]), ("conus", &[0])]),
+        );
+        let d03 = plot_seed_field("wrf", "local_d03", (-99.0, -98.0, 38.0, 39.0));
+        let wide = plot_seed_field("wrf", "conus", (-122.0, -72.0, 21.0, 53.0));
+
+        dock.seed_native_plot_domain(&d03);
+        assert!(dock.plot_viewer.active_domain().is_some());
+        dock.seed_native_plot_domain(&wide);
+        assert!(
+            dock.plot_viewer.active_domain().is_none(),
+            "a generated nested-domain crop cannot leak into a wide run"
+        );
+    }
+
+    #[test]
+    fn native_plot_user_domain_survives_wrf_run_switch() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(
+            &ctx,
+            tree_with_runs("wrf", &[("local_d03", &[0]), ("local_d02", &[0])]),
+        );
+        let d03 = plot_seed_field("wrf", "local_d03", (-99.0, -98.0, 38.0, 39.0));
+        let d02 = plot_seed_field("wrf", "local_d02", (-102.0, -95.0, 35.0, 42.0));
+        let user = CustomDomain::new("my storm", (-98.8, -98.4, 38.2, 38.6));
+
+        dock.seed_native_plot_domain(&d03);
+        dock.apply_map_plot_domain(user.clone());
+        dock.seed_native_plot_domain(&d02);
+        assert_eq!(dock.plot_viewer.active_domain(), Some(&user));
+    }
+
+    #[test]
+    fn late_wrf_d03_field_cannot_replace_selected_d02_at_same_valid_time() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+        let exact = rw_store::RwsExactTime::new(47_700, 134_243_280);
+        let d02_hour = HourKey {
+            model: "wrf".to_owned(),
+            run: "local_19740403_131500_d02".to_owned(),
+            hour: 0,
+            exact_time: Some(exact),
+        };
+        let d03_hour = HourKey {
+            run: "local_19740403_131500_d03".to_owned(),
+            ..d02_hour.clone()
+        };
+        dock.browser.select(d02_hour.clone());
+        dock.viewer
+            .set_hour(d02_hour.clone(), vec![test_var("temperature_2m", "K")]);
+        dock.hour_store_vars = vec!["temperature_2m".to_owned()];
+
+        let mut d02 = override_test_field("temperature_2m");
+        d02.key.hour = d02_hour.clone();
+        d02.values = vec![280.0];
+        let d02_key = d02.key.clone();
+        dock.apply_store_field_response(d02_key, Ok(d02));
+        assert_eq!(
+            dock.latest_field.as_deref().expect("d02 installed").values,
+            [280.0]
+        );
+
+        let mut stale_d03 = override_test_field("temperature_2m");
+        stale_d03.key.hour = d03_hour;
+        stale_d03.values = vec![999.0];
+        let stale_key = stale_d03.key.clone();
+        dock.apply_store_field_response(stale_key, Ok(stale_d03));
+
+        let installed = dock.latest_field.as_deref().expect("d02 retained");
+        assert_eq!(installed.key.hour, d02_hour);
+        assert_eq!(installed.values, [280.0]);
+        assert_eq!(
+            dock.viewer.current_field().expect("viewer retained").values,
+            [280.0]
+        );
+
+        // During the inverse transition, the old complete field may remain a
+        // map fallback, but it is not eligible for the native plot.
+        dock.browser.select(HourKey {
+            run: "local_19740403_131500_d03".to_owned(),
+            ..d02_hour
+        });
+        assert!(dock.current_native_plot_field().is_none());
     }
 
     #[test]
