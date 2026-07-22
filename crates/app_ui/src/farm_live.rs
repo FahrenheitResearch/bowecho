@@ -1917,20 +1917,19 @@ mod tests {
         assert_eq!(drape.source.size, [4, 4]);
         assert_eq!((drape.full_w, drape.full_h), (4, 4));
         assert_eq!(
-            drape.source.pixels[1 * 4 + 2],
-            echo,
+            drape.source.pixels[6], echo,
             "the crop must retain the exact native quicklook pixel"
         );
 
         let masked = echoes_only_image(&drape.source);
-        assert_eq!(masked.pixels[1 * 4 + 2], echo);
+        assert_eq!(masked.pixels[6], echo);
         assert_eq!(
             masked.pixels[0],
             egui::Color32::TRANSPARENT,
             "low-chroma basemap pixels must remain absent"
         );
         assert_eq!(
-            masked.pixels[1 * 4 + 2].a(),
+            masked.pixels[6].a(),
             255,
             "a one-pixel gate must not be diluted by a 2x2 box filter"
         );

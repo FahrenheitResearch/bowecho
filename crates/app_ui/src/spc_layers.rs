@@ -2235,19 +2235,19 @@ pub fn fetch_spc(
     data.day1_issue_status = if day != 1 {
         None
     } else if day1_issue == SpcDay1Issue::Auto {
-        archive_date_naive.and_then(|date| {
+        archive_date_naive.map(|date| {
             if standard_requested == 0 {
-                Some(SpcDay1IssueStatus::NoStandardProductSelected)
+                SpcDay1IssueStatus::NoStandardProductSelected
             } else if let Some(issue) = auto_archive_slot.and_then(SpcDay1Issue::from_archive_slot)
             {
-                Some(SpcDay1IssueStatus::AutoArchiveLoaded {
+                SpcDay1IssueStatus::AutoArchiveLoaded {
                     date,
                     issue,
                     loaded: standard_loaded,
                     requested: standard_requested,
-                })
+                }
             } else {
-                Some(SpcDay1IssueStatus::AutoArchiveMissing { date })
+                SpcDay1IssueStatus::AutoArchiveMissing { date }
             }
         })
     } else if standard_requested == 0 {

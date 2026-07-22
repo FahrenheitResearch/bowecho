@@ -492,9 +492,9 @@ fn build_box_sounding(
     }
 
     for required in ["temperature_iso", "u_iso", "v_iso", "height_iso"] {
-        if !reader
+        if reader
             .variable(required)
-            .is_some_and(|var| var.kind == "pressure3d")
+            .is_none_or(|var| var.kind != "pressure3d")
         {
             return Err(format!(
                 "{} lacks required box-sounding column '{required}'",
