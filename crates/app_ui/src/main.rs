@@ -36115,24 +36115,34 @@ impl ViewerApp {
     /// WoFS viewer window: run/product/minute browser over the public
     /// CB-WoFS imagery, with sync-to-radar-frame.
     fn wofs_window(&mut self, ctx: &egui::Context) {
-        if !self.wofs.open && !self.wofs.drape_on_map {
-            return;
-        }
-        if self.wofs.catalog.is_none() && self.wofs.catalog_rx.is_none() {
-            self.wofs.start_catalog(ctx);
-        }
+        let pane = dock::WorkspacePane::Wofs;
+        let pane_visible = self.wofs.open
+            && (!self.workspace.is_docked(pane) || self.workspace.is_pane_active(pane));
+        let map_visible = self.workspace.is_pane_active(dock::WorkspacePane::Map);
+        let map_drape_visible = self.wofs.drape_on_map && map_visible;
+        let sounding_visible =
+            self.wofs.open && self.wofs.soundings_mode && self.wofs.selected_station.is_some();
+        let activity =
+            wofs::WofsPumpActivity::new(pane_visible, map_drape_visible, sounding_visible);
         // Radar-time sync: pick the forecast minute nearest the displayed
-        // frame (init + minute ≈ frame time).
-        if self.wofs.sync_to_radar
+        // frame (init + minute ≈ frame time). Covered panes do not keep
+        // mutating their selection unless their map drape or sounding window
+        // is actually visible.
+        if activity.should_sync_radar()
+            && self.wofs.sync_to_radar
             && let Some(frame) = self.displayed_timeline_time_utc()
         {
             self.wofs.sync_to_displayed_time(frame);
         }
-        self.wofs.pump(ctx);
+        // Always drain already-running work; `activity` gates only new work.
+        self.wofs.pump(ctx, activity);
+        if !self.wofs.open && !self.wofs.drape_on_map {
+            return;
+        }
         if !self.wofs.open {
             return;
         }
-        if self.workspace.is_docked(dock::WorkspacePane::Wofs) {
+        if self.workspace.is_docked(pane) {
             // Body renders as a workspace pane; the WoFS sounding picker
             // stays its own floating sub-window either way.
             self.wofs.sounding_window(ctx);
@@ -36355,11 +36365,15 @@ impl ViewerApp {
     /// FARM mobile-radar live quicklooks: sensor chips (live = green),
     /// product picker, frame loop with follow-live, map-drape controls.
     fn farm_window(&mut self, ctx: &egui::Context) {
-        // The frame loop keeps pumping while the map drape is on, even
-        // with the window closed (the drape follows the live loop).
-        if self.farm.open || self.farm.drape.enabled {
-            self.farm.pump_window(ctx);
-        }
+        let pane = dock::WorkspacePane::Farm;
+        let pane_visible = self.farm.open
+            && (!self.workspace.is_docked(pane) || self.workspace.is_pane_active(pane));
+        let map_visible = self.workspace.is_pane_active(dock::WorkspacePane::Map);
+        let activity =
+            farm_live::FarmPumpActivity::new(pane_visible, self.farm.drape.enabled && map_visible);
+        // Always drain already-running work; `activity` gates playback,
+        // polling, prefetch, and new drape analysis.
+        self.farm.pump_window(ctx, activity);
         // Persist georeferences the moment they land (auto fix or manual
         // pin — placement happens on the map, outside this window).
         if self.farm.drape.take_dirty() {
@@ -36369,7 +36383,7 @@ impl ViewerApp {
         if !self.farm.open {
             return;
         }
-        if self.workspace.is_docked(dock::WorkspacePane::Farm) {
+        if self.workspace.is_docked(pane) {
             return; // body renders as a workspace pane
         }
         let mut open = self.farm.open;

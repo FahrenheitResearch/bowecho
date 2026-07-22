@@ -914,6 +914,12 @@ pub struct DrapeState {
     order: VecDeque<String>,
     texture: Option<DrapeTexture>,
     analysis_rx: Option<mpsc::Receiver<AnalysisOutcome>>,
+    /// Most recent full quicklook that may need georeference analysis. Keep
+    /// only one: the cropped drape cache is sufficient for rendering, while
+    /// analysis needs the full plot/title/town-label image. Holding it here
+    /// lets an image fetch finish safely after the map becomes hidden without
+    /// starting new CPU work until the map is visible again.
+    analysis_candidate: Option<(String, egui::ColorImage)>,
     /// Scan id we already auto-located (or failed on) — retried only on
     /// a new scan id or an explicit re-locate.
     attempted_scan: Option<String>,
@@ -936,6 +942,7 @@ impl Default for DrapeState {
             order: VecDeque::new(),
             texture: None,
             analysis_rx: None,
+            analysis_candidate: None,
             attempted_scan: None,
         }
     }
@@ -982,6 +989,7 @@ impl DrapeState {
         self.geometry = None;
         self.attempted_scan = None;
         self.analysis_rx = None;
+        self.analysis_candidate = None;
         self.place_armed = false;
         self.status = String::new();
         self.georef = sensor_id.and_then(|id| self.saved.get(&id)).cloned();
@@ -1040,8 +1048,10 @@ impl DrapeState {
         self.georef = Some(fix);
     }
 
-    /// Per-frame ingest (image fetch thread already decoded the PNG):
-    /// cache a drape crop and kick the auto-locator when needed.
+    /// Per-frame ingest (image fetch thread already decoded the PNG): cache a
+    /// drape crop and retain at most one full-frame analysis candidate. The
+    /// caller decides when visible presentation is allowed to start the
+    /// auto-locator.
     fn ingest(&mut self, url: &str, image: &egui::ColorImage) {
         if !self.enabled {
             return;
@@ -1066,19 +1076,14 @@ impl DrapeState {
             .unwrap_or(false);
         let already_tried = self.attempted_scan.as_deref() == Some(scan.as_str());
         if !have_fix_for_scan && !already_tried && self.analysis_rx.is_none() {
-            self.attempted_scan = Some(scan.clone());
-            self.status = "locating deployment…".to_owned();
-            let (tx, rx) = mpsc::channel();
-            self.analysis_rx = Some(rx);
-            let image = image.clone();
-            thread::spawn(move || {
-                let _ = tx.send(analyze_frame(&image, &scan));
-            });
+            self.analysis_candidate = Some((url.to_owned(), image.clone()));
         }
     }
 
-    /// Drain analysis results + keep the drape texture current.
-    fn pump(&mut self, ctx: &egui::Context, sensor_id: Option<u32>, current_url: Option<&str>) {
+    /// Accept an already-running locator result regardless of current pane
+    /// visibility. Hiding a pane suspends future work; it never discards work
+    /// that was already started while the map was visible.
+    fn drain_analysis(&mut self, sensor_id: Option<u32>) {
         if let Some(rx) = &self.analysis_rx {
             match rx.try_recv() {
                 Ok(outcome) => {
@@ -1106,6 +1111,41 @@ impl DrapeState {
                 Err(mpsc::TryRecvError::Disconnected) => self.analysis_rx = None,
             }
         }
+    }
+
+    /// Start a retained candidate only while the FARM drape is actually
+    /// visible on the map.
+    fn schedule_analysis(&mut self) {
+        if !self.enabled || self.analysis_rx.is_some() {
+            return;
+        }
+        let Some((url, image)) = self.analysis_candidate.clone() else {
+            return;
+        };
+        let scan = scan_id_of(&url);
+        let have_fix_for_scan = self
+            .georef
+            .as_ref()
+            .map(|g| g.scan_id == scan)
+            .unwrap_or(false);
+        let already_tried = self.attempted_scan.as_deref() == Some(scan.as_str());
+        if have_fix_for_scan || already_tried {
+            return;
+        }
+        self.attempted_scan = Some(scan.clone());
+        self.status = "locating deployment…".to_owned();
+        let (tx, rx) = mpsc::channel();
+        self.analysis_rx = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(analyze_frame(&image, &scan));
+        });
+    }
+
+    /// Keep the visible map texture current. This is deliberately separate
+    /// from receiver draining so a covered Map tab cannot upload textures or
+    /// start georeference work.
+    fn update_visible_texture(&mut self, ctx: &egui::Context, current_url: Option<&str>) {
+        self.schedule_analysis();
         if !self.enabled || self.georef.is_none() {
             return;
         }
@@ -1254,6 +1294,35 @@ pub struct FarmState {
     pub drape: DrapeState,
 }
 
+/// Which FARM presentation surfaces can currently be seen. Completed network
+/// and analysis work is always accepted; this policy controls only new work.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FarmPumpActivity {
+    pane_visible: bool,
+    map_drape_visible: bool,
+}
+
+impl FarmPumpActivity {
+    pub(crate) fn new(pane_visible: bool, map_drape_visible: bool) -> Self {
+        Self {
+            pane_visible,
+            map_drape_visible,
+        }
+    }
+
+    fn has_visible_presentation(self) -> bool {
+        self.pane_visible || self.map_drape_visible
+    }
+
+    fn prefetch_full_loop(self) -> bool {
+        self.pane_visible
+    }
+
+    fn update_map_drape(self) -> bool {
+        self.map_drape_visible
+    }
+}
+
 impl Default for FarmState {
     fn default() -> Self {
         Self {
@@ -1366,10 +1435,14 @@ impl FarmState {
         }
     }
 
-    /// Window-open work: frame-list refresh, texture fetches, playback.
-    pub fn pump_window(&mut self, ctx: &egui::Context) {
-        // Default selection: the live sensor, else the first.
-        if self.sensor_id.is_none() {
+    /// Accept completed work on every app update, but schedule frame refresh,
+    /// image fetches, playback, and map work only for a visible presentation.
+    pub(crate) fn pump_window(&mut self, ctx: &egui::Context, activity: FarmPumpActivity) {
+        self.drape.drain_analysis(self.sensor_id);
+
+        // Default selection: the live sensor, else the first. Do not mutate a
+        // never-opened FARM viewer merely because its tab exists in a layout.
+        if activity.has_visible_presentation() && self.sensor_id.is_none() {
             let pick = self
                 .live_sensor()
                 .or(self.sensors.first())
@@ -1408,7 +1481,11 @@ impl FarmState {
             .last_frames_fetch
             .map(|at| at.elapsed().as_secs() > FRAMES_REFRESH_SECS)
             .unwrap_or(true);
-        if due && self.frames_rx.is_none() && !self.product.is_empty() {
+        if activity.has_visible_presentation()
+            && due
+            && self.frames_rx.is_none()
+            && !self.product.is_empty()
+        {
             self.last_frames_fetch = Some(Instant::now());
             let (tx, rx) = mpsc::channel();
             self.frames_rx = Some(rx);
@@ -1448,8 +1525,15 @@ impl FarmState {
                 Err(mpsc::TryRecvError::Disconnected) => self.image_rx = None,
             }
         }
+        let wanted_url = if activity.prefetch_full_loop() {
+            self.next_wanted_url()
+        } else if activity.update_map_drape() {
+            self.next_drape_url()
+        } else {
+            None
+        };
         if self.image_rx.is_none()
-            && let Some(url) = self.next_wanted_url()
+            && let Some(url) = wanted_url
         {
             self.pending.push(url.clone());
             let (tx, rx) = mpsc::channel();
@@ -1461,12 +1545,15 @@ impl FarmState {
                 ctx_clone.request_repaint();
             });
         }
-        // Map drape upkeep: drain the locator, follow the playhead.
+        // Map drape upkeep follows only a visible Map pane.
         let current_url = self.frames.get(self.frame_index).cloned();
-        self.drape.pump(ctx, self.sensor_id, current_url.as_deref());
+        if activity.update_map_drape() {
+            self.drape
+                .update_visible_texture(ctx, current_url.as_deref());
+        }
         // Playback over LOADED frames only (skipping holes would jitter
         // the loop; holding until the texture lands reads better).
-        if self.playing && self.frames.len() > 1 {
+        if activity.has_visible_presentation() && self.playing && self.frames.len() > 1 {
             if self.last_advance.elapsed() > Duration::from_millis(180) {
                 let next = (self.frame_index + 1) % self.frames.len();
                 if self.textures.contains_key(&self.frames[next]) {
@@ -1475,6 +1562,10 @@ impl FarmState {
                 }
             }
             ctx.request_repaint_after(Duration::from_millis(60));
+        } else if !activity.has_visible_presentation() {
+            // Freeze the playhead rather than immediately skipping a frame
+            // after a tab has been covered for a long time.
+            self.last_advance = Instant::now();
         }
     }
 
@@ -1497,6 +1588,25 @@ impl FarmState {
             }
         }
         None
+    }
+
+    /// Minimal map-only pipeline: fetch the displayed drape and, while the
+    /// visible map is playing, one next frame. It does not fill the hidden
+    /// FARM pane's entire texture loop speculatively.
+    fn next_drape_url(&self) -> Option<String> {
+        let n = self.frames.len();
+        if n == 0 {
+            return None;
+        }
+        let mut wanted = vec![self.frame_index];
+        if self.playing && n > 1 {
+            wanted.push((self.frame_index + 1) % n);
+        }
+        wanted.into_iter().find_map(|index| {
+            let url = &self.frames[index];
+            (!self.drape.images.contains_key(url) && !self.pending.contains(url))
+                .then(|| url.clone())
+        })
     }
 
     /// Select a sensor (resets the loop to its default product).
@@ -1532,6 +1642,46 @@ mod tests {
     use super::*;
 
     const INDEX_FIXTURE: &str = r#"<p class="medium"><a href="data.php?id=4&prod=DBZHC">DOW7</a></p><p class="tiny">Last Plot: <span style="color: white; padding: 2px;">2026-06-10 20:51:17 UTC</span></p><br/><p class="medium"><a href="data.php?id=9&prod=DBZHC_F">COW2</a></p><p class="tiny">Last Plot: <span style="color: black; background: #77FF77; padding: 2px;">2026-06-11 21:25:36 UTC</span></p><br/>"#;
+
+    #[test]
+    fn hidden_farm_pauses_while_map_only_avoids_full_loop_prefetch() {
+        let hidden = FarmPumpActivity::new(false, false);
+        assert!(!hidden.has_visible_presentation());
+        assert!(!hidden.prefetch_full_loop());
+        assert!(!hidden.update_map_drape());
+
+        let map_only = FarmPumpActivity::new(false, true);
+        assert!(map_only.has_visible_presentation());
+        assert!(!map_only.prefetch_full_loop());
+        assert!(map_only.update_map_drape());
+
+        let pane = FarmPumpActivity::new(true, false);
+        assert!(pane.has_visible_presentation());
+        assert!(pane.prefetch_full_loop());
+        assert!(!pane.update_map_drape());
+    }
+
+    #[test]
+    fn map_only_farm_requests_current_and_one_next_frame() {
+        let mut state = FarmState {
+            frames: vec!["current".to_owned(), "next".to_owned(), "later".to_owned()],
+            playing: true,
+            ..FarmState::default()
+        };
+        assert_eq!(state.next_drape_url().as_deref(), Some("current"));
+
+        let image = || DrapeImage {
+            source: egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT),
+            crop_left: 0,
+            crop_top: 0,
+            full_w: 1,
+            full_h: 1,
+        };
+        state.drape.images.insert("current".to_owned(), image());
+        assert_eq!(state.next_drape_url().as_deref(), Some("next"));
+        state.drape.images.insert("next".to_owned(), image());
+        assert_eq!(state.next_drape_url(), None, "later is speculative");
+    }
 
     #[test]
     fn index_parses_sensors_and_stamps() {

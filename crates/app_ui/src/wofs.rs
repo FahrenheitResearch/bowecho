@@ -668,6 +668,45 @@ pub struct WofsState {
     pub georef_progress: Arc<AtomicUsize>,
 }
 
+/// Which WoFS presentation surfaces can currently be seen. Receivers are
+/// drained in every mode; this policy controls only new network/CPU work.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WofsPumpActivity {
+    pane_visible: bool,
+    map_drape_visible: bool,
+    sounding_visible: bool,
+}
+
+impl WofsPumpActivity {
+    pub(crate) fn new(pane_visible: bool, map_drape_visible: bool, sounding_visible: bool) -> Self {
+        Self {
+            pane_visible,
+            map_drape_visible,
+            sounding_visible,
+        }
+    }
+
+    pub(crate) fn has_visible_presentation(self) -> bool {
+        self.pane_visible || self.map_drape_visible || self.sounding_visible
+    }
+
+    pub(crate) fn should_sync_radar(self) -> bool {
+        self.has_visible_presentation()
+    }
+
+    fn schedule_pane_work(self) -> bool {
+        self.pane_visible
+    }
+
+    fn schedule_map_work(self) -> bool {
+        self.map_drape_visible
+    }
+
+    fn schedule_sounding_work(self) -> bool {
+        self.sounding_visible
+    }
+}
+
 /// Honest map-layer readiness. Keeping this separate from `drape_on_map`
 /// prevents the rail from calling a selected-but-undrawable frame "live".
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -912,7 +951,7 @@ impl WofsState {
         true
     }
 
-    fn pump_availability(&mut self, ctx: &egui::Context) {
+    fn pump_availability(&mut self, ctx: &egui::Context, schedule_new: bool) {
         if let Some(rx) = &self.availability_rx {
             match rx.try_recv() {
                 Ok((key, Ok(max_posted))) => {
@@ -940,6 +979,10 @@ impl WofsState {
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.availability_rx = None,
             }
+        }
+
+        if !schedule_new {
+            return;
         }
 
         // Cached selections still need clamping when radar-time sync advances
@@ -1195,17 +1238,61 @@ impl WofsState {
             ));
         }
         urls.into_iter()
-            .filter(|u| !self.textures.contains_key(u))
-            .filter(|u| {
-                self.missing
-                    .get(u)
-                    .map(|at| at.elapsed().as_secs() > 60)
-                    .unwrap_or(true)
-            })
+            .filter(|u| self.url_needs_fetch(u))
             .collect()
     }
 
-    pub fn pump(&mut self, ctx: &egui::Context) {
+    fn url_needs_fetch(&self, url: &str) -> bool {
+        !self.textures.contains_key(url)
+            && self
+                .missing
+                .get(url)
+                .map(|at| at.elapsed().as_secs() > 60)
+                .unwrap_or(true)
+    }
+
+    fn wanted_map_base_url(&self) -> Option<String> {
+        let catalog = self.catalog.as_ref()?;
+        let run = catalog.runs.get(self.run_index)?;
+        let availability = availability_key(run, &self.init, &self.product);
+        self.max_posted_minutes
+            .contains_key(&availability)
+            .then_some(())?;
+        let url = image_url(run, &self.init, &self.product, self.minute);
+        self.url_needs_fetch(&url).then_some(url)
+    }
+
+    fn wanted_sounding_url(&self) -> Option<String> {
+        if !self.soundings_mode {
+            return None;
+        }
+        let catalog = self.catalog.as_ref()?;
+        let run = catalog.runs.get(self.run_index)?;
+        let station = self.selected_station.as_ref()?;
+        let url = sounding_url(run, &self.init, self.sounding_frame(), station);
+        self.url_needs_fetch(&url).then_some(url)
+    }
+
+    fn wanted_urls_for(&self, activity: WofsPumpActivity) -> Vec<String> {
+        if activity.schedule_pane_work() {
+            return self.want_urls();
+        }
+        let mut urls = Vec::with_capacity(2);
+        if activity.schedule_map_work()
+            && let Some(url) = self.wanted_map_base_url()
+        {
+            urls.push(url);
+        }
+        if activity.schedule_sounding_work()
+            && let Some(url) = self.wanted_sounding_url()
+            && !urls.contains(&url)
+        {
+            urls.push(url);
+        }
+        urls
+    }
+
+    pub(crate) fn pump(&mut self, ctx: &egui::Context, activity: WofsPumpActivity) {
         if let Some(rx) = &self.catalog_rx {
             match rx.try_recv() {
                 Ok(Ok(catalog)) => {
@@ -1220,7 +1307,7 @@ impl WofsState {
                 Err(mpsc::TryRecvError::Disconnected) => self.catalog_rx = None,
             }
         }
-        self.pump_availability(ctx);
+        self.pump_availability(ctx, activity.has_visible_presentation());
         if let Some(rx) = &self.image_rx {
             match rx.try_recv() {
                 Ok((url, Ok(image))) => {
@@ -1283,7 +1370,8 @@ impl WofsState {
                 Err(mpsc::TryRecvError::Disconnected) => self.stations_rx = None,
             }
         }
-        if self.soundings_mode
+        if activity.schedule_pane_work()
+            && self.soundings_mode
             && self.stations_rx.is_none()
             && let Some(catalog) = &self.catalog
             && let Some(run) = catalog.runs.get(self.run_index)
@@ -1311,7 +1399,7 @@ impl WofsState {
         // One in-flight fetch at a time; the CDN is fast.
         if self.image_rx.is_none()
             && let Some(url) = self
-                .want_urls()
+                .wanted_urls_for(activity)
                 .into_iter()
                 .find(|u| !self.pending_urls.contains(u))
         {
@@ -1325,16 +1413,18 @@ impl WofsState {
                 ctx_clone.request_repaint();
             });
         }
-        self.pump_georef(ctx);
+        self.pump_georef(ctx, activity.schedule_map_work());
         // WoFS adds live cycles throughout the day.  The old one-shot catalog
         // left the init picker and radar sync permanently pinned until restart.
-        self.start_catalog(ctx);
+        if activity.has_visible_presentation() {
+            self.start_catalog(ctx);
+        }
     }
 
     /// Drape calibration lifecycle: collect a finished build, and kick off
     /// a new one when the drape is on and the selected run has no georef
     /// yet. Results cache per RUN id (the domain is per-run).
-    fn pump_georef(&mut self, ctx: &egui::Context) {
+    fn pump_georef(&mut self, ctx: &egui::Context, schedule_new: bool) {
         if let Some((run_id, rx)) = &self.georef_rx {
             match rx.try_recv() {
                 Ok(Ok(georef)) => {
@@ -1352,7 +1442,8 @@ impl WofsState {
                 Err(mpsc::TryRecvError::Disconnected) => self.georef_rx = None,
             }
         }
-        if self.drape_on_map
+        if schedule_new
+            && self.drape_on_map
             && self.georef_rx.is_none()
             && let Some(catalog) = &self.catalog
             && let Some(run) = catalog.runs.get(self.run_index)
@@ -1759,6 +1850,44 @@ impl WofsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_wofs_suspends_and_map_only_schedules_only_map_work() {
+        let hidden = WofsPumpActivity::new(false, false, false);
+        assert!(!hidden.has_visible_presentation());
+        assert!(!hidden.should_sync_radar());
+        assert!(!hidden.schedule_pane_work());
+        assert!(!hidden.schedule_map_work());
+
+        let map_only = WofsPumpActivity::new(false, true, false);
+        assert!(map_only.has_visible_presentation());
+        assert!(map_only.should_sync_radar());
+        assert!(!map_only.schedule_pane_work());
+        assert!(map_only.schedule_map_work());
+        assert!(!map_only.schedule_sounding_work());
+
+        let covered_pane_with_sounding = WofsPumpActivity::new(false, false, true);
+        assert!(covered_pane_with_sounding.has_visible_presentation());
+        assert!(!covered_pane_with_sounding.schedule_pane_work());
+        assert!(covered_pane_with_sounding.schedule_sounding_work());
+    }
+
+    #[test]
+    fn map_only_wofs_requests_the_base_frame_not_hidden_overlays_or_sounding() {
+        let (mut state, run, product) = selected_test_drape();
+        let key = availability_key(&run, &state.init, &product);
+        state.max_posted_minutes.insert(key, (0, Instant::now()));
+        state.overlays = vec!["comp_dz_overlay__paintballs_thresh_40".to_owned()];
+        state.soundings_mode = true;
+        state.selected_station = Some("10_10".to_owned());
+
+        let urls = state.wanted_urls_for(WofsPumpActivity::new(false, true, false));
+        assert_eq!(urls.len(), 1);
+        assert_eq!(
+            urls[0],
+            image_url(&run, &state.init, &state.product, state.minute)
+        );
+    }
 
     /// Station fractions map into the AXES BOX, never the margins. Guards
     /// the bug this geometry was verified against: mapped to the full
