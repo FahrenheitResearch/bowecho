@@ -1125,6 +1125,11 @@ mod tests {
             }],
             products: vec![ProductReceipt {
                 name: "reflectivity".into(),
+                domain: Some("d01".into()),
+                initialization_time: None,
+                valid_time: None,
+                storage_slot: Some(0),
+                lead_seconds: Some(0),
                 units: "dBZ".into(),
                 source_variables: vec!["REFL_10CM".into()],
                 derivation: DerivationMethod::Direct,

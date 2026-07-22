@@ -111,6 +111,21 @@ pub struct ArtifactFileReceipt {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProductReceipt {
     pub name: String,
+    /// Domain and physical model time are explicit on every product so a
+    /// multi-domain, sub-hourly manifest never relies on its filename for
+    /// scientific identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_time: Option<String>,
+    /// Ordinal rw-store key used while rendering. This is not a forecast
+    /// hour; `lead_seconds` is the authoritative lead coordinate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_slot: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_seconds: Option<u64>,
     pub units: String,
     #[serde(default)]
     pub source_variables: Vec<String>,
@@ -123,6 +138,10 @@ pub struct ProductReceipt {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UnavailableProduct {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_time: Option<String>,
     pub reason: String,
     #[serde(default)]
     pub source_variables: Vec<String>,
