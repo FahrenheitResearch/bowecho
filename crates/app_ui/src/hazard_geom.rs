@@ -1411,6 +1411,7 @@ pub(crate) fn parse_weather_alert_feature_with_zones(
     let description = feature.properties.description.clone();
     let motion = weather_alert_parameter(&feature.properties.parameters, "eventMotionDescription");
     let label_count = rings.len();
+    let component_key = weather_alert_component_key(feature);
 
     Ok(rings
         .into_iter()
@@ -1418,10 +1419,11 @@ pub(crate) fn parse_weather_alert_feature_with_zones(
         .filter_map(|(index, points)| {
             let points = sanitize_weather_alert_ring(points, &event_family);
             (points.len() >= 3).then(|| HazardRecord {
-                event_id: if label_count > 1 {
-                    format!("{event_id}#{index}")
-                } else {
-                    event_id.clone()
+                event_id: match (&component_key, label_count > 1) {
+                    (Some(component), true) => format!("{event_id}#{component}-{index}"),
+                    (Some(component), false) => format!("{event_id}#{component}"),
+                    (None, true) => format!("{event_id}#{index}"),
+                    (None, false) => event_id.clone(),
                 },
                 label: if label_count > 1 {
                     format!("{} {}", label, index + 1)
@@ -1484,6 +1486,8 @@ fn zone_geometry_scope_includes(scope: ZoneGeometryScope<'_>, event_family: &str
             | "severe thunderstorm"
             | "flash flood"
             | "flood"
+            | "tropical storm"
+            | "hurricane"
             | "fire weather"
             | "special marine"
             | "snow squall"
@@ -1496,6 +1500,37 @@ fn zone_geometry_scope_includes(scope: ZoneGeometryScope<'_>, event_family: &str
             display && alert_family_enabled(families, event_family)
         }
     }
+}
+
+/// Stable geometry-component identity for zone-based CAP features. NWS emits
+/// many zone features with one shared VTEC event id; retaining only that base
+/// id makes deduplication collapse an entire tropical warning into whichever
+/// zone happened to be processed last. The suffix keeps each zone set while
+/// [`base_hazard_event_id`] still supplies cross-source event authority.
+fn weather_alert_component_key(feature: &WeatherAlertFeature) -> Option<String> {
+    if feature.properties.affected_zones.is_empty() {
+        return None;
+    }
+    let mut zones = feature
+        .properties
+        .affected_zones
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    zones.sort_unstable();
+    zones.dedup();
+
+    // Deterministic FNV-1a keeps event ids compact without depending on a
+    // process-random hash seed. Zone URLs themselves remain in the source
+    // feature/report; this token is only the stable internal component key.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for zone in zones {
+        for byte in zone.bytes().chain(std::iter::once(0xff)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    Some(format!("z{hash:016x}"))
 }
 
 /// The deduped, capped list of zone URLs a load must resolve: zones of
@@ -4280,6 +4315,8 @@ mod tests {
             "severe thunderstorm",
             "flash flood",
             "flood",
+            "tropical storm",
+            "hurricane",
             "fire weather",
             "special marine",
             "snow squall",
@@ -4342,13 +4379,17 @@ mod tests {
                 "Tornado Warning",
                 "https://api.weather.gov/zones/county/OKC109",
             ),
+            zoneless_alert_feature(
+                "Tropical Storm Warning",
+                "https://api.weather.gov/zones/forecast/LAZ068",
+            ),
         ];
 
         let display = weather_alert_zone_urls(&features, ZoneGeometryScope::Display);
         assert_eq!(
             display.len(),
-            2,
-            "display scope enriches watches and warnings"
+            3,
+            "display scope enriches watches, severe warnings, and tropical warnings"
         );
 
         let all_families: Vec<String> = Vec::new();
@@ -4366,6 +4407,75 @@ mod tests {
             vec!["https://api.weather.gov/zones/county/OKC109".to_owned()],
             "a watch cannot sound when only tornado is enabled, so its zone fetch is shed"
         );
+    }
+
+    #[test]
+    #[ignore = "network: proves tropical CAP zone/component coverage against live api.weather.gov"]
+    fn live_nws_tropical_warning_zone_components_survive_parse_and_dedupe() {
+        let query_time = Utc::now();
+        let text = data_source::fetch_text(ACTIVE_ALERTS_URL).expect("live NWS active alerts");
+        let collection: WeatherAlertFeatureCollection =
+            serde_json::from_str(&text).expect("live NWS alert collection");
+        let tropical = collection
+            .features
+            .iter()
+            .filter(|feature| {
+                let event = feature
+                    .properties
+                    .event
+                    .as_deref()
+                    .unwrap_or("Weather Alert");
+                let vtec = weather_alert_parameter(&feature.properties.parameters, "VTEC")
+                    .and_then(|value| parse_vtec_alert(&value));
+                vtec.as_ref().is_some_and(|vtec| vtec.significance == "W")
+                    && matches!(
+                        weather_alert_family_with_vtec(event, vtec.as_ref()).as_str(),
+                        "tropical storm" | "hurricane"
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !tropical.is_empty(),
+            "live feed has no tropical warning to prove"
+        );
+
+        let zone_urls = tropical
+            .iter()
+            .filter(|feature| feature.geometry.is_none())
+            .flat_map(|feature| feature.properties.affected_zones.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let zone_geometries =
+            resolve_zone_geometries(&zone_urls, fetch_weather_alert_zone_geometry);
+        let mut records = Vec::new();
+        for feature in &tropical {
+            records.extend(
+                parse_weather_alert_feature_with_zones(feature, query_time, &zone_geometries)
+                    .expect("live tropical CAP feature"),
+            );
+        }
+        let base_events = records
+            .iter()
+            .map(|record| base_hazard_event_id(&record.event_id).to_owned())
+            .collect::<BTreeSet<_>>();
+        dedupe_hazard_records(&mut records);
+
+        println!(
+            "live tropical proof: features={} zoneless_zones={} base_events={} retained_polygons={}",
+            tropical.len(),
+            zone_urls.len(),
+            base_events.len(),
+            records.len()
+        );
+        assert!(
+            records.len() > base_events.len(),
+            "separate zone components collapsed back to one polygon per VTEC event"
+        );
+        assert!(records.iter().all(|record| {
+            matches!(record.event_family.as_str(), "tropical storm" | "hurricane")
+                && hazard_points_renderable(&record.points)
+        }));
     }
 
     #[test]

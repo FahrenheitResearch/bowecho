@@ -42105,6 +42105,8 @@ fn live_warning_requires_active_alert(record: &HazardRecord) -> bool {
             | "severe thunderstorm"
             | "flash flood"
             | "flood"
+            | "tropical storm"
+            | "hurricane"
             | "fire weather"
             | "special marine"
             | "snow squall"
@@ -63206,6 +63208,7 @@ mod tests {
         // This is above the former 240 px/deg cliff that enabled every fill
         // at once even while the same dense scene remained visible.
         app.map_scale = 520.0;
+        app.selected_hazard_index = Some(0);
 
         let built = app.build_hazard_overlay_shapes(test_map_rect(), None);
 
@@ -63220,6 +63223,60 @@ mod tests {
         assert_eq!(
             built.outline_shapes.len(),
             HAZARD_HEAVY_LAYER_FILL_LIMIT + 1
+        );
+    }
+
+    #[test]
+    fn dense_warning_guard_is_scoped_by_family() {
+        let mut records = (0..=HAZARD_HEAVY_LAYER_FILL_LIMIT)
+            .map(|index| {
+                let column = (index % 9) as f32;
+                let row = (index / 9) as f32;
+                let west = -0.45 + column * 0.1;
+                let south = -0.45 + row * 0.1;
+                test_hazard_record(
+                    &format!("FLW-{index}"),
+                    &format!("FLW {index}"),
+                    "flood",
+                    square_hazard_points(west, south, west + 0.08, south + 0.08),
+                )
+            })
+            .collect::<Vec<_>>();
+        records.push(test_hazard_record(
+            "TRW-1",
+            "TRW 1",
+            "tropical storm",
+            square_hazard_points(-0.4, -0.4, -0.3, -0.3),
+        ));
+        records.push(test_hazard_record(
+            "TRW-2",
+            "TRW 2",
+            "tropical storm",
+            square_hazard_points(-0.35, -0.35, -0.25, -0.25),
+        ));
+        let mut app = test_viewer_app_with_hazards(records);
+        app.map_center_lat = 0.0;
+        app.map_center_lon = 0.0;
+        app.map_scale = 520.0;
+
+        let built = app.build_hazard_overlay_shapes(test_map_rect(), None);
+
+        assert_eq!(
+            built.fill_shapes.len(),
+            1,
+            "dense floods must not suppress the independently styled tropical family"
+        );
+        assert_eq!(
+            built.outline_shapes.len(),
+            HAZARD_HEAVY_LAYER_FILL_LIMIT + 3
+        );
+
+        app.selected_hazard_index = Some(HAZARD_HEAVY_LAYER_FILL_LIMIT + 2);
+        let selected = app.build_hazard_overlay_shapes(test_map_rect(), None);
+        assert_eq!(
+            selected.fill_shapes.len(),
+            2,
+            "selection may highlight one tropical polygon without suppressing its family peer"
         );
     }
 
@@ -64310,7 +64367,8 @@ mod tests {
         let record = &records[0];
         assert_eq!(record.event_family, "watch");
         assert_eq!(record.label, "SVR 0123");
-        assert_eq!(record.event_id, "KWNS.SV.A.0123");
+        assert_eq!(base_hazard_event_id(&record.event_id), "KWNS.SV.A.0123");
+        assert!(record.event_id.contains("#z"));
         assert_eq!(record.lifecycle_status.as_deref(), Some("Active"));
         assert!(hazard_polygon_contains_point(
             &record.points,
@@ -64393,6 +64451,55 @@ mod tests {
         assert_eq!(records[0].event_family, "tropical storm");
         assert_eq!(records[0].event_id, "KLIX.TR.W.0001");
         assert_eq!(records[0].label, "TRW 0001");
+    }
+
+    #[test]
+    fn weather_gov_zone_components_with_one_vtec_event_do_not_collapse() {
+        let feature = |zone: &str, west: f64| -> WeatherAlertFeature {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("https://api.weather.gov/alerts/{zone}"),
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [west, 29.0], [west + 0.5, 29.0], [west + 0.5, 29.5],
+                        [west, 29.5], [west, 29.0]
+                    ]]
+                },
+                "properties": {
+                    "id": format!("urn:oid:{zone}"),
+                    "event": "Tropical Storm Warning",
+                    "senderName": "NWS New Orleans LA",
+                    "onset": "2026-07-21T18:00:00+00:00",
+                    "expires": "2026-07-22T01:00:00+00:00",
+                    "affectedZones": [format!("https://api.weather.gov/zones/forecast/{zone}")],
+                    "parameters": {
+                        "VTEC": ["/O.CON.KLIX.TR.W.1002.260721T1800Z-260722T0100Z/"]
+                    }
+                }
+            }))
+            .expect("zone-based tropical warning feature")
+        };
+        let query_time = Utc.with_ymd_and_hms(2026, 7, 21, 20, 0, 0).unwrap();
+        let mut records = parse_weather_alert_feature(&feature("LAZ068", -90.5), query_time)
+            .expect("first tropical zone");
+        records.extend(
+            parse_weather_alert_feature(&feature("LAZ069", -89.5), query_time)
+                .expect("second tropical zone"),
+        );
+
+        dedupe_hazard_records(&mut records);
+
+        assert_eq!(
+            records.len(),
+            2,
+            "one VTEC event retains both zone polygons"
+        );
+        assert_ne!(records[0].event_id, records[1].event_id);
+        assert!(
+            records
+                .iter()
+                .all(|record| base_hazard_event_id(&record.event_id) == "KLIX.TR.W.1002")
+        );
     }
 
     #[test]

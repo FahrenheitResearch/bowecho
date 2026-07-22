@@ -1827,23 +1827,25 @@ impl ViewerApp {
             return out;
         };
         let bounds = self.visible_geo_bounds(rect).expand(0.05);
-        let visible_count = overlay
-            .records
-            .iter()
-            .filter(|record| {
-                self.hazard_record_visible_at_timeline_time(record, frame_time)
-                    && hazard_points_renderable(&record.points)
-                    && bounds.intersects_bbox(record.bbox)
-            })
-            .count();
-        // Dense warning scenes stay outline-first until the viewport contains
-        // fewer records.  This must be driven by visible complexity, not a
-        // fixed zoom threshold: the old `map_scale < 240` guard switched every
-        // Gulf-coast Flood Warning on at once as the user crossed that zoom,
-        // forcing the same-family fill flattener to rebuild a large union on
-        // every wheel tick. Zooming farther naturally reduces `visible_count`
-        // and brings fills/labels back when the scene is cheap enough to draw.
-        let heavy_layer = visible_count > HAZARD_HEAVY_LAYER_FILL_LIMIT;
+        let mut visible_family_counts = HashMap::<&str, usize>::new();
+        for record in &overlay.records {
+            if self.hazard_record_visible_at_timeline_time(record, frame_time)
+                && hazard_points_renderable(&record.points)
+                && bounds.intersects_bbox(record.bbox)
+            {
+                *visible_family_counts
+                    .entry(record.event_family.as_str())
+                    .or_default() += 1;
+            }
+        }
+        let heavy_layer =
+            visible_family_counts.values().sum::<usize>() > HAZARD_HEAVY_LAYER_FILL_LIMIT;
+        // Dense warning families stay outline-first until the viewport holds
+        // fewer records of that type. Keeping the guard family-scoped retains
+        // the user's warning-type grouping: a large Flood Warning field cannot
+        // suppress fills for a small, independently styled tropical/tornado
+        // family. The selected record stays outline-only with its wider stroke
+        // instead of becoming the misleading lone filled polygon.
         let mut label_rects = Vec::<egui::Rect>::new();
         let mut labeled_events = BTreeSet::<String>::new();
         let mut fill_candidates = Vec::<HazardFillCandidate>::new();
@@ -1863,6 +1865,9 @@ impl ViewerApp {
                 continue;
             }
             let selected = self.selected_hazard_index == Some(index);
+            let heavy_family = visible_family_counts
+                .get(record.event_family.as_str())
+                .is_some_and(|count| *count > HAZARD_HEAVY_LAYER_FILL_LIMIT);
             let style = self
                 .style_registry
                 .hazard_polygon(&record.event_family, hazard_record_style_threat(record));
@@ -1912,7 +1917,7 @@ impl ViewerApp {
             // Avoid all tessellation/union work when there is nothing to
             // paint; this also makes the user-facing Fill=0 setting an actual
             // performance escape hatch.
-            if fill_alpha > 0 && (!heavy_layer || selected) && !has_screen_jump && fill_ok {
+            if fill_alpha > 0 && !heavy_family && !has_screen_jump && fill_ok {
                 // Fills are not pushed directly: same-family same-color fills
                 // are flattened after the loop so overlaps paint once
                 // (selection boosts alpha, giving the selected record its own
