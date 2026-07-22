@@ -13,8 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
-use rw_store::{DerivedFieldInput, WrittenHour, write_hour_from_fields_with_derived};
+use rw_store::{
+    DerivedFieldInput, RwsExactTime, WrittenHour, write_hour_from_fields_with_derived,
+    write_hour_from_fields_with_derived_exact,
+};
 use serde::{Deserialize, Serialize};
+
+use app_ui::wrf_scene_inventory::{WrfSceneGroup, WrfSceneTime, parse_wrf_internal_time};
 
 use crate::wrf_volumes::{IsoVolume, SurfaceFallback, build_iso_volumes};
 use wrf_core::variables::{VARS, VarDim};
@@ -36,6 +41,11 @@ pub struct WrfProcessOptions {
     pub heavy_ecape: bool,
     #[serde(default = "default_true")]
     pub raw_extras: bool,
+    /// Compute 2-D extrema from native 3-D dynamics. Kept opt-in so the
+    /// desktop's established "full" import cost does not silently increase;
+    /// the severe headless preset enables it explicitly.
+    #[serde(default)]
+    pub vertical_extrema: bool,
     #[serde(default)]
     pub only: Vec<String>,
     #[serde(default)]
@@ -49,6 +59,7 @@ impl Default for WrfProcessOptions {
             diagnostics: true,
             heavy_ecape: false,
             raw_extras: true,
+            vertical_extrema: false,
             only: Vec::new(),
             skip: Vec::new(),
         }
@@ -101,7 +112,19 @@ impl WrfProcessOptions {
             let store_name = derived_name(raw, None);
             if self.should_process(raw, Some(&store_name), WrfProductGroup::Raw) {
                 names.push(store_name);
+                if *raw == "WSPD10MAX" {
+                    names.push("wind_gust_10m".to_owned());
+                }
             }
+        }
+        if self.vertical_extrema
+            && self.should_process(
+                "wa",
+                Some("max_vertical_velocity"),
+                WrfProductGroup::Diagnostic,
+            )
+        {
+            names.push("max_vertical_velocity".to_owned());
         }
         names.sort();
         names.dedup();
@@ -210,6 +233,23 @@ pub struct WrfProcessSummary {
     pub hours_written: usize,
     pub variables: Vec<String>,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrfProcessedScene {
+    pub source_path: PathBuf,
+    pub time_index: usize,
+    pub storage_slot: u16,
+    pub lead_seconds: u64,
+    pub valid_unix: i64,
+    pub valid_time: String,
+    pub precipitation_interval_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WrfExactProcessSummary {
+    pub process: WrfProcessSummary,
+    pub scenes: Vec<WrfProcessedScene>,
 }
 
 struct WrfHourFields {
@@ -503,6 +543,224 @@ fn process_paths(
     })
 }
 
+/// Process one already-inventoried compatible WRF run/domain/grid group into
+/// rw-store v2. Storage slots are ordinal and never presented as forecast
+/// hours; every slot carries its authoritative physical lead/valid time.
+///
+/// This is the synchronous headless seam. It deliberately reuses the same
+/// [`read_wrf_products`] science path as the GUI worker and processes scenes
+/// sequentially so multi-gigabyte wrfouts do not multiply their live caches.
+pub fn process_scene_group_exact(
+    group: &WrfSceneGroup,
+    store_root: &Path,
+    run: &str,
+    options: &WrfProcessOptions,
+    progress: &mut impl FnMut(String),
+) -> Result<WrfExactProcessSummary, String> {
+    if group.scenes.is_empty() {
+        return Err("WRF scene group is empty".to_owned());
+    }
+    if !group.diagnostics.unavailable_times.is_empty() {
+        return Err(format!(
+            "WRF scene group contains {} scene(s) without a valid time",
+            group.diagnostics.unavailable_times.len()
+        ));
+    }
+    if !group.diagnostics.duplicate_times.is_empty() {
+        let times = group
+            .diagnostics
+            .duplicate_times
+            .iter()
+            .map(|duplicate| duplicate.valid_time.to_rfc3339())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "WRF scene group contains duplicate valid times: {times}"
+        ));
+    }
+    if group.scenes.len() > usize::from(u16::MAX) + 1 {
+        return Err(format!(
+            "WRF scene group has {} scenes; rw-store supports at most {} ordinal slots",
+            group.scenes.len(),
+            usize::from(u16::MAX) + 1
+        ));
+    }
+    let initialization = parse_wrf_internal_time(&group.key.run_domain.run.0).ok_or_else(|| {
+        format!(
+            "WRF run '{}' has no authoritative START_DATE/SIMULATION_START_DATE; exact lead times cannot be derived",
+            group.key.run_domain.run.0
+        )
+    })?;
+    let options = options.clone().normalized();
+    let model = "wrf".to_owned();
+    let mut written = Vec::<WrittenHour>::new();
+    let mut processed_scenes = Vec::with_capacity(group.scenes.len());
+    let mut all_vars = Vec::<String>::new();
+    let mut all_notes = Vec::<String>::new();
+    let mut files_seen = BTreeSet::<PathBuf>::new();
+    let mut previous_precipitation = None::<(i64, Vec<f32>)>;
+
+    for (index, scene) in group.scenes.iter().enumerate() {
+        if !group.key.is_compatible(scene) {
+            return Err(format!(
+                "WRF scene {} time {} does not match its run/domain/grid group",
+                scene.path.display(),
+                scene.time_index
+            ));
+        }
+        let valid_time = match &scene.time {
+            WrfSceneTime::InternalTimes { valid_time, .. } => *valid_time,
+            WrfSceneTime::FilenameFallback { .. } => {
+                return Err(format!(
+                    "WRF scene {} time {} only has a filename fallback; exact processing requires internal Times",
+                    scene.path.display(),
+                    scene.time_index
+                ));
+            }
+            WrfSceneTime::Unavailable { .. } => {
+                return Err(format!(
+                    "WRF scene {} time {} has no valid time",
+                    scene.path.display(),
+                    scene.time_index
+                ));
+            }
+        };
+        let lead_seconds_signed = valid_time
+            .signed_duration_since(initialization)
+            .num_seconds();
+        let lead_seconds = u64::try_from(lead_seconds_signed).map_err(|_| {
+            format!(
+                "WRF valid time {} precedes initialization {}",
+                valid_time.to_rfc3339(),
+                initialization.to_rfc3339()
+            )
+        })?;
+        let storage_slot = u16::try_from(index).expect("scene count checked above");
+        let exact_time = RwsExactTime::new(lead_seconds, valid_time.timestamp());
+        progress(format!(
+            "Computing WRF {} time {} -> slot {storage_slot:05} ({})",
+            display_name(&scene.path),
+            scene.time_index,
+            valid_time.format("%Y-%m-%dT%H:%M:%SZ")
+        ));
+
+        let file = WrfFile::open(&scene.path)
+            .map_err(|error| format!("Open WRF {} failed: {error}", scene.path.display()))?;
+        if scene.time_index >= file.nt {
+            return Err(format!(
+                "WRF {} changed after inventory: time index {} is outside 0..{}",
+                scene.path.display(),
+                scene.time_index,
+                file.nt
+            ));
+        }
+        let current_time = file
+            .times()
+            .map_err(|error| format!("Read WRF Times from {}: {error}", scene.path.display()))?
+            .get(scene.time_index)
+            .and_then(|raw| parse_wrf_internal_time(raw))
+            .ok_or_else(|| {
+                format!(
+                    "WRF {} time {} lost its authoritative Times record after inventory",
+                    scene.path.display(),
+                    scene.time_index
+                )
+            })?;
+        if current_time != valid_time {
+            return Err(format!(
+                "WRF {} time {} changed after inventory: expected {}, got {}",
+                scene.path.display(),
+                scene.time_index,
+                valid_time.to_rfc3339(),
+                current_time.to_rfc3339()
+            ));
+        }
+
+        let mut fields =
+            read_wrf_products(&file, &scene.path, scene.time_index, &options, progress)?;
+        if fields.canonical.is_empty() {
+            return Err(format!(
+                "WRF {} time {} produced no canonical 2D grid fields",
+                scene.path.display(),
+                scene.time_index
+            ));
+        }
+        let precipitation_interval_seconds = add_interval_precipitation(
+            &mut fields,
+            &mut previous_precipitation,
+            valid_time.timestamp(),
+        );
+        let refs = fields
+            .canonical
+            .iter()
+            .map(|(name, field)| (name.as_str(), field))
+            .collect::<Vec<_>>();
+        let derived_refs = fields
+            .derived
+            .iter()
+            .map(|field| DerivedFieldInput {
+                name: field.name.as_str(),
+                units: field.units.as_str(),
+                values: field.values.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let volume_inputs = fields
+            .volumes
+            .iter()
+            .map(IsoVolume::as_input)
+            .collect::<Vec<_>>();
+        let result = write_hour_from_fields_with_derived_exact(
+            store_root,
+            &model,
+            run,
+            storage_slot,
+            exact_time,
+            &refs,
+            &derived_refs,
+            &volume_inputs,
+            writer_build(),
+            now_unix(),
+        )
+        .map_err(|error| {
+            format!(
+                "Write WRF slot {storage_slot:05} ({}) failed: {error}",
+                valid_time.to_rfc3339()
+            )
+        })?;
+        file.clear_cache();
+        files_seen.insert(scene.path.clone());
+        all_vars.extend(result.vars.iter().cloned());
+        all_notes.extend(fields.notes);
+        written.push(result);
+        processed_scenes.push(WrfProcessedScene {
+            source_path: scene.path.clone(),
+            time_index: scene.time_index,
+            storage_slot,
+            lead_seconds,
+            valid_unix: valid_time.timestamp(),
+            valid_time: valid_time.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            precipitation_interval_seconds,
+        });
+    }
+
+    all_vars.sort();
+    all_vars.dedup();
+    all_notes.sort();
+    all_notes.dedup();
+    Ok(WrfExactProcessSummary {
+        process: WrfProcessSummary {
+            store_root: store_root.to_path_buf(),
+            model,
+            run: run.to_owned(),
+            files_seen: files_seen.len(),
+            hours_written: written.len(),
+            variables: all_vars,
+            notes: all_notes,
+        },
+        scenes: processed_scenes,
+    })
+}
+
 fn read_wrf_products(
     file: &WrfFile,
     path: &Path,
@@ -601,6 +859,19 @@ fn read_wrf_products(
         FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
         Some("m/s")
     );
+    if options.should_process("WSPD10MAX", Some("wind_gust_10m"), WrfProductGroup::Raw) {
+        push_canonical(
+            &mut fields,
+            file,
+            timeidx,
+            &grid,
+            projection.clone(),
+            "WSPD10MAX",
+            "wind_gust_10m",
+            FieldSelector::height_agl(CanonicalField::WindGust, 10),
+            Some("m/s"),
+        );
+    }
     push_core!(
         "slp",
         "mslp",
@@ -688,6 +959,28 @@ fn read_wrf_products(
             Err(err) => fields
                 .notes
                 .push(format!("{} unavailable: {err}", def.name)),
+        }
+    }
+
+    if options.vertical_extrema
+        && options.should_process(
+            "wa",
+            Some("max_vertical_velocity"),
+            WrfProductGroup::Diagnostic,
+        )
+    {
+        progress("Computing WRF vertical maximum: wa".to_owned());
+        match compute_var(file, "wa", timeidx, Some("m/s"))
+            .and_then(|output| column_maximum(output, shape.len()))
+        {
+            Ok((values, units)) => fields.derived.push(OwnedDerivedField {
+                name: "max_vertical_velocity".to_owned(),
+                units,
+                values,
+            }),
+            Err(error) => fields
+                .notes
+                .push(format!("max_vertical_velocity unavailable: {error}")),
         }
     }
 
@@ -921,6 +1214,33 @@ fn single_plane(output: VarOutput, cells: usize) -> Result<(Vec<f32>, String), S
     }
 }
 
+fn column_maximum(output: VarOutput, cells: usize) -> Result<(Vec<f32>, String), String> {
+    let levels = match output.shape.as_slice() {
+        [levels, ny, nx] if ny * nx == cells => *levels,
+        other => return Err(format!("expected [nz,ny,nx], got {other:?}")),
+    };
+    if output.data.len() != levels.saturating_mul(cells) {
+        return Err(format!(
+            "shape {:?} requires {} values, got {}",
+            output.shape,
+            levels.saturating_mul(cells),
+            output.data.len()
+        ));
+    }
+    let mut maximum = vec![f32::NAN; cells];
+    for level in output.data.chunks_exact(cells) {
+        for (result, value) in maximum.iter_mut().zip(level) {
+            if value.is_finite() && value.abs() < 1.0e30 && *value > -9998.0 {
+                let value = *value as f32;
+                if result.is_nan() || value > *result {
+                    *result = value;
+                }
+            }
+        }
+    }
+    Ok((maximum, output.units))
+}
+
 fn compute_var(
     file: &WrfFile,
     name: &str,
@@ -982,6 +1302,86 @@ fn total_precip(file: &WrfFile, timeidx: usize, cells: usize) -> Option<Vec<f32>
         found = true;
     }
     found.then_some(total)
+}
+
+/// Add a physically timed interval-precipitation plane to one exact-time
+/// scene. A reset/decrease makes the whole interval unavailable: BowEcho does
+/// not clamp a restarted accumulator into a fabricated zero-precip product.
+fn add_interval_precipitation(
+    fields: &mut WrfHourFields,
+    previous: &mut Option<(i64, Vec<f32>)>,
+    valid_unix: i64,
+) -> Option<u64> {
+    let Some(current) = fields
+        .canonical
+        .iter()
+        .find(|(name, _)| name == "apcp")
+        .map(|(_, field)| field.values.clone())
+    else {
+        fields
+            .notes
+            .push("precip_interval unavailable: total precipitation was not supplied".to_owned());
+        return None;
+    };
+    let Some((previous_valid_unix, previous_values)) =
+        previous.replace((valid_unix, current.clone()))
+    else {
+        fields.notes.push(
+            "precip_interval unavailable: first scene has no preceding accumulation".to_owned(),
+        );
+        return None;
+    };
+    let Some(interval_delta) = valid_unix.checked_sub(previous_valid_unix) else {
+        fields
+            .notes
+            .push("precip_interval unavailable: scene time difference overflowed".to_owned());
+        return None;
+    };
+    let Ok(interval_seconds) = u64::try_from(interval_delta) else {
+        fields.notes.push(
+            "precip_interval unavailable: scene time did not advance monotonically".to_owned(),
+        );
+        return None;
+    };
+    if interval_seconds == 0 || current.len() != previous_values.len() {
+        fields.notes.push(if interval_seconds == 0 {
+            "precip_interval unavailable: scene time did not advance monotonically".to_owned()
+        } else {
+            format!(
+                "precip_interval unavailable: accumulation grid changed from {} to {} cells",
+                previous_values.len(),
+                current.len()
+            )
+        });
+        return None;
+    }
+
+    let mut interval = Vec::with_capacity(current.len());
+    let mut decrease = None;
+    for (index, (&current_value, &previous_value)) in
+        current.iter().zip(&previous_values).enumerate()
+    {
+        if !current_value.is_finite() || !previous_value.is_finite() {
+            interval.push(f32::NAN);
+        } else if current_value < previous_value {
+            decrease = Some((index, previous_value, current_value));
+            break;
+        } else {
+            interval.push(current_value - previous_value);
+        }
+    }
+    if let Some((index, previous_value, current_value)) = decrease {
+        fields.notes.push(format!(
+            "precip_interval unavailable: precipitation accumulator decreased at cell {index} ({previous_value} -> {current_value})"
+        ));
+        return None;
+    }
+    fields.derived.push(OwnedDerivedField {
+        name: "precip_interval".to_owned(),
+        units: "kg/m^2".to_owned(),
+        values: interval,
+    });
+    Some(interval_seconds)
 }
 
 fn clean_values(values: &[f64]) -> Vec<f32> {
@@ -1363,6 +1763,80 @@ mod tests {
         assert_eq!(derived_name("sbcape", None), "sbcape");
         assert_eq!(derived_name("srh1", None), "srh_0_1km");
         assert_eq!(derived_name("shear_0_6km", None), "bulk_shear_0_6km");
+    }
+
+    fn precipitation_fields(values: Vec<f32>) -> WrfHourFields {
+        let shape = GridShape::new(values.len(), 1).unwrap();
+        let grid =
+            LatLonGrid::new(shape, vec![35.0; values.len()], vec![-97.0; values.len()]).unwrap();
+        let field = SelectedField2D::new(
+            FieldSelector::surface(CanonicalField::TotalPrecipitation),
+            "kg/m^2",
+            grid,
+            values,
+        )
+        .unwrap();
+        WrfHourFields {
+            canonical: vec![("apcp".to_owned(), field)],
+            derived: Vec::new(),
+            volumes: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exact_interval_precipitation_is_timed_and_never_invents_a_reset() {
+        let mut previous = None;
+        let mut first = precipitation_fields(vec![1.0, 2.0]);
+        assert_eq!(
+            add_interval_precipitation(&mut first, &mut previous, 1_000),
+            None
+        );
+        assert!(first.derived.is_empty());
+
+        let mut second = precipitation_fields(vec![1.5, 3.25]);
+        assert_eq!(
+            add_interval_precipitation(&mut second, &mut previous, 1_900),
+            Some(900)
+        );
+        assert_eq!(second.derived.len(), 1);
+        assert_eq!(second.derived[0].name, "precip_interval");
+        assert_eq!(second.derived[0].values, vec![0.5, 1.25]);
+
+        let mut reset = precipitation_fields(vec![0.1, 4.0]);
+        assert_eq!(
+            add_interval_precipitation(&mut reset, &mut previous, 2_800),
+            None
+        );
+        assert!(reset.derived.is_empty());
+        assert!(
+            reset
+                .notes
+                .iter()
+                .any(|note| note.contains("accumulator decreased"))
+        );
+    }
+
+    #[test]
+    fn vertical_maximum_preserves_missing_columns_and_negative_updrafts() {
+        let output = VarOutput {
+            data: vec![-3.0, f64::NAN, 1.0, -2.0, -1.0, -1.0],
+            shape: vec![3, 1, 2],
+            units: "m/s".to_owned(),
+            description: "destaggered vertical velocity".to_owned(),
+        };
+        let (values, units) = column_maximum(output, 2).unwrap();
+        assert_eq!(units, "m/s");
+        assert_eq!(values[0], 1.0);
+        assert_eq!(values[1], -1.0);
+
+        let all_missing = VarOutput {
+            data: vec![f64::NAN, f64::NAN],
+            shape: vec![2, 1, 1],
+            units: "m/s".to_owned(),
+            description: String::new(),
+        };
+        assert!(column_maximum(all_missing, 1).unwrap().0[0].is_nan());
     }
 
     #[test]

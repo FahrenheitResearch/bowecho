@@ -32,10 +32,17 @@ pub struct SelectedWrfScenes {
     pub notes: Vec<WrfInventoryNote>,
 }
 
-/// Inventory selected WRF files and require one compatible run/domain/grid.
-/// Mixed d01/d02 selections, remeshed files, duplicate/restart times, and
-/// untimed scenes are surfaced as errors rather than silently merged.
-pub fn inventory_selected_wrf_paths(paths: &[PathBuf]) -> Result<SelectedWrfScenes, String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InventoriedWrfPaths {
+    pub inventory: WrfSceneInventory,
+    pub notes: Vec<WrfInventoryNote>,
+}
+
+/// Inventory every selected WRF scene without requiring all inputs to share
+/// one run/domain/grid. Callers that can isolate work per compatible group
+/// (the headless renderer and forecast watcher) use this entry point; the GUI
+/// simulated-radar path retains [`inventory_selected_wrf_paths`] below.
+pub fn inventory_wrf_paths(paths: &[PathBuf]) -> Result<InventoriedWrfPaths, String> {
     if paths.is_empty() {
         return Err("No WRF files selected".to_owned());
     }
@@ -91,7 +98,17 @@ pub fn inventory_selected_wrf_paths(paths: &[PathBuf]) -> Result<SelectedWrfScen
         file.clear_cache();
     }
 
-    let inventory = WrfSceneInventory::from_scenes(scenes);
+    Ok(InventoriedWrfPaths {
+        inventory: WrfSceneInventory::from_scenes(scenes),
+        notes,
+    })
+}
+
+/// Inventory selected WRF files and require one compatible run/domain/grid.
+/// Mixed d01/d02 selections, remeshed files, duplicate/restart times, and
+/// untimed scenes are surfaced as errors rather than silently merged.
+pub fn inventory_selected_wrf_paths(paths: &[PathBuf]) -> Result<SelectedWrfScenes, String> {
+    let InventoriedWrfPaths { inventory, notes } = inventory_wrf_paths(paths)?;
     if inventory.groups.len() != 1 {
         let groups = inventory
             .groups

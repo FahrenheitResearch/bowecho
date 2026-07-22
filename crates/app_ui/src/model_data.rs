@@ -151,6 +151,7 @@ impl WrfProcessUiState {
             diagnostics: self.diagnostics,
             heavy_ecape: self.heavy_ecape,
             raw_extras: self.raw_extras,
+            vertical_extrema: false,
             only: field_filter(&self.only_text),
             skip: field_filter(&self.skip_text),
         }
@@ -4634,6 +4635,7 @@ impl ModelDataDock {
                         diagnostics: false,
                         heavy_ecape: false,
                         raw_extras: false,
+                        vertical_extrema: false,
                         only: Vec::new(),
                         skip: Vec::new(),
                     };
