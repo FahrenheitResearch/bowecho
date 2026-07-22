@@ -9740,8 +9740,9 @@ mod tests {
             "wrf_swdnb".to_owned(),
             "temperature_iso".to_owned(),
         ];
-        // The synthesized entry is the picker selection, so the loader's
-        // stale-drop accepts the plane when it lands.
+        // The browser and its synthesized entry are both selected, matching
+        // the production picker state the loader's stale-drop requires.
+        dock.browser.select(hour.clone());
         dock.viewer
             .set_hour(hour.clone(), vec![test_var("Temperature 850 mb", "K")]);
         dock.request_field_load(rw_ui::FieldKey {

@@ -1316,6 +1316,8 @@ pub(crate) fn isolate_panics<T>(
 }
 
 fn total_precip(file: &WrfFile, timeidx: usize, cells: usize) -> Option<Vec<f32>> {
+    const PRECIP_ABSOLUTE_ROUNDOFF_KG_M2: f32 = 1.0e-5;
+
     let mut total = vec![0.0f32; cells];
     let mut found = false;
     for name in ["RAINC", "RAINNC", "RAINSH"] {
@@ -1334,7 +1336,18 @@ fn total_precip(file: &WrfFile, timeidx: usize, cells: usize) -> Option<Vec<f32>
         }
         found = true;
     }
-    found.then_some(total)
+    if !found {
+        return None;
+    }
+    // Accumulated precipitation is physically non-negative. Some WRF files
+    // contain signed roundoff at dry cells (for example -9e-26 kg/m^2); keep
+    // genuine negative/reset values visible to the interval integrity check.
+    for value in &mut total {
+        if value.is_finite() && *value < 0.0 && *value >= -PRECIP_ABSOLUTE_ROUNDOFF_KG_M2 {
+            *value = 0.0;
+        }
+    }
+    Some(total)
 }
 
 /// Add a physically timed interval-precipitation plane to one exact-time
@@ -1345,6 +1358,9 @@ fn add_interval_precipitation(
     previous: &mut Option<(i64, Vec<f32>)>,
     valid_unix: i64,
 ) -> Option<u64> {
+    const PRECIP_ABSOLUTE_ROUNDOFF_KG_M2: f32 = 1.0e-5;
+    const PRECIP_ULPS_OF_HEADROOM: f32 = 16.0;
+
     let Some(current) = fields
         .canonical
         .iter()
@@ -1396,11 +1412,16 @@ fn add_interval_precipitation(
     {
         if !current_value.is_finite() || !previous_value.is_finite() {
             interval.push(f32::NAN);
-        } else if current_value < previous_value {
-            decrease = Some((index, previous_value, current_value));
-            break;
         } else {
-            interval.push(current_value - previous_value);
+            let delta = current_value - previous_value;
+            let scale = current_value.abs().max(previous_value.abs()).max(1.0);
+            let tolerance =
+                PRECIP_ABSOLUTE_ROUNDOFF_KG_M2.max(PRECIP_ULPS_OF_HEADROOM * f32::EPSILON * scale);
+            if delta < -tolerance {
+                decrease = Some((index, previous_value, current_value));
+                break;
+            }
+            interval.push(delta.max(0.0));
         }
     }
     if let Some((index, previous_value, current_value)) = decrease {
@@ -1853,6 +1874,13 @@ mod tests {
         assert_eq!(second.derived.len(), 1);
         assert_eq!(second.derived[0].name, "precip_interval");
         assert_eq!(second.derived[0].values, vec![0.5, 1.25]);
+
+        let mut numerical_residue = precipitation_fields(vec![1.5 - 1.0e-7, 3.25]);
+        assert_eq!(
+            add_interval_precipitation(&mut numerical_residue, &mut previous, 2_000),
+            Some(100)
+        );
+        assert_eq!(numerical_residue.derived[0].values, vec![0.0, 0.0]);
 
         let mut reset = precipitation_fields(vec![0.1, 4.0]);
         assert_eq!(
