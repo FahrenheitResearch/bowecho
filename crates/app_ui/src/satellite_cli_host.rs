@@ -960,9 +960,16 @@ fn fetch_native_archive(
         }
         match fetched {
             Ok(stored) => {
+                let run_directory = stored.path.parent().ok_or_else(|| ArchiveCliFailure {
+                    kind: ArchiveCliFailureKind::Store,
+                    message: format!(
+                        "stored satellite frame has no run-directory parent: {}",
+                        stored.path.display()
+                    ),
+                })?;
                 result.stored.push(NativeFetchedFrame {
                     source,
-                    run_directory: store_root.join(&stored.model).join(&stored.run),
+                    run_directory: run_directory.to_path_buf(),
                     model: stored.model,
                     run: stored.run,
                     hhmm: stored.hhmm,

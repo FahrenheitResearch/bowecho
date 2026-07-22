@@ -5828,8 +5828,8 @@ fn catalog_goes_archive(
         let prefix = goes_hour_prefix(sector.abi_product(), hour);
         let objects = list_s3_objects(&agent, &bucket, &prefix, None)
             .map_err(|error| format!("list GOES {prefix}: {error}"))?;
-        let mut scans: BTreeMap<DateTime<Utc>, (DateTime<Utc>, HashMap<u8, S3Object>)> =
-            BTreeMap::new();
+        type GoesArchiveScan = (DateTime<Utc>, HashMap<u8, S3Object>);
+        let mut scans: BTreeMap<DateTime<Utc>, GoesArchiveScan> = BTreeMap::new();
         for object in objects {
             if !object.key.ends_with(".nc") {
                 continue;
