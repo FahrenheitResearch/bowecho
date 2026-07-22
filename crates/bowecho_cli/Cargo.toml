@@ -1,0 +1,15 @@
+[package]
+name = "bowecho_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+netcrust = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "d6a89546bb69e5c4d52de10e651e0fe53aca3d82" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror.workspace = true
+wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "9874474d9566a7536a90f457a48be30caa5f973a", package = "wrf-core" }

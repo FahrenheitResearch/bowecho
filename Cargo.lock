@@ -296,6 +296,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "app_ui"
 version = "0.34.5"
 dependencies = [
+ "bowecho_cli",
  "chrono",
  "color_tables",
  "data_source",
@@ -779,6 +780,20 @@ dependencies = [
  "render2d",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bowecho_cli"
+version = "0.34.5"
+dependencies = [
+ "chrono",
+ "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=d6a89546bb69e5c4d52de10e651e0fe53aca3d82)",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=9874474d9566a7536a90f457a48be30caa5f973a)",
 ]
 
 [[package]]

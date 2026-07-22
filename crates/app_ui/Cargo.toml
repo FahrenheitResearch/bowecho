@@ -8,6 +8,7 @@ build = "build.rs"
 [dependencies]
 chrono.workspace = true
 rayon.workspace = true
+bowecho_cli = { path = "../bowecho_cli" }
 color_tables = { path = "../color_tables" }
 data_source = { path = "../data_source" }
 flate2.workspace = true

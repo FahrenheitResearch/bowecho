@@ -1372,6 +1372,11 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    let input_path = match dispatch_headless_command() {
+        HeadlessStartup::Gui(input_path) => input_path,
+        HeadlessStartup::Complete => return Ok(()),
+    };
+
     // Crash forensics: panics land in a log next to the settings so field
     // reports from other machines carry a backtrace ("crashes a lot when
     // switching pane views" needs a line number, not a guess).
@@ -1403,7 +1408,6 @@ fn main() -> eframe::Result {
     // executable or app bundle may still be in use while the pre-update
     // process finishes exiting; failures stay silent and retry next launch.
     cleanup_stale_update_artifacts();
-    let input_path = std::env::args_os().nth(1).map(PathBuf::from);
     let startup_settings = load_startup_settings_report();
     let startup_name = brand::window_title(&startup_settings.settings.brand);
 
@@ -1435,6 +1439,54 @@ fn main() -> eframe::Result {
         relaunch_after_self_update();
     }
     result
+}
+
+enum HeadlessStartup {
+    Gui(Option<PathBuf>),
+    Complete,
+}
+
+/// Route exact command-family prefixes before any eframe/GPU initialization.
+/// Every other argv[1] keeps the historical GUI file-open behavior.
+fn dispatch_headless_command() -> HeadlessStartup {
+    let invocation = match bowecho_cli::parse_invocation(std::env::args_os()) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            if !error.message.is_empty() {
+                eprintln!("bowecho: {}", error.message);
+            }
+            if let Some(help) = error.help {
+                eprint!("{help}");
+            }
+            std::process::exit(error.code.as_i32());
+        }
+    };
+    match invocation {
+        bowecho_cli::Invocation::Gui { input_path } => HeadlessStartup::Gui(input_path),
+        bowecho_cli::Invocation::Cli(command) => {
+            let context = bowecho_cli::RuntimeContext::new(
+                env!("CARGO_PKG_VERSION"),
+                option_env!("BOWECHO_BUILD_GIT").unwrap_or("unknown"),
+            );
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let result =
+                bowecho_cli::execute(command, &context, &mut stdout.lock(), &mut stderr.lock());
+            match result {
+                Ok(bowecho_cli::ExitCode::Success) => HeadlessStartup::Complete,
+                Ok(code) => std::process::exit(code.as_i32()),
+                Err(error) => {
+                    if !error.message.is_empty() {
+                        eprintln!("bowecho: {}", error.message);
+                    }
+                    if let Some(help) = error.help {
+                        eprint!("{help}");
+                    }
+                    std::process::exit(error.code.as_i32());
+                }
+            }
+        }
+    }
 }
 
 fn bowecho_native_options(
