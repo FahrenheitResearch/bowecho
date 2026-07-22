@@ -6081,7 +6081,10 @@ fn catalog_meteosat_archive(
     if clipped_end >= clipped_start {
         let cadence_seconds = cadence * 60;
         let first_offset = (clipped_start - layer.first_time).num_seconds();
-        let first_index = first_offset.div_ceil(cadence_seconds).max(0);
+        let first_index = first_offset
+            .saturating_add(cadence_seconds - 1)
+            .div_euclid(cadence_seconds)
+            .max(0);
         let last_index = ((clipped_end - layer.first_time).num_seconds() / cadence_seconds).max(0);
         let count = last_index.saturating_sub(first_index).saturating_add(1) as usize;
         let take = count.min(limit.saturating_add(1));
