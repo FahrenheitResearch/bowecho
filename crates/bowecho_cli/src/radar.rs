@@ -737,8 +737,8 @@ pub fn render(
         }
     }
 
-    sources.sort_by(|a, b| stable_path_key(&a.path).cmp(&stable_path_key(&b.path)));
-    decoded.sort_by(|a, b| stable_path_key(&a.receipt.path).cmp(&stable_path_key(&b.receipt.path)));
+    sources.sort_by_key(|source| stable_path_key(&source.path));
+    decoded.sort_by_key(|frame| stable_path_key(&frame.receipt.path));
     let mut staged_products = Vec::new();
     let mut unavailable_products = Vec::new();
     let tables = ColorTableSet::default();
