@@ -149,6 +149,7 @@ mod wrf_volumes;
 
 use hazard_geom::append_flattened_hazard_fill_shapes;
 use hazard_geom::bbox_contains;
+use hazard_geom::bounded_hazard_fill_points;
 use hazard_geom::build_live_hazard_overlay;
 use hazard_geom::cone_overlay_shapes;
 use hazard_geom::cone_segment_jump_limit_px;
@@ -1264,13 +1265,11 @@ const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
 /// fill meshes in one frame and made every subsequent zoom rebuild expensive
 /// geometry.
 const HAZARD_HEAVY_LAYER_FILL_LIMIT: usize = 80;
-/// Per-polygon projected-vertex ceiling for the O(n^2) ear-clip fill. A
-/// coastline-traced polygon — an Alaska marine SPS (e.g. around PACG), or a
-/// big multi-county watch union — can carry thousands of vertices and drop
-/// the whole map to single-digit FPS while its fill mesh re-uploads every
-/// frame. Above this count we skip ONLY the fill and let the existing outline
-/// path draw the ring unaltered. The overwhelming majority of warning polygons
-/// are well under this and are completely unchanged (fill and all).
+/// Per-polygon projected-vertex ceiling for fill tessellation. A coastline-
+/// traced zone can carry thousands of vertices and drop the map to single-
+/// digit FPS during shape-cache rebuilds. Above this count only the translucent
+/// fill copy is simplified to the ceiling; outlines and hit testing retain the
+/// exact source ring. Ordinary warning polygons remain pixel-identical.
 const HAZARD_FILL_VERTEX_LIMIT: usize = 600;
 const SCREEN_POLYGON_MAX_SEGMENT_DIAGONAL_FRACTION: f32 = 0.35;
 const SCREEN_POLYGON_MIN_MAX_SEGMENT_PX: f32 = 110.0;
@@ -66721,6 +66720,69 @@ mod tests {
         assert_eq!(
             fill_paint_multiplicity(&built.fill_shapes, overlap_point),
             2
+        );
+    }
+
+    #[test]
+    fn coastline_dense_tropical_fill_survives_and_layers_over_flood() {
+        let tropical_points = (0..2_400)
+            .map(|index| {
+                let angle = std::f32::consts::TAU * index as f32 / 2_400.0;
+                let radius = 0.72 + 0.035 * (angle * 17.0).sin();
+                HazardPoint {
+                    lon: radius * angle.cos(),
+                    lat: radius * angle.sin(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let flood = test_hazard_record(
+            "KLIX.FL.W.0001",
+            "FLW 0001",
+            "flood",
+            square_hazard_points(-0.3, -0.3, 0.3, 0.3),
+        );
+        let tropical = test_hazard_record(
+            "KLIX.TR.W.1001#zone-LAZ068",
+            "TRW 1001",
+            "tropical storm",
+            tropical_points,
+        );
+        let mut app = test_viewer_app_with_hazards(vec![flood, tropical]);
+        app.map_center_lat = 0.0;
+        app.map_center_lon = 0.0;
+        app.map_scale = 520.0;
+        let rect = test_map_rect();
+
+        let tropical_screen = app.hazard_overlay.as_ref().expect("test overlay").records[1]
+            .points
+            .iter()
+            .map(|point| app.lon_lat_to_screen(rect, point.lon, point.lat))
+            .collect::<Vec<_>>();
+        assert!(tropical_screen.len() > HAZARD_FILL_VERTEX_LIMIT);
+        let bounded = bounded_hazard_fill_points(&tropical_screen).expect("bounded fill ring");
+        assert_eq!(bounded.len(), HAZARD_FILL_VERTEX_LIMIT);
+        let overlap_point = app.lon_lat_to_screen(rect, 0.13, 0.17);
+        assert!(
+            screen_polygon_contains_point(&bounded, overlap_point),
+            "bounded tropical fill must retain its interior"
+        );
+
+        let built = app.build_hazard_overlay_shapes(rect, None);
+
+        assert_eq!(
+            built.fill_shapes.len(),
+            2,
+            "the dense tropical zone and overlapping flood must both retain fills"
+        );
+        assert_eq!(
+            built.outline_shapes.len(),
+            2,
+            "fill simplification must not replace either exact outline"
+        );
+        assert_eq!(
+            fill_paint_multiplicity(&built.fill_shapes, overlap_point),
+            2,
+            "cross-family overlap must paint both translucent layers"
         );
     }
 

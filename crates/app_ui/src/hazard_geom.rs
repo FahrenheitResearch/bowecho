@@ -3369,6 +3369,94 @@ pub(crate) fn cleaned_screen_polygon(points: &[egui::Pos2]) -> Vec<egui::Pos2> {
     cleaned
 }
 
+fn screen_triangle_area_key(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> u32 {
+    cross_points(a, b, c).abs().to_bits()
+}
+
+/// Reduce a dense closed screen ring to an exact vertex budget while keeping
+/// its most important corners. This is the Visvalingam effective-area idea:
+/// repeatedly remove the least-area vertex and update only its two neighbors.
+/// The original ring remains untouched for outlines, hit testing, and hazard
+/// identity; this bounded copy exists only so coastline-traced NWS zones can
+/// retain a translucent fill without reintroducing an unbounded O(n^2)
+/// tessellation during every pan or zoom.
+fn simplify_closed_screen_ring(points: &[egui::Pos2], max_points: usize) -> Vec<egui::Pos2> {
+    let count = points.len();
+    let target = max_points.max(3);
+    if count <= target {
+        return points.to_vec();
+    }
+
+    let mut previous = (0..count)
+        .map(|index| if index == 0 { count - 1 } else { index - 1 })
+        .collect::<Vec<_>>();
+    let mut next = (0..count)
+        .map(|index| if index + 1 == count { 0 } else { index + 1 })
+        .collect::<Vec<_>>();
+    let mut active = vec![true; count];
+    let mut versions = vec![0_u32; count];
+    let mut queue =
+        std::collections::BinaryHeap::<std::cmp::Reverse<(u32, usize, u32)>>::with_capacity(
+            count * 2,
+        );
+    for index in 0..count {
+        queue.push(std::cmp::Reverse((
+            screen_triangle_area_key(points[previous[index]], points[index], points[next[index]]),
+            index,
+            versions[index],
+        )));
+    }
+
+    let mut remaining = count;
+    while remaining > target {
+        let Some(std::cmp::Reverse((_, index, version))) = queue.pop() else {
+            break;
+        };
+        if !active[index] || versions[index] != version {
+            continue;
+        }
+
+        let left = previous[index];
+        let right = next[index];
+        active[index] = false;
+        remaining -= 1;
+        next[left] = right;
+        previous[right] = left;
+
+        for neighbor in [left, right] {
+            versions[neighbor] = versions[neighbor].wrapping_add(1);
+            queue.push(std::cmp::Reverse((
+                screen_triangle_area_key(
+                    points[previous[neighbor]],
+                    points[neighbor],
+                    points[next[neighbor]],
+                ),
+                neighbor,
+                versions[neighbor],
+            )));
+        }
+    }
+
+    points
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, point)| active[index].then_some(point))
+        .collect()
+}
+
+/// Return a tessellation-safe fill ring. Ordinary warnings remain pixel
+/// identical; only rings above [`HAZARD_FILL_VERTEX_LIMIT`] are simplified,
+/// and the result is always bounded by that same performance budget.
+pub(crate) fn bounded_hazard_fill_points(points: &[egui::Pos2]) -> Option<Vec<egui::Pos2>> {
+    let cleaned = cleaned_screen_polygon(points);
+    if cleaned.len() < 3 {
+        return None;
+    }
+    let bounded = simplify_closed_screen_ring(&cleaned, HAZARD_FILL_VERTEX_LIMIT);
+    (bounded.len() >= 3).then_some(bounded)
+}
+
 /// Triangulate a cleaned, non-self-intersecting screen ring via earcut (the
 /// tessellator the outlook holes path already uses). Earcut tolerates the
 /// degenerate vertex patterns real CAP rings carry — repeated vertices,
@@ -3768,14 +3856,14 @@ mod tests {
         assert_eq!(selected, ["inside", "pad"]);
     }
 
-    /// Golden parity: default SPC outlook styling (fill 58, stroke 230,
+    /// Readable default SPC outlook styling (fill 80, stroke 230,
     /// width 2.0, published colors) and report markers (tornado red 5 px
     /// w/ black outline, wind blue 3.5, hail green 3.5, no outline).
     #[test]
     fn default_styles_pin_spc_constants() {
         let registry = styles::StyleRegistry::default();
         let spc = registry.spc();
-        assert_eq!(spc.outlook_fill_alpha, 58);
+        assert_eq!(spc.outlook_fill_alpha, 80);
         assert_eq!(spc.outlook_stroke_alpha, 230);
         assert_eq!(spc.outlook_stroke_width, 2.0);
         assert!(spc.use_spc_published_colors);
@@ -4461,12 +4549,54 @@ mod tests {
             .collect::<BTreeSet<_>>();
         dedupe_hazard_records(&mut records);
 
+        let oversized = records
+            .iter()
+            .filter(|record| record.points.len() > HAZARD_FILL_VERTEX_LIMIT)
+            .count();
+        let max_points = records
+            .iter()
+            .map(|record| record.points.len())
+            .max()
+            .unwrap_or_default();
+        let total_points = records
+            .iter()
+            .map(|record| record.points.len())
+            .sum::<usize>();
+        let oversized_fillable = records
+            .iter()
+            .filter(|record| record.points.len() > HAZARD_FILL_VERTEX_LIMIT)
+            .filter(|record| {
+                let center_lon = (record.bbox[0] + record.bbox[2]) * 0.5;
+                let center_lat = (record.bbox[1] + record.bbox[3]) * 0.5;
+                let lon_scale = center_lat.to_radians().cos().max(0.2) * 520.0;
+                let screen = record
+                    .points
+                    .iter()
+                    .map(|point| {
+                        egui::pos2(
+                            (point.lon - center_lon) * lon_scale,
+                            (center_lat - point.lat) * 520.0,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                bounded_hazard_fill_points(&screen).is_some_and(|bounded| {
+                    filled_polygon_mesh(&bounded, egui::Color32::WHITE).is_some()
+                })
+            })
+            .count();
+
         println!(
-            "live tropical proof: features={} zoneless_zones={} base_events={} retained_polygons={}",
+            "live tropical proof: features={} zoneless_zones={} base_events={} \
+             retained_polygons={} oversized_fills={} oversized_fillable={} \
+             max_points={} total_points={}",
             tropical.len(),
             zone_urls.len(),
             base_events.len(),
-            records.len()
+            records.len(),
+            oversized,
+            oversized_fillable,
+            max_points,
+            total_points,
         );
         assert!(
             records.len() > base_events.len(),
@@ -4476,6 +4606,10 @@ mod tests {
             matches!(record.event_family.as_str(), "tropical storm" | "hurricane")
                 && hazard_points_renderable(&record.points)
         }));
+        assert_eq!(
+            oversized_fillable, oversized,
+            "every live oversized tropical ring must keep a bounded fill mesh"
+        );
     }
 
     #[test]

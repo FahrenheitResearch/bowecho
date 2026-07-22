@@ -1904,20 +1904,19 @@ impl ViewerApp {
             let solid = matches!(style.dash, styles::DashPattern::Solid);
             let legit_px = hazard_bbox_segment_allowance_px(record.bbox, self.map_scale);
             let has_screen_jump = screen_polyline_has_jump(&points, true, rect, legit_px);
-            // Perf edge case: a coastline-traced polygon (an Alaska marine SPS,
-            // or a big multi-county watch union) can carry thousands of
-            // vertices, and the fill runs an O(n^2) self-intersection scan
-            // plus a huge per-frame mesh. Above the limit we skip ONLY the
-            // fill and let the existing, jump-aware outline path draw the
-            // ring verbatim — no geometry is altered, so nothing new can
-            // self-intersect. Normal polygons (the overwhelming majority) are
-            // well under the limit and unchanged.
-            let fill_ok = points.len() <= HAZARD_FILL_VERTEX_LIMIT;
+            // A coastline-traced zone can carry thousands of vertices. Keep
+            // its exact, jump-aware outline, but reduce the fill-only copy to
+            // the tessellation budget so it remains visible without restoring
+            // the old O(n^2) zoom lag.
             // Alpha zero is a rendering disable, not merely transparent ink.
             // Avoid all tessellation/union work when there is nothing to
             // paint; this also makes the user-facing Fill=0 setting an actual
             // performance escape hatch.
-            if fill_alpha > 0 && !heavy_family && !has_screen_jump && fill_ok {
+            if fill_alpha > 0
+                && !heavy_family
+                && !has_screen_jump
+                && let Some(fill_points) = bounded_hazard_fill_points(&points)
+            {
                 // Fills are not pushed directly: same-family same-color fills
                 // are flattened after the loop so overlaps paint once
                 // (selection boosts alpha, giving the selected record its own
@@ -1925,7 +1924,7 @@ impl ViewerApp {
                 fill_candidates.push(HazardFillCandidate {
                     family: record.event_family.clone(),
                     fill,
-                    points: points.clone(),
+                    points: fill_points,
                 });
             }
             if solid {

@@ -562,7 +562,9 @@ impl Default for HazardGlobalStyle {
 impl Default for SpcStyle {
     fn default() -> Self {
         Self {
-            outlook_fill_alpha: 58,
+            // Field feedback found the former 58/255 wash especially hard to
+            // distinguish on tornado-probability outlooks over radar data.
+            outlook_fill_alpha: 80,
             outlook_stroke_alpha: 230,
             outlook_stroke_width: 2.0,
             use_spc_published_colors: true,
