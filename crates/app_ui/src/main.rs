@@ -403,6 +403,38 @@ const MAX_MAP_SCALE: f32 = 32_000.0;
 const DEFAULT_RADAR_RANGE_KM: f32 = 460.0;
 const SURFACE_OBS_LOOP_WINDOW_MS: i64 = 60 * 60 * 1000;
 const SURFACE_OBS_LOOP_PLAYBACK_MS: u128 = 30 * 1000;
+
+/// Elapsed presentation time for a loop whose wall clock can be frozen.
+fn loop_clock_elapsed_at(
+    started_at: Instant,
+    paused_at: Option<Instant>,
+    now: Instant,
+) -> Duration {
+    paused_at
+        .unwrap_or(now)
+        .saturating_duration_since(started_at)
+}
+
+/// Pause/resume a loop clock without changing its playhead. On resume, shift
+/// the origin by exactly the hidden duration so elapsed presentation time is
+/// continuous rather than jumping to the current wall clock.
+fn sync_loop_clock_running(
+    started_at: &mut Instant,
+    paused_at: &mut Option<Instant>,
+    running: bool,
+    now: Instant,
+) -> bool {
+    if running {
+        if let Some(paused) = paused_at.take() {
+            *started_at += now.saturating_duration_since(paused);
+        }
+        true
+    } else {
+        paused_at.get_or_insert(now);
+        false
+    }
+}
+
 /// Top of the vertical cross-section (m above the radar) — shared by the
 /// compute and the panel's height-axis labels so they can't drift.
 const CROSS_SECTION_TOP_M: f32 = 18_000.0;
@@ -3395,6 +3427,10 @@ struct ViewerApp {
     obs_adjust_soundings: bool,
     obs_hour_loop_enabled: bool,
     obs_hour_loop_started_at: Instant,
+    /// The wall-clock instant when the obs loop became non-visible. Keeping
+    /// this separate from `started_at` freezes the playhead while Surface obs
+    /// are off or the Map tile is covered, then resumes at the same frame.
+    obs_hour_loop_paused_at: Option<Instant>,
     obs_hour_loop_end_utc: DateTime<Utc>,
     surface_obs: obs::ObPool,
     obs_fetched_at: Option<Instant>,
@@ -9105,6 +9141,7 @@ impl ViewerApp {
             obs_adjust_soundings: restored_obs_adjust_soundings,
             obs_hour_loop_enabled: false,
             obs_hour_loop_started_at: Instant::now(),
+            obs_hour_loop_paused_at: None,
             obs_hour_loop_end_utc: Utc::now(),
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
@@ -11550,14 +11587,36 @@ impl ViewerApp {
 
     fn surface_obs_frame_time_utc(&self) -> DateTime<Utc> {
         if self.obs_hour_loop_enabled {
-            let elapsed_ms =
-                self.obs_hour_loop_started_at.elapsed().as_millis() % SURFACE_OBS_LOOP_PLAYBACK_MS;
+            let elapsed_ms = loop_clock_elapsed_at(
+                self.obs_hour_loop_started_at,
+                self.obs_hour_loop_paused_at,
+                Instant::now(),
+            )
+            .as_millis()
+                % SURFACE_OBS_LOOP_PLAYBACK_MS;
             let frame_offset_ms = (elapsed_ms as i64 * SURFACE_OBS_LOOP_WINDOW_MS)
                 / SURFACE_OBS_LOOP_PLAYBACK_MS as i64;
             return self.obs_hour_loop_end_utc
                 - chrono::Duration::milliseconds(SURFACE_OBS_LOOP_WINDOW_MS - frame_offset_ms);
         }
         self.displayed_timeline_time_utc().unwrap_or_else(Utc::now)
+    }
+
+    /// Synchronize the surface-observation loop with actual map visibility.
+    /// Returns true only while the playhead should animate and therefore
+    /// needs its 100 ms presentation repaint.
+    fn sync_surface_obs_hour_loop_visibility(&mut self, now: Instant) -> bool {
+        if !self.obs_hour_loop_enabled {
+            self.obs_hour_loop_paused_at = None;
+            return false;
+        }
+        let visible = self.obs_enabled && self.workspace.is_pane_active(dock::WorkspacePane::Map);
+        sync_loop_clock_running(
+            &mut self.obs_hour_loop_started_at,
+            &mut self.obs_hour_loop_paused_at,
+            visible,
+            now,
+        )
     }
 
     fn arm_unified_player_timeline_warning_sync(&mut self) {
@@ -20402,14 +20461,20 @@ impl eframe::App for ViewerApp {
         self.poll_archive_listing(&ctx);
         self.poll_intl_archive_listing(&ctx);
         self.poll_spc_reports(&ctx);
-        self.tropical.maybe_refresh(&ctx);
+        let map_pane_active = self.workspace.is_pane_active(dock::WorkspacePane::Map);
+        let tropical_visible = self.app_settings.show_tropical
+            && (map_pane_active || self.app_settings.show_tropical_panel);
+        self.tropical.maybe_refresh(&ctx, tropical_visible);
         self.tropical.poll();
-        self.tropical
-            .hurricane_hunters
-            .maybe_refresh(&ctx, self.app_settings.show_hurricane_hunters);
+        self.tropical.hurricane_hunters.maybe_refresh(
+            &ctx,
+            self.app_settings.show_hurricane_hunters && map_pane_active,
+        );
         self.tropical.hurricane_hunters.poll(Utc::now());
         if self.app_settings.show_tropical {
-            self.tropical.drive_geometry(&ctx);
+            if tropical_visible {
+                self.tropical.drive_geometry(&ctx);
+            }
             if self.app_settings.show_tropical_panel {
                 // Local `open` mirrors the [✕] into the persisted setting
                 // without a double borrow of `self` (the body closure also
@@ -20503,7 +20568,7 @@ impl eframe::App for ViewerApp {
         self.pump_ingest_responses();
         self.poll_surface_obs(&ctx);
         self.river_gauges.poll();
-        if self.obs_hour_loop_enabled {
+        if self.sync_surface_obs_hour_loop_visibility(Instant::now()) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         if self.glm_enabled {
@@ -27594,7 +27659,7 @@ impl ViewerApp {
     }
 
     fn request_repaint_for_background_activity(&self, ctx: &egui::Context) {
-        if self.active_background_activity().is_some() {
+        if self.background_activity_needs_progress_poll() {
             ctx.request_repaint_after(Duration::from_millis(BACKGROUND_ACTIVITY_REPAINT_MS));
         }
         // Keep-alive: while a live warning watch or live radar poll is armed,
@@ -27608,6 +27673,14 @@ impl ViewerApp {
         if self.live_hazard_auto_refresh || self.primary.live.enabled {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+    }
+
+    /// Only progress counters that mutate without delivering an egui wake
+    /// need the global 250 ms timer. Completion-notifying workers and scoped
+    /// channel pollers wake/schedule themselves; treating every status entry
+    /// as a heartbeat kept the entire app alive while unrelated work ran.
+    fn background_activity_needs_progress_poll(&self) -> bool {
+        self.oa_comp_rx.is_some() || self.wofs.georef_rx.is_some()
     }
 
     fn status_or_activity_label(&self, fallback: &str) -> String {
@@ -67758,6 +67831,7 @@ mod tests {
             obs_adjust_soundings: false,
             obs_hour_loop_enabled: false,
             obs_hour_loop_started_at: Instant::now(),
+            obs_hour_loop_paused_at: None,
             obs_hour_loop_end_utc: Utc::now(),
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
@@ -69454,6 +69528,68 @@ mod tests {
 
         assert_eq!(activity.label, "Archive loop 3/5 - Decoded KTLX scan");
         assert_eq!(activity.fraction, Some(0.6));
+    }
+
+    #[test]
+    fn hidden_loop_clock_freezes_and_resumes_without_a_playhead_jump() {
+        let origin = Instant::now();
+        let mut started_at = origin;
+        let mut paused_at = None;
+        let hide_at = origin + Duration::from_secs(7);
+
+        assert!(!sync_loop_clock_running(
+            &mut started_at,
+            &mut paused_at,
+            false,
+            hide_at,
+        ));
+        assert_eq!(paused_at, Some(hide_at));
+        assert_eq!(
+            loop_clock_elapsed_at(started_at, paused_at, hide_at + Duration::from_secs(19)),
+            Duration::from_secs(7),
+            "wall-clock time while hidden must not advance the obs playhead"
+        );
+
+        let resume_at = hide_at + Duration::from_secs(19);
+        assert!(sync_loop_clock_running(
+            &mut started_at,
+            &mut paused_at,
+            true,
+            resume_at,
+        ));
+        assert!(paused_at.is_none());
+        assert_eq!(
+            loop_clock_elapsed_at(started_at, paused_at, resume_at),
+            Duration::from_secs(7),
+            "resuming must preserve the exact visible playhead"
+        );
+        assert_eq!(
+            loop_clock_elapsed_at(started_at, paused_at, resume_at + Duration::from_secs(3)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn only_atomic_background_progress_needs_the_global_timer() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        let (_sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.load_receiver = Some(receiver);
+        assert!(app.active_background_activity().is_some());
+        assert!(
+            !app.background_activity_needs_progress_poll(),
+            "completion-notifying/scoped load pollers must not inherit a global heartbeat"
+        );
+        app.load_receiver = None;
+
+        let (_sender, receiver) = mpsc::channel::<OaCompositesResult>();
+        app.oa_comp_rx = Some(receiver);
+        assert!(app.background_activity_needs_progress_poll());
+        app.oa_comp_rx = None;
+
+        let (_sender, receiver) = mpsc::channel::<Result<wofs_georef::WofsGeoref, String>>();
+        app.wofs.georef_rx = Some(("WOFSRun20260722-test".to_owned(), receiver));
+        assert!(app.background_activity_needs_progress_poll());
     }
 
     fn test_archive_object(site: &str, time_hms: &str) -> data_source::S3Object {

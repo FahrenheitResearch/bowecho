@@ -180,7 +180,10 @@ impl Default for TropicalState {
 impl TropicalState {
     /// Kick a refresh if it's due and none is in flight; heartbeat so the
     /// interval keeps ticking on an otherwise-idle map.
-    pub fn maybe_refresh(&mut self, ctx: &egui::Context) {
+    pub fn maybe_refresh(&mut self, ctx: &egui::Context, visible: bool) {
+        if !visible {
+            return;
+        }
         // Until we have a good result, poll aggressively so a slow/failed first
         // fetch recovers in seconds instead of after the full 10-minute cycle.
         let interval = if self.last_fetch_ok == Some(true) {
@@ -1607,5 +1610,38 @@ mod tests {
         let first = state.next_sat_view_ticket();
         let second = state.next_sat_view_ticket();
         assert!(second > first && first > 0);
+    }
+
+    #[test]
+    fn hidden_tropical_state_does_not_start_work_or_a_heartbeat() {
+        let ctx = egui::Context::default();
+        let repaint_delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&repaint_delays);
+        ctx.set_request_repaint_callback(move |info| {
+            captured
+                .lock()
+                .expect("repaint callback lock")
+                .push(info.delay);
+        });
+        let mut state = TropicalState::default();
+
+        state.maybe_refresh(&ctx, false);
+
+        assert!(state.last_refresh.is_none());
+        assert!(!state.storms_rx.in_flight());
+        assert!(
+            repaint_delays
+                .lock()
+                .expect("repaint callback lock")
+                .is_empty(),
+            "a hidden tropical layer must not keep a one-second heartbeat alive"
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel::<StormsResult>();
+        state.storms_rx.inject_for_test(receiver);
+        sender.send(Ok(Vec::new())).expect("inject hidden result");
+        state.poll();
+        assert_eq!(state.last_fetch_ok, Some(true));
+        assert!(!state.storms_rx.in_flight());
     }
 }

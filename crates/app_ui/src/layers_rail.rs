@@ -907,6 +907,7 @@ impl ViewerApp {
             let mut obs_adjust_soundings = self.obs_adjust_soundings;
             let obs_hour_loop_enabled = &mut self.obs_hour_loop_enabled;
             let obs_hour_loop_started_at = &mut self.obs_hour_loop_started_at;
+            let obs_hour_loop_paused_at = &mut self.obs_hour_loop_paused_at;
             let obs_hour_loop_end_utc = &mut self.obs_hour_loop_end_utc;
             let obs_fetched_at = self.obs_fetched_at;
             let obs_station_count = self.surface_obs.station_count;
@@ -948,12 +949,16 @@ impl ViewerApp {
                             {
                                 if *obs_hour_loop_enabled {
                                     *obs_hour_loop_started_at = Instant::now();
+                                    *obs_hour_loop_paused_at = None;
                                     *obs_hour_loop_end_utc = chrono::Utc::now();
+                                } else {
+                                    *obs_hour_loop_paused_at = None;
                                 }
                                 ui.ctx().request_repaint();
                             }
                             if *obs_hour_loop_enabled && ui.button("Restart obs loop").clicked() {
                                 *obs_hour_loop_started_at = Instant::now();
+                                *obs_hour_loop_paused_at = None;
                                 *obs_hour_loop_end_utc = chrono::Utc::now();
                                 ui.ctx().request_repaint();
                             }
