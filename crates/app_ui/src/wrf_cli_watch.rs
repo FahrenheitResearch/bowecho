@@ -838,8 +838,12 @@ mod tests {
             valid_times: Vec::new(),
             grid: Default::default(),
         };
-        assert!(source_receipt_for_path(&[receipt.clone()], &receipt.path, 42).is_some());
-        assert!(source_receipt_for_path(&[receipt.clone()], &receipt.path, 41).is_none());
+        assert!(
+            source_receipt_for_path(std::slice::from_ref(&receipt), &receipt.path, 42).is_some()
+        );
+        assert!(
+            source_receipt_for_path(std::slice::from_ref(&receipt), &receipt.path, 41).is_none()
+        );
         assert!(source_receipt_for_path(&[receipt], Path::new("other"), 42).is_none());
     }
 
