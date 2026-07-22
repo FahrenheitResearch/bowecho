@@ -120,17 +120,41 @@ pub fn expand_input_files(input: &Path) -> Result<Vec<PathBuf>, CliError> {
             input.display()
         )));
     }
-
-    let mut files = Vec::new();
-    visit_directory(input, 0, &mut files)?;
-    files.sort_by_key(|path| stable_path_key(path));
-    files.dedup();
+    let files = discover_input_files(input)?;
     if files.is_empty() {
         return Err(CliError::input(format!(
             "no NetCDF/HDF5 candidates found under {}",
             input.display()
         )));
     }
+    Ok(files)
+}
+
+/// Discover current NetCDF/HDF5 candidates beneath a live directory. Unlike
+/// [`expand_input_files`], an empty directory is a valid snapshot: a watcher
+/// waits for the producer instead of treating "nothing written yet" as a
+/// fatal input error. Symlinks are still refused/skipped and ordering remains
+/// deterministic.
+pub fn discover_input_files(directory: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let metadata = fs::symlink_metadata(directory).map_err(|error| {
+        CliError::input(format!("cannot inspect {}: {error}", directory.display()))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::input(format!(
+            "refusing symlink input {}",
+            directory.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(CliError::input(format!(
+            "watch input is not a directory: {}",
+            directory.display()
+        )));
+    }
+    let mut files = Vec::new();
+    visit_directory(directory, 0, &mut files)?;
+    files.sort_by_key(|path| stable_path_key(path));
+    files.dedup();
     Ok(files)
 }
 
@@ -289,6 +313,13 @@ mod tests {
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["a", "z.nc"]);
+    }
+
+    #[test]
+    fn live_discovery_allows_an_empty_directory() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(discover_input_files(root.path()).unwrap().is_empty());
+        assert!(expand_input_files(root.path()).is_err());
     }
 
     #[test]
