@@ -759,7 +759,7 @@ fn receipt_manifest_path(main: &Path, source_sha256: &str) -> Result<PathBuf, Cl
     let parent = main.parent().unwrap_or_else(|| Path::new("."));
     Ok(parent.join(format!(
         "artifact-manifest.source-{}.json",
-        &source_sha256[..16].to_ascii_lowercase()
+        source_sha256[..16].to_ascii_lowercase()
     )))
 }
 

@@ -649,14 +649,14 @@ impl RiverGaugeState {
                 painter.circle_stroke(
                     point.position,
                     radius + 2.6,
-                    egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 205, 80)),
+                    egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(255, 205, 80)),
                 );
             }
             if selected {
                 painter.circle_stroke(
                     point.position,
                     radius + 4.2,
-                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
                 );
             }
             if hovered {
@@ -1467,7 +1467,7 @@ fn draw_hydrograph(
     painter.rect_stroke(
         plot,
         2.0,
-        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)),
         egui::StrokeKind::Inside,
     );
     let total_seconds = (max_time - min_time).num_seconds().max(1) as f64;
@@ -1488,7 +1488,7 @@ fn draw_hydrograph(
             let y = position(min_time, value).y;
             painter.line_segment(
                 [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-                egui::Stroke::new(0.8, category.color().gamma_multiply(0.65)),
+                egui::Stroke::new(0.8_f32, category.color().gamma_multiply(0.65)),
             );
         }
     }
@@ -1499,7 +1499,7 @@ fn draw_hydrograph(
             .filter_map(|point| point.primary.map(|value| position(point.time, value)))
             .collect::<Vec<_>>();
         if points.len() >= 2 {
-            painter.add(egui::Shape::line(points, egui::Stroke::new(1.8, color)));
+            painter.add(egui::Shape::line(points, egui::Stroke::new(1.8_f32, color)));
         }
     };
     if let Some(observed) = &hydrograph.observed {

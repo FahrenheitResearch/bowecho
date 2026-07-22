@@ -1643,11 +1643,14 @@ impl WofsState {
             // both satellite imagery and BowEcho's dark vector basemap.
             painter.add(egui::Shape::line(
                 outline.clone(),
-                egui::Stroke::new(4.5, egui::Color32::from_rgba_unmultiplied(2, 7, 12, 235)),
+                egui::Stroke::new(
+                    4.5_f32,
+                    egui::Color32::from_rgba_unmultiplied(2, 7, 12, 235),
+                ),
             ));
             painter.add(egui::Shape::line(
                 outline,
-                egui::Stroke::new(2.25, egui::Color32::from_rgb(188, 239, 255)),
+                egui::Stroke::new(2.25_f32, egui::Color32::from_rgb(188, 239, 255)),
             ));
         }
     }

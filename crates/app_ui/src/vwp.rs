@@ -839,7 +839,7 @@ fn draw_hodograph(
         let v_kt = -motion.speed_kt * direction_rad.cos();
         let position = center + egui::vec2(u_kt / scale_kt * radius, -v_kt / scale_kt * radius);
         let color = visuals.warn_fg_color;
-        painter.line_segment([center, position], egui::Stroke::new(1.3, color));
+        painter.line_segment([center, position], egui::Stroke::new(1.3_f32, color));
         let diamond = [
             position + egui::vec2(0.0, -5.0),
             position + egui::vec2(5.0, 0.0),
@@ -849,7 +849,7 @@ fn draw_hodograph(
         painter.add(egui::Shape::convex_polygon(
             diamond.to_vec(),
             color,
-            egui::Stroke::new(1.0, visuals.extreme_bg_color),
+            egui::Stroke::new(1.0_f32, visuals.extreme_bg_color),
         ));
         painter.text(
             position + egui::vec2(7.0, -7.0),
