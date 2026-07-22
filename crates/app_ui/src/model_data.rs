@@ -148,6 +148,7 @@ impl WrfProcessUiState {
         };
         crate::wrf_process::WrfProcessOptions {
             core_fields: self.core_fields,
+            sounding_volumes: true,
             diagnostics: self.diagnostics,
             heavy_ecape: self.heavy_ecape,
             raw_extras: self.raw_extras,
@@ -4633,6 +4634,7 @@ impl ModelDataDock {
                 {
                     let options = crate::wrf_process::WrfProcessOptions {
                         core_fields: true,
+                        sounding_volumes: true,
                         diagnostics: false,
                         heavy_ecape: false,
                         raw_extras: false,

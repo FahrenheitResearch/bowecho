@@ -35,6 +35,11 @@ pub struct WrfProcessTask {
 pub struct WrfProcessOptions {
     #[serde(default = "default_true")]
     pub core_fields: bool,
+    /// Build the five isobaric 3-D sounding volumes. Desktop full processing
+    /// keeps this on; plot-only headless batches disable it to avoid decoding
+    /// and interpolating data they will never render.
+    #[serde(default = "default_true")]
+    pub sounding_volumes: bool,
     #[serde(default = "default_true")]
     pub diagnostics: bool,
     #[serde(default)]
@@ -61,6 +66,7 @@ impl Default for WrfProcessOptions {
     fn default() -> Self {
         Self {
             core_fields: true,
+            sounding_volumes: true,
             diagnostics: true,
             heavy_ecape: false,
             raw_extras: true,
@@ -95,7 +101,7 @@ impl WrfProcessOptions {
         }
         // Isobaric sounding volumes ride along with the core group (they are
         // gated on `core_fields` in `read_wrf_products`).
-        if self.core_fields {
+        if self.core_fields && self.sounding_volumes {
             for iso in ISO_VOLUME_NAMES {
                 names.push((*iso).to_string());
             }
@@ -1037,7 +1043,7 @@ fn read_wrf_products(
     // clears the cache right after its LAST getvar (the hour's last), so the
     // interpolation loop and the store write below run without the ~5 GB of
     // dead intermediates.
-    if options.core_fields {
+    if options.core_fields && options.sounding_volumes {
         // Isolated for the same reason as `compute_var`: the volume builder's
         // `getvar` reads must degrade to a note, not kill the hour.
         let volumes_result = isolate_panics("isobaric volumes", || {
@@ -2271,6 +2277,17 @@ mod tests {
         assert!(core_only.iter().any(|name| name == "temperature_2m"));
         assert!(core_only.iter().any(|name| name == "height_iso"));
         assert!(!core_only.iter().any(|name| name == "sbcape"));
+
+        let plot_only = WrfProcessOptions {
+            sounding_volumes: false,
+            diagnostics: false,
+            raw_extras: false,
+            ..WrfProcessOptions::default()
+        }
+        .normalized()
+        .planned_store_fields();
+        assert!(plot_only.iter().any(|name| name == "temperature_2m"));
+        assert!(!plot_only.iter().any(|name| name == "temperature_iso"));
 
         // Enabling heavy eCAPE adds the entrainment-CAPE family (e.g.
         // ecape_scp / ecape_ehi from wrf-core's VARS).
