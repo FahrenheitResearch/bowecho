@@ -325,6 +325,18 @@ impl TorTracksState {
 }
 
 impl crate::ViewerApp {
+    pub(crate) fn set_tor_track_layers_visible(&mut self, show_tracks: bool, show_tds: bool) {
+        self.tor_tracks.show_tracks = show_tracks;
+        self.tor_tracks.show_tds = show_tds;
+        if self.app_settings.rotation_tracks_enabled != show_tracks
+            || self.app_settings.tds_tracks_enabled != show_tds
+        {
+            self.app_settings.rotation_tracks_enabled = show_tracks;
+            self.app_settings.tds_tracks_enabled = show_tds;
+            self.mark_app_settings_dirty();
+        }
+    }
+
     /// Per-update pump: install finished background work, reconcile the
     /// processed frames with the loaded history (site switch / trimmed loop /
     /// re-decoded live frames), kick the next background job, and keep the
@@ -817,9 +829,7 @@ impl crate::ViewerApp {
         let show_tracks = state.show_tracks;
         let show_tds = state.show_tds;
         if previous_show_tracks != show_tracks || previous_show_tds != show_tds {
-            self.app_settings.rotation_tracks_enabled = show_tracks;
-            self.app_settings.tds_tracks_enabled = show_tds;
-            self.mark_app_settings_dirty();
+            self.set_tor_track_layers_visible(show_tracks, show_tds);
         }
     }
 }

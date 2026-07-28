@@ -8980,13 +8980,14 @@ impl ViewerApp {
             .as_ref()
             .map(|base| base.site_id.clone())
             .unwrap_or_default();
+        let restored_radar_algorithms = RadarAlgorithmPreferences::from_settings(&app_settings);
         let restored_tor_tracks = tor_tracks::TorTracksState::with_persisted(
             sites
                 .get(selected_site_index)
                 .map(|site| site.level2_id.as_str())
                 .unwrap_or("KTLX"),
-            app_settings.rotation_tracks_enabled,
-            app_settings.tds_tracks_enabled,
+            restored_radar_algorithms.rotation_tracks_enabled,
+            restored_radar_algorithms.tds_tracks_enabled,
         );
         let (render_sender, render_receiver, render_recycle_sender) = spawn_render_worker();
         let loop_prewarm = spawn_loop_prewarm_render_workers();
@@ -9016,7 +9017,6 @@ impl ViewerApp {
             normalized_storm_track_max_tracks(usize::from(app_settings.storm_track_max_tracks));
         let restored_storm_track_min_dbz =
             normalized_storm_track_min_dbz(app_settings.storm_track_min_dbz_tenths as f32 / 10.0);
-        let restored_show_storm_tracks = app_settings.storm_tracks_enabled;
         let mut app = Self {
             source_path,
             renderer_backend,
@@ -9056,7 +9056,7 @@ impl ViewerApp {
             bind_palette_to_product: false,
             table_editor: table_editor::TableEditor::default(),
             flip_velocity_color_polarity: false,
-            unfold_velocity_display: false,
+            unfold_velocity_display: restored_radar_algorithms.unfold_velocity_display,
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
             color_table_status:
@@ -9124,7 +9124,7 @@ impl ViewerApp {
             storm_cells_receiver: None,
             storm_cells_cache: BTreeMap::new(),
             storm_cells_cache_order: VecDeque::new(),
-            show_storm_tracks: restored_show_storm_tracks,
+            show_storm_tracks: restored_radar_algorithms.storm_tracks_enabled,
             storm_track_max_tracks: restored_storm_track_max_tracks,
             storm_track_min_dbz: restored_storm_track_min_dbz,
             storm_track_follow: None,
@@ -9135,10 +9135,10 @@ impl ViewerApp {
             rotation_receiver: None,
             rotation_markers_cache: BTreeMap::new(),
             rotation_markers_cache_order: VecDeque::new(),
-            show_rotation_markers: true,
+            show_rotation_markers: restored_radar_algorithms.rotation_markers_enabled,
             tor_tracks: restored_tor_tracks,
             gate_filter_dbz: None,
-            dealias_engine: DealiasEngine::Region,
+            dealias_engine: restored_radar_algorithms.dealias_engine,
             dealias_env: dealias_env::DealiasEnvCache::default(),
             display_smoothing: SmoothingMode::Native,
             hail_freezing_level_km: 3.2,
@@ -13758,6 +13758,35 @@ impl ViewerApp {
         // state warm while hidden so toggling the layer (or reopening the app)
         // does not throw away the accumulated path.
         self.storm_cells_volume_ptr = 0;
+    }
+
+    fn set_rotation_markers_visible(&mut self, enabled: bool) {
+        self.show_rotation_markers = enabled;
+        if self.app_settings.rotation_markers_enabled != enabled {
+            self.app_settings.rotation_markers_enabled = enabled;
+            self.mark_app_settings_dirty();
+        }
+        self.rotation_markers_key = None;
+        if !enabled {
+            self.rotation_markers.clear();
+        }
+    }
+
+    fn set_unfold_velocity_display(&mut self, enabled: bool) {
+        self.unfold_velocity_display = enabled;
+        if self.app_settings.unfold_velocity_display != enabled {
+            self.app_settings.unfold_velocity_display = enabled;
+            self.mark_app_settings_dirty();
+        }
+    }
+
+    fn set_dealias_engine(&mut self, engine: DealiasEngine) {
+        self.dealias_engine = engine;
+        let slug = engine.settings_slug();
+        if self.app_settings.dealias_engine != slug {
+            self.app_settings.dealias_engine = slug.to_owned();
+            self.mark_app_settings_dirty();
+        }
     }
 
     fn storm_track_cells_for_settings(&self, cells: &[StormCell]) -> Vec<StormCell> {
@@ -19929,7 +19958,7 @@ impl ViewerApp {
             .collect();
         self.spc_reports_enabled = true;
         self.spc_last_key = None;
-        self.show_rotation_markers = true;
+        self.set_rotation_markers_visible(true);
         self.set_storm_tracks_visible(true);
         self.show_inspector_card = true;
         self.vrot_tool_armed = false;
@@ -21546,7 +21575,7 @@ impl ViewerApp {
                 self.obs_show_metar = true;
                 self.obs_show_mesonet = true;
                 self.glm_enabled = true;
-                self.show_rotation_markers = true;
+                self.set_rotation_markers_visible(true);
                 self.set_storm_tracks_visible(true);
                 self.show_inspector_card = true;
                 self.vrot_tool_armed = false;
@@ -21560,7 +21589,7 @@ impl ViewerApp {
                 self.sidebar_tab = SidebarTab::Radar;
                 self.hazards_visible = true;
                 self.hazards_active_only = true;
-                self.show_rotation_markers = true;
+                self.set_rotation_markers_visible(true);
                 self.set_storm_tracks_visible(true);
                 self.show_inspector_card = true;
                 self.vrot_tool_armed = true;
@@ -21751,7 +21780,7 @@ impl ViewerApp {
         self.sat_map_follow = snapshot.sat_map_follow;
         self.app_settings.show_tropical = snapshot.show_tropical;
         self.app_settings.show_tropical_panel = snapshot.show_tropical_panel;
-        self.show_rotation_markers = snapshot.show_rotation_markers;
+        self.set_rotation_markers_visible(snapshot.show_rotation_markers);
         self.set_storm_tracks_visible(snapshot.show_storm_tracks);
         self.show_inspector_card = snapshot.show_inspector_card;
         self.vrot_tool_armed = snapshot.vrot_tool_armed;
@@ -25229,13 +25258,15 @@ impl ViewerApp {
                 let plain_velocity =
                     matches!(editing_product, DisplayProduct::Moment(MomentType::Velocity));
                 if plain_velocity {
+                    let mut unfold_velocity_display = self.unfold_velocity_display;
                     let unfold_changed = ui
-                        .checkbox(&mut self.unfold_velocity_display, "Auto-dealias VEL")
+                        .checkbox(&mut unfold_velocity_display, "Auto-dealias VEL")
                         .on_hover_text(
                             "Off keeps plain VEL exactly as transmitted by the radar. Turn on to render VEL through the selected dealias engine; DVEL and DSRV are always dealiased.",
                         )
                         .changed();
                     if unfold_changed {
+                        self.set_unfold_velocity_display(unfold_velocity_display);
                         self.dealiased_readout_cache = None;
                         self.clear_texture();
                         ctx.request_repaint();
@@ -25245,9 +25276,10 @@ impl ViewerApp {
                 let engine_applies = editing_product.uses_dealiased_velocity()
                     || (plain_velocity && self.unfold_velocity_display);
                 let mut engine_changed = false;
+                let mut selected_engine = self.dealias_engine;
                 ui.add_enabled_ui(engine_applies, |ui| {
                     egui::ComboBox::from_id_salt("dealias_engine")
-                        .selected_text(match self.dealias_engine {
+                        .selected_text(match selected_engine {
                             DealiasEngine::Region => "Region",
                             DealiasEngine::RegionGlobal => "Region Global",
                             DealiasEngine::Analyst3d => "Analyst 3D",
@@ -25256,7 +25288,7 @@ impl ViewerApp {
                         .show_ui(ui, |ui| {
                             engine_changed |= ui
                                 .selectable_value(
-                                    &mut self.dealias_engine,
+                                    &mut selected_engine,
                                     DealiasEngine::Region,
                                     "Region",
                                 )
@@ -25266,7 +25298,7 @@ impl ViewerApp {
                                 .changed();
                             engine_changed |= ui
                                 .selectable_value(
-                                    &mut self.dealias_engine,
+                                    &mut selected_engine,
                                     DealiasEngine::RegionGlobal,
                                     "Region Global",
                                 )
@@ -25276,7 +25308,7 @@ impl ViewerApp {
                                 .changed();
                             engine_changed |= ui
                                 .selectable_value(
-                                    &mut self.dealias_engine,
+                                    &mut selected_engine,
                                     DealiasEngine::Analyst3d,
                                     "Analyst 3D (model-anchored)",
                                 )
@@ -25287,6 +25319,7 @@ impl ViewerApp {
                         });
                 });
                 if engine_changed {
+                    self.set_dealias_engine(selected_engine);
                     self.dealiased_readout_cache = None;
                     self.clear_texture();
                     ctx.request_repaint();
@@ -25615,17 +25648,15 @@ impl ViewerApp {
 
     /// ALGORITHMS section body — detection/tracking toggles + camera follow.
     fn radar_algorithms_section_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut show_rotation_markers = self.show_rotation_markers;
         if ui
-            .checkbox(&mut self.show_rotation_markers, "Rotation markers")
+            .checkbox(&mut show_rotation_markers, "Rotation markers")
             .on_hover_text(
                 "NSSL MDA/TDA-style detection (Stumpf et al. 1998; Mitchell et al. 1998): QC-masked, vertically-continuous circulations only, on a background thread. Pale ring = weak, orange = moderate, double gold = mesocyclone (rank ≥ 5), red triangle = TVS. Zoom in for rank + Vrot.",
             )
             .changed()
         {
-            self.rotation_markers_key = None;
-            if !self.show_rotation_markers {
-                self.rotation_markers.clear();
-            }
+            self.set_rotation_markers_visible(show_rotation_markers);
             ctx.request_repaint();
         }
         // (Rotation tracks + TDS moved to the layer rail — they are map
@@ -41285,6 +41316,47 @@ enum DealiasEngine {
     Analyst3d,
 }
 
+impl DealiasEngine {
+    fn from_settings(settings: &settings::AppSettings) -> Self {
+        match settings.dealias_engine.trim().to_ascii_lowercase().as_str() {
+            "region-global" | "region_global" | "global" => Self::RegionGlobal,
+            "analyst-3d" | "analyst3d" | "analyst_3d" => Self::Analyst3d,
+            _ => Self::Region,
+        }
+    }
+
+    fn settings_slug(self) -> &'static str {
+        match self {
+            Self::Region => "region",
+            Self::RegionGlobal => "region-global",
+            Self::Analyst3d => "analyst-3d",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RadarAlgorithmPreferences {
+    storm_tracks_enabled: bool,
+    rotation_tracks_enabled: bool,
+    tds_tracks_enabled: bool,
+    rotation_markers_enabled: bool,
+    unfold_velocity_display: bool,
+    dealias_engine: DealiasEngine,
+}
+
+impl RadarAlgorithmPreferences {
+    fn from_settings(settings: &settings::AppSettings) -> Self {
+        Self {
+            storm_tracks_enabled: settings.storm_tracks_enabled,
+            rotation_tracks_enabled: settings.rotation_tracks_enabled,
+            tds_tracks_enabled: settings.tds_tracks_enabled,
+            rotation_markers_enabled: settings.rotation_markers_enabled,
+            unfold_velocity_display: settings.unfold_velocity_display,
+            dealias_engine: DealiasEngine::from_settings(settings),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum SmoothingMode {
     /// Raw gates, nearest-gate rendering — the app's identity.
@@ -54666,6 +54738,43 @@ mod tests {
         );
         assert!(!app.show_storm_tracks);
         assert!(!app.app_settings.storm_tracks_enabled);
+    }
+
+    #[test]
+    fn radar_algorithm_preferences_survive_settings_restart() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        app.set_storm_tracks_visible(true);
+        app.set_tor_track_layers_visible(true, true);
+        app.set_rotation_markers_visible(false);
+        app.set_unfold_velocity_display(true);
+        app.set_dealias_engine(DealiasEngine::Analyst3d);
+
+        let persisted = settings::AppSettings::from_json(&app.app_settings.to_json());
+        assert_eq!(
+            RadarAlgorithmPreferences::from_settings(&persisted),
+            RadarAlgorithmPreferences {
+                storm_tracks_enabled: true,
+                rotation_tracks_enabled: true,
+                tds_tracks_enabled: true,
+                rotation_markers_enabled: false,
+                unfold_velocity_display: true,
+                dealias_engine: DealiasEngine::Analyst3d,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_saved_dealias_engine_falls_back_to_region() {
+        let settings = settings::AppSettings {
+            dealias_engine: "future-engine".to_owned(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RadarAlgorithmPreferences::from_settings(&settings).dealias_engine,
+            DealiasEngine::Region
+        );
     }
 
     #[test]

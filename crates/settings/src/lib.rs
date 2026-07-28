@@ -550,6 +550,19 @@ pub struct AppSettings {
     /// Draw deterministic tornado-debris-signature gates/trails.
     #[serde(default)]
     pub tds_tracks_enabled: bool,
+    /// Draw the per-volume rotation-marker layer. This is distinct from the
+    /// accumulated rotation-tracks swath and keeps the existing first-run
+    /// default (enabled) for older settings documents.
+    #[serde(default = "default_rotation_markers_enabled")]
+    pub rotation_markers_enabled: bool,
+    /// Render ordinary VEL through the selected dealias engine. DVEL/DSRV
+    /// remain intrinsically dealiased regardless of this preference.
+    #[serde(default)]
+    pub unfold_velocity_display: bool,
+    /// Stable slug for the selected velocity-dealias engine. Kept as a
+    /// string so mixed-version installs preserve unknown future engines.
+    #[serde(default = "default_dealias_engine")]
+    pub dealias_engine: String,
     /// Maximum SCIT storm cells fed into the storm-track associator each scan.
     /// Lower values reduce linear-mode clutter without touching radar render
     /// resolution or algorithm caches.
@@ -868,6 +881,14 @@ fn default_units() -> String {
 
 fn default_time_zone() -> String {
     "utc".to_owned()
+}
+
+fn default_rotation_markers_enabled() -> bool {
+    true
+}
+
+fn default_dealias_engine() -> String {
+    "region".to_owned()
 }
 
 fn default_sat_ir_enhancement() -> String {
@@ -1200,6 +1221,9 @@ impl Default for AppSettings {
             storm_tracks_enabled: false,
             rotation_tracks_enabled: false,
             tds_tracks_enabled: false,
+            rotation_markers_enabled: default_rotation_markers_enabled(),
+            unfold_velocity_display: false,
+            dealias_engine: default_dealias_engine(),
             storm_track_max_tracks: default_storm_track_max_tracks(),
             storm_track_min_dbz_tenths: default_storm_track_min_dbz_tenths(),
             product_hotkeys: default_product_hotkeys(),
@@ -2529,6 +2553,9 @@ mod tests {
         assert!(!old.storm_tracks_enabled);
         assert!(!old.rotation_tracks_enabled);
         assert!(!old.tds_tracks_enabled);
+        assert!(old.rotation_markers_enabled);
+        assert!(!old.unfold_velocity_display);
+        assert_eq!(old.dealias_engine, "region");
         assert_eq!(old.storm_track_max_tracks, 16);
         assert_eq!(old.storm_track_min_dbz_tenths, 350);
 
@@ -2536,6 +2563,9 @@ mod tests {
             storm_tracks_enabled: true,
             rotation_tracks_enabled: true,
             tds_tracks_enabled: true,
+            rotation_markers_enabled: false,
+            unfold_velocity_display: true,
+            dealias_engine: "analyst-3d".to_owned(),
             storm_track_max_tracks: 24,
             storm_track_min_dbz_tenths: 420,
             ..Default::default()
@@ -2545,6 +2575,9 @@ mod tests {
         assert!(back.storm_tracks_enabled);
         assert!(back.rotation_tracks_enabled);
         assert!(back.tds_tracks_enabled);
+        assert!(!back.rotation_markers_enabled);
+        assert!(back.unfold_velocity_display);
+        assert_eq!(back.dealias_engine, "analyst-3d");
         assert_eq!(back.storm_track_max_tracks, 24);
         assert_eq!(back.storm_track_min_dbz_tenths, 420);
     }
