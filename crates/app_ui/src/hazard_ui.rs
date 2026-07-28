@@ -2548,6 +2548,7 @@ mod tests {
         let mut app =
             crate::tests::test_viewer_app_with_hazards(vec![watch, ordinary, escalated, tornado]);
         app.hazards_active_only = false;
+        app.hidden_hazard_families.remove("watch");
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
 
         assert_eq!(
