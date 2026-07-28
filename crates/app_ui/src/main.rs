@@ -9398,6 +9398,9 @@ impl ViewerApp {
         app.gate_filter_dbz = restored_gate_filter_dbz;
         app.swath.reflectivity.enabled = app.app_settings.overlay_max_ref_swath;
         app.swath.velocity.enabled = app.app_settings.overlay_max_vel_swath;
+        app.swath.correlation_coefficient.enabled = app.app_settings.overlay_cc_drop_swath;
+        let cc_drop_max_hundredths = app.app_settings.effective_cc_drop_swath_max_hundredths();
+        app.swath.set_cc_drop_max_hundredths(cc_drop_max_hundredths);
         app.display_smoothing = SmoothingMode::from_settings(&app.app_settings);
         app.restore_workspace_layout();
         // Palette persistence: scan My tables (user .pal files copied into
@@ -34826,6 +34829,8 @@ impl ViewerApp {
         self.app_settings.overlay_mping_reports = self.mping_enabled;
         self.app_settings.overlay_max_ref_swath = self.swath.reflectivity.enabled;
         self.app_settings.overlay_max_vel_swath = self.swath.velocity.enabled;
+        self.app_settings.overlay_cc_drop_swath = self.swath.correlation_coefficient.enabled;
+        self.app_settings.cc_drop_swath_max_hundredths = self.swath.cc_drop_max_hundredths();
         let _ = self.app_settings.save();
     }
 
@@ -51238,10 +51243,7 @@ mod tests {
             smoothing_mode_for_product(&reflectivity, SmoothingMode::Interpolated),
             SmoothingMode::Interpolated
         );
-        assert_eq!(
-            raster_supersample_factor_for_product(&reflectivity, 4),
-            4
-        );
+        assert_eq!(raster_supersample_factor_for_product(&reflectivity, 4), 4);
         assert_eq!(
             smoothing_mode_for_product(
                 &DisplayProduct::StormRelativeVelocity,

@@ -37,6 +37,8 @@ const MAX_GATES: usize = 4000;
 pub enum SwathAggregation {
     /// Keep the largest value (peak reflectivity: "max REF").
     Max,
+    /// Keep the smallest value (minimum correlation coefficient: "CC drop").
+    Min,
     /// Keep the value of largest absolute magnitude, sign preserved (peak
     /// inbound/outbound velocity: "max |V|").
     MaxMagnitude,
@@ -44,11 +46,15 @@ pub enum SwathAggregation {
 
 impl SwathAggregation {
     fn combine(self, existing: f32, candidate: f32) -> f32 {
+        if !candidate.is_finite() {
+            return existing;
+        }
         if !existing.is_finite() {
             return candidate;
         }
         match self {
             Self::Max => existing.max(candidate),
+            Self::Min => existing.min(candidate),
             Self::MaxMagnitude => {
                 if candidate.abs() > existing.abs() {
                     candidate
@@ -86,7 +92,8 @@ struct FrameTilt<'a> {
     grid: &'a MomentGrid,
 }
 
-/// Build the per-gate max-value swath over `frames` for `moment`.
+/// Build a per-gate value swath over `frames` for `moment` using the requested
+/// aggregation policy.
 ///
 /// Returns a single-tilt [`RadarVolume`] whose one moment grid is F32 (NaN =
 /// no data) so the renderer's transparency handling drops empty gates, or
@@ -412,6 +419,65 @@ mod tests {
         let grid = &swath.cuts[0].moments[&MomentType::Velocity];
         let v = grid.scaled_value(0, 1).unwrap();
         assert!((v - (-30.0)).abs() < 0.6, "expected -30 m/s, got {v}");
+    }
+
+    #[test]
+    fn minimum_aggregation_keeps_the_lowest_finite_gate() {
+        let high = volume_with(MomentType::Reflectivity, 4, 3, 100, |_r, g| {
+            if g == 1 { dbz_raw(55.0) } else { 0 }
+        });
+        let low = volume_with(MomentType::Reflectivity, 4, 3, 200, |_r, g| {
+            if g == 1 { dbz_raw(30.0) } else { 0 }
+        });
+
+        let swath = max_value_swath(
+            &[&high, &low],
+            MomentType::Reflectivity,
+            SwathAggregation::Min,
+        )
+        .unwrap();
+        let grid = &swath.cuts[0].moments[&MomentType::Reflectivity];
+        let value = grid.scaled_value(0, 1).unwrap();
+        assert!((value - 30.0).abs() < 0.6, "expected 30 dBZ, got {value}");
+    }
+
+    #[test]
+    fn minimum_aggregation_ignores_nan_and_preserves_a_moving_footprint() {
+        // Missing samples are transparent NaNs in the accumulator. A low
+        // value at two different positions over time must leave both points
+        // in the minimum swath.
+        let first = volume_with(MomentType::Reflectivity, 4, 4, 100, |_r, g| match g {
+            1 => dbz_raw(10.0),
+            2 => dbz_raw(50.0),
+            _ => 0,
+        });
+        let second = volume_with(MomentType::Reflectivity, 4, 4, 200, |_r, g| match g {
+            1 => dbz_raw(50.0),
+            2 => dbz_raw(15.0),
+            _ => 0,
+        });
+
+        let swath = max_value_swath(
+            &[&first, &second],
+            MomentType::Reflectivity,
+            SwathAggregation::Min,
+        )
+        .unwrap();
+        let grid = &swath.cuts[0].moments[&MomentType::Reflectivity];
+        assert!((grid.scaled_value(0, 1).unwrap() - 10.0).abs() < 0.6);
+        assert!((grid.scaled_value(0, 2).unwrap() - 15.0).abs() < 0.6);
+        assert!(grid.scaled_value(0, 0).unwrap().is_nan());
+
+        assert_eq!(
+            SwathAggregation::Min.combine(0.75, f32::NAN),
+            0.75,
+            "a non-finite candidate must not erase an observed minimum"
+        );
+        assert_eq!(
+            SwathAggregation::Min.combine(f32::NAN, 0.70),
+            0.70,
+            "the first finite candidate must replace the empty accumulator"
+        );
     }
 
     #[test]

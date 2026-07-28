@@ -1,13 +1,14 @@
 //! Max-value swath overlay — "where the storm has BEEN".
 //!
-//! Two toggleable overlay layers that accumulate the per-gate MAXIMUM of a
-//! base-tilt moment across every frame of the loaded loop and draw it beneath
-//! the live radar frame, so the operator sees a storm's whole footprint /
-//! where it started without scrubbing the loop back:
+//! Three toggleable overlay layers accumulate a base-tilt moment across every
+//! frame of the loaded loop and draw it beneath the live radar frame, so the
+//! operator sees a storm's whole footprint without scrubbing backward:
 //!
 //!   * **Max REF swath** — peak reflectivity (the storm's track).
 //!   * **Max VEL swath** — peak velocity magnitude, sign preserved (peak
 //!     inbound/outbound; the tropical-cyclone velocity couplet envelope).
+//!   * **CC-drop swath** — minimum correlation coefficient, with normal/high
+//!     CC masked so only the moving low-CC footprint remains.
 //!
 //! The heavy lifting is [`render2d::max_value_swath`], which folds the loop's
 //! base tilts into ONE synthetic single-tilt volume. That volume renders
@@ -39,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use color_tables::{ColorTableFamily, ColorTableSet};
 use eframe::egui;
-use radar_core::{MomentType, RadarVolume};
+use radar_core::{MomentStorage, MomentType, RadarVolume};
 use render2d::{
     SwathAggregation, ViewportMomentCache, ViewportRasterOptions, max_value_swath,
     viewport_rgba_buffer_len,
@@ -47,7 +48,7 @@ use render2d::{
 use ui_core::worker_slot::{SlotPoll, WorkerSlot};
 
 use crate::{
-    LayerRowOpacity, LayerRowSpec, LayerRowVis, ViewerApp, ViewportKey,
+    LayerRowGear, LayerRowOpacity, LayerRowSpec, LayerRowVis, ViewerApp, ViewportKey,
     anchored_radar_texture_rect, layer_row, paint_rotated_image, radar_color_image_from_rgba,
     radar_texture_options,
 };
@@ -57,6 +58,7 @@ use crate::{
 pub(crate) enum SwathMoment {
     Reflectivity,
     Velocity,
+    CorrelationCoefficient,
 }
 
 impl SwathMoment {
@@ -64,6 +66,7 @@ impl SwathMoment {
         match self {
             Self::Reflectivity => MomentType::Reflectivity,
             Self::Velocity => MomentType::Velocity,
+            Self::CorrelationCoefficient => MomentType::CorrelationCoefficient,
         }
     }
 
@@ -71,6 +74,7 @@ impl SwathMoment {
         match self {
             Self::Reflectivity => ColorTableFamily::Reflectivity,
             Self::Velocity => ColorTableFamily::Velocity,
+            Self::CorrelationCoefficient => ColorTableFamily::CorrelationCoefficient,
         }
     }
 
@@ -80,6 +84,7 @@ impl SwathMoment {
             // Peak velocity magnitude, sign preserved (the diverging velocity
             // table then colors inbound vs outbound extremes).
             Self::Velocity => SwathAggregation::MaxMagnitude,
+            Self::CorrelationCoefficient => SwathAggregation::Min,
         }
     }
 
@@ -87,9 +92,14 @@ impl SwathMoment {
         match self {
             Self::Reflectivity => "max-ref-swath",
             Self::Velocity => "max-vel-swath",
+            Self::CorrelationCoefficient => "cc-drop-swath",
         }
     }
 }
+
+const DEFAULT_CC_DROP_MAX_HUNDREDTHS: u16 = 90;
+const MIN_CC_DROP_MAX_HUNDREDTHS: u16 = 50;
+const MAX_CC_DROP_MAX_HUNDREDTHS: u16 = 99;
 
 /// Default overlay alpha — a semi-transparent trail that reads as distinct
 /// from the opaque live frame drawn over it.
@@ -143,6 +153,9 @@ pub(crate) struct SwathLayer {
     viewport_key: Option<ViewportKey>,
     rotation_rad: f32,
     color_signature: u64,
+    /// Optional upper-value mask applied after aggregation. The CC-drop layer
+    /// uses this to discard meteorological/high-correlation gates.
+    mask_above_hundredths: Option<u16>,
     /// Background fold + raster job — at most one in flight; paint keeps the
     /// stale texture until the result lands (finding #8: never block the
     /// paint thread on swath work).
@@ -168,6 +181,7 @@ impl SwathLayer {
             viewport_key: None,
             rotation_rad: 0.0,
             color_signature: 0,
+            mask_above_hundredths: None,
             worker: WorkerSlot::idle(label),
             pending_generation: None,
             builds_dispatched: 0,
@@ -308,10 +322,13 @@ impl SwathLayer {
         if matches!(source, SwathVolumeSource::Rebuild(_)) {
             self.builds_dispatched += 1;
         }
+        let mask_above = self
+            .mask_above_hundredths
+            .map(|hundredths| hundredths as f32 / 100.0);
         self.worker.spawn(ctx, move |tx| {
             let volume = match source {
                 SwathVolumeSource::Rebuild(volumes) => {
-                    build_swath_volume(&volumes, moment).map(Arc::new)
+                    build_swath_volume(&volumes, moment, mask_above).map(Arc::new)
                 }
                 SwathVolumeSource::Reuse(volume) => Some(volume),
             };
@@ -351,17 +368,21 @@ impl SwathLayer {
     }
 }
 
-/// Both swath overlays.
+/// The three loop-derived swath overlays.
 pub(crate) struct SwathState {
     pub(crate) reflectivity: SwathLayer,
     pub(crate) velocity: SwathLayer,
+    pub(crate) correlation_coefficient: SwathLayer,
 }
 
 impl Default for SwathState {
     fn default() -> Self {
+        let mut correlation_coefficient = SwathLayer::new("cc-drop-swath");
+        correlation_coefficient.mask_above_hundredths = Some(DEFAULT_CC_DROP_MAX_HUNDREDTHS);
         Self {
             reflectivity: SwathLayer::new("max-ref-swath"),
             velocity: SwathLayer::new("max-vel-swath"),
+            correlation_coefficient,
         }
     }
 }
@@ -371,6 +392,7 @@ impl SwathState {
         match moment {
             SwathMoment::Reflectivity => &self.reflectivity,
             SwathMoment::Velocity => &self.velocity,
+            SwathMoment::CorrelationCoefficient => &self.correlation_coefficient,
         }
     }
 
@@ -378,12 +400,29 @@ impl SwathState {
         match moment {
             SwathMoment::Reflectivity => &mut self.reflectivity,
             SwathMoment::Velocity => &mut self.velocity,
+            SwathMoment::CorrelationCoefficient => &mut self.correlation_coefficient,
         }
+    }
+
+    pub(crate) fn cc_drop_max_hundredths(&self) -> u16 {
+        self.correlation_coefficient
+            .mask_above_hundredths
+            .unwrap_or(DEFAULT_CC_DROP_MAX_HUNDREDTHS)
+    }
+
+    pub(crate) fn set_cc_drop_max_hundredths(&mut self, value: u16) -> bool {
+        let value = value.clamp(MIN_CC_DROP_MAX_HUNDREDTHS, MAX_CC_DROP_MAX_HUNDREDTHS);
+        if self.cc_drop_max_hundredths() == value {
+            return false;
+        }
+        self.correlation_coefficient.mask_above_hundredths = Some(value);
+        self.correlation_coefficient.invalidate();
+        true
     }
 }
 
 impl ViewerApp {
-    /// The two swath rows in the BASE group of the layer rail. Placed with the
+    /// The swath rows in the BASE group of the layer rail. Placed with the
     /// radar-derived rows because a swath is a pure product of the loaded
     /// radar loop.
     pub(crate) fn max_swath_rail_rows(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -401,6 +440,13 @@ impl ViewerApp {
             "Max VEL swath",
             "Peak base-tilt velocity magnitude over the loaded loop, inbound/outbound sign preserved (raw, may alias near the Nyquist limit).",
         );
+        self.max_swath_rail_row(
+            ui,
+            ctx,
+            SwathMoment::CorrelationCoefficient,
+            "CC-drop swath",
+            "Minimum base-tilt correlation coefficient over the loaded loop. Normal/high CC is masked so the low-CC trail can reveal debris or other non-meteorological scatterers.",
+        );
     }
 
     fn max_swath_rail_row(
@@ -413,10 +459,24 @@ impl ViewerApp {
     ) {
         // Owned locals first so the row can hold disjoint &mut borrows of the
         // layer without also borrowing the rest of `self`.
-        let built = self.swath.layer(moment).volume.is_some();
-        let building = self.swath.layer(moment).worker.in_flight();
+        let layer = self.swath.layer(moment);
+        let enabled = layer.enabled;
+        let built = layer.volume.is_some();
+        let building = layer.worker.in_flight();
         let frame_count = self.primary.history.len();
-        let trailing_text = if !self.swath.layer(moment).enabled {
+        let source_moment = moment.moment();
+        let source_available = !enabled
+            || built
+            || building
+            || frame_count < 2
+            || self.primary.history.as_slice().iter().any(|frame| {
+                frame.volume.cuts.iter().any(|cut| {
+                    cut.moments
+                        .get(&source_moment)
+                        .is_some_and(|grid| !grid.radial_indices.is_empty())
+                })
+            });
+        let trailing_text = if !enabled {
             String::new()
         } else if built {
             format!("{frame_count} frames")
@@ -424,43 +484,74 @@ impl ViewerApp {
             "building…".to_owned()
         } else if frame_count < 2 {
             "need loop".to_owned()
+        } else if !source_available {
+            format!("no {} data", source_moment.short_name())
         } else {
             String::new()
         };
 
-        let layer = self.swath.layer_mut(moment);
-        let was_enabled = layer.enabled;
-        let changed = layer_row(
-            ui,
-            LayerRowSpec {
-                vis: LayerRowVis::Toggle {
-                    value: &mut layer.enabled,
-                    hover,
-                },
-                name,
-                name_hover: hover,
-                count: (!trailing_text.is_empty()).then_some(trailing_text.as_str()),
-                opacity: Some(LayerRowOpacity::U8 {
-                    value: &mut layer.opacity,
-                    min: 40,
-                    max: 255,
+        let mut cc_max = self.swath.cc_drop_max_hundredths();
+        let gear = if moment == SwathMoment::CorrelationCoefficient {
+            Some(LayerRowGear::Menu {
+                hover: "Set the maximum CC retained by the drop swath",
+                content: Box::new(|ui| {
+                    ui.strong("CC-drop threshold");
+                    ui.label(format!("Show CC at or below {:.2}", cc_max as f32 / 100.0));
+                    ui.add(
+                        egui::Slider::new(
+                            &mut cc_max,
+                            MIN_CC_DROP_MAX_HUNDREDTHS..=MAX_CC_DROP_MAX_HUNDREDTHS,
+                        )
+                        .show_value(false),
+                    );
+                    ui.weak(
+                        "Higher/normal CC is transparent. Lower values isolate stronger drops.",
+                    );
                 }),
-                ..Default::default()
-            },
-            |_ui| {},
-        );
-        if changed {
+            })
+        } else {
+            None
+        };
+
+        let (changed, turned_off) = {
+            let layer = self.swath.layer_mut(moment);
+            let was_enabled = layer.enabled;
+            let changed = layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut layer.enabled,
+                        hover,
+                    },
+                    name,
+                    name_hover: hover,
+                    count: (!trailing_text.is_empty()).then_some(trailing_text.as_str()),
+                    opacity: Some(LayerRowOpacity::U8 {
+                        value: &mut layer.opacity,
+                        min: 40,
+                        max: 255,
+                    }),
+                    gear,
+                    ..Default::default()
+                },
+                |_ui| {},
+            );
+            (changed, was_enabled && !layer.enabled)
+        };
+        if turned_off {
             // Toggling off frees the caches (and cancels any in-flight
             // build); toggling on rebuilds via the worker on the next draw.
-            if was_enabled && !self.swath.layer(moment).enabled {
-                self.swath.layer_mut(moment).invalidate();
-            }
+            self.swath.layer_mut(moment).invalidate();
+        }
+        let cc_max_changed = moment == SwathMoment::CorrelationCoefficient
+            && self.swath.set_cc_drop_max_hundredths(cc_max);
+        if changed || cc_max_changed {
             self.save_overlay_defaults();
             ctx.request_repaint();
         }
     }
 
-    /// Drain/dispatch the background jobs and draw both enabled swaths.
+    /// Drain/dispatch the background jobs and draw the enabled swaths.
     /// Called once per frame, beneath the primary radar layer. Never blocks:
     /// the fold + raster run on a worker thread and the stale texture keeps
     /// drawing until the fresh one lands.
@@ -470,7 +561,10 @@ impl ViewerApp {
         painter: &egui::Painter,
         rect: egui::Rect,
     ) {
-        if !self.swath.reflectivity.enabled && !self.swath.velocity.enabled {
+        if !self.swath.reflectivity.enabled
+            && !self.swath.velocity.enabled
+            && !self.swath.correlation_coefficient.enabled
+        {
             return;
         }
         let Some((radar_lat, radar_lon)) = self.radar_location() else {
@@ -488,7 +582,11 @@ impl ViewerApp {
             || self.smooth_camera_follow_playback_active();
         let generation = self.primary.history.generation();
 
-        for moment in [SwathMoment::Reflectivity, SwathMoment::Velocity] {
+        for moment in [
+            SwathMoment::Reflectivity,
+            SwathMoment::Velocity,
+            SwathMoment::CorrelationCoefficient,
+        ] {
             if !self.swath.layer(moment).enabled {
                 continue;
             }
@@ -548,9 +646,33 @@ impl ViewerApp {
 
 /// Build the synthetic swath volume from the loop's frame volumes. Runs on
 /// the background worker — this is the expensive whole-loop fold.
-fn build_swath_volume(volumes: &[Arc<RadarVolume>], moment: SwathMoment) -> Option<RadarVolume> {
+fn build_swath_volume(
+    volumes: &[Arc<RadarVolume>],
+    moment: SwathMoment,
+    mask_above: Option<f32>,
+) -> Option<RadarVolume> {
     let volumes: Vec<&RadarVolume> = volumes.iter().map(|volume| volume.as_ref()).collect();
-    max_value_swath(&volumes, moment.moment(), moment.aggregation())
+    let mut swath = max_value_swath(&volumes, moment.moment(), moment.aggregation())?;
+    if let Some(maximum) = mask_above {
+        mask_values_above(&mut swath, moment.moment(), maximum);
+    }
+    Some(swath)
+}
+
+fn mask_values_above(volume: &mut RadarVolume, moment: MomentType, maximum: f32) {
+    for cut in &mut volume.cuts {
+        let Some(grid) = cut.moments.get_mut(&moment) else {
+            continue;
+        };
+        let MomentStorage::F32(values) = &mut grid.storage else {
+            continue;
+        };
+        for value in values {
+            if value.is_finite() && *value > maximum {
+                *value = f32::NAN;
+            }
+        }
+    }
 }
 
 /// Rasterize a swath volume to a full-viewport RGBA image through the normal
@@ -641,8 +763,104 @@ mod tests {
         volume
     }
 
+    fn cc_volume_with(
+        nrows: usize,
+        gate_count: usize,
+        time_s: i64,
+        mut sample: impl FnMut(usize, usize) -> u8,
+    ) -> RadarVolume {
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        for r in 0..nrows {
+            cut.radials.push(Radial {
+                azimuth_deg: r as f32 * (360.0 / nrows as f32),
+                elevation_deg: 0.5,
+                time_offset_ms: 0,
+                gate_range: gate_range(gate_count),
+                nyquist_velocity_mps: None,
+                radial_status: None,
+            });
+        }
+        // raw / 100 = rhoHV. 0 is nodata, matching the synthetic-volume
+        // convention used by the other swath fixtures.
+        let mut grid = MomentGrid::new_u8(
+            MomentType::CorrelationCoefficient,
+            gate_range(gate_count),
+            100.0,
+            0.0,
+            Some(0),
+            Some(1),
+        );
+        for r in 0..nrows {
+            let row: Vec<u8> = (0..gate_count).map(|g| sample(r, g)).collect();
+            grid.push_row(r, MomentRow::U8(row)).unwrap();
+        }
+        cut.moments.insert(MomentType::CorrelationCoefficient, grid);
+        let mut volume = RadarVolume::new(
+            RadarSite::new("KEAX"),
+            DateTime::<Utc>::from_timestamp(time_s, 0).unwrap(),
+        );
+        volume.cuts.push(cut);
+        volume
+    }
+
     fn dbz_raw(dbz: f32) -> u8 {
         (dbz * 2.0 + 66.0).round() as u8
+    }
+
+    #[test]
+    fn cc_drop_swath_keeps_moving_minima_and_masks_normal_cc() {
+        let first = Arc::new(cc_volume_with(4, 4, 100, |_r, gate| match gate {
+            1 => 70,
+            3 => 90,
+            _ => 98,
+        }));
+        let second = Arc::new(cc_volume_with(4, 4, 200, |_r, gate| match gate {
+            2 => 75,
+            _ => 98,
+        }));
+
+        let swath = build_swath_volume(
+            &[first, second],
+            SwathMoment::CorrelationCoefficient,
+            Some(0.90),
+        )
+        .expect("CC loop should build a swath");
+        let grid = &swath.cuts[0].moments[&MomentType::CorrelationCoefficient];
+        assert!((grid.scaled_value(0, 1).unwrap() - 0.70).abs() < 0.001);
+        assert!((grid.scaled_value(0, 2).unwrap() - 0.75).abs() < 0.001);
+        assert!((grid.scaled_value(0, 3).unwrap() - 0.90).abs() < 0.001);
+        assert!(
+            grid.scaled_value(0, 0).unwrap().is_nan(),
+            "normal 0.98 CC must be transparent"
+        );
+    }
+
+    #[test]
+    fn cc_drop_swath_is_absent_when_the_loop_has_no_cc_moment() {
+        let reflectivity = Arc::new(volume_with(4, 3, 100, |_r, _g| dbz_raw(40.0)));
+        assert!(
+            build_swath_volume(
+                &[reflectivity],
+                SwathMoment::CorrelationCoefficient,
+                Some(0.90),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn changing_cc_drop_threshold_invalidates_only_that_cache() {
+        let mut state = SwathState::default();
+        state.reflectivity.built_generation = Some(3);
+        state.correlation_coefficient.built_generation = Some(3);
+
+        assert!(state.set_cc_drop_max_hundredths(82));
+        assert_eq!(state.cc_drop_max_hundredths(), 82);
+        assert_eq!(state.reflectivity.built_generation, Some(3));
+        assert_eq!(state.correlation_coefficient.built_generation, None);
+        assert!(!state.set_cc_drop_max_hundredths(82));
+        assert!(state.set_cc_drop_max_hundredths(500));
+        assert_eq!(state.cc_drop_max_hundredths(), 99);
     }
 
     /// Frame `index` lights gate `index` (a "moving echo" across the loop).
@@ -935,7 +1153,7 @@ mod tests {
             .map(|frame| Arc::clone(&frame.volume))
             .collect();
         let fold_start = Instant::now();
-        let reference = build_swath_volume(&volumes, SwathMoment::Reflectivity)
+        let reference = build_swath_volume(&volumes, SwathMoment::Reflectivity, None)
             .expect("KEAX loop must fold a reflectivity swath");
         let sync_fold = fold_start.elapsed();
         eprintln!(

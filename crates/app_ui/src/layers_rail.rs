@@ -156,6 +156,7 @@ impl ViewerApp {
             + usize::from(self.mping_enabled)
             + usize::from(self.swath.reflectivity.enabled)
             + usize::from(self.swath.velocity.enabled)
+            + usize::from(self.swath.correlation_coefficient.enabled)
             + usize::from(self.hazards_visible && self.hazard_overlay.is_some())
             + usize::from(self.tor_tracks.show_tracks)
             + usize::from(self.tor_tracks.show_tds)

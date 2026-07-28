@@ -381,13 +381,20 @@ pub struct AppSettings {
     pub overlay_spc_reports: bool,
     #[serde(default)]
     pub overlay_mping_reports: bool,
-    /// Max-value swath overlays: the per-gate maximum reflectivity (and, as a
-    /// separate toggle, peak velocity magnitude) accumulated across the loaded
-    /// loop — "where the storm has been". Default off (recomputed on demand).
+    /// Loop swath overlays: per-gate maximum reflectivity, peak velocity
+    /// magnitude, and minimum correlation coefficient accumulated across the
+    /// loaded loop — "where the storm has been". Default off (recomputed on
+    /// demand).
     #[serde(default)]
     pub overlay_max_ref_swath: bool,
     #[serde(default)]
     pub overlay_max_vel_swath: bool,
+    #[serde(default)]
+    pub overlay_cc_drop_swath: bool,
+    /// Maximum correlation coefficient retained by the CC-drop swath, stored
+    /// in hundredths so settings remain exactly round-trippable. 90 = 0.90.
+    #[serde(default = "default_cc_drop_swath_max_hundredths")]
+    pub cc_drop_swath_max_hundredths: u16,
     /// Basemap style key: "dark" (vector), "satellite", "streets", "topo".
     #[serde(default = "default_basemap_style")]
     pub basemap_style: String,
@@ -1090,6 +1097,10 @@ fn default_warning_refresh_seconds() -> u64 {
     30
 }
 
+fn default_cc_drop_swath_max_hundredths() -> u16 {
+    90
+}
+
 fn default_warning_source() -> String {
     "auto".to_owned()
 }
@@ -1138,6 +1149,8 @@ impl Default for AppSettings {
             overlay_mping_reports: false,
             overlay_max_ref_swath: false,
             overlay_max_vel_swath: false,
+            overlay_cc_drop_swath: false,
+            cc_drop_swath_max_hundredths: default_cc_drop_swath_max_hundredths(),
             startup_site: None,
             display_owner_site: None,
             favorites: Vec::new(),
@@ -1393,6 +1406,12 @@ impl AppSettings {
     /// have `event_pad_frames`, so `None` deliberately inherits that value.
     pub fn effective_event_after_scans(&self) -> u16 {
         self.event_after_scans.unwrap_or(self.event_pad_frames)
+    }
+
+    /// A hand-edited settings file cannot make the CC-drop mask meaningless.
+    /// The UI exposes this same 0.50–0.99 diagnostic range.
+    pub fn effective_cc_drop_swath_max_hundredths(&self) -> u16 {
+        self.cc_drop_swath_max_hundredths.clamp(50, 99)
     }
 
     /// Favorite keys come in two shapes (v0.29 spec §1.1): bare US site
@@ -2885,6 +2904,32 @@ mod tests {
         let restored = AppSettings::from_json(&settings.to_json());
         assert_eq!(restored.radar_product_favorites, ["REF", "ET"]);
         assert_eq!(restored.wofs_product_favorites, ["uh_2to5__prob_60"]);
+    }
+
+    #[test]
+    fn cc_drop_swath_defaults_off_at_point_nine_and_round_trips() {
+        let defaults = AppSettings::from_json("{}");
+        assert!(!defaults.overlay_cc_drop_swath);
+        assert_eq!(defaults.cc_drop_swath_max_hundredths, 90);
+        assert_eq!(defaults.effective_cc_drop_swath_max_hundredths(), 90);
+
+        let settings = AppSettings {
+            overlay_cc_drop_swath: true,
+            cc_drop_swath_max_hundredths: 82,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(&settings.to_json());
+        assert!(restored.overlay_cc_drop_swath);
+        assert_eq!(restored.cc_drop_swath_max_hundredths, 82);
+        assert_eq!(restored.effective_cc_drop_swath_max_hundredths(), 82);
+    }
+
+    #[test]
+    fn cc_drop_swath_threshold_clamps_hand_edited_settings() {
+        let too_low = AppSettings::from_json(r#"{"cc_drop_swath_max_hundredths": 1}"#);
+        let too_high = AppSettings::from_json(r#"{"cc_drop_swath_max_hundredths": 500}"#);
+        assert_eq!(too_low.effective_cc_drop_swath_max_hundredths(), 50);
+        assert_eq!(too_high.effective_cc_drop_swath_max_hundredths(), 99);
     }
 
     #[test]
