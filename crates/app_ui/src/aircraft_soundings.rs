@@ -436,11 +436,11 @@ fn profiles_from_arrays(arrays: &MadisArrays) -> Result<Vec<AircraftProfile>, St
 
         let mut latitude = arrays.latitude[record];
         let mut longitude = arrays.longitude[record];
-        if !valid_coordinates(latitude, longitude) {
-            if let Some((lat, lon)) = track.first().copied() {
-                latitude = lat as f64;
-                longitude = lon as f64;
-            }
+        if !valid_coordinates(latitude, longitude)
+            && let Some((lat, lon)) = track.first().copied()
+        {
+            latitude = lat as f64;
+            longitude = lon as f64;
         }
         if !valid_coordinates(latitude, longitude) {
             continue;

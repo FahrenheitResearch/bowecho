@@ -1104,7 +1104,7 @@ impl WofsState {
         let Some(first) = frames.first() else {
             return false;
         };
-        if frame < first.valid_time.clone() {
+        if frame < first.valid_time {
             return false;
         }
         let frame_millis = frame.timestamp_millis();
@@ -1184,11 +1184,11 @@ impl WofsState {
                 .copied()
                 .filter(|minute| *minute <= posted_edge)
             {
-                let valid_time = init_time.clone() + chrono::Duration::minutes(i64::from(minute));
+                let valid_time = init_time + chrono::Duration::minutes(i64::from(minute));
                 let candidate = WofsTimelineFrame {
                     init: init.clone(),
                     minute,
-                    valid_time: valid_time.clone(),
+                    valid_time,
                 };
                 by_valid_time.entry(valid_time).or_insert(candidate);
             }
@@ -1206,9 +1206,9 @@ impl WofsState {
                 return Vec::new();
             };
             for minute in minutes {
-                let valid_time = init_time.clone() + chrono::Duration::minutes(i64::from(minute));
+                let valid_time = init_time + chrono::Duration::minutes(i64::from(minute));
                 by_valid_time.insert(
-                    valid_time.clone(),
+                    valid_time,
                     WofsTimelineFrame {
                         init: self.init.clone(),
                         minute,
