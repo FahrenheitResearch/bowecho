@@ -232,6 +232,14 @@ pub struct AppSettings {
     pub display_owner_site: Option<String>,
     /// Favorite site ids, in user order.
     pub favorites: Vec<String>,
+    /// Favorite radar products, stored by the same stable short labels used
+    /// by product hotkeys (for example `REF`, `VEL`, and `ET`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub radar_product_favorites: Vec<String>,
+    /// Favorite WoFS base products, stored by the official API slug so a
+    /// temporarily unavailable product remains favorited for later runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wofs_product_favorites: Vec<String>,
     /// Live auto-refresh poll interval (seconds).
     pub polling_interval_seconds: u64,
     /// Selected color table per family label (family.label() -> table name).
@@ -276,6 +284,15 @@ pub struct AppSettings {
     pub overlay_obs_metar: bool,
     #[serde(default = "default_true")]
     pub overlay_obs_mesonet: bool,
+    /// Limit map-rendered METARs to `overlay_obs_metar_states`. Analysis and
+    /// sounding calculations deliberately continue to see every observation.
+    #[serde(default)]
+    pub overlay_obs_metar_state_filter_enabled: bool,
+    /// Selected two-letter US state/territory abbreviations for the METAR map
+    /// filter. An empty list while filtering is enabled intentionally means
+    /// that no METAR station plots are drawn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlay_obs_metar_states: Vec<String>,
     /// Replace the lowest model-sounding level with a nearby surface
     /// observation before recomputing parcel diagnostics. Enabling this in
     /// the sounding header also enables `overlay_obs`; disabling it leaves
@@ -1097,6 +1114,8 @@ impl Default for AppSettings {
             overlay_river_gauges: false,
             overlay_obs_metar: true,
             overlay_obs_mesonet: true,
+            overlay_obs_metar_state_filter_enabled: false,
+            overlay_obs_metar_states: Vec::new(),
             overlay_obs_adjust_soundings: false,
             overlay_glm: false,
             glm_show_last_minutes: default_glm_show_last_minutes(),
@@ -1122,6 +1141,8 @@ impl Default for AppSettings {
             startup_site: None,
             display_owner_site: None,
             favorites: Vec::new(),
+            radar_product_favorites: Vec::new(),
+            wofs_product_favorites: Vec::new(),
             polling_interval_seconds: 60,
             palette_by_family: BTreeMap::new(),
             palette_by_product: BTreeMap::new(),
@@ -2836,6 +2857,34 @@ mod tests {
             ..Default::default()
         };
         assert!(AppSettings::from_json(&settings.to_json()).overlay_aircraft_soundings);
+    }
+
+    #[test]
+    fn metar_state_filter_defaults_to_all_and_round_trips_an_explicit_selection() {
+        let defaults = AppSettings::from_json("{}");
+        assert!(!defaults.overlay_obs_metar_state_filter_enabled);
+        assert!(defaults.overlay_obs_metar_states.is_empty());
+
+        let settings = AppSettings {
+            overlay_obs_metar_state_filter_enabled: true,
+            overlay_obs_metar_states: vec!["MI".to_owned(), "IN".to_owned()],
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(&settings.to_json());
+        assert!(restored.overlay_obs_metar_state_filter_enabled);
+        assert_eq!(restored.overlay_obs_metar_states, ["MI", "IN"]);
+    }
+
+    #[test]
+    fn product_favorites_keep_stable_labels_and_wofs_slugs() {
+        let settings = AppSettings {
+            radar_product_favorites: vec!["REF".to_owned(), "ET".to_owned()],
+            wofs_product_favorites: vec!["uh_2to5__prob_60".to_owned()],
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(&settings.to_json());
+        assert_eq!(restored.radar_product_favorites, ["REF", "ET"]);
+        assert_eq!(restored.wofs_product_favorites, ["uh_2to5__prob_60"]);
     }
 
     #[test]

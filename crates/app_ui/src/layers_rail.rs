@@ -46,6 +46,14 @@ fn model_map_layer_opacity_hover(grid_composite: bool) -> &'static str {
 
 const PLACEFILE_VISIBILITY_RANGE_PERCENTS: [u16; 5] = [100, 200, 400, 800, u16::MAX];
 
+#[rustfmt::skip]
+const METAR_STATE_FILTER_ABBRS: &[&str] = &[
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA", "HI", "ID",
+    "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO",
+    "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA",
+    "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+];
+
 /// Draw the visibility range as direct choices in the placefile gear menu.
 ///
 /// Do not replace these with a `ComboBox`: both the gear menu and a combo are
@@ -912,6 +920,10 @@ impl ViewerApp {
             let obs_fetched_at = self.obs_fetched_at;
             let obs_station_count = self.surface_obs.station_count;
             let mut obs_adjust_changed = false;
+            let mut metar_state_filter_enabled =
+                self.app_settings.overlay_obs_metar_state_filter_enabled;
+            let mut metar_states = self.app_settings.overlay_obs_metar_states.clone();
+            let mut metar_state_filter_changed = false;
             let obs_fetching =
                 self.obs_rx.is_some() || self.nws_obs_rx.is_some() || self.mesonet_rx.is_some();
             let obs_count_text = obs_fetched_at.map(|at| {
@@ -940,6 +952,70 @@ impl ViewerApp {
                                         .on_hover_text(
                                             "IEM RWIS road sensors + DCP/RAWS networks — denser but lower siting quality (road sensors read hot in sun); uncheck for strict-QC METAR-only",
                                         );
+                            let state_filter_label = if metar_state_filter_enabled {
+                                format!("METAR states ({})", metar_states.len())
+                            } else {
+                                "METAR states (all)".to_owned()
+                            };
+                            ui.menu_button(state_filter_label, |ui| {
+                                if ui
+                                    .checkbox(
+                                        &mut metar_state_filter_enabled,
+                                        "Limit station plots by state",
+                                    )
+                                    .on_hover_text(
+                                        "Display-only filter: model analysis and obs-adjusted soundings still use every loaded observation.",
+                                    )
+                                    .changed()
+                                {
+                                    metar_state_filter_changed = true;
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("All states").clicked() {
+                                        metar_state_filter_enabled = false;
+                                        metar_state_filter_changed = true;
+                                    }
+                                    if ui.button("None").clicked() {
+                                        metar_state_filter_enabled = true;
+                                        metar_states.clear();
+                                        metar_state_filter_changed = true;
+                                    }
+                                });
+                                ui.add_enabled_ui(metar_state_filter_enabled, |ui| {
+                                    egui::Grid::new("metar_state_filter_grid")
+                                        .num_columns(7)
+                                        .spacing(egui::vec2(6.0, 2.0))
+                                        .show(ui, |ui| {
+                                            for (index, abbreviation) in
+                                                METAR_STATE_FILTER_ABBRS.iter().enumerate()
+                                            {
+                                                let mut selected = metar_states
+                                                    .iter()
+                                                    .any(|state| state == abbreviation);
+                                                if ui
+                                                    .checkbox(&mut selected, *abbreviation)
+                                                    .changed()
+                                                {
+                                                    if selected {
+                                                        metar_states.push((*abbreviation).to_owned());
+                                                        metar_states.sort();
+                                                        metar_states.dedup();
+                                                    } else {
+                                                        metar_states
+                                                            .retain(|state| state != abbreviation);
+                                                    }
+                                                    metar_state_filter_changed = true;
+                                                }
+                                                if (index + 1) % 7 == 0 {
+                                                    ui.end_row();
+                                                }
+                                            }
+                                        });
+                                    if metar_states.is_empty() {
+                                        ui.weak("No states selected: METAR station plots are hidden.");
+                                    }
+                                });
+                            });
                             if ui
                                 .checkbox(obs_hour_loop_enabled, "Loop latest hour")
                                 .on_hover_text(
@@ -988,6 +1064,13 @@ impl ViewerApp {
                     }
                 },
             ) {
+                ctx.request_repaint();
+            }
+            if metar_state_filter_changed {
+                self.app_settings.overlay_obs_metar_state_filter_enabled =
+                    metar_state_filter_enabled;
+                self.app_settings.overlay_obs_metar_states = metar_states;
+                let _ = self.app_settings.save();
                 ctx.request_repaint();
             }
             if obs_adjust_changed {
@@ -1299,7 +1382,35 @@ impl ViewerApp {
             let fetching = self.aircraft_profiles_rx.is_some();
             let status = self.aircraft_profiles_status.clone();
             let source_file = self.aircraft_profiles_file.clone();
-            if layer_row(
+            let selected_profile = self
+                .selected_aircraft_profile
+                .as_deref()
+                .and_then(|selected| {
+                    self.aircraft_profiles
+                        .iter()
+                        .find(|profile| profile.airport == selected)
+                })
+                .map(|profile| {
+                    let (latitude, longitude) = profile.marker_position();
+                    (
+                        profile.display_id(),
+                        profile.airport.clone(),
+                        latitude,
+                        longitude,
+                    )
+                });
+            let newest_profile = self
+                .aircraft_profiles
+                .iter()
+                .max_by(|left, right| left.valid_time.cmp(&right.valid_time))
+                .map(|profile| {
+                    let (latitude, longitude) = profile.marker_position();
+                    (profile.airport.clone(), latitude, longitude)
+                });
+            let mut follow_selected = self.aircraft_follow_selected;
+            let mut follow_changed = false;
+            let mut center_profile = None;
+            let row_changed = layer_row(
                 ui,
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
@@ -1310,11 +1421,44 @@ impl ViewerApp {
                     name_hover: "MADIS aircraft profiles - limited anonymous public real-time subset",
                     gear: Some(LayerRowGear::Menu {
                         hover: "MADIS aircraft-profile source and coverage",
-                        content: Box::new(move |ui| {
+                        content: Box::new(|ui| {
                             ui.strong(format!("{profile_count} current airport profiles"));
                             ui.weak(&status);
                             if let Some(file) = &source_file {
                                 ui.weak(format!("Hourly source file: {file}"));
+                            }
+                            if ui
+                                .add_enabled(
+                                    newest_profile.is_some(),
+                                    egui::Button::new("Find newest profile"),
+                                )
+                                .on_hover_text(
+                                    "Select and center the newest anonymous MADIS profile endpoint",
+                                )
+                                .clicked()
+                                && let Some(profile) = &newest_profile
+                            {
+                                center_profile = Some(profile.clone());
+                            }
+                            if let Some((display_id, airport, latitude, longitude)) =
+                                &selected_profile
+                            {
+                                ui.separator();
+                                ui.label(format!("Selected: {display_id}"));
+                                if ui
+                                    .checkbox(&mut follow_selected, "Follow selected profile")
+                                    .on_hover_text(
+                                        "Recenter on this airport's newest hourly profile endpoint after each MADIS refresh. This is not continuous live aircraft tracking.",
+                                    )
+                                    .changed()
+                                {
+                                    follow_changed = true;
+                                }
+                                if ui.button("Center selected profile").clicked() {
+                                    center_profile = Some((airport.clone(), *latitude, *longitude));
+                                }
+                            } else {
+                                ui.weak("Click a cyan profile marker to select its path.");
                             }
                             ui.separator();
                             ui.label(format!("Source: {}.", aircraft_soundings::SOURCE_NAME));
@@ -1333,7 +1477,20 @@ impl ViewerApp {
                         ui.spinner();
                     }
                 },
-            ) {
+            );
+            if let Some((airport, latitude, longitude)) = center_profile {
+                self.selected_aircraft_profile = Some(airport);
+                self.center_map_on(latitude, longitude);
+                ctx.request_repaint();
+            }
+            if follow_changed {
+                self.aircraft_follow_selected = follow_selected;
+                if follow_selected && let Some((_, _, latitude, longitude)) = selected_profile {
+                    self.center_map_on(latitude, longitude);
+                }
+                ctx.request_repaint();
+            }
+            if row_changed {
                 if self.aircraft_soundings_enabled {
                     self.aircraft_profiles_next_poll = None;
                 }

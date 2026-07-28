@@ -3572,7 +3572,8 @@ impl ViewerApp {
             .iter()
             .enumerate()
             .filter_map(|(index, profile)| {
-                let position = self.lon_lat_to_screen(rect, profile.longitude, profile.latitude);
+                let (latitude, longitude) = profile.marker_position();
+                let position = self.lon_lat_to_screen(rect, longitude, latitude);
                 rect.expand(18.0)
                     .contains(position)
                     .then_some((index, position))
@@ -4011,6 +4012,43 @@ impl ViewerApp {
                     egui::Color32::from_rgb(210, 246, 250),
                 );
             }
+        }
+    }
+
+    /// Draw the level-by-level trajectory carried by each anonymous MADIS
+    /// profile. These are hourly profile paths, not continuous live aircraft
+    /// tracks; the selected airport is emphasized so the follow control has a
+    /// clear visual target.
+    pub(crate) fn draw_aircraft_profile_paths(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.aircraft_soundings_enabled {
+            return;
+        }
+        for profile in &self.aircraft_profiles {
+            if profile.track.len() < 2 {
+                continue;
+            }
+            let points = profile
+                .track
+                .iter()
+                .map(|(lat, lon)| self.lon_lat_to_screen(rect, *lon, *lat))
+                .collect::<Vec<_>>();
+            if !points
+                .iter()
+                .any(|point| rect.expand(24.0).contains(*point))
+            {
+                continue;
+            }
+            let selected =
+                self.selected_aircraft_profile.as_deref() == Some(profile.airport.as_str());
+            let stroke = if selected {
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 225, 240))
+            } else {
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(72, 170, 192, 150),
+                )
+            };
+            painter.add(egui::Shape::line(points, stroke));
         }
     }
 

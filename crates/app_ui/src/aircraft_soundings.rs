@@ -31,6 +31,10 @@ pub struct AircraftProfile {
     pub airport: String,
     pub latitude: f32,
     pub longitude: f32,
+    /// Reported level-by-level flight path in source order. MADIS does not
+    /// expose a stable aircraft identity in this anonymous hourly feed, so
+    /// this is a profile trajectory rather than a continuous live track.
+    pub track: Vec<(f32, f32)>,
     pub valid_time: DateTime<Utc>,
     pub ascending: bool,
     pub source: String,
@@ -45,6 +49,13 @@ impl AircraftProfile {
 
     pub fn display_id(&self) -> String {
         format!("{} {}", self.airport, self.direction_label())
+    }
+
+    pub fn marker_position(&self) -> (f32, f32) {
+        self.track
+            .last()
+            .copied()
+            .unwrap_or((self.latitude, self.longitude))
     }
 }
 
@@ -411,18 +422,24 @@ fn profiles_from_arrays(arrays: &MadisArrays) -> Result<Vec<AircraftProfile>, St
             continue;
         }
 
+        let track_start = record * arrays.max_levels;
+        let track_end = track_start + n_levels;
+        let mut track = arrays.track_lat[track_start..track_end]
+            .iter()
+            .zip(&arrays.track_lon[track_start..track_end])
+            .filter(|(lat, lon)| valid_coordinates(**lat, **lon))
+            .map(|(lat, lon)| (*lat as f32, *lon as f32))
+            .collect::<Vec<_>>();
+        track.dedup_by(|left, right| {
+            (left.0 - right.0).abs() < 0.0001 && (left.1 - right.1).abs() < 0.0001
+        });
+
         let mut latitude = arrays.latitude[record];
         let mut longitude = arrays.longitude[record];
         if !valid_coordinates(latitude, longitude) {
-            let start = record * arrays.max_levels;
-            let end = start + n_levels;
-            if let Some((lat, lon)) = arrays.track_lat[start..end]
-                .iter()
-                .zip(&arrays.track_lon[start..end])
-                .find(|(lat, lon)| valid_coordinates(**lat, **lon))
-            {
-                latitude = *lat;
-                longitude = *lon;
+            if let Some((lat, lon)) = track.first().copied() {
+                latitude = lat as f64;
+                longitude = lon as f64;
             }
         }
         if !valid_coordinates(latitude, longitude) {
@@ -477,6 +494,7 @@ fn profiles_from_arrays(arrays: &MadisArrays) -> Result<Vec<AircraftProfile>, St
             airport,
             latitude: latitude as f32,
             longitude: longitude as f32,
+            track,
             valid_time,
             ascending: arrays.profile_type[record] >= 0.0,
             source,
@@ -614,6 +632,22 @@ mod tests {
                 .station_id
                 .contains("pressure-altitude p")
         );
+    }
+
+    #[test]
+    fn profile_keeps_reported_track_and_uses_its_endpoint_for_the_marker() {
+        let mut arrays = test_arrays(12);
+        for level in 0..12 {
+            arrays.track_lat[level] = 38.70 + level as f64 * 0.01;
+            arrays.track_lon[level] = -90.50 + level as f64 * 0.02;
+        }
+
+        let profile = profiles_from_arrays(&arrays).unwrap().remove(0);
+
+        assert_eq!(profile.track.len(), 12);
+        let (lat, lon) = profile.marker_position();
+        assert!((lat - 38.81).abs() < 0.001);
+        assert!((lon + 90.28).abs() < 0.001);
     }
 
     #[test]

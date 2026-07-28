@@ -3544,6 +3544,10 @@ struct ViewerApp {
     aircraft_profiles_file: Option<String>,
     aircraft_profiles_status: String,
     aircraft_soundings_enabled: bool,
+    /// Airport key of the selected anonymous MADIS profile. The feed has no
+    /// stable flight id, so selection/following is explicitly profile-based.
+    selected_aircraft_profile: Option<String>,
+    aircraft_follow_selected: bool,
     /// Viewport-cached official NOAA/NWS NWPS river gauges. The persisted
     /// visibility toggle lives directly in `app_settings`.
     river_gauges: river_gauges::RiverGaugeState,
@@ -7943,6 +7947,10 @@ fn product_picker_group(product: &DisplayProduct) -> ProductPickerGroup {
     }
 }
 
+fn product_visible_in_picker(product: &DisplayProduct, unfold_plain_velocity: bool) -> bool {
+    !(unfold_plain_velocity && matches!(product, DisplayProduct::DealiasedVelocity))
+}
+
 fn product_picker_long_label(product: &DisplayProduct) -> String {
     if let Some(label) = validation_product_label(product) {
         return label.to_owned();
@@ -9264,6 +9272,8 @@ impl ViewerApp {
             aircraft_profiles_file: None,
             aircraft_profiles_status: "Enable to load the public MADIS subset".to_owned(),
             aircraft_soundings_enabled: restored_aircraft_soundings,
+            selected_aircraft_profile: None,
+            aircraft_follow_selected: false,
             river_gauges: river_gauges::RiverGaugeState::default(),
             // An enabled adjustment depends on the observation feed. Keep a
             // saved adjustment effective even if an older/inconsistent config
@@ -24881,6 +24891,11 @@ impl ViewerApp {
         let product_buttons = self
             .displayable_products_for_picker(volume)
             .into_iter()
+            // When plain VEL is already rendered through the selected dealias
+            // engine, DVEL would be an identical second picker row. Keep the
+            // product itself valid for saved panes and hotkeys, but remove the
+            // redundant ordinary-browser entry while Auto-dealias VEL is on.
+            .filter(|product| product_visible_in_picker(product, self.unfold_velocity_display))
             .map(|product| {
                 let target_cut = if editing_pane.is_none() {
                     self.preferred_primary_cut_for_product_switch(volume, &product)
@@ -24986,6 +25001,64 @@ impl ViewerApp {
             .map(|(key, label)| (label.clone(), key.clone()))
             .collect();
         let mut clicked_product = None;
+        let editing_label = editing_product.label().to_owned();
+        let editing_is_favorite = self
+            .app_settings
+            .radar_product_favorites
+            .iter()
+            .any(|label| label == &editing_label);
+        let favorite_products = self
+            .app_settings
+            .radar_product_favorites
+            .iter()
+            .filter_map(|label| {
+                product_buttons
+                    .iter()
+                    .find(|(product, _)| product.label() == label)
+                    .map(|(product, _)| product.clone())
+            })
+            .collect::<Vec<_>>();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .small_button(if editing_is_favorite {
+                    "★ Favorited"
+                } else {
+                    "☆ Favorite"
+                })
+                .on_hover_text(if editing_is_favorite {
+                    "Remove the current radar product from Favorites"
+                } else {
+                    "Add the current radar product to Favorites"
+                })
+                .clicked()
+            {
+                if editing_is_favorite {
+                    self.app_settings
+                        .radar_product_favorites
+                        .retain(|label| label != &editing_label);
+                } else {
+                    self.app_settings
+                        .radar_product_favorites
+                        .push(editing_label.clone());
+                }
+                let _ = self.app_settings.save();
+            }
+            if !favorite_products.is_empty() {
+                ui.weak("Favorites:");
+                for product in favorite_products {
+                    if ui
+                        .selectable_label(
+                            editing_product == &product,
+                            product_display_label(&product),
+                        )
+                        .on_hover_text(product_picker_long_label(&product))
+                        .clicked()
+                    {
+                        clicked_product = Some(product);
+                    }
+                }
+            }
+        });
         if self.app_settings.classic_product_picker {
             // Compatibility layout: the compact pre-v0.34.2 chip grid. This
             // intentionally changes presentation only; product availability,
@@ -29651,6 +29724,7 @@ impl ViewerApp {
             .hover_pos()
             .and_then(|pointer| nearest_marker_within(&aircraft_points, pointer))
             .map(|(index, _)| index);
+        self.draw_aircraft_profile_paths(painter, rect);
         self.draw_aircraft_profile_markers(painter, &aircraft_points, hovered_aircraft);
         let hovered_river = response
             .hover_pos()
@@ -30187,6 +30261,7 @@ impl ViewerApp {
                 .flatten()
                 .and_then(|pointer| nearest_marker_within(&aircraft_points, pointer))
                 .map(|(index, _)| index);
+            self.draw_aircraft_profile_paths(&cell_painter, cell);
             self.draw_aircraft_profile_markers(&cell_painter, &aircraft_points, hovered_aircraft);
             let river_gauge_points = self.river_gauge_marker_points(cell);
             let hovered_river = hovers
@@ -31220,6 +31295,27 @@ impl ViewerApp {
         }
     }
 
+    /// Whether an observation belongs on the map. The optional state filter
+    /// intentionally applies only to METAR presentation/hit-testing; objective
+    /// analysis and sounding adjustment keep their complete observation pool.
+    fn surface_ob_visible_on_map(&self, ob: &obs::SurfaceOb) -> bool {
+        if ob.network != "METAR" {
+            return self.obs_show_mesonet;
+        }
+        if !self.obs_show_metar {
+            return false;
+        }
+        if !self.app_settings.overlay_obs_metar_state_filter_enabled {
+            return true;
+        }
+        us_state_abbr_for_lon_lat(ob.lat, ob.lon).is_some_and(|state| {
+            self.app_settings
+                .overlay_obs_metar_states
+                .iter()
+                .any(|selected| selected == state)
+        })
+    }
+
     fn nearest_surface_ob_to_lonlat(
         &self,
         lon: f32,
@@ -31232,10 +31328,7 @@ impl ViewerApp {
         let frame_time = self.surface_obs_frame_time_utc();
         self.surface_obs
             .frame_obs(frame_time)
-            .filter(|ob| {
-                let is_metar = ob.network == "METAR";
-                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
-            })
+            .filter(|ob| self.surface_ob_visible_on_map(ob))
             .filter_map(|ob| {
                 let distance_km = haversine_km(lat, lon, ob.lat, ob.lon);
                 (distance_km <= max_km).then_some((distance_km, ob))
@@ -31275,10 +31368,7 @@ impl ViewerApp {
         let frame_time = self.surface_obs_frame_time_utc();
         self.surface_obs
             .frame_obs_in_bounds(frame_time, bounds)
-            .filter(|ob| {
-                let is_metar = ob.network == "METAR";
-                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
-            })
+            .filter(|ob| self.surface_ob_visible_on_map(ob))
             .filter_map(|ob| {
                 let position = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
                 let distance = position.distance(pointer);
@@ -34520,6 +34610,16 @@ impl ViewerApp {
                     snapshot.file_hour.format("%Y-%m-%d %H00Z")
                 );
                 self.aircraft_profiles = snapshot.profiles;
+                if self.aircraft_follow_selected
+                    && let Some(selected) = self.selected_aircraft_profile.as_deref()
+                    && let Some((latitude, longitude)) = self
+                        .aircraft_profiles
+                        .iter()
+                        .find(|profile| profile.airport == selected)
+                        .map(aircraft_soundings::AircraftProfile::marker_position)
+                {
+                    self.center_map_on(latitude, longitude);
+                }
             }
             Ok(Err(error)) => {
                 self.aircraft_profiles_rx = None;
@@ -36389,10 +36489,61 @@ impl ViewerApp {
                     .on_hover_text(
                         "Transparent stackables (dBZ/UH paintballs) drawn over the base product — like the official viewer's WoFS Overlays",
                     );
+                    let current_wofs_product = self.wofs.product.clone();
+                    let current_wofs_favorite = self
+                        .app_settings
+                        .wofs_product_favorites
+                        .iter()
+                        .any(|slug| slug == &current_wofs_product);
+                    if ui
+                        .small_button(if current_wofs_favorite { "★" } else { "☆" })
+                        .on_hover_text(if current_wofs_favorite {
+                            "Remove this WoFS product from Favorites"
+                        } else {
+                            "Add this WoFS product to Favorites"
+                        })
+                        .clicked()
+                    {
+                        if current_wofs_favorite {
+                            self.app_settings
+                                .wofs_product_favorites
+                                .retain(|slug| slug != &current_wofs_product);
+                        } else {
+                            self.app_settings
+                                .wofs_product_favorites
+                                .push(current_wofs_product.clone());
+                        }
+                        let _ = self.app_settings.save();
+                    }
+                    let favorite_wofs_products = self
+                        .app_settings
+                        .wofs_product_favorites
+                        .iter()
+                        .filter(|favorite| {
+                            catalog
+                                .groups
+                                .values()
+                                .flatten()
+                                .any(|available| available == *favorite)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
                     egui::ComboBox::from_id_salt("wofs_product")
                         .selected_text(wofs::product_label(&self.wofs.product))
                         .width(240.0)
                         .show_ui(ui, |ui| {
+                            if !favorite_wofs_products.is_empty() {
+                                ui.strong("Favorites");
+                                for slug in &favorite_wofs_products {
+                                    let response = ui.selectable_value(
+                                        &mut self.wofs.product,
+                                        slug.clone(),
+                                        wofs::product_label(slug),
+                                    );
+                                    response.on_hover_text(slug.as_str());
+                                }
+                                ui.separator();
+                            }
                             for (group, slugs) in &catalog.groups {
                                 ui.weak(group);
                                 for slug in slugs.iter().take(40) {
@@ -38617,10 +38768,7 @@ impl ViewerApp {
         let mut order: Vec<(&obs::SurfaceOb, egui::Pos2)> = self
             .surface_obs
             .frame_obs_in_bounds(frame_time, ob_bounds)
-            .filter(|ob| {
-                let is_metar = ob.network == "METAR";
-                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
-            })
+            .filter(|ob| self.surface_ob_visible_on_map(ob))
             .filter(|ob| {
                 !looping
                     || ob
@@ -38742,10 +38890,7 @@ impl ViewerApp {
         let reports: Vec<&obs::SurfaceOb> = self
             .surface_obs
             .frame_obs_in_bounds(frame_time, ob_bounds)
-            .filter(|ob| {
-                let is_metar = ob.network == "METAR";
-                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
-            })
+            .filter(|ob| self.surface_ob_visible_on_map(ob))
             .filter(|ob| {
                 ob.time_utc
                     .map(|time| (frame_time - time).num_minutes().abs() <= 60)
@@ -39810,6 +39955,7 @@ impl ViewerApp {
                 let Some(profile) = self.aircraft_profiles.get(index).cloned() else {
                     return false;
                 };
+                self.selected_aircraft_profile = Some(profile.airport.clone());
                 self.start_aircraft_sounding_for(profile, ctx);
                 true
             }
@@ -39912,6 +40058,7 @@ impl ViewerApp {
                 let Some(profile) = self.aircraft_profiles.get(index).cloned() else {
                     return false;
                 };
+                self.selected_aircraft_profile = Some(profile.airport.clone());
                 self.start_aircraft_sounding_for(profile, ctx);
                 true
             }
@@ -51453,6 +51600,26 @@ mod tests {
         assert!(products.contains(&DisplayProduct::DealiasedVelocity));
         assert!(products.contains(&DisplayProduct::StormRelativeVelocity));
         assert!(products.contains(&DisplayProduct::StormRelativeDealiasedVelocity));
+    }
+
+    #[test]
+    fn auto_dealiased_vel_hides_only_the_redundant_dvel_picker_row() {
+        assert!(!product_visible_in_picker(
+            &DisplayProduct::DealiasedVelocity,
+            true
+        ));
+        assert!(product_visible_in_picker(
+            &DisplayProduct::Moment(MomentType::Velocity),
+            true
+        ));
+        assert!(product_visible_in_picker(
+            &DisplayProduct::StormRelativeDealiasedVelocity,
+            true
+        ));
+        assert!(product_visible_in_picker(
+            &DisplayProduct::DealiasedVelocity,
+            false
+        ));
     }
 
     #[test]
@@ -68408,6 +68575,8 @@ mod tests {
             aircraft_profiles_file: None,
             aircraft_profiles_status: String::new(),
             aircraft_soundings_enabled: false,
+            selected_aircraft_profile: None,
+            aircraft_follow_selected: false,
             river_gauges: river_gauges::RiverGaugeState::default(),
             obs_enabled: false,
             obs_show_metar: true,
@@ -68818,6 +68987,26 @@ mod tests {
         app.toggle_inspector_pin(rect, station_px);
         assert!(app.pinned_obs_chart_station.is_none());
         assert!(app.pinned_inspector_lonlat.is_some());
+    }
+
+    #[test]
+    fn metar_state_filter_affects_map_plots_but_not_mesonet_visibility() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.obs_show_metar = true;
+        app.obs_show_mesonet = true;
+        app.app_settings.overlay_obs_metar_state_filter_enabled = true;
+        app.app_settings.overlay_obs_metar_states = vec!["MI".to_owned()];
+
+        let michigan_metar = test_surface_ob("KLAN", 42.78, -84.59, "METAR");
+        let indiana_metar = test_surface_ob("KIND", 39.72, -86.29, "METAR");
+        let indiana_mesonet = test_surface_ob("IN001", 39.72, -86.29, "DCP");
+
+        assert!(app.surface_ob_visible_on_map(&michigan_metar));
+        assert!(!app.surface_ob_visible_on_map(&indiana_metar));
+        assert!(app.surface_ob_visible_on_map(&indiana_mesonet));
+
+        app.app_settings.overlay_obs_metar_state_filter_enabled = false;
+        assert!(app.surface_ob_visible_on_map(&indiana_metar));
     }
 
     fn test_storm_volume(scan_time: DateTime<Utc>) -> RadarVolume {
