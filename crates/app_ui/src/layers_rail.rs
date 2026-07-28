@@ -1386,7 +1386,7 @@ impl ViewerApp {
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
                         value: &mut self.raob_markers_enabled,
-                        hover: "Radiosonde launch sites as lavender diamond markers — click one for that station's observed sounding at the DISPLAYED radar time (specials included: scrub an archive loop to 21z, get the 21z special). Wyoming + IEM archives, no key.",
+                        hover: "Radiosonde launch sites as lavender diamond markers — click one for that station's observed sounding at the DISPLAYED radar time (06/18z and other specials included). IEM archive, no key.",
                     },
                     name: "RAOB stations",
                     name_hover: "Observed-sounding launch sites (click a marker for the sounding at the displayed time, rendered in the native skew-T)",
@@ -1394,10 +1394,9 @@ impl ViewerApp {
                         hover: "RAOB layer notes",
                         content: Box::new(move |ui| {
                             ui.weak(format!("{site_count} launch sites (live + archive)."));
-                            ui.weak("Soundings come from the U. Wyoming archive");
-                            ui.weak("(every launch incl. off-hour specials, decades");
-                            ui.weak("deep) with the IEM RAOB archive as fallback");
-                            ui.weak("(synoptic 00/12z). The launch nearest BEFORE");
+                            ui.weak("Soundings come from the IEM RAOB archive");
+                            ui.weak("(every available launch, including 06/18z");
+                            ui.weak("and other specials). The launch nearest BEFORE");
                             ui.weak("the displayed frame time is fetched.");
                         }),
                     }),
@@ -1955,7 +1954,7 @@ impl ViewerApp {
                         if ui
                             .button("Obs sounding (RAOB)")
                             .on_hover_text(
-                                "Nearest radiosonde launch site to the map center, at the launch nearest the displayed frame — specials included (Wyoming + IEM archives, no key). Renders in the native skew-T with the full parameter suite. Tip: the RAOB stations layer puts every launch site on the map, click-to-sound.",
+                                "Nearest radiosonde launch site to the map center, at the launch nearest the displayed frame — 06/18z and other specials included (IEM archive, no key). Renders in the native skew-T with the full parameter suite. Tip: the RAOB stations layer puts every launch site on the map, click-to-sound.",
                             )
                             .clicked()
                         {

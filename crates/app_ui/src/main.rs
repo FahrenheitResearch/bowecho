@@ -34798,11 +34798,7 @@ impl ViewerApp {
         distance_km: Option<f32>,
         ctx: &egui::Context,
     ) {
-        let when = self
-            .volume
-            .as_ref()
-            .map(|volume| volume.volume_time.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
+        let when = self.displayed_timeline_time_utc().unwrap_or_else(Utc::now);
         let time_zone = self.time_zone();
         let sender = self.begin_raob_sounding_request(&site.id, ctx);
         let ctx_clone = ctx.clone();

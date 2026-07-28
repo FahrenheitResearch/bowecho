@@ -2,22 +2,12 @@
 //! skew-T pipeline as model soundings — full sharprs parameter suites on
 //! real RAOB launches.
 //!
-//! Two archives of the same provider family, in preference order:
-//!
-//! 1. University of Wyoming upper-air archive
-//!    (<https://weather.uwyo.edu/upperair/sounding.html>, CGI:
-//!    `cgi-bin/sounding?TYPE=TEXT:LIST&YEAR=&MONTH=&FROM=DDHH&TO=DDHH&
-//!    STNM=wmo`): serves EVERY transmitted launch — synoptic 00/12z AND
-//!    off-hour specials (verified: ILX 21z 11 Jun 2026, BMX 18z 27 Apr
-//!    2011, OUN 18z 03 May 1999) — decades deep (per-station
-//!    commissioning limits). One windowed request returns every launch
-//!    in the range, so the launch nearest the displayed frame is found
-//!    without probing hour by hour.
-//! 2. Iowa Environmental Mesonet RAOB archive (JSON, no key): site list
-//!    from the RAOB network GeoJSON, profiles from `json/raob.py` at the
-//!    synoptic hours. Synoptic-only (00/12z; no specials — verified
-//!    empty for the launches above) but reaches 1940s starts for legacy
-//!    stations. Used when a site has no WMO number or Wyoming fails.
+//! The Iowa Environmental Mesonet RAOB archive provides the embedded/live
+//! station catalog plus a bounded CSV profile request. A single request
+//! returns every launch in the window, including 06/18z and other special
+//! soundings, so the launch nearest the displayed frame can be selected by
+//! its exact `validUTC`. The point JSON service is retained as a 00/12z
+//! fallback when the range service is unavailable.
 //!
 //! Archive-aware: callers pass the displayed frame's time and get the
 //! launch nearest BEFORE it (+90 min grace for transmission), specials
@@ -26,9 +16,9 @@
 //! Public MADIS aircraft-profile soundings are implemented separately in
 //! `aircraft_soundings`; this module remains dedicated to radiosondes.
 
-use std::sync::OnceLock;
+use std::{collections::BTreeMap, sync::OnceLock};
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Timelike, Utc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RaobSite {
@@ -38,8 +28,8 @@ pub struct RaobSite {
     pub name: String,
     pub lat: f32,
     pub lon: f32,
-    /// WMO synoptic number (74560) — what the Wyoming CGI's STNM wants.
-    /// None: IEM-only station.
+    /// WMO synoptic number retained from the upstream station catalog.
+    /// Some sites (notably KEFD) do not have a trustworthy WMO mapping.
     pub synop: Option<u32>,
 }
 
@@ -221,11 +211,8 @@ const IGRA2_COORD_OVERRIDES: &[(u32, f32, f32)] = &[
     (76679, 19.4037, -99.1966),  // MMMX Mexico City
 ];
 
-/// IEM-catalog corrections shared by the embedded table and the live
-/// refresh: IGRA2 coordinate overrides, and KEFD's bogus synop (IEM
-/// carries Polish-block 12906 for Ellington; Wyoming's STNM=12906 is
-/// empty, so the special-launch path would silently never work — keep
-/// KEFD IEM-only).
+/// IEM-catalog corrections shared by the embedded table and live refresh:
+/// IGRA2 coordinate overrides plus KEFD's bogus Polish-block WMO number.
 fn apply_catalog_corrections(site: &mut RaobSite) {
     if site.id == "KEFD" {
         site.synop = None;
@@ -414,13 +401,22 @@ fn column_from_levels(
     })
 }
 
-/// Fetch one IEM RAOB profile (synoptic hours only) into the
-/// native-sounding column shape.
+fn iem_timestamp(time: &DateTime<Utc>) -> String {
+    time.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn iem_query_timestamp(time: &DateTime<Utc>) -> String {
+    iem_timestamp(time).replace(':', "%3A")
+}
+
+/// Fetch one IEM RAOB profile into the native-sounding column shape.
+/// The service requires an ISO-8601 timestamp; compact ten-digit timestamps
+/// happen to resolve at 00z but return empty profiles at later launches.
 pub fn fetch_raob(
     station: &str,
     launch: DateTime<Utc>,
 ) -> Result<rustwx_sounding::SoundingColumn, String> {
-    let ts = launch.format("%Y%m%d%H").to_string();
+    let ts = iem_query_timestamp(&launch);
     let url = format!("https://mesonet.agron.iastate.edu/json/raob.py?ts={ts}&station={station}");
     let text = data_source::fetch_text(&url).map_err(|e| e.to_string())?;
     let root: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -428,6 +424,16 @@ pub fn fetch_raob(
         .as_array()
         .and_then(|p| p.first())
         .ok_or("no profile")?;
+    let actual_valid = profile["valid"]
+        .as_str()
+        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+        .map(|time| time.with_timezone(&Utc))
+        .ok_or("profile missing valid time")?;
+    if actual_valid != launch {
+        return Err(format!(
+            "profile valid {actual_valid} did not match requested launch {launch}"
+        ));
+    }
     let levels = profile["profile"].as_array().ok_or("no levels")?;
     let mut raw = Vec::new();
     for level in levels {
@@ -448,7 +454,7 @@ pub fn fetch_raob(
             },
         });
     }
-    column_from_levels(station, launch, &raw)
+    column_from_levels(station, actual_valid, &raw)
 }
 
 /// The launch search window for a displayed-frame time: `when` plus the
@@ -459,152 +465,104 @@ fn launch_window(when: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
     (end - Duration::hours(13), end)
 }
 
-/// One Wyoming CGI query: a (YEAR, MONTH, FROM, TO) tuple in the archive's
-/// DDHH convention. A window is served by one query per calendar month it
-/// touches (FROM/TO are day-hour within YEAR/MONTH), so a 13-hour window
-/// yields one segment, or two across a month boundary.
-fn wyoming_segments(start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<(i32, u32, String, String)> {
-    let ddhh = |t: &DateTime<Utc>| format!("{:02}{:02}", t.day(), t.hour());
-    if (start.year(), start.month()) == (end.year(), end.month()) {
-        return vec![(start.year(), start.month(), ddhh(&start), ddhh(&end))];
+fn iem_range_url(station: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> String {
+    // `ets` is exclusive. One extra second keeps a launch exactly at the
+    // +90-minute grace boundary eligible without admitting a later cycle.
+    let exclusive_end = end + Duration::seconds(1);
+    let sts = iem_query_timestamp(&start);
+    let ets = iem_query_timestamp(&exclusive_end);
+    format!(
+        "https://mesonet.agron.iastate.edu/cgi-bin/request/raob.py?station={station}&sts={sts}&ets={ets}"
+    )
+}
+
+fn csv_number(fields: &[&str], index: usize) -> Option<f64> {
+    let value = fields.get(index)?.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("M") {
+        return None;
     }
-    // Month boundary: [start ..= last hour of start's month], then
-    // [first hour of end's month ..= end].
-    let first_of_end_month = match Utc.with_ymd_and_hms(end.year(), end.month(), 1, 0, 0, 0) {
-        chrono::LocalResult::Single(t) => t,
-        _ => return vec![(end.year(), end.month(), "0100".to_owned(), ddhh(&end))],
-    };
-    let last_of_start_month = first_of_end_month - Duration::hours(1);
-    vec![
-        (
-            start.year(),
-            start.month(),
-            ddhh(&start),
-            ddhh(&last_of_start_month),
-        ),
-        (end.year(), end.month(), "0100".to_owned(), ddhh(&end)),
-    ]
+    value.parse().ok()
 }
 
-/// Parse a Wyoming `Observations at 21Z 11 Jun 2026` header time. Manual
-/// hour split because chrono's `NaiveDateTime` parser wants minutes the
-/// header doesn't carry.
-fn parse_wyoming_header_time(text: &str) -> Option<DateTime<Utc>> {
-    let (hour_text, date_text) = text.trim().split_once("Z ")?;
-    let hour: u32 = hour_text.trim().parse().ok()?;
-    let date = NaiveDate::parse_from_str(date_text.trim(), "%d %b %Y").ok()?;
-    Some(date.and_hms_opt(hour, 0, 0)?.and_utc())
-}
-
-/// One fixed-width column of a Wyoming TEXT:LIST data line (7 chars per
-/// column: PRES HGHT TEMP DWPT RELH MIXR DRCT SKNT THTA THTE THTV).
-/// Blank columns are MISSING — whitespace splitting would shift fields,
-/// so slice by position.
-fn wyoming_column(line: &str, index: usize) -> Option<f64> {
-    let start = index * 7;
-    let end = (start + 7).min(line.len());
-    line.get(start..end)?.trim().parse().ok()
-}
-
-/// Every sounding in a Wyoming TEXT:LIST response: (valid time, levels).
-/// Sections are `<H2>… Observations at HHZ dd Mon yyyy</H2><PRE>table
-/// </PRE>`; malformed sections are skipped, never fatal (network data).
-fn parse_wyoming_listing(html: &str) -> Vec<(DateTime<Utc>, Vec<RawLevel>)> {
-    let mut soundings = Vec::new();
-    for section in html.split("<H2>").skip(1) {
-        let Some(header_end) = section.find("</H2>") else {
+/// Decode the IEM range CSV and group its rows by the exact launch time.
+/// The first nine fields are unquoted identifiers/timestamps/numbers; later
+/// balloon-location fields are intentionally ignored.
+fn parse_iem_range_csv(text: &str) -> Vec<(DateTime<Utc>, Vec<RawLevel>)> {
+    let mut launches: BTreeMap<DateTime<Utc>, Vec<RawLevel>> = BTreeMap::new();
+    for line in text.lines().skip(1) {
+        let fields = line.trim_end_matches('\r').split(',').collect::<Vec<_>>();
+        if fields.len() < 9 {
             continue;
-        };
-        let Some(valid) = section[..header_end]
-            .split("Observations at ")
-            .nth(1)
-            .and_then(parse_wyoming_header_time)
+        }
+        let Some(valid) = NaiveDateTime::parse_from_str(fields[1].trim(), "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|time| time.and_utc())
         else {
             continue;
         };
-        // The data table is the <PRE> right after the header; the
-        // station-info <PRE> further on never reaches this slice.
-        let Some(pre_start) = section[header_end..].find("<PRE>") else {
+        let (Some(pres), Some(hght), Some(tmpc), Some(dwpc)) = (
+            csv_number(&fields, 3),
+            csv_number(&fields, 4),
+            csv_number(&fields, 5),
+            csv_number(&fields, 6),
+        ) else {
             continue;
         };
-        let table_start = header_end + pre_start + "<PRE>".len();
-        let Some(pre_len) = section[table_start..].find("</PRE>") else {
-            continue;
-        };
-        let mut raw = Vec::new();
-        for line in section[table_start..table_start + pre_len].lines() {
-            if !line.is_ascii() {
-                continue;
-            }
-            // Header/divider lines fail the numeric parse and fall out.
-            let (Some(pres), Some(hght), Some(tmpc), Some(dwpc)) = (
-                wyoming_column(line, 0),
-                wyoming_column(line, 1),
-                wyoming_column(line, 2),
-                wyoming_column(line, 3),
-            ) else {
-                continue;
-            };
-            raw.push(RawLevel {
-                pres,
-                hght,
-                tmpc,
-                dwpc,
-                wind: match (wyoming_column(line, 6), wyoming_column(line, 7)) {
-                    (Some(d), Some(s)) => Some((d, s)),
-                    _ => None,
-                },
-            });
-        }
-        if !raw.is_empty() {
-            soundings.push((valid, raw));
-        }
+        launches.entry(valid).or_default().push(RawLevel {
+            pres,
+            hght,
+            tmpc,
+            dwpc,
+            wind: match (csv_number(&fields, 7), csv_number(&fields, 8)) {
+                (Some(direction), Some(speed_knots)) => Some((direction, speed_knots)),
+                _ => None,
+            },
+        });
     }
-    soundings
+    launches.into_iter().collect()
+}
+
+fn eligible_iem_launches(
+    text: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Vec<(DateTime<Utc>, Vec<RawLevel>)> {
+    let mut launches = parse_iem_range_csv(text);
+    launches.retain(|(valid, _)| *valid >= start && *valid <= end);
+    launches.sort_by_key(|(valid, _)| std::cmp::Reverse(*valid));
+    launches
 }
 
 /// Fetch the launch nearest BEFORE `when` (+grace) for one station,
-/// specials included: one windowed Wyoming-archive query lists every
-/// launch around the displayed time (a 21z special beats the 12z
-/// synoptic when the loop is scrubbed to 21z); the IEM synoptic walk
-/// covers stations without WMO numbers and Wyoming outages. Returns the
-/// column and the launch's actual valid time.
+/// specials included. One bounded IEM request lists every exact launch
+/// around the displayed time (an 18z or 21z special beats the 12z
+/// synoptic when the loop is scrubbed to it). The point JSON synoptic walk
+/// covers a range-service outage. Returns the column and actual valid time.
 pub fn fetch_raob_near(
     site: &RaobSite,
     when: DateTime<Utc>,
 ) -> Result<(rustwx_sounding::SoundingColumn, DateTime<Utc>), String> {
-    let mut wyoming_err = String::new();
-    if let Some(synop) = site.synop {
-        let (start, end) = launch_window(when);
-        let mut launches: Vec<(DateTime<Utc>, Vec<RawLevel>)> = Vec::new();
-        for (year, month, from, to) in wyoming_segments(start, end) {
-            let url = format!(
-                "https://weather.uwyo.edu/cgi-bin/sounding?TYPE=TEXT%3ALIST\
-                 &YEAR={year}&MONTH={month:02}&FROM={from}&TO={to}&STNM={synop}"
-            );
-            match data_source::fetch_listing_text(&url) {
-                Ok(html) => launches.extend(parse_wyoming_listing(&html)),
-                Err(e) => wyoming_err = e.to_string(),
+    let (start, end) = launch_window(when);
+    let range_url = iem_range_url(&site.id, start, end);
+    let mut last_err = String::new();
+    match data_source::fetch_listing_text(&range_url) {
+        Ok(text) => {
+            for (valid, raw) in eligible_iem_launches(&text, start, end) {
+                match column_from_levels(&site.id, valid, &raw) {
+                    Ok(column) => return Ok((column, valid)),
+                    Err(error) => last_err = error,
+                }
+            }
+            if last_err.is_empty() {
+                last_err = "range response contained no eligible launch".to_owned();
             }
         }
-        // Newest launch at-or-before the window end first — specials rank
-        // by their actual valid hour, exactly what loop-scrubbing wants.
-        // Walk DOWN the window on a thin/rejected column instead of
-        // abandoning Wyoming entirely (review finding: a good 18Z special
-        // must not lose to the IEM 12Z fallback because a later truncated
-        // transmission failed to assemble).
-        launches.retain(|(valid, _)| *valid <= end);
-        launches.sort_by_key(|(valid, _)| std::cmp::Reverse(*valid));
-        for (valid, raw) in launches {
-            match column_from_levels(&site.id, valid, &raw) {
-                Ok(column) => return Ok((column, valid)),
-                Err(e) => wyoming_err = e,
-            }
-        }
+        Err(error) => last_err = error.to_string(),
     }
-    // IEM synoptic fallback (no WMO number, Wyoming outage, or a
-    // too-thin special): walk back through 00/12z launches.
-    let mut last_err = wyoming_err;
+
+    // Point-service fallback: walk back through the ordinary 00/12z
+    // launches. This uses ISO timestamps and validates the returned cycle,
+    // preventing the former 12z-empty -> 00z alias.
     for launch in launch_times_before(when) {
         match fetch_raob(&site.id, launch) {
             Ok(column) => return Ok((column, launch)),
@@ -688,20 +646,20 @@ mod tests {
         panic!("no station produced a column");
     }
 
-    /// The field request itself: the ILX 21z special launch on the
-    /// 2026-06-11 derecho day, via the displayed-time targeting path.
+    /// A known ILX 18z special launch on the 2026-06-11 derecho day, via
+    /// the displayed-time targeting path.
     /// Network test, run with --ignored.
     #[test]
     #[ignore]
-    fn live_ilx_21z_special() {
-        use chrono::TimeZone;
+    fn live_ilx_18z_special() {
+        use chrono::{Datelike, TimeZone};
         let site = static_sites()
             .iter()
             .find(|site| site.id == "KILX")
             .expect("KILX in the static table")
             .clone();
-        let when = Utc.with_ymd_and_hms(2026, 6, 11, 21, 30, 0).unwrap();
-        let (column, valid) = fetch_raob_near(&site, when).expect("fetch ILX near 21z");
+        let when = Utc.with_ymd_and_hms(2026, 6, 11, 18, 30, 0).unwrap();
+        let (column, valid) = fetch_raob_near(&site, when).expect("fetch ILX near 18z");
         println!(
             "KILX launch {valid}: {} levels, p {:.0}..{:.0} hPa",
             column.pressure_hpa.len(),
@@ -710,8 +668,8 @@ mod tests {
         );
         assert_eq!(
             (valid.hour(), valid.day()),
-            (21, 11),
-            "expected the 21z 11 Jun special, got {valid}"
+            (18, 11),
+            "expected the 18z 11 Jun special, got {valid}"
         );
         let native = rustwx_sounding::NativeSounding::from_column(&column).expect("native compute");
         let params = &native.params;
@@ -750,36 +708,13 @@ mod tests {
                 site.lat.abs() <= 90.0 && site.lon.abs() <= 180.0,
                 "{site:?}"
             );
-            // Every station carries a Wyoming key EXCEPT KEFD, whose IEM
-            // synop (Polish-block 12906) is bogus — corrected to IEM-only
-            // by apply_catalog_corrections.
+            // Every station carries upstream WMO metadata EXCEPT KEFD,
+            // whose Polish-block synop is bogus.
             assert!(site.synop.is_some() || site.id == "KEFD", "{site:?}");
         }
-        // The Wyoming STNM key for the field request's station.
+        // Upstream WMO metadata remains intact for catalog consumers.
         let ilx = sites.iter().find(|s| s.id == "KILX").unwrap();
         assert_eq!(ilx.synop, Some(74560));
-    }
-
-    #[test]
-    fn wyoming_segments_split_only_on_month_boundaries() {
-        use chrono::TimeZone;
-        // Mid-month window: one segment.
-        let start = Utc.with_ymd_and_hms(2026, 6, 11, 9, 30, 0).unwrap();
-        let end = Utc.with_ymd_and_hms(2026, 6, 11, 22, 30, 0).unwrap();
-        assert_eq!(
-            wyoming_segments(start, end),
-            vec![(2026, 6, "1109".to_owned(), "1122".to_owned())]
-        );
-        // Across a year boundary: two segments, December then January.
-        let start = Utc.with_ymd_and_hms(2025, 12, 31, 20, 0, 0).unwrap();
-        let end = Utc.with_ymd_and_hms(2026, 1, 1, 9, 0, 0).unwrap();
-        assert_eq!(
-            wyoming_segments(start, end),
-            vec![
-                (2025, 12, "3120".to_owned(), "3123".to_owned()),
-                (2026, 1, "0100".to_owned(), "0109".to_owned()),
-            ]
-        );
     }
 
     #[test]
@@ -791,81 +726,62 @@ mod tests {
         assert!(start <= Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap());
     }
 
-    /// A clipped, real-shaped Wyoming TEXT:LIST response (ILX 11 Jun
-    /// 2026): two sections — the 12z synoptic and the 21z special — with
-    /// blank fixed-width columns that MUST parse as missing, not shift.
-    /// (concat!, not line continuations: `\` would strip the leading
-    /// spaces the 7-char columns depend on.)
-    const WYOMING_FIXTURE: &str = concat!(
-        "<HTML>\n<TITLE>University of Wyoming - Radiosonde Data</TITLE>\n",
-        "<H2>74560 ILX Lincoln Observations at 12Z 11 Jun 2026</H2>\n<PRE>\n",
-        "-----------------------------------------------------------------------------\n",
-        "   PRES   HGHT   TEMP   DWPT   RELH   MIXR   DRCT   SKNT   THTA   THTE   THTV\n",
-        "    hPa     m      C      C      %    g/kg    deg   knot     K      K      K \n",
-        "-----------------------------------------------------------------------------\n",
-        " 1000.0     56                                                               \n",
-        "  986.0    178   25.6   22.1     81  17.31    180      6  300.0  350.9  303.1\n",
-        "  979.0    241   25.2   20.2     74  15.47    150     16  300.2  345.7  302.9\n",
-        "  972.0    305   26.0   19.6     68  15.04    175     17  301.6  346.2  304.3\n",
-        "</PRE><H3>Station information and sounding indices</H3><PRE>\n",
-        "                         Station identifier: ILX\n",
-        "                             Station number: 74560\n",
-        "</PRE>\n",
-        "<H2>74560 ILX Lincoln Observations at 21Z 11 Jun 2026</H2>\n<PRE>\n",
-        "-----------------------------------------------------------------------------\n",
-        "   PRES   HGHT   TEMP   DWPT   RELH   MIXR   DRCT   SKNT   THTA   THTE   THTV\n",
-        "    hPa     m      C      C      %    g/kg    deg   knot     K      K      K \n",
-        "-----------------------------------------------------------------------------\n",
-        "  984.0    178   30.8   24.8     70  20.52    155     11  305.4  367.2  309.1\n",
-        "  979.0    224   30.4   24.4     70  20.13    162         305.4  366.1  309.1\n",
-        "  970.1    305   29.6   24.0     72  19.80    175     23  305.4  365.0  308.9\n",
-        "</PRE>\n</BODY></HTML>\n",
+    const IEM_RANGE_FIXTURE: &str = concat!(
+        "station,validUTC,levelcode,pressure_mb,height_m,tmpc,dwpc,drct,speed_kts,bearing,range_sm\n",
+        "KILX,2026-06-11 12:00:00,4,986.0,178.0,25.6,22.1,180.0,6,M,M\n",
+        "KILX,2026-06-11 12:00:00,4,979.0,241.0,25.2,20.2,M,M,M,M\n",
+        "KILX,2026-06-11 18:00:00,4,984.0,178.0,30.8,24.8,155.0,11,M,M\n",
+        "KILX,2026-06-11 18:00:00,4,979.0,224.0,30.4,24.4,162.0,18,M,M\n",
+        "KILX,2026-06-11 21:00:00,4,970.1,305.0,29.6,24.0,175.0,23,M,M\n",
+        "KILX,2026-06-11 21:00:00,4,960.0,390.0,M,M,180.0,25,M,M\n",
     );
 
     #[test]
-    fn wyoming_listing_parses_every_section_with_fixed_columns() {
+    fn iem_range_csv_keeps_exact_synoptic_and_special_launches() {
         use chrono::TimeZone;
-        let soundings = parse_wyoming_listing(WYOMING_FIXTURE);
-        assert_eq!(soundings.len(), 2);
+        let launches = parse_iem_range_csv(IEM_RANGE_FIXTURE);
+        assert_eq!(launches.len(), 3);
         assert_eq!(
-            soundings[0].0,
-            Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap()
+            launches
+                .iter()
+                .map(|(valid, _)| valid.hour())
+                .collect::<Vec<_>>(),
+            vec![12, 18, 21]
         );
+        assert_eq!(launches[0].1[0].wind, Some((180.0, 6.0)));
+        assert_eq!(launches[0].1[1].wind, None);
+        // The 21z row missing required thermo fields is skipped, while the
+        // valid row remains attached to the exact special launch.
+        assert_eq!(launches[2].1.len(), 1);
         assert_eq!(
-            soundings[1].0,
+            launches[2].0,
             Utc.with_ymd_and_hms(2026, 6, 11, 21, 0, 0).unwrap()
         );
-        // The 1000.0 surface line lacks temp/dew -> dropped; three data
-        // lines minus one partial = 3 levels in the 12z section.
-        assert_eq!(soundings[0].1.len(), 3);
-        let first = &soundings[0].1[0];
-        assert_eq!(
-            (first.pres, first.hght, first.tmpc, first.dwpc),
-            (986.0, 178.0, 25.6, 22.1)
-        );
-        assert_eq!(first.wind, Some((180.0, 6.0)));
-        // 21z section: the truncated-wind line keeps thermo but reports
-        // no wind (blank SKNT column must not steal THTA's digits).
-        let special = &soundings[1].1;
-        assert_eq!(special.len(), 3);
-        assert_eq!(special[1].wind, None);
-        assert_eq!(special[1].tmpc, 30.4);
-        // Station-info <PRE> blocks contribute nothing.
-        assert!(special.iter().all(|level| level.pres > 900.0));
     }
 
     #[test]
-    fn wyoming_header_time_parses_and_rejects_garbage() {
+    fn range_selection_uses_newest_launch_inside_grace_window() {
         use chrono::TimeZone;
+        let start = Utc.with_ymd_and_hms(2026, 6, 11, 9, 30, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 11, 19, 30, 0).unwrap();
+        let launches = eligible_iem_launches(IEM_RANGE_FIXTURE, start, end);
         assert_eq!(
-            parse_wyoming_header_time("21Z 11 Jun 2026"),
-            Some(Utc.with_ymd_and_hms(2026, 6, 11, 21, 0, 0).unwrap())
+            launches
+                .iter()
+                .map(|(valid, _)| valid.hour())
+                .collect::<Vec<_>>(),
+            vec![18, 12]
         );
-        assert_eq!(
-            parse_wyoming_header_time("00Z 03 May 1999"),
-            Some(Utc.with_ymd_and_hms(1999, 5, 3, 0, 0, 0).unwrap())
-        );
-        assert_eq!(parse_wyoming_header_time("not a time"), None);
-        assert_eq!(parse_wyoming_header_time("99Z 11 Jun 2026"), None);
+    }
+
+    #[test]
+    fn iem_urls_use_iso_minutes_and_exclusive_range_end() {
+        use chrono::TimeZone;
+        let launch = Utc.with_ymd_and_hms(2026, 7, 28, 12, 0, 0).unwrap();
+        assert_eq!(iem_timestamp(&launch), "2026-07-28T12:00:00Z");
+        let end = Utc.with_ymd_and_hms(2026, 7, 28, 18, 0, 0).unwrap();
+        let url = iem_range_url("KILX", launch, end);
+        assert!(url.contains("sts=2026-07-28T12%3A00%3A00Z"));
+        assert!(url.contains("ets=2026-07-28T18%3A00%3A01Z"));
     }
 }
