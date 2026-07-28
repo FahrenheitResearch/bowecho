@@ -36513,6 +36513,7 @@ impl ViewerApp {
                                         .first()
                                         .cloned()
                                         .unwrap_or_default();
+                                    self.wofs.note_manual_cycle_selection();
                                 }
                             }
                         });
@@ -36522,11 +36523,16 @@ impl ViewerApp {
                             .width(76.0)
                             .show_ui(ui, |ui| {
                                 for init in run.inits.iter().rev() {
-                                    ui.selectable_value(
-                                        &mut self.wofs.init,
-                                        init.clone(),
-                                        format!("{}z", wofs::init_hhmm(init)),
-                                    );
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.wofs.init,
+                                            init.clone(),
+                                            format!("{}z", wofs::init_hhmm(init)),
+                                        )
+                                        .changed()
+                                    {
+                                        self.wofs.note_manual_cycle_selection();
+                                    }
                                 }
                             });
                     }

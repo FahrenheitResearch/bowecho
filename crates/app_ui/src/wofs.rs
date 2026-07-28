@@ -24,7 +24,7 @@
 
 use crate::wofs_georef::{self, WofsGeoref};
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -560,6 +560,13 @@ pub fn fetch_image(url: &str) -> Result<egui::ColorImage, String> {
 pub type StationsMsg = (String, Result<Vec<WofsStation>, String>);
 type AvailabilityMsg = (String, Result<u32, String>);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WofsTimelineFrame {
+    init: String,
+    minute: u32,
+    valid_time: chrono::DateTime<chrono::Utc>,
+}
+
 /// Disk cache path for one run's georef (run ids are CDN-safe already;
 /// sanitize anyway).
 fn georef_disk_path(run_id: &str) -> std::path::PathBuf {
@@ -621,6 +628,10 @@ pub struct WofsState {
     /// Stacked transparent overlays (paintball slugs).
     pub overlays: Vec<String>,
     pub sync_to_radar: bool,
+    /// True when radar-time sync chose an older cycle only to extend the
+    /// valid-time range. Catalog refresh must still treat that as following
+    /// live guidance rather than a deliberate manual cycle selection.
+    auto_cycle_for_valid_time: bool,
     /// Texture cache by URL (bounded).
     pub textures: HashMap<String, egui::TextureHandle>,
     pub image_rx: Option<mpsc::Receiver<(String, Result<egui::ColorImage, String>)>>,
@@ -770,6 +781,7 @@ impl Default for WofsState {
             minute: 60,
             overlays: Vec::new(),
             sync_to_radar: true,
+            auto_cycle_for_valid_time: false,
             textures: HashMap::new(),
             image_rx: None,
             pending_urls: Vec::new(),
@@ -807,11 +819,13 @@ impl WofsState {
             Some((run.id.clone(), self.init.clone()))
         });
         let followed_previous_live_edge = self.sync_to_radar
-            && self.catalog.as_ref().is_some_and(|old| {
-                old.runs.first().is_some_and(|run| {
-                    self.run_index == 0 && run.inits.first().is_some_and(|init| init == &self.init)
-                })
-            });
+            && (self.auto_cycle_for_valid_time
+                || self.catalog.as_ref().is_some_and(|old| {
+                    old.runs.first().is_some_and(|run| {
+                        self.run_index == 0
+                            && run.inits.first().is_some_and(|init| init == &self.init)
+                    })
+                }));
 
         if self.init.is_empty() || followed_previous_live_edge {
             self.run_index = 0;
@@ -824,6 +838,7 @@ impl WofsState {
             if followed_previous_live_edge {
                 self.snd_frame = None;
             }
+            self.auto_cycle_for_valid_time = false;
         } else if let Some((run_id, init)) = previous_selection {
             if let Some(index) = catalog.runs.iter().position(|run| run.id == run_id) {
                 self.run_index = index;
@@ -854,6 +869,13 @@ impl WofsState {
                 .unwrap_or_default()
         );
         self.catalog = Some(catalog);
+    }
+
+    /// Mark a run/init picker change as an explicit user choice. This keeps a
+    /// subsequent catalog refresh from mistaking it for an automatic
+    /// cross-cycle valid-time selection.
+    pub fn note_manual_cycle_selection(&mut self) {
+        self.auto_cycle_for_valid_time = false;
     }
 
     fn current_base_url(&self) -> Option<String> {
@@ -1000,43 +1022,49 @@ impl WofsState {
         if self.init.is_empty() {
             return;
         }
-        let init = self.init.clone();
         let product = self.product.clone();
-        let key = availability_key(&run, &init, &product);
-        let advertised_max = catalog
-            .times
-            .get(&product)
-            .into_iter()
-            .flatten()
-            .map(|seconds| seconds / 60)
-            .max()
-            .unwrap_or(0);
-        if self
-            .max_posted_minutes
-            .get(&key)
-            .is_some_and(|(posted, checked)| {
-                *posted >= advertised_max || checked.elapsed().as_secs() <= 60
-            })
-        {
-            return;
-        }
-        if self
-            .availability_failed
-            .get(&key)
-            .is_some_and(|(at, _)| at.elapsed().as_secs() <= 60)
-        {
-            return;
-        }
         let Some(candidates) = catalog.times.get(&product).map(|seconds| {
             seconds
                 .iter()
                 .map(|seconds| seconds / 60)
                 .collect::<Vec<_>>()
         }) else {
+            let key = availability_key(&run, &self.init, &product);
             let error = "product has no forecast grid".to_owned();
             self.availability_failed
                 .insert(key, (Instant::now(), error.clone()));
             self.status = format!("WoFS availability: {error}");
+            return;
+        };
+        let advertised_max = candidates.iter().copied().max().unwrap_or(0);
+
+        // Populate the selected cycle first, then inventory the other cycles
+        // in this run one at a time. That gives the valid-time timeline enough
+        // information to continue through an older, fully posted cycle when
+        // the newest live cycle has not reached the requested time yet.
+        let mut inits = Vec::with_capacity(run.inits.len().saturating_add(1));
+        inits.push(self.init.clone());
+        inits.extend(run.inits.iter().filter(|init| *init != &self.init).cloned());
+        let target = inits.into_iter().find_map(|init| {
+            let key = availability_key(&run, &init, &product);
+            let is_live_cycle = run.inits.first() == Some(&init);
+            let already_checked = if is_live_cycle {
+                self.max_posted_minutes
+                    .get(&key)
+                    .is_some_and(|(posted, checked)| {
+                        *posted >= advertised_max || checked.elapsed().as_secs() <= 60
+                    })
+                    || self
+                        .availability_failed
+                        .get(&key)
+                        .is_some_and(|(at, _)| at.elapsed().as_secs() <= 60)
+            } else {
+                self.max_posted_minutes.contains_key(&key)
+                    || self.availability_failed.contains_key(&key)
+            };
+            (!already_checked).then_some((init, key))
+        });
+        let Some((init, key)) = target else {
             return;
         };
         let (tx, rx) = mpsc::channel();
@@ -1072,29 +1100,35 @@ impl WofsState {
     /// this here makes the time mapping directly testable and prevents callers
     /// from accidentally using the newest background volume instead.
     pub fn sync_to_displayed_time(&mut self, frame: chrono::DateTime<chrono::Utc>) -> bool {
-        let Some(catalog) = &self.catalog else {
+        let frames = self.timeline_frames();
+        let Some(first) = frames.first() else {
             return false;
         };
-        let Some(run) = catalog.runs.get(self.run_index) else {
-            return false;
-        };
-        let Some(init_time) = init_time_utc(run, &self.init) else {
-            return false;
-        };
-        let delta_min = (frame - init_time).num_minutes();
-        if delta_min < 0 {
+        if frame < first.valid_time.clone() {
             return false;
         }
-        let target = u32::try_from(delta_min).unwrap_or(u32::MAX);
-        let snapped = self.snap_minute(target);
-        if snapped == self.minute {
+        let frame_millis = frame.timestamp_millis();
+        let Some(selected) = frames.into_iter().min_by_key(|candidate| {
+            candidate
+                .valid_time
+                .timestamp_millis()
+                .abs_diff(frame_millis)
+        }) else {
+            return false;
+        };
+        if selected.init == self.init && selected.minute == self.minute {
             return false;
         }
-        self.minute = snapped;
+        if selected.init != self.init {
+            self.auto_cycle_for_valid_time = true;
+        }
+        self.init = selected.init;
+        self.minute = selected.minute;
+        self.snd_frame = None;
         true
     }
 
-    fn timeline_minutes(&self) -> Vec<u32> {
+    fn product_minutes(&self) -> Vec<u32> {
         let Some(catalog) = &self.catalog else {
             return Vec::new();
         };
@@ -1107,10 +1141,84 @@ impl WofsState {
             .collect::<Vec<_>>();
         minutes.sort_unstable();
         minutes.dedup();
+        minutes
+    }
+
+    fn current_init_minutes(&self) -> Vec<u32> {
+        let mut minutes = self.product_minutes();
         if let Some(edge) = self.posted_edge_minute() {
             minutes.retain(|minute| *minute <= edge);
         }
         minutes
+    }
+
+    fn current_valid_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let catalog = self.catalog.as_ref()?;
+        let run = catalog.runs.get(self.run_index)?;
+        let init = init_time_utc(run, &self.init)?;
+        Some(init + chrono::Duration::minutes(i64::from(self.minute)))
+    }
+
+    /// Chronological valid-time grid across every inventoried cycle in the
+    /// selected run. Equal valid times keep the newest initialization, which
+    /// avoids displaying stale guidance when cycles overlap.
+    fn timeline_frames(&self) -> Vec<WofsTimelineFrame> {
+        let Some(catalog) = &self.catalog else {
+            return Vec::new();
+        };
+        let Some(run) = catalog.runs.get(self.run_index) else {
+            return Vec::new();
+        };
+        let minutes = self.product_minutes();
+        let mut by_valid_time = BTreeMap::new();
+        for init in &run.inits {
+            let key = availability_key(run, init, &self.product);
+            let Some(&(posted_edge, _)) = self.max_posted_minutes.get(&key) else {
+                continue;
+            };
+            let Some(init_time) = init_time_utc(run, init) else {
+                continue;
+            };
+            for minute in minutes
+                .iter()
+                .copied()
+                .filter(|minute| *minute <= posted_edge)
+            {
+                let valid_time = init_time.clone() + chrono::Duration::minutes(i64::from(minute));
+                let candidate = WofsTimelineFrame {
+                    init: init.clone(),
+                    minute,
+                    valid_time: valid_time.clone(),
+                };
+                by_valid_time.entry(valid_time).or_insert(candidate);
+            }
+        }
+
+        if by_valid_time.is_empty() {
+            // Preserve immediate timeline controls while the first availability
+            // probe is still running. A proved failure stays empty instead of
+            // offering theoretical frames that are known not to exist.
+            let key = availability_key(run, &self.init, &self.product);
+            if self.availability_failed.contains_key(&key) {
+                return Vec::new();
+            }
+            let Some(init_time) = init_time_utc(run, &self.init) else {
+                return Vec::new();
+            };
+            for minute in minutes {
+                let valid_time = init_time.clone() + chrono::Duration::minutes(i64::from(minute));
+                by_valid_time.insert(
+                    valid_time.clone(),
+                    WofsTimelineFrame {
+                        init: self.init.clone(),
+                        minute,
+                        valid_time,
+                    },
+                );
+            }
+        }
+
+        by_valid_time.into_values().collect()
     }
 
     pub fn posted_edge_minute(&self) -> Option<u32> {
@@ -1119,7 +1227,7 @@ impl WofsState {
     }
 
     pub fn timeline_max_minute(&self) -> u32 {
-        self.timeline_minutes()
+        self.current_init_minutes()
             .last()
             .copied()
             .or_else(|| {
@@ -1135,11 +1243,14 @@ impl WofsState {
     }
 
     pub fn can_step_minute(&self, forward: bool) -> bool {
-        let minutes = self.timeline_minutes();
+        let Some(current) = self.current_valid_time() else {
+            return false;
+        };
+        let frames = self.timeline_frames();
         if forward {
-            minutes.iter().any(|minute| *minute > self.minute)
+            frames.iter().any(|frame| frame.valid_time > current)
         } else {
-            minutes.iter().any(|minute| *minute < self.minute)
+            frames.iter().any(|frame| frame.valid_time < current)
         }
     }
 
@@ -1147,19 +1258,25 @@ impl WofsState {
     /// releases radar sync so the next UI frame cannot immediately undo the
     /// user's choice.
     pub fn step_minute(&mut self, forward: bool) -> bool {
-        let minutes = self.timeline_minutes();
+        let Some(current) = self.current_valid_time() else {
+            return false;
+        };
+        let frames = self.timeline_frames();
         let next = if forward {
-            minutes.into_iter().find(|minute| *minute > self.minute)
+            frames.into_iter().find(|frame| frame.valid_time > current)
         } else {
-            minutes
+            frames
                 .into_iter()
                 .rev()
-                .find(|minute| *minute < self.minute)
+                .find(|frame| frame.valid_time < current)
         };
         let Some(next) = next else {
             return false;
         };
-        self.minute = next;
+        self.init = next.init;
+        self.minute = next.minute;
+        self.snd_frame = None;
+        self.auto_cycle_for_valid_time = false;
         self.sync_to_radar = false;
         true
     }
@@ -2178,6 +2295,102 @@ mod tests {
         assert!(!state.can_step_minute(true));
         assert!(state.step_minute(false));
         assert_eq!(state.minute, 10);
+    }
+
+    #[test]
+    fn valid_time_timeline_continues_through_an_older_posted_cycle() {
+        let catalog = timeline_test_catalog(&["202607211200", "202607211130"]);
+        let run = catalog.runs[0].clone();
+        let product = SND_REF_PRODUCT.to_owned();
+        let newest_key = availability_key(&run, &run.inits[0], &product);
+        let older_key = availability_key(&run, &run.inits[1], &product);
+        let mut state = WofsState {
+            catalog: Some(catalog),
+            init: run.inits[0].clone(),
+            product,
+            minute: 60,
+            sync_to_radar: true,
+            snd_frame: Some(12),
+            ..WofsState::default()
+        };
+        state
+            .max_posted_minutes
+            .insert(newest_key, (60, Instant::now()));
+        state
+            .max_posted_minutes
+            .insert(older_key, (360, Instant::now()));
+
+        let timeline = state.timeline_frames();
+        let noon = chrono::DateTime::parse_from_rfc3339("2026-07-21T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let noon_frame = timeline
+            .iter()
+            .find(|frame| frame.valid_time == noon)
+            .expect("overlapping cycles should expose noon");
+        assert_eq!(noon_frame.init, "202607211200");
+        assert_eq!(noon_frame.minute, 0, "newest init wins equal valid time");
+        assert_eq!(
+            timeline
+                .last()
+                .map(|frame| (frame.init.as_str(), frame.minute)),
+            Some(("202607211130", 360))
+        );
+
+        assert!(state.can_step_minute(true));
+        assert!(state.step_minute(true));
+        assert_eq!(state.init, "202607211130");
+        assert_eq!(state.minute, 95, "13:05 UTC continues on the older cycle");
+        assert!(!state.sync_to_radar);
+        assert_eq!(state.snd_frame, None);
+
+        let late = chrono::DateTime::parse_from_rfc3339("2026-07-21T17:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(state.sync_to_displayed_time(late));
+        assert_eq!(state.init, "202607211130");
+        assert_eq!(state.minute, 360);
+        assert!(!state.can_step_minute(true));
+    }
+
+    #[test]
+    fn radar_sync_cross_cycle_selection_still_follows_the_live_catalog_edge() {
+        let catalog = timeline_test_catalog(&["202607211200", "202607211130"]);
+        let run = catalog.runs[0].clone();
+        let product = SND_REF_PRODUCT.to_owned();
+        let mut state = WofsState {
+            catalog: Some(catalog),
+            init: run.inits[0].clone(),
+            product: product.clone(),
+            minute: 60,
+            sync_to_radar: true,
+            ..WofsState::default()
+        };
+        state.max_posted_minutes.insert(
+            availability_key(&run, &run.inits[0], &product),
+            (60, Instant::now()),
+        );
+        state.max_posted_minutes.insert(
+            availability_key(&run, &run.inits[1], &product),
+            (360, Instant::now()),
+        );
+
+        let next_valid = chrono::DateTime::parse_from_rfc3339("2026-07-21T13:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(state.sync_to_displayed_time(next_valid));
+        assert_eq!(state.init, "202607211130");
+        assert_eq!(state.minute, 95);
+
+        state.apply_catalog(timeline_test_catalog(&[
+            "202607211230",
+            "202607211200",
+            "202607211130",
+        ]));
+        assert_eq!(
+            state.init, "202607211230",
+            "an automatic range-extension cycle must not pin catalog refresh"
+        );
     }
 
     #[test]
