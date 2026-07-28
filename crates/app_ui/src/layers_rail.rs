@@ -44,6 +44,42 @@ fn model_map_layer_opacity_hover(grid_composite: bool) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OaAnalysisReadiness {
+    NeedsModelField,
+    NeedsSupportedField,
+    NeedsSurfaceObs,
+    WaitingForSurfaceObs,
+    NeedsMapLayer,
+    Busy,
+    Ready,
+}
+
+fn oa_analysis_readiness(
+    dock_has_field: bool,
+    has_supported_field: bool,
+    surface_obs_enabled: bool,
+    surface_obs_available: bool,
+    model_map_layer_available: bool,
+    busy: bool,
+) -> OaAnalysisReadiness {
+    if !dock_has_field {
+        OaAnalysisReadiness::NeedsModelField
+    } else if !has_supported_field {
+        OaAnalysisReadiness::NeedsSupportedField
+    } else if !surface_obs_enabled {
+        OaAnalysisReadiness::NeedsSurfaceObs
+    } else if !surface_obs_available {
+        OaAnalysisReadiness::WaitingForSurfaceObs
+    } else if !model_map_layer_available {
+        OaAnalysisReadiness::NeedsMapLayer
+    } else if busy {
+        OaAnalysisReadiness::Busy
+    } else {
+        OaAnalysisReadiness::Ready
+    }
+}
+
 const PLACEFILE_VISIBILITY_RANGE_PERCENTS: [u16; 5] = [100, 200, 400, 800, u16::MAX];
 
 #[rustfmt::skip]
@@ -1808,15 +1844,13 @@ impl ViewerApp {
     /// ANALYSIS (OA) — compute that *emits* layers lives at the rail's
     /// bottom, not among the rows (spec §2.5): Bratseth obs-correction of
     /// the dock's current surface field, RAOB soundings, and the SPC
-    /// composite suite. Default-closed; gated on a model hour existing —
-    /// the disabled-state hints inside explain themselves.
+    /// composite suite. Default-closed; readiness hints and a direct Model
+    /// action explain how to supply any missing prerequisites.
     pub(crate) fn oa_analysis_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // MESOANALYSIS: Bratseth obs-correction of the dock's
         // current surface field, stacked as its own "(OA)" layer.
-        // OA tools render whenever a model hour exists — gating the
-        // whole section on the DISPLAYED variable made the buttons
-        // vanish after restarts (field report). Disabled states
-        // explain themselves instead.
+        // Always render the section. A missing model field used to return
+        // here, leaving a blank panel with no explanation or recovery path.
         let oa_var = self
             .model_dock
             .as_ref()
@@ -1828,9 +1862,6 @@ impl ViewerApp {
             .as_ref()
             .and_then(|dock| dock.latest_field())
             .is_some();
-        if !dock_has_field {
-            return;
-        }
         ui.add_space(4.0);
         let oa_open = self.section_open("layers_analysis_oa", false);
         let oa_response = egui::CollapsingHeader::new("Analysis (OA)")
@@ -1839,13 +1870,19 @@ impl ViewerApp {
             .show(ui, |ui| {
                     let var = oa_var.clone().unwrap_or_default();
                     ui.horizontal(|ui| {
-                        let ready = oa_var.is_some()
-                            && self.obs_enabled
-                            && !self.surface_obs.is_empty()
-                            && self.model_lut.is_some()
-                            && self.oa_rx.is_none();
+                        let readiness = oa_analysis_readiness(
+                            dock_has_field,
+                            oa_var.is_some(),
+                            self.obs_enabled,
+                            !self.surface_obs.is_empty(),
+                            self.model_lut.is_some(),
+                            self.oa_rx.is_some(),
+                        );
                         if ui
-                            .add_enabled(ready, egui::Button::new("Analyze obs"))
+                            .add_enabled(
+                                readiness == OaAnalysisReadiness::Ready,
+                                egui::Button::new("Analyze obs"),
+                            )
                             .on_hover_text(format!(
                                 "Bratseth objective analysis: correct {var} with the live surface obs (converges to Optimal Interpolation; Bratseth 1986, ADAS weights, RTMA-style QC). Adds a \"{var} (OA)\" layer.",
                             ))
@@ -1853,17 +1890,43 @@ impl ViewerApp {
                         {
                             self.start_mesoanalysis(ctx);
                         }
-                        if self.oa_rx.is_some() {
-                            ui.spinner();
-                        }
-                        if !self.obs_enabled {
-                            ui.weak("<- turn on Surface obs above");
-                        } else if self.surface_obs.is_empty() {
-                            ui.weak("waiting for obs fetch…");
-                        } else if self.model_lut.is_none() {
-                            ui.weak("<- \"Show on radar map\" first (Model window)");
-                        } else if oa_var.is_none() {
-                            ui.weak("show T2m / Td2m / 10m wind to analyze");
+                        match readiness {
+                            OaAnalysisReadiness::NeedsModelField => {
+                                ui.weak("Load a model field to begin analysis.");
+                                if ui
+                                    .small_button("Open Model")
+                                    .on_hover_text("Open the Model window to download or select a field")
+                                    .clicked()
+                                {
+                                    self.model_enabled = true;
+                                    self.open_viewer(dock::WorkspacePane::Model);
+                                    if self
+                                        .model_dock
+                                        .as_ref()
+                                        .and_then(|dock| dock.newest_run())
+                                        .is_none()
+                                    {
+                                        self.model_download_open = true;
+                                    }
+                                }
+                            }
+                            OaAnalysisReadiness::NeedsSupportedField => {
+                                ui.weak("Show T2m, Td2m, or 10m wind to analyze.");
+                            }
+                            OaAnalysisReadiness::NeedsSurfaceObs => {
+                                ui.weak("Turn on Surface obs above.");
+                            }
+                            OaAnalysisReadiness::WaitingForSurfaceObs => {
+                                ui.weak("Waiting for the surface-observation fetch…");
+                            }
+                            OaAnalysisReadiness::NeedsMapLayer => {
+                                ui.weak("Use \"Show on radar map\" in the Model window first.");
+                            }
+                            OaAnalysisReadiness::Busy => {
+                                ui.spinner();
+                                ui.weak("Analyzing observations…");
+                            }
+                            OaAnalysisReadiness::Ready => {}
                         }
                     });
                     if let Some(summary) = &self.oa_last_summary {
@@ -3105,6 +3168,48 @@ impl ViewerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oa_analysis_readiness_explains_every_blocked_state() {
+        use OaAnalysisReadiness::*;
+
+        assert_eq!(
+            oa_analysis_readiness(false, false, false, false, false, false),
+            NeedsModelField
+        );
+        assert_eq!(
+            oa_analysis_readiness(true, false, true, true, true, false),
+            NeedsSupportedField
+        );
+        assert_eq!(
+            oa_analysis_readiness(true, true, false, false, false, false),
+            NeedsSurfaceObs
+        );
+        assert_eq!(
+            oa_analysis_readiness(true, true, true, false, false, false),
+            WaitingForSurfaceObs
+        );
+        assert_eq!(
+            oa_analysis_readiness(true, true, true, true, false, false),
+            NeedsMapLayer
+        );
+        assert_eq!(
+            oa_analysis_readiness(true, true, true, true, true, true),
+            Busy
+        );
+        assert_eq!(
+            oa_analysis_readiness(true, true, true, true, true, false),
+            Ready
+        );
+    }
+
+    #[test]
+    fn missing_model_field_is_the_primary_analysis_recovery_state() {
+        assert_eq!(
+            oa_analysis_readiness(false, true, true, true, true, true),
+            OaAnalysisReadiness::NeedsModelField
+        );
+    }
 
     #[test]
     fn grid_composite_hover_does_not_claim_model_sounding_behavior() {
