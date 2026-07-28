@@ -15143,6 +15143,8 @@ impl ViewerApp {
         // frame's chosen quality (1 during active playback) or the loop-frame
         // factor. factor 1 leaves the base options/key bit-identical to today.
         let (viewport_options, _) = self.viewport_raster_options(ctx, rect)?;
+        let supersample_factor =
+            raster_supersample_factor_for_product(&self.selected_product, supersample_factor);
         let viewport_options = viewport_options.supersampled(supersample_factor);
         let viewport_key = raster_quality::viewport_key_for_options(viewport_options);
         let color_tables = self.render_color_tables_for_product(&self.selected_product);
@@ -15455,14 +15457,11 @@ impl ViewerApp {
             .unwrap_or(i16::MIN)
     }
 
-    /// Smoothing applies to everything except storm-relative products (their
-    /// per-row palette path bypasses the grid-smoothing seam).
+    /// Product-specific smoothing policy. Storm-relative velocity bypasses
+    /// the grid-smoothing seam, while echo tops intentionally retain their
+    /// discrete gate/height-bin appearance.
     fn smoothing_for_product(&self, product: &DisplayProduct) -> SmoothingMode {
-        if product.is_storm_relative_velocity() {
-            SmoothingMode::Native
-        } else {
-            self.display_smoothing
-        }
+        smoothing_mode_for_product(product, self.display_smoothing)
     }
 
     fn render_color_tables_for_product(&self, product: &DisplayProduct) -> ColorTableSet {
@@ -17680,16 +17679,20 @@ impl ViewerApp {
         // so the u8 conversion cannot fail in practice.
         let pane_lane = u8::try_from(pane_number).ok()?;
         let volume = self.extra_pane_display_volume(pane_slot)?;
-        // Extra panes are displayed radar layers too — give them the same
-        // smart-default quality as the primary frame (Standard during playback).
-        let (viewport_options, _) = self.viewport_raster_options(ctx, rect)?;
-        let viewport_options =
-            viewport_options.supersampled(self.displayed_raster_supersample_factor());
-        let viewport_key = raster_quality::viewport_key_for_options(viewport_options);
         let (product, pane_cut) = self
             .extra_panes
             .get(pane_slot)
             .map(|p| (p.product.clone(), p.cut))?;
+        // Extra panes are displayed radar layers too — give them the same
+        // smart-default quality as the primary frame. ET stays at the native
+        // viewport resolution so supersampling cannot soften its bins.
+        let (viewport_options, _) = self.viewport_raster_options(ctx, rect)?;
+        let supersample_factor = raster_supersample_factor_for_product(
+            &product,
+            self.displayed_raster_supersample_factor(),
+        );
+        let viewport_options = viewport_options.supersampled(supersample_factor);
+        let viewport_key = raster_quality::viewport_key_for_options(viewport_options);
         let volume = self.display_source_volume_for_extra_pane_product(
             pane_slot,
             &product,
@@ -41291,6 +41294,27 @@ impl SmoothingMode {
     }
 }
 
+fn smoothing_mode_for_product(
+    product: &DisplayProduct,
+    configured: SmoothingMode,
+) -> SmoothingMode {
+    if product.is_storm_relative_velocity()
+        || matches!(product, DisplayProduct::Derived(DerivedProduct::EchoTops))
+    {
+        SmoothingMode::Native
+    } else {
+        configured
+    }
+}
+
+fn raster_supersample_factor_for_product(product: &DisplayProduct, requested: u32) -> u32 {
+    if matches!(product, DisplayProduct::Derived(DerivedProduct::EchoTops)) {
+        1
+    } else {
+        requested
+    }
+}
+
 fn cross_section_smoothing_from_settings(
     settings: &settings::AppSettings,
 ) -> CrossSectionSmoothing {
@@ -51183,6 +51207,48 @@ mod tests {
             s.smooth_display_mode = mode.settings_str().to_owned();
             assert_eq!(SmoothingMode::from_settings(&s), mode);
         }
+    }
+
+    #[test]
+    fn echo_tops_always_use_native_pixelated_rendering() {
+        let echo_tops = DisplayProduct::Derived(DerivedProduct::EchoTops);
+
+        for configured in [
+            SmoothingMode::Native,
+            SmoothingMode::Soften,
+            SmoothingMode::Interpolated,
+        ] {
+            assert_eq!(
+                smoothing_mode_for_product(&echo_tops, configured),
+                SmoothingMode::Native
+            );
+        }
+        for requested in [1, 2, 4] {
+            assert_eq!(
+                raster_supersample_factor_for_product(&echo_tops, requested),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn native_et_policy_does_not_change_other_product_quality() {
+        let reflectivity = DisplayProduct::Moment(MomentType::Reflectivity);
+        assert_eq!(
+            smoothing_mode_for_product(&reflectivity, SmoothingMode::Interpolated),
+            SmoothingMode::Interpolated
+        );
+        assert_eq!(
+            raster_supersample_factor_for_product(&reflectivity, 4),
+            4
+        );
+        assert_eq!(
+            smoothing_mode_for_product(
+                &DisplayProduct::StormRelativeVelocity,
+                SmoothingMode::Soften,
+            ),
+            SmoothingMode::Native
+        );
     }
 
     #[test]
