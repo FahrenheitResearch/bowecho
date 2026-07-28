@@ -288,7 +288,7 @@ pub struct AppSettings {
     /// sounding calculations deliberately continue to see every observation.
     #[serde(default)]
     pub overlay_obs_metar_state_filter_enabled: bool,
-    /// Selected two-letter US state/territory abbreviations for the METAR map
+    /// Selected two-letter US state abbreviations (plus DC) for the METAR map
     /// filter. An empty list while filtering is enabled intentionally means
     /// that no METAR station plots are drawn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

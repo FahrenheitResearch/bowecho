@@ -817,6 +817,8 @@ fn layers(ui: &mut egui::Ui) {
          transparent, and the opacity slider remains available. The WoFS state dot says \
          ready only when the exact base frame and its validated georeference are present; \
          loading, unavailable, and calibration failures do not masquerade as an active layer. \
+         The time controls traverse the deduplicated valid-time sequence across posted cycles, \
+         preferring the newest init where cycles overlap instead of stopping at one init's edge. \
          Observed radar intentionally draws above forecast guidance; lower the Radar row's \
          opacity when you want to compare their overlap.",
     );
@@ -861,6 +863,13 @@ fn layers(ui: &mut egui::Ui) {
          Warning polygons. PDS and tornado-emergency styles still take priority when those \
          stronger tags are present. SPC's CIG regions ride inside the ordinary outlook \
          products, so duplicate standalone CIG switches are intentionally omitted.",
+    );
+    para(
+        ui,
+        "Current-warning cards are ordered by operational priority before polygon size: tornado, \
+         escalated severe thunderstorm, ordinary warnings, then watches. Priority previews and \
+         completed live updates share one NEW notification without letting a radar scan blank the \
+         polygons or interrupt warning audio.",
     );
     action(
         ui,
@@ -2684,8 +2693,10 @@ fn archive(ui: &mut egui::Ui) {
         ui,
         "Date row",
         "— a UTC date (YYYY-MM-DD) with \u{25c0} \u{25b6} day steps and a Today button; \
-         stepping re-lists immediately. List fetches every volume for that date, grouped by \
-         hour — click a minute chip to load it.",
+         stepping re-lists immediately. List fetches every volume for that UTC date, while scan \
+         groups and chip labels use the configured display time zone. Click a minute chip to load \
+         it; an explicit archive choice turns off Live and supersedes only an in-flight automatic \
+         refresh so the requested frame cannot be silently ignored.",
     );
     action(
         ui,

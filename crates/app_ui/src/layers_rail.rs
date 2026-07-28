@@ -1420,8 +1420,8 @@ impl ViewerApp {
             let fetching = self.aircraft_profiles_rx.is_some();
             let status = self.aircraft_profiles_status.clone();
             let source_file = self.aircraft_profiles_file.clone();
-            let selected_profile = self
-                .selected_aircraft_profile
+            let selected_airport = self.selected_aircraft_profile.clone();
+            let selected_profile = selected_airport
                 .as_deref()
                 .and_then(|selected| {
                     self.aircraft_profiles
@@ -1495,6 +1495,19 @@ impl ViewerApp {
                                 if ui.button("Center selected profile").clicked() {
                                     center_profile = Some((airport.clone(), *latitude, *longitude));
                                 }
+                            } else if let Some(airport) = selected_airport.as_deref() {
+                                ui.separator();
+                                ui.label(format!("Selected: {airport} (not in latest snapshot)"));
+                                if ui
+                                    .checkbox(&mut follow_selected, "Follow selected profile")
+                                    .on_hover_text(
+                                        "Keep waiting for this airport's next hourly profile, or turn follow off here. This is not continuous live aircraft tracking.",
+                                    )
+                                    .changed()
+                                {
+                                    follow_changed = true;
+                                }
+                                ui.weak("The selected profile path is temporarily unavailable.");
                             } else {
                                 ui.weak("Click a cyan profile marker to select its path.");
                             }

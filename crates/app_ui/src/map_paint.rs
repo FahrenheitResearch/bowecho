@@ -832,7 +832,11 @@ impl ViewerApp {
         let ob_owns_card = if self.obs_enabled && !self.surface_obs.is_empty() {
             let frame_time = self.surface_obs_frame_time_utc();
             let mut best: Option<(f32, &obs::SurfaceOb)> = None;
-            for ob in self.surface_obs.frame_obs(frame_time) {
+            for ob in self
+                .surface_obs
+                .frame_obs(frame_time)
+                .filter(|ob| self.surface_ob_visible_on_map(ob))
+            {
                 let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
                 let d = pos.distance(anchor);
                 if d < 40.0 && best.map(|(bd, _)| d < bd).unwrap_or(true) {

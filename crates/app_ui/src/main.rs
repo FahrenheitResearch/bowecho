@@ -36595,8 +36595,8 @@ impl ViewerApp {
                         .filter(|favorite| {
                             catalog
                                 .groups
-                                .values()
-                                .flatten()
+                                .iter()
+                                .flat_map(|(_, slugs)| slugs.iter())
                                 .any(|available| available == *favorite)
                         })
                         .cloned()
