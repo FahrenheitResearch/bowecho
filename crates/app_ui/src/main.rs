@@ -32066,17 +32066,24 @@ impl ViewerApp {
             && self.native_sounding_rx.is_none()
         {
             let adjust_wanted = !fresh_is_box && self.obs_adjust_soundings && self.obs_enabled;
-            // Archive case: a displayed volume more than RETAIN (3 h) from
+            // Archive case: a model sounding more than RETAIN (3 h) behind
             // the wall clock can never find its ob in the live pool (merge
             // prunes against Utc::now), so the adjusting ob comes from a
-            // fetched IEM archive window around the volume's hour. Hold the
+            // fetched IEM archive window around the model's valid hour. Hold the
             // sounding un-consumed until that window is cached — the fetch
             // worker repaints and this poll re-runs; a failed fetch caches
             // an empty window, so the sounding proceeds un-adjusted.
-            let historical_valid = (adjust_wanted && data.lat.is_some() && data.lon.is_some())
-                .then(|| self.displayed_timeline_time_utc())
-                .flatten()
-                .filter(|valid| (Utc::now() - *valid).num_minutes().abs() > 180);
+            // Observation age must be measured against the MODEL sounding's
+            // valid time. Using the active radar timeline here could splice a
+            // current METAR into an unrelated local/archive WRF column.
+            // Opaque legacy local slots have no authoritative UTC and fail
+            // closed instead of guessing from a filename-derived run label.
+            let model_valid = (adjust_wanted && data.lat.is_some() && data.lon.is_some())
+                .then(|| model_sounding_valid_time_utc(&data.hour))
+                .flatten();
+            let historical_valid = model_valid.filter(|valid| {
+                Utc::now().signed_duration_since(*valid) > chrono::Duration::hours(3)
+            });
             if let Some(valid) = historical_valid
                 && !self.ensure_historical_obs(round_to_hour_utc(valid), ctx)
             {
@@ -32098,29 +32105,21 @@ impl ViewerApp {
                         .unwrap_or(&[]);
                     select_historical_adjust_ob(window, valid, lat, lon)
                 })
+            } else if let Some(valid) = model_valid {
+                data.lat.zip(data.lon).and_then(|(lat, lon)| {
+                    select_adjust_ob(
+                        self.surface_obs.frame_obs(valid).filter(|ob| {
+                            let is_metar = ob.network == "METAR";
+                            (is_metar && self.obs_show_metar)
+                                || (!is_metar && self.obs_show_mesonet)
+                        }),
+                        valid,
+                        lat,
+                        lon,
+                    )
+                })
             } else {
-                adjust_wanted
-                    .then(|| {
-                        let (lat, lon) = (data.lat?, data.lon?);
-                        let now = Utc::now();
-                        self.surface_obs
-                            .frame_obs(now)
-                            .filter(|ob| {
-                                let is_metar = ob.network == "METAR";
-                                (is_metar && self.obs_show_metar)
-                                    || (!is_metar && self.obs_show_mesonet)
-                            })
-                            .filter(|ob| ob.temp_c.is_some() && ob.dewpoint_c.is_some())
-                            .filter(|ob| {
-                                ob.time_utc
-                                    .map(|t| (now - t).num_minutes() <= 60)
-                                    .unwrap_or(false)
-                            })
-                            .map(|ob| (haversine_km(lat, lon, ob.lat, ob.lon), ob.clone()))
-                            .filter(|(d, _)| *d <= 30.0)
-                            .min_by(|a, b| a.0.total_cmp(&b.0))
-                    })
-                    .flatten()
+                None
             };
             // The sharprs parcel math is only consumed by the hail-env
             // H0/H−20 extraction below — a plain model click just needs the
@@ -44690,6 +44689,29 @@ fn with_synthesized_dewpoint(data: &rw_ui::SoundingData) -> Option<rw_ui::Soundi
     Some(out)
 }
 
+/// Authoritative UTC for an observation-adjusted model sounding.
+///
+/// Exact-time store metadata wins. Legacy downloaded-model runs retain the
+/// established `YYYYMMDD_HHz` initialization plus integral forecast-hour
+/// contract. Local WRF run names are deliberately not parsed here: older
+/// stores used filename-derived labels and opaque slots, so treating those as
+/// meteorological truth could silently pair a sounding with the wrong ob.
+fn model_sounding_valid_time_utc(hour: &rw_ui::HourKey) -> Option<DateTime<Utc>> {
+    if let Some(exact) = hour.exact_time {
+        return Utc.timestamp_opt(exact.valid_unix, 0).single();
+    }
+
+    let (date, cycle) = hour.run.split_once('_')?;
+    let cycle = cycle.strip_suffix('z')?;
+    if date.len() != 8 || cycle.len() != 2 {
+        return None;
+    }
+    let date = NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
+    let cycle_hour = cycle.parse::<u32>().ok()?;
+    let initialization = Utc.from_utc_datetime(&date.and_hms_opt(cycle_hour, 0, 0)?);
+    initialization.checked_add_signed(chrono::Duration::hours(i64::from(hour.hour)))
+}
+
 /// Round to the nearest whole hour — the historical obs window's cache
 /// key, so soundings scrubbed within the same hour reuse one IEM fetch.
 fn round_to_hour_utc(time: DateTime<Utc>) -> DateTime<Utc> {
@@ -44705,20 +44727,17 @@ fn round_to_hour_utc(time: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
-/// The archive-time analogue of poll_native_sounding's live ob pick:
-/// nearest station within 30 km of the sounding point whose report has
-/// T and Td and sits within 60 min of the sounding's VALID time (the
-/// live path gates freshness against the wall clock instead). Distance
-/// ties — multiple reports from one station inside the window — prefer
-/// the report closest in time.
-fn select_historical_adjust_ob(
-    window: &[obs::SurfaceOb],
+/// Pick the nearest complete surface report within 30 km and +/-60 minutes
+/// of the model sounding's valid time. Distance wins; reports from the same
+/// station/location break ties toward the closest time.
+fn select_adjust_ob<'a>(
+    observations: impl IntoIterator<Item = &'a obs::SurfaceOb>,
     valid: DateTime<Utc>,
     lat: f32,
     lon: f32,
 ) -> Option<(f32, obs::SurfaceOb)> {
-    window
-        .iter()
+    observations
+        .into_iter()
         .filter(|ob| ob.temp_c.is_some() && ob.dewpoint_c.is_some())
         .filter_map(|ob| {
             let minutes_off = (valid - ob.time_utc?).num_minutes().abs();
@@ -44728,6 +44747,21 @@ fn select_historical_adjust_ob(
         .filter(|(distance_km, ..)| *distance_km <= 30.0)
         .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
         .map(|(distance_km, _, ob)| (distance_km, ob.clone()))
+}
+
+/// The archive-time analogue of poll_native_sounding's live ob pick:
+/// nearest station within 30 km of the sounding point whose report has
+/// T and Td and sits within 60 min of the sounding's VALID time. Distance
+/// ties — multiple reports from one station inside the window — prefer the
+/// report closest in time. Live and archive paths intentionally share the
+/// same time/distance rule.
+fn select_historical_adjust_ob(
+    window: &[obs::SurfaceOb],
+    valid: DateTime<Utc>,
+    lat: f32,
+    lon: f32,
+) -> Option<(f32, obs::SurfaceOb)> {
+    select_adjust_ob(window, valid, lat, lon)
 }
 
 /// Build the native sounding, optionally swapping the model surface for
@@ -48297,6 +48331,33 @@ mod tests {
             network: "METAR".to_owned(),
             elevation_m: None,
         }
+    }
+
+    #[test]
+    fn obs_adjust_uses_authoritative_model_valid_time_and_fails_closed() {
+        let mut data = test_model_sounding_data();
+
+        let exact_valid = Utc.with_ymd_and_hms(1974, 4, 3, 20, 0, 0).unwrap();
+        data.hour.run = "local_19740403200000_d01".to_owned();
+        data.hour.exact_time = Some(rw_store::RwsExactTime {
+            lead_seconds: 0,
+            valid_unix: exact_valid.timestamp(),
+        });
+        assert_eq!(model_sounding_valid_time_utc(&data.hour), Some(exact_valid));
+
+        data.hour.run = "20260728_12z".to_owned();
+        data.hour.hour = 3;
+        data.hour.exact_time = None;
+        assert_eq!(
+            model_sounding_valid_time_utc(&data.hour),
+            Some(Utc.with_ymd_and_hms(2026, 7, 28, 15, 0, 0).unwrap())
+        );
+
+        // A legacy local label was derived from a filename and its F-slot can
+        // be opaque. It must never authorize a live observation adjustment.
+        data.hour.run = "local_19740403200000_d01".to_owned();
+        data.hour.hour = 0;
+        assert_eq!(model_sounding_valid_time_utc(&data.hour), None);
     }
 
     /// Historical (archive-date) obs-adjust ob selection: from a fetched
