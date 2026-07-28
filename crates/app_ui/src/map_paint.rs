@@ -4045,10 +4045,10 @@ impl ViewerApp {
             let selected =
                 self.selected_aircraft_profile.as_deref() == Some(profile.airport.as_str());
             let stroke = if selected {
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 225, 240))
+                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(120, 225, 240))
             } else {
                 egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     egui::Color32::from_rgba_unmultiplied(72, 170, 192, 150),
                 )
             };
