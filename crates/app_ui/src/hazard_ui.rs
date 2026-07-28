@@ -169,39 +169,50 @@ impl ViewerApp {
                 }
                 ui.ctx().request_repaint();
             }
-            ui.add_enabled_ui(!self.hidden_hazard_families.contains("watch"), |ui| {
-                ui.weak("Watch types");
-                let watch_chips = HAZARD_WATCH_FILTERS
-                    .iter()
-                    .map(|&(watch_type, label)| panel_kit::Chip {
-                        label,
-                        hotkey: None,
-                        selected: !self
+            ui.weak("Watch types");
+            let watch_parent_visible = !self.hidden_hazard_families.contains("watch");
+            let watch_chips = HAZARD_WATCH_FILTERS
+                .iter()
+                .map(|&(watch_type, label)| panel_kit::Chip {
+                    label,
+                    hotkey: None,
+                    selected: (watch_parent_visible || watch_type == "pds")
+                        && !self
                             .app_settings
                             .hidden_hazard_watch_types
                             .iter()
                             .any(|hidden| hidden.eq_ignore_ascii_case(watch_type)),
-                        hover: Some(format!("Show {label} polygons")),
-                    })
-                    .collect::<Vec<_>>();
-                if let Some(clicked) = panel_kit::chip_grid(ui, &watch_chips) {
-                    let watch_type = HAZARD_WATCH_FILTERS[clicked].0;
-                    if let Some(index) = self
-                        .app_settings
-                        .hidden_hazard_watch_types
-                        .iter()
-                        .position(|hidden| hidden.eq_ignore_ascii_case(watch_type))
-                    {
-                        self.app_settings.hidden_hazard_watch_types.remove(index);
+                    hover: Some(if watch_type == "pds" {
+                        "Show PDS watches even when the general Watch family is hidden".to_owned()
                     } else {
-                        self.app_settings
-                            .hidden_hazard_watch_types
-                            .push(watch_type.to_owned());
-                    }
+                        format!("Show {label} polygons")
+                    }),
+                })
+                .collect::<Vec<_>>();
+            if let Some(clicked) = panel_kit::chip_grid(ui, &watch_chips) {
+                let watch_type = HAZARD_WATCH_FILTERS[clicked].0;
+                if !watch_parent_visible && watch_type != "pds" {
+                    self.hidden_hazard_families.remove("watch");
+                    self.app_settings
+                        .hidden_hazard_watch_types
+                        .retain(|hidden| !hidden.eq_ignore_ascii_case(watch_type));
+                    self.persist_hazard_panel_settings();
+                } else if let Some(index) = self
+                    .app_settings
+                    .hidden_hazard_watch_types
+                    .iter()
+                    .position(|hidden| hidden.eq_ignore_ascii_case(watch_type))
+                {
+                    self.app_settings.hidden_hazard_watch_types.remove(index);
                     self.mark_app_settings_dirty();
-                    ui.ctx().request_repaint();
+                } else {
+                    self.app_settings
+                        .hidden_hazard_watch_types
+                        .push(watch_type.to_owned());
+                    self.mark_app_settings_dirty();
                 }
-            });
+                ui.ctx().request_repaint();
+            }
             // The ordinary fill slider is authoritative for every family;
             // per-family alpha remains available in Appearance for advanced
             // customization after this global control is used.
@@ -1476,7 +1487,15 @@ impl ViewerApp {
         record: &HazardRecord,
         frame_time: Option<DateTime<Utc>>,
     ) -> bool {
-        if self.hidden_hazard_families.contains(&record.event_family) {
+        let pds_watch_visible_through_parent = hazard_record_is_pds_watch(record)
+            && !self
+                .app_settings
+                .hidden_hazard_watch_types
+                .iter()
+                .any(|hidden| hidden.eq_ignore_ascii_case("pds"));
+        if self.hidden_hazard_families.contains(&record.event_family)
+            && !pds_watch_visible_through_parent
+        {
             return false;
         }
         if record.event_family == "watch"
@@ -1533,10 +1552,11 @@ impl ViewerApp {
         self.hazards_at_position(rect, position).into_iter().next()
     }
 
-    /// All exact warning polygons beneath a map click, ordered with the
-    /// smallest (most specific) polygon first. Edge/label tolerance remains a
-    /// single best hit: stacking several nearby-but-not-containing warnings is
-    /// noisy and can imply the click was inside polygons it was not.
+    /// All exact warning polygons beneath a map click, ordered by operational
+    /// warning priority and then by smallest (most specific) polygon. Edge/
+    /// label tolerance remains a single best hit: stacking several nearby-but-
+    /// not-containing warnings is noisy and can imply the click was inside
+    /// polygons it was not.
     pub(crate) fn hazards_at_position(&self, rect: egui::Rect, position: egui::Pos2) -> Vec<usize> {
         if !self.hazards_visible {
             return Vec::new();
@@ -1546,7 +1566,7 @@ impl ViewerApp {
         };
         let (lon, lat) = self.screen_to_lon_lat(rect, position);
         let point = HazardPoint { lon, lat };
-        let mut containing = Vec::<(usize, f32, u8, String)>::new();
+        let mut containing = Vec::<(usize, f32, String)>::new();
         let mut best_near = None::<(usize, f32, f32, u8)>;
         let mut best_label = None::<(usize, f32, f32, u8)>;
         let mut seen_exact = BTreeSet::<String>::new();
@@ -1561,7 +1581,7 @@ impl ViewerApp {
             {
                 let base_id = base_hazard_event_id(&record.event_id).to_owned();
                 if seen_exact.insert(base_id.clone()) {
-                    containing.push((index, screen_area, family_order, base_id));
+                    containing.push((index, screen_area, base_id));
                 }
                 continue;
             }
@@ -1601,15 +1621,11 @@ impl ViewerApp {
         }
         if !containing.is_empty() {
             containing.sort_by(|left, right| {
-                left.1
-                    .total_cmp(&right.1)
+                compare_hazard_popup_records(&overlay.records[left.0], &overlay.records[right.0])
+                    .then_with(|| left.1.total_cmp(&right.1))
                     .then_with(|| left.2.cmp(&right.2))
-                    .then_with(|| left.3.cmp(&right.3))
             });
-            return containing
-                .into_iter()
-                .map(|(index, _, _, _)| index)
-                .collect();
+            return containing.into_iter().map(|(index, _, _)| index).collect();
         }
         best_near
             .map(|(index, _, _, _)| vec![index])
@@ -2048,6 +2064,11 @@ fn hazard_popup_title(record: &HazardRecord) -> String {
         "fire weather" => Some("Fire Weather Warning"),
         "special weather" => Some("Special Weather Statement"),
         "watch" => match hazard_record_style_threat(record) {
+            Some("pds") => match hazard_watch_base_type(record) {
+                Some("tornado") => Some("PDS Tornado Watch"),
+                Some("severe-thunderstorm") => Some("PDS Severe Thunderstorm Watch"),
+                _ => Some("PDS Watch"),
+            },
             Some("tornado") => Some("Tornado Watch"),
             Some("severe-thunderstorm") => Some("Severe Thunderstorm Watch"),
             _ => None,
@@ -2488,7 +2509,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_overlap_stacks_all_unique_events_smallest_first() {
+    fn exact_overlap_stacks_all_unique_events_priority_then_area() {
         let broad = popup_test_record(
             "KTLX.SV.W.0001",
             "severe thunderstorm",
@@ -2507,6 +2528,49 @@ mod tests {
         let hits = app.hazards_at_position(rect, rect.center());
 
         assert_eq!(hits, vec![1, 0], "multipart pieces must dedupe by base id");
+    }
+
+    #[test]
+    fn exact_overlap_orders_operational_priority_before_polygon_area() {
+        let watch = popup_test_record("KOUN.SV.A.0500", "watch", -0.1, -0.1, 0.1, 0.1);
+        let ordinary = popup_test_record("KOUN.FF.W.0501", "flash flood", -0.2, -0.2, 0.2, 0.2);
+        let mut escalated = popup_test_record(
+            "KOUN.SV.W.0502",
+            "severe thunderstorm",
+            -0.5,
+            -0.5,
+            0.5,
+            0.5,
+        );
+        escalated.damage_threat = Some("DESTRUCTIVE".to_owned());
+        let tornado = popup_test_record("KOUN.TO.W.0503", "tornado", -1.0, -1.0, 1.0, 1.0);
+        let mut app =
+            crate::tests::test_viewer_app_with_hazards(vec![watch, ordinary, escalated, tornado]);
+        app.hazards_active_only = false;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        assert_eq!(
+            app.hazards_at_position(rect, rect.center()),
+            vec![3, 2, 1, 0],
+            "TOR > escalated SVR > ordinary warning > watch must beat area"
+        );
+    }
+
+    #[test]
+    fn pds_watch_bypasses_legacy_hidden_watch_parent_only_until_explicitly_hidden() {
+        let mut pds = popup_test_record("KOUN.TO.A.0504", "watch", -1.0, -1.0, 1.0, 1.0);
+        pds.details = vec!["THIS IS A PARTICULARLY DANGEROUS SITUATION".to_owned()];
+        let ordinary = popup_test_record("KOUN.TO.A.0505", "watch", -1.0, -1.0, 1.0, 1.0);
+        let mut app = crate::tests::test_viewer_app_with_hazards(vec![pds, ordinary]);
+        app.hidden_hazard_families.insert("watch".to_owned());
+
+        assert!(app.hazard_record_visible(&app.hazard_overlay.as_ref().unwrap().records[0]));
+        assert!(!app.hazard_record_visible(&app.hazard_overlay.as_ref().unwrap().records[1]));
+
+        app.app_settings
+            .hidden_hazard_watch_types
+            .push("pds".to_owned());
+        assert!(!app.hazard_record_visible(&app.hazard_overlay.as_ref().unwrap().records[0]));
     }
 
     #[test]
@@ -2708,6 +2772,14 @@ mod tests {
             hazard_popup_title(&severe_watch),
             "Severe Thunderstorm Watch"
         );
+    }
+
+    #[test]
+    fn popup_title_names_pds_watch_and_preserves_base_kind() {
+        let mut pds = popup_test_record("KOUN.TO.A.0503", "watch", -1.0, -1.0, 1.0, 1.0);
+        pds.details = vec!["PARTICULARLY DANGEROUS SITUATION".to_owned()];
+
+        assert_eq!(hazard_popup_title(&pds), "PDS Tornado Watch");
     }
 
     #[test]

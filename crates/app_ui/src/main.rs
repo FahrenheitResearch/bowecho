@@ -151,6 +151,7 @@ use hazard_geom::append_flattened_hazard_fill_shapes;
 use hazard_geom::bbox_contains;
 use hazard_geom::bounded_hazard_fill_points;
 use hazard_geom::build_live_hazard_overlay;
+use hazard_geom::compare_hazard_popup_records;
 use hazard_geom::cone_overlay_shapes;
 use hazard_geom::cone_segment_jump_limit_px;
 use hazard_geom::custom_warning_provider_url;
@@ -171,6 +172,7 @@ use hazard_geom::hazard_overlay_change;
 use hazard_geom::hazard_overlay_records_match;
 use hazard_geom::hazard_points_renderable;
 use hazard_geom::hazard_polygon_contains_point;
+use hazard_geom::hazard_record_is_pds_watch;
 use hazard_geom::hazard_record_should_latch_attention;
 use hazard_geom::hazard_record_style_threat;
 use hazard_geom::hazard_style_key_known;
@@ -178,6 +180,7 @@ use hazard_geom::hazard_style_keys;
 use hazard_geom::hazard_style_label;
 use hazard_geom::hazard_style_resolved_polygon;
 use hazard_geom::hazard_visible_label_anchor;
+use hazard_geom::hazard_watch_base_type;
 use hazard_geom::hazard_watch_filter_key;
 use hazard_geom::is_convex_screen_polygon;
 use hazard_geom::load_event_loop_hazard_overlay_with_preview;
@@ -45452,6 +45455,7 @@ struct WeatherAlertProperties {
     event: Option<String>,
     headline: Option<String>,
     description: Option<String>,
+    instruction: Option<String>,
     #[serde(rename = "areaDesc")]
     area_desc: Option<String>,
     #[serde(rename = "senderName")]
@@ -71757,6 +71761,9 @@ mod tests {
             "severe-thunderstorm"
         );
         assert_eq!(hazard_watch_filter_key(&pds_watch), "pds");
+        assert!(hazard_record_is_pds_watch(&pds_watch));
+        assert_eq!(hazard_record_style_threat(&pds_watch), Some("pds"));
+        assert_eq!(hazard_watch_base_type(&pds_watch), Some("tornado"));
         assert_eq!(hazard_watch_filter_key(&generic_watch), "other");
     }
 

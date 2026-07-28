@@ -491,6 +491,7 @@ pub const HAZARD_ESCALATIONS: &[&str] = &[
     "flash-flood/catastrophic",
     "flood/considerable",
     "flood/catastrophic",
+    "watch/pds",
     "watch/tornado",
     "watch/severe-thunderstorm",
 ];
@@ -532,6 +533,7 @@ pub fn default_hazard_stroke_color(key: &str) -> Rgba {
         "special-marine" => [70, 190, 238, 255],
         "snow-squall" => [170, 210, 255, 255],
         "watch" => [235, 92, 245, 255],
+        "watch/pds" => [255, 64, 175, 255],
         "watch/tornado" => [210, 82, 245, 255],
         "watch/severe-thunderstorm" => [246, 183, 57, 255],
         "mesoscale-discussion" => [95, 174, 255, 255],
@@ -1323,6 +1325,10 @@ mod tests {
         assert_eq!(
             registry.hazard_polygon("watch", None).stroke_color,
             [235, 92, 245, 255]
+        );
+        assert_eq!(
+            registry.hazard_polygon("watch", Some("pds")).stroke_color,
+            [255, 64, 175, 255]
         );
         // Unknown family falls back to the "other" yellow.
         assert_eq!(

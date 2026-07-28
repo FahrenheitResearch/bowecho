@@ -1518,6 +1518,7 @@ pub(crate) fn parse_weather_alert_feature_with_zones(
     let source_url = weather_alert_source_url(feature);
     let area = feature.properties.area_desc.clone();
     let description = feature.properties.description.clone();
+    let instruction = feature.properties.instruction.clone();
     let motion = weather_alert_parameter(&feature.properties.parameters, "eventMotionDescription");
     let label_count = rings.len();
     let component_key = weather_alert_component_key(feature);
@@ -1547,10 +1548,12 @@ pub(crate) fn parse_weather_alert_feature_with_zones(
                 source_url: source_url.clone(),
                 area: area.clone(),
                 motion: motion.clone(),
-                details: description
-                    .as_ref()
-                    .filter(|description| headline.as_ref() != Some(description))
+                details: [description.as_ref(), instruction.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|detail| headline.as_ref() != Some(detail))
                     .cloned()
+                    .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect(),
                 valid_start: valid_start_text.clone(),
@@ -1643,13 +1646,61 @@ fn weather_alert_component_key(feature: &WeatherAlertFeature) -> Option<String> 
     Some(format!("z{hash:016x}"))
 }
 
+fn weather_alert_feature_is_pds_watch(feature: &WeatherAlertFeature) -> bool {
+    weather_alert_feature_family(feature) == "watch"
+        && hazard_text_values_have_pds_marker(
+            [
+                feature.properties.event.as_deref(),
+                feature.properties.headline.as_deref(),
+                feature.properties.description.as_deref(),
+                feature.properties.instruction.as_deref(),
+                feature.properties.area_desc.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .chain(
+                feature
+                    .properties
+                    .parameters
+                    .values()
+                    .flatten()
+                    .map(String::as_str),
+            ),
+        )
+}
+
+fn append_zone_groups_round_robin(
+    groups: &[Vec<String>],
+    ordered: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+) {
+    let max_group_len = groups.iter().map(Vec::len).max().unwrap_or(0);
+    for offset in 0..max_group_len {
+        for group in groups {
+            let Some(zone_url) = group.get(offset) else {
+                continue;
+            };
+            if seen.insert(zone_url.clone()) {
+                ordered.push(zone_url.clone());
+                if ordered.len() >= MAX_ACTIVE_ALERT_ZONE_GEOMETRIES {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// The deduped, capped list of zone URLs a load must resolve: zones of
-/// geometry-less alerts whose family is in `scope`.
+/// geometry-less alerts whose family is in `scope`. Short-fuse warnings and
+/// PDS watches receive a fair round-robin allocation before bulk flood/watch
+/// zones, so the global cap cannot be consumed by the first large event in
+/// lexicographic URL order.
 fn weather_alert_zone_urls(
     features: &[WeatherAlertFeature],
     scope: ZoneGeometryScope<'_>,
 ) -> Vec<String> {
-    let mut zone_urls = BTreeSet::new();
+    let mut priority_groups = Vec::<Vec<String>>::new();
+    let mut bulk_groups = Vec::<Vec<String>>::new();
     for feature in features {
         if feature.geometry.is_some() {
             continue;
@@ -1658,16 +1709,32 @@ fn weather_alert_zone_urls(
         if !zone_geometry_scope_includes(scope, &event_family) {
             continue;
         }
-        for zone_url in &feature.properties.affected_zones {
-            if zone_url.starts_with("https://api.weather.gov/zones/") {
-                zone_urls.insert(zone_url.clone());
-            }
+        let mut zones = feature
+            .properties
+            .affected_zones
+            .iter()
+            .filter(|zone_url| zone_url.starts_with("https://api.weather.gov/zones/"))
+            .cloned()
+            .collect::<Vec<_>>();
+        zones.sort_unstable();
+        zones.dedup();
+        if zones.is_empty() {
+            continue;
+        }
+        if priority_live_hazard_family(&event_family) || weather_alert_feature_is_pds_watch(feature)
+        {
+            priority_groups.push(zones);
+        } else {
+            bulk_groups.push(zones);
         }
     }
-    zone_urls
-        .into_iter()
-        .take(MAX_ACTIVE_ALERT_ZONE_GEOMETRIES)
-        .collect()
+    let mut ordered = Vec::with_capacity(MAX_ACTIVE_ALERT_ZONE_GEOMETRIES);
+    let mut seen = BTreeSet::new();
+    append_zone_groups_round_robin(&priority_groups, &mut ordered, &mut seen);
+    if ordered.len() < MAX_ACTIVE_ALERT_ZONE_GEOMETRIES {
+        append_zone_groups_round_robin(&bulk_groups, &mut ordered, &mut seen);
+    }
+    ordered
 }
 
 fn zone_geometry_memo() -> &'static Mutex<HashMap<String, Vec<Vec<HazardPoint>>>> {
@@ -2599,6 +2666,7 @@ pub(crate) fn hazard_style_label(key: &str) -> String {
         "special-marine" => "Special marine warning".to_owned(),
         "snow-squall" => "Snow squall warning".to_owned(),
         "watch" => "Watch polygons".to_owned(),
+        "watch/pds" => "PDS watch".to_owned(),
         "watch/tornado" => "Tornado watch".to_owned(),
         "watch/severe-thunderstorm" => "Severe thunderstorm watch".to_owned(),
         "mesoscale-discussion" => "Mesoscale discussions".to_owned(),
@@ -2638,6 +2706,20 @@ pub(crate) fn hazard_record_style_threat(record: &HazardRecord) -> Option<&str> 
         }
         return None;
     }
+    if hazard_record_is_pds_watch(record) {
+        return Some("pds");
+    }
+    hazard_watch_base_type(record).or(record.damage_threat.as_deref())
+}
+
+/// Base convective watch kind, independent from the PDS escalation. Keeping
+/// the two concepts separate lets a PDS watch resolve its dedicated style
+/// while cards can still say whether it is a tornado or severe-thunderstorm
+/// watch.
+pub(crate) fn hazard_watch_base_type(record: &HazardRecord) -> Option<&'static str> {
+    if record.event_family != "watch" {
+        return None;
+    }
     if hazard_record_text_contains(record, "TORNADO WATCH")
         || record.event_id.to_ascii_uppercase().contains(".TO.A.")
     {
@@ -2648,7 +2730,26 @@ pub(crate) fn hazard_record_style_threat(record: &HazardRecord) -> Option<&str> 
     {
         return Some("severe-thunderstorm");
     }
-    record.damage_threat.as_deref()
+    None
+}
+
+/// One shared PDS-watch predicate feeds visibility, filtering, style
+/// resolution, popup titles, and zone-fetch prioritization. CAP `instruction`
+/// is copied into `HazardRecord::details`, so a marker carried only there is
+/// not lost.
+pub(crate) fn hazard_record_is_pds_watch(record: &HazardRecord) -> bool {
+    record.event_family == "watch"
+        && hazard_text_values_have_pds_marker(
+            [
+                Some(record.label.as_str()),
+                record.headline.as_deref(),
+                record.area.as_deref(),
+                record.motion.as_deref(),
+            ]
+            .into_iter()
+            .chain(record.details.iter().map(|detail| Some(detail.as_str())))
+            .flatten(),
+        )
 }
 
 /// Alerts-tab watch subtype. PDS is intentionally a distinct bucket rather
@@ -2657,30 +2758,49 @@ pub(crate) fn hazard_watch_filter_key(record: &HazardRecord) -> &'static str {
     if record.event_family != "watch" {
         return "other";
     }
-    if hazard_record_text_contains(record, "PARTICULARLY DANGEROUS SITUATION")
-        || hazard_record_text_has_token(record, "PDS")
-    {
+    if hazard_record_is_pds_watch(record) {
         return "pds";
     }
-    match hazard_record_style_threat(record) {
+    match hazard_watch_base_type(record) {
         Some("tornado") => "tornado",
         Some("severe-thunderstorm") => "severe-thunderstorm",
         _ => "other",
     }
 }
 
-fn hazard_record_text_has_token(record: &HazardRecord, token: &str) -> bool {
-    [
-        Some(record.label.as_str()),
-        record.headline.as_deref(),
-        record.area.as_deref(),
-        record.motion.as_deref(),
-    ]
-    .into_iter()
-    .chain(record.details.iter().map(|detail| Some(detail.as_str())))
-    .flatten()
-    .flat_map(|value| value.split(|character: char| !character.is_ascii_alphanumeric()))
-    .any(|word| word.eq_ignore_ascii_case(token))
+fn hazard_text_values_have_pds_marker<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
+    values.any(|value| {
+        value
+            .to_ascii_uppercase()
+            .contains("PARTICULARLY DANGEROUS SITUATION")
+            || value
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .any(|word| word.eq_ignore_ascii_case("PDS"))
+    })
+}
+
+fn hazard_popup_priority_group(record: &HazardRecord) -> u8 {
+    match record.event_family.as_str() {
+        "tornado" => 0,
+        "severe thunderstorm" if hazard_record_threat_priority(record) > 0 => 1,
+        "watch" => 3,
+        _ => 2,
+    }
+}
+
+/// Operational ordering for exact-overlap popup cards. Polygon area remains a
+/// useful specificity tie-breaker, but never promotes a watch above the
+/// warning that caused the operator to click the stack.
+pub(crate) fn compare_hazard_popup_records(left: &HazardRecord, right: &HazardRecord) -> Ordering {
+    hazard_popup_priority_group(left)
+        .cmp(&hazard_popup_priority_group(right))
+        .then_with(|| {
+            hazard_record_threat_priority(right).cmp(&hazard_record_threat_priority(left))
+        })
+        .then_with(|| {
+            hazard_family_order(&left.event_family).cmp(&hazard_family_order(&right.event_family))
+        })
+        .then_with(|| hazard_record_is_pds_watch(right).cmp(&hazard_record_is_pds_watch(left)))
 }
 
 fn hazard_record_text_contains(record: &HazardRecord, needle: &str) -> bool {
@@ -4471,6 +4591,47 @@ mod tests {
     }
 
     #[test]
+    fn weather_gov_pds_watch_marker_in_instruction_reaches_filter_and_style() {
+        let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
+            "id": "https://api.weather.gov/alerts/urn:oid:pds-watch",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-99.0, 34.0],
+                    [-97.0, 34.0],
+                    [-97.0, 36.0],
+                    [-99.0, 34.0]
+                ]]
+            },
+            "properties": {
+                "event": "Tornado Watch",
+                "headline": "Tornado Watch 501 issued",
+                "instruction": "THIS IS A PARTICULARLY DANGEROUS SITUATION.",
+                "onset": "2026-07-27T18:00:00+00:00",
+                "expires": "2026-07-28T01:00:00+00:00",
+                "parameters": {
+                    "VTEC": ["/O.NEW.KWNS.TO.A.0501.260727T1800Z-260728T0100Z/"]
+                }
+            }
+        }))
+        .expect("PDS watch CAP feature");
+        let query_time = Utc.with_ymd_and_hms(2026, 7, 27, 19, 0, 0).unwrap();
+
+        let records = parse_weather_alert_feature(&feature, query_time).expect("PDS watch parses");
+
+        assert_eq!(records.len(), 1);
+        assert!(hazard_record_is_pds_watch(&records[0]));
+        assert_eq!(hazard_watch_filter_key(&records[0]), "pds");
+        assert_eq!(hazard_record_style_threat(&records[0]), Some("pds"));
+        assert!(
+            records[0]
+                .details
+                .iter()
+                .any(|detail| detail.contains("PARTICULARLY"))
+        );
+    }
+
+    #[test]
     fn damage_threat_escalates_label() {
         let emergency = ParsedWarningTags {
             tornado: Some("OBSERVED".into()),
@@ -4584,6 +4745,32 @@ mod tests {
                 "sound-enabled family {family} lost its zone enrichment"
             );
         }
+    }
+
+    #[test]
+    fn capped_zone_catalog_allocates_priority_and_pds_events_before_bulk_zones() {
+        let mut bulk = zoneless_alert_feature(
+            "Flood Warning",
+            "https://api.weather.gov/zones/county/AA000",
+        );
+        bulk.properties.affected_zones = (0..(MAX_ACTIVE_ALERT_ZONE_GEOMETRIES + 40))
+            .map(|index| format!("https://api.weather.gov/zones/county/AA{index:03}"))
+            .collect();
+        let mut pds = zoneless_alert_feature(
+            "Tornado Watch",
+            "https://api.weather.gov/zones/county/ZZ901",
+        );
+        pds.properties.instruction = Some("THIS IS A PARTICULARLY DANGEROUS SITUATION".to_owned());
+        let severe = zoneless_alert_feature(
+            "Severe Thunderstorm Warning",
+            "https://api.weather.gov/zones/county/ZZ902",
+        );
+
+        let urls = weather_alert_zone_urls(&[bulk, pds, severe], ZoneGeometryScope::Display);
+
+        assert_eq!(urls.len(), MAX_ACTIVE_ALERT_ZONE_GEOMETRIES);
+        assert!(urls.iter().any(|url| url.ends_with("/ZZ901")));
+        assert!(urls.iter().any(|url| url.ends_with("/ZZ902")));
     }
 
     fn zoneless_alert_feature(event: &str, zone_url: &str) -> WeatherAlertFeature {
@@ -5301,11 +5488,13 @@ mod tests {
         assert!(hazard_style_key_known("flash-flood/considerable"));
         assert!(hazard_style_key_known("flood/catastrophic"));
         assert!(hazard_style_key_known("fire-weather"));
+        assert!(hazard_style_key_known("watch/pds"));
         assert!(hazard_style_key_known("watch/tornado"));
         assert!(hazard_style_key_known("watch/severe-thunderstorm"));
         assert!(!hazard_style_key_known("not-a-real-polygon-family"));
         assert!(hazard_style_label("tornado/catastrophic").contains("emergency"));
         assert!(hazard_style_label("flood/considerable").contains("Considerable"));
+        assert!(hazard_style_label("watch/pds").contains("PDS"));
         assert!(hazard_style_label("watch/tornado").contains("Tornado watch"));
         assert_eq!(
             hazard_dash_label(styles::DashPattern::Dashed {
