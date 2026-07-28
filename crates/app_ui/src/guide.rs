@@ -510,8 +510,9 @@ fn products(ui: &mut egui::Ui) {
         ui,
         "DVEL — Dealiased velocity",
         "the continuity-unfolded velocity field as its own product — what the shear and wind \
-         algorithms consume.",
-        "",
+         algorithms consume. When Auto-dealias VEL is enabled, the ordinary picker hides the \
+         identical DVEL row to avoid duplication; saved DVEL panes and product hotkeys remain valid.",
+        "turn Auto-dealias VEL off when you need raw VEL and DVEL visible side by side.",
         "",
     );
     product_entry(
@@ -668,7 +669,8 @@ fn products(ui: &mut egui::Ui) {
         "ET — Echo tops (kft)",
         "height of the highest beam with \u{2265}18.3 dBZ, 4/3-Earth beam geometry.",
         "reads low in the cone of silence right over the radar (no high tilts), and gets \
-         coarse far out where tilt gaps widen.",
+         coarse far out where tilt gaps widen. ET intentionally stays at native 1x raster \
+         resolution without display smoothing so those discrete sampling limits remain visible.",
         "NWS echo-tops convention; beam height per Doviak & Zrni\u{107} 1993, eq. 2.28b.",
     );
     product_entry(
@@ -818,6 +820,26 @@ fn layers(ui: &mut egui::Ui) {
          Observed radar intentionally draws above forecast guidance; lower the Radar row's \
          opacity when you want to compare their overlap.",
     );
+    action(
+        ui,
+        "Product favorites",
+        "— the star beside the current radar or WoFS product persists it as a favorite. Radar \
+         favorites appear as quick chips above the product browser; available WoFS favorites \
+         appear first in its picker, while temporarily unavailable slugs remain saved.",
+    );
+    action(
+        ui,
+        "Surface obs ⚙ > METAR states",
+        "— limits only the METAR station plots and their map hit targets to selected US states. \
+         Mesonet plots are independent, and objective analysis plus obs-adjusted soundings retain \
+         the complete loaded observation pool.",
+    );
+    action(
+        ui,
+        "CC-drop swath",
+        "— accumulates the minimum correlation coefficient across the radar loop and masks normal \
+         high-CC gates. Adjust the cutoff in the layer row; the source volume must contain RHO/CC.",
+    );
     para(
         ui,
         "Custom \u{25b8} Appearance also owns deep visual tuning: map backdrop, warning-polygon \
@@ -865,10 +887,11 @@ fn layers(ui: &mut egui::Ui) {
     para(
         ui,
         "In Analysis overlays: compute that EMITS layers. Analyze obs runs a Bratseth \
-         objective analysis of the model surface field against live obs; Compute composites \
-         builds the full SPC mesoanalysis suite (SCP, STP, SHIP, EHI, …) — each field then \
-         adds as an instant \"(OA)\" layer, also reachable from + Add layer > \
-         Mesoanalysis (OA).",
+          objective analysis of the model surface field against live obs; Compute composites \
+          builds the full SPC mesoanalysis suite (SCP, STP, SHIP, EHI, …) — each field then \
+          adds as an instant \"(OA)\" layer, also reachable from + Add layer > \
+          Mesoanalysis (OA). If no model field is ready, this section now states the missing \
+          prerequisite and offers Open Model instead of appearing blank.",
     );
     cite(
         ui,

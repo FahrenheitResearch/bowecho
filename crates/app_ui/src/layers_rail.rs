@@ -1026,15 +1026,16 @@ impl ViewerApp {
                                             for (index, abbreviation) in
                                                 METAR_STATE_FILTER_ABBRS.iter().enumerate()
                                             {
+                                                let abbreviation = *abbreviation;
                                                 let mut selected = metar_states
                                                     .iter()
                                                     .any(|state| state == abbreviation);
                                                 if ui
-                                                    .checkbox(&mut selected, *abbreviation)
+                                                    .checkbox(&mut selected, abbreviation)
                                                     .changed()
                                                 {
                                                     if selected {
-                                                        metar_states.push((*abbreviation).to_owned());
+                                                        metar_states.push(abbreviation.to_owned());
                                                         metar_states.sort();
                                                         metar_states.dedup();
                                                     } else {
