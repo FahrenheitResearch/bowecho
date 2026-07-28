@@ -34,11 +34,11 @@ use ui_core::worker_slot::{SlotMessage, StreamState};
 
 use crate::{
     ACTIVE_LOAD_POLL_MS, ArchiveLoadProgress, AsyncLoadResult, AsyncLoadUpdate, DecodedLoad,
-    DecodedLoadBatch, FeedSource, FrameStatus, LoadTimings, MAX_ARCHIVE_FRAME_COUNT,
-    MAX_HISTORY_FRAME_LIMIT, SpcReport, ViewerApp, archive_load_progress_row,
-    archive_object_scan_time_utc, cache_dir, compact_intl_identity, decode_archive_history_object,
-    fetch_assemble_intl_plan, fetch_intl_frame_plan_batch, intl_provider_label, panel_kit,
-    send_archive_progress,
+    DecodedLoadBatch, DisplayTimeZone, FeedSource, FrameStatus, LoadTimings,
+    MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, SpcReport, ViewerApp,
+    archive_load_progress_row, archive_object_scan_time_utc, cache_dir, compact_intl_identity,
+    decode_archive_history_object, fetch_assemble_intl_plan, fetch_intl_frame_plan_batch,
+    intl_provider_label, panel_kit, send_archive_progress,
 };
 
 /// Capability answers are values, not missing branches (spec §1.3): the
@@ -402,7 +402,51 @@ fn intl_archive_listing_matches(
     listing.provider_id == provider_id && listing.site_id == site_id && listing.date_utc == date_utc
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArchivePickerTimeText {
+    group: String,
+    chip: String,
+    hover: String,
+}
+
+fn archive_picker_time_text(
+    time_utc: DateTime<Utc>,
+    time_zone: DisplayTimeZone,
+) -> ArchivePickerTimeText {
+    let local = time_utc.with_timezone(&time_zone.fixed_offset(time_utc));
+    ArchivePickerTimeText {
+        group: format!(
+            "{} {}",
+            local.format("%Y-%m-%d %H"),
+            time_zone.abbreviation(time_utc)
+        ),
+        chip: local.format("%M:%S").to_string(),
+        hover: time_zone.format_date_hms(time_utc),
+    }
+}
+
 impl ViewerApp {
+    /// Manual archive commands own the primary timeline. They may supersede
+    /// the one-second live refresh, but never an explicit user load already
+    /// in progress.
+    pub(crate) fn prepare_manual_archive_picker_load(&mut self) -> bool {
+        if self.intl_loop_rx.is_some() {
+            self.status = "Wait for the current load to finish".to_owned();
+            return false;
+        }
+        if self.load_receiver.is_some() {
+            if !self.primary_load_is_auto_refresh {
+                self.status = "Wait for the current load to finish".to_owned();
+                return false;
+            }
+            self.cancel_primary_radar_load_for_user_command();
+        }
+        self.primary.live.enabled = false;
+        self.primary_load_is_auto_refresh = false;
+        self.live_refresh_skip_reason = None;
+        true
+    }
+
     /// The site that owns the primary display, as a [`SiteRef`] — the
     /// Phase-2 shim derived from `PollSource` (matching
     /// `intl_source_owns_primary_display`'s ownership rule). Phase 3
@@ -570,7 +614,24 @@ impl ViewerApp {
             if volumes.is_empty() {
                 ui.weak("No volumes for that date");
             } else {
-                ui.weak(format!("{} volumes (UTC)", volumes.len()));
+                let time_zone = self.time_zone();
+                ui.weak(format!(
+                    "{} volumes · {} display (UTC date query)",
+                    volumes.len(),
+                    time_zone.label()
+                ));
+                let display_times = volumes
+                    .iter()
+                    .map(|(object, fallback)| {
+                        archive_object_scan_time_utc(object)
+                            .map(|time| archive_picker_time_text(time, time_zone))
+                            .unwrap_or_else(|| ArchivePickerTimeText {
+                                group: "Unknown time".to_owned(),
+                                chip: fallback.clone(),
+                                hover: object.key.clone(),
+                            })
+                    })
+                    .collect::<Vec<_>>();
                 let mut load_object: Option<usize> = None;
                 egui::ScrollArea::vertical()
                     .id_salt("archive_volume_list")
@@ -580,21 +641,19 @@ impl ViewerApp {
                         // truncating, full name on hover).
                         let mut index = 0usize;
                         while index < volumes.len() {
-                            let hour = volumes[index].1.get(0..2).unwrap_or("??");
-                            ui.weak(format!("{hour} UTC"));
+                            let group = display_times[index].group.clone();
+                            ui.weak(&group);
                             let group_start = index;
-                            while index < volumes.len()
-                                && volumes[index].1.get(0..2).unwrap_or("??") == hour
-                            {
+                            while index < volumes.len() && display_times[index].group == group {
                                 index += 1;
                             }
-                            let chips = volumes[group_start..index]
+                            let chips = display_times[group_start..index]
                                 .iter()
-                                .map(|volume| panel_kit::Chip {
-                                    label: volume.1.get(3..8).unwrap_or(&volume.1),
+                                .map(|display| panel_kit::Chip {
+                                    label: &display.chip,
                                     hotkey: None,
                                     selected: false,
-                                    hover: Some(volume.1.clone()),
+                                    hover: Some(display.hover.clone()),
                                 })
                                 .collect::<Vec<_>>();
                             if let Some(clicked) = panel_kit::chip_grid(ui, &chips) {
@@ -820,38 +879,41 @@ impl ViewerApp {
                 if listing.rows.is_empty() {
                     ui.weak("No archive scans for that date");
                 } else {
-                    ui.weak(format!("{} scans (UTC)", listing.rows.len()));
+                    let time_zone = self.time_zone();
+                    ui.weak(format!(
+                        "{} scans · {} display (UTC date query)",
+                        listing.rows.len(),
+                        time_zone.label()
+                    ));
                     let rows = &listing.rows;
+                    let display_times = rows
+                        .iter()
+                        .map(|row| archive_picker_time_text(row.time_utc, time_zone))
+                        .collect::<Vec<_>>();
                     egui::ScrollArea::vertical()
                         .id_salt("intl_archive_scan_list")
                         .max_height(190.0)
                         .show(ui, |ui| {
                             let mut index = 0usize;
                             while index < rows.len() {
-                                let hour = rows[index].time_utc.format("%H").to_string();
-                                ui.weak(format!("{hour} UTC"));
+                                let group = display_times[index].group.clone();
+                                ui.weak(&group);
                                 let group_start = index;
-                                while index < rows.len()
-                                    && rows[index].time_utc.format("%H").to_string() == hour
-                                {
+                                while index < rows.len() && display_times[index].group == group {
                                     index += 1;
                                 }
-                                let labels = rows[group_start..index]
+                                let chips = display_times[group_start..index]
                                     .iter()
-                                    .map(|row| {
-                                        (
-                                            row.time_utc.format("%M:%S").to_string(),
-                                            intl_row_hover_text(row),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>();
-                                let chips = labels
-                                    .iter()
-                                    .map(|(label, hover)| panel_kit::Chip {
-                                        label,
+                                    .zip(&rows[group_start..index])
+                                    .map(|(display, row)| panel_kit::Chip {
+                                        label: &display.chip,
                                         hotkey: None,
                                         selected: false,
-                                        hover: Some(hover.clone()),
+                                        hover: Some(format!(
+                                            "{} · {}",
+                                            display.hover,
+                                            intl_row_hover_text(row)
+                                        )),
                                     })
                                     .collect::<Vec<_>>();
                                 if let Some(clicked) = panel_kit::chip_grid(ui, &chips) {
@@ -890,6 +952,7 @@ impl ViewerApp {
         };
         // Browsing the archive is explicit intent — the live poll must
         // not stomp archive frames (same contract as the US browser).
+        self.primary.live.enabled = false;
         if self.poll_active {
             self.poll_active = false;
             self.status = "Live poll paused (archive browse)".to_owned();
@@ -1083,8 +1146,7 @@ impl ViewerApp {
             self.status = "Archive date must be YYYY-MM-DD".to_owned();
             return;
         };
-        if self.load_receiver.is_some() {
-            self.status = "Wait for the current load to finish".to_owned();
+        if !self.prepare_manual_archive_picker_load() {
             return;
         }
         if self.intl_archive_list_rx.in_flight() {
@@ -1279,8 +1341,7 @@ impl ViewerApp {
             self.status = "Archive: no scans selected".to_owned();
             return;
         }
-        if self.load_receiver.is_some() {
-            self.status = "Wait for the current load to finish".to_owned();
+        if !self.prepare_manual_archive_picker_load() {
             return;
         }
         let total_frames = plans.len().min(MAX_HISTORY_FRAME_LIMIT);
@@ -1752,6 +1813,7 @@ impl ViewerApp {
         };
         // Browsing the archive is explicit intent — same contract as
         // explicit site loads: the URL poll must not stomp archive frames.
+        self.primary.live.enabled = false;
         if self.poll_active {
             self.poll_active = false;
             self.status = "URL poll paused (archive browse)".to_owned();
@@ -2212,6 +2274,45 @@ mod tests {
             }],
             merge: false,
         }
+    }
+
+    #[test]
+    fn archive_picker_time_text_honors_eastern_standard_and_daylight_time() {
+        let winter = Utc.with_ymd_and_hms(2026, 1, 15, 5, 5, 9).unwrap();
+        let summer = Utc.with_ymd_and_hms(2026, 7, 27, 1, 5, 9).unwrap();
+
+        assert_eq!(
+            archive_picker_time_text(winter, DisplayTimeZone::Eastern),
+            ArchivePickerTimeText {
+                group: "2026-01-15 00 EST".to_owned(),
+                chip: "05:09".to_owned(),
+                hover: "2026-01-15 00:05:09 EST".to_owned(),
+            }
+        );
+        assert_eq!(
+            archive_picker_time_text(summer, DisplayTimeZone::Eastern),
+            ArchivePickerTimeText {
+                group: "2026-07-26 21 EDT".to_owned(),
+                chip: "05:09".to_owned(),
+                hover: "2026-07-26 21:05:09 EDT".to_owned(),
+            },
+            "a UTC-date listing must disclose the previous local day"
+        );
+    }
+
+    #[test]
+    fn archive_picker_time_text_switches_at_the_eastern_dst_boundary() {
+        let before = Utc.with_ymd_and_hms(2026, 3, 8, 6, 59, 0).unwrap();
+        let after = Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap();
+
+        assert_eq!(
+            archive_picker_time_text(before, DisplayTimeZone::Eastern).group,
+            "2026-03-08 01 EST"
+        );
+        assert_eq!(
+            archive_picker_time_text(after, DisplayTimeZone::Eastern).group,
+            "2026-03-08 03 EDT"
+        );
     }
 
     fn decoded(identity: &str, minute: u32) -> DecodedLoad {

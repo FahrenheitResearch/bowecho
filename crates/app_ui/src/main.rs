@@ -18834,8 +18834,7 @@ impl ViewerApp {
             self.status = "No site selected".to_owned();
             return false;
         };
-        if self.load_receiver.is_some() {
-            self.status = "Wait for the current load to finish".to_owned();
+        if !self.prepare_manual_archive_picker_load() {
             return false;
         }
         self.archive_load_owns_warning_sync = true;
@@ -20018,14 +20017,13 @@ impl ViewerApp {
             self.status = "No site selected".to_owned();
             return false;
         };
+        if !self.prepare_manual_archive_picker_load() {
+            return false;
+        }
         let Some(volumes) = &self.archive_volumes else {
             self.status = "Archive: list a date before loading".to_owned();
             return false;
         };
-        if self.load_receiver.is_some() {
-            self.status = "Wait for the current load to finish".to_owned();
-            return false;
-        }
         if end >= volumes.len() || start > end || selected < start || selected > end {
             self.status = "Archive load request was out of range".to_owned();
             return false;
@@ -20050,7 +20048,6 @@ impl ViewerApp {
         // like live-follow playback, which immediately released historical
         // warning sync and painted current warnings over the archive scan.
         self.clear_frame_history();
-        self.primary.live.enabled = false;
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
@@ -60882,6 +60879,32 @@ mod tests {
         app.app_settings.show_radar_labels = false;
         assert!(app.loaded_volume_marker_should_draw_text("KCCX"));
         assert!(app.loaded_volume_marker_should_draw_text("KPBZ"));
+    }
+
+    #[test]
+    fn manual_archive_picker_supersedes_only_live_auto_refresh() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (auto_sender, auto_receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.load_receiver = Some(auto_receiver);
+        app.primary_load_is_auto_refresh = true;
+        app.primary.live.enabled = true;
+
+        assert!(app.prepare_manual_archive_picker_load());
+        assert!(app.load_receiver.is_none());
+        assert!(!app.primary_load_is_auto_refresh);
+        assert!(!app.primary.live.enabled);
+        drop(auto_sender);
+
+        let (user_sender, user_receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.load_receiver = Some(user_receiver);
+        app.primary_load_is_auto_refresh = false;
+        app.primary.live.enabled = true;
+
+        assert!(!app.prepare_manual_archive_picker_load());
+        assert!(app.load_receiver.is_some());
+        assert!(app.primary.live.enabled);
+        assert_eq!(app.status, "Wait for the current load to finish");
+        drop(user_sender);
     }
 
     fn test_intl_archive_listing(
