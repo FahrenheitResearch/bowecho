@@ -241,6 +241,7 @@ impl ViewerApp {
             if fixed_action_button(ui, "Clear", 52.0).clicked() {
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
                 self.hazard_overlay = None;
+                self.completed_live_hazard_overlay = None;
                 self.selected_hazard_index = None;
                 self.unacknowledged_hazard_event_ids.clear();
                 self.hazard_status = if europe_list_only {

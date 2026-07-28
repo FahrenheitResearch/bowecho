@@ -1498,7 +1498,8 @@ impl ViewerApp {
                     .on_hover_text("Play the selected radar-updated sound once")
                     .clicked()
                 {
-                    let _ = alert_audio::play(&self.app_settings.radar_update_sound_path);
+                    let _ =
+                        alert_audio::play_radar_update(&self.app_settings.radar_update_sound_path);
                 }
                 if ui
                     .button("System")

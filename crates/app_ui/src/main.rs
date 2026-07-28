@@ -618,6 +618,7 @@ mod alert_audio {
     const MB_ICONEXCLAMATION: u32 = 0x0000_0030;
     const SND_ASYNC: u32 = 0x0001;
     const SND_NODEFAULT: u32 = 0x0002;
+    const SND_NOSTOP: u32 = 0x0010;
     const SND_FILENAME: u32 = 0x0002_0000;
 
     #[link(name = "user32")]
@@ -630,7 +631,7 @@ mod alert_audio {
         fn PlaySoundW(pszSound: *const u16, hmod: *mut c_void, fdwSound: u32) -> i32;
     }
 
-    pub fn play(sound_path: &str) -> bool {
+    fn play_with_flags(sound_path: &str, extra_flags: u32) -> bool {
         let path = sound_path.trim();
         if !path.is_empty() && Path::new(path).is_file() {
             let wide = OsStr::new(path)
@@ -642,17 +643,32 @@ mod alert_audio {
                 PlaySoundW(
                     wide.as_ptr(),
                     null_mut(),
-                    SND_FILENAME | SND_ASYNC | SND_NODEFAULT,
+                    SND_FILENAME | SND_ASYNC | SND_NODEFAULT | extra_flags,
                 ) != 0
             };
         }
         unsafe { MessageBeep(MB_ICONEXCLAMATION) != 0 }
+    }
+
+    pub fn play(sound_path: &str) -> bool {
+        play_with_flags(sound_path, 0)
+    }
+
+    /// Radar is always the lower-priority cue. `SND_NOSTOP` makes a radar
+    /// update decline playback instead of replacing a warning WAV already on
+    /// the process PlaySound channel.
+    pub fn play_radar_update(sound_path: &str) -> bool {
+        play_with_flags(sound_path, SND_NOSTOP)
     }
 }
 
 #[cfg(not(windows))]
 mod alert_audio {
     pub fn play(_sound_path: &str) -> bool {
+        false
+    }
+
+    pub fn play_radar_update(_sound_path: &str) -> bool {
         false
     }
 }
@@ -662,6 +678,10 @@ mod alert_audio {
 /// window still cues quickly, but slow enough to never busy-loop or hammer
 /// the API. The watcher sleeps this long between polls (no CPU spin).
 const ALERT_WATCH_INTERVAL: Duration = Duration::from_secs(20);
+/// App-side guard complements Windows `SND_NOSTOP`: even platform/default
+/// beeps and near-adjacent UI frames cannot let a low-priority radar cue talk
+/// over the operator's warning notification.
+const WARNING_AUDIO_RADAR_GUARD: Duration = Duration::from_secs(15);
 /// Anonymous MADIS aircraft profiles are hourly; a five-minute probe finds a
 /// newly published hour promptly without treating the public archive like a
 /// high-frequency feed.
@@ -881,6 +901,11 @@ fn sound_path_label(sound_path: &str) -> String {
         .and_then(|name| name.to_str())
         .map(str::to_owned)
         .unwrap_or_else(|| path.to_owned())
+}
+
+fn radar_update_audio_allowed(last_warning: Option<Instant>, now: Instant) -> bool {
+    last_warning
+        .is_none_or(|started| now.saturating_duration_since(started) >= WARNING_AUDIO_RADAR_GUARD)
 }
 
 /// Fetch the current NWS active-alert overlay for the background watcher.
@@ -3708,6 +3733,11 @@ struct ViewerApp {
     /// Native RHI range-height panel (mobile-radar elevation sweeps).
     rhi_panel: rhi::RhiPanel,
     hazard_overlay: Option<HazardOverlay>,
+    /// Last fully completed live warning load. Preview and timeline overlays
+    /// may replace `hazard_overlay` for presentation, but they never replace
+    /// this attention baseline; otherwise a priority preview makes its own
+    /// warning look old when the final load arrives.
+    completed_live_hazard_overlay: Option<HazardOverlay>,
     hazard_path_text: String,
     hazard_status: String,
     hazards_visible: bool,
@@ -3742,6 +3772,9 @@ struct ViewerApp {
     /// is minimized/unfocused, when eframe throttles the foreground update
     /// loop. `gate` dedupes so a warning cues exactly once across both paths.
     alert_watch: AlertWatchHandle,
+    /// Most recent foreground warning cue. Radar-update audio yields during
+    /// the guard window; Windows also uses `SND_NOSTOP` for the actual call.
+    last_warning_sound_started: Option<Instant>,
     /// Baseline scan time for the optional "radar updated" cue: the newest
     /// primary frame already announced. `None` until the first frame seeds it,
     /// so enabling the cue mid-session never fires for already-loaded data.
@@ -9354,6 +9387,7 @@ impl ViewerApp {
             cross_section_dealias_cache: VolumeDealiasCache::new(),
             rhi_panel: rhi::RhiPanel::new(),
             hazard_overlay: None,
+            completed_live_hazard_overlay: None,
             hazard_path_text,
             hazard_status: "No hazard polygons loaded".to_owned(),
             hazards_visible: restored_hazards_visible,
@@ -9373,6 +9407,7 @@ impl ViewerApp {
             hazard_map_popup: None,
             unacknowledged_hazard_event_ids: BTreeSet::new(),
             alert_watch: AlertWatchHandle::spawned(),
+            last_warning_sound_started: None,
             last_radar_sound_frame_time: None,
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
@@ -9493,8 +9528,9 @@ impl ViewerApp {
             return;
         }
         let preview_records = self
-            .hazard_overlay
+            .completed_live_hazard_overlay
             .as_ref()
+            .or(self.hazard_overlay.as_ref())
             .map(preview_retained_hazard_records)
             .unwrap_or_default();
         let custom_provider_url =
@@ -9533,7 +9569,7 @@ impl ViewerApp {
     }
 
     fn switch_to_live_hazard_mode(&mut self) {
-        let clear_timeline_overlay = self.event_loop_hazard_window.is_some()
+        let returning_from_timeline = self.event_loop_hazard_window.is_some()
             || self.pending_event_loop_hazard_window.is_some()
             || self.hazard_overlay.as_ref().is_some_and(|overlay| {
                 overlay.source_label.contains("archive")
@@ -9547,11 +9583,10 @@ impl ViewerApp {
         self.hazards_active_only = true;
         self.live_hazard_auto_refresh = true;
         self.last_live_hazard_refresh = None;
-        if clear_timeline_overlay {
-            self.hazard_overlay = None;
-            self.selected_hazard_index = None;
-            self.unacknowledged_hazard_event_ids.clear();
-            self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
+        if returning_from_timeline {
+            self.hazard_status =
+                "Returning to live warnings; keeping current polygons until replacement arrives"
+                    .to_owned();
         }
     }
 
@@ -9566,6 +9601,7 @@ impl ViewerApp {
     fn reload_warning_source(&mut self, ctx: &egui::Context) {
         self.hazard_receiver = None;
         self.hazard_overlay = None;
+        self.completed_live_hazard_overlay = None;
         self.selected_hazard_index = None;
         self.unacknowledged_hazard_event_ids.clear();
         self.app_settings.current_alert_filter = "all".to_owned();
@@ -11780,26 +11816,14 @@ impl ViewerApp {
     /// Enter timeline-owned warning mode for an explicit US archive load.
     ///
     /// The full archive browser bypasses the Unified Player actions that
-    /// normally arm warning sync. Cancel any live warning request here and do
-    /// not leave its current-only overlay painted while historical radar is
-    /// loading. An already-installed archive overlay is safe to retain until
-    /// the replacement window lands because its own timeline window continues
-    /// to gate every polygon.
+    /// normally arm warning sync. Cancel any live warning request here, but
+    /// retain the installed overlay until the first timeline preview arrives;
+    /// blanking it during the handoff also used to erase NEW-warning state.
     fn arm_archive_timeline_warning_sync(&mut self) {
         self.historical_frame_warning_sync = false;
         self.hazard_receiver = None;
         self.pending_event_loop_hazard_window = None;
         self.last_live_hazard_refresh = None;
-
-        if self.event_loop_hazard_window.is_none() {
-            let cleared_overlay = self.hazard_overlay.take().is_some();
-            self.selected_hazard_index = None;
-            self.hazard_map_popup = None;
-            self.unacknowledged_hazard_event_ids.clear();
-            if cleared_overlay {
-                self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
-            }
-        }
 
         self.unified_player.auto_sync_warnings = true;
         self.arm_unified_player_timeline_warning_sync();
@@ -13851,7 +13875,34 @@ impl ViewerApp {
             .collect()
     }
 
-    fn trigger_alert_sound(&self) {
+    /// Latch attention against the last COMPLETED live load, never against
+    /// the presentation overlay. A priority preview may paint a warning first;
+    /// the final load must still see that warning as new relative to the prior
+    /// completed poll. Set insertion and the shared sound gate make repeated
+    /// previews/final delivery idempotent.
+    fn latch_live_hazard_attention(&mut self, overlay: &HazardOverlay, updating: bool) {
+        let new_attention_ids = self
+            .completed_live_hazard_overlay
+            .as_ref()
+            .map(|baseline| new_hazard_attention_event_ids(baseline, overlay))
+            .unwrap_or_default();
+        let sound_ids = self.soundable_new_ids(overlay, &new_attention_ids);
+        let visual_alert_ids = self.visual_alert_event_ids(overlay, &new_attention_ids);
+
+        self.unacknowledged_hazard_event_ids
+            .extend(visual_alert_ids);
+        prune_unacknowledged_hazard_ids(overlay, &mut self.unacknowledged_hazard_event_ids);
+        if !sound_ids.is_empty() && self.alert_watch.claim_any(&sound_ids) {
+            self.trigger_alert_sound();
+        }
+
+        if !updating {
+            self.completed_live_hazard_overlay = Some(overlay.clone());
+        }
+    }
+
+    fn trigger_alert_sound(&mut self) {
+        self.last_warning_sound_started = Some(Instant::now());
         let _ = alert_audio::play(&self.app_settings.alert_sound_path);
     }
 
@@ -13867,7 +13918,10 @@ impl ViewerApp {
             .map(|frame| frame.identity.scan_time_utc)
             .max();
         if self.radar_update_sound_due_for(newest) {
-            let _ = alert_audio::play(&self.app_settings.radar_update_sound_path);
+            let now = Instant::now();
+            if radar_update_audio_allowed(self.last_warning_sound_started, now) {
+                let _ = alert_audio::play_radar_update(&self.app_settings.radar_update_sound_path);
+            }
         }
     }
 
@@ -13900,6 +13954,8 @@ impl ViewerApp {
                 // enrichment runs. Empty live previews remain ignored.
                 // Archive previews are cumulative across product workers and
                 // install against the pending timeline window.
+                let timeline_result = self.event_loop_hazard_window.is_some()
+                    || self.pending_event_loop_hazard_window.is_some();
                 let timeline_preview = updating && self.pending_event_loop_hazard_window.is_some();
                 if updating && !timeline_preview && overlay.records.is_empty() {
                     return false;
@@ -13915,6 +13971,9 @@ impl ViewerApp {
                     .is_some_and(|window| previous_event_loop_window.as_ref() != Some(window));
                 if let Some(window) = pending_event_loop_window {
                     self.event_loop_hazard_window = Some(window);
+                }
+                if !timeline_result {
+                    self.latch_live_hazard_attention(&overlay, updating);
                 }
                 if let Some(existing) = &self.hazard_overlay
                     && hazard_overlay_records_match(existing, &overlay)
@@ -13947,17 +14006,6 @@ impl ViewerApp {
                     .hazard_overlay
                     .as_ref()
                     .map(|existing| hazard_overlay_change(existing, &overlay));
-                let suppress_alert_latches = self.event_loop_hazard_window.is_some();
-                let new_attention_ids = if !updating && !suppress_alert_latches {
-                    self.hazard_overlay
-                        .as_ref()
-                        .map(|existing| new_hazard_attention_event_ids(existing, &overlay))
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let sound_ids = self.soundable_new_ids(&overlay, &new_attention_ids);
-                let visual_alert_ids = self.visual_alert_event_ids(&overlay, &new_attention_ids);
                 let selected_event_id = self
                     .selected_hazard_record()
                     .map(|record| record.event_id.clone());
@@ -13983,22 +14031,6 @@ impl ViewerApp {
                     &overlay.records,
                     selected_event_id.as_deref(),
                 );
-                if !updating && !suppress_alert_latches {
-                    self.unacknowledged_hazard_event_ids
-                        .extend(visual_alert_ids.iter().cloned());
-                    prune_unacknowledged_hazard_ids(
-                        &overlay,
-                        &mut self.unacknowledged_hazard_event_ids,
-                    );
-                    // Dedupe against the background watcher so a new warning
-                    // cues exactly once: only play here for ids the watcher
-                    // has not already claimed (and never re-play one).
-                    if !sound_ids.is_empty() && self.alert_watch.claim_any(&sound_ids) {
-                        self.trigger_alert_sound();
-                    }
-                } else if suppress_alert_latches {
-                    self.unacknowledged_hazard_event_ids.clear();
-                }
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
                 self.hazard_overlay = Some(overlay);
                 true
@@ -23375,15 +23407,11 @@ impl ViewerApp {
         };
 
         if !self.historical_frame_warning_sync {
-            // Do not paint a current-only polygon over an older scan while
-            // the first archive source returns. Preview results then populate
-            // the stack incrementally through the normal hazard worker path.
+            // Keep the completed overlay visible until the first cumulative
+            // archive preview replaces it. Clearing here caused a blank map
+            // and destroyed NEW-warning ownership whenever a fresh scan made
+            // the displayed frame historical.
             self.hazard_receiver = None;
-            self.hazard_overlay = None;
-            self.selected_hazard_index = None;
-            self.hazard_map_popup = None;
-            self.unacknowledged_hazard_event_ids.clear();
-            self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
             self.event_loop_hazard_window = None;
             self.pending_event_loop_hazard_window = None;
             self.last_live_hazard_refresh = None;
@@ -54307,6 +54335,9 @@ mod tests {
         app.pending_event_loop_hazard_window = Some((start + chrono::Duration::minutes(5), end));
         app.hazards_active_only = false;
         app.live_hazard_auto_refresh = false;
+        app.unacknowledged_hazard_event_ids
+            .insert("current-warning".to_owned());
+        let generation = app.hazard_overlay_generation;
 
         app.switch_to_live_hazard_mode();
 
@@ -54315,10 +54346,16 @@ mod tests {
         assert!(app.pending_event_loop_hazard_window.is_none());
         assert!(app.hazards_active_only);
         assert!(app.live_hazard_auto_refresh);
+        assert!(app.hazard_overlay.is_some());
+        assert_eq!(app.hazard_overlay_generation, generation);
+        assert!(
+            app.unacknowledged_hazard_event_ids
+                .contains("current-warning")
+        );
     }
 
     #[test]
-    fn archive_warning_arm_removes_current_only_overlay_while_radar_loads() {
+    fn archive_warning_arm_keeps_current_overlay_until_timeline_preview_arrives() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let (_sender, receiver) = mpsc::channel::<AsyncHazardResult>();
         app.hazard_receiver = Some(receiver);
@@ -54333,10 +54370,13 @@ mod tests {
         app.arm_archive_timeline_warning_sync();
 
         assert!(app.hazard_receiver.is_none());
-        assert!(app.hazard_overlay.is_none());
-        assert!(app.selected_hazard_index.is_none());
-        assert!(app.unacknowledged_hazard_event_ids.is_empty());
-        assert_eq!(app.hazard_overlay_generation, generation.wrapping_add(1));
+        assert!(app.hazard_overlay.is_some());
+        assert_eq!(app.selected_hazard_index, Some(0));
+        assert!(
+            app.unacknowledged_hazard_event_ids
+                .contains("current-warning")
+        );
+        assert_eq!(app.hazard_overlay_generation, generation);
         assert!(app.unified_player.auto_sync_warnings);
         assert!(app.hazards_visible);
         assert!(!app.hazards_active_only);
@@ -65407,7 +65447,8 @@ mod tests {
 
         assert!(app.install_hazard_result(Ok(test_hazard_overlay(vec![existing, added])), false));
 
-        assert!(app.unacknowledged_hazard_event_ids.is_empty());
+        assert!(app.unacknowledged_hazard_event_ids.contains("stale"));
+        assert!(!app.unacknowledged_hazard_event_ids.contains("new"));
         assert!(
             app.visible_hazard_list_rows()
                 .iter()
@@ -66065,6 +66106,24 @@ mod tests {
     }
 
     #[test]
+    fn radar_update_audio_yields_during_warning_guard_window() {
+        let warning_started = Instant::now();
+        assert!(!radar_update_audio_allowed(
+            Some(warning_started),
+            warning_started
+        ));
+        assert!(!radar_update_audio_allowed(
+            Some(warning_started),
+            warning_started + WARNING_AUDIO_RADAR_GUARD - Duration::from_millis(1)
+        ));
+        assert!(radar_update_audio_allowed(
+            Some(warning_started),
+            warning_started + WARNING_AUDIO_RADAR_GUARD
+        ));
+        assert!(radar_update_audio_allowed(None, warning_started));
+    }
+
+    #[test]
     fn visual_alert_gate_respects_flash_toggle_and_family_filter() {
         let tornado = test_hazard_record(
             "tor",
@@ -66172,7 +66231,44 @@ mod tests {
         assert!(app.install_hazard_result(Ok(test_hazard_overlay(vec![existing, incoming])), true));
         assert_eq!(app.hazard_overlay.as_ref().unwrap().records.len(), 2);
         assert_eq!(app.hazard_overlay_generation, generation.wrapping_add(1));
-        assert!(app.unacknowledged_hazard_event_ids.is_empty());
+        assert!(
+            app.unacknowledged_hazard_event_ids
+                .contains("KSGF.SV.W.0324")
+        );
+    }
+
+    #[test]
+    fn live_priority_preview_then_matching_final_latches_once_against_completed_baseline() {
+        let existing = test_hazard_record(
+            "KSGF.TO.W.0045",
+            "TOR 0045",
+            "tornado",
+            square_hazard_points(-0.1, -0.1, 0.1, 0.1),
+        );
+        let incoming = test_hazard_record(
+            "KSGF.SV.W.0324",
+            "SVR 0324",
+            "severe thunderstorm",
+            square_hazard_points(0.3, 0.3, 0.5, 0.5),
+        );
+        let overlay = test_hazard_overlay(vec![existing.clone(), incoming.clone()]);
+        let mut app = test_viewer_app_with_hazards(vec![existing]);
+
+        assert!(app.install_hazard_result(Ok(overlay.clone()), true));
+        assert!(
+            app.unacknowledged_hazard_event_ids
+                .contains(&incoming.event_id)
+        );
+        assert!(app.install_hazard_result(Ok(overlay), false));
+        assert_eq!(app.unacknowledged_hazard_event_ids.len(), 1);
+        assert!(
+            app.completed_live_hazard_overlay
+                .as_ref()
+                .unwrap()
+                .records
+                .iter()
+                .any(|record| record.event_id == incoming.event_id)
+        );
     }
 
     #[test]
@@ -68357,6 +68453,7 @@ mod tests {
             FeedSource::CustomUrl(String::new()),
         );
         primary.live.enabled = false;
+        let completed_live_hazard_overlay = Some(test_hazard_overlay(records.clone()));
         ViewerApp {
             source_path: None,
             renderer_backend: "test",
@@ -68723,6 +68820,7 @@ mod tests {
             cross_section_dealias_cache: VolumeDealiasCache::new(),
             rhi_panel: rhi::RhiPanel::new(),
             hazard_overlay: Some(test_hazard_overlay(records)),
+            completed_live_hazard_overlay,
             hazard_path_text: String::new(),
             hazard_status: String::new(),
             hazards_visible: true,
@@ -68742,6 +68840,7 @@ mod tests {
             hazard_map_popup: None,
             unacknowledged_hazard_event_ids: BTreeSet::new(),
             alert_watch: AlertWatchHandle::default(),
+            last_warning_sound_started: None,
             last_radar_sound_frame_time: None,
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
