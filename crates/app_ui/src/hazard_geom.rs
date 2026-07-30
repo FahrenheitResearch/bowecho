@@ -1451,6 +1451,10 @@ fn priority_live_hazard_family(event_family: &str) -> bool {
     )
 }
 
+fn tropical_warning_family(event_family: &str) -> bool {
+    matches!(event_family, "tropical storm" | "hurricane")
+}
+
 pub(crate) fn parse_weather_alert_feature_with_zones(
     feature: &WeatherAlertFeature,
     query_time_utc: DateTime<Utc>,
@@ -1700,6 +1704,7 @@ fn weather_alert_zone_urls(
     scope: ZoneGeometryScope<'_>,
 ) -> Vec<String> {
     let mut priority_groups = Vec::<Vec<String>>::new();
+    let mut tropical_groups = Vec::<Vec<String>>::new();
     let mut bulk_groups = Vec::<Vec<String>>::new();
     for feature in features {
         if feature.geometry.is_some() {
@@ -1724,6 +1729,12 @@ fn weather_alert_zone_urls(
         if priority_live_hazard_family(&event_family) || weather_alert_feature_is_pds_watch(feature)
         {
             priority_groups.push(zones);
+        } else if tropical_warning_family(&event_family) {
+            // A landfalling cyclone can coexist with hundreds of flood/watch
+            // zones nationally. Keep every available tropical/hurricane
+            // component ahead of that bulk catalog so the cold-cache fetch
+            // cap cannot make the warning look spatially incomplete.
+            tropical_groups.push(zones);
         } else {
             bulk_groups.push(zones);
         }
@@ -1731,6 +1742,9 @@ fn weather_alert_zone_urls(
     let mut ordered = Vec::with_capacity(MAX_ACTIVE_ALERT_ZONE_GEOMETRIES);
     let mut seen = BTreeSet::new();
     append_zone_groups_round_robin(&priority_groups, &mut ordered, &mut seen);
+    if ordered.len() < MAX_ACTIVE_ALERT_ZONE_GEOMETRIES {
+        append_zone_groups_round_robin(&tropical_groups, &mut ordered, &mut seen);
+    }
     if ordered.len() < MAX_ACTIVE_ALERT_ZONE_GEOMETRIES {
         append_zone_groups_round_robin(&bulk_groups, &mut ordered, &mut seen);
     }
@@ -3003,16 +3017,12 @@ fn screen_polyline_chunks(
     chunks
 }
 
-pub(crate) fn hazard_fill_alpha(base_alpha: u8, selected: bool) -> u8 {
-    // Zero is an explicit master disable. Selection still gets its thicker
-    // outline, but must not resurrect a fill the operator turned off.
-    if base_alpha == 0 {
-        0
-    } else if selected {
-        base_alpha.saturating_add(20).min(100)
-    } else {
-        base_alpha
-    }
+pub(crate) fn hazard_fill_alpha(base_alpha: u8, _selected: bool) -> u8 {
+    // Selection is carried by the boosted outline, not a one-record alpha
+    // change. Giving the selected polygon a different fill split it out of
+    // the same-family union, so the visible overlap appeared to follow the
+    // last polygon clicked. Zero remains a true geometry disable upstream.
+    base_alpha
 }
 
 /// Upper bound (px) on a LEGITIMATE hazard edge's on-screen length:
@@ -3281,14 +3291,15 @@ pub(crate) fn filled_polygon_mesh(
     // and paints outside the ring. Real inputs do this — screen quantization
     // folds dense coastline-traced zone rings at low zoom (Cape May NJC009
     // at map_scale 60-120), and CAP polygons have shipped crossed vertex
-    // orders — so those rings take the exact even-odd scanline fill instead,
-    // and when even the scanline bails (degenerate band structure, the
-    // vertex-limit valve) the fill is dropped outright: outline-only beats
-    // handing a known-crossed ring to earcut and painting wedges outside it.
+    // orders — so those rings take the exact even-odd scanline fill instead.
+    // The same fallback also covers the rare numerically degenerate ring that
+    // earcut rejects without an explicit proper crossing.
     if screen_ring_self_intersects(&points) {
         return scanline_fill_mesh(std::slice::from_ref(&points), fill);
     }
-    let triangles = triangulate_screen_polygon(&points)?;
+    let Some(triangles) = triangulate_screen_polygon(&points) else {
+        return scanline_fill_mesh(std::slice::from_ref(&points), fill);
+    };
     let mut mesh = egui::epaint::Mesh::default();
     for point in &points {
         mesh.colored_vertex(*point, fill);
@@ -3375,10 +3386,11 @@ fn single_hazard_fill_shape(candidate: &HazardFillCandidate) -> Option<egui::Sha
 /// 2026 KCTP scene stacks three successive SVR fills over central PA).
 /// Cross-family and cross-threat overlap still layers: those are distinct
 /// hazards deliberately drawn over each other. Within a group only records
-/// whose fills can touch (transitively bbox-overlapping components) share a
-/// union mesh; isolated records — and components too big to flatten within
-/// [`HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET`] — keep the legacy per-record
-/// path.
+/// whose fills can touch (transitively bbox-overlapping components) share an
+/// exact scanline union; isolated records keep the legacy single-ring path.
+/// Dense unions may be emitted as several non-overlapping mesh chunks, but
+/// their interiors still tile the union exactly once, so chunking never
+/// restores the old same-family alpha stacking.
 pub(crate) fn append_flattened_hazard_fill_shapes(
     candidates: Vec<HazardFillCandidate>,
     fill_shapes: &mut Vec<egui::Shape>,
@@ -3418,14 +3430,7 @@ pub(crate) fn append_flattened_hazard_fill_shapes(
         }
         for mut component in components {
             component.sort_unstable();
-            // Cheap pre-flight bound BEFORE the flatten's quadratic edge
-            // scan (see HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET): an oversized
-            // component falls back to per-record fills, like a singleton.
-            let component_edges: usize = component
-                .iter()
-                .map(|&local| candidates[members[local]].points.len())
-                .sum();
-            if component.len() == 1 || component_edges > HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET {
+            if component.len() == 1 {
                 for &local in &component {
                     if let Some(shape) = single_hazard_fill_shape(&candidates[members[local]]) {
                         fill_shapes.push(shape);
@@ -3438,10 +3443,14 @@ pub(crate) fn append_flattened_hazard_fill_shapes(
                 .map(|&local| candidates[members[local]].points.clone())
                 .collect::<Vec<_>>();
             let fill = candidates[members[component[0]]].fill;
-            if let Some(mesh) = scanline_fill_mesh(&rings, fill) {
-                fill_shapes.push(egui::Shape::mesh(mesh));
+            let meshes = scanline_fill_meshes(&rings, fill);
+            if !meshes.is_empty() {
+                fill_shapes.extend(meshes.into_iter().map(egui::Shape::mesh));
             } else {
-                // Safety-valve fallback: paint per record as before.
+                // Degenerate rings with no non-zero-height interior retain the
+                // legacy path. This is not the dense-work valve: every valid
+                // dense component above is flattened, including components
+                // over HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET.
                 for &local in &component {
                     if let Some(shape) = single_hazard_fill_shape(&candidates[members[local]]) {
                         fill_shapes.push(shape);
@@ -3706,6 +3715,14 @@ pub(crate) fn hazard_fill_vertex_limit(family_count: usize) -> usize {
         .clamp(HAZARD_FILL_MIN_VERTEX_LIMIT, HAZARD_FILL_VERTEX_LIMIT)
 }
 
+/// Allocate a larger but still constant screen-space outline budget across a
+/// visible warning family. Detail increases smoothly as fewer polygons remain
+/// in view; total line work does not grow without bound in a national scene.
+pub(crate) fn hazard_outline_vertex_limit(family_count: usize) -> usize {
+    (HAZARD_OUTLINE_FAMILY_VERTEX_BUDGET / family_count.max(1))
+        .clamp(HAZARD_OUTLINE_MIN_VERTEX_LIMIT, HAZARD_OUTLINE_VERTEX_LIMIT)
+}
+
 /// Return a tessellation-safe fill ring bounded to `max_points`. The exact
 /// source ring remains available to the outline and hit-testing paths.
 pub(crate) fn bounded_hazard_fill_points(
@@ -3805,6 +3822,63 @@ fn scanline_edge_crossing_y(a: &ScanlineFillEdge, b: &ScanlineFillEdge) -> Optio
     (t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0).then_some(a.y0 + t * d1y)
 }
 
+fn scanline_edge_bounds(edge: &ScanlineFillEdge) -> [f32; 4] {
+    [
+        edge.x0.min(edge.x1),
+        edge.y0.min(edge.y1),
+        edge.x0.max(edge.x1),
+        edge.y0.max(edge.y1),
+    ]
+}
+
+fn scanline_edge_bounds_overlap(left: [f32; 4], right: [f32; 4]) -> bool {
+    left[0] <= right[2] && right[0] <= left[2] && left[1] <= right[3] && right[1] <= left[3]
+}
+
+/// Add every proper edge-crossing y event. Small components retain the
+/// straightforward pair walk; dense components sort by minimum x and stop as
+/// soon as the remaining edge bboxes cannot overlap. Both paths reject
+/// disjoint x/y bboxes before doing the segment math and produce the same
+/// exact event set.
+fn append_scanline_edge_crossing_events(
+    edges: &[ScanlineFillEdge],
+    edge_bounds: &[[f32; 4]],
+    events: &mut Vec<f32>,
+) {
+    let mut append_pair = |first: usize, second: usize| {
+        if scanline_edge_bounds_overlap(edge_bounds[first], edge_bounds[second])
+            && let Some(y) = scanline_edge_crossing_y(&edges[first], &edges[second])
+        {
+            events.push(y);
+        }
+    };
+
+    if edges.len() <= HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET {
+        for first in 0..edges.len() {
+            for second in (first + 1)..edges.len() {
+                append_pair(first, second);
+            }
+        }
+        return;
+    }
+
+    let mut order = (0..edges.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        edge_bounds[left][0]
+            .total_cmp(&edge_bounds[right][0])
+            .then_with(|| edge_bounds[left][2].total_cmp(&edge_bounds[right][2]))
+            .then_with(|| left.cmp(&right))
+    });
+    for (position, &first) in order.iter().enumerate() {
+        for &second in order.iter().skip(position + 1) {
+            if edge_bounds[second][0] > edge_bounds[first][2] {
+                break;
+            }
+            append_pair(first, second);
+        }
+    }
+}
+
 /// Exact fill tessellation for possibly-degenerate screen rings: even-odd
 /// inside each ring, union across rings, emitted as trapezoid bands between
 /// consecutive vertex/crossing scanlines. Within a band no edge starts, ends,
@@ -3813,10 +3887,11 @@ fn scanline_edge_crossing_y(a: &ScanlineFillEdge, b: &ScanlineFillEdge) -> Optio
 /// fill never double-blends no matter how the rings overlap or self-cross.
 /// This is both the self-intersecting-ring fill and the same-family hazard
 /// overlap flattener.
-pub(crate) fn scanline_fill_mesh(
+fn scanline_fill_meshes_with_limit(
     rings: &[Vec<egui::Pos2>],
     fill: egui::Color32,
-) -> Option<egui::epaint::Mesh> {
+    vertex_limit: usize,
+) -> Vec<egui::epaint::Mesh> {
     let mut edges = Vec::new();
     for (ring_index, ring) in rings.iter().enumerate() {
         if ring.len() < 3 {
@@ -3837,44 +3912,68 @@ pub(crate) fn scanline_fill_mesh(
         }
     }
     if edges.is_empty() {
-        return None;
+        return Vec::new();
     }
+
+    let edge_bounds = edges.iter().map(scanline_edge_bounds).collect::<Vec<_>>();
 
     let mut events = Vec::with_capacity(edges.len() * 2);
     for edge in &edges {
         events.push(edge.y0);
         events.push(edge.y1);
     }
-    for first in 0..edges.len() {
-        for second in (first + 1)..edges.len() {
-            if let Some(y) = scanline_edge_crossing_y(&edges[first], &edges[second]) {
-                events.push(y);
-            }
-        }
-    }
+    append_scanline_edge_crossing_events(&edges, &edge_bounds, &mut events);
     events.sort_by(f32::total_cmp);
     events.dedup();
 
     let x_at = |edge: &ScanlineFillEdge, y: f32| {
         edge.x0 + (y - edge.y0) * (edge.x1 - edge.x0) / (edge.y1 - edge.y0)
     };
-    let mut mesh = egui::epaint::Mesh::default();
-    let mut crossings = Vec::<(f32, usize)>::new();
+    let mut starts = (0..edges.len()).collect::<Vec<_>>();
+    starts.sort_by(|&left, &right| {
+        edge_bounds[left][1]
+            .total_cmp(&edge_bounds[right][1])
+            .then_with(|| left.cmp(&right))
+    });
+    let mut ends = (0..edges.len()).collect::<Vec<_>>();
+    ends.sort_by(|&left, &right| {
+        edge_bounds[left][3]
+            .total_cmp(&edge_bounds[right][3])
+            .then_with(|| left.cmp(&right))
+    });
+    let mut start_cursor = 0usize;
+    let mut end_cursor = 0usize;
+    let mut active_edges = std::collections::BTreeSet::<usize>::new();
+    let mut crossings_by_ring = (0..rings.len())
+        .map(|_| Vec::<(f32, usize)>::new())
+        .collect::<Vec<_>>();
     let mut intervals = Vec::<(usize, usize)>::new();
+    let mut meshes = Vec::<egui::epaint::Mesh>::new();
+    let mut mesh = egui::epaint::Mesh::default();
+    let vertex_limit = vertex_limit.max(4);
     for band in events.windows(2) {
         let (y0, y1) = (band[0], band[1]);
         let midline = 0.5 * (y0 + y1);
         if !(y0 < midline && midline < y1) {
             continue;
         }
-        intervals.clear();
-        for ring_index in 0..rings.len() {
+        while start_cursor < starts.len() && edge_bounds[starts[start_cursor]][1] < midline {
+            active_edges.insert(starts[start_cursor]);
+            start_cursor += 1;
+        }
+        while end_cursor < ends.len() && edge_bounds[ends[end_cursor]][3] <= midline {
+            active_edges.remove(&ends[end_cursor]);
+            end_cursor += 1;
+        }
+        for crossings in &mut crossings_by_ring {
             crossings.clear();
-            for (edge_index, edge) in edges.iter().enumerate() {
-                if edge.ring == ring_index && (edge.y0 > midline) != (edge.y1 > midline) {
-                    crossings.push((x_at(edge, midline), edge_index));
-                }
-            }
+        }
+        for &edge_index in &active_edges {
+            let edge = &edges[edge_index];
+            crossings_by_ring[edge.ring].push((x_at(edge, midline), edge_index));
+        }
+        intervals.clear();
+        for crossings in &mut crossings_by_ring {
             crossings.sort_by(|left, right| left.0.total_cmp(&right.0));
             for pair in crossings.chunks_exact(2) {
                 intervals.push((pair[0].1, pair[1].1));
@@ -3898,6 +3997,9 @@ pub(crate) fn scanline_fill_mesh(
         for (left, right) in merged {
             let left_edge = &edges[left];
             let right_edge = &edges[right];
+            if mesh.vertices.len().saturating_add(4) > vertex_limit && !mesh.indices.is_empty() {
+                meshes.push(std::mem::take(&mut mesh));
+            }
             let base = mesh.vertices.len() as u32;
             mesh.colored_vertex(egui::pos2(x_at(left_edge, y0), y0), fill);
             mesh.colored_vertex(egui::pos2(x_at(right_edge, y0), y0), fill);
@@ -3906,11 +4008,38 @@ pub(crate) fn scanline_fill_mesh(
             mesh.add_triangle(base, base + 1, base + 2);
             mesh.add_triangle(base, base + 2, base + 3);
         }
-        if mesh.vertices.len() > SCANLINE_FILL_VERTEX_LIMIT {
-            return None;
-        }
     }
-    (!mesh.indices.is_empty()).then_some(mesh)
+    if !mesh.indices.is_empty() {
+        meshes.push(mesh);
+    }
+    meshes
+}
+
+/// Exact scanline union emitted in bounded, mutually non-overlapping mesh
+/// chunks. Chunk boundaries lie between complete trapezoids, so translucent
+/// same-family fills still paint every interior point exactly once.
+fn scanline_fill_meshes(rings: &[Vec<egui::Pos2>], fill: egui::Color32) -> Vec<egui::epaint::Mesh> {
+    scanline_fill_meshes_with_limit(rings, fill, SCANLINE_FILL_VERTEX_LIMIT)
+}
+
+fn merge_scanline_meshes(meshes: Vec<egui::epaint::Mesh>) -> Option<egui::epaint::Mesh> {
+    let mut chunks = meshes.into_iter();
+    let mut merged = chunks.next()?;
+    for chunk in chunks {
+        merged.append(chunk);
+    }
+    Some(merged)
+}
+
+pub(crate) fn scanline_fill_mesh(
+    rings: &[Vec<egui::Pos2>],
+    fill: egui::Color32,
+) -> Option<egui::epaint::Mesh> {
+    // Legacy single-mesh callers (notably the self-intersecting single-ring
+    // path) must not lose a valid fill merely because bounded tessellation
+    // emitted several chunks. `Mesh::append` offsets indices while retaining
+    // the chunks' mutually non-overlapping triangles.
+    merge_scanline_meshes(scanline_fill_meshes(rings, fill))
 }
 
 pub(crate) fn cross_points(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> f32 {
@@ -4083,8 +4212,8 @@ mod tests {
     #[test]
     fn hazard_fill_alpha_is_product_independent() {
         assert_eq!(hazard_fill_alpha(50, false), 50);
-        assert_eq!(hazard_fill_alpha(50, true), 70);
-        assert_eq!(hazard_fill_alpha(90, true), 100);
+        assert_eq!(hazard_fill_alpha(50, true), 50);
+        assert_eq!(hazard_fill_alpha(90, true), 90);
         assert_eq!(hazard_fill_alpha(0, true), 0);
     }
 
@@ -4773,6 +4902,36 @@ mod tests {
         assert!(urls.iter().any(|url| url.ends_with("/ZZ902")));
     }
 
+    #[test]
+    fn capped_zone_catalog_keeps_tropical_components_ahead_of_bulk_zones() {
+        let mut bulk = zoneless_alert_feature(
+            "Flood Warning",
+            "https://api.weather.gov/zones/county/AA000",
+        );
+        bulk.properties.affected_zones = (0..(MAX_ACTIVE_ALERT_ZONE_GEOMETRIES + 40))
+            .map(|index| format!("https://api.weather.gov/zones/county/AA{index:03}"))
+            .collect();
+        let mut tropical = zoneless_alert_feature(
+            "Tropical Storm Warning",
+            "https://api.weather.gov/zones/forecast/FLZ201",
+        );
+        tropical.properties.affected_zones = vec![
+            "https://api.weather.gov/zones/forecast/FLZ201".to_owned(),
+            "https://api.weather.gov/zones/forecast/FLZ202".to_owned(),
+            "https://api.weather.gov/zones/forecast/GMZ650".to_owned(),
+        ];
+
+        let urls = weather_alert_zone_urls(&[bulk, tropical], ZoneGeometryScope::Display);
+
+        assert_eq!(urls.len(), MAX_ACTIVE_ALERT_ZONE_GEOMETRIES);
+        for zone in ["FLZ201", "FLZ202", "GMZ650"] {
+            assert!(
+                urls.iter().any(|url| url.ends_with(zone)),
+                "cold-cache cap dropped tropical component {zone}"
+            );
+        }
+    }
+
     fn zoneless_alert_feature(event: &str, zone_url: &str) -> WeatherAlertFeature {
         WeatherAlertFeature {
             id: None,
@@ -4841,6 +5000,16 @@ mod tests {
         }
         for family in ["flood", "tropical storm", "hurricane", "watch"] {
             assert!(!priority_live_hazard_family(family));
+        }
+    }
+
+    #[test]
+    fn tropical_warning_families_are_reserved_in_the_full_zone_catalog() {
+        for family in ["tropical storm", "hurricane"] {
+            assert!(tropical_warning_family(family));
+        }
+        for family in ["tornado", "flash flood", "flood", "watch"] {
+            assert!(!tropical_warning_family(family));
         }
     }
 
@@ -5032,6 +5201,69 @@ mod tests {
 
         assert_eq!(mesh.indices.len(), 9);
         assert_eq!(mesh.vertices.len(), 5);
+    }
+
+    #[test]
+    fn scanline_chunking_preserves_union_and_single_mesh_callers() {
+        fn paint_multiplicity(meshes: &[egui::epaint::Mesh], point: egui::Pos2) -> usize {
+            meshes
+                .iter()
+                .map(|mesh| {
+                    mesh.indices
+                        .chunks_exact(3)
+                        .filter(|triangle| {
+                            let a = mesh.vertices[triangle[0] as usize].pos;
+                            let b = mesh.vertices[triangle[1] as usize].pos;
+                            let c = mesh.vertices[triangle[2] as usize].pos;
+                            point_in_triangle(point, a, b, c)
+                        })
+                        .count()
+                })
+                .sum()
+        }
+
+        let rings = vec![
+            vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(100.0, 0.0),
+                egui::pos2(100.0, 100.0),
+                egui::pos2(0.0, 100.0),
+            ],
+            vec![
+                egui::pos2(60.0, 40.0),
+                egui::pos2(180.0, 40.0),
+                egui::pos2(180.0, 160.0),
+                egui::pos2(60.0, 160.0),
+            ],
+        ];
+        let probes = [
+            egui::pos2(20.3, 20.7),
+            egui::pos2(80.3, 70.7),
+            egui::pos2(150.3, 120.7),
+        ];
+
+        let chunks = scanline_fill_meshes_with_limit(
+            &rings,
+            egui::Color32::from_rgba_unmultiplied(30, 160, 90, 80),
+            8,
+        );
+        assert!(chunks.len() > 1, "the test must exercise mesh chunking");
+        for point in probes {
+            assert_eq!(
+                paint_multiplicity(&chunks, point),
+                1,
+                "chunked union must paint each interior probe exactly once"
+            );
+        }
+
+        let merged = merge_scanline_meshes(chunks).expect("valid chunks merge");
+        for point in probes {
+            assert_eq!(
+                paint_multiplicity(std::slice::from_ref(&merged), point),
+                1,
+                "legacy single-mesh caller must retain every chunk"
+            );
+        }
     }
 
     #[test]

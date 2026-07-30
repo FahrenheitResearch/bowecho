@@ -341,7 +341,7 @@ impl crate::ViewerApp {
         }
         let result_current = self.gbvtd_result_is_current();
         if self.gbvtd.result.is_some() && !result_current {
-            ui.weak("Velocity dealias engine or Analyst 3D anchor changed; re-run the retrieval.");
+            ui.weak("Velocity dealias engine or Analyst v4 anchor changed; re-run the retrieval.");
         }
         if let Some(circ) = self.gbvtd.result.as_ref().filter(|_| result_current) {
             ui.separator();

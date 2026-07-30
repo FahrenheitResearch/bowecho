@@ -1039,7 +1039,7 @@ reduction graft — mechanism and full delta table in
   the no-env path, and the sidebar shows which anchor the current volume
   actually has.
 - The picker slot formerly labeled "3D + time (beta)" is now
-  "Analyst 3D (model-anchored)" and runs v4.1. The in-memory engine
+  "Analyst v4 (whole volume)" and runs v4.1. The in-memory engine
   toggle keeps its historical name (`dealias_cascade`) so any state that
   selected the retired hybrid engine maps forward to v4. (The bool was
   never persisted to settings files; nothing on disk needed migration.)

@@ -129,6 +129,11 @@ pub enum DockRequest {
     /// Pane leaves the tree; the viewer hides. `prefer_docked` keeps the
     /// memory so reopening it returns it to the dock.
     Hide(WorkspacePane),
+    /// Suspend or resume presentation work for a docked viewer without
+    /// closing it. This is deliberately session-only: every app launch wakes
+    /// all panes, while explicit downloads and worker completion drains keep
+    /// running so a sleeping pane cannot strand an in-flight result.
+    SetSleeping(WorkspacePane, bool),
 }
 
 /// The workspace layout: the tile tree plus dock bookkeeping.
@@ -137,6 +142,9 @@ pub struct Workspace {
     /// Viewers that should return DOCKED the next time they open (set on
     /// dock, kept across hide, cleared when the user floats the pane).
     pub prefer_docked: BTreeSet<WorkspacePane>,
+    /// Docked viewers whose presentation and automatic scheduling are paused
+    /// for this session. The map anchor can never sleep.
+    sleeping: BTreeSet<WorkspacePane>,
     /// Requests raised during the tree pass — see [`DockRequest`].
     pub requests: Vec<DockRequest>,
     /// Layout changed (dock/undock/drag/resize/tri-state) — persist after
@@ -151,6 +159,7 @@ impl Default for Workspace {
         Self {
             tree: default_tree(),
             prefer_docked: BTreeSet::new(),
+            sleeping: BTreeSet::new(),
             requests: Vec::new(),
             dirty: false,
             last_edit: None,
@@ -195,10 +204,30 @@ impl Workspace {
     /// answer so an open-but-covered tab does not keep animating or scheduling
     /// expensive viewer work.
     pub fn is_pane_active(&self, pane: WorkspacePane) -> bool {
+        if self.is_sleeping(pane) {
+            return false;
+        }
         let Some(tile) = self.tree.tiles.find_pane(&pane) else {
             return false;
         };
         self.tree.active_tiles().contains(&tile)
+    }
+
+    pub fn is_sleeping(&self, pane: WorkspacePane) -> bool {
+        pane != WorkspacePane::Map && self.sleeping.contains(&pane)
+    }
+
+    /// Change a viewer's session-only sleep state. Sleeping applies only to a
+    /// pane that is still docked; floating, hidden, and map panes always wake.
+    pub fn set_sleeping(&mut self, pane: WorkspacePane, sleeping: bool) -> bool {
+        if pane == WorkspacePane::Map || !self.is_docked(pane) {
+            return self.sleeping.remove(&pane);
+        }
+        if sleeping {
+            self.sleeping.insert(pane)
+        } else {
+            self.sleeping.remove(&pane)
+        }
     }
 
     /// Layout changed: queue a (debounced) persist.
@@ -233,6 +262,7 @@ impl Workspace {
         }
         self.tree = persisted.tree;
         self.prefer_docked = persisted.prefer_docked;
+        self.sleeping.clear();
         self.ensure_map_pane();
         Some(persisted.viewers)
     }
@@ -244,6 +274,7 @@ impl Workspace {
         if pane == WorkspacePane::Map || self.is_docked(pane) {
             return;
         }
+        self.sleeping.remove(&pane);
         self.prefer_docked.insert(pane);
         let child = self.tree.tiles.insert_pane(pane);
         // Prefer tabbing alongside an already-docked viewer.
@@ -319,6 +350,7 @@ impl Workspace {
         if pane == WorkspacePane::Map || self.is_docked(pane) {
             return;
         }
+        self.sleeping.remove(&pane);
         let Some(anchor_pane) = self.tree.tiles.find_pane(&anchor) else {
             // The anchor isn't in the tree: nothing to split beside it.
             self.dock(pane);
@@ -390,6 +422,7 @@ impl Workspace {
         if pane == WorkspacePane::Map {
             return;
         }
+        self.sleeping.remove(&pane);
         if let Some(tile_id) = self.tree.tiles.find_pane(&pane) {
             self.tree.remove_recursively(tile_id);
             self.mark_dirty();
@@ -402,6 +435,7 @@ impl Workspace {
         if self.tree.tiles.find_pane(&WorkspacePane::Map).is_none() {
             self.tree = default_tree();
             self.prefer_docked.clear();
+            self.sleeping.clear();
             self.mark_dirty();
         }
     }
@@ -410,6 +444,7 @@ impl Workspace {
     pub fn reset(&mut self) {
         self.tree = default_tree();
         self.prefer_docked.clear();
+        self.sleeping.clear();
         self.mark_dirty();
     }
 }
@@ -474,7 +509,11 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
     }
 
     fn tab_title_for_pane(&mut self, pane: &WorkspacePane) -> egui::WidgetText {
-        pane.tab_title().into()
+        if self.app.workspace.is_sleeping(*pane) {
+            format!("{} (sleep)", pane.tab_title()).into()
+        } else {
+            pane.tab_title().into()
+        }
     }
 
     fn is_tab_closable(
@@ -513,6 +552,14 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
         }
         let sounding = pane == WorkspacePane::Sounding;
         button_response.context_menu(|ui| {
+            let sleeping = self.app.workspace.is_sleeping(pane);
+            if ui.button(if sleeping { "Wake" } else { "Sleep" }).clicked() {
+                self.app
+                    .workspace
+                    .requests
+                    .push(DockRequest::SetSleeping(pane, !sleeping));
+                ui.close();
+            }
             if ui.button("Float as window").clicked() {
                 self.app.workspace.requests.push(DockRequest::Float(pane));
                 ui.close();
@@ -523,9 +570,9 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
             }
         });
         button_response.on_hover_text(if sounding {
-            "Drag to rearrange · right-click to float/close · × floats as a window"
+            "Drag to rearrange · right-click to sleep/float/close · × floats as a window"
         } else {
-            "Drag to rearrange · right-click to float/hide · × floats as a window"
+            "Drag to rearrange · right-click to sleep/float/hide · × floats as a window"
         })
     }
 
@@ -650,6 +697,34 @@ mod tests {
         assert!(workspace.activate_pane(WorkspacePane::Model));
         assert!(workspace.is_pane_active(WorkspacePane::Model));
         assert!(!workspace.is_pane_active(WorkspacePane::FormulaLab));
+    }
+
+    #[test]
+    fn sleeping_active_pane_suspends_presentation_until_woken() {
+        let mut workspace = Workspace::default();
+        workspace.dock(WorkspacePane::Wofs);
+        assert!(workspace.is_pane_active(WorkspacePane::Wofs));
+
+        assert!(workspace.set_sleeping(WorkspacePane::Wofs, true));
+        assert!(workspace.is_sleeping(WorkspacePane::Wofs));
+        assert!(!workspace.is_pane_active(WorkspacePane::Wofs));
+        assert!(!workspace.set_sleeping(WorkspacePane::Wofs, true));
+
+        assert!(workspace.set_sleeping(WorkspacePane::Wofs, false));
+        assert!(!workspace.is_sleeping(WorkspacePane::Wofs));
+        assert!(workspace.is_pane_active(WorkspacePane::Wofs));
+    }
+
+    #[test]
+    fn map_and_undocked_viewers_cannot_sleep() {
+        let mut workspace = Workspace::default();
+        assert!(!workspace.set_sleeping(WorkspacePane::Map, true));
+        assert!(!workspace.set_sleeping(WorkspacePane::Farm, true));
+
+        workspace.dock(WorkspacePane::Farm);
+        assert!(workspace.set_sleeping(WorkspacePane::Farm, true));
+        workspace.undock(WorkspacePane::Farm);
+        assert!(!workspace.is_sleeping(WorkspacePane::Farm));
     }
 
     /// The tab strip (Tabs container) that directly wraps a docked pane.

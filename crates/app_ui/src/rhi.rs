@@ -209,7 +209,7 @@ impl RhiPanel {
         };
         // Velocity panels show dealiased velocity, matching the map and
         // cross-section displays — through the same engine the user selected.
-        // Analyst 3D here runs the whole-volume v4 solve for this cut WITHOUT
+        // Analyst v4 here runs the whole-volume solve for this cut WITHOUT
         // the previous-volume / RAP prior the map fetches (the RHI has no
         // access to them), falling back to the Region solver if v4 declines.
         let dealiased;

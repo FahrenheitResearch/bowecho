@@ -21,11 +21,12 @@ use ui_core::loop_engine::FeedSource;
 use crate::{
     GLM_LIVE_MAX_AGE_MINUTES, ItalyDpcMapProduct, LayerRowGear, LayerRowOpacity, LayerRowOrder,
     LayerRowRemove, LayerRowSpec, LayerRowVis, PlacefileSlot, RadarSite, SidebarTab, ViewerApp,
-    aircraft_soundings, compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
-    custom_poll_links_from_gis, dock, eumetsat, format_site_label, glm_latest_age_minutes,
-    glm_latest_is_live, glm_satellite_label, grid_composites, intl_provider_label, layer_row,
-    mesoanalysis, normalized_poll_url, oa_derived, panel_kit, parse_custom_poll_marker_inputs,
-    poll_url_name, poll_urls_match, spc_layers,
+    aircraft_soundings, compact_layer_status, compact_layer_success_age, compact_status_age,
+    custom_poll_entry_label, custom_poll_entry_lat_lon, custom_poll_links_from_gis, dock, eumetsat,
+    farm_frame_time_utc, format_site_label, glm_latest_age_minutes, glm_latest_is_live,
+    glm_satellite_label, grid_composites, intl_provider_label, layer_row, mesoanalysis,
+    normalized_poll_url, oa_derived, panel_kit, parse_custom_poll_marker_inputs, poll_url_name,
+    poll_urls_match, spc_layers, warning_live_success_age,
 };
 
 fn model_map_layer_visibility_hover(grid_composite: bool) -> &'static str {
@@ -221,6 +222,24 @@ impl ViewerApp {
         } else {
             "loaded"
         };
+        let primary_frame_time = self.selected_frame_scan_time_utc();
+        let primary_count = primary_frame_time.as_ref().map(|time| {
+            format!(
+                "{} · {}",
+                time.format("%H:%MZ"),
+                compact_status_age(time.to_owned(), chrono::Utc::now())
+            )
+        });
+        let primary_hover = primary_frame_time
+            .as_ref()
+            .map(|time| {
+                format!(
+                    "Primary radar (site/products in SITE and PRODUCTS above)\nDisplayed source frame: {} ({})",
+                    time.format("%Y-%m-%d %H:%M:%SZ"),
+                    compact_status_age(time.to_owned(), chrono::Utc::now())
+                )
+            })
+            .unwrap_or_else(|| "Primary radar (site/products in SITE and PRODUCTS above)\nNo source frame loaded".to_owned());
         if layer_row(
             ui,
             LayerRowSpec {
@@ -229,8 +248,9 @@ impl ViewerApp {
                     hover: "Primary radar — always drawn; site and products in the sections above",
                 },
                 name: &primary_name,
-                name_hover: "Primary radar (site/products in SITE and PRODUCTS above)",
+                name_hover: &primary_hover,
                 state: Some(primary_state),
+                count: primary_count.as_deref(),
                 opacity: Some(LayerRowOpacity::F32 {
                     value: &mut self.radar_opacity,
                     min: 0.15,
@@ -761,6 +781,38 @@ impl ViewerApp {
                     "simsat" => ("SimSat", "Simulated satellite frame"),
                     _ => ("GOES", "GOES ABI satellite frame"),
                 });
+        let sat_frame_time = self
+            .sat_layer
+            .as_ref()
+            .and_then(|layer| rw_sat::store::frame_time(&layer.key.run, layer.hhmm));
+        let sat_count = self.sat_layer.as_ref().map(|layer| {
+            sat_frame_time
+                .as_ref()
+                .map(|time| {
+                    format!(
+                        "{} · {}",
+                        time.format("%H:%MZ"),
+                        compact_status_age(time.to_owned(), chrono::Utc::now())
+                    )
+                })
+                .unwrap_or_else(|| format!("{:02}:{:02}Z", layer.hhmm / 100, layer.hhmm % 100))
+        });
+        let sat_name_hover = sat_layer_source.map(|source| source.1).map(|source| {
+            sat_frame_time
+                .as_ref()
+                .map(|time| {
+                    format!(
+                        "{source}\nSource frame: {} ({})",
+                        time.format("%Y-%m-%d %H:%M:%SZ"),
+                        compact_status_age(time.to_owned(), chrono::Utc::now())
+                    )
+                })
+                .unwrap_or_else(|| format!("{source}\nSource frame time is not dated in this run"))
+        });
+        let sat_loading = self.sat_map_inflight.is_some()
+            || self.sat_map_pending.is_some()
+            || self.sat_layer_build_rx.is_some()
+            || self.sat_layer_render_rx.is_some();
         if let Some(layer) = &mut self.sat_layer
             && layer_row(
                 ui,
@@ -772,9 +824,9 @@ impl ViewerApp {
                     name: sat_layer_source
                         .map(|source| source.0)
                         .unwrap_or("Satellite"),
-                    name_hover: sat_layer_source
-                        .map(|source| source.1)
-                        .unwrap_or("Satellite frame"),
+                    name_hover: sat_name_hover.as_deref().unwrap_or("Satellite frame"),
+                    state: Some(if sat_loading { "loading" } else { "loaded" }),
+                    count: sat_count.as_deref(),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.1,
@@ -900,6 +952,44 @@ impl ViewerApp {
         // "Show on map", removable here.
         if self.farm.drape.enabled {
             let live = self.farm.live_sensor().map(|s| s.name.clone());
+            let farm_frame_time = self
+                .farm
+                .frames
+                .get(self.farm.frame_index)
+                .and_then(|url| farm_frame_time_utc(url));
+            let farm_count = farm_frame_time
+                .as_ref()
+                .map(|time| {
+                    format!(
+                        "{} · {}",
+                        time.format("%H:%MZ"),
+                        compact_status_age(time.to_owned(), chrono::Utc::now())
+                    )
+                })
+                .or_else(|| live.clone());
+            let farm_hover = format!(
+                "Georeferenced FARM (DOW/COW) quicklook drape\nSensor: {} · Product: {}\n{}{}",
+                live.as_deref().unwrap_or("selected deployment"),
+                if self.farm.product.is_empty() {
+                    "unknown"
+                } else {
+                    self.farm.product.as_str()
+                },
+                if self.farm.status.is_empty() {
+                    "No completed frame-page status"
+                } else {
+                    self.farm.status.as_str()
+                },
+                farm_frame_time
+                    .as_ref()
+                    .map(|time| format!(
+                        "\nDisplayed source frame: {} ({})",
+                        time.format("%Y-%m-%d %H:%M:%SZ"),
+                        compact_status_age(time.to_owned(), chrono::Utc::now())
+                    ))
+                    .unwrap_or_default()
+            );
+            let farm_loading = self.farm.background_activity_label().is_some();
             let mut open_farm = false;
             let mut remove_drape = false;
             if layer_row(
@@ -910,9 +1000,15 @@ impl ViewerApp {
                         hover: "Drape the FARM quicklook PPI onto the radar map (georeferenced)",
                     },
                     name: "FARM drape",
-                    name_hover: "Georeferenced FARM (DOW/COW) quicklook drape — sensor, placement, and echoes-only live in the FARM window",
-                    state: Some(if live.is_some() { "live" } else { "loaded" }),
-                    count: live.as_deref(),
+                    name_hover: &farm_hover,
+                    state: Some(if farm_loading {
+                        "loading"
+                    } else if live.is_some() {
+                        "live"
+                    } else {
+                        "loaded"
+                    }),
+                    count: farm_count.as_deref(),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut self.farm.drape.opacity,
                         min: 0.15,
@@ -954,22 +1050,45 @@ impl ViewerApp {
             let obs_hour_loop_started_at = &mut self.obs_hour_loop_started_at;
             let obs_hour_loop_paused_at = &mut self.obs_hour_loop_paused_at;
             let obs_hour_loop_end_utc = &mut self.obs_hour_loop_end_utc;
-            let obs_fetched_at = self.obs_fetched_at;
+            let obs_fetched_at = [
+                self.obs_fetched_at,
+                self.iem_metar_fetched_at,
+                self.nws_obs_fetched_at,
+                self.mesonet_fetched_at,
+            ]
+            .into_iter()
+            .flatten()
+            .max();
             let obs_station_count = self.surface_obs.station_count;
             let mut obs_adjust_changed = false;
             let mut metar_state_filter_enabled =
                 self.app_settings.overlay_obs_metar_state_filter_enabled;
             let mut metar_states = self.app_settings.overlay_obs_metar_states.clone();
             let mut metar_state_filter_changed = false;
-            let obs_fetching =
-                self.obs_rx.is_some() || self.nws_obs_rx.is_some() || self.mesonet_rx.is_some();
-            let obs_count_text = obs_fetched_at.map(|at| {
-                format!(
-                    "{} stn · {}m ago",
-                    obs_station_count,
-                    at.elapsed().as_secs() / 60
-                )
-            });
+            let obs_fetching = self.obs_rx.is_some()
+                || self.iem_metar_rx.is_some()
+                || self.nws_obs_rx.is_some()
+                || self.mesonet_rx.is_some();
+            let obs_success_age =
+                obs_fetched_at.map(|at| compact_layer_success_age(at, Instant::now()));
+            let obs_count_text = obs_success_age
+                .as_deref()
+                .map(|age| format!("{obs_station_count} stn · {age}"))
+                .or_else(|| (obs_station_count > 0).then(|| format!("{obs_station_count} stn")));
+            let obs_hover = format!(
+                "METAR station plots: temperature/dewpoint (units per Settings > Display), wind barbs, gusts — every reporting station, refreshed ~5 min\n{}{}",
+                obs_success_age
+                    .as_deref()
+                    .map(|age| format!("Last successful source update: {age}"))
+                    .unwrap_or_else(|| "No successful source update yet".to_owned()),
+                if self.status.starts_with("Surface obs fetch failed")
+                    || self.status.starts_with("IEM global METAR fetch failed")
+                {
+                    format!("\nLatest refresh status: {}", self.status)
+                } else {
+                    String::new()
+                }
+            );
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -978,11 +1097,23 @@ impl ViewerApp {
                         hover: "METAR station plots: temperature/dewpoint (units per Settings > Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
                     },
                     name: "Surface obs",
-                    name_hover: "METAR station plots: temperature/dewpoint (units per Settings > Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                    name_hover: &obs_hover,
+                    state: Some(if obs_fetching {
+                        "loading"
+                    } else if self.status.starts_with("Surface obs fetch failed")
+                        || self.status.starts_with("IEM global METAR fetch failed")
+                    {
+                        "error"
+                    } else if obs_fetched_at.is_some() {
+                        "live"
+                    } else {
+                        "idle"
+                    }),
                     count: obs_count_text.as_deref(),
-                    gear: Some(LayerRowGear::Menu {
+                    gear: Some(LayerRowGear::PersistentMenu {
                         hover: "Networks: METAR · Mesonet · obs-adjusted soundings",
                         content: Box::new(|ui| {
+                            ui.set_min_width(370.0);
                             ui.checkbox(obs_show_metar, "METAR")
                                 .on_hover_text("Airport-grade ASOS/AWOS stations");
                             ui.checkbox(obs_show_mesonet, "Mesonet")
@@ -990,18 +1121,20 @@ impl ViewerApp {
                                             "IEM RWIS road sensors + DCP/RAWS networks — denser but lower siting quality (road sensors read hot in sun); uncheck for strict-QC METAR-only",
                                         );
                             let state_filter_label = if metar_state_filter_enabled {
-                                format!("METAR states ({})", metar_states.len())
+                                format!("Station states ({})", metar_states.len())
                             } else {
-                                "METAR states (all)".to_owned()
+                                "Station states (all)".to_owned()
                             };
-                            ui.menu_button(state_filter_label, |ui| {
+                            egui::CollapsingHeader::new(state_filter_label)
+                                .default_open(metar_state_filter_enabled)
+                                .show(ui, |ui| {
                                 if ui
                                     .checkbox(
                                         &mut metar_state_filter_enabled,
                                         "Limit station plots by state",
                                     )
                                     .on_hover_text(
-                                        "Display-only filter: model analysis and obs-adjusted soundings still use every loaded observation.",
+                                        "Display-only filter for METAR and mesonet station plots. Model analysis and obs-adjusted soundings still use every loaded observation.",
                                     )
                                     .changed()
                                 {
@@ -1050,7 +1183,7 @@ impl ViewerApp {
                                             }
                                         });
                                     if metar_states.is_empty() {
-                                        ui.weak("No states selected: METAR station plots are hidden.");
+                                        ui.weak("No states selected: all station plots are hidden.");
                                     }
                                 });
                             });
@@ -1092,6 +1225,10 @@ impl ViewerApp {
                                     }
                             ui.separator();
                             ui.weak("Appearance controls land here next.");
+                            ui.separator();
+                            if ui.button("Done").clicked() {
+                                ui.close();
+                            }
                         }),
                     }),
                     ..Default::default()
@@ -1418,6 +1555,23 @@ impl ViewerApp {
             let profile_count = self.aircraft_profiles.len();
             let fetching = self.aircraft_profiles_rx.is_some();
             let status = self.aircraft_profiles_status.clone();
+            let aircraft_success_age = self
+                .aircraft_profiles_fetched_at
+                .map(|at| compact_layer_success_age(at, Instant::now()));
+            let aircraft_count = match (profile_count, aircraft_success_age.as_deref()) {
+                (0, Some(age)) => Some(format!("0 apt · {age}")),
+                (count, Some(age)) => Some(format!("{count} apt · {age}")),
+                (count, None) if count > 0 => Some(format!("{count} apt")),
+                _ => None,
+            };
+            let aircraft_hover = format!(
+                "MADIS aircraft profiles - limited anonymous public real-time subset\n{}\n{}",
+                status,
+                aircraft_success_age
+                    .as_deref()
+                    .map(|age| format!("Last successful profile update: {age}"))
+                    .unwrap_or_else(|| "No successful profile update yet".to_owned())
+            );
             let source_file = self.aircraft_profiles_file.clone();
             let selected_airport = self.selected_aircraft_profile.clone();
             let selected_profile = selected_airport
@@ -1455,7 +1609,17 @@ impl ViewerApp {
                         hover: "Latest QC-usable airport ascent/descent profiles from the anonymous public NOAA/NWS MADIS aircraft subset. Click a cyan profile marker to open the native sounding.",
                     },
                     name: "Aircraft soundings (AMDAR/ACARS)",
-                    name_hover: "MADIS aircraft profiles - limited anonymous public real-time subset",
+                    name_hover: &aircraft_hover,
+                    state: Some(if fetching {
+                        "loading"
+                    } else if status.contains("failed") || status.contains("stopped") {
+                        "error"
+                    } else if self.aircraft_profiles_fetched_at.is_some() {
+                        "live"
+                    } else {
+                        "idle"
+                    }),
+                    count: aircraft_count.as_deref(),
                     gear: Some(LayerRowGear::Menu {
                         hover: "MADIS aircraft-profile source and coverage",
                         content: Box::new(|ui| {
@@ -1570,6 +1734,33 @@ impl ViewerApp {
                 _ => format!("SPC D{} outlook", self.spc_day),
             };
             let fetching = self.spc_rx.is_some();
+            let outlook_area_count = self
+                .spc_data
+                .outlooks
+                .iter()
+                .map(|(_, features)| features.len())
+                .sum::<usize>()
+                + self
+                    .spc_data
+                    .estofex_issues
+                    .iter()
+                    .map(|issue| issue.polygons.len())
+                    .sum::<usize>();
+            let spc_completed_age = self
+                .spc_data
+                .fetched_at
+                .map(|at| compact_layer_success_age(at, Instant::now()));
+            let outlook_count = spc_completed_age
+                .as_deref()
+                .map(|age| format!("{outlook_area_count} area · {age}"))
+                .or_else(|| (outlook_area_count > 0).then(|| format!("{outlook_area_count} area")));
+            let outlook_hover = format!(
+                "SPC convective outlook polygons. Off remembers your kind set; on restores it. ⚙ opens the ALERTS tab's SPC outlooks section (day + kinds).\n{}",
+                spc_completed_age
+                    .as_deref()
+                    .map(|age| format!("Last completed SPC check: {age}"))
+                    .unwrap_or_else(|| "No completed SPC check yet".to_owned())
+            );
             let mut open_severe = false;
             let vis_changed = layer_row(
                 ui,
@@ -1579,7 +1770,15 @@ impl ViewerApp {
                         hover: "Convective outlooks in SPC's own colors, archive-aware: shows the displayed day's outlook",
                     },
                     name: &name,
-                    name_hover: "SPC convective outlook polygons. Off remembers your kind set; on restores it. ⚙ opens the ALERTS tab's SPC outlooks section (day + kinds).",
+                    name_hover: &outlook_hover,
+                    state: Some(if fetching {
+                        "loading"
+                    } else if self.spc_data.fetched_at.is_some() {
+                        "loaded"
+                    } else {
+                        "idle"
+                    }),
+                    count: outlook_count.as_deref(),
                     gear: Some(LayerRowGear::Open {
                         hover: "Configure in the ALERTS tab: day · categorical / tornado / wind / hail",
                         clicked: &mut open_severe,
@@ -1605,7 +1804,7 @@ impl ViewerApp {
                     }
                     self.spc_outlooks_enabled.clear();
                 }
-                self.spc_data.fetched_at = None;
+                self.spc_last_attempt_at = None;
                 self.save_overlay_defaults();
                 ctx.request_repaint();
             }
@@ -1618,6 +1817,23 @@ impl ViewerApp {
         // the outlook row's config line).
         {
             let mut open_severe = false;
+            let fetching = self.spc_rx.is_some();
+            let spc_completed_age = self
+                .spc_data
+                .fetched_at
+                .map(|at| compact_layer_success_age(at, Instant::now()));
+            let report_count = self.spc_data.reports.len();
+            let reports_count = spc_completed_age
+                .as_deref()
+                .map(|age| format!("{report_count} rpt · {age}"))
+                .or_else(|| (report_count > 0).then(|| format!("{report_count} rpt")));
+            let reports_hover = format!(
+                "SPC storm report dots + tornado track lines for the displayed day; click a track to load its radar loop\n{}",
+                spc_completed_age
+                    .as_deref()
+                    .map(|age| format!("Last completed SPC check: {age}"))
+                    .unwrap_or_else(|| "No completed SPC check yet".to_owned())
+            );
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -1626,7 +1842,15 @@ impl ViewerApp {
                         hover: "Filtered storm reports (tornado / wind / hail) for the DISPLAYED day: live today (refreshed ~5 min), the archived convective day (12Z-12Z) when browsing the past — with clickable tornado tracks (DATA tab: Event day)",
                     },
                     name: "SPC reports",
-                    name_hover: "SPC storm report dots + tornado track lines for the displayed day; click a track to load its radar loop",
+                    name_hover: &reports_hover,
+                    state: Some(if fetching {
+                        "loading"
+                    } else if self.spc_data.fetched_at.is_some() {
+                        "loaded"
+                    } else {
+                        "idle"
+                    }),
+                    count: reports_count.as_deref(),
                     gear: Some(LayerRowGear::Open {
                         hover: "Open the ALERTS tab",
                         clicked: &mut open_severe,
@@ -1635,7 +1859,7 @@ impl ViewerApp {
                 },
                 |_ui| {},
             ) {
-                self.spc_data.fetched_at = None;
+                self.spc_last_attempt_at = None;
                 self.save_overlay_defaults();
                 ctx.request_repaint();
             }
@@ -1645,13 +1869,25 @@ impl ViewerApp {
         }
         // mPING REPORTS — live crowd reports from the public display feed.
         {
-            let mping_status = if self.mping_rx.is_some() {
-                Some("loading".to_owned())
-            } else if self.mping_enabled && !self.mping_reports.is_empty() {
-                Some(format!("{} rpt", self.mping_reports.len()))
-            } else {
-                None
-            };
+            let mping_success_age = self
+                .mping_fetched_at
+                .map(|at| compact_layer_success_age(at, Instant::now()));
+            let report_count = self.mping_reports.len();
+            let mping_status = mping_success_age
+                .as_deref()
+                .map(|age| format!("{report_count} rpt · {age}"))
+                .or_else(|| (report_count > 0).then(|| format!("{report_count} rpt")));
+            let mping_hover = format!(
+                "Recent mPING public display reports: precipitation, hail, wind damage, flooding, visibility, and winter impacts\nData courtesy of NOAA NSSL / University of Oklahoma\n{}{}",
+                mping_success_age
+                    .as_deref()
+                    .map(|age| format!("Last successful update: {age}"))
+                    .unwrap_or_else(|| "No successful update yet".to_owned()),
+                self.mping_last_error
+                    .as_deref()
+                    .map(|error| format!("\nLatest refresh failed: {error}"))
+                    .unwrap_or_default()
+            );
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -1660,13 +1896,22 @@ impl ViewerApp {
                         hover: "mPING crowd reports from the public display feed, refreshed about every 5 min",
                     },
                     name: "mPING",
-                    name_hover: "Recent mPING public display reports: precipitation, hail, wind damage, flooding, visibility, and winter impacts\nData courtesy of NOAA NSSL / University of Oklahoma",
+                    name_hover: &mping_hover,
+                    state: Some(if self.mping_rx.is_some() {
+                        "loading"
+                    } else if self.mping_last_error.is_some() {
+                        "error"
+                    } else if self.mping_fetched_at.is_some() {
+                        "live"
+                    } else {
+                        "idle"
+                    }),
                     count: mping_status.as_deref(),
                     ..Default::default()
                 },
                 |_ui| {},
             ) {
-                self.mping_fetched_at = None;
+                self.mping_last_attempt_at = None;
                 self.save_overlay_defaults();
                 ctx.request_repaint();
             }
@@ -1681,7 +1926,34 @@ impl ViewerApp {
                 .as_ref()
                 .map(|overlay| overlay.records.len())
                 .unwrap_or(0);
-            let warnings_count = (active_count > 0).then(|| format!("{active_count} act"));
+            let warning_timeline = self.event_loop_hazard_window.is_some()
+                || self.pending_event_loop_hazard_window.is_some();
+            let warnings_success_age = warning_live_success_age(
+                self.last_successful_live_hazard_refresh,
+                warning_timeline,
+                Instant::now(),
+            );
+            let warnings_count = warnings_success_age
+                .as_deref()
+                .map(|age| format!("{active_count} act · {age}"))
+                .or_else(|| (active_count > 0).then(|| format!("{active_count} act")));
+            let warning_freshness = if warning_timeline {
+                "Archive/event warning window".to_owned()
+            } else {
+                warnings_success_age
+                    .as_deref()
+                    .map(|age| format!("Last successful live update: {age}"))
+                    .unwrap_or_else(|| "No successful live update yet".to_owned())
+            };
+            let warnings_hover = format!(
+                "Warning polygons (filters + full text in the Alerts tab)\n{}\n{}",
+                if self.hazard_status.is_empty() {
+                    "No warning load status"
+                } else {
+                    self.hazard_status.as_str()
+                },
+                warning_freshness
+            );
             let mut open_severe = false;
             if layer_row(
                 ui,
@@ -1691,7 +1963,20 @@ impl ViewerApp {
                         hover: "NWS warning/watch/MD polygons on the map",
                     },
                     name: "Warnings",
-                    name_hover: "Warning polygons (filters + full text in the Alerts tab)",
+                    name_hover: &warnings_hover,
+                    state: Some(if self.hazard_receiver.is_some() {
+                        "loading"
+                    } else if self.hazard_status.contains("failed")
+                        || self.hazard_status.contains("disconnected")
+                    {
+                        "error"
+                    } else if warning_timeline {
+                        "archive"
+                    } else if self.last_successful_live_hazard_refresh.is_some() {
+                        "live"
+                    } else {
+                        "idle"
+                    }),
                     count: warnings_count.as_deref(),
                     opacity: Some(LayerRowOpacity::U8 {
                         value: &mut fill_alpha,
@@ -1774,12 +2059,25 @@ impl ViewerApp {
                 .map(|p| p.title.clone())
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| crate::placefiles::source_display_name(&slot.url));
+            let placefile_success_age = slot
+                .last_successful_load
+                .map(|at| compact_layer_success_age(at, Instant::now()));
             let hover = format!(
-                "{}
-{}",
-                slot.url, slot.status
+                "{}\n{}\n{}",
+                slot.url,
+                slot.status,
+                placefile_success_age
+                    .as_deref()
+                    .map(|age| format!("Last successful load: {age}"))
+                    .unwrap_or_else(|| "No successful load yet".to_owned())
             );
-            let compact_status = compact_layer_status(&slot.status, 22);
+            let compact_status = match (slot.data.as_ref(), placefile_success_age.as_deref()) {
+                (Some(placefile), Some(age)) => {
+                    format!("{} obj · {age}", placefile.objects.len())
+                }
+                (Some(placefile), None) => format!("{} obj", placefile.objects.len()),
+                (None, _) => compact_layer_status(&slot.status, 22),
+            };
             let state = if slot.receiver.is_some() {
                 "loading"
             } else if slot.status.starts_with("load failed") {

@@ -9,8 +9,7 @@
 //!
 //! Deliberately NOT routed through here: warning-desk Vrot readouts
 //! (kt · nm · kft — the operational convention worldwide), skew-T °C,
-//! SPC report magnitudes (mph / inches are the source-data semantics),
-//! and the metric-neutral "km range" status chip.
+//! and SPC report magnitudes (mph / inches are the source-data semantics).
 
 use settings::AppSettings;
 

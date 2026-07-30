@@ -43,9 +43,10 @@ Moment names use BowEcho's stable short IDs: `REF`, `VEL`, `SW`, `ZDR`, `RHO`,
 `PHI`, and `KDP`. A requested moment that is absent is recorded as unavailable;
 it is never synthesized or replaced by a different field.
 
-`DVEL` (BowEcho region-v4 dealiased velocity) and `CREF` (composite
-reflectivity) are available as explicit derived product IDs. Their derivation
-method is named in the artifact manifest.
+`DVEL` (BowEcho whole-volume v4 dealiased velocity) and `CREF` (composite
+reflectivity) are available as explicit derived product IDs. CLI `DVEL` does
+not use temporal or model-wind anchors; that provenance and each derivation
+method are named in the artifact manifest.
 
 The output is a deterministic transparent polar radar raster using BowEcho's
 production moment renderer and color tables. It deliberately does not fetch a

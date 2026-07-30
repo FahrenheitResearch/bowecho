@@ -157,6 +157,17 @@ impl V4VolumeSolution {
     pub fn into_tilt_grid(mut self, cut_index: usize) -> Option<MomentGrid> {
         self.tilts.get_mut(cut_index)?.take().map(|tilt| tilt.grid)
     }
+
+    /// Consume the solution into its cut-indexed grids without cloning their
+    /// gate storage. Callers that cache a whole-volume solve can share these
+    /// outputs across every per-cut consumer.
+    pub fn into_tilt_grids(self) -> Vec<(usize, MomentGrid)> {
+        self.tilts
+            .into_iter()
+            .flatten()
+            .map(|tilt| (tilt.cut_index, tilt.grid))
+            .collect()
+    }
 }
 
 /// Solve the whole volume once (spec §6 public surface).

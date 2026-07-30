@@ -19,19 +19,20 @@ use data_source::sites::{SiteKind, SiteRef};
 use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite, RealtimeChunkType};
 use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
+#[cfg(test)]
+use render2d::dealias_velocity_grid_v4;
 use render2d::{
     CrossSectionSmoothing, ECHO_TOP_THRESHOLD_DBZ, EnvironmentalWindProfile, StormCell,
-    StormMotion, StormRelativePaletteCache, StormTrack, StormTracker, TIME_GATE_S,
+    StormMotion, StormRelativePaletteCache, StormTrack, StormTracker, TIME_GATE_S, TemporalPrior,
     ViewportGeometryCache, ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache,
     VolumeDealiasCache, apply_reflectivity_gate_filter, azimuthal_shear_grid_from_dealiased,
     color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
-    dealias_velocity_grid_pyart_region, dealias_velocity_grid_v4,
-    detect_rotation_sites_from_dealiased, echo_top_grid, gust_proxy_grid_from_dealiased,
-    hail_grids, identify_storm_cells, marc_grid_from_dealiased, mehs_grid,
-    moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid_from_dealiased,
-    reflectivity_cross_section_with_smoothing, rotation_velocity_cut_indices, smooth_moment_grid,
-    storm_relative_velocity_mps, upsample_moment_grid,
-    velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
+    dealias_velocity_grid_pyart_region, dealias_volume_v4, detect_rotation_sites_from_dealiased,
+    echo_top_grid, gust_proxy_grid_from_dealiased, hail_grids, identify_storm_cells,
+    marc_grid_from_dealiased, mehs_grid, moment_cross_section_with_smoothing, poh_grid,
+    radial_divergence_grid_from_dealiased, reflectivity_cross_section_with_smoothing,
+    rotation_velocity_cut_indices, smooth_moment_grid, storm_relative_velocity_mps,
+    upsample_moment_grid, velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::{Deserialize, Serialize};
@@ -168,6 +169,7 @@ use hazard_geom::hazard_fill_alpha;
 use hazard_geom::hazard_fill_vertex_limit;
 use hazard_geom::hazard_label_screen_rect;
 use hazard_geom::hazard_map_label;
+use hazard_geom::hazard_outline_vertex_limit;
 use hazard_geom::hazard_overlay_change;
 use hazard_geom::hazard_overlay_records_match;
 use hazard_geom::hazard_points_renderable;
@@ -477,20 +479,20 @@ const HIGH_END_LOOP_RENDER_CACHE_BYTES: usize = 512 * 1024 * 1024;
 /// radar-history budget still capped the grid memo at the small tier — the
 /// loop tail evicted and re-ran the ~200 ms dealiaser every pass ("works then
 /// re-dealiases toward the end", worst in dual-pane where two tilts compete
-/// for the same tier). These grids are a few percent of the raw volumes the
-/// history budget already holds (~60-100 MB each), so a memo sized to a small
-/// fraction of that budget holds one grid PER loaded frame PER active tilt.
+/// for the same tier). These grids are a fraction of the raw volumes the
+/// history budget already holds (~60-100 MB each), so the memo is sized from
+/// that budget. Same-sweep engines store selected grids; Analyst v4 stores one
+/// whole-volume entry containing every velocity grid, with their exact summed
+/// bytes charged to the same cap.
 const LOW_END_DEALIAS_GRID_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MID_RANGE_DEALIAS_GRID_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 const HIGH_END_DEALIAS_GRID_CACHE_BYTES: usize = 3 * 1024 * 1024 * 1024;
 /// Fraction (as a divisor) of the radar-history RAM budget the dealiased-grid
-/// memo may use PER active dealias pane. A dealiased tilt is ~2-6% of the raw
-/// volume it derives from, so one grid per history frame costs a small slice
-/// of the history budget; 1/8 (12.5%) covers the worst case (F32 grids on
-/// small intl volumes) with margin. The memo never actually allocates up to
-/// this cap — resident bytes are bounded by the real grids (frames × tilts) —
-/// so a generous cap simply guarantees the whole loaded loop stays memoized
-/// instead of the tail thrashing.
+/// memo may use PER active dealias pane. A selected dealiased tilt is commonly
+/// ~2-6% of its raw volume, while an Analyst v4 entry can contain several such
+/// grids. The cache accounts the actual storage of every retained grid; the
+/// 1/8 (12.5%) share supplies loop headroom without allowing whole-volume v4
+/// entries to escape the user's memory-derived LRU cap.
 const DEALIAS_GRID_BUDGET_HISTORY_DIVISOR: usize = 8;
 /// Keep prewarming a sliding working set instead of eventually rasterizing the
 /// entire history while playback is paused or running.
@@ -529,6 +531,12 @@ const MAX_ACTIVE_ALERT_ZONE_GEOMETRIES: usize = 320;
 /// national alert set take minutes; eight shared-client requests keep the
 /// follow-up enrichment finite without an unbounded burst at api.weather.gov.
 const ACTIVE_ALERT_ZONE_FETCH_CONCURRENCY: usize = 8;
+/// Warning outlines retain more detail than translucent fills, but they still
+/// need a fixed family-wide budget: exact coastline-traced zone rings can
+/// otherwise contribute millions of line vertices to every pan/zoom rebuild.
+const HAZARD_OUTLINE_VERTEX_LIMIT: usize = 1_024;
+const HAZARD_OUTLINE_FAMILY_VERTEX_BUDGET: usize = 32_768;
+const HAZARD_OUTLINE_MIN_VERTEX_LIMIT: usize = 48;
 /// Screen-pixel radius for the Shift+click "pin this station's 3h obs
 /// timeline" gesture and its hover-card hint. Matches the pinned-inspector
 /// release radius so the pin and release gestures share one feel.
@@ -2196,9 +2204,10 @@ fn decoded_volume_decode_count() -> u64 {
 }
 
 /// Count of ACTUAL velocity dealias runs performed by [`cached_dealias_grid`]
-/// (shared-memo cache MISSES only). A cache hit does not bump it. Read by tests
-/// to prove the primary render and a following/pinned pane render the SAME
-/// dealiased tilt without re-running the ~200 ms region dealiaser twice.
+/// and [`cached_v4_dealias_grid`] (shared-memo cache MISSES only). A cache hit
+/// does not bump it. Read by tests to prove the primary render and a
+/// following/pinned pane share one same-sweep grid or one whole-volume v4
+/// solve for an exact context.
 static DEALIAS_GRID_COMPUTE_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2855,7 +2864,7 @@ struct PlotDomainMapDrag {
 /// Exact inputs that determine a computed vertical-wind profile. The Arc
 /// address separates same-time replacement volumes; completed workers also
 /// carry a strong Arc witness, so this cheap key is never trusted by itself.
-/// Analyst 3D's temporal/model anchors ride in the shared dealias context key.
+/// Analyst v4's temporal/model anchors ride in the shared dealias context key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VwpWorkKey {
     volume_ptr: usize,
@@ -3204,12 +3213,10 @@ struct ViewerApp {
     tor_tracks: tor_tracks::TorTracksState,
     /// Reflectivity gate filter threshold (dBZ); None = off.
     gate_filter_dbz: Option<f32>,
-    /// Velocity dealias engine (see [`DealiasEngine`]): `Region` (default,
-    /// fast same-tilt solver), `RegionGlobal` (Rust Py-ART region port,
-    /// same-tilt), or `Analyst3d` (model-anchored v4 whole-volume engine —
-    /// all velocity tilts solved jointly with a previous-volume temporal
-    /// prior and a RAP wind anchor when available). Only `Analyst3d` uses
-    /// the temporal/model inputs (dealias-v4 spec §16).
+    /// Velocity dealias engine (see [`DealiasEngine`]): `Analyst3d` is the
+    /// default v4 whole-volume engine, `Region` is the fast same-tilt
+    /// fallback, and `RegionGlobal` is the Rust Py-ART same-tilt port. Only
+    /// `Analyst3d` uses the temporal/model inputs (dealias-v4 spec §16).
     dealias_engine: DealiasEngine,
     /// RAP 0-h analysis wind profiles per (site, cycle) for the v4 engine's
     /// absolute-branch anchor (CONUS only; intl sites run without one).
@@ -3515,10 +3522,18 @@ struct ViewerApp {
     spc_day: u8,
     spc_day1_issue: spc_layers::SpcDay1Issue,
     spc_last_key: Option<SpcFetchKey>,
+    /// Cadence/attempt clock. Kept separate from `SpcData::fetched_at`,
+    /// which describes the last completed data install shown in the rail.
+    spc_last_attempt_at: Option<Instant>,
     spc_rx: Option<mpsc::Receiver<spc_layers::SpcData>>,
     mping_reports: Vec<mping::MpingReport>,
     mping_enabled: bool,
+    /// Last successfully installed mPING response. Failures must not make
+    /// stale reports look freshly updated.
     mping_fetched_at: Option<Instant>,
+    /// Attempt clock used for retry cadence independently of success age.
+    mping_last_attempt_at: Option<Instant>,
+    mping_last_error: Option<String>,
     mping_rx: Option<mpsc::Receiver<std::result::Result<Vec<mping::MpingReport>, String>>>,
     /// Per-repaint memo of [`Self::timeline_report_reference_time_utc`] —
     /// refreshed once at the top of `update()`; the per-report visibility
@@ -3569,6 +3584,7 @@ struct ViewerApp {
     aircraft_profiles_rx:
         Option<mpsc::Receiver<std::result::Result<aircraft_soundings::AircraftSnapshot, String>>>,
     aircraft_profiles_next_poll: Option<Instant>,
+    aircraft_profiles_fetched_at: Option<Instant>,
     aircraft_profiles_file: Option<String>,
     aircraft_profiles_status: String,
     aircraft_soundings_enabled: bool,
@@ -3598,13 +3614,19 @@ struct ViewerApp {
     obs_hour_loop_paused_at: Option<Instant>,
     obs_hour_loop_end_utc: DateTime<Utc>,
     surface_obs: obs::ObPool,
+    /// Per-source successful installs. Their maximum is the aggregate
+    /// Surface obs success age shown in the layer rail.
     obs_fetched_at: Option<Instant>,
+    obs_last_attempt_at: Option<Instant>,
     obs_rx: Option<mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>>,
     iem_metar_fetched_at: Option<Instant>,
+    iem_metar_last_attempt_at: Option<Instant>,
     iem_metar_rx: Option<mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>>,
     nws_obs_fetched_at: Option<Instant>,
+    nws_obs_last_attempt_at: Option<Instant>,
     nws_obs_rx: Option<mpsc::Receiver<Vec<obs::SurfaceOb>>>,
     mesonet_fetched_at: Option<Instant>,
+    mesonet_last_attempt_at: Option<Instant>,
     mesonet_rx: Option<mpsc::Receiver<Vec<obs::SurfaceOb>>>,
     /// Archive-time obs-adjust source: the IEM ASOS window around the
     /// displayed volume's hour, keyed by that rounded hour. The live
@@ -3759,7 +3781,14 @@ struct ViewerApp {
     live_hazard_auto_refresh: bool,
     show_performance_stats: bool,
     sidebar_tab: SidebarTab,
+    /// Live-warning request cadence/attempt clock.
     last_live_hazard_refresh: Option<Instant>,
+    /// Last fully successful live-warning final install. Archive/local loads
+    /// and failed refresh attempts never advance this timestamp.
+    last_successful_live_hazard_refresh: Option<Instant>,
+    /// True only for the receiver installed by `load_live_hazards`; the same
+    /// channel type is also used by archive and local warning loads.
+    hazard_request_tracks_live_success: bool,
     selected_hazard_index: Option<usize>,
     hazard_map_popup: Option<HazardMapPopup>,
     /// Hazard event ids added by a later refresh and not yet clicked. This is
@@ -3945,6 +3974,34 @@ impl BackgroundActivity {
             fraction,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BackgroundActivityDisplay {
+    Full,
+    ProgressOnly(f32),
+    SpinnerOnly,
+}
+
+fn background_activity_display(
+    activity: &BackgroundActivity,
+    current_status: &str,
+) -> BackgroundActivityDisplay {
+    if activity.label.trim() != current_status.trim() {
+        BackgroundActivityDisplay::Full
+    } else if let Some(fraction) = activity.fraction {
+        BackgroundActivityDisplay::ProgressOnly(fraction)
+    } else {
+        BackgroundActivityDisplay::SpinnerOnly
+    }
+}
+
+fn manual_frame_load_indicator_active(
+    primary_load_present: bool,
+    primary_load_is_auto_refresh: bool,
+    international_loop_present: bool,
+) -> bool {
+    (primary_load_present && !primary_load_is_auto_refresh) || international_loop_present
 }
 
 fn archive_load_progress_row(ui: &mut egui::Ui, progress: &ArchiveLoadProgress) {
@@ -6390,6 +6447,26 @@ impl DealiasGridKey {
             engine,
         }
     }
+
+    fn volume_key(self) -> DealiasVolumeKey {
+        DealiasVolumeKey {
+            volume_ptr: self.volume_ptr,
+            reference_volume_ptr: self.reference_volume_ptr,
+            dealias_env_ptr: self.dealias_env_ptr,
+            engine: self.engine,
+        }
+    }
+}
+
+/// Cut-independent identity for one whole-volume dealias solve. Analyst v4
+/// produces every velocity tilt together, so including a cut here would repeat
+/// the same global solve and discard all but one output.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DealiasVolumeKey {
+    volume_ptr: usize,
+    reference_volume_ptr: usize,
+    dealias_env_ptr: usize,
+    engine: DealiasEngine,
 }
 
 /// Liveness witness for the raw addresses in a [`DealiasGridKey`]. Each
@@ -6458,6 +6535,74 @@ struct DealiasGridEntry {
     bytes: usize,
 }
 
+struct DealiasV4VolumeEntry {
+    key: DealiasVolumeKey,
+    witness: DealiasGridWitness,
+    /// Indexed by source cut; `None` for cuts without a usable velocity grid.
+    /// These are the sole cached Arcs for v4 -- there are no duplicate per-cut
+    /// entries alongside this volume entry.
+    grids: Vec<Option<Arc<MomentGrid>>>,
+    bytes: usize,
+}
+
+enum DealiasCacheEntry {
+    Grid(DealiasGridEntry),
+    V4Volume(DealiasV4VolumeEntry),
+}
+
+impl DealiasCacheEntry {
+    fn witness(&self) -> &DealiasGridWitness {
+        match self {
+            Self::Grid(entry) => &entry.witness,
+            Self::V4Volume(entry) => &entry.witness,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Grid(entry) => entry.bytes,
+            Self::V4Volume(entry) => entry.bytes,
+        }
+    }
+
+    fn grid_for(&self, key: &DealiasGridKey) -> Option<Arc<MomentGrid>> {
+        match self {
+            Self::Grid(entry) if entry.key == *key => Some(Arc::clone(&entry.grid)),
+            Self::V4Volume(entry) if entry.key == key.volume_key() => entry
+                .grids
+                .get(key.cut_index)
+                .and_then(Option::as_ref)
+                .map(Arc::clone),
+            _ => None,
+        }
+    }
+
+    fn contains_grid(&self, key: &DealiasGridKey) -> bool {
+        match self {
+            Self::Grid(entry) => entry.key == *key,
+            Self::V4Volume(entry) => {
+                entry.key == key.volume_key()
+                    && entry.grids.get(key.cut_index).is_some_and(Option::is_some)
+            }
+        }
+    }
+
+    fn is_exact_grid(&self, key: DealiasGridKey) -> bool {
+        matches!(self, Self::Grid(entry) if entry.key == key)
+    }
+
+    fn is_v4_volume(&self, key: DealiasVolumeKey) -> bool {
+        matches!(self, Self::V4Volume(entry) if entry.key == key)
+    }
+
+    fn belongs_to_volume_context(&self, key: DealiasVolumeKey) -> bool {
+        match self {
+            Self::Grid(entry) => entry.key.volume_key() == key,
+            Self::V4Volume(entry) => entry.key == key,
+        }
+    }
+}
+
 /// Approximate resident size of a dealiased grid, for the cache byte budget.
 fn moment_grid_cache_bytes(grid: &MomentGrid) -> usize {
     let word_bytes = usize::from(grid.storage.word_size_bits()) / 8;
@@ -6472,7 +6617,7 @@ fn moment_grid_cache_bytes(grid: &MomentGrid) -> usize {
 /// Linear scan is fine: lookups happen on render-cache misses (a handful per
 /// frame), never per pixel, and the entry count stays in the low hundreds.
 struct DealiasGridCache {
-    entries: VecDeque<DealiasGridEntry>,
+    entries: VecDeque<DealiasCacheEntry>,
     bytes: usize,
     budget_bytes: usize,
 }
@@ -6491,15 +6636,38 @@ impl DealiasGridCache {
     /// addresses in the key no longer identify the grid's inputs, so the
     /// stale entry is evicted and the caller recomputes.
     fn get(&mut self, key: &DealiasGridKey) -> Option<Arc<MomentGrid>> {
-        let pos = self.entries.iter().position(|entry| entry.key == *key)?;
-        if !self.entries[pos].witness.alive() {
+        let pos = self
+            .entries
+            .iter()
+            .position(|entry| entry.contains_grid(key))?;
+        if !self.entries[pos].witness().alive() {
             if let Some(dead) = self.entries.remove(pos) {
-                self.bytes = self.bytes.saturating_sub(dead.bytes);
+                self.bytes = self.bytes.saturating_sub(dead.bytes());
             }
             return None;
         }
         let entry = self.entries.remove(pos)?;
-        let grid = Arc::clone(&entry.grid);
+        let grid = entry.grid_for(key)?;
+        self.entries.push_back(entry);
+        Some(grid)
+    }
+
+    /// Look up an Analyst v4 volume context, including a cached `None` for a
+    /// source cut that produced no usable output. The outer `Option` means the
+    /// context entry exists; the inner one is that cut's grid.
+    fn get_v4_context(&mut self, key: &DealiasGridKey) -> Option<Option<Arc<MomentGrid>>> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|entry| entry.is_v4_volume(key.volume_key()))?;
+        if !self.entries[pos].witness().alive() {
+            if let Some(dead) = self.entries.remove(pos) {
+                self.bytes = self.bytes.saturating_sub(dead.bytes());
+            }
+            return None;
+        }
+        let entry = self.entries.remove(pos)?;
+        let grid = entry.grid_for(key);
         self.entries.push_back(entry);
         Some(grid)
     }
@@ -6511,19 +6679,58 @@ impl DealiasGridCache {
     /// comparison, and orphaned grids stop piling up toward the byte cap.
     fn insert(&mut self, key: DealiasGridKey, witness: DealiasGridWitness, grid: Arc<MomentGrid>) {
         self.purge_dead();
-        if let Some(pos) = self.entries.iter().position(|entry| entry.key == key)
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|entry| entry.is_exact_grid(key) || entry.is_v4_volume(key.volume_key()))
             && let Some(old) = self.entries.remove(pos)
         {
-            self.bytes = self.bytes.saturating_sub(old.bytes);
+            self.bytes = self.bytes.saturating_sub(old.bytes());
         }
         let bytes = moment_grid_cache_bytes(&grid);
         self.bytes += bytes;
-        self.entries.push_back(DealiasGridEntry {
-            key,
-            witness,
-            grid,
-            bytes,
-        });
+        self.entries
+            .push_back(DealiasCacheEntry::Grid(DealiasGridEntry {
+                key,
+                witness,
+                grid,
+                bytes,
+            }));
+        self.evict_to_budget();
+    }
+
+    /// Store one v4 whole-volume solution as the sole cache representation for
+    /// all of its tilt grids. Its summed grid bytes share the same LRU budget as
+    /// the same-sweep entries above.
+    fn insert_v4_volume(
+        &mut self,
+        key: DealiasVolumeKey,
+        witness: DealiasGridWitness,
+        grids: Vec<Option<Arc<MomentGrid>>>,
+    ) {
+        self.purge_dead();
+        while let Some(pos) = self
+            .entries
+            .iter()
+            .position(|entry| entry.belongs_to_volume_context(key))
+        {
+            if let Some(old) = self.entries.remove(pos) {
+                self.bytes = self.bytes.saturating_sub(old.bytes());
+            }
+        }
+        let bytes = grids
+            .iter()
+            .filter_map(Option::as_deref)
+            .map(moment_grid_cache_bytes)
+            .sum();
+        self.bytes += bytes;
+        self.entries
+            .push_back(DealiasCacheEntry::V4Volume(DealiasV4VolumeEntry {
+                key,
+                witness,
+                grids,
+                bytes,
+            }));
         self.evict_to_budget();
     }
 
@@ -6542,10 +6749,10 @@ impl DealiasGridCache {
     fn purge_dead(&mut self) {
         let mut freed = 0usize;
         self.entries.retain(|entry| {
-            if entry.witness.alive() {
+            if entry.witness().alive() {
                 true
             } else {
-                freed += entry.bytes;
+                freed += entry.bytes();
                 false
             }
         });
@@ -6559,7 +6766,7 @@ impl DealiasGridCache {
             let Some(front) = self.entries.pop_front() else {
                 break;
             };
-            self.bytes = self.bytes.saturating_sub(front.bytes);
+            self.bytes = self.bytes.saturating_sub(front.bytes());
         }
     }
 
@@ -6585,10 +6792,10 @@ fn dealias_grid_cache_tier_floor_bytes() -> usize {
 }
 
 /// Byte budget for the shared dealiased-grid memo, scaled to the user's
-/// radar-history RAM budget so it can hold one dealiased grid PER loaded frame
-/// PER active dealias pane — the whole loaded loop stays memoized instead of
-/// the tail re-dealiasing under LRU eviction. `active_dealias_panes` is the
-/// pane count (primary + extras, 1..=4); floored at the per-machine tier.
+/// radar-history RAM budget and active dealias pane count. Same-sweep entries
+/// hold requested grids; each Analyst v4 entry holds every solved velocity
+/// grid and charges their summed bytes. This keeps either representation under
+/// the same LRU cap instead of letting a long loop grow without bound.
 fn dealias_grid_cache_budget_bytes(history_budget_gib: u16, active_dealias_panes: usize) -> usize {
     let panes = active_dealias_panes.max(1);
     let scaled = radar_history_budget_bytes(history_budget_gib)
@@ -6608,15 +6815,17 @@ fn set_dealias_grid_cache_budget(history_budget_gib: u16, active_dealias_panes: 
         .set_budget(budget);
 }
 
-/// Process-wide memo of dealiased velocity grids. The three dealiasers
-/// (`dealias_velocity_grid`, `dealias_velocity_grid_pyart_region`,
-/// `dealias_velocity_grid_v4`) cost ~200 ms/tilt (measured: 219 ms on a live
-/// PGUA super-res velocity cut); without this, replaying a loop or toggling a
-/// product back to dealiased velocity re-runs them on every frame. Shared
-/// across ALL render workers (primary, panes, overlay, and the
+/// Process-wide memo of dealiased velocity grids. The same-sweep dealiasers
+/// (`dealias_velocity_grid`, `dealias_velocity_grid_pyart_region`)
+/// cost ~200 ms/tilt (measured: 219 ms on a live PGUA super-res velocity cut),
+/// while Analyst v4 solves every velocity tilt jointly and stores one
+/// cut-indexed volume entry. Without this, replaying a loop or toggling a
+/// product back to dealiased velocity re-runs the solver on every frame.
+/// Shared across ALL render workers (primary, panes, overlay, and the
 /// one-shot loop-prewarm pool whose Overlay policy keeps only one moment cache)
 /// plus the UI-thread cursor readout, so a given (volume, cut, engine) tilt is
-/// dealiased at most once. LRU-bounded so a long loop cannot grow it forever.
+/// dealiased at most once and one v4 context is solved at most once while its
+/// entry remains resident. LRU-bounded so a long loop cannot grow it forever.
 fn dealias_grid_cache() -> &'static Mutex<DealiasGridCache> {
     static CACHE: OnceLock<Mutex<DealiasGridCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
@@ -6628,6 +6837,39 @@ fn dealias_grid_cache() -> &'static Mutex<DealiasGridCache> {
             dealias_grid_cache_budget_bytes(settings::default_radar_history_budget_gib(), 1),
         ))
     })
+}
+
+/// One weakly-registered mutex per exact Analyst v4 context. This is separate
+/// from the LRU mutex so an expensive whole-volume solve never blocks cache
+/// hits for unrelated frames. Concurrent first misses for the same context
+/// serialize here, then recheck the LRU before deciding whether to solve.
+struct DealiasV4SolveGateEntry {
+    key: DealiasVolumeKey,
+    witness: DealiasGridWitness,
+    gate: Weak<Mutex<()>>,
+}
+
+fn dealias_v4_solve_gate(key: DealiasVolumeKey, witness: &DealiasGridWitness) -> Arc<Mutex<()>> {
+    static GATES: OnceLock<Mutex<Vec<DealiasV4SolveGateEntry>>> = OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    gates.retain(|entry| entry.witness.alive() && entry.gate.strong_count() > 0);
+    if let Some(gate) = gates
+        .iter()
+        .find(|entry| entry.key == key)
+        .and_then(|entry| entry.gate.upgrade())
+    {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.push(DealiasV4SolveGateEntry {
+        key,
+        witness: witness.clone(),
+        gate: Arc::downgrade(&gate),
+    });
+    gate
 }
 
 /// Return the memoized dealiased grid for `key`, computing it via `compute`
@@ -6691,6 +6933,91 @@ fn cached_dealias_grid(
     Some(grid)
 }
 
+/// Return one tilt from a cached Analyst v4 whole-volume solution. The first
+/// miss consumes the solver result into one shared `Arc` per output grid and
+/// inserts exactly one volume entry whose summed bytes count against the same
+/// LRU budget as same-sweep grids. The context gate deduplicates concurrent
+/// first misses without holding the global cache mutex during the solve.
+fn cached_v4_dealias_grid(
+    key: DealiasGridKey,
+    witness: DealiasGridWitness,
+    volume: &Arc<RadarVolume>,
+    previous_volume: Option<&Arc<RadarVolume>>,
+    dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
+) -> Option<Arc<MomentGrid>> {
+    cached_v4_dealias_grid_with(key, witness, volume, || {
+        dealias_volume_v4(
+            volume.as_ref(),
+            previous_volume.map(|reference| TemporalPrior::Volume(reference.as_ref())),
+            dealias_env.map(Arc::as_ref),
+        )
+    })
+}
+
+fn cached_v4_dealias_grid_with(
+    key: DealiasGridKey,
+    witness: DealiasGridWitness,
+    volume: &Arc<RadarVolume>,
+    solve: impl FnOnce() -> render2d::V4VolumeSolution,
+) -> Option<Arc<MomentGrid>> {
+    debug_assert_eq!(key.engine, DealiasEngine::Analyst3d);
+    debug_assert_eq!(witness.volume.as_ptr() as usize, key.volume_ptr);
+    debug_assert_eq!(
+        witness
+            .reference_volume
+            .as_ref()
+            .map(|weak| weak.as_ptr() as usize)
+            .unwrap_or(0),
+        key.reference_volume_ptr
+    );
+    debug_assert_eq!(
+        witness
+            .dealias_env
+            .as_ref()
+            .map(|weak| weak.as_ptr() as usize)
+            .unwrap_or(0),
+        key.dealias_env_ptr
+    );
+
+    if let Some(cached) = dealias_grid_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get_v4_context(&key)
+    {
+        return cached;
+    }
+
+    let volume_key = key.volume_key();
+    let gate = dealias_v4_solve_gate(volume_key, &witness);
+    let _solve_guard = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(cached) = dealias_grid_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get_v4_context(&key)
+    {
+        return cached;
+    }
+
+    note_dealias_grid_computed();
+    let solution = solve();
+    let mut grids = vec![None; volume.cuts.len()];
+    for (cut_index, grid) in solution.into_tilt_grids() {
+        if let Some(slot) = grids.get_mut(cut_index) {
+            *slot = Some(Arc::new(grid));
+        }
+    }
+    let requested = grids.get(key.cut_index)?.as_ref().map(Arc::clone);
+
+    let mut cache = dealias_grid_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(existing) = cache.get_v4_context(&key) {
+        return existing;
+    }
+    cache.insert_v4_volume(volume_key, witness, grids);
+    cache.get_v4_context(&key).unwrap_or(requested)
+}
+
 /// Resolve exactly one dealiased velocity tilt through the process-wide memo.
 /// Every display and analysis path calls this seam, so the selected engine and
 /// Analyst3d anchor identity cannot drift between the painted velocity,
@@ -6712,16 +7039,17 @@ fn resolve_dealiased_grid(
     );
     let cut = volume.cuts.get(cut_index)?;
     let source = cut.moments.get(&MomentType::Velocity)?;
-    cached_dealias_grid(key, witness, || match engine {
-        DealiasEngine::Analyst3d => dealias_velocity_grid_v4(
-            volume,
-            cut_index,
-            previous_volume.map(|reference| reference.as_ref()),
-            dealias_env.map(|profile| profile.as_ref()),
-        ),
-        DealiasEngine::RegionGlobal => Some(dealias_velocity_grid_pyart_region(cut, source)),
-        DealiasEngine::Region => Some(dealias_velocity_grid(cut, source)),
-    })
+    match engine {
+        DealiasEngine::Analyst3d => {
+            cached_v4_dealias_grid(key, witness, volume, previous_volume, dealias_env)
+        }
+        DealiasEngine::RegionGlobal => cached_dealias_grid(key, witness, || {
+            Some(dealias_velocity_grid_pyart_region(cut, source))
+        }),
+        DealiasEngine::Region => {
+            cached_dealias_grid(key, witness, || Some(dealias_velocity_grid(cut, source)))
+        }
+    }
 }
 
 /// Resolve every velocity-bearing cut using [`resolve_dealiased_grid`]. The
@@ -6747,8 +7075,9 @@ fn resolve_dealiased_volume_grids(
 }
 
 /// Resolve only the listed cuts while preserving a volume-aligned result
-/// vector. Rotation markers and tracks use their kernel-owned cut selectors so
-/// Analyst3d never pays whole-volume solve cost for tilts they will discard.
+/// vector. Rotation markers and tracks keep their kernel-owned cut selectors;
+/// Analyst v4 solves once per exact volume context and each requested cut then
+/// shares the corresponding cached output grid.
 fn resolve_dealiased_cut_grids(
     volume: &Arc<RadarVolume>,
     previous_volume: Option<&Arc<RadarVolume>>,
@@ -8887,10 +9216,10 @@ impl ViewerApp {
             app_settings.radar_history_budget_gib,
         ));
         // Size the shared dealiased-grid memo to the same RAM the user gave the
-        // radar-history loop, scaled by pane count, so a fully loaded
-        // dealiased-velocity loop is dealiased ONCE per tilt and never
-        // re-dealiased on the tail by LRU eviction (dual-pane tail re-dealias
-        // bug). Rescaled by `set_radar_history_budget`/`sync_extra_panes`.
+        // radar-history loop, scaled by pane count, so a fully loaded loop
+        // retains its same-sweep grids or v4 whole-volume entries without
+        // tail thrash. Each exact v4 context is solved once while resident.
+        // Rescaled by `set_radar_history_budget`/`sync_extra_panes`.
         set_dealias_grid_cache_budget(
             app_settings.radar_history_budget_gib,
             app_settings.grid_pane_count,
@@ -9272,6 +9601,7 @@ impl ViewerApp {
             spc_day: 1,
             spc_day1_issue: spc_layers::SpcDay1Issue::Auto,
             spc_last_key: None,
+            spc_last_attempt_at: None,
             glm: None,
             glm_secondary: None,
             glm_refresh_requested_at: None,
@@ -9280,6 +9610,8 @@ impl ViewerApp {
             mping_reports: Vec::new(),
             mping_enabled: restored_overlays.7,
             mping_fetched_at: None,
+            mping_last_attempt_at: None,
+            mping_last_error: None,
             mping_rx: None,
             timeline_reports_reference_utc: None,
             event_explorer: event_explorer::EventExplorerState::default(),
@@ -9305,6 +9637,7 @@ impl ViewerApp {
             aircraft_profiles: Vec::new(),
             aircraft_profiles_rx: None,
             aircraft_profiles_next_poll: None,
+            aircraft_profiles_fetched_at: None,
             aircraft_profiles_file: None,
             aircraft_profiles_status: "Enable to load the public MADIS subset".to_owned(),
             aircraft_soundings_enabled: restored_aircraft_soundings,
@@ -9324,12 +9657,16 @@ impl ViewerApp {
             obs_hour_loop_end_utc: Utc::now(),
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
+            obs_last_attempt_at: None,
             obs_rx: None,
             iem_metar_fetched_at: None,
+            iem_metar_last_attempt_at: None,
             iem_metar_rx: None,
             nws_obs_fetched_at: None,
+            nws_obs_last_attempt_at: None,
             nws_obs_rx: None,
             mesonet_fetched_at: None,
+            mesonet_last_attempt_at: None,
             mesonet_rx: None,
             historical_obs: None,
             historical_obs_rx: None,
@@ -9403,6 +9740,8 @@ impl ViewerApp {
             show_performance_stats: false,
             sidebar_tab: SidebarTab::Radar,
             last_live_hazard_refresh: None,
+            last_successful_live_hazard_refresh: None,
+            hazard_request_tracks_live_success: false,
             selected_hazard_index: None,
             hazard_map_popup: None,
             unacknowledged_hazard_event_ids: BTreeSet::new(),
@@ -9506,6 +9845,7 @@ impl ViewerApp {
         self.historical_frame_warning_sync = false;
         self.event_loop_hazard_window = None;
         self.pending_event_loop_hazard_window = None;
+        self.hazard_request_tracks_live_success = false;
         let query_time_utc = Utc::now();
         let source = self.resolved_warning_source();
         if let meteoalarm::ResolvedWarningSource::Unavailable(reason) = &source {
@@ -9516,6 +9856,7 @@ impl ViewerApp {
         if let meteoalarm::ResolvedWarningSource::MeteoAlarm(country) = source {
             let (sender, receiver) = mpsc::channel();
             self.hazard_receiver = Some(receiver);
+            self.hazard_request_tracks_live_success = true;
             self.last_live_hazard_refresh = Some(Instant::now());
             self.hazard_status = format!("Loading MeteoAlarm {} warnings", country.label);
             thread::spawn(move || {
@@ -9537,6 +9878,7 @@ impl ViewerApp {
             custom_warning_provider_url(&self.app_settings.warning_provider_url);
         let (sender, receiver) = mpsc::channel();
         self.hazard_receiver = Some(receiver);
+        self.hazard_request_tracks_live_success = true;
         self.last_live_hazard_refresh = Some(Instant::now());
         self.hazard_status = "Loading live hazards".to_owned();
         let alert_watch = self.alert_watch.clone();
@@ -9624,6 +9966,7 @@ impl ViewerApp {
             return;
         }
         let replaced_active_load = self.hazard_receiver.take().is_some();
+        self.hazard_request_tracks_live_success = false;
         self.pending_event_loop_hazard_window = Some((start_utc, end_utc));
         self.last_live_hazard_refresh = None;
         let (sender, receiver) = mpsc::channel();
@@ -9656,6 +9999,7 @@ impl ViewerApp {
         if self.hazard_receiver.is_some() {
             return;
         }
+        self.hazard_request_tracks_live_success = false;
         self.event_loop_hazard_window = None;
         self.pending_event_loop_hazard_window = None;
         let trimmed_path = self.hazard_path_text.trim();
@@ -10030,6 +10374,7 @@ impl ViewerApp {
             volume,
             self.advanced_products_enabled || self.app_settings.show_derived_products,
             self.app_settings.show_derived_products,
+            &self.app_settings.radar_product_favorites,
         )
     }
 
@@ -13828,7 +14173,14 @@ impl ViewerApp {
                         }
                         AsyncHazardUpdate::Final(result) => {
                             keep_receiver = false;
-                            self.install_hazard_result(result, false)
+                            let live_success =
+                                self.hazard_request_tracks_live_success && result.is_ok();
+                            let changed = self.install_hazard_result(result, false);
+                            if live_success {
+                                self.last_successful_live_hazard_refresh = Some(Instant::now());
+                            }
+                            self.hazard_request_tracks_live_success = false;
+                            changed
                         }
                     };
                     if changed {
@@ -13844,6 +14196,7 @@ impl ViewerApp {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     keep_receiver = false;
+                    self.hazard_request_tracks_live_success = false;
                     self.hazard_status = "Hazard loader disconnected".to_owned();
                     break;
                 }
@@ -14281,19 +14634,23 @@ impl ViewerApp {
         &mut self,
         preserve_pending_following_live_partial_cuts: bool,
     ) {
-        let Some(volume) = &self.volume else {
-            return;
-        };
-        if volume.cuts.is_empty() {
-            self.selected_cut = 0;
-            return;
-        }
-        self.selected_cut = self.selected_cut.min(volume.cuts.len() - 1);
         let primary_volume = self.volume.clone();
+        if let Some(volume) = primary_volume.as_deref() {
+            if volume.cuts.is_empty() {
+                self.selected_cut = 0;
+            } else {
+                self.selected_cut = self.selected_cut.min(volume.cuts.len() - 1);
+            }
+        }
         let show_derived_products = self.app_settings.show_derived_products;
         let advanced_products_enabled = self.advanced_products_enabled || show_derived_products;
+        let favorite_products = self.app_settings.radar_product_favorites.clone();
         for pane in &mut self.extra_panes {
             if let Some(pane_volume) = pane.volume.clone().or_else(|| primary_volume.clone()) {
+                if pane_volume.cuts.is_empty() {
+                    pane.cut = Some(0);
+                    continue;
+                }
                 if !pane.owns_radar()
                     && !volume_can_materialize_product_with_live_filter(
                         pane_volume.as_ref(),
@@ -14318,8 +14675,11 @@ impl ViewerApp {
                 if let Some(cut) = pane.cut {
                     pane.cut = Some(cut.min(pane_volume.cuts.len().saturating_sub(1)));
                 }
-                let pane_product_visible =
-                    is_product_visible_in_picker(&pane.product, show_derived_products);
+                let pane_product_visible = is_product_visible_in_picker(
+                    &pane.product,
+                    show_derived_products,
+                    &favorite_products,
+                );
                 if !pane_product_visible
                     || !can_materialize_product_on_cut(
                         pane_volume.as_ref(),
@@ -14332,6 +14692,7 @@ impl ViewerApp {
                             pane_volume.as_ref(),
                             advanced_products_enabled,
                             show_derived_products,
+                            &favorite_products,
                         )
                         .first()
                         .cloned()
@@ -14357,6 +14718,7 @@ impl ViewerApp {
                             pane_volume.as_ref(),
                             advanced_products_enabled,
                             show_derived_products,
+                            &favorite_products,
                         )
                         .first()
                         .cloned()
@@ -14367,17 +14729,27 @@ impl ViewerApp {
                 }
             }
         }
-        if is_product_visible_in_picker(&self.selected_product, show_derived_products)
-            && can_materialize_product_on_cut(volume, self.selected_cut, &self.selected_product)
+        let Some(volume) = primary_volume.as_deref() else {
+            return;
+        };
+        if volume.cuts.is_empty() {
+            return;
+        }
+        if is_product_visible_in_picker(
+            &self.selected_product,
+            show_derived_products,
+            &favorite_products,
+        ) && can_materialize_product_on_cut(volume, self.selected_cut, &self.selected_product)
         {
             return;
         }
-        if is_product_visible_in_picker(&self.selected_product, show_derived_products)
-            && let Some(cut) =
-                advanced_product_source_cut(volume, self.selected_cut, &self.selected_product)
-                    .or_else(|| {
-                        best_cut_for_product(volume, self.selected_cut, &self.selected_product)
-                    })
+        if is_product_visible_in_picker(
+            &self.selected_product,
+            show_derived_products,
+            &favorite_products,
+        ) && let Some(cut) =
+            advanced_product_source_cut(volume, self.selected_cut, &self.selected_product)
+                .or_else(|| best_cut_for_product(volume, self.selected_cut, &self.selected_product))
         {
             self.selected_cut = cut;
             return;
@@ -14396,7 +14768,10 @@ impl ViewerApp {
         ];
         if let Some(product) = preferred
             .iter()
-            .find(|product| is_displayable_on_cut(volume, self.selected_cut, product))
+            .find(|product| {
+                is_product_visible_in_picker(product, show_derived_products, &favorite_products)
+                    && is_displayable_on_cut(volume, self.selected_cut, product)
+            })
             .cloned()
         {
             self.selected_product = product;
@@ -14404,13 +14779,16 @@ impl ViewerApp {
             volume,
             advanced_products_enabled,
             show_derived_products,
+            &favorite_products,
         )
         .into_iter()
         .find(|product| is_displayable_on_cut(volume, self.selected_cut, product))
         .or_else(|| {
             displayable_products(volume, self.selected_cut)
                 .into_iter()
-                .find(|product| is_product_visible_in_picker(product, show_derived_products))
+                .find(|product| {
+                    is_product_visible_in_picker(product, show_derived_products, &favorite_products)
+                })
         }) {
             self.selected_product = product;
         }
@@ -15192,7 +15570,7 @@ impl ViewerApp {
         let volume = self.display_source_volume_for_product(&self.selected_product, volume);
         // The completeness substitution above can replace a live-partial
         // target with its preceding complete frame. Re-select the temporal
-        // prior against the ACTUAL rendered volume so Analyst3d never receives
+        // prior against the ACTUAL rendered volume so Analyst v4 never receives
         // that same complete frame as both target and "previous" anchor.
         let previous_volume = if self.dealias_engine == DealiasEngine::Analyst3d
             && (self.product_render_uses_dealiased_velocity(&self.selected_product)
@@ -15668,7 +16046,7 @@ impl ViewerApp {
                 || (dealiased_velocity && request.dealias_engine != DealiasEngine::Region)
             {
                 // Preprocessed display (gate filter / smoothing / a non-Region
-                // dealias engine — Analyst 3D or Region Global): build the grid
+                // dealias engine — Analyst v4 or Region Global): build the grid
                 // ONCE (cached by this very moment cache) and render it through
                 // the existing fast path — pans stay full speed. (Native-smooth
                 // Region dealiasing takes the fast per-tilt path below.)
@@ -16507,9 +16885,9 @@ impl ViewerApp {
         self.active_pane = self
             .active_pane
             .min(self.grid_layout.panel_count().saturating_sub(1));
-        // Rescale the dealiased-grid memo for the current pane count: a dual/
-        // quad-pane loop can hold one grid per frame per pane, so a
-        // dealiased-velocity pane never re-dealiases the loop tail.
+        // Rescale the dealiased-grid memo for the current pane count. This is
+        // headroom for distinct same-sweep grids or distinct Analyst v4
+        // contexts; panes sharing an exact v4 context share one volume entry.
         set_dealias_grid_cache_budget(
             self.app_settings.radar_history_budget_gib,
             self.grid_layout.panel_count(),
@@ -16681,6 +17059,7 @@ impl ViewerApp {
         };
         let show_derived_products = self.app_settings.show_derived_products;
         let advanced_products_enabled = self.advanced_products_enabled || show_derived_products;
+        let favorite_products = self.app_settings.radar_product_favorites.clone();
         let primary_live = self.primary.live.enabled;
 
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
@@ -16721,14 +17100,18 @@ impl ViewerApp {
         }
         if let Some(volume) = primary_volume.as_deref() {
             let current_cut = pane.cut.unwrap_or(self.selected_cut);
-            let pane_product_visible =
-                is_product_visible_in_picker(&pane.product, show_derived_products);
+            let pane_product_visible = is_product_visible_in_picker(
+                &pane.product,
+                show_derived_products,
+                &favorite_products,
+            );
             if !pane_product_visible || !is_displayable_on_cut(volume, current_cut, &pane.product) {
                 if !pane_product_visible {
                     if let Some(product) = global_displayable_products_for_picker(
                         volume,
                         advanced_products_enabled,
                         show_derived_products,
+                        &favorite_products,
                     )
                     .first()
                     .cloned()
@@ -16742,6 +17125,7 @@ impl ViewerApp {
                     volume,
                     advanced_products_enabled,
                     show_derived_products,
+                    &favorite_products,
                 )
                 .first()
                 .cloned()
@@ -18404,7 +18788,7 @@ impl ViewerApp {
         let dealias_label = match engine {
             DealiasEngine::Region => "Region dealias",
             DealiasEngine::RegionGlobal => "Region Global dealias",
-            DealiasEngine::Analyst3d => "Analyst 3D dealias",
+            DealiasEngine::Analyst3d => "Analyst v4 dealias",
         };
         self.vwp_requested_key = Some(key);
         self.vwp_panel.begin_compute(format!(
@@ -18700,7 +19084,11 @@ impl ViewerApp {
     fn pin_event_day_for_archive_date(&mut self, date: NaiveDate) {
         self.event_explorer.pin_day(date);
         self.spc_reports_enabled = true;
+        // The installed SPC snapshot belongs to the previous live/archive
+        // key. Clear its completion clock while the newly pinned day loads so
+        // the layer rail cannot label old-day data as a fresh result.
         self.spc_data.fetched_at = None;
+        self.spc_last_attempt_at = None;
     }
 
     fn poll_spc_reports(&mut self, ctx: &egui::Context) {
@@ -22095,12 +22483,12 @@ impl ViewerApp {
 
         // Resolve through the same process-wide production dealias cache used
         // by rendering and analysis. A replay/synthetic pane has no earlier
-        // observed anchor, so Analyst 3D receives the honest no-anchor form.
+        // observed anchor, so Analyst v4 receives the honest no-anchor form.
         let engine = self.dealias_engine;
         let engine_label = match engine {
             DealiasEngine::Region => "Region dealias",
             DealiasEngine::RegionGlobal => "Region Global dealias",
-            DealiasEngine::Analyst3d => "Analyst 3D dealias (no external anchor)",
+            DealiasEngine::Analyst3d => "Analyst v4 dealias (no external anchor)",
         };
         let dealiased = volume
             .cuts
@@ -22563,8 +22951,47 @@ impl ViewerApp {
     /// button flash), and user load commands supersede it via
     /// `cancel_primary_radar_load_for_user_command` anyway.
     fn unified_player_load_busy(&self) -> bool {
-        let user_load = self.load_receiver.is_some() && !self.primary_load_is_auto_refresh;
-        user_load || self.intl_loop_rx.is_some()
+        manual_frame_load_indicator_active(
+            self.load_receiver.is_some(),
+            self.primary_load_is_auto_refresh,
+            self.intl_loop_rx.is_some(),
+        )
+    }
+
+    fn show_manual_frame_load_overlay(&self, ctx: &egui::Context, rect: egui::Rect) {
+        if !self.unified_player_load_busy() {
+            return;
+        }
+        let width = (rect.width() - 32.0).clamp(220.0, 520.0);
+        let position = egui::pos2(rect.center().x - width * 0.5, rect.top() + 14.0);
+        let theme = ui_theme::theme();
+        egui::Area::new(egui::Id::new("manual_frame_load_overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme.bg)
+                    .stroke(egui::Stroke::new(1.0_f32, theme.outline))
+                    .corner_radius(4)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        if let Some(progress) = &self.archive_load_progress {
+                            archive_load_progress_row(ui, progress);
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    egui::RichText::new(
+                                        self.status_or_activity_label("Loading archive frame"),
+                                    )
+                                    .color(theme.text),
+                                );
+                            });
+                        }
+                    });
+            });
     }
 
     fn cancel_primary_radar_load_for_user_command(&mut self) -> bool {
@@ -22938,7 +23365,7 @@ impl ViewerApp {
         self.mping_enabled = enabled;
         self.app_settings.overlay_mping_reports = enabled;
         if enabled {
-            self.mping_fetched_at = None;
+            self.mping_last_attempt_at = None;
         }
     }
 
@@ -25069,7 +25496,7 @@ impl ViewerApp {
             .app_settings
             .radar_product_favorites
             .iter()
-            .any(|label| label == &editing_label);
+            .any(|label| label.eq_ignore_ascii_case(&editing_label));
         let favorite_products = self
             .app_settings
             .radar_product_favorites
@@ -25077,10 +25504,11 @@ impl ViewerApp {
             .filter_map(|label| {
                 product_buttons
                     .iter()
-                    .find(|(product, _)| product.label() == label)
+                    .find(|(product, _)| product.label().eq_ignore_ascii_case(label))
                     .map(|(product, _)| product.clone())
             })
             .collect::<Vec<_>>();
+        let mut favorite_changed = false;
         ui.horizontal_wrapped(|ui| {
             if ui
                 .small_button(if editing_is_favorite {
@@ -25098,12 +25526,13 @@ impl ViewerApp {
                 if editing_is_favorite {
                     self.app_settings
                         .radar_product_favorites
-                        .retain(|label| label != &editing_label);
+                        .retain(|label| !label.eq_ignore_ascii_case(&editing_label));
                 } else {
                     self.app_settings
                         .radar_product_favorites
                         .push(editing_label.clone());
                 }
+                favorite_changed = true;
                 let _ = self.app_settings.save();
             }
             if !favorite_products.is_empty() {
@@ -25122,6 +25551,11 @@ impl ViewerApp {
                 }
             }
         });
+        if favorite_changed {
+            self.sanitize_selection();
+            self.clear_texture();
+            ctx.request_repaint();
+        }
         if self.app_settings.classic_product_picker {
             // Compatibility layout: the compact pre-v0.34.2 chip grid. This
             // intentionally changes presentation only; product availability,
@@ -25279,7 +25713,7 @@ impl ViewerApp {
                         .selected_text(match selected_engine {
                             DealiasEngine::Region => "Region",
                             DealiasEngine::RegionGlobal => "Region Global",
-                            DealiasEngine::Analyst3d => "Analyst 3D",
+                            DealiasEngine::Analyst3d => "Analyst v4",
                         })
                         .width(128.0)
                         .show_ui(ui, |ui| {
@@ -25290,7 +25724,7 @@ impl ViewerApp {
                                     "Region",
                                 )
                                 .on_hover_text(
-                                    "Fast same-tilt region unfolding (the default). Good fallback, but an isolated connected group's absolute Nyquist branch can be ambiguous.",
+                                    "Fast same-tilt region unfolding. Good fallback, but an isolated connected group's absolute Nyquist branch can be ambiguous.",
                                 )
                                 .changed();
                             engine_changed |= ui
@@ -25307,10 +25741,10 @@ impl ViewerApp {
                                 .selectable_value(
                                     &mut selected_engine,
                                     DealiasEngine::Analyst3d,
-                                    "Analyst 3D (model-anchored)",
+                                    "Analyst v4 (whole volume)",
                                 )
                                 .on_hover_text(
-                                    "Whole-volume branch optimization: all velocity tilts solved jointly, using the previous volume and a RAP model wind profile at the radar site when available (US CONUS sites; fetched in the background). International sites run without the model anchor. Slower than Region; replaces the old 3D + time engine.",
+                                    "Default whole-volume v4 optimization: all velocity tilts are solved jointly, using the previous volume and a RAP model wind profile at the radar site when available (US CONUS sites; fetched in the background). International sites run without the model anchor.",
                                 )
                                 .changed();
                         });
@@ -27547,7 +27981,10 @@ impl ViewerApp {
             ui.label(format!("SkewT {snd_ms:.0} ms"));
         }
         ui.label(format!("{} overlays", self.radar_layers.len()));
-        ui.label(format!("{:.0} km range", self.radar_range_km));
+        ui.label(format!(
+            "{} range",
+            units::format_distance_km(self.radar_range_km, self.units())
+        ));
         if self.show_performance_stats {
             ui.separator();
             self.timing_readout(ui);
@@ -27867,24 +28304,37 @@ impl ViewerApp {
                 ui.separator();
             }
             if let Some(activity) = self.active_background_activity() {
-                let duplicate_status = activity.label.trim() == self.status.trim();
-                if !duplicate_status {
-                    if let Some(fraction) = activity.fraction {
-                        ui.add_sized(
-                            [210.0, height],
-                            egui::ProgressBar::new(fraction).text(activity.label),
-                        );
-                    } else {
-                        ui.add_sized(
-                            [38.0, height],
-                            egui::Label::new(mono("BUSY".to_owned()).color(accent_color())),
-                        );
-                        ui.add_sized(
-                            [172.0, height],
-                            egui::Label::new(mono(activity.label)).truncate(),
-                        );
+                match background_activity_display(&activity, &self.status) {
+                    BackgroundActivityDisplay::Full => {
+                        if let Some(fraction) = activity.fraction {
+                            ui.add_sized(
+                                [210.0, height],
+                                egui::ProgressBar::new(fraction).text(activity.label),
+                            );
+                        } else {
+                            ui.add_sized(
+                                [38.0, height],
+                                egui::Label::new(mono("BUSY".to_owned()).color(accent_color())),
+                            );
+                            ui.add_sized(
+                                [172.0, height],
+                                egui::Label::new(mono(activity.label)).truncate(),
+                            );
+                        }
+                        ui.separator();
                     }
-                    ui.separator();
+                    BackgroundActivityDisplay::ProgressOnly(fraction) => {
+                        ui.add_sized(
+                            [110.0, height],
+                            egui::ProgressBar::new(fraction)
+                                .text(format!("{:.0}%", fraction * 100.0)),
+                        );
+                        ui.separator();
+                    }
+                    BackgroundActivityDisplay::SpinnerOnly => {
+                        ui.spinner();
+                        ui.separator();
+                    }
                 }
             }
             // Stable metrics anchor to the right edge; the variable-width
@@ -27918,7 +28368,10 @@ impl ViewerApp {
                     ui.label(mono(format!("{} overlays", self.radar_layers.len())));
                     ui.separator();
                 }
-                ui.label(mono(format!("{:.0} km range", self.radar_range_km)));
+                ui.label(mono(format!(
+                    "{} range",
+                    units::format_distance_km(self.radar_range_km, self.units())
+                )));
                 ui.separator();
                 ui.label(mono(format!("map {:.0} px/deg", self.map_scale)));
                 // Cursor readout only — the old "{product} cut {n}"
@@ -28377,6 +28830,15 @@ impl ViewerApp {
                         self.workspace.mark_dirty();
                     }
                 }
+                dock::DockRequest::SetSleeping(pane, sleeping) => {
+                    if self.workspace.set_sleeping(pane, sleeping) {
+                        self.status = if sleeping {
+                            format!("{} is sleeping", pane.tab_title())
+                        } else {
+                            format!("{} is awake", pane.tab_title())
+                        };
+                    }
+                }
             }
         }
     }
@@ -28702,6 +29164,25 @@ impl ViewerApp {
             ui.weak(format!("{} is hidden", pane.tab_title()));
             return;
         }
+        if self.workspace.is_sleeping(pane) {
+            ui.horizontal(|ui| {
+                ui.strong(format!("{} is sleeping", pane.tab_title()));
+                if ui
+                    .small_button("Wake")
+                    .on_hover_text("Resume this pane's presentation and automatic updates")
+                    .clicked()
+                {
+                    self.workspace
+                        .requests
+                        .push(dock::DockRequest::SetSleeping(pane, false));
+                }
+            });
+            ui.weak(
+                "The pane stays docked while new presentation work is paused. \
+                 In-flight results and map-owned layers continue safely.",
+            );
+            return;
+        }
         // Always-visible undock affordance (field report: the tab ✕ and
         // right-click menu were not discoverable). Bodies run inside the
         // tree pass, so dock-state changes travel as deferred requests.
@@ -28795,6 +29276,7 @@ impl ViewerApp {
         // Brand Kit option and therefore cannot be disabled with watermark or
         // share-card settings.
         self.draw_imgw_attribution(&painter, rect);
+        self.show_manual_frame_load_overlay(ui.ctx(), rect);
         let popup_pane = self
             .hazard_map_popup
             .as_ref()
@@ -30578,6 +31060,7 @@ impl ViewerApp {
                         });
                         slot.status = placefile_parse_status(&placefile);
                         slot.data = Some(placefile);
+                        slot.last_successful_load = Some(now);
                         slot.generation = slot.generation.wrapping_add(1);
                         schedule_placefile_sheets(slot, ctx);
                         ctx.request_repaint();
@@ -31361,13 +31844,16 @@ impl ViewerApp {
     }
 
     /// Whether an observation belongs on the map. The optional state filter
-    /// intentionally applies only to METAR presentation/hit-testing; objective
-    /// analysis and sounding adjustment keep their complete observation pool.
+    /// applies to every displayed station plot (METAR and mesonet) so selecting
+    /// states actually removes all out-of-state clutter. Objective analysis
+    /// and sounding adjustment keep their complete observation pool.
     fn surface_ob_visible_on_map(&self, ob: &obs::SurfaceOb) -> bool {
-        if ob.network != "METAR" {
-            return self.obs_show_mesonet;
-        }
-        if !self.obs_show_metar {
+        let network_visible = if ob.network == "METAR" {
+            self.obs_show_metar
+        } else {
+            self.obs_show_mesonet
+        };
+        if !network_visible {
             return false;
         }
         if !self.app_settings.overlay_obs_metar_state_filter_enabled {
@@ -34667,6 +35153,7 @@ impl ViewerApp {
         match receiver.try_recv() {
             Ok(Ok(snapshot)) => {
                 self.aircraft_profiles_rx = None;
+                self.aircraft_profiles_fetched_at = Some(Instant::now());
                 self.aircraft_profiles_file = Some(snapshot.file_name.clone());
                 self.aircraft_profiles_status = format!(
                     "{} usable airport profiles from {}",
@@ -35057,13 +35544,13 @@ impl ViewerApp {
             && self.spc_rx.is_none()
             && (key_changed
                 || self
-                    .spc_data
-                    .fetched_at
+                    .spc_last_attempt_at
                     .map(|at| at.elapsed() > refresh_after)
                     .unwrap_or(true))
         {
             let (sender, receiver) = mpsc::channel();
             self.spc_rx = Some(receiver);
+            self.spc_last_attempt_at = Some(Instant::now());
             let kinds: Vec<String> = self.spc_outlooks_enabled.clone();
             // Dated days draw from the Event Explorer cache instead of
             // the live filtered CSVs — skip the redundant live fetch.
@@ -35081,7 +35568,7 @@ impl ViewerApp {
         }
         if let Some(receiver) = &self.spc_rx {
             match receiver.try_recv() {
-                Ok(data) => {
+                Ok(mut data) => {
                     let estofex_count = data
                         .estofex_issues
                         .iter()
@@ -35114,6 +35601,10 @@ impl ViewerApp {
                         status.push_str(" - SPC raw PTS is newer than GeoJSON");
                     }
                     self.spc_rx = None;
+                    // `fetch_spc` can preserve a partial/empty-but-valid
+                    // response; this clock means the worker completed and
+                    // its result was installed, not merely that it started.
+                    data.fetched_at = Some(Instant::now());
                     self.spc_data = data;
                     self.status = status;
                     ctx.request_repaint();
@@ -35132,12 +35623,14 @@ impl ViewerApp {
         }
         if self.mping_rx.is_none()
             && self
-                .mping_fetched_at
+                .mping_last_attempt_at
                 .map(|at| at.elapsed() > Duration::from_secs(300))
                 .unwrap_or(true)
         {
             let (sender, receiver) = mpsc::channel();
             self.mping_rx = Some(receiver);
+            self.mping_last_attempt_at = Some(Instant::now());
+            self.mping_last_error = None;
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
                 let result = mping::fetch_reports();
@@ -35150,6 +35643,7 @@ impl ViewerApp {
                 Ok(Ok(reports)) => {
                     self.mping_rx = None;
                     self.mping_fetched_at = Some(Instant::now());
+                    self.mping_last_error = None;
                     let count = reports.len();
                     self.mping_reports = reports;
                     self.status = format!("mPING: {count} recent reports");
@@ -35157,12 +35651,15 @@ impl ViewerApp {
                 }
                 Ok(Err(error)) => {
                     self.mping_rx = None;
-                    self.mping_fetched_at = Some(Instant::now());
+                    self.mping_last_error = Some(error.clone());
                     self.status = format!("mPING failed: {error}");
                     ctx.request_repaint();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.mping_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.mping_rx = None;
+                    self.mping_last_error = Some("refresh worker stopped".to_owned());
+                }
             }
         }
     }
@@ -35234,12 +35731,13 @@ impl ViewerApp {
         if self.obs_enabled
             && self.obs_rx.is_none()
             && self
-                .obs_fetched_at
+                .obs_last_attempt_at
                 .map(|at| at.elapsed() > Duration::from_secs(300))
                 .unwrap_or(true)
         {
             let (sender, receiver) = mpsc::channel();
             self.obs_rx = Some(receiver);
+            self.obs_last_attempt_at = Some(Instant::now());
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
                 let result = obs::fetch_surface_obs();
@@ -35253,12 +35751,13 @@ impl ViewerApp {
             && self.obs_show_metar
             && self.iem_metar_rx.is_none()
             && self
-                .iem_metar_fetched_at
+                .iem_metar_last_attempt_at
                 .map(|at| at.elapsed() > Duration::from_secs(900))
                 .unwrap_or(true)
         {
             let (sender, receiver) = mpsc::channel();
             self.iem_metar_rx = Some(receiver);
+            self.iem_metar_last_attempt_at = Some(Instant::now());
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
                 let result = obs::fetch_iem_global_metar_obs();
@@ -35270,12 +35769,13 @@ impl ViewerApp {
         if self.obs_enabled
             && self.mesonet_rx.is_none()
             && self
-                .mesonet_fetched_at
+                .mesonet_last_attempt_at
                 .map(|at| at.elapsed() > Duration::from_secs(600))
                 .unwrap_or(true)
         {
             let (sender, receiver) = mpsc::channel();
             self.mesonet_rx = Some(receiver);
+            self.mesonet_last_attempt_at = Some(Instant::now());
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
                 let obs = obs::fetch_mesonet_obs();
@@ -35309,7 +35809,6 @@ impl ViewerApp {
                 }
                 Ok(Err(err)) => {
                     self.obs_rx = None;
-                    self.obs_fetched_at = Some(Instant::now());
                     self.status = format!("Surface obs fetch failed: {err}");
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -35334,7 +35833,6 @@ impl ViewerApp {
                 }
                 Ok(Err(err)) => {
                     self.iem_metar_rx = None;
-                    self.iem_metar_fetched_at = Some(Instant::now());
                     if self.surface_obs.is_empty() {
                         self.status = format!("IEM global METAR fetch failed: {err}");
                     }
@@ -35368,7 +35866,7 @@ impl ViewerApp {
             && self.nws_obs_rx.is_none()
             && !self.surface_obs.is_empty()
             && self
-                .nws_obs_fetched_at
+                .nws_obs_last_attempt_at
                 .map(|at| at.elapsed() > Duration::from_secs(180))
                 .unwrap_or(true)
             && let Some(rect) = self.media.last_map_rect
@@ -35386,7 +35884,7 @@ impl ViewerApp {
                 chrono::Duration::minutes(18),
                 48,
             );
-            self.nws_obs_fetched_at = Some(Instant::now());
+            self.nws_obs_last_attempt_at = Some(Instant::now());
             if !stations.is_empty() {
                 let (sender, receiver) = mpsc::channel();
                 self.nws_obs_rx = Some(receiver);
@@ -40996,6 +41494,9 @@ struct PlacefileSlot {
     /// to a newer file that reuses the same numeric sheet index.
     source_generation: u64,
     next_refresh: Option<Instant>,
+    /// Last successfully parsed source install. Retry scheduling and failure
+    /// status are deliberately separate so an error cannot look fresh.
+    last_successful_load: Option<Instant>,
     status: String,
     receiver: Option<mpsc::Receiver<std::result::Result<placefiles::Placefile, String>>>,
     /// Loaded icon sprite sheets (fetched + decoded off-thread, texture
@@ -41034,6 +41535,7 @@ impl PlacefileSlot {
             generation: 0,
             source_generation: 0,
             next_refresh: None,
+            last_successful_load: None,
             status: "queued".to_owned(),
             receiver: None,
             sheets: Vec::new(),
@@ -41293,10 +41795,10 @@ struct CrossSectionReadout {
 /// `smooth_display` bool maps to `Soften` so old configs keep their look.
 /// Which velocity-dealias engine the viewer runs. All three produce a
 /// dealiased VEL/DVEL/DSRV grid; they differ in method and cost:
-/// - `Region`: the fast same-tilt BowEcho region solver (the default).
+/// - `Region`: the fast same-tilt BowEcho region solver.
 /// - `RegionGlobal`: a Rust port of Py-ART's `dealias_region_based`
 ///   per-sweep core — same-tilt, no volume/model/temporal evidence.
-/// - `Analyst3d`: the model-anchored v4 engine (whole-volume branch
+/// - `Analyst3d`: the default model-anchored v4 engine (whole-volume branch
 ///   optimization; uses the previous volume + a RAP wind profile).
 ///
 /// Only `Analyst3d` consumes the previous volume and RAP env profile;
@@ -41305,21 +41807,22 @@ struct CrossSectionReadout {
 /// invalidates cached textures and readouts.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum DealiasEngine {
-    /// Fast same-tilt region unfolding — the app's default.
-    #[default]
+    /// Fast same-tilt region unfolding.
     Region,
     /// Rust port of Py-ART `dealias_region_based` (same-tilt).
     RegionGlobal,
-    /// Model-anchored whole-volume v4 engine.
+    /// Default model-anchored whole-volume v4 engine.
+    #[default]
     Analyst3d,
 }
 
 impl DealiasEngine {
     fn from_settings(settings: &settings::AppSettings) -> Self {
         match settings.dealias_engine.trim().to_ascii_lowercase().as_str() {
+            "region" => Self::Region,
             "region-global" | "region_global" | "global" => Self::RegionGlobal,
             "analyst-3d" | "analyst3d" | "analyst_3d" => Self::Analyst3d,
-            _ => Self::Region,
+            _ => Self::Analyst3d,
         }
     }
 
@@ -42580,6 +43083,45 @@ pub(crate) fn compact_layer_status(status: &str, max_chars: usize) -> String {
     }
 }
 
+/// Compact age for a successful in-process install. Callers pass an explicit
+/// `now` so rail labels and tests do not race the clock.
+pub(crate) fn compact_layer_success_age(at: Instant, now: Instant) -> String {
+    let seconds = now.saturating_duration_since(at).as_secs();
+    match seconds {
+        0..=59 => "now".to_owned(),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h {}m ago", seconds / 3_600, (seconds % 3_600) / 60),
+        _ => format!("{}d {}h ago", seconds / 86_400, (seconds % 86_400) / 3_600),
+    }
+}
+
+/// A live warning refresh age belongs only to the live feed. Archive/event
+/// warning windows may coexist with an older successful live refresh in
+/// memory, but must never present that live clock as the archive data's age.
+pub(crate) fn warning_live_success_age(
+    last_live_success: Option<Instant>,
+    warning_timeline_owned: bool,
+    now: Instant,
+) -> Option<String> {
+    (!warning_timeline_owned)
+        .then(|| last_live_success.map(|at| compact_layer_success_age(at, now)))
+        .flatten()
+}
+
+/// FARM frame filenames carry the source scan time immediately before the
+/// scan id (`...-20260611212522-14544.png`). This is the data timestamp, not
+/// the HTTP check time.
+pub(crate) fn farm_frame_time_utc(url: &str) -> Option<DateTime<Utc>> {
+    let file = url.rsplit('/').next().unwrap_or(url);
+    let stem = file.strip_suffix(".png").unwrap_or(file);
+    let token = stem
+        .split('-')
+        .rev()
+        .find(|token| token.len() == 14 && token.bytes().all(|byte| byte.is_ascii_digit()))?;
+    let naive = NaiveDateTime::parse_from_str(token, "%Y%m%d%H%M%S").ok()?;
+    Some(Utc.from_utc_datetime(&naive))
+}
+
 /// Visibility slot of a unified layer row: a toggle for ordinary layers, a
 /// fixed badge for the always-on primary radar (no vis toggle, no ✕).
 enum LayerRowVis<'a> {
@@ -42627,6 +43169,12 @@ enum LayerRowGear<'a> {
     },
     /// ⚙ opens a small anchored popover with the layer's few options.
     Menu {
+        hover: &'a str,
+        content: Box<dyn FnOnce(&mut egui::Ui) + 'a>,
+    },
+    /// A configuration popover that stays open while controls are clicked.
+    /// The caller can provide an explicit Done action with `ui.close()`.
+    PersistentMenu {
         hover: &'a str,
         content: Box<dyn FnOnce(&mut egui::Ui) + 'a>,
     },
@@ -42856,6 +43404,18 @@ fn layer_row(
                 })
                 .response
                 .on_hover_text(hover);
+            }
+            Some(LayerRowGear::PersistentMenu { hover, content }) => {
+                let (response, _) = egui::containers::menu::MenuButton::new("⚙")
+                    .config(
+                        egui::containers::menu::MenuConfig::new()
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| {
+                        ui.set_min_width(170.0);
+                        content(ui);
+                    });
+                response.on_hover_text(hover);
             }
             None => {
                 ui.allocate_exact_size(
@@ -45675,21 +46235,14 @@ struct HazardFillCandidate {
     points: Vec<egui::Pos2>,
 }
 
-/// Per-component edge budget for the same-family fill flattener. The
-/// scanline union in [`scanline_fill_mesh`] runs an all-pairs edge-crossing
-/// scan (~E²/2 tests) BEFORE any output-size valve can trip, and the whole
-/// hazard shape cache rebuilds on every pan/zoom — so the bound has to hold
-/// before any quadratic work starts. At 1,024 edges the scan is ~0.5M pair
-/// tests; an unbounded stacked-warning cluster (40+ transitively-overlapping
-/// fills × up to [`HAZARD_FILL_VERTEX_LIMIT`] vertices each) would otherwise
-/// rebuild thousands of edges during every map interaction and freeze the
-/// map. Components over budget paint per record through
-/// the bounded legacy path instead: alpha stacking returns for that extreme
-/// cluster — a mild visual regression that beats a frozen map.
+/// Edge-count threshold where the same-family scanline union changes from a
+/// straightforward pair walk to bbox-swept crossing discovery. This is not a
+/// fill-disable threshold: dense components remain one exact-alpha union.
 const HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET: usize = 1_024;
 
-/// Safety valve for [`scanline_fill_mesh`]: a pathological band structure
-/// falls back to the caller's per-ring path instead of building a huge mesh.
+/// Maximum vertices per emitted scanline-union mesh chunk. A pathological
+/// union is split into non-overlapping chunks rather than dropped or painted
+/// per record.
 const SCANLINE_FILL_VERTEX_LIMIT: usize = 200_000;
 
 struct ScanlineFillEdge {
@@ -49603,13 +50156,18 @@ mod tests {
     /// required (the intl/no-env path). The cache must key the v4 grid
     /// separately from region output, and flipping engines must invalidate it.
     #[test]
-    fn analyst3d_engine_routes_readout_through_the_v4_engine() {
+    fn default_analyst_v4_engine_routes_readout_through_the_v4_engine() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let volume = Arc::new(test_aliased_velocity_volume());
         app.volume = Some(Arc::clone(&volume));
         app.selected_cut = 0;
         app.selected_product = DisplayProduct::DealiasedVelocity;
-        app.dealias_engine = DealiasEngine::Analyst3d;
+        app.dealias_engine = DealiasEngine::from_settings(&app.app_settings);
+        assert_eq!(
+            app.dealias_engine,
+            DealiasEngine::Analyst3d,
+            "the default settings route must remain Analyst v4"
+        );
 
         let grid = app
             .dealiased_velocity_readout_grid(&volume, 0)
@@ -49637,6 +50195,117 @@ mod tests {
         let cut = &volume.cuts[0];
         let source = cut.moments.get(&MomentType::Velocity).expect("velocity");
         assert_eq!(region_grid.as_ref(), &dealias_velocity_grid(cut, source));
+    }
+
+    #[test]
+    fn analyst_v4_first_tilt_populates_one_volume_cache_entry_for_every_tilt() {
+        let mut volume = test_aliased_velocity_volume();
+        let mut upper = volume.cuts[0].clone();
+        upper.elevation_deg = 1.5;
+        upper.elevation_number = Some(2);
+        for radial in &mut upper.radials {
+            radial.elevation_deg = 1.5;
+        }
+        volume.cuts.push(upper);
+        let volume = Arc::new(volume);
+
+        let first = resolve_dealiased_grid(&volume, None, None, 0, DealiasEngine::Analyst3d)
+            .expect("first v4 tilt");
+        let context = DealiasContextKey::new(DealiasEngine::Analyst3d, None, None);
+        let upper_key = DealiasGridKey::from_context(Arc::as_ptr(&volume) as usize, 1, context);
+        let volume_key = upper_key.volume_key();
+        let mut cache = dealias_grid_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let cached_upper = cache
+            .get(&upper_key)
+            .expect("the first solve must cache the upper tilt too");
+        let matching_entries = cache
+            .entries
+            .iter()
+            .filter(|entry| entry.belongs_to_volume_context(volume_key))
+            .count();
+        assert_eq!(matching_entries, 1, "v4 uses one volume cache entry");
+        assert!(cache.entries.iter().any(
+            |entry| matches!(entry, DealiasCacheEntry::V4Volume(item) if item.key == volume_key)
+        ));
+        drop(cache);
+
+        let upper_again = resolve_dealiased_grid(&volume, None, None, 1, DealiasEngine::Analyst3d)
+            .expect("cached upper v4 tilt");
+        assert!(Arc::ptr_eq(&cached_upper, &upper_again));
+        assert!(!Arc::ptr_eq(&first, &upper_again));
+    }
+
+    #[test]
+    fn analyst_v4_negative_caches_a_velocity_cut_with_no_usable_output() {
+        use std::cell::Cell;
+
+        let mut volume = test_aliased_velocity_volume();
+        volume.cuts[0]
+            .moments
+            .get_mut(&MomentType::Velocity)
+            .expect("velocity")
+            .radial_indices
+            .clear();
+        let volume = Arc::new(volume);
+        let context = DealiasContextKey::new(DealiasEngine::Analyst3d, None, None);
+        let key = DealiasGridKey::from_context(Arc::as_ptr(&volume) as usize, 0, context);
+        let solves = Cell::new(0usize);
+
+        for _ in 0..2 {
+            let witness = DealiasGridWitness::with_anchors(&volume, None, None);
+            let result = cached_v4_dealias_grid_with(key, witness, &volume, || {
+                solves.set(solves.get() + 1);
+                dealias_volume_v4(volume.as_ref(), None, None)
+            });
+            assert!(result.is_none());
+        }
+
+        assert_eq!(
+            solves.get(),
+            1,
+            "a cached no-output cut must not repeat its whole-volume solve"
+        );
+    }
+
+    #[test]
+    fn analyst_v4_concurrent_first_misses_share_one_whole_volume_solve() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let volume = Arc::new(test_aliased_velocity_volume());
+        let starts = Arc::new(Barrier::new(3));
+        let solves = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let worker_volume = Arc::clone(&volume);
+            let worker_starts = Arc::clone(&starts);
+            let worker_solves = Arc::clone(&solves);
+            workers.push(thread::spawn(move || {
+                let context = DealiasContextKey::new(DealiasEngine::Analyst3d, None, None);
+                let key =
+                    DealiasGridKey::from_context(Arc::as_ptr(&worker_volume) as usize, 0, context);
+                let witness = DealiasGridWitness::with_anchors(&worker_volume, None, None);
+                worker_starts.wait();
+                cached_v4_dealias_grid_with(key, witness, &worker_volume, || {
+                    worker_solves.fetch_add(1, AtomicOrdering::SeqCst);
+                    thread::sleep(Duration::from_millis(40));
+                    dealias_volume_v4(worker_volume.as_ref(), None, None)
+                })
+                .expect("concurrent v4 grid")
+            }));
+        }
+        starts.wait();
+        let first = workers.remove(0).join().expect("first worker");
+        let second = workers.remove(0).join().expect("second worker");
+
+        assert_eq!(
+            solves.load(AtomicOrdering::SeqCst),
+            1,
+            "the exact-context gate must deduplicate concurrent first misses"
+        );
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     /// Pin for the third engine: `RegionGlobal` routes the readout through the
@@ -54825,7 +55494,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_saved_dealias_engine_falls_back_to_region() {
+    fn default_and_unknown_dealias_engine_use_v4_while_known_choices_survive() {
         let settings = settings::AppSettings {
             dealias_engine: "future-engine".to_owned(),
             ..Default::default()
@@ -54833,8 +55502,24 @@ mod tests {
 
         assert_eq!(
             RadarAlgorithmPreferences::from_settings(&settings).dealias_engine,
-            DealiasEngine::Region
+            DealiasEngine::Analyst3d
         );
+        assert_eq!(
+            DealiasEngine::from_settings(&settings::AppSettings::default()),
+            DealiasEngine::Analyst3d
+        );
+        for (slug, expected) in [
+            ("region", DealiasEngine::Region),
+            ("region-global", DealiasEngine::RegionGlobal),
+            ("analyst-3d", DealiasEngine::Analyst3d),
+        ] {
+            let settings = settings::AppSettings {
+                dealias_engine: slug.to_owned(),
+                ..Default::default()
+            };
+            assert_eq!(DealiasEngine::from_settings(&settings), expected);
+            assert_eq!(expected.settings_slug(), slug);
+        }
     }
 
     #[test]
@@ -54972,17 +55657,54 @@ mod tests {
     }
 
     #[test]
-    fn unified_player_mping_toggle_resets_fetch_freshness() {
+    fn unified_player_mping_toggle_forces_check_without_erasing_success() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.mping_enabled = false;
         app.app_settings.overlay_mping_reports = false;
-        app.mping_fetched_at = Some(Instant::now());
+        let successful_at = Instant::now();
+        app.mping_fetched_at = Some(successful_at);
+        app.mping_last_attempt_at = Some(successful_at);
 
         app.apply_unified_player_mping_enabled_state(true);
 
         assert!(app.mping_enabled);
         assert!(app.app_settings.overlay_mping_reports);
-        assert!(app.mping_fetched_at.is_none());
+        assert_eq!(app.mping_fetched_at, Some(successful_at));
+        assert!(app.mping_last_attempt_at.is_none());
+    }
+
+    #[test]
+    fn failed_mping_refresh_preserves_last_success_time() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let successful_at = Instant::now() - Duration::from_secs(120);
+        app.mping_enabled = true;
+        app.mping_fetched_at = Some(successful_at);
+        app.mping_last_attempt_at = Some(Instant::now());
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Err("network down".to_owned())).unwrap();
+        app.mping_rx = Some(receiver);
+
+        app.poll_mping(&egui::Context::default());
+
+        assert_eq!(app.mping_fetched_at, Some(successful_at));
+        assert_eq!(app.mping_last_error.as_deref(), Some("network down"));
+    }
+
+    #[test]
+    fn failed_surface_obs_refresh_preserves_last_success_time() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let successful_at = Instant::now() - Duration::from_secs(120);
+        app.obs_enabled = false;
+        app.obs_fetched_at = Some(successful_at);
+        app.obs_last_attempt_at = Some(Instant::now());
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Err("network down".to_owned())).unwrap();
+        app.obs_rx = Some(receiver);
+
+        app.poll_surface_obs(&egui::Context::default());
+
+        assert_eq!(app.obs_fetched_at, Some(successful_at));
+        assert!(app.status.starts_with("Surface obs fetch failed"));
     }
 
     #[test]
@@ -63675,6 +64397,15 @@ mod tests {
         assert_eq!(hazard_fill_vertex_limit(32), HAZARD_FILL_VERTEX_LIMIT);
         assert_eq!(hazard_fill_vertex_limit(80), 102);
         assert_eq!(hazard_fill_vertex_limit(400), HAZARD_FILL_MIN_VERTEX_LIMIT);
+        assert_eq!(hazard_outline_vertex_limit(1), HAZARD_OUTLINE_VERTEX_LIMIT);
+        assert_eq!(
+            hazard_outline_vertex_limit(64),
+            HAZARD_OUTLINE_FAMILY_VERTEX_BUDGET / 64
+        );
+        assert_eq!(
+            hazard_outline_vertex_limit(1_000),
+            HAZARD_OUTLINE_MIN_VERTEX_LIMIT
+        );
     }
 
     #[test]
@@ -63780,8 +64511,14 @@ mod tests {
         let selected = app.build_hazard_overlay_shapes(test_map_rect(), None);
         assert_eq!(
             selected.fill_shapes.len(),
-            HAZARD_HEAVY_LAYER_LABEL_LIMIT + 3,
-            "selection may split its color group without suppressing any family peer"
+            built.fill_shapes.len(),
+            "selection must remain in its warning-family fill union"
+        );
+        let overlap = app.lon_lat_to_screen(test_map_rect(), -0.325, -0.325);
+        assert_eq!(
+            fill_paint_multiplicity(&selected.fill_shapes, overlap),
+            fill_paint_multiplicity(&built.fill_shapes, overlap),
+            "clicking one tropical polygon must not add another translucent paint"
         );
     }
 
@@ -64583,18 +65320,92 @@ mod tests {
     }
 
     #[test]
-    fn hiding_derived_products_sanitizes_active_selection() {
+    fn product_picker_keeps_only_favorited_derived_products_when_more_products_is_off() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_advanced_source_volume(Utc::now())));
+        app.advanced_products_enabled = false;
+        app.app_settings.show_derived_products = false;
+        // Favorite matching is intentionally case-insensitive so manually
+        // edited and older settings cannot strand a visible-but-unremovable
+        // favorite.
+        app.app_settings.radar_product_favorites = vec!["cref".to_owned(), "phif".to_owned()];
+        let volume = app.volume.clone().expect("volume");
+
+        let visible = app.displayable_products_for_picker(volume.as_ref());
+        let composite = DisplayProduct::Derived(DerivedProduct::CompositeReflectivity);
+        let phif = DisplayProduct::Moment(MomentType::Unknown("PHIF".to_owned()));
+
+        assert!(visible.contains(&composite), "{visible:?}");
+        assert!(
+            visible.contains(&phif),
+            "a favorite must expose its lazy advanced placeholder without enabling the full catalog: {visible:?}"
+        );
+        assert!(!visible.contains(&DisplayProduct::Derived(DerivedProduct::EchoTops)));
+        let advanced_labels = visible
+            .iter()
+            .filter(|product| advanced_derived_product_for_display_product(product).is_some())
+            .map(|product| product.label())
+            .collect::<Vec<_>>();
+        assert_eq!(advanced_labels, ["PHIF"]);
+    }
+
+    #[test]
+    fn favorite_derived_selection_survives_hiding_then_unfavorite_sanitizes_all_panes() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
         app.selected_cut = 0;
-        app.selected_product = DisplayProduct::Derived(DerivedProduct::CompositeReflectivity);
+        let composite = DisplayProduct::Derived(DerivedProduct::CompositeReflectivity);
+        app.selected_product = composite.clone();
+        app.extra_panes.push(test_pane(composite.clone()));
         app.app_settings.show_derived_products = false;
+        app.app_settings.radar_product_favorites = vec!["CREF".to_owned()];
+
+        app.sanitize_selection();
+
+        assert_eq!(app.selected_product, composite);
+        assert_eq!(app.extra_panes[0].product, composite);
+
+        // This is the same state transition performed by the Favorite button
+        // before it invokes `sanitize_selection`.
+        app.app_settings.radar_product_favorites.clear();
 
         app.sanitize_selection();
 
         assert_eq!(
             app.selected_product,
             DisplayProduct::Moment(MomentType::Reflectivity)
+        );
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Reflectivity)
+        );
+    }
+
+    #[test]
+    fn unfavorite_sanitizes_independent_pane_without_a_primary_volume() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let composite = DisplayProduct::Derived(DerivedProduct::CompositeReflectivity);
+        let mut pane = test_pane(composite.clone());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "TEST".to_owned(),
+        });
+        pane.volume = Some(Arc::new(test_ref_then_velocity_volume()));
+        pane.cut = Some(0);
+        app.extra_panes.push(pane);
+        app.volume = None;
+        app.app_settings.show_derived_products = false;
+        app.app_settings.radar_product_favorites = vec!["CREF".to_owned()];
+
+        app.sanitize_selection();
+        assert_eq!(app.extra_panes[0].product, composite);
+
+        app.app_settings.radar_product_favorites.clear();
+        app.sanitize_selection();
+
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            "a pane-owned volume must sanitize even while the primary is empty"
         );
     }
 
@@ -66467,6 +67278,38 @@ mod tests {
     }
 
     #[test]
+    fn warning_success_clock_advances_only_for_successful_live_final() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(AsyncHazardResult {
+                update: AsyncHazardUpdate::Final(Ok(test_hazard_overlay(Vec::new()))),
+            })
+            .unwrap();
+        app.hazard_receiver = Some(receiver);
+        app.hazard_request_tracks_live_success = true;
+
+        app.poll_async_hazards(&ctx);
+
+        let successful_at = app
+            .last_successful_live_hazard_refresh
+            .expect("successful live final records its install time");
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(AsyncHazardResult {
+                update: AsyncHazardUpdate::Final(Err("network down".to_owned())),
+            })
+            .unwrap();
+        app.hazard_receiver = Some(receiver);
+        app.hazard_request_tracks_live_success = true;
+
+        app.poll_async_hazards(&ctx);
+
+        assert_eq!(app.last_successful_live_hazard_refresh, Some(successful_at));
+    }
+
+    #[test]
     fn live_hazard_priority_preview_seeds_empty_overlay() {
         let incoming = test_hazard_record(
             "KSGF.SV.W.0324",
@@ -67422,12 +68265,11 @@ mod tests {
             .collect()
     }
 
-    /// A same-family component whose total edge count exceeds the flatten
-    /// budget must fall back to bounded per-record fills BEFORE the union's
-    /// quadratic edge-crossing scan runs (the 40-stacked-SVR freeze), while
-    /// a normal small overlap keeps flattening to one union shape.
+    /// Dense same-family components on either side of the crossing-sweep
+    /// threshold must remain one-alpha unions. The large case used to fall
+    /// back to per-record fills, restoring the overlap glow.
     #[test]
-    fn oversized_flatten_component_falls_back_to_per_record_fills() {
+    fn dense_flatten_components_keep_single_alpha() {
         let overlapping_rings = |count: usize, vertices: usize| -> Vec<HazardFillCandidate> {
             (0..count)
                 .map(|i| HazardFillCandidate {
@@ -67439,9 +68281,7 @@ mod tests {
         };
 
         // Six synthetic 600-vertex rings: 3,600 edges in one transitive
-        // component, well over HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET. This
-        // calls the post-bounding flattener directly to prove its independent
-        // pre-flight valve; every record must still paint as its own shape.
+        // component, well over HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET.
         let candidates = overlapping_rings(6, 600);
         assert!(
             candidates.iter().map(|c| c.points.len()).sum::<usize>()
@@ -67449,11 +68289,12 @@ mod tests {
         );
         let mut shapes = Vec::new();
         append_flattened_hazard_fill_shapes(candidates, &mut shapes);
-        assert_eq!(shapes.len(), 6, "over-budget component paints per record");
+        assert!(!shapes.is_empty(), "over-budget component remains filled");
         let overlap_point = egui::pos2(225.3, 200.7);
-        assert!(
-            fill_paint_multiplicity(&shapes, overlap_point) >= 2,
-            "per-record fills layer in the shared area"
+        assert_eq!(
+            fill_paint_multiplicity(&shapes, overlap_point),
+            1,
+            "over-budget component must not restore per-record alpha stacking"
         );
 
         // A normal 3-record overlap stays flattened to a single union paint.
@@ -67461,6 +68302,39 @@ mod tests {
         append_flattened_hazard_fill_shapes(overlapping_rings(3, 64), &mut shapes);
         assert_eq!(shapes.len(), 1, "small components still flatten");
         assert_eq!(fill_paint_multiplicity(&shapes, overlap_point), 1);
+
+        // Just below the dense crossing-sweep threshold, vary both center
+        // coordinates so the 42 rings produce many distinct y bands. The old
+        // band x ring x every-edge loop did tens of millions of visits here.
+        let candidates = (0..42)
+            .map(|index| HazardFillCandidate {
+                family: "flood".to_owned(),
+                fill: spike_probe_fill(),
+                points: circle_ring(
+                    egui::pos2(200.0 + index as f32 * 0.2, 200.0 + index as f32 * 0.1),
+                    90.0,
+                    24,
+                ),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.points.len())
+                .sum::<usize>()
+                <= HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET
+        );
+        let mut shapes = Vec::new();
+        append_flattened_hazard_fill_shapes(candidates, &mut shapes);
+        assert!(!shapes.is_empty(), "near-budget component remains filled");
+        assert_eq!(
+            // Avoid every source-vertex/event y and the trapezoid diagonals:
+            // the strict multiplicity probe intentionally excludes shared
+            // mesh seams even though the GPU fills them continuously.
+            fill_paint_multiplicity(&shapes, egui::pos2(204.37, 202.73)),
+            1,
+            "near-budget component must remain one-alpha"
+        );
     }
 
     /// A self-intersecting ring whose scanline tessellation bails must drop
@@ -68903,6 +69777,7 @@ mod tests {
             spc_day: 1,
             spc_day1_issue: spc_layers::SpcDay1Issue::Auto,
             spc_last_key: None,
+            spc_last_attempt_at: None,
             glm: None,
             glm_secondary: None,
             glm_refresh_requested_at: None,
@@ -68911,6 +69786,8 @@ mod tests {
             mping_reports: Vec::new(),
             mping_enabled: false,
             mping_fetched_at: None,
+            mping_last_attempt_at: None,
+            mping_last_error: None,
             mping_rx: None,
             timeline_reports_reference_utc: None,
             event_explorer: event_explorer::EventExplorerState::default(),
@@ -68936,6 +69813,7 @@ mod tests {
             aircraft_profiles: Vec::new(),
             aircraft_profiles_rx: None,
             aircraft_profiles_next_poll: None,
+            aircraft_profiles_fetched_at: None,
             aircraft_profiles_file: None,
             aircraft_profiles_status: String::new(),
             aircraft_soundings_enabled: false,
@@ -68952,12 +69830,16 @@ mod tests {
             obs_hour_loop_end_utc: Utc::now(),
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
+            obs_last_attempt_at: None,
             obs_rx: None,
             iem_metar_fetched_at: None,
+            iem_metar_last_attempt_at: None,
             iem_metar_rx: None,
             nws_obs_fetched_at: None,
+            nws_obs_last_attempt_at: None,
             nws_obs_rx: None,
             mesonet_fetched_at: None,
+            mesonet_last_attempt_at: None,
             mesonet_rx: None,
             historical_obs: None,
             historical_obs_rx: None,
@@ -69031,6 +69913,8 @@ mod tests {
             show_performance_stats: false,
             sidebar_tab: SidebarTab::Radar,
             last_live_hazard_refresh: None,
+            last_successful_live_hazard_refresh: None,
+            hazard_request_tracks_live_success: false,
             selected_hazard_index: None,
             hazard_map_popup: None,
             unacknowledged_hazard_event_ids: BTreeSet::new(),
@@ -69356,7 +70240,7 @@ mod tests {
     }
 
     #[test]
-    fn metar_state_filter_affects_map_plots_but_not_mesonet_visibility() {
+    fn station_state_filter_applies_to_metar_and_mesonet_map_plots() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.obs_show_metar = true;
         app.obs_show_mesonet = true;
@@ -69364,15 +70248,18 @@ mod tests {
         app.app_settings.overlay_obs_metar_states = vec!["MI".to_owned()];
 
         let michigan_metar = test_surface_ob("KLAN", 42.78, -84.59, "METAR");
+        let michigan_mesonet = test_surface_ob("MI001", 42.78, -84.59, "DCP");
         let indiana_metar = test_surface_ob("KIND", 39.72, -86.29, "METAR");
         let indiana_mesonet = test_surface_ob("IN001", 39.72, -86.29, "DCP");
 
         assert!(app.surface_ob_visible_on_map(&michigan_metar));
+        assert!(app.surface_ob_visible_on_map(&michigan_mesonet));
         assert!(!app.surface_ob_visible_on_map(&indiana_metar));
-        assert!(app.surface_ob_visible_on_map(&indiana_mesonet));
+        assert!(!app.surface_ob_visible_on_map(&indiana_mesonet));
 
         app.app_settings.overlay_obs_metar_state_filter_enabled = false;
         assert!(app.surface_ob_visible_on_map(&indiana_metar));
+        assert!(app.surface_ob_visible_on_map(&indiana_mesonet));
     }
 
     fn test_storm_volume(scan_time: DateTime<Utc>) -> RadarVolume {
@@ -70134,6 +71021,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn layer_success_age_uses_the_supplied_clock() {
+        let now = Instant::now();
+        assert_eq!(
+            compact_layer_success_age(now - Duration::from_secs(20), now),
+            "now"
+        );
+        assert_eq!(
+            compact_layer_success_age(now - Duration::from_secs(3_780), now),
+            "1h 3m ago"
+        );
+        assert_eq!(
+            compact_layer_success_age(now - Duration::from_secs(93_600), now),
+            "1d 2h ago"
+        );
+    }
+
+    #[test]
+    fn archive_warning_row_never_reuses_the_live_success_clock() {
+        let now = Instant::now();
+        let last_live_success = Some(now - Duration::from_secs(180));
+        assert_eq!(
+            warning_live_success_age(last_live_success, false, now).as_deref(),
+            Some("3m ago")
+        );
+        assert_eq!(warning_live_success_age(last_live_success, true, now), None);
+    }
+
+    #[test]
+    fn farm_frame_timestamp_is_read_from_the_source_filename() {
+        assert_eq!(
+            farm_frame_time_utc("https://svr.guru/FARM/COW2-PPI-DBZHC_F-20260611212522-14544.png"),
+            Some(Utc.with_ymd_and_hms(2026, 6, 11, 21, 25, 22).unwrap())
+        );
+        assert!(farm_frame_time_utc("https://svr.guru/FARM/not-a-frame.png").is_none());
+    }
+
     /// Health classifier pinned to the LIVE `api.weather.gov/radar/stations`
     /// value space (sampled 2026-07 across all 208 reporting sites).
     #[test]
@@ -70667,6 +71591,33 @@ mod tests {
 
         assert_eq!(activity.label, "Archive loop 3/5 - Decoded KTLX scan");
         assert_eq!(activity.fraction, Some(0.6));
+    }
+
+    #[test]
+    fn duplicate_background_status_keeps_a_visible_progress_indicator() {
+        let progress = BackgroundActivity::progress("Loading frame 3/5", 3, 5);
+        assert_eq!(
+            background_activity_display(&progress, "Loading frame 3/5"),
+            BackgroundActivityDisplay::ProgressOnly(0.6)
+        );
+
+        let spinner = BackgroundActivity::indeterminate("Loading archive frame");
+        assert_eq!(
+            background_activity_display(&spinner, "Loading archive frame"),
+            BackgroundActivityDisplay::SpinnerOnly
+        );
+        assert_eq!(
+            background_activity_display(&spinner, "Another status"),
+            BackgroundActivityDisplay::Full
+        );
+    }
+
+    #[test]
+    fn manual_frame_indicator_excludes_live_auto_refresh() {
+        assert!(manual_frame_load_indicator_active(true, false, false));
+        assert!(manual_frame_load_indicator_active(false, false, true));
+        assert!(!manual_frame_load_indicator_active(true, true, false));
+        assert!(!manual_frame_load_indicator_active(false, false, false));
     }
 
     #[test]

@@ -29,14 +29,14 @@ rotation.
 
 **Success =** the pinned probe reads ~−35 (anything strongly negative,
 < −20, is directionally right; verify visually too) on **v4** (called
-"Analyst 3D" in-app), ideally also on **region**, with NO other case
+"Analyst v4" in-app), ideally also on **region**, with NO other case
 regressing (§4 below).
 
 ## 2. Repo orientation (only what you need)
 
-- `crates/render2d/src/region_core.rs` — the Region engine (default in
-  the app). Region-based unfolding, Eilts & Smith 1990 lineage.
-- `crates/render2d/src/dealias_v4/` — the v4.1 engine ("Analyst 3D"):
+- `crates/render2d/src/region_core.rs` — the fast Region fallback.
+  Region-based unfolding, Eilts & Smith 1990 lineage.
+- `crates/render2d/src/dealias_v4/` — the default v4.1 engine ("Analyst v4"):
   - `mod.rs` — entry points, super-region segmentation over all tilts;
   - `graph.rs` — boundary-vote graph;
   - `solve.rs` — max-spanning-forest DP + ICM (Besag 1986) over one

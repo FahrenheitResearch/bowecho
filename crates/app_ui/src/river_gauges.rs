@@ -405,38 +405,7 @@ impl RiverGaugeState {
         match self.tile_worker.poll() {
             SlotPoll::Ready(Ok(batch)) => {
                 let now = Instant::now();
-                for (key, gauges) in batch.tiles {
-                    self.failures.remove(&key);
-                    self.tiles.insert(
-                        key,
-                        CachedTile {
-                            gauges,
-                            fetched_at: now,
-                            last_used_tick: self.tick,
-                        },
-                    );
-                }
-                for (key, _) in &batch.errors {
-                    self.failures.insert(*key, now);
-                }
-                self.in_flight_tiles.clear();
-                self.force_refresh = false;
-                self.prune_tiles();
-                if !self.tiles.is_empty() {
-                    self.last_success = Some(now);
-                }
-                self.status = if batch.errors.is_empty() {
-                    format!("{} NWPS gauges cached", self.gauge_count())
-                } else if self.tiles.is_empty() {
-                    format!("NWPS unavailable ({} tile errors)", batch.errors.len())
-                } else {
-                    format!(
-                        "{} NWPS gauges cached; {} tile{} unavailable",
-                        self.gauge_count(),
-                        batch.errors.len(),
-                        if batch.errors.len() == 1 { "" } else { "s" }
-                    )
-                };
+                self.apply_tile_batch(batch, now);
             }
             SlotPoll::Ready(Err(error)) => {
                 let now = Instant::now();
@@ -479,6 +448,46 @@ impl RiverGaugeState {
             }
             SlotPoll::Idle | SlotPoll::Pending => {}
         }
+    }
+
+    fn apply_tile_batch(&mut self, batch: TileBatch, now: Instant) {
+        // Cached tiles from an earlier refresh do not make an all-error batch
+        // successful. Advance freshness only when this batch actually landed
+        // at least one requested tile (an empty gauge list is still a valid
+        // successful tile response).
+        let successful_tiles = batch.tiles.len();
+        let error_count = batch.errors.len();
+        for (key, gauges) in batch.tiles {
+            self.failures.remove(&key);
+            self.tiles.insert(
+                key,
+                CachedTile {
+                    gauges,
+                    fetched_at: now,
+                    last_used_tick: self.tick,
+                },
+            );
+        }
+        for (key, _) in &batch.errors {
+            self.failures.insert(*key, now);
+        }
+        self.in_flight_tiles.clear();
+        self.force_refresh = false;
+        self.prune_tiles();
+        if successful_tiles > 0 {
+            self.last_success = Some(now);
+        }
+        self.status = if error_count == 0 {
+            format!("{} NWPS gauges cached", self.gauge_count())
+        } else if self.tiles.is_empty() {
+            format!("NWPS unavailable ({error_count} tile errors)")
+        } else {
+            format!(
+                "{} NWPS gauges cached; {error_count} tile{} unavailable",
+                self.gauge_count(),
+                if error_count == 1 { "" } else { "s" }
+            )
+        };
     }
 
     pub(crate) fn maybe_refresh(
@@ -1632,6 +1641,40 @@ mod tests {
         assert_eq!(time, Utc.with_ymd_and_hms(2026, 7, 21, 6, 0, 0).unwrap());
         assert_eq!(value, 16.5);
         assert_eq!(unit, "ft");
+    }
+
+    #[test]
+    fn failed_tile_batch_does_not_advance_success_freshness() {
+        let mut state = RiverGaugeState::default();
+        let previous_success = Instant::now() - Duration::from_secs(300);
+        state.last_success = Some(previous_success);
+
+        state.apply_tile_batch(
+            TileBatch {
+                tiles: Vec::new(),
+                errors: vec![(TileKey { x: 4, y: 3 }, "upstream unavailable".to_owned())],
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(state.last_success, Some(previous_success));
+        assert!(state.status.contains("unavailable"));
+    }
+
+    #[test]
+    fn successful_empty_tile_response_advances_success_freshness() {
+        let mut state = RiverGaugeState::default();
+        let completed_at = Instant::now();
+
+        state.apply_tile_batch(
+            TileBatch {
+                tiles: vec![(TileKey { x: 4, y: 3 }, Vec::new())],
+                errors: Vec::new(),
+            },
+            completed_at,
+        );
+
+        assert_eq!(state.last_success, Some(completed_at));
     }
 
     #[test]

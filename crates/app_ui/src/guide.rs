@@ -147,9 +147,15 @@ impl GuideSection {
 
     fn matches_search(self, query: &str) -> bool {
         let query = query.trim().to_ascii_lowercase();
-        query.is_empty()
-            || self.label().to_ascii_lowercase().contains(&query)
-            || self.search_terms().contains(&query)
+        if query.is_empty() {
+            return true;
+        }
+        let haystack = format!(
+            "{} {}",
+            self.label().to_ascii_lowercase(),
+            self.search_terms()
+        );
+        query.split_whitespace().all(|word| haystack.contains(word))
     }
 }
 
@@ -169,24 +175,28 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
         .min_size([600.0, 380.0])
         .resizable(true)
         .show(ctx, |ui| {
+            let mut has_search_match = true;
             egui::Panel::left("guide_nav")
                 .resizable(false)
                 .exact_size(190.0)
                 .show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let changed = ui
+                        let mut changed = ui
                             .add_sized(
                                 [158.0, 24.0],
-                                egui::TextEdit::singleline(&mut query).hint_text("🔎 Search guide"),
+                                egui::TextEdit::singleline(&mut query).hint_text("Search guide"),
                             )
                             .changed();
                         if ui.small_button("×").on_hover_text("Clear search").clicked() {
                             query.clear();
+                            changed = true;
                         }
-                        if changed
-                            && let Some(first_match) = GuideSection::ALL
-                                .into_iter()
-                                .find(|candidate| candidate.matches_search(&query))
+                        let first_match = GuideSection::ALL
+                            .into_iter()
+                            .find(|candidate| candidate.matches_search(&query));
+                        has_search_match = first_match.is_some();
+                        if (changed || !section.matches_search(&query))
+                            && let Some(first_match) = first_match
                         {
                             section = first_match;
                         }
@@ -208,6 +218,9 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
                                     section = candidate;
                                 }
                             }
+                            if !has_search_match {
+                                ui.weak("No sections match");
+                            }
                             ui.add_space(8.0);
                             ui.separator();
                             ui.label(
@@ -224,23 +237,28 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.add_space(2.0);
-                        match section {
-                            GuideSection::GettingStarted => getting_started(ui),
-                            GuideSection::Products => products(ui),
-                            GuideSection::Layers => layers(ui),
-                            GuideSection::ModelData => model_data(ui),
-                            GuideSection::Wrf => wrf(ui),
-                            GuideSection::Cm1 => cm1(ui),
-                            GuideSection::FormulaLab => formula_lab(ui),
-                            GuideSection::Satellite => satellite(ui),
-                            GuideSection::SimSat => simsat(ui),
-                            GuideSection::Archive => archive(ui),
-                            GuideSection::Player => unified_player(ui),
-                            GuideSection::Tools => tools(ui),
-                            GuideSection::Volume3d => volume_3d(ui),
-                            GuideSection::CaptureBrand => capture_brand(ui),
-                            GuideSection::Shortcuts => shortcuts(ui),
-                            GuideSection::Sources => sources(ui),
+                        if has_search_match {
+                            match section {
+                                GuideSection::GettingStarted => getting_started(ui),
+                                GuideSection::Products => products(ui),
+                                GuideSection::Layers => layers(ui),
+                                GuideSection::ModelData => model_data(ui),
+                                GuideSection::Wrf => wrf(ui),
+                                GuideSection::Cm1 => cm1(ui),
+                                GuideSection::FormulaLab => formula_lab(ui),
+                                GuideSection::Satellite => satellite(ui),
+                                GuideSection::SimSat => simsat(ui),
+                                GuideSection::Archive => archive(ui),
+                                GuideSection::Player => unified_player(ui),
+                                GuideSection::Tools => tools(ui),
+                                GuideSection::Volume3d => volume_3d(ui),
+                                GuideSection::CaptureBrand => capture_brand(ui),
+                                GuideSection::Shortcuts => shortcuts(ui),
+                                GuideSection::Sources => sources(ui),
+                            }
+                        } else {
+                            ui.heading("No guide sections match");
+                            ui.weak("Try fewer words or clear the search field.");
                         }
                         ui.add_space(10.0);
                     });
@@ -494,14 +512,13 @@ fn products(ui: &mut egui::Ui) {
          the beam only; flow across the beam is invisible.",
         "keep Unfold VEL on. Raw velocity folds at the Nyquist speed and a folded gate reads \
          as a fake opposite-direction couplet — the inspector warns on near-Nyquist gates. \
-         Two dealias engines: Region (default) unfolds each tilt from boundary evidence — \
-         fast and honest, but an isolated echo's absolute branch can be ambiguous. \
-         Analyst 3D (model-anchored) solves all velocity tilts of the volume jointly, adds \
+         Analyst v4 is the default: it solves all velocity tilts of the volume jointly, adds \
          the previous volume as a temporal prior, and — for US CONUS sites — anchors the \
          absolute branch to a RAP analysis wind profile fetched in the background; \
-         international sites run it without the model anchor. Slower than Region.",
+         international sites run it without the model anchor. Region remains available as a \
+         faster same-tilt fallback, and Region Global is the Py-ART-style same-tilt solver.",
         "Region: Jing & Wiener 1993 (JTECH 10); Feldmann et al. 2020, R2D2 \
-         (JTECH-D-20-0054.1); Helmus & Collis 2016 (Py-ART, JORS). Analyst 3D adds: \
+         (JTECH-D-20-0054.1); Helmus & Collis 2016 (Py-ART, JORS). Analyst v4 adds: \
          Eilts & Smith 1990 (JTECH 7, environmental wind constraints); James & Houze 2001 \
          (JTECH 18, 4DD sounding initialization); Louf et al. 2020 (JTECH 37, UNRAVEL \
          repair checks).",
@@ -3286,7 +3303,7 @@ fn sources(ui: &mut egui::Ui) {
          local store by the \
          rusty-weather stack (rw-ingest / rw-ui); the native skew-T is verified against \
          sharprs. RAP (13 km) 0-hour analysis wind profiles are fetched per site from the \
-         NOAA open-data mirror to anchor the Analyst 3D dealiaser (CONUS sites). \
+         NOAA open-data mirror to anchor the Analyst v4 dealiaser (CONUS sites). \
          GOES-16/18/19 ABI imagery from NOAA open-data buckets via rw-sat. Simulated satellite \
          imagery is rendered by FahrenheitResearch/simsat (MIT OR Apache-2.0) from WRF or \
          HRRR native-level fields; its seasonal ground layer uses NASA Blue Marble Next \
@@ -3378,7 +3395,7 @@ fn sources(ui: &mut egui::Ui) {
          Helmus & Collis 2016 (Py-ART, JORS) — region-based velocity dealiasing.",
         "Eilts & Smith 1990, JTECH 7, 118\u{2013}128 — environmental wind constraints; \
          James & Houze 2001, JTECH 18, 1674\u{2013}1683 — 4DD sounding initialization; \
-         Louf et al. 2020, JTECH 37 — UNRAVEL reference checks (the Analyst 3D \
+         Louf et al. 2020, JTECH 37 — UNRAVEL reference checks (the Analyst v4 \
          model-anchored dealiaser).",
         "Johnson et al. 1998, Wea. Forecasting 13, 263\u{2013}276 — SCIT storm tracking.",
         "Stumpf et al. 1998, Wea. Forecasting 13, 304\u{2013}326 — mesocyclone detection; \
@@ -3761,6 +3778,9 @@ mod tests {
         assert!(GuideSection::Satellite.matches_search("meteosat"));
         assert!(GuideSection::Wrf.matches_search("cuda"));
         assert!(GuideSection::Archive.matches_search("historical"));
+        assert!(GuideSection::Layers.matches_search("metar warning"));
+        assert!(GuideSection::ModelData.matches_search("sounding download"));
+        assert!(!GuideSection::Layers.matches_search("metar cuda"));
         assert!(!GuideSection::Shortcuts.matches_search("simulated radar"));
     }
 }

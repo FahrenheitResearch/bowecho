@@ -201,14 +201,37 @@ fn is_hideable_derived_product(product: &DisplayProduct) -> bool {
 pub(crate) fn is_product_visible_in_picker(
     product: &DisplayProduct,
     show_derived_products: bool,
+    favorite_labels: &[String],
 ) -> bool {
-    show_derived_products || !is_hideable_derived_product(product)
+    show_derived_products
+        || !is_hideable_derived_product(product)
+        || favorite_labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case(product.label()))
 }
 
-fn retain_picker_visible_products(products: &mut Vec<DisplayProduct>, show_derived_products: bool) {
+fn retain_picker_visible_products(
+    products: &mut Vec<DisplayProduct>,
+    show_derived_products: bool,
+    favorite_labels: &[String],
+) {
     if !show_derived_products {
-        products.retain(|product| !is_hideable_derived_product(product));
+        products.retain(|product| {
+            is_product_visible_in_picker(product, show_derived_products, favorite_labels)
+        });
     }
+}
+
+fn favorites_include_advanced_product(favorite_labels: &[String]) -> bool {
+    product_engine::DerivedSweepProduct::ALL
+        .iter()
+        .copied()
+        .filter_map(advanced_derived_display_product)
+        .any(|product| {
+            favorite_labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case(product.label()))
+        })
 }
 
 fn append_present_advanced_products(
@@ -284,10 +307,13 @@ pub(crate) fn global_displayable_products_for_picker(
     volume: &RadarVolume,
     include_advanced_placeholders: bool,
     show_derived_products: bool,
+    favorite_labels: &[String],
 ) -> Vec<DisplayProduct> {
+    let include_advanced_placeholders =
+        include_advanced_placeholders || favorites_include_advanced_product(favorite_labels);
     let mut products =
         global_displayable_products_with_advanced(volume, include_advanced_placeholders);
-    retain_picker_visible_products(&mut products, show_derived_products);
+    retain_picker_visible_products(&mut products, show_derived_products, favorite_labels);
     products.sort_by(|left, right| picker_product_rank(left).cmp(&picker_product_rank(right)));
     products
 }

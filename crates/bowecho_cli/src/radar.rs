@@ -17,8 +17,8 @@ use nexrad_io::{
 };
 use radar_core::{MomentGrid, MomentStorage, MomentType, RadarVolume, RadialStatus};
 use render2d::{
-    ColorTableFamily, ColorTableSet, ViewportMomentCache, ViewportRasterOptions,
-    composite_reflectivity_grid, dealias_skipped_no_nyquist, dealias_velocity_grid,
+    ColorTableFamily, ColorTableSet, V4VolumeSolution, ViewportMomentCache, ViewportRasterOptions,
+    composite_reflectivity_grid, dealias_skipped_no_nyquist, dealias_volume_v4,
     viewport_rgba_buffer_len,
 };
 use serde::{Deserialize, Serialize};
@@ -902,6 +902,12 @@ fn stage_volume_products(
     unavailable: &mut Vec<RadarUnavailableProduct>,
     failures: &mut Vec<FailureRecord>,
 ) {
+    // DVEL uses the same true whole-volume v4 solve as the desktop app. Build
+    // it once per source volume so rendering several cuts never repeats the
+    // expensive global solve.
+    let v4_solution = products
+        .contains(&ProductSpec::Dvel)
+        .then(|| dealias_volume_v4(&source.volume, None, None));
     for &product in products {
         if product == ProductSpec::Cref {
             match stage_composite_reflectivity(source, options, tables, staging_root) {
@@ -938,7 +944,15 @@ fn stage_volume_products(
             continue;
         }
         for cut_index in selected {
-            match stage_cut_product(source, product, cut_index, options, tables, staging_root) {
+            match stage_cut_product(
+                source,
+                product,
+                cut_index,
+                options,
+                tables,
+                staging_root,
+                v4_solution.as_ref(),
+            ) {
                 Ok(product) => staged.push(product),
                 Err(reason) => failures.push(FailureRecord {
                     stage: "radar-render".into(),
@@ -957,6 +971,7 @@ fn stage_cut_product(
     options: &RadarRenderOptions,
     tables: &ColorTableSet,
     staging_root: &Path,
+    v4_solution: Option<&V4VolumeSolution>,
 ) -> Result<StagedProduct, String> {
     let cut = source
         .volume
@@ -976,13 +991,14 @@ fn stage_cut_product(
     }
 
     let (cache, statistics, derivation, dealias_method) = if product == ProductSpec::Dvel {
-        let dealiased = dealias_velocity_grid(cut, source_grid);
+        let dealiased = v4_solution
+            .and_then(|solution| solution.tilt_grid(cut_index))
+            .cloned()
+            .ok_or_else(|| {
+                format!("whole-volume v4 returned no velocity grid for cut {cut_index}")
+            })?;
         let statistics = grid_statistics(&dealiased);
-        let method = if dealias_skipped_no_nyquist(cut, source_grid) {
-            "region-v4 pass-through (source has no usable Nyquist velocity)"
-        } else {
-            "BowEcho region-v4 velocity dealiasing"
-        };
+        let method = v4_dealias_method_label(dealias_skipped_no_nyquist(cut, source_grid));
         let cache = ViewportMomentCache::new_dealiased_velocity_from_grid_with_color_tables(
             &source.volume,
             cut_index,
@@ -1025,6 +1041,14 @@ fn stage_cut_product(
         options,
         staging_root,
     )
+}
+
+fn v4_dealias_method_label(pass_through: bool) -> &'static str {
+    if pass_through {
+        "whole-volume v4 pass-through (source has no usable Nyquist velocity; no temporal/model anchors)"
+    } else {
+        "BowEcho whole-volume v4 velocity dealiasing (no temporal/model anchors)"
+    }
 }
 
 fn stage_composite_reflectivity(
@@ -2343,6 +2367,68 @@ mod tests {
         );
         assert_eq!(ProductSpec::parse("cc").unwrap(), ProductSpec::Rho);
         assert_eq!(ProductSpec::parse("dbz").unwrap(), ProductSpec::Ref);
+    }
+
+    #[test]
+    fn dvel_receipt_names_the_true_whole_volume_v4_route() {
+        assert_eq!(
+            v4_dealias_method_label(false),
+            "BowEcho whole-volume v4 velocity dealiasing (no temporal/model anchors)"
+        );
+        assert_eq!(
+            v4_dealias_method_label(true),
+            "whole-volume v4 pass-through (source has no usable Nyquist velocity; no temporal/model anchors)"
+        );
+        assert!(!v4_dealias_method_label(false).contains("region-v4"));
+    }
+
+    #[test]
+    fn dvel_no_nyquist_route_passes_through_and_declares_no_anchors() {
+        let gate_range = radar_core::GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 1_000,
+            gate_count: 3,
+        };
+        let mut cut = radar_core::ElevationCut::new(0.5, Some(1));
+        cut.radials.push(radar_core::Radial {
+            azimuth_deg: 0.0,
+            elevation_deg: 0.5,
+            time_offset_ms: 0,
+            gate_range: gate_range.clone(),
+            nyquist_velocity_mps: None,
+            radial_status: None,
+        });
+        let mut velocity = MomentGrid::new_u8(
+            MomentType::Velocity,
+            gate_range,
+            1.0,
+            64.0,
+            Some(0),
+            Some(1),
+        );
+        velocity
+            .push_u8_row_slice(0, &[64, 72, 55])
+            .expect("velocity row");
+        cut.moments.insert(MomentType::Velocity, velocity);
+        let mut volume = RadarVolume::new(
+            radar_core::RadarSite::new("TEST"),
+            chrono::DateTime::<Utc>::UNIX_EPOCH,
+        );
+        volume.cuts.push(cut);
+
+        let source = volume.cuts[0]
+            .moments
+            .get(&MomentType::Velocity)
+            .expect("source velocity");
+        assert!(dealias_skipped_no_nyquist(&volume.cuts[0], source));
+        let solution = dealias_volume_v4(&volume, None, None);
+        let output = solution.tilt_grid(0).expect("pass-through v4 grid");
+        for gate in 0..3 {
+            assert_eq!(output.scaled_value(0, gate), source.scaled_value(0, gate));
+        }
+        let label = v4_dealias_method_label(true);
+        assert!(label.contains("pass-through"));
+        assert!(label.contains("no temporal/model anchors"));
     }
 
     #[test]

@@ -1920,23 +1920,32 @@ impl ViewerApp {
             let solid = matches!(style.dash, styles::DashPattern::Solid);
             let legit_px = hazard_bbox_segment_allowance_px(record.bbox, self.map_scale);
             let has_screen_jump = screen_polyline_has_jump(&points, true, rect, legit_px);
-            // A coastline-traced zone can carry thousands of vertices. Keep
-            // its exact, jump-aware outline, but reduce the fill-only copy to
-            // the tessellation budget so it remains visible without restoring
-            // the old O(n^2) zoom lag.
+            // A coastline-traced zone can carry thousands of vertices. Keep a
+            // larger detail budget for the jump-safe outline and a smaller
+            // budget for fill tessellation. Both budgets are family-wide, so
+            // dense scenes remain bounded across pan/zoom without an
+            // outline-only/fill-on threshold.
+            let outline_points = if has_screen_jump {
+                points.clone()
+            } else {
+                bounded_hazard_fill_points(&points, hazard_outline_vertex_limit(family_count))
+                    .unwrap_or_else(|| points.clone())
+            };
             // Alpha zero is a rendering disable, not merely transparent ink.
             // Avoid all tessellation/union work when there is nothing to
             // paint; this also makes the user-facing Fill=0 setting an actual
             // performance escape hatch.
             if fill_alpha > 0
                 && !has_screen_jump
-                && let Some(fill_points) =
-                    bounded_hazard_fill_points(&points, hazard_fill_vertex_limit(family_count))
+                && let Some(fill_points) = bounded_hazard_fill_points(
+                    &outline_points,
+                    hazard_fill_vertex_limit(family_count),
+                )
             {
                 // Fills are not pushed directly: same-family same-color fills
-                // are flattened after the loop so overlaps paint once
-                // (selection boosts alpha, giving the selected record its own
-                // color group — it still pops over the flattened layer).
+                // are flattened after the loop so overlaps paint once.
+                // Selection is shown by the boosted outline and deliberately
+                // stays in this family union instead of splitting its fill.
                 fill_candidates.push(HazardFillCandidate {
                     family: record.event_family.clone(),
                     fill,
@@ -1944,14 +1953,20 @@ impl ViewerApp {
                 });
             }
             if solid {
-                push_solid_closed_line(&mut out.outline_shapes, &points, stroke, rect, legit_px);
+                push_solid_closed_line(
+                    &mut out.outline_shapes,
+                    &outline_points,
+                    stroke,
+                    rect,
+                    legit_px,
+                );
             } else {
                 match style.dash {
                     styles::DashPattern::Solid => unreachable!("solid handled above"),
                     styles::DashPattern::Dashed { dash, gap } => {
                         push_dashed_closed_line(
                             &mut out.outline_shapes,
-                            &points,
+                            &outline_points,
                             stroke,
                             dash,
                             gap,
@@ -1963,7 +1978,7 @@ impl ViewerApp {
                         let dot = stroke.width.max(1.0);
                         push_dashed_closed_line(
                             &mut out.outline_shapes,
-                            &points,
+                            &outline_points,
                             stroke,
                             dot,
                             dot * 2.0,
