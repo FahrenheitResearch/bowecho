@@ -340,22 +340,133 @@ fn interp_profile_xs(prof: &[ProfileSample], z: f64, s: f64, policy: InterpPolic
     Some(last.v)
 }
 
-/// Per-output-gate column at ground range `s`, azimuth `az`: (height_m, dbz)
-/// pairs across all cuts, sorted ascending by height. Reused by all products.
-fn column_profile(cols: &[CutColumn<'_>], az: f32, s: f64) -> Vec<(f64, f32)> {
-    let mut prof: Vec<(f64, f32)> = cols
+const MISSING_GATE: u32 = u32::MAX;
+
+/// Lookup tables shared by the full-volume products.
+///
+/// Every product samples the same base-tilt ground ranges. Resolve those
+/// ranges into each cut once, then reuse the result for every azimuth row.
+/// Height order is also fixed for a `(cut, base gate)` pair, so it can be
+/// sorted once here instead of once per output cell.
+struct FullVolumeColumnWalk<'a> {
+    columns: Vec<CutColumn<'a>>,
+    gate_by_cut: Vec<Vec<u32>>,
+    cuts_by_height: Vec<u32>,
+    base_gate_count: usize,
+}
+
+impl<'a> FullVolumeColumnWalk<'a> {
+    fn new(columns: Vec<CutColumn<'a>>, base_ground_range_m: &[f64]) -> Self {
+        let base_gate_count = base_ground_range_m.len();
+        let gate_by_cut: Vec<Vec<u32>> = columns
+            .iter()
+            .map(|column| {
+                base_ground_range_m
+                    .iter()
+                    .map(|&range_m| {
+                        column
+                            .gate_for_ground_range(range_m)
+                            .map(|gate| {
+                                debug_assert!(gate < MISSING_GATE as usize);
+                                gate as u32
+                            })
+                            .unwrap_or(MISSING_GATE)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let cut_count = columns.len();
+        let mut cuts_by_height = vec![MISSING_GATE; base_gate_count * cut_count];
+        let mut order = Vec::with_capacity(cut_count);
+        for base_gate in 0..base_gate_count {
+            order.clear();
+            order.extend(
+                gate_by_cut
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, gates)| gates[base_gate] != MISSING_GATE)
+                    .map(|(cut, _)| cut as u32),
+            );
+            order.sort_by(|&a, &b| {
+                let a = a as usize;
+                let b = b as usize;
+                let a_gate = gate_by_cut[a][base_gate] as usize;
+                let b_gate = gate_by_cut[b][base_gate] as usize;
+                columns[a].height_m[a_gate].total_cmp(&columns[b].height_m[b_gate])
+            });
+            let start = base_gate * cut_count;
+            cuts_by_height[start..start + order.len()].copy_from_slice(&order);
+        }
+
+        Self {
+            columns,
+            gate_by_cut,
+            cuts_by_height,
+            base_gate_count,
+        }
+    }
+
+    fn rows_for_azimuth(&self, az: f32) -> Vec<usize> {
+        self.columns
+            .iter()
+            .map(|column| column.nearest_row(az))
+            .collect()
+    }
+
+    /// Fill a caller-owned scratch profile in exactly the same height order as
+    /// the former per-cell `column_profile` implementation.
+    fn fill_profile(
+        &self,
+        rows_for_azimuth: &[usize],
+        base_gate: usize,
+        profile: &mut Vec<(f64, f32)>,
+    ) {
+        debug_assert_eq!(rows_for_azimuth.len(), self.columns.len());
+        debug_assert!(base_gate < self.base_gate_count);
+        profile.clear();
+
+        let cut_count = self.columns.len();
+        let start = base_gate * cut_count;
+        for &cut in &self.cuts_by_height[start..start + cut_count] {
+            if cut == MISSING_GATE {
+                break;
+            }
+            let cut = cut as usize;
+            let gate = self.gate_by_cut[cut][base_gate] as usize;
+            let column = &self.columns[cut];
+            let Some(value) = column.grid.scaled_value(rows_for_azimuth[cut], gate) else {
+                continue;
+            };
+            if value.is_finite() {
+                profile.push((column.height_m[gate], value));
+            }
+        }
+    }
+
+    fn cut_count(&self) -> usize {
+        self.columns.len()
+    }
+}
+
+/// Retained reference implementation for bit-for-bit parity tests. Keep this
+/// independent of the precomputed lookup tables so the tests can catch lookup,
+/// row-hoisting, filtering, or ordering drift.
+#[cfg(test)]
+fn column_profile_reference(cols: &[CutColumn<'_>], az: f32, s: f64) -> Vec<(f64, f32)> {
+    let mut profile: Vec<(f64, f32)> = cols
         .iter()
-        .filter_map(|c| c.sample(az, s).map(|(dbz, h)| (h, dbz)))
+        .filter_map(|column| column.sample(az, s).map(|(dbz, height)| (height, dbz)))
         .collect();
-    prof.sort_by(|a, b| a.0.total_cmp(&b.0));
-    prof
+    profile.sort_by(|a, b| a.0.total_cmp(&b.0));
+    profile
 }
 
 /// Composite (column-max) reflectivity, on the base tilt geometry.
 pub fn composite_reflectivity_grid(volume: &RadarVolume) -> Option<MomentGrid> {
     let (base_idx, base_grid) = base_reflectivity_cut(volume)?;
     let base = CutColumn::new(volume, base_idx, base_grid)?;
-    let cols = reflectivity_columns(volume);
+    let walk = FullVolumeColumnWalk::new(reflectivity_columns(volume), &base.ground_range_m);
     let rows = base_grid.radial_indices.len();
     let gates = base_grid.gate_range.gate_count;
     let mut out = vec![f32::NAN; rows * gates];
@@ -368,10 +479,12 @@ pub fn composite_reflectivity_grid(volume: &RadarVolume) -> Option<MomentGrid> {
             if !az.is_finite() {
                 return;
             }
+            let rows_for_azimuth = walk.rows_for_azimuth(az);
+            let mut profile = Vec::with_capacity(walk.cut_count());
             for (gate, cell) in out_row.iter_mut().enumerate() {
-                let s = base.ground_range_m[gate];
+                walk.fill_profile(&rows_for_azimuth, gate, &mut profile);
                 let mut max_dbz = f32::NEG_INFINITY;
-                for (_, dbz) in column_profile(&cols, az, s) {
+                for &(_, dbz) in &profile {
                     if dbz > max_dbz {
                         max_dbz = dbz;
                     }
@@ -388,7 +501,7 @@ pub fn composite_reflectivity_grid(volume: &RadarVolume) -> Option<MomentGrid> {
 pub fn echo_top_grid(volume: &RadarVolume, threshold_dbz: f32) -> Option<MomentGrid> {
     let (base_idx, base_grid) = base_reflectivity_cut(volume)?;
     let base = CutColumn::new(volume, base_idx, base_grid)?;
-    let cols = reflectivity_columns(volume);
+    let walk = FullVolumeColumnWalk::new(reflectivity_columns(volume), &base.ground_range_m);
     let rows = base_grid.radial_indices.len();
     let gates = base_grid.gate_range.gate_count;
     let mut out = vec![f32::NAN; rows * gates];
@@ -400,11 +513,12 @@ pub fn echo_top_grid(volume: &RadarVolume, threshold_dbz: f32) -> Option<MomentG
             if !az.is_finite() {
                 return;
             }
+            let rows_for_azimuth = walk.rows_for_azimuth(az);
+            let mut profile = Vec::with_capacity(walk.cut_count());
             for (gate, cell) in out_row.iter_mut().enumerate() {
-                let s = base.ground_range_m[gate];
-                let prof = column_profile(&cols, az, s);
+                walk.fill_profile(&rows_for_azimuth, gate, &mut profile);
                 // highest height whose dbz >= threshold
-                let top = prof
+                let top = profile
                     .iter()
                     .filter(|(_, dbz)| *dbz >= threshold_dbz)
                     .map(|(h, _)| *h)
@@ -429,7 +543,7 @@ fn dbz_to_z(dbz: f32) -> f64 {
 pub fn vil_grid(volume: &RadarVolume) -> Option<MomentGrid> {
     let (base_idx, base_grid) = base_reflectivity_cut(volume)?;
     let base = CutColumn::new(volume, base_idx, base_grid)?;
-    let cols = reflectivity_columns(volume);
+    let walk = FullVolumeColumnWalk::new(reflectivity_columns(volume), &base.ground_range_m);
     let rows = base_grid.radial_indices.len();
     let gates = base_grid.gate_range.gate_count;
     let mut out = vec![f32::NAN; rows * gates];
@@ -443,21 +557,22 @@ pub fn vil_grid(volume: &RadarVolume) -> Option<MomentGrid> {
             if !az.is_finite() {
                 return;
             }
+            let rows_for_azimuth = walk.rows_for_azimuth(az);
+            let mut profile = Vec::with_capacity(walk.cut_count());
             for (gate, cell) in out_row.iter_mut().enumerate() {
-                let s = base.ground_range_m[gate];
-                let prof = column_profile(&cols, az, s);
-                if prof.is_empty() {
+                walk.fill_profile(&rows_for_azimuth, gate, &mut profile);
+                if profile.is_empty() {
                     continue;
                 }
                 let mut vil = 0.0f64;
                 // Surface layer: the lowest beam represents the column down to the
                 // ground (operational convention; Greene & Clark 1972, Witt 1998),
                 // so a single deep tilt still contributes rather than reporting 0.
-                let (h0, z0) = prof[0];
+                let (h0, z0) = profile[0];
                 if h0 > 0.0 {
                     vil += vil_inc(dbz_to_z(z0.min(VIL_HAIL_CAP_DBZ)), h0);
                 }
-                for w in prof.windows(2) {
+                for w in profile.windows(2) {
                     let (ha, za) = w[0];
                     let (hb, zb) = w[1];
                     let dh = (hb - ha).max(0.0);
@@ -532,7 +647,7 @@ pub fn hail_grids(
 ) -> Option<HailGrids> {
     let (base_idx, base_grid) = base_reflectivity_cut(volume)?;
     let base = CutColumn::new(volume, base_idx, base_grid)?;
-    let cols = reflectivity_columns(volume);
+    let walk = FullVolumeColumnWalk::new(reflectivity_columns(volume), &base.ground_range_m);
     let rows = base_grid.radial_indices.len();
     let gates = base_grid.gate_range.gate_count;
     let mut shi_out = vec![f32::NAN; rows * gates];
@@ -563,14 +678,15 @@ pub fn hail_grids(
             if !az.is_finite() {
                 return;
             }
+            let rows_for_azimuth = walk.rows_for_azimuth(az);
+            let mut profile = Vec::with_capacity(walk.cut_count());
             for gate in 0..gates {
-                let s = base.ground_range_m[gate];
-                let prof = column_profile(&cols, az, s);
-                if prof.len() < 2 {
+                walk.fill_profile(&rows_for_azimuth, gate, &mut profile);
+                if profile.len() < 2 {
                     continue;
                 }
                 let mut shi = 0.0f64;
-                for w in prof.windows(2) {
+                for w in profile.windows(2) {
                     let (ha, za) = w[0];
                     let (hb, zb) = w[1];
                     let dh = (hb - ha).max(0.0);
@@ -664,7 +780,7 @@ pub fn mehs_grid(
 ) -> Option<MomentGrid> {
     let (base_idx, base_grid) = base_reflectivity_cut(volume)?;
     let base = CutColumn::new(volume, base_idx, base_grid)?;
-    let cols = reflectivity_columns(volume);
+    let walk = FullVolumeColumnWalk::new(reflectivity_columns(volume), &base.ground_range_m);
     let rows = base_grid.radial_indices.len();
     let gates = base_grid.gate_range.gate_count;
     let mut out = vec![f32::NAN; rows * gates];
@@ -689,14 +805,15 @@ pub fn mehs_grid(
             if !az.is_finite() {
                 return;
             }
+            let rows_for_azimuth = walk.rows_for_azimuth(az);
+            let mut profile = Vec::with_capacity(walk.cut_count());
             for (gate, cell) in out_row.iter_mut().enumerate() {
-                let s = base.ground_range_m[gate];
-                let prof = column_profile(&cols, az, s);
-                if prof.len() < 2 {
+                walk.fill_profile(&rows_for_azimuth, gate, &mut profile);
+                if profile.len() < 2 {
                     continue;
                 }
                 let mut shi = 0.0f64;
-                for w in prof.windows(2) {
+                for w in profile.windows(2) {
                     let (ha, za) = w[0];
                     let (hb, zb) = w[1];
                     let dh = (hb - ha).max(0.0);
@@ -1214,6 +1331,426 @@ mod tests {
             cuts,
             ..Default::default()
         }
+    }
+
+    fn cut_with_irregular_ref(
+        elev: f32,
+        azimuths: &[f32],
+        gate_range: GateRange,
+        seed: usize,
+    ) -> ElevationCut {
+        let mut cut = ElevationCut::new(elev, None);
+        for &azimuth_deg in azimuths {
+            cut.radials.push(Radial {
+                azimuth_deg,
+                elevation_deg: elev,
+                time_offset_ms: 0,
+                gate_range: gate_range.clone(),
+                nyquist_velocity_mps: None,
+                radial_status: None,
+            });
+        }
+
+        let mut values = Vec::with_capacity(azimuths.len() * gate_range.gate_count);
+        for row in 0..azimuths.len() {
+            for gate in 0..gate_range.gate_count {
+                if (row * 11 + gate * 7 + seed).is_multiple_of(23) {
+                    values.push(f32::NAN);
+                } else {
+                    values.push(
+                        34.0 + elev * 1.1
+                            + (row % 4) as f32 * 3.75
+                            + (gate % 6) as f32 * 2.25
+                            + seed as f32 * 0.125,
+                    );
+                }
+            }
+        }
+
+        let grid = MomentGrid {
+            moment: MomentType::Reflectivity,
+            gate_range,
+            scale: 1.0,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: (0..azimuths.len()).collect(),
+            storage: MomentStorage::F32(values),
+        };
+        cut.moments.insert(MomentType::Reflectivity, grid);
+        cut
+    }
+
+    fn irregular_reflectivity_volume() -> RadarVolume {
+        // Deliberately unsorted elevations, unequal gate geometries, irregular
+        // azimuth spacing, wrap-around azimuths, and sparse NaNs exercise every
+        // lookup and filtering branch in the optimized walk.
+        volume_with(vec![
+            cut_with_irregular_ref(
+                6.0,
+                &[4.0, 63.0, 126.0, 189.0, 251.0, 316.0],
+                GateRange {
+                    first_gate_m: 1_700,
+                    gate_spacing_m: 1_250,
+                    gate_count: 14,
+                },
+                1,
+            ),
+            cut_with_irregular_ref(
+                0.4,
+                &[358.0, 31.0, 83.0, 147.0, 212.0, 274.0, 327.0],
+                GateRange {
+                    first_gate_m: 250,
+                    gate_spacing_m: 1_000,
+                    gate_count: 20,
+                },
+                2,
+            ),
+            cut_with_irregular_ref(
+                12.0,
+                &[9.0, 78.0, 154.0, 225.0, 301.0, 344.0],
+                GateRange {
+                    first_gate_m: 3_500,
+                    gate_spacing_m: 1_600,
+                    gate_count: 9,
+                },
+                3,
+            ),
+            cut_with_irregular_ref(
+                2.0,
+                &[1.0, 42.0, 101.0, 166.0, 233.0, 289.0, 338.0],
+                GateRange {
+                    first_gate_m: 800,
+                    gate_spacing_m: 700,
+                    gate_count: 25,
+                },
+                4,
+            ),
+        ])
+    }
+
+    fn assert_f32_grid_bits_eq(label: &str, actual: &MomentGrid, expected: &[f32]) {
+        let MomentStorage::F32(actual) = &actual.storage else {
+            panic!("{label} did not use F32 storage");
+        };
+        assert_eq!(actual.len(), expected.len(), "{label} length");
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "{label} differs at cell {index}: actual={actual:?}, expected={expected:?}"
+            );
+        }
+    }
+
+    struct ReferenceProducts {
+        composite: Vec<f32>,
+        echo_top: Vec<f32>,
+        echo_top_45: Vec<f32>,
+        vil: Vec<f32>,
+        shi: Vec<f32>,
+        mesh: Vec<f32>,
+        posh: Vec<f32>,
+        mehs: Vec<f32>,
+    }
+
+    fn reference_products(
+        volume: &RadarVolume,
+        freezing_level_m: f32,
+        minus20c_level_m: f32,
+        calibration: MeshCalibration,
+    ) -> ReferenceProducts {
+        let (base_idx, base_grid) = base_reflectivity_cut(volume).expect("base reflectivity");
+        let base = CutColumn::new(volume, base_idx, base_grid).expect("base column");
+        let columns = reflectivity_columns(volume);
+        let rows = base_grid.radial_indices.len();
+        let gates = base_grid.gate_range.gate_count;
+        let len = rows * gates;
+        let mut products = ReferenceProducts {
+            composite: vec![f32::NAN; len],
+            echo_top: vec![f32::NAN; len],
+            echo_top_45: vec![f32::NAN; len],
+            vil: vec![f32::NAN; len],
+            shi: vec![f32::NAN; len],
+            mesh: vec![f32::NAN; len],
+            posh: vec![f32::NAN; len],
+            mehs: vec![f32::NAN; len],
+        };
+        let row_azimuths = base.row_azimuths(rows);
+        let h0 = freezing_level_m.max(0.0) as f64;
+        let hm20 = minus20c_level_m.max(freezing_level_m + 1.0) as f64;
+        let wt_thresh = (57.5 * h0 / 1000.0 - 121.0).max(20.0);
+        let vil_inc = |z_lin: f64, dh: f64| 3.44e-6 * z_lin.powf(4.0 / 7.0) * dh;
+        let ke_flux = |dbz: f64| -> f64 {
+            let weight = ((dbz - 40.0) / 10.0).clamp(0.0, 1.0);
+            if weight <= 0.0 {
+                0.0
+            } else {
+                5.0e-6 * 10f64.powf(0.084 * dbz) * weight
+            }
+        };
+        let thermal_weight = |height: f64| ((height - h0) / (hm20 - h0)).clamp(0.0, 1.0);
+
+        for (row, &azimuth) in row_azimuths.iter().enumerate() {
+            if !azimuth.is_finite() {
+                continue;
+            }
+            for gate in 0..gates {
+                let index = row * gates + gate;
+                let profile =
+                    column_profile_reference(&columns, azimuth, base.ground_range_m[gate]);
+
+                let max_dbz = profile
+                    .iter()
+                    .map(|(_, dbz)| *dbz)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if max_dbz.is_finite() {
+                    products.composite[index] = max_dbz;
+                }
+
+                for (threshold, output) in [
+                    (ECHO_TOP_THRESHOLD_DBZ, &mut products.echo_top),
+                    (45.0, &mut products.echo_top_45),
+                ] {
+                    let top = profile
+                        .iter()
+                        .filter(|(_, dbz)| *dbz >= threshold)
+                        .map(|(height, _)| *height)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    if top.is_finite() {
+                        output[index] = top as f32;
+                    }
+                }
+
+                if let Some(&(lowest_height, lowest_dbz)) = profile.first() {
+                    let mut vil = 0.0f64;
+                    if lowest_height > 0.0 {
+                        vil += vil_inc(dbz_to_z(lowest_dbz.min(VIL_HAIL_CAP_DBZ)), lowest_height);
+                    }
+                    for pair in profile.windows(2) {
+                        let (height_a, dbz_a) = pair[0];
+                        let (height_b, dbz_b) = pair[1];
+                        let depth = (height_b - height_a).max(0.0);
+                        let z_a = dbz_to_z(dbz_a.min(VIL_HAIL_CAP_DBZ));
+                        let z_b = dbz_to_z(dbz_b.min(VIL_HAIL_CAP_DBZ));
+                        vil += vil_inc(0.5 * (z_a + z_b), depth);
+                    }
+                    if vil > 0.0 {
+                        products.vil[index] = vil as f32;
+                    }
+                }
+
+                if profile.len() >= 2 {
+                    let mut shi = 0.0f64;
+                    for pair in profile.windows(2) {
+                        let (height_a, dbz_a) = pair[0];
+                        let (height_b, dbz_b) = pair[1];
+                        let depth = (height_b - height_a).max(0.0);
+                        if height_b <= h0 || depth <= 0.0 {
+                            continue;
+                        }
+                        let mid_height = 0.5 * (height_a + height_b);
+                        let mid_energy = 0.5 * (ke_flux(dbz_a as f64) + ke_flux(dbz_b as f64));
+                        shi += thermal_weight(mid_height) * mid_energy * depth;
+                    }
+                    shi *= 0.1;
+                    if shi > 1.0 {
+                        products.shi[index] = shi as f32;
+                        products.mesh[index] = calibration.mesh_mm(shi) as f32;
+                        products.mehs[index] = (2.54 * shi.sqrt()) as f32;
+                        let posh = (29.0 * (shi / wt_thresh).ln() + 50.0).clamp(0.0, 100.0);
+                        if posh > 0.0 {
+                            products.posh[index] = posh as f32;
+                        }
+                    }
+                }
+            }
+        }
+        products
+    }
+
+    fn reference_vil_density(vil: &[f32], echo_top: &[f32]) -> Vec<f32> {
+        vil.iter()
+            .zip(echo_top)
+            .map(|(&vil, &height)| {
+                if vil.is_finite() && height.is_finite() && height > 1_500.0 {
+                    1000.0 * vil / height
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect()
+    }
+
+    fn reference_poh(echo_top_45: &[f32], freezing_level_m: f32) -> Vec<f32> {
+        const TABLE: [(f64, f64); 11] = [
+            (1.65, 0.0),
+            (1.80, 10.0),
+            (1.97, 20.0),
+            (2.17, 30.0),
+            (2.40, 40.0),
+            (2.70, 50.0),
+            (3.07, 60.0),
+            (3.55, 70.0),
+            (4.20, 80.0),
+            (5.00, 90.0),
+            (5.80, 100.0),
+        ];
+        let h0_km = freezing_level_m.max(0.0) as f64 / 1000.0;
+        echo_top_45
+            .iter()
+            .map(|&top_m| {
+                if !top_m.is_finite() {
+                    return f32::NAN;
+                }
+                let delta_km = top_m as f64 / 1000.0 - h0_km;
+                if delta_km <= TABLE[0].0 {
+                    return f32::NAN;
+                }
+                let poh = if delta_km >= TABLE[10].0 {
+                    100.0
+                } else {
+                    TABLE
+                        .windows(2)
+                        .find_map(|pair| {
+                            let (delta_0, probability_0) = pair[0];
+                            let (delta_1, probability_1) = pair[1];
+                            (delta_km >= delta_0 && delta_km <= delta_1).then(|| {
+                                probability_0
+                                    + (probability_1 - probability_0) * (delta_km - delta_0)
+                                        / (delta_1 - delta_0)
+                            })
+                        })
+                        .unwrap_or(0.0)
+                };
+                if poh > 0.0 { poh as f32 } else { f32::NAN }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn optimized_column_walk_matches_reference_lookups_and_profiles() {
+        let volume = irregular_reflectivity_volume();
+        let (base_idx, base_grid) = base_reflectivity_cut(&volume).expect("base reflectivity");
+        let base = CutColumn::new(&volume, base_idx, base_grid).expect("base column");
+        let walk = FullVolumeColumnWalk::new(reflectivity_columns(&volume), &base.ground_range_m);
+        let row_azimuths = base.row_azimuths(base_grid.radial_indices.len());
+        assert!(
+            walk.gate_by_cut
+                .iter()
+                .flatten()
+                .any(|&gate| gate == MISSING_GATE),
+            "fixture must exercise missing near/far gate mappings"
+        );
+        assert!(
+            walk.gate_by_cut
+                .iter()
+                .flatten()
+                .any(|&gate| gate != MISSING_GATE),
+            "fixture must exercise present gate mappings"
+        );
+
+        for (cut_index, column) in walk.columns.iter().enumerate() {
+            for (base_gate, &range_m) in base.ground_range_m.iter().enumerate() {
+                let expected = column
+                    .gate_for_ground_range(range_m)
+                    .map(|gate| gate as u32)
+                    .unwrap_or(MISSING_GATE);
+                assert_eq!(
+                    walk.gate_by_cut[cut_index][base_gate], expected,
+                    "gate map differs for cut {cut_index}, base gate {base_gate}"
+                );
+            }
+        }
+
+        for &azimuth in &row_azimuths {
+            let rows_for_azimuth = walk.rows_for_azimuth(azimuth);
+            let expected_rows: Vec<_> = walk
+                .columns
+                .iter()
+                .map(|column| column.nearest_row(azimuth))
+                .collect();
+            assert_eq!(rows_for_azimuth, expected_rows);
+
+            let mut optimized = Vec::with_capacity(walk.cut_count());
+            for (base_gate, &range_m) in base.ground_range_m.iter().enumerate() {
+                walk.fill_profile(&rows_for_azimuth, base_gate, &mut optimized);
+                let reference = column_profile_reference(&walk.columns, azimuth, range_m);
+                assert_eq!(
+                    optimized.len(),
+                    reference.len(),
+                    "profile length differs at azimuth {azimuth}, base gate {base_gate}"
+                );
+                for (sample, expected) in optimized.iter().zip(&reference) {
+                    assert_eq!(sample.0.to_bits(), expected.0.to_bits());
+                    assert_eq!(sample.1.to_bits(), expected.1.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_full_volume_products_are_bit_identical_to_reference() {
+        let volume = irregular_reflectivity_volume();
+        let freezing_level_m = 500.0;
+        let minus20c_level_m = 2_500.0;
+        let calibration = MeshCalibration::MurilloHomeyer2019P75;
+        let reference =
+            reference_products(&volume, freezing_level_m, minus20c_level_m, calibration);
+        for (label, values) in [
+            ("composite", &reference.composite),
+            ("echo top", &reference.echo_top),
+            ("echo top 45", &reference.echo_top_45),
+            ("VIL", &reference.vil),
+            ("SHI", &reference.shi),
+            ("MESH", &reference.mesh),
+            ("POSH", &reference.posh),
+            ("MEHS", &reference.mehs),
+        ] {
+            assert!(
+                values.iter().any(|value| value.is_finite()),
+                "fixture must exercise finite {label} output"
+            );
+        }
+
+        assert_f32_grid_bits_eq(
+            "composite",
+            &composite_reflectivity_grid(&volume).expect("composite"),
+            &reference.composite,
+        );
+        assert_f32_grid_bits_eq(
+            "echo top",
+            &echo_top_grid(&volume, ECHO_TOP_THRESHOLD_DBZ).expect("echo top"),
+            &reference.echo_top,
+        );
+        assert_f32_grid_bits_eq(
+            "echo top 45",
+            &echo_top_grid(&volume, 45.0).expect("echo top 45"),
+            &reference.echo_top_45,
+        );
+        assert_f32_grid_bits_eq("VIL", &vil_grid(&volume).expect("VIL"), &reference.vil);
+
+        let hail = hail_grids(&volume, freezing_level_m, minus20c_level_m, calibration)
+            .expect("hail grids");
+        assert_f32_grid_bits_eq("SHI", &hail.shi, &reference.shi);
+        assert_f32_grid_bits_eq("MESH", &hail.mesh_mm, &reference.mesh);
+        assert_f32_grid_bits_eq("POSH", &hail.posh_pct, &reference.posh);
+        assert_f32_grid_bits_eq(
+            "MEHS",
+            &mehs_grid(&volume, freezing_level_m, minus20c_level_m).expect("MEHS"),
+            &reference.mehs,
+        );
+
+        assert_f32_grid_bits_eq(
+            "VIL density",
+            &vil_density_grid(&volume).expect("VIL density"),
+            &reference_vil_density(&reference.vil, &reference.echo_top),
+        );
+        assert_f32_grid_bits_eq(
+            "POH",
+            &poh_grid(&volume, freezing_level_m).expect("POH"),
+            &reference_poh(&reference.echo_top_45, freezing_level_m),
+        );
     }
 
     #[test]

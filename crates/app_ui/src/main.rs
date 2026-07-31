@@ -177,13 +177,16 @@ use hazard_geom::hazard_polygon_contains_point;
 use hazard_geom::hazard_record_is_pds_watch;
 use hazard_geom::hazard_record_should_latch_attention;
 use hazard_geom::hazard_record_style_threat;
+use hazard_geom::hazard_record_style_threat_with_pds;
 use hazard_geom::hazard_style_key_known;
 use hazard_geom::hazard_style_keys;
 use hazard_geom::hazard_style_label;
 use hazard_geom::hazard_style_resolved_polygon;
 use hazard_geom::hazard_visible_label_anchor;
 use hazard_geom::hazard_watch_base_type;
+#[cfg(test)]
 use hazard_geom::hazard_watch_filter_key;
+use hazard_geom::hazard_watch_filter_key_with_pds;
 use hazard_geom::is_convex_screen_polygon;
 use hazard_geom::load_event_loop_hazard_overlay_with_preview;
 use hazard_geom::load_hazard_overlay_from_path;
@@ -3241,6 +3244,12 @@ struct ViewerApp {
     /// Bumped on every hazard_overlay assignment — exact invalidation for the
     /// hazard shape cache (content proxies like record counts can alias).
     hazard_overlay_generation: u64,
+    /// Content-only warning metadata, built lazily from the final installed
+    /// (already deduplicated) overlay. The generation is the same exact
+    /// invalidation token used by the shape cache, so renderability/PDS scans
+    /// never run on every repaint and cannot survive an overlay replacement.
+    hazard_record_metadata_cache:
+        std::cell::RefCell<Option<(u64, Arc<[HazardRecordRenderMetadata]>)>>,
     // Multi-pane grid: layout + the extra synchronized panes (pane 0 is the
     // primary view's own state above).
     grid_layout: PanelLayout,
@@ -9616,6 +9625,7 @@ impl ViewerApp {
             pinned_inspector_lonlat: None,
             pinned_obs_chart_station: None,
             hazard_overlay_generation: 0,
+            hazard_record_metadata_cache: std::cell::RefCell::new(None),
             grid_layout: restored_grid_layout,
             extra_panes: Vec::new(),
             simradar_comparison: None,
@@ -10086,6 +10096,7 @@ impl ViewerApp {
     fn reload_warning_source(&mut self, ctx: &egui::Context) {
         self.hazard_receiver = None;
         self.hazard_overlay = None;
+        self.invalidate_hazard_record_metadata_cache();
         self.completed_live_hazard_overlay = None;
         self.selected_hazard_index = None;
         self.unacknowledged_hazard_event_ids.clear();
@@ -12787,6 +12798,7 @@ impl ViewerApp {
             return;
         }
         let frame_ms = self.screen_loop_frame_ms();
+        let frame_dwell = Duration::from_millis(frame_ms);
         if !self.primary_screen_loop_texture_ready() {
             // Do not let time spent decoding/rendering count against this
             // frame's on-screen dwell. The current selection stays put until
@@ -12797,19 +12809,26 @@ impl ViewerApp {
         }
 
         let now = Instant::now();
-        match self.primary.cursor.last_step {
-            None => self.primary.cursor.last_step = Some(now),
-            Some(last_step) if last_step.elapsed() >= Duration::from_millis(frame_ms) => {
-                self.advance_primary_screen_loop(ctx);
-                // The newly selected step gets its own complete dwell after
-                // its matching texture is ready.
-                self.primary.cursor.last_step = None;
-                ctx.request_repaint_after(Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS));
-                return;
+        let elapsed = match self.primary.cursor.last_step {
+            None => {
+                self.primary.cursor.last_step = Some(now);
+                Duration::ZERO
             }
-            Some(_) => {}
+            Some(last_step) => now.saturating_duration_since(last_step),
+        };
+        if elapsed >= frame_dwell {
+            self.advance_primary_screen_loop(ctx);
+            // The newly selected step gets its own complete dwell after
+            // its matching texture is ready.
+            self.primary.cursor.last_step = None;
+            ctx.request_repaint_after(Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS));
+            return;
         }
-        ctx.request_repaint_after(Duration::from_millis(loop_repaint_poll_ms(frame_ms)));
+        ctx.request_repaint_after(loop_dwell_repaint_delay(
+            frame_dwell,
+            elapsed,
+            self.smooth_camera_follow_playback_active(),
+        ));
     }
 
     fn maybe_advance_extra_pane_history_loops(&mut self, ctx: &egui::Context) {
@@ -12818,6 +12837,8 @@ impl ViewerApp {
         let mut steps = Vec::new();
         let mut waiting_for_render = false;
         let mut any_playing = false;
+        let mut minimum_ready_remaining = None;
+        let frame_dwell = Duration::from_millis(frame_ms);
 
         for slot in 0..self.extra_panes.len() {
             if !self.extra_panes[slot].engine.cursor.playing
@@ -12831,12 +12852,18 @@ impl ViewerApp {
                 waiting_for_render = true;
                 continue;
             }
-            match self.extra_panes[slot].engine.cursor.last_step {
-                None => self.extra_panes[slot].engine.cursor.last_step = Some(now),
-                Some(last_step) if last_step.elapsed() >= Duration::from_millis(frame_ms) => {
-                    steps.push(slot);
+            let elapsed = match self.extra_panes[slot].engine.cursor.last_step {
+                None => {
+                    self.extra_panes[slot].engine.cursor.last_step = Some(now);
+                    Duration::ZERO
                 }
-                Some(_) => {}
+                Some(last_step) => now.saturating_duration_since(last_step),
+            };
+            if elapsed >= frame_dwell {
+                steps.push(slot);
+            } else {
+                let remaining = frame_dwell.saturating_sub(elapsed);
+                minimum_ready_remaining = minimum_repaint_delay(minimum_ready_remaining, remaining);
             }
         }
 
@@ -12848,12 +12875,19 @@ impl ViewerApp {
         }
 
         if any_playing {
-            let poll_ms = if waiting_for_render || !steps.is_empty() {
-                LOOP_RENDER_WAIT_POLL_MS
-            } else {
-                loop_repaint_poll_ms(frame_ms)
+            if waiting_for_render || !steps.is_empty() {
+                minimum_ready_remaining = minimum_repaint_delay(
+                    minimum_ready_remaining,
+                    Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS),
+                );
+            }
+            let Some(next_repaint) = minimum_ready_remaining else {
+                return;
             };
-            ctx.request_repaint_after(Duration::from_millis(poll_ms));
+            ctx.request_repaint_after(loop_repaint_delay(
+                next_repaint,
+                self.smooth_camera_follow_playback_active(),
+            ));
         }
     }
 
@@ -14522,6 +14556,7 @@ impl ViewerApp {
                             self.hazard_overlay_generation =
                                 self.hazard_overlay_generation.wrapping_add(1);
                         }
+                        self.invalidate_hazard_record_metadata_cache();
                         self.hazard_overlay = Some(overlay);
                         return true;
                     }
@@ -14557,6 +14592,7 @@ impl ViewerApp {
                     selected_event_id.as_deref(),
                 );
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
+                self.invalidate_hazard_record_metadata_cache();
                 self.hazard_overlay = Some(overlay);
                 true
             }
@@ -14578,6 +14614,7 @@ impl ViewerApp {
                 }
                 self.hazard_status = err;
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
+                self.invalidate_hazard_record_metadata_cache();
                 self.hazard_overlay = None;
                 self.pending_event_loop_hazard_window = None;
                 self.selected_hazard_index = None;
@@ -15087,6 +15124,11 @@ impl ViewerApp {
     /// Product hotkeys (customizable in config.json). Routes to the focused
     /// pane, like the arrow keys.
     fn handle_product_hotkeys(&mut self, ctx: &egui::Context) -> bool {
+        if !ctx.input(|input| {
+            configured_product_hotkey_pressed(input, &self.app_settings.product_hotkeys)
+        }) {
+            return false;
+        }
         let focused_slot = self.focused_extra_pane();
         let Some(volume) = focused_slot
             .and_then(|slot| {
@@ -15098,30 +15140,32 @@ impl ViewerApp {
         else {
             return false;
         };
-        for (name, label) in self.app_settings.product_hotkeys.clone() {
-            let Some(key) = product_hotkey_egui_key(&name) else {
-                continue;
-            };
-            let Some(product) = self
-                .displayable_products_for_picker(volume.as_ref())
-                .into_iter()
-                .find(|product| product.label().eq_ignore_ascii_case(&label))
-            else {
-                continue;
-            };
-            if !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
-                continue;
-            }
-            match focused_slot {
-                Some(slot) => {
-                    return self.switch_pane_product(slot, product);
+        let products = self.displayable_products_for_picker(volume.as_ref());
+        let matched = self
+            .app_settings
+            .product_hotkeys
+            .iter()
+            .find_map(|(name, label)| {
+                let key = product_hotkey_egui_key(name)?;
+                if !ctx.input(|input| unconsumed_product_hotkey_press(input, key)) {
+                    return None;
                 }
-                None => {
-                    return self.switch_primary_product(product);
-                }
-            }
+                products
+                    .iter()
+                    .find(|product| product.label().eq_ignore_ascii_case(label))
+                    .cloned()
+                    .map(|product| (key, product))
+            });
+        let Some((key, product)) = matched else {
+            return false;
+        };
+        if !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
+            return false;
         }
-        false
+        match focused_slot {
+            Some(slot) => self.switch_pane_product(slot, product),
+            None => self.switch_primary_product(product),
+        }
     }
 
     /// The extra-pane slot the sidebar/keyboard edits, when an extra pane is
@@ -30144,7 +30188,8 @@ impl ViewerApp {
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_radar_layer_renders(ui.ctx(), rect);
         self.request_texture_render(ui.ctx(), rect);
-        self.draw_hazard_fills(painter, rect);
+        let hazard_shapes = self.hazard_overlay_shapes_for_draw(rect);
+        self.draw_hazard_fills(painter, hazard_shapes.as_deref());
         self.draw_radar_overlay_layers(ui.ctx(), painter, rect);
         // Max-value swath trail, beneath the live frame so the current echo
         // draws over "where the storm has been".
@@ -30153,7 +30198,7 @@ impl ViewerApp {
         let overlay_start = Instant::now();
         self.draw_basemap_overlay(painter, rect);
         self.draw_tor_tracks(painter, rect);
-        self.draw_hazard_overlays(painter, rect);
+        self.draw_hazard_overlays(painter, rect, hazard_shapes.as_deref());
         self.draw_tropical(painter, rect);
         self.draw_gbvtd(painter, rect);
         self.draw_rotation_markers(painter, rect);
@@ -30915,6 +30960,7 @@ impl ViewerApp {
                 .pane_product_cut(cell_index)
                 .unwrap_or_else(|| (self.selected_product.clone(), self.selected_cut));
             let cell_painter = ui.painter_at(cell);
+            let hazard_shapes = self.hazard_overlay_shapes_for_draw(cell);
             self.draw_basemap(&cell_painter, cell);
             self.draw_spc_outlooks(&cell_painter, cell);
             self.draw_upper_air_layer(&cell_painter, cell);
@@ -30924,17 +30970,17 @@ impl ViewerApp {
             if cell_index == 0 {
                 self.request_radar_layer_renders(&ctx, cell);
                 self.request_texture_render(&ctx, cell);
-                self.draw_hazard_fills(&cell_painter, cell);
+                self.draw_hazard_fills(&cell_painter, hazard_shapes.as_deref());
                 self.draw_radar_overlay_layers(&ctx, &cell_painter, cell);
                 self.draw_radar_layer(&ctx, &cell_painter, cell);
             } else {
                 self.request_pane_render(&ctx, cell, cell_index);
-                self.draw_hazard_fills(&cell_painter, cell);
+                self.draw_hazard_fills(&cell_painter, hazard_shapes.as_deref());
                 self.draw_extra_pane_layer(&ctx, &cell_painter, cell, cell_index);
             }
             self.draw_basemap_overlay(&cell_painter, cell);
             self.draw_tor_tracks(&cell_painter, cell);
-            self.draw_hazard_overlays(&cell_painter, cell);
+            self.draw_hazard_overlays(&cell_painter, cell, hazard_shapes.as_deref());
             self.draw_tropical(&cell_painter, cell);
             self.draw_gbvtd(&cell_painter, cell);
             self.draw_rotation_markers(&cell_painter, cell);
@@ -42179,6 +42225,16 @@ struct HazardOverlayShapes {
     labels: Vec<(egui::Pos2, String, bool, usize)>,
 }
 
+/// Per-record facts that depend only on installed warning content. Keeping
+/// these outside `HazardRecord` avoids cache-field merge hazards while letting
+/// every pane and list reuse the expensive geometry/PDS classification work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HazardRecordRenderMetadata {
+    renderable: bool,
+    pds_watch: bool,
+    watch_filter_key: &'static str,
+}
+
 #[derive(Clone, Debug)]
 struct CrossSectionReadout {
     product: DisplayProduct,
@@ -47768,6 +47824,64 @@ fn normalized_history_limit(limit: usize) -> usize {
 
 fn loop_repaint_poll_ms(frame_ms: u64) -> u64 {
     frame_ms.clamp(1, MAX_LOOP_REPAINT_POLL_MS)
+}
+
+fn loop_repaint_delay(remaining_dwell: Duration, smooth_camera_follow: bool) -> Duration {
+    if smooth_camera_follow {
+        remaining_dwell.min(Duration::from_millis(MAX_LOOP_REPAINT_POLL_MS))
+    } else {
+        remaining_dwell
+    }
+}
+
+fn minimum_repaint_delay(current: Option<Duration>, candidate: Duration) -> Option<Duration> {
+    Some(current.map_or(candidate, |current| current.min(candidate)))
+}
+
+fn loop_dwell_repaint_delay(
+    frame_dwell: Duration,
+    elapsed: Duration,
+    smooth_camera_follow: bool,
+) -> Duration {
+    loop_repaint_delay(frame_dwell.saturating_sub(elapsed), smooth_camera_follow)
+}
+
+fn unconsumed_product_hotkey_press(input: &egui::InputState, key: egui::Key) -> bool {
+    input.events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                key: event_key,
+                modifiers,
+                pressed: true,
+                ..
+            } if *event_key == key && modifiers.matches_logically(egui::Modifiers::NONE)
+        )
+    })
+}
+
+fn configured_product_hotkey_pressed(
+    input: &egui::InputState,
+    hotkeys: &BTreeMap<String, String>,
+) -> bool {
+    // Most frames have no key event at all. Check that allocation-free case
+    // before normalizing any configurable key names.
+    if !input.events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                modifiers,
+                pressed: true,
+                ..
+            } if modifiers.matches_logically(egui::Modifiers::NONE)
+        )
+    }) {
+        return false;
+    }
+    hotkeys
+        .keys()
+        .filter_map(|name| product_hotkey_egui_key(name))
+        .any(|key| unconsumed_product_hotkey_press(input, key))
 }
 
 fn extend_time_range(range: &mut Option<(DateTime<Utc>, DateTime<Utc>)>, time: DateTime<Utc>) {
@@ -59596,6 +59710,88 @@ mod tests {
     }
 
     #[test]
+    fn loop_repaint_delay_uses_exact_remaining_dwell_without_camera_follow() {
+        let dwell = Duration::from_millis(HISTORY_LOOP_FRAME_MS);
+
+        assert_eq!(
+            loop_dwell_repaint_delay(dwell, Duration::from_millis(123), false),
+            Duration::from_millis(HISTORY_LOOP_FRAME_MS - 123)
+        );
+        assert_eq!(
+            loop_dwell_repaint_delay(dwell, dwell + Duration::from_millis(1), false),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn smooth_camera_follow_caps_repaint_delay_without_oversleeping_dwell() {
+        assert_eq!(
+            loop_repaint_delay(Duration::from_millis(500), true),
+            Duration::from_millis(MAX_LOOP_REPAINT_POLL_MS)
+        );
+        assert_eq!(
+            loop_repaint_delay(Duration::from_millis(5), true),
+            Duration::from_millis(5)
+        );
+    }
+
+    #[test]
+    fn extra_loop_repaint_uses_earliest_ready_pane_or_render_wait() {
+        let remaining = minimum_repaint_delay(None, Duration::from_millis(420));
+        let remaining = minimum_repaint_delay(remaining, Duration::from_millis(37));
+        assert_eq!(remaining, Some(Duration::from_millis(37)));
+
+        let with_render_wait =
+            minimum_repaint_delay(remaining, Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS));
+        assert_eq!(
+            with_render_wait,
+            Some(Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS))
+        );
+
+        let pane_due_before_render_poll = minimum_repaint_delay(
+            Some(Duration::from_millis(3)),
+            Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS),
+        );
+        assert_eq!(pane_due_before_render_poll, Some(Duration::from_millis(3)));
+    }
+
+    #[test]
+    fn product_hotkey_guard_is_non_consuming_and_ignores_unconfigured_keys() {
+        let hotkeys = BTreeMap::from([("1".to_owned(), "REF".to_owned())]);
+        let key_event = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        let configured_ctx = egui::Context::default();
+        let configured_input = egui::RawInput {
+            events: vec![key_event(egui::Key::Num1)],
+            ..Default::default()
+        };
+        let _ = configured_ctx.run_ui(configured_input, |ui| {
+            assert!(ui.input(|input| configured_product_hotkey_pressed(input, &hotkeys)));
+            assert!(
+                ui.input_mut(|input| { input.consume_key(egui::Modifiers::NONE, egui::Key::Num1) })
+            );
+        });
+
+        let unconfigured_ctx = egui::Context::default();
+        let unconfigured_input = egui::RawInput {
+            events: vec![key_event(egui::Key::Num2)],
+            ..Default::default()
+        };
+        let _ = unconfigured_ctx.run_ui(unconfigured_input, |ui| {
+            assert!(!ui.input(|input| configured_product_hotkey_pressed(input, &hotkeys)));
+            assert!(
+                ui.input_mut(|input| { input.consume_key(egui::Modifiers::NONE, egui::Key::Num2) })
+            );
+        });
+    }
+
+    #[test]
     fn nearest_sat_frame_uses_selected_family_and_run_date() {
         let runs = vec![
             test_sat_run("g19", "conus_c13_20260616", &[1200, 1205]),
@@ -70250,6 +70446,7 @@ mod tests {
             pinned_inspector_lonlat: None,
             pinned_obs_chart_station: None,
             hazard_overlay_generation: 0,
+            hazard_record_metadata_cache: std::cell::RefCell::new(None),
             grid_layout: PanelLayout::One,
             extra_panes: Vec::new(),
             simradar_comparison: None,

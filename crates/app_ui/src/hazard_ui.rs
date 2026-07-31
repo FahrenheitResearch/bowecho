@@ -240,6 +240,7 @@ impl ViewerApp {
             }
             if fixed_action_button(ui, "Clear", 52.0).clicked() {
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
+                self.invalidate_hazard_record_metadata_cache();
                 self.hazard_overlay = None;
                 self.completed_live_hazard_overlay = None;
                 self.selected_hazard_index = None;
@@ -259,6 +260,7 @@ impl ViewerApp {
             true,
             |app, ui| {
                 let rows = app.visible_hazard_list_rows();
+                let record_metadata = app.cached_hazard_record_metadata();
                 let total = app
                     .hazard_overlay
                     .as_ref()
@@ -396,7 +398,17 @@ impl ViewerApp {
                                             app.style_registry
                                                 .hazard_polygon(
                                                     &record.event_family,
-                                                    hazard_record_style_threat(record),
+                                                    record_metadata
+                                                        .get(row.index)
+                                                        .map(|metadata| {
+                                                            hazard_record_style_threat_with_pds(
+                                                                record,
+                                                                metadata.pds_watch,
+                                                            )
+                                                        })
+                                                        .unwrap_or_else(|| {
+                                                            hazard_record_style_threat(record)
+                                                        }),
                                                 )
                                                 .stroke_color,
                                         )
@@ -930,15 +942,20 @@ impl ViewerApp {
         let Some(overlay) = &self.hazard_overlay else {
             return Vec::new();
         };
+        let metadata = self.cached_hazard_record_metadata();
+        let frame_time = self.hazard_overlay_timeline_time();
         let filter = HazardListFilter::from_key(&self.app_settings.current_alert_filter);
         let mut rows = overlay
             .records
             .iter()
             .enumerate()
-            .filter(|(_, record)| {
-                self.hazard_record_visible(record)
-                    && (hazard_points_renderable(&record.points)
-                        || meteoalarm::is_meteoalarm_record(record))
+            .filter(|(index, record)| {
+                let record_metadata = metadata[*index];
+                self.hazard_record_visible_at_timeline_time_with_metadata(
+                    record,
+                    frame_time,
+                    record_metadata,
+                ) && (record_metadata.renderable || meteoalarm::is_meteoalarm_record(record))
             })
             .filter(|(_, record)| filter.matches_record(record))
             .map(|(index, record)| self.hazard_list_row(index, record))
@@ -968,14 +985,17 @@ impl ViewerApp {
         let Some(overlay) = &self.hazard_overlay else {
             return Vec::new();
         };
+        let metadata = self.cached_hazard_record_metadata();
         let mut rows = overlay
             .records
             .iter()
             .enumerate()
-            .filter(|(_, record)| {
+            .filter(|(index, record)| {
                 self.unacknowledged_hazard_event_ids
                     .contains(&record.event_id)
-                    && hazard_record_should_latch_attention(record)
+                    && metadata[*index].renderable
+                    && hazard_record_is_active_or_pending(record)
+                    && record.event_family != "local storm report"
             })
             .map(|(index, record)| self.hazard_list_row(index, record))
             .collect::<Vec<_>>();
@@ -998,11 +1018,18 @@ impl ViewerApp {
     }
 
     pub(crate) fn focus_hazard_record(&mut self, index: usize, ctx: &egui::Context) -> bool {
+        let metadata = self.cached_hazard_record_metadata();
+        let record_metadata = metadata.get(index).copied();
+        let frame_time = self.hazard_overlay_timeline_time();
         if let Some(record) = self
             .hazard_overlay
             .as_ref()
             .and_then(|overlay| overlay.records.get(index))
-            && self.hazard_record_visible(record)
+            && record_metadata.is_some_and(|metadata| {
+                self.hazard_record_visible_at_timeline_time_with_metadata(
+                    record, frame_time, metadata,
+                )
+            })
             && meteoalarm::is_meteoalarm_record(record)
         {
             let label = record.label.clone();
@@ -1016,8 +1043,14 @@ impl ViewerApp {
             .as_ref()
             .and_then(|overlay| overlay.records.get(index))
             .and_then(|record| {
-                (self.hazard_record_visible(record) && hazard_points_renderable(&record.points))
-                    .then(|| (record.bbox, record.label.clone()))
+                record_metadata
+                    .filter(|metadata| {
+                        metadata.renderable
+                            && self.hazard_record_visible_at_timeline_time_with_metadata(
+                                record, frame_time, *metadata,
+                            )
+                    })
+                    .map(|_| (record.bbox, record.label.clone()))
             })
         else {
             return false;
@@ -1148,19 +1181,30 @@ impl ViewerApp {
         let anchor_geo = popup.anchor;
         let wanted_ids = popup.event_ids.clone();
         let mut cards = Vec::<(usize, String, HazardRecord, styles::PolygonStyle)>::new();
+        let metadata = self.cached_hazard_record_metadata();
+        let frame_time = self.hazard_overlay_timeline_time();
         if let Some(overlay) = &self.hazard_overlay {
             for wanted_id in &wanted_ids {
                 if let Some((index, record)) =
-                    overlay.records.iter().enumerate().find(|(_, record)| {
+                    overlay.records.iter().enumerate().find(|(index, record)| {
+                        let record_metadata = metadata[*index];
                         base_hazard_event_id(&record.event_id) == wanted_id
                             && record.event_family != "mesoscale discussion"
-                            && self.hazard_record_visible(record)
-                            && hazard_points_renderable(&record.points)
+                            && self.hazard_record_visible_at_timeline_time_with_metadata(
+                                record,
+                                frame_time,
+                                record_metadata,
+                            )
+                            && record_metadata.renderable
                     })
                 {
+                    let record_metadata = metadata[index];
                     let style = self
                         .style_registry
-                        .hazard_polygon(&record.event_family, hazard_record_style_threat(record))
+                        .hazard_polygon(
+                            &record.event_family,
+                            hazard_record_style_threat_with_pds(record, record_metadata.pds_watch),
+                        )
                         .clone();
                     cards.push((index, wanted_id.clone(), record.clone(), style));
                 }
@@ -1454,13 +1498,22 @@ impl ViewerApp {
         let Some(overlay) = &self.hazard_overlay else {
             return;
         };
+        let metadata = self.cached_hazard_record_metadata();
+        let frame_time = self.hazard_overlay_timeline_time();
         let visible_ids = overlay
             .records
             .iter()
-            .filter(|record| {
-                self.hazard_record_visible(record) && hazard_points_renderable(&record.points)
+            .enumerate()
+            .filter(|(index, record)| {
+                let record_metadata = metadata[*index];
+                record_metadata.renderable
+                    && self.hazard_record_visible_at_timeline_time_with_metadata(
+                        record,
+                        frame_time,
+                        record_metadata,
+                    )
             })
-            .map(|record| record.event_id.clone())
+            .map(|(_, record)| record.event_id.clone())
             .collect::<Vec<_>>();
         for event_id in visible_ids {
             self.unacknowledged_hazard_event_ids.remove(&event_id);
@@ -1477,6 +1530,45 @@ impl ViewerApp {
         self.hazard_record_visible_at_timeline_time(record, self.hazard_overlay_timeline_time())
     }
 
+    fn cached_hazard_record_metadata(&self) -> Arc<[HazardRecordRenderMetadata]> {
+        let generation = self.hazard_overlay_generation;
+        if let Some(metadata) = self
+            .hazard_record_metadata_cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached_generation, _)| *cached_generation == generation)
+            .map(|(_, metadata)| Arc::clone(metadata))
+        {
+            return metadata;
+        }
+
+        let metadata = self
+            .hazard_overlay
+            .as_ref()
+            .map(|overlay| {
+                overlay
+                    .records
+                    .iter()
+                    .map(|record| {
+                        let pds_watch = hazard_record_is_pds_watch(record);
+                        HazardRecordRenderMetadata {
+                            renderable: hazard_points_renderable(&record.points),
+                            pds_watch,
+                            watch_filter_key: hazard_watch_filter_key_with_pds(record, pds_watch),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let metadata = Arc::<[HazardRecordRenderMetadata]>::from(metadata);
+        *self.hazard_record_metadata_cache.borrow_mut() = Some((generation, Arc::clone(&metadata)));
+        metadata
+    }
+
+    pub(crate) fn invalidate_hazard_record_metadata_cache(&self) {
+        self.hazard_record_metadata_cache.borrow_mut().take();
+    }
+
     fn hazard_overlay_timeline_time(&self) -> Option<DateTime<Utc>> {
         self.event_loop_hazard_window
             .is_some()
@@ -1489,7 +1581,27 @@ impl ViewerApp {
         record: &HazardRecord,
         frame_time: Option<DateTime<Utc>>,
     ) -> bool {
-        let pds_watch_visible_through_parent = hazard_record_is_pds_watch(record)
+        let pds_watch = hazard_record_is_pds_watch(record);
+        self.hazard_record_visible_at_timeline_time_with_metadata(
+            record,
+            frame_time,
+            HazardRecordRenderMetadata {
+                // Visibility itself is independent from polygon validity; the
+                // indexed paint/list paths consult the cached value separately.
+                renderable: false,
+                pds_watch,
+                watch_filter_key: hazard_watch_filter_key_with_pds(record, pds_watch),
+            },
+        )
+    }
+
+    fn hazard_record_visible_at_timeline_time_with_metadata(
+        &self,
+        record: &HazardRecord,
+        frame_time: Option<DateTime<Utc>>,
+        metadata: HazardRecordRenderMetadata,
+    ) -> bool {
+        let pds_watch_visible_through_parent = metadata.pds_watch
             && !self
                 .app_settings
                 .hidden_hazard_watch_types
@@ -1505,7 +1617,7 @@ impl ViewerApp {
                 .app_settings
                 .hidden_hazard_watch_types
                 .iter()
-                .any(|hidden| hidden.eq_ignore_ascii_case(hazard_watch_filter_key(record)))
+                .any(|hidden| hidden.eq_ignore_ascii_case(metadata.watch_filter_key))
         {
             return false;
         }
@@ -1534,9 +1646,15 @@ impl ViewerApp {
         let Some(overlay) = &self.hazard_overlay else {
             return hasher.finish();
         };
+        let metadata = self.cached_hazard_record_metadata();
         for (index, record) in overlay.records.iter().enumerate() {
-            if self.hazard_record_visible_at_timeline_time(record, frame_time)
-                && hazard_points_renderable(&record.points)
+            let record_metadata = metadata[index];
+            if record_metadata.renderable
+                && self.hazard_record_visible_at_timeline_time_with_metadata(
+                    record,
+                    frame_time,
+                    record_metadata,
+                )
             {
                 index.hash(&mut hasher);
                 record.event_id.hash(&mut hasher);
@@ -1566,6 +1684,8 @@ impl ViewerApp {
         let Some(overlay) = self.hazard_overlay.as_ref() else {
             return Vec::new();
         };
+        let metadata = self.cached_hazard_record_metadata();
+        let frame_time = self.hazard_overlay_timeline_time();
         let (lon, lat) = self.screen_to_lon_lat(rect, position);
         let point = HazardPoint { lon, lat };
         let mut containing = Vec::<(usize, f32, String)>::new();
@@ -1573,7 +1693,14 @@ impl ViewerApp {
         let mut best_label = None::<(usize, f32, f32, u8)>;
         let mut seen_exact = BTreeSet::<String>::new();
         for (index, record) in overlay.records.iter().enumerate() {
-            if !self.hazard_record_visible(record) || !hazard_points_renderable(&record.points) {
+            let record_metadata = metadata[index];
+            if !record_metadata.renderable
+                || !self.hazard_record_visible_at_timeline_time_with_metadata(
+                    record,
+                    frame_time,
+                    record_metadata,
+                )
+            {
                 continue;
             }
             let screen_area = self.hazard_screen_area(rect, &record.points);
@@ -1689,25 +1816,40 @@ impl ViewerApp {
         best_distance_sq.sqrt()
     }
 
-    pub(crate) fn draw_hazard_fills(&self, painter: &egui::Painter, rect: egui::Rect) {
+    /// Resolve warning geometry once at the start of a pane's paint pass. The
+    /// returned Arc is then shared by the below-radar fills and above-radar
+    /// outlines/labels without a second visibility-signature/cache lookup.
+    pub(crate) fn hazard_overlay_shapes_for_draw(
+        &self,
+        rect: egui::Rect,
+    ) -> Option<Arc<HazardOverlayShapes>> {
         if !self.hazards_visible {
-            return;
+            return None;
         }
-        if self.hazard_overlay.is_none() {
+        self.hazard_overlay.as_ref()?;
+        Some(self.cached_hazard_overlay_shapes(rect))
+    }
+
+    pub(crate) fn draw_hazard_fills(
+        &self,
+        painter: &egui::Painter,
+        built: Option<&HazardOverlayShapes>,
+    ) {
+        let Some(built) = built else {
             return;
-        }
-        let built = self.cached_hazard_overlay_shapes(rect);
+        };
         painter.extend(built.fill_shapes.iter().cloned());
     }
 
-    pub(crate) fn draw_hazard_overlays(&self, painter: &egui::Painter, rect: egui::Rect) {
-        if !self.hazards_visible {
+    pub(crate) fn draw_hazard_overlays(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        built: Option<&HazardOverlayShapes>,
+    ) {
+        let Some(built) = built else {
             return;
-        }
-        if self.hazard_overlay.is_none() {
-            return;
-        }
-        let built = self.cached_hazard_overlay_shapes(rect);
+        };
         painter.extend(built.outline_shapes.iter().cloned());
         self.draw_unacknowledged_hazard_flashes(painter, rect);
         if !self.app_settings.show_hazard_labels {
@@ -1773,12 +1915,19 @@ impl ViewerApp {
         };
         let stroke = egui::Stroke::new(if blink_on { 4.5_f32 } else { 2.75_f32 }, color);
         let bounds = self.visible_geo_bounds(rect).expand(0.05);
-        for record in &overlay.records {
+        let metadata = self.cached_hazard_record_metadata();
+        let frame_time = self.hazard_overlay_timeline_time();
+        for (index, record) in overlay.records.iter().enumerate() {
+            let record_metadata = metadata[index];
             if !self
                 .unacknowledged_hazard_event_ids
                 .contains(&record.event_id)
-                || !self.hazard_record_visible(record)
-                || !hazard_points_renderable(&record.points)
+                || !record_metadata.renderable
+                || !self.hazard_record_visible_at_timeline_time_with_metadata(
+                    record,
+                    frame_time,
+                    record_metadata,
+                )
                 || !bounds.intersects_bbox(record.bbox)
             {
                 continue;
@@ -1844,11 +1993,17 @@ impl ViewerApp {
         let Some(overlay) = &self.hazard_overlay else {
             return out;
         };
+        let metadata = self.cached_hazard_record_metadata();
         let bounds = self.visible_geo_bounds(rect).expand(0.05);
         let mut visible_family_counts = HashMap::<&str, usize>::new();
-        for record in &overlay.records {
-            if self.hazard_record_visible_at_timeline_time(record, frame_time)
-                && hazard_points_renderable(&record.points)
+        for (index, record) in overlay.records.iter().enumerate() {
+            let record_metadata = metadata[index];
+            if record_metadata.renderable
+                && self.hazard_record_visible_at_timeline_time_with_metadata(
+                    record,
+                    frame_time,
+                    record_metadata,
+                )
                 && bounds.intersects_bbox(record.bbox)
             {
                 *visible_family_counts
@@ -1866,8 +2021,13 @@ impl ViewerApp {
         let mut labeled_events = BTreeSet::<String>::new();
         let mut fill_candidates = Vec::<HazardFillCandidate>::new();
         for (index, record) in overlay.records.iter().enumerate() {
-            if !self.hazard_record_visible_at_timeline_time(record, frame_time)
-                || !hazard_points_renderable(&record.points)
+            let record_metadata = metadata[index];
+            if !record_metadata.renderable
+                || !self.hazard_record_visible_at_timeline_time_with_metadata(
+                    record,
+                    frame_time,
+                    record_metadata,
+                )
                 || !bounds.intersects_bbox(record.bbox)
             {
                 continue;
@@ -1885,9 +2045,10 @@ impl ViewerApp {
                 .get(record.event_family.as_str())
                 .copied()
                 .unwrap_or(1);
-            let style = self
-                .style_registry
-                .hazard_polygon(&record.event_family, hazard_record_style_threat(record));
+            let style = self.style_registry.hazard_polygon(
+                &record.event_family,
+                hazard_record_style_threat_with_pds(record, record_metadata.pds_watch),
+            );
             let global = self.style_registry.hazard_global();
             let color = style_color32(style.stroke_color);
             let base_alpha = style.fill_alpha.unwrap_or(global.fill_alpha);
@@ -2589,6 +2750,49 @@ mod tests {
             .hidden_hazard_watch_types
             .push("pds".to_owned());
         assert!(!app.hazard_record_visible(&app.hazard_overlay.as_ref().unwrap().records[0]));
+    }
+
+    #[test]
+    fn installed_hazard_metadata_reuses_and_invalidates_on_overlay_generation() {
+        let mut pds = popup_test_record("KOUN.TO.A.0504", "watch", -1.0, -1.0, 1.0, 1.0);
+        pds.details = vec!["THIS IS A PARTICULARLY DANGEROUS SITUATION".to_owned()];
+        let mut app = crate::tests::test_viewer_app_with_hazards(vec![pds]);
+
+        let first = app.cached_hazard_record_metadata();
+        let reused = app.cached_hazard_record_metadata();
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert!(first[0].renderable);
+        assert!(first[0].pds_watch);
+        assert_eq!(first[0].watch_filter_key, "pds");
+
+        let record = &mut app.hazard_overlay.as_mut().unwrap().records[0];
+        record.details.clear();
+        record.points.truncate(2);
+        app.hazard_overlay_generation = app.hazard_overlay_generation.wrapping_add(1);
+
+        let refreshed = app.cached_hazard_record_metadata();
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert!(!refreshed[0].renderable);
+        assert!(!refreshed[0].pds_watch);
+        assert_eq!(refreshed[0].watch_filter_key, "tornado");
+    }
+
+    #[test]
+    fn pane_draw_preparation_reuses_one_shape_arc_and_honors_visibility_gate() {
+        let warning = popup_test_record("KOUN.TO.W.0504", "tornado", -101.0, 34.0, -100.0, 35.0);
+        let mut app = crate::tests::test_viewer_app_with_hazards(vec![warning]);
+        app.hazards_active_only = false;
+        app.map_center_lon = -100.5;
+        app.map_center_lat = 34.5;
+        app.map_scale = 360.0;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let prepared = app.hazard_overlay_shapes_for_draw(rect).unwrap();
+        let same_pane_cache_entry = app.cached_hazard_overlay_shapes(rect);
+        assert!(Arc::ptr_eq(&prepared, &same_pane_cache_entry));
+
+        app.hazards_visible = false;
+        assert!(app.hazard_overlay_shapes_for_draw(rect).is_none());
     }
 
     #[test]

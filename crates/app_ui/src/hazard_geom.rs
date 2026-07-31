@@ -2704,6 +2704,16 @@ pub(crate) fn hazard_style_resolved_polygon(
 }
 
 pub(crate) fn hazard_record_style_threat(record: &HazardRecord) -> Option<&str> {
+    hazard_record_style_threat_with_pds(record, hazard_record_is_pds_watch(record))
+}
+
+/// Variant for callers that already classified the installed record. This is
+/// deliberately passed a content-derived flag rather than storing cache state
+/// on `HazardRecord`, whose values are merged during alert deduplication.
+pub(crate) fn hazard_record_style_threat_with_pds(
+    record: &HazardRecord,
+    pds_watch: bool,
+) -> Option<&str> {
     if record.event_family != "watch" {
         // Keep IBW escalations (PDS / emergency) authoritative. Ordinary
         // observed TORs get their own independently customizable border.
@@ -2720,7 +2730,7 @@ pub(crate) fn hazard_record_style_threat(record: &HazardRecord) -> Option<&str> 
         }
         return None;
     }
-    if hazard_record_is_pds_watch(record) {
+    if pds_watch {
         return Some("pds");
     }
     hazard_watch_base_type(record).or(record.damage_threat.as_deref())
@@ -2768,11 +2778,19 @@ pub(crate) fn hazard_record_is_pds_watch(record: &HazardRecord) -> bool {
 
 /// Alerts-tab watch subtype. PDS is intentionally a distinct bucket rather
 /// than double-counting as TOR/SVR, so each chip has unambiguous behavior.
+#[cfg(test)]
 pub(crate) fn hazard_watch_filter_key(record: &HazardRecord) -> &'static str {
+    hazard_watch_filter_key_with_pds(record, hazard_record_is_pds_watch(record))
+}
+
+pub(crate) fn hazard_watch_filter_key_with_pds(
+    record: &HazardRecord,
+    pds_watch: bool,
+) -> &'static str {
     if record.event_family != "watch" {
         return "other";
     }
-    if hazard_record_is_pds_watch(record) {
+    if pds_watch {
         return "pds";
     }
     match hazard_watch_base_type(record) {
