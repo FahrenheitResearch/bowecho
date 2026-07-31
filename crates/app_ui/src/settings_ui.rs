@@ -1836,6 +1836,26 @@ impl ViewerApp {
         );
 
         ui.separator();
+        ui.strong("Screenshots");
+        if ui
+            .checkbox(
+                &mut self.app_settings.save_still_screenshots_to_disk,
+                "Also save still screenshots to disk",
+            )
+            .on_hover_text(format!(
+                "Still screenshots always copy to the clipboard. When enabled, BowEcho also writes a PNG to Pictures/{}.",
+                edited.output_folder_name()
+            ))
+            .changed()
+        {
+            self.mark_app_settings_dirty();
+        }
+        ui.weak(format!(
+            "Clipboard copy is always on. Optional PNG folder: Pictures/{}.",
+            edited.output_folder_name()
+        ));
+
+        ui.separator();
         ui.strong("Social sharing");
         changed |= ui
             .checkbox(&mut edited.sharing.watermark_enabled, "Watermark exports")

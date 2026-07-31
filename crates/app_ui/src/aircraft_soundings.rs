@@ -25,6 +25,7 @@ const MAX_GZIP_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
 const FILE_LOOKBACK_HOURS: i64 = 6;
 const CACHE_KEEP_FILES: usize = 12;
+const MAX_RECENT_PROFILES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AircraftProfile {
@@ -64,6 +65,14 @@ pub struct AircraftSnapshot {
     pub profiles: Vec<AircraftProfile>,
     pub file_hour: DateTime<Utc>,
     pub file_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AircraftHistorySnapshot {
+    pub profiles: Vec<AircraftProfile>,
+    pub newest_hour: DateTime<Utc>,
+    pub oldest_hour: DateTime<Utc>,
+    pub files_loaded: usize,
 }
 
 #[derive(Debug)]
@@ -150,6 +159,106 @@ pub fn fetch_latest(cache_dir: &Path, now: DateTime<Utc>) -> Result<AircraftSnap
             .cloned()
             .unwrap_or_else(|| "no candidates".to_owned())
     ))
+}
+
+/// Fetch and merge the bounded public history window on explicit user
+/// request. This is deliberately separate from [`fetch_latest`]: opening the
+/// live map layer stays one-file cheap, while the history browser may read up
+/// to six hourly files on its own worker. Duplicate rolling-file records are
+/// collapsed by airport, valid time, and ascent/descent identity.
+pub fn fetch_recent_history(
+    cache_dir: &Path,
+    now: DateTime<Utc>,
+) -> Result<AircraftHistorySnapshot, String> {
+    fs::create_dir_all(cache_dir)
+        .map_err(|error| format!("create MADIS aircraft cache: {error}"))?;
+    let newest_hour = rounded_hour(now)?;
+    let mut oldest_hour = newest_hour;
+    let mut files_loaded = 0usize;
+    let mut profiles = Vec::new();
+    let mut failures = Vec::new();
+    for offset in 0..FILE_LOOKBACK_HOURS {
+        let candidate = newest_hour - Duration::hours(offset);
+        match fetch_hour_profiles(cache_dir, candidate) {
+            Ok(hour_profiles) if !hour_profiles.is_empty() => {
+                oldest_hour = candidate;
+                files_loaded += 1;
+                profiles.extend(hour_profiles);
+            }
+            Ok(_) => failures.push(format!(
+                "{}: no profiles passed MADIS QC",
+                candidate.format("%Y%m%d_%H00.gz")
+            )),
+            Err(error) => failures.push(error),
+        }
+    }
+    let profiles = normalize_recent_profiles(profiles);
+    if profiles.is_empty() {
+        return Err(format!(
+            "no usable public MADIS aircraft-profile history: {}",
+            failures
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "no candidates".to_owned())
+        ));
+    }
+    prune_cache(cache_dir);
+    Ok(AircraftHistorySnapshot {
+        profiles,
+        newest_hour,
+        oldest_hour,
+        files_loaded,
+    })
+}
+
+fn rounded_hour(now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    now.with_minute(0)
+        .and_then(|time| time.with_second(0))
+        .and_then(|time| time.with_nanosecond(0))
+        .ok_or_else(|| "round MADIS request time".to_owned())
+}
+
+fn fetch_hour_profiles(
+    cache_dir: &Path,
+    candidate: DateTime<Utc>,
+) -> Result<Vec<AircraftProfile>, String> {
+    let file_name = format!("{}.gz", candidate.format("%Y%m%d_%H00"));
+    let cache_path = cache_dir.join(&file_name);
+    let gzip = match fs::read(&cache_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let url = format!("{PUBLIC_BASE_URL}/{file_name}");
+            let bytes =
+                data_source::fetch_bytes(&url).map_err(|error| format!("{file_name}: {error}"))?;
+            if bytes.len() > MAX_GZIP_BYTES {
+                return Err(format!("{file_name}: compressed file too large"));
+            }
+            if let Err(error) = fs::write(&cache_path, &bytes) {
+                // The requested history is still usable in memory; keep the
+                // cache failure attached only when decoding itself fails.
+                let decoded = parse_gzip_netcdf(&bytes).map_err(|decode| {
+                    format!("{file_name}: {decode}; cache write failed: {error}")
+                })?;
+                return Ok(decoded);
+            }
+            bytes
+        }
+    };
+    parse_gzip_netcdf(&gzip).map_err(|error| format!("{file_name}: {error}"))
+}
+
+fn normalize_recent_profiles(mut profiles: Vec<AircraftProfile>) -> Vec<AircraftProfile> {
+    profiles.sort_by_key(|profile| std::cmp::Reverse(profile.valid_time));
+    let mut seen = HashSet::new();
+    profiles.retain(|profile| {
+        seen.insert((
+            profile.airport.clone(),
+            profile.valid_time.timestamp(),
+            profile.ascending,
+        ))
+    });
+    profiles.truncate(MAX_RECENT_PROFILES);
+    profiles
 }
 
 pub fn cache_dir(root: &Path) -> PathBuf {
@@ -648,6 +757,27 @@ mod tests {
         let (lat, lon) = profile.marker_position();
         assert!((lat - 38.81).abs() < 0.001);
         assert!((lon + 90.28).abs() < 0.001);
+    }
+
+    #[test]
+    fn recent_history_is_newest_first_and_collapses_rolling_file_duplicates() {
+        let base = profiles_from_arrays(&test_arrays(12)).unwrap().remove(0);
+        let mut older = base.clone();
+        older.valid_time -= Duration::hours(1);
+        let mut descent = older.clone();
+        descent.ascending = false;
+
+        let normalized =
+            normalize_recent_profiles(vec![older.clone(), base.clone(), older, descent.clone()]);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].valid_time, base.valid_time);
+        assert!(
+            normalized
+                .windows(2)
+                .all(|pair| { pair[0].valid_time >= pair[1].valid_time })
+        );
+        assert!(normalized.iter().any(|profile| !profile.ascending));
     }
 
     #[test]

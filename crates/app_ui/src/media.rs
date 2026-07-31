@@ -1,4 +1,5 @@
-//! Media sharing: screenshots to clipboard + disk, and loop recording.
+//! Media sharing: screenshots always to clipboard, optionally to disk, and
+//! loop recording.
 //!
 //! Capture flow (eframe 0.34): send
 //! `egui::ViewportCommand::Screenshot(egui::UserData)` and the composited
@@ -453,11 +454,18 @@ impl ViewerApp {
         } else {
             image
         };
+        // Clipboard is the invariant still-capture destination. Disk output
+        // is an optional second destination controlled by settings below.
         ctx.copy_image(image.clone());
+
+        let short_name = brand_config.resolved_short_name().to_owned();
+        if !self.app_settings.save_still_screenshots_to_disk {
+            self.status = format!("{short_name} {subject} copied to clipboard");
+            return;
+        }
 
         let result_tx = self.media.result_tx.clone();
         let repaint_ctx = ctx.clone();
-        let short_name = brand_config.resolved_short_name().to_owned();
         thread::spawn(move || {
             let message = match save_capture_png(&image, &brand_config) {
                 Ok(path) => format!(
@@ -479,9 +487,14 @@ impl ViewerApp {
 
     pub(crate) fn media_top_bar_ui(&mut self, ui: &mut egui::Ui) {
         let output_folder = self.app_settings.brand.output_folder_name();
+        let screenshot_destination = if self.app_settings.save_still_screenshots_to_disk {
+            format!(" and save a PNG in Pictures/{output_folder}")
+        } else {
+            "; disk saving is off in Settings > App Identity / Brand Kit".to_owned()
+        };
         if crate::toolbar_action_button(ui, "Screenshot", 76.0)
             .on_hover_text(format!(
-                "Copy a full-window screenshot to the clipboard and save a PNG in Pictures/{output_folder} (F12; Shift+F12 captures the map only)"
+                "Copy a full-window screenshot to the clipboard{screenshot_destination} (F12; Shift+F12 captures the map only)"
             ))
             .clicked()
         {

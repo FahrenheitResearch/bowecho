@@ -596,6 +596,8 @@ impl RiverGaugeState {
         &self,
         rect: egui::Rect,
         now: DateTime<Utc>,
+        state_filter_enabled: bool,
+        selected_states: &[String],
         mut project: impl FnMut(f32, f32) -> egui::Pos2,
     ) -> Vec<RiverGaugeMarkerPoint> {
         let mut by_lid: HashMap<&str, &GaugeSummary> = HashMap::new();
@@ -608,6 +610,9 @@ impl RiverGaugeState {
             .map(|selected| selected.summary.lid.as_str());
         let mut candidates = by_lid
             .into_values()
+            .filter(|gauge| {
+                river_gauge_visible_for_states(gauge, state_filter_enabled, selected_states)
+            })
             .filter_map(|gauge| {
                 let position = project(gauge.lon, gauge.lat);
                 rect.expand(12.0).contains(position).then(|| {
@@ -852,6 +857,19 @@ impl RiverGaugeState {
     }
 }
 
+fn river_gauge_visible_for_states(
+    gauge: &GaugeSummary,
+    filter_enabled: bool,
+    selected_states: &[String],
+) -> bool {
+    !filter_enabled
+        || gauge.state.as_deref().is_some_and(|state| {
+            selected_states
+                .iter()
+                .any(|selected| selected.eq_ignore_ascii_case(state))
+        })
+}
+
 pub(crate) fn nearest_marker(
     points: &[RiverGaugeMarkerPoint],
     pointer: egui::Pos2,
@@ -889,10 +907,13 @@ impl ViewerApp {
         if !self.app_settings.overlay_river_gauges {
             return Vec::new();
         }
-        self.river_gauges
-            .marker_points(rect, Utc::now(), |lon, lat| {
-                self.lon_lat_to_screen(rect, lon, lat)
-            })
+        self.river_gauges.marker_points(
+            rect,
+            Utc::now(),
+            self.app_settings.overlay_river_gauge_state_filter_enabled,
+            &self.app_settings.overlay_river_gauge_states,
+            |lon, lat| self.lon_lat_to_screen(rect, lon, lat),
+        )
     }
 
     pub(crate) fn draw_river_gauge_markers(
@@ -1614,6 +1635,31 @@ mod tests {
         assert_eq!(gauge.display_category(now), (FloodCategory::Moderate, true));
         let late = now + chrono::Duration::days(20);
         assert_eq!(gauge.display_category(late).0, FloodCategory::Stale);
+    }
+
+    #[test]
+    fn state_filter_hides_unselected_and_unknown_gauges() {
+        let gauge = parse_gauge_catalog(SUMMARY_JSON).unwrap().remove(0);
+        assert!(river_gauge_visible_for_states(&gauge, false, &[]));
+        assert!(river_gauge_visible_for_states(
+            &gauge,
+            true,
+            &["ok".to_owned()]
+        ));
+        assert!(!river_gauge_visible_for_states(
+            &gauge,
+            true,
+            &["MI".to_owned()]
+        ));
+        assert!(!river_gauge_visible_for_states(&gauge, true, &[]));
+
+        let mut unknown = gauge;
+        unknown.state = None;
+        assert!(!river_gauge_visible_for_states(
+            &unknown,
+            true,
+            &["OK".to_owned()]
+        ));
     }
 
     #[test]

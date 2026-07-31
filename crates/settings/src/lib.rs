@@ -280,6 +280,15 @@ pub struct AppSettings {
     /// Default off; catalogue polling occurs only while the layer is enabled.
     #[serde(default)]
     pub overlay_river_gauges: bool,
+    /// Limit map-rendered river gauges to `overlay_river_gauge_states`.
+    /// Fetching remains viewport-based so changing this display filter is
+    /// instant and does not invalidate the NWPS tile cache.
+    #[serde(default)]
+    pub overlay_river_gauge_state_filter_enabled: bool,
+    /// Selected two-letter US state abbreviations (plus DC) for the river
+    /// gauge map filter. Empty while enabled intentionally hides all gauges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlay_river_gauge_states: Vec<String>,
     #[serde(default = "default_true")]
     pub overlay_obs_metar: bool,
     #[serde(default = "default_true")]
@@ -666,6 +675,11 @@ pub struct AppSettings {
     /// Draw a small screen-center capture reticle over map panes.
     #[serde(default)]
     pub show_center_crosshair: bool,
+    /// Also write still screenshots to the brand's Pictures output folder.
+    /// Clipboard copy is unconditional and is not controlled by this option.
+    /// Default true preserves the behavior of builds predating this setting.
+    #[serde(default = "default_true")]
+    pub save_still_screenshots_to_disk: bool,
     /// Free/manual viewport recording frame rate. Loop exports still preserve
     /// their own export-speed cadence; this controls the live viewport recorder.
     #[serde(default = "default_record_fps")]
@@ -1144,6 +1158,8 @@ impl Default for AppSettings {
             brand: BrandConfig::default(),
             overlay_obs: false,
             overlay_river_gauges: false,
+            overlay_river_gauge_state_filter_enabled: false,
+            overlay_river_gauge_states: Vec::new(),
             overlay_obs_metar: true,
             overlay_obs_mesonet: true,
             overlay_obs_metar_state_filter_enabled: false,
@@ -1244,6 +1260,7 @@ impl Default for AppSettings {
             live_low_sweep_auto_advance: false,
             live_low_sweep_auto_advance_seconds: default_live_low_sweep_auto_advance_seconds(),
             show_center_crosshair: false,
+            save_still_screenshots_to_disk: true,
             record_fps: default_record_fps(),
             record_size: default_record_size(),
             record_format: default_record_format(),
@@ -1912,12 +1929,20 @@ mod tests {
 
     #[test]
     fn river_gauge_preference_defaults_off_and_round_trips() {
-        assert!(!AppSettings::from_json("{}").overlay_river_gauges);
+        let defaults = AppSettings::from_json("{}");
+        assert!(!defaults.overlay_river_gauges);
+        assert!(!defaults.overlay_river_gauge_state_filter_enabled);
+        assert!(defaults.overlay_river_gauge_states.is_empty());
         let settings = AppSettings {
             overlay_river_gauges: true,
+            overlay_river_gauge_state_filter_enabled: true,
+            overlay_river_gauge_states: vec!["MI".to_owned(), "IN".to_owned()],
             ..AppSettings::default()
         };
-        assert!(AppSettings::from_json(&settings.to_json()).overlay_river_gauges);
+        let restored = AppSettings::from_json(&settings.to_json());
+        assert!(restored.overlay_river_gauges);
+        assert!(restored.overlay_river_gauge_state_filter_enabled);
+        assert_eq!(restored.overlay_river_gauge_states, ["MI", "IN"]);
     }
 
     #[test]
@@ -2627,6 +2652,24 @@ mod tests {
         assert_eq!(back.record_format, "webp");
         assert_eq!(back.history_frame_limit, 96);
         assert_eq!(back.loop_record_speed_percent, 1600);
+    }
+
+    #[test]
+    fn still_screenshot_disk_save_defaults_on_for_legacy_settings() {
+        assert!(AppSettings::default().save_still_screenshots_to_disk);
+        let legacy = AppSettings::from_json("{}");
+        assert!(legacy.save_still_screenshots_to_disk);
+    }
+
+    #[test]
+    fn still_screenshot_disk_save_round_trips_off() {
+        let settings = AppSettings {
+            save_still_screenshots_to_disk: false,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(&settings.to_json());
+
+        assert!(!restored.save_still_screenshots_to_disk);
     }
 
     #[test]

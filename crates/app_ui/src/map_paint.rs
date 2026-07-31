@@ -1188,9 +1188,10 @@ impl ViewerApp {
         // under the cursor, rasterize the REAL polar gates into a small
         // disk-sized ColorImage and let the mesh sample it 1:1 — true gate
         // resolution instead of a magnified copy of the Cartesian raster. Any
-        // product the native path does not cover (derived Cartesian fields,
-        // storm-relative and dealiased velocity) falls back to the raster
-        // magnifier below, unchanged.
+        // product the native path does not cover (derived Cartesian fields and
+        // storm-relative velocity) falls back to the raster magnifier below.
+        // Plain VEL with auto-dealias and DVEL use their resolved dealiased
+        // polar grid here rather than magnifying the old Cartesian raster.
         let native = radar_has_gate
             .then(|| {
                 self.radar_loupe_native_prepare(painter.ctx(), rect, center, focus, radius, magnify)
@@ -1294,9 +1295,11 @@ impl ViewerApp {
     /// cursor, rasterize the disk region into a small ColorImage (reused/rebuilt
     /// only when the sampling inputs change), upload it, and return the texture
     /// id + the image's screen-space bounding square. Returns `None` for any
-    /// product the native path does not cover — derived Cartesian products,
-    /// storm-relative velocity (needs per-radial motion), and dealiased velocity
-    /// (a separate grid) — so the caller falls back to the raster magnifier.
+    /// product the native path does not cover — derived Cartesian products and
+    /// storm-relative velocity (needs a per-radial transformation) — so the
+    /// caller falls back to the raster magnifier. Plain/DVEL dealiasing is safe
+    /// because it remains a polar gate grid and is resolved through the shared
+    /// app dealias cache.
     fn radar_loupe_native_prepare(
         &mut self,
         ctx: &egui::Context,
@@ -1348,23 +1351,32 @@ impl ViewerApp {
     /// raster (`primary_render_request_for_volume`) and the cursor readout
     /// (`cursor_readout_for`) resolve: the same displayed volume, the same
     /// `MomentGrid`, and the same color table (`render_color_tables_for_product`
-    /// → `for_family`). `None` if the product is not a plain base moment.
-    fn radar_loupe_native_plan(&self, rect: egui::Rect) -> Option<LoupeNativePlan> {
+    /// → `for_family`). `None` if the product is not a plain base moment or
+    /// DVEL-compatible polar velocity field.
+    fn radar_loupe_native_plan(&mut self, rect: egui::Rect) -> Option<LoupeNativePlan> {
         let product = self.selected_product.clone();
-        // Native gates only exist for the plain base moments; the raster
-        // magnifier still serves everything else.
-        if product.derived().is_some()
-            || product.is_storm_relative_velocity()
-            || self.product_render_uses_dealiased_velocity(&product)
-        {
+        // Derived Cartesian grids and storm-relative velocity do not preserve
+        // the plain polar-value contract. Storm-relative stays on the existing
+        // raster path until its per-radial transform can be reproduced here.
+        if product.derived().is_some() || product.is_storm_relative_velocity() {
             return None;
         }
         let volume = self
             .volume
             .clone()
             .map(|volume| self.display_source_volume_for_product(&product, volume))?;
-        let cut = volume.cuts.get(self.selected_cut)?;
-        let grid = cut.moments.get(&product.base_moment())?;
+        let cut_index = self.selected_cut;
+        let render_dealiased = self.product_render_uses_dealiased_velocity(&product);
+        let dealiased_grid = if render_dealiased {
+            Some(self.dealiased_velocity_readout_grid(&volume, cut_index)?)
+        } else {
+            None
+        };
+        let cut = volume.cuts.get(cut_index)?;
+        let moment = product.base_moment();
+        let grid = dealiased_grid
+            .as_deref()
+            .or_else(|| cut.moments.get(&moment))?;
         if grid.radial_indices.is_empty() {
             return None;
         }
@@ -1380,14 +1392,15 @@ impl ViewerApp {
         let table = color_tables.for_family(product.color_family()).clone();
         let az_lut = LoupeAzLut::build(cut, grid);
         Some(LoupeNativePlan {
-            cut: self.selected_cut,
-            moment: product.base_moment(),
+            cut: cut_index,
+            moment,
             product_label: product.label().to_owned(),
             color_signature,
             geom,
             az_lut,
             sampler: table.sampler(),
             volume,
+            dealiased_grid,
         })
     }
 
@@ -2722,6 +2735,10 @@ pub(crate) fn build_radar_loupe_image(
 /// per-frame rebuild never clones the gate array.
 pub(crate) struct LoupeNativePlan {
     pub(crate) volume: Arc<RadarVolume>,
+    /// Present for plain VEL rendered with auto-dealias and for DVEL. This is
+    /// the same Arc supplied by the shared render/readout dealias cache, so the
+    /// loupe neither clones gate storage nor drifts from the displayed field.
+    pub(crate) dealiased_grid: Option<Arc<MomentGrid>>,
     pub(crate) cut: usize,
     pub(crate) moment: MomentType,
     pub(crate) product_label: String,
@@ -2733,7 +2750,9 @@ pub(crate) struct LoupeNativePlan {
 
 impl LoupeNativePlan {
     pub(crate) fn grid(&self) -> Option<&MomentGrid> {
-        self.volume.cuts.get(self.cut)?.moments.get(&self.moment)
+        self.dealiased_grid
+            .as_deref()
+            .or_else(|| self.volume.cuts.get(self.cut)?.moments.get(&self.moment))
     }
 }
 
@@ -2744,6 +2763,10 @@ impl LoupeNativePlan {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LoupeNativeKey {
     volume_ptr: usize,
+    /// Exact sampled grid identity. Required for DVEL because the source
+    /// volume/cut/product remain unchanged when engine or anchor inputs yield a
+    /// replacement dealiased Arc.
+    grid_ptr: usize,
     cut: usize,
     product_label: String,
     color_signature: u64,
@@ -2767,6 +2790,10 @@ impl LoupeNativeKey {
         let quantize = |p: egui::Pos2| [p.x.round() as i32, p.y.round() as i32];
         Self {
             volume_ptr: Arc::as_ptr(&plan.volume) as usize,
+            grid_ptr: plan
+                .grid()
+                .map(|grid| std::ptr::from_ref(grid) as usize)
+                .unwrap_or(0),
             cut: plan.cut,
             product_label: plan.product_label.clone(),
             color_signature: plan.color_signature,
@@ -5322,6 +5349,85 @@ mod loupe_native_gates_tests {
         grid.radial_indices = (0..radial_count).collect();
         grid.storage = MomentStorage::U8(vec![raw; radial_count * gate_count]);
         (cut, grid)
+    }
+
+    fn aliased_velocity_volume() -> RadarVolume {
+        let range = GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 10_000,
+            gate_count: 3,
+        };
+        let mut site = radar_core::RadarSite::new("TEST");
+        site.latitude_deg = Some(35.0);
+        site.longitude_deg = Some(-97.0);
+        let mut volume = RadarVolume::new(site, chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        let mut radial = test_radial(0.0, range.clone());
+        radial.nyquist_velocity_mps = Some(10.0);
+        cut.radials.push(radial);
+        let mut velocity =
+            MomentGrid::new_u8(MomentType::Velocity, range, 1.0, 64.0, Some(0), Some(1));
+        velocity
+            .push_u8_row_slice(0, &[64, 72, 55])
+            .expect("velocity row");
+        cut.moments.insert(MomentType::Velocity, velocity);
+        volume.cuts.push(cut);
+        volume
+    }
+
+    #[test]
+    fn native_loupe_uses_dealiased_polar_grids_and_keys_their_identity() {
+        let mut app = crate::tests::test_viewer_app_with_hazards(Vec::new());
+        let volume = Arc::new(aliased_velocity_volume());
+        app.volume = Some(Arc::clone(&volume));
+        app.selected_cut = 0;
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        app.map_scale = 1_000.0;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let focus = rect.center();
+        let loupe_center = focus + egui::vec2(0.0, -100.0);
+
+        app.selected_product = DisplayProduct::DealiasedVelocity;
+        app.dealias_engine = DealiasEngine::Region;
+        let dvel_plan = app
+            .radar_loupe_native_plan(rect)
+            .expect("DVEL native polar plan");
+        assert!(dvel_plan.dealiased_grid.is_some());
+        let raw = volume.cuts[0]
+            .moments
+            .get(&MomentType::Velocity)
+            .expect("raw velocity");
+        assert_ne!(
+            std::ptr::from_ref(dvel_plan.grid().expect("DVEL grid")) as usize,
+            std::ptr::from_ref(raw) as usize,
+            "the native loupe must sample the resolved dealiased grid"
+        );
+        let region_key = LoupeNativeKey::new(&dvel_plan, focus, loupe_center, 6.0, 140);
+        drop(dvel_plan);
+
+        // Plain VEL joins the native path only when its display is dealiased.
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.unfold_velocity_display = true;
+        assert!(
+            app.radar_loupe_native_plan(rect)
+                .is_some_and(|plan| plan.dealiased_grid.is_some())
+        );
+
+        // Storm-relative values require an additional per-radial transform and
+        // deliberately remain on the existing raster fallback.
+        app.selected_product = DisplayProduct::StormRelativeDealiasedVelocity;
+        assert!(app.radar_loupe_native_plan(rect).is_none());
+
+        // Same source/cut/product, different dealias output: the native texture
+        // key must invalidate on the resolved grid Arc, not just the volume.
+        app.selected_product = DisplayProduct::DealiasedVelocity;
+        app.dealias_engine = DealiasEngine::RegionGlobal;
+        let global_plan = app
+            .radar_loupe_native_plan(rect)
+            .expect("Region Global DVEL native plan");
+        let global_key = LoupeNativeKey::new(&global_plan, focus, loupe_center, 6.0, 140);
+        assert!(region_key != global_key, "dealiased grid identity is keyed");
     }
 
     fn compact_quality(

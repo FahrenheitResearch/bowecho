@@ -795,6 +795,7 @@ impl ViewerApp {
                     app.spc_kinds_memory = app.spc_outlooks_enabled.clone();
                 }
                 app.spc_data.fetched_at = None; // force refetch
+                app.invalidate_spc_fetch_request();
                 app.status = if app
                     .spc_outlooks_enabled
                     .iter()

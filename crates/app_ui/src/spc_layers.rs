@@ -212,6 +212,16 @@ pub fn effective_spc_outlook_kinds(day: u8, requested: &[&str]) -> Vec<&'static 
     out
 }
 
+/// Whether a loaded canonical SPC kind represents one of the operator's
+/// requested controls for this outlook day. Day 3 publishes one `prob`
+/// product for the legacy tornado/wind/hail choices, so draw visibility must
+/// use the same normalization as fetching rather than comparing raw slugs.
+pub fn effective_spc_outlook_kind_enabled(day: u8, requested: &[&str], loaded_kind: &str) -> bool {
+    requested.iter().any(|kind| {
+        effective_spc_outlook_kind(day, kind).is_some_and(|effective| effective == loaded_kind)
+    })
+}
+
 fn effective_spc_outlook_kind(day: u8, kind: &str) -> Option<&'static str> {
     match (day, kind) {
         (_, ESTOFEX_OUTLOOK_KIND) => None,
@@ -2471,6 +2481,15 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
         assert_eq!(
             effective_spc_outlook_kinds(3, &["cat", "torn", "wind", "hail"]),
             vec!["cat", "prob"]
+        );
+        assert!(effective_spc_outlook_kind_enabled(
+            3,
+            &["torn", "wind", "hail"],
+            "prob"
+        ));
+        assert!(
+            !effective_spc_outlook_kind_enabled(2, &["torn", "wind", "hail"], "prob"),
+            "Day 2 keeps hazard-specific probabilities distinct"
         );
         assert_eq!(
             live_outlook_urls(

@@ -109,12 +109,10 @@ pub(crate) fn format_station_temp_c(c: f32, units: Units) -> String {
     }
 }
 
-/// Range-circle annotation label: imperial leads with miles but keeps
-/// the km in parentheses (radar range rings are spoken in km); metric
-/// reads km alone.
+/// Range-circle annotation label in the user's selected distance system.
 pub(crate) fn format_range_ring_km(km: f32, units: Units) -> String {
     match units {
-        Units::Imperial => format!("{:.1} mi ({:.1} km)", km * MI_PER_KM, km),
+        Units::Imperial => format!("{:.1} mi", km * MI_PER_KM),
         Units::Metric => format!("{km:.1} km"),
     }
 }
@@ -192,15 +190,9 @@ mod tests {
 
     #[test]
     fn range_ring_label_leads_with_the_chosen_system() {
-        // 10 km × 0.621371 = 6.21371 → "6.2 mi (10.0 km)".
-        assert_eq!(
-            format_range_ring_km(10.0, Units::Imperial),
-            "6.2 mi (10.0 km)"
-        );
+        // 10 km × 0.621371 = 6.21371 → "6.2 mi".
+        assert_eq!(format_range_ring_km(10.0, Units::Imperial), "6.2 mi");
         assert_eq!(format_range_ring_km(10.0, Units::Metric), "10.0 km");
-        assert_eq!(
-            format_range_ring_km(160.9344, Units::Imperial),
-            "100.0 mi (160.9 km)"
-        );
+        assert_eq!(format_range_ring_km(160.9344, Units::Imperial), "100.0 mi");
     }
 }

@@ -84,7 +84,7 @@ fn oa_analysis_readiness(
 const PLACEFILE_VISIBILITY_RANGE_PERCENTS: [u16; 5] = [100, 200, 400, 800, u16::MAX];
 
 #[rustfmt::skip]
-const METAR_STATE_FILTER_ABBRS: &[&str] = &[
+const US_STATE_FILTER_ABBRS: &[&str] = &[
     "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA", "HI", "ID",
     "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO",
     "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA",
@@ -1157,7 +1157,7 @@ impl ViewerApp {
                                         .spacing(egui::vec2(6.0, 2.0))
                                         .show(ui, |ui| {
                                             for (index, abbreviation) in
-                                                METAR_STATE_FILTER_ABBRS.iter().enumerate()
+                                                US_STATE_FILTER_ABBRS.iter().enumerate()
                                             {
                                                 let abbreviation = *abbreviation;
                                                 let mut selected = metar_states
@@ -1262,6 +1262,10 @@ impl ViewerApp {
             let status = self.river_gauges.status_line();
             let fetching = self.river_gauges.is_fetching();
             let mut refresh = false;
+            let mut state_filter_enabled =
+                self.app_settings.overlay_river_gauge_state_filter_enabled;
+            let mut states = self.app_settings.overlay_river_gauge_states.clone();
+            let mut state_filter_changed = false;
             let changed = layer_row(
                 ui,
                 LayerRowSpec {
@@ -1272,17 +1276,89 @@ impl ViewerApp {
                     name: "River gauges",
                     name_hover: "National Water Prediction Service observations and official NWS river forecasts (anonymous, no key)",
                     count: Some(status.as_str()),
-                    gear: Some(LayerRowGear::Menu {
-                        hover: "NWPS source, legend, and refresh",
+                    gear: Some(LayerRowGear::PersistentMenu {
+                        hover: "NWPS source, state filter, legend, and refresh",
                         content: Box::new(|ui| {
+                            ui.set_min_width(370.0);
                             ui.strong("NOAA/NWS National Water Prediction Service");
                             ui.weak("Viewport-cached; visible map tiles refresh every 5 minutes.");
                             ui.weak("Blue no flooding - yellow action - orange minor - red moderate - magenta major.");
                             ui.weak("An amber outer ring means the displayed category comes from the forecast.");
                             ui.weak("Gray means stale, not current, or unavailable. Values can be provisional.");
+                            let state_filter_label = if state_filter_enabled {
+                                format!("Gauge states ({})", states.len())
+                            } else {
+                                "Gauge states (all)".to_owned()
+                            };
+                            egui::CollapsingHeader::new(state_filter_label)
+                                .default_open(state_filter_enabled)
+                                .show(ui, |ui| {
+                                    if ui
+                                        .checkbox(
+                                            &mut state_filter_enabled,
+                                            "Limit gauge markers by state",
+                                        )
+                                        .on_hover_text(
+                                            "Display-only filter. Cached NWPS data is retained so changing states is immediate.",
+                                        )
+                                        .changed()
+                                    {
+                                        state_filter_changed = true;
+                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui.button("All states").clicked() {
+                                            state_filter_enabled = false;
+                                            state_filter_changed = true;
+                                        }
+                                        if ui.button("None").clicked() {
+                                            state_filter_enabled = true;
+                                            states.clear();
+                                            state_filter_changed = true;
+                                        }
+                                    });
+                                    ui.add_enabled_ui(state_filter_enabled, |ui| {
+                                        egui::Grid::new("river_gauge_state_filter_grid")
+                                            .num_columns(7)
+                                            .spacing(egui::vec2(6.0, 2.0))
+                                            .show(ui, |ui| {
+                                                for (index, abbreviation) in
+                                                    US_STATE_FILTER_ABBRS.iter().enumerate()
+                                                {
+                                                    let abbreviation = *abbreviation;
+                                                    let mut selected = states
+                                                        .iter()
+                                                        .any(|state| state == abbreviation);
+                                                    if ui
+                                                        .checkbox(&mut selected, abbreviation)
+                                                        .changed()
+                                                    {
+                                                        if selected {
+                                                            states.push(abbreviation.to_owned());
+                                                            states.sort();
+                                                            states.dedup();
+                                                        } else {
+                                                            states.retain(|state| {
+                                                                state != abbreviation
+                                                            });
+                                                        }
+                                                        state_filter_changed = true;
+                                                    }
+                                                    if (index + 1) % 7 == 0 {
+                                                        ui.end_row();
+                                                    }
+                                                }
+                                            });
+                                        if states.is_empty() {
+                                            ui.weak("No states selected: all gauge markers are hidden.");
+                                        }
+                                    });
+                                });
+                            ui.separator();
                             ui.hyperlink_to("Official NWPS", "https://water.noaa.gov/");
                             if ui.button("Refresh visible gauges").clicked() {
                                 refresh = true;
+                            }
+                            if ui.button("Done").clicked() {
                                 ui.close();
                             }
                         }),
@@ -1297,6 +1373,12 @@ impl ViewerApp {
             );
             if refresh {
                 self.river_gauges.request_refresh();
+                ctx.request_repaint();
+            }
+            if state_filter_changed {
+                self.app_settings.overlay_river_gauge_state_filter_enabled = state_filter_enabled;
+                self.app_settings.overlay_river_gauge_states = states;
+                let _ = self.app_settings.save();
                 ctx.request_repaint();
             }
             if changed {
@@ -1601,6 +1683,9 @@ impl ViewerApp {
             let mut follow_selected = self.aircraft_follow_selected;
             let mut follow_changed = false;
             let mut center_profile = None;
+            let history_loading = self.aircraft_history_rx.is_some();
+            let history_count = self.aircraft_history_profiles.len();
+            let mut open_history = false;
             let row_changed = layer_row(
                 ui,
                 LayerRowSpec {
@@ -1640,6 +1725,28 @@ impl ViewerApp {
                                 && let Some(profile) = &newest_profile
                             {
                                 center_profile = Some(profile.clone());
+                            }
+                            if ui
+                                .add_enabled(
+                                    !history_loading,
+                                    egui::Button::new(if history_count > 0 {
+                                        format!("Previous soundings ({history_count})")
+                                    } else {
+                                        "Load previous soundings".to_owned()
+                                    }),
+                                )
+                                .on_hover_text(
+                                    "Open a newest-first browser populated on demand from the preceding six public MADIS hourly files",
+                                )
+                                .clicked()
+                            {
+                                open_history = true;
+                            }
+                            if history_loading {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.weak("Loading recent profile history...");
+                                });
                             }
                             if let Some((display_id, airport, latitude, longitude)) =
                                 &selected_profile
@@ -1696,6 +1803,9 @@ impl ViewerApp {
                 self.selected_aircraft_profile = Some(airport);
                 self.center_map_on(latitude, longitude);
                 ctx.request_repaint();
+            }
+            if open_history {
+                self.request_aircraft_history(ctx);
             }
             if follow_changed {
                 self.aircraft_follow_selected = follow_selected;
@@ -1804,7 +1914,7 @@ impl ViewerApp {
                     }
                     self.spc_outlooks_enabled.clear();
                 }
-                self.spc_last_attempt_at = None;
+                self.invalidate_spc_fetch_request();
                 self.save_overlay_defaults();
                 ctx.request_repaint();
             }
@@ -1859,7 +1969,7 @@ impl ViewerApp {
                 },
                 |_ui| {},
             ) {
-                self.spc_last_attempt_at = None;
+                self.invalidate_spc_fetch_request();
                 self.save_overlay_defaults();
                 ctx.request_repaint();
             }

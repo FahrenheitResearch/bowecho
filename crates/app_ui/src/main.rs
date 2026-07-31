@@ -592,7 +592,7 @@ fn radar_history_budget_bytes(gib: u16) -> usize {
     (gib.clamp(2, 64) as usize) * 1024 * 1024 * 1024
 }
 const MAX_LIVE_PRELOAD_FRAME_COUNT: usize = 10;
-const STORM_TRACK_MAX_TRACK_OPTIONS: &[usize] = &[8, 12, 16, 24, 32];
+const STORM_TRACK_MAX_TRACK_OPTIONS: &[usize] = &[8, 12, 16, 24, 32, 48, 64, 70];
 const DEFAULT_STORM_TRACK_MAX_TRACKS: usize = 16;
 const DEFAULT_STORM_TRACK_MIN_DBZ: f32 = 35.0;
 const MIN_STORM_TRACK_MIN_DBZ: f32 = 30.0;
@@ -3525,7 +3525,7 @@ struct ViewerApp {
     /// Cadence/attempt clock. Kept separate from `SpcData::fetched_at`,
     /// which describes the last completed data install shown in the rail.
     spc_last_attempt_at: Option<Instant>,
-    spc_rx: Option<mpsc::Receiver<spc_layers::SpcData>>,
+    spc_rx: Option<mpsc::Receiver<SpcFetchResult>>,
     mping_reports: Vec<mping::MpingReport>,
     mping_enabled: bool,
     /// Last successfully installed mPING response. Failures must not make
@@ -3588,6 +3588,15 @@ struct ViewerApp {
     aircraft_profiles_file: Option<String>,
     aircraft_profiles_status: String,
     aircraft_soundings_enabled: bool,
+    /// Explicitly requested bounded history (up to the preceding six public
+    /// MADIS hourly files). Kept separate from latest map markers so opening
+    /// the live layer remains cheap.
+    aircraft_history_profiles: Vec<aircraft_soundings::AircraftProfile>,
+    aircraft_history_rx: Option<
+        mpsc::Receiver<std::result::Result<aircraft_soundings::AircraftHistorySnapshot, String>>,
+    >,
+    aircraft_history_status: String,
+    show_aircraft_history: bool,
     /// Airport key of the selected anonymous MADIS profile. The feed has no
     /// stable flight id, so selection/following is explicitly profile-based.
     selected_aircraft_profile: Option<String>,
@@ -3994,6 +4003,24 @@ fn background_activity_display(
     } else {
         BackgroundActivityDisplay::SpinnerOnly
     }
+}
+
+/// The persistent top readout already owns site/time/frame facts. Keep the
+/// bottom-left fixed slot for transient actions, while preserving an optional
+/// action suffix appended after a frame-status install (for example camera
+/// follow state).
+fn status_without_scan_duplicate(status: &str, selected_scan_prefix: Option<&str>) -> String {
+    let status = status.trim();
+    let Some(prefix) = selected_scan_prefix else {
+        return status.to_owned();
+    };
+    if !status.starts_with(prefix) {
+        return status.to_owned();
+    }
+    status
+        .rfind(") - ")
+        .map(|split| status[split + 4..].trim().to_owned())
+        .unwrap_or_default()
 }
 
 fn manual_frame_load_indicator_active(
@@ -5848,8 +5875,59 @@ fn intl_recent_loop_provider_labels() -> &'static str {
             .join(", ")
     })
 }
-/// SPC fetch identity: (day, archive date) — refetch when it changes.
-type SpcFetchKey = (u8, Option<(i32, u32, u32)>, spc_layers::SpcDay1Issue);
+/// Complete identity of one SPC-layer request. Kind order and legacy Day-3
+/// hazard-specific probability choices are canonicalized so equivalent
+/// requests reuse a result, while toggling SPC/fire/WPC products or reports
+/// can never reuse an incomplete response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SpcFetchKey {
+    day: u8,
+    archive_date: Option<(i32, u32, u32)>,
+    day1_issue: spc_layers::SpcDay1Issue,
+    outlook_kinds: Vec<String>,
+    reports: bool,
+}
+
+impl SpcFetchKey {
+    fn canonical(
+        day: u8,
+        archive_date: Option<(i32, u32, u32)>,
+        day1_issue: spc_layers::SpcDay1Issue,
+        requested_kinds: &[String],
+        reports: bool,
+    ) -> Self {
+        let requested = requested_kinds
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut outlook_kinds = spc_layers::effective_spc_outlook_kinds(day, &requested)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if requested.contains(&spc_layers::ESTOFEX_OUTLOOK_KIND) {
+            outlook_kinds.push(spc_layers::ESTOFEX_OUTLOOK_KIND.to_owned());
+        }
+        outlook_kinds.sort_unstable();
+        outlook_kinds.dedup();
+        Self {
+            day,
+            archive_date,
+            day1_issue: if day == 1 {
+                day1_issue
+            } else {
+                spc_layers::SpcDay1Issue::Auto
+            },
+            outlook_kinds,
+            reports,
+        }
+    }
+}
+
+struct SpcFetchResult {
+    key: SpcFetchKey,
+    data: spc_layers::SpcData,
+}
+
 type ModelLayerRender = (u64, ModelLayerView, egui::ColorImage, f32);
 
 /// One SPC storm report (tornado) — the archive events browser entry.
@@ -9702,6 +9780,10 @@ impl ViewerApp {
             aircraft_profiles_file: None,
             aircraft_profiles_status: "Enable to load the public MADIS subset".to_owned(),
             aircraft_soundings_enabled: restored_aircraft_soundings,
+            aircraft_history_profiles: Vec::new(),
+            aircraft_history_rx: None,
+            aircraft_history_status: "Load recent profiles to browse history".to_owned(),
+            show_aircraft_history: false,
             selected_aircraft_profile: None,
             aircraft_follow_selected: false,
             river_gauges: river_gauges::RiverGaugeState::default(),
@@ -21268,6 +21350,8 @@ impl eframe::App for ViewerApp {
         self.poll_coverage_probe(&ctx);
         self.poll_raob_sites(&ctx);
         self.poll_aircraft_profiles(&ctx);
+        self.poll_aircraft_history(&ctx);
+        self.show_aircraft_history_window(&ctx);
         self.poll_native_sounding(&ctx);
         self.poll_dealias_env(&ctx);
         self.poll_vwp(&ctx);
@@ -23415,10 +23499,11 @@ impl ViewerApp {
     }
 
     fn apply_unified_player_spc_reports_enabled_state(&mut self, enabled: bool) {
+        let changed = self.spc_reports_enabled != enabled;
         self.spc_reports_enabled = enabled;
         self.app_settings.overlay_spc_reports = enabled;
-        if enabled {
-            self.spc_last_key = None;
+        if changed {
+            self.invalidate_spc_fetch_request();
         }
     }
 
@@ -25529,20 +25614,23 @@ impl ViewerApp {
                 }
                 let _ = self.app_settings.save();
             }
-            let mut show_derived_products = self.app_settings.show_derived_products;
-            if ui
-                .checkbox(&mut show_derived_products, "More products")
-                .on_hover_text(
-                    "Show volume, motion-analysis, dual-pol, precipitation, texture, and quality products. Advanced products compute only when selected.",
-                )
-                .changed()
-            {
-                self.app_settings.show_derived_products = show_derived_products;
-                self.sanitize_selection();
-                self.clear_texture();
-                let _ = self.app_settings.save();
-                ctx.request_repaint();
-            }
+        }
+        // Global catalog visibility, not a primary-pane preference. Keep this
+        // reachable while an extra pane is focused so users can expose a
+        // product before assigning it to that pane.
+        let mut show_derived_products = self.app_settings.show_derived_products;
+        if ui
+            .checkbox(&mut show_derived_products, "More products")
+            .on_hover_text(
+                "Show volume, motion-analysis, dual-pol, precipitation, texture, and quality products. Advanced products compute only when selected.",
+            )
+            .changed()
+        {
+            self.app_settings.show_derived_products = show_derived_products;
+            self.sanitize_selection();
+            self.clear_texture();
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
         }
         // Invert the hotkey map so each product chip can show its key.
         let hotkey_for_label: std::collections::HashMap<String, String> = self
@@ -28358,9 +28446,19 @@ impl ViewerApp {
             // changes width constantly — give it a FIXED slot so it never
             // shoves the rest of the bar around.
             let height = ui.available_height();
+            let selected_scan_prefix = self.selected_frame().map(|frame| {
+                format!(
+                    "{} {}",
+                    frame.identity.site_id,
+                    self.time_zone()
+                        .format_date_hms(frame.identity.scan_time_utc)
+                )
+            });
+            let transient_status =
+                status_without_scan_duplicate(&self.status, selected_scan_prefix.as_deref());
             ui.add_sized(
                 [230.0, height],
-                egui::Label::new(mono(self.status.clone())).truncate(),
+                egui::Label::new(mono(transient_status)).truncate(),
             );
             ui.separator();
             if let Some(persistence) = self.settings_persistence.status_view(Instant::now()) {
@@ -28706,6 +28804,11 @@ impl ViewerApp {
         if self.aircraft_profiles_rx.is_some() {
             return Some(BackgroundActivity::indeterminate(
                 "Refreshing MADIS aircraft profiles",
+            ));
+        }
+        if self.aircraft_history_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                "Loading recent aircraft soundings",
             ));
         }
         if self.obs_rx.is_some()
@@ -31138,7 +31241,12 @@ impl ViewerApp {
                         slot.data = Some(placefile);
                         slot.last_successful_load = Some(now);
                         slot.generation = slot.generation.wrapping_add(1);
-                        schedule_placefile_sheets(slot, ctx);
+                        // Disabled sources are preloaded for their parsed
+                        // Title/status only. Icon sheets can be large and
+                        // have no use until the layer is actually enabled.
+                        if slot.enabled {
+                            schedule_placefile_sheets(slot, ctx);
+                        }
                         ctx.request_repaint();
                     }
                     Ok(Err(error)) => {
@@ -31176,14 +31284,14 @@ impl ViewerApp {
             // A stale batch clears the scheduled generation; immediately
             // start the exact current generation instead of waiting for the
             // next placefile refresh interval.
-            schedule_placefile_sheets(slot, ctx);
-            if !slot.enabled {
-                continue;
+            if slot.enabled {
+                schedule_placefile_sheets(slot, ctx);
             }
-            let due = slot
-                .next_refresh
-                .map(|at| now >= at)
-                .unwrap_or(slot.data.is_none());
+            // Load every configured source once, even when disabled, so its
+            // parsed Title is available in the Layers list immediately after
+            // startup. Disabled sources stop after that metadata preload;
+            // only enabled layers enter their normal refresh cadence.
+            let due = placefile_source_fetch_due(slot, now);
             if !due {
                 continue;
             }
@@ -35262,6 +35370,139 @@ impl ViewerApp {
         }
     }
 
+    pub(crate) fn request_aircraft_history(&mut self, ctx: &egui::Context) {
+        self.show_aircraft_history = true;
+        if self.aircraft_history_rx.is_some() || !self.aircraft_history_profiles.is_empty() {
+            return;
+        }
+        self.start_aircraft_history_fetch(ctx);
+    }
+
+    fn reload_aircraft_history(&mut self, ctx: &egui::Context) {
+        self.show_aircraft_history = true;
+        if self.aircraft_history_rx.is_none() {
+            self.start_aircraft_history_fetch(ctx);
+        }
+    }
+
+    fn start_aircraft_history_fetch(&mut self, ctx: &egui::Context) {
+        self.aircraft_history_status =
+            "Loading the previous six public MADIS hourly files...".to_owned();
+        let (sender, receiver) = mpsc::channel();
+        self.aircraft_history_rx = Some(receiver);
+        let cache = aircraft_soundings::cache_dir(&app_cache_root());
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let _ = sender.send(aircraft_soundings::fetch_recent_history(&cache, Utc::now()));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_aircraft_history(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.aircraft_history_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(snapshot)) => {
+                self.aircraft_history_rx = None;
+                self.aircraft_history_status = format!(
+                    "{} profiles from {} hourly file{} ({} to {})",
+                    snapshot.profiles.len(),
+                    snapshot.files_loaded,
+                    if snapshot.files_loaded == 1 { "" } else { "s" },
+                    snapshot.oldest_hour.format("%H00Z"),
+                    snapshot.newest_hour.format("%H00Z")
+                );
+                self.aircraft_history_profiles = snapshot.profiles;
+                ctx.request_repaint();
+            }
+            Ok(Err(error)) => {
+                self.aircraft_history_rx = None;
+                self.aircraft_history_status = format!("Aircraft history unavailable: {error}");
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.aircraft_history_rx = None;
+                self.aircraft_history_status =
+                    "Aircraft-history worker stopped unexpectedly".to_owned();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+            }
+        }
+    }
+
+    fn show_aircraft_history_window(&mut self, ctx: &egui::Context) {
+        if !self.show_aircraft_history {
+            return;
+        }
+        let mut open = true;
+        let mut reload = false;
+        let mut selected = None;
+        let status = self.aircraft_history_status.clone();
+        let loading = self.aircraft_history_rx.is_some();
+        let profiles = &self.aircraft_history_profiles;
+        let time_zone = self.time_zone();
+        egui::Window::new("Previous aircraft soundings")
+            .default_width(520.0)
+            .default_height(430.0)
+            .resizable(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if loading {
+                        ui.spinner();
+                    }
+                    ui.label(&status);
+                    if ui
+                        .add_enabled(!loading, egui::Button::new("Reload"))
+                        .clicked()
+                    {
+                        reload = true;
+                    }
+                });
+                ui.weak(
+                    "Anonymous public MADIS subset; newest first. Pressure is derived from pressure altitude and remains labeled as such.",
+                );
+                ui.separator();
+                if profiles.is_empty() && !loading {
+                    ui.weak("No recent profiles loaded.");
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("aircraft_profile_history_grid")
+                            .num_columns(5)
+                            .striped(true)
+                            .spacing(egui::vec2(12.0, 5.0))
+                            .show(ui, |ui| {
+                                ui.strong("Airport");
+                                ui.strong("Valid");
+                                ui.strong("Profile");
+                                ui.strong("Levels");
+                                ui.label("");
+                                ui.end_row();
+                                for profile in profiles {
+                                    ui.label(&profile.airport);
+                                    ui.label(time_zone.format_date_hm(profile.valid_time));
+                                    ui.label(profile.direction_label());
+                                    ui.label(profile.column.len().to_string());
+                                    if ui.button("Open sounding").clicked() {
+                                        selected = Some(profile.clone());
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+        self.show_aircraft_history = open;
+        if reload {
+            self.reload_aircraft_history(ctx);
+        }
+        if let Some(profile) = selected {
+            self.start_aircraft_sounding_for(profile, ctx);
+        }
+    }
+
     /// Fetch + render the RAOB launch nearest the map center through the
     /// native skew-T channel — the Analysis (OA) button path, now one
     /// caller of the station-parameterized fetch.
@@ -35599,24 +35840,45 @@ impl ViewerApp {
         (when != today).then(|| (when.year(), when.month(), when.day()))
     }
 
+    fn desired_spc_fetch_key(&self) -> Option<SpcFetchKey> {
+        (!self.spc_outlooks_enabled.is_empty() || self.spc_reports_enabled).then(|| {
+            // Dated days draw reports from the Event Explorer cache instead
+            // of the live filtered CSVs, so this is the effective worker flag.
+            let reports = self.spc_reports_enabled && self.event_followed_day().is_none();
+            SpcFetchKey::canonical(
+                self.spc_day,
+                self.spc_outlook_archive_date(),
+                self.spc_day1_issue,
+                &self.spc_outlooks_enabled,
+                reports,
+            )
+        })
+    }
+
+    /// Drop request identity and the receiver, not the installed layer. A
+    /// control edit can launch its replacement on the next poll immediately;
+    /// the detached old worker can no longer overwrite the new selection.
+    fn invalidate_spc_fetch_request(&mut self) {
+        self.spc_last_key = None;
+        self.spc_last_attempt_at = None;
+        self.spc_rx = None;
+    }
+
     fn poll_spc(&mut self, ctx: &egui::Context) {
-        let wants = !self.spc_outlooks_enabled.is_empty() || self.spc_reports_enabled;
-        // Archive-aware: the Event-day pin wins, else the displayed
-        // volume's day — show THAT day's outlook (latest issuance).
-        let archive_date = self.spc_outlook_archive_date();
-        let day1_issue = if self.spc_day == 1 {
-            self.spc_day1_issue
-        } else {
-            spc_layers::SpcDay1Issue::Auto
-        };
-        let current_key = Some((self.spc_day, archive_date, day1_issue));
-        let key_changed = wants && self.spc_last_key != current_key;
-        let refresh_after = if archive_date.is_none() && self.spc_data.outlook_geojson_lagging {
+        let current_key = self.desired_spc_fetch_key();
+        let key_changed = current_key
+            .as_ref()
+            .is_some_and(|key| self.spc_last_key.as_ref() != Some(key));
+        let refresh_after = if current_key
+            .as_ref()
+            .is_some_and(|key| key.archive_date.is_none())
+            && self.spc_data.outlook_geojson_lagging
+        {
             Duration::from_secs(20)
         } else {
             Duration::from_secs(300)
         };
-        if wants
+        if let Some(request_key) = current_key.as_ref().cloned()
             && self.spc_rx.is_none()
             && (key_changed
                 || self
@@ -35627,24 +35889,32 @@ impl ViewerApp {
             let (sender, receiver) = mpsc::channel();
             self.spc_rx = Some(receiver);
             self.spc_last_attempt_at = Some(Instant::now());
-            let kinds: Vec<String> = self.spc_outlooks_enabled.clone();
-            // Dated days draw from the Event Explorer cache instead of
-            // the live filtered CSVs — skip the redundant live fetch.
-            let want_reports = self.spc_reports_enabled && self.event_followed_day().is_none();
-            let day = self.spc_day;
-            self.spc_last_key = Some((day, archive_date, day1_issue));
+            self.spc_last_key = Some(request_key.clone());
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
-                let kind_refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
-                let data =
-                    spc_layers::fetch_spc(&kind_refs, want_reports, day, archive_date, day1_issue);
-                let _ = sender.send(data);
+                let kind_refs = request_key
+                    .outlook_kinds
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                let data = spc_layers::fetch_spc(
+                    &kind_refs,
+                    request_key.reports,
+                    request_key.day,
+                    request_key.archive_date,
+                    request_key.day1_issue,
+                );
+                let _ = sender.send(SpcFetchResult {
+                    key: request_key,
+                    data,
+                });
                 ctx_clone.request_repaint();
             });
         }
-        if let Some(receiver) = &self.spc_rx {
-            match receiver.try_recv() {
-                Ok(mut data) => {
+        let received = self.spc_rx.as_ref().map(|receiver| receiver.try_recv());
+        if let Some(received) = received {
+            match received {
+                Ok(SpcFetchResult { key, mut data }) if current_key.as_ref() == Some(&key) => {
                     let estofex_count = data
                         .estofex_issues
                         .iter()
@@ -35682,7 +35952,14 @@ impl ViewerApp {
                     // its result was installed, not merely that it started.
                     data.fetched_at = Some(Instant::now());
                     self.spc_data = data;
+                    self.spc_last_key = Some(key);
                     self.status = status;
+                    ctx.request_repaint();
+                }
+                Ok(SpcFetchResult { .. }) => {
+                    // Controls or the followed archive day changed while the
+                    // worker ran. Never install the obsolete response.
+                    self.invalidate_spc_fetch_request();
                     ctx.request_repaint();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -38927,8 +39204,14 @@ impl ViewerApp {
         // Alphas/width come from the style registry at draw time (features
         // carry SPC's base colors) so style edits never refetch.
         let spc_style = self.style_registry.spc();
+        let requested_kinds = self
+            .spc_outlooks_enabled
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         for (kind, features) in &self.spc_data.outlooks {
-            if !self.spc_outlooks_enabled.iter().any(|k| k == kind) {
+            if !spc_layers::effective_spc_outlook_kind_enabled(self.spc_day, &requested_kinds, kind)
+            {
                 continue;
             }
             for feature in features {
@@ -41717,6 +42000,16 @@ fn placefile_parse_status(placefile: &placefiles::Placefile) -> String {
     )
 }
 
+fn placefile_source_fetch_due(slot: &PlacefileSlot, now: Instant) -> bool {
+    if slot.enabled {
+        slot.next_refresh
+            .map(|at| now >= at)
+            .unwrap_or(slot.data.is_none())
+    } else {
+        slot.data.is_none() && slot.next_refresh.is_none_or(|at| now >= at)
+    }
+}
+
 fn placefile_sheet_specs_to_load(slot: &PlacefileSlot) -> Vec<placefiles::IconSheetSpec> {
     let Some(placefile) = slot.data.as_ref() else {
         return Vec::new();
@@ -41733,7 +42026,8 @@ fn placefile_sheet_specs_to_load(slot: &PlacefileSlot) -> Vec<placefiles::IconSh
 }
 
 fn schedule_placefile_sheets(slot: &mut PlacefileSlot, ctx: &egui::Context) {
-    if slot.data.is_none()
+    if !slot.enabled
+        || slot.data.is_none()
         || slot.sheets_receiver.is_some()
         || slot.sheets_generation == Some(slot.source_generation)
     {
@@ -47492,7 +47786,7 @@ fn normalized_storm_track_max_tracks(count: usize) -> usize {
     } else {
         count.clamp(
             STORM_TRACK_MAX_TRACK_OPTIONS[0],
-            *STORM_TRACK_MAX_TRACK_OPTIONS.last().unwrap_or(&32),
+            *STORM_TRACK_MAX_TRACK_OPTIONS.last().unwrap_or(&70),
         )
     }
 }
@@ -55792,25 +56086,160 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.spc_reports_enabled = false;
         app.app_settings.overlay_spc_reports = false;
-        app.spc_last_key = Some((app.spc_day, None, spc_layers::SpcDay1Issue::Auto));
+        app.spc_last_key = Some(SpcFetchKey::canonical(
+            app.spc_day,
+            None,
+            spc_layers::SpcDay1Issue::Auto,
+            &app.spc_outlooks_enabled,
+            false,
+        ));
+        app.spc_last_attempt_at = Some(Instant::now());
+        let (_sender, receiver) = mpsc::channel::<SpcFetchResult>();
+        app.spc_rx = Some(receiver);
 
         app.apply_unified_player_spc_reports_enabled_state(true);
 
         assert!(app.spc_reports_enabled);
         assert!(app.app_settings.overlay_spc_reports);
         assert_eq!(app.spc_last_key, None);
+        assert!(app.spc_last_attempt_at.is_none());
+        assert!(app.spc_rx.is_none());
     }
 
     #[test]
-    fn spc_fetch_key_distinguishes_day1_issuance_without_affecting_auto() {
+    fn spc_fetch_key_covers_products_reports_day_archive_and_issuance() {
         let date = Some((2026, 7, 19));
-        let auto: SpcFetchKey = (1, date, spc_layers::SpcDay1Issue::Auto);
-        let early: SpcFetchKey = (1, date, spc_layers::SpcDay1Issue::At0600);
-        let later: SpcFetchKey = (1, date, spc_layers::SpcDay1Issue::At1630);
+        let kinds = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let base = SpcFetchKey::canonical(
+            1,
+            date,
+            spc_layers::SpcDay1Issue::Auto,
+            &kinds(&["wpc_ero", "cat", "fire_wind"]),
+            false,
+        );
+        let reordered = SpcFetchKey::canonical(
+            1,
+            date,
+            spc_layers::SpcDay1Issue::Auto,
+            &kinds(&["fire_wind", "wpc_ero", "cat", "cat"]),
+            false,
+        );
+        assert_eq!(base, reordered, "kind order and duplicates are canonical");
+        assert_eq!(
+            base.outlook_kinds,
+            [
+                "cat".to_owned(),
+                "fire_wind".to_owned(),
+                "wpc_ero".to_owned()
+            ]
+        );
 
-        assert_ne!(auto, early);
-        assert_ne!(early, later);
-        assert_eq!(auto, (1, date, spc_layers::SpcDay1Issue::Auto));
+        let changed = |day, archive_date, issue, selected: &[&str], reports| {
+            SpcFetchKey::canonical(day, archive_date, issue, &kinds(selected), reports)
+        };
+        assert_ne!(
+            base,
+            changed(
+                1,
+                date,
+                spc_layers::SpcDay1Issue::At0600,
+                &["cat", "fire_wind", "wpc_ero"],
+                false
+            )
+        );
+        assert_ne!(
+            base,
+            changed(
+                1,
+                Some((2026, 7, 20)),
+                spc_layers::SpcDay1Issue::Auto,
+                &["cat", "fire_wind", "wpc_ero"],
+                false
+            )
+        );
+        assert_ne!(
+            base,
+            changed(
+                2,
+                date,
+                spc_layers::SpcDay1Issue::Auto,
+                &["cat", "fire_wind", "wpc_ero"],
+                false
+            )
+        );
+        assert_ne!(
+            base,
+            changed(
+                1,
+                date,
+                spc_layers::SpcDay1Issue::Auto,
+                &["cat", "fire_dryt", "wpc_ero"],
+                false
+            )
+        );
+        assert_ne!(
+            base,
+            changed(
+                1,
+                date,
+                spc_layers::SpcDay1Issue::Auto,
+                &["cat", "fire_wind", "wpc_ero"],
+                true
+            )
+        );
+
+        let legacy_day3 = changed(
+            3,
+            date,
+            spc_layers::SpcDay1Issue::At2000,
+            &["torn", "wind", "hail"],
+            false,
+        );
+        let canonical_day3 = changed(3, date, spc_layers::SpcDay1Issue::Auto, &["prob"], false);
+        assert_eq!(legacy_day3, canonical_day3);
+        assert_eq!(legacy_day3.outlook_kinds, ["prob".to_owned()]);
+    }
+
+    #[test]
+    fn stale_spc_worker_completion_cannot_replace_current_selection() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.spc_day = 1;
+        app.spc_outlooks_enabled = vec!["cat".to_owned()];
+        app.spc_reports_enabled = false;
+        app.spc_data.outlook_geojson_lagging = false;
+        let stale_key = SpcFetchKey::canonical(
+            1,
+            None,
+            spc_layers::SpcDay1Issue::Auto,
+            &["fire_wind".to_owned()],
+            false,
+        );
+        let stale_data = spc_layers::SpcData {
+            outlook_geojson_lagging: true,
+            ..Default::default()
+        };
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(SpcFetchResult {
+                key: stale_key.clone(),
+                data: stale_data,
+            })
+            .unwrap();
+        app.spc_rx = Some(receiver);
+        app.spc_last_key = Some(stale_key);
+        app.spc_last_attempt_at = Some(Instant::now());
+
+        app.poll_spc(&egui::Context::default());
+
+        assert!(!app.spc_data.outlook_geojson_lagging);
+        assert!(app.spc_rx.is_none());
+        assert!(app.spc_last_key.is_none());
+        assert!(app.spc_last_attempt_at.is_none());
     }
 
     #[test]
@@ -60538,6 +60967,17 @@ mod tests {
         );
         assert_eq!(normalized_history_limit(1), HISTORY_SIZE_OPTIONS[0]);
         assert_eq!(normalized_history_limit(5000), MAX_HISTORY_FRAME_LIMIT);
+    }
+
+    #[test]
+    fn storm_track_max_options_reach_70_and_normalization_preserves_it() {
+        assert!(STORM_TRACK_MAX_TRACK_OPTIONS.contains(&70));
+        assert_eq!(
+            normalized_storm_track_max_tracks(0),
+            DEFAULT_STORM_TRACK_MAX_TRACKS
+        );
+        assert_eq!(normalized_storm_track_max_tracks(70), 70);
+        assert_eq!(normalized_storm_track_max_tracks(usize::MAX), 70);
     }
 
     #[test]
@@ -69974,6 +70414,10 @@ mod tests {
             aircraft_profiles_file: None,
             aircraft_profiles_status: String::new(),
             aircraft_soundings_enabled: false,
+            aircraft_history_profiles: Vec::new(),
+            aircraft_history_rx: None,
+            aircraft_history_status: String::new(),
+            show_aircraft_history: false,
             selected_aircraft_profile: None,
             aircraft_follow_selected: false,
             river_gauges: river_gauges::RiverGaugeState::default(),
@@ -71771,6 +72215,24 @@ mod tests {
     }
 
     #[test]
+    fn bottom_status_removes_top_scan_duplicate_but_keeps_action_suffix() {
+        let prefix = "KOAX 2026-07-31 00:01:10 EDT";
+        let scan = format!("{prefix} live partial age 5m (realtime L2 KOAX)");
+        assert_eq!(status_without_scan_duplicate(&scan, Some(prefix)), "");
+        assert_eq!(
+            status_without_scan_duplicate(
+                &format!("{scan} - Storm camera follow stopped"),
+                Some(prefix)
+            ),
+            "Storm camera follow stopped"
+        );
+        assert_eq!(
+            status_without_scan_duplicate("Refreshing warnings", Some(prefix)),
+            "Refreshing warnings"
+        );
+    }
+
+    #[test]
     fn manual_frame_indicator_excludes_live_auto_refresh() {
         assert!(manual_frame_load_indicator_active(true, false, false));
         assert!(manual_frame_load_indicator_active(false, false, true));
@@ -72131,6 +72593,50 @@ mod tests {
         assert_eq!(effective_placefile_threshold_nm(100.0, 400), 400.0);
         assert!(effective_placefile_threshold_nm(100.0, u16::MAX).is_infinite());
         assert_eq!(normalized_placefile_visibility_range_percent(0), 100);
+    }
+
+    #[test]
+    fn disabled_placefile_preloads_once_without_entering_refresh_cadence() {
+        let now = Instant::now();
+        let mut slot = PlacefileSlot::new("https://example.test/placefile.txt".to_owned(), false);
+        assert!(placefile_source_fetch_due(&slot, now));
+
+        slot.next_refresh = Some(now + Duration::from_secs(120));
+        assert!(!placefile_source_fetch_due(&slot, now));
+        slot.next_refresh = Some(now - Duration::from_secs(1));
+        assert!(placefile_source_fetch_due(&slot, now));
+
+        slot.data = Some(placefiles::Placefile {
+            title: "Preloaded title".to_owned(),
+            refresh_minutes: 5,
+            objects: Vec::new(),
+            icon_sheets: Vec::new(),
+            skipped: 0,
+        });
+        assert!(!placefile_source_fetch_due(&slot, now));
+
+        slot.enabled = true;
+        assert!(placefile_source_fetch_due(&slot, now));
+    }
+
+    #[test]
+    fn disabled_placefile_never_schedules_icon_sheets() {
+        let mut slot = PlacefileSlot::new("https://example.test/placefile.txt".to_owned(), false);
+        slot.data = Some(placefiles::Placefile {
+            title: "Preloaded title".to_owned(),
+            refresh_minutes: 5,
+            objects: Vec::new(),
+            icon_sheets: vec![test_placefile_icon_spec(
+                1,
+                "https://example.test/icons.png".to_owned(),
+            )],
+            skipped: 0,
+        });
+
+        schedule_placefile_sheets(&mut slot, &egui::Context::default());
+
+        assert!(slot.sheets_receiver.is_none());
+        assert_eq!(slot.sheets_generation, None);
     }
 
     #[test]

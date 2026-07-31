@@ -1002,7 +1002,9 @@ fn model_data(ui: &mut egui::Ui) {
             "a cyan ascent/descent marker and its reported flight path at each airport with a ",
             "QC-usable profile. Click a marker to select the path and open it in the native ",
             "sounding panel; the layer gear can center it or follow that airport's newest ",
-            "hourly profile endpoint. This is the limited public ",
+            "hourly profile endpoint. Previous soundings opens an on-demand, newest-first ",
+            "browser over the preceding six public hourly files without making the live map ",
+            "layer pay that download/parse cost. This is the limited public ",
             "real-time subset (primarily WVSS-II-equipped aircraft), not unrestricted global ",
             "AMDAR/ACARS; restricted airline observations are delayed before public release, ",
             "so coverage is sparse and uneven, and profile-follow is not continuous live ",
@@ -3096,10 +3098,12 @@ fn capture_brand(ui: &mut egui::Ui) {
     subhead(ui, "SCREENSHOTS");
     para(
         ui,
-        "Screenshot writes a PNG to Pictures/BowEcho and places a paste-ready image on the \
-         clipboard. Shift+F12 captures the map only; F12 captures the full app window. Map \
-         Only hides chrome for clean screenshots and recordings, and the top hover affordance \
-         brings the UI back if the tabs are hidden.",
+        "Screenshot always places a paste-ready image on the clipboard. By default it also \
+         writes a PNG to Pictures/BowEcho; turn that second destination off with Settings > \
+         App Identity / Brand Kit > Also save still screenshots to disk. Shift+F12 captures \
+         the map only; F12 captures the full app window. Map Only hides chrome for clean \
+         screenshots and recordings, and the top hover affordance brings the UI back if the \
+         tabs are hidden.",
     );
 
     subhead(ui, "VIDEO, GIF, WEBP");
@@ -3172,7 +3176,7 @@ fn shortcuts(ui: &mut egui::Ui) {
     key_row(
         ui,
         "F12",
-        "screenshot — full window to the clipboard + a PNG in Pictures/BowEcho",
+        "screenshot — full window always to the clipboard; optional PNG in Pictures/BowEcho",
     );
     key_row(ui, "Shift+F12", "screenshot cropped to the map only");
     key_row(
