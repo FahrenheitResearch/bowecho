@@ -36,7 +36,7 @@ regressing (§4 below).
 
 - `crates/render2d/src/region_core.rs` — the fast Region fallback.
   Region-based unfolding, Eilts & Smith 1990 lineage.
-- `crates/render2d/src/dealias_v4/` — the default v4.1 engine ("Analyst v4"):
+- `crates/render2d/src/dealias_v4/` — the whole-volume v4.1 engine ("Analyst v4"):
   - `mod.rs` — entry points, super-region segmentation over all tilts;
   - `graph.rs` — boundary-vote graph;
   - `solve.rs` — max-spanning-forest DP + ICM (Besag 1986) over one

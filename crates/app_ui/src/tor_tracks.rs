@@ -240,6 +240,10 @@ impl Default for TorTracksState {
 }
 
 impl TorTracksState {
+    pub(crate) fn job_active(&self) -> bool {
+        self.job.is_some()
+    }
+
     pub(crate) fn with_persisted(expected_site: &str, show_tracks: bool, show_tds: bool) -> Self {
         let mut state = Self {
             show_tracks,
@@ -441,7 +445,7 @@ impl crate::ViewerApp {
         if self.tor_tracks.job.is_none() {
             let next = self.primary.history.iter().find_map(|frame| {
                 if frame.identity.site_id != active_site
-                    || frame.status == crate::FrameStatus::Preview
+                    || !crate::frame_ready_for_background_velocity_analysis(frame.status)
                     || !self.tor_tracks.in_window(frame.identity.scan_time_utc)
                 {
                     return None;

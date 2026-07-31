@@ -888,7 +888,7 @@ fn default_rotation_markers_enabled() -> bool {
 }
 
 fn default_dealias_engine() -> String {
-    "analyst-3d".to_owned()
+    "region".to_owned()
 }
 
 fn default_sat_ir_enhancement() -> String {
@@ -2555,7 +2555,7 @@ mod tests {
         assert!(!old.tds_tracks_enabled);
         assert!(old.rotation_markers_enabled);
         assert!(!old.unfold_velocity_display);
-        assert_eq!(old.dealias_engine, "analyst-3d");
+        assert_eq!(old.dealias_engine, "region");
         assert_eq!(old.storm_track_max_tracks, 16);
         assert_eq!(old.storm_track_min_dbz_tenths, 350);
 

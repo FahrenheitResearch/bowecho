@@ -3213,10 +3213,10 @@ struct ViewerApp {
     tor_tracks: tor_tracks::TorTracksState,
     /// Reflectivity gate filter threshold (dBZ); None = off.
     gate_filter_dbz: Option<f32>,
-    /// Velocity dealias engine (see [`DealiasEngine`]): `Analyst3d` is the
-    /// default v4 whole-volume engine, `Region` is the fast same-tilt
-    /// fallback, and `RegionGlobal` is the Rust Py-ART same-tilt port. Only
-    /// `Analyst3d` uses the temporal/model inputs (dealias-v4 spec §16).
+    /// Velocity dealias engine (see [`DealiasEngine`]): `Region` is the fast
+    /// default, `RegionGlobal` is the Rust Py-ART same-tilt port, and
+    /// `Analyst3d` is the opt-in v4 whole-volume engine. Only `Analyst3d` uses
+    /// the temporal/model inputs (dealias-v4 spec §16).
     dealias_engine: DealiasEngine,
     /// RAP 0-h analysis wind profiles per (site, cycle) for the v4 engine's
     /// absolute-branch anchor (CONUS only; intl sites run without one).
@@ -4303,6 +4303,15 @@ fn previous_dealias_reference_volume(
                 && frame.volume.volume_time < current.volume_time
         })
         .map(|frame| Arc::clone(&frame.volume))
+}
+
+/// Background velocity analyses are intentionally scan-complete. Live-partial
+/// Level-II objects are replaced as chunks arrive, so starting a dealias solve
+/// for each transient `Arc` can keep a CPU core saturated for an entire scan.
+/// The displayed radar may still render partial data; only rotation/TDS
+/// analysis waits for the complete frame.
+pub(crate) fn frame_ready_for_background_velocity_analysis(status: FrameStatus) -> bool {
+    !matches!(status, FrameStatus::Preview | FrameStatus::LivePartial)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -5725,7 +5734,9 @@ fn diagnostic_poll_source_label(source: &FeedSource) -> String {
         // ever CustomUrl or Live(Intl) until the stage-(ii) unify.
         FeedSource::Live(SiteRef::Us { level2_id }) => format!("us {level2_id}"),
         FeedSource::Archive { site, .. } => format!("archive {}", site.settings_key()),
-        FeedSource::LocalFiles { label } => format!("local {label}"),
+        FeedSource::LocalFiles { label } => {
+            format!("local {}", redact_diagnostic_profile_component(label))
+        }
     }
 }
 
@@ -5755,9 +5766,59 @@ fn optional_ms_label(value: Option<f32>) -> String {
         .unwrap_or_else(|| "-".to_owned())
 }
 
+fn diagnostic_home_path() -> Option<PathBuf> {
+    ["USERPROFILE", "HOME"].into_iter().find_map(|name| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+fn redact_diagnostic_profile_component(value: &str) -> String {
+    let mut redacted = value.to_owned();
+    for marker in [r"\users\", "/users/", r"\home\", "/home/"] {
+        let mut search_from = 0usize;
+        loop {
+            let lowercase = redacted.to_ascii_lowercase();
+            let Some(relative_start) = lowercase[search_from..].find(marker) else {
+                break;
+            };
+            let profile_start = search_from + relative_start + marker.len();
+            let profile_tail = &redacted[profile_start..];
+            let profile_len = profile_tail.find(['\\', '/']).unwrap_or(profile_tail.len());
+            if profile_len == 0 {
+                break;
+            }
+            let profile_end = profile_start + profile_len;
+            if &redacted[profile_start..profile_end] != "<user>" {
+                redacted.replace_range(profile_start..profile_end, "<user>");
+            }
+            search_from = profile_start + "<user>".len();
+        }
+    }
+    redacted
+}
+
+fn diagnostic_path_label_with_home(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home
+        && let Ok(relative) = path.strip_prefix(home)
+    {
+        if relative.as_os_str().is_empty() {
+            return "<user>".to_owned();
+        }
+        return format!("<user>{}{}", std::path::MAIN_SEPARATOR, relative.display());
+    }
+    redact_diagnostic_profile_component(&path.display().to_string())
+}
+
+fn diagnostic_path_label(path: &Path) -> String {
+    let home = diagnostic_home_path();
+    diagnostic_path_label_with_home(path, home.as_deref())
+}
+
 fn push_optional_path(text: &mut String, label: &str, path: Option<&Path>) {
     let value = path
-        .map(|path| path.display().to_string())
+        .map(diagnostic_path_label)
         .unwrap_or_else(|| "-".to_owned());
     let _ = writeln!(text, "{label}: {value}");
 }
@@ -18550,7 +18611,7 @@ impl ViewerApp {
                 self.primary
                     .history
                     .iter()
-                    .filter(|frame| frame.status != FrameStatus::Preview)
+                    .filter(|frame| frame_ready_for_background_velocity_analysis(frame.status))
                     .map(|frame| Arc::clone(&frame.volume)),
             );
         }
@@ -25724,7 +25785,7 @@ impl ViewerApp {
                                     "Region",
                                 )
                                 .on_hover_text(
-                                    "Fast same-tilt region unfolding. Good fallback, but an isolated connected group's absolute Nyquist branch can be ambiguous.",
+                                    "Responsive default: fast same-tilt region unfolding. An isolated connected group's absolute Nyquist branch can still be ambiguous.",
                                 )
                                 .changed();
                             engine_changed |= ui
@@ -25744,7 +25805,7 @@ impl ViewerApp {
                                     "Analyst v4 (whole volume)",
                                 )
                                 .on_hover_text(
-                                    "Default whole-volume v4 optimization: all velocity tilts are solved jointly, using the previous volume and a RAP model wind profile at the radar site when available (US CONUS sites; fetched in the background). International sites run without the model anchor.",
+                                    "Higher-cost whole-volume v4 optimization: all velocity tilts are solved jointly, using the previous volume and a RAP model wind profile at the radar site when available (US CONUS sites; fetched in the background). International sites run without the model anchor.",
                                 )
                                 .changed();
                         });
@@ -27799,7 +27860,7 @@ impl ViewerApp {
             let _ = writeln!(text, "volume: none");
         }
         if let Some(path) = self.source_path.as_ref() {
-            let _ = writeln!(text, "source_path: {}", path.display());
+            let _ = writeln!(text, "source_path: {}", diagnostic_path_label(path));
         }
 
         let _ = writeln!(
@@ -27827,6 +27888,18 @@ impl ViewerApp {
                 .unwrap_or(0),
             self.model_layers.len(),
             self.sat_layer.is_some()
+        );
+        let _ = writeln!(
+            text,
+            "analysis: engine={} rotation_markers={} rotation_running={} rotation_tracks={} tds={} tracks_running={} storm_tracks={} storm_running={}",
+            self.dealias_engine.settings_slug(),
+            self.show_rotation_markers,
+            self.rotation_receiver.is_some(),
+            self.tor_tracks.show_tracks,
+            self.tor_tracks.show_tds,
+            self.tor_tracks.job_active(),
+            self.show_storm_tracks,
+            self.storm_cells_receiver.is_some()
         );
         if let Some(load_timing) = &self.load_timing {
             let _ = writeln!(
@@ -27858,7 +27931,10 @@ impl ViewerApp {
         push_optional_path(&mut text, "model_store", Some(&model_store));
         let sat_store = settings::sat_store_dir();
         push_optional_path(&mut text, "sat_store", Some(&sat_store));
-        text
+        // Status/error strings can also contain a local path. Run the complete
+        // support snapshot through the same profile-name redactor so adding a
+        // new diagnostic field cannot silently reintroduce this privacy leak.
+        redact_diagnostic_profile_component(&text)
     }
 
     fn stats_panel(&mut self, ui: &mut egui::Ui) {
@@ -27875,7 +27951,7 @@ impl ViewerApp {
         }
         if ui
             .button("Copy diagnostics")
-            .on_hover_text("Copy a compact support snapshot: version, renderer, source, map state, workers, timing, and data paths")
+            .on_hover_text("Copy a compact support snapshot: version, renderer, source, map state, workers, timing, and data paths. Local profile names are redacted.")
             .clicked()
         {
             ui.ctx().copy_text(self.diagnostic_summary());
@@ -39797,9 +39873,17 @@ impl ViewerApp {
                         markers.clone(),
                         ALGO_FRAME_CACHE_LIMIT,
                     );
-                    let current_key = self.volume.as_ref().map(|volume| {
-                        let (_, _, context) = self.primary_dealias_inputs_for_volume(volume);
-                        DealiasFrameWorkKey::new(volume, context)
+                    let current_key = self.volume.as_ref().and_then(|volume| {
+                        let ready = self
+                            .selected_frame()
+                            .filter(|frame| Arc::ptr_eq(&frame.volume, volume))
+                            .is_none_or(|frame| {
+                                frame_ready_for_background_velocity_analysis(frame.status)
+                            });
+                        ready.then(|| {
+                            let (_, _, context) = self.primary_dealias_inputs_for_volume(volume);
+                            DealiasFrameWorkKey::new(volume, context)
+                        })
                     });
                     if current_key.as_ref() == Some(&key) {
                         self.install_rotation_markers_for_frame(&key, markers, ctx);
@@ -39825,6 +39909,13 @@ impl ViewerApp {
             }
             return;
         };
+        if self
+            .selected_frame()
+            .filter(|frame| Arc::ptr_eq(&frame.volume, &volume))
+            .is_some_and(|frame| !frame_ready_for_background_velocity_analysis(frame.status))
+        {
+            return;
+        }
         let (previous_volume, dealias_env, context) =
             self.primary_dealias_inputs_for_volume(&volume);
         let key = DealiasFrameWorkKey::new(&volume, context);
@@ -41795,10 +41886,10 @@ struct CrossSectionReadout {
 /// `smooth_display` bool maps to `Soften` so old configs keep their look.
 /// Which velocity-dealias engine the viewer runs. All three produce a
 /// dealiased VEL/DVEL/DSRV grid; they differ in method and cost:
-/// - `Region`: the fast same-tilt BowEcho region solver.
+/// - `Region`: the fast same-tilt BowEcho region solver (the default).
 /// - `RegionGlobal`: a Rust port of Py-ART's `dealias_region_based`
 ///   per-sweep core — same-tilt, no volume/model/temporal evidence.
-/// - `Analyst3d`: the default model-anchored v4 engine (whole-volume branch
+/// - `Analyst3d`: the opt-in model-anchored v4 engine (whole-volume branch
 ///   optimization; uses the previous volume + a RAP wind profile).
 ///
 /// Only `Analyst3d` consumes the previous volume and RAP env profile;
@@ -41807,12 +41898,12 @@ struct CrossSectionReadout {
 /// invalidates cached textures and readouts.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum DealiasEngine {
-    /// Fast same-tilt region unfolding.
+    /// Fast same-tilt region unfolding — the app's default.
+    #[default]
     Region,
     /// Rust port of Py-ART `dealias_region_based` (same-tilt).
     RegionGlobal,
-    /// Default model-anchored whole-volume v4 engine.
-    #[default]
+    /// Model-anchored whole-volume v4 engine.
     Analyst3d,
 }
 
@@ -41822,7 +41913,7 @@ impl DealiasEngine {
             "region" => Self::Region,
             "region-global" | "region_global" | "global" => Self::RegionGlobal,
             "analyst-3d" | "analyst3d" | "analyst_3d" => Self::Analyst3d,
-            _ => Self::Analyst3d,
+            _ => Self::Region,
         }
     }
 
@@ -49502,12 +49593,45 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_path_label_redacts_local_profile_names() {
+        let windows = diagnostic_path_label_with_home(
+            Path::new("C:/Users/local-profile/Downloads/weather data/cache/KOAX"),
+            Some(Path::new("C:/Users/local-profile")),
+        );
+        assert!(windows.contains("<user>"));
+        assert!(!windows.contains("local-profile"));
+        assert!(windows.contains("Downloads"));
+
+        let windows_fallback = diagnostic_path_label_with_home(
+            Path::new(r"C:\Users\local-profile\AppData\Roaming\bowecho\config.json"),
+            None,
+        );
+        assert!(windows_fallback.contains(r"Users\<user>\AppData"));
+        assert!(!windows_fallback.contains("local-profile"));
+
+        let unix = diagnostic_path_label_with_home(
+            Path::new("/home/local-profile/.config/bowecho/config.json"),
+            None,
+        );
+        assert_eq!(unix, "/home/<user>/.config/bowecho/config.json");
+
+        let multiple = redact_diagnostic_profile_component(
+            "source C:/Users/local-profile/file\nconfig C:\\Users\\second-profile\\config.json",
+        );
+        assert!(!multiple.contains("local-profile"));
+        assert!(!multiple.contains("second-profile"));
+        assert_eq!(multiple.matches("<user>").count(), 2);
+    }
+
+    #[test]
     fn diagnostic_summary_includes_support_context() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.renderer_backend = "glow";
         app.startup_notice = Some(WGPU_TO_GLOW_FALLBACK_NOTICE.to_owned());
         app.status = "Polled FWLX".to_owned();
-        app.source_path = Some(PathBuf::from("C:/cases/FWLX20260613_120000"));
+        app.source_path = Some(PathBuf::from(
+            "C:/Users/local-profile/cases/FWLX20260613_120000",
+        ));
         app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
         app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
         app.selected_cut = 1;
@@ -49533,7 +49657,9 @@ mod tests {
         assert!(summary.contains("volume: site=TEST"));
         assert!(summary.contains("products=[REF,VEL,DVEL,SRV,DSRV"));
         assert!(summary.contains("poll: active=true source=custom http://198.51.100.9/..."));
-        assert!(summary.contains("source_path: C:/cases/FWLX20260613_120000"));
+        assert!(summary.contains("source_path: C:/Users/<user>/cases/FWLX20260613_120000"));
+        assert!(!summary.contains("local-profile"));
+        assert!(summary.contains("analysis: engine=region"));
         assert!(summary.contains("config:"));
         assert!(summary.contains("styles:"));
     }
@@ -50129,6 +50255,27 @@ mod tests {
     }
 
     #[test]
+    fn background_velocity_analysis_waits_for_complete_live_frames() {
+        assert!(!frame_ready_for_background_velocity_analysis(
+            FrameStatus::Preview
+        ));
+        assert!(!frame_ready_for_background_velocity_analysis(
+            FrameStatus::LivePartial
+        ));
+        for status in [
+            FrameStatus::Local,
+            FrameStatus::LiveComplete,
+            FrameStatus::Complete,
+            FrameStatus::Stale,
+        ] {
+            assert!(
+                frame_ready_for_background_velocity_analysis(status),
+                "{status:?} should be stable enough for background velocity analysis"
+            );
+        }
+    }
+
+    #[test]
     fn cursor_readout_uses_dealiased_velocity_grid_for_dvel() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_aliased_velocity_volume()));
@@ -50156,18 +50303,13 @@ mod tests {
     /// required (the intl/no-env path). The cache must key the v4 grid
     /// separately from region output, and flipping engines must invalidate it.
     #[test]
-    fn default_analyst_v4_engine_routes_readout_through_the_v4_engine() {
+    fn analyst_v4_engine_routes_readout_through_the_v4_engine_when_selected() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let volume = Arc::new(test_aliased_velocity_volume());
         app.volume = Some(Arc::clone(&volume));
         app.selected_cut = 0;
         app.selected_product = DisplayProduct::DealiasedVelocity;
-        app.dealias_engine = DealiasEngine::from_settings(&app.app_settings);
-        assert_eq!(
-            app.dealias_engine,
-            DealiasEngine::Analyst3d,
-            "the default settings route must remain Analyst v4"
-        );
+        app.dealias_engine = DealiasEngine::Analyst3d;
 
         let grid = app
             .dealiased_velocity_readout_grid(&volume, 0)
@@ -55494,7 +55636,7 @@ mod tests {
     }
 
     #[test]
-    fn default_and_unknown_dealias_engine_use_v4_while_known_choices_survive() {
+    fn default_and_unknown_dealias_engine_use_region_while_known_choices_survive() {
         let settings = settings::AppSettings {
             dealias_engine: "future-engine".to_owned(),
             ..Default::default()
@@ -55502,11 +55644,11 @@ mod tests {
 
         assert_eq!(
             RadarAlgorithmPreferences::from_settings(&settings).dealias_engine,
-            DealiasEngine::Analyst3d
+            DealiasEngine::Region
         );
         assert_eq!(
             DealiasEngine::from_settings(&settings::AppSettings::default()),
-            DealiasEngine::Analyst3d
+            DealiasEngine::Region
         );
         for (slug, expected) in [
             ("region", DealiasEngine::Region),

@@ -512,11 +512,11 @@ fn products(ui: &mut egui::Ui) {
          the beam only; flow across the beam is invisible.",
         "keep Unfold VEL on. Raw velocity folds at the Nyquist speed and a folded gate reads \
          as a fake opposite-direction couplet — the inspector warns on near-Nyquist gates. \
-         Analyst v4 is the default: it solves all velocity tilts of the volume jointly, adds \
-         the previous volume as a temporal prior, and — for US CONUS sites — anchors the \
-         absolute branch to a RAP analysis wind profile fetched in the background; \
-         international sites run it without the model anchor. Region remains available as a \
-         faster same-tilt fallback, and Region Global is the Py-ART-style same-tilt solver.",
+         Region is the responsive default and unfolds only the selected tilt. Analyst v4 is \
+         the higher-cost option: it solves all velocity tilts of the volume jointly, adds the \
+         previous volume as a temporal prior, and — for US CONUS sites — anchors the absolute \
+         branch to a RAP analysis wind profile fetched in the background; international sites \
+         run it without the model anchor. Region Global is the Py-ART-style same-tilt solver.",
         "Region: Jing & Wiener 1993 (JTECH 10); Feldmann et al. 2020, R2D2 \
          (JTECH-D-20-0054.1); Helmus & Collis 2016 (Py-ART, JORS). Analyst v4 adds: \
          Eilts & Smith 1990 (JTECH 7, environmental wind constraints); James & Houze 2001 \
