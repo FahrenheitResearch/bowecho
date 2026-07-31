@@ -831,20 +831,12 @@ impl ViewerApp {
         // decoded report, with age.
         let ob_owns_card = if self.obs_enabled && !self.surface_obs.is_empty() {
             let frame_time = self.surface_obs_frame_time_utc();
-            let mut best: Option<(f32, &obs::SurfaceOb)> = None;
-            for ob in self
-                .surface_obs
-                .frame_obs(frame_time)
-                .filter(|ob| self.surface_ob_visible_on_map(ob))
-            {
-                let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
-                let d = pos.distance(anchor);
-                if d < 40.0 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                    best = Some((d, ob));
-                }
-            }
+            // The observation pool is global and carries several reports per
+            // station. Use the geo-bounded station hit test instead of
+            // projecting the whole pool on every hovered repaint.
+            let best = self.surface_ob_near_screen(rect, anchor, 40.0);
             let ob_matched = best.is_some();
-            if let Some((_, ob)) = best {
+            if let Some(ob) = best.as_ref() {
                 let mut line = ob.station_id.clone();
                 if let (Some(t), Some(td)) = (ob.temp_c, ob.dewpoint_c) {
                     line.push_str(&format!(

@@ -31935,7 +31935,7 @@ impl ViewerApp {
         if !self.app_settings.overlay_obs_metar_state_filter_enabled {
             return true;
         }
-        us_state_abbr_for_lon_lat(ob.lat, ob.lon).is_some_and(|state| {
+        ob.map_state_abbr.is_some_and(|state| {
             self.app_settings
                 .overlay_obs_metar_states
                 .iter()
@@ -35800,11 +35800,12 @@ impl ViewerApp {
         }
     }
 
-    /// Surface-obs refresh: fetch the METAR cache on enable and every
-    /// 5 minutes after (background thread; one in flight).
+    /// Surface-obs refresh: fetch the METAR cache while that network is
+    /// visible, then every 5 minutes after (background thread; one in flight).
     fn poll_surface_obs(&mut self, ctx: &egui::Context) {
         let mut observations_updated = false;
         if self.obs_enabled
+            && self.obs_show_metar
             && self.obs_rx.is_none()
             && self
                 .obs_last_attempt_at
@@ -35843,6 +35844,7 @@ impl ViewerApp {
         }
         // Mesonet density (IEM RWIS+DCP): 10-minute cadence, same pool.
         if self.obs_enabled
+            && self.obs_show_mesonet
             && self.mesonet_rx.is_none()
             && self
                 .mesonet_last_attempt_at
@@ -39388,8 +39390,13 @@ impl ViewerApp {
         let font_id = egui::FontId::proportional(obs_style.small_font_px);
         // Fuller reports first so they win declutter cells.
         let looping = self.primary.cursor.playing || self.primary.cursor.browsing;
+        // Text-heavy station models are the part users feel while dragging or
+        // wheel-zooming. Keep observations present, but use the established
+        // loop-playback budget until interaction ends; the next input repaint
+        // restores full detail.
+        let moving_map = map_layer_rerender_deferred(painter.ctx());
         let plot_units = self.units();
-        let (max_candidates, max_full_plots, max_labels, max_dots) = if looping {
+        let (max_candidates, max_full_plots, max_labels, max_dots) = if looping || moving_map {
             (3000usize, 150usize, 0usize, 500usize)
         } else {
             (5000usize, 400usize, 120usize, 1000usize)
@@ -39529,7 +39536,10 @@ impl ViewerApp {
             east: bounds.east,
             north: bounds.north,
         };
-        let reports: Vec<&obs::SurfaceOb> = self
+        let mut report_count = 0usize;
+        let mut newest = None;
+        let mut metar_count = 0usize;
+        for ob in self
             .surface_obs
             .frame_obs_in_bounds(frame_time, ob_bounds)
             .filter(|ob| self.surface_ob_visible_on_map(ob))
@@ -39538,19 +39548,23 @@ impl ViewerApp {
                     .map(|time| (frame_time - time).num_minutes().abs() <= 60)
                     .unwrap_or(false)
             })
-            .collect();
-        if reports.is_empty() {
+        {
+            report_count += 1;
+            metar_count += usize::from(ob.network == "METAR");
+            if let Some(time) = ob.time_utc {
+                newest = Some(newest.map_or(time, |current: DateTime<Utc>| current.max(time)));
+            }
+        }
+        if report_count == 0 {
             return;
         }
-        let newest = reports.iter().filter_map(|ob| ob.time_utc).max();
         let newest_age = newest
             .map(|time| (frame_time - time).num_minutes().max(0))
             .unwrap_or(0);
-        let metar_count = reports.iter().filter(|ob| ob.network == "METAR").count();
-        let mesonet_count = reports.len().saturating_sub(metar_count);
+        let mesonet_count = report_count.saturating_sub(metar_count);
         let lines = [
             format!("OBS {}", self.time_zone().format_hms(frame_time)),
-            format!("{} plots - newest {}m old", reports.len(), newest_age),
+            format!("{report_count} plots - newest {newest_age}m old"),
             format!("{metar_count} METAR - {mesonet_count} mesonet"),
         ];
         let font = egui::FontId::monospace(12.0);
@@ -48970,6 +48984,7 @@ mod tests {
             completeness: 8,
             network: "METAR".to_owned(),
             elevation_m: None,
+            map_state_abbr: Some("OK"),
         }
     }
 
@@ -70308,6 +70323,7 @@ mod tests {
             completeness: 4,
             network: network.to_owned(),
             elevation_m: None,
+            map_state_abbr: us_state_abbr_for_lon_lat(lat, lon),
         }
     }
 

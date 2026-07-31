@@ -42,6 +42,10 @@ pub struct SurfaceOb {
     /// Station elevation, m MSL (METAR cache only; mesonets fall back
     /// to model terrain at their cell in the analysis).
     pub elevation_m: Option<f32>,
+    /// Cached state lookup for the display-only station filter. Production
+    /// parsers populate this on their existing worker threads so map paints do
+    /// not repeatedly point-in-polygon test every visible observation.
+    pub map_state_abbr: Option<&'static str>,
 }
 
 /// Fetch + decode the full METAR cache. Blocking — call on a worker
@@ -233,6 +237,7 @@ fn parse_nws_latest_ob(
         completeness,
         network: "METAR".to_owned(),
         elevation_m,
+        map_state_abbr: crate::map_paint::us_state_abbr_for_lon_lat(lat, lon),
     })
 }
 
@@ -339,6 +344,7 @@ fn parse_row(columns: &[&str], line: &str) -> Option<SurfaceOb> {
         wind_gust_kt,
         altim_in_hg,
         completeness,
+        map_state_abbr: crate::map_paint::us_state_abbr_for_lon_lat(lat, lon),
     })
 }
 
@@ -411,6 +417,7 @@ fn parse_iem_asos_row(columns: &[&str], line: &str) -> Option<SurfaceOb> {
         completeness,
         network: "METAR".to_owned(),
         elevation_m: f32_of("elevation").filter(|e| (-430.0..=4500.0).contains(e)),
+        map_state_abbr: crate::map_paint::us_state_abbr_for_lon_lat(lat, lon),
     })
 }
 
@@ -575,6 +582,7 @@ fn fetch_network(network: &str) -> Result<Vec<SurfaceOb>, String> {
             wind_gust_kt,
             altim_in_hg,
             completeness,
+            map_state_abbr: crate::map_paint::us_state_abbr_for_lon_lat(lat, lon),
         });
     }
     Ok(obs)
@@ -775,6 +783,7 @@ mod tests {
         assert_eq!(ob.temp_c, Some(25.0));
         assert_eq!(ob.wind_gust_kt, Some(13.0));
         assert!(ob.completeness >= 4);
+        assert_eq!(ob.map_state_abbr, Some("MO"));
     }
 
     #[test]
@@ -933,6 +942,7 @@ mod tests {
         assert!((ob.wind_speed_kt.unwrap() - 11.0).abs() < 0.01);
         assert!((ob.altim_in_hg.unwrap() - 30.05).abs() < 0.01);
         assert_eq!(ob.elevation_m, Some(391.0));
+        assert_eq!(ob.map_state_abbr, Some("OK"));
     }
 
     #[test]
@@ -953,6 +963,7 @@ mod tests {
             wind_gust_kt: None,
             altim_in_hg: None,
             completeness: 1,
+            map_state_abbr: None,
         };
         let mut pool = ObPool::new();
         // NOTE: merge prunes vs wall clock; use raw insert semantics by
@@ -991,6 +1002,7 @@ mod tests {
             wind_gust_kt: None,
             altim_in_hg: None,
             completeness: 1,
+            map_state_abbr: None,
         };
         let mut pool = ObPool::new();
         pool.by_station.insert(
@@ -1098,6 +1110,7 @@ mod tests {
             completeness: 4,
             network: "METAR".to_owned(),
             elevation_m: None,
+            map_state_abbr: crate::map_paint::us_state_abbr_for_lon_lat(lat, lon),
         }
     }
 }

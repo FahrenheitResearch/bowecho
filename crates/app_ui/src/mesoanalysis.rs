@@ -526,6 +526,7 @@ mod tests {
             wind_gust_kt: None,
             altim_in_hg: None,
             completeness: 1,
+            map_state_abbr: None,
         }
     }
 
