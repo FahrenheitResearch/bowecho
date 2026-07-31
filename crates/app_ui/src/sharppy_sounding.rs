@@ -18,7 +18,9 @@ use crate::formula_sounding::FormulaSoundingDiagnostic;
 use crate::sounding_correction::{
     CorrectionLevel, CorrectionRecipe, CorrectionResult, QcSeverity, apply_correction_recipe,
 };
-use crate::sounding_correction_io::{CorrectionSourceContext, ImportedRawSounding};
+use crate::sounding_correction_io::{
+    CorrectionSourceContext, ImportedRawSounding, corrected_profile_csv, sharppy_raw_text,
+};
 use crate::sounding_correction_ui::{BatchDiagnosticValues, SoundingCorrectionEditor};
 use crate::sounding_table_config::{
     SoundingTableConfig, SoundingTableEditor, config_from_view_state, write_config_to_view_state,
@@ -154,13 +156,124 @@ pub(crate) struct SoundingHeaderControls {
     pub(crate) formula_diagnostic: Option<FormulaSoundingDiagnostic>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SoundingTextFormat {
+    SharppyRaw,
+    Csv,
+}
+
+impl SoundingTextFormat {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::SharppyRaw => "SHARPpy RAW",
+            Self::Csv => "CSV",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::SharppyRaw => "txt",
+            Self::Csv => "csv",
+        }
+    }
+}
+
+fn sounding_text_payload(
+    column: &SoundingColumn,
+    title: &str,
+    format: SoundingTextFormat,
+) -> Result<String, String> {
+    match format {
+        SoundingTextFormat::SharppyRaw => sharppy_raw_text(column, Some(title)),
+        SoundingTextFormat::Csv => corrected_profile_csv(column),
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn sounding_export_default_file_name(
+    column: &SoundingColumn,
+    title: &str,
+    format: SoundingTextFormat,
+) -> String {
+    let metadata_identity = format!(
+        "{} {}",
+        column.metadata.station_id.trim(),
+        column.metadata.valid_time.trim()
+    );
+    let identity = if metadata_identity.trim().is_empty() {
+        title
+    } else {
+        metadata_identity.trim()
+    };
+    let mut stem = String::new();
+    let mut separator_pending = false;
+    for character in identity.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator_pending && !stem.is_empty() {
+                stem.push('-');
+            }
+            stem.push(character.to_ascii_lowercase());
+            separator_pending = false;
+        } else if !stem.is_empty() {
+            separator_pending = true;
+        }
+        if stem.len() >= 72 {
+            break;
+        }
+    }
+    while stem.ends_with('-') {
+        stem.pop();
+    }
+    if stem.is_empty() {
+        stem.push_str("profile");
+    }
+    format!("sounding-{stem}.{}", format.extension())
+}
+
+fn sounding_text_export_action(
+    column: &SoundingColumn,
+    title: &str,
+    format: SoundingTextFormat,
+    save_to_file: bool,
+) -> SoundingTextExportAction {
+    match sounding_text_payload(column, title, format) {
+        Ok(text) if save_to_file => SoundingTextExportAction::Save {
+            format,
+            text,
+            default_file_name: sounding_export_default_file_name(column, title, format),
+        },
+        Ok(text) => SoundingTextExportAction::Copy { format, text },
+        Err(message) => SoundingTextExportAction::Error { format, message },
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SoundingTextExportAction {
+    Copy {
+        format: SoundingTextFormat,
+        text: String,
+    },
+    Save {
+        format: SoundingTextFormat,
+        text: String,
+        default_file_name: String,
+    },
+    Error {
+        format: SoundingTextFormat,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SoundingHeaderActions {
     pub(crate) toggle_box_sounding: bool,
     pub(crate) toggle_obs_adjusted: bool,
     /// Visible physical sounding board to copy/save on the next composited
     /// viewport screenshot. Kept as a host action because eframe owns capture.
     pub(crate) capture_sounding: Option<egui::Rect>,
+    /// Clipboard and file export stay host actions so BowEcho can report the
+    /// outcome through its ordinary application status line.
+    pub(crate) text_export: Option<SoundingTextExportAction>,
 }
 
 pub struct SharppySoundingPanel {
@@ -185,6 +298,11 @@ pub struct SharppySoundingPanel {
     /// Manual correction always rebuilds from this copy, never from a prior
     /// edited result, so Reset is exact and the model store is never mutated.
     source: Option<SoundingSource>,
+    /// Exact physical column currently rendered by both SHARPpy and Classic.
+    /// This is deliberately distinct from `source.column`: an accepted manual
+    /// correction replaces it, while a QC-blocked preview falls back to the
+    /// untouched source. Text export must follow what the user can see.
+    display_column: Option<SoundingColumn>,
     correction_editor: SoundingCorrectionEditor,
     correction_recipe: CorrectionRecipe,
     correction_result: Option<CorrectionResult>,
@@ -204,6 +322,7 @@ impl SharppySoundingPanel {
             layout_tokens: None,
             pending_layout_tokens: None,
             source: None,
+            display_column: None,
             correction_editor: SoundingCorrectionEditor::default(),
             correction_recipe: CorrectionRecipe::default(),
             correction_result: None,
@@ -221,6 +340,7 @@ impl SharppySoundingPanel {
 
     pub fn set_loading(&mut self) {
         self.source = None;
+        self.display_column = None;
         self.correction_recipe = CorrectionRecipe::default();
         self.correction_result = None;
         self.correction_editor.reset_source_state();
@@ -230,6 +350,7 @@ impl SharppySoundingPanel {
     pub fn set_error(&mut self, message: String) {
         self.analysis = None;
         self.source = None;
+        self.display_column = None;
         self.correction_recipe = CorrectionRecipe::default();
         self.correction_result = None;
         self.correction_editor.reset_source_state();
@@ -239,6 +360,7 @@ impl SharppySoundingPanel {
     pub fn clear(&mut self) {
         self.analysis = None;
         self.source = None;
+        self.display_column = None;
         self.correction_recipe = CorrectionRecipe::default();
         self.correction_result = None;
         self.correction_editor.reset_source_state();
@@ -376,6 +498,7 @@ impl SharppySoundingPanel {
             Ok(column) => self.install_source(data, column, footprint),
             Err(_) => {
                 self.source = None;
+                self.display_column = None;
                 self.correction_recipe = CorrectionRecipe::default();
                 self.correction_result = None;
                 self.correction_editor.reset_source_state();
@@ -468,12 +591,16 @@ impl SharppySoundingPanel {
             .as_ref()
             .filter(|_| active)
             .map_or_else(|| source.column.clone(), |result| result.column.clone());
-        let candidate_analysis = build_analysis(&source.data, &candidate_column, source.footprint);
-        // sharppyrs deliberately rejects structurally invalid or supersaturated
-        // profiles. Keep the last honest source plot visible while the editor
-        // reports the exact QC issue; never silently clip Td or show a blank
-        // sounding as the user experiments.
-        let preview_blocked = active && candidate_analysis.is_none();
+        let correction_has_errors =
+            active && result.as_ref().is_some_and(CorrectionResult::has_errors);
+        // Do not feed a correction that already failed explicit QC into the
+        // analysis engine. Keep the last honest source plot visible while the
+        // editor reports the exact issue; analyzer rejection follows the same
+        // fallback instead of showing a blank sounding.
+        let candidate_analysis = (!correction_has_errors)
+            .then(|| build_analysis(&source.data, &candidate_column, source.footprint))
+            .flatten();
+        let preview_blocked = active && (correction_has_errors || candidate_analysis.is_none());
         let (column, analysis) = if preview_blocked {
             let column = source.column.clone();
             let analysis = build_analysis(&source.data, &column, source.footprint);
@@ -481,6 +608,10 @@ impl SharppySoundingPanel {
         } else {
             (candidate_column, candidate_analysis)
         };
+        // Classic can render a short, otherwise valid column that SHARPpy
+        // cannot analyze (for example, two levels). Keep export attached to
+        // the actual rendered column independently of `analysis`.
+        self.display_column = Some(column.clone());
         self.analysis = analysis;
         if active && let Some(analysis) = self.analysis.as_mut() {
             analysis.title.push_str(if preview_blocked {
@@ -551,11 +682,15 @@ impl SharppySoundingPanel {
         {
             sharppyrs::store_layout(ui.ctx(), layout_id, &layout);
         }
-        if self.analysis.is_some() {
+        if self.display_column.is_some() {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.classic, false, "SHARPpy");
-                ui.selectable_value(&mut self.classic, true, "Classic");
-                if !self.classic {
+                if self.analysis.is_some() {
+                    ui.selectable_value(&mut self.classic, false, "SHARPpy");
+                    ui.selectable_value(&mut self.classic, true, "Classic");
+                } else {
+                    ui.strong("Classic");
+                }
+                if !self.classic && self.analysis.is_some() {
                     ui.menu_button("Text", |ui| {
                         ui.set_min_width(230.0);
                         ui.label(egui::RichText::new("FONT").small().strong());
@@ -596,6 +731,79 @@ impl SharppySoundingPanel {
                         )
                         .clicked();
                 }
+                ui.separator();
+                let export_column = self.display_column.as_ref();
+                let fallback_export_title = self
+                    .analysis
+                    .is_none()
+                    .then(|| {
+                        self.source.as_ref().zip(export_column).map(|(source, column)| {
+                            sounding_title(&source.data, &column.metadata)
+                        })
+                    })
+                    .flatten();
+                let export_title = self
+                    .analysis
+                    .as_ref()
+                    .map(|analysis| analysis.title.as_str())
+                    .or(fallback_export_title.as_deref());
+                ui.add_enabled_ui(export_column.is_some() && export_title.is_some(), |ui| {
+                    ui.menu_button("Export", |ui| {
+                        let (Some(column), Some(title)) = (export_column, export_title) else {
+                            ui.close();
+                            return;
+                        };
+                        if ui
+                            .button("Copy SHARPpy RAW")
+                            .on_hover_text(
+                                "Copy the exact displayed profile as conventional six-column SPC/SHARPpy RAW text",
+                            )
+                            .clicked()
+                        {
+                            actions.text_export = Some(sounding_text_export_action(
+                                column,
+                                title,
+                                SoundingTextFormat::SharppyRaw,
+                                false,
+                            ));
+                            ui.close();
+                        }
+                        if ui
+                            .button("Save SHARPpy RAW…")
+                            .on_hover_text(
+                                "Save the exact displayed profile as UTF-8 SPC/SHARPpy RAW text",
+                            )
+                            .clicked()
+                        {
+                            actions.text_export = Some(sounding_text_export_action(
+                                column,
+                                title,
+                                SoundingTextFormat::SharppyRaw,
+                                true,
+                            ));
+                            ui.close();
+                        }
+                        if ui
+                            .button("Save CSV…")
+                            .on_hover_text(
+                                "Save pressure, MSL/AGL height, temperature, dewpoint, U/V, direction/speed, and omega for the exact displayed profile",
+                            )
+                            .clicked()
+                        {
+                            actions.text_export = Some(sounding_text_export_action(
+                                column,
+                                title,
+                                SoundingTextFormat::Csv,
+                                true,
+                            ));
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Copy or save the exact profile currently displayed in either SHARPpy or Classic mode",
+                    );
+                });
                 let manual_editable = self
                     .source
                     .as_ref()
@@ -667,7 +875,7 @@ impl SharppySoundingPanel {
                         })
                         .clicked();
                 }
-                if !self.classic {
+                if !self.classic && self.analysis.is_some() {
                     ui.separator();
                     ui.weak(if docked { "Pane" } else { "Window" });
                     ui.selectable_value(&mut docked_stretch, true, "Stretch")
@@ -1079,13 +1287,21 @@ mod tests {
 
     fn manual_test_column() -> SoundingColumn {
         SoundingColumn {
-            pressure_hpa: vec![1000.0, 950.0, 900.0, 850.0, 800.0],
-            height_m_msl: vec![100.0, 600.0, 1100.0, 1600.0, 2100.0],
-            temperature_c: vec![20.0, 16.0, 12.0, 8.0, 4.0],
-            dewpoint_c: vec![12.0, 9.0, 6.0, 3.0, 0.0],
-            u_ms: vec![0.0, 1.0, 2.0, 3.0, 4.0],
-            v_ms: vec![-5.0, -6.0, -7.0, -8.0, -9.0],
-            omega_pa_s: vec![0.0; 5],
+            pressure_hpa: vec![
+                1000.0, 925.0, 850.0, 700.0, 500.0, 400.0, 300.0, 250.0, 200.0, 150.0,
+            ],
+            height_m_msl: vec![
+                110.0, 780.0, 1500.0, 3100.0, 5800.0, 7500.0, 9600.0, 10900.0, 12300.0, 14100.0,
+            ],
+            temperature_c: vec![
+                27.0, 22.0, 17.5, 8.0, -8.5, -20.0, -36.0, -46.0, -55.0, -60.0,
+            ],
+            dewpoint_c: vec![
+                22.0, 19.0, 15.0, 4.0, -15.0, -30.0, -48.0, -58.0, -68.0, -75.0,
+            ],
+            u_ms: vec![2.0, 6.0, 9.0, 13.0, 18.0, 22.0, 27.0, 30.0, 32.0, 30.0],
+            v_ms: vec![8.0, 10.0, 11.0, 12.0, 14.0, 15.0, 16.0, 16.0, 15.0, 14.0],
+            omega_pa_s: vec![0.0; 10],
             metadata: rustwx_sounding::SoundingMetadata::default(),
         }
     }
@@ -1109,6 +1325,137 @@ mod tests {
     }
 
     #[test]
+    fn text_export_uses_the_original_displayed_profile_and_safe_actions() {
+        let mut panel = SharppySoundingPanel::new();
+        let mut original = manual_test_column();
+        original.metadata.station_id = "KOUN / test".to_owned();
+        original.metadata.valid_time = "2026-07-31 00:00Z".to_owned();
+        original.metadata.latitude_deg = Some(35.18);
+        original.metadata.longitude_deg = Some(-97.44);
+        panel.install_source(manual_test_data("wrf"), original.clone(), None);
+
+        let displayed = panel.display_column.as_ref().expect("displayed profile");
+        let title = &panel.analysis.as_ref().expect("displayed analysis").title;
+        assert_eq!(displayed, &original);
+
+        let expected_raw = sharppy_raw_text(&original, Some(title)).expect("RAW payload");
+        assert_eq!(
+            sounding_text_export_action(displayed, title, SoundingTextFormat::SharppyRaw, false),
+            SoundingTextExportAction::Copy {
+                format: SoundingTextFormat::SharppyRaw,
+                text: expected_raw,
+            }
+        );
+
+        let expected_csv = corrected_profile_csv(&original).expect("CSV payload");
+        assert_eq!(
+            sounding_text_export_action(displayed, title, SoundingTextFormat::Csv, true),
+            SoundingTextExportAction::Save {
+                format: SoundingTextFormat::Csv,
+                text: expected_csv,
+                default_file_name: "sounding-koun-test-2026-07-31-00-00z.csv".to_owned(),
+            }
+        );
+        assert_eq!(
+            sounding_export_default_file_name(
+                &manual_test_column(),
+                "WRF local/profile F000",
+                SoundingTextFormat::SharppyRaw,
+            ),
+            "sounding-wrf-local-profile-f000.txt"
+        );
+
+        panel.set_loading();
+        assert!(panel.display_column.is_none());
+        panel.install_source(manual_test_data("wrf"), original.clone(), None);
+        panel.set_error("test error".to_owned());
+        assert!(panel.display_column.is_none());
+        panel.install_source(manual_test_data("wrf"), original, None);
+        panel.clear();
+        assert!(panel.display_column.is_none());
+    }
+
+    #[test]
+    fn text_export_tracks_an_accepted_corrected_profile() {
+        use crate::sounding_correction::{ThermalEdit, ThermalTarget};
+
+        let mut panel = SharppySoundingPanel::new();
+        let original = manual_test_column();
+        panel.install_source(manual_test_data("wrf"), original.clone(), None);
+
+        let mut level = CorrectionLevel::at_height(0.0);
+        level.thermal = Some(ThermalEdit::new(ThermalTarget::TemperatureC(29.0)));
+        panel.correction_recipe.levels.push(level);
+        panel.rebuild_from_source();
+
+        let corrected = panel
+            .correction_result
+            .as_ref()
+            .expect("correction result")
+            .column
+            .clone();
+        assert_ne!(corrected, original);
+        assert_eq!(panel.display_column.as_ref(), Some(&corrected));
+        let title = &panel.analysis.as_ref().expect("corrected analysis").title;
+        assert!(title.contains("[MANUAL CORRECTION]"), "{title}");
+        assert_eq!(
+            sounding_text_payload(&corrected, title, SoundingTextFormat::SharppyRaw),
+            sharppy_raw_text(&corrected, Some(title)).map_err(|error| error.to_string())
+        );
+    }
+
+    #[test]
+    fn text_export_tracks_the_visible_source_when_correction_preview_is_blocked() {
+        use crate::sounding_correction::{ThermalEdit, ThermalTarget};
+
+        let mut panel = SharppySoundingPanel::new();
+        let original = manual_test_column();
+        panel.install_source(manual_test_data("wrf"), original.clone(), None);
+
+        let mut level = CorrectionLevel::at_height(0.0);
+        level.thermal = Some(ThermalEdit::new(ThermalTarget::TemperatureC(f64::NAN)));
+        panel.correction_recipe.levels.push(level);
+        panel.rebuild_from_source();
+
+        let result = panel.correction_result.as_ref().expect("correction result");
+        assert!(result.has_errors());
+        assert_eq!(panel.display_column.as_ref(), Some(&original));
+        let title = &panel.analysis.as_ref().expect("source analysis").title;
+        assert!(title.contains("[CORRECTION BLOCKED - SEE QC]"), "{title}");
+        assert_eq!(
+            sounding_text_payload(&original, title, SoundingTextFormat::Csv),
+            corrected_profile_csv(&original).map_err(|error| error.to_string())
+        );
+    }
+
+    #[test]
+    fn classic_only_short_profile_still_retains_text_export_state() {
+        let mut panel = SharppySoundingPanel::new();
+        let mut short = manual_test_column();
+        short.pressure_hpa.truncate(2);
+        short.height_m_msl.truncate(2);
+        short.temperature_c.truncate(2);
+        short.dewpoint_c.truncate(2);
+        short.u_ms.truncate(2);
+        short.v_ms.truncate(2);
+        short.omega_pa_s.truncate(2);
+        short.metadata.station_id = "SHORT".to_owned();
+        panel.install_source(manual_test_data("local"), short.clone(), None);
+
+        assert!(
+            panel.analysis.is_none(),
+            "SHARPpy requires at least three levels"
+        );
+        assert_eq!(panel.display_column.as_ref(), Some(&short));
+        let source = panel.source.as_ref().expect("retained source");
+        let title = sounding_title(&source.data, &short.metadata);
+        assert!(matches!(
+            sounding_text_export_action(&short, &title, SoundingTextFormat::SharppyRaw, false),
+            SoundingTextExportAction::Copy { .. }
+        ));
+    }
+
+    #[test]
     fn model_correction_source_is_kept_but_raob_is_not_editable() {
         use crate::sounding_correction::{ThermalEdit, ThermalTarget};
 
@@ -1125,10 +1472,14 @@ mod tests {
         assert_eq!(panel.source.as_ref().unwrap().column, model_column);
 
         panel.correction_editor.open();
-        panel.install_source(manual_test_data("KOUN RAOB"), manual_test_column(), None);
+        let raob_column = manual_test_column();
+        panel.install_source(manual_test_data("KOUN RAOB"), raob_column.clone(), None);
         assert!(!panel.source.as_ref().unwrap().manual_editable);
         assert!(panel.correction_recipe.levels.is_empty());
         assert!(!panel.correction_editor.is_open());
+        assert_eq!(panel.display_column.as_ref(), Some(&raob_column));
+        let title = &panel.analysis.as_ref().expect("RAOB analysis").title;
+        assert!(sounding_text_payload(&raob_column, title, SoundingTextFormat::SharppyRaw).is_ok());
     }
 
     #[test]

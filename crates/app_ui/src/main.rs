@@ -33189,6 +33189,56 @@ impl ViewerApp {
         if let Some(rect) = actions.capture_sounding {
             self.request_sounding_screenshot(ctx, rect);
         }
+        if let Some(export) = actions.text_export {
+            self.apply_sounding_text_export(export, ctx);
+        }
+    }
+
+    fn apply_sounding_text_export(
+        &mut self,
+        export: sharppy_sounding::SoundingTextExportAction,
+        ctx: &egui::Context,
+    ) {
+        use sharppy_sounding::SoundingTextExportAction;
+
+        match export {
+            SoundingTextExportAction::Copy { format, text } => {
+                ctx.copy_text(text);
+                self.status = format!("Sounding profile copied as {} text", format.label());
+                ctx.request_repaint();
+            }
+            SoundingTextExportAction::Save {
+                format,
+                text,
+                default_file_name,
+            } => {
+                let dialog = match format {
+                    sharppy_sounding::SoundingTextFormat::SharppyRaw => rfd::FileDialog::new()
+                        .set_title("Save sounding as SPC/SHARPpy RAW text")
+                        .add_filter("SHARPpy RAW", &["txt", "raw"]),
+                    sharppy_sounding::SoundingTextFormat::Csv => rfd::FileDialog::new()
+                        .set_title("Save sounding profile as CSV")
+                        .add_filter("CSV", &["csv"]),
+                }
+                .set_file_name(default_file_name);
+                let Some(path) = dialog.save_file() else {
+                    return;
+                };
+                self.status = match std::fs::write(&path, text) {
+                    Ok(()) => format!("Saved sounding {}: {}", format.label(), path.display()),
+                    Err(error) => format!(
+                        "Could not save sounding {} to {}: {error}",
+                        format.label(),
+                        path.display()
+                    ),
+                };
+                ctx.request_repaint();
+            }
+            SoundingTextExportAction::Error { format, message } => {
+                self.status = format!("Could not export sounding {}: {message}", format.label());
+                ctx.request_repaint();
+            }
+        }
     }
 
     /// Apply the combined sounding-header preference. Enabling adjustment
@@ -74170,7 +74220,7 @@ mod tests {
             toggle_obs_adjusted: true,
             ..Default::default()
         };
-        app.apply_sounding_header_actions(toggle, &ctx);
+        app.apply_sounding_header_actions(toggle.clone(), &ctx);
 
         assert!(app.obs_enabled);
         assert!(app.obs_adjust_soundings);

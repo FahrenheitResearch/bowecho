@@ -1091,6 +1091,18 @@ fn model_data(ui: &mut egui::Ui) {
     );
     action(
         ui,
+        "Export",
+        concat!(
+            "— copy the exact displayed profile to the clipboard as SPC/SHARPpy RAW text, ",
+            "or save it as RAW text or CSV. Export is available in both SHARPpy and Classic ",
+            "mode for model points, box means, observation-adjusted profiles, RAOBs, MADIS ",
+            "aircraft profiles, local data, and imported RAW soundings. An accepted correction ",
+            "exports the corrected column; if correction QC blocks the preview, export follows ",
+            "the untouched source profile that remains visible.",
+        ),
+    );
+    action(
+        ui,
         "Correct / Corrected",
         concat!(
             "— opens a separate resizable correction lab, so a long list of edits never ",
@@ -1106,9 +1118,9 @@ fn model_data(ui: &mut egui::Ui) {
             "pressure-mass-weighted sensible enthalpy; it aborts if its affected layer would ",
             "become saturated. The skew-T, hodograph, parcels, and diagnostics recalculate ",
             "from a panel-local copy. Reset original restores the exact untouched source. ",
-            "The lab's File menu saves fingerprint-bound project JSON, exports the current ",
-            "corrected column as CSV or SPC/SHARPpy RAW, and imports RAW as a new native ",
-            "editable sounding; a project for another physical source is refused. Expand ",
+            "The lab's File menu saves fingerprint-bound project JSON and imports RAW as a new ",
+            "native editable sounding; its advanced corrected-profile export commands remain ",
+            "available there too. A project for another physical source is refused. Expand ",
             "Batch experiment to vary 1–4 numeric fields on one correction row (up to 256 ",
             "deterministic Cartesian members), rebuild every member, and inspect/export real ",
             "finite min/median/max parcel, thermodynamic, kinematic, and severe diagnostics. ",
