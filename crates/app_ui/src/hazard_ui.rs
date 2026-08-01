@@ -2056,6 +2056,15 @@ impl ViewerApp {
             if points.len() < 3 {
                 continue;
             }
+            // The geographic bounds test above is deliberately generous for
+            // curved map projections. After projection, discard records whose
+            // screen bbox is definitely outside the pane before they enter
+            // simplification and the exact same-family union. This preserves
+            // visible fills while keeping off-pane zone polygons out of the
+            // expensive dense-warning path during pan and zoom.
+            if !screen_polygon_bbox_intersects(&points, rect.expand(HAZARD_LABEL_CLICK_RADIUS_PX)) {
+                continue;
+            }
             let selected = self.selected_hazard_index == Some(index);
             let family_count = visible_family_counts
                 .get(record.event_family.as_str())
