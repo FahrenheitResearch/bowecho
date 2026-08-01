@@ -25391,7 +25391,7 @@ impl ViewerApp {
                 let custom_poll_owns_primary = self.poll_active
                     && matches!(&self.primary.feed, FeedSource::CustomUrl(_))
                     && self.poll_source_armed();
-                let selected_cache_site = self.sites.get(selected_site_index);
+                let selected_cache_site = self.selected_site();
                 let cached_site_dir = if site_control_pane.is_none()
                     && primary_intl_source.is_none()
                     && !custom_poll_owns_primary
