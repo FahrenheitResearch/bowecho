@@ -240,6 +240,11 @@ pub struct AppSettings {
     /// temporarily unavailable product remains favorited for later runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wofs_product_favorites: Vec<String>,
+    /// Optional user-facing names for WoFS products, keyed by the stable API
+    /// slug. The source slug remains authoritative for fetching and survives
+    /// temporary catalog changes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wofs_product_aliases: BTreeMap<String, String>,
     /// Live auto-refresh poll interval (seconds).
     pub polling_interval_seconds: u64,
     /// Selected color table per family label (family.label() -> table name).
@@ -386,6 +391,10 @@ pub struct AppSettings {
     /// Enabled outlook kinds ("cat", "torn", "wind", "hail", "estofex").
     #[serde(default)]
     pub overlay_spc_outlooks: Vec<String>,
+    /// Keep SPC/ESTOFEX outlines and labels but suppress fill tessellation at
+    /// wide map scales. Default off preserves the pre-existing appearance.
+    #[serde(default)]
+    pub overlay_spc_outline_only_wide_zoom: bool,
     #[serde(default)]
     pub overlay_spc_reports: bool,
     #[serde(default)]
@@ -1182,6 +1191,7 @@ impl Default for AppSettings {
             show_hurricane_hunters: false,
             show_radar_status: false,
             overlay_spc_outlooks: Vec::new(),
+            overlay_spc_outline_only_wide_zoom: false,
             overlay_spc_reports: false,
             overlay_mping_reports: false,
             overlay_max_ref_swath: false,
@@ -1193,6 +1203,7 @@ impl Default for AppSettings {
             favorites: Vec::new(),
             radar_product_favorites: Vec::new(),
             wofs_product_favorites: Vec::new(),
+            wofs_product_aliases: BTreeMap::new(),
             polling_interval_seconds: 60,
             palette_by_family: BTreeMap::new(),
             palette_by_product: BTreeMap::new(),
@@ -2971,15 +2982,36 @@ mod tests {
     }
 
     #[test]
-    fn product_favorites_keep_stable_labels_and_wofs_slugs() {
+    fn product_favorites_and_wofs_aliases_keep_stable_slugs() {
         let settings = AppSettings {
             radar_product_favorites: vec!["REF".to_owned(), "ET".to_owned()],
             wofs_product_favorites: vec!["uh_2to5__prob_60".to_owned()],
+            wofs_product_aliases: BTreeMap::from([(
+                "uh_2to5__prob_60".to_owned(),
+                "My UH probability".to_owned(),
+            )]),
             ..Default::default()
         };
         let restored = AppSettings::from_json(&settings.to_json());
         assert_eq!(restored.radar_product_favorites, ["REF", "ET"]);
         assert_eq!(restored.wofs_product_favorites, ["uh_2to5__prob_60"]);
+        assert_eq!(
+            restored
+                .wofs_product_aliases
+                .get("uh_2to5__prob_60")
+                .map(String::as_str),
+            Some("My UH probability")
+        );
+    }
+
+    #[test]
+    fn spc_wide_view_outline_mode_defaults_off_and_round_trips() {
+        assert!(!AppSettings::from_json("{}").overlay_spc_outline_only_wide_zoom);
+        let settings = AppSettings {
+            overlay_spc_outline_only_wide_zoom: true,
+            ..Default::default()
+        };
+        assert!(AppSettings::from_json(&settings.to_json()).overlay_spc_outline_only_wide_zoom);
     }
 
     #[test]

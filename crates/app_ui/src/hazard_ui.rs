@@ -536,6 +536,22 @@ impl ViewerApp {
                     ui.spinner();
                 }
             });
+            panel_kit::row(ui, "Wide view", |ui| {
+                let mut outline_only = app
+                    .app_settings
+                    .overlay_spc_outline_only_wide_zoom;
+                if ui
+                    .checkbox(&mut outline_only, "Outlines only when zoomed out")
+                    .on_hover_text(
+                        "At wide map scales, keep SPC/ESTOFEX outlines and labels but skip polygon fills. Zooming in restores shading.",
+                    )
+                    .changed()
+                {
+                    app.app_settings.overlay_spc_outline_only_wide_zoom = outline_only;
+                    app.mark_app_settings_dirty();
+                    ui.ctx().request_repaint();
+                }
+            });
             if app.spc_day == 1 {
                 let outlook_date = app.spc_outlook_date();
                 let now = Utc::now();

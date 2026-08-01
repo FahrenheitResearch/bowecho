@@ -447,6 +447,11 @@ impl ViewerApp {
             "CC-drop swath",
             "Minimum base-tilt correlation coefficient over the loaded loop. Normal/high CC is masked so the low-CC trail can reveal debris or other non-meteorological scatterers.",
         );
+        let frame_count = self.primary.history.len();
+        ui.weak(format!(
+            "Swath length is the loaded loop ({frame_count} {}). To extend it, set Radar > Site > Frames to load, then press Load Loop.",
+            if frame_count == 1 { "frame" } else { "frames" }
+        ));
     }
 
     fn max_swath_rail_row(

@@ -315,6 +315,31 @@ use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
 fn product_display_label(product: &DisplayProduct) -> &str {
     validation_product_label(product).unwrap_or_else(|| product.label())
 }
+
+fn wofs_product_display_label(slug: &str, aliases: &BTreeMap<String, String>) -> String {
+    aliases
+        .get(slug)
+        .map(|alias| alias.trim())
+        .filter(|alias| !alias.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| wofs::product_label(slug))
+}
+
+fn wofs_product_matches_search(
+    slug: &str,
+    search: &str,
+    aliases: &BTreeMap<String, String>,
+) -> bool {
+    let query = search.trim().to_ascii_lowercase();
+    query.is_empty()
+        || slug.to_ascii_lowercase().contains(&query)
+        || wofs::product_label(slug)
+            .to_ascii_lowercase()
+            .contains(&query)
+        || aliases
+            .get(slug)
+            .is_some_and(|alias| alias.to_ascii_lowercase().contains(&query))
+}
 // v0.30 phase-1 extraction #5: the satellite window/worker/map-layer
 // family and the pure sat sampling helpers moved VERBATIM to
 // `sat_paint.rs` (docs/main-decomposition-plan.md); these re-exports keep
@@ -580,6 +605,13 @@ const HISTORY_SIZE_OPTIONS: &[usize] = &[
 ];
 pub(crate) const FRAMES_TO_LOAD_HELP: &str = "Sets how many recent radar scans the next Load Loop fetches and keeps for playback. \
      To add more frames, raise it and press Load Loop again. This is not an export limit.";
+/// At or below this wide-view scale, the optional SPC outline-only mode skips
+/// fill tessellation while preserving every outline and label.
+const SPC_OUTLOOK_FILL_MIN_SCALE: f32 = 48.0;
+
+fn spc_outlook_fill_visible(outline_only_wide_zoom: bool, map_scale: f32) -> bool {
+    !outline_only_wide_zoom || map_scale > SPC_OUTLOOK_FILL_MIN_SCALE
+}
 const VIDEO_EXPORT_SETTINGS_HELP: &str = "These controls create GIF/MP4/WebP recordings from frames already loaded above. \
      They do not change how many radar scans Load Loop fetches.";
 const DEFAULT_ARCHIVE_FRAME_COUNT: usize = 10;
@@ -3176,6 +3208,8 @@ struct ViewerApp {
     hazard_receiver: Option<mpsc::Receiver<AsyncHazardResult>>,
     pending_site_id: Option<String>,
     cursor_readout: Option<CursorReadout>,
+    /// US state under the pointer, independent of whether a radar gate exists.
+    cursor_state_abbr: Option<&'static str>,
     /// Placefile overlays (GRLevelX-style community feeds).
     placefile_slots: Vec<PlacefileSlot>,
     placefile_url_input: String,
@@ -3605,6 +3639,9 @@ struct ViewerApp {
         mpsc::Receiver<std::result::Result<aircraft_soundings::AircraftHistorySnapshot, String>>,
     >,
     aircraft_history_status: String,
+    /// Session-only query shared by current and recent MADIS aircraft-profile
+    /// browsers.
+    aircraft_profile_search: String,
     show_aircraft_history: bool,
     /// Airport key of the selected anonymous MADIS profile. The feed has no
     /// stable flight id, so selection/following is explicitly profile-based.
@@ -4450,6 +4487,26 @@ impl StormFollowLead {
             Self::Plus45 => "+45 min",
         }
     }
+}
+
+fn storm_track_detail_text(track: &StormTrack, time_zone: DisplayTimeZone) -> Option<String> {
+    let (u, v) = track.fitted_motion?;
+    let (last_time, _, _) = track.last_fix()?;
+    let direction = u.atan2(v).to_degrees().rem_euclid(360.0);
+    let speed_kt = u.hypot(v) / KNOT_TO_MPS as f64;
+    let forecast_times = [15, 30, 45]
+        .into_iter()
+        .map(|minutes| {
+            format!(
+                "+{minutes} {}",
+                time_zone.format_hm(last_time + chrono::Duration::minutes(minutes))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    Some(format!(
+        "toward {direction:03.0}° at {speed_kt:.0} kt · {forecast_times}"
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9590,6 +9647,7 @@ impl ViewerApp {
             hazard_receiver: None,
             pending_site_id: None,
             cursor_readout: None,
+            cursor_state_abbr: None,
             placefile_slots: restored_placefile_slots,
             placefile_url_input: String::new(),
             placefile_input_focus: false,
@@ -9793,6 +9851,7 @@ impl ViewerApp {
             aircraft_history_profiles: Vec::new(),
             aircraft_history_rx: None,
             aircraft_history_status: "Load recent profiles to browse history".to_owned(),
+            aircraft_profile_search: String::new(),
             show_aircraft_history: false,
             selected_aircraft_profile: None,
             aircraft_follow_selected: false,
@@ -25328,6 +25387,47 @@ impl ViewerApp {
                 self.start_local_volume_file_selection(paths, ui.ctx());
             }
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            {
+                let custom_poll_owns_primary = self.poll_active
+                    && matches!(&self.primary.feed, FeedSource::CustomUrl(_))
+                    && self.poll_source_armed();
+                let selected_cache_site = self.sites.get(selected_site_index);
+                let cached_site_dir = if site_control_pane.is_none()
+                    && primary_intl_source.is_none()
+                    && !custom_poll_owns_primary
+                {
+                    selected_cache_site.map(|site| cache_dir(&site.level2_id))
+                } else {
+                    None
+                };
+                let cache_site_id = selected_cache_site
+                    .map(|site| site.level2_id.as_str())
+                    .unwrap_or("site");
+                let cache_available = cached_site_dir
+                    .as_ref()
+                    .is_some_and(|directory| directory.is_dir());
+                let cache_button_label = format!("Cached {cache_site_id}…");
+                let response = ui
+                    .add_enabled_ui(
+                        self.load_receiver.is_none() && cache_available,
+                        |ui| fixed_action_button(ui, &cache_button_label, 104.0),
+                    )
+                    .inner
+                    .on_hover_text(format!(
+                        "Open recent raw Level II scans already stored in {cache_site_id}'s rebuildable cache. Select one file or several for a loop; no download is needed. Cached files may be pruned, so this is not a permanent storm archive. This action is unavailable while an international or custom feed owns the primary display."
+                    ));
+                if response.clicked()
+                    && let Some(directory) = cached_site_dir
+                    && let Some(paths) = rfd::FileDialog::new()
+                        .add_filter("All cached radar files", &["*"])
+                        .set_title("Open cached Level II scans")
+                        .set_directory(directory)
+                        .pick_files()
+                {
+                    self.start_local_volume_file_selection(paths, ui.ctx());
+                }
+            }
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             if fixed_action_button(ui, "Open Folder…", 96.0)
                 .on_hover_text(
                     "Open a whole deployment folder: per-sweep DORADE files \
@@ -25676,6 +25776,41 @@ impl ViewerApp {
             let _ = self.app_settings.save();
             ctx.request_repaint();
         }
+        // Gate filter (GR2-style GateFilter): hide non-REF gates whose
+        // co-located reflectivity is weak — the standard VEL declutter.
+        ui.horizontal(|ui| {
+            let mut on = self.gate_filter_dbz.is_some();
+            if ui
+                .checkbox(&mut on, "Gate filter")
+                .on_hover_text(
+                    "Hide velocity/dual-pol gates where the same-tilt reflectivity is below the threshold (declutters clear-air noise). Reflectivity itself is never filtered.",
+                )
+                .changed()
+            {
+                self.gate_filter_dbz = on.then_some(5.0);
+                self.app_settings.gate_filter_decidbz = self.gate_filter_key_setting();
+                self.mark_app_settings_dirty();
+                self.clear_texture();
+                ctx.request_repaint();
+            }
+            ui.add_enabled_ui(self.gate_filter_dbz.is_some(), |ui| {
+                if let Some(threshold) = self.gate_filter_dbz.as_mut()
+                    && ui
+                        .add(
+                            egui::DragValue::new(threshold)
+                                .range(-15.0..=40.0)
+                                .speed(0.5)
+                                .suffix(" dBZ"),
+                        )
+                        .changed()
+                {
+                    self.app_settings.gate_filter_decidbz = self.gate_filter_key_setting();
+                    self.mark_app_settings_dirty();
+                    self.clear_texture();
+                    ctx.request_repaint();
+                }
+            });
+        });
         // Invert the hotkey map so each product chip can show its key.
         let hotkey_for_label: std::collections::HashMap<String, String> = self
             .app_settings
@@ -26158,42 +26293,6 @@ impl ViewerApp {
                 }
             });
         }
-
-        // Gate filter (GR2-style GateFilter): hide non-REF gates whose
-        // co-located reflectivity is weak — the standard VEL declutter.
-        ui.horizontal(|ui| {
-            let mut on = self.gate_filter_dbz.is_some();
-            if ui
-                .checkbox(&mut on, "Gate filter")
-                .on_hover_text(
-                    "Hide velocity/dual-pol gates where the same-tilt reflectivity is below the threshold (declutters clear-air noise). Reflectivity itself is never filtered.",
-                )
-                .changed()
-            {
-                self.gate_filter_dbz = on.then_some(5.0);
-                self.app_settings.gate_filter_decidbz = self.gate_filter_key_setting();
-                self.mark_app_settings_dirty();
-                self.clear_texture();
-                ctx.request_repaint();
-            }
-            ui.add_enabled_ui(self.gate_filter_dbz.is_some(), |ui| {
-                if let Some(threshold) = self.gate_filter_dbz.as_mut()
-                    && ui
-                        .add(
-                            egui::DragValue::new(threshold)
-                                .range(-15.0..=40.0)
-                                .speed(0.5)
-                                .suffix(" dBZ"),
-                        )
-                        .changed()
-                {
-                    self.app_settings.gate_filter_decidbz = self.gate_filter_key_setting();
-                    self.mark_app_settings_dirty();
-                    self.clear_texture();
-                    ctx.request_repaint();
-                }
-            });
-        });
     }
 
     /// TILT section body — left-aligned truncating monospace rows
@@ -26298,6 +26397,24 @@ impl ViewerApp {
                 self.set_storm_tracks_visible(show_storm_tracks);
                 ctx.request_repaint();
             }
+            let mut max_tracks = self.storm_track_max_tracks;
+            ui.label("Max");
+            egui::ComboBox::from_id_salt("storm_track_max_tracks")
+                .selected_text(format!("{max_tracks} tracks"))
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    for option in STORM_TRACK_MAX_TRACK_OPTIONS {
+                        ui.selectable_value(
+                            &mut max_tracks,
+                            *option,
+                            format!("{option} tracks"),
+                        );
+                    }
+                });
+            if max_tracks != self.storm_track_max_tracks {
+                let min_dbz = self.storm_track_min_dbz;
+                self.set_storm_track_filters(max_tracks, min_dbz, ctx);
+            }
             if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
                 && ui
                     .small_button("SRV<-tracks")
@@ -26345,25 +26462,28 @@ impl ViewerApp {
                 }
             }
         });
+        if let Some(track_id) = self.storm_track_follow.map(|follow| follow.track_id)
+            && let Some(track) = self
+                .storm_tracker
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+            && let Some(detail) = storm_track_detail_text(track, self.time_zone())
+        {
+            ui.add(
+                egui::Label::new(egui::RichText::new(format!(
+                    "Forecast positions: {detail}"
+                )))
+                .wrap(),
+            )
+            .on_hover_text(
+                "Motion-fit extrapolation for the +15/+30/+45 minute track dots. These are forecast valid times, not site-specific impact claims.",
+            );
+        }
         egui::CollapsingHeader::new("Storm track settings")
             .id_salt("storm_track_settings")
             .default_open(false)
             .show(ui, |ui| {
-                let mut max_tracks = self.storm_track_max_tracks;
-                panel_kit::row(ui, "Max tracks", |ui| {
-                    egui::ComboBox::from_id_salt("storm_track_max_tracks")
-                        .selected_text(format!("{max_tracks} tracks"))
-                        .width(96.0)
-                        .show_ui(ui, |ui| {
-                            for option in STORM_TRACK_MAX_TRACK_OPTIONS {
-                                ui.selectable_value(
-                                    &mut max_tracks,
-                                    *option,
-                                    format!("{option} tracks"),
-                                );
-                            }
-                        });
-                });
                 let mut min_dbz = self.storm_track_min_dbz;
                 let min_changed = panel_kit::slider_row(
                     ui,
@@ -26374,7 +26494,8 @@ impl ViewerApp {
                     |value| format!("{value:.0} dBZ"),
                 )
                 .changed();
-                if max_tracks != self.storm_track_max_tracks || min_changed {
+                if min_changed {
+                    let max_tracks = self.storm_track_max_tracks;
                     self.set_storm_track_filters(max_tracks, min_dbz, ctx);
                 }
                 ui.separator();
@@ -28592,6 +28713,11 @@ impl ViewerApp {
                 )));
                 ui.separator();
                 ui.label(mono(format!("map {:.0} px/deg", self.map_scale)));
+                if let Some(state) = self.cursor_state_abbr {
+                    ui.separator();
+                    ui.label(mono(cursor_state_status_text(state)))
+                        .on_hover_text("US state under the map pointer");
+                }
                 // Cursor readout only — the old "{product} cut {n}"
                 // fallback duplicated the top bar's product segment and
                 // was dropped with it (tilt lives in the sidebar TILT
@@ -30123,12 +30249,16 @@ impl ViewerApp {
                 self.clamp_map_center();
             }
         }
-        let cursor_readout = response
+        let cursor_position = response
             .hovered()
             .then(|| ui.input(|input| input.pointer.hover_pos()))
-            .flatten()
-            .and_then(|position| self.cursor_readout_at(rect, position));
-        self.cursor_readout = cursor_readout;
+            .flatten();
+        self.cursor_state_abbr = cursor_position.and_then(|position| {
+            let (lon, lat) = self.screen_to_lon_lat(rect, position);
+            us_state_abbr_for_lon_lat(lat, lon)
+        });
+        self.cursor_readout =
+            cursor_position.and_then(|position| self.cursor_readout_at(rect, position));
 
         // Right-click context menu: the lowest-beam radars for this spot
         // (4/3-Earth geometry at the 0.5° base tilt — community idea from
@@ -30548,6 +30678,7 @@ impl ViewerApp {
         let ctx = ui.ctx().clone();
         let frame_start = Instant::now();
         let mut hovered_readout = None;
+        let mut hovered_state = None;
         let mut hovered_cell: Option<usize> = None;
         let mut hovers: Vec<Option<egui::Pos2>> = Vec::with_capacity(cells.len());
 
@@ -30646,6 +30777,8 @@ impl ViewerApp {
                 }
                 // Each pane reports ITS OWN product/tilt under the cursor.
                 if let Some(position) = ui.input(|input| input.pointer.hover_pos()) {
+                    let (lon, lat) = self.screen_to_lon_lat(cell, position);
+                    hovered_state = us_state_abbr_for_lon_lat(lat, lon);
                     hovered_readout = if cell_index == 0 {
                         self.cursor_readout_at(cell, position)
                     } else if let Some(pane) = self.extra_panes.get(cell_index - 1) {
@@ -31098,6 +31231,7 @@ impl ViewerApp {
         }
 
         self.cursor_readout = hovered_readout;
+        self.cursor_state_abbr = hovered_state;
         self.basemap_ms = Some(frame_start.elapsed().as_secs_f32() * 1000.0);
     }
 
@@ -35537,6 +35671,7 @@ impl ViewerApp {
         let status = self.aircraft_history_status.clone();
         let loading = self.aircraft_history_rx.is_some();
         let profiles = &self.aircraft_history_profiles;
+        let mut search = self.aircraft_profile_search.clone();
         let time_zone = self.time_zone();
         egui::Window::new("Previous aircraft soundings")
             .default_width(520.0)
@@ -35559,6 +35694,24 @@ impl ViewerApp {
                 ui.weak(
                     "Anonymous public MADIS subset; newest first. Pressure is derived from pressure altitude and remains labeled as such.",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("Find");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut search)
+                            .hint_text("Airport code, source, ascent/descent…")
+                            .desired_width(260.0),
+                    );
+                    if !search.is_empty() && ui.small_button("Clear").clicked() {
+                        search.clear();
+                    }
+                    let matches = profiles
+                        .iter()
+                        .filter(|profile| {
+                            aircraft_soundings::profile_matches_search(profile, &search)
+                        })
+                        .count();
+                    ui.weak(format!("{matches}/{}", profiles.len()));
+                });
                 ui.separator();
                 if profiles.is_empty() && !loading {
                     ui.weak("No recent profiles loaded.");
@@ -35577,7 +35730,9 @@ impl ViewerApp {
                                 ui.strong("Levels");
                                 ui.label("");
                                 ui.end_row();
-                                for profile in profiles {
+                                for profile in profiles.iter().filter(|profile| {
+                                    aircraft_soundings::profile_matches_search(profile, &search)
+                                }) {
                                     ui.label(&profile.airport);
                                     ui.label(time_zone.format_date_hm(profile.valid_time));
                                     ui.label(profile.direction_label());
@@ -35590,6 +35745,7 @@ impl ViewerApp {
                             });
                     });
             });
+        self.aircraft_profile_search = search;
         self.show_aircraft_history = open;
         if reload {
             self.reload_aircraft_history(ctx);
@@ -37007,6 +37163,21 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    fn add_grid_composite_overlay_preserve_view(
+        &mut self,
+        source: grid_composites::GridCompositeSource,
+        ctx: &egui::Context,
+    ) {
+        self.prepare_grid_composite_overlay_preserve_view();
+        self.start_grid_composite_refresh(source, ctx, true);
+        self.status = format!("{}: fetching latest map overlay", source.short_label());
+        ctx.request_repaint();
+    }
+
+    fn prepare_grid_composite_overlay_preserve_view(&mut self) {
+        self.model_enabled = true;
+    }
+
     /// Grid composites share the model-map LUT/build machinery, even though
     /// they are observed radar products. Wake that pipeline before starting
     /// the fetch so a disabled Model setting cannot strand the build result.
@@ -37437,18 +37608,19 @@ impl ViewerApp {
                     let run_label = catalog
                         .runs
                         .get(self.wofs.run_index)
-                        .map(|r| format!("{} {}", r.rundate, r.name))
+                        .map(|run| self.wofs.run_display_label(run))
                         .unwrap_or_default();
                     egui::ComboBox::from_id_salt("wofs_run")
                         .selected_text(run_label)
                         .width(ui_theme::COMBO_MAX_W)
                         .show_ui(ui, |ui| {
                             for (i, run) in catalog.runs.iter().enumerate().take(20) {
+                                let display_label = self.wofs.run_display_label(run);
                                 if ui
                                     .selectable_value(
                                         &mut self.wofs.run_index,
                                         i,
-                                        format!("{} {}", run.rundate, run.name),
+                                        display_label,
                                     )
                                     .changed()
                                 {
@@ -37461,6 +37633,18 @@ impl ViewerApp {
                                 }
                             }
                         });
+                    if ui
+                        .add_enabled(
+                            self.wofs.run_index != 0,
+                            egui::Button::new("Latest domain").small(),
+                        )
+                        .on_hover_text(
+                            "Return explicitly to the newest posted WoFS domain. Catalog refreshes preserve your current domain.",
+                        )
+                        .clicked()
+                    {
+                        self.wofs.select_latest_run();
+                    }
                     if let Some(run) = catalog.runs.get(self.wofs.run_index) {
                         egui::ComboBox::from_id_salt("wofs_init")
                             .selected_text(format!("{}z", wofs::init_hhmm(&self.wofs.init)))
@@ -37506,6 +37690,23 @@ impl ViewerApp {
                     .on_hover_text(
                         "Transparent stackables (dBZ/UH paintballs) drawn over the base product — like the official viewer's WoFS Overlays",
                     );
+                    ui.menu_button("Latest MRMS", |ui| {
+                        ui.weak("Independent latest observation; not time-aligned to the WoFS frame");
+                        for source in [
+                            grid_composites::GridCompositeSource::MrmsLowestAltitudeReflectivity,
+                            grid_composites::GridCompositeSource::MrmsCompositeReflectivity,
+                        ] {
+                            if ui.button(source.label()).clicked() {
+                                let ctx = ui.ctx().clone();
+                                self.add_grid_composite_overlay_preserve_view(source, &ctx);
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Add the latest national MRMS field to the map without moving the current WoFS view. This is not a historical or time-aligned WoFS overlay.",
+                    );
                     let current_wofs_product = self.wofs.product.clone();
                     let current_wofs_favorite = self
                         .app_settings
@@ -37546,34 +37747,134 @@ impl ViewerApp {
                         .cloned()
                         .collect::<Vec<_>>();
                     egui::ComboBox::from_id_salt("wofs_product")
-                        .selected_text(wofs::product_label(&self.wofs.product))
+                        .selected_text(wofs_product_display_label(
+                            &self.wofs.product,
+                            &self.app_settings.wofs_product_aliases,
+                        ))
                         .width(240.0)
                         .show_ui(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.wofs.product_search)
+                                    .hint_text("Search product name or slug…")
+                                    .desired_width(230.0),
+                            );
+                            if !self.wofs.product_search.is_empty()
+                                && ui.small_button("Clear search").clicked()
+                            {
+                                self.wofs.product_search.clear();
+                            }
+                            ui.separator();
                             if !favorite_wofs_products.is_empty() {
-                                ui.strong("Favorites");
-                                for slug in &favorite_wofs_products {
+                                let matching_favorites = favorite_wofs_products
+                                    .iter()
+                                    .filter(|slug| {
+                                        wofs_product_matches_search(
+                                            slug,
+                                            &self.wofs.product_search,
+                                            &self.app_settings.wofs_product_aliases,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                if !matching_favorites.is_empty() {
+                                    ui.strong("Favorites");
+                                }
+                                for slug in matching_favorites {
                                     let response = ui.selectable_value(
                                         &mut self.wofs.product,
                                         slug.clone(),
-                                        wofs::product_label(slug),
+                                        wofs_product_display_label(
+                                            slug,
+                                            &self.app_settings.wofs_product_aliases,
+                                        ),
                                     );
-                                    response.on_hover_text(slug.as_str());
+                                    response.on_hover_text(format!(
+                                        "{}\n{}",
+                                        wofs::product_label(slug),
+                                        slug
+                                    ));
                                 }
-                                ui.separator();
+                                if !favorite_wofs_products.is_empty() {
+                                    ui.separator();
+                                }
                             }
                             for (group, slugs) in &catalog.groups {
+                                let matching = slugs
+                                    .iter()
+                                    .filter(|slug| {
+                                        wofs_product_matches_search(
+                                            slug,
+                                            &self.wofs.product_search,
+                                            &self.app_settings.wofs_product_aliases,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                if matching.is_empty() {
+                                    continue;
+                                }
                                 ui.weak(group);
-                                for slug in slugs.iter().take(40) {
+                                for slug in matching {
                                     let response = ui.selectable_value(
                                         &mut self.wofs.product,
                                         slug.clone(),
-                                        wofs::product_label(slug),
+                                        wofs_product_display_label(
+                                            slug,
+                                            &self.app_settings.wofs_product_aliases,
+                                        ),
                                     );
-                                    response.on_hover_text(slug.as_str());
+                                    response.on_hover_text(format!(
+                                        "{}\n{}",
+                                        wofs::product_label(slug),
+                                        slug
+                                    ));
                                 }
                                 ui.separator();
                             }
                         });
+                    let selected_product = self.wofs.product.clone();
+                    ui.menu_button("Rename", |ui| {
+                        ui.label("Custom name for selected product");
+                        ui.weak(wofs::product_label(&selected_product));
+                        ui.monospace(&selected_product);
+                        let mut alias = self
+                            .app_settings
+                            .wofs_product_aliases
+                            .get(&selected_product)
+                            .cloned()
+                            .unwrap_or_default();
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut alias)
+                                    .hint_text("Use official name")
+                                    .desired_width(230.0),
+                            )
+                            .changed()
+                        {
+                            let alias = alias.trim().to_owned();
+                            if alias.is_empty() {
+                                self.app_settings
+                                    .wofs_product_aliases
+                                    .remove(&selected_product);
+                            } else {
+                                self.app_settings
+                                    .wofs_product_aliases
+                                    .insert(selected_product.clone(), alias);
+                            }
+                            let _ = self.app_settings.save();
+                        }
+                        if self
+                            .app_settings
+                            .wofs_product_aliases
+                            .contains_key(&selected_product)
+                            && ui.small_button("Reset to official name").clicked()
+                        {
+                            self.app_settings
+                                .wofs_product_aliases
+                                .remove(&selected_product);
+                            let _ = self.app_settings.save();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Give the selected WoFS product a local display name");
                 });
             ui.horizontal_wrapped(|ui| {
                     ui.label("f+min");
@@ -39300,6 +39601,10 @@ impl ViewerApp {
         // Alphas/width come from the style registry at draw time (features
         // carry SPC's base colors) so style edits never refetch.
         let spc_style = self.style_registry.spc();
+        let draw_fill = spc_outlook_fill_visible(
+            self.app_settings.overlay_spc_outline_only_wide_zoom,
+            self.map_scale,
+        ) && spc_style.outlook_fill_alpha > 0;
         let requested_kinds = self
             .spc_outlooks_enabled
             .iter()
@@ -39366,7 +39671,8 @@ impl ViewerApp {
                     // across the map ("spokes" field report). The cleaner
                     // also absorbs SPC's unclosed/degenerate ring edge cases.
                     // All SPC kinds now use the same hole-aware treatment.
-                    if feature.fill_enabled
+                    if draw_fill
+                        && feature.fill_enabled
                         && !screen_polyline_has_jump(&outer_screen, true, rect, 0.0)
                         && hole_screens
                             .iter()
@@ -39458,7 +39764,11 @@ impl ViewerApp {
             for hole in &hole_screens {
                 draw_outlook_ring(painter, hole, stroke, rect);
             }
-            if feature.fill_enabled
+            if spc_outlook_fill_visible(
+                self.app_settings.overlay_spc_outline_only_wide_zoom,
+                self.map_scale,
+            ) && spc_style.outlook_fill_alpha > 0
+                && feature.fill_enabled
                 && !screen_polyline_has_jump(&outer_screen, true, rect, 0.0)
                 && hole_screens
                     .iter()
@@ -40118,7 +40428,7 @@ impl ViewerApp {
                         let dir = (u.atan2(v)).to_degrees().rem_euclid(360.0);
                         let kt = u.hypot(v) / KNOT_TO_MPS as f64;
                         format!(
-                            "#{} {:.0}dBZ {:03.0}°/{:.0}kt",
+                            "#{} {:.0}dBZ toward {:03.0}°/{:.0}kt",
                             track.id, track.max_dbz, dir, kt
                         )
                     }
@@ -41788,6 +42098,12 @@ const US_STATE_ANCHORS: &[UsStateAnchor] = &[
     UsStateAnchor { abbr: "MP", lon: 145.6, lat: 15.1 },
     UsStateAnchor { abbr: "AS", lon: -170.7, lat: -14.3 },
 ];
+
+fn cursor_state_status_text(abbr: &str) -> String {
+    us_state_name(abbr)
+        .map(|name| format!("{name} ({abbr})"))
+        .unwrap_or_else(|| abbr.to_owned())
+}
 
 fn us_state_name(abbr: &str) -> Option<&'static str> {
     match abbr {
@@ -48512,6 +48828,46 @@ mod tests {
             resolved_floating_window_accent(&settings),
             egui::Color32::from_rgb(9, 88, 177)
         );
+    }
+
+    #[test]
+    fn wofs_product_search_matches_official_name_slug_and_custom_alias() {
+        let slug = "uh_2to5__paintballs_thresh_75";
+        let aliases = BTreeMap::from([(slug.to_owned(), "My rotating storms".to_owned())]);
+
+        assert!(wofs_product_matches_search(
+            slug,
+            "updraft helicity",
+            &aliases
+        ));
+        assert!(wofs_product_matches_search(slug, "paintballs", &aliases));
+        assert!(wofs_product_matches_search(
+            slug,
+            "rotating storms",
+            &aliases
+        ));
+        assert!(!wofs_product_matches_search(slug, "temperature", &aliases));
+        assert_eq!(
+            wofs_product_display_label(slug, &aliases),
+            "My rotating storms"
+        );
+    }
+
+    #[test]
+    fn cursor_state_status_uses_full_name_and_abbreviation() {
+        assert_eq!(cursor_state_status_text("MI"), "Michigan (MI)");
+        assert_eq!(cursor_state_status_text("CA"), "California (CA)");
+        assert_eq!(cursor_state_status_text("ZZ"), "ZZ");
+    }
+
+    #[test]
+    fn spc_outline_only_wide_view_has_an_exact_scale_boundary() {
+        assert!(spc_outlook_fill_visible(false, 1.0));
+        assert!(!spc_outlook_fill_visible(true, SPC_OUTLOOK_FILL_MIN_SCALE));
+        assert!(spc_outlook_fill_visible(
+            true,
+            SPC_OUTLOOK_FILL_MIN_SCALE + 0.1
+        ));
     }
 
     #[test]
@@ -60441,6 +60797,22 @@ mod tests {
         assert_eq!(app.map_scale, expected_scale);
     }
 
+    #[test]
+    fn grid_composite_overlay_wakes_pipeline_without_moving_wofs_view() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.model_enabled = false;
+        app.map_center_lat = 35.2;
+        app.map_center_lon = -97.4;
+        app.map_scale = 121.0;
+
+        app.prepare_grid_composite_overlay_preserve_view();
+
+        assert!(app.model_enabled);
+        assert_eq!(app.map_center_lat, 35.2);
+        assert_eq!(app.map_center_lon, -97.4);
+        assert_eq!(app.map_scale, 121.0);
+    }
+
     fn test_vwp_key(volume: &Arc<RadarVolume>) -> VwpWorkKey {
         VwpWorkKey {
             volume_ptr: Arc::as_ptr(volume) as usize,
@@ -70461,6 +70833,7 @@ mod tests {
             hazard_receiver: None,
             pending_site_id: None,
             cursor_readout: None,
+            cursor_state_abbr: None,
             placefile_slots: Vec::new(),
             placefile_url_input: String::new(),
             placefile_input_focus: false,
@@ -70664,6 +71037,7 @@ mod tests {
             aircraft_history_profiles: Vec::new(),
             aircraft_history_rx: None,
             aircraft_history_status: String::new(),
+            aircraft_profile_search: String::new(),
             show_aircraft_history: false,
             selected_aircraft_profile: None,
             aircraft_follow_selected: false,
@@ -71173,6 +71547,36 @@ mod tests {
             Some(7)
         );
         assert!(app.status.contains("storm #7"));
+    }
+
+    #[test]
+    fn storm_track_detail_reports_toward_motion_and_forecast_valid_times() {
+        let fix_time = Utc
+            .with_ymd_and_hms(2026, 7, 20, 0, 0, 0)
+            .single()
+            .expect("valid scan time");
+        let track = test_storm_track(
+            12,
+            fix_time,
+            0.0,
+            0.0,
+            Some((20.0 * KNOT_TO_MPS as f64, 0.0)),
+        );
+
+        assert_eq!(
+            storm_track_detail_text(&track, DisplayTimeZone::Utc).as_deref(),
+            Some("toward 090° at 20 kt · +15 00:15Z · +30 00:30Z · +45 00:45Z")
+        );
+        assert_eq!(
+            storm_track_detail_text(&track, DisplayTimeZone::Eastern).as_deref(),
+            Some("toward 090° at 20 kt · +15 20:15 EDT · +30 20:30 EDT · +45 20:45 EDT")
+        );
+
+        let no_motion = test_storm_track(13, fix_time, 0.0, 0.0, None);
+        assert_eq!(
+            storm_track_detail_text(&no_motion, DisplayTimeZone::Utc),
+            None
+        );
     }
 
     #[test]

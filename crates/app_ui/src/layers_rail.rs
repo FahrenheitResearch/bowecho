@@ -152,6 +152,7 @@ impl ViewerApp {
             + usize::from(self.app_settings.overlay_river_gauges)
             + usize::from(self.glm_enabled)
             + usize::from(self.raob_markers_enabled)
+            + usize::from(self.app_settings.show_tropical)
             + usize::from(!self.spc_outlooks_enabled.is_empty())
             + usize::from(self.spc_reports_enabled)
             + usize::from(self.mping_enabled)
@@ -1683,6 +1684,9 @@ impl ViewerApp {
             let mut follow_selected = self.aircraft_follow_selected;
             let mut follow_changed = false;
             let mut center_profile = None;
+            let mut open_profile = None;
+            let mut aircraft_search = self.aircraft_profile_search.clone();
+            let searchable_profiles = &self.aircraft_profiles;
             let history_loading = self.aircraft_history_rx.is_some();
             let history_count = self.aircraft_history_profiles.len();
             let mut open_history = false;
@@ -1705,14 +1709,69 @@ impl ViewerApp {
                         "idle"
                     }),
                     count: aircraft_count.as_deref(),
-                    gear: Some(LayerRowGear::Menu {
+                    gear: Some(LayerRowGear::PersistentMenu {
                         hover: "MADIS aircraft-profile source and coverage",
                         content: Box::new(|ui| {
+                            ui.set_min_width(390.0);
                             ui.strong(format!("{profile_count} current airport profiles"));
                             ui.weak(&status);
                             if let Some(file) = &source_file {
                                 ui.weak(format!("Hourly source file: {file}"));
                             }
+                            ui.separator();
+                            ui.label("Find a current profile");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut aircraft_search)
+                                        .hint_text("Airport code, source, ascent/descent…")
+                                        .desired_width(270.0),
+                                );
+                                if !aircraft_search.is_empty() && ui.small_button("Clear").clicked()
+                                {
+                                    aircraft_search.clear();
+                                }
+                            });
+                            let matching_profiles = searchable_profiles
+                                .iter()
+                                .filter(|profile| {
+                                    aircraft_soundings::profile_matches_search(
+                                        profile,
+                                        &aircraft_search,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            ui.weak(format!(
+                                "{} of {} current profiles",
+                                matching_profiles.len(),
+                                searchable_profiles.len()
+                            ));
+                            egui::ScrollArea::vertical()
+                                .id_salt("aircraft_current_profile_search")
+                                .max_height(170.0)
+                                .show(ui, |ui| {
+                                    for profile in matching_profiles.iter().take(50) {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "{} · {} · {}Z",
+                                                profile.airport,
+                                                profile.direction_label(),
+                                                profile.valid_time.format("%H:%M")
+                                            ));
+                                            if ui.small_button("Center").clicked() {
+                                                let (latitude, longitude) =
+                                                    profile.marker_position();
+                                                center_profile = Some((
+                                                    profile.airport.clone(),
+                                                    latitude,
+                                                    longitude,
+                                                ));
+                                            }
+                                            if ui.small_button("Open").clicked() {
+                                                open_profile = Some((**profile).clone());
+                                            }
+                                        });
+                                    }
+                                });
                             if ui
                                 .add_enabled(
                                     newest_profile.is_some(),
@@ -1799,10 +1858,14 @@ impl ViewerApp {
                     }
                 },
             );
+            self.aircraft_profile_search = aircraft_search;
             if let Some((airport, latitude, longitude)) = center_profile {
                 self.selected_aircraft_profile = Some(airport);
                 self.center_map_on(latitude, longitude);
                 ctx.request_repaint();
+            }
+            if let Some(profile) = open_profile {
+                self.start_aircraft_sounding_for(profile, ctx);
             }
             if open_history {
                 self.request_aircraft_history(ctx);
@@ -1825,6 +1888,99 @@ impl ViewerApp {
         panel_kit::subgroup(ui, "Severe", |ui| {
             let _ = ui;
         });
+        // Active tropical cyclones already draw official forecast tracks on
+        // the map, but their only visibility control used to live deep in
+        // Settings. Surface the existing layer here without inventing a
+        // second toggle or feed: NHC owns Atlantic and East/Central Pacific,
+        // while JTWC supplies the official forecast outside NHC's basins.
+        {
+            let storm_count = self.tropical.storms.len();
+            let fetching = self.tropical.is_fetching();
+            let tropical_status = self.tropical.status.clone();
+            let tropical_count = (storm_count > 0).then(|| format!("{storm_count} active"));
+            let tropical_state = if fetching {
+                "loading"
+            } else if tropical_status.starts_with("Sources unavailable") {
+                "error"
+            } else if storm_count > 0 {
+                "live"
+            } else if tropical_status.starts_with("No active") {
+                "quiet"
+            } else {
+                "idle"
+            };
+            let tropical_hover = format!(
+                "Active tropical-cyclone positions, forecast tracks, intensity, and wind radii. NHC covers the Atlantic and East/Central Pacific; JTWC covers the West Pacific, Indian Ocean, and Southern Hemisphere.\n{tropical_status}"
+            );
+            // TropicalState keeps storms strongest-first.
+            let strongest = self
+                .tropical
+                .storms
+                .first()
+                .map(|storm| (storm.name.clone(), storm.position.lat, storm.position.lon));
+            let mut show_tracks = self.app_settings.show_tropical;
+            let mut show_cards = self.app_settings.show_tropical_panel;
+            let mut cards_changed = false;
+            let mut center_request = None;
+            let row_changed = layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut show_tracks,
+                        hover: "Show active tropical-cyclone forecast tracks and wind footprints on the map",
+                    },
+                    name: "Tropical cyclone tracks",
+                    name_hover: &tropical_hover,
+                    state: Some(tropical_state),
+                    count: tropical_count.as_deref(),
+                    gear: Some(LayerRowGear::PersistentMenu {
+                        hover: "Tropical-track status, storm cards, and source coverage",
+                        content: Box::new(|ui| {
+                            ui.set_min_width(360.0);
+                            ui.strong("Tropical cyclone tracks");
+                            ui.weak(&tropical_status);
+                            if ui
+                                .checkbox(&mut show_cards, "Storm cards window")
+                                .on_hover_text(
+                                    "Show the floating active-storm cards while the map layer is enabled",
+                                )
+                                .changed()
+                            {
+                                cards_changed = true;
+                            }
+                            if let Some((name, latitude, longitude)) = &strongest
+                                && ui.button(format!("Center {name}")).clicked()
+                            {
+                                center_request = Some((name.clone(), *latitude, *longitude));
+                            }
+                            ui.separator();
+                            ui.weak("NHC: Atlantic and East/Central Pacific.");
+                            ui.weak("JTWC: West Pacific, Indian Ocean, and Southern Hemisphere; GDACS supplies global discovery and supporting geometry.");
+                            if ui.button("Done").clicked() {
+                                ui.close();
+                            }
+                        }),
+                    }),
+                    ..Default::default()
+                },
+                |ui| {
+                    if fetching {
+                        ui.spinner();
+                    }
+                },
+            );
+            if row_changed || cards_changed {
+                self.app_settings.show_tropical = show_tracks;
+                self.app_settings.show_tropical_panel = show_cards;
+                self.mark_app_settings_dirty();
+                ctx.request_repaint();
+            }
+            if let Some((name, latitude, longitude)) = center_request {
+                self.center_map_on(latitude, longitude);
+                self.status = format!("Centered on tropical cyclone {name}");
+                ctx.request_repaint();
+            }
+        }
         // SPC OUTLOOK — one row (spec §2.3): vis = any kind enabled
         // (off remembers the set, on restores it); ⚙ jumps to the SEVERE
         // tab's SPC outlooks section (day + kinds live there now).

@@ -624,6 +624,9 @@ pub struct WofsState {
     pub run_index: usize,
     pub init: String,
     pub product: String,
+    /// Transient product-picker filter. Product aliases persist in settings;
+    /// this query deliberately does not.
+    pub product_search: String,
     pub minute: u32,
     /// Stacked transparent overlays (paintball slugs).
     pub overlays: Vec<String>,
@@ -778,6 +781,7 @@ impl Default for WofsState {
             run_index: 0,
             init: String::new(),
             product: "comp_dz__paintballs_thresh_40".to_owned(),
+            product_search: String::new(),
             minute: 60,
             overlays: Vec::new(),
             sync_to_radar: true,
@@ -809,25 +813,40 @@ impl Default for WofsState {
 }
 
 impl WofsState {
+    /// Human-readable run label. Once a run has a validated georeference, add
+    /// the state containing its domain center so broad source names such as
+    /// "Northeast" or "Midwest" are easier to identify without pretending a
+    /// movable WoFS domain covers only one state.
+    pub fn run_display_label(&self, run: &WofsRun) -> String {
+        let base = format!("{} {}", run.rundate, run.name);
+        let Some(georef) = self.georef_cache.get(&run.id) else {
+            return base;
+        };
+        let (lon, lat) = georef.lonlat_of(0.5, 0.5);
+        crate::map_paint::us_state_abbr_for_lon_lat(lat, lon)
+            .map(|state| format!("{base} · centered in {state}"))
+            .unwrap_or(base)
+    }
+
     /// Install a refreshed catalog without surprising a user who deliberately
     /// selected an older run/cycle.  When radar sync is enabled and the old
     /// selection was the live edge, advance to the new live edge as new
     /// 30-minute initializations appear.
-    fn apply_catalog(&mut self, catalog: WofsCatalog) {
+    fn apply_catalog(&mut self, mut catalog: WofsCatalog) {
         let previous_selection = self.catalog.as_ref().and_then(|old| {
             let run = old.runs.get(self.run_index)?;
-            Some((run.id.clone(), self.init.clone()))
+            Some((run.clone(), self.init.clone()))
         });
         let followed_previous_live_edge = self.sync_to_radar
             && (self.auto_cycle_for_valid_time
                 || self.catalog.as_ref().is_some_and(|old| {
-                    old.runs.first().is_some_and(|run| {
-                        self.run_index == 0
-                            && run.inits.first().is_some_and(|init| init == &self.init)
-                    })
+                    old.runs
+                        .get(self.run_index)
+                        .and_then(|run| run.inits.first())
+                        .is_some_and(|init| init == &self.init)
                 }));
 
-        if self.init.is_empty() || followed_previous_live_edge {
+        if self.init.is_empty() {
             self.run_index = 0;
             self.init = catalog
                 .runs
@@ -835,28 +854,38 @@ impl WofsState {
                 .and_then(|run| run.inits.first())
                 .cloned()
                 .unwrap_or_default();
-            if followed_previous_live_edge {
-                self.snd_frame = None;
-            }
             self.auto_cycle_for_valid_time = false;
-        } else if let Some((run_id, init)) = previous_selection {
-            if let Some(index) = catalog.runs.iter().position(|run| run.id == run_id) {
-                self.run_index = index;
-                let run = &catalog.runs[index];
-                self.init = if run.inits.contains(&init) {
-                    init
-                } else {
-                    run.inits.first().cloned().unwrap_or_default()
-                };
+        } else if let Some((selected_run, init)) = previous_selection {
+            let index = catalog
+                .runs
+                .iter()
+                .position(|run| run.id == selected_run.id)
+                .unwrap_or_else(|| {
+                    // The live catalog is intentionally bounded. Keep the
+                    // selected run addressable when it ages out of that
+                    // window instead of silently jumping to index zero. The
+                    // newest fetched run remains first, and replacing the
+                    // last unselected entry keeps the picker bounded.
+                    if catalog.runs.len() < MAX_PICKER_RUNS {
+                        catalog.runs.push(selected_run.clone());
+                        catalog.runs.len() - 1
+                    } else {
+                        let last = catalog.runs.len() - 1;
+                        catalog.runs[last] = selected_run.clone();
+                        last
+                    }
+                });
+            self.run_index = index;
+            let run = &catalog.runs[index];
+            self.init = if followed_previous_live_edge {
+                self.snd_frame = None;
+                self.auto_cycle_for_valid_time = false;
+                run.inits.first().cloned().unwrap_or_default()
+            } else if run.inits.contains(&init) {
+                init
             } else {
-                self.run_index = 0;
-                self.init = catalog
-                    .runs
-                    .first()
-                    .and_then(|run| run.inits.first())
-                    .cloned()
-                    .unwrap_or_default();
-            }
+                run.inits.first().cloned().unwrap_or_default()
+            };
         }
 
         self.status = format!(
@@ -876,6 +905,26 @@ impl WofsState {
     /// cross-cycle valid-time selection.
     pub fn note_manual_cycle_selection(&mut self) {
         self.auto_cycle_for_valid_time = false;
+    }
+
+    /// Select the newest run and initialization currently advertised by the
+    /// catalog. Older manual selections survive catalog refreshes, so this is
+    /// the explicit route back to the live edge.
+    pub fn select_latest_run(&mut self) -> bool {
+        let Some(run) = self
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.runs.first())
+        else {
+            return false;
+        };
+        let init = run.inits.first().cloned().unwrap_or_default();
+        let changed = self.run_index != 0 || self.init != init;
+        self.run_index = 0;
+        self.init = init;
+        self.snd_frame = None;
+        self.auto_cycle_for_valid_time = false;
+        changed
     }
 
     fn current_base_url(&self) -> Option<String> {
@@ -1556,7 +1605,16 @@ impl WofsState {
                     self.georef_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.georef_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Do not silently start the same calibration forever if
+                    // its worker panicked or otherwise exited before sending
+                    // a result. Surface a stable, retryable failure instead.
+                    self.georef_failed.insert(
+                        run_id.clone(),
+                        "calibration worker stopped unexpectedly".to_owned(),
+                    );
+                    self.georef_rx = None;
+                }
             }
         }
         if schedule_new
@@ -2272,6 +2330,217 @@ mod tests {
     }
 
     #[test]
+    fn live_catalog_refresh_never_switches_a_still_available_domain() {
+        let previous_run = WofsRun {
+            id: "WOFSRun20260728-northeast".to_owned(),
+            name: "Northeast".to_owned(),
+            rundate: "20260728".to_owned(),
+            inits: vec!["202607290300".to_owned()],
+        };
+        let selected_run = WofsRun {
+            id: "WOFSRun20260731-midwest".to_owned(),
+            name: "Midwest".to_owned(),
+            rundate: "20260731".to_owned(),
+            inits: vec!["202608010300".to_owned()],
+        };
+        let product_times = HashMap::from([(SND_REF_PRODUCT.to_owned(), vec![0, 300])]);
+        let mut state = WofsState {
+            catalog: Some(WofsCatalog {
+                runs: vec![selected_run.clone(), previous_run.clone()],
+                groups: Vec::new(),
+                times: product_times.clone(),
+            }),
+            run_index: 0,
+            init: selected_run.inits[0].clone(),
+            product: SND_REF_PRODUCT.to_owned(),
+            sync_to_radar: true,
+            ..WofsState::default()
+        };
+        let newly_advertised = WofsRun {
+            id: "WOFSRun20260801-pnw".to_owned(),
+            name: "Pacific Northwest".to_owned(),
+            rundate: "20260801".to_owned(),
+            inits: vec!["202608011700".to_owned()],
+        };
+
+        state.apply_catalog(WofsCatalog {
+            runs: vec![newly_advertised, selected_run.clone(), previous_run],
+            groups: Vec::new(),
+            times: product_times,
+        });
+
+        assert_eq!(state.run_index, 1);
+        assert_eq!(state.init, selected_run.inits[0]);
+        assert_eq!(
+            state.catalog.as_ref().unwrap().runs[state.run_index].id,
+            selected_run.id,
+            "a catalog refresh may advance a cycle inside the selected run, but must not jump domains"
+        );
+    }
+
+    #[test]
+    fn selected_domain_keeps_advancing_after_successive_catalog_reorders() {
+        let product_times = HashMap::from([(SND_REF_PRODUCT.to_owned(), vec![0, 300])]);
+        let selected_v1 = WofsRun {
+            id: "WOFSRun20260731-midwest".to_owned(),
+            name: "Midwest".to_owned(),
+            rundate: "20260731".to_owned(),
+            inits: vec!["202608010200".to_owned()],
+        };
+        let mut state = WofsState {
+            catalog: Some(WofsCatalog {
+                runs: vec![selected_v1.clone()],
+                groups: Vec::new(),
+                times: product_times.clone(),
+            }),
+            run_index: 0,
+            init: selected_v1.inits[0].clone(),
+            product: SND_REF_PRODUCT.to_owned(),
+            sync_to_radar: true,
+            ..WofsState::default()
+        };
+        let selected_v2 = WofsRun {
+            inits: vec!["202608010230".to_owned(), "202608010200".to_owned()],
+            ..selected_v1.clone()
+        };
+        state.apply_catalog(WofsCatalog {
+            runs: vec![
+                WofsRun {
+                    id: "WOFSRun20260801-pnw".to_owned(),
+                    name: "Pacific Northwest".to_owned(),
+                    rundate: "20260801".to_owned(),
+                    inits: vec!["202608011700".to_owned()],
+                },
+                selected_v2.clone(),
+            ],
+            groups: Vec::new(),
+            times: product_times.clone(),
+        });
+        assert_eq!(state.run_index, 1);
+        assert_eq!(state.init, selected_v2.inits[0]);
+
+        let selected_v3 = WofsRun {
+            inits: vec![
+                "202608010300".to_owned(),
+                "202608010230".to_owned(),
+                "202608010200".to_owned(),
+            ],
+            ..selected_v1
+        };
+        state.apply_catalog(WofsCatalog {
+            runs: vec![
+                WofsRun {
+                    id: "WOFSRun20260801-southeast".to_owned(),
+                    name: "Southeast".to_owned(),
+                    rundate: "20260801".to_owned(),
+                    inits: vec!["202608011730".to_owned()],
+                },
+                WofsRun {
+                    id: "WOFSRun20260801-pnw".to_owned(),
+                    name: "Pacific Northwest".to_owned(),
+                    rundate: "20260801".to_owned(),
+                    inits: vec!["202608011700".to_owned()],
+                },
+                selected_v3.clone(),
+            ],
+            groups: Vec::new(),
+            times: product_times,
+        });
+
+        assert_eq!(state.run_index, 2);
+        assert_eq!(state.init, selected_v3.inits[0]);
+        assert_eq!(
+            state.catalog.as_ref().unwrap().runs[state.run_index].id,
+            selected_v3.id
+        );
+    }
+
+    #[test]
+    fn bounded_catalog_refresh_retains_an_omitted_selected_run() {
+        let selected_run = WofsRun {
+            id: "WOFSRun20260728-northeast".to_owned(),
+            name: "Northeast".to_owned(),
+            rundate: "20260728".to_owned(),
+            inits: vec!["202607290300".to_owned(), "202607290230".to_owned()],
+        };
+        let other_old_run = WofsRun {
+            id: "WOFSRun20260731-midwest".to_owned(),
+            name: "Midwest".to_owned(),
+            rundate: "20260731".to_owned(),
+            inits: vec!["202608010300".to_owned()],
+        };
+        let product_times = HashMap::from([(SND_REF_PRODUCT.to_owned(), vec![0, 300])]);
+        let mut state = WofsState {
+            catalog: Some(WofsCatalog {
+                runs: vec![other_old_run, selected_run.clone()],
+                groups: Vec::new(),
+                times: product_times.clone(),
+            }),
+            run_index: 1,
+            init: selected_run.inits[1].clone(),
+            product: SND_REF_PRODUCT.to_owned(),
+            sync_to_radar: true,
+            ..WofsState::default()
+        };
+        let refreshed_runs = (0..MAX_PICKER_RUNS)
+            .map(|index| WofsRun {
+                id: format!("WOFSRun20260801-new-{index:02}"),
+                name: format!("New domain {index}"),
+                rundate: "20260801".to_owned(),
+                inits: vec!["202608011700".to_owned()],
+            })
+            .collect::<Vec<_>>();
+        let newest_id = refreshed_runs[0].id.clone();
+
+        state.apply_catalog(WofsCatalog {
+            runs: refreshed_runs,
+            groups: Vec::new(),
+            times: product_times,
+        });
+
+        let catalog = state.catalog.as_ref().unwrap();
+        assert_eq!(catalog.runs.len(), MAX_PICKER_RUNS);
+        assert_eq!(catalog.runs[0].id, newest_id);
+        assert_eq!(catalog.runs[state.run_index].id, selected_run.id);
+        assert_eq!(state.init, selected_run.inits[1]);
+    }
+
+    #[test]
+    fn select_latest_run_returns_to_the_catalog_front() {
+        let latest_run = WofsRun {
+            id: "WOFSRun20260801-latest".to_owned(),
+            name: "Latest".to_owned(),
+            rundate: "20260801".to_owned(),
+            inits: vec!["202608011730".to_owned(), "202608011700".to_owned()],
+        };
+        let older_run = WofsRun {
+            id: "WOFSRun20260728-northeast".to_owned(),
+            name: "Northeast".to_owned(),
+            rundate: "20260728".to_owned(),
+            inits: vec!["202607290300".to_owned()],
+        };
+        let mut state = WofsState {
+            catalog: Some(WofsCatalog {
+                runs: vec![latest_run.clone(), older_run.clone()],
+                groups: Vec::new(),
+                times: HashMap::new(),
+            }),
+            run_index: 1,
+            init: older_run.inits[0].clone(),
+            snd_frame: Some(12),
+            auto_cycle_for_valid_time: true,
+            ..WofsState::default()
+        };
+
+        assert!(state.select_latest_run());
+        assert_eq!(state.run_index, 0);
+        assert_eq!(state.init, latest_run.inits[0]);
+        assert_eq!(state.snd_frame, None);
+        assert!(!state.auto_cycle_for_valid_time);
+        assert!(!state.select_latest_run());
+    }
+
+    #[test]
     fn frame_buttons_step_only_through_posted_minutes() {
         let catalog = timeline_test_catalog(&["202607211900"]);
         let run = catalog.runs[0].clone();
@@ -2431,6 +2700,25 @@ mod tests {
         state
             .georef_failed
             .insert(run_id.to_owned(), "temporary CDN timeout".to_owned());
+        state.retry_georef_for_run(run_id);
+        assert!(!state.georef_failed.contains_key(run_id));
+    }
+
+    #[test]
+    fn disconnected_georef_worker_becomes_a_retryable_failure() {
+        let mut state = WofsState::default();
+        let run_id = "WOFSRun20260711-130130d1";
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        state.georef_rx = Some((run_id.to_owned(), receiver));
+
+        state.pump_georef(&egui::Context::default(), false);
+
+        assert!(state.georef_rx.is_none());
+        assert_eq!(
+            state.georef_failed.get(run_id).map(String::as_str),
+            Some("calibration worker stopped unexpectedly")
+        );
         state.retry_georef_for_run(run_id);
         assert!(!state.georef_failed.contains_key(run_id));
     }

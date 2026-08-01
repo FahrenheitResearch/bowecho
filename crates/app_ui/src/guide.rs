@@ -115,7 +115,7 @@ impl GuideSection {
     fn search_terms(self) -> &'static str {
         match self {
             Self::GettingStarted => {
-                "install update live radar first run windows mac linux interface"
+                "install update live radar first run windows mac linux interface cache cached reopen recent level ii"
             }
             Self::Products => {
                 "reflectivity velocity correlation coefficient zdr dual pol derived gust hail tornado"
@@ -135,7 +135,9 @@ impl GuideSection {
             Self::SimSat => {
                 "simsat synthetic satellite hrrr wrf atmosphere visible infrared water vapor"
             }
-            Self::Archive => "archive old historical radar frames events browser warnings",
+            Self::Archive => {
+                "archive old historical radar frames events browser warnings past previous storm tracks"
+            }
             Self::Player => "loop frames playback load export video gif unified player",
             Self::Tools => "cross section inspector vwp annotate workflows dealiasing",
             Self::Volume3d => "3d volume rendering isosurface camera",
@@ -403,6 +405,14 @@ fn getting_started(ui: &mut egui::Ui) {
          catalogs load real loops, single-frame providers start at the newest scan and grow \
          live. Center recenters the map on it. The site you load is remembered as the \
          startup site for next launch.",
+    );
+    action(
+        ui,
+        "Cached… (recent Level-II)",
+        "— Radar > Site > Cached… opens one or more recent Level-II files already in the \
+         selected US site's per-site downloaded cache, without downloading them again. This \
+         cache is rebuildable and retention-limited: old files recycle as limits are reached, \
+         so it is not a permanent archive. Use Data > Archive when you need to fetch an older scan.",
     );
     action(
         ui,
@@ -855,9 +865,11 @@ fn layers(ui: &mut egui::Ui) {
     );
     action(
         ui,
-        "CC-drop swath",
-        "— accumulates the minimum correlation coefficient across the radar loop and masks normal \
-         high-CC gates. Adjust the cutoff in the layer row; the source volume must contain RHO/CC.",
+        "Max REF / VEL and CC-drop swaths",
+        "— accumulate peak reflectivity, peak velocity magnitude, or minimum correlation \
+         coefficient across the radar loop. Every swath covers exactly the loaded loop. To extend \
+         its track, set Radar > Site > Frames to load, then press Load Loop again. CC-drop masks \
+         normal high-CC gates; adjust its cutoff in the layer row. Its source volume must contain RHO/CC.",
     );
     para(
         ui,
@@ -2737,6 +2749,15 @@ fn archive(ui: &mut egui::Ui) {
          back in time.",
     );
 
+    subhead(ui, "PREVIOUS STORM TRACKS");
+    para(
+        ui,
+        "To review a previous storm, load a historical/archive radar loop and enable Storm \
+         tracks. BowEcho reconstructs SCIT-style tracks from the frames in that loaded loop. \
+         It does not yet maintain a durable past-storm-track library; changing or unloading \
+         the loop changes or removes those reconstructed tracks.",
+    );
+
     subhead(ui, "UNIFIED PLAYER WINDOWS");
     para(
         ui,
@@ -3789,14 +3810,35 @@ mod tests {
     }
 
     #[test]
+    fn guide_explains_that_swath_length_comes_from_the_loaded_loop() {
+        let guide_src = include_str!("guide.rs");
+        assert!(guide_src.contains("Every swath covers exactly the loaded loop"));
+        assert!(guide_src.contains("Frames to load, then press Load Loop again"));
+    }
+
+    #[test]
     fn guide_search_routes_common_feature_terms() {
         assert!(GuideSection::Layers.matches_search("hurricane hunters"));
         assert!(GuideSection::Satellite.matches_search("meteosat"));
         assert!(GuideSection::Wrf.matches_search("cuda"));
         assert!(GuideSection::Archive.matches_search("historical"));
+        assert!(GuideSection::GettingStarted.matches_search("cached radar"));
+        assert!(GuideSection::Archive.matches_search("previous storm tracks"));
         assert!(GuideSection::Layers.matches_search("metar warning"));
         assert!(GuideSection::ModelData.matches_search("sounding download"));
         assert!(!GuideSection::Layers.matches_search("metar cuda"));
         assert!(!GuideSection::Shortcuts.matches_search("simulated radar"));
+    }
+
+    #[test]
+    fn guide_documents_recent_cache_and_reconstructed_historical_tracks() {
+        let guide_src = include_str!("guide.rs");
+        assert!(guide_src.contains("Cached… (recent Level-II)"));
+        assert!(guide_src.contains("without downloading them again"));
+        assert!(guide_src.contains("rebuildable and retention-limited"));
+        assert!(guide_src.contains("not a permanent archive"));
+        assert!(guide_src.contains("PREVIOUS STORM TRACKS"));
+        assert!(guide_src.contains("reconstructs SCIT-style tracks"));
+        assert!(guide_src.contains("does not yet maintain a durable past-storm-track library"));
     }
 }

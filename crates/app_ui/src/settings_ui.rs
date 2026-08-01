@@ -14,12 +14,11 @@ impl ViewerApp {
             self.set_section_open("customize_appearance", true);
         }
         self.remembered_section(ui, "customize_map_layers", "Map layers", true, |app, ui| {
+            app.add_layer_menu(ui, ctx);
+            ui.separator();
             app.radar_marker_label_toggle(ui, ctx);
             ui.separator();
             app.layers_rail(ui, ctx);
-        });
-        self.remembered_section(ui, "customize_add_layer", "Add layer", true, |app, ui| {
-            app.add_layer_menu(ui, ctx);
         });
         self.remembered_section(
             ui,

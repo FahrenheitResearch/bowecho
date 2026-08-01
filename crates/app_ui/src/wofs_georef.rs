@@ -538,7 +538,12 @@ struct CalibrationFetch {
     index: usize,
     row: u32,
     col: u32,
-    result: Result<Vec<u8>, String>,
+    result: Result<TitleOcr, CalibrationFailure>,
+}
+
+enum CalibrationFailure {
+    Fetch(String),
+    Decode(String),
 }
 
 fn fetch_sounding_with_retry(url: &str) -> Result<Vec<u8>, String> {
@@ -576,7 +581,27 @@ fn fetch_calibration_soundings(
                     let url = format!(
                         "{SOUNDING_API}/{run_id}/{rd_init}/0/wofs_snd_{row:02}_{col:02}.png"
                     );
-                    let result = fetch_sounding_with_retry(&url);
+                    // Decode and OCR on the same bounded worker that fetched
+                    // the PNG. Previously all 28 downloads completed first,
+                    // the progress UI reached 28/28, and only then did a
+                    // serial decode/OCR pass begin. On slower machines that
+                    // looked permanently stuck at a completed calibration.
+                    // A completed progress item now means the sounding has
+                    // been fully processed and only the tiny fit remains.
+                    let result = fetch_sounding_with_retry(&url)
+                        .map_err(CalibrationFailure::Fetch)
+                        .and_then(|bytes| {
+                            image::load_from_memory(&bytes)
+                                .map_err(|error| CalibrationFailure::Decode(error.to_string()))
+                        })
+                        .map(|decoded| {
+                            let gray = decoded.to_luma8();
+                            ocr_title_gray(
+                                gray.width() as usize,
+                                gray.height() as usize,
+                                gray.as_raw(),
+                            )
+                        });
                     results
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -616,24 +641,19 @@ pub fn build_georef(
     let mut first_failure: Option<String> = None;
     let fetched = fetch_calibration_soundings(run_id, rd_init, progress);
     for fetch in fetched {
-        let bytes = match fetch.result {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        let ocr = match fetch.result {
+            Ok(ocr) => ocr,
+            Err(CalibrationFailure::Fetch(error)) => {
                 fetch_failures += 1;
                 first_failure.get_or_insert(error);
                 continue;
             }
-        };
-        let decoded = match image::load_from_memory(&bytes) {
-            Ok(decoded) => decoded,
-            Err(error) => {
+            Err(CalibrationFailure::Decode(error)) => {
                 decode_failures += 1;
-                first_failure.get_or_insert_with(|| error.to_string());
+                first_failure.get_or_insert(error);
                 continue;
             }
         };
-        let gray = decoded.to_luma8();
-        let ocr = ocr_title_gray(gray.width() as usize, gray.height() as usize, gray.as_raw());
         let (fx, fy) = station_fraction(fetch.row, fetch.col);
         if let Some(lat) = ocr.lat {
             lat_pts.push((fx, fy, lat));

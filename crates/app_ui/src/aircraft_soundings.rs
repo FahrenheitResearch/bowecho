@@ -60,6 +60,27 @@ impl AircraftProfile {
     }
 }
 
+/// Case-insensitive all-terms filter shared by the current-profile and recent
+/// history browsers. The anonymous feed reliably exposes airport code,
+/// direction, source, and UTC valid time; it does not provide dependable full
+/// airport names or a stable aircraft identity.
+pub fn profile_matches_search(profile: &AircraftProfile, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {} {} {} {}",
+        profile.airport,
+        profile.direction_label(),
+        profile.source,
+        profile.valid_time.to_rfc3339(),
+        profile.valid_time.format("%Y%m%d %H%MZ")
+    )
+    .to_ascii_lowercase();
+    query.split_whitespace().all(|term| haystack.contains(term))
+}
+
 #[derive(Clone, Debug)]
 pub struct AircraftSnapshot {
     pub profiles: Vec<AircraftProfile>,
@@ -778,6 +799,19 @@ mod tests {
                 .all(|pair| { pair[0].valid_time >= pair[1].valid_time })
         );
         assert!(normalized.iter().any(|profile| !profile.ascending));
+    }
+
+    #[test]
+    fn profile_search_matches_all_terms_across_airport_direction_source_and_time() {
+        let profile = profiles_from_arrays(&test_arrays(12)).unwrap().remove(0);
+
+        assert!(profile_matches_search(&profile, ""));
+        assert!(profile_matches_search(&profile, "stl"));
+        assert!(profile_matches_search(&profile, "STL ASCENT"));
+        assert!(profile_matches_search(&profile, "mdcrs public"));
+        assert!(profile_matches_search(&profile, "202607"));
+        assert!(!profile_matches_search(&profile, "stl descent"));
+        assert!(!profile_matches_search(&profile, "ord"));
     }
 
     #[test]

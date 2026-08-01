@@ -178,6 +178,13 @@ impl Default for TropicalState {
 }
 
 impl TropicalState {
+    /// Whether either tropical-data worker is currently fetching the active
+    /// storm list or one storm's forecast geometry. Used by the layer rail so
+    /// its status reflects real work without exposing the worker slots.
+    pub fn is_fetching(&self) -> bool {
+        self.storms_rx.in_flight() || self.geometry_rx.in_flight()
+    }
+
     /// Kick a refresh if it's due and none is in flight; heartbeat so the
     /// interval keeps ticking on an otherwise-idle map.
     pub fn maybe_refresh(&mut self, ctx: &egui::Context, visible: bool) {
