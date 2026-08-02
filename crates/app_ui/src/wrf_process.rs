@@ -242,7 +242,20 @@ const RAW_EXTRA_CATALOG: &[&str] = &[
 #[derive(Debug)]
 pub enum WrfProcessMessage {
     Progress(String),
+    /// One hour/scene has been atomically committed and is safe for the model
+    /// browser to enumerate while the remaining folder continues processing.
+    Committed(WrfProcessCommit),
     Done(Result<WrfProcessSummary, String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct WrfProcessCommit {
+    pub model: String,
+    pub run: String,
+    pub storage_slot: u16,
+    pub exact_time: Option<RwsExactTime>,
+    pub completed: usize,
+    pub total: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,9 +364,18 @@ fn process_desktop_paths(
         let mut progress = |message: String| {
             let _ = tx.send(WrfProcessMessage::Progress(message));
         };
-        let mut summary =
-            process_scene_group_exact(&selected.group, store_root, &run, options, &mut progress)?
-                .process;
+        let mut committed = |commit: WrfProcessCommit| {
+            let _ = tx.send(WrfProcessMessage::Committed(commit));
+        };
+        let mut summary = process_scene_group_exact_with_commit(
+            &selected.group,
+            store_root,
+            &run,
+            options,
+            &mut progress,
+            &mut committed,
+        )?
+        .process;
         summary.notes.extend(
             selected
                 .notes
@@ -529,6 +551,14 @@ fn process_paths(
                     .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
                     all_vars.extend(result.vars.iter().cloned());
                     written.push(result);
+                    let _ = tx.send(WrfProcessMessage::Committed(WrfProcessCommit {
+                        model: model.clone(),
+                        run: run.clone(),
+                        storage_slot: hour,
+                        exact_time: None,
+                        completed: written.len(),
+                        total: None,
+                    }));
                     continue;
                 }
                 Ok(None) => {}
@@ -596,6 +626,14 @@ fn process_paths(
             all_vars.extend(result.vars.iter().cloned());
             all_notes.extend(fields.notes);
             written.push(result);
+            let _ = tx.send(WrfProcessMessage::Committed(WrfProcessCommit {
+                model: model.clone(),
+                run: run.clone(),
+                storage_slot: hour,
+                exact_time: None,
+                completed: written.len(),
+                total: None,
+            }));
         }
     }
 
@@ -627,6 +665,17 @@ pub fn process_scene_group_exact(
     run: &str,
     options: &WrfProcessOptions,
     progress: &mut impl FnMut(String),
+) -> Result<WrfExactProcessSummary, String> {
+    process_scene_group_exact_with_commit(group, store_root, run, options, progress, &mut |_| {})
+}
+
+fn process_scene_group_exact_with_commit(
+    group: &WrfSceneGroup,
+    store_root: &Path,
+    run: &str,
+    options: &WrfProcessOptions,
+    progress: &mut impl FnMut(String),
+    committed: &mut impl FnMut(WrfProcessCommit),
 ) -> Result<WrfExactProcessSummary, String> {
     if group.scenes.is_empty() {
         return Err("WRF scene group is empty".to_owned());
@@ -754,6 +803,7 @@ pub fn process_scene_group_exact(
             .iter()
             .map(IsoVolume::as_input)
             .collect::<Vec<_>>();
+        let hour_exact_time = exact_time.clone();
         let result = write_hour_from_fields_with_derived_exact(
             store_root,
             &model,
@@ -785,6 +835,14 @@ pub fn process_scene_group_exact(
             valid_unix: valid_time.timestamp(),
             valid_time: valid_time.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             precipitation_interval_seconds,
+        });
+        committed(WrfProcessCommit {
+            model: model.clone(),
+            run: run.to_owned(),
+            storage_slot,
+            exact_time: Some(hour_exact_time),
+            completed: processed_scenes.len(),
+            total: Some(group.scenes.len()),
         });
     }
 
@@ -2191,6 +2249,7 @@ mod tests {
                 Ok(WrfProcessMessage::Progress(line)) => {
                     eprintln!("[{:9.2?}] {line}", start.elapsed());
                 }
+                Ok(WrfProcessMessage::Committed(_)) => continue,
                 Ok(WrfProcessMessage::Done(result)) => {
                     let summary = result.expect("default full-diagnostics import should succeed");
                     eprintln!(

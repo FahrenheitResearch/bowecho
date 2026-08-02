@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! <screenshots>/plots/<model>/<run>/<field>/f###.png
+//! <screenshots>/plots/<model>/<run>/<field>/loop.gif|loop.mp4
 //! <screenshots>/plots/<model>/<run>/index.json
 //! ```
 //!
@@ -70,12 +71,55 @@ pub(crate) struct BatchPlotRequest {
     pub options: BatchPlotOptions,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct BatchPlotOptions {
     pub width: u32,
     pub height: u32,
     /// Also render the synthesized per-level isobaric planes.
     pub include_iso: bool,
+    /// Restrict the sweep to one store variable or synthesized iso slug.
+    /// `None` retains the established "plot everything" behavior.
+    pub only_var: Option<String>,
+    /// After rendering, encode this variable's ordered PNG frames.
+    pub animation: Option<PlotAnimationOptions>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlotAnimationFormat {
+    Gif,
+    Mp4,
+}
+
+impl PlotAnimationFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Gif => "GIF",
+            Self::Mp4 => "MP4",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Gif => "gif",
+            Self::Mp4 => "mp4",
+        }
+    }
+
+    fn sequence_format(self) -> crate::media::SequenceFormat {
+        match self {
+            Self::Gif => crate::media::SequenceFormat::Gif,
+            Self::Mp4 => crate::media::SequenceFormat::Mp4,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlotAnimationOptions {
+    pub var: String,
+    pub format: PlotAnimationFormat,
+    /// Display duration of one model timestep in the output.
+    pub frame_delay_ms: u32,
+    pub max_width: u32,
 }
 
 impl Default for BatchPlotOptions {
@@ -84,6 +128,8 @@ impl Default for BatchPlotOptions {
             width: DEFAULT_PLOT_WIDTH,
             height: DEFAULT_PLOT_HEIGHT,
             include_iso: true,
+            only_var: None,
+            animation: None,
         }
     }
 }
@@ -113,6 +159,8 @@ pub(crate) struct BatchPlotSummary {
     pub out_dir: PathBuf,
     /// PNGs written.
     pub written: usize,
+    /// GIF/MP4 outputs written after their PNG sequence completed.
+    pub animations: Vec<PathBuf>,
     /// Subset of `written` that fell through to the generic ramp (no
     /// production/user/Solar style).
     pub fallback_styled: usize,
@@ -150,6 +198,9 @@ impl BatchPlotSummary {
         }
         if self.cancelled {
             line.push_str(" — cancelled early");
+        }
+        if !self.animations.is_empty() {
+            line.push_str(&format!(" — {} animation(s)", self.animations.len()));
         }
         line
     }
@@ -343,6 +394,7 @@ pub(crate) fn run_batch_plot(
             run: request.run.clone(),
             out_dir: run_dir.clone(),
             written: 0,
+            animations: Vec::new(),
             fallback_styled: 0,
             skipped: 0,
             failed: 0,
@@ -388,6 +440,14 @@ pub(crate) fn run_batch_plot(
         // Every surface 2-D variable — mirror of the rw-ui worker's
         // `load_field`: read, resolve style, convert units in place.
         for var in meta.variables.iter().filter(|var| var.kind == "surface2d") {
+            if request
+                .options
+                .only_var
+                .as_ref()
+                .is_some_and(|wanted| wanted != &var.name)
+            {
+                continue;
+            }
             if cancel.load(Ordering::Relaxed) {
                 state.summary.cancelled = true;
                 break 'hours;
@@ -450,6 +510,14 @@ pub(crate) fn run_batch_plot(
         // picker offers for this hour.
         if request.options.include_iso {
             for spec in iso_plane_specs(&meta.variables) {
+                if request
+                    .options
+                    .only_var
+                    .as_ref()
+                    .is_some_and(|wanted| wanted != &spec.slug())
+                {
+                    continue;
+                }
                 if cancel.load(Ordering::Relaxed) {
                     state.summary.cancelled = true;
                     break 'hours;
@@ -496,13 +564,76 @@ pub(crate) fn run_batch_plot(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0),
-        plots: state.index.into_values().collect(),
+        plots: std::mem::take(&mut state.index).into_values().collect(),
     };
     if let Err(err) = write_index(&run_dir, &index) {
         state.summary.failed += 1;
         state.summary.notes.push(format!("index.json: {err}"));
     }
+    if !state.summary.cancelled
+        && let Some(animation) = request.options.animation.as_ref()
+    {
+        match encode_plot_animation(&run_dir, &index, animation, cancel, &mut *state.progress) {
+            Ok(path) => state.summary.animations.push(path),
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                state.summary.cancelled = true;
+                state.push_note("animation cancelled; partial output removed".to_owned());
+            }
+            Err(err) => {
+                state.summary.failed += 1;
+                state.push_note(format!("{} animation: {err}", animation.format.label()));
+            }
+        }
+    }
     Ok(state.summary)
+}
+
+fn encode_plot_animation(
+    run_dir: &Path,
+    index: &PlotIndex,
+    options: &PlotAnimationOptions,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(String),
+) -> Result<PathBuf, String> {
+    let plot = index
+        .plots
+        .iter()
+        .find(|plot| plot.var == options.var)
+        .ok_or_else(|| format!("field '{}' produced no PNG sequence", options.var))?;
+    if plot.frames.len() < 2 {
+        return Err(format!(
+            "field '{}' has only {} frame(s); at least two timesteps are required",
+            options.var,
+            plot.frames.len()
+        ));
+    }
+
+    let var_dir = run_dir.join(sanitize_component(&options.var));
+    let out_path = var_dir.join(format!("loop.{}", options.format.extension()));
+    let mut encoder = crate::media::SequenceEncoder::create(
+        options.format.sequence_format(),
+        out_path,
+        options.max_width,
+        options.frame_delay_ms,
+    )?;
+    for (index, frame) in plot.frames.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_owned());
+        }
+        let path = run_dir.join(Path::new(&frame.path));
+        let image = image::open(&path)
+            .map_err(|err| format!("decode {}: {err}", path.display()))?
+            .into_rgba8();
+        encoder.push_rgba(image)?;
+        progress(format!(
+            "Encoding {} {}/{}: {}",
+            options.format.label(),
+            index + 1,
+            plot.frames.len(),
+            plot.title
+        ));
+    }
+    encoder.finish()
 }
 
 /// Style the field through the fallback ladder, render it, and record the
@@ -901,6 +1032,7 @@ mod tests {
                 width: 320,
                 height: 240,
                 include_iso,
+                ..BatchPlotOptions::default()
             },
         }
     }
@@ -1062,6 +1194,103 @@ mod tests {
                 );
             }
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn wrf_progress_and_animation_selected_field_exports_ordered_gif() {
+        use image::AnimationDecoder as _;
+
+        let root = write_fixture("animation", &[0, 1]);
+        let out = temp_out("animation");
+        let _ = std::fs::remove_dir_all(&out);
+        let mut request = request(&root, &out, true);
+        request.options.only_var = Some("temperature_2m".to_owned());
+        request.options.animation = Some(PlotAnimationOptions {
+            var: "temperature_2m".to_owned(),
+            format: PlotAnimationFormat::Gif,
+            frame_delay_ms: 350,
+            max_width: 320,
+        });
+
+        let summary = run_batch_plot(&request, &AtomicBool::new(false), &mut |_| {})
+            .expect("selected field animation runs");
+        assert_eq!(summary.written, 2, "one field across two hours");
+        assert_eq!(summary.failed, 0, "notes: {:?}", summary.notes);
+        assert_eq!(summary.animations.len(), 1);
+        let gif = &summary.animations[0];
+        assert_eq!(
+            gif.file_name().and_then(|name| name.to_str()),
+            Some("loop.gif")
+        );
+        let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(
+            std::fs::read(gif).expect("GIF written"),
+        ))
+        .expect("GIF decodes");
+        let frames = decoder.into_frames().collect_frames().expect("GIF frames");
+        assert_eq!(frames.len(), 2);
+        let run_dir = plot_run_dir(&out, "wrf", "local_wrf_19740403_090000");
+        let index: PlotIndex = serde_json::from_slice(
+            &std::fs::read(run_dir.join("index.json")).expect("index written"),
+        )
+        .expect("index parses");
+        assert_eq!(index.plots.len(), 1);
+        assert_eq!(index.plots[0].var, "temperature_2m");
+        assert_eq!(index.plots[0].frames[0].hour, 0);
+        assert_eq!(index.plots[0].frames[1].hour, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn wrf_progress_and_animation_requires_two_frames_and_cleans_cancel() {
+        let root = write_fixture("animation-edge", &[0]);
+        let out = temp_out("animation-edge");
+        let _ = std::fs::remove_dir_all(&out);
+        let mut one_frame_request = request(&root, &out, false);
+        one_frame_request.options.only_var = Some("temperature_2m".to_owned());
+        one_frame_request.options.animation = Some(PlotAnimationOptions {
+            var: "temperature_2m".to_owned(),
+            format: PlotAnimationFormat::Gif,
+            frame_delay_ms: 350,
+            max_width: 320,
+        });
+        let summary = run_batch_plot(&one_frame_request, &AtomicBool::new(false), &mut |_| {})
+            .expect("single-frame plot still summarizes");
+        assert_eq!(summary.animations.len(), 0);
+        assert_eq!(summary.failed, 1);
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note.contains("at least two"))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let root = write_fixture("animation-cancel", &[0, 1, 2]);
+        let cancel = AtomicBool::new(false);
+        let cancel_ref = &cancel;
+        let mut cancelled_request = request(&root, &out, false);
+        cancelled_request.options.only_var = Some("temperature_2m".to_owned());
+        cancelled_request.options.animation = Some(PlotAnimationOptions {
+            var: "temperature_2m".to_owned(),
+            format: PlotAnimationFormat::Gif,
+            frame_delay_ms: 350,
+            max_width: 320,
+        });
+        cancel.store(false, Ordering::Relaxed);
+        let summary = run_batch_plot(&cancelled_request, cancel_ref, &mut |message| {
+            if message.starts_with("Encoding GIF") {
+                cancel_ref.store(true, Ordering::Relaxed);
+            }
+        })
+        .expect("cancelled animation summarizes");
+        assert!(summary.cancelled);
+        let run_dir = plot_run_dir(&out, "wrf", "local_wrf_19740403_090000");
+        assert!(!run_dir.join("temperature_2m").join("loop.gif").exists());
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&out);

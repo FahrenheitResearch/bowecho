@@ -161,6 +161,25 @@ enum ResolvedRecordFormat {
     WebP,
 }
 
+/// Output format for a deterministic sequence of already-rendered RGBA
+/// frames. Model/WRF native plots use this small adapter so they share the
+/// exact same GIF and ffmpeg paths as screen recordings without pretending
+/// to be a radar-history timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SequenceFormat {
+    Gif,
+    Mp4,
+}
+
+impl SequenceFormat {
+    fn resolved(self) -> ResolvedRecordFormat {
+        match self {
+            Self::Gif => ResolvedRecordFormat::Gif,
+            Self::Mp4 => ResolvedRecordFormat::Mp4,
+        }
+    }
+}
+
 impl ResolvedRecordFormat {
     fn label(self) -> &'static str {
         match self {
@@ -1552,25 +1571,41 @@ enum LoopSink {
 
 impl LoopSink {
     fn new(job: &LoopEncodeJob) -> Result<Self, String> {
-        match job.format {
+        Self::for_output(
+            job.format,
+            job.out_path.clone(),
+            job.max_width,
+            job.frame_delay_ms,
+            job.frame_rate_fps,
+        )
+    }
+
+    fn for_output(
+        format: ResolvedRecordFormat,
+        out_path: PathBuf,
+        max_width: u32,
+        frame_delay_ms: u32,
+        frame_rate_fps: Option<u16>,
+    ) -> Result<Self, String> {
+        match format {
             ResolvedRecordFormat::Gif => Ok(Self::Gif(GifSink::create(
-                &job.out_path,
-                job.max_width,
-                job.frame_delay_ms,
+                &out_path,
+                max_width,
+                frame_delay_ms,
             )?)),
             ResolvedRecordFormat::Mp4 => Ok(Self::Mp4(FfmpegSink::new(
-                job.out_path.clone(),
-                job.max_width,
-                job.frame_delay_ms,
-                job.frame_rate_fps,
-                job.format,
+                out_path,
+                max_width,
+                frame_delay_ms,
+                frame_rate_fps,
+                format,
             ))),
             ResolvedRecordFormat::WebP => Ok(Self::WebP(FfmpegSink::new(
-                job.out_path.clone(),
-                job.max_width,
-                job.frame_delay_ms,
-                job.frame_rate_fps,
-                job.format,
+                out_path,
+                max_width,
+                frame_delay_ms,
+                frame_rate_fps,
+                format,
             ))),
         }
     }
@@ -1580,6 +1615,14 @@ impl LoopSink {
             Self::Gif(sink) => sink.push(image),
             Self::Mp4(sink) => sink.push(image),
             Self::WebP(sink) => sink.push(image),
+        }
+    }
+
+    fn push_rgba(&mut self, image: image::RgbaImage) -> Result<(), String> {
+        match self {
+            Self::Gif(sink) => sink.push_rgba(image),
+            Self::Mp4(sink) => sink.push_rgba(image),
+            Self::WebP(sink) => sink.push_rgba(image),
         }
     }
 
@@ -1598,6 +1641,63 @@ impl LoopSink {
             Self::WebP(sink) => sink.discard(),
         }
         let _ = std::fs::remove_file(out_path);
+    }
+}
+
+/// Bounded-memory encoder for an ordered, pre-rendered image sequence.
+/// Callers decode and push one frame at a time; dropping without `finish`
+/// aborts ffmpeg and removes the partial output.
+pub(crate) struct SequenceEncoder {
+    sink: Option<LoopSink>,
+    out_path: PathBuf,
+}
+
+impl SequenceEncoder {
+    pub(crate) fn create(
+        format: SequenceFormat,
+        out_path: PathBuf,
+        max_width: u32,
+        frame_delay_ms: u32,
+    ) -> Result<Self, String> {
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+        }
+        let sink = LoopSink::for_output(
+            format.resolved(),
+            out_path.clone(),
+            max_width,
+            frame_delay_ms.max(1),
+            None,
+        )?;
+        Ok(Self {
+            sink: Some(sink),
+            out_path,
+        })
+    }
+
+    pub(crate) fn push_rgba(&mut self, image: image::RgbaImage) -> Result<(), String> {
+        self.sink
+            .as_mut()
+            .ok_or_else(|| "sequence encoder is already finished".to_owned())?
+            .push_rgba(image)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<PathBuf, String> {
+        let sink = self
+            .sink
+            .take()
+            .ok_or_else(|| "sequence encoder is already finished".to_owned())?;
+        sink.finish(&self.out_path)?;
+        Ok(self.out_path.clone())
+    }
+}
+
+impl Drop for SequenceEncoder {
+    fn drop(&mut self) {
+        if let Some(sink) = self.sink.take() {
+            sink.discard(&self.out_path);
+        }
     }
 }
 
@@ -1632,6 +1732,15 @@ impl GifSink {
 
     fn push(&mut self, image: &egui::ColorImage) -> Result<(), String> {
         let frame = scaled_record_frame(image, self.max_width, &mut self.locked_dims)?;
+        self.encode_rgba(frame)
+    }
+
+    fn push_rgba(&mut self, image: image::RgbaImage) -> Result<(), String> {
+        let frame = scaled_rgba_frame(image, self.max_width, &mut self.locked_dims)?;
+        self.encode_rgba(frame)
+    }
+
+    fn encode_rgba(&mut self, frame: image::RgbaImage) -> Result<(), String> {
         let delay = image::Delay::from_numer_denom_ms(self.frame_delay_ms, 1);
         self.encoder
             .encode_frame(image::Frame::from_parts(frame, 0, 0, delay))
@@ -1677,6 +1786,15 @@ impl FfmpegSink {
 
     fn push(&mut self, image: &egui::ColorImage) -> Result<(), String> {
         let frame = scaled_record_frame(image, self.max_width, &mut self.locked_dims)?;
+        self.push_scaled(frame)
+    }
+
+    fn push_rgba(&mut self, image: image::RgbaImage) -> Result<(), String> {
+        let frame = scaled_rgba_frame(image, self.max_width, &mut self.locked_dims)?;
+        self.push_scaled(frame)
+    }
+
+    fn push_scaled(&mut self, frame: image::RgbaImage) -> Result<(), String> {
         if self.child.is_none() {
             let (width, height) = frame.dimensions();
             let args = ffmpeg_encode_args(
@@ -1748,6 +1866,18 @@ fn scaled_record_frame(
     let rgba = rgba_bytes_from_color_image(image);
     let frame = image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| "captured frame had inconsistent dimensions".to_owned())?;
+    scaled_rgba_frame(frame, max_width, locked_dims)
+}
+
+fn scaled_rgba_frame(
+    frame: image::RgbaImage,
+    max_width: u32,
+    locked_dims: &mut Option<(u32, u32)>,
+) -> Result<image::RgbaImage, String> {
+    let (width, height) = frame.dimensions();
+    if width == 0 || height == 0 {
+        return Err("captured frame was empty".to_owned());
+    }
     let (target_width, target_height) =
         *locked_dims.get_or_insert_with(|| target_dimensions(width, height, max_width));
     if frame.dimensions() == (target_width, target_height) {
@@ -2450,6 +2580,50 @@ mod tests {
             frames[1].buffer().dimensions()
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrf_progress_and_animation_sequence_encoder_accepts_rgba_and_discards_unfinished() {
+        use image::AnimationDecoder as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "bowecho_media_test_{}_rgba_sequence",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let finished = dir.join("finished.gif");
+        let mut encoder =
+            SequenceEncoder::create(SequenceFormat::Gif, finished.clone(), 64, 400).unwrap();
+        for tint in [20_u8, 180] {
+            encoder
+                .push_rgba(image::RgbaImage::from_pixel(
+                    96,
+                    64,
+                    image::Rgba([tint, 40, 90, 255]),
+                ))
+                .unwrap();
+        }
+        assert_eq!(encoder.finish().unwrap(), finished);
+        let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(
+            std::fs::read(&finished).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(decoder.into_frames().collect_frames().unwrap().len(), 2);
+
+        let abandoned = dir.join("abandoned.gif");
+        {
+            let mut encoder =
+                SequenceEncoder::create(SequenceFormat::Gif, abandoned.clone(), 64, 400).unwrap();
+            encoder
+                .push_rgba(image::RgbaImage::from_pixel(
+                    96,
+                    64,
+                    image::Rgba([1, 2, 3, 255]),
+                ))
+                .unwrap();
+        }
+        assert!(!abandoned.exists(), "drop removes unfinished output");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

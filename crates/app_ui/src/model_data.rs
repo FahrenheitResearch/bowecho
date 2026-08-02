@@ -112,6 +112,10 @@ struct WrfProcessUiState {
     /// by default — the whole point of a bulk import is bulk output.
     #[serde(default = "wrf_default_true")]
     auto_plot: bool,
+    /// Re-enumerate the model store after every atomic WRF hour commit and
+    /// select the newest completed timestep while a folder job continues.
+    #[serde(default = "wrf_default_true")]
+    follow_processing: bool,
 }
 
 fn wrf_default_true() -> bool {
@@ -129,6 +133,7 @@ impl Default for WrfProcessUiState {
             only_text: String::new(),
             skip_text: String::new(),
             auto_plot: true,
+            follow_processing: true,
         }
     }
 }
@@ -2843,6 +2848,12 @@ impl ModelDataDock {
         enum PollResult {
             Idle,
             Progress(String),
+            /// A WRF hour is fully committed and safe to enumerate even while
+            /// the remaining folder continues processing.
+            Committed {
+                message: String,
+                hour: HourKey,
+            },
             Finished {
                 message: String,
                 /// `(store_root, model, run)` of a run that just landed in
@@ -2918,11 +2929,15 @@ impl ModelDataDock {
                 // Drain the whole backlog and show only the newest progress
                 // line — same pattern as the heavy path below.
                 let mut latest = None;
+                let mut latest_commit = None;
                 let mut done = None;
                 loop {
                     match task.rx.try_recv() {
                         Ok(crate::local_import::LocalImportMessage::Progress(message)) => {
                             latest = Some(message);
+                        }
+                        Ok(crate::local_import::LocalImportMessage::Committed(commit)) => {
+                            latest_commit = Some(commit);
                         }
                         Ok(crate::local_import::LocalImportMessage::Done(outcome)) => {
                             done = Some(outcome);
@@ -2955,19 +2970,37 @@ impl ModelDataDock {
                         message: format!("Import failed: {error}"),
                         plot: None,
                     },
-                    None => match latest {
-                        Some(message) => PollResult::Progress(message),
-                        None => PollResult::Progress(String::new()),
+                    None => match latest_commit {
+                        Some(commit) => PollResult::Committed {
+                            message: format!(
+                                "Imported WRF timestep {}/{}; available in Models now",
+                                commit.completed, commit.total
+                            ),
+                            hour: HourKey {
+                                model: commit.model,
+                                run: commit.run,
+                                hour: commit.storage_slot,
+                                exact_time: None,
+                            },
+                        },
+                        None => match latest {
+                            Some(message) => PollResult::Progress(message),
+                            None => PollResult::Progress(String::new()),
+                        },
                     },
                 }
             }
             Some(ImportJob::Process(task)) => {
                 let mut latest = None;
+                let mut latest_commit = None;
                 let mut done = None;
                 loop {
                     match task.rx.try_recv() {
                         Ok(crate::wrf_process::WrfProcessMessage::Progress(message)) => {
                             latest = Some(message);
+                        }
+                        Ok(crate::wrf_process::WrfProcessMessage::Committed(commit)) => {
+                            latest_commit = Some(commit);
                         }
                         Ok(crate::wrf_process::WrfProcessMessage::Done(outcome)) => {
                             done = Some(outcome);
@@ -2995,9 +3028,28 @@ impl ModelDataDock {
                         message: format!("WRF processing failed: {error}"),
                         plot: None,
                     },
-                    None => match latest {
-                        Some(message) => PollResult::Progress(message),
-                        None => PollResult::Progress(String::new()),
+                    None => match latest_commit {
+                        Some(commit) => {
+                            let progress = commit.total.map_or_else(
+                                || commit.completed.to_string(),
+                                |total| format!("{}/{total}", commit.completed),
+                            );
+                            PollResult::Committed {
+                                message: format!(
+                                    "Processed WRF timestep {progress}; available in Models now"
+                                ),
+                                hour: HourKey {
+                                    model: commit.model,
+                                    run: commit.run,
+                                    hour: commit.storage_slot,
+                                    exact_time: commit.exact_time,
+                                },
+                            }
+                        }
+                        None => match latest {
+                            Some(message) => PollResult::Progress(message),
+                            None => PollResult::Progress(String::new()),
+                        },
                     },
                 }
             }
@@ -3119,6 +3171,16 @@ impl ModelDataDock {
                 }
                 // No repaint hook on the import worker thread — keep the UI
                 // ticking so progress and completion show promptly.
+                self.repaint.request_repaint();
+            }
+            PollResult::Committed { message, hour } => {
+                self.import_message = Some(message);
+                // Store writers publish the hour first and the run manifest
+                // last, so enumeration can never observe a half-written hour.
+                self.rescan();
+                if self.wrf_options.follow_processing {
+                    self.select_hour_key(hour);
+                }
                 self.repaint.request_repaint();
             }
             PollResult::Finished { message, plot } => {
@@ -3259,6 +3321,55 @@ impl ModelDataDock {
             self.repaint.clone(),
         );
         self.plot_job = Some(task);
+    }
+
+    /// Render one selected model field across the run and immediately encode
+    /// the ordered native-plot frames. This is intentionally one background
+    /// job: users do not need to pre-render a run or manage a frame directory.
+    fn start_plot_animation_job(
+        &mut self,
+        model: String,
+        run: String,
+        var: String,
+        format: crate::batch_plots::PlotAnimationFormat,
+    ) {
+        if self.formula_lab.busy() {
+            self.plot_message =
+                Some("Animation export cannot start while Formula Lab is evaluating".to_owned());
+            return;
+        }
+        if self.plot_job.is_some() {
+            self.plot_message =
+                Some("A plot or animation job is already running — cancel it first.".to_owned());
+            return;
+        }
+        let format_label = match format {
+            crate::batch_plots::PlotAnimationFormat::Gif => "GIF",
+            crate::batch_plots::PlotAnimationFormat::Mp4 => "MP4",
+        };
+        self.plot_done = None;
+        self.plot_message = Some(format!(
+            "Rendering {var} across {model}/{run} for {format_label} export…"
+        ));
+        let mut options = crate::batch_plots::BatchPlotOptions::default();
+        options.only_var = Some(var.clone());
+        options.animation = Some(crate::batch_plots::PlotAnimationOptions {
+            var,
+            format,
+            frame_delay_ms: 500,
+            max_width: 1600,
+        });
+        self.plot_job = Some(crate::batch_plots::spawn_batch_plot(
+            crate::batch_plots::BatchPlotRequest {
+                store_root: self.store_root.clone(),
+                model,
+                run,
+                plots_base: self.plots_base.clone(),
+                overrides: self.color_tables.settings().clone().normalized(),
+                options,
+            },
+            self.repaint.clone(),
+        ));
     }
 
     /// Drain the running batch plot job (same pattern as `poll_import`):
@@ -3636,10 +3747,16 @@ impl ModelDataDock {
         if let Some(task) = &self.plot_job {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(egui::RichText::new("Rendering plots").small().weak());
+                ui.label(
+                    egui::RichText::new("Rendering plots / animation")
+                        .small()
+                        .weak(),
+                );
                 if ui
                     .button("Cancel")
-                    .on_hover_text("Stop after the current plot; finished PNGs are kept.")
+                    .on_hover_text(
+                        "Stop after the current plot; finished PNGs are kept and partial animation output is removed.",
+                    )
                     .clicked()
                 {
                     task.cancel
@@ -3668,6 +3785,14 @@ impl ModelDataDock {
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn import_pickers(&mut self, ui: &mut egui::Ui) {
         let busy = self.import_job.is_some() || self.formula_lab.busy();
+        ui.checkbox(
+            &mut self.wrf_options.follow_processing,
+            "Follow completed timesteps while processing",
+        )
+        .on_hover_text(
+            "Each atomically written WRF timestep appears in the Models library immediately. When enabled, the viewer advances to the newest completed timestep while the rest of the selected folder continues processing.",
+        );
+        ui.add_space(6.0);
         model_workflow_card(
             ui,
             "Open WRF / NetCDF",
@@ -6008,8 +6133,10 @@ impl ModelDataDock {
                         .clicked()
                     {
                         let auto_plot = opts.auto_plot;
+                        let follow_processing = opts.follow_processing;
                         *opts = WrfProcessUiState::default();
                         opts.auto_plot = auto_plot;
+                        opts.follow_processing = follow_processing;
                     }
                 });
 
@@ -6202,6 +6329,30 @@ impl ModelDataDock {
         if self.latest_field.is_none() {
             return;
         }
+        let animation_target = self.latest_field.as_ref().map(|field| {
+            (
+                field.key.hour.model.clone(),
+                field.key.hour.run.clone(),
+                field.key.var.clone(),
+            )
+        });
+        let animation_hours = animation_target
+            .as_ref()
+            .and_then(|(model, run, _)| {
+                self.tree
+                    .as_ref()?
+                    .models
+                    .iter()
+                    .find(|entry| &entry.model == model)?
+                    .runs
+                    .iter()
+                    .find(|entry| &entry.run == run)
+                    .map(|entry| entry.hours.len())
+            })
+            .unwrap_or(0);
+        let animation_ready =
+            animation_hours >= 2 && self.plot_job.is_none() && !self.formula_lab.busy();
+        let mut requested_animation = None;
         let box_control = self
             .sounding_header_controls()
             .box_sounding
@@ -6262,6 +6413,31 @@ impl ModelDataDock {
                         self.show_plot_viewer = model_plot_open;
                     }
 
+                    if ui
+                        .add_enabled(animation_ready, egui::Button::new("GIF loop"))
+                        .on_hover_text(if animation_hours >= 2 {
+                            "Render this field for every model timestep and save a clean looping GIF."
+                        } else {
+                            "This run needs at least two completed timesteps."
+                        })
+                        .clicked()
+                    {
+                        requested_animation =
+                            Some(crate::batch_plots::PlotAnimationFormat::Gif);
+                    }
+                    if ui
+                        .add_enabled(animation_ready, egui::Button::new("MP4 video"))
+                        .on_hover_text(if animation_hours >= 2 {
+                            "Render this field for every model timestep and save an MP4. Requires ffmpeg on PATH."
+                        } else {
+                            "This run needs at least two completed timesteps."
+                        })
+                        .clicked()
+                    {
+                        requested_animation =
+                            Some(crate::batch_plots::PlotAnimationFormat::Mp4);
+                    }
+
                     // Map-side domain drawing remains explicitly armed so it
                     // cannot collide with pan, loupe, sounding, or 3-D input.
                     let plot_changed = ui
@@ -6282,6 +6458,9 @@ impl ModelDataDock {
                         );
                 });
             });
+        if let (Some(format), Some((model, run, var))) = (requested_animation, animation_target) {
+            self.start_plot_animation_job(model, run, var, format);
+        }
         ui.add_space(4.0);
     }
 
@@ -7088,8 +7267,9 @@ mod tests {
     /// BEFORE the toggle existed restores to ON too (serde default) — an
     /// old config must not silently disable the new behavior.
     #[test]
-    fn auto_plot_toggle_defaults_on_and_survives_old_settings() {
+    fn wrf_progress_and_animation_toggles_survive_old_settings() {
         assert!(WrfProcessUiState::default().auto_plot);
+        assert!(WrfProcessUiState::default().follow_processing);
         let restored: WrfProcessUiState = serde_json::from_value(serde_json::json!({
             "core_fields": true,
             "diagnostics": true,
@@ -7100,15 +7280,21 @@ mod tests {
         }))
         .expect("pre-toggle settings blob parses");
         assert!(restored.auto_plot);
+        assert!(restored.follow_processing);
         let roundtrip: WrfProcessUiState = serde_json::from_value(
             serde_json::to_value(WrfProcessUiState {
                 auto_plot: false,
+                follow_processing: false,
                 ..WrfProcessUiState::default()
             })
             .expect("serializes"),
         )
         .expect("roundtrips");
         assert!(!roundtrip.auto_plot, "an explicit OFF persists");
+        assert!(
+            !roundtrip.follow_processing,
+            "an explicit follow OFF persists"
+        );
     }
 
     #[test]
@@ -7920,6 +8106,86 @@ mod tests {
         assert!(
             dock.import_in_flight(),
             "a running import job is reported so the app pauses live radar decode"
+        );
+    }
+
+    #[test]
+    fn wrf_progress_and_animation_committed_hour_is_visible_and_follow_is_controlled() {
+        let ctx = egui::Context::default();
+        let tree = tree_with_runs("wrf", &[("20260707_00z", &[0, 1])]);
+        let mut dock = ModelDataDock::new_for_test(&ctx, tree.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(crate::wrf_process::WrfProcessMessage::Committed(
+            crate::wrf_process::WrfProcessCommit {
+                model: "wrf".to_owned(),
+                run: "20260707_00z".to_owned(),
+                storage_slot: 1,
+                exact_time: None,
+                completed: 2,
+                total: Some(4),
+            },
+        ))
+        .unwrap();
+        dock.import_job = Some(ImportJob::Process(crate::wrf_process::WrfProcessTask {
+            label: "progressive WRF".to_owned(),
+            rx,
+        }));
+        dock.poll_import();
+        assert_eq!(dock.selected_hour().map(|hour| hour.hour), Some(1));
+        assert_eq!(
+            dock.import_message.as_deref(),
+            Some("Processed WRF timestep 2/4; available in Models now")
+        );
+        assert!(dock.import_job.is_some(), "commit is not terminal");
+
+        let mut dock = ModelDataDock::new_for_test(&ctx, tree);
+        dock.wrf_options.follow_processing = false;
+        let original = dock.selected_hour().cloned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(crate::wrf_process::WrfProcessMessage::Committed(
+            crate::wrf_process::WrfProcessCommit {
+                model: "wrf".to_owned(),
+                run: "20260707_00z".to_owned(),
+                storage_slot: 1,
+                exact_time: None,
+                completed: 2,
+                total: None,
+            },
+        ))
+        .unwrap();
+        dock.import_job = Some(ImportJob::Process(crate::wrf_process::WrfProcessTask {
+            label: "progressive WRF".to_owned(),
+            rx,
+        }));
+        dock.poll_import();
+        assert_eq!(dock.selected_hour(), original.as_ref());
+        assert_eq!(
+            dock.import_message.as_deref(),
+            Some("Processed WRF timestep 2; available in Models now")
+        );
+
+        let mut dock =
+            ModelDataDock::new_for_test(&ctx, tree_with_runs("wrf", &[("20260707_00z", &[0, 1])]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(crate::local_import::LocalImportMessage::Committed(
+            crate::local_import::LocalImportCommit {
+                model: "wrf".to_owned(),
+                run: "20260707_00z".to_owned(),
+                storage_slot: 1,
+                completed: 2,
+                total: 3,
+            },
+        ))
+        .unwrap();
+        dock.import_job = Some(ImportJob::Local(crate::local_import::LocalImportTask {
+            label: "progressive quick WRF".to_owned(),
+            rx,
+        }));
+        dock.poll_import();
+        assert_eq!(dock.selected_hour().map(|hour| hour.hour), Some(1));
+        assert_eq!(
+            dock.import_message.as_deref(),
+            Some("Imported WRF timestep 2/3; available in Models now")
         );
     }
 

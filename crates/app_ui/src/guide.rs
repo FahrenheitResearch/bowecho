@@ -127,7 +127,7 @@ impl GuideSection {
                 "models hrrr gfs grib sounding box download import plot color table formula point probe sample cursor pin fixed history graph time series extrema minimum maximum"
             }
             Self::Wrf => {
-                "wrf processing simulated radar dual pol p3 tmatrix namelist interpolation cuda"
+                "wrf processing folder progress follow timestep animation gif mp4 video simulated radar dual pol p3 tmatrix namelist interpolation cuda"
             }
             Self::Cm1 => "cm1 native output simulated radar moving domain placement",
             Self::FormulaLab => "formula lab expression diagnostics units custom fields equations",
@@ -1063,6 +1063,11 @@ fn model_data(ui: &mut egui::Ui) {
          direct shortcut, and Shift-drag on the field viewer inside the Model window still \
          works.",
     );
+    action(
+        ui,
+        "GIF loop / MP4 video",
+        "— in Field tools, render the displayed field through the native plot pipeline for every completed timestep in its run, then encode the ordered frames as a clean plot-only animation. GIF is built in; MP4 requires ffmpeg on PATH. Output lands beside the PNG sequence under the screenshots/plots folder.",
+    );
 
     subhead(ui, "SOUNDINGS");
     action(
@@ -1281,6 +1286,11 @@ fn wrf(ui: &mut egui::Ui) {
          multi-select one to hundreds. Folder actions find supported files and sort them before \
          work begins. Each WRF time becomes a store timestep for import, or normally one \
          radar-loop frame for simulated radar.",
+    );
+    action(
+        ui,
+        "Follow completed timesteps while processing",
+        "— each quick-import or full-diagnostics WRF timestep is published to the Models library immediately after its atomic store commit, without waiting for the rest of the selected folder. Keep this enabled to advance the viewer as new timesteps finish, or disable it to preserve the hour you are inspecting. Folder discovery remains a snapshot taken when its folder button is clicked; files that arrive later require another run.",
     );
     action(
         ui,

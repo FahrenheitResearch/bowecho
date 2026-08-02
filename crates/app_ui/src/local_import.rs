@@ -45,11 +45,22 @@ pub struct LocalImportTask {
 /// Worker → UI messages, same shape as `wrf_process::WrfProcessMessage`: the
 /// dock shows the latest `Progress` line while the import runs (on a 250 m
 /// grid the light path is legitimately minutes per file — an anonymous
-/// spinner reads as a hang), then a single terminal `Done`.
+/// spinner reads as a hang), emits `Committed` after each atomically published
+/// WRF timestep, then sends a single terminal `Done`.
 #[derive(Debug)]
 pub enum LocalImportMessage {
     Progress(String),
+    Committed(LocalImportCommit),
     Done(Result<LocalImportSummary, String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalImportCommit {
+    pub model: String,
+    pub run: String,
+    pub storage_slot: u16,
+    pub completed: usize,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -96,8 +107,12 @@ pub fn spawn_import_paths(paths: Vec<PathBuf>, store_root: PathBuf) -> LocalImpo
             let mut progress = |message: String| {
                 let _ = tx.send(LocalImportMessage::Progress(message));
             };
+            let mut committed = |commit: LocalImportCommit| {
+                let _ = tx.send(LocalImportMessage::Committed(commit));
+            };
             let result =
-                import_paths(&paths, &store_root, &mut progress).map_err(|err| err.to_string());
+                import_paths_with_commit(&paths, &store_root, &mut progress, &mut committed)
+                    .map_err(|err| err.to_string());
             let _ = tx.send(LocalImportMessage::Done(result));
         })
         .expect("spawn local import worker");
@@ -151,6 +166,15 @@ fn import_paths(
     paths: &[PathBuf],
     store_root: &Path,
     progress: &mut dyn FnMut(String),
+) -> Result<LocalImportSummary, ImportError> {
+    import_paths_with_commit(paths, store_root, progress, &mut |_| {})
+}
+
+fn import_paths_with_commit(
+    paths: &[PathBuf],
+    store_root: &Path,
+    progress: &mut dyn FnMut(String),
+    committed: &mut dyn FnMut(LocalImportCommit),
 ) -> Result<LocalImportSummary, ImportError> {
     if paths.is_empty() {
         return Err(ImportError::NoFiles);
@@ -256,6 +280,13 @@ fn import_paths(
             )?;
             all_vars.extend(result.vars.iter().cloned());
             written.push(result);
+            committed(LocalImportCommit {
+                model: model.clone(),
+                run: run.clone(),
+                storage_slot: hour,
+                completed: written.len(),
+                total,
+            });
             continue;
         }
         progress(format!("{tag}: reading 2D surface fields"));
@@ -336,6 +367,13 @@ fn import_paths(
         )?;
         all_vars.extend(result.vars.iter().cloned());
         written.push(result);
+        committed(LocalImportCommit {
+            model: model.clone(),
+            run: run.clone(),
+            storage_slot: hour,
+            completed: written.len(),
+            total,
+        });
     }
     all_vars.sort();
     all_vars.dedup();
@@ -2204,6 +2242,7 @@ mod tests {
         loop {
             match task.rx.recv() {
                 Ok(LocalImportMessage::Progress(_)) => continue,
+                Ok(LocalImportMessage::Committed(_)) => continue,
                 Ok(LocalImportMessage::Done(result)) => {
                     result.expect_err("missing file must fail the import");
                     break;
