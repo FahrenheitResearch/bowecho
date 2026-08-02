@@ -202,13 +202,27 @@ mod tests {
         let path = temp.path().join("linework.shp");
         write_line_shapefile(&path, &[TEST_LINES]).expect("write GIS linework");
 
-        let loaded = rustwx_render::load_lines_from_shapefile(&path).expect("read GIS linework");
+        let loaded =
+            shapefile::read_shapes_as::<_, shapefile::Polyline>(&path).expect("read GIS linework");
         assert_eq!(loaded.len(), 2);
         assert_eq!(
-            loaded[0],
+            loaded[0]
+                .part(0)
+                .expect("single line part")
+                .iter()
+                .map(|point| (point.x, point.y))
+                .collect::<Vec<_>>(),
             vec![(-100.0, 30.0), (-99.0, 31.0), (-98.0, 32.0)]
         );
-        assert_eq!(loaded[1], vec![(-90.0, 35.0), (-89.0, 36.0), (-88.5, 35.0)]);
+        assert_eq!(
+            loaded[1]
+                .part(0)
+                .expect("single line part")
+                .iter()
+                .map(|point| (point.x, point.y))
+                .collect::<Vec<_>>(),
+            vec![(-90.0, 35.0), (-89.0, 36.0), (-88.5, 35.0)]
+        );
         assert!(shapefile_pair_ready(&path));
     }
 
@@ -218,9 +232,14 @@ mod tests {
         let path = temp.path().join("land.shp");
         write_polygon_shapefile(&path, TEST_LINES).expect("write GIS polygons");
 
-        let loaded = rustwx_render::load_polygons_from_shapefile(&path).expect("read GIS polygons");
+        let loaded =
+            shapefile::read_shapes_as::<_, shapefile::Polygon>(&path).expect("read GIS polygons");
         assert_eq!(loaded.len(), 2);
-        assert!(loaded.iter().all(|polygon| polygon[0].len() >= 4));
+        assert!(
+            loaded
+                .iter()
+                .all(|polygon| polygon.ring(0).is_some_and(|ring| ring.points().len() >= 4))
+        );
         assert!(shapefile_pair_ready(&path));
     }
 

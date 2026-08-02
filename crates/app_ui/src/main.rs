@@ -237,8 +237,6 @@ use hazard_geom::screen_polygon_contains_point;
 #[cfg(test)]
 use hazard_geom::screen_ring_self_intersects;
 #[cfg(test)]
-use hazard_geom::sort_hazard_records;
-#[cfg(test)]
 use hazard_geom::weather_alert_geometry_rings;
 
 use sites_ui::{BeamCandidate, pin_intl_ids, pin_us_id, radar_site_search_matches, us_site_kind};
