@@ -4,8 +4,9 @@
 //! the executable.  `rw-ui` currently discovers equivalent linework as ESRI
 //! shapefiles next to the rusty-weather workspace, which is useful in that
 //! repository but leaves a standalone BowEcho executable with empty
-//! Broad/Regional/Counties layers.  Materialize a small, versioned cache from
-//! BowEcho's embedded data before `rw-ui` is constructed and point
+//! Broad/Regional/Counties layers. Materialize a versioned cache from
+//! BowEcho's embedded data and rustwx-render's public-domain Natural Earth
+//! context layers before `rw-ui` is constructed, then point
 //! `rustwx-render` at it through its supported `RUSTWX_BASEMAP_DIR` override.
 
 use std::path::Path;
@@ -13,8 +14,8 @@ use std::path::Path;
 use crate::basemap_data::{self, BasemapLine};
 
 const RUSTWX_BASEMAP_DIR_ENV: &str = "RUSTWX_BASEMAP_DIR";
-const CACHE_SCHEMA: &str = "bowecho-model-gis-v2";
-const READY_MARKER: &str = "ready-v2";
+const CACHE_SCHEMA: &str = "bowecho-model-gis-v3";
+const READY_MARKER: &str = "ready-v3";
 
 const NATURAL_EARTH_RESOLUTIONS: [&str; 2] = ["10m", "110m"];
 const OCEAN_LAYER: &str = "ocean";
@@ -66,12 +67,6 @@ fn ensure_runtime_basemap(root: &Path) -> Result<(), String> {
     materialize_runtime_basemap(
         root,
         basemap_data::BASEMAP_WORLD_COUNTRY_LINES,
-        &[
-            basemap_data::BASEMAP_US_STATE_LINES,
-            basemap_data::BASEMAP_CANADA_ADMIN_LINES,
-            basemap_data::BASEMAP_MEXICO_ADMIN_LINES,
-            basemap_data::BASEMAP_JAPAN_ADMIN_LINES,
-        ],
         basemap_data::BASEMAP_US_COUNTY_LINES,
     )
 }
@@ -79,9 +74,10 @@ fn ensure_runtime_basemap(root: &Path) -> Result<(), String> {
 fn materialize_runtime_basemap(
     root: &Path,
     world_country_lines: &[BasemapLine],
-    admin1_groups: &[&[BasemapLine]],
     county_lines: &[BasemapLine],
 ) -> Result<(), String> {
+    let worldwide_admin1 = rustwx_render::bundled_natural_earth_admin1_10m();
+    let worldwide_lakes = rustwx_render::bundled_natural_earth_lakes_10m();
     for resolution in NATURAL_EARTH_RESOLUTIONS {
         let natural_earth = natural_earth_root(root, resolution);
         std::fs::create_dir_all(&natural_earth)
@@ -102,7 +98,10 @@ fn materialize_runtime_basemap(
             &natural_earth_layer_path(root, resolution, COUNTRIES_LAYER),
             world_country_lines,
         )?;
-        write_empty_shapefile(&natural_earth_layer_path(root, resolution, LAKES_LAYER))?;
+        write_bundled_shapefile(
+            &natural_earth_layer_path(root, resolution, LAKES_LAYER),
+            worldwide_lakes,
+        )?;
         write_line_shapefile(
             &natural_earth_layer_path(root, resolution, COAST_LAYER),
             &[world_country_lines],
@@ -111,9 +110,9 @@ fn materialize_runtime_basemap(
             &natural_earth_layer_path(root, resolution, ADMIN0_LAYER),
             &[world_country_lines],
         )?;
-        write_line_shapefile(
+        write_bundled_shapefile(
             &natural_earth_layer_path(root, resolution, ADMIN1_LAYER),
-            admin1_groups,
+            worldwide_admin1,
         )?;
     }
 
@@ -158,13 +157,10 @@ fn natural_earth_resolution_ready(root: &Path, resolution: &str) -> bool {
         COAST_LAYER,
         ADMIN0_LAYER,
         ADMIN1_LAYER,
+        LAKES_LAYER,
     ]
     .into_iter()
     .all(|layer| shapefile_pair_ready(&natural_earth_layer_path(root, resolution, layer)))
-        // BowEcho currently has no embedded lake geometry. Keep an explicit,
-        // valid empty layer in the override rather than allowing a machine's
-        // unrelated checkout assets to decide whether lakes appear.
-        && shapefile_pair_has_header(&natural_earth_layer_path(root, resolution, LAKES_LAYER))
 }
 
 fn shapefile_pair_ready(shp: &Path) -> bool {
@@ -173,18 +169,15 @@ fn shapefile_pair_ready(shp: &Path) -> bool {
         .all(|path| path.metadata().is_ok_and(|metadata| metadata.len() > 100))
 }
 
-fn shapefile_pair_has_header(shp: &Path) -> bool {
-    [shp.to_path_buf(), shp.with_extension("shx")]
-        .iter()
-        .all(|path| path.metadata().is_ok_and(|metadata| metadata.len() >= 100))
-}
-
-fn write_empty_shapefile(path: &Path) -> Result<(), String> {
-    let mut writer = shapefile::ShapeWriter::from_path(path)
-        .map_err(|error| format!("create {}: {error}", path.display()))?;
-    writer
-        .finalize()
-        .map_err(|error| format!("finalize {}: {error}", path.display()))
+fn write_bundled_shapefile(
+    path: &Path,
+    layer: rustwx_render::BundledShapefile,
+) -> Result<(), String> {
+    std::fs::write(path, layer.shp)
+        .map_err(|error| format!("write bundled {}: {error}", path.display()))?;
+    let index_path = path.with_extension("shx");
+    std::fs::write(&index_path, layer.shx)
+        .map_err(|error| format!("write bundled {}: {error}", index_path.display()))
 }
 
 fn write_polygon_shapefile(path: &Path, lines: &[BasemapLine]) -> Result<(), String> {
@@ -260,11 +253,6 @@ mod tests {
         },
     ];
 
-    const TEST_ADMIN1_LINES: &[BasemapLine] = &[BasemapLine {
-        bbox: [-104.0, 38.0, -102.0, 40.0],
-        points: &[(-104.0, 38.0), (-103.0, 39.0), (-102.0, 40.0)],
-    }];
-
     #[test]
     fn embedded_model_gis_lines_round_trip_through_shapefile() {
         let temp = tempfile::tempdir().expect("temporary model GIS root");
@@ -315,13 +303,8 @@ mod tests {
     #[test]
     fn runtime_cache_materializes_both_natural_earth_resolutions() {
         let temp = tempfile::tempdir().expect("temporary model GIS root");
-        materialize_runtime_basemap(
-            temp.path(),
-            TEST_LINES,
-            &[TEST_ADMIN1_LINES],
-            TEST_ADMIN1_LINES,
-        )
-        .expect("materialize model GIS cache");
+        materialize_runtime_basemap(temp.path(), TEST_LINES, TEST_LINES)
+            .expect("materialize model GIS cache");
 
         assert!(runtime_basemap_ready(temp.path()));
         for resolution in NATURAL_EARTH_RESOLUTIONS {
@@ -334,6 +317,7 @@ mod tests {
                 COAST_LAYER,
                 ADMIN0_LAYER,
                 ADMIN1_LAYER,
+                LAKES_LAYER,
             ] {
                 assert!(shapefile_pair_ready(&natural_earth_layer_path(
                     temp.path(),
@@ -341,48 +325,57 @@ mod tests {
                     layer,
                 )));
             }
-            assert!(shapefile_pair_has_header(&natural_earth_layer_path(
-                temp.path(),
-                resolution,
-                LAKES_LAYER,
-            )));
-
             let admin0 = shapefile::read_shapes_as::<_, shapefile::Polyline>(
                 natural_earth_layer_path(temp.path(), resolution, ADMIN0_LAYER),
             )
             .expect("read admin-0 linework");
-            let admin1 = shapefile::read_shapes_as::<_, shapefile::Polyline>(
-                natural_earth_layer_path(temp.path(), resolution, ADMIN1_LAYER),
-            )
-            .expect("read admin-1 linework");
             assert_eq!(admin0.len(), TEST_LINES.len());
-            assert_eq!(admin1.len(), TEST_ADMIN1_LINES.len());
-            assert_eq!(
-                admin1[0]
-                    .part(0)
-                    .expect("single admin-1 part")
-                    .iter()
-                    .map(|point| (point.x, point.y))
-                    .collect::<Vec<_>>(),
-                vec![(-104.0, 38.0), (-103.0, 39.0), (-102.0, 40.0)]
-            );
+
+            let admin1_path = natural_earth_layer_path(temp.path(), resolution, ADMIN1_LAYER);
+            let mut reader = shapefile::ShapeReader::from_path(&admin1_path)
+                .expect("open worldwide admin-1 linework");
+            let mut admin1_shapes = 0usize;
+            let mut central_europe_points = 0usize;
+            for shape in reader.iter_shapes() {
+                let shape = shape.expect("read worldwide admin-1 shape");
+                if let shapefile::Shape::Polyline(polyline) = shape {
+                    admin1_shapes += 1;
+                    central_europe_points += polyline
+                        .parts()
+                        .iter()
+                        .flat_map(|part| part.iter())
+                        .filter(|point| {
+                            (0.0..=15.0).contains(&point.x) && (42.0..=55.0).contains(&point.y)
+                        })
+                        .count();
+                }
+            }
+            assert!(admin1_shapes > 10_000);
+            assert!(central_europe_points > 1_000);
+
+            let lakes_path = natural_earth_layer_path(temp.path(), resolution, LAKES_LAYER);
+            let mut reader =
+                shapefile::ShapeReader::from_path(&lakes_path).expect("open worldwide lakes");
+            let lake_shapes = reader
+                .iter_shapes()
+                .filter_map(Result::ok)
+                .filter(|shape| matches!(shape, shapefile::Shape::Polygon(_)))
+                .count();
+            assert!(lake_shapes > 1_000);
         }
     }
 
     #[test]
-    fn legacy_ready_marker_does_not_validate_v2_cache() {
+    fn legacy_ready_markers_do_not_validate_v3_cache() {
         let temp = tempfile::tempdir().expect("temporary model GIS root");
-        materialize_runtime_basemap(
-            temp.path(),
-            TEST_LINES,
-            &[TEST_ADMIN1_LINES],
-            TEST_ADMIN1_LINES,
-        )
-        .expect("materialize model GIS cache");
+        materialize_runtime_basemap(temp.path(), TEST_LINES, TEST_LINES)
+            .expect("materialize model GIS cache");
         assert!(runtime_basemap_ready(temp.path()));
 
-        std::fs::remove_file(temp.path().join(READY_MARKER)).expect("remove v2 marker");
+        std::fs::remove_file(temp.path().join(READY_MARKER)).expect("remove v3 marker");
         std::fs::write(temp.path().join("ready-v1"), "bowecho-model-gis-v1")
+            .expect("write legacy marker");
+        std::fs::write(temp.path().join("ready-v2"), "bowecho-model-gis-v2")
             .expect("write legacy marker");
 
         assert!(!runtime_basemap_ready(temp.path()));
