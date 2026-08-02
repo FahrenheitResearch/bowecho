@@ -292,8 +292,9 @@ pub struct HimawariCompositeSpec {
     /// lets proofs/backfills pin an exact scan (e.g. the last daylight pass).
     pub as_of: Option<DateTime<Utc>>,
     /// Number of recent unique scans to ingest into the selected daily run.
-    /// General Satellite controls keep this at one; tropical cards request
-    /// ten so the storm opens as a short history loop.
+    /// General Satellite controls and tropical visible cards keep this at one
+    /// because each three-band source set is large; single-band IR cards use
+    /// their separate specs for short history loops.
     pub frame_count: usize,
     /// Tropical-card correlation ticket: when set, the dispatcher reports
     /// this ingest's outcome on the card-outcome side channel (see
@@ -504,6 +505,15 @@ pub enum SatResponse {
     EumetsatCredentialsLoaded(Result<Option<EumetsatAuthSpec>, String>),
     EumetsatCredentialsSaved(Result<String, String>),
     Runs(Vec<SatRunListing>),
+    /// A completed one-shot RGB/IR history ingest. The refreshed catalog and
+    /// exact newest selection travel together so the UI can intentionally
+    /// admit a product whose satellite/sector differs from the live-follow
+    /// panel (for example a hurricane-card GOES full-disk crop).
+    IngestReady {
+        runs: Vec<SatRunListing>,
+        key: SatRunKey,
+        hhmm: u16,
+    },
     FollowStarted,
     /// The session ended: `Ok` = clean stop, `Err` = failure.
     FollowFinished(Result<String, String>),
@@ -530,7 +540,7 @@ pub enum SatResponse {
         bytes: u64,
         encode_ms: u64,
         /// True only for rw-sat's live-follow/load-loop event stream. One-shot
-        /// product ingests already publish their own final SelectFrame.
+        /// product ingests already publish their own final selection.
         select_live_run: bool,
     },
     Evicted {
@@ -4302,8 +4312,8 @@ fn ingest_selected_history<P>(
     let Some(newest) = frames.first() else {
         return Err(format!("{label}: no recent scans were selected"));
     };
-    send(SatResponse::Runs(scan_runs(store_root)));
-    send(SatResponse::SelectFrame {
+    send(SatResponse::IngestReady {
+        runs: scan_runs(store_root),
         key: newest.key.clone(),
         hhmm: newest.hhmm,
     });
@@ -7064,22 +7074,21 @@ mod tests {
         assert_eq!(processed.borrow().len(), MAX_RECENT_HISTORY_FRAMES);
         assert!(summary.contains("loaded 10 of 10"), "{summary}");
         let messages = messages.lock().expect("messages");
-        assert_eq!(
-            messages
-                .iter()
-                .filter(|message| matches!(message, SatResponse::Runs(_)))
-                .count(),
-            1
-        );
-        let selections: Vec<_> = messages
+        let ready: Vec<_> = messages
             .iter()
             .filter_map(|message| match message {
-                SatResponse::SelectFrame { key, hhmm } => Some((key, *hhmm)),
+                SatResponse::IngestReady { runs, key, hhmm } => Some((runs, key, *hhmm)),
                 _ => None,
             })
             .collect();
-        assert_eq!(selections.len(), 1);
-        assert_eq!(selections[0].1, 1200);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].2, 1200);
+        assert_eq!(ready[0].1.model, "g19");
+        assert_eq!(ready[0].1.run, "fulldisk_rgb_test_20260714");
+        assert!(
+            ready[0].0.is_empty(),
+            "the synthetic ingest writes no files, but still publishes one atomic selection"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

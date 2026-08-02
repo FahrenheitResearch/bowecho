@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use data_source::tropical::{self, Basin, Category, StormGeometry, TropicalCyclone};
 use eframe::egui;
 use ui_core::worker_slot::{SlotPoll, WorkerSlot};
@@ -416,13 +416,18 @@ impl TropicalState {
                     // native-resolution window centered on the storm, and
                     // show it (Satellite window + map layer) when it lands.
                     let busy = self.sat_view_inflight.is_some();
+                    let vis_daylight = tc_vis_is_daylight(
+                        Utc::now(),
+                        f64::from(storm.position.lat),
+                        f64::from(storm.position.lon),
+                    );
                     for (product, label, hover) in [
                         (
                             TcSatProduct::Vis,
                             "🛰 Vis",
                             "One press: pick the covering geostationary satellite \
-                             (Himawari / GOES-East / GOES-West) and load up to 10 recent \
-                             native-resolution TRUE-COLOR frames centered on this storm. Opens \
+                             (Himawari / GOES-East / GOES-West) and load the latest \
+                             native-resolution TRUE-COLOR frame centered on this storm. Opens \
                              the Satellite window and follows the newest frame onto the radar \
                              map. Daylight side only.",
                         ),
@@ -434,12 +439,19 @@ impl TropicalState {
                              the currently selected IR enhancement (BD, AVN, …). Works day and night.",
                         ),
                     ] {
-                        let response = ui
-                            .add_enabled(!busy, egui::Button::new(label).small())
-                            .on_hover_text(hover)
-                            .on_disabled_hover_text(
+                        let product_available = product != TcSatProduct::Vis || vis_daylight;
+                        let mut response = ui
+                            .add_enabled(!busy && product_available, egui::Button::new(label).small())
+                            .on_hover_text(hover);
+                        if busy {
+                            response = response.on_disabled_hover_text(
                                 "a storm satellite load is already running — one at a time",
                             );
+                        } else if !product_available {
+                            response = response.on_disabled_hover_text(
+                                "True color is unavailable while the storm is on the night side; use IR now.",
+                            );
+                        }
                         if response.clicked() {
                             self.sat_view_request = Some(TcSatViewRequest {
                                 product,
@@ -572,6 +584,50 @@ fn tropical_http_client() -> Result<reqwest::blocking::Client, String> {
 /// cyclone, small enough that the 0.5 km visible crop (~2000² px) stays
 /// loop-friendly. Inside [`SatNativeWindow`]'s 50..2000 km domain.
 pub const TC_SAT_WINDOW_KM: f64 = 1000.0;
+
+/// True color is intentionally one latest frame. A single GOES full-disk
+/// C01+C02+C03 source set is already several hundred MB; requesting ten before
+/// showing anything made a hurricane-card press look hung and could transfer
+/// multiple GB. IR remains a ten-frame loop because it needs only one band.
+const TC_VIS_FRAME_COUNT: usize = 1;
+const TC_IR_FRAME_COUNT: usize = 10;
+
+/// Approximate solar elevation at a point using NOAA's fractional-year
+/// equation. This is a preflight UX gate only—the satellite pixels remain the
+/// authority—but it prevents starting an expensive true-color ingest when its
+/// newest scan is necessarily dark.
+fn solar_elevation_deg(time: DateTime<Utc>, lat_deg: f64, lon_deg: f64) -> f64 {
+    if !lat_deg.is_finite() || !lon_deg.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+    let hour = f64::from(time.hour())
+        + f64::from(time.minute()) / 60.0
+        + f64::from(time.second()) / 3600.0;
+    let gamma = std::f64::consts::TAU / 365.0 * (f64::from(time.ordinal0()) + (hour - 12.0) / 24.0);
+    let equation_of_time_minutes = 229.18
+        * (0.000_075 + 0.001_868 * gamma.cos()
+            - 0.032_077 * gamma.sin()
+            - 0.014_615 * (2.0 * gamma).cos()
+            - 0.040_849 * (2.0 * gamma).sin());
+    let declination = 0.006_918 - 0.399_912 * gamma.cos() + 0.070_257 * gamma.sin()
+        - 0.006_758 * (2.0 * gamma).cos()
+        + 0.000_907 * (2.0 * gamma).sin()
+        - 0.002_697 * (3.0 * gamma).cos()
+        + 0.001_48 * (3.0 * gamma).sin();
+    let utc_minutes = hour * 60.0;
+    let true_solar_minutes =
+        (utc_minutes + equation_of_time_minutes + 4.0 * lon_deg).rem_euclid(1440.0);
+    let hour_angle = (true_solar_minutes / 4.0 - 180.0).to_radians();
+    let latitude = lat_deg.clamp(-90.0, 90.0).to_radians();
+    let cos_zenith = (latitude.sin() * declination.sin()
+        + latitude.cos() * declination.cos() * hour_angle.cos())
+    .clamp(-1.0, 1.0);
+    90.0 - cos_zenith.acos().to_degrees()
+}
+
+fn tc_vis_is_daylight(time: DateTime<Utc>, lat_deg: f64, lon_deg: f64) -> bool {
+    solar_elevation_deg(time, lat_deg, lon_deg) > 0.0
+}
 
 /// Give up on a card spinner after this long without a worker outcome: a
 /// first (uncached) full-disk visible scan is a few-hundred-MB download,
@@ -760,7 +816,7 @@ fn plan_tc_sat_view(
                 satellite: sat.satellite_slug().to_string(),
                 style: "true_color".to_string(),
                 window: Some(window),
-                frame_count: 10,
+                frame_count: TC_VIS_FRAME_COUNT,
                 card_ticket: Some(ticket),
                 ..Default::default()
             })
@@ -772,7 +828,7 @@ fn plan_tc_sat_view(
                 window,
                 lookback_minutes: 180,
                 as_of: None,
-                frame_count: 10,
+                frame_count: TC_IR_FRAME_COUNT,
                 card_ticket: Some(ticket),
             })
         }
@@ -785,7 +841,7 @@ fn plan_tc_sat_view(
                 sector: "fulldisk".to_string(),
                 style: "natural_color".to_string(),
                 window: Some(window),
-                frame_count: 10,
+                frame_count: TC_VIS_FRAME_COUNT,
                 card_ticket: Some(ticket),
                 ..Default::default()
             })
@@ -798,7 +854,7 @@ fn plan_tc_sat_view(
                 window,
                 lookback_minutes: 180,
                 as_of: None,
-                frame_count: 10,
+                frame_count: TC_IR_FRAME_COUNT,
                 card_ticket: Some(ticket),
             })
         }
@@ -1073,7 +1129,7 @@ impl crate::ViewerApp {
     /// pump that installs finished frames), the map recenters on the storm,
     /// map-follow turns on, and the planned one-shot ingest auto-selects
     /// its frame in the player + map when it lands
-    /// (`SatResponse::SelectFrame`). While it runs, the pressed card wears
+    /// (`SatResponse::IngestReady`). While it runs, the pressed card wears
     /// a spinner and every card's 🛰 buttons disable; the worker reports
     /// the outcome on the card-only channel
     /// ([`sat_worker::SatWorker::try_recv_card_outcome`]), with a timeout
@@ -1534,6 +1590,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn true_color_daylight_gate_tracks_local_solar_time() {
+        let equinox_noon = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+        let equinox_midnight = Utc.with_ymd_and_hms(2026, 3, 20, 0, 0, 0).unwrap();
+
+        assert!(solar_elevation_deg(equinox_noon, 0.0, 0.0) > 85.0);
+        assert!(tc_vis_is_daylight(equinox_noon, 0.0, 0.0));
+        assert!(solar_elevation_deg(equinox_midnight, 0.0, 0.0) < -85.0);
+        assert!(!tc_vis_is_daylight(equinox_midnight, 0.0, 0.0));
+        assert!(
+            tc_vis_is_daylight(equinox_midnight, 0.0, 180.0),
+            "the antimeridian is near local noon at 00Z"
+        );
+    }
+
     /// Request construction: every basin/product pair sends the right spec
     /// with a storm-centered native window and the correlation ticket.
     #[test]
@@ -1546,7 +1617,7 @@ mod tests {
             TcSatPlan::HimawariVis(spec) => {
                 assert_eq!(spec.satellite, "h9");
                 assert_eq!(spec.style, "true_color");
-                assert_eq!(spec.frame_count, 10);
+                assert_eq!(spec.frame_count, TC_VIS_FRAME_COUNT);
                 assert_eq!(spec.card_ticket, Some(7));
                 let window = spec.window.expect("native window attached");
                 assert!((window.center_lat_deg - 25.3).abs() < 1e-9);
@@ -1562,7 +1633,7 @@ mod tests {
             TcSatPlan::HimawariIr(spec) => {
                 assert_eq!(spec.satellite, "h9");
                 assert_eq!(spec.band, 13);
-                assert_eq!(spec.frame_count, 10);
+                assert_eq!(spec.frame_count, TC_IR_FRAME_COUNT);
                 assert_eq!(spec.card_ticket, Some(8));
                 assert!((spec.window.center_lon_deg - 131.2).abs() < 1e-9);
             }
@@ -1578,7 +1649,7 @@ mod tests {
                 assert_eq!(spec.satellite, "goes19");
                 assert_eq!(spec.sector, "fulldisk");
                 assert_eq!(spec.style, "natural_color");
-                assert_eq!(spec.frame_count, 10);
+                assert_eq!(spec.frame_count, TC_VIS_FRAME_COUNT);
                 assert_eq!(spec.card_ticket, Some(9));
                 let window = spec.window.expect("native window attached");
                 assert!((window.center_lat_deg - 22.7).abs() < 1e-9);
@@ -1595,7 +1666,7 @@ mod tests {
                 assert_eq!(spec.satellite, "goes18");
                 assert_eq!(spec.sector, "fulldisk");
                 assert_eq!(spec.band, 13);
-                assert_eq!(spec.frame_count, 10);
+                assert_eq!(spec.frame_count, TC_IR_FRAME_COUNT);
                 assert_eq!(spec.card_ticket, Some(10));
                 assert!((spec.window.center_lon_deg - (-105.0)).abs() < 1e-9);
             }

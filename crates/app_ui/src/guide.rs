@@ -124,7 +124,7 @@ impl GuideSection {
                 "map warnings alerts placefiles metar observations wofs tropical hurricane hunters recon"
             }
             Self::ModelData => {
-                "models hrrr gfs sounding box download import plot color table formula"
+                "models hrrr gfs grib sounding box download import plot color table formula point probe sample cursor pin fixed history graph time series extrema minimum maximum"
             }
             Self::Wrf => {
                 "wrf processing simulated radar dual pol p3 tmatrix namelist interpolation cuda"
@@ -798,8 +798,9 @@ fn products(ui: &mut egui::Ui) {
     subhead(ui, "DISPLAY AIDS");
     para(
         ui,
-        "Gate filter hides velocity/dual-pol gates whose same-tilt reflectivity is weak (the \
-         standard VEL declutter; REF itself is never filtered). \"Hide below\" is a per-family \
+        "Filter weak-REF gates hides REF below the chosen dBZ threshold and hides \
+         velocity/dual-pol gates wherever same-tilt reflectivity is weaker (the standard VEL \
+         declutter). \"Hide below\" is a per-family \
          render threshold — data stays intact and the inspector still reads it. Smooth display \
          (Settings) applies a GR2-style binomial kernel once per product, so pans stay fast.",
     );
@@ -1196,8 +1197,16 @@ fn model_data(ui: &mut egui::Ui) {
     subhead(ui, "INSPECTOR");
     para(
         ui,
-        "With \"Model value\" ticked in Inspector\u{2026}, the cursor card reads the model \
-         field under the cursor — even while the map layer is hidden.",
+        "With \"Model / GRIB point value\" ticked in Inspector\u{2026}, the cursor card reads \
+         the loaded model field under the cursor with its units, run, lead, and authoritative \
+         valid time when the store carries one. Shift+click fixes that probe at the displayed \
+         latitude/longitude so it stays put through pan, zoom, and model-time changes. In Tools, \
+         Forecast graph… plots that fixed point over locally stored forecast times and can \
+         switch to the selected field's domain-wide minimum or maximum; point reads touch only \
+         the needed grid-cell window and extrema use cached store statistics. Use Unpin probe or \
+         Shift+click the pin to release it. This probes fields BowEcho has successfully ingested \
+         into Models; it is not a promise that every arbitrary GRIB edition, grid, or parameter \
+         can be opened.",
     );
     subhead(ui, "EVENT AUTO-LOAD");
     para(
@@ -2885,7 +2894,9 @@ fn unified_player(ui: &mut egui::Ui) {
         "Low sweeps expands each volume into the real low-level cuts inside that scan. All \
          low shows every low sweep, same degree follows matching physical elevation, and base \
          only keeps the base tilt. This is useful for SAILS/MRLE-style rapid low-level cuts \
-         without pretending every product updates at the same instant.",
+         without pretending every product updates at the same instant. The separate Live \
+         sweeps control determines whether a newly arriving low cut may move the live display; \
+         leave Follow new low cuts off to keep the selected sweep fixed.",
     );
 
     subhead(ui, "TIME-SYNCED LAYERS");
@@ -2935,9 +2946,12 @@ fn tools(ui: &mut egui::Ui) {
     action(
         ui,
         "Shift+click",
-        "— pins the card to a geo point: it sticks through pan/zoom and re-reads every new \
-         volume (watch one spot evolve through a loop). Shift+click near the pin releases it. \
-         In grid layouts the pin works on the main pane.",
+        "— pins the card to a geo point: for loaded model/GRIB fields this is a fixed point \
+         probe with value, units, run, lead, and valid time. It sticks through pan/zoom and \
+         re-reads every new radar volume or model timestep. Tools › Forecast graph plots its \
+         locally stored time history or the same field's domain min/max. Shift+click near the \
+         pin or use Tools › Unpin probe to release it. In grid layouts it works from any map \
+         pane.",
     );
 
     subhead(ui, "WHY THIS SYNTHETIC GATE?");

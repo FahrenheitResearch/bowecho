@@ -887,8 +887,10 @@ impl ViewerApp {
         // read out together (field request). Falls back to the dock's
         // field when no layer produced a value.
         let _ = ob_owns_card;
+        let mut model_value_shown = false;
         if self.model_enabled && self.inspector_show_model {
             let mut shown = false;
+            let mut shown_hours: Vec<rw_ui::HourKey> = Vec::new();
             // The topmost model layer contributes the color chip, but only
             // when no radar gate already owns the value line (then the chip
             // above matches the radar raster, not the model raster).
@@ -901,10 +903,17 @@ impl ViewerApp {
             {
                 let field = &slot.layer.field;
                 if let Some(index) = slot.layer.lut.lookup(cursor_lat, cursor_lon)
-                    && let Some(value) = field.values.get(index).copied()
-                    && value.is_finite()
+                    && let Some(value) = model_layer::sample_field_value(
+                        field.as_ref(),
+                        index,
+                        cursor_lat,
+                        cursor_lon,
+                    )
                 {
                     lines.push(format!("{} {:.1} {}", field.key.var, value, field.units));
+                    if !shown_hours.contains(&field.key.hour) {
+                        shown_hours.push(field.key.hour.clone());
+                    }
                     if model_chip.is_none()
                         && readout.is_none()
                         && self.inspector_show_hex
@@ -915,20 +924,25 @@ impl ViewerApp {
                         lines.push(hex_rgb_line(c));
                     }
                     shown = true;
+                    model_value_shown = true;
                 }
             }
             if let Some(chip) = model_chip {
                 swatches.push(chip);
             }
             if !shown
-                && let Some((_, lut)) = &self.model_lut
+                && let Some((grid_hash, lut)) = &self.model_lut
                 && let Some(field) = self
                     .model_dock
                     .as_ref()
                     .and_then(|dock| dock.latest_field())
+                && field
+                    .grid
+                    .as_ref()
+                    .is_some_and(|grid| &grid.hash == grid_hash)
                 && let Some(index) = lut.lookup(cursor_lat, cursor_lon)
-                && let Some(value) = field.values.get(index).copied()
-                && value.is_finite()
+                && let Some(value) =
+                    model_layer::sample_field_value(field.as_ref(), index, cursor_lat, cursor_lon)
             {
                 lines.push(format!(
                     "{} {} {:.1} {}",
@@ -937,6 +951,11 @@ impl ViewerApp {
                     value,
                     field.units
                 ));
+                shown_hours.push(field.key.hour.clone());
+                model_value_shown = true;
+            }
+            for hour in shown_hours {
+                lines.push(format_model_probe_context(&hour));
             }
         }
         if let Some(probe) = readout.as_ref().and_then(|readout| readout.vrot) {
@@ -976,7 +995,13 @@ impl ViewerApp {
             ));
         }
         if pinned {
-            lines.push("pinned — Shift+click to release".to_owned());
+            lines.push(
+                if model_value_shown && self.pinned_obs_chart_station.is_none() {
+                    "fixed model probe — Tools › Forecast graph / Unpin".to_owned()
+                } else {
+                    "pinned — Shift+click or Tools › Unpin".to_owned()
+                },
+            );
         }
 
         let font = egui::FontId::monospace(11.0);
@@ -1526,6 +1551,7 @@ impl ViewerApp {
             if current.distance(pointer) <= 14.0 {
                 self.pinned_inspector_lonlat = None;
                 self.pinned_obs_chart_station = None;
+                self.status = "Released fixed map probe".to_owned();
                 return;
             }
         }
@@ -1536,6 +1562,16 @@ impl ViewerApp {
         let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
         self.pinned_inspector_lonlat = Some((lon, lat));
         self.pinned_obs_chart_station = None;
+        self.show_inspector_card = true;
+        self.app_settings.inspector_card_visible = true;
+        if self.model_enabled {
+            self.inspector_show_model = true;
+            self.app_settings.inspector_show_model_value = true;
+            self.status = format!("Fixed model probe at {}", format_lat_lon(lat, lon));
+        } else {
+            self.status = format!("Fixed inspector at {}", format_lat_lon(lat, lon));
+        }
+        self.mark_app_settings_dirty();
     }
 
     pub(crate) fn model_soundings_available(&self) -> bool {

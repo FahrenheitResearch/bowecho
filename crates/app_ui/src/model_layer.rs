@@ -454,6 +454,71 @@ fn sample_curvilinear_field(
     None
 }
 
+/// Four-cell bilinear stencil for one geographic point on a curvilinear
+/// model grid. The probe-history reader uses this to read only the tiny
+/// `2 x 2` store window needed at each forecast time while producing the
+/// same interpolated value as the rendered map layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldSampleStencil {
+    x0: usize,
+    y0: usize,
+    u: f32,
+    v: f32,
+}
+
+impl FieldSampleStencil {
+    pub fn window_bounds(self) -> (usize, usize, usize, usize) {
+        (self.x0, self.y0, self.x0 + 2, self.y0 + 2)
+    }
+
+    pub fn sample(self, values: [f32; 4]) -> Option<f32> {
+        if values.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let top = values[0] * (1.0 - self.u) + values[1] * self.u;
+        let bottom = values[2] * (1.0 - self.u) + values[3] * self.u;
+        Some(top * (1.0 - self.v) + bottom * self.v)
+    }
+}
+
+/// Ordered candidate cells around the inverse-LUT seed. The live map sampler
+/// stays on its original lazy, allocation-free loop above; the history worker
+/// computes this fixed array once per chart request so it can repeat the same
+/// missing-cell fallback while reading tiny store windows at every hour.
+pub fn sample_stencils_for_point(
+    grid: &rw_store::grid::GridFile,
+    nearest_index: usize,
+    target_lat: f32,
+    target_lon: f32,
+) -> [Option<FieldSampleStencil>; 4] {
+    let Some(cell_count) = grid.nx.checked_mul(grid.ny) else {
+        return [None; 4];
+    };
+    if grid.nx < 2
+        || grid.ny < 2
+        || nearest_index >= cell_count
+        || grid.lat.len() != cell_count
+        || grid.lon.len() != cell_count
+    {
+        return [None; 4];
+    }
+    let row = nearest_index / grid.nx;
+    let col = nearest_index % grid.nx;
+    let row_starts = neighboring_cell_starts(row, grid.ny);
+    let col_starts = neighboring_cell_starts(col, grid.nx);
+    let mut stencils = [None; 4];
+    let mut count = 0usize;
+    for y0 in row_starts.into_iter().flatten() {
+        for x0 in col_starts.into_iter().flatten() {
+            if let Some((u, v)) = sample_cell_coords(grid, x0, y0, target_lat, target_lon) {
+                stencils[count] = Some(FieldSampleStencil { x0, y0, u, v });
+                count += 1;
+            }
+        }
+    }
+    stencils
+}
+
 pub(crate) fn neighboring_cell_starts(index: usize, len: usize) -> [Option<usize>; 2] {
     if len < 2 {
         return [None, None];
@@ -475,20 +540,33 @@ fn sample_cell(
     target_lat: f32,
     target_lon: f32,
 ) -> Option<f32> {
-    let nx = field.nx;
-    let i00 = y0 * nx + x0;
-    let i10 = i00 + 1;
-    let i01 = i00 + nx;
-    let i11 = i01 + 1;
+    let i00 = y0 * field.nx + x0;
     let values = [
         *field.values.get(i00)?,
-        *field.values.get(i10)?,
-        *field.values.get(i01)?,
-        *field.values.get(i11)?,
+        *field.values.get(i00 + 1)?,
+        *field.values.get(i00 + field.nx)?,
+        *field.values.get(i00 + field.nx + 1)?,
     ];
     if values.iter().any(|value| !value.is_finite()) {
         return None;
     }
+    let (u, v) = sample_cell_coords(grid, x0, y0, target_lat, target_lon)?;
+    let stencil = FieldSampleStencil { x0, y0, u, v };
+    stencil.sample(values)
+}
+
+fn sample_cell_coords(
+    grid: &rw_store::grid::GridFile,
+    x0: usize,
+    y0: usize,
+    target_lat: f32,
+    target_lon: f32,
+) -> Option<(f32, f32)> {
+    let nx = grid.nx;
+    let i00 = y0 * nx + x0;
+    let i10 = i00 + 1;
+    let i01 = i00 + nx;
+    let i11 = i01 + 1;
     let target_lon = f64::from(target_lon);
     let target_lat = f64::from(target_lat);
     let corners = [
@@ -515,9 +593,7 @@ fn sample_cell(
     }
     let u = u.clamp(0.0, 1.0) as f32;
     let v = v.clamp(0.0, 1.0) as f32;
-    let top = values[0] * (1.0 - u) + values[1] * u;
-    let bottom = values[2] * (1.0 - u) + values[3] * u;
-    Some(top * (1.0 - v) + bottom * v)
+    Some((u, v))
 }
 
 pub(crate) fn solve_bilinear_coords(
@@ -861,5 +937,43 @@ mod tests {
             (value - 25.0).abs() < 1e-3,
             "expected bilinear midpoint, got {value}"
         );
+    }
+
+    #[test]
+    fn model_field_sampler_tries_adjacent_cell_after_missing_first_candidate() {
+        let grid = Arc::new(GridFile {
+            nx: 3,
+            ny: 3,
+            lat: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+            lon: vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            projection: None,
+            hash: "missing-edge-test".to_owned(),
+        });
+        let field = FieldData {
+            key: rw_ui::FieldKey {
+                hour: rw_ui::HourKey {
+                    model: "wrf".to_owned(),
+                    run: "local".to_owned(),
+                    hour: 0,
+                    exact_time: None,
+                },
+                var: "temperature_2m".to_owned(),
+            },
+            units: "K".to_owned(),
+            nx: 3,
+            ny: 3,
+            // The southwest candidate around index 4 contains NaN at index
+            // 0. The southeast candidate is finite and must still win.
+            values: vec![f32::NAN, 10.0, 20.0, 30.0, 42.0, 50.0, 60.0, 70.0, 80.0],
+            range: Some((10.0, 80.0)),
+            grid: Some(grid),
+            lat_descending: false,
+            style: None,
+        };
+
+        assert_eq!(sample_field_value(&field, 4, 1.0, 1.0), Some(42.0));
+        let candidates =
+            sample_stencils_for_point(field.grid.as_deref().expect("grid"), 4, 1.0, 1.0);
+        assert!(candidates.iter().flatten().count() >= 2);
     }
 }

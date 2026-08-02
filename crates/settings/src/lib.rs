@@ -473,9 +473,30 @@ pub struct AppSettings {
     /// Default off so normal map clicks do not leave accidental markers.
     #[serde(default)]
     pub map_click_drops_coordinate_marker: bool,
-    /// Reflectivity gate filter threshold in deci-dBZ; None = off. Hides
-    /// non-REF gates whose co-located reflectivity is weaker (GR2-style
-    /// GateFilter).
+    /// Show the floating cursor/pinned data inspector card.
+    #[serde(default = "default_true")]
+    pub inspector_card_visible: bool,
+    /// Include the original folded velocity alongside a dealiased readout.
+    #[serde(default = "default_true")]
+    pub inspector_show_raw_velocity: bool,
+    /// Include range, azimuth, and selected-tilt metadata.
+    #[serde(default = "default_true")]
+    pub inspector_show_range_azimuth: bool,
+    /// Include radar-beam height at the inspected gate.
+    #[serde(default = "default_true")]
+    pub inspector_show_beam_height: bool,
+    /// Include values from the selected/visible model field.
+    #[serde(default = "default_true")]
+    pub inspector_show_model_value: bool,
+    /// Include the sampled color swatch and hexadecimal RGB value.
+    #[serde(default = "default_true")]
+    pub inspector_show_color_hex: bool,
+    /// Keep the field loupe visible without requiring the Shift key.
+    #[serde(default)]
+    pub inspector_show_field_loupe: bool,
+    /// Reflectivity gate filter threshold in deci-dBZ; None = off. Hides REF
+    /// below the threshold and other base-moment gates whose co-located REF is
+    /// weaker (GR2-style GateFilter).
     #[serde(default)]
     pub gate_filter_decidbz: Option<i16>,
     /// Model store retention: keep the newest N runs (0 = unlimited).
@@ -1228,6 +1249,13 @@ impl Default for AppSettings {
             hidden_hazard_watch_types: Vec::new(),
             right_click_loads_nearest: false,
             map_click_drops_coordinate_marker: false,
+            inspector_card_visible: true,
+            inspector_show_raw_velocity: true,
+            inspector_show_range_azimuth: true,
+            inspector_show_beam_height: true,
+            inspector_show_model_value: true,
+            inspector_show_color_hex: true,
+            inspector_show_field_loupe: false,
             gate_filter_decidbz: None,
             model_keep_runs: default_model_keep_runs(),
             rebuildable_cache_limit_gib: default_rebuildable_cache_limit_gib(),
@@ -2925,6 +2953,37 @@ mod tests {
         );
         assert_eq!(s.startup_site.as_deref(), Some("KDMX"));
         assert_eq!(s.polling_interval_seconds, 60);
+    }
+
+    #[test]
+    fn inspector_preferences_default_and_round_trip() {
+        let defaults = AppSettings::from_json("{}");
+        assert!(defaults.inspector_card_visible);
+        assert!(defaults.inspector_show_raw_velocity);
+        assert!(defaults.inspector_show_range_azimuth);
+        assert!(defaults.inspector_show_beam_height);
+        assert!(defaults.inspector_show_model_value);
+        assert!(defaults.inspector_show_color_hex);
+        assert!(!defaults.inspector_show_field_loupe);
+
+        let settings = AppSettings {
+            inspector_card_visible: false,
+            inspector_show_raw_velocity: false,
+            inspector_show_range_azimuth: false,
+            inspector_show_beam_height: false,
+            inspector_show_model_value: false,
+            inspector_show_color_hex: false,
+            inspector_show_field_loupe: true,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+        assert!(!back.inspector_card_visible);
+        assert!(!back.inspector_show_raw_velocity);
+        assert!(!back.inspector_show_range_azimuth);
+        assert!(!back.inspector_show_beam_height);
+        assert!(!back.inspector_show_model_value);
+        assert!(!back.inspector_show_color_hex);
+        assert!(back.inspector_show_field_loupe);
     }
 
     #[test]

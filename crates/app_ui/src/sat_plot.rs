@@ -27,6 +27,34 @@ const EXPORT_WIDTH: u32 = 1600;
 const EXPORT_HEIGHT: u32 = 1200;
 const PALETTE_BINS: usize = 256;
 
+/// Prompt for a destination and export the full georeferenced native plot.
+///
+/// Keeping the dialog and dimensions here gives Satellite and SimSat the same
+/// PNG contract instead of letting each caller invent its own raster size.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+pub(crate) fn prompt_png_export(
+    source: &SatellitePlotSource,
+    dialog_title: &str,
+) -> Option<String> {
+    let path = rfd::FileDialog::new()
+        .add_filter("PNG image", &["png"])
+        .set_file_name(source.suggested_file_name())
+        .set_title(dialog_title)
+        .save_file()?;
+    Some(match source.save_png(&path, EXPORT_WIDTH, EXPORT_HEIGHT) {
+        Ok(()) => format!("Saved PNG to {}", path.display()),
+        Err(error) => format!("PNG export failed: {error}"),
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+pub(crate) fn prompt_png_export(
+    _source: &SatellitePlotSource,
+    _dialog_title: &str,
+) -> Option<String> {
+    None
+}
+
 /// A sampled scalar palette in the exact units carried by a plot source.
 ///
 /// Satellite enhancement tables can contain duplicate breakpoints for hard
@@ -493,7 +521,9 @@ impl SatellitePlotPanel {
                 )
                 .on_hover_text("Export this georeferenced native plot as a 1600x1200 PNG");
             if save.clicked() {
-                self.save_dialog(&source);
+                if let Some(status) = prompt_png_export(&source, "Save satellite native plot") {
+                    self.status = Some(status);
+                }
             }
         });
         if let Some(status) = &self.status {
@@ -569,25 +599,6 @@ impl SatellitePlotPanel {
         ));
         self.last_upload_ms = Some(upload.elapsed().as_secs_f32() * 1000.0);
     }
-
-    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-    fn save_dialog(&mut self, source: &SatellitePlotSource) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG image", &["png"])
-            .set_file_name(source.suggested_file_name())
-            .set_title("Save satellite native plot")
-            .save_file()
-        else {
-            return;
-        };
-        self.status = Some(match source.save_png(&path, EXPORT_WIDTH, EXPORT_HEIGHT) {
-            Ok(()) => format!("Saved PNG to {}", path.display()),
-            Err(error) => format!("PNG export failed: {error}"),
-        });
-    }
-
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-    fn save_dialog(&mut self, _source: &SatellitePlotSource) {}
 }
 
 fn validate_mesh(

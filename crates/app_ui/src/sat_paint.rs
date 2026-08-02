@@ -47,6 +47,113 @@ impl SatelliteSource {
     }
 }
 
+const SAT_STALE_DRAPE_GRID: usize = 8;
+
+/// Preserve the GOES panel's provider/detail choices when turning its
+/// single-band follow spec into a one-shot RGB request. The old inline
+/// struct update silently fell back to `GoesCompositeSpec::default()` for
+/// `downsample`, so changing Detail had no effect on Load RGB.
+fn goes_composite_spec_from_follow(
+    base: &rw_ui::SatFollowSpec,
+    style: String,
+    window: Option<sat_window::SatNativeWindow>,
+) -> sat_worker::GoesCompositeSpec {
+    sat_worker::GoesCompositeSpec {
+        satellite: base.satellite.clone(),
+        sector: base.sector.clone(),
+        style,
+        downsample: base.downsample,
+        window,
+        ..sat_worker::GoesCompositeSpec::default()
+    }
+}
+
+/// Project one texel-grid vertex from the AEQD viewport where the stale
+/// satellite raster was rendered into the current AEQD viewport. Repeating
+/// this across a small mesh keeps the raster attached to geography while the
+/// exact background rerender catches up; a single translated rectangle drifts
+/// sideways because two AEQD view centers are not related by an affine shift.
+fn stale_sat_texture_vertex(
+    rect: egui::Rect,
+    texture_pts: egui::Vec2,
+    rendered: &ModelLayerView,
+    current: &ModelLayerView,
+    u: f32,
+    v: f32,
+) -> Option<egui::Pos2> {
+    if !rect.is_finite()
+        || !texture_pts.is_finite()
+        || texture_pts.x <= 0.0
+        || texture_pts.y <= 0.0
+        || !rendered.center_lat.is_finite()
+        || !rendered.center_lon.is_finite()
+        || !rendered.map_scale.is_finite()
+        || rendered.map_scale <= 0.0
+        || !current.center_lat.is_finite()
+        || !current.center_lon.is_finite()
+        || !current.map_scale.is_finite()
+        || current.map_scale <= 0.0
+    {
+        return None;
+    }
+    let rendered_km_per_pt = 111.32 / f64::from(rendered.map_scale);
+    let east_km = f64::from((u - 0.5) * texture_pts.x) * rendered_km_per_pt;
+    let north_km = f64::from((0.5 - v) * texture_pts.y) * rendered_km_per_pt;
+    let (lat, lon) = aeqd_inverse_km(
+        f64::from(rendered.center_lat),
+        f64::from(rendered.center_lon),
+        east_km,
+        north_km,
+    );
+    let (current_east_km, current_north_km) = aeqd_forward_km(
+        f64::from(current.center_lat),
+        f64::from(current.center_lon),
+        lat,
+        lon,
+    );
+    let current_pts_per_km = f64::from(current.map_scale) / 111.32;
+    let point = egui::pos2(
+        rect.center().x + (current_east_km * current_pts_per_km) as f32,
+        rect.center().y - (current_north_km * current_pts_per_km) as f32,
+    );
+    (point.x.is_finite() && point.y.is_finite()).then_some(point)
+}
+
+fn stale_sat_texture_mesh(
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    texture_pts: egui::Vec2,
+    rendered: &ModelLayerView,
+    current: &ModelLayerView,
+    tint: egui::Color32,
+) -> Option<egui::epaint::Mesh> {
+    let n = SAT_STALE_DRAPE_GRID;
+    let mut mesh = egui::epaint::Mesh::with_texture(texture_id);
+    mesh.vertices.reserve((n + 1) * (n + 1));
+    mesh.indices.reserve(n * n * 6);
+    for j in 0..=n {
+        for i in 0..=n {
+            let u = i as f32 / n as f32;
+            let v = j as f32 / n as f32;
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: stale_sat_texture_vertex(rect, texture_pts, rendered, current, u, v)?,
+                uv: egui::pos2(u, v),
+                color: tint,
+            });
+        }
+    }
+    let stride = (n + 1) as u32;
+    for j in 0..n as u32 {
+        for i in 0..n as u32 {
+            let a = j * stride + i;
+            let (b, c, d) = (a + 1, a + stride, a + stride + 1);
+            mesh.add_triangle(a, c, b);
+            mesh.add_triangle(b, c, d);
+        }
+    }
+    Some(mesh)
+}
+
 impl ViewerApp {
     /// Satellite window: GOES live-follow plus non-GOES ingest/discovery
     /// actions, all writing into BowEcho's own rolling satellite store.
@@ -469,13 +576,13 @@ impl ViewerApp {
             }
         }
 
-        panel_kit::subgroup(ui, "Region & resolution", |_ui| {});
+        panel_kit::subgroup(ui, "RGB / MTG focused crop", |_ui| {});
         let mut window_changed = false;
         ui.horizontal_wrapped(|ui| {
             window_changed |= ui
-                .checkbox(&mut self.sat_window_enabled, "Focused window")
+                .checkbox(&mut self.sat_window_enabled, "Use focused crop")
                 .on_hover_text(
-                    "Use the same saved center and size for provider RGB/MTG requests. Instrument-native GOES/Himawari composites stay at native resolution; EUMETView requests a high-resolution geolocated crop.",
+                    "Use the saved center and size for the next provider RGB/MTG request. GOES/Himawari crops decode at instrument-native resolution; EUMETView requests a high-resolution geolocated crop.",
                 )
                 .changed();
             ui.label("lat");
@@ -506,7 +613,28 @@ impl ViewerApp {
             if ui.button("Use map center").clicked() {
                 self.sat_window_lat_deg = f64::from(self.map_center_lat);
                 self.sat_window_lon_deg = f64::from(self.map_center_lon);
+                self.sat_window_enabled = true;
                 window_changed = true;
+            }
+        });
+        ui.weak(match (self.satellite_source, self.sat_window_enabled) {
+            (SatelliteSource::Goes, true) => {
+                "Applies on the next Load RGB. A native focused crop overrides GOES Detail."
+            }
+            (SatelliteSource::Goes, false) => {
+                "Focused crop is off. GOES Detail now applies to the next Load RGB."
+            }
+            (SatelliteSource::Himawari, true) => {
+                "Applies on the next Load RGB. A native focused crop overrides the selected region/full-disk scope."
+            }
+            (SatelliteSource::Himawari, false) => {
+                "Focused crop is off. The selected Himawari region/full-disk scope applies to the next Load RGB."
+            }
+            (SatelliteSource::Meteosat, true) => {
+                "Applies on the next Meteosat Latest or Load loop request."
+            }
+            (SatelliteSource::Meteosat, false) => {
+                "Focused crop is off. Meteosat requests use their normal provider extent."
             }
         });
         if window_changed {
@@ -533,13 +661,7 @@ impl ViewerApp {
             self.status = format!("Satellite: composing GOES {} {style}", base.sector);
             if let Some(sat) = &self.sat {
                 sat.send(sat_worker::SatRequest::IngestLatestGoesComposite(
-                    sat_worker::GoesCompositeSpec {
-                        satellite: base.satellite,
-                        sector: base.sector,
-                        style,
-                        window,
-                        ..sat_worker::GoesCompositeSpec::default()
-                    },
+                    goes_composite_spec_from_follow(&base, style, window),
                 ));
             }
         }
@@ -851,6 +973,21 @@ impl ViewerApp {
     }
 
     pub(crate) fn satellite_run_key_matches_current_spec(&self, key: &rw_ui::SatRunKey) -> bool {
+        // A one-shot RGB/IR ingest (notably a hurricane-card full-disk
+        // request) intentionally may not match the GOES live-follow panel's
+        // sector. Once the worker explicitly selects it, keep that exact run
+        // admissible until the user selects another run or changes the spec.
+        if self
+            .sat_last_frame
+            .as_ref()
+            .is_some_and(|(selected, _)| selected == key)
+            || self
+                .sat_player
+                .selected_run()
+                .is_some_and(|selected| selected == key)
+        {
+            return true;
+        }
         sat_worker::run_filters_for_spec(self.sat_panel.spec())
             .map(|(model, prefixes)| {
                 satellite_run_key_matches_resolved_spec(key, &model, &prefixes)
@@ -865,9 +1002,13 @@ impl ViewerApp {
         let Ok((model, prefixes)) = sat_worker::run_filters_for_spec(self.sat_panel.spec()) else {
             return runs;
         };
-        runs.into_iter()
-            .filter(|run| satellite_run_key_matches_resolved_spec(&run.key, &model, &prefixes))
-            .collect()
+        satellite_runs_matching_resolved_spec(
+            runs,
+            &model,
+            &prefixes,
+            self.sat_last_frame.as_ref().map(|(key, _)| key),
+            self.sat_player.selected_run(),
+        )
     }
 
     pub(crate) fn request_sat_map_frame(&mut self, key: rw_ui::SatRunKey, hhmm: u16) {
@@ -1029,6 +1170,29 @@ impl ViewerApp {
                     let runs = self.satellite_runs_for_current_spec(runs);
                     self.sat_run_listings = runs.clone();
                     self.sat_player.set_runs(runs);
+                }
+                sat_worker::SatResponse::IngestReady { runs, key, hhmm } => {
+                    // This is an explicit one-shot product result, not an
+                    // unsolicited cache run. Admit its exact identity before
+                    // applying the normal follow-spec filter so a tropical
+                    // full-disk/window request can display while the panel is
+                    // still configured for (for example) GOES-East CONUS.
+                    self.sat_last_frame = Some((key.clone(), hhmm));
+                    let runs = self.satellite_runs_for_current_spec(runs);
+                    self.sat_run_listings = runs.clone();
+                    self.sat_player.set_runs(runs);
+                    self.sat_player.select_frame(key.clone(), hhmm);
+                    if let Some(sat) = &self.sat {
+                        sat.send(sat_worker::SatRequest::LoadFrame {
+                            key: key.clone(),
+                            hhmm,
+                        });
+                    }
+                    if self.sat_map_follow
+                        && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
+                    {
+                        self.request_sat_map_frame(key, hhmm);
+                    }
                 }
                 sat_worker::SatResponse::FollowStarted => self.sat_panel.begin_follow(),
                 sat_worker::SatResponse::FollowFinished(result) => {
@@ -1494,13 +1658,26 @@ impl ViewerApp {
             if model_layer_view_needs_rerender(rendered, &view) {
                 // Mid-gesture (owner report: "every time we zoom in the sat
                 // image disappears until we stop"): keep painting the last
-                // rendered raster, world-anchored into the moving view like
-                // the radar texture — momentary AEQD distortion is expected
-                // and the fresh render above swaps in when it lands.
-                let anchored =
-                    anchored_sat_texture_rect(rect, texture.size_vec2(), rendered, &view);
-                if anchored.is_finite() && anchored.intersects(rect) {
-                    painter.image(texture.id(), anchored, uv, tint);
+                // rendered raster through a small georeferenced drape. A
+                // single translated rectangle drifts sideways because the
+                // old and new AEQD views are not affinely related.
+                if let Some(mesh) = stale_sat_texture_mesh(
+                    texture.id(),
+                    rect,
+                    texture.size_vec2(),
+                    rendered,
+                    &view,
+                    tint,
+                ) {
+                    painter.add(egui::Shape::mesh(mesh));
+                } else {
+                    // Degenerate projection inputs are rare; retain the old
+                    // affine bridge as a safe visual fallback.
+                    let anchored =
+                        anchored_sat_texture_rect(rect, texture.size_vec2(), rendered, &view);
+                    if anchored.is_finite() && anchored.intersects(rect) {
+                        painter.image(texture.id(), anchored, uv, tint);
+                    }
                 }
             } else {
                 painter.image(texture.id(), rect, uv, tint);
@@ -1769,6 +1946,22 @@ fn satellite_run_key_matches_resolved_spec(
                     .iter()
                     .any(|prefix| key.run.starts_with(prefix.as_str()))
             }
+}
+
+fn satellite_runs_matching_resolved_spec(
+    runs: Vec<rw_ui::SatRunListing>,
+    model: &str,
+    prefixes: &[String],
+    admitted: Option<&rw_ui::SatRunKey>,
+    selected: Option<&rw_ui::SatRunKey>,
+) -> Vec<rw_ui::SatRunListing> {
+    runs.into_iter()
+        .filter(|run| {
+            admitted.is_some_and(|key| key == &run.key)
+                || selected.is_some_and(|key| key == &run.key)
+                || satellite_run_key_matches_resolved_spec(&run.key, model, prefixes)
+        })
+        .collect()
 }
 
 /// True/natural-color RGB composite runs (`<sector>_rgb_<style>_<YYYYMMDD>`)
@@ -2047,6 +2240,27 @@ mod tests {
     }
 
     #[test]
+    fn goes_rgb_request_preserves_the_selected_detail() {
+        let mut base = rw_ui::SatFollowSpec::default();
+        base.satellite = "goes18".to_owned();
+        base.sector = "fulldisk".to_owned();
+        base.downsample = 7;
+        let window = sat_window::SatNativeWindow {
+            center_lat_deg: 22.0,
+            center_lon_deg: -105.0,
+            size_km: 600.0,
+        };
+
+        let request =
+            goes_composite_spec_from_follow(&base, "natural_color".to_owned(), Some(window));
+
+        assert_eq!(request.satellite, "goes18");
+        assert_eq!(request.sector, "fulldisk");
+        assert_eq!(request.downsample, 7);
+        assert_eq!(request.window, Some(window));
+    }
+
+    #[test]
     fn satellite_player_layout_reserves_a_practical_preview_at_any_pane_width() {
         let narrow = satellite_player_panel_height(320.0);
         let normal = satellite_player_panel_height(900.0);
@@ -2145,6 +2359,94 @@ mod tests {
             model,
             &prefixes,
         ));
+    }
+
+    #[test]
+    fn an_explicit_one_shot_run_survives_the_live_follow_filter() {
+        let listing = |model: &str, run: &str| rw_ui::SatRunListing {
+            key: rw_ui::SatRunKey {
+                model: model.to_owned(),
+                run: run.to_owned(),
+            },
+            title: run.to_owned(),
+            nx: 100,
+            ny: 100,
+            frames: vec![1200],
+        };
+        let conus = listing("g19", "conus_rgb_natural_color_20260713");
+        let tropical = listing("g19", "fulldisk_win227n875w1000_rgb_natural_color_20260713");
+        let prefixes = vec!["conus_c13_".to_owned()];
+
+        let normal = satellite_runs_matching_resolved_spec(
+            vec![conus.clone(), tropical.clone()],
+            "g19",
+            &prefixes,
+            None,
+            None,
+        );
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].key, conus.key);
+
+        let forced = satellite_runs_matching_resolved_spec(
+            vec![conus, tropical.clone()],
+            "g19",
+            &prefixes,
+            Some(&tropical.key),
+            None,
+        );
+        assert_eq!(forced.len(), 2);
+        assert!(forced.iter().any(|run| run.key == tropical.key));
+    }
+
+    #[test]
+    fn stale_satellite_drape_round_trips_an_unchanged_view() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
+        let view = ModelLayerView {
+            center_lat: 39.0,
+            center_lon: -95.0,
+            map_scale: 100.0,
+        };
+        for (u, v, expected) in [
+            (0.0, 0.0, rect.left_top()),
+            (1.0, 0.0, rect.right_top()),
+            (1.0, 1.0, rect.right_bottom()),
+            (0.0, 1.0, rect.left_bottom()),
+            (0.5, 0.5, rect.center()),
+        ] {
+            let actual = stale_sat_texture_vertex(rect, rect.size(), &view, &view, u, v)
+                .expect("valid projection");
+            assert!(
+                actual.distance(expected) < 0.02,
+                "({u}, {v}) landed at {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_satellite_drape_reprojects_instead_of_sliding_as_one_rectangle() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let rendered = ModelLayerView {
+            center_lat: 30.0,
+            center_lon: -120.0,
+            map_scale: 60.0,
+        };
+        let current = ModelLayerView {
+            center_lat: 42.0,
+            center_lon: -95.0,
+            map_scale: 60.0,
+        };
+        let left = stale_sat_texture_vertex(rect, rect.size(), &rendered, &current, 0.0, 0.0)
+            .expect("left");
+        let middle = stale_sat_texture_vertex(rect, rect.size(), &rendered, &current, 0.5, 0.0)
+            .expect("middle");
+        let right = stale_sat_texture_vertex(rect, rect.size(), &rendered, &current, 1.0, 0.0)
+            .expect("right");
+        let affine_middle = egui::pos2((left.x + right.x) * 0.5, (left.y + right.y) * 0.5);
+
+        assert!(
+            middle.distance(affine_middle) > 0.1,
+            "the curved AEQD edge must not collapse back to the old affine slide"
+        );
     }
 
     #[test]

@@ -29,6 +29,7 @@ styles = { path = "../styles" }
 ui_core = { path = "../ui_core" }
 serde.workspace = true
 serde_json.workspace = true
+shapefile = "0.7"
 thiserror.workspace = true
 quick-xml.workspace = true
 # SimSat v0.2.1 engine plus MTG-I1 camera integration, pinned exactly.

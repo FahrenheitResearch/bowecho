@@ -20,6 +20,8 @@ use crate::formula_lab::{
 };
 use crate::sat_plot::{SatellitePlotPanel, SatellitePlotSource};
 
+mod probe_history;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum NativePlotContent {
     #[default]
@@ -1253,6 +1255,9 @@ pub struct ModelDataDock {
     sounding: crate::sharppy_sounding::SharppySoundingPanel,
     /// Most recent loaded field (kept for the map layer).
     latest_field: Option<std::sync::Arc<rw_ui::FieldData>>,
+    /// Forecast-time graph for the fixed map probe. Its worker reads only a
+    /// tiny point window plus indexed domain statistics per stored hour.
+    probe_history: probe_history::ModelProbeHistoryPanel,
     /// Most recent sounding data (kept for the native skew-T window).
     latest_sounding: Option<std::sync::Arc<rw_ui::SoundingData>>,
     /// Which request owns the reusable sounding surface. This prevents a
@@ -1422,6 +1427,7 @@ impl ModelDataDock {
             viewer: FieldViewerPanel::new(),
             sounding: crate::sharppy_sounding::SharppySoundingPanel::new(),
             latest_field: None,
+            probe_history: probe_history::ModelProbeHistoryPanel::default(),
             latest_sounding: None,
             sounding_request_mode: SoundingRequestMode::None,
             box_sounding_armed: false,
@@ -2163,6 +2169,7 @@ impl ModelDataDock {
     /// Draw auxiliary windows that belong to the shared Models/WRF backend
     /// exactly once per app frame, independent of which owner surface is open.
     pub fn auxiliary_windows(&mut self, ctx: &egui::Context) {
+        self.probe_history.show(ctx);
         let import_message = self.import_message.clone();
         if let Some(request) = self.cm1.show_window(
             ctx,
@@ -2463,6 +2470,36 @@ impl ModelDataDock {
     /// The most recently loaded field (for layer auto-refresh).
     pub fn latest_field(&self) -> Option<&std::sync::Arc<rw_ui::FieldData>> {
         self.latest_field.as_ref()
+    }
+
+    /// Open a real forecast-time graph for the field under a fixed map probe.
+    /// Point samples use the map layer's exact curvilinear interpolation
+    /// stencil; domain min/max series use rw-store's cached tile statistics.
+    pub fn open_probe_history(
+        &mut self,
+        lat: f32,
+        lon: f32,
+        field: std::sync::Arc<rw_ui::FieldData>,
+        lut: std::sync::Arc<crate::model_layer::InverseLut>,
+    ) -> Result<String, String> {
+        let label = format!(
+            "{} {} history at {:.4}°, {:.4}°",
+            field.key.hour.model.to_uppercase(),
+            field.key.var,
+            lat,
+            lon
+        );
+        self.probe_history.open(
+            probe_history::ProbeHistoryRequest {
+                store_root: self.store_root.clone(),
+                field,
+                lut,
+                lat,
+                lon,
+            },
+            self.repaint.clone(),
+        )?;
+        Ok(label)
     }
 
     /// Selected model hour in the store browser.

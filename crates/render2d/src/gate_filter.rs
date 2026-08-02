@@ -1,8 +1,9 @@
 //! Reflectivity gate filter (the GR2Analyst "GateFilter"): hide gates of a
-//! non-reflectivity moment wherever the SAME CUT's reflectivity is below a
-//! threshold — the standard declutter for clear-air noise on velocity and
-//! dual-pol products. Applied once per (volume, cut, product) on the render
-//! worker and cached; the per-frame fast path is untouched.
+//! displayed base moment wherever the SAME CUT's reflectivity is below a
+//! threshold — including reflectivity itself, plus the standard clear-air
+//! declutter for velocity and dual-pol products. Applied once per (volume,
+//! cut, product) on the render worker and cached; the per-frame fast path is
+//! untouched.
 
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType};
 
@@ -123,6 +124,17 @@ mod tests {
         assert!(filtered.scaled_value(0, 1).is_none_or(|v| v.is_nan()));
         assert!(filtered.scaled_value(0, 2).is_none_or(|v| v.is_nan()));
         assert_eq!(filtered.scaled_value(0, 3), Some(-20.0));
+    }
+
+    #[test]
+    fn filters_reflectivity_against_its_own_threshold() {
+        let cut = cut_with(&[35.0, 5.0, -8.0, 20.0], &[10.0, -12.0, 8.0, -20.0], 4);
+        let reflectivity = cut.moments.get(&MomentType::Reflectivity).unwrap();
+        let filtered = apply_reflectivity_gate_filter(&cut, reflectivity, 10.0);
+        assert_eq!(filtered.scaled_value(0, 0), Some(35.0));
+        assert!(filtered.scaled_value(0, 1).is_none_or(|v| v.is_nan()));
+        assert!(filtered.scaled_value(0, 2).is_none_or(|v| v.is_nan()));
+        assert_eq!(filtered.scaled_value(0, 3), Some(20.0));
     }
 
     #[test]

@@ -335,6 +335,7 @@ dependencies = [
  "serde_json",
  "settings",
  "sha2",
+ "shapefile",
  "sharppyrs",
  "sharprs",
  "simradar_cuda",

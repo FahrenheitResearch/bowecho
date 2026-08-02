@@ -86,6 +86,7 @@ mod media;
 mod mesoanalysis;
 mod meteoalarm;
 mod model_data;
+mod model_gis;
 mod model_layer;
 mod mping;
 mod oa_derived;
@@ -156,6 +157,7 @@ use hazard_geom::compare_hazard_popup_records;
 use hazard_geom::cone_overlay_shapes;
 use hazard_geom::cone_segment_jump_limit_px;
 use hazard_geom::custom_warning_provider_url;
+use hazard_geom::dedupe_hazard_records;
 use hazard_geom::draw_outlook_ring;
 use hazard_geom::filled_polygon_mesh;
 use hazard_geom::filled_polygon_with_holes_mesh;
@@ -203,6 +205,7 @@ use hazard_geom::screen_polygon_bbox_intersects;
 use hazard_geom::screen_polyline_has_jump;
 use hazard_geom::selected_hazard_index_for_event_id;
 use hazard_geom::sort_hazard_list_rows;
+use hazard_geom::sort_hazard_records;
 use hazard_geom::style_color32;
 
 #[cfg(test)]
@@ -213,8 +216,6 @@ use hazard_geom::cleaned_screen_polygon;
 use hazard_geom::closest_point_on_segment;
 #[cfg(test)]
 use hazard_geom::cross_points;
-#[cfg(test)]
-use hazard_geom::dedupe_hazard_records;
 #[cfg(test)]
 use hazard_geom::hazard_bbox;
 #[cfg(test)]
@@ -543,6 +544,11 @@ const LOW_ZOOM_RENDER_BACKOFF_MIN_MS: u64 = 2_000;
 const LOW_ZOOM_RENDER_BACKOFF_MIN_RENDER_MS: f32 = 80.0;
 const LOW_ZOOM_REALTIME_REFRESH_SECONDS: u64 = 5;
 const ALGO_FRAME_CACHE_LIMIT: usize = 96;
+/// Keep storm-cell warmup responsive to a newly selected/live frame. Each
+/// worker prioritizes that frame, then fills a bounded slice of loop history;
+/// the next idle poll continues the remaining cache instead of trapping a new
+/// frame behind an entire 96-volume archive.
+const STORM_TRACK_WORK_BATCH_LIMIT: usize = 12;
 /// Some GPUs expose a max 2D texture dimension of 8192. GOES full-disk
 /// preview frames can be 10000 px wide, so cap the player preview well
 /// below the hard limit before egui uploads it.
@@ -1470,6 +1476,10 @@ fn main() -> eframe::Result {
         HeadlessStartup::Complete => return Ok(()),
     };
 
+    if let Err(error) = model_gis::prepare_runtime_basemap() {
+        eprintln!("Model GIS basemap unavailable: {error}");
+    }
+
     // Crash forensics: panics land in a log next to the settings so field
     // reports from other machines carry a backtrace ("crashes a lot when
     // switching pane views" needs a line number, not a guess).
@@ -1729,6 +1739,18 @@ fn cache_dir(name: &str) -> PathBuf {
     app_cache_root()
         .join("level2")
         .join(sanitized_cache_segment(name))
+}
+
+/// The recent-cache chooser is bound to `selected_site()`, so it is honest
+/// only from the primary SITE controls while no international or armed custom
+/// feed owns that display. The button also names the selected US site, making
+/// its target explicit when the primary is otherwise idle.
+fn selected_us_cache_action_allowed(
+    targets_primary: bool,
+    intl_source_owns_primary: bool,
+    custom_poll_owns_primary: bool,
+) -> bool {
+    targets_primary && !intl_source_owns_primary && !custom_poll_owns_primary
 }
 
 fn app_cache_root() -> PathBuf {
@@ -3705,8 +3727,8 @@ struct ViewerApp {
     /// holding Shift). Inspired by Solarpower07's WRF-Runner loupe.
     inspector_show_loupe: bool,
     /// Loupe optical magnification, retuned by the scroll wheel while the loupe
-    /// is shown (clamped to [`map_paint::LOUPE_MAGNIFY_MIN`]..=`MAX`). Session
-    /// state only, like `inspector_show_loupe` — defaults to
+    /// is shown (clamped to [`map_paint::LOUPE_MAGNIFY_MIN`]..=`MAX`). The
+    /// magnification itself is session-only and defaults to
     /// [`map_paint::LOUPE_MAGNIFY_DEFAULT`].
     loupe_magnify: f32,
     /// Color swatch + `#RRGGBB` chip on the inspector card's value line.
@@ -4048,6 +4070,19 @@ fn background_activity_display(
         BackgroundActivityDisplay::ProgressOnly(fraction)
     } else {
         BackgroundActivityDisplay::SpinnerOnly
+    }
+}
+
+fn background_activity_display_for_width(
+    activity: &BackgroundActivity,
+    current_status: &str,
+    available_width: f32,
+) -> BackgroundActivityDisplay {
+    match background_activity_display(activity, current_status) {
+        BackgroundActivityDisplay::Full if available_width < 1_050.0 => {
+            BackgroundActivityDisplay::SpinnerOnly
+        }
+        display => display,
     }
 }
 
@@ -9477,6 +9512,15 @@ impl ViewerApp {
             sat_worker::IrEnhancement::parse(&app_settings.sat_ir_enhancement);
         let restored_bold_labels = app_settings.bold_labels;
         let restored_gate_filter_dbz = app_settings.gate_filter_decidbz.map(|d| d as f32 / 10.0);
+        let restored_inspector = (
+            app_settings.inspector_card_visible,
+            app_settings.inspector_show_raw_velocity,
+            app_settings.inspector_show_range_azimuth,
+            app_settings.inspector_show_beam_height,
+            app_settings.inspector_show_model_value,
+            app_settings.inspector_show_color_hex,
+            app_settings.inspector_show_field_loupe,
+        );
         let restored_placefile_slots: Vec<PlacefileSlot> = app_settings
             .placefiles
             .iter()
@@ -9679,7 +9723,7 @@ impl ViewerApp {
             hail_freezing_level_km: 3.2,
             hail_minus20_level_km: 6.4,
             display_thresholds: BTreeMap::new(),
-            show_inspector_card: true,
+            show_inspector_card: restored_inspector.0,
             pinned_inspector_lonlat: None,
             pinned_obs_chart_station: None,
             hazard_overlay_generation: 0,
@@ -9884,15 +9928,13 @@ impl ViewerApp {
             historical_obs_rx: None,
             last_sounding_request: None,
             hail_env_pending: false,
-            inspector_show_raw_vel: true,
-            inspector_show_range_az: true,
-            inspector_show_beam: true,
-            inspector_show_model: true,
-            // Loupe is off by default (a Shift-hold magnifier); the hex chip
-            // rides the card whenever a value resolves.
-            inspector_show_loupe: false,
+            inspector_show_raw_vel: restored_inspector.1,
+            inspector_show_range_az: restored_inspector.2,
+            inspector_show_beam: restored_inspector.3,
+            inspector_show_model: restored_inspector.4,
+            inspector_show_loupe: restored_inspector.6,
             loupe_magnify: map_paint::LOUPE_MAGNIFY_DEFAULT,
-            inspector_show_hex: true,
+            inspector_show_hex: restored_inspector.5,
             model_lut: None,
             model_lut_rx: None,
             model_enabled: true,
@@ -11917,7 +11959,8 @@ impl ViewerApp {
                 &seed_product,
                 volume.as_ref(),
                 VolumeSelectionPolicy {
-                    allow_low_level_auto_advance: !self.primary.cursor.playing,
+                    allow_low_level_auto_advance: self.app_settings.live_low_sweep_auto_advance
+                        && !self.primary.cursor.playing,
                     allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
                     require_complete_live_cut,
                     low_level_min_seconds: self.live_low_sweep_auto_advance_min_seconds(),
@@ -12095,6 +12138,7 @@ impl ViewerApp {
         let require_complete_live_cut =
             frame_status == FrameStatus::LivePartial && !self.display_live_chunk_updates;
         let live_partial = frame_status == FrameStatus::LivePartial;
+        let live_low_sweep_auto_advance = self.app_settings.live_low_sweep_auto_advance;
         let low_level_min_seconds = self.live_low_sweep_auto_advance_min_seconds();
         for pane in &mut self.extra_panes {
             if pane.owns_radar() {
@@ -12168,7 +12212,8 @@ impl ViewerApp {
                     &seed_product,
                     volume,
                     VolumeSelectionPolicy {
-                        allow_low_level_auto_advance: !self.primary.cursor.playing,
+                        allow_low_level_auto_advance: live_low_sweep_auto_advance
+                            && !self.primary.cursor.playing,
                         allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
                         require_complete_live_cut,
                         low_level_min_seconds,
@@ -14381,6 +14426,26 @@ impl ViewerApp {
             .collect()
     }
 
+    fn storm_track_analysis_progress(&self) -> (usize, usize) {
+        let Some(site_id) = self.volume.as_ref().map(|volume| volume.site.id.as_str()) else {
+            return (0, 0);
+        };
+        self.primary
+            .history
+            .iter()
+            .filter(|frame| {
+                frame.status != FrameStatus::LivePartial
+                    && frame.identity.site_id.eq_ignore_ascii_case(site_id)
+            })
+            .fold((0, 0), |(ready, total), frame| {
+                let key = FrameWorkKey::new(&frame.volume, Arc::as_ptr(&frame.volume) as usize);
+                (
+                    ready + usize::from(self.storm_cells_cache.contains_key(&key)),
+                    total + 1,
+                )
+            })
+    }
+
     fn begin_primary_load_telemetry(&mut self) {
         self.active_load_started_at = Some(Instant::now());
         self.first_data_ms = None;
@@ -14565,7 +14630,7 @@ impl ViewerApp {
         updating: bool,
     ) -> bool {
         match result {
-            Ok(overlay) => {
+            Ok(mut overlay) => {
                 // Live previews contain the previous completed records plus
                 // newly parsed priority alerts, so they can paint short-fuse
                 // warnings without deleting anything while slower zone
@@ -14577,6 +14642,21 @@ impl ViewerApp {
                 let timeline_preview = updating && self.pending_event_loop_hazard_window.is_some();
                 if updating && !timeline_preview && overlay.records.is_empty() {
                     return false;
+                }
+                // Archive source workers finish independently. A cumulative
+                // preview may not contain the warning family that was already
+                // visible yet, which made polygons blink out while stepping
+                // backward and then return when the final source landed. Keep
+                // only previously displayed records that intersect the target
+                // window during previews; the final result still replaces the
+                // preview authoritatively.
+                if timeline_preview
+                    && let (Some(existing), Some(window)) = (
+                        self.hazard_overlay.as_ref(),
+                        self.pending_event_loop_hazard_window,
+                    )
+                {
+                    retain_timeline_preview_records(&mut overlay, existing, window);
                 }
                 let previous_event_loop_window = self.event_loop_hazard_window;
                 let pending_event_loop_window = if timeline_preview {
@@ -16267,12 +16347,10 @@ impl ViewerApp {
         )
         .is_none()
         {
-            // The gate filter applies to every non-reflectivity base moment
-            // (GR2-style GateFilter); it composes BEFORE smoothing.
-            let gate_filter = (request.gate_filter_decidbz != i16::MIN
-                && base_moment != MomentType::Reflectivity
-                && derived.is_none())
-            .then(|| request.gate_filter_decidbz as f32 / 10.0);
+            // The gate filter applies to every base moment (GR2-style
+            // GateFilter), including REF itself; it composes BEFORE smoothing.
+            let gate_filter = (request.gate_filter_decidbz != i16::MIN && derived.is_none())
+                .then(|| request.gate_filter_decidbz as f32 / 10.0);
             let cache = if let Some(d) = derived {
                 build_derived_moment_cache(
                     &request.volume,
@@ -18147,6 +18225,7 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) {
         let display_live_chunk_updates = self.display_live_chunk_updates;
+        let live_low_sweep_auto_advance = self.app_settings.live_low_sweep_auto_advance;
         let low_level_min_seconds = self.live_low_sweep_auto_advance_min_seconds();
         let main_cut = self.selected_cut;
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
@@ -18183,7 +18262,8 @@ impl ViewerApp {
                 &seed_product,
                 volume.as_ref(),
                 VolumeSelectionPolicy {
-                    allow_low_level_auto_advance: !pane.engine.cursor.playing,
+                    allow_low_level_auto_advance: live_low_sweep_auto_advance
+                        && !pane.engine.cursor.playing,
                     allow_incomplete_live_chunk_advance: display_live_chunk_updates,
                     require_complete_live_cut,
                     low_level_min_seconds,
@@ -25392,10 +25472,11 @@ impl ViewerApp {
                     && matches!(&self.primary.feed, FeedSource::CustomUrl(_))
                     && self.poll_source_armed();
                 let selected_cache_site = self.selected_site();
-                let cached_site_dir = if site_control_pane.is_none()
-                    && primary_intl_source.is_none()
-                    && !custom_poll_owns_primary
-                {
+                let cached_site_dir = if selected_us_cache_action_allowed(
+                    site_control_pane.is_none(),
+                    primary_intl_source.is_some(),
+                    custom_poll_owns_primary,
+                ) {
                     selected_cache_site.map(|site| cache_dir(&site.level2_id))
                 } else {
                     None
@@ -25442,17 +25523,26 @@ impl ViewerApp {
                 self.start_local_volume_load(dir, ui.ctx());
             }
         });
-        panel_kit::row(ui, "Low gap", |ui| {
-            let mut low_sweep_seconds = if self.app_settings.live_low_sweep_auto_advance {
-                MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS
-            } else {
+        panel_kit::row(ui, "Live sweeps", |ui| {
+            let mut auto_advance = self.app_settings.live_low_sweep_auto_advance;
+            if ui
+                .checkbox(&mut auto_advance, "Follow new low cuts")
+                .on_hover_text(
+                    "Off keeps the selected sweep fixed as new cuts arrive. On follows newer complete low-level SAILS/MESO-SAILS cuts in the same scan.",
+                )
+                .changed()
+            {
+                self.app_settings.live_low_sweep_auto_advance = auto_advance;
+                self.mark_app_settings_dirty();
+            }
+            let mut low_sweep_seconds =
                 self.app_settings.live_low_sweep_auto_advance_seconds.clamp(
                     MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
                     MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
-                )
-            };
-            if ui
-                .add(
+                );
+            let threshold = ui
+                .add_enabled(
+                    auto_advance,
                     egui::DragValue::new(&mut low_sweep_seconds)
                         .range(
                             MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS
@@ -25462,11 +25552,9 @@ impl ViewerApp {
                         .suffix(" s"),
                 )
                 .on_hover_text(
-                    "Minimum seconds between same-scan low-level sweeps before live display advances to the newer complete low tilt",
-                )
-                .changed()
-            {
-                self.app_settings.live_low_sweep_auto_advance = false;
+                    "Minimum time gap before BowEcho follows a newer complete low-level cut",
+                );
+            if threshold.changed() {
                 self.app_settings.live_low_sweep_auto_advance_seconds = low_sweep_seconds;
                 self.mark_app_settings_dirty();
             }
@@ -25776,14 +25864,14 @@ impl ViewerApp {
             let _ = self.app_settings.save();
             ctx.request_repaint();
         }
-        // Gate filter (GR2-style GateFilter): hide non-REF gates whose
-        // co-located reflectivity is weak — the standard VEL declutter.
+        // Gate filter (GR2-style GateFilter): hide REF below the threshold and
+        // other base-moment gates whose co-located reflectivity is weak.
         ui.horizontal(|ui| {
             let mut on = self.gate_filter_dbz.is_some();
             if ui
-                .checkbox(&mut on, "Gate filter")
+                .checkbox(&mut on, "Filter weak-REF gates")
                 .on_hover_text(
-                    "Hide velocity/dual-pol gates where the same-tilt reflectivity is below the threshold (declutters clear-air noise). Reflectivity itself is never filtered.",
+                    "On REF, hide values below this threshold. On velocity and dual-pol products, hide gates where the same-tilt reflectivity is below it.",
                 )
                 .changed()
             {
@@ -25800,6 +25888,7 @@ impl ViewerApp {
                             egui::DragValue::new(threshold)
                                 .range(-15.0..=40.0)
                                 .speed(0.5)
+                                .prefix("REF ≥ ")
                                 .suffix(" dBZ"),
                         )
                         .changed()
@@ -26480,6 +26569,24 @@ impl ViewerApp {
                 "Motion-fit extrapolation for the +15/+30/+45 minute track dots. These are forecast valid times, not site-specific impact claims.",
             );
         }
+        if self.show_storm_tracks {
+            let (ready, total) = self.storm_track_analysis_progress();
+            let running = self.storm_cells_receiver.is_some();
+            let label = if total >= 2 {
+                format!(
+                    "Loaded-loop history: {ready}/{total} frames{} · click a track for motion and valid times",
+                    if running { " analyzing" } else { "" }
+                )
+            } else {
+                format!(
+                    "Loaded-loop history: {ready}/{total} frame{} · load a loop for past tracks",
+                    if total == 1 { "" } else { "s" }
+                )
+            };
+            ui.weak(label).on_hover_text(
+                "Storm tracks are reconstructed from complete reflectivity volumes already loaded in the radar timeline; BowEcho now warms those frames in the background.",
+            );
+        }
         egui::CollapsingHeader::new("Storm track settings")
             .id_salt("storm_track_settings")
             .default_open(false)
@@ -26573,27 +26680,85 @@ impl ViewerApp {
             let _ = self.app_settings.save();
             ctx.request_repaint();
         }
+        let mut inspector_changed = false;
         ui.menu_button("Inspector…", |ui| {
-            ui.checkbox(
-                &mut self.inspector_show_raw_vel,
-                "Raw velocity / fold warning",
-            );
-            ui.checkbox(&mut self.inspector_show_range_az, "Range / azimuth / tilt");
-            ui.checkbox(&mut self.inspector_show_beam, "Beam height");
-            ui.checkbox(&mut self.inspector_show_model, "Model value");
-            ui.checkbox(&mut self.inspector_show_hex, "Color swatch + hex")
+            inspector_changed |= ui
+                .checkbox(
+                    &mut self.inspector_show_raw_vel,
+                    "Raw velocity / fold warning",
+                )
+                .changed();
+            inspector_changed |= ui
+                .checkbox(&mut self.inspector_show_range_az, "Range / azimuth / tilt")
+                .changed();
+            inspector_changed |= ui
+                .checkbox(&mut self.inspector_show_beam, "Beam height")
+                .changed();
+            inspector_changed |= ui
+                .checkbox(&mut self.inspector_show_model, "Model / GRIB point value")
+                .on_hover_text(
+                    "Read the loaded model field at the map cursor. Shift+click the map to keep a fixed probe at that latitude/longitude as model times change.",
+                )
+                .changed();
+            inspector_changed |= ui
+                .checkbox(&mut self.inspector_show_hex, "Color swatch + hex")
                 .on_hover_text(
                     "Show the sampled field color as a chip plus its #RRGGBB value on the card.",
-                );
-            ui.checkbox(&mut self.inspector_show_loupe, "Field loupe")
+                )
+                .changed();
+            inspector_changed |= ui
+                .checkbox(&mut self.inspector_show_loupe, "Field loupe")
                 .on_hover_text(
                     "Circular GPU magnifier at the cursor showing the pixelated field, its value, color and coordinates. Hold Shift to summon it momentarily even when this is off. While it is shown, the scroll wheel zooms the loupe (2x-20x) instead of the map. Loupe design inspired by Solarpower07's WRF-Runner.",
-                );
+                )
+                .changed();
         });
-        ui.checkbox(&mut self.show_inspector_card, "Inspector card")
-            .on_hover_text(
-                "Floating data card at the cursor (value, range/azimuth, beam height, Vrot; velocity products add a radial in/outbound arrow). Shift+click the map to pin it to a spot — it tracks pan/zoom and live updates; Shift+click it again to release.",
-            );
+        let mut open_probe_history = false;
+        ui.horizontal_wrapped(|ui| {
+            inspector_changed |= ui
+                .checkbox(&mut self.show_inspector_card, "Inspector card")
+                .on_hover_text(
+                    "Floating data card at the cursor (value, range/azimuth, beam height, Vrot; velocity products add a radial in/outbound arrow). Shift+click the map to pin it to a spot — it tracks pan/zoom and live updates; Shift+click it again to release.",
+                )
+                .changed();
+            if self.pinned_inspector_lonlat.is_some() {
+                open_probe_history = ui
+                    .small_button("Forecast graph…")
+                    .on_hover_text(
+                        "Graph this fixed point across locally stored forecast times (up to 256 around the selected time for unusually long runs); the graph can also switch to domain-wide minimum or maximum for the same field.",
+                    )
+                    .clicked();
+                if ui
+                    .small_button("Unpin probe")
+                    .on_hover_text("Release the fixed inspector/model probe")
+                    .clicked()
+                {
+                    self.pinned_inspector_lonlat = None;
+                    self.pinned_obs_chart_station = None;
+                    self.status = "Released fixed map probe".to_owned();
+                    ctx.request_repaint();
+                }
+            } else if self.model_enabled {
+                ui.label(
+                    egui::RichText::new("Shift+click map → fixed model probe")
+                        .small()
+                        .weak(),
+                );
+            }
+        });
+        if open_probe_history {
+            self.open_fixed_model_probe_history(ctx);
+        }
+        if inspector_changed {
+            self.app_settings.inspector_card_visible = self.show_inspector_card;
+            self.app_settings.inspector_show_raw_velocity = self.inspector_show_raw_vel;
+            self.app_settings.inspector_show_range_azimuth = self.inspector_show_range_az;
+            self.app_settings.inspector_show_beam_height = self.inspector_show_beam;
+            self.app_settings.inspector_show_model_value = self.inspector_show_model;
+            self.app_settings.inspector_show_color_hex = self.inspector_show_hex;
+            self.app_settings.inspector_show_field_loupe = self.inspector_show_loupe;
+            self.mark_app_settings_dirty();
+        }
         ui.horizontal(|ui| {
             let was_vrot = self.vrot_tool_armed;
             ui.checkbox(&mut self.vrot_tool_armed, "Vrot tool")
@@ -28606,6 +28771,7 @@ impl ViewerApp {
                 .monospace()
                 .size(READOUT_FONT_SIZE)
         };
+        let total_width = ui.available_width();
         ui.horizontal(|ui| {
             // The loader status ("Rendering", "Refreshing", download progress)
             // changes width constantly — give it a FIXED slot so it never
@@ -28621,12 +28787,22 @@ impl ViewerApp {
             });
             let transient_status =
                 status_without_scan_duplicate(&self.status, selected_scan_prefix.as_deref());
+            let transient_width = if total_width < 720.0 {
+                120.0
+            } else if total_width < 1_050.0 {
+                170.0
+            } else {
+                230.0
+            };
             ui.add_sized(
-                [230.0, height],
+                [transient_width, height],
                 egui::Label::new(mono(transient_status)).truncate(),
-            );
+            )
+            .on_hover_text(self.status.clone());
             ui.separator();
-            if let Some(persistence) = self.settings_persistence.status_view(Instant::now()) {
+            if total_width >= 820.0
+                && let Some(persistence) = self.settings_persistence.status_view(Instant::now())
+            {
                 let color = match persistence.level {
                     settings_persistence::PersistenceNoticeLevel::Success => {
                         egui::Color32::from_rgb(108, 218, 142)
@@ -28643,7 +28819,7 @@ impl ViewerApp {
                 ui.separator();
             }
             if let Some(activity) = self.active_background_activity() {
-                match background_activity_display(&activity, &self.status) {
+                match background_activity_display_for_width(&activity, &self.status, total_width) {
                     BackgroundActivityDisplay::Full => {
                         if let Some(fraction) = activity.fraction {
                             ui.add_sized(
@@ -28671,7 +28847,7 @@ impl ViewerApp {
                         ui.separator();
                     }
                     BackgroundActivityDisplay::SpinnerOnly => {
-                        ui.spinner();
+                        ui.spinner().on_hover_text(activity.label);
                         ui.separator();
                     }
                 }
@@ -28687,11 +28863,16 @@ impl ViewerApp {
                     Some(frame) => {
                         let now_utc = Utc::now();
                         let chunk = live_chunk_readout(frame, now_utc, self.time_zone());
-                        ui.label(mono(chrome_readouts::status_bar_frame_detail(
-                            frame.status.label(),
-                            chunk.as_deref(),
-                            &frame.source_label,
-                        )))
+                        let frame_width = if total_width < 900.0 { 170.0 } else { 290.0 };
+                        ui.add_sized(
+                            [frame_width, height],
+                            egui::Label::new(mono(chrome_readouts::status_bar_frame_detail(
+                                frame.status.label(),
+                                chunk.as_deref(),
+                                &frame.source_label,
+                            )))
+                            .truncate(),
+                        )
                         .on_hover_text(frame_status_text(
                             frame,
                             now_utc,
@@ -28699,20 +28880,28 @@ impl ViewerApp {
                         ));
                     }
                     None => {
-                        ui.label(mono("No Level II frame loaded".to_owned()));
+                        ui.add_sized(
+                            [170.0, height],
+                            egui::Label::new(mono("No Level II frame loaded".to_owned()))
+                                .truncate(),
+                        );
                     }
                 }
                 ui.separator();
-                if !self.radar_layers.is_empty() {
+                if total_width >= 1_100.0 && !self.radar_layers.is_empty() {
                     ui.label(mono(format!("{} overlays", self.radar_layers.len())));
                     ui.separator();
                 }
-                ui.label(mono(format!(
-                    "{} range",
-                    units::format_distance_km(self.radar_range_km, self.units())
-                )));
-                ui.separator();
-                ui.label(mono(format!("map {:.0} px/deg", self.map_scale)));
+                if total_width >= 800.0 {
+                    ui.label(mono(format!(
+                        "{} range",
+                        units::format_distance_km(self.radar_range_km, self.units())
+                    )));
+                    ui.separator();
+                }
+                if total_width >= 980.0 {
+                    ui.label(mono(format!("map {:.0} px/deg", self.map_scale)));
+                }
                 if let Some(state) = self.cursor_state_abbr {
                     ui.separator();
                     ui.label(mono(cursor_state_status_text(state)))
@@ -31887,38 +32076,34 @@ impl ViewerApp {
     }
 
     fn poll_storm_tracks(&mut self, ctx: &egui::Context) {
+        let mut completed = Vec::new();
+        let mut worker_disconnected = false;
         if let Some(receiver) = &self.storm_cells_receiver {
-            match receiver.try_recv() {
-                Ok((key, cells)) => {
-                    self.storm_cells_receiver = None;
-                    insert_limited_frame_cache(
-                        &mut self.storm_cells_cache,
-                        &mut self.storm_cells_cache_order,
-                        key.clone(),
-                        cells.clone(),
-                        ALGO_FRAME_CACHE_LIMIT,
-                    );
-                    let current_key = self
-                        .volume
-                        .as_ref()
-                        .map(|volume| FrameWorkKey::new(volume, Arc::as_ptr(volume) as usize));
-                    if let Some(current_key) = current_key {
-                        if let Some(current_cells) =
-                            self.storm_cells_cache.get(&current_key).cloned()
-                        {
-                            self.install_storm_cells_for_frame(&current_key, &current_cells, ctx);
-                        } else if current_key == key {
-                            self.install_storm_cells_for_frame(&key, &cells, ctx);
-                        } else {
-                            self.storm_cells_volume_ptr = 0;
-                        }
-                    } else {
-                        self.storm_cells_volume_ptr = 0;
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => completed.push(result),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        worker_disconnected = true;
+                        break;
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.storm_cells_receiver = None,
             }
+        }
+        if worker_disconnected {
+            self.storm_cells_receiver = None;
+        }
+        if !completed.is_empty() {
+            for (key, cells) in completed {
+                insert_limited_frame_cache(
+                    &mut self.storm_cells_cache,
+                    &mut self.storm_cells_cache_order,
+                    key,
+                    cells,
+                    ALGO_FRAME_CACHE_LIMIT,
+                );
+            }
+            self.install_best_cached_storm_cells_for_display(ctx);
         }
         if !self.storm_tracking_active() {
             return;
@@ -31937,27 +32122,86 @@ impl ViewerApp {
             self.storm_cells_volume_ptr = 0;
         }
         let volume_ptr = Arc::as_ptr(&volume) as usize;
-        if volume_ptr == self.storm_cells_volume_ptr {
-            return;
-        }
         let key = FrameWorkKey::new(&volume, volume_ptr);
-        if let Some(cells) = self.storm_cells_cache.get(&key).cloned() {
+        if volume_ptr != self.storm_cells_volume_ptr
+            && let Some(cells) = self.storm_cells_cache.get(&key).cloned()
+        {
             self.install_storm_cells_for_frame(&key, &cells, ctx);
-            return;
         }
         if self.storm_cells_receiver.is_some() {
             return;
         }
         self.storm_cells_volume_ptr = volume_ptr;
+        let selected_is_partial = self
+            .selected_frame()
+            .is_some_and(|frame| frame.status == FrameStatus::LivePartial);
+        let mut queued_ptrs = BTreeSet::new();
+        let mut work = Vec::<(FrameWorkKey, Arc<RadarVolume>)>::new();
+        if !selected_is_partial && !self.storm_cells_cache.contains_key(&key) {
+            queued_ptrs.insert(volume_ptr);
+            work.push((key, Arc::clone(&volume)));
+        }
+        for frame in self.primary.history.iter().rev() {
+            if work.len() >= STORM_TRACK_WORK_BATCH_LIMIT {
+                break;
+            }
+            if frame.status == FrameStatus::LivePartial
+                || !frame.identity.site_id.eq_ignore_ascii_case(&volume.site.id)
+            {
+                continue;
+            }
+            let frame_ptr = Arc::as_ptr(&frame.volume) as usize;
+            let frame_key = FrameWorkKey::new(&frame.volume, frame_ptr);
+            if queued_ptrs.insert(frame_ptr) && !self.storm_cells_cache.contains_key(&frame_key) {
+                work.push((frame_key, Arc::clone(&frame.volume)));
+            }
+        }
+        if work.is_empty() {
+            return;
+        }
         let (sender, receiver) = mpsc::channel();
         self.storm_cells_receiver = Some(receiver);
         let ctx = ctx.clone();
-        let key_for_worker = key.clone();
         thread::spawn(move || {
-            let cells = identify_storm_cells(&volume);
-            let _ = sender.send((key_for_worker, cells));
-            ctx.request_repaint();
+            for (key, volume) in work {
+                let cells = identify_storm_cells(&volume);
+                if sender.send((key, cells)).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
         });
+    }
+
+    fn install_best_cached_storm_cells_for_display(&mut self, ctx: &egui::Context) -> bool {
+        let Some(volume) = self.volume.as_ref() else {
+            self.storm_cells_volume_ptr = 0;
+            return false;
+        };
+        let current_key = FrameWorkKey::new(volume, Arc::as_ptr(volume) as usize);
+        let best = if self.storm_cells_cache.contains_key(&current_key) {
+            Some(current_key)
+        } else {
+            self.primary.history.iter().rev().find_map(|frame| {
+                if frame.status == FrameStatus::LivePartial
+                    || !frame.identity.site_id.eq_ignore_ascii_case(&volume.site.id)
+                    || frame.identity.scan_time_utc > current_key.identity.scan_time_utc
+                {
+                    return None;
+                }
+                let key = FrameWorkKey::new(&frame.volume, Arc::as_ptr(&frame.volume) as usize);
+                self.storm_cells_cache.contains_key(&key).then_some(key)
+            })
+        };
+        let Some(key) = best else {
+            self.storm_cells_volume_ptr = 0;
+            return false;
+        };
+        let Some(cells) = self.storm_cells_cache.get(&key).cloned() else {
+            return false;
+        };
+        self.install_storm_cells_for_frame(&key, &cells, ctx);
+        true
     }
 
     /// Switch to a beam-ranked pick. Explicit picks always win: the
@@ -33242,15 +33486,10 @@ impl ViewerApp {
     }
 
     fn live_low_sweep_auto_advance_min_seconds(&self) -> i64 {
-        let configured = self.app_settings.live_low_sweep_auto_advance_seconds.clamp(
+        i64::from(self.app_settings.live_low_sweep_auto_advance_seconds.clamp(
             MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
             MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
-        );
-        if self.app_settings.live_low_sweep_auto_advance {
-            i64::from(MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS)
-        } else {
-            i64::from(configured)
-        }
+        ))
     }
 
     fn primary_realtime_refresh_interval(&self) -> u64 {
@@ -33585,6 +33824,57 @@ impl ViewerApp {
             });
         self.set_viewer_open(dock::WorkspacePane::Model, open);
         self.dispatch_download_events(events);
+    }
+
+    fn open_fixed_model_probe_history(&mut self, ctx: &egui::Context) {
+        let Some((lon, lat)) = self.pinned_inspector_lonlat else {
+            self.status = "Shift+click the map to place a fixed model probe first".to_owned();
+            return;
+        };
+
+        // Match the inspector card: topmost visible model layer at the fixed
+        // point wins. Fall back to the dock's current field only when its
+        // grid hash matches the shared LUT.
+        let source = self
+            .model_layers
+            .iter()
+            .rev()
+            .filter(|slot| slot.layer.visible)
+            .find_map(|slot| {
+                slot.layer
+                    .lut
+                    .lookup(lat, lon)
+                    .is_some()
+                    .then(|| (slot.layer.field.clone(), slot.layer.lut.clone()))
+            })
+            .or_else(|| {
+                let (grid_hash, lut) = self.model_lut.as_ref()?;
+                let field = self.model_dock.as_ref()?.latest_field()?.clone();
+                field
+                    .grid
+                    .as_ref()
+                    .is_some_and(|grid| &grid.hash == grid_hash)
+                    .then(|| (field, lut.clone()))
+            });
+        let Some((field, lut)) = source else {
+            self.status =
+                "No loaded model field covers the fixed probe; add a model field to the map first"
+                    .to_owned();
+            return;
+        };
+
+        self.model_enabled = true;
+        self.ensure_model_data_dock(ctx);
+        let result = self
+            .model_dock
+            .as_mut()
+            .expect("model dock was just ensured")
+            .open_probe_history(lat, lon, field, lut);
+        match result {
+            Ok(label) => self.status = format!("Opened {label}"),
+            Err(error) => self.status = format!("Model history: {error}"),
+        }
+        ctx.request_repaint();
     }
 
     fn wrf_window(&mut self, ctx: &egui::Context) {
@@ -40511,6 +40801,12 @@ impl ViewerApp {
     }
 
     fn start_storm_track_follow(&mut self, hit: StormTrackHit, ctx: &egui::Context) {
+        let detail = self
+            .storm_tracker
+            .tracks
+            .iter()
+            .find(|track| track.id == hit.track_id)
+            .and_then(|track| storm_track_detail_text(track, self.time_zone()));
         self.event_explorer.camera_follow = None;
         self.manual_camera_path.follow = false;
         let follow = StormTrackFollow {
@@ -40518,12 +40814,14 @@ impl ViewerApp {
             lead: self.storm_follow_lead,
         };
         self.storm_track_follow = Some(follow);
-        self.status =
-            if let Some(label) = self.apply_storm_track_camera_follow_for_current_frame(ctx) {
-                label
-            } else {
-                format!("following storm #{}", hit.track_id)
-            };
+        self.sidebar_tab = SidebarTab::Radar;
+        self.set_section_open("radar_algorithms", true);
+        let follow_label = self
+            .apply_storm_track_camera_follow_for_current_frame(ctx)
+            .unwrap_or_else(|| format!("following storm #{}", hit.track_id));
+        self.status = detail
+            .map(|detail| format!("{follow_label} · {detail}"))
+            .unwrap_or(follow_label);
         ctx.request_repaint();
     }
 
@@ -42842,6 +43140,28 @@ fn format_lat_lon(lat: f32, lon: f32) -> String {
     format!("{:.3}{}, {:.3}{}", lat.abs(), ns, lon.abs(), ew)
 }
 
+/// Compact provenance for a model value pinned on the map. Exact-time store
+/// metadata wins; recognized legacy operational runs retain their established
+/// init + forecast-hour contract. Opaque legacy/local runs deliberately stop
+/// at their stored hour label instead of fabricating a valid timestamp.
+fn format_model_probe_context(hour: &rw_ui::HourKey) -> String {
+    let prefix = format!(
+        "{} · {} · {}",
+        hour.model.to_uppercase(),
+        hour.run,
+        hour.lead_label()
+    );
+    model_sounding_valid_time_utc(hour).map_or_else(
+        || prefix.clone(),
+        |valid| {
+            format!(
+                "{prefix} · valid {}",
+                rw_ui::format_valid_unix(valid.timestamp())
+            )
+        },
+    )
+}
+
 /// `#RRGGBB` card line for a sampled color, with a 3-space gutter reserved for
 /// the color chip drawn over it.
 fn hex_rgb_line(rgba: [u8; 4]) -> String {
@@ -43736,6 +44056,23 @@ fn event_loop_hazard_record_intersects_window(
         return false;
     };
     start <= end_utc && end >= start_utc
+}
+
+fn retain_timeline_preview_records(
+    preview: &mut HazardOverlay,
+    existing: &HazardOverlay,
+    (start_utc, end_utc): (DateTime<Utc>, DateTime<Utc>),
+) {
+    preview.records.extend(
+        existing
+            .records
+            .iter()
+            .filter(|record| event_loop_hazard_record_intersects_window(record, start_utc, end_utc))
+            .cloned(),
+    );
+    dedupe_hazard_records(&mut preview.records);
+    sort_hazard_records(&mut preview.records);
+    preview.polygon_records = preview.records.len();
 }
 
 fn event_loop_hazard_record_valid_at(record: &HazardRecord, time_utc: DateTime<Utc>) -> bool {
@@ -54800,14 +55137,46 @@ mod tests {
         app.app_settings.live_low_sweep_auto_advance_seconds = 30;
         assert_eq!(app.live_low_sweep_auto_advance_min_seconds(), 30);
 
-        app.app_settings.live_low_sweep_auto_advance_seconds = 10;
-        assert_eq!(app.live_low_sweep_auto_advance_min_seconds(), 10);
-
         app.app_settings.live_low_sweep_auto_advance = true;
+        assert_eq!(app.live_low_sweep_auto_advance_min_seconds(), 30);
+
+        app.app_settings.live_low_sweep_auto_advance_seconds = 0;
         assert_eq!(
             app.live_low_sweep_auto_advance_min_seconds(),
             i64::from(MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS)
         );
+        app.app_settings.live_low_sweep_auto_advance_seconds = u16::MAX;
+        assert_eq!(
+            app.live_low_sweep_auto_advance_min_seconds(),
+            i64::from(MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS)
+        );
+    }
+
+    #[test]
+    fn disabled_live_low_sweep_auto_advance_keeps_selected_cut_when_new_cut_arrives() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.live_low_sweep_auto_advance = false;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        app.volume = Some(Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            720,
+        )));
+        let next = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (0.5, 90_000)],
+            720,
+        ));
+
+        app.install_volume_arc(
+            next,
+            None,
+            false,
+            None,
+            FrameStatus::LivePartial,
+            &egui::Context::default(),
+        );
+
+        assert_eq!(app.selected_cut, 0);
     }
 
     #[test]
@@ -63131,6 +63500,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recent_cache_action_only_targets_the_selected_us_primary() {
+        assert!(selected_us_cache_action_allowed(true, false, false));
+        assert!(
+            !selected_us_cache_action_allowed(false, false, false),
+            "an independent pane must not expose the primary site's cache"
+        );
+        assert!(
+            !selected_us_cache_action_allowed(true, true, false),
+            "an international primary owner must hide the stale US cache target"
+        );
+        assert!(
+            !selected_us_cache_action_allowed(true, false, true),
+            "an armed custom poll must hide the stale US cache target"
+        );
+    }
+
     /// Field report (v0.29.0-alpha.2): load a Euro archive, then map-click
     /// a US site — the radar switched but the player, Event Loop Builder,
     /// and Load Latest all still targeted the Euro site, because only the
@@ -68583,6 +68969,44 @@ mod tests {
     }
 
     #[test]
+    fn archive_hazard_preview_retains_visible_record_until_final_source_lands() {
+        let window = (
+            Utc.with_ymd_and_hms(2026, 7, 14, 20, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 14, 21, 0, 1).unwrap(),
+        );
+        let mut existing = test_hazard_record(
+            "KSGF.FF.W.0012",
+            "FFW 0012",
+            "flash flood",
+            square_hazard_points(-1.0, -1.0, 0.0, 0.0),
+        );
+        existing.valid_start = Some("2026-07-14T20:10:00Z".to_owned());
+        existing.valid_end = Some("2026-07-14T20:50:00Z".to_owned());
+        let preview = test_hazard_record(
+            "KSGF.TO.W.0045",
+            "TOR 0045",
+            "tornado",
+            square_hazard_points(0.0, 0.0, 1.0, 1.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![existing]);
+        app.pending_event_loop_hazard_window = Some(window);
+
+        assert!(app.install_hazard_result(Ok(test_hazard_overlay(vec![preview])), true));
+
+        let records = &app.hazard_overlay.as_ref().unwrap().records;
+        assert!(
+            records
+                .iter()
+                .any(|record| record.event_id == "KSGF.FF.W.0012")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.event_id == "KSGF.TO.W.0045")
+        );
+    }
+
+    #[test]
     fn archive_hazard_final_replaces_preview_and_completes_window() {
         let preview = test_hazard_record(
             "KSGF.SV.W.0324",
@@ -70078,6 +70502,47 @@ mod tests {
         assert_eq!(format_lat_lon(39.322, -83.959), "39.322N, 83.959W");
         assert_eq!(format_lat_lon(-33.865, 151.209), "33.865S, 151.209E");
         assert_eq!(format_lat_lon(0.0, 0.0), "0.000N, 0.000E");
+    }
+
+    #[test]
+    fn model_probe_context_reports_exact_lead_and_valid_time() {
+        let valid = Utc.with_ymd_and_hms(2026, 8, 2, 15, 20, 0).unwrap();
+        let hour = rw_ui::HourKey {
+            model: "wrf".to_owned(),
+            run: "local_wrf_20260802_151500".to_owned(),
+            hour: 1,
+            exact_time: Some(rw_store::RwsExactTime::new(300, valid.timestamp())),
+        };
+
+        assert_eq!(
+            format_model_probe_context(&hour),
+            "WRF · local_wrf_20260802_151500 · +00:05:00 · valid 2026-08-02 15:20:00Z"
+        );
+    }
+
+    #[test]
+    fn model_probe_context_derives_only_authoritative_legacy_times() {
+        let operational = rw_ui::HourKey {
+            model: "hrrr".to_owned(),
+            run: "20260802_12z".to_owned(),
+            hour: 3,
+            exact_time: None,
+        };
+        assert_eq!(
+            format_model_probe_context(&operational),
+            "HRRR · 20260802_12z · f003 · valid 2026-08-02 15:00:00Z"
+        );
+
+        let opaque = rw_ui::HourKey {
+            model: "wrf".to_owned(),
+            run: "local_wrf_unknown_time".to_owned(),
+            hour: 3,
+            exact_time: None,
+        };
+        assert_eq!(
+            format_model_probe_context(&opaque),
+            "WRF · local_wrf_unknown_time · f003"
+        );
     }
 
     #[test]
@@ -71999,6 +72464,8 @@ mod tests {
     #[test]
     fn inspector_pin_uses_extra_grid_pane_geometry() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.show_inspector_card = false;
+        app.inspector_show_model = false;
         app.map_center_lon = -97.0;
         app.map_center_lat = 35.0;
         app.map_scale = 500.0;
@@ -72013,10 +72480,19 @@ mod tests {
         let (lon, lat) = app.pinned_inspector_lonlat.expect("pin set");
         assert!((lon - expected.0).abs() < 0.001);
         assert!((lat - expected.1).abs() < 0.001);
+        assert!(app.show_inspector_card, "placing a probe must reveal it");
+        assert!(
+            app.inspector_show_model,
+            "placing a probe while Models is enabled must expose the model value"
+        );
+        assert!(app.app_settings.inspector_card_visible);
+        assert!(app.app_settings.inspector_show_model_value);
+        assert!(app.status.starts_with("Fixed model probe at "));
 
         app.toggle_inspector_pin(extra_cell, pointer);
 
         assert!(app.pinned_inspector_lonlat.is_none());
+        assert_eq!(app.status, "Released fixed map probe");
     }
 
     #[test]
@@ -72861,6 +73337,20 @@ mod tests {
         );
         assert_eq!(
             background_activity_display(&spinner, "Another status"),
+            BackgroundActivityDisplay::Full
+        );
+    }
+
+    #[test]
+    fn narrow_status_bar_compacts_independent_background_text() {
+        let activity = BackgroundActivity::indeterminate("Refreshing warning archive");
+
+        assert_eq!(
+            background_activity_display_for_width(&activity, "Loading radar", 900.0),
+            BackgroundActivityDisplay::SpinnerOnly
+        );
+        assert_eq!(
+            background_activity_display_for_width(&activity, "Loading radar", 1_200.0),
             BackgroundActivityDisplay::Full
         );
     }

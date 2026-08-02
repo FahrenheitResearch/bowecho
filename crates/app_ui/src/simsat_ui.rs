@@ -34,7 +34,7 @@ use simsat::store_out::{self, IrFrame, VisibleFrame};
 use simsat::thermal_sensor::ThermalSensor;
 use simsat::wv::WvBand;
 
-use crate::sat_plot::{SatellitePlotPalette, SatellitePlotSource};
+use crate::sat_plot::{SatellitePlotPalette, SatellitePlotSource, prompt_png_export};
 use crate::simsat_hrrr::{HrrrNativeSpec, discover_native_files, download_native, latest_specs};
 use crate::simsat_store::{DerivedFrame, write_derived_frame};
 
@@ -1900,6 +1900,29 @@ impl SimSatPane {
                     match payload.to_plot_source() {
                         Ok(source) => actions.push(SimSatAction::OpenPlot(source)),
                         Err(error) => self.error = Some(format!("Could not open plot: {error}")),
+                    }
+                }
+                let save = ui
+                    .add_enabled(
+                        self.last_plot.is_some()
+                            && cfg!(any(windows, target_os = "macos", target_os = "linux")),
+                        egui::Button::new("Save plot PNG"),
+                    )
+                    .on_hover_text(
+                        "Export the latest SimSat result as the same georeferenced 1600x1200 PNG \
+                         used by Native plot.",
+                    );
+                if save.clicked()
+                    && let Some(payload) = &self.last_plot
+                {
+                    match payload.to_plot_source() {
+                        Ok(source) => {
+                            if let Some(status) = prompt_png_export(&source, "Save SimSat plot PNG")
+                            {
+                                self.status = status;
+                            }
+                        }
+                        Err(error) => self.error = Some(format!("Could not export plot: {error}")),
                     }
                 }
             });
