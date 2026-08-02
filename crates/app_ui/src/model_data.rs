@@ -2719,6 +2719,40 @@ impl ModelDataDock {
         serde_json::to_value(self.color_tables.settings()).unwrap_or(serde_json::Value::Null)
     }
 
+    /// Versioned durable state for the native model-map popout. Runtime
+    /// textures/timings and the current run's auto-selected domain are never
+    /// persisted; reviewed render settings and explicitly saved domains are.
+    pub fn native_plot_state_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "settings": self.plot_viewer.settings_json(),
+            "saved_domains": self.plot_viewer.saved_domains(),
+        })
+    }
+
+    /// Restore native-popout presentation state from settings. Older direct
+    /// settings snapshots (without the BowEcho wrapper) remain accepted.
+    pub fn apply_native_plot_state_json(&mut self, value: &serde_json::Value) -> bool {
+        let settings = value.get("settings").unwrap_or(value);
+        let mut applied = self.plot_viewer.apply_settings_json(settings);
+        if let Some(saved) = value.get("saved_domains")
+            && let Ok(domains) = serde_json::from_value::<Vec<CustomDomain>>(saved.clone())
+        {
+            self.plot_viewer.set_saved_domains(domains);
+            applied = true;
+        }
+        applied
+    }
+
+    /// Return a durable snapshot only after an applied Rerender/settings
+    /// change or saved-domain edit. Draft controls intentionally do not leak
+    /// into persisted state until the user applies them.
+    pub fn take_native_plot_state_if_dirty(&mut self) -> Option<serde_json::Value> {
+        let settings_changed = self.plot_viewer.take_settings_changed();
+        let domains_changed = self.plot_viewer.take_saved_domains_changed();
+        (settings_changed || domains_changed).then(|| self.native_plot_state_json())
+    }
+
     /// Restore persisted color-table overrides: load them into the editor and
     /// push them to the store worker so field palettes resolve through them.
     /// Returns false on malformed JSON (older/newer schema) — left at defaults.
@@ -6964,6 +6998,52 @@ mod tests {
         dock.set_plot_domain_armed(true);
         assert!(dock.plot_domain_armed());
         assert!(!dock.box_sounding_armed());
+    }
+
+    #[test]
+    fn native_plot_settings_and_saved_domains_round_trip_only_after_apply() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+        let saved = serde_json::json!({
+            "version": 1,
+            "settings": {
+                "map_detail": "broad",
+                "show_states": true,
+                "show_counties": false,
+                "line_width_percent": 175,
+                "sampling": "pixel_exact",
+                "plot_style": "operational",
+                "render_scale": "two"
+            },
+            "saved_domains": [{
+                "name": "Great Lakes",
+                "bounds": [-93.0, -75.0, 40.0, 49.0],
+                "rotation_deg": 0.0
+            }]
+        });
+
+        assert!(dock.apply_native_plot_state_json(&saved));
+        assert!(dock.take_native_plot_state_if_dirty().is_none());
+        assert_eq!(dock.plot_viewer.saved_domains().len(), 1);
+        assert_eq!(
+            dock.native_plot_state_json()["settings"]["map_detail"],
+            "broad"
+        );
+        assert_eq!(
+            dock.native_plot_state_json()["settings"]["line_width_percent"],
+            175
+        );
+
+        dock.plot_viewer.rerender();
+        let applied = dock
+            .take_native_plot_state_if_dirty()
+            .expect("Rerender marks the applied native-map state dirty");
+        assert_eq!(applied["saved_domains"][0]["name"], "Great Lakes");
+        assert!(dock.take_native_plot_state_if_dirty().is_none());
+
+        let mut restored = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+        assert!(restored.apply_native_plot_state_json(&applied));
+        assert_eq!(restored.native_plot_state_json(), applied);
     }
 
     #[test]

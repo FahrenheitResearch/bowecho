@@ -812,6 +812,12 @@ pub struct AppSettings {
     /// serialized). Kept opaque here for the same reason as the sounding state.
     #[serde(default)]
     pub model_style_overrides: Option<serde_json::Value>,
+    /// Native model-map popout state (map detail/layers, sampling, plot style,
+    /// line styling, output scale, and saved domains). The app-ui/rw-ui side
+    /// owns the versioned schema; settings keeps it opaque so the renderer can
+    /// evolve without coupling this crate to its UI types.
+    #[serde(default)]
+    pub model_native_plot_state: Option<serde_json::Value>,
     /// Last-used WRF "full diagnostics" processing selection (which product
     /// groups + optional only/skip field filters). Opaque JSON built by
     /// app_ui's model dock, kept UI-crate-free here like the two states above.
@@ -1323,6 +1329,7 @@ impl Default for AppSettings {
             workspace_layout: None,
             sounding_view_state: None,
             model_style_overrides: None,
+            model_native_plot_state: None,
             wrf_process_options: None,
             wrf_synth_radar: None,
             formula_lab_state: None,
@@ -2924,6 +2931,25 @@ mod tests {
         assert_eq!(back, s);
         // Older configs simply restore the Formula Lab starter draft.
         assert_eq!(AppSettings::from_json("{}").formula_lab_state, None);
+    }
+
+    #[test]
+    fn model_native_plot_state_round_trips_as_opaque_json() {
+        let s = AppSettings {
+            model_native_plot_state: Some(serde_json::json!({
+                "version": 1,
+                "map_detail": "auto",
+                "plot_style": "operational_fast",
+                "show_states": true,
+                "line_opacity": 0.9,
+                "saved_domains": []
+            })),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back, s);
+        // Older configs restore the native plotter's reviewed defaults.
+        assert_eq!(AppSettings::from_json("{}").model_native_plot_state, None);
     }
 
     #[test]

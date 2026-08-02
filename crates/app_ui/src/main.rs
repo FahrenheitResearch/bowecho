@@ -21738,6 +21738,9 @@ impl eframe::App for ViewerApp {
         if let Some(dock) = self.model_dock.as_mut() {
             dock.auxiliary_windows(&ctx);
         }
+        // Native-map settings are staged in the floating plot and become
+        // durable only when Rerender applies them (or a saved domain changes).
+        self.persist_model_native_plot_state();
         self.apply_cm1_window_requests();
         self.vwp_window(&ctx);
         self.radar_overlays_window(&ctx);
@@ -21895,6 +21898,7 @@ impl eframe::App for ViewerApp {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.persist_sounding_view_state();
         self.persist_model_style_overrides();
+        self.persist_model_native_plot_state();
         self.persist_wrf_process_options();
         self.persist_wrf_synth_radar();
         self.persist_formula_lab_state();
@@ -29534,6 +29538,23 @@ impl ViewerApp {
         }
     }
 
+    /// Persist only applied native-map settings. The popout owns a staged
+    /// draft, so closing the app before Rerender deliberately keeps the last
+    /// rendered configuration rather than silently applying half-edited UI.
+    fn persist_model_native_plot_state(&mut self) {
+        let Some(value) = self
+            .model_dock
+            .as_mut()
+            .and_then(model_data::ModelDataDock::take_native_plot_state_if_dirty)
+        else {
+            return;
+        };
+        if self.app_settings.model_native_plot_state.as_ref() != Some(&value) {
+            self.app_settings.model_native_plot_state = Some(value);
+            self.mark_app_settings_dirty();
+        }
+    }
+
     /// Persist the WRF full-diagnostics processing selection when it changes,
     /// so the chosen product groups / field filters survive restarts (same
     /// opaque-JSON pattern as the sounding and style states).
@@ -33715,6 +33736,9 @@ impl ViewerApp {
         }
         if let Some(value) = self.app_settings.model_style_overrides.as_ref() {
             dock.apply_style_overrides_json(value);
+        }
+        if let Some(value) = self.app_settings.model_native_plot_state.as_ref() {
+            dock.apply_native_plot_state_json(value);
         }
         if let Some(value) = self.app_settings.wrf_process_options.as_ref() {
             dock.apply_wrf_process_options_json(value);
