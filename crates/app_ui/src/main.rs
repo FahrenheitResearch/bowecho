@@ -54968,8 +54968,9 @@ mod tests {
     }
 
     #[test]
-    fn synced_velocity_pane_advances_to_newer_low_level_revisit() {
+    fn synced_velocity_pane_advances_to_newer_low_level_revisit_when_enabled() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.live_low_sweep_auto_advance = true;
         app.volume = Some(Arc::new(test_velocity_sails_volume_with_radials(
             &[(0.5, 0)],
             720,
