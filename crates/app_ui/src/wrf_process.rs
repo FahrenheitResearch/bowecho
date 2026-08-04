@@ -480,6 +480,12 @@ fn process_paths(
     let mut written = Vec::<WrittenHour>::new();
     let mut all_vars = Vec::<String>::new();
     let mut all_notes = Vec::<String>::new();
+    if let Ok(metadata) = crate::wrf_source::WrfRunSourceMetadata::inspect(&files[0])
+        && let Err(error) =
+            crate::wrf_source::write_run_metadata(store_root, &model, &run, metadata)
+    {
+        all_notes.push(format!("WRF source metadata was not saved: {error}"));
+    }
 
     for path in &files {
         if written.len() > u16::MAX as usize {
@@ -719,6 +725,12 @@ fn process_scene_group_exact_with_commit(
     let mut all_notes = Vec::<String>::new();
     let mut files_seen = BTreeSet::<PathBuf>::new();
     let mut previous_precipitation = None::<(i64, Vec<f32>)>;
+    let source_metadata = crate::wrf_source::WrfRunSourceMetadata::from_scene_group(group);
+    if let Err(error) =
+        crate::wrf_source::write_run_metadata(store_root, &model, run, source_metadata)
+    {
+        all_notes.push(format!("WRF source metadata was not saved: {error}"));
+    }
 
     for (index, scene) in group.scenes.iter().enumerate() {
         if !group.key.is_compatible(scene) {
@@ -1893,7 +1905,8 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
     use app_ui::wrf_scene_inventory::{
-        WrfDomainId, WrfGridSignature, WrfRunDomain, WrfRunId, WrfSourceIdentity,
+        WrfDomainId, WrfGridSignature, WrfProducerIdentity, WrfRunDomain, WrfRunId,
+        WrfSourceIdentity,
     };
 
     #[test]
@@ -1943,6 +1956,7 @@ mod tests {
                 "test-grid",
                 42,
             ),
+            producer: WrfProducerIdentity::Wrf,
             source_identity: WrfSourceIdentity("test:second-slot".to_owned()),
             time: WrfSceneTime::InternalTimes {
                 valid_time,

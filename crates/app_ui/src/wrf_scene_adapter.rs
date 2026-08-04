@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use wrf_core::WrfFile;
 
 use crate::wrf_scene_inventory::{
-    WrfDomainId, WrfGridSignature, WrfRunDomain, WrfRunId, WrfScene, WrfSceneGroup,
-    WrfSceneInventory, WrfSceneTime, WrfSourceIdentity, parse_wrf_domain_id,
+    WrfDomainId, WrfGridSignature, WrfProducerIdentity, WrfRunDomain, WrfRunId, WrfScene,
+    WrfSceneGroup, WrfSceneInventory, WrfSceneTime, WrfSourceIdentity, parse_wrf_domain_id,
 };
 
 const SOURCE_PREFIX_BYTES: u64 = 64 * 1024;
@@ -39,7 +39,7 @@ pub struct InventoriedWrfPaths {
 }
 
 /// Inventory every selected WRF scene without requiring all inputs to share
-/// one run/domain/grid. Callers that can isolate work per compatible group
+/// one run/domain/grid/producer. Callers that can isolate work per compatible group
 /// (the headless renderer and forecast watcher) use this entry point; the GUI
 /// simulated-radar path retains [`inventory_selected_wrf_paths`] below.
 pub fn inventory_wrf_paths(paths: &[PathBuf]) -> Result<InventoriedWrfPaths, String> {
@@ -56,6 +56,7 @@ pub fn inventory_wrf_paths(paths: &[PathBuf]) -> Result<InventoriedWrfPaths, Str
         let run = run_identity(&file, path);
         let domain = domain_identity(&file, path)?;
         let grid_signature = grid_signature(&file)?;
+        let producer = producer_identity(&file);
         let times = file.times().unwrap_or_default();
         if times.len() != file.nt {
             notes.push(WrfInventoryNote {
@@ -91,6 +92,7 @@ pub fn inventory_wrf_paths(paths: &[PathBuf]) -> Result<InventoriedWrfPaths, Str
                     domain,
                 },
                 grid_signature: grid_signature.clone(),
+                producer: producer.clone(),
                 source_identity: source_identity.clone(),
                 time,
             });
@@ -104,8 +106,13 @@ pub fn inventory_wrf_paths(paths: &[PathBuf]) -> Result<InventoriedWrfPaths, Str
     })
 }
 
-/// Inventory selected WRF files and require one compatible run/domain/grid.
-/// Mixed d01/d02 selections, remeshed files, duplicate/restart times, and
+fn producer_identity(file: &WrfFile) -> WrfProducerIdentity {
+    let version = file.global_attr_str("GPUWM_VERSION").ok();
+    WrfProducerIdentity::from_gpuwm_version(version.as_deref())
+}
+
+/// Inventory selected WRF files and require one compatible run/domain/grid/producer.
+/// Mixed d01/d02 or ArWen/other-WRF selections, remeshed files, duplicate/restart times, and
 /// untimed scenes are surfaced as errors rather than silently merged.
 pub fn inventory_selected_wrf_paths(paths: &[PathBuf]) -> Result<SelectedWrfScenes, String> {
     let InventoriedWrfPaths { inventory, notes } = inventory_wrf_paths(paths)?;
@@ -117,7 +124,7 @@ pub fn inventory_selected_wrf_paths(paths: &[PathBuf]) -> Result<SelectedWrfScen
             .collect::<Vec<_>>()
             .join("; ");
         return Err(format!(
-            "Selected WRF files contain {} incompatible run/domain/grid groups ({groups}). Build one simulated-radar loop per compatible domain.",
+            "Selected WRF files contain {} incompatible run/domain/grid/producer groups ({groups}). Build one simulated-radar loop per compatible domain and producer.",
             inventory.groups.len()
         ));
     }
@@ -338,7 +345,8 @@ fn hex(bytes: &[u8]) -> String {
 
 fn group_description(group: &WrfSceneGroup) -> String {
     format!(
-        "run {} {} {}x{}x{} ({} scene(s))",
+        "{} run {} {} {}x{}x{} ({} scene(s))",
+        group.key.producer.display_label(),
         group.key.run_domain.run.0,
         group.key.run_domain.domain.label(),
         group.key.grid_signature.nx,

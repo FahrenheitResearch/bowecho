@@ -222,6 +222,12 @@ fn import_paths_with_commit(
     let mut all_vars = Vec::new();
     let mut written = Vec::<WrittenHour>::new();
     let mut notes = Vec::<String>::new();
+    if let Ok(metadata) = crate::wrf_source::WrfRunSourceMetadata::inspect(&files[0])
+        && let Err(error) =
+            crate::wrf_source::write_run_metadata(store_root, &model, &run, metadata)
+    {
+        notes.push(format!("WRF source metadata was not saved: {error}"));
+    }
     for (index, path) in files.iter().enumerate() {
         let hour = u16::try_from(index).expect("bounded above");
         // Every stage line carries the file position, so a folder import reads

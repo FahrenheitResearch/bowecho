@@ -58,7 +58,7 @@ pub const READOUT_FONT_SIZE: f32 = 11.0;
 // THEME PASS (ui-refresh-plan §4): the chrome ramp + accent + status colors.
 // Built as TWO candidates for an owner A/B; the owner liked both, so both
 // ship as a user setting (Settings > Display > Theme, persisted as
-// `AppSettings.ui_theme`, applied live via [`set_active_theme`] +
+// `AppSettings.ui_theme`, applied live via [`apply_persisted_theme`] +
 // re-running `configure_style`):
 //
 //   "Slate" (default): near-black blue-grey ramp, the current cyan-family
@@ -226,6 +226,17 @@ pub fn set_active_theme(choice: ThemeChoice) {
     ACTIVE_THEME.store(choice as u8, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Restore BowEcho's persisted chrome palette and keep egui on its dark style
+/// branch. Both shipped palettes are dark themes; leaving egui's independent
+/// preference at its `System` default lets the first Windows theme event
+/// switch to egui's untouched light style after startup configuration ran.
+pub fn apply_persisted_theme(ctx: &eframe::egui::Context, slug: &str) -> ThemeChoice {
+    let choice = ThemeChoice::from_slug(slug);
+    set_active_theme(choice);
+    ctx.set_theme(eframe::egui::Theme::Dark);
+    choice
+}
+
 pub fn active_theme_choice() -> ThemeChoice {
     match ACTIVE_THEME.load(std::sync::atomic::Ordering::Relaxed) {
         1 => ThemeChoice::Graphite,
@@ -361,6 +372,19 @@ mod tests {
         assert_eq!(ThemeChoice::from_slug(""), ThemeChoice::Slate);
         assert_eq!(ThemeChoice::from_slug("neon"), ThemeChoice::Slate);
         assert_eq!(ThemeChoice::default(), ThemeChoice::Slate);
+    }
+
+    #[test]
+    fn feedback_v03412_theme_startup_selection_overrides_system_light_branch() {
+        let ctx = eframe::egui::Context::default();
+        // Reproduce a light Windows preference before applying the persisted
+        // BowEcho palette. Startup must still select BowEcho's dark branch.
+        ctx.set_theme(eframe::egui::Theme::Light);
+
+        let selected = apply_persisted_theme(&ctx, "graphite");
+
+        assert_eq!(selected, ThemeChoice::Graphite);
+        assert_eq!(ctx.theme(), eframe::egui::Theme::Dark);
     }
 
     /// The two choices map to the two distinct palettes (a copy-paste slip

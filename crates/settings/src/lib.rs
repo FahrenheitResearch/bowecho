@@ -491,6 +491,9 @@ pub struct AppSettings {
     /// Include the sampled color swatch and hexadecimal RGB value.
     #[serde(default = "default_true")]
     pub inspector_show_color_hex: bool,
+    /// Include latitude/longitude on the floating inspector card.
+    #[serde(default = "default_true")]
+    pub inspector_show_coordinates: bool,
     /// Keep the field loupe visible without requiring the Shift key.
     #[serde(default)]
     pub inspector_show_field_loupe: bool,
@@ -1261,6 +1264,7 @@ impl Default for AppSettings {
             inspector_show_beam_height: true,
             inspector_show_model_value: true,
             inspector_show_color_hex: true,
+            inspector_show_coordinates: true,
             inspector_show_field_loupe: false,
             gate_filter_decidbz: None,
             model_keep_runs: default_model_keep_runs(),
@@ -2503,7 +2507,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_theme_defaults_to_empty_and_round_trips() {
+    fn feedback_v03412_theme_legacy_default_and_json_round_trip() {
         // Older configs have no ui_theme key: empty reads as the slate
         // default at use sites (app_ui/ui_theme.rs ThemeChoice::from_slug).
         assert_eq!(AppSettings::from_json("{}").ui_theme, "");
@@ -2990,6 +2994,7 @@ mod tests {
         assert!(defaults.inspector_show_beam_height);
         assert!(defaults.inspector_show_model_value);
         assert!(defaults.inspector_show_color_hex);
+        assert!(defaults.inspector_show_coordinates);
         assert!(!defaults.inspector_show_field_loupe);
 
         let settings = AppSettings {
@@ -2999,6 +3004,7 @@ mod tests {
             inspector_show_beam_height: false,
             inspector_show_model_value: false,
             inspector_show_color_hex: false,
+            inspector_show_coordinates: false,
             inspector_show_field_loupe: true,
             ..Default::default()
         };
@@ -3009,6 +3015,7 @@ mod tests {
         assert!(!back.inspector_show_beam_height);
         assert!(!back.inspector_show_model_value);
         assert!(!back.inspector_show_color_hex);
+        assert!(!back.inspector_show_coordinates);
         assert!(back.inspector_show_field_loupe);
     }
 

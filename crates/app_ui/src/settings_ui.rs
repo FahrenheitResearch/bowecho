@@ -776,7 +776,7 @@ impl ViewerApp {
                 && option != current
             {
                 self.app_settings.ui_theme = option.as_slug().to_owned();
-                ui_theme::set_active_theme(option);
+                ui_theme::apply_persisted_theme(ctx, &self.app_settings.ui_theme);
                 // Rebuild the egui style document — theme() feeds
                 // configure_style, per-frame accessors pick it up anyway.
                 configure_style(ctx, &self.app_settings);

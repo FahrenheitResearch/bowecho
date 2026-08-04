@@ -421,10 +421,10 @@ pub struct HimawariIrWindowSpec {
 /// the Kelvin BT through the worker's CURRENT IR enhancement, and write the
 /// result as a baked three-plane `_rgb_` frame.
 ///
-/// Why baked: the app's run-key display filter admits GOES runs
-/// unconditionally only for `_rgb_` (baked three-plane) run families, and
-/// the store contract "`_rgb_` in the run name ⇔ the frame holds
-/// `rgb_r/g/b` planes" must hold. The cost is that the enhancement is
+/// Why baked: the store contract "`_rgb_` in the run name ⇔ the frame
+/// holds `rgb_r/g/b` planes" must hold. Its exact run identity is admitted
+/// when the one-shot ingest completes rather than through the scalar-band
+/// saved-run filter. The cost is that the enhancement is
 /// fixed at ingest time — switching the IR-enhancement picker later
 /// recolors single-band BT frames but not these; press the card button
 /// again to bake the new curve.
@@ -692,31 +692,19 @@ const BAND_NAMES: [&str; 16] = [
     "CO2 Longwave 13.3 µm",
 ];
 
-/// Layer picker entries: every ABI band, then every RGB composite (a
-/// composite follow ingests its required bands; each band run plays in
-/// the frame player).
+/// Products the live-follow player can render directly: the 16 scalar ABI
+/// bands. RGB recipes use the adjacent `Load RGB` control, which fetches,
+/// co-registers, and stores one baked composite frame. Offering those recipes
+/// here was misleading because Follow downloaded their component bands and
+/// then played the raw bands rather than the named RGB product.
 pub fn layer_options() -> Vec<SatLayerOption> {
-    let mut options: Vec<SatLayerOption> = (1u8..=16)
+    (1u8..=16)
         .map(|band| SatLayerOption {
             slug: format!("c{band:02}"),
             label: format!("C{band:02} · {}", BAND_NAMES[usize::from(band - 1)]),
             note: String::new(),
         })
-        .collect();
-    for style in GoesAbiRgbCompositeStyle::ALL {
-        let bands = style
-            .required_channels()
-            .iter()
-            .map(|band| format!("C{band:02}"))
-            .collect::<Vec<_>>()
-            .join("+");
-        options.push(SatLayerOption {
-            slug: style.slug().to_string(),
-            label: format!("RGB · {}", style.title()),
-            note: format!("follows {bands}; each band run plays in the player"),
-        });
-    }
-    options
+        .collect()
 }
 
 /// The RGB composite styles offered by the one-shot true-color ingest, as
@@ -1758,12 +1746,13 @@ fn render_sat_pixels(
         };
         for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
             let [r, g, b, a] = anchor_color(value, static_anchors);
-            let alpha = if map_overlay && ir_band {
-                bt_overlay_alpha(value)
-            } else {
-                a
-            };
-            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
+            // A valid satellite sample is coverage, not a cloud-presence
+            // mask. The old map-only BT fade made every warm/clear IR pixel
+            // transparent and left only sparse cold speckles, which looked
+            // like a broken layer and made most of the scene impossible to
+            // inspect. Preserve the production palette's source alpha here;
+            // the map layer's existing opacity control owns radar blending.
+            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
         }
     }
     (pixels, false)
@@ -1801,7 +1790,7 @@ fn render_ahi_legacy_stretch(
     nx: usize,
     ny: usize,
     flip_rows: bool,
-    map_overlay: bool,
+    _map_overlay: bool,
 ) -> Vec<Color32> {
     let Some((lo, hi)) = finite_percentile_range(values, 0.02, 0.98) else {
         return vec![Color32::TRANSPARENT; nx * ny];
@@ -1822,13 +1811,8 @@ fn render_ahi_legacy_stretch(
             // colorful part of the enhancement.
             let norm = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
             let pseudo_k = DYN_COLD_K + norm * (DYN_WARM_K - DYN_COLD_K);
-            let [r, g, b, _] = anchor_color(pseudo_k, ENHANCED_IR);
-            let alpha = if map_overlay {
-                ((1.0 - norm) * 235.0) as u8 // cold=opaque, warm=clear
-            } else {
-                255
-            };
-            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
+            let [r, g, b, a] = anchor_color(pseudo_k, ENHANCED_IR);
+            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
         }
     }
     pixels
@@ -2136,19 +2120,6 @@ fn wv_grayscale_for_band(band: u8) -> Option<rw_sat::palette::Anchors> {
         10 => Some(WV_GRAYSCALE_C10),
         _ => None,
     }
-}
-
-/// Radar-map-overlay alpha from brightness temperature: warm (> +5 C) fully
-/// transparent so radar/basemap shows through; cold storm tops (< -40 C)
-/// nearly opaque. Replaces the old luminance proxy, which mis-fired once IR is
-/// in color (saturated hues have low luminance).
-fn bt_overlay_alpha(bt: f32) -> u8 {
-    if !bt.is_finite() {
-        return 0;
-    }
-    const WARM: f32 = 278.0; // +5 C
-    const COLD: f32 = 233.0; // -40 C
-    (((WARM - bt) / (WARM - COLD)).clamp(0.0, 1.0) * 235.0) as u8
 }
 
 /// Map one follow-engine event into panel-ready responses. `current_key`
@@ -5334,8 +5305,9 @@ fn write_goes_composite_frame(
 /// tropical-card enhanced-IR window frames: `family` is the run-name token
 /// between sector and day (`rgb_<style>` / `rgb_ir13`) and MUST contain
 /// `rgb` — the run-name⇔content contract is "`_rgb_` in the name ⇔ the
-/// frame holds three baked `rgb_r/g/b` planes", and the app's run-key
-/// display filter admits these runs by that token.
+/// frame holds three baked `rgb_r/g/b` planes". The app uses that token to
+/// choose the RGB loader; catalog admission is by the completed ingest's exact
+/// run identity.
 #[allow(clippy::too_many_arguments)]
 fn write_goes_rgb_frame(
     store_root: &Path,
@@ -6951,11 +6923,16 @@ mod tests {
     }
 
     #[test]
-    fn layer_options_cover_all_bands_and_composites() {
+    fn feedback_v03412_live_satellite_picker_only_offers_directly_rendered_bands() {
         let options = layer_options();
-        assert_eq!(options.len(), 16 + GoesAbiRgbCompositeStyle::ALL.len());
+        assert_eq!(options.len(), 16);
         for option in &options {
             resolve_layer(&option.slug).expect("every picker entry resolves");
+            assert!(
+                option.slug.starts_with('c'),
+                "RGB recipes belong to the separate Load RGB action: {}",
+                option.slug
+            );
         }
         assert!(options[12].label.contains("Clean IR"), "C13 label");
     }
@@ -8507,43 +8484,38 @@ mod tests {
     }
 
     #[test]
-    fn ir_map_overlay_alpha_fades_warm_by_temperature() {
-        // Kelvin: warm surface, mid cloud, cold storm top.
-        let values = vec![290.0, 255.0, 210.0];
+    fn feedback_v03412_ir_map_overlay_preserves_every_valid_source_pixel() {
+        // Kelvin: missing, warm surface, mid cloud, cold storm top.
+        let values = vec![f32::NAN, 290.0, 255.0, 210.0];
         let (overlay, _) = render_sat_pixels(
             "cmi_c13",
             13,
             &values,
-            3,
+            4,
             1,
             false,
             true,
             IrEnhancement::Cimss,
         );
 
-        assert_eq!(
-            overlay[0].a(),
-            0,
-            "warm (+17 C) clears so radar shows through"
-        );
+        assert_eq!(overlay[0].a(), 0, "missing coverage stays transparent");
         assert!(
-            overlay[1].a() > 0 && overlay[1].a() < overlay[2].a(),
-            "mid cloud is semi-transparent"
+            overlay[1..].iter().all(|pixel| pixel.a() == 255),
+            "warm/clear IR is still valid imagery; map opacity, not a hidden BT mask, owns blending"
         );
-        assert!(overlay[2].a() > 200, "cold storm top (-63 C) stays visible");
 
-        // The full-screen player keeps the palette opaque (no BT fade).
+        // Player and map use identical per-pixel coverage and colors.
         let (player, _) = render_sat_pixels(
             "cmi_c13",
             13,
             &values,
-            3,
+            4,
             1,
             false,
             false,
             IrEnhancement::Cimss,
         );
-        assert!(player[0].a() > 200, "player keeps warm pixels opaque");
+        assert_eq!(overlay, player);
     }
 
     #[test]
@@ -9905,8 +9877,8 @@ mod tests {
 
     /// The GOES enhanced-IR bake + write path end to end (offline): BD
     /// colors over Kelvin BT, NaN stays transparent, the run lands in the
-    /// `_rgb_ir13_` family (the token that passes the app's composite
-    /// display filter), and the player load path renders it.
+    /// `_rgb_ir13_` family (the token that selects the composite loader), and
+    /// the player load path renders it.
     #[test]
     fn goes_ir_window_bake_writes_a_recognized_rgb_frame() {
         let dir = test_dir("ir-window-bake");

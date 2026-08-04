@@ -220,6 +220,18 @@ impl ViewerApp {
         self.sat = Some(worker);
     }
 
+    /// Reset all displayed satellite identity after a provider/product control
+    /// changes, then rebuild the saved-loop picker. Keeping the prior map drape
+    /// here lets a sparse MTG-lightning raster masquerade as newly selected GOES
+    /// or Geo Colour imagery; the normal spec-change clear also invalidates any
+    /// in-flight map render from that old product.
+    fn refresh_satellite_catalog_for_provider_change(&mut self) {
+        self.clear_satellite_display_for_spec_change();
+        if let Some(worker) = &self.sat {
+            worker.send(sat_worker::SatRequest::Scan);
+        }
+    }
+
     /// The persisted native-resolution window, when enabled — handed to the
     /// true-color composite ingests so they fetch/compose just that box at
     /// full instrument resolution.
@@ -281,6 +293,10 @@ impl ViewerApp {
         self.app_settings.satellite_source = self.satellite_source.slug().to_owned();
         self.app_settings.eumetsat_product = self.eumetsat_product.clone();
         self.mark_app_settings_dirty();
+        // This action can originate in Layers while the Satellite pane is
+        // closed, so the provider-controls change detector never sees it.
+        // Reset the old run/drape explicitly before the MTG response arrives.
+        self.refresh_satellite_catalog_for_provider_change();
         let window = self.sat_native_window_if_visible(0.0, "Meteosat-12");
         let scope = window
             .map(|window| format!(" · focused {}", window.run_slug()))
@@ -333,10 +349,14 @@ impl ViewerApp {
                 }
             }
         });
-        if let Some(source) = selected_source {
+        let mut catalog_filter_changed = false;
+        if let Some(source) = selected_source
+            && source != self.satellite_source
+        {
             self.satellite_source = source;
             self.app_settings.satellite_source = self.satellite_source.slug().to_owned();
             self.mark_app_settings_dirty();
+            catalog_filter_changed = true;
         }
 
         let mut panel_events = Vec::new();
@@ -416,6 +436,7 @@ impl ViewerApp {
                     .find(|(slug, _)| *slug == self.himawari_true_color_scope)
                     .map(|(_, label)| *label)
                     .unwrap_or("Region · WPac");
+                let band_before = self.himawari_band;
                 ui.horizontal_wrapped(|ui| {
                     ui.label("IR / WV");
                     egui::ComboBox::from_id_salt("himawari_ir_band")
@@ -430,6 +451,7 @@ impl ViewerApp {
                         load_himawari = true;
                     }
                 });
+                catalog_filter_changed |= self.himawari_band != band_before;
                 ui.horizontal_wrapped(|ui| {
                     ui.label("True color");
                     let before = self.himawari_true_color_scope.clone();
@@ -464,6 +486,7 @@ impl ViewerApp {
                 );
             }
             SatelliteSource::Meteosat => {
+                let product_before = self.eumetsat_product.clone();
                 let selected =
                     eumetsat::MtgProduct::parse(&self.eumetsat_product).unwrap_or_default();
                 ui.horizontal_wrapped(|ui| {
@@ -520,6 +543,7 @@ impl ViewerApp {
                 if selected == eumetsat::MtgProduct::LightningAfa {
                     ui.hyperlink_to("Open MTG LI color legend", eumetsat::MTG_LI_LEGEND_URL);
                 }
+                catalog_filter_changed |= self.eumetsat_product != product_before;
 
                 if eumetsat_credentials::DATA_STORE_ACCOUNT_UI_ENABLED {
                     egui::CollapsingHeader::new("Data Store account · optional")
@@ -574,6 +598,10 @@ impl ViewerApp {
                         });
                 }
             }
+        }
+
+        if catalog_filter_changed {
+            self.refresh_satellite_catalog_for_provider_change();
         }
 
         panel_kit::subgroup(ui, "RGB / MTG focused crop", |_ui| {});
@@ -988,27 +1016,35 @@ impl ViewerApp {
         {
             return true;
         }
-        sat_worker::run_filters_for_spec(self.sat_panel.spec())
-            .map(|(model, prefixes)| {
-                satellite_run_key_matches_resolved_spec(key, &model, &prefixes)
-            })
-            .unwrap_or(true)
+        match self.satellite_source {
+            SatelliteSource::Goes => sat_worker::run_filters_for_spec(self.sat_panel.spec())
+                .map(|(model, prefixes)| {
+                    satellite_run_key_matches_resolved_spec(key, &model, &prefixes)
+                })
+                .unwrap_or(false),
+            SatelliteSource::Himawari => {
+                satellite_run_key_matches_himawari(key, self.himawari_band)
+            }
+            SatelliteSource::Meteosat => satellite_run_key_matches_meteosat(
+                key,
+                eumetsat::MtgProduct::parse(&self.eumetsat_product).unwrap_or_default(),
+            ),
+        }
     }
 
     pub(crate) fn satellite_runs_for_current_spec(
         &self,
         runs: Vec<rw_ui::SatRunListing>,
     ) -> Vec<rw_ui::SatRunListing> {
-        let Ok((model, prefixes)) = sat_worker::run_filters_for_spec(self.sat_panel.spec()) else {
-            return runs;
-        };
-        satellite_runs_matching_resolved_spec(
-            runs,
-            &model,
-            &prefixes,
-            self.sat_last_frame.as_ref().map(|(key, _)| key),
-            self.sat_player.selected_run(),
-        )
+        let admitted = self.sat_last_frame.as_ref().map(|(key, _)| key);
+        let selected = self.sat_player.selected_run();
+        runs.into_iter()
+            .filter(|run| {
+                admitted.is_some_and(|key| key == &run.key)
+                    || selected.is_some_and(|key| key == &run.key)
+                    || self.satellite_run_key_matches_current_spec(&run.key)
+            })
+            .collect()
     }
 
     pub(crate) fn request_sat_map_frame(&mut self, key: rw_ui::SatRunKey, hhmm: u16) {
@@ -1256,10 +1292,26 @@ impl ViewerApp {
                 }
                 sat_worker::SatResponse::DiskUsage(usage) => self.sat_panel.set_disk_usage(usage),
                 sat_worker::SatResponse::SelectFrame { key, hhmm } => {
-                    if !self.satellite_run_key_matches_current_spec(&key) {
+                    // SimSat is an external producer rather than a provider
+                    // tab. Its atomic ScanAndSelect response is therefore the
+                    // authority that admits the just-written run. Ordinary
+                    // provider selections must still match the active source
+                    // controls so a stale response cannot put MTG Lightning
+                    // back under GOES/Geo Colour labels.
+                    let explicit_simsat = key.model == "simsat";
+                    if !explicit_simsat && !self.satellite_run_key_matches_current_spec(&key) {
                         continue;
                     }
+                    let needs_catalog_rescan =
+                        explicit_simsat && !self.sat_run_listings.iter().any(|run| run.key == key);
                     self.sat_last_frame = Some((key.clone(), hhmm));
+                    if needs_catalog_rescan && let Some(sat) = &self.sat {
+                        // The Scan half of ScanAndSelect arrived before this
+                        // explicit identity was admitted and was correctly
+                        // source-filtered. Re-scan now so the player owns the
+                        // new run before its colored frame lands.
+                        sat.send(sat_worker::SatRequest::Scan);
+                    }
                     self.sat_player.select_frame(key.clone(), hhmm);
                     if let Some(sat) = &self.sat {
                         sat.send(sat_worker::SatRequest::LoadFrame {
@@ -1910,68 +1962,49 @@ pub(crate) fn sat_map_request_matches(
         .is_some_and(|(pending_key, pending_hhmm)| pending_key == key && *pending_hhmm == hhmm)
 }
 
-fn satellite_run_key_is_other_source(key: &rw_ui::SatRunKey) -> bool {
-    !matches!(key.model.as_str(), "g16" | "g17" | "g18" | "g19")
-}
-
-/// Match one stored run against the resolved GOES spec. Non-GOES sources
-/// remain available in the shared player. GOES RGB composites are exempt
-/// from only the single-band part of the prefix check, never from the selected
-/// satellite or sector: admitting a cached GOES-West/other-sector composite
-/// can show a healthy preview whose coverage is entirely outside the map.
+/// Match one stored scalar-band run against the resolved GOES live-follow
+/// spec. One-shot RGB products are admitted by exact identity only after the
+/// ingest response selects them; admitting every cached composite here lets a
+/// newer but unrelated RGB run replace the selected scalar product on scan.
 fn satellite_run_key_matches_resolved_spec(
     key: &rw_ui::SatRunKey,
     model: &str,
     prefixes: &[String],
 ) -> bool {
-    satellite_run_key_is_other_source(key)
-        || key.model == model
-            && if satellite_run_key_is_composite(key) {
-                let run_sector = key.run.split_once("_rgb_").map(|(sector, _)| sector);
-                prefixes.iter().any(|prefix| {
-                    prefix
-                        .rsplit_once("_c")
-                        .map(|(sector, _)| {
-                            run_sector.is_some_and(|run_sector| {
-                                run_sector == sector
-                                    || run_sector
-                                        .strip_prefix(sector)
-                                        .is_some_and(|suffix| suffix.starts_with("_win"))
-                            })
-                        })
-                        .unwrap_or(false)
-                })
-            } else {
-                prefixes
-                    .iter()
-                    .any(|prefix| key.run.starts_with(prefix.as_str()))
-            }
+    key.model == model
+        && prefixes
+            .iter()
+            .any(|prefix| key.run.starts_with(prefix.as_str()))
 }
 
-fn satellite_runs_matching_resolved_spec(
-    runs: Vec<rw_ui::SatRunListing>,
-    model: &str,
-    prefixes: &[String],
-    admitted: Option<&rw_ui::SatRunKey>,
-    selected: Option<&rw_ui::SatRunKey>,
-) -> Vec<rw_ui::SatRunListing> {
-    runs.into_iter()
-        .filter(|run| {
-            admitted.is_some_and(|key| key == &run.key)
-                || selected.is_some_and(|key| key == &run.key)
-                || satellite_run_key_matches_resolved_spec(&run.key, model, prefixes)
-        })
-        .collect()
+fn run_has_band_token(run: &str, prefix: char, band: u8) -> bool {
+    let token = format!("{prefix}{band:02}");
+    run.split('_').any(|candidate| candidate == token)
 }
 
-/// True/natural-color RGB composite runs (`<sector>_rgb_<style>_<YYYYMMDD>`)
-/// are exempt from the follow spec's BAND filter — they belong to a GOES
-/// model dir but carry no single `c<band>` prefix. The selected satellite and
-/// sector are still enforced by [`satellite_run_key_matches_resolved_spec`].
+fn satellite_run_key_matches_himawari(key: &rw_ui::SatRunKey, band: u8) -> bool {
+    if !matches!(key.model.as_str(), "h8" | "h9") {
+        return false;
+    }
+    let band = band.clamp(7, 16);
+    run_has_band_token(&key.run, 'c', band) || run_has_band_token(&key.run, 'b', band)
+}
+
+fn satellite_run_key_matches_meteosat(
+    key: &rw_ui::SatRunKey,
+    product: eumetsat::MtgProduct,
+) -> bool {
+    key.model == "mtg_i1" && key.run.contains(&format!("_rgb_wms_{}_", product.slug()))
+}
+
+/// Whether a store run contains baked RGB planes rather than one scalar band.
+/// Timeline/map consumers use this content-identity test independently of the
+/// stricter provider/product catalog filter above.
 pub(crate) fn satellite_run_key_is_composite(key: &rw_ui::SatRunKey) -> bool {
     key.run.contains("_rgb_")
 }
 
+/// Normalize a dated run name to its reusable product/view family.
 pub(crate) fn sat_run_family(run_name: &str) -> String {
     let mut saw_day = false;
     run_name
@@ -2315,7 +2348,7 @@ mod tests {
     }
 
     #[test]
-    fn goes_composites_ignore_band_but_not_satellite_or_sector_filters() {
+    fn feedback_v03412_goes_catalog_rejects_cross_product_provider_and_sector_runs() {
         let model = "g19";
         let prefixes = vec!["conus_c13_".to_owned()];
         let key = |model: &str, run: &str| rw_ui::SatRunKey {
@@ -2324,15 +2357,26 @@ mod tests {
         };
 
         assert!(satellite_run_key_matches_resolved_spec(
-            &key("g19", "conus_rgb_natural_color_20260713"),
+            &key("g19", "conus_c13_20260713"),
             model,
             &prefixes,
         ));
-        assert!(satellite_run_key_matches_resolved_spec(
-            &key("g19", "conus_win295n954w600_rgb_natural_color_20260713"),
-            model,
-            &prefixes,
-        ));
+        assert!(
+            !satellite_run_key_matches_resolved_spec(
+                &key("g19", "conus_rgb_natural_color_20260713"),
+                model,
+                &prefixes,
+            ),
+            "one-shot RGB is admitted only after its exact ingest response"
+        );
+        assert!(
+            !satellite_run_key_matches_resolved_spec(
+                &key("g19", "conus_win295n954w600_rgb_natural_color_20260713"),
+                model,
+                &prefixes,
+            ),
+            "a focused one-shot RGB is not the selected live-follow product"
+        );
         assert!(
             !satellite_run_key_matches_resolved_spec(
                 &key("g19", "fulldisk_rgb_natural_color_20260713"),
@@ -2354,15 +2398,66 @@ mod tests {
             model,
             &prefixes,
         ));
-        assert!(satellite_run_key_matches_resolved_spec(
-            &key("h9", "fulldisk_rgb_true_color_20260713"),
-            model,
-            &prefixes,
+        assert!(
+            !satellite_run_key_matches_resolved_spec(
+                &key("h9", "fulldisk_rgb_true_color_20260713"),
+                model,
+                &prefixes,
+            ),
+            "a provider tab must not inherit unrelated saved runs"
+        );
+    }
+
+    #[test]
+    fn feedback_v03412_non_goes_catalog_filters_keep_products_with_provider_controls() {
+        let key = |model: &str, run: &str| rw_ui::SatRunKey {
+            model: model.to_owned(),
+            run: run.to_owned(),
+        };
+
+        assert!(satellite_run_key_matches_himawari(
+            &key("h9", "fulldisk_c13_20260713"),
+            13,
+        ));
+        assert!(
+            !satellite_run_key_matches_himawari(&key("h9", "fulldisk_rgb_true_color_20260713"), 13,),
+            "one-shot true color is admitted only after its exact ingest response"
+        );
+        assert!(
+            !satellite_run_key_matches_himawari(
+                &key("h9", "fulldisk_win150n1400e600_rgb_ir13_20260713"),
+                13,
+            ),
+            "a focused one-shot IR run must not replace the full-disk scalar run"
+        );
+        assert!(!satellite_run_key_matches_himawari(
+            &key("h9", "fulldisk_c08_20260713"),
+            13,
+        ));
+        assert!(!satellite_run_key_matches_himawari(
+            &key("g19", "fulldisk_c13_20260713"),
+            13,
+        ));
+
+        assert!(satellite_run_key_matches_meteosat(
+            &key("mtg_i1", "mtg_fd_rgb_wms_geo_colour_20260723"),
+            eumetsat::MtgProduct::GeoColour,
+        ));
+        assert!(
+            !satellite_run_key_matches_meteosat(
+                &key("mtg_i1", "mtg_fd_rgb_wms_lightning_afa_20260723"),
+                eumetsat::MtgProduct::GeoColour,
+            ),
+            "an old sparse lightning loop must never masquerade as Geo Colour"
+        );
+        assert!(!satellite_run_key_matches_meteosat(
+            &key("g19", "conus_rgb_natural_color_20260723"),
+            eumetsat::MtgProduct::GeoColour,
         ));
     }
 
     #[test]
-    fn an_explicit_one_shot_run_survives_the_live_follow_filter() {
+    fn feedback_v03412_explicit_one_shot_run_survives_the_live_follow_filter() {
         let listing = |model: &str, run: &str| rw_ui::SatRunListing {
             key: rw_ui::SatRunKey {
                 model: model.to_owned(),
@@ -2373,27 +2468,25 @@ mod tests {
             ny: 100,
             frames: vec![1200],
         };
-        let conus = listing("g19", "conus_rgb_natural_color_20260713");
+        let conus = listing("g19", "conus_c13_20260713");
         let tropical = listing("g19", "fulldisk_win227n875w1000_rgb_natural_color_20260713");
         let prefixes = vec!["conus_c13_".to_owned()];
 
-        let normal = satellite_runs_matching_resolved_spec(
-            vec![conus.clone(), tropical.clone()],
-            "g19",
-            &prefixes,
-            None,
-            None,
-        );
+        let normal = vec![conus.clone(), tropical.clone()]
+            .into_iter()
+            .filter(|run| satellite_run_key_matches_resolved_spec(&run.key, "g19", &prefixes))
+            .collect::<Vec<_>>();
         assert_eq!(normal.len(), 1);
         assert_eq!(normal[0].key, conus.key);
 
-        let forced = satellite_runs_matching_resolved_spec(
-            vec![conus, tropical.clone()],
-            "g19",
-            &prefixes,
-            Some(&tropical.key),
-            None,
-        );
+        let admitted = &tropical.key;
+        let forced = vec![conus, tropical.clone()]
+            .into_iter()
+            .filter(|run| {
+                &run.key == admitted
+                    || satellite_run_key_matches_resolved_spec(&run.key, "g19", &prefixes)
+            })
+            .collect::<Vec<_>>();
         assert_eq!(forced.len(), 2);
         assert!(forced.iter().any(|run| run.key == tropical.key));
     }

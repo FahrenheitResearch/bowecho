@@ -20,15 +20,27 @@ use crate::model_layer::{FieldSampleStencil, InverseLut, sample_stencils_for_poi
 /// exact-time stores carrying thousands of minute-cadence outputs. Long runs
 /// use a contiguous window centered on the selected forecast time and label
 /// that truncation in the UI.
-const MAX_HISTORY_TIMES: usize = 256;
+const MAX_POINT_HISTORY_TIMES: usize = 256;
+// Domain extrema come from each hour's cached statistics and therefore avoid
+// the point probe's repeated cell-window reads. Keep enough exact timesteps for
+// a full multi-hour, minute-cadence convection simulation in one graph.
+const MAX_DOMAIN_HISTORY_TIMES: usize = 4_096;
+
+#[derive(Clone)]
+pub(super) struct PointProbeRequest {
+    pub lut: Arc<InverseLut>,
+    pub lat: f32,
+    pub lon: f32,
+}
 
 #[derive(Clone)]
 pub(super) struct ProbeHistoryRequest {
     pub store_root: PathBuf,
     pub field: Arc<FieldData>,
-    pub lut: Arc<InverseLut>,
-    pub lat: f32,
-    pub lon: f32,
+    /// Optional fixed geographic sample. Domain extrema deliberately do not
+    /// require one: their values come from the whole stored grid at each
+    /// forecast time.
+    pub point: Option<PointProbeRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -81,8 +93,7 @@ struct HistorySeries {
     source_hour: HourKey,
     variable: String,
     units: String,
-    lat: f32,
-    lon: f32,
+    point: Option<(f32, f32)>,
     samples: Vec<HistorySample>,
     failed_hours: usize,
     stored_hours_total: usize,
@@ -130,6 +141,11 @@ impl ModelProbeHistoryPanel {
         repaint: egui::Context,
     ) -> Result<(), String> {
         validate_request(&request)?;
+        self.metric = if request.point.is_some() {
+            HistoryMetric::Point
+        } else {
+            HistoryMetric::DomainMinimum
+        };
         self.start(request, repaint)
     }
 
@@ -163,10 +179,10 @@ impl ModelProbeHistoryPanel {
         Ok(())
     }
 
-    pub(super) fn show(&mut self, ctx: &egui::Context) {
+    pub(super) fn show(&mut self, ctx: &egui::Context) -> Option<HourKey> {
         self.poll();
         if !self.open {
-            return;
+            return None;
         }
 
         if self.task.is_some() {
@@ -174,14 +190,27 @@ impl ModelProbeHistoryPanel {
         }
         let mut open = true;
         let mut reload = false;
-        egui::Window::new("Model forecast history")
+        let mut selected_hour = None;
+        let point_available = self
+            .request
+            .as_ref()
+            .is_some_and(|request| request.point.is_some());
+        let title = if point_available {
+            "Model point / domain history"
+        } else {
+            "Model domain extrema"
+        };
+        egui::Window::new(title)
             .open(&mut open)
             .default_size([680.0, 390.0])
             .min_size([440.0, 300.0])
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for metric in HistoryMetric::ALL {
+                    for metric in HistoryMetric::ALL
+                        .into_iter()
+                        .filter(|metric| *metric != HistoryMetric::Point || point_available)
+                    {
                         ui.selectable_value(&mut self.metric, metric, metric.label());
                     }
                     ui.separator();
@@ -212,7 +241,7 @@ impl ModelProbeHistoryPanel {
                 if let Some(series) = &self.series {
                     history_header(ui, series, self.metric);
                     ui.add_space(4.0);
-                    history_chart(ui, series, self.metric);
+                    selected_hour = history_chart(ui, series, self.metric);
                     ui.add_space(4.0);
                     ui.weak(history_io_summary(series));
                     if series.failed_hours > 0 {
@@ -239,6 +268,7 @@ impl ModelProbeHistoryPanel {
             self.task = None;
             self.open = false;
         }
+        selected_hour
     }
 
     fn poll(&mut self) {
@@ -279,36 +309,38 @@ impl ModelProbeHistoryPanel {
 }
 
 fn validate_request(request: &ProbeHistoryRequest) -> Result<(), String> {
-    let grid = request
-        .field
-        .grid
-        .as_ref()
-        .ok_or_else(|| "The selected model field has no geographic grid".to_owned())?;
-    if grid.nx != request.field.nx || grid.ny != request.field.ny {
-        return Err("The selected model field's grid dimensions do not match".to_owned());
-    }
-    let Some(seed) = request.lut.lookup(request.lat, request.lon) else {
-        return Err("The fixed probe is outside the selected model field".to_owned());
-    };
-    let seed_lat = grid
-        .lat
-        .get(seed)
-        .copied()
-        .filter(|value| value.is_finite());
-    let seed_lon = grid
-        .lon
-        .get(seed)
-        .copied()
-        .filter(|value| value.is_finite());
-    let seed_matches_grid = seed_lat.zip(seed_lon).is_some_and(|(seed_lat, seed_lon)| {
-        let lon_delta = (seed_lon - request.lon).abs().rem_euclid(360.0);
-        (seed_lat - request.lat).abs() <= 2.0 && lon_delta.min(360.0 - lon_delta) <= 2.0
-    });
-    if !seed_matches_grid {
-        return Err("The model probe lookup belongs to a different or stale grid".to_owned());
-    }
     if request.field.key.var.trim().is_empty() {
         return Err("The selected model field has no variable name".to_owned());
+    }
+    if let Some(point) = &request.point {
+        let grid = request
+            .field
+            .grid
+            .as_ref()
+            .ok_or_else(|| "The selected model field has no geographic grid".to_owned())?;
+        if grid.nx != request.field.nx || grid.ny != request.field.ny {
+            return Err("The selected model field's grid dimensions do not match".to_owned());
+        }
+        let Some(seed) = point.lut.lookup(point.lat, point.lon) else {
+            return Err("The fixed probe is outside the selected model field".to_owned());
+        };
+        let seed_lat = grid
+            .lat
+            .get(seed)
+            .copied()
+            .filter(|value| value.is_finite());
+        let seed_lon = grid
+            .lon
+            .get(seed)
+            .copied()
+            .filter(|value| value.is_finite());
+        let seed_matches_grid = seed_lat.zip(seed_lon).is_some_and(|(seed_lat, seed_lon)| {
+            let lon_delta = (seed_lon - point.lon).abs().rem_euclid(360.0);
+            (seed_lat - point.lat).abs() <= 2.0 && lon_delta.min(360.0 - lon_delta) <= 2.0
+        });
+        if !seed_matches_grid {
+            return Err("The model probe lookup belongs to a different or stale grid".to_owned());
+        }
     }
     Ok(())
 }
@@ -354,18 +386,23 @@ fn load_history(
         ));
     }
     let stored_units = source_variable.units.clone();
+    let source_nx = source_reader.meta().nx;
+    let source_ny = source_reader.meta().ny;
     drop(source_reader);
 
-    let grid = request
-        .field
-        .grid
-        .as_ref()
-        .expect("request validation requires a grid");
-    let nearest = request
-        .lut
-        .lookup(request.lat, request.lon)
-        .expect("request validation requires an in-domain point");
-    let stencils = sample_stencils_for_point(grid, nearest, request.lat, request.lon);
+    let point_sampling = request.point.as_ref().map(|point| {
+        let grid = request
+            .field
+            .grid
+            .as_ref()
+            .expect("point request validation requires a grid");
+        let nearest = point
+            .lut
+            .lookup(point.lat, point.lon)
+            .expect("point request validation requires an in-domain point");
+        let stencils = sample_stencils_for_point(grid, nearest, point.lat, point.lon);
+        (nearest, grid.nx, stencils)
+    });
     let conversion = request
         .field
         .style
@@ -378,7 +415,8 @@ fn load_history(
         .iter()
         .position(|entry| entry.hour == source_hour.hour)
         .unwrap_or(0);
-    let history_range = history_window(stored_hours_total, selected_position, MAX_HISTORY_TIMES);
+    let history_limit = history_time_limit(request.point.is_some());
+    let history_range = history_window(stored_hours_total, selected_position, history_limit);
     let total = history_range.len();
     let progress_stride = (total / 50).max(1);
     let mut failed_hours = 0usize;
@@ -402,13 +440,15 @@ fn load_history(
                 let meta = reader.variable(&variable)?;
                 if meta.kind != "surface2d"
                     || meta.units != stored_units
-                    || reader.meta().nx != grid.nx
-                    || reader.meta().ny != grid.ny
+                    || reader.meta().nx != source_nx
+                    || reader.meta().ny != source_ny
                 {
                     return None;
                 }
                 let stats = reader.stats_2d(&variable).ok();
-                let point = read_point_value(&reader, &variable, nearest, grid.nx, &stencils);
+                let point = point_sampling.as_ref().and_then(|(nearest, nx, stencils)| {
+                    read_point_value(&reader, &variable, *nearest, *nx, stencils)
+                });
                 Some((
                     point.map(|value| conversion.apply(value)),
                     stats
@@ -439,10 +479,9 @@ fn load_history(
         }
     }
 
-    if samples
-        .iter()
-        .all(|sample| sample.point.is_none() && sample.domain_min.is_none())
-    {
+    if samples.iter().all(|sample| {
+        sample.point.is_none() && sample.domain_min.is_none() && sample.domain_max.is_none()
+    }) {
         return Err(format!(
             "'{}' is not a readable stored 2-D field across this run; generated formulas and unsupported pressure-level fields need a dedicated history evaluator",
             variable
@@ -452,8 +491,7 @@ fn load_history(
         source_hour,
         variable,
         units: request.field.units.clone(),
-        lat: request.lat,
-        lon: request.lon,
+        point: request.point.as_ref().map(|point| (point.lat, point.lon)),
         samples,
         failed_hours,
         stored_hours_total,
@@ -503,6 +541,14 @@ fn history_window(total: usize, selected: usize, limit: usize) -> std::ops::Rang
     start..start + limit
 }
 
+fn history_time_limit(has_point: bool) -> usize {
+    if has_point {
+        MAX_POINT_HISTORY_TIMES
+    } else {
+        MAX_DOMAIN_HISTORY_TIMES
+    }
+}
+
 fn history_io_summary(series: &HistorySeries) -> String {
     let coverage = if series.samples.len() < series.stored_hours_total {
         format!(
@@ -513,7 +559,13 @@ fn history_io_summary(series: &HistorySeries) -> String {
     } else {
         format!("{} stored times", series.samples.len())
     };
-    format!("{coverage} · point reads use tiny cell windows; extrema use cached store statistics.")
+    if series.point.is_some() {
+        format!(
+            "{coverage} · point reads use tiny cell windows; extrema use cached store statistics."
+        )
+    } else {
+        format!("{coverage} · extrema use cached store statistics; no map pin is required.")
+    }
 }
 
 fn history_header(ui: &mut egui::Ui, series: &HistorySeries, metric: HistoryMetric) {
@@ -528,7 +580,11 @@ fn history_header(ui: &mut egui::Ui, series: &HistorySeries, metric: HistoryMetr
     });
     match metric {
         HistoryMetric::Point => {
-            ui.weak(format!("Fixed at {:.4}°, {:.4}°", series.lat, series.lon));
+            if let Some((lat, lon)) = series.point {
+                ui.weak(format!("Fixed at {lat:.4}°, {lon:.4}°"));
+            } else {
+                ui.weak("No fixed point is attached to this domain-extrema graph");
+            }
         }
         HistoryMetric::DomainMinimum | HistoryMetric::DomainMaximum => {
             ui.weak("Whole stored model grid for each forecast time");
@@ -536,9 +592,13 @@ fn history_header(ui: &mut egui::Ui, series: &HistorySeries, metric: HistoryMetr
     }
 }
 
-fn history_chart(ui: &mut egui::Ui, series: &HistorySeries, metric: HistoryMetric) {
+fn history_chart(
+    ui: &mut egui::Ui,
+    series: &HistorySeries,
+    metric: HistoryMetric,
+) -> Option<HourKey> {
     let size = egui::vec2(ui.available_width().max(360.0), 255.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals().clone();
     painter.rect_filled(rect, 4.0, visuals.extreme_bg_color);
@@ -553,7 +613,7 @@ fn history_chart(ui: &mut egui::Ui, series: &HistorySeries, metric: HistoryMetri
         rect.right_bottom() - egui::vec2(12.0, 30.0),
     );
     if plot.width() < 80.0 || plot.height() < 80.0 {
-        return;
+        return None;
     }
 
     let points = chart_values(series, metric);
@@ -565,7 +625,7 @@ fn history_chart(ui: &mut egui::Ui, series: &HistorySeries, metric: HistoryMetri
             egui::FontId::proportional(13.0),
             visuals.weak_text_color(),
         );
-        return;
+        return None;
     }
     let x_min = points
         .iter()
@@ -693,10 +753,11 @@ fn history_chart(ui: &mut egui::Ui, series: &HistorySeries, metric: HistoryMetri
             position + egui::vec2(6.0, -5.0),
             egui::Align2::LEFT_BOTTOM,
             format!(
-                "{} {} {}",
+                "{} {} {} @ {}",
                 metric.short_label(),
                 format_chart_value(extremum.value),
-                series.units
+                series.units,
+                extremum.time_label,
             ),
             egui::FontId::monospace(10.0),
             visuals.text_color(),
@@ -717,7 +778,7 @@ fn history_chart(ui: &mut egui::Ui, series: &HistorySeries, metric: HistoryMetri
     if let Some(point) = hovered {
         let position = egui::pos2(x_screen(point.axis), y_screen(point.value));
         painter.circle_filled(position, 3.4, line_color);
-        response.on_hover_ui(|ui| {
+        response.clone().on_hover_ui(|ui| {
             ui.strong(point.time_label.as_str());
             ui.monospace(format!(
                 "{}: {} {}",
@@ -725,8 +786,13 @@ fn history_chart(ui: &mut egui::Ui, series: &HistorySeries, metric: HistoryMetri
                 format_chart_value(point.value),
                 series.units
             ));
+            ui.weak("Click to load this model timestep");
         });
     }
+    response
+        .clicked()
+        .then(|| hovered.map(|point| point.hour.clone()))
+        .flatten()
 }
 
 #[derive(Clone)]
@@ -820,7 +886,31 @@ mod tests {
     }
 
     #[test]
-    fn exact_history_axis_uses_lead_seconds_instead_of_storage_slot() {
+    fn feedback_v03412_domain_extrema_requires_neither_grid_nor_map_pin() {
+        let request = ProbeHistoryRequest {
+            store_root: PathBuf::from("unused"),
+            field: Arc::new(FieldData {
+                key: rw_ui::FieldKey {
+                    hour: sample().hour,
+                    var: "pressure_surface".to_owned(),
+                },
+                units: "Pa".to_owned(),
+                nx: 2,
+                ny: 2,
+                values: vec![100_000.0; 4],
+                range: Some((100_000.0, 100_000.0)),
+                grid: None,
+                lat_descending: false,
+                style: None,
+            }),
+            point: None,
+        };
+
+        assert!(validate_request(&request).is_ok());
+    }
+
+    #[test]
+    fn feedback_v03412_domain_extrema_axis_uses_exact_lead_seconds() {
         let hour = HourKey {
             model: "wrf".to_owned(),
             run: "local".to_owned(),
@@ -841,8 +931,7 @@ mod tests {
             source_hour: samples[0].hour.clone(),
             variable: "temperature_2m".to_owned(),
             units: "F".to_owned(),
-            lat: 35.0,
-            lon: -97.0,
+            point: Some((35.0, -97.0)),
             samples,
             failed_hours: 1,
             stored_hours_total: 3,
@@ -854,10 +943,33 @@ mod tests {
     }
 
     #[test]
+    fn feedback_v03412_domain_extrema_summary_does_not_claim_a_point_probe() {
+        let series = HistorySeries {
+            source_hour: sample().hour,
+            variable: "pressure_surface".to_owned(),
+            units: "hPa".to_owned(),
+            point: None,
+            samples: vec![sample()],
+            failed_hours: 0,
+            stored_hours_total: 1,
+        };
+
+        let summary = history_io_summary(&series);
+        assert!(summary.contains("no map pin is required"));
+        assert!(!summary.contains("point reads"));
+    }
+
+    #[test]
     fn very_long_runs_are_windowed_around_the_selected_time() {
         assert_eq!(history_window(1_000, 500, 256), 372..628);
         assert_eq!(history_window(1_000, 3, 256), 0..256);
         assert_eq!(history_window(1_000, 999, 256), 744..1_000);
         assert_eq!(history_window(10, 5, 256), 0..10);
+    }
+
+    #[test]
+    fn feedback_v03412_cached_domain_extrema_keep_a_longer_minute_cadence_run() {
+        assert_eq!(history_time_limit(true), 256);
+        assert_eq!(history_time_limit(false), 4_096);
     }
 }

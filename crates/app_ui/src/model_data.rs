@@ -1298,6 +1298,10 @@ pub struct ModelDataDock {
     /// deliberately selected, so changing WRF domains replaces only the
     /// former and never tramples the latter.
     native_plot_auto_domain: Option<CustomDomain>,
+    /// BowEcho-owned WRF producer/grid presentation metadata. Cached by run
+    /// so the native plot never re-reads the store-root registry per repaint.
+    native_plot_source_run: Option<(String, String)>,
+    native_plot_source_metadata: Option<crate::wrf_source::WrfRunSourceMetadata>,
     /// v0.29.3 gesture-collision fix: while true, the NEXT drag on the radar
     /// map draws the plot domain — no modifiers, and none of the map's other
     /// gestures (pan, loupe, soundings, 3D box) fire. Armed by the 📐 button
@@ -1446,6 +1450,8 @@ impl ModelDataDock {
             show_plot_viewer: false,
             native_plot_seeded_run: None,
             native_plot_auto_domain: None,
+            native_plot_source_run: None,
+            native_plot_source_metadata: None,
             plot_domain_armed: false,
             color_tables: ColorTableEditorPanel::new(),
             show_color_tables: false,
@@ -1769,7 +1775,11 @@ impl ModelDataDock {
                 if field.key != key {
                     return;
                 }
-                attach_solar_fallback_style(&mut field, &self.hour_store_vars);
+                apply_local_wrf_field_style(
+                    &mut field,
+                    &self.hour_store_vars,
+                    self.color_tables.settings(),
+                );
                 self.latest_field = Some(std::sync::Arc::new(field.clone()));
                 field.key = display;
                 self.viewer.set_field(field);
@@ -1863,7 +1873,11 @@ impl ModelDataDock {
                 // `latest_field` keeps the STORE name: every consumer outside
                 // the dock stays keyed by real store variables. Only the
                 // viewer's copy carries the display label.
-                attach_solar_fallback_style(&mut field, &self.hour_store_vars);
+                apply_local_wrf_field_style(
+                    &mut field,
+                    &self.hour_store_vars,
+                    self.color_tables.settings(),
+                );
                 self.latest_field = Some(std::sync::Arc::new(field.clone()));
                 field.key = display;
                 self.viewer.set_field(field);
@@ -2174,7 +2188,9 @@ impl ModelDataDock {
     /// Draw auxiliary windows that belong to the shared Models/WRF backend
     /// exactly once per app frame, independent of which owner surface is open.
     pub fn auxiliary_windows(&mut self, ctx: &egui::Context) {
-        self.probe_history.show(ctx);
+        if let Some(hour) = self.probe_history.show(ctx) {
+            self.select_hour_key(hour);
+        }
         let import_message = self.import_message.clone();
         if let Some(request) = self.cm1.show_window(
             ctx,
@@ -2243,13 +2259,28 @@ impl ModelDataDock {
                 .flatten();
             if let Some(field) = &field {
                 self.seed_native_plot_domain(field);
+                self.refresh_native_plot_source_metadata(field);
             }
+            let source_label = model_plot
+                .then(|| {
+                    self.native_plot_source_metadata
+                        .as_ref()
+                        .map(crate::wrf_source::WrfRunSourceMetadata::plot_label)
+                })
+                .flatten();
             let mut open = true;
             egui::Window::new("Native plot")
                 .open(&mut open)
                 .default_size([560.0, 440.0])
                 .show(ctx, |ui| {
                     if model_plot {
+                        if let Some(label) = source_label.as_deref() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.weak("Source/grid");
+                                ui.monospace(label);
+                            });
+                            ui.separator();
+                        }
                         self.plot_viewer.ui(ui, field.as_deref());
                     } else {
                         self.satellite_plot.ui(ui);
@@ -2462,6 +2493,18 @@ impl ModelDataDock {
             .flatten()
     }
 
+    fn refresh_native_plot_source_metadata(&mut self, field: &rw_ui::FieldData) {
+        let run = (field.key.hour.model.clone(), field.key.hour.run.clone());
+        if self.native_plot_source_run.as_ref() == Some(&run) {
+            return;
+        }
+        self.native_plot_source_metadata =
+            crate::wrf_source::read_run_metadata(&self.store_root, &run.0, &run.1)
+                .ok()
+                .flatten();
+        self.native_plot_source_run = Some(run);
+    }
+
     #[cfg(test)]
     pub(crate) fn plot_viewer_shown_for_test(&self) -> bool {
         self.show_plot_viewer
@@ -2498,9 +2541,31 @@ impl ModelDataDock {
             probe_history::ProbeHistoryRequest {
                 store_root: self.store_root.clone(),
                 field,
-                lut,
-                lat,
-                lon,
+                point: Some(probe_history::PointProbeRequest { lut, lat, lon }),
+            },
+            self.repaint.clone(),
+        )?;
+        Ok(label)
+    }
+
+    /// Open whole-domain minimum/maximum history for the currently selected
+    /// stored 2-D field. Unlike a fixed point probe, this analysis has no
+    /// geographic prerequisite: every chart sample is the extrema over the
+    /// complete model grid at that exact forecast time.
+    fn open_domain_extrema_history(&mut self) -> Result<String, String> {
+        let field = self.current_native_plot_field().ok_or_else(|| {
+            "Load a stored 2-D model field before opening domain extrema".to_owned()
+        })?;
+        let label = format!(
+            "{} {} domain extrema",
+            field.key.hour.model.to_uppercase(),
+            field.key.var
+        );
+        self.probe_history.open(
+            probe_history::ProbeHistoryRequest {
+                store_root: self.store_root.clone(),
+                field,
+                point: None,
             },
             self.repaint.clone(),
         )?;
@@ -2824,6 +2889,8 @@ impl ModelDataDock {
     /// Re-scan the store (after an ingest finishes).
     pub fn rescan(&mut self) {
         self.worker.send(StoreRequest::Enumerate);
+        self.native_plot_source_run = None;
+        self.native_plot_source_metadata = None;
         // A re-enumerated run may keep the same model/run/hour identity while
         // its manifest and variables changed. Clear compatibility metadata
         // immediately and refresh that hour after the queued enumeration so
@@ -6353,6 +6420,12 @@ impl ModelDataDock {
         let animation_ready =
             animation_hours >= 2 && self.plot_job.is_none() && !self.formula_lab.busy();
         let mut requested_animation = None;
+        let extrema_ready = self.current_native_plot_field().is_some_and(|field| {
+            self.hour_store_var_info.iter().any(|variable| {
+                variable.name == field.key.var && variable.kind == rw_ui::VarKind::Surface2D
+            })
+        });
+        let mut requested_extrema = false;
         let box_control = self
             .sounding_header_controls()
             .box_sounding
@@ -6414,6 +6487,18 @@ impl ModelDataDock {
                     }
 
                     if ui
+                        .add_enabled(extrema_ready, egui::Button::new("Domain extrema…"))
+                        .on_hover_text(if extrema_ready {
+                            "Graph this field's whole-domain minimum or maximum at every stored forecast time. No map pin is required; click a chart point to load that timestep."
+                        } else {
+                            "Load a stored 2-D field to graph whole-domain minima and maxima."
+                        })
+                        .clicked()
+                    {
+                        requested_extrema = true;
+                    }
+
+                    if ui
                         .add_enabled(animation_ready, egui::Button::new("GIF loop"))
                         .on_hover_text(if animation_hours >= 2 {
                             "Render this field for every model timestep and save a clean looping GIF."
@@ -6458,6 +6543,12 @@ impl ModelDataDock {
                         );
                 });
             });
+        if requested_extrema {
+            self.import_message = Some(match self.open_domain_extrema_history() {
+                Ok(label) => format!("Opened {label}"),
+                Err(error) => format!("Domain extrema: {error}"),
+            });
+        }
         if let (Some(format), Some((model, run, var))) = (requested_animation, animation_target) {
             self.start_plot_animation_job(model, run, var, format);
         }
@@ -6948,6 +7039,70 @@ pub(crate) fn user_style_override_active(
         .is_some_and(|(_, table)| table.to_store_style(&field.key.var, &field.units).is_some())
 }
 
+/// Apply BowEcho's local-WRF display policy after rw-ui has converted a field
+/// into its display units. The standalone 10 m wind chart deliberately has a
+/// different scale from the MSLP wind overlay: it starts at zero and masks
+/// nothing, while an explicit user table always wins.
+///
+/// Returns `true` only when the standalone wind correction was installed.
+pub(crate) fn apply_local_wrf_field_style(
+    field: &mut rw_ui::FieldData,
+    hour_store_vars: &[String],
+    settings: &StyleOverrideSettings,
+) -> bool {
+    let local_wrf = field.key.hour.model.to_ascii_lowercase().starts_with("wrf");
+    let var = field.key.var.to_ascii_lowercase();
+    let standalone_wind = matches!(var.as_str(), "wind_speed_10m" | "wrf_wspd10" | "wspd10");
+    if local_wrf && standalone_wind && !user_style_override_active(settings, field) {
+        let title = display_var_name(&field.key.var, hour_store_vars)
+            .filter(|label| label != &field.key.var)
+            .unwrap_or_else(|| "10 m AGL Wind Speed".to_owned());
+        let mut style = field.style.take().unwrap_or_else(|| {
+            rustwx_products::viewer::generic_style_for_store_variable(
+                &field.key.var,
+                &field.units,
+                field.range,
+            )
+        });
+        let unit_factor = knots_to_display_unit_factor(&field.units);
+        style.title = title;
+        style.display_units = field.units.clone();
+        // FieldData from the worker is already converted to display units;
+        // style conversion must never be applied a second time.
+        style.convert = rustwx_products::viewer::UnitConvert::None;
+        style.scale = rustwx_render::ColorScale::Discrete(rustwx_render::DiscreteColorScale {
+            levels: (0..=24)
+                .map(|step| f64::from(step) * 2.5 * unit_factor)
+                .collect(),
+            colors: rustwx_render::weather::winds_palette_segments(60),
+            extend: rustwx_render::ExtendMode::Max,
+            mask_below: None,
+        });
+        style.cbar_tick_step = Some(10.0 * unit_factor);
+        field.style = Some(style);
+        return true;
+    }
+
+    attach_solar_fallback_style(field, hour_store_vars);
+    false
+}
+
+fn knots_to_display_unit_factor(units: &str) -> f64 {
+    let compact = units.to_ascii_lowercase().replace([' ', '_', '·', '^'], "");
+    if compact.contains("mph") || compact.contains("mi/h") {
+        1.150_779_448
+    } else if matches!(
+        compact.as_str(),
+        "m/s" | "ms-1" | "ms⁻1" | "mps" | "meterpersecond" | "meterspersecond"
+    ) {
+        1.0 / 1.943_844_5
+    } else {
+        // The production WRF style resolves to knots. Unknown speed-unit
+        // spellings retain that established convention instead of guessing.
+        1.0
+    }
+}
+
 /// v0.30 RC3 fix — give style-less local-WRF fields their Solarpower07
 /// palette as the field's OWN style, so the dock FIELD VIEWER shows it.
 ///
@@ -7393,6 +7548,76 @@ mod tests {
         // Deleting the table prunes its bindings — no dangling override.
         settings.remove_table("My temp");
         assert!(!user_style_override_active(&settings, &field));
+    }
+
+    #[test]
+    fn feedback_v03412_standalone_ten_meter_wind_has_no_low_speed_mask() {
+        let masked_style = |var: &str, units: &str| {
+            let mut style = rustwx_products::viewer::generic_style_for_store_variable(
+                var,
+                units,
+                Some((0.0, 60.0)),
+            );
+            style.scale = rustwx_render::ColorScale::Discrete(rustwx_render::DiscreteColorScale {
+                levels: vec![10.0, 60.0],
+                colors: rustwx_render::weather::winds_palette_segments(2),
+                extend: rustwx_render::ExtendMode::Max,
+                mask_below: Some(10.0),
+            });
+            style
+        };
+        let mut wind = override_test_field("wind_speed_10m");
+        wind.units = "kt".to_owned();
+        wind.values = vec![5.0];
+        wind.range = Some((5.0, 5.0));
+        wind.style = Some(masked_style("wind_speed_10m", "kt"));
+
+        assert!(apply_local_wrf_field_style(
+            &mut wind,
+            &["wind_speed_10m".to_owned()],
+            &StyleOverrideSettings::default(),
+        ));
+        let scale = wind.style.unwrap().scale.resolved_discrete();
+        assert_eq!(scale.levels.first().copied(), Some(0.0));
+        assert_eq!(scale.levels.last().copied(), Some(60.0));
+        assert_eq!(scale.mask_below, None);
+
+        // The MSLP overlay is not the standalone wind field and retains its
+        // deliberate strong-wind threshold.
+        let mut mslp = override_test_field("mslp");
+        mslp.units = "kt".to_owned();
+        mslp.style = Some(masked_style("mslp", "kt"));
+        assert!(!apply_local_wrf_field_style(
+            &mut mslp,
+            &["mslp".to_owned()],
+            &StyleOverrideSettings::default(),
+        ));
+        assert_eq!(
+            mslp.style.unwrap().scale.resolved_discrete().mask_below,
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn feedback_v03412_user_wind_table_still_overrides_builtin_no_mask_scale() {
+        let mut settings = StyleOverrideSettings::default();
+        settings.upsert_table(rw_ui::UserColorTable::simple("My wind", "My wind", "kt"));
+        settings.bind_product("wind_speed_10m", "My wind");
+        let mut wind = override_test_field("wind_speed_10m");
+        wind.units = "kt".to_owned();
+        wind.style = settings.style_for_store_variable(
+            "wind_speed_10m",
+            &serde_json::Value::Null,
+            "kt",
+            "wrf".parse::<rustwx_core::ModelId>().ok(),
+        );
+        let before = wind.style.clone();
+        assert!(!apply_local_wrf_field_style(
+            &mut wind,
+            &["wind_speed_10m".to_owned()],
+            &settings,
+        ));
+        assert_eq!(wind.style, before);
     }
 
     fn test_var(name: &str, units: &str) -> rw_ui::VarInfo {

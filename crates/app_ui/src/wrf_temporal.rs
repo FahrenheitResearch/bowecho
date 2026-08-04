@@ -901,8 +901,8 @@ mod tests {
         read_property_scene,
     };
     use crate::wrf_scene_inventory::{
-        WrfDomainId, WrfGridSignature, WrfRunDomain, WrfRunId, WrfScene, WrfSceneDiagnostics,
-        WrfSceneGroupKey, WrfSceneTime, WrfSourceIdentity,
+        WrfDomainId, WrfGridSignature, WrfProducerIdentity, WrfRunDomain, WrfRunId, WrfScene,
+        WrfSceneDiagnostics, WrfSceneGroupKey, WrfSceneTime, WrfSourceIdentity,
     };
 
     fn scene(name: &str, hour: u32) -> WrfScene {
@@ -922,6 +922,7 @@ mod tests {
                 "lambert",
                 7,
             ),
+            producer: WrfProducerIdentity::Wrf,
             source_identity: WrfSourceIdentity(name.to_owned()),
             time: WrfSceneTime::InternalTimes {
                 valid_time: Utc.with_ymd_and_hms(2026, 7, 12, hour, 0, 0).unwrap(),
@@ -939,6 +940,7 @@ mod tests {
             key: WrfSceneGroupKey {
                 run_domain: scenes[0].run_domain.clone(),
                 grid_signature: scenes[0].grid_signature.clone(),
+                producer: scenes[0].producer.clone(),
             },
             scenes,
             diagnostics: WrfSceneDiagnostics::default(),

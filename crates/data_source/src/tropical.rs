@@ -92,6 +92,20 @@ impl Basin {
             _ => "Cyclone",
         }
     }
+
+    /// JTWC supplies the official warning forecast outside the Atlantic and
+    /// East/Central Pacific areas covered by NHC/CPHC. Name matching alone is
+    /// not sufficient: storm names can be reused across basins and seasons.
+    fn uses_jtwc_forecasts(self) -> bool {
+        matches!(
+            self,
+            Basin::WestPacific
+                | Basin::NorthIndian
+                | Basin::SouthIndian
+                | Basin::SouthPacific
+                | Basin::Other
+        )
+    }
 }
 
 /// Which center/aggregator a record came from (shown in the card for honesty).
@@ -1575,7 +1589,7 @@ fn is_jtwc_designation(tok: &str) -> bool {
 /// number advances. (NHC storms already carry per-point wind in their own TCM.)
 pub fn attach_jtwc_forecast_urls(storms: &mut [TropicalCyclone], refs: &[JtwcWarningRef]) {
     for storm in storms.iter_mut() {
-        if storm.source != Source::Gdacs {
+        if storm.source != Source::Gdacs || !storm.basin.uses_jtwc_forecasts() {
             continue;
         }
         if let Some(matched) = refs
@@ -2807,6 +2821,29 @@ MAX WIND 50 KT...GUSTS 65 KT.
         let maysak = storms.iter().find(|s| s.name == "Maysak").unwrap();
         assert_eq!(maysak.forecast_url, None);
         assert_eq!(maysak.jtwc_warning_nr, None);
+    }
+
+    #[test]
+    fn feedback_v03412_jtwc_name_match_never_overrides_an_nhc_basin() {
+        let warning = JtwcWarningRef {
+            designation: "09W".to_owned(),
+            name: "Bavi".to_owned(),
+            warning_url: "https://www.metoc.navy.mil/jtwc/products/wp0926web.txt".to_owned(),
+            warning_nr: Some(25),
+        };
+        let mut storms = vec![
+            synthetic_storm("gdacs:atl", "Bavi", Source::Gdacs, -60.0, 25.0, 70.0),
+            synthetic_storm("gdacs:wp", "Bavi", Source::Gdacs, 130.0, 20.0, 70.0),
+        ];
+
+        attach_jtwc_forecast_urls(&mut storms, &[warning]);
+
+        assert_eq!(storms[0].basin, Basin::Atlantic);
+        assert_eq!(storms[0].forecast_url, None);
+        assert_eq!(storms[0].jtwc_warning_nr, None);
+        assert_eq!(storms[1].basin, Basin::WestPacific);
+        assert!(storms[1].forecast_url.is_some());
+        assert_eq!(storms[1].jtwc_warning_nr, Some(25));
     }
 
     #[test]

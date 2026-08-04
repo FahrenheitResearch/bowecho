@@ -157,9 +157,61 @@ pub struct WofsCatalog {
     pub runs: Vec<WofsRun>,
     /// Menu tree from the `hierarchy` endpoint: (group, slugs).
     pub groups: Vec<(String, Vec<String>)>,
-    /// Per-product valid times in SECONDS from `products?metadata=true`
-    /// — each product has its own grid; never guess minutes.
-    pub times: HashMap<String, Vec<u32>>,
+    /// Full records from `products?metadata=true`. Time offsets are signed
+    /// seconds because observation products include pre-initialization frames.
+    pub products: HashMap<String, WofsProductMetadata>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WofsProductMetadata {
+    pub label: Option<String>,
+    pub times_available: Vec<i32>,
+    /// Official renderer family (`product_type` in the response).
+    pub product_type: Option<String>,
+    /// Official backing product, when one is declared.
+    pub background: Option<String>,
+    /// Official data kind (`type` in the response), e.g. `obs`.
+    pub kind: Option<String>,
+}
+
+impl WofsProductMetadata {
+    fn is_observation(&self) -> bool {
+        self.kind.as_deref() == Some("obs")
+    }
+}
+
+fn parse_product_metadata(
+    products_text: &str,
+) -> Result<HashMap<String, WofsProductMetadata>, String> {
+    let products: serde_json::Value =
+        serde_json::from_str(products_text).map_err(|error| error.to_string())?;
+    let mut parsed = HashMap::new();
+    let Some(map) = products.as_object() else {
+        return Ok(parsed);
+    };
+    for (slug, meta) in map {
+        let times_available = meta["times_available"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_i64().and_then(|value| i32::try_from(value).ok()))
+            .collect::<Vec<_>>();
+        if times_available.is_empty() {
+            continue;
+        }
+        let string_field = |name: &str| meta[name].as_str().map(ToOwned::to_owned);
+        parsed.insert(
+            slug.clone(),
+            WofsProductMetadata {
+                label: string_field("label"),
+                times_available,
+                product_type: string_field("product_type"),
+                background: string_field("background"),
+                kind: string_field("type"),
+            },
+        );
+    }
+    Ok(parsed)
 }
 
 /// Fetch the run list + product groups (blocking; worker thread).
@@ -255,41 +307,26 @@ pub fn fetch_catalog() -> Result<WofsCatalog, String> {
         "{API}/products?{query}&type=products&metadata=true"
     ))
     .map_err(|e| format!("products: {e}"))?;
-    let products: serde_json::Value =
-        serde_json::from_str(&products_text).map_err(|e| e.to_string())?;
-    let mut times = HashMap::new();
-    if let Some(map) = products.as_object() {
-        for (slug, meta) in map {
-            if let Some(list) = meta["times_available"].as_array() {
-                let secs: Vec<u32> = list
-                    .iter()
-                    .filter_map(|v| v.as_u64().map(|s| s as u32))
-                    .collect();
-                if !secs.is_empty() {
-                    times.insert(slug.clone(), secs);
-                }
-            }
-        }
-    }
+    let products = parse_product_metadata(&products_text)?;
     // `hierarchy` is a capability tree, not an availability response. It
     // contains products with no files for this run as well as transparent
     // overlay-only images. Present only metadata-backed base products here;
     // transparent products remain in the dedicated Overlays menu, which is
-    // built from `times`.
-    retain_available_base_products(&mut groups, &times);
+    // built from `products`.
+    retain_available_base_products(&mut groups, &products);
     Ok(WofsCatalog {
         runs,
         groups,
-        times,
+        products,
     })
 }
 
 fn retain_available_base_products(
     groups: &mut Vec<(String, Vec<String>)>,
-    times: &HashMap<String, Vec<u32>>,
+    products: &HashMap<String, WofsProductMetadata>,
 ) {
     for (_, slugs) in groups.iter_mut() {
-        slugs.retain(|slug| times.contains_key(slug) && !slug.contains("_overlay_"));
+        slugs.retain(|slug| products.contains_key(slug) && !slug.contains("_overlay_"));
     }
     groups.retain(|(_, slugs)| !slugs.is_empty());
 }
@@ -339,13 +376,37 @@ fn collect_slugs(node: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// Product image URL: forecast minute as f{MMM}.
-pub fn image_url(run: &WofsRun, init: &str, product: &str, minute: u32) -> String {
+/// Forecast-product image URL: forecast minute as f{MMM}.
+pub fn image_url(run: &WofsRun, init: &str, product: &str, minute: i32) -> String {
     let (init_date, init_hhmm) = init_date_and_hhmm(&run.rundate, init);
     format!(
         "{CDN}/{}/{}/{}/img/{}_f{minute:03}.png",
         run.id, init_date, init_hhmm, product
     )
+}
+
+/// Product URL selected from the official metadata. Observation imagery is
+/// keyed by its valid UTC timestamp, not by a forecast `fMMM` suffix.
+fn product_image_url(
+    run: &WofsRun,
+    init: &str,
+    product: &str,
+    minute: i32,
+    metadata: Option<&WofsProductMetadata>,
+) -> String {
+    if metadata.is_some_and(WofsProductMetadata::is_observation)
+        && let Some(valid_time) =
+            init_time_utc(run, init).map(|time| time + chrono::Duration::minutes(i64::from(minute)))
+    {
+        return format!(
+            "{CDN}/{}/obs/{}/{}{}.png",
+            run.id,
+            valid_time.format("%Y%m%d"),
+            product,
+            valid_time.format("%Y%m%d%H%M")
+        );
+    }
+    image_url(run, init, product, minute)
 }
 
 fn availability_key(run: &WofsRun, init: &str, product: &str) -> String {
@@ -364,16 +425,17 @@ fn latest_posted_minute(
     run: &WofsRun,
     init: &str,
     product: &str,
-    candidates: &[u32],
+    metadata: Option<&WofsProductMetadata>,
+    candidates: &[i32],
     mut exists: impl FnMut(&str) -> Result<bool, String>,
-) -> Result<u32, String> {
+) -> Result<i32, String> {
     let mut minutes = candidates.to_vec();
     minutes.sort_unstable();
     minutes.dedup();
     let Some(&first) = minutes.first() else {
         return Err("product has no advertised forecast times".to_owned());
     };
-    if !exists(&image_url(run, init, product, first))? {
+    if !exists(&product_image_url(run, init, product, first, metadata))? {
         return Err("product has no posted analysis frame for this run/cycle".to_owned());
     }
 
@@ -381,7 +443,13 @@ fn latest_posted_minute(
     let mut high = minutes.len() - 1;
     while low < high {
         let middle = (low + high).div_ceil(2);
-        if exists(&image_url(run, init, product, minutes[middle]))? {
+        if exists(&product_image_url(
+            run,
+            init,
+            product,
+            minutes[middle],
+            metadata,
+        ))? {
             low = middle;
         } else {
             high = middle - 1;
@@ -413,6 +481,7 @@ fn known_product_label(slug: &str) -> Option<&'static str> {
     match slug {
         "comp_dz__paintballs_thresh_40" => Some("Composite reflectivity (paintballs >=40 dBZ)"),
         "comp_dz__ens_mean" => Some("Composite reflectivity (ensemble mean)"),
+        "mrms_dbz__" => Some("MRMS composite reflectivity (observation)"),
         "t_2__ens_mean" => Some("2 m temperature (ensemble mean)"),
         "td_2__ens_mean" => Some("2 m dewpoint (ensemble mean)"),
         "uh_0to2__paintballs_thresh_75" => Some("0-2 km updraft helicity (paintballs >=75)"),
@@ -558,12 +627,12 @@ pub fn fetch_image(url: &str) -> Result<egui::ColorImage, String> {
 /// Station-lattice worker message: the "{run_id}/{init}" key it was
 /// fetched for + the result.
 pub type StationsMsg = (String, Result<Vec<WofsStation>, String>);
-type AvailabilityMsg = (String, Result<u32, String>);
+type AvailabilityMsg = (String, Result<i32, String>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WofsTimelineFrame {
     init: String,
-    minute: u32,
+    minute: i32,
     valid_time: chrono::DateTime<chrono::Utc>,
 }
 
@@ -627,7 +696,9 @@ pub struct WofsState {
     /// Transient product-picker filter. Product aliases persist in settings;
     /// this query deliberately does not.
     pub product_search: String,
-    pub minute: u32,
+    /// Signed minute offset from the selected initialization. Forecast fields
+    /// are normally nonnegative; official observations may precede it.
+    pub minute: i32,
     /// Stacked transparent overlays (paintball slugs).
     pub overlays: Vec<String>,
     pub sync_to_radar: bool,
@@ -646,7 +717,7 @@ pub struct WofsState {
     /// metadata endpoint advertises the complete theoretical grid even while
     /// a live cycle has only posted part of it. Partial live edges are
     /// refreshed once per minute until the complete grid lands.
-    max_posted_minutes: HashMap<String, (u32, Instant)>,
+    max_posted_minutes: HashMap<String, (i32, Instant)>,
     availability_rx: Option<mpsc::Receiver<AvailabilityMsg>>,
     /// Last availability failure by selection: timestamp + diagnostic. The
     /// message lets the UI distinguish a proved-missing frame from a network
@@ -928,9 +999,37 @@ impl WofsState {
     }
 
     fn current_base_url(&self) -> Option<String> {
+        self.selected_product_url(&self.product)
+    }
+
+    /// URL for a product at the selected run/init/offset, honoring the
+    /// product's official forecast-vs-observation metadata.
+    pub fn selected_product_url(&self, product: &str) -> Option<String> {
         let catalog = self.catalog.as_ref()?;
         let run = catalog.runs.get(self.run_index)?;
-        (!self.init.is_empty()).then(|| image_url(run, &self.init, &self.product, self.minute))
+        (!self.init.is_empty()).then(|| {
+            product_image_url(
+                run,
+                &self.init,
+                product,
+                self.minute,
+                catalog.products.get(product),
+            )
+        })
+    }
+
+    pub fn selected_product_is_observation(&self) -> bool {
+        self.catalog
+            .as_ref()
+            .and_then(|catalog| catalog.products.get(&self.product))
+            .is_some_and(WofsProductMetadata::is_observation)
+    }
+
+    fn product_supports_minute(&self, product: &str, minute: i32) -> bool {
+        self.catalog
+            .as_ref()
+            .and_then(|catalog| catalog.products.get(product))
+            .is_some_and(|metadata| metadata.times_available.contains(&(minute * 60)))
     }
 
     fn current_availability_key(&self) -> Option<String> {
@@ -971,7 +1070,9 @@ impl WofsState {
             };
         }
 
-        let base_url = image_url(run, &self.init, &self.product, self.minute);
+        let Some(base_url) = self.current_base_url() else {
+            return WofsDrapeReadiness::WaitingForCatalog;
+        };
         if self.missing.contains_key(&base_url) {
             return WofsDrapeReadiness::FrameUnavailable;
         }
@@ -1005,18 +1106,21 @@ impl WofsState {
         let Some(&(max_posted, _)) = self.max_posted_minutes.get(&key) else {
             return false;
         };
-        if self.minute <= max_posted {
-            return false;
-        }
-        let clamped = self
+        let available = self
             .catalog
             .as_ref()
-            .and_then(|catalog| catalog.times.get(&self.product))
+            .and_then(|catalog| catalog.products.get(&self.product))
             .into_iter()
-            .flatten()
+            .flat_map(|metadata| &metadata.times_available)
             .map(|seconds| seconds / 60)
             .filter(|minute| *minute <= max_posted)
-            .max()
+            .collect::<Vec<_>>();
+        if available.contains(&self.minute) {
+            return false;
+        }
+        let clamped = available
+            .into_iter()
+            .min_by_key(|minute| minute.abs_diff(self.minute))
             .unwrap_or(max_posted);
         self.minute = clamped;
         true
@@ -1034,7 +1138,7 @@ impl WofsState {
                         && self.clamp_minute_to_posted_edge()
                     {
                         self.status = format!(
-                            "live cycle currently posted through f+{} min; selection adjusted",
+                            "live cycle currently posted through {:+} min; selection adjusted",
                             self.minute
                         );
                     }
@@ -1072,19 +1176,19 @@ impl WofsState {
             return;
         }
         let product = self.product.clone();
-        let Some(candidates) = catalog.times.get(&product).map(|seconds| {
-            seconds
-                .iter()
-                .map(|seconds| seconds / 60)
-                .collect::<Vec<_>>()
-        }) else {
+        let Some(metadata) = catalog.products.get(&product).cloned() else {
             let key = availability_key(&run, &self.init, &product);
-            let error = "product has no forecast grid".to_owned();
+            let error = "product has no advertised time grid".to_owned();
             self.availability_failed
                 .insert(key, (Instant::now(), error.clone()));
             self.status = format!("WoFS availability: {error}");
             return;
         };
+        let candidates = metadata
+            .times_available
+            .iter()
+            .map(|seconds| seconds / 60)
+            .collect::<Vec<_>>();
         let advertised_max = candidates.iter().copied().max().unwrap_or(0);
 
         // Populate the selected cycle first, then inventory the other cycles
@@ -1123,23 +1227,26 @@ impl WofsState {
         self.availability_rx = Some(rx);
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
-            let result = latest_posted_minute(&run, &init, &product, &candidates, |url| {
-                data_source::url_exists(url).map_err(|error| error.to_string())
-            });
+            let result =
+                latest_posted_minute(&run, &init, &product, Some(&metadata), &candidates, |url| {
+                    data_source::url_exists(url).map_err(|error| error.to_string())
+                });
             let _ = tx.send((key, result));
             ctx_clone.request_repaint();
         });
     }
 
-    /// Nearest available forecast minute for the current product.
-    pub fn snap_minute(&self, target_min: u32) -> u32 {
+    /// Nearest available signed minute offset for the current product.
+    pub fn snap_minute(&self, target_min: i32) -> i32 {
         let Some(catalog) = &self.catalog else {
             return target_min;
         };
-        let Some(secs) = catalog.times.get(&self.product) else {
+        let Some(metadata) = catalog.products.get(&self.product) else {
             return target_min;
         };
-        secs.iter()
+        metadata
+            .times_available
+            .iter()
             .map(|s| s / 60)
             .min_by_key(|m| m.abs_diff(target_min))
             .unwrap_or(target_min)
@@ -1177,15 +1284,15 @@ impl WofsState {
         true
     }
 
-    fn product_minutes(&self) -> Vec<u32> {
+    fn product_minutes(&self) -> Vec<i32> {
         let Some(catalog) = &self.catalog else {
             return Vec::new();
         };
         let mut minutes = catalog
-            .times
+            .products
             .get(&self.product)
             .into_iter()
-            .flatten()
+            .flat_map(|metadata| &metadata.times_available)
             .map(|seconds| seconds / 60)
             .collect::<Vec<_>>();
         minutes.sort_unstable();
@@ -1193,7 +1300,7 @@ impl WofsState {
         minutes
     }
 
-    fn current_init_minutes(&self) -> Vec<u32> {
+    fn current_init_minutes(&self) -> Vec<i32> {
         let mut minutes = self.product_minutes();
         if let Some(edge) = self.posted_edge_minute() {
             minutes.retain(|minute| *minute <= edge);
@@ -1270,20 +1377,29 @@ impl WofsState {
         by_valid_time.into_values().collect()
     }
 
-    pub fn posted_edge_minute(&self) -> Option<u32> {
+    pub fn posted_edge_minute(&self) -> Option<i32> {
         let key = self.current_availability_key()?;
         self.max_posted_minutes.get(&key).map(|(minute, _)| *minute)
     }
 
-    pub fn timeline_max_minute(&self) -> u32 {
+    pub fn timeline_min_minute(&self) -> i32 {
+        self.current_init_minutes()
+            .first()
+            .copied()
+            .or_else(|| self.product_minutes().first().copied())
+            .unwrap_or(0)
+    }
+
+    pub fn timeline_max_minute(&self) -> i32 {
         self.current_init_minutes()
             .last()
             .copied()
             .or_else(|| {
                 self.catalog
                     .as_ref()?
-                    .times
+                    .products
                     .get(&self.product)?
+                    .times_available
                     .iter()
                     .map(|seconds| seconds / 60)
                     .max()
@@ -1332,16 +1448,17 @@ impl WofsState {
 
     /// The sounding frame grid (seconds): the reference product's
     /// `times_available` — soundings post on the same 5-min grid.
-    fn snd_grid(&self) -> Option<&Vec<u32>> {
+    fn snd_grid(&self) -> Option<&[i32]> {
         self.catalog.as_ref().and_then(|c| {
-            c.times
+            c.products
                 .get(SND_REF_PRODUCT)
-                .or_else(|| c.times.get(&self.product))
+                .or_else(|| c.products.get(&self.product))
+                .map(|metadata| metadata.times_available.as_slice())
         })
     }
 
     /// Frame index on the sounding grid nearest a forecast minute.
-    fn frame_for_minute(&self, minute: u32) -> u32 {
+    fn frame_for_minute(&self, minute: i32) -> u32 {
         if let Some(secs) = self.snd_grid()
             && !secs.is_empty()
         {
@@ -1353,7 +1470,7 @@ impl WofsState {
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0);
         }
-        minute / 5
+        minute.max(0) as u32 / 5
     }
 
     /// Highest valid sounding frame index (72 on the standard 6 h grid).
@@ -1364,10 +1481,10 @@ impl WofsState {
     }
 
     /// Forecast minute a sounding frame is valid at.
-    fn frame_minute(&self, frame: u32) -> u32 {
+    fn frame_minute(&self, frame: u32) -> i32 {
         self.snd_grid()
             .and_then(|secs| secs.get(frame as usize).map(|s| s / 60))
-            .unwrap_or(frame * 5)
+            .unwrap_or((frame * 5) as i32)
     }
 
     /// Current sounding frame: manual prev/next override, else follow the
@@ -1389,9 +1506,23 @@ impl WofsState {
         if !self.max_posted_minutes.contains_key(&availability) {
             return Vec::new();
         }
-        let mut urls = vec![image_url(run, &self.init, &self.product, self.minute)];
+        let mut urls = vec![product_image_url(
+            run,
+            &self.init,
+            &self.product,
+            self.minute,
+            catalog.products.get(&self.product),
+        )];
         for overlay in &self.overlays {
-            urls.push(image_url(run, &self.init, overlay, self.minute));
+            if self.product_supports_minute(overlay, self.minute) {
+                urls.push(product_image_url(
+                    run,
+                    &self.init,
+                    overlay,
+                    self.minute,
+                    catalog.products.get(overlay),
+                ));
+            }
         }
         if self.soundings_mode
             && let Some(station) = &self.selected_station
@@ -1424,7 +1555,13 @@ impl WofsState {
         self.max_posted_minutes
             .contains_key(&availability)
             .then_some(())?;
-        let url = image_url(run, &self.init, &self.product, self.minute);
+        let url = product_image_url(
+            run,
+            &self.init,
+            &self.product,
+            self.minute,
+            catalog.products.get(&self.product),
+        );
         self.url_needs_fetch(&url).then_some(url)
     }
 
@@ -1776,13 +1913,27 @@ impl WofsState {
         let Some(run) = catalog.runs.get(self.run_index) else {
             return;
         };
-        let base_url = image_url(run, &self.init, &self.product, self.minute);
+        let base_url = product_image_url(
+            run,
+            &self.init,
+            &self.product,
+            self.minute,
+            catalog.products.get(&self.product),
+        );
         let Some(georef) = self.georef_cache.get(&run.id) else {
             return;
         };
         let mut urls = vec![base_url];
         for overlay in &self.overlays {
-            urls.push(image_url(run, &self.init, overlay, self.minute));
+            if self.product_supports_minute(overlay, self.minute) {
+                urls.push(product_image_url(
+                    run,
+                    &self.init,
+                    overlay,
+                    self.minute,
+                    catalog.products.get(overlay),
+                ));
+            }
         }
         let mut drew_drape = false;
         for url in urls {
@@ -2029,6 +2180,162 @@ impl WofsState {
 mod tests {
     use super::*;
 
+    fn test_products(times: HashMap<String, Vec<i32>>) -> HashMap<String, WofsProductMetadata> {
+        times
+            .into_iter()
+            .map(|(slug, times_available)| {
+                (
+                    slug,
+                    WofsProductMetadata {
+                        times_available,
+                        ..WofsProductMetadata::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn feedback_v03412_wofs_captured_metadata_preserves_signed_obs_fields() {
+        let captured = r#"{
+            "mrms_dbz__": {
+                "label": "MRMS Composite Reflectivity",
+                "times_available_key": "times_5m_hrlag",
+                "times_available": [-3600, -3300, -300, 0, 300, 21600],
+                "product_type": "mrms_rad",
+                "background": "mrms_dbz__",
+                "type": "obs"
+            },
+            "comp_dz__ens_mean": {
+                "label": "Composite Reflectivity Ensemble Mean",
+                "times_available": [0, 300],
+                "product_type": "wofs"
+            }
+        }"#;
+
+        let products = parse_product_metadata(captured).expect("captured metadata parses");
+        let mrms = products.get("mrms_dbz__").expect("MRMS metadata retained");
+        assert_eq!(mrms.times_available, [-3600, -3300, -300, 0, 300, 21600]);
+        assert_eq!(mrms.kind.as_deref(), Some("obs"));
+        assert_eq!(mrms.product_type.as_deref(), Some("mrms_rad"));
+        assert_eq!(mrms.background.as_deref(), Some("mrms_dbz__"));
+        assert!(mrms.is_observation());
+        assert!(!products["comp_dz__ens_mean"].is_observation());
+    }
+
+    #[test]
+    fn feedback_v03412_wofs_observation_url_uses_valid_time_across_midnight() {
+        let run = WofsRun {
+            id: "WOFSRun20260711-test".to_owned(),
+            name: "Test domain".to_owned(),
+            rundate: "20260711".to_owned(),
+            inits: vec!["202607120030".to_owned()],
+        };
+        let metadata = WofsProductMetadata {
+            times_available: vec![-3600, 0, 300],
+            kind: Some("obs".to_owned()),
+            product_type: Some("mrms_rad".to_owned()),
+            background: Some("mrms_dbz__".to_owned()),
+            ..WofsProductMetadata::default()
+        };
+
+        assert_eq!(
+            product_image_url(&run, &run.inits[0], "mrms_dbz__", -60, Some(&metadata)),
+            format!("{CDN}/WOFSRun20260711-test/obs/20260711/mrms_dbz__202607112330.png")
+        );
+        assert!(
+            product_image_url(&run, &run.inits[0], "comp_dz__ens_mean", 5, None,)
+                .ends_with("/20260712/0030/img/comp_dz__ens_mean_f005.png")
+        );
+    }
+
+    #[test]
+    fn feedback_v03412_wofs_obs_timeline_steps_negative_zero_positive() {
+        let run = WofsRun {
+            id: "WOFSRun20260721-live".to_owned(),
+            name: "Live domain".to_owned(),
+            rundate: "20260721".to_owned(),
+            inits: vec!["202607211700".to_owned()],
+        };
+        let product = "mrms_dbz__".to_owned();
+        let mut state = WofsState {
+            catalog: Some(WofsCatalog {
+                runs: vec![run.clone()],
+                groups: vec![("Observations".to_owned(), vec![product.clone()])],
+                products: HashMap::from([(
+                    product.clone(),
+                    WofsProductMetadata {
+                        times_available: vec![-300, 0, 300],
+                        kind: Some("obs".to_owned()),
+                        product_type: Some("mrms_rad".to_owned()),
+                        background: Some(product.clone()),
+                        ..WofsProductMetadata::default()
+                    },
+                )]),
+            }),
+            init: run.inits[0].clone(),
+            product: product.clone(),
+            minute: 0,
+            sync_to_radar: true,
+            ..WofsState::default()
+        };
+        state.max_posted_minutes.insert(
+            availability_key(&run, &run.inits[0], &product),
+            (5, Instant::now()),
+        );
+
+        let frames = state.timeline_frames();
+        assert_eq!(
+            frames.iter().map(|frame| frame.minute).collect::<Vec<_>>(),
+            [-5, 0, 5]
+        );
+        assert_eq!(state.timeline_min_minute(), -5);
+        assert_eq!(state.timeline_max_minute(), 5);
+        assert!(state.step_minute(false));
+        assert_eq!(state.minute, -5);
+        assert!(state.step_minute(true));
+        assert_eq!(state.minute, 0);
+        assert!(state.step_minute(true));
+        assert_eq!(state.minute, 5);
+    }
+
+    #[test]
+    fn feedback_v03412_wofs_availability_probes_native_obs_urls() {
+        let run = WofsRun {
+            id: "WOFSRun20260721-live".to_owned(),
+            name: "Live domain".to_owned(),
+            rundate: "20260721".to_owned(),
+            inits: vec!["202607211700".to_owned()],
+        };
+        let metadata = WofsProductMetadata {
+            times_available: vec![-300, 0, 300],
+            kind: Some("obs".to_owned()),
+            ..WofsProductMetadata::default()
+        };
+        let mut probes = Vec::new();
+        let edge = latest_posted_minute(
+            &run,
+            &run.inits[0],
+            "mrms_dbz__",
+            Some(&metadata),
+            &[-5, 0, 5],
+            |url| {
+                probes.push(url.to_owned());
+                Ok(true)
+            },
+        )
+        .expect("observation grid is contiguous");
+
+        assert_eq!(edge, 5);
+        assert!(probes.iter().all(|url| url.contains("/obs/20260721/")));
+        assert!(probes.iter().all(|url| !url.contains("_f")));
+        assert!(
+            probes
+                .iter()
+                .any(|url| url.ends_with("mrms_dbz__202607211655.png"))
+        );
+    }
+
     #[test]
     fn hidden_wofs_suspends_and_map_only_schedules_only_map_work() {
         let hidden = WofsPumpActivity::new(false, false, false);
@@ -2202,15 +2509,22 @@ mod tests {
         };
         let candidates = (0..=360).step_by(5).collect::<Vec<_>>();
         let mut probes = 0usize;
-        let edge = latest_posted_minute(&run, &run.inits[0], SND_REF_PRODUCT, &candidates, |url| {
-            probes += 1;
-            let minute = url
-                .rsplit_once("_f")
-                .and_then(|(_, suffix)| suffix.strip_suffix(".png"))
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap();
-            Ok(minute <= 215)
-        })
+        let edge = latest_posted_minute(
+            &run,
+            &run.inits[0],
+            SND_REF_PRODUCT,
+            None,
+            &candidates,
+            |url| {
+                probes += 1;
+                let minute = url
+                    .rsplit_once("_f")
+                    .and_then(|(_, suffix)| suffix.strip_suffix(".png"))
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .unwrap();
+                Ok(minute <= 215)
+            },
+        )
         .unwrap();
 
         assert_eq!(edge, 215);
@@ -2231,10 +2545,10 @@ mod tests {
             catalog: Some(WofsCatalog {
                 runs: vec![run.clone()],
                 groups: Vec::new(),
-                times: HashMap::from([(
+                products: test_products(HashMap::from([(
                     product.clone(),
                     (0..=360).step_by(5).map(|minute| minute * 60).collect(),
-                )]),
+                )])),
             }),
             init: run.inits[0].clone(),
             product,
@@ -2256,10 +2570,10 @@ mod tests {
                 inits: inits.iter().map(|init| (*init).to_owned()).collect(),
             }],
             groups: Vec::new(),
-            times: HashMap::from([(
+            products: test_products(HashMap::from([(
                 SND_REF_PRODUCT.to_owned(),
                 (0..=360).step_by(5).map(|minute| minute * 60).collect(),
-            )]),
+            )])),
         }
     }
 
@@ -2348,7 +2662,7 @@ mod tests {
             catalog: Some(WofsCatalog {
                 runs: vec![selected_run.clone(), previous_run.clone()],
                 groups: Vec::new(),
-                times: product_times.clone(),
+                products: test_products(product_times.clone()),
             }),
             run_index: 0,
             init: selected_run.inits[0].clone(),
@@ -2366,7 +2680,7 @@ mod tests {
         state.apply_catalog(WofsCatalog {
             runs: vec![newly_advertised, selected_run.clone(), previous_run],
             groups: Vec::new(),
-            times: product_times,
+            products: test_products(product_times),
         });
 
         assert_eq!(state.run_index, 1);
@@ -2391,7 +2705,7 @@ mod tests {
             catalog: Some(WofsCatalog {
                 runs: vec![selected_v1.clone()],
                 groups: Vec::new(),
-                times: product_times.clone(),
+                products: test_products(product_times.clone()),
             }),
             run_index: 0,
             init: selected_v1.inits[0].clone(),
@@ -2414,7 +2728,7 @@ mod tests {
                 selected_v2.clone(),
             ],
             groups: Vec::new(),
-            times: product_times.clone(),
+            products: test_products(product_times.clone()),
         });
         assert_eq!(state.run_index, 1);
         assert_eq!(state.init, selected_v2.inits[0]);
@@ -2444,7 +2758,7 @@ mod tests {
                 selected_v3.clone(),
             ],
             groups: Vec::new(),
-            times: product_times,
+            products: test_products(product_times),
         });
 
         assert_eq!(state.run_index, 2);
@@ -2474,7 +2788,7 @@ mod tests {
             catalog: Some(WofsCatalog {
                 runs: vec![other_old_run, selected_run.clone()],
                 groups: Vec::new(),
-                times: product_times.clone(),
+                products: test_products(product_times.clone()),
             }),
             run_index: 1,
             init: selected_run.inits[1].clone(),
@@ -2495,7 +2809,7 @@ mod tests {
         state.apply_catalog(WofsCatalog {
             runs: refreshed_runs,
             groups: Vec::new(),
-            times: product_times,
+            products: test_products(product_times),
         });
 
         let catalog = state.catalog.as_ref().unwrap();
@@ -2523,7 +2837,7 @@ mod tests {
             catalog: Some(WofsCatalog {
                 runs: vec![latest_run.clone(), older_run.clone()],
                 groups: Vec::new(),
-                times: HashMap::new(),
+                products: HashMap::new(),
             }),
             run_index: 1,
             init: older_run.inits[0].clone(),
@@ -2674,15 +2988,15 @@ mod tests {
                 vec!["comp_dz_overlay__paintballs_thresh_40".to_owned()],
             ),
         ];
-        let times = HashMap::from([
+        let products = test_products(HashMap::from([
             ("t_2__ens_mean".to_owned(), vec![0, 300]),
             (
                 "comp_dz_overlay__paintballs_thresh_40".to_owned(),
                 vec![0, 300],
             ),
-        ]);
+        ]));
 
-        retain_available_base_products(&mut groups, &times);
+        retain_available_base_products(&mut groups, &products);
 
         assert_eq!(
             groups,
@@ -2735,7 +3049,7 @@ mod tests {
             catalog: Some(WofsCatalog {
                 runs: vec![run.clone()],
                 groups: Vec::new(),
-                times: HashMap::from([(product.clone(), vec![0, 300])]),
+                products: test_products(HashMap::from([(product.clone(), vec![0, 300])])),
             }),
             init: run.inits[0].clone(),
             product: product.clone(),

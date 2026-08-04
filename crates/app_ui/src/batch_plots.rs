@@ -44,7 +44,7 @@ use rw_store::format::RwsVariableMeta;
 use rw_store::grid::GridFile;
 use rw_ui::{FieldData, FieldKey, HourKey, StoreView, StyleOverrideSettings};
 
-use crate::model_data::{attach_solar_fallback_style, display_var_name};
+use crate::model_data::{apply_local_wrf_field_style, display_var_name};
 
 /// Default output size. Production plots are landscape 4:3 — big enough for
 /// the colorbar/title furniture to read, small enough that a 100-field ×
@@ -299,6 +299,7 @@ struct RunRenderCtx<'a> {
     lat_descending: bool,
     bounds: (f64, f64, f64, f64),
     projected: ProjectedMap,
+    source_metadata: Option<crate::wrf_source::WrfRunSourceMetadata>,
     run_dir: PathBuf,
 }
 
@@ -386,6 +387,13 @@ pub(crate) fn run_batch_plot(
         lat_descending,
         bounds,
         projected,
+        source_metadata: crate::wrf_source::read_run_metadata(
+            &request.store_root,
+            &request.model,
+            &request.run,
+        )
+        .ok()
+        .flatten(),
         run_dir: run_dir.clone(),
     };
     let mut state = RunState {
@@ -645,7 +653,7 @@ fn plot_one(
     store_var_names: &[String],
     hour_position: (usize, usize),
 ) {
-    let source = ensure_style(&mut field, store_var_names);
+    let source = ensure_style(&mut field, store_var_names, &ctx.request.overrides);
     let hour = field.key.hour.hour;
     let var_slug = sanitize_component(&field.key.var);
     let path = ctx.run_dir.join(&var_slug).join(frame_file_name(hour));
@@ -655,6 +663,7 @@ fn plot_one(
         ctx.bounds,
         ctx.request.options.width,
         ctx.request.options.height,
+        ctx.source_metadata.as_ref(),
         &path,
     ) {
         Ok(()) => {
@@ -698,11 +707,16 @@ fn plot_one(
 /// The style ladder: keep a resolved production/user style, then the Solar
 /// local-WRF fallback, then a generic ramp titled with the field's friendly
 /// label so the plot is honest about being unstyled.
-fn ensure_style(field: &mut FieldData, store_var_names: &[String]) -> StyleSource {
-    if field.style.is_some() {
+fn ensure_style(
+    field: &mut FieldData,
+    store_var_names: &[String],
+    overrides: &StyleOverrideSettings,
+) -> StyleSource {
+    let pre_resolved = field.style.is_some();
+    let standalone_wind = apply_local_wrf_field_style(field, store_var_names, overrides);
+    if pre_resolved || standalone_wind {
         return StyleSource::Production;
     }
-    attach_solar_fallback_style(field, store_var_names);
     if field.style.is_some() {
         return StyleSource::Solar;
     }
@@ -797,6 +811,7 @@ fn render_field_png(
     bounds: (f64, f64, f64, f64),
     width: u32,
     height: u32,
+    source_metadata: Option<&crate::wrf_source::WrfRunSourceMetadata>,
     path: &Path,
 ) -> Result<(), String> {
     let style = field
@@ -838,10 +853,15 @@ fn render_field_png(
     request.apply_projected_map(projected);
     request.title = Some(style.title.clone());
     request.subtitle_left = Some(format!(
-        "{} f{:03}",
-        field.key.hour.run, field.key.hour.hour
+        "{} {}",
+        field.key.hour.run,
+        field.key.hour.time_label()
     ));
-    request.subtitle_right = Some(field.key.hour.model.to_ascii_uppercase());
+    request.subtitle_right = Some(
+        source_metadata
+            .map(crate::wrf_source::WrfRunSourceMetadata::plot_label)
+            .unwrap_or_else(|| field.key.hour.model.to_ascii_uppercase()),
+    );
     request.width = width;
     request.height = height;
     request.render_density = style.colormap_options.render_density;
@@ -1085,24 +1105,28 @@ mod tests {
             style: None,
         };
         let store_vars = vec!["temperature_2m".to_owned(), "wrf_widget".to_owned()];
+        let overrides = StyleOverrideSettings::default();
 
         // Pre-resolved style: untouched, production bucket.
         let mut styled = field("wrf", "temperature_2m", "K");
         styled.style = rw_ui::UserColorTable::simple("t", "t", "K").to_store_style("t", "K");
         assert_eq!(
-            ensure_style(&mut styled, &store_vars),
+            ensure_style(&mut styled, &store_vars, &overrides),
             StyleSource::Production
         );
 
         // Canonical wrf var without a style: Solarpower07 fallback.
         let mut solar = field("wrf", "temperature_2m", "K");
-        assert_eq!(ensure_style(&mut solar, &store_vars), StyleSource::Solar);
+        assert_eq!(
+            ensure_style(&mut solar, &store_vars, &overrides),
+            StyleSource::Solar
+        );
         assert!(solar.style.is_some(), "solar fallback compiled a style");
 
         // Unknown wrf var: generic ramp spanning the data, titled by name.
         let mut generic = field("wrf", "wrf_widget", "widgets");
         assert_eq!(
-            ensure_style(&mut generic, &store_vars),
+            ensure_style(&mut generic, &store_vars, &overrides),
             StyleSource::Generic
         );
         let style = generic.style.expect("generic ramp built");
@@ -1111,7 +1135,10 @@ mod tests {
 
         // Non-wrf model: the Solar gate must not fire — generic.
         let mut other = field("gfs", "temperature_2m", "K");
-        assert_eq!(ensure_style(&mut other, &store_vars), StyleSource::Generic);
+        assert_eq!(
+            ensure_style(&mut other, &store_vars, &overrides),
+            StyleSource::Generic
+        );
     }
 
     /// Full sweep over a tiny two-hour store: every surface field and every

@@ -11178,7 +11178,8 @@ mod tests {
         time_index: usize,
     ) -> app_ui::wrf_scene_inventory::WrfScene {
         use app_ui::wrf_scene_inventory::{
-            WrfDomainId, WrfGridSignature, WrfRunDomain, WrfRunId, WrfSceneTime, WrfSourceIdentity,
+            WrfDomainId, WrfGridSignature, WrfProducerIdentity, WrfRunDomain, WrfRunId,
+            WrfSceneTime, WrfSourceIdentity,
         };
         use chrono::TimeZone;
 
@@ -11198,6 +11199,7 @@ mod tests {
                 "lambert",
                 0x1234,
             ),
+            producer: WrfProducerIdentity::Wrf,
             source_identity: WrfSourceIdentity(source_identity.to_owned()),
             time: WrfSceneTime::InternalTimes {
                 valid_time: Utc.with_ymd_and_hms(2026, 7, 12, 1, 0, 0).unwrap(),

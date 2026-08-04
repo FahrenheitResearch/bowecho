@@ -735,13 +735,20 @@ impl ViewerApp {
             .as_deref()
             .and_then(|station| self.obs_history_data(station, history_frame_time));
 
-        // Card lines. The coordinate line is ALWAYS shown (Solarpower07's
-        // loupe convention: N/S + E/W); `swatches` pins a color chip to a
-        // line index so the field's color rides next to its #RRGGBB value.
+        // Card lines. Coordinates use the N/S + E/W loupe convention when the
+        // persisted inspector preference enables them; `swatches` pins a color
+        // chip to a line index so the field's color rides next to its #RRGGBB
+        // value.
         let mut lines = Vec::new();
         let mut swatches: Vec<(usize, egui::Color32)> = Vec::new();
         let (cursor_lon, cursor_lat) = self.screen_to_lon_lat(rect, anchor);
-        lines.push(format_lat_lon(cursor_lat, cursor_lon));
+        if let Some(coordinates) = inspector_coordinate_line(
+            self.app_settings.inspector_show_coordinates,
+            cursor_lat,
+            cursor_lon,
+        ) {
+            lines.push(coordinates);
+        }
         if let Some(readout) = &readout {
             // Value in the active table's declared unit space (an mph
             // velocity table reads out mph) — the SI diagnostics below
@@ -2466,17 +2473,26 @@ pub(crate) const LOUPE_MAGNIFY_MAX: f32 = 20.0;
 /// notch (~50 points on Windows) is ~exp(50*0.0025)=1.13x, a comfortable step.
 pub(crate) const LOUPE_MAGNIFY_SCROLL_RATE: f32 = 0.0025;
 
+/// Optional first line of the inspector card. Keeping this decision pure makes
+/// the persisted hide-coordinates preference testable without a GUI renderer.
+pub(crate) fn inspector_coordinate_line(show: bool, lat: f32, lon: f32) -> Option<String> {
+    show.then(|| format_lat_lon(lat, lon))
+}
+
 /// Whether the Field Loupe owns the scroll wheel this frame (so it retunes the
-/// loupe magnification and the map does NOT zoom). The loupe is shown when the
-/// inspector card is enabled AND (its loupe toggle is on OR Shift is held), and
-/// never while a plot-domain box drag/arm owns the surface.
+/// loupe magnification and the map does NOT zoom). Ordinary wheel input always
+/// belongs to the map; the loupe only intercepts Control/Command+wheel while it
+/// is visible. The loupe is shown when the inspector card is enabled AND (its
+/// loupe toggle is on OR Shift is held), and never while a plot-domain box
+/// drag/arm owns the surface.
 pub(crate) fn loupe_owns_scroll(
     show_inspector_card: bool,
     loupe_toggle: bool,
     shift_held: bool,
+    control_held: bool,
     plot_domain_busy: bool,
 ) -> bool {
-    show_inspector_card && (loupe_toggle || shift_held) && !plot_domain_busy
+    show_inspector_card && (loupe_toggle || shift_held) && control_held && !plot_domain_busy
 }
 
 /// Next loupe magnification after a scroll of `scroll` points (wheel up =
@@ -5686,17 +5702,28 @@ mod loupe_polish_tests {
     // ---- Item 3: scroll routing decision + magnification clamp ----
 
     #[test]
-    fn loupe_owns_scroll_matches_visibility_gate() {
+    fn feedback_ux_loupe_owns_scroll_matches_visibility_gate() {
         // Card off -> never (loupe only draws inside the card).
-        assert!(!loupe_owns_scroll(false, true, true, false));
-        // Card on + toggle on -> owns scroll even without Shift.
-        assert!(loupe_owns_scroll(true, true, false, false));
-        // Card on + Shift held -> owns scroll (transient loupe).
-        assert!(loupe_owns_scroll(true, false, true, false));
+        assert!(!loupe_owns_scroll(false, true, true, true, false));
+        // Ordinary wheel always stays with the map, even when pinned on.
+        assert!(!loupe_owns_scroll(true, true, false, false, false));
+        // Card on + toggle on + Control -> loupe owns scroll without Shift.
+        assert!(loupe_owns_scroll(true, true, false, true, false));
+        // Shift summons the transient loupe; Control explicitly retunes it.
+        assert!(loupe_owns_scroll(true, false, true, true, false));
         // Card on but neither toggle nor Shift -> map keeps the wheel.
-        assert!(!loupe_owns_scroll(true, false, false, false));
+        assert!(!loupe_owns_scroll(true, false, false, true, false));
         // Plot-domain box owns the surface -> loupe never intercepts.
-        assert!(!loupe_owns_scroll(true, true, true, true));
+        assert!(!loupe_owns_scroll(true, true, true, true, true));
+    }
+
+    #[test]
+    fn feedback_ux_inspector_coordinate_line_respects_hide_preference() {
+        assert_eq!(
+            inspector_coordinate_line(true, 39.764, -84.497).as_deref(),
+            Some("39.764N, 84.497W")
+        );
+        assert_eq!(inspector_coordinate_line(false, 39.764, -84.497), None);
     }
 
     #[test]

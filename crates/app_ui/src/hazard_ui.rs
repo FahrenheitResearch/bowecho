@@ -322,6 +322,7 @@ impl ViewerApp {
                 }
                 let unacknowledged_count = rows.iter().filter(|row| row.unacknowledged).count();
                 if unacknowledged_count > 0 {
+                    ui.ctx().request_repaint_after(Duration::from_millis(350));
                     ui.horizontal(|ui| {
                         ui.colored_label(
                             egui::Color32::from_rgb(255, 202, 92),
@@ -388,7 +389,7 @@ impl ViewerApp {
                                 row.unacknowledged,
                                 max_chars,
                             );
-                            let accent = app
+                            let family_accent = app
                                 .hazard_overlay
                                 .as_ref()
                                 .and_then(|overlay| overlay.records.get(row.index))
@@ -414,6 +415,11 @@ impl ViewerApp {
                                         )
                                     })
                                 });
+                            let accent = current_alert_accent_color(
+                                family_accent,
+                                row.unacknowledged,
+                                ui.input(|input| input.time),
+                            );
                             let response = panel_kit::select_row(
                                 ui,
                                 row.selected,
@@ -450,28 +456,33 @@ impl ViewerApp {
 
         if let Some(record) = self.selected_hazard_record() {
             ui.add_space(6.0);
-            let detail_lines = hazard_record_detail_lines(record);
-            fixed_height_scroll(
-                ui,
-                "hazard_detail_text",
-                HAZARD_DETAIL_SCROLL_HEIGHT,
-                |ui| {
-                    for line in &detail_lines {
-                        wrapped_label(ui, line);
+            egui::CollapsingHeader::new("Selected alert text")
+                .id_salt("hazard_selected_alert_text")
+                .default_open(true)
+                .show(ui, |ui| {
+                    let detail_lines = hazard_record_detail_lines(record);
+                    fixed_height_scroll(
+                        ui,
+                        "hazard_detail_text",
+                        HAZARD_DETAIL_SCROLL_HEIGHT,
+                        |ui| {
+                            for line in &detail_lines {
+                                wrapped_label(ui, line);
+                            }
+                        },
+                    );
+                    spc_md_image::show(
+                        ui,
+                        &record.event_family,
+                        record.source_url.as_deref(),
+                        &record.event_id,
+                    );
+                    if meteoalarm::is_meteoalarm_record(record)
+                        && let Some(source_url) = record.source_url.as_deref()
+                    {
+                        ui.hyperlink_to("Open official CAP warning", source_url);
                     }
-                },
-            );
-            spc_md_image::show(
-                ui,
-                &record.event_family,
-                record.source_url.as_deref(),
-                &record.event_id,
-            );
-            if meteoalarm::is_meteoalarm_record(record)
-                && let Some(source_url) = record.source_url.as_deref()
-            {
-                ui.hyperlink_to("Open official CAP warning", source_url);
-            }
+                });
         }
 
         let summary_lines = self.hazard_summary_lines();
@@ -3169,5 +3180,21 @@ mod tests {
         // No office, no expiry: just the head columns.
         let bare = hazard_alert_row_text("MD", "MD 1234", "", None, false, 60);
         assert!(bare.trim_end().ends_with("1234"), "{bare}");
+    }
+
+    #[test]
+    fn feedback_ux_current_alert_accent_flashes_only_until_acknowledged() {
+        let family = egui::Color32::from_rgb(20, 180, 90);
+        let flash_a = current_alert_accent_color(Some(family), true, 0.0);
+        let flash_b = current_alert_accent_color(Some(family), true, 0.5);
+        assert_ne!(flash_a, Some(family));
+        assert_ne!(flash_b, Some(family));
+        assert_ne!(flash_a, flash_b, "unacknowledged indicator must alternate");
+        assert_eq!(
+            current_alert_accent_color(Some(family), false, 0.0),
+            Some(family),
+            "acknowledgement restores the warning-family accent"
+        );
+        assert_eq!(current_alert_accent_color(None, false, 0.5), None);
     }
 }

@@ -6,8 +6,8 @@
 //! remains untimed; this module never manufactures epoch-based timestamps.
 //!
 //! Grouping is intentionally stricter than "all selected wrfout files": run,
-//! WRF domain, and grid signature must all match.  That keeps d01/d02 and
-//! geometrically incompatible grids out of the same synthetic loop.
+//! WRF domain, grid signature, and producer must all match. That keeps d01/d02,
+//! ArWen/other-WRF, and geometrically incompatible grids out of one loop.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -48,6 +48,54 @@ pub struct WrfSourceIdentity(pub String);
 impl From<&str> for WrfSourceIdentity {
     fn from(value: &str) -> Self {
         Self(value.to_string())
+    }
+}
+
+/// Model producer carried separately from the rw-store model slug. ArWen
+/// writes ordinary WRF output, so it stays in the `wrf` storage lane while
+/// this identity prevents a mixed ArWen/other-WRF selection from being
+/// silently merged into one run.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum WrfProducerIdentity {
+    Wrf,
+    Arwen { version: String },
+}
+
+impl WrfProducerIdentity {
+    pub fn from_gpuwm_version(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::Wrf;
+        };
+        let mut version = String::new();
+        let mut previous_space = false;
+        for character in raw
+            .trim_matches(|character: char| character.is_whitespace() || character == '\0')
+            .chars()
+        {
+            if version.len() >= 64 {
+                break;
+            }
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '+') {
+                version.push(character);
+                previous_space = false;
+            } else if character.is_whitespace() && !previous_space && !version.is_empty() {
+                version.push(' ');
+                previous_space = true;
+            }
+        }
+        let version = version.trim().to_owned();
+        if version.is_empty() {
+            Self::Wrf
+        } else {
+            Self::Arwen { version }
+        }
+    }
+
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::Wrf => "WRF".to_owned(),
+            Self::Arwen { version } => format!("ArWen {version}"),
+        }
     }
 }
 
@@ -226,6 +274,7 @@ pub struct WrfScene {
     pub time_index: usize,
     pub run_domain: WrfRunDomain,
     pub grid_signature: WrfGridSignature,
+    pub producer: WrfProducerIdentity,
     pub source_identity: WrfSourceIdentity,
     pub time: WrfSceneTime,
 }
@@ -252,11 +301,14 @@ pub struct WrfSceneLocator {
 pub struct WrfSceneGroupKey {
     pub run_domain: WrfRunDomain,
     pub grid_signature: WrfGridSignature,
+    pub producer: WrfProducerIdentity,
 }
 
 impl WrfSceneGroupKey {
     pub fn is_compatible(&self, scene: &WrfScene) -> bool {
-        self.run_domain == scene.run_domain && self.grid_signature == scene.grid_signature
+        self.run_domain == scene.run_domain
+            && self.grid_signature == scene.grid_signature
+            && self.producer == scene.producer
     }
 }
 
@@ -305,7 +357,7 @@ pub struct WrfSceneGroup {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WrfSceneInventory {
-    /// Deterministic `(run, domain, grid signature)` order.
+    /// Deterministic `(run, domain, grid signature, producer)` order.
     pub groups: Vec<WrfSceneGroup>,
 }
 
@@ -316,6 +368,7 @@ impl WrfSceneInventory {
             let key = WrfSceneGroupKey {
                 run_domain: scene.run_domain.clone(),
                 grid_signature: scene.grid_signature.clone(),
+                producer: scene.producer.clone(),
             };
             groups.entry(key).or_default().push(scene);
         }
@@ -457,6 +510,7 @@ mod tests {
                 domain: WrfDomainId(domain),
             },
             grid_signature: grid(grid_digest),
+            producer: WrfProducerIdentity::Wrf,
             source_identity: source.into(),
             time,
         }
@@ -514,6 +568,48 @@ mod tests {
         assert_eq!(parse_wrf_domain_id(colon), Some(WrfDomainId(2)));
         assert_eq!(parse_wrf_domain_id(underscore), Some(WrfDomainId(3)));
         assert!(parse_wrf_filename_time(Path::new("wrfout_d01_2026-02-30_00_00_00")).is_none());
+    }
+
+    #[test]
+    fn feedback_v03412_arwen_identity_is_bounded_and_separates_other_wrf_scenes() {
+        assert_eq!(
+            WrfProducerIdentity::from_gpuwm_version(Some(" 1.5.1\0 ")),
+            WrfProducerIdentity::Arwen {
+                version: "1.5.1".to_owned()
+            }
+        );
+        assert_eq!(
+            WrfProducerIdentity::from_gpuwm_version(Some("\0 \t")),
+            WrfProducerIdentity::Wrf
+        );
+
+        let mut arwen = scene(
+            "run/arwen",
+            0,
+            "run",
+            1,
+            10,
+            "arwen",
+            internal("2026-05-10_01:00:00"),
+        );
+        arwen.producer = WrfProducerIdentity::Arwen {
+            version: "1.5.1".to_owned(),
+        };
+        let ordinary = scene(
+            "run/wrf",
+            0,
+            "run",
+            1,
+            10,
+            "wrf",
+            internal("2026-05-10_02:00:00"),
+        );
+        assert_eq!(
+            WrfSceneInventory::from_scenes([arwen, ordinary])
+                .groups
+                .len(),
+            2
+        );
     }
 
     #[test]

@@ -147,6 +147,7 @@ mod wrf_radar;
 mod wrf_radar_estimator;
 pub use app_ui::wrf_radar_physics;
 mod wrf_refractivity;
+mod wrf_source;
 mod wrf_volumes;
 
 use hazard_geom::append_flattened_hazard_fill_shapes;
@@ -4458,6 +4459,28 @@ impl LowSweepCutKey {
     }
 }
 
+fn low_sweep_cut_is_disabled(
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+    identity: &FrameIdentity,
+    cut_index: usize,
+) -> bool {
+    disabled_cuts
+        .iter()
+        .any(|disabled| disabled.applies_to(identity, cut_index))
+}
+
+fn set_low_sweep_cut_enabled(
+    disabled_cuts: &mut BTreeSet<LowSweepCutKey>,
+    identity: &FrameIdentity,
+    cut_index: usize,
+    enabled: bool,
+) {
+    disabled_cuts.retain(|disabled| !disabled.applies_to(identity, cut_index));
+    if !enabled {
+        disabled_cuts.insert(LowSweepCutKey::session(identity, cut_index));
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct FrameWorkKey {
     identity: FrameIdentity,
@@ -4540,6 +4563,30 @@ fn storm_track_detail_text(track: &StormTrack, time_zone: DisplayTimeZone) -> Op
     Some(format!(
         "toward {direction:03.0}° at {speed_kt:.0} kt · {forecast_times}"
     ))
+}
+
+/// Map label for the one storm track the user selected. Histories and forecast
+/// circles stay visible for every track, but their text no longer blankets the
+/// radar until a click makes one track the active follow target.
+fn storm_track_map_label(
+    track: &StormTrack,
+    selected_track_id: Option<u32>,
+    map_scale: f32,
+) -> Option<String> {
+    if map_scale < 90.0 || selected_track_id != Some(track.id) {
+        return None;
+    }
+    Some(match track.fitted_motion {
+        Some((u, v)) => {
+            let dir = (u.atan2(v)).to_degrees().rem_euclid(360.0);
+            let kt = u.hypot(v) / KNOT_TO_MPS as f64;
+            format!(
+                "#{} {:.0}dBZ toward {:03.0}°/{:.0}kt",
+                track.id, track.max_dbz, dir, kt
+            )
+        }
+        None => format!("#{} {:.0}dBZ", track.id, track.max_dbz),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9415,7 +9462,7 @@ impl ViewerApp {
         settings::set_storage_namespace(app_settings.brand.effective_storage_namespace());
         // Persisted chrome theme BEFORE the style document is built —
         // configure_style reads ui_theme::theme().
-        ui_theme::set_active_theme(ui_theme::ThemeChoice::from_slug(&app_settings.ui_theme));
+        ui_theme::apply_persisted_theme(&cc.egui_ctx, &app_settings.ui_theme);
         configure_style(&cc.egui_ctx, &app_settings);
         // CJK fallback before the first frame: Japanese site names render
         // as glyphs, not tofu (appended LAST — Latin text is untouched).
@@ -14075,18 +14122,19 @@ impl ViewerApp {
         ui.horizontal_wrapped(|ui| {
             ui.weak("Sweep cuts");
             for cut in candidates {
-                let key = LowSweepCutKey::session(&identity, cut);
-                let mut enabled = !self.low_sweep_disabled_cuts.contains(&key);
+                let mut enabled =
+                    !low_sweep_cut_is_disabled(&self.low_sweep_disabled_cuts, &identity, cut);
                 if ui
                     .checkbox(&mut enabled, low_sweep_cut_label(volume.as_ref(), cut))
                     .on_hover_text(low_sweep_cut_hover_text(volume.as_ref(), cut))
                     .changed()
                 {
-                    if enabled {
-                        self.low_sweep_disabled_cuts.remove(&key);
-                    } else {
-                        self.low_sweep_disabled_cuts.insert(key);
-                    }
+                    set_low_sweep_cut_enabled(
+                        &mut self.low_sweep_disabled_cuts,
+                        &identity,
+                        cut,
+                        enabled,
+                    );
                     changed = true;
                 }
             }
@@ -14151,18 +14199,19 @@ impl ViewerApp {
         ui.horizontal_wrapped(|ui| {
             ui.weak("Sweep cuts");
             for cut in candidates {
-                let key = LowSweepCutKey::session(&identity, cut);
-                let mut enabled = !self.low_sweep_disabled_cuts.contains(&key);
+                let mut enabled =
+                    !low_sweep_cut_is_disabled(&self.low_sweep_disabled_cuts, &identity, cut);
                 if ui
                     .checkbox(&mut enabled, low_sweep_cut_label(volume.as_ref(), cut))
                     .on_hover_text(low_sweep_cut_hover_text(volume.as_ref(), cut))
                     .changed()
                 {
-                    if enabled {
-                        self.low_sweep_disabled_cuts.remove(&key);
-                    } else {
-                        self.low_sweep_disabled_cuts.insert(key);
-                    }
+                    set_low_sweep_cut_enabled(
+                        &mut self.low_sweep_disabled_cuts,
+                        &identity,
+                        cut,
+                        enabled,
+                    );
                     changed = true;
                 }
             }
@@ -26709,11 +26758,37 @@ impl ViewerApp {
                 )
                 .changed();
             inspector_changed |= ui
+                .checkbox(
+                    &mut self.app_settings.inspector_show_coordinates,
+                    "Coordinates",
+                )
+                .on_hover_text("Show latitude and longitude on the inspector card.")
+                .changed();
+            inspector_changed |= ui
                 .checkbox(&mut self.inspector_show_loupe, "Field loupe")
                 .on_hover_text(
-                    "Circular GPU magnifier at the cursor showing the pixelated field, its value, color and coordinates. Hold Shift to summon it momentarily even when this is off. While it is shown, the scroll wheel zooms the loupe (2x-20x) instead of the map. Loupe design inspired by Solarpower07's WRF-Runner.",
+                    "Circular GPU magnifier at the cursor showing the pixelated field. Hold Shift to summon it momentarily even when this is off. The ordinary scroll wheel always zooms the map; hold Control (Command on macOS) while scrolling to change loupe magnification. Loupe design inspired by Solarpower07's WRF-Runner.",
                 )
                 .changed();
+            ui.horizontal(|ui| {
+                ui.label("Loupe zoom");
+                if ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.loupe_magnify,
+                            map_paint::LOUPE_MAGNIFY_MIN..=map_paint::LOUPE_MAGNIFY_MAX,
+                        )
+                        .suffix("x")
+                        .show_value(true),
+                    )
+                    .on_hover_text(
+                        "Set the loupe's optical magnification. Control/Command+wheel over the map changes the same value.",
+                    )
+                    .changed()
+                {
+                    ui.ctx().request_repaint();
+                }
+            });
         });
         let mut open_probe_history = false;
         ui.horizontal_wrapped(|ui| {
@@ -30324,18 +30399,22 @@ impl ViewerApp {
         );
     }
 
-    /// Whether the Field Loupe is currently showing over the map, so the scroll
-    /// wheel should retune its magnification instead of zooming the map. Mirrors
-    /// the visibility gate in `draw_cursor_loupe`/`cursor_loupe_disk`, minus the
-    /// per-frame disk geometry (always satisfiable while the pointer hovers the
-    /// canvas). The loupe only draws inside the inspector card, so it also
-    /// requires `show_inspector_card`.
+    /// Whether the Field Loupe is visible and the user explicitly holds
+    /// Control/Command, so the wheel retunes its magnification. Ordinary wheel
+    /// input always remains map zoom. The loupe only draws inside the inspector
+    /// card, so it also requires `show_inspector_card`.
     fn loupe_scroll_active(&self, ctx: &egui::Context) -> bool {
-        let shift_held = ctx.input(|input| input.modifiers.shift);
+        let (shift_held, control_held) = ctx.input(|input| {
+            (
+                input.modifiers.shift,
+                input.modifiers.ctrl || input.modifiers.command,
+            )
+        });
         map_paint::loupe_owns_scroll(
             self.show_inspector_card,
             self.inspector_show_loupe,
             shift_held,
+            control_held,
             self.plot_domain_map_drag.is_some() || self.model_map_box_arm_active(),
         )
     }
@@ -37978,7 +38057,7 @@ impl ViewerApp {
                     }
                     ui.menu_button("Overlays ⏷", |ui| {
                         let overlay_slugs: Vec<String> = catalog
-                            .times
+                            .products
                             .keys()
                             .filter(|slug| slug.contains("_overlay_"))
                             .cloned()
@@ -38189,7 +38268,11 @@ impl ViewerApp {
                     .on_hover_text("Give the selected WoFS product a local display name");
                 });
             ui.horizontal_wrapped(|ui| {
-                    ui.label("f+min");
+                    ui.label(if self.wofs.selected_product_is_observation() {
+                        "obs offset"
+                    } else {
+                        "f+min"
+                    });
                     let can_step_back = self.wofs.can_step_minute(false);
                     if ui
                         .add_enabled(can_step_back, egui::Button::new("◀").small())
@@ -38198,17 +38281,18 @@ impl ViewerApp {
                     {
                         self.wofs.step_minute(false);
                     }
-                    let mut minute = self.wofs.minute as i32;
-                    let max_minute = self.wofs.timeline_max_minute().max(5) as i32;
+                    let mut minute = self.wofs.minute;
+                    let min_minute = self.wofs.timeline_min_minute();
+                    let max_minute = self.wofs.timeline_max_minute().max(min_minute + 5);
                     if ui
                         .add(
-                            egui::Slider::new(&mut minute, 0..=max_minute)
+                            egui::Slider::new(&mut minute, min_minute..=max_minute)
                                 .step_by(5.0)
                                 .show_value(true),
                         )
                         .changed()
                     {
-                        self.wofs.minute = self.wofs.snap_minute(minute as u32);
+                        self.wofs.minute = self.wofs.snap_minute(minute);
                         self.wofs.sync_to_radar = false;
                     }
                     let can_step_forward = self.wofs.can_step_minute(true);
@@ -38225,11 +38309,11 @@ impl ViewerApp {
                         );
                     if self.wofs.sync_to_radar {
                         ui.weak(format!(
-                            "-> {}z + {} min",
+                            "-> {}z {:+} min",
                             wofs::init_hhmm(&self.wofs.init), self.wofs.minute
                         ));
                     } else if let Some(edge) = self.wofs.posted_edge_minute() {
-                        ui.weak(format!("posted through +{edge}m"));
+                        ui.weak(format!("posted through {edge:+}m"));
                     }
                     self.wofs.soundings_toggle_ui(ui);
                     if self.wofs.image_rx.is_some() {
@@ -38241,9 +38325,10 @@ impl ViewerApp {
                     );
                 });
             self.wofs.drape_controls_ui(ui);
-            if let Some(run) = catalog.runs.get(self.wofs.run_index) {
-                let base_url =
-                    wofs::image_url(run, &self.wofs.init, &self.wofs.product, self.wofs.minute);
+            if catalog.runs.get(self.wofs.run_index).is_some() {
+                let Some(base_url) = self.wofs.selected_product_url(&self.wofs.product) else {
+                    return;
+                };
                 let size = ui.available_size();
                 let side = (size.x.min(size.y * 900.0 / 800.0)).max(200.0);
                 let rect_size = egui::vec2(side, side * 800.0 / 900.0);
@@ -38277,7 +38362,9 @@ impl ViewerApp {
                     );
                 }
                 for overlay in self.wofs.overlays.clone() {
-                    let url = wofs::image_url(run, &self.wofs.init, &overlay, self.wofs.minute);
+                    let Some(url) = self.wofs.selected_product_url(&overlay) else {
+                        continue;
+                    };
                     if let Some(texture) = self.wofs.textures.get(&url) {
                         ui.painter().image(
                             texture.id(),
@@ -40734,18 +40821,11 @@ impl ViewerApp {
                     previous = position;
                 }
             }
-            if self.map_scale >= 90.0 {
-                let label = match track.fitted_motion {
-                    Some((u, v)) => {
-                        let dir = (u.atan2(v)).to_degrees().rem_euclid(360.0);
-                        let kt = u.hypot(v) / KNOT_TO_MPS as f64;
-                        format!(
-                            "#{} {:.0}dBZ toward {:03.0}°/{:.0}kt",
-                            track.id, track.max_dbz, dir, kt
-                        )
-                    }
-                    None => format!("#{} {:.0}dBZ", track.id, track.max_dbz),
-                };
+            if let Some(label) = storm_track_map_label(
+                track,
+                self.storm_track_follow.map(|follow| follow.track_id),
+                self.map_scale,
+            ) {
                 draw_halo_text(
                     painter,
                     current + egui::vec2(8.0, -8.0),
@@ -44699,12 +44779,26 @@ fn hazard_record_list_hover(record: &HazardRecord) -> String {
 }
 
 fn new_hazard_label_color(ctx: &egui::Context) -> egui::Color32 {
-    let blink_on = ctx.input(|input| (input.time * 2.4) as i64 % 2 == 0);
+    new_hazard_label_color_at(ctx.input(|input| input.time))
+}
+
+fn new_hazard_label_color_at(time: f64) -> egui::Color32 {
+    let blink_on = (time * 2.4) as i64 % 2 == 0;
     if blink_on {
         egui::Color32::from_rgba_unmultiplied(255, 230, 96, 245)
     } else {
         egui::Color32::from_rgba_unmultiplied(255, 118, 72, 220)
     }
+}
+
+fn current_alert_accent_color(
+    family_color: Option<egui::Color32>,
+    unacknowledged: bool,
+    time: f64,
+) -> Option<egui::Color32> {
+    unacknowledged
+        .then_some(new_hazard_label_color_at(time))
+        .or(family_color)
 }
 
 fn hazard_focus_view(bbox: [f32; 4]) -> (f32, f32, f32) {
@@ -68327,7 +68421,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_low_sweep_cut_stays_disabled_when_stepping_frames() {
+    fn feedback_ux_disabled_low_sweep_cut_stays_disabled_when_stepping_frames() {
         let first_volume = Arc::new(test_reflectivity_sails_volume_with_radials(
             &[(0.5, 0), (0.5, 60_000)],
             720,
@@ -68352,7 +68446,7 @@ mod tests {
             status: FrameStatus::LiveComplete,
             source_label: "test".to_owned(),
         };
-        let disabled = BTreeSet::from([LowSweepCutKey::session(&first.identity, 1)]);
+        let mut disabled = BTreeSet::from([LowSweepCutKey::session(&first.identity, 1)]);
         let product = DisplayProduct::Moment(MomentType::Reflectivity);
         let policy = SweepPolicy::default();
 
@@ -68364,6 +68458,19 @@ mod tests {
             sweep_cuts_for_history_entry(&second, &product, policy, &disabled),
             vec![0],
             "a cut hidden on one scan must stay hidden on the next scan"
+        );
+        assert!(
+            low_sweep_cut_is_disabled(&disabled, &second.identity, 1),
+            "the next scan's checkbox must reflect the session-wide off state"
+        );
+
+        set_low_sweep_cut_enabled(&mut disabled, &second.identity, 1, true);
+        assert!(!low_sweep_cut_is_disabled(&disabled, &first.identity, 1));
+        assert!(!low_sweep_cut_is_disabled(&disabled, &second.identity, 1));
+        assert_eq!(
+            sweep_cuts_for_history_entry(&second, &product, policy, &disabled),
+            vec![0, 1],
+            "re-enabling from a later scan must clear the session-wide off state"
         );
     }
 
@@ -71844,7 +71951,7 @@ mod tests {
     }
 
     #[test]
-    fn loupe_magnify_defaults_and_scroll_routing_respects_toggle() {
+    fn feedback_ux_loupe_magnify_defaults_and_scroll_routing_respects_toggle() {
         let ctx = egui::Context::default();
         let mut app = test_viewer_app_with_hazards(Vec::new());
         // Field seeded to the shared default.
@@ -71853,8 +71960,11 @@ mod tests {
         app.show_inspector_card = true;
         app.inspector_show_loupe = false;
         assert!(!app.loupe_scroll_active(&ctx));
-        // Loupe pinned on -> the wheel routes to the loupe.
+        // Loupe pinned on still leaves ordinary wheel input with the map.
         app.inspector_show_loupe = true;
+        assert!(!app.loupe_scroll_active(&ctx));
+        // Control/Command is the explicit magnification gesture.
+        ctx.input_mut(|input| input.modifiers.ctrl = true);
         assert!(app.loupe_scroll_active(&ctx));
         // Inspector card hidden -> loupe cannot show, so the map keeps the wheel.
         app.show_inspector_card = false;
@@ -72064,6 +72174,30 @@ mod tests {
         assert_eq!(
             storm_track_detail_text(&no_motion, DisplayTimeZone::Utc),
             None
+        );
+    }
+
+    #[test]
+    fn feedback_ux_storm_track_map_text_only_appears_for_selected_track() {
+        let fix_time = Utc
+            .with_ymd_and_hms(2026, 7, 20, 0, 0, 0)
+            .single()
+            .expect("valid scan time");
+        let selected = test_storm_track(
+            12,
+            fix_time,
+            0.0,
+            0.0,
+            Some((20.0 * KNOT_TO_MPS as f64, 0.0)),
+        );
+        let other = test_storm_track(13, fix_time, 0.0, 0.0, None);
+
+        assert_eq!(storm_track_map_label(&selected, None, 650.0), None);
+        assert_eq!(storm_track_map_label(&other, Some(12), 650.0), None);
+        assert_eq!(storm_track_map_label(&selected, Some(12), 80.0), None);
+        assert_eq!(
+            storm_track_map_label(&selected, Some(12), 650.0).as_deref(),
+            Some("#12 58dBZ toward 090°/20kt")
         );
     }
 

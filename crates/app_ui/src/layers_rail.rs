@@ -82,6 +82,25 @@ fn oa_analysis_readiness(
 }
 
 const PLACEFILE_VISIBILITY_RANGE_PERCENTS: [u16; 5] = [100, 200, 400, 800, u16::MAX];
+const GLM_LAYER_NAME: &str = "GOES GLM";
+const MTG_LIGHTNING_MENU_LABEL: &str = "Meteosat LI · 1-hour loop";
+
+fn compact_glm_flash_count(count: usize) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
+
+fn glm_live_status(source: &str, count: usize, window_minutes: i64) -> String {
+    format!(
+        "{source} live · {}/{window_minutes}m",
+        compact_glm_flash_count(count)
+    )
+}
 
 #[rustfmt::skip]
 const US_STATE_FILTER_ABBRS: &[&str] = &[
@@ -879,13 +898,17 @@ impl ViewerApp {
         // is closed, and the state dot reports actual draw readiness.
         if self.wofs.drape_on_map {
             let minute = self.wofs.minute;
+            let time_kind = if self.wofs.selected_product_is_observation() {
+                "obs offset"
+            } else {
+                "forecast offset"
+            };
             let init = self.wofs.init.clone();
             let readiness = self.wofs.drape_readiness();
             let name_hover = format!(
-                "WoFS ensemble drape: {} · init {}z · f+{}m{}\nGeoreferenced onto the radar map; product/run/minute live in the WoFS window.\nMap status: {}",
+                "WoFS ensemble drape: {} · init {}z · {time_kind} {minute:+}m{}\nGeoreferenced onto the radar map; product/run/minute live in the WoFS window.\nMap status: {}",
                 self.wofs.product,
                 if init.is_empty() { "??" } else { &init },
-                minute,
                 if self.wofs.sync_to_radar {
                     " · synced to radar time"
                 } else {
@@ -897,7 +920,7 @@ impl ViewerApp {
             let mut remove_drape = false;
             let mut visibility_mode_changed = false;
             let high_visibility = &mut self.wofs.drape_high_visibility;
-            let selection = (!init.is_empty()).then(|| format!("{init}z+{minute}m"));
+            let selection = (!init.is_empty()).then(|| format!("{init}z{minute:+}m"));
             let wofs_count = if readiness == crate::wofs::WofsDrapeReadiness::Ready {
                 selection
             } else {
@@ -1443,7 +1466,7 @@ impl ViewerApp {
                         if count > 0 && !displaying_live_time {
                             format!("{source} {count} at selected time")
                         } else if count > 0 {
-                            format!("{source} live ({count}/{glm_window_min}m)")
+                            glm_live_status(source, count, glm_window_min)
                         } else if let Some(error) = &glm.last_read_error {
                             format!("{source} read {}", compact_layer_status(error, 18))
                         } else if let Some(latest_ms) = glm.latest_flash_time_ms {
@@ -1451,7 +1474,7 @@ impl ViewerApp {
                             let age_min = glm_latest_age_minutes(live_ms, latest_ms);
                             if glm_latest_is_live(live_ms, latest_ms) {
                                 if displaying_live_time {
-                                    format!("{source} live ({latest_count}/{glm_window_min}m)")
+                                    glm_live_status(source, latest_count, glm_window_min)
                                 } else {
                                     format!("{source} live · none at selected time")
                                 }
@@ -1504,7 +1527,6 @@ impl ViewerApp {
             let show_glm_line = self.glm_enabled;
             let mut refresh_glm = false;
             let mut open_mtg_lightning = false;
-            let mut quick_mtg_lightning = false;
             let mut next_window_min = glm_window_min;
             let mut glm_style_changed = false;
             let row_changed = layer_row(
@@ -1514,8 +1536,8 @@ impl ViewerApp {
                         value: &mut self.glm_enabled,
                         hover: "GOES GLM flashes, free via AWS (no key): trailing Show last window, age-faded, time-synced to the radar loop. Live/stale health uses the newest-flash gate.",
                     },
-                    name: "Lightning",
-                    name_hover: "GOES GLM point flashes. The gear also opens a Meteosat Lightning Imager accumulated-flash-area loop for Europe/Africa. Himawari has no onboard lightning mapper.",
+                    name: GLM_LAYER_NAME,
+                    name_hover: "GOES Geostationary Lightning Mapper point flashes. Meteosat Lightning Imager accumulated-flash-area loops are a separate action in the gear menu. Himawari has no onboard lightning mapper.",
                     state: glm_state,
                     count: show_glm_line.then_some(glm_line.as_str()),
                     gear: Some(LayerRowGear::Menu {
@@ -1534,7 +1556,7 @@ impl ViewerApp {
                             ui.weak(
                                 "Meteosat LI is a five-minute accumulated-flash-area raster, not individual point flashes.",
                             );
-                            if ui.button("Meteosat LI · 1-hour loop").clicked() {
+                            if ui.button(MTG_LIGHTNING_MENU_LABEL).clicked() {
                                 open_mtg_lightning = true;
                                 ui.close();
                             }
@@ -1564,23 +1586,13 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    if ui
-                        .small_button("MTG LI")
-                        .on_hover_text(
-                            "Load a one-hour Meteosat Lightning Imager accumulated-flash-area loop",
-                        )
-                        .clicked()
-                    {
-                        quick_mtg_lightning = true;
-                    }
-                },
+                |_ui| {},
             );
             if refresh_glm {
                 self.refresh_glm_data(ctx);
                 ctx.request_repaint();
             }
-            if open_mtg_lightning || quick_mtg_lightning {
+            if open_mtg_lightning {
                 self.show_satellite = true;
                 self.queue_meteosat_product(ctx, eumetsat::MtgProduct::LightningAfa, 12);
                 ctx.request_repaint();
@@ -3746,6 +3758,21 @@ impl ViewerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feedback_v03412_lightning_row_keeps_goes_and_meteosat_unambiguous() {
+        assert_eq!(GLM_LAYER_NAME, "GOES GLM");
+        assert!(!GLM_LAYER_NAME.contains("MTG"));
+        assert!(MTG_LIGHTNING_MENU_LABEL.starts_with("Meteosat LI"));
+
+        let status = glm_live_status("GOES-East", 19_023, 30);
+        assert_eq!(status, "GOES-East live · 19.0k/30m");
+        assert!(status.chars().count() < 32, "narrow rail status: {status}");
+        assert!(
+            !status.contains("MTG") && !status.contains("Meteosat"),
+            "GOES provider health must not look like an MTG source: {status}"
+        );
+    }
 
     #[test]
     fn oa_analysis_readiness_explains_every_blocked_state() {

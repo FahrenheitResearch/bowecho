@@ -124,7 +124,7 @@ impl GuideSection {
                 "map warnings alerts placefiles metar observations wofs tropical hurricane hunters recon"
             }
             Self::ModelData => {
-                "models hrrr gfs grib sounding box download import plot color table formula point probe sample cursor pin fixed history graph time series extrema minimum maximum"
+                "models hrrr gfs grib sounding box download import plot color table formula point probe sample cursor pin fixed history graph time series domain extrema minimum maximum tornado simulation"
             }
             Self::Wrf => {
                 "wrf processing folder progress follow timestep animation gif mp4 video simulated radar dual pol p3 tmatrix namelist interpolation cuda"
@@ -1205,13 +1205,17 @@ fn model_data(ui: &mut egui::Ui) {
         "With \"Model / GRIB point value\" ticked in Inspector\u{2026}, the cursor card reads \
          the loaded model field under the cursor with its units, run, lead, and authoritative \
          valid time when the store carries one. Shift+click fixes that probe at the displayed \
-         latitude/longitude so it stays put through pan, zoom, and model-time changes. In Tools, \
-         Forecast graph… plots that fixed point over locally stored forecast times and can \
-         switch to the selected field's domain-wide minimum or maximum; point reads touch only \
-         the needed grid-cell window and extrema use cached store statistics. Use Unpin probe or \
+         latitude/longitude so it stays put through pan, zoom, and model-time changes. The \
+         fixed-point Forecast graph in Radar › Tools plots that location over locally stored \
+         forecast times; point reads touch only the needed grid-cell window. Use Unpin probe or \
          Shift+click the pin to release it. This probes fields BowEcho has successfully ingested \
          into Models; it is not a promise that every arbitrary GRIB edition, grid, or parameter \
          can be opened.",
+    );
+    action(
+        ui,
+        "Domain extrema…",
+        "— in Models › Field tools, graph the selected stored 2-D field's whole-domain minimum or maximum at every charted forecast time. This does not require a map pin. Exact WRF lead seconds preserve minute-cadence simulations, the charted peak is marked with its time, and clicking a chart point loads that timestep.",
     );
     subhead(ui, "EVENT AUTO-LOAD");
     para(
