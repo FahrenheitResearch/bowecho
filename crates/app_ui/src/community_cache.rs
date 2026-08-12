@@ -133,6 +133,8 @@ pub(crate) struct CommunityCacheClient {
     authority_federation: Option<AuthorityFederationPolicy>,
     #[cfg(test)]
     origin_attempts: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    archival_origin_attempts: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -636,6 +638,35 @@ impl CommunityCacheClient {
         settings: &settings::CommunityCacheSettings,
         cache_root: PathBuf,
     ) -> Result<Self, CommunityCacheError> {
+        Self::from_settings_with_credentials(settings, cache_root, || {
+            crate::community_credentials::load_credentials()
+                .map_err(|_| CommunityCacheError::Credentials)
+                .map(|credentials| credentials.map(|value| value.bearer_token().to_owned()))
+        })
+    }
+
+    /// Deterministic credential injection for unit tests running without an OS
+    /// secret-service session. Production construction always uses the vault.
+    #[cfg(test)]
+    pub(crate) fn from_settings_for_test(
+        settings: &settings::CommunityCacheSettings,
+        cache_root: PathBuf,
+        bearer_token: &str,
+    ) -> Result<Self, CommunityCacheError> {
+        let bearer_token = bearer_token.trim();
+        if bearer_token.is_empty() {
+            return Err(CommunityCacheError::Credentials);
+        }
+        Self::from_settings_with_credentials(settings, cache_root, || {
+            Ok(Some(bearer_token.to_owned()))
+        })
+    }
+
+    fn from_settings_with_credentials(
+        settings: &settings::CommunityCacheSettings,
+        cache_root: PathBuf,
+        load_bearer_token: impl FnOnce() -> Result<Option<String>, CommunityCacheError>,
+    ) -> Result<Self, CommunityCacheError> {
         if !settings.phase1_active() {
             return Err(CommunityCacheError::Disabled);
         }
@@ -652,9 +683,7 @@ impl CommunityCacheClient {
         let upload_limit_bytes_per_hour = u64::from(settings.upload_cap_mib_per_hour)
             .checked_mul(1024 * 1024)
             .ok_or(CommunityCacheError::Quota)?;
-        let bearer_token = crate::community_credentials::load_credentials()
-            .map_err(|_| CommunityCacheError::Credentials)?
-            .map(|value| value.bearer_token().to_owned());
+        let bearer_token = load_bearer_token()?;
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
@@ -683,6 +712,8 @@ impl CommunityCacheClient {
             authority_federation: None,
             #[cfg(test)]
             origin_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            archival_origin_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -923,6 +954,9 @@ impl CommunityCacheClient {
         if manifest.manifest.request != *request {
             return Err(CommunityCacheError::Response);
         }
+        #[cfg(test)]
+        self.archival_origin_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let object =
             self.fetch_object_at(&self.origin_url, manifest, request, DeliveryTier::Origin)?;
         self.disk.store(&object)
@@ -976,6 +1010,12 @@ impl CommunityCacheClient {
     #[cfg(test)]
     pub(crate) fn origin_attempts_for_test(&self) -> u64 {
         self.origin_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn archival_origin_attempts_for_test(&self) -> u64 {
+        self.archival_origin_attempts
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -4669,6 +4709,7 @@ mod tests {
                 preferred_origin_id: Some("university-lab".into()),
             }),
             origin_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            archival_origin_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         assert!(matches!(
             client.historical_manifest(&request("20260812_00z")),
@@ -4861,9 +4902,18 @@ mod tests {
             manifest_public_key_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             ..Default::default()
         };
-        let mut first = CommunityCacheClient::from_settings(&settings, cache_root.clone()).unwrap();
-        let mut second =
-            CommunityCacheClient::from_settings(&settings, cache_root.join(".")).unwrap();
+        let mut first = CommunityCacheClient::from_settings_for_test(
+            &settings,
+            cache_root.clone(),
+            "test-origin-bearer",
+        )
+        .unwrap();
+        let mut second = CommunityCacheClient::from_settings_for_test(
+            &settings,
+            cache_root.join("."),
+            "test-origin-bearer",
+        )
+        .unwrap();
         let ledger = cache_root.join(TRANSFER_USAGE_FILE);
         first.transfers = TransferGate::shared(10, 7, 15, 1, ledger.clone()).unwrap();
         second.transfers = TransferGate::shared(10, 7, 15, 1, ledger.clone()).unwrap();

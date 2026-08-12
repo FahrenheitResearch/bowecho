@@ -12970,9 +12970,10 @@ mod tests {
             manifest_public_key_base64: ORIGIN_KEY.to_owned(),
             ..Default::default()
         };
-        let client = crate::community_cache::CommunityCacheClient::from_settings(
+        let client = crate::community_cache::CommunityCacheClient::from_settings_for_test(
             &settings,
             temp.path().to_path_buf(),
+            "test-origin-bearer",
         )
         .unwrap();
         let runtime = crate::community_relay::CommunityRelayRuntime::start(
@@ -13029,9 +13030,10 @@ mod tests {
             max_concurrent_downloads: 4,
             ..Default::default()
         };
-        let client = crate::community_cache::CommunityCacheClient::from_settings(
+        let client = crate::community_cache::CommunityCacheClient::from_settings_for_test(
             &settings,
             temp.path().to_path_buf(),
+            "test-origin-bearer",
         )
         .unwrap();
         let runtime = crate::community_relay::CommunityRelayRuntime::start(
@@ -13503,9 +13505,10 @@ mod tests {
             ..Default::default()
         };
         let root = tempfile::tempdir().expect("cache root");
-        let client = crate::community_cache::CommunityCacheClient::from_settings(
+        let client = crate::community_cache::CommunityCacheClient::from_settings_for_test(
             &settings,
             root.path().to_path_buf(),
+            "test-origin-bearer",
         )
         .expect("valid offline client settings");
         (client, root)

@@ -183,6 +183,8 @@ enum RuntimeCommand {
     },
     #[cfg(test)]
     ResponsivenessProbe(std_mpsc::Sender<()>),
+    #[cfg(test)]
+    InstallFallbackCache(Box<CommunityCacheClient>),
     Shutdown,
 }
 
@@ -274,6 +276,16 @@ impl CommunityRelayRuntime {
         } else {
             *lock_unpoisoned(&self.configuration_cancellation) = next_configuration;
         }
+    }
+
+    #[cfg(test)]
+    fn install_fallback_cache_for_test(&self, cache: CommunityCacheClient) {
+        assert!(
+            self.commands
+                .try_send(RuntimeCommand::InstallFallbackCache(Box::new(cache)))
+                .is_ok(),
+            "test relay command queue has capacity"
+        );
     }
 
     /// Explicit historical-only entry point. There is intentionally no
@@ -483,7 +495,11 @@ async fn worker_loop(
         tokio::select! {
             _ = cancellation.cancelled() => break,
             command = receiver.recv() => match command {
-                Some(RuntimeCommand::Reconfigure { settings, cache_root, network_unmetered_confirmed }) => {
+                Some(RuntimeCommand::Reconfigure {
+                    settings,
+                    cache_root,
+                    network_unmetered_confirmed,
+                }) => {
                     if let Some(task) = seed_task.take() {
                         task.abort();
                         let _ = task.await;
@@ -586,6 +602,10 @@ async fn worker_loop(
                 #[cfg(test)]
                 Some(RuntimeCommand::ResponsivenessProbe(response)) => {
                     let _ = response.send(());
+                }
+                #[cfg(test)]
+                Some(RuntimeCommand::InstallFallbackCache(cache)) => {
+                    fallback_cache = Some(*cache);
                 }
                 Some(RuntimeCommand::Shutdown) | None => break,
             },
@@ -1018,8 +1038,10 @@ async fn recover_without_relay(
     mutate_status(status, |value| {
         value.phase = CommunityRelayPhase::FallingBack
     });
-    let archival =
-        tokio::task::spawn_blocking(move || cache.recover_archival_https(&request, &manifest));
+    let archival_cache = cache.clone();
+    let archival = tokio::task::spawn_blocking(move || {
+        archival_cache.recover_archival_https(&request, &manifest)
+    });
     let archival = tokio::select! {
         _ = global_cancel.cancelled() => return HistoricalRecoveryResult::Cancelled,
         _ = request_cancel.cancelled() => return HistoricalRecoveryResult::Cancelled,
@@ -1433,7 +1455,14 @@ mod tests {
             historical_relay_enabled: false,
             ..Default::default()
         };
+        let fallback_cache = CommunityCacheClient::from_settings_for_test(
+            &settings,
+            temp.path().to_path_buf(),
+            "test-origin-bearer",
+        )
+        .unwrap();
         let mut runtime = CommunityRelayRuntime::start(&settings, temp.path().to_path_buf(), false);
+        runtime.install_fallback_cache_for_test(fallback_cache.clone());
 
         let request = test_request();
         let result = runtime
@@ -1445,6 +1474,11 @@ mod tests {
         assert_eq!(result, HistoricalRecoveryResult::Unavailable);
         let status = runtime.status();
         assert_eq!(status.archival_fallbacks, 1);
+        assert_eq!(
+            fallback_cache.archival_origin_attempts_for_test(),
+            1,
+            "the fallback must reach the exact archival HTTPS object request"
+        );
         assert_eq!(status.phase, CommunityRelayPhase::Off);
         assert!(!status.retrieval_enabled);
         assert_eq!(status.advertised_objects, 0);
