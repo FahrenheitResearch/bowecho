@@ -4758,7 +4758,7 @@ mod tests {
         assert!(profiles_only.allows(&profile.query));
         profiles_only.require(&profile.query).unwrap();
 
-        let variants = vec![
+        let variants = [
             ShareQuery::PointSeries {
                 latitude_e7: 350_000_000,
                 longitude_e7: -970_000_000,
