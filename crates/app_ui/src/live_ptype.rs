@@ -2390,15 +2390,16 @@ mod tests {
             center_lon: -97.0,
             map_scale: 80.0,
         };
+        let scan_time = Utc::now();
         let key = |generation| LivePtypeRenderKey {
             frame_generation: 7,
             thermo_request_key: live_ptype_request_key(
                 LivePtypeModelSource::Hrrr,
                 LivePtypeSurfaceMode::ModelOnly,
                 None,
-                radar.scan_time,
+                scan_time,
             ),
-            reference_time_millis: radar.scan_time.timestamp_millis(),
+            reference_time_millis: scan_time.timestamp_millis(),
             view,
             size: [100, 100],
             viewport_size_points: [100, 100],

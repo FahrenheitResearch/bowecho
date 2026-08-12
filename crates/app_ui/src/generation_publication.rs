@@ -2583,7 +2583,7 @@ enum PublicationTaskOutput {
     LocalJobs(Vec<GenerationPublicationJob>),
     RemoteRecords(Vec<RunGenerationOwnerRecord>),
     Spool(SpoolCollectionReport),
-    Capabilities(RunGenerationOwnerCapabilities),
+    Capabilities(Box<RunGenerationOwnerCapabilities>),
 }
 
 struct PublicationTask {
@@ -2794,7 +2794,7 @@ impl GenerationPublicationPanel {
                         "Origin account verified: {} live publication(s), {} active upload(s).",
                         capabilities.usage.live_publications, capabilities.usage.active_uploads
                     ));
-                    self.capabilities = Some(capabilities);
+                    self.capabilities = Some(*capabilities);
                 }
                 Err(message) => self.status = Some(format!("{label} failed: {message}")),
             }
@@ -2971,9 +2971,9 @@ impl GenerationPublicationPanel {
             {
                 let settings = self.settings.clone();
                 self.start(ui.ctx(), "Check origin capacity", move || {
-                    Ok(PublicationTaskOutput::Capabilities(
+                    Ok(PublicationTaskOutput::Capabilities(Box::new(
                         fetch_owner_capabilities(&settings)?,
-                    ))
+                    )))
                 });
             }
         });
