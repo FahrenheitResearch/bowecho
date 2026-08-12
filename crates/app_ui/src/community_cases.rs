@@ -293,6 +293,7 @@ struct LoadedArtifact {
 
 /// Session-only case-room interaction state. No publication draft, local
 /// source identity, selected image bytes, or owner principal is persisted.
+#[derive(Default)]
 pub(crate) struct CommunityCaseWorkspace {
     draft: CaseDraft,
     artifact_draft: ArtifactDraft,
@@ -303,22 +304,6 @@ pub(crate) struct CommunityCaseWorkspace {
     artifact_fetch: Option<RunningArtifactFetch>,
     loaded_artifacts: BTreeMap<(String, String), LoadedArtifact>,
     artifact_status: Option<String>,
-}
-
-impl Default for CommunityCaseWorkspace {
-    fn default() -> Self {
-        Self {
-            draft: CaseDraft::default(),
-            artifact_draft: ArtifactDraft::default(),
-            prepared: Vec::new(),
-            remotely_published: Vec::new(),
-            publication_task: None,
-            publication_status: None,
-            artifact_fetch: None,
-            loaded_artifacts: BTreeMap::new(),
-            artifact_status: None,
-        }
-    }
 }
 
 impl CommunityCaseWorkspace {
@@ -1753,7 +1738,7 @@ fn render_overlay(ui: &mut egui::Ui, overlay: &OverlayArtifact) {
             rect.bottom() - 8.0 - y as f32 * (rect.height() - 16.0),
         )
     };
-    let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(76, 178, 236));
+    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(76, 178, 236));
     let mut rendered = 0usize;
     for feature in &overlay.features {
         if rendered >= MAX_RENDERED_OVERLAY_COORDINATES {
@@ -1811,10 +1796,8 @@ fn format_case_time(time: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 fn format_unix(unix: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0).map_or_else(
-        || "invalid signed time".into(),
-        |time| format_case_time(time),
-    )
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
+        .map_or_else(|| "invalid signed time".into(), format_case_time)
 }
 
 fn parse_token_list(value: &str) -> Vec<String> {
@@ -1884,7 +1867,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
-    if value.is_empty() || value.len() % 4 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(4) {
         return Err("Verified image payload contains malformed base64.".into());
     }
     let mut output = Vec::with_capacity(value.len() / 4 * 3);

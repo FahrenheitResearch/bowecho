@@ -3250,7 +3250,7 @@ impl VerifiedDiskCache {
     fn indexed_requests(&self, limits: &ProtocolLimits, maximum: usize) -> Vec<ShareRequest> {
         let _cache_guard = lock_unpoisoned(&self.lock);
         let mut entries = self.read_index().entries.into_iter().collect::<Vec<_>>();
-        entries.sort_by(|left, right| right.1.last_access_unix.cmp(&left.1.last_access_unix));
+        entries.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.last_access_unix));
         entries
             .into_iter()
             .take(maximum)
@@ -4458,8 +4458,10 @@ mod tests {
         // rejects it below.
         let compressible = vec![0u8; 512];
         let (signed, encoded, _) = signed_object(&request, &compressible);
-        let mut limits = ProtocolLimits::default();
-        limits.max_decompression_ratio = 1;
+        let limits = ProtocolLimits {
+            max_decompression_ratio: 1,
+            ..ProtocolLimits::default()
+        };
         assert!(decode_verified(&signed.manifest, &encoded, &limits).is_err());
     }
 
@@ -4756,49 +4758,50 @@ mod tests {
         assert!(profiles_only.allows(&profile.query));
         profiles_only.require(&profile.query).unwrap();
 
-        let mut variants = Vec::new();
-        variants.push(ShareQuery::PointSeries {
-            latitude_e7: 350_000_000,
-            longitude_e7: -970_000_000,
-            window: rw_community_protocol::TimeWindow::Utc {
-                start_unix: 1_800_000_000,
-                end_unix: 1_800_003_600,
+        let variants = vec![
+            ShareQuery::PointSeries {
+                latitude_e7: 350_000_000,
+                longitude_e7: -970_000_000,
+                window: rw_community_protocol::TimeWindow::Utc {
+                    start_unix: 1_800_000_000,
+                    end_unix: 1_800_003_600,
+                },
+                missing_policy: rw_community_protocol::MissingPolicy::Strict,
             },
-            missing_policy: rw_community_protocol::MissingPolicy::Strict,
-        });
-        variants.push(ShareQuery::NativeWindow {
-            storage_slot: 1,
-            valid_unix: 1_800_000_000,
-            x0: 0,
-            y0: 0,
-            x1: 1,
-            y1: 1,
-            pressure_levels_hpa: vec![],
-        });
-        variants.push(ShareQuery::GeographicWindow {
-            storage_slot: 1,
-            valid_unix: 1_800_000_000,
-            west_longitude_e7: 1_700_000_000,
-            south_latitude_e7: 200_000_000,
-            east_longitude_e7: -1_700_000_000,
-            north_latitude_e7: 500_000_000,
-            pressure_levels_hpa: vec![],
-        });
-        variants.push(ShareQuery::TemporalGrid {
-            window: rw_community_protocol::TimeWindow::Utc {
-                start_unix: 1_800_000_000,
-                end_unix: 1_800_003_600,
+            ShareQuery::NativeWindow {
+                storage_slot: 1,
+                valid_unix: 1_800_000_000,
+                x0: 0,
+                y0: 0,
+                x1: 1,
+                y1: 1,
+                pressure_levels_hpa: vec![],
             },
-            reducer: "maximum".into(),
-            semantics: "utc_window".into(),
-            missing_policy: rw_community_protocol::MissingPolicy::Strict,
-            pressure_levels_hpa: vec![],
-        });
-        variants.push(ShareQuery::CaseArtifact {
-            case_id: "case-1".into(),
-            artifact_id: "artifact-1".into(),
-            artifact_type: rw_community_protocol::CaseArtifactType::DerivedTable,
-        });
+            ShareQuery::GeographicWindow {
+                storage_slot: 1,
+                valid_unix: 1_800_000_000,
+                west_longitude_e7: 1_700_000_000,
+                south_latitude_e7: 200_000_000,
+                east_longitude_e7: -1_700_000_000,
+                north_latitude_e7: 500_000_000,
+                pressure_levels_hpa: vec![],
+            },
+            ShareQuery::TemporalGrid {
+                window: rw_community_protocol::TimeWindow::Utc {
+                    start_unix: 1_800_000_000,
+                    end_unix: 1_800_003_600,
+                },
+                reducer: "maximum".into(),
+                semantics: "utc_window".into(),
+                missing_policy: rw_community_protocol::MissingPolicy::Strict,
+                pressure_levels_hpa: vec![],
+            },
+            ShareQuery::CaseArtifact {
+                case_id: "case-1".into(),
+                artifact_id: "artifact-1".into(),
+                artifact_type: rw_community_protocol::CaseArtifactType::DerivedTable,
+            },
+        ];
         assert!(variants.iter().all(|query| !profiles_only.allows(query)));
         assert!(variants.iter().all(|query| matches!(
             profiles_only.require(query),

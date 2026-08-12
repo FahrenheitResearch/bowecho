@@ -59,7 +59,7 @@ struct RemoteOutputExpected {
 
 enum RemoteOutputLoad {
     PointSeries {
-        result: rw_query::PointSeriesResult,
+        result: Box<rw_query::PointSeriesResult>,
         tier: crate::community_cache::DeliveryTier,
     },
     NativeWindow2D {
@@ -71,11 +71,11 @@ enum RemoteOutputLoad {
         tier: crate::community_cache::DeliveryTier,
     },
     GeographicWindow {
-        result: rw_query::GeographicWindowResult,
+        result: Box<rw_query::GeographicWindowResult>,
         tier: crate::community_cache::DeliveryTier,
     },
     TemporalGrid {
-        result: rw_query::TemporalGridResult,
+        result: Box<rw_query::TemporalGridResult>,
         tier: crate::community_cache::DeliveryTier,
     },
 }
@@ -101,18 +101,18 @@ impl Drop for RemoteOutputTask {
 
 enum RemoteOutputResult {
     PointSeries {
-        result: rw_query::PointSeriesResult,
+        result: Box<rw_query::PointSeriesResult>,
         tier: crate::community_cache::DeliveryTier,
         request_sha256: String,
     },
     Field {
-        field: rw_ui::FieldData,
+        field: Box<rw_ui::FieldData>,
         tier: crate::community_cache::DeliveryTier,
         request_sha256: String,
         coverage_note: String,
     },
     Temporal {
-        result: rw_query::TemporalGridResult,
+        result: Box<rw_query::TemporalGridResult>,
         tier: crate::community_cache::DeliveryTier,
         request_sha256: String,
         selected_metric: usize,
@@ -136,7 +136,9 @@ struct LocalEnsembleCatalogTask {
     rx: std::sync::mpsc::Receiver<Result<Vec<rw_query::VariableCapability>, String>>,
 }
 
+#[derive(Default)]
 enum LocalEnsembleCatalogState {
+    #[default]
     Idle,
     Loading(HourKey),
     Ready {
@@ -147,12 +149,6 @@ enum LocalEnsembleCatalogState {
         hour: HourKey,
         message: String,
     },
-}
-
-impl Default for LocalEnsembleCatalogState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,18 +368,13 @@ impl ModelDomainChoice {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum RemoteCatalogState {
+    #[default]
     Idle,
     Loading,
     Ready(Vec<crate::community_cache::RemoteModelCatalogEntry>),
     Error(String),
-}
-
-impl Default for RemoteCatalogState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 struct RemoteCatalogTask {
@@ -420,7 +411,7 @@ enum RemoteCatalogLoad {
     ProfileCatalog {
         model: String,
         run: String,
-        catalog: crate::community_cache::RemoteProfileCatalog,
+        catalog: Box<crate::community_cache::RemoteProfileCatalog>,
     },
     Sounding(rw_ui::SoundingData),
 }
@@ -2811,7 +2802,7 @@ impl ModelDataDock {
                     .map(|catalog| RemoteCatalogLoad::ProfileCatalog {
                         model: task_model,
                         run: task_run,
-                        catalog,
+                        catalog: Box::new(catalog),
                     })
                     .map_err(|error| format!("Remote profile catalog unavailable: {error}"));
                 let _ = tx.send(result);
@@ -3330,7 +3321,7 @@ impl ModelDataDock {
                         RemoteFetchKind::PointSeries => client
                             .fetch_point_series::<rw_query::PointSeriesResult>(request)
                             .map(|(payload, tier)| RemoteOutputLoad::PointSeries {
-                                result: payload.data,
+                                result: Box::new(payload.data),
                                 tier,
                             }),
                         RemoteFetchKind::NativeWindow2D => client
@@ -3348,13 +3339,13 @@ impl ModelDataDock {
                         RemoteFetchKind::GeographicWindow => client
                             .fetch_geographic_window::<rw_query::GeographicWindowResult>(request)
                             .map(|(payload, tier)| RemoteOutputLoad::GeographicWindow {
-                                result: payload.data,
+                                result: Box::new(payload.data),
                                 tier,
                             }),
                         RemoteFetchKind::TemporalGrid => client
                             .fetch_temporal_grid::<rw_query::TemporalGridResult>(request)
                             .map(|(payload, tier)| RemoteOutputLoad::TemporalGrid {
-                                result: payload.data,
+                                result: Box::new(payload.data),
                                 tier,
                             }),
                     }
@@ -3446,7 +3437,7 @@ impl ModelDataDock {
 
     fn install_remote_output_field(&mut self) {
         let field = match self.remote_output_result.as_ref() {
-            Some(RemoteOutputResult::Field { field, .. }) => Some(field.clone()),
+            Some(RemoteOutputResult::Field { field, .. }) => Some(field.as_ref().clone()),
             Some(RemoteOutputResult::Temporal {
                 result,
                 selected_metric,
@@ -3557,7 +3548,7 @@ impl ModelDataDock {
                     self.remote_latitude,
                     self.remote_longitude
                 ));
-                self.remote_profile_catalog = Some(catalog);
+                self.remote_profile_catalog = Some(*catalog);
             }
             Ok(RemoteCatalogLoad::Sounding(data)) => {
                 self.box_sounding_summary = None;
@@ -4281,7 +4272,7 @@ impl ModelDataDock {
         if self.workspace_source == ModelWorkspaceSource::RemoteCatalog {
             return match self.remote_output_result.as_ref() {
                 Some(RemoteOutputResult::Field { field, .. }) if field.grid.is_some() => {
-                    Some(std::sync::Arc::new(field.clone()))
+                    Some(std::sync::Arc::new(field.as_ref().clone()))
                 }
                 _ => None,
             };
@@ -5331,14 +5322,16 @@ impl ModelDataDock {
         self.plot_message = Some(format!(
             "Rendering {var} across {model}/{run} for {format_label} export…"
         ));
-        let mut options = crate::batch_plots::BatchPlotOptions::default();
-        options.only_var = Some(var.clone());
-        options.animation = Some(crate::batch_plots::PlotAnimationOptions {
-            var,
-            format,
-            frame_delay_ms: 500,
-            max_width: 1600,
-        });
+        let options = crate::batch_plots::BatchPlotOptions {
+            only_var: Some(var.clone()),
+            animation: Some(crate::batch_plots::PlotAnimationOptions {
+                var,
+                format,
+                frame_delay_ms: 500,
+                max_width: 1600,
+            }),
+            ..Default::default()
+        };
         self.plot_job = Some(crate::batch_plots::spawn_batch_plot(
             crate::batch_plots::BatchPlotRequest {
                 store_root: self.store_root.clone(),
@@ -8743,7 +8736,7 @@ impl ModelDataDock {
         let theme = crate::ui_theme::theme();
         egui::Frame::new()
             .fill(theme.bg)
-            .stroke(egui::Stroke::new(1.0, theme.hairline))
+            .stroke(egui::Stroke::new(1.0_f32, theme.hairline))
             .corner_radius(5)
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
@@ -9815,7 +9808,7 @@ impl ModelDataDock {
                     );
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Add to radar map").clicked() {
-                            remote_map_request = Some(std::sync::Arc::new(field.clone()));
+                            remote_map_request = Some(std::sync::Arc::new(field.as_ref().clone()));
                         }
                         if ui.button("Native plot").clicked() {
                             open_remote_native_plot = true;
@@ -10867,7 +10860,7 @@ fn adapt_remote_output(
                 expected.run_ny,
             )?;
             Ok(RemoteOutputResult::Field {
-                field,
+                field: Box::new(field),
                 tier,
                 request_sha256,
                 coverage_note,
@@ -10881,7 +10874,7 @@ fn adapt_remote_output(
                 expected.run_ny,
             )?;
             Ok(RemoteOutputResult::Field {
-                field,
+                field: Box::new(field),
                 tier,
                 request_sha256,
                 coverage_note,
@@ -10892,14 +10885,14 @@ fn adapt_remote_output(
             RemoteOutputLoad::GeographicWindow { result, tier },
         ) => {
             let (field, coverage_note) = remote_geographic_field(
-                result,
+                *result,
                 &expected.request,
                 expected.run_nx,
                 expected.run_ny,
                 &expected.variable_selectors,
             )?;
             Ok(RemoteOutputResult::Field {
-                field,
+                field: Box::new(field),
                 tier,
                 request_sha256,
                 coverage_note,
@@ -12144,17 +12137,17 @@ fn remote_point_series_ui(ui: &mut egui::Ui, result: &rw_query::PointSeriesResul
     painter.rect_stroke(
         rect,
         4.0,
-        egui::Stroke::new(1.0, theme.hairline),
+        egui::Stroke::new(1.0_f32, theme.hairline),
         egui::StrokeKind::Inside,
     );
     let plot = rect.shrink2(egui::vec2(42.0, 24.0));
     painter.line_segment(
         [plot.left_bottom(), plot.right_bottom()],
-        egui::Stroke::new(1.0, theme.hairline),
+        egui::Stroke::new(1.0_f32, theme.hairline),
     );
     painter.line_segment(
         [plot.left_bottom(), plot.left_top()],
-        egui::Stroke::new(1.0, theme.hairline),
+        egui::Stroke::new(1.0_f32, theme.hairline),
     );
     let x_span = (x_max - x_min).max(1.0);
     let y_span = (y_max - y_min).max(f32::EPSILON);
@@ -12177,7 +12170,7 @@ fn remote_point_series_ui(ui: &mut egui::Ui, result: &rw_query::PointSeriesResul
             };
             painter.line_segment(
                 [map(left), map(right)],
-                egui::Stroke::new(2.0, colors[series_index % colors.len()]),
+                egui::Stroke::new(2.0_f32, colors[series_index % colors.len()]),
             );
         }
     }
@@ -13503,11 +13496,12 @@ mod tests {
         crate::community_cache::CommunityCacheClient,
         tempfile::TempDir,
     ) {
-        let mut settings = settings::CommunityCacheSettings::default();
-        settings.enabled = true;
-        settings.origin_url = "https://weather.example.test".to_owned();
-        settings.manifest_public_key_base64 =
-            "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=".to_owned();
+        let settings = settings::CommunityCacheSettings {
+            enabled: true,
+            origin_url: "https://weather.example.test".to_owned(),
+            manifest_public_key_base64: "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=".to_owned(),
+            ..Default::default()
+        };
         let root = tempfile::tempdir().expect("cache root");
         let client = crate::community_cache::CommunityCacheClient::from_settings(
             &settings,
@@ -14077,7 +14071,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
         dock.remote_output_result = Some(RemoteOutputResult::Field {
-            field: override_test_field("remote_temperature"),
+            field: Box::new(override_test_field("remote_temperature")),
             tier: crate::community_cache::DeliveryTier::R2,
             request_sha256: "verified".to_owned(),
             coverage_note: "complete".to_owned(),

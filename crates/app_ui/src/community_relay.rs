@@ -164,7 +164,7 @@ enum RuntimeCommand {
         network_unmetered_confirmed: bool,
     },
     RecoverExactHistorical {
-        request: ShareRequest,
+        request: Box<ShareRequest>,
         manifest: Box<SignedObjectManifest>,
         cancellation: CancellationFlag,
         configuration_cancellation: CancellationFlag,
@@ -337,7 +337,7 @@ impl CommunityRelayDispatcher {
         let (result, receiver) = std_mpsc::channel();
         self.commands
             .try_send(RuntimeCommand::RecoverExactHistorical {
-                request,
+                request: Box::new(request),
                 manifest: Box::new(manifest),
                 cancellation: cancellation.clone(),
                 configuration_cancellation,
@@ -538,7 +538,7 @@ async fn worker_loop(
                     let outcome = match state.as_mut() {
                         Some(state) => recover_exact_historical(
                             state,
-                            request,
+                            *request,
                             *manifest,
                             &request_cancel,
                             &configuration_cancellation,
@@ -548,7 +548,7 @@ async fn worker_loop(
                         None => match fallback_cache.clone() {
                             Some(cache) => recover_without_relay(
                                 cache,
-                                request,
+                                *request,
                                 *manifest,
                                 &request_cancel,
                                 &configuration_cancellation,

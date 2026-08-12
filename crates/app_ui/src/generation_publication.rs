@@ -1313,10 +1313,10 @@ impl GenerationPublicationStore {
         }
         self.verify_job_spool(&job)?;
 
-        if matches!(job.status, GenerationJobStatus::FinalizeUncertain { .. }) {
-            if let Some(record) = transport.publication(credentials, job_id)? {
-                return self.apply_remote_record(job_id, record);
-            }
+        if matches!(job.status, GenerationJobStatus::FinalizeUncertain { .. })
+            && let Some(record) = transport.publication(credentials, job_id)?
+        {
+            return self.apply_remote_record(job_id, record);
         }
 
         let capabilities = transport.capabilities(credentials)?;
@@ -1483,12 +1483,11 @@ impl GenerationPublicationStore {
             | GenerationJobStatus::Failed {
                 retryable: true, ..
             } => {
-                if let Some(cancelled) = transport.cancel(credentials, job_id)? {
-                    if cancelled.generation_id != job.job_id
-                        || cancelled.generation_sha256 != job.generation_sha256
-                    {
-                        return Err(PublicationError::Transport);
-                    }
+                if let Some(cancelled) = transport.cancel(credentials, job_id)?
+                    && (cancelled.generation_id != job.job_id
+                        || cancelled.generation_sha256 != job.generation_sha256)
+                {
+                    return Err(PublicationError::Transport);
                 }
             }
             GenerationJobStatus::FinalizeUncertain { .. } => {
@@ -2039,7 +2038,7 @@ impl GenerationPublicationStore {
         }
         validate_store_component("publication model", &job.model)?;
         validate_store_component("publication run", &job.run)?;
-        if let Some(_) = job.confirmed_unix() {
+        if job.confirmed_unix().is_some() {
             job.replication_manifest(&self.settings.policy.protocol_limits())?;
         }
         Ok(())
@@ -2580,7 +2579,7 @@ fn is_sha256(value: &str) -> bool {
 }
 
 enum PublicationTaskOutput {
-    Job(GenerationPublicationJob),
+    Job(Box<GenerationPublicationJob>),
     LocalJobs(Vec<GenerationPublicationJob>),
     RemoteRecords(Vec<RunGenerationOwnerRecord>),
     Spool(SpoolCollectionReport),
@@ -2752,7 +2751,7 @@ impl GenerationPublicationPanel {
             self.next_progress_poll = None;
             match result {
                 Ok(PublicationTaskOutput::Job(job)) => {
-                    self.merge_job(job);
+                    self.merge_job(*job);
                     self.status = Some(format!("{label} completed."));
                 }
                 Ok(PublicationTaskOutput::LocalJobs(jobs)) => {
@@ -2950,7 +2949,7 @@ impl GenerationPublicationPanel {
                         modification_notices,
                         now_unix: chrono::Utc::now().timestamp(),
                     })?;
-                    Ok(PublicationTaskOutput::Job(job))
+                    Ok(PublicationTaskOutput::Job(Box::new(job)))
                 });
             }
             if ui
@@ -3078,11 +3077,11 @@ impl GenerationPublicationPanel {
                     let confirmations = self.confirmations;
                     self.start(ui.ctx(), "Confirm publication", move || {
                         let store = Self::store_for(&settings)?;
-                        Ok(PublicationTaskOutput::Job(store.confirm(
+                        Ok(PublicationTaskOutput::Job(Box::new(store.confirm(
                             &job_id,
                             confirmations,
                             chrono::Utc::now().timestamp(),
-                        )?))
+                        )?)))
                     });
                 }
             }
@@ -3144,13 +3143,13 @@ impl GenerationPublicationPanel {
                         let reason = self.revoke_reason.trim().to_owned();
                         self.start(ui.ctx(), "Revoke publication", move || {
                             let (store, credentials, transport) = Self::network_for(&settings)?;
-                            Ok(PublicationTaskOutput::Job(store.revoke(
+                            Ok(PublicationTaskOutput::Job(Box::new(store.revoke(
                                 &transport,
                                 &credentials,
                                 &job_id,
                                 &reason,
                                 chrono::Utc::now().timestamp(),
-                            )?))
+                            )?)))
                         });
                     }
                 });
@@ -3173,10 +3172,10 @@ impl GenerationPublicationPanel {
                     let job_id = job.job_id.clone();
                     self.start(ui.ctx(), "Discard local publication", move || {
                         let store = Self::store_for(&settings)?;
-                        Ok(PublicationTaskOutput::Job(store.discard_local(
+                        Ok(PublicationTaskOutput::Job(Box::new(store.discard_local(
                             &job_id,
                             chrono::Utc::now().timestamp(),
-                        )?))
+                        )?)))
                     });
                 }
             }
@@ -3196,12 +3195,12 @@ impl GenerationPublicationPanel {
                     let job_id = job.job_id.clone();
                     self.start(ui.ctx(), "Cancel origin upload", move || {
                         let (store, credentials, transport) = Self::network_for(&settings)?;
-                        Ok(PublicationTaskOutput::Job(store.cancel(
+                        Ok(PublicationTaskOutput::Job(Box::new(store.cancel(
                             &transport,
                             &credentials,
                             &job_id,
                             chrono::Utc::now().timestamp(),
-                        )?))
+                        )?)))
                     });
                 }
             }
@@ -3269,11 +3268,11 @@ impl GenerationPublicationPanel {
         let settings = self.settings.clone();
         self.start(ctx, "Publish generation", move || {
             let (store, credentials, transport) = Self::network_for(&settings)?;
-            Ok(PublicationTaskOutput::Job(store.publish(
+            Ok(PublicationTaskOutput::Job(Box::new(store.publish(
                 &transport,
                 &credentials,
                 &job_id,
-            )?))
+            )?)))
         });
     }
 
@@ -3281,11 +3280,11 @@ impl GenerationPublicationPanel {
         let settings = self.settings.clone();
         self.start(ctx, "Reconcile publication", move || {
             let (store, credentials, transport) = Self::network_for(&settings)?;
-            Ok(PublicationTaskOutput::Job(store.reconcile(
+            Ok(PublicationTaskOutput::Job(Box::new(store.reconcile(
                 &transport,
                 &credentials,
                 &job_id,
-            )?))
+            )?)))
         });
     }
 }

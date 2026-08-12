@@ -375,7 +375,7 @@ fn write_wrf_hour_fields(
     };
     writer.set_source_provenance(vec![source_provenance.clone()])?;
     for field in &fields.canonical {
-        let selector = serde_json::to_value(&field.selector).map_err(|error| {
+        let selector = serde_json::to_value(field.selector).map_err(|error| {
             RwStoreError::Meta(format!("2D field '{}': selector JSON: {error}", field.name))
         })?;
         writer.add_field_2d(&field.name, &field.units, selector, &field.values)?;
@@ -483,40 +483,38 @@ fn process_desktop_paths(
         .collect::<Vec<_>>();
     if let Some(selected) =
         checked_native_inventory(&native_raw, || inventory_selected_wrf_paths(&files))?
-    {
-        if selected
+        && selected
             .group
             .scenes
             .iter()
             .all(|scene| scene.time.is_authoritative())
-            && parse_wrf_internal_time(&selected.group.key.run_domain.run.0).is_some()
-        {
-            let run = process_run_name(&files);
-            let mut progress = |message: String| {
-                let _ = tx.send(WrfProcessMessage::Progress(message));
-            };
-            let mut committed = |commit: WrfProcessCommit| {
-                let _ = tx.send(WrfProcessMessage::Committed(commit));
-            };
-            let mut summary = process_scene_group_exact_with_commit(
-                &selected.group,
-                store_root,
-                &run,
-                options,
-                &mut progress,
-                &mut committed,
-            )?
-            .process;
-            summary.notes.extend(
-                selected
-                    .notes
-                    .into_iter()
-                    .map(|note| format!("{}: {}", note.source_name, note.message)),
-            );
-            summary.notes.sort();
-            summary.notes.dedup();
-            return Ok(summary);
-        }
+        && parse_wrf_internal_time(&selected.group.key.run_domain.run.0).is_some()
+    {
+        let run = process_run_name(&files);
+        let mut progress = |message: String| {
+            let _ = tx.send(WrfProcessMessage::Progress(message));
+        };
+        let mut committed = |commit: WrfProcessCommit| {
+            let _ = tx.send(WrfProcessMessage::Committed(commit));
+        };
+        let mut summary = process_scene_group_exact_with_commit(
+            &selected.group,
+            store_root,
+            &run,
+            options,
+            &mut progress,
+            &mut committed,
+        )?
+        .process;
+        summary.notes.extend(
+            selected
+                .notes
+                .into_iter()
+                .map(|note| format!("{}: {}", note.source_name, note.message)),
+        );
+        summary.notes.sort();
+        summary.notes.dedup();
+        return Ok(summary);
     }
 
     process_paths(&files, store_root, options, tx)
@@ -913,7 +911,7 @@ fn process_scene_group_exact_with_commit(
             &mut previous_precipitation,
             valid_time.timestamp(),
         );
-        let hour_exact_time = exact_time.clone();
+        let hour_exact_time = exact_time;
         let result = write_wrf_hour_fields(
             store_root,
             &model,
@@ -2250,7 +2248,7 @@ mod tests {
 
         let canonical = &fields.canonical[0];
         let old_field = rustwx_core::SelectedField2D::new(
-            canonical.selector.clone(),
+            canonical.selector,
             canonical.units.clone(),
             fields.grid.clone(),
             canonical.values.clone(),

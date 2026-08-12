@@ -46711,7 +46711,7 @@ fn model_download_cadence_hint(model: rustwx_core::ModelId, cycle: u8) -> &'stat
         ModelId::Sref => "3-hourly 000-087; ensemble mean",
         ModelId::Rtma | ModelId::Urma => "analysis hour 000 only",
         ModelId::Nbm => "hourly 001-036, 3-hourly 039-192, 6-hourly 198-264",
-        ModelId::RrfsPublic if cycle % 6 == 0 => "hourly 000-084; preliminary CONUS",
+        ModelId::RrfsPublic if cycle.is_multiple_of(6) => "hourly 000-084; preliminary CONUS",
         ModelId::RrfsPublic => "hourly 000-018; preliminary CONUS",
         ModelId::Refs => "hourly 001-060; preliminary CONUS ensemble mean",
         _ => "",

@@ -195,8 +195,6 @@ pub(crate) struct LivePtypeRadarOccurrence {
     pub alpha: Arc<[u8]>,
     pub source: String,
     pub scan_time: DateTime<Utc>,
-    /// Increment for every radar image or occurrence-mask change.
-    pub generation: u64,
 }
 
 /// Immutable radar inputs handed to the precipitation-type render worker.
@@ -240,7 +238,6 @@ impl LivePtypeRadarOccurrence {
         rgba: &[u8],
         source: impl Into<String>,
         scan_time: DateTime<Utc>,
-        generation: u64,
     ) -> Option<Self> {
         let cells = size[0].checked_mul(size[1])?;
         if rgba.len() != cells.checked_mul(4)? {
@@ -252,7 +249,6 @@ impl LivePtypeRadarOccurrence {
             alpha,
             source: source.into(),
             scan_time,
-            generation,
         })
     }
 
@@ -263,13 +259,15 @@ impl LivePtypeRadarOccurrence {
             alpha: vec![alpha; size[0] * size[1]].into(),
             source: "test radar".to_owned(),
             scan_time: Utc::now(),
-            generation: 1,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LivePtypeCategory {
+    // Kept because zero is part of the signed/public ptype-code contract even
+    // though the current map path represents no precipitation as transparency.
+    #[allow(dead_code)]
     NoPrecip,
     Rain,
     Snow,
@@ -280,6 +278,9 @@ pub(crate) enum LivePtypeCategory {
 }
 
 impl LivePtypeCategory {
+    // The app consumes categories directly; this conversion guards parity
+    // with the public Rusty Weather product code in regression tests.
+    #[allow(dead_code)]
     pub(crate) fn code(self) -> u8 {
         match self {
             Self::NoPrecip => 0,
@@ -1250,17 +1251,7 @@ impl LivePtypeState {
                         }
                         (LivePtypeOccurrenceMode::Radar, None) => (None, None, None),
                     };
-                let image = render_image(
-                    &frame,
-                    size,
-                    key.viewport_size_points,
-                    view,
-                    key.display_mode,
-                    key.occurrence_mode,
-                    f32::from(key.threshold_milli) / 1_000.0,
-                    occurrence.as_ref(),
-                    reference_time,
-                );
+                let image = render_image(&frame, &key, occurrence.as_ref(), reference_time);
                 let _ = sender.send(LivePtypeRenderResult {
                     serial,
                     key,
@@ -1943,32 +1934,22 @@ fn build_radar_occurrence(
     cache
         .render_moment_rgba_into(source.volume.as_ref(), options, &mut rgba)
         .map_err(|error| format!("render low-level reflectivity mask: {error}"))?;
-    LivePtypeRadarOccurrence::from_rgba(
-        size,
-        &rgba,
-        source.source.clone(),
-        source.scan_time,
-        source.generation,
-    )
-    .ok_or_else(|| "rendered reflectivity mask dimensions disagree".to_owned())
+    LivePtypeRadarOccurrence::from_rgba(size, &rgba, source.source.clone(), source.scan_time)
+        .ok_or_else(|| "rendered reflectivity mask dimensions disagree".to_owned())
 }
 
 fn render_image(
     frame: &LivePtypeFrame,
-    size: [usize; 2],
-    viewport_size_points: [u32; 2],
-    view: ModelLayerView,
-    mode: LivePtypeDisplayMode,
-    occurrence_mode: LivePtypeOccurrenceMode,
-    mixed_threshold: f32,
+    key: &LivePtypeRenderKey,
     occurrence: Option<&LivePtypeRadarOccurrence>,
     now: DateTime<Utc>,
 ) -> egui::ColorImage {
-    let [width, height] = size;
+    let [width, height] = key.size;
     let mut pixels = vec![egui::Color32::TRANSPARENT; width * height];
-    let km_per_point = 111.32 / f64::from(view.map_scale.max(1.0e-4));
-    let points_per_pixel_x = f64::from(viewport_size_points[0]) / width as f64;
-    let points_per_pixel_y = f64::from(viewport_size_points[1]) / height as f64;
+    let km_per_point = 111.32 / f64::from(key.view.map_scale.max(1.0e-4));
+    let points_per_pixel_x = f64::from(key.viewport_size_points[0]) / width as f64;
+    let points_per_pixel_y = f64::from(key.viewport_size_points[1]) / height as f64;
+    let mixed_threshold = f32::from(key.threshold_milli) / 1_000.0;
     let age_alpha = age_fade(now, frame.provenance.model_valid)
         * age_fade(now, frame.provenance.surface_analysis_valid);
     pixels
@@ -1978,22 +1959,22 @@ fn render_image(
             let x = index % width;
             let y = index / width;
             let occurrence_alpha =
-                occurrence_alpha(occurrence_mode, occurrence, x, y, width, height);
+                occurrence_alpha(key.occurrence_mode, occurrence, x, y, width, height);
             if occurrence_alpha == 0 {
                 return;
             }
             let east_km = (x as f64 - width as f64 * 0.5) * points_per_pixel_x * km_per_point;
             let north_km = (height as f64 * 0.5 - y as f64) * points_per_pixel_y * km_per_point;
             let (lat, lon) = aeqd_inverse_km(
-                f64::from(view.center_lat),
-                f64::from(view.center_lon),
+                f64::from(key.view.center_lat),
+                f64::from(key.view.center_lon),
                 east_km,
                 north_km,
             );
             let Some(sample) = frame.sample(lat as f32, lon as f32, mixed_threshold) else {
                 return;
             };
-            let (rgb, phase_alpha) = sample_color(&sample, mode);
+            let (rgb, phase_alpha) = sample_color(&sample, key.display_mode);
             let alpha = (f32::from(occurrence_alpha) * phase_alpha * age_alpha)
                 .round()
                 .clamp(0.0, 255.0) as u8;
@@ -2002,7 +1983,7 @@ fn render_image(
             }
         });
     egui::ColorImage {
-        size,
+        size: key.size,
         source_size: egui::vec2(width as f32, height as f32),
         pixels,
     }
@@ -2262,7 +2243,7 @@ fn target_analysis_hour(time: DateTime<Utc>) -> DateTime<Utc> {
 
 fn rtma_is_operationally_available(target: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     let age_seconds = now.signed_duration_since(target).num_seconds();
-    age_seconds >= -3_600 && age_seconds <= RTMA_OPERATIONAL_WINDOW_HOURS * 3_600
+    (-3_600..=RTMA_OPERATIONAL_WINDOW_HOURS * 3_600).contains(&age_seconds)
 }
 
 fn age_fade(now: DateTime<Utc>, valid: DateTime<Utc>) -> f32 {
@@ -2400,9 +2381,8 @@ mod tests {
 
     #[test]
     fn radar_scan_is_not_part_of_thermodynamic_generation() {
-        let first = LivePtypeRadarOccurrence::uniform([1, 1], 255);
-        let mut second = first.clone();
-        second.generation += 1;
+        let first_generation = 1;
+        let second_generation = 2;
         // Radar changes key the render only. The frame generation is supplied
         // independently by the thermodynamic worker.
         let view = ModelLayerView {
@@ -2410,7 +2390,7 @@ mod tests {
             center_lon: -97.0,
             map_scale: 80.0,
         };
-        let key = |radar: &LivePtypeRadarOccurrence| LivePtypeRenderKey {
+        let key = |generation| LivePtypeRenderKey {
             frame_generation: 7,
             thermo_request_key: live_ptype_request_key(
                 LivePtypeModelSource::Hrrr,
@@ -2425,17 +2405,20 @@ mod tests {
             display_mode: LivePtypeDisplayMode::Dominant,
             occurrence_mode: LivePtypeOccurrenceMode::Radar,
             threshold_milli: 600,
-            occurrence_generation: Some(radar.generation),
+            occurrence_generation: Some(generation),
         };
-        assert_eq!(key(&first).frame_generation, key(&second).frame_generation);
+        assert_eq!(
+            key(first_generation).frame_generation,
+            key(second_generation).frame_generation
+        );
         assert_ne!(
-            key(&first).occurrence_generation,
-            key(&second).occurrence_generation
+            key(first_generation).occurrence_generation,
+            key(second_generation).occurrence_generation
         );
         assert_eq!(
             occurrence_render_generation(
                 LivePtypeOccurrenceMode::ModelOnlyDiagnostic,
-                Some(second.generation),
+                Some(second_generation),
             ),
             None,
             "model-only diagnostic renders must not be invalidated by radar scans"

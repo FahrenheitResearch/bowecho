@@ -117,11 +117,7 @@ struct IsoPlaneSlices<'a> {
 
 impl<'a> IsoPlaneSlices<'a> {
     fn for_range(planes: &'a mut IsoPlanes, start: usize, end: usize) -> Self {
-        fn field_slices<'a>(
-            planes: &'a mut [Vec<f32>],
-            start: usize,
-            end: usize,
-        ) -> Vec<&'a mut [f32]> {
+        fn field_slices(planes: &mut [Vec<f32>], start: usize, end: usize) -> Vec<&mut [f32]> {
             planes
                 .iter_mut()
                 .map(|plane| &mut plane[start..end])
@@ -142,10 +138,7 @@ impl<'a> IsoPlaneSlices<'a> {
     }
 
     fn split_at(self, mid: usize) -> (Self, Self) {
-        fn split_field<'a>(
-            planes: Vec<&'a mut [f32]>,
-            mid: usize,
-        ) -> (Vec<&'a mut [f32]>, Vec<&'a mut [f32]>) {
+        fn split_field(planes: Vec<&mut [f32]>, mid: usize) -> (Vec<&mut [f32]>, Vec<&mut [f32]>) {
             let mut left = Vec::with_capacity(planes.len());
             let mut right = Vec::with_capacity(planes.len());
             for plane in planes {
@@ -225,8 +218,8 @@ fn interpolate_iso_cells(
 ) {
     for local_cell in 0..planes.len() {
         let cell = cell_start + local_cell;
-        for k in 0..inputs.nz {
-            col_p[k] = inputs.pressure_hpa[k * inputs.cells + cell];
+        for (k, pressure) in col_p.iter_mut().enumerate().take(inputs.nz) {
+            *pressure = inputs.pressure_hpa[k * inputs.cells + cell];
         }
         for (level_index, &level) in inputs.levels.iter().enumerate() {
             let Some((k, t)) = bracket(col_p, f64::from(level)) else {

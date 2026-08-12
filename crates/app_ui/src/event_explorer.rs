@@ -86,6 +86,8 @@ impl Default for EventExplorerState {
 }
 
 impl EventExplorerState {
+    // Whole-app regression tests pin synthetic days without exercising the UI.
+    #[allow(dead_code)]
     pub(crate) fn pin_day(&mut self, day: NaiveDate) {
         self.date_input = day.format("%Y-%m-%d").to_string();
         self.pinned_day = Some(day);

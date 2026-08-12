@@ -520,10 +520,10 @@ impl SatellitePlotPanel {
                     egui::Button::new("Save PNG"),
                 )
                 .on_hover_text("Export this georeferenced native plot as a 1600x1200 PNG");
-            if save.clicked() {
-                if let Some(status) = prompt_png_export(&source, "Save satellite native plot") {
-                    self.status = Some(status);
-                }
+            if save.clicked()
+                && let Some(status) = prompt_png_export(&source, "Save satellite native plot")
+            {
+                self.status = Some(status);
             }
         });
         if let Some(status) = &self.status {

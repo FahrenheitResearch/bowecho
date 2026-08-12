@@ -2000,6 +2000,8 @@ fn satellite_run_key_matches_meteosat(
 /// Whether a store run contains baked RGB planes rather than one scalar band.
 /// Timeline/map consumers use this content-identity test independently of the
 /// stricter provider/product catalog filter above.
+// Retained as a narrow whole-app regression-test seam.
+#[allow(dead_code)]
 pub(crate) fn satellite_run_key_is_composite(key: &rw_ui::SatRunKey) -> bool {
     key.run.contains("_rgb_")
 }
@@ -2274,10 +2276,12 @@ mod tests {
 
     #[test]
     fn goes_rgb_request_preserves_the_selected_detail() {
-        let mut base = rw_ui::SatFollowSpec::default();
-        base.satellite = "goes18".to_owned();
-        base.sector = "fulldisk".to_owned();
-        base.downsample = 7;
+        let base = rw_ui::SatFollowSpec {
+            satellite: "goes18".to_owned(),
+            sector: "fulldisk".to_owned(),
+            downsample: 7,
+            ..rw_ui::SatFollowSpec::default()
+        };
         let window = sat_window::SatNativeWindow {
             center_lat_deg: 22.0,
             center_lon_deg: -105.0,

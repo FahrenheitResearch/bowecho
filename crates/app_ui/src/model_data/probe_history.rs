@@ -669,7 +669,7 @@ fn history_chart(
         let y = plot.bottom() - fraction * plot.height();
         painter.line_segment(
             [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-            egui::Stroke::new(1.0, grid),
+            egui::Stroke::new(1.0_f32, grid),
         );
         let value = y_min + fraction * (y_max - y_min);
         painter.text(
@@ -707,7 +707,7 @@ fn history_chart(
                     .iter()
                     .map(|point| egui::pos2(x_screen(point.axis), y_screen(point.value)))
                     .collect(),
-                egui::Stroke::new(1.8, line_color),
+                egui::Stroke::new(1.8_f32, line_color),
             ));
         } else if let Some(point) = segment.first() {
             painter.circle_filled(
@@ -726,7 +726,7 @@ fn history_chart(
                 egui::pos2(position.x, plot.bottom()),
             ],
             egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgb(250, 204, 21).gamma_multiply(0.65),
             ),
         );
