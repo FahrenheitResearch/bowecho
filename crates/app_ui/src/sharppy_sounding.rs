@@ -394,13 +394,18 @@ impl SharppySoundingPanel {
     /// `["zooms"]["scene"]` — and keeps old saves loadable as-is.
     pub fn view_state_json(&self) -> serde_json::Value {
         let mut value = self.inner.view_state_json();
-        if let (Some(obj), Some(tokens)) = (value.as_object_mut(), &self.layout_tokens) {
-            obj.insert(
-                "sharppy_layout".to_owned(),
-                serde_json::Value::String(tokens.clone()),
-            );
-        }
         if let Some(obj) = value.as_object_mut() {
+            // `rw_ui::SoundingPanel` losslessly preserves JSON members it
+            // does not own. This outer panel owns `sharppy_layout`, so remove
+            // any raw pass-through value before emitting only tokens that
+            // survived BowEcho's validation/canonicalization step.
+            obj.remove("sharppy_layout");
+            if let Some(tokens) = &self.layout_tokens {
+                obj.insert(
+                    "sharppy_layout".to_owned(),
+                    serde_json::Value::String(tokens.clone()),
+                );
+            }
             obj.insert(
                 "sharppy_docked_stretch".to_owned(),
                 serde_json::Value::Bool(self.docked_stretch),
