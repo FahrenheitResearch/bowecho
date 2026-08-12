@@ -128,7 +128,7 @@ pub fn valid_time_ui(
                 egui::pos2(rect.left() + 2.0, rect.center().y),
                 egui::pos2(rect.right() - 2.0, rect.center().y),
             ],
-            egui::Stroke::new(1.0, theme().hairline),
+            egui::Stroke::new(1.0_f32, theme().hairline),
         );
         let count = session.outputs.len();
         let x_for = |index: usize| {

@@ -101,11 +101,11 @@ pub fn configure_style(ctx: &egui::Context) {
     style.visuals.override_text_color = Some(theme.text);
     style.visuals.panel_fill = theme.bg;
     style.visuals.window_fill = theme.bg;
-    style.visuals.window_stroke = egui::Stroke::new(1.0, theme.outline);
+    style.visuals.window_stroke = egui::Stroke::new(1.0_f32, theme.outline);
     style.visuals.extreme_bg_color = theme.inset;
     style.visuals.faint_bg_color = theme.faint;
     style.visuals.selection.bg_fill = theme.selection_bg;
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, theme.accent);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, theme.accent);
     style.visuals.hyperlink_color = theme.accent;
     // Modest radii — instrument, not toy.
     let radius = egui::CornerRadius::same(3);
@@ -114,28 +114,28 @@ pub fn configure_style(ctx: &egui::Context) {
 
     let widgets = &mut style.visuals.widgets;
     widgets.noninteractive.bg_fill = theme.bg;
-    widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme.hairline);
-    widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme.text);
+    widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, theme.hairline);
+    widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, theme.text);
     widgets.noninteractive.corner_radius = radius;
     widgets.inactive.bg_fill = theme.raised;
     widgets.inactive.weak_bg_fill = theme.raised;
     widgets.inactive.bg_stroke = egui::Stroke::NONE;
-    widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.text);
+    widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, theme.text);
     widgets.inactive.corner_radius = radius;
     widgets.hovered.bg_fill = theme.hover;
     widgets.hovered.weak_bg_fill = theme.hover;
-    widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme.outline);
-    widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.text_strong);
+    widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, theme.outline);
+    widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, theme.text_strong);
     widgets.hovered.corner_radius = radius;
     widgets.active.bg_fill = theme.active;
     widgets.active.weak_bg_fill = theme.active;
-    widgets.active.bg_stroke = egui::Stroke::new(1.0, theme.accent);
-    widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.text_strong);
+    widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, theme.accent);
+    widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, theme.text_strong);
     widgets.active.corner_radius = radius;
     widgets.open.bg_fill = theme.raised;
     widgets.open.weak_bg_fill = theme.raised;
-    widgets.open.bg_stroke = egui::Stroke::new(1.0, theme.outline);
-    widgets.open.fg_stroke = egui::Stroke::new(1.0, theme.text_strong);
+    widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, theme.outline);
+    widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, theme.text_strong);
     widgets.open.corner_radius = radius;
 
     ctx.set_global_style(style);

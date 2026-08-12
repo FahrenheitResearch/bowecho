@@ -377,7 +377,7 @@ impl MapPane {
             );
         }
         let hairline = egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(200, 205, 210, 64),
         );
         frame.view.paint_basemap_lines(
@@ -387,7 +387,7 @@ impl MapPane {
             hairline,
         );
         let state_stroke = egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(200, 205, 210, 96),
         );
         frame.view.paint_basemap_lines(
@@ -754,7 +754,7 @@ impl MapPane {
                 hits.push((path.len(), geom.grid_id));
             }
         }
-        hits.sort_by(|a, b| b.0.cmp(&a.0));
+        hits.sort_by_key(|hit| std::cmp::Reverse(hit.0));
         hits.into_iter().map(|(_, grid_id)| grid_id).collect()
     }
 
@@ -1032,7 +1032,7 @@ impl MapPane {
                 .project_polyline(rect, domain.outline_lon_lat(24));
             painter.add(egui::Shape::line(
                 points,
-                egui::Stroke::new(1.6, theme().accent),
+                egui::Stroke::new(1.6_f32, theme().accent),
             ));
             for (grid_id, path) in nest_paths(&session.tree) {
                 let outline = arwen_map::nest_outline_lon_lat(domain, &path, 24);
@@ -1055,7 +1055,7 @@ impl MapPane {
                     .project_polyline(rect, domain.outline_lon_lat(16));
                 painter.add(egui::Shape::line(
                     points,
-                    egui::Stroke::new(1.2, theme().accent_text),
+                    egui::Stroke::new(1.2_f32, theme().accent_text),
                 ));
             }
         }
@@ -1072,7 +1072,7 @@ impl MapPane {
             let root_corner = points.first().copied();
             painter.add(egui::Shape::line(
                 points,
-                egui::Stroke::new(2.4, theme().accent_text),
+                egui::Stroke::new(2.4_f32, theme().accent_text),
             ));
             // The root carries its facts like any nest: id · dx ·
             // nx × ny, from the ENGINE's own tree values.
@@ -1152,7 +1152,7 @@ impl MapPane {
                 if selected {
                     painter.add(egui::Shape::line(
                         points.clone(),
-                        egui::Stroke::new(3.2, theme().accent),
+                        egui::Stroke::new(3.2_f32, theme().accent),
                     ));
                 }
                 // Selected label carries the facts: id · dx · nx×ny —
@@ -1208,7 +1208,7 @@ impl MapPane {
                         painter.rect_stroke(
                             egui::Rect::from_center_size(position, egui::vec2(7.0, 7.0)),
                             1.0,
-                            egui::Stroke::new(1.0, theme().inset),
+                            egui::Stroke::new(1.0_f32, theme().inset),
                             egui::StrokeKind::Outside,
                         );
                     }
@@ -1271,7 +1271,7 @@ impl MapPane {
                 let corner = points.first().copied();
                 painter.add(egui::Shape::line(
                     points,
-                    egui::Stroke::new(2.6, theme().alert),
+                    egui::Stroke::new(2.6_f32, theme().alert),
                 ));
                 if let Some(position) = corner {
                     let galley = painter.layout(
@@ -1304,7 +1304,7 @@ impl MapPane {
                 .project_polyline(rect, domain.outline_lon_lat(24));
             painter.add(egui::Shape::line(
                 points,
-                egui::Stroke::new(1.8, theme().accent),
+                egui::Stroke::new(1.8_f32, theme().accent),
             ));
             if frame.editable {
                 for (_, position) in handle_positions(domain, frame.view, rect) {
@@ -1316,7 +1316,7 @@ impl MapPane {
                     painter.rect_stroke(
                         egui::Rect::from_center_size(position, egui::vec2(7.0, 7.0)),
                         1.0,
-                        egui::Stroke::new(1.0, theme().inset),
+                        egui::Stroke::new(1.0_f32, theme().inset),
                         egui::StrokeKind::Outside,
                     );
                 }
@@ -1376,10 +1376,10 @@ impl MapPane {
         }
         let points = frame.view.project_polyline(rect, ring);
         let stroke = if live {
-            egui::Stroke::new(1.8, theme().warn)
+            egui::Stroke::new(1.8_f32, theme().warn)
         } else {
             egui::Stroke::new(
-                1.2,
+                1.2_f32,
                 egui::Color32::from_rgba_unmultiplied(224, 164, 84, 150),
             )
         };
@@ -1425,7 +1425,11 @@ impl MapPane {
         if !rect.contains(position) {
             return;
         }
-        painter.circle_stroke(position, 6.0, egui::Stroke::new(1.5, theme().accent_text));
+        painter.circle_stroke(
+            position,
+            6.0,
+            egui::Stroke::new(1.5_f32, theme().accent_text),
+        );
         painter.circle_filled(position, 2.0, theme().accent_text);
         if let Some(label) = &marker.label {
             painter.text(
@@ -1617,7 +1621,7 @@ impl MapPane {
         if !self.search_results.is_empty() && !self.search_query.is_empty() {
             egui::Frame::new()
                 .fill(theme().raised)
-                .stroke(egui::Stroke::new(1.0, theme().outline))
+                .stroke(egui::Stroke::new(1.0_f32, theme().outline))
                 .corner_radius(3.0)
                 .show(&mut child, |ui| {
                     ui.set_width(overlay_width);
@@ -1736,7 +1740,7 @@ fn paint_keepout_band(
     painter.extend(egui::Shape::dashed_line(
         &inner,
         egui::Stroke::new(
-            1.2,
+            1.2_f32,
             egui::Color32::from_rgba_unmultiplied(226, 110, 92, 150),
         ),
         4.0,
@@ -1775,14 +1779,14 @@ fn paint_nest_outline_styled(
             if provisional {
                 painter.extend(egui::Shape::dashed_line(
                     &points,
-                    egui::Stroke::new(1.6, theme().accent_text),
+                    egui::Stroke::new(1.6_f32, theme().accent_text),
                     7.0,
                     4.0,
                 ));
             } else {
                 painter.add(egui::Shape::line(
                     points,
-                    egui::Stroke::new(1.8, theme().accent_text),
+                    egui::Stroke::new(1.8_f32, theme().accent_text),
                 ));
             }
             if let Some(position) = corner {
@@ -1801,7 +1805,7 @@ fn paint_nest_outline_styled(
             let ghost = egui::Color32::from_rgba_unmultiplied(163, 205, 232, 110);
             painter.extend(egui::Shape::dashed_line(
                 &points,
-                egui::Stroke::new(1.4, ghost),
+                egui::Stroke::new(1.4_f32, ghost),
                 6.0,
                 5.0,
             ));
@@ -1862,7 +1866,7 @@ fn paint_relocation_trail(
     let line: Vec<egui::Pos2> = centers.iter().map(|(position, _)| *position).collect();
     painter.add(egui::Shape::line(
         line,
-        egui::Stroke::new(1.2, theme().warn),
+        egui::Stroke::new(1.2_f32, theme().warn),
     ));
     for (position, elapsed) in &centers {
         painter.circle_filled(*position, 2.5, theme().warn);

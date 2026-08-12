@@ -40,7 +40,7 @@ pub fn section(ui: &mut egui::Ui, title: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 2.0), egui::Sense::hover());
     ui.painter().line_segment(
         [rect.left_center(), rect.right_center()],
-        egui::Stroke::new(1.0, theme().section_rule),
+        egui::Stroke::new(1.0_f32, theme().section_rule),
     );
     ui.label(
         egui::RichText::new(title.to_uppercase())
