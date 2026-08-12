@@ -237,9 +237,11 @@ mod tests {
     fn run_options_never_carries_undeclared_keys() {
         // Serializing must produce ONLY declared keys (the engine refuses
         // unknowns). A device UUID travels as a string.
-        let mut options = RunOptions::default();
-        options.device = Some(serde_json::json!("GPU-aaaa"));
-        options.restart = Some("run/checkpoint.gpuwmrst".into());
+        let options = RunOptions {
+            device: Some(serde_json::json!("GPU-aaaa")),
+            restart: Some("run/checkpoint.gpuwmrst".into()),
+            ..RunOptions::default()
+        };
         let value = serde_json::to_value(&options).unwrap();
         let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["device", "restart"]);

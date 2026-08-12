@@ -747,6 +747,35 @@ fn query_capture(
     Ok(stdout_text)
 }
 
+/// Plan handed to `--estimate`/`--resolve` as a temp file that cleans up
+/// after the query.
+struct TempPlanFile {
+    path: PathBuf,
+}
+
+impl TempPlanFile {
+    fn write(plan_json: &str) -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!(
+            "arwen-studio-plan-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, plan_json)
+            .map_err(|error| format!("write temp plan {}: {error}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn path_string(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for TempPlanFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,34 +892,5 @@ mod tests {
         );
         assert_eq!(value["env_key_present"], true);
         assert_eq!(value["env_url_present"], true);
-    }
-}
-
-/// Plan handed to `--estimate`/`--resolve` as a temp file that cleans up
-/// after the query.
-struct TempPlanFile {
-    path: PathBuf,
-}
-
-impl TempPlanFile {
-    fn write(plan_json: &str) -> Result<Self, String> {
-        let path = std::env::temp_dir().join(format!(
-            "arwen-studio-plan-{}-{}.json",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::write(&path, plan_json)
-            .map_err(|error| format!("write temp plan {}: {error}", path.display()))?;
-        Ok(Self { path })
-    }
-
-    fn path_string(&self) -> String {
-        self.path.to_string_lossy().into_owned()
-    }
-}
-
-impl Drop for TempPlanFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
