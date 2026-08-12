@@ -37,8 +37,8 @@ use crate::{
     DecodedLoadBatch, DisplayTimeZone, FeedSource, FrameStatus, LoadTimings,
     MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, ViewerApp, archive_load_progress_row,
     archive_object_scan_time_utc, cache_dir, compact_intl_identity, decode_archive_history_object,
-    fetch_assemble_intl_plan, fetch_intl_frame_plan_batch, format_site_label, intl_provider_label,
-    panel_kit, send_archive_progress, us_site_kind,
+    fetch_assemble_intl_plan, fetch_intl_frame_plan_batch, intl_provider_label, panel_kit,
+    send_archive_progress,
 };
 
 /// Capability answers are values, not missing branches (spec §1.3): the
@@ -510,35 +510,32 @@ impl ViewerApp {
         // (The loop transport renders above this section in the DATA tab —
         // archive browsing shouldn't need a tab switch to play what it just
         // loaded.)
-        let mut selected_site_index = self.selected_site_index;
-        let original_site_index = selected_site_index;
+        let mut selected_site = self.live_us_site_ref_at(self.selected_site_index);
+        let original_site = selected_site.clone();
         panel_kit::row(ui, "Radar site", |ui| {
             let selected = self
-                .sites
-                .get(selected_site_index)
-                .map(format_site_label)
+                .live_us_site_label_at(self.selected_site_index)
                 .unwrap_or_else(|| "Choose site".to_owned());
             egui::ComboBox::from_id_salt("archive_site_combo")
                 .selected_text(selected)
                 .width(176.0)
                 .show_ui(ui, |ui| {
-                    for (index, site) in self.sites.iter().enumerate() {
+                    for row in self.live_us_site_rows() {
                         if matches!(
-                            us_site_kind(site),
+                            row.kind,
                             data_source::sites::SiteKind::Wsr88d
                                 | data_source::sites::SiteKind::Tdwr
                         ) {
-                            ui.selectable_value(
-                                &mut selected_site_index,
-                                index,
-                                format_site_label(site),
-                            );
+                            ui.selectable_value(&mut selected_site, Some(row.site), row.label);
                         }
                     }
                 });
         });
-        if selected_site_index != original_site_index {
-            self.select_us_archive_site(selected_site_index);
+        if selected_site != original_site
+            && let Some(site) = selected_site
+            && let Some(index) = self.live_us_site_index(&site)
+        {
+            self.select_us_archive_site(index);
         }
         panel_kit::row(ui, "Manual picker frames", |ui| {
             // Right-to-left: the frame count at the row edge, +5 older to

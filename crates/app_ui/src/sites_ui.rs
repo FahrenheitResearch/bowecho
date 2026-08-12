@@ -5,7 +5,7 @@
 //! rows, nearest-overlay dispatch, and the `SiteRef` encode/resolve
 //! helpers. Feature code elsewhere goes through `data_source::sites`
 //! (`resolve` / `all_sites` / `sites_near`) or these helpers — raw
-//! `self.sites` / `intl_static_sites()` iteration is confined here and
+//! live-US storage / `intl_static_sites()` iteration is confined here and
 //! ratcheted by `tests/sites_catalog_guard.rs`.
 
 use data_source::RadarSite;
@@ -34,7 +34,63 @@ pub(crate) struct BeamCandidate {
     pub(crate) distance_km: f32,
 }
 
+/// Kind-tagged picker row adapted from the live NOAA Level-II catalog.
+///
+/// The union catalog is compiled-in and therefore cannot contain a brand-new
+/// site discovered by the asynchronous S3 catalog refresh. This adapter keeps
+/// that loader boundary in this module while feature UI deals only in stable
+/// [`SiteRef`] identity plus catalog-derived [`SiteKind`].
+#[derive(Clone, Debug)]
+pub(crate) struct LiveUsSiteRow {
+    pub(crate) site: SiteRef,
+    pub(crate) kind: SiteKind,
+    pub(crate) label: String,
+}
+
 impl ViewerApp {
+    /// The sole adapter onto the app's refreshable legacy US-site storage.
+    /// All feature-facing helpers below return stable refs or owned loader
+    /// values, so consumers never iterate or retain raw catalog indices.
+    fn live_us_sites(&self) -> &[RadarSite] {
+        &self.sites
+    }
+
+    pub(crate) fn live_us_site_rows(&self) -> Vec<LiveUsSiteRow> {
+        self.live_us_sites()
+            .iter()
+            .map(|site| LiveUsSiteRow {
+                site: SiteRef::Us {
+                    level2_id: site.level2_id.clone(),
+                },
+                kind: us_site_kind(site),
+                label: format_site_label(site),
+            })
+            .collect()
+    }
+
+    pub(crate) fn live_us_site_ref_at(&self, index: usize) -> Option<SiteRef> {
+        self.live_us_sites().get(index).map(|site| SiteRef::Us {
+            level2_id: site.level2_id.clone(),
+        })
+    }
+
+    pub(crate) fn live_us_site_label_at(&self, index: usize) -> Option<String> {
+        self.live_us_sites().get(index).map(format_site_label)
+    }
+
+    pub(crate) fn live_us_site_index(&self, site: &SiteRef) -> Option<usize> {
+        let SiteRef::Us { level2_id } = site else {
+            return None;
+        };
+        self.live_us_sites()
+            .iter()
+            .position(|row| row.level2_id.eq_ignore_ascii_case(level2_id))
+    }
+
+    pub(crate) fn live_us_radar_site_at(&self, index: usize) -> Option<RadarSite> {
+        self.live_us_sites().get(index).cloned()
+    }
+
     /// Lowest-beam radar candidates for a geo point across the primary
     /// Level II site catalog, sorted by 0.5° beam height ascending (slant
     /// range → 4/3-Earth beam height). Community/research feeds stay

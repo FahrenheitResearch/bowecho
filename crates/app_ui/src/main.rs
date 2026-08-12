@@ -25834,9 +25834,7 @@ impl ViewerApp {
                 let index = independent_pane
                     .map(|slot| self.extra_pane_selected_site_index(slot))
                     .unwrap_or(self.selected_site_index);
-                self.sites.get(index).map(|site| SiteRef::Us {
-                    level2_id: site.level2_id.clone(),
-                })
+                self.live_us_site_ref_at(index)
             });
         let Some(mut picked_site) = current_site else {
             ui.weak("No radar sites are available");
@@ -25849,14 +25847,8 @@ impl ViewerApp {
                 .selected_text(selected_label)
                 .width((ui.available_width() - 8.0).max(180.0))
                 .show_ui(ui, |ui| {
-                    for site in &self.sites {
-                        ui.selectable_value(
-                            &mut picked_site,
-                            SiteRef::Us {
-                                level2_id: site.level2_id.clone(),
-                            },
-                            format_site_label(site),
-                        );
+                    for row in self.live_us_site_rows() {
+                        ui.selectable_value(&mut picked_site, row.site, row.label);
                     }
                     let mut intl_pick = match &picked_site {
                         SiteRef::Intl { .. } => Some(picked_site.clone()),
@@ -25871,11 +25863,9 @@ impl ViewerApp {
         if picked_site != original_site {
             match picked_site {
                 SiteRef::Us { level2_id } => {
-                    if let Some(index) = self
-                        .sites
-                        .iter()
-                        .position(|site| site.level2_id.eq_ignore_ascii_case(&level2_id))
-                    {
+                    if let Some(index) = self.live_us_site_index(&SiteRef::Us {
+                        level2_id: level2_id.clone(),
+                    }) {
                         if let Some(slot) = independent_pane {
                             self.set_extra_pane_selected_site(slot, index);
                         } else {
@@ -25966,10 +25956,8 @@ impl ViewerApp {
                     && let Some(site) = Self::find_intl_site(&provider_id, &site_id)
                 {
                     self.start_extra_pane_intl_load(slot, site, mode, ctx);
-                } else if let Some(site) = self
-                    .sites
-                    .get(self.extra_pane_selected_site_index(slot))
-                    .cloned()
+                } else if let Some(site) =
+                    self.live_us_radar_site_at(self.extra_pane_selected_site_index(slot))
                 {
                     if load_loop {
                         self.start_extra_pane_loop_load(slot, site, ctx);
