@@ -196,13 +196,59 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\release\bowecho.exe "dist\${{ matrix.artifact_name }}.exe"
-          if ("${{ matrix.artifact_name }}" -eq "bowecho-windows-x64") {
-            New-Item -ItemType Directory -Force package | Out-Null
-            Copy-Item target\release\bowecho.exe package\bowecho.exe
-            Copy-Item README.md package\README.md
-            Copy-Item LICENSE-MIT package\LICENSE-MIT
-            Copy-Item LICENSE-APACHE package\LICENSE-APACHE
-            Compress-Archive -Path package\* -DestinationPath "dist\${{ matrix.artifact_name }}.zip" -Force
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item target\release\bowecho.exe package\bowecho.exe
+          Copy-Item README.md package\README.md
+          Copy-Item LICENSE-MIT package\LICENSE-MIT
+          Copy-Item LICENSE-APACHE package\LICENSE-APACHE
+          Copy-Item THIRD-PARTY-NOTICES.md package\THIRD-PARTY-NOTICES.md
+          Copy-Item PYART-LICENSE.txt package\PYART-LICENSE.txt
+          Compress-Archive -Path package\* -DestinationPath "dist\${{ matrix.artifact_name }}.zip" -Force
+
+      # The raw .exe name is an updater protocol contract. The matching ZIP is
+      # the canonical manual download and its embedded executable must be the
+      # same signed bytes; it also acts as the notice sidecar for that updater
+      # asset instead of changing the baked BOWECHO_UPDATE_ASSET name.
+      - name: Verify Windows package contents
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expected = @(
+            "bowecho.exe",
+            "README.md",
+            "LICENSE-MIT",
+            "LICENSE-APACHE",
+            "THIRD-PARTY-NOTICES.md",
+            "PYART-LICENSE.txt"
+          ) | Sort-Object
+          $check = Join-Path $env:RUNNER_TEMP "bowecho-package-check"
+          New-Item -ItemType Directory -Force $check | Out-Null
+          Expand-Archive "dist\${{ matrix.artifact_name }}.zip" -DestinationPath $check -Force
+          $directories = @(Get-ChildItem $check -Recurse -Directory)
+          if ($directories.Count -ne 0) {
+            throw "Windows package contains an unexpected nested directory"
+          }
+          $actual = Get-ChildItem $check -Recurse -File | ForEach-Object {
+            $_.FullName.Substring($check.Length).TrimStart(
+              [IO.Path]::DirectorySeparatorChar,
+              [IO.Path]::AltDirectorySeparatorChar
+            ).Replace('\', '/')
+          } | Sort-Object
+          $difference = Compare-Object -ReferenceObject $expected -DifferenceObject $actual
+          if ($difference) {
+            $difference | Format-Table | Out-String | Write-Error
+            throw "Windows package contents differ from the exact release contract"
+          }
+          if ((Get-FileHash "dist\${{ matrix.artifact_name }}.exe" -Algorithm SHA256).Hash -ne
+              (Get-FileHash (Join-Path $check "bowecho.exe") -Algorithm SHA256).Hash) {
+            throw "The Windows updater executable differs from the notice-bearing package executable"
+          }
+          foreach ($notice in @("README.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.md", "PYART-LICENSE.txt")) {
+            if ((Get-FileHash $notice -Algorithm SHA256).Hash -ne
+                (Get-FileHash (Join-Path $check $notice) -Algorithm SHA256).Hash) {
+              throw "Packaged $notice differs from the repository copy"
+            }
           }
 
       - name: Package macOS app
@@ -217,6 +263,8 @@ jobs:
           cp README.md "$app/Contents/Resources/README.md"
           cp LICENSE-MIT "$app/Contents/Resources/LICENSE-MIT"
           cp LICENSE-APACHE "$app/Contents/Resources/LICENSE-APACHE"
+          cp THIRD-PARTY-NOTICES.md "$app/Contents/Resources/THIRD-PARTY-NOTICES.md"
+          cp PYART-LICENSE.txt "$app/Contents/Resources/PYART-LICENSE.txt"
           chmod +x "$app/Contents/MacOS/${BIN_NAME}"
           if [[ "${GITHUB_REF_NAME:-}" =~ ^v[0-9] ]]; then
             version="${GITHUB_REF_NAME#v}"
@@ -346,6 +394,36 @@ jobs:
           set -euo pipefail
           ditto -c -k --sequesterRsrc --keepParent "BowEcho.app" "dist/${{ matrix.artifact_name }}.zip"
 
+      - name: Verify macOS package contents
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/${{ matrix.artifact_name }}.zip"
+          entries="$(unzip -Z1 "$archive")"
+          required=(
+            "BowEcho.app/Contents/MacOS/bowecho"
+            "BowEcho.app/Contents/Resources/README.md"
+            "BowEcho.app/Contents/Resources/LICENSE-MIT"
+            "BowEcho.app/Contents/Resources/LICENSE-APACHE"
+            "BowEcho.app/Contents/Resources/THIRD-PARTY-NOTICES.md"
+            "BowEcho.app/Contents/Resources/PYART-LICENSE.txt"
+          )
+          for path in "${required[@]}"; do
+            count="$(printf '%s\n' "$entries" \
+              | awk -v expected="$path" '$0 == expected { count++ } END { print count + 0 }')"
+            if [[ "$count" -ne 1 ]]; then
+              echo "::error::macOS package is missing exactly one ${path} entry"
+              exit 1
+            fi
+          done
+          unzip -p "$archive" "BowEcho.app/Contents/MacOS/bowecho" \
+            | cmp - "BowEcho.app/Contents/MacOS/bowecho"
+          for notice in README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md PYART-LICENSE.txt; do
+            unzip -p "$archive" "BowEcho.app/Contents/Resources/${notice}" \
+              | cmp - "$notice"
+          done
+
       - name: Check Linux release executable size
         if: runner.os == 'Linux'
         shell: bash
@@ -356,9 +434,44 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "dist"
-          cp "target/release/${BIN_NAME}" "dist/${{ matrix.artifact_name }}"
-          chmod +x "dist/${{ matrix.artifact_name }}"
+          bundle="${{ matrix.artifact_name }}"
+          mkdir -p "dist/${bundle}"
+          cp "target/release/${BIN_NAME}" "dist/${bundle}/bowecho"
+          cp README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md PYART-LICENSE.txt "dist/${bundle}/"
+          chmod +x "dist/${bundle}/bowecho"
+          tar --sort=name \
+            --mtime='UTC 1970-01-01' \
+            --owner=0 --group=0 --numeric-owner \
+            -czf "dist/${bundle}.tar.gz" -C dist "${bundle}"
+          rm -rf -- "dist/${bundle}"
+
+      - name: Verify Linux package contents
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="${{ matrix.artifact_name }}"
+          archive="dist/${bundle}.tar.gz"
+          check_dir="${RUNNER_TEMP}/bowecho-package-check"
+          expected="${RUNNER_TEMP}/bowecho-package-expected.txt"
+          actual="${RUNNER_TEMP}/bowecho-package-actual.txt"
+          mkdir -p "$check_dir"
+          printf '%s\n' \
+            "${bundle}/" \
+            "${bundle}/LICENSE-APACHE" \
+            "${bundle}/LICENSE-MIT" \
+            "${bundle}/PYART-LICENSE.txt" \
+            "${bundle}/README.md" \
+            "${bundle}/THIRD-PARTY-NOTICES.md" \
+            "${bundle}/bowecho" \
+            | LC_ALL=C sort > "$expected"
+          tar -tzf "$archive" | LC_ALL=C sort > "$actual"
+          diff -u "$expected" "$actual"
+          tar -xzf "$archive" -C "$check_dir"
+          cmp "target/release/${BIN_NAME}" "$check_dir/${bundle}/bowecho"
+          for notice in README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md PYART-LICENSE.txt; do
+            cmp "$notice" "$check_dir/${bundle}/${notice}"
+          done
 
       # v0.34.1 carries the optional research data once, on the Linux x64
       # matrix leg. It is deliberately a separate release asset rather than
@@ -390,13 +503,6 @@ jobs:
 
           cp "$pack_path" "dist/${PACK_NAME}"
 
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/*
-          if-no-files-found: error
-
       - name: Generate SHA-256 checksums
         shell: bash
         # Published beside every asset so users can verify a download is the
@@ -408,6 +514,49 @@ jobs:
           for f in *; do
             sha256sum "$f" > "$f.sha256"
           done
+
+      - name: Verify SHA-256 checksum set
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob
+          assets=()
+          for path in *; do
+            if [[ -f "$path" && "$path" != *.sha256 ]]; then
+              assets+=("$path")
+            fi
+          done
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "::error::No release assets exist to verify"
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            checksum="${asset}.sha256"
+            if [[ ! -f "$checksum" ]]; then
+              echo "::error::Missing checksum for ${asset}"
+              exit 1
+            fi
+            expected="$(sha256sum "$asset")"
+            actual="$(cat "$checksum")"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::Checksum file for ${asset} is malformed or stale"
+              exit 1
+            fi
+          done
+          for checksum in *.sha256; do
+            if [[ ! -f "${checksum%.sha256}" ]]; then
+              echo "::error::Orphan checksum ${checksum}"
+              exit 1
+            fi
+          done
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
 
       - name: Upload release asset
         if: startsWith(github.ref, 'refs/tags/')

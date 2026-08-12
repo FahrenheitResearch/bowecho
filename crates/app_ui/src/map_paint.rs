@@ -965,6 +965,30 @@ impl ViewerApp {
                 lines.push(format_model_probe_context(&hour));
             }
         }
+        if let Some(sample) = self
+            .live_ptype
+            .sample(f64::from(cursor_lat), f64::from(cursor_lon))
+        {
+            let details = sample.inspector_lines();
+            let detail_count = if self.live_ptype.show_uncertainty_qc {
+                details.len()
+            } else {
+                details.len().saturating_sub(1)
+            };
+            lines.extend(details.into_iter().take(detail_count));
+            if let Some(provenance) = self.live_ptype.provenance() {
+                lines.push(format!(
+                    "{} · Modified Bourgouin v{} · cycle {} valid {} · surface {} {}",
+                    provenance.model_id.to_ascii_uppercase(),
+                    provenance.algorithm_version,
+                    provenance.model_cycle.format("%m-%d %H:%MZ"),
+                    provenance.model_valid.format("%m-%d %H:%MZ"),
+                    provenance.surface_analysis_id,
+                    provenance.surface_analysis_valid.format("%H:%MZ"),
+                ));
+                lines.push(provenance.truth_label());
+            }
+        }
         if let Some(probe) = readout.as_ref().and_then(|readout| readout.vrot) {
             lines.push(format_vrot_card_line(
                 probe,

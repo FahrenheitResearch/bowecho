@@ -222,6 +222,9 @@ impl RhiPanel {
                 crate::DealiasEngine::RegionGlobal => {
                     render2d::dealias_velocity_grid_pyart_region(cut, grid)
                 }
+                crate::DealiasEngine::Rift => {
+                    render2d::dealias_velocity_grid_region_global_rift(cut, grid)
+                }
                 crate::DealiasEngine::Region => render2d::dealias_velocity_grid(cut, grid),
             };
             &dealiased

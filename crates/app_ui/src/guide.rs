@@ -121,7 +121,7 @@ impl GuideSection {
                 "reflectivity velocity correlation coefficient zdr dual pol derived gust hail tornado"
             }
             Self::Layers => {
-                "map warnings alerts placefiles metar observations wofs tropical hurricane hunters recon"
+                "map warnings alerts placefiles metar observations wofs tropical hurricane hunters recon precipitation type ptype rain snow sleet ice pellets freezing rain mixed"
             }
             Self::ModelData => {
                 "models hrrr gfs grib sounding box download import plot color table formula point probe sample cursor pin fixed history graph time series domain extrema minimum maximum tornado simulation"
@@ -143,7 +143,9 @@ impl GuideSection {
             Self::Volume3d => "3d volume rendering isosurface camera",
             Self::CaptureBrand => "screenshot save image png branding attribution recording",
             Self::Shortcuts => "keyboard hotkeys controls",
-            Self::Sources => "sources credits attribution license nws noaa nhc eumetsat",
+            Self::Sources => {
+                "sources credits attribution license nws noaa nhc eumetsat census natural earth basemap"
+            }
         }
     }
 
@@ -522,12 +524,14 @@ fn products(ui: &mut egui::Ui) {
          the beam only; flow across the beam is invisible.",
         "keep Unfold VEL on. Raw velocity folds at the Nyquist speed and a folded gate reads \
          as a fake opposite-direction couplet — the inspector warns on near-Nyquist gates. \
-         Region is the responsive default and unfolds only the selected tilt. Analyst v4 is \
+         Region Global is the optimized default and unfolds the selected sweep with a joint \
+         Py-ART-style region-network solve. Region Fast keeps the legacy/local same-tilt solver \
+         available for comparison. Analyst v4 is \
          the higher-cost option: it solves all velocity tilts of the volume jointly, adds the \
          previous volume as a temporal prior, and — for US CONUS sites — anchors the absolute \
          branch to a RAP analysis wind profile fetched in the background; international sites \
-         run it without the model anchor. Region Global is the Py-ART-style same-tilt solver.",
-        "Region: Jing & Wiener 1993 (JTECH 10); Feldmann et al. 2020, R2D2 \
+         run it without the model anchor.",
+        "Region engines: Jing & Wiener 1993 (JTECH 10); Feldmann et al. 2020, R2D2 \
          (JTECH-D-20-0054.1); Helmus & Collis 2016 (Py-ART, JORS). Analyst v4 adds: \
          Eilts & Smith 1990 (JTECH 7, environmental wind constraints); James & Houze 2001 \
          (JTECH 18, 4DD sounding initialization); Louf et al. 2020 (JTECH 37, UNRAVEL \
@@ -920,6 +924,28 @@ fn layers(ui: &mut egui::Ui) {
         "— the single front door for every map data type: radar overlays, model fields, \
          satellite, WoFS/FARM drapes, mesoanalysis composites, surface obs, placefiles. You \
          never need to know which window a layer is born in.",
+    );
+
+    subhead(ui, "LIVE PRECIPITATION TYPE");
+    para(
+        ui,
+        "Add Live precipitation type from + Add layer. Radar reflectivity supplies the current \
+         precipitation footprint; an HRRR or RAP thermodynamic column supplies the phase prior. \
+         BowEcho keeps rain, snow, freezing-rain, and ice-pellet scores independent while \
+         regridding, then chooses the displayed category. Mixed means no one phase reaches the \
+         selected confidence threshold—it is a real transition signal, not an error.",
+    );
+    para(
+        ui,
+        "The layer follows live or archive radar time: scans in one model hour reuse the cached \
+         thermodynamic prior, while crossing an hour selects a new exact-valid HRRR/RAP input. \
+         Historical scenes retain the model surface because the operational RTMA source has no \
+         deep archive. The layer window and cursor inspector report the model cycle and valid time, surface \
+         correction source and time, radar scan time, source ages, and model-grid resolution. \
+         The map is at radar-footprint resolution; the phase prior remains at model resolution. \
+         Missing or stale inputs are labelled instead of silently presented as current. The \
+         method cannot distinguish freezing drizzle from freezing rain, depends on model-profile \
+         quality, and deliberately keeps a permissive echo threshold so light snow is not erased.",
     );
 
     subhead(ui, "ANALYSIS (OA)");
@@ -2743,7 +2769,9 @@ fn archive(ui: &mut egui::Ui) {
     ui.heading("Archive & events");
     para(
         ui,
-        "The Data tab's Archive section follows the primary radar. For a US site it replays \
+        "The Data tab's Archive section has two explicit modes. Site + scan lets you choose a \
+         radar and replay one scan or a simple loop. Event day loads selected report/track \
+         categories so clicking one can build the matching radar loop. For a US site it replays \
          any day in the US NEXRAD Level II record — the loop transport sits at the top of the \
          tab so you never switch tabs to play what you just loaded. For an international site \
          whose provider exposes an archive (EUMETNET ORD, SMHI Sweden, Australia NCI), the \
@@ -2804,9 +2832,10 @@ fn archive(ui: &mut egui::Ui) {
     subhead(ui, "DATA PACKS");
     para(
         ui,
-        "Data packs are ready-made review scenes for important dual-pol and debug cases. Load \
-         one to fetch the needed archive frames, apply the intended scene, then expand the \
-         window if you want more context.",
+        "Data packs fetch ready-made archive windows for important cases while preserving your \
+         panes, products, cuts, tools, and SPC layers. The Nashville 2026 Ice Storm pack also \
+         enables a time-matched HRRR precipitation-type layer. Expand a loaded pack when you \
+         want more context.",
     );
 
     subhead(ui, "SPC TORNADO EVENTS");
@@ -2839,8 +2868,9 @@ fn archive(ui: &mut egui::Ui) {
     action(
         ui,
         "Event day \u{25b8} Load",
-        "— pins the reports/outlook day from the DATA tab without moving the map, and shows \
-         the day's count (\"N reports · M tornado segments\"). A day with no SPC file (quiet \
+        "— pins the report/track day from Data > Archive > Event day without moving the map, \
+         never auto-enables SPC outlook shading, and shows the day's count (\"N reports · M \
+         tornado segments\"). A day with no SPC file (quiet \
          or pre-2004) says so — no error spam. Unpin returns to following the displayed time.",
     );
     action(
@@ -3414,8 +3444,12 @@ fn sources(ui: &mut egui::Ui) {
     subhead(ui, "BASEMAPS");
     para(
         ui,
-        "The default dark vector basemap is built in (offline). Tile styles: imagery © Esri, \
-         Maxar, Earthstar Geographics; Streets/Topo map tiles © Esri and contributors.",
+        "The default dark vector basemap is built in (offline). Its U.S. state/county geometry \
+         comes from U.S. Census Bureau 2024 cartographic boundary files; dense U.S. town/place \
+         labels come from the 2023 1:500,000 place-boundary set. Global country, regional \
+         administrative, and populated-place data comes from public-domain Natural Earth. \
+         These same generated tables support the embedded ArWen Studio map. Tile styles: imagery \
+         © Esri, Maxar, Earthstar Geographics; Streets/Topo map tiles © Esri and contributors.",
     );
 
     subhead(ui, "CONTRIBUTED WORK");

@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DataPackLayout {
     DualPolTornadoReview,
+    WinterPtypeReview,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -241,6 +242,21 @@ pub(crate) const BUILT_IN_DATA_PACKS: &[BuiltInDataPack] = &[
         max_frames: 12,
         layout: DataPackLayout::DualPolTornadoReview,
     },
+    BuiltInDataPack {
+        id: "nashville-ice-2026-kohx",
+        title: "Nashville 2026 Ice Storm",
+        summary: "Three KOHX scans during the January 24-25, 2026 ice storm, paired with the time-matched HRRR precipitation-type analysis.",
+        site_id: "KOHX",
+        start_utc: "2026-01-25T15:02:45Z",
+        end_utc: "2026-01-25T15:14:51Z",
+        anchor_utc: "2026-01-25T15:08:48Z",
+        focus_lat: 36.05,
+        focus_lon: -86.10,
+        map_scale: 600.0,
+        pad_scans: 0,
+        max_frames: 3,
+        layout: DataPackLayout::WinterPtypeReview,
+    },
 ];
 
 /// A ready-made review scene over an international provider archive —
@@ -320,7 +336,7 @@ mod tests {
 
     #[test]
     fn built_in_data_packs_parse_to_valid_windows() {
-        assert_eq!(BUILT_IN_DATA_PACKS.len(), 7);
+        assert_eq!(BUILT_IN_DATA_PACKS.len(), 8);
 
         for pack in BUILT_IN_DATA_PACKS {
             let request = pack
@@ -364,12 +380,21 @@ mod tests {
     }
 
     #[test]
-    fn pack_set_is_dual_pol_first() {
+    fn legacy_pack_set_stays_dual_pol_and_winter_pack_is_explicit() {
         assert!(
-            BUILT_IN_DATA_PACKS
+            BUILT_IN_DATA_PACKS[..7]
                 .iter()
                 .all(|pack| pack.layout == DataPackLayout::DualPolTornadoReview)
         );
+        let winter = BUILT_IN_DATA_PACKS
+            .iter()
+            .find(|pack| pack.id == "nashville-ice-2026-kohx")
+            .expect("Nashville winter pack");
+        assert_eq!(winter.layout, DataPackLayout::WinterPtypeReview);
+        assert_eq!(winter.site_id, "KOHX");
+        assert_eq!(winter.max_frames, 3);
+        assert_eq!(winter.pad_scans, 0);
+        assert_eq!(winter.anchor_utc, "2026-01-25T15:08:48Z");
     }
 
     #[test]

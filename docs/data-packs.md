@@ -1,8 +1,9 @@
 # Data Packs
 
 Data packs are ready-made radar scenes: press Load, BowEcho fetches the
-required scans, builds the master timeline, selects low-level tilts, applies
-the view, and starts the loop without manual archive hunting.
+required scans, builds the master timeline, applies the event focus, and
+starts the loop without manual archive hunting. Loading a pack preserves the
+operator's current panes, products, cuts, tools, and SPC layers.
 
 ## Goals
 
@@ -28,12 +29,13 @@ the view, and starts the loop without manual archive hunting.
 5. The selected objects decode into history frames (oldest first), which
    are the master frame list; low-tilt mode filters playback to the
    allowed low cuts inside the existing loop player.
-6. BowEcho pauses live polling, applies the layout/view/overlays, selects the
-   requested frame, and starts playback when requested.
+6. BowEcho pauses live polling, applies the event focus, selects the requested
+   frame, and starts playback without replacing the operator's workspace.
 
-## Built-In V1 Packs
+## Built-In Packs
 
-The first in-app pack set should stay dual-pol first:
+The original cases emphasize dual-pol tornado review; winter cases can add
+explicit analysis layers without changing the operator's displayed product:
 
 | Pack | Radar | UTC window | Anchor | Focus | Default view |
 | --- | --- | --- | --- | --- | --- |
@@ -43,6 +45,7 @@ The first in-app pack set should stay dual-pol first:
 | Mayfield EF4 | KPAH | 2021-12-11 02:45-04:05 | 03:27 | 36.740, -88.640 | REF, dealiased velocity, CC, ZDR |
 | Rolling Fork EF4 | KDGX | 2023-03-25 00:50-02:15 | 01:07 | 32.906, -90.878 | REF, dealiased velocity, CC, ZDR |
 | Amory EF3 | KGWX | 2023-03-25 03:18-04:05 | 03:38 | 33.950, -88.620 | REF, dealiased velocity, CC, ZDR |
+| Nashville 2026 Ice Storm | KOHX | 2026-01-25 15:02-15:14 | 15:08 | 36.050, -86.100 | Existing workspace + time-matched HRRR precipitation type |
 
 Tuscaloosa 2011 remains an important velocity case, but it should not be in
 the first dual-pol set because KBMX had not been upgraded yet.

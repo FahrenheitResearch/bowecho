@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::TimeZone;
+use chrono::{TimeZone, Utc};
 use color_tables::ColorTableFamily;
 use data_source::grid_products::imgw::IMGW_POLRAD_SITES;
 use data_source::sites::SiteRef;
@@ -167,6 +167,7 @@ impl ViewerApp {
             + usize::from(self.grid_composite_placeholder_source().is_some())
             + usize::from(self.sat_layer.is_some())
             + self.model_layers.len()
+            + usize::from(self.live_ptype.enabled)
             + usize::from(self.obs_enabled)
             + usize::from(self.app_settings.overlay_river_gauges)
             + usize::from(self.glm_enabled)
@@ -614,6 +615,89 @@ impl ViewerApp {
             && let Some(dock) = &mut self.model_dock
         {
             dock.step_hour(step_hour);
+        }
+        if self.live_ptype.enabled {
+            let status = self.live_ptype.status_label();
+            let hover = self.live_ptype.hover_text();
+            let ptype_busy = self.live_ptype.is_busy();
+            let frame_text = self
+                .live_ptype
+                .provenance()
+                .map(|provenance| provenance.model_valid.format("%H:%MZ").to_string());
+            let lifecycle = if ptype_busy {
+                "loading"
+            } else if self.live_ptype.has_frame() {
+                "ready"
+            } else {
+                "idle"
+            };
+            let mut visible = self.live_ptype.visible;
+            let mut opacity = self.live_ptype.opacity;
+            let mut open_settings = false;
+            let mut refresh = false;
+            let mut remove = false;
+            if layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut visible,
+                        hover: "Show the radar-masked live precipitation-type analysis",
+                    },
+                    name: "Live precipitation type",
+                    name_hover: &hover,
+                    state: Some(lifecycle),
+                    count: frame_text.as_deref(),
+                    opacity: Some(LayerRowOpacity::F32 {
+                        value: &mut opacity,
+                        min: 0.05,
+                        hover: "Live precipitation-type opacity",
+                    }),
+                    gear: Some(LayerRowGear::Menu {
+                        hover: "Precipitation-type inputs, mode, provenance, and refresh",
+                        content: Box::new(|ui| {
+                            if ui.button("Open settings…").clicked() {
+                                open_settings = true;
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(!ptype_busy, egui::Button::new("Refresh analysis"))
+                                .clicked()
+                            {
+                                refresh = true;
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.weak(&status);
+                        }),
+                    }),
+                    remove: Some(LayerRowRemove {
+                        hover: "Remove live precipitation type",
+                        clicked: &mut remove,
+                    }),
+                    ..Default::default()
+                },
+                |_ui| {},
+            ) {
+                self.live_ptype.set_visible(visible);
+                self.live_ptype.set_opacity(opacity);
+                ctx.request_repaint();
+            }
+            if open_settings {
+                self.live_ptype.open();
+            }
+            if refresh {
+                let bounds = self.live_ptype_current_bounds();
+                let target_valid = self.selected_frame_scan_time_utc().unwrap_or_else(Utc::now);
+                self.live_ptype.request_refresh(
+                    ctx,
+                    &settings::model_cache_dir(),
+                    bounds,
+                    target_valid,
+                );
+            }
+            if remove {
+                self.live_ptype.remove();
+            }
         }
         // (The model master switch + "Keep runs" retention policy
         // moved to Settings ▸ Model — proposal step 4: the fold holds
@@ -3447,6 +3531,7 @@ impl ViewerApp {
         let mut add_italy_dpc: Option<ItalyDpcMapProduct> = None;
         let mut add_taiwan_cwa = false;
         let mut add_grid_composite: Option<grid_composites::GridCompositeSource> = None;
+        let mut add_live_ptype = false;
         ui.menu_button("+ Add layer ⏷", |ui| {
                     ui.menu_button("Radar overlay", |ui| {
                         ui.set_min_width(220.0);
@@ -3533,6 +3618,16 @@ impl ViewerApp {
                         {
                             self.model_download_open = true;
                         }
+                        ui.close();
+                    }
+                    if ui
+                        .button("Live precipitation type…")
+                        .on_hover_text(
+                            "Radar precipitation footprint plus an HRRR/RAP or local WRF thermodynamic phase prior",
+                        )
+                        .clicked()
+                    {
+                        add_live_ptype = true;
                         ui.close();
                     }
                     ui.menu_button("Grid / Composites", |ui| {
@@ -3745,6 +3840,17 @@ impl ViewerApp {
         }
         if let Some(source) = add_grid_composite {
             self.add_grid_composite_layer(source, ctx);
+        }
+        if add_live_ptype {
+            self.live_ptype.enable();
+            let bounds = self.live_ptype_current_bounds();
+            let target_valid = self.selected_frame_scan_time_utc().unwrap_or_else(Utc::now);
+            self.live_ptype.request_refresh(
+                ctx,
+                &settings::model_cache_dir(),
+                bounds,
+                target_valid,
+            );
         }
         // A composite picked from the menu becomes a layer immediately, even
         // while the Analysis (OA) section is collapsed (its own consumer

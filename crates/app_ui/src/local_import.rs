@@ -222,12 +222,10 @@ fn import_paths_with_commit(
     let mut all_vars = Vec::new();
     let mut written = Vec::<WrittenHour>::new();
     let mut notes = Vec::<String>::new();
-    if let Ok(metadata) = crate::wrf_source::WrfRunSourceMetadata::inspect(&files[0])
-        && let Err(error) =
-            crate::wrf_source::write_run_metadata(store_root, &model, &run, metadata)
-    {
-        notes.push(format!("WRF source metadata was not saved: {error}"));
-    }
+    let source_metadata = crate::wrf_source::WrfRunSourceMetadata::inspect(&files[0])
+        .unwrap_or_else(|_| crate::wrf_source::WrfRunSourceMetadata::generic_wrf());
+    crate::wrf_source::write_run_metadata(store_root, &model, &run, source_metadata.clone())
+        .map_err(|error| ImportError::Store(rw_store::RwStoreError::Meta(error)))?;
     for (index, path) in files.iter().enumerate() {
         let hour = u16::try_from(index).expect("bounded above");
         // Every stage line carries the file position, so a folder import reads
@@ -284,6 +282,14 @@ fn import_paths_with_commit(
                 writer_build(),
                 now_unix(),
             )?;
+            crate::wrf_source::stamp_hour_source_provenance(
+                store_root,
+                &model,
+                &run,
+                hour,
+                &source_metadata,
+            )
+            .map_err(|error| ImportError::Store(rw_store::RwStoreError::Meta(error)))?;
             all_vars.extend(result.vars.iter().cloned());
             written.push(result);
             committed(LocalImportCommit {
@@ -371,6 +377,14 @@ fn import_paths_with_commit(
             writer_build(),
             now_unix(),
         )?;
+        crate::wrf_source::stamp_hour_source_provenance(
+            store_root,
+            &model,
+            &run,
+            hour,
+            &source_metadata,
+        )
+        .map_err(|error| ImportError::Store(rw_store::RwStoreError::Meta(error)))?;
         all_vars.extend(result.vars.iter().cloned());
         written.push(result);
         committed(LocalImportCommit {

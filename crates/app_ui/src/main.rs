@@ -25,14 +25,15 @@ use render2d::{
     CrossSectionSmoothing, ECHO_TOP_THRESHOLD_DBZ, EnvironmentalWindProfile, StormCell,
     StormMotion, StormRelativePaletteCache, StormTrack, StormTracker, TIME_GATE_S, TemporalPrior,
     ViewportGeometryCache, ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache,
-    VolumeDealiasCache, apply_reflectivity_gate_filter, azimuthal_shear_grid_from_dealiased,
-    color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
-    dealias_velocity_grid_pyart_region, dealias_volume_v4, detect_rotation_sites_from_dealiased,
-    echo_top_grid, gust_proxy_grid_from_dealiased, hail_grids, identify_storm_cells,
-    marc_grid_from_dealiased, mehs_grid, moment_cross_section_with_smoothing, poh_grid,
-    radial_divergence_grid_from_dealiased, reflectivity_cross_section_with_smoothing,
-    rotation_velocity_cut_indices, smooth_moment_grid, storm_relative_velocity_mps,
-    upsample_moment_grid, velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
+    apply_reflectivity_gate_filter, azimuthal_shear_grid_from_dealiased, color_family_for_moment,
+    composite_reflectivity_grid, dealias_velocity_grid, dealias_velocity_grid_pyart_region,
+    dealias_velocity_grid_region_global_rift, dealias_volume_v4,
+    detect_rotation_sites_from_dealiased, echo_top_grid, gust_proxy_grid_from_dealiased,
+    hail_grids, identify_storm_cells, marc_grid_from_dealiased, mehs_grid,
+    moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid_from_dealiased,
+    reflectivity_cross_section_with_smoothing, rotation_velocity_cut_indices, smooth_moment_grid,
+    storm_relative_velocity_mps, upsample_moment_grid,
+    velocity_cross_section_from_dealiased_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,10 @@ mod box_sounding;
 mod brand;
 mod chrome_readouts;
 mod cm1_ui;
+mod community_cache;
+mod community_cases;
+mod community_credentials;
+mod community_relay;
 mod cross_section_ui;
 mod data_packs;
 mod dealias_env;
@@ -66,6 +71,7 @@ mod formula_lab;
 mod formula_sounding;
 mod gbvtd_retrieval;
 mod gdex_ui;
+mod generation_publication;
 mod geo_helpers;
 mod glm_layer;
 mod grib_import;
@@ -78,6 +84,7 @@ mod ingest_worker;
 mod italy_dpc;
 mod layers_rail;
 mod live_archive_bar;
+mod live_ptype;
 mod local_import;
 mod local_radar_import;
 mod map_paint;
@@ -1300,7 +1307,10 @@ struct CustomGisSite {
     latitude_deg: f32,
     longitude_deg: f32,
 }
-const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.4;
+/// Expanded timeline playback keeps the established <= 1.4-degree low-sweep catalog.
+const LIVE_LOW_LEVEL_MAX_ELEVATION_DEG: f32 = 1.4;
+/// Live-follow tracks the operational lowest two/three cuts without jumping to 1.3 degrees.
+const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.1;
 const MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS: u16 = 1;
 const MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS: u16 = 180;
 const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 720;
@@ -3271,8 +3281,8 @@ struct ViewerApp {
     tor_tracks: tor_tracks::TorTracksState,
     /// Reflectivity gate filter threshold (dBZ); None = off.
     gate_filter_dbz: Option<f32>,
-    /// Velocity dealias engine (see [`DealiasEngine`]): `Region` is the fast
-    /// default, `RegionGlobal` is the Rust Py-ART same-tilt port, and
+    /// Velocity dealias engine (see [`DealiasEngine`]): `RegionGlobal` is the
+    /// optimized default, `Region` is the legacy/local same-tilt solver, and
     /// `Analyst3d` is the opt-in v4 whole-volume engine. Only `Analyst3d` uses
     /// the temporal/model inputs (dealias-v4 spec §16).
     dealias_engine: DealiasEngine,
@@ -3347,9 +3357,6 @@ struct ViewerApp {
     context_menu_gate: Option<CursorReadout>,
     radar_operational_status_cache: BTreeMap<String, RadarOperationalStatusCacheEntry>,
     radar_operational_status_rx: WorkerSlot<RadarOperationalStatusLoad>,
-    /// SPC storm reports for the archive date (tornado events browser).
-    spc_reports: Option<Vec<SpcReport>>,
-    spc_receiver: WorkerSlot<std::result::Result<Vec<SpcReport>, String>>,
     /// One-shot debug launcher focus: after the requested archive object
     /// lands, switch to the known product/cut/view for the repro case.
     pending_debug_archive_case: Option<DebugArchiveCase>,
@@ -3358,6 +3365,19 @@ struct ViewerApp {
     pending_data_pack_scene: Option<data_packs::DataPackScene>,
     data_pack_expanded: BTreeSet<String>,
     loaded_data_pack: Option<data_packs::LoadedDataPack>,
+    archive_browse_mode: ArchiveBrowseMode,
+    /// Explicit, session-only signed case-room directory browse state. The
+    /// Data tab never starts a network request merely by being opened.
+    community_case_browser: community_cache::CommunityCaseBrowser,
+    /// Session-only deliberate case publication and verified artifact viewer.
+    community_case_workspace: community_cases::CommunityCaseWorkspace,
+    /// Cancellable, bounded TURN-only cold-object task. Operational model
+    /// requests never hold or invoke this handle.
+    community_relay_runtime: Option<community_relay::CommunityRelayRuntime>,
+    /// Session-only positive confirmation. Unknown/new networks are treated
+    /// as metered, so seeding pauses by default and the choice never silently
+    /// carries across an app restart.
+    community_relay_network_unmetered_confirmed: bool,
     /// Production model download: rw-ui DownloadPanel + the ported
     /// IngestWorker harness (live estimates, per-hour stage chips, probe,
     /// cancel — the full rusty-weather download workflow).
@@ -3487,6 +3507,10 @@ struct ViewerApp {
     model_layers: Vec<MapLayerSlot>,
     model_layer_build_rx: Option<mpsc::Receiver<Option<model_layer::ModelMapLayer>>>,
     model_layer_generation: u64,
+    /// Cross-source precipitation phase analysis. Its thermodynamic frame is
+    /// cached independently from the radar occurrence mask so live scans do
+    /// not rerun Modified Bourgouin classification.
+    live_ptype: live_ptype::LivePtypeState,
     /// SPC-style upper-air quicklook (height/temp contours + model wind barbs).
     upper_air_layer: Option<upper_air::UpperAirLayer>,
     upper_air_rx: WorkerSlot<UpperAirResult>,
@@ -3825,9 +3849,6 @@ struct ViewerApp {
     /// the HOLD criterion (vertical completeness; cut COUNT is fooled by
     /// SAILS re-visits inflating it before the upper tilts arrive).
     cross_section_volume_top_deg: f32,
-    /// Per-volume dealias memo for velocity sections: endpoint drags pay the
-    /// all-tilt dealias once per volume instead of every frame.
-    cross_section_dealias_cache: VolumeDealiasCache,
     /// Native RHI range-height panel (mobile-radar elevation sweeps).
     rhi_panel: rhi::RhiPanel,
     hazard_overlay: Option<HazardOverlay>,
@@ -5707,7 +5728,7 @@ struct MapLayerSlot {
 }
 
 /// The map view a model-layer raster was rendered for.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ModelLayerView {
     center_lat: f32,
     center_lon: f32,
@@ -5913,6 +5934,22 @@ fn diagnostic_poll_source_label(source: &FeedSource) -> String {
     }
 }
 
+/// Site shown by the primary quick selector. A newly chosen U.S. catalog site
+/// is a pending load target and must win over the still-displayed U.S. feed;
+/// an active international feed remains authoritative until the user chooses
+/// a U.S. target (which releases that source in the selector's change path).
+fn primary_quick_site_ref(
+    feed: &FeedSource,
+    selected_us_level2_id: Option<&str>,
+) -> Option<SiteRef> {
+    match feed {
+        FeedSource::Live(site @ SiteRef::Intl { .. }) => Some(site.clone()),
+        _ => selected_us_level2_id.map(|level2_id| SiteRef::Us {
+            level2_id: level2_id.to_owned(),
+        }),
+    }
+}
+
 fn diagnostic_url_label(url: &str) -> String {
     let trimmed = url.trim();
     if trimmed.is_empty() {
@@ -6075,64 +6112,6 @@ struct SpcFetchResult {
 }
 
 type ModelLayerRender = (u64, ModelLayerView, egui::ColorImage, f32);
-
-/// One SPC storm report (tornado) — the archive events browser entry.
-#[derive(Clone, Debug)]
-struct SpcReport {
-    time_utc: DateTime<Utc>,
-    f_scale: String,
-    location: String,
-    state: String,
-    lat: f32,
-    lon: f32,
-}
-
-/// Parse SPC's filtered tornado-report CSV
-/// (Time,F_Scale,Location,County,State,Lat,Lon,Comments; times UTC; the
-/// report "day" runs 12Z -> 12Z next day, so HHMM < 1200 belongs to the
-/// following calendar date).
-fn parse_spc_tornado_csv(date: chrono::NaiveDate, text: &str) -> Vec<SpcReport> {
-    let mut reports = Vec::new();
-    for line in text.lines().skip(1) {
-        let fields: Vec<&str> = line.splitn(8, ',').collect();
-        if fields.len() < 7 {
-            continue;
-        }
-        let Ok(hhmm) = fields[0].trim().parse::<u32>() else {
-            continue;
-        };
-        let (hour, minute) = (hhmm / 100, hhmm % 100);
-        if hour > 23 || minute > 59 {
-            continue;
-        }
-        let report_date = if hour < 12 {
-            date + chrono::Duration::days(1)
-        } else {
-            date
-        };
-        let Some(time_utc) = report_date
-            .and_hms_opt(hour, minute, 0)
-            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
-        else {
-            continue;
-        };
-        let (Ok(lat), Ok(lon)) = (
-            fields[5].trim().parse::<f32>(),
-            fields[6].trim().parse::<f32>(),
-        ) else {
-            continue;
-        };
-        reports.push(SpcReport {
-            time_utc,
-            f_scale: fields[1].trim().to_owned(),
-            location: fields[2].trim().to_owned(),
-            state: fields[4].trim().to_owned(),
-            lat,
-            lon,
-        });
-    }
-    reports
-}
 
 /// A rotation site detected on the lowest velocity tilt, geolocated.
 #[derive(Clone, Copy, Debug)]
@@ -7330,6 +7309,9 @@ fn resolve_dealiased_grid(
         }
         DealiasEngine::RegionGlobal => cached_dealias_grid(key, witness, || {
             Some(dealias_velocity_grid_pyart_region(cut, source))
+        }),
+        DealiasEngine::Rift => cached_dealias_grid(key, witness, || {
+            Some(dealias_velocity_grid_region_global_rift(cut, source))
         }),
         DealiasEngine::Region => {
             cached_dealias_grid(key, witness, || Some(dealias_velocity_grid(cut, source)))
@@ -8736,6 +8718,13 @@ enum SidebarTab {
     Settings,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ArchiveBrowseMode {
+    #[default]
+    SiteAndScan,
+    EventDay,
+}
+
 impl SidebarTab {
     /// Stable settings slug for this tab — what `app_settings.sidebar_tab`
     /// stores so the active tab survives restarts (like `sidebar_width_pt`).
@@ -8998,7 +8987,7 @@ impl WorkflowPreset {
                 "Satellite window following the player plus active tropical cyclones and the storm-cards panel"
             }
             Self::ArchiveReview => {
-                "Data tab, archive loop mode, reports/outlooks visible, and live polling paused"
+                "Data tab, single-pane archive loop mode, existing overlays preserved, and live polling paused"
             }
         }
     }
@@ -9526,6 +9515,8 @@ impl ViewerApp {
         let restored_eumetsat_product = app_settings.eumetsat_product.clone();
         let restored_eumetsat_loop_frames = app_settings.eumetsat_loop_frames.clamp(2, 36);
         let simsat = simsat_ui::SimSatPane::new(app_settings.simsat_state.as_ref());
+        let live_ptype =
+            live_ptype::LivePtypeState::from_persisted(app_settings.live_ptype_state.as_ref());
         let restored_overlays = (
             app_settings.overlay_obs,
             app_settings.overlay_obs_metar,
@@ -9604,6 +9595,13 @@ impl ViewerApp {
             .map(|base| base.site_id.clone())
             .unwrap_or_default();
         let restored_radar_algorithms = RadarAlgorithmPreferences::from_settings(&app_settings);
+        // Canonicalize legacy/default aliases in memory so the next ordinary
+        // settings save records the migrated production choice. A user who
+        // reselects Region Fast writes its new durable `region-fast` slug.
+        app_settings.dealias_engine = restored_radar_algorithms
+            .dealias_engine
+            .settings_slug()
+            .to_owned();
         let restored_tor_tracks = tor_tracks::TorTracksState::with_persisted(
             sites
                 .get(selected_site_index)
@@ -9640,6 +9638,11 @@ impl ViewerApp {
             normalized_storm_track_max_tracks(usize::from(app_settings.storm_track_max_tracks));
         let restored_storm_track_min_dbz =
             normalized_storm_track_min_dbz(app_settings.storm_track_min_dbz_tenths as f32 / 10.0);
+        let community_relay_runtime = Some(community_relay::CommunityRelayRuntime::start(
+            &app_settings.community_cache,
+            settings::community_cache_dir(),
+            false,
+        ));
         let mut app = Self {
             source_path,
             renderer_backend,
@@ -9790,12 +9793,15 @@ impl ViewerApp {
             context_menu_gate: None,
             radar_operational_status_cache: BTreeMap::new(),
             radar_operational_status_rx: WorkerSlot::idle("radar-operational-status"),
-            spc_reports: None,
-            spc_receiver: WorkerSlot::idle("spc-tornado-reports"),
             pending_debug_archive_case: None,
             pending_data_pack_scene: None,
             data_pack_expanded: BTreeSet::new(),
             loaded_data_pack: None,
+            archive_browse_mode: ArchiveBrowseMode::default(),
+            community_case_browser: community_cache::CommunityCaseBrowser::default(),
+            community_case_workspace: community_cases::CommunityCaseWorkspace::default(),
+            community_relay_runtime,
+            community_relay_network_unmetered_confirmed: false,
             ingest: None,
             download_panel: rw_ui::DownloadPanel::new(default_download_spec(&restored_model_slug)),
             sat: None,
@@ -9848,6 +9854,7 @@ impl ViewerApp {
             model_layers: Vec::new(),
             model_layer_build_rx: None,
             model_layer_generation: 0,
+            live_ptype,
             upper_air_layer: None,
             upper_air_rx: WorkerSlot::idle("upper-air-quicklook"),
             tropical: tropical::TropicalState::default(),
@@ -10020,7 +10027,6 @@ impl ViewerApp {
             cross_section_user_signature: None,
             cross_section_volume_cuts: 0,
             cross_section_volume_top_deg: 0.0,
-            cross_section_dealias_cache: VolumeDealiasCache::new(),
             rhi_panel: rhi::RhiPanel::new(),
             hazard_overlay: None,
             completed_live_hazard_overlay: None,
@@ -18899,11 +18905,17 @@ impl ViewerApp {
             return;
         }
         let now = Utc::now();
-        // The primary displayed volume + any extra pane's volume whose
-        // product renders dealiased velocity.
+        let velocity_cross_section_active = self.cross_section_view_open
+            && self.cross_section_a_lonlat.is_some()
+            && self.cross_section_b_lonlat.is_some()
+            && self.selected_product.is_signed_radial_velocity();
+        // The primary displayed volume (including an open velocity
+        // cross-section) + any extra pane's volume whose product renders
+        // dealiased velocity.
         let mut wanted: Vec<Arc<RadarVolume>> = Vec::new();
         if (self.product_render_uses_dealiased_velocity(&self.selected_product)
-            || self.unfold_velocity_display)
+            || self.unfold_velocity_display
+            || velocity_cross_section_active)
             && let Some(volume) = &self.volume
         {
             wanted.push(Arc::clone(volume));
@@ -19159,8 +19171,9 @@ impl ViewerApp {
 
         let engine = self.dealias_engine;
         let dealias_label = match engine {
-            DealiasEngine::Region => "Region dealias",
+            DealiasEngine::Region => "Region Fast dealias",
             DealiasEngine::RegionGlobal => "Region Global dealias",
+            DealiasEngine::Rift => "RIFT dealias",
             DealiasEngine::Analyst3d => "Analyst v4 dealias",
         };
         self.vwp_requested_key = Some(key);
@@ -19431,54 +19444,6 @@ impl ViewerApp {
         self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::Loop);
     }
 
-    /// Fetch SPC tornado reports for the archive date (background).
-    fn start_spc_fetch(&mut self, ctx: &egui::Context) {
-        let Ok(date) =
-            chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
-        else {
-            self.status = "Archive date must be YYYY-MM-DD".to_owned();
-            return;
-        };
-        self.pin_event_day_for_archive_date(date);
-        self.spc_receiver.cancel();
-        self.spc_reports = None;
-        self.spc_receiver.spawn(ctx, move |tx| {
-            let url = format!(
-                "https://www.spc.noaa.gov/climo/reports/{}_rpts_filtered_torn.csv",
-                date.format("%y%m%d")
-            );
-            let result = data_source::fetch_text(&url)
-                .map(|text| parse_spc_tornado_csv(date, &text))
-                .map_err(|err| err.to_string());
-            let _ = tx.send(result);
-        });
-    }
-
-    fn pin_event_day_for_archive_date(&mut self, date: NaiveDate) {
-        self.event_explorer.pin_day(date);
-        self.spc_reports_enabled = true;
-        // The installed SPC snapshot belongs to the previous live/archive
-        // key. Clear its completion clock while the newly pinned day loads so
-        // the layer rail cannot label old-day data as a fresh result.
-        self.spc_data.fetched_at = None;
-        self.spc_last_attempt_at = None;
-    }
-
-    fn poll_spc_reports(&mut self, ctx: &egui::Context) {
-        match self.spc_receiver.poll() {
-            SlotPoll::Ready(Ok(reports)) => {
-                self.status = format!("SPC: {} tornado reports", reports.len());
-                self.spc_reports = Some(reports);
-                ctx.request_repaint();
-            }
-            SlotPoll::Ready(Err(err)) => {
-                self.status = format!("SPC fetch failed: {err}");
-                ctx.request_repaint();
-            }
-            SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
-        }
-    }
-
     fn best_archive_event_site_index(&self, lat: f32, lon: f32) -> Option<(usize, f32)> {
         event_explorer::event_jump_eligible_sites(&self.sites)
             .into_iter()
@@ -19542,19 +19507,6 @@ impl ViewerApp {
         }
     }
 
-    /// Event click: switch to the lowest-beam radar over the report, center
-    /// the map there, and load a point-event archive loop with explicit scans
-    /// before AND after the report time. This never uses the live/latest path.
-    fn jump_to_spc_report(&mut self, report: &SpcReport, ctx: &egui::Context) {
-        let scale = if report.f_scale.is_empty() || report.f_scale == "UNK" {
-            String::new()
-        } else {
-            format!("EF{} ", report.f_scale)
-        };
-        let label = format!("{scale}{}, {}", report.location, report.state);
-        self.jump_to_archive_event(report.lat, report.lon, report.time_utc, label, ctx);
-    }
-
     fn jump_to_storm_report(&mut self, report: &spc_layers::StormReport, ctx: &egui::Context) {
         let magnitude = report
             .magnitude_label()
@@ -19574,6 +19526,7 @@ impl ViewerApp {
         }
         self.reports_for_display()
             .iter()
+            .filter(|report| self.event_report_kind_visible(report.kind))
             .filter(|report| self.spc_report_visible_for_timeline(report))
             .filter_map(|report| {
                 let report_pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
@@ -19932,7 +19885,7 @@ impl ViewerApp {
                         }
                         if ui
                             .add_enabled(!busy, egui::Button::new("Load"))
-                            .on_hover_text("List the public Level II archive, download the pack frames, and apply the review scene")
+                            .on_hover_text("List the public Level II archive, download the pack frames, and focus the case without replacing your panes, products, or layers")
                             .clicked()
                         {
                             requested = Some((
@@ -19996,7 +19949,7 @@ impl ViewerApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(!busy, egui::Button::new("Load"))
-                            .on_hover_text("Fetch the feed dir.list, download the newest decodable frames, and apply the review scene")
+                            .on_hover_text("Fetch the feed dir.list and newest decodable frames without replacing your panes, products, or layers")
                             .clicked()
                         {
                             research_requested = true;
@@ -20054,7 +20007,7 @@ impl ViewerApp {
                         if ui
                             .add_enabled(!busy, egui::Button::new("Load"))
                             .on_hover_text(
-                                "List the provider archive, download the pack window, and apply the review scene",
+                                "List the provider archive and download the pack window without replacing your panes, products, or layers",
                             )
                             .clicked()
                         {
@@ -20672,13 +20625,26 @@ impl ViewerApp {
 
     fn supersede_live_load_for_data_pack(&mut self) {
         let can_supersede = self.data_pack_can_supersede_current_load();
+        // Data-pack loads own the archive lane. Retire any browser catalog
+        // worker before installing the pack receiver; otherwise an
+        // identity-less US listing (or a queued international list-then-load)
+        // can arrive late and replace the pack with a different loop.
+        self.archive_list_receiver = None;
+        self.archive_load_after_listing = false;
+        self.archive_volumes = None;
+        self.archive_loaded_range = None;
+        self.intl_archive_list_rx.cancel();
+        self.intl_archive_rows = None;
+        self.intl_archive_loaded_range = None;
+        self.intl_archive_load_after_listing = false;
+        self.intl_archive_full_day_after_listing = false;
+        self.archive_load_progress = None;
         self.primary.live.enabled = false;
         self.poll_active = false;
         self.poll_rx = None;
         self.poll_next = None;
         if self.load_receiver.is_some() && can_supersede {
             self.load_receiver = None;
-            self.archive_load_progress = None;
             self.pending_site_id = None;
             self.live_refresh_skip_reason = None;
             self.event_explorer.pending_autoplay = false;
@@ -20695,34 +20661,18 @@ impl ViewerApp {
         if !volume.site.id.eq_ignore_ascii_case(scene.site_id) {
             return;
         }
+        let scene_scan_time = volume.volume_time.with_timezone(&Utc);
 
-        self.selected_cut = 0;
         match scene.layout {
-            data_packs::DataPackLayout::DualPolTornadoReview => {
-                self.set_workflow_layout(PanelLayout::FourGrid);
-                self.set_primary_product_prefer(DisplayProduct::Moment(MomentType::Reflectivity));
-                self.set_extra_pane_products(&[
-                    DisplayProduct::DealiasedVelocity,
-                    DisplayProduct::Moment(MomentType::CorrelationCoefficient),
-                    DisplayProduct::Moment(MomentType::DifferentialReflectivity),
-                ]);
+            data_packs::DataPackLayout::DualPolTornadoReview => {}
+            data_packs::DataPackLayout::WinterPtypeReview => {
+                self.live_ptype.configure_winter_archive_scene();
             }
         }
-        self.sidebar_tab = SidebarTab::Radar;
-        self.hazards_visible = true;
-        self.hazards_active_only = false;
-        self.spc_day = 1;
-        self.spc_outlooks_enabled = ["cat", "torn", "wind", "hail"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        self.spc_reports_enabled = true;
-        self.spc_last_key = None;
-        self.set_rotation_markers_visible(true);
-        self.set_storm_tracks_visible(true);
-        self.show_inspector_card = true;
-        self.vrot_tool_armed = false;
-        self.vrot_points.clear();
+        // A completed download must not mutate panes, products, cuts, sidebar,
+        // outlook/report layers, or analysis tools behind the operator's back.
+        // Packs own only their documented focus/scale and playback behavior;
+        // the winter acceptance pack additionally owns its ptype layer.
         self.center_map_on(scene.focus_lat, scene.focus_lon);
         self.map_scale = scene.map_scale.clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
         self.clamp_map_center();
@@ -20763,6 +20713,15 @@ impl ViewerApp {
             extra_start_scans: scene.options.extra_start_scans,
             extra_end_scans: scene.options.extra_end_scans,
         });
+        if scene.layout == data_packs::DataPackLayout::WinterPtypeReview {
+            let bounds = self.live_ptype_current_bounds();
+            self.live_ptype.request_refresh(
+                ctx,
+                &settings::model_cache_dir(),
+                bounds,
+                scene_scan_time,
+            );
+        }
         self.pending_data_pack_scene = None;
         ctx.request_repaint();
     }
@@ -21428,7 +21387,6 @@ impl eframe::App for ViewerApp {
         self.poll_radar_operational_status(&ctx);
         self.poll_archive_listing(&ctx);
         self.poll_intl_archive_listing(&ctx);
-        self.poll_spc_reports(&ctx);
         let map_pane_active = self.workspace.is_pane_active(dock::WorkspacePane::Map);
         let tropical_visible = self.app_settings.show_tropical
             && (map_pane_active || self.app_settings.show_tropical_panel);
@@ -21518,6 +21476,28 @@ impl eframe::App for ViewerApp {
             self.frame_ms_avg * 0.95 + dt_ms * 0.05
         };
         self.poll_model_layer(&ctx);
+        self.live_ptype.poll(&ctx);
+        let live_ptype_target = self
+            .selected_frame_scan_time_utc()
+            .or_else(|| self.live_ptype.fallback_target_valid())
+            .unwrap_or_else(Utc::now);
+        if self.live_ptype.needs_initial_refresh() {
+            let bounds = self.live_ptype_current_bounds();
+            self.live_ptype.request_refresh(
+                &ctx,
+                &settings::model_cache_dir(),
+                bounds,
+                live_ptype_target,
+            );
+        } else if self.live_ptype.enabled {
+            let bounds = self.live_ptype_current_bounds();
+            self.live_ptype.ensure_target(
+                &ctx,
+                &settings::model_cache_dir(),
+                bounds,
+                live_ptype_target,
+            );
+        }
         self.poll_simsat(&ctx);
         if self.sat.is_some() {
             if let Some(source) = self.pump_sat_responses(&ctx) {
@@ -21790,6 +21770,17 @@ impl eframe::App for ViewerApp {
         // Native-map settings are staged in the floating plot and become
         // durable only when Rerender applies them (or a saved domain changes).
         self.persist_model_native_plot_state();
+        let live_ptype_bounds = self.live_ptype_current_bounds();
+        let live_ptype_target = self
+            .selected_frame_scan_time_utc()
+            .or_else(|| self.live_ptype.fallback_target_valid())
+            .unwrap_or_else(Utc::now);
+        self.live_ptype.show_window(
+            &ctx,
+            &settings::model_cache_dir(),
+            live_ptype_bounds,
+            live_ptype_target,
+        );
         self.apply_cm1_window_requests();
         self.vwp_window(&ctx);
         self.radar_overlays_window(&ctx);
@@ -21928,6 +21919,7 @@ impl eframe::App for ViewerApp {
 
         // SimSat exposes only durable control changes through its dirty
         // snapshot; runtime progress/output never reaches AppSettings.
+        self.persist_live_ptype_state();
         self.persist_simsat_state();
         // Workspace layout persistence (debounced; on_exit flushes).
         self.maybe_persist_workspace_layout(&ctx);
@@ -21945,12 +21937,16 @@ impl eframe::App for ViewerApp {
         self.alert_watch
             .shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(runtime) = &self.community_relay_runtime {
+            runtime.shutdown();
+        }
         self.persist_sounding_view_state();
         self.persist_model_style_overrides();
         self.persist_model_native_plot_state();
         self.persist_wrf_process_options();
         self.persist_wrf_synth_radar();
         self.persist_formula_lab_state();
+        self.persist_live_ptype_state();
         self.persist_simsat_state();
         if !self.storm_tracks_site.is_empty() {
             let _ = save_storm_track_cache(&self.storm_tracks_site, &self.storm_tracker);
@@ -22409,10 +22405,6 @@ impl ViewerApp {
                 self.app_settings.archive_frame_count = self.archive_frame_count as u16;
                 self.primary.live.enabled = false;
                 self.poll_active = false;
-                self.hazards_visible = true;
-                self.hazards_active_only = false;
-                self.spc_outlooks_enabled = ["cat"].into_iter().map(str::to_owned).collect();
-                self.spc_reports_enabled = true;
                 self.primary.cursor.playing = false;
             }
         }
@@ -22865,8 +22857,9 @@ impl ViewerApp {
         // observed anchor, so Analyst v4 receives the honest no-anchor form.
         let engine = self.dealias_engine;
         let engine_label = match engine {
-            DealiasEngine::Region => "Region dealias",
+            DealiasEngine::Region => "Region Fast dealias",
             DealiasEngine::RegionGlobal => "Region Global dealias",
+            DealiasEngine::Rift => "RIFT dealias",
             DealiasEngine::Analyst3d => "Analyst v4 dealias (no external anchor)",
         };
         let dealiased = volume
@@ -25579,7 +25572,7 @@ impl ViewerApp {
             if ui
                 .checkbox(&mut auto_advance, "Follow new low cuts")
                 .on_hover_text(
-                    "Off keeps the selected sweep fixed as new cuts arrive. On follows newer complete low-level SAILS/MESO-SAILS cuts in the same scan.",
+                    "Off keeps the selected sweep fixed as new cuts arrive. On follows every newer complete, product-compatible cut through 1.10 deg in the same scan.",
                 )
                 .changed()
             {
@@ -25676,7 +25669,668 @@ impl ViewerApp {
         }
     }
 
+    fn radar_pane_layout_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        editing_pane: Option<usize>,
+        independent_pane: Option<usize>,
+    ) {
+        let mut independent_toggle: Option<bool> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Panes");
+            for (layout, label, hover) in [
+                (PanelLayout::One, "1", "Single pane"),
+                (
+                    PanelLayout::TwoVertical,
+                    "2",
+                    "Two panes side by side (synced)",
+                ),
+                (
+                    PanelLayout::ThreeStacked,
+                    "3",
+                    "Three panes: large primary plus two stacked comparison panes",
+                ),
+                (
+                    PanelLayout::FourGrid,
+                    "4",
+                    "Quad grid - REF / VEL / CC / ZDR (synced)",
+                ),
+            ] {
+                if ui
+                    .selectable_label(self.grid_layout == layout, label)
+                    .on_hover_text(hover)
+                    .clicked()
+                    && self.grid_layout != layout
+                {
+                    // Defer: textures from the outgoing layout may already be
+                    // in this frame's paint list (Metal rejects freed handles).
+                    self.pending_grid_layout = Some(layout);
+                    self.app_settings.grid_pane_count = layout.panel_count();
+                    let _ = self.app_settings.save();
+                    ctx.request_repaint();
+                }
+            }
+            ui.separator();
+            let mut independent = self.app_settings.independent_panels;
+            if ui
+                .checkbox(&mut independent, "Independent")
+                .on_hover_text(
+                    "Selected extra panes own their radar source, loop history, pan/zoom, products, and tilts",
+                )
+                .changed()
+            {
+                independent_toggle = Some(independent);
+            }
+        });
+        if let Some(enabled) = independent_toggle {
+            self.set_independent_panels(enabled, ctx);
+        }
+        if let Some(slot) = editing_pane {
+            if independent_pane == Some(slot) {
+                ui.colored_label(
+                    accent_color(),
+                    format!(
+                        "Independent pane {} - site, product, tilt, and loop controls target this pane",
+                        slot + 2
+                    ),
+                );
+            } else {
+                ui.colored_label(
+                    accent_color(),
+                    format!(
+                        "Editing pane {} - click the main (top-left) pane to edit all",
+                        slot + 2
+                    ),
+                );
+                self.extra_pane_site_controls(ui, ctx, slot);
+            }
+        }
+    }
+
+    fn radar_quick_product_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        editing_pane: Option<usize>,
+        editing_product: &DisplayProduct,
+        product_buttons: &[(DisplayProduct, Option<usize>)],
+    ) {
+        let mut picked_product = editing_product.clone();
+        let original_product = picked_product.clone();
+        panel_kit::row(ui, "Product", |ui| {
+            egui::ComboBox::from_id_salt(("radar_quick_product", editing_pane))
+                .selected_text(product_picker_long_label(editing_product))
+                .width((ui.available_width() - 8.0).max(180.0))
+                .show_ui(ui, |ui| {
+                    ui.set_min_width(280.0);
+                    for group in ProductPickerGroup::ALL {
+                        let products = product_buttons
+                            .iter()
+                            .filter(|(product, _)| product_picker_group(product) == group)
+                            .collect::<Vec<_>>();
+                        if products.is_empty() {
+                            continue;
+                        }
+                        ui.strong(group.label());
+                        for (product, _) in products {
+                            ui.selectable_value(
+                                &mut picked_product,
+                                product.clone(),
+                                product_picker_long_label(product),
+                            );
+                        }
+                    }
+                });
+        });
+        if picked_product != original_product {
+            let changed = if let Some(slot) = editing_pane {
+                self.switch_pane_product(slot, picked_product)
+            } else {
+                self.switch_primary_product(picked_product)
+            };
+            if changed {
+                ctx.request_repaint();
+            }
+        }
+
+        let table_name = self
+            .active_table_for_product(editing_product)
+            .name()
+            .to_owned();
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(format!(
+                "Active: {}",
+                product_display_label(editing_product)
+            ));
+            ui.menu_button(format!("Color table: {table_name}"), |ui| {
+                self.active_product_color_picker(ui, ctx, editing_product);
+            })
+            .response
+            .on_hover_text("Choose or edit the color table used by the active radar product");
+        });
+    }
+
+    fn radar_quick_source_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        independent_pane: Option<usize>,
+    ) {
+        let current_site = independent_pane
+            .and_then(|slot| self.extra_panes.get(slot))
+            .and_then(|pane| pane.pin.clone())
+            .or_else(|| {
+                if independent_pane.is_none() {
+                    primary_quick_site_ref(
+                        &self.primary.feed,
+                        self.selected_site().map(|site| site.level2_id.as_str()),
+                    )
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                let index = independent_pane
+                    .map(|slot| self.extra_pane_selected_site_index(slot))
+                    .unwrap_or(self.selected_site_index);
+                self.sites.get(index).map(|site| SiteRef::Us {
+                    level2_id: site.level2_id.clone(),
+                })
+            });
+        let Some(mut picked_site) = current_site else {
+            ui.weak("No radar sites are available");
+            return;
+        };
+        let original_site = picked_site.clone();
+        let selected_label = self.site_pin_label(&picked_site);
+        panel_kit::row(ui, "Site", |ui| {
+            egui::ComboBox::from_id_salt(("radar_quick_site", independent_pane))
+                .selected_text(selected_label)
+                .width((ui.available_width() - 8.0).max(180.0))
+                .show_ui(ui, |ui| {
+                    for site in &self.sites {
+                        ui.selectable_value(
+                            &mut picked_site,
+                            SiteRef::Us {
+                                level2_id: site.level2_id.clone(),
+                            },
+                            format_site_label(site),
+                        );
+                    }
+                    let mut intl_pick = match &picked_site {
+                        SiteRef::Intl { .. } => Some(picked_site.clone()),
+                        SiteRef::Us { .. } => None,
+                    };
+                    intl_site_combo_section(ui, &mut intl_pick);
+                    if let Some(site) = intl_pick {
+                        picked_site = site;
+                    }
+                });
+        });
+        if picked_site != original_site {
+            match picked_site {
+                SiteRef::Us { level2_id } => {
+                    if let Some(index) = self
+                        .sites
+                        .iter()
+                        .position(|site| site.level2_id.eq_ignore_ascii_case(&level2_id))
+                    {
+                        if let Some(slot) = independent_pane {
+                            self.set_extra_pane_selected_site(slot, index);
+                        } else {
+                            self.selected_site_index = index;
+                            if self.intl_source_owns_primary_display() {
+                                self.release_intl_primary_display();
+                            }
+                            self.status = format!(
+                                "Selected {level2_id}; choose Newest / Live or Loop / History"
+                            );
+                        }
+                    }
+                }
+                SiteRef::Intl {
+                    provider_id,
+                    site_id,
+                } => {
+                    if let Some(site) = Self::find_intl_site(&provider_id, &site_id) {
+                        if let Some(slot) = independent_pane {
+                            self.set_extra_pane_intl_site(slot, &site);
+                        } else {
+                            if let (Some(latitude_deg), Some(longitude_deg)) =
+                                (site.latitude_deg, site.longitude_deg)
+                            {
+                                self.center_map_on(latitude_deg, longitude_deg);
+                            }
+                            self.start_intl_poll(provider_id, site_id, ctx);
+                            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+                        }
+                    }
+                }
+            }
+        }
+
+        let history_mode = independent_pane
+            .and_then(|slot| self.extra_panes.get(slot))
+            .map(|pane| pane.engine.history.len() > 1)
+            .unwrap_or_else(|| self.primary.history.len() > 1);
+        let mut load_newest = false;
+        let mut load_loop = false;
+        panel_kit::row(ui, "Mode", |ui| {
+            load_newest = ui
+                .selectable_label(!history_mode, "Newest / Live")
+                .on_hover_text("Load the newest scan and optionally keep following live updates")
+                .clicked();
+            load_loop = ui
+                .selectable_label(history_mode, "Loop / History")
+                .on_hover_text(format!(
+                    "Load up to {} recent scans for playback",
+                    self.primary.limits.frame_limit
+                ))
+                .clicked();
+
+            if let Some(slot) = independent_pane {
+                if let Some(pane) = self.extra_panes.get_mut(slot) {
+                    ui.checkbox(&mut pane.engine.live.enabled, "Auto-live")
+                        .on_hover_text("Keep this pane on incoming radar scans");
+                }
+            } else if self.intl_source_owns_primary_display() {
+                let mut live = self.poll_active;
+                if ui
+                    .checkbox(&mut live, "Auto-live")
+                    .on_hover_text("Pause or resume live polling for this international radar")
+                    .changed()
+                {
+                    self.set_intl_poll_paused(!live);
+                }
+            } else {
+                ui.checkbox(&mut self.primary.live.enabled, "Auto-live")
+                    .on_hover_text("Keep the primary radar on incoming scans");
+            }
+        });
+
+        if load_newest || load_loop {
+            let mode = if load_loop {
+                LatestLoadMode::Loop
+            } else {
+                LatestLoadMode::User
+            };
+            if let Some(slot) = independent_pane {
+                self.cancel_extra_pane_load_for_user_command(slot);
+                let intl = self
+                    .extra_panes
+                    .get(slot)
+                    .and_then(|pane| pane.pinned_intl())
+                    .map(|(provider, site)| (provider.to_owned(), site.to_owned()));
+                if let Some((provider_id, site_id)) = intl
+                    && let Some(site) = Self::find_intl_site(&provider_id, &site_id)
+                {
+                    self.start_extra_pane_intl_load(slot, site, mode, ctx);
+                } else if let Some(site) = self
+                    .sites
+                    .get(self.extra_pane_selected_site_index(slot))
+                    .cloned()
+                {
+                    if load_loop {
+                        self.start_extra_pane_loop_load(slot, site, ctx);
+                    } else {
+                        self.start_extra_pane_latest_load(slot, site, ctx);
+                    }
+                }
+            } else {
+                self.cancel_primary_radar_load_for_user_command();
+                if self.intl_source_owns_primary_display() || self.intl_poll_owns_primary() {
+                    if load_loop {
+                        self.start_intl_loop_load(ctx);
+                    } else if let FeedSource::Live(SiteRef::Intl {
+                        provider_id,
+                        site_id,
+                    }) = &self.primary.feed
+                    {
+                        self.start_intl_poll(provider_id.clone(), site_id.clone(), ctx);
+                        self.poll_next = None;
+                    }
+                } else if load_loop {
+                    self.load_loop_history_for_selected_site(ctx);
+                    self.remember_startup_site();
+                } else {
+                    self.load_latest_level2_for_selected_site(ctx);
+                    self.remember_startup_site();
+                }
+            }
+            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+        }
+    }
+
+    fn radar_quick_tilt_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        editing_pane: Option<usize>,
+        cut_rows: &[TiltCutRow],
+    ) {
+        let selected_position = cut_rows.iter().position(|row| row.4).unwrap_or(0);
+        let selected_index = cut_rows
+            .get(selected_position)
+            .map(|row| row.0)
+            .unwrap_or(0);
+        let lower = cut_rows[..selected_position]
+            .iter()
+            .rev()
+            .find(|row| row.5)
+            .map(|row| row.0);
+        let higher = cut_rows
+            .get(selected_position.saturating_add(1)..)
+            .and_then(|rows| rows.iter().find(|row| row.5))
+            .map(|row| row.0);
+        let mut picked_cut = None;
+        panel_kit::row(ui, "Tilt", |ui| {
+            if ui
+                .add_enabled(lower.is_some(), egui::Button::new("Lower"))
+                .on_hover_text("Select the next lower product-compatible tilt")
+                .clicked()
+            {
+                picked_cut = lower;
+            }
+            let selected_text = cut_rows
+                .get(selected_position)
+                .map(|row| format!("{:.2} deg  (#{})", row.1, row.0))
+                .unwrap_or_else(|| "No compatible tilt".to_owned());
+            egui::ComboBox::from_id_salt(("radar_quick_tilt", editing_pane))
+                .selected_text(selected_text)
+                .width(118.0)
+                .show_ui(ui, |ui| {
+                    for row in cut_rows {
+                        let response = ui.add_enabled(
+                            row.5,
+                            egui::Button::selectable(
+                                row.0 == selected_index,
+                                format!("{:.2} deg - cut #{} - {} radials", row.1, row.0, row.2),
+                            ),
+                        );
+                        if response.clicked() {
+                            picked_cut = Some(row.0);
+                        }
+                    }
+                });
+            if ui
+                .add_enabled(higher.is_some(), egui::Button::new("Higher"))
+                .on_hover_text("Select the next higher product-compatible tilt")
+                .clicked()
+            {
+                picked_cut = higher;
+            }
+        });
+        if editing_pane.is_none() {
+            let mut follow_low = self.app_settings.live_low_sweep_auto_advance;
+            if ui
+                .checkbox(&mut follow_low, "Auto-follow new complete low tilts")
+                .on_hover_text(
+                    "Advance through every newer complete, product-compatible low tilt as it arrives; manual tilt controls remain available",
+                )
+                .changed()
+            {
+                self.app_settings.live_low_sweep_auto_advance = follow_low;
+                self.mark_app_settings_dirty();
+            }
+        }
+        if let Some(index) = picked_cut {
+            if let Some(slot) = editing_pane {
+                self.extra_panes[slot].cut = Some(index);
+                ctx.request_repaint();
+            } else {
+                self.select_primary_cut_manually(index, ctx);
+            }
+        }
+    }
+
+    fn radar_quick_playback_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(slot) = self.focused_extra_pane_loop_slot() {
+            // Independent panes retain their dedicated transport. Their loop
+            // state is separate, so routing through the established panel is
+            // safer and clearer than presenting the primary controls.
+            self.extra_pane_frame_history_panel(ui, ctx, slot);
+            return;
+        }
+        if self.primary.history.is_empty() {
+            ui.weak("No history loaded - choose Loop / History above");
+            return;
+        }
+
+        let frame_count = self.primary.history.len();
+        let can_play = self.primary_history_loop_can_step();
+        let mut timeline_step_delta = None;
+        let mut next_frame_index = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled_ui(frame_count > 1, |ui| fixed_action_button(ui, "<", 28.0))
+                .inner
+                .on_hover_text("Previous frame")
+                .clicked()
+            {
+                timeline_step_delta = Some(-1);
+            }
+            let play_label = if self.primary.cursor.playing {
+                "Pause"
+            } else {
+                "Play"
+            };
+            if ui
+                .add_enabled_ui(can_play, |ui| fixed_action_button(ui, play_label, 54.0))
+                .inner
+                .on_hover_text("Play or pause loaded history (Space)")
+                .clicked()
+            {
+                self.toggle_history_playback(ctx);
+            }
+            if ui
+                .add_enabled_ui(frame_count > 1, |ui| fixed_action_button(ui, ">", 28.0))
+                .inner
+                .on_hover_text("Next frame")
+                .clicked()
+            {
+                timeline_step_delta = Some(1);
+            }
+            ui.weak(self.loop_timeline_position_label(LoopTimelineTarget::Primary));
+            self.loop_speed_combo_ui(ui, ctx, "radar_quick_loop_speed");
+        });
+
+        let mut slider_index = self.primary.cursor.index.min(frame_count - 1);
+        if ui
+            .add_enabled_ui(frame_count > 1, |ui| {
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - PANEL_BUTTON_HEIGHT).max(panel_kit::SLIDER_TRACK_MIN_W);
+                ui.add(egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false))
+            })
+            .inner
+            .on_hover_text("Scrub loaded radar history")
+            .changed()
+        {
+            next_frame_index = Some(slider_index);
+        }
+
+        if let Some(delta) = timeline_step_delta {
+            let _ = self.select_relative_timeline_step_for_target(
+                LoopTimelineTarget::Primary,
+                delta,
+                ctx,
+            );
+        } else if let Some(index) = next_frame_index {
+            self.primary.cursor.playing = false;
+            self.select_history_frame(index, false, ctx);
+            self.primary.cursor.browsing = index + 1 < self.primary.history.len();
+        }
+    }
+
     fn radar_controls_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The sidebar edits the focused pane. Keep the basic workflow stable
+        // and short; the full analyst surface remains in Advanced below.
+        let editing_pane: Option<usize> = (self.grid_layout != PanelLayout::One
+            && self.active_pane >= 1
+            && self.active_pane - 1 < self.extra_panes.len())
+        .then(|| self.active_pane - 1);
+        let independent_pane = self.independent_editing_pane();
+        let editing_product = editing_pane
+            .map(|slot| self.extra_panes[slot].product.clone())
+            .unwrap_or_else(|| self.selected_product.clone());
+        let editing_cut = editing_pane
+            .and_then(|slot| self.extra_panes[slot].cut)
+            .unwrap_or(self.selected_cut);
+        let active_volume = editing_pane
+            .and_then(|slot| {
+                self.extra_panes
+                    .get(slot)
+                    .and_then(|pane| pane.volume.clone())
+            })
+            .or_else(|| self.volume.clone());
+
+        let quick_data = active_volume.as_deref().map(|volume| {
+            let effective_cut =
+                best_cut_for_product(volume, editing_cut, &editing_product).unwrap_or(editing_cut);
+            let products = self
+                .displayable_products_for_picker(volume)
+                .into_iter()
+                .filter(|product| product_visible_in_picker(product, self.unfold_velocity_display))
+                .map(|product| {
+                    let target_cut = if editing_pane.is_none() {
+                        self.preferred_primary_cut_for_product_switch(volume, &product)
+                    } else {
+                        advanced_product_source_cut(volume, effective_cut, &product).or_else(|| {
+                            cut_for_user_product_switch(volume, effective_cut, &product)
+                        })
+                    };
+                    (product, target_cut)
+                })
+                .collect::<Vec<_>>();
+            let cuts = volume
+                .cuts
+                .iter()
+                .enumerate()
+                .map(|(index, cut)| {
+                    (
+                        index,
+                        cut.elevation_deg,
+                        cut.radials.len(),
+                        cut_start_time_utc(volume, index),
+                        index == effective_cut,
+                        is_displayable_on_cut(volume, index, &editing_product),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (products, cuts)
+        });
+
+        if let Some((products, _)) = &quick_data {
+            self.radar_quick_product_controls(ui, ctx, editing_pane, &editing_product, products);
+        } else {
+            panel_kit::row(ui, "Product", |ui| {
+                ui.add_enabled(false, egui::Button::new("Load a radar to choose a product"));
+            });
+        }
+
+        self.radar_quick_source_controls(ui, ctx, independent_pane);
+
+        let Some(volume) = active_volume else {
+            ui.weak("Choose a site, then load Newest / Live or Loop / History.");
+            panel_kit::subgroup(ui, "Advanced", |_| {});
+            self.remembered_section(
+                ui,
+                "radar_advanced_site",
+                "Site, files & loading settings",
+                false,
+                |app, ui| app.radar_site_section_body(ui, independent_pane),
+            );
+            self.remembered_section(
+                ui,
+                "radar_advanced_workspace",
+                "Pane layout & independent views",
+                false,
+                |app, ui| app.radar_pane_layout_controls(ui, ctx, editing_pane, independent_pane),
+            );
+            return;
+        };
+        let volume = volume.as_ref();
+        let (product_buttons, cut_rows) = quick_data.expect("volume and quick radar data agree");
+
+        self.radar_quick_tilt_controls(ui, ctx, editing_pane, &cut_rows);
+
+        panel_kit::subgroup(ui, "Playback", |_| {});
+        self.radar_quick_playback_controls(ui, ctx);
+
+        let layer_count = self.rail_layer_count();
+        if ui
+            .link(format!("Map & appearance: {layer_count} layers >"))
+            .on_hover_text(
+                "Open the Custom tab for map layers, overlays, and the full color-table manager",
+            )
+            .clicked()
+        {
+            self.sidebar_tab = SidebarTab::Layers;
+        }
+
+        panel_kit::subgroup(ui, "Advanced", |_| {});
+        self.remembered_section(
+            ui,
+            "radar_advanced_workspace",
+            "Pane layout & independent views",
+            false,
+            |app, ui| app.radar_pane_layout_controls(ui, ctx, editing_pane, independent_pane),
+        );
+        self.remembered_section(
+            ui,
+            "radar_advanced_products",
+            "All products & display settings",
+            false,
+            |app, ui| {
+                app.radar_products_section_body(
+                    ui,
+                    ctx,
+                    editing_pane,
+                    &editing_product,
+                    volume,
+                    &product_buttons,
+                );
+            },
+        );
+        self.remembered_section(
+            ui,
+            "radar_advanced_tilt",
+            "All tilts & sweep details",
+            false,
+            |app, ui| app.radar_tilt_section_body(ui, ctx, editing_pane, &cut_rows),
+        );
+        self.remembered_section(
+            ui,
+            "radar_advanced_site",
+            "Site, files & loading settings",
+            false,
+            |app, ui| app.radar_site_section_body(ui, independent_pane),
+        );
+        self.remembered_section(
+            ui,
+            "radar_advanced_algorithms",
+            "Algorithms & tracking",
+            false,
+            |app, ui| app.radar_algorithms_section_body(ui, ctx),
+        );
+        self.remembered_section(
+            ui,
+            "radar_advanced_tools",
+            "Diagnostics & tools",
+            false,
+            |app, ui| app.radar_tools_section_body(ui, ctx),
+        );
+        self.remembered_section(
+            ui,
+            "radar_advanced_loop",
+            "Loop details, recording & sweep playback",
+            false,
+            |app, ui| app.frame_history_panel(ui, ctx),
+        );
+    }
+
+    #[allow(dead_code)]
+    fn radar_controls_panel_legacy(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // The sidebar edits the FOCUSED pane: the main pane (or 1x1) edits the
         // shared state everyone follows; a focused extra pane edits itself.
         // (Volume-free — hoisted above the volume gate.)
@@ -26179,8 +26833,9 @@ impl ViewerApp {
                 ui.add_enabled_ui(engine_applies, |ui| {
                     egui::ComboBox::from_id_salt("dealias_engine")
                         .selected_text(match selected_engine {
-                            DealiasEngine::Region => "Region",
-                            DealiasEngine::RegionGlobal => "Region Global",
+                            DealiasEngine::Region => "Region Fast",
+                            DealiasEngine::RegionGlobal => "Region Global (default)",
+                            DealiasEngine::Rift => "RIFT (opt-in)",
                             DealiasEngine::Analyst3d => "Analyst v4",
                         })
                         .width(128.0)
@@ -26188,21 +26843,31 @@ impl ViewerApp {
                             engine_changed |= ui
                                 .selectable_value(
                                     &mut selected_engine,
-                                    DealiasEngine::Region,
-                                    "Region",
+                                    DealiasEngine::RegionGlobal,
+                                    "Region Global (default)",
                                 )
                                 .on_hover_text(
-                                    "Responsive default: fast same-tilt region unfolding. An isolated connected group's absolute Nyquist branch can still be ambiguous.",
+                                    "Optimized same-sweep global region-network solve. It unfolds every connected velocity region jointly, resolves ambiguous folds more cleanly than Region Fast, and is now fast enough to be the default. No model or temporal anchor.",
                                 )
                                 .changed();
                             engine_changed |= ui
                                 .selectable_value(
                                     &mut selected_engine,
-                                    DealiasEngine::RegionGlobal,
-                                    "Region Global",
+                                    DealiasEngine::Rift,
+                                    "RIFT (opt-in gate refinement)",
                                 )
                                 .on_hover_text(
-                                    "Global fold optimization across the whole sweep: every connected velocity region is unfolded jointly by a weighted region-network merge. Same-tilt only (no model or temporal anchor). Slower than Region, but resolves ambiguous folds far more cleanly.",
+                                    "Starts from Region Global, then conservatively refines compact gate-level branch ambiguities only when an independent couplet trigger and wrapped-vortex fit agree. Uses the tilt's physical gate geometry; no temporal or model anchor.",
+                                )
+                                .changed();
+                            engine_changed |= ui
+                                .selectable_value(
+                                    &mut selected_engine,
+                                    DealiasEngine::Region,
+                                    "Region Fast",
+                                )
+                                .on_hover_text(
+                                    "Legacy/local same-tilt region unfolding. Kept as a lightweight comparison and fallback; isolated connected groups can choose an ambiguous Nyquist branch.",
                                 )
                                 .changed();
                             engine_changed |= ui
@@ -29166,6 +29831,11 @@ impl ViewerApp {
                 format!("Rendering {radar_renders} radar panes/layers")
             }));
         }
+        if self.live_ptype.is_busy() {
+            return Some(BackgroundActivity::indeterminate(
+                self.live_ptype.status_label(),
+            ));
+        }
         if self.model_layer_build_rx.is_some() {
             return Some(BackgroundActivity::indeterminate("Building model layer"));
         }
@@ -29225,9 +29895,6 @@ impl ViewerApp {
             return Some(BackgroundActivity::indeterminate(
                 "Refreshing mPING reports",
             ));
-        }
-        if self.spc_receiver.in_flight() {
-            return Some(BackgroundActivity::indeterminate("Loading SPC reports"));
         }
         if let Some(day) = self.event_explorer.fetching_day() {
             return Some(BackgroundActivity::indeterminate(format!(
@@ -29668,6 +30335,18 @@ impl ViewerApp {
         let value = dock.formula_lab_state_json();
         if self.app_settings.formula_lab_state.as_ref() != Some(&value) {
             self.app_settings.formula_lab_state = Some(value);
+            self.mark_app_settings_dirty();
+        }
+    }
+
+    /// Persist only precipitation-type presentation/input choices. Analysis
+    /// frames, radar masks, errors, and local source paths remain session-only.
+    fn persist_live_ptype_state(&mut self) {
+        let Some(value) = self.live_ptype.take_persisted_if_dirty() else {
+            return;
+        };
+        if self.app_settings.live_ptype_state.as_ref() != Some(&value) {
+            self.app_settings.live_ptype_state = Some(value);
             self.mark_app_settings_dirty();
         }
     }
@@ -30612,6 +31291,7 @@ impl ViewerApp {
         // draws over "where the storm has been".
         self.draw_swath_overlays(ui.ctx(), painter, rect);
         self.draw_radar_layer(ui.ctx(), painter, rect);
+        self.draw_live_ptype_layer(ui.ctx(), painter, rect);
         let overlay_start = Instant::now();
         self.draw_basemap_overlay(painter, rect);
         self.draw_tor_tracks(painter, rect);
@@ -31393,6 +32073,7 @@ impl ViewerApp {
                 self.draw_hazard_fills(&cell_painter, hazard_shapes.as_deref());
                 self.draw_radar_overlay_layers(&ctx, &cell_painter, cell);
                 self.draw_radar_layer(&ctx, &cell_painter, cell);
+                self.draw_live_ptype_layer(&ctx, &cell_painter, cell);
             } else {
                 self.request_pane_render(&ctx, cell, cell_index);
                 self.draw_hazard_fills(&cell_painter, hazard_shapes.as_deref());
@@ -33828,6 +34509,22 @@ impl ViewerApp {
         if let Some(value) = self.app_settings.formula_lab_state.as_ref() {
             dock.apply_formula_lab_state_json(value);
         }
+        let community_client = crate::community_cache::CommunityCacheClient::from_settings(
+            &self.app_settings.community_cache,
+            settings::community_cache_dir(),
+        )
+        .ok();
+        dock.set_community_cache_client(community_client);
+        dock.set_generation_publication_settings(&self.app_settings.generation_publication);
+        dock.set_community_relay_dispatcher(
+            self.community_relay_runtime
+                .as_ref()
+                .map(community_relay::CommunityRelayRuntime::dispatcher),
+        );
+        dock.set_federation_settings(
+            &self.app_settings.community_cache,
+            &self.app_settings.federation,
+        );
         dock.set_plots_base(
             settings::screenshots_dir_for_brand(&self.app_settings.brand).join("plots"),
         );
@@ -34043,7 +34740,10 @@ impl ViewerApp {
         let displayed_radar = self.volume.clone();
         let mut open_models = false;
         ui.horizontal_wrapped(|ui| {
-            ui.weak("Processed fields and Formula Lab results are displayed in Models.");
+            ui.weak(
+                "Open/process wrfout files here, or design and monitor ArWen forecasts. \
+                 Processed fields and Formula Lab results are displayed in Models.",
+            );
             open_models = ui.button("Open Models").clicked();
         });
         ui.separator();
@@ -34488,11 +35188,20 @@ impl ViewerApp {
         for event in events {
             match event {
                 rw_ui::DownloadEvent::SpecChanged(spec) => {
+                    let model_changed = spec.model != self.app_settings.model_slug;
+                    let mut spec = spec;
+                    if model_changed && let Ok(model) = spec.model.parse::<rustwx_core::ModelId>() {
+                        let (profile, derived) = default_model_download_profile(model);
+                        spec.profile = profile.to_owned();
+                        spec.derived = derived;
+                        spec.heavy = false;
+                        spec.hours = "0-3".to_owned();
+                    }
                     let spec = normalize_model_download_spec(spec);
                     if self.download_panel.spec() != &spec {
                         self.download_panel.set_spec(spec.clone());
                     }
-                    if spec.model != self.app_settings.model_slug {
+                    if model_changed {
                         // Model switch: persist the pick and snap date/cycle
                         // to the model's newest available run (cadences
                         // differ — an HRRR 07z is no GFS cycle).
@@ -36484,10 +37193,11 @@ impl ViewerApp {
     }
 
     fn desired_spc_fetch_key(&self) -> Option<SpcFetchKey> {
-        (!self.spc_outlooks_enabled.is_empty() || self.spc_reports_enabled).then(|| {
-            // Dated days draw reports from the Event Explorer cache instead
-            // of the live filtered CSVs, so this is the effective worker flag.
-            let reports = self.spc_reports_enabled && self.event_followed_day().is_none();
+        // Dated days draw reports from the Event Explorer cache instead of
+        // the live filtered CSVs, so they must not start an empty SPC worker
+        // when outlook shading is off.
+        let reports = self.spc_reports_enabled && self.event_followed_day().is_none();
+        (!self.spc_outlooks_enabled.is_empty() || reports).then(|| {
             SpcFetchKey::canonical(
                 self.spc_day,
                 self.spc_outlook_archive_date(),
@@ -37734,6 +38444,88 @@ impl ViewerApp {
             center_lon: self.map_center_lon,
             map_scale: self.map_scale,
         }
+    }
+
+    /// Geographic window requested from HRRR/RAP for live precipitation
+    /// type. Sampling the perimeter (not only two diagonal corners) keeps the
+    /// cropped fetch honest under the map's azimuthal-equidistant projection.
+    fn live_ptype_current_bounds(&self) -> live_ptype::LivePtypeBounds {
+        let Some(rect) = self.media.last_map_rect.filter(|rect| rect.is_positive()) else {
+            return live_ptype::LivePtypeBounds::new(
+                f64::from(self.map_center_lon) - 12.0,
+                f64::from(self.map_center_lon) + 12.0,
+                f64::from(self.map_center_lat) - 8.0,
+                f64::from(self.map_center_lat) + 8.0,
+            );
+        };
+        let center = rect.center();
+        let points = [
+            rect.left_top(),
+            egui::pos2(center.x, rect.top()),
+            rect.right_top(),
+            egui::pos2(rect.right(), center.y),
+            rect.right_bottom(),
+            egui::pos2(center.x, rect.bottom()),
+            rect.left_bottom(),
+            egui::pos2(rect.left(), center.y),
+            center,
+        ];
+        let mut west = f32::INFINITY;
+        let mut east = f32::NEG_INFINITY;
+        let mut south = f32::INFINITY;
+        let mut north = f32::NEG_INFINITY;
+        for point in points {
+            let (lon, lat) = self.screen_to_lon_lat(rect, point);
+            west = west.min(lon);
+            east = east.max(lon);
+            south = south.min(lat);
+            north = north.max(lat);
+        }
+        live_ptype::LivePtypeBounds::new(
+            f64::from(west),
+            f64::from(east),
+            f64::from(south),
+            f64::from(north),
+        )
+    }
+
+    fn live_ptype_radar_source(
+        &self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+    ) -> Option<live_ptype::LivePtypeRadarSourceSnapshot> {
+        let volume = Arc::clone(self.volume.as_ref()?);
+        let reflectivity = DisplayProduct::Moment(MomentType::Reflectivity);
+        let cut = lowest_displayable_cut_for_product(volume.as_ref(), &reflectivity)?;
+        let (viewport, _) = self.viewport_raster_options(ctx, rect)?;
+        let mut hasher = DefaultHasher::new();
+        (Arc::as_ptr(&volume) as usize).hash(&mut hasher);
+        volume.volume_time.timestamp_millis().hash(&mut hasher);
+        cut.hash(&mut hasher);
+        let generation = hasher.finish();
+        let source = format!("{} lowest REF", volume.site.id);
+        Some(live_ptype::LivePtypeRadarSourceSnapshot::new(
+            volume, cut, viewport, source, generation,
+        ))
+    }
+
+    /// The phase layer intentionally paints after observed radar. Its colors
+    /// remain legible over reflectivity, while the radar-derived occurrence
+    /// mask is built in the layer worker rather than on the repaint thread.
+    fn draw_live_ptype_layer(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+    ) {
+        if !self.live_ptype.enabled || !self.live_ptype.visible {
+            return;
+        }
+        let view = self.model_layer_current_view();
+        let radar_source = self.live_ptype_radar_source(ctx, rect);
+        self.live_ptype
+            .request_render(ctx, rect, view, radar_source);
+        self.live_ptype.paint(painter, rect, view);
     }
 
     /// Draw every model layer in stack order. Model/MRMS rasters are valid
@@ -40203,6 +40995,7 @@ impl ViewerApp {
         let visible: Vec<(&spc_layers::StormReport, egui::Pos2)> = self
             .reports_for_display()
             .iter()
+            .filter(|report| self.event_report_kind_visible(report.kind))
             .filter(|report| self.spc_report_visible_for_timeline(report))
             .filter_map(|report| {
                 let pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
@@ -41293,6 +42086,13 @@ impl ViewerApp {
         let top_m = (coverage_top * 1.08).clamp(4_000.0, CROSS_SECTION_TOP_M);
         let (w, h) = (640usize, 256usize);
         let smoothing = self.cross_section_smoothing;
+        let (dealias_previous_volume, dealias_env, dealias_context) = if velocity {
+            let (previous_volume, environment, context) =
+                self.primary_dealias_inputs_for_volume(&volume);
+            (previous_volume, environment, Some(context))
+        } else {
+            (None, None, None)
+        };
 
         // recompute guard (top_m derives from endpoints+volume, both hashed)
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -41302,6 +42102,8 @@ impl ViewerApp {
         b.0.to_bits().hash(&mut hasher);
         b.1.to_bits().hash(&mut hasher);
         velocity.hash(&mut hasher);
+        velocity.then_some(self.dealias_engine).hash(&mut hasher);
+        dealias_context.hash(&mut hasher);
         smoothing.hash(&mut hasher);
         (Arc::as_ptr(&volume) as usize).hash(&mut hasher);
         self.color_tables
@@ -41321,6 +42123,9 @@ impl ViewerApp {
         b.0.to_bits().hash(&mut user_hasher);
         b.1.to_bits().hash(&mut user_hasher);
         velocity.hash(&mut user_hasher);
+        velocity
+            .then_some(self.dealias_engine)
+            .hash(&mut user_hasher);
         smoothing.hash(&mut user_hasher);
         self.color_tables
             .signature_for_family(family)
@@ -41383,9 +42188,16 @@ impl ViewerApp {
                 smoothing,
             )
         } else if velocity {
-            velocity_cross_section_cached_with_smoothing(
+            let grids = resolve_dealiased_volume_grids(
                 &volume,
-                &mut self.cross_section_dealias_cache,
+                dealias_previous_volume.as_ref(),
+                dealias_env.as_ref(),
+                self.dealias_engine,
+            );
+            let borrowed: Vec<Option<&MomentGrid>> = grids.iter().map(Option::as_deref).collect();
+            velocity_cross_section_from_dealiased_with_smoothing(
+                volume.as_ref(),
+                &borrowed,
                 start,
                 end,
                 w,
@@ -43014,25 +43826,31 @@ struct CrossSectionReadout {
 /// Display smoothing mode (Settings ▸ Display ▸ Smoothing). Persisted as a
 /// string in `AppSettings::smooth_display_mode`; the legacy
 /// `smooth_display` bool maps to `Soften` so old configs keep their look.
-/// Which velocity-dealias engine the viewer runs. All three produce a
+/// Which velocity-dealias engine the viewer runs. All four produce a
 /// dealiased VEL/DVEL/DSRV grid; they differ in method and cost:
-/// - `Region`: the fast same-tilt BowEcho region solver (the default).
-/// - `RegionGlobal`: a Rust port of Py-ART's `dealias_region_based`
-///   per-sweep core — same-tilt, no volume/model/temporal evidence.
+/// - `RegionGlobal`: the optimized Rust port of Py-ART's
+///   `dealias_region_based` per-sweep core (the default) — same-tilt, no
+///   volume/model/temporal evidence.
+/// - `Rift`: the explicit opt-in v0.2 RIFT gate-resolution refinement over
+///   Region Global. It uses the sweep's physical gate geometry but currently
+///   no external references.
+/// - `Region`: the legacy/local BowEcho same-tilt region solver.
 /// - `Analyst3d`: the opt-in model-anchored v4 engine (whole-volume branch
 ///   optimization; uses the previous volume + a RAP wind profile).
 ///
 /// Only `Analyst3d` consumes the previous volume and RAP env profile;
-/// `Region` and `RegionGlobal` are pure same-tilt engines. This enum is
-/// carried through every render/readout cache key so switching engines
+/// `Region`, `RegionGlobal`, and `Rift` are pure same-tilt engines. This enum
+/// is carried through every render/readout cache key so switching engines
 /// invalidates cached textures and readouts.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum DealiasEngine {
-    /// Fast same-tilt region unfolding — the app's default.
-    #[default]
+    /// Legacy/local same-tilt region unfolding.
     Region,
-    /// Rust port of Py-ART `dealias_region_based` (same-tilt).
+    /// Optimized Rust port of Py-ART `dealias_region_based` (same-tilt).
+    #[default]
     RegionGlobal,
+    /// Region Global plus conservative gate-resolution refinement.
+    Rift,
     /// Model-anchored whole-volume v4 engine.
     Analyst3d,
 }
@@ -43040,17 +43858,22 @@ enum DealiasEngine {
 impl DealiasEngine {
     fn from_settings(settings: &settings::AppSettings) -> Self {
         match settings.dealias_engine.trim().to_ascii_lowercase().as_str() {
-            "region" => Self::Region,
-            "region-global" | "region_global" | "global" => Self::RegionGlobal,
+            // v0.34.8-v0.34.12 serialized `region` for the then-default local
+            // engine. Reinterpret that legacy default as the new production
+            // default; choosing Region Fast now writes the durable new slug.
+            "region-fast" | "region_fast" | "region-local" | "local" => Self::Region,
+            "region" | "region-global" | "region_global" | "global" => Self::RegionGlobal,
+            "rift" | "region-global-rift" | "region_global_rift" => Self::Rift,
             "analyst-3d" | "analyst3d" | "analyst_3d" => Self::Analyst3d,
-            _ => Self::Region,
+            _ => Self::RegionGlobal,
         }
     }
 
     fn settings_slug(self) -> &'static str {
         match self {
-            Self::Region => "region",
+            Self::Region => "region-fast",
             Self::RegionGlobal => "region-global",
+            Self::Rift => "rift",
             Self::Analyst3d => "analyst-3d",
         }
     }
@@ -45805,24 +46628,72 @@ fn prune_model_store(store_root: &str, keep: usize) {
 /// Model picker options for the download panel (multi-model entries show
 /// disabled until rw-ingest supports them — "coming soon").
 fn ingest_worker_model_options() -> Vec<rw_ui::ModelOption> {
-    rustwx_models::supported_models()
-        .iter()
-        .copied()
-        .filter(|&model| bowecho_model_download_supported(model))
-        .map(|model| rw_ui::ModelOption {
-            slug: model.as_str().to_string(),
-            label: model.as_str().to_uppercase(),
+    rw_ingest::model_ingest_capabilities()
+        .into_iter()
+        .filter(|capability| capability.status == rw_ingest::IngestSupportStatus::Ready)
+        .map(|capability| rw_ui::ModelOption {
+            slug: capability.model.as_str().to_string(),
+            label: format!(
+                "{} · {}",
+                capability.model.as_str().to_uppercase(),
+                model_ingest_capability_short_note(&capability)
+            ),
             enabled: true,
-            note: String::new(),
+            note: model_ingest_capability_note(&capability),
         })
         .collect()
+}
+
+fn model_ingest_capability_short_note(capability: &rw_ingest::ModelIngestCapability) -> String {
+    use rw_ingest::{IngestCapabilityLimitation as L, IngestVerificationLevel as V};
+    let mut notes = vec![match capability.verification {
+        V::LiveVerified => "live",
+        V::FixtureVerified => "fixture",
+        V::ImplementedUnverified => "beta",
+        V::Unsupported => "unsupported",
+    }];
+    if capability.limitations.contains(&L::AnalysisOnly) {
+        notes.push("analysis");
+    } else if capability.limitations.contains(&L::SurfaceOnly) {
+        notes.push("surface");
+    }
+    if capability.limitations.contains(&L::EnsembleMeanOnly) {
+        notes.push("mean");
+    }
+    if capability.limitations.contains(&L::DerivedProductsDisabled) {
+        notes.push("raw");
+    }
+    if capability.limitations.contains(&L::PreOperationalFeed) {
+        notes.push("pre-op");
+    }
+    notes.join(" · ")
+}
+
+fn model_ingest_capability_note(capability: &rw_ingest::ModelIngestCapability) -> String {
+    let limitations = capability
+        .limitations
+        .iter()
+        .map(|limitation| limitation.as_str().replace('_', " "))
+        .collect::<Vec<_>>();
+    if limitations.is_empty() {
+        format!(
+            "{} ingest",
+            capability.verification.as_str().replace('_', " ")
+        )
+    } else {
+        format!(
+            "{} ingest; {}",
+            capability.verification.as_str().replace('_', " "),
+            limitations.join(", ")
+        )
+    }
 }
 
 fn bowecho_model_download_supported(model: rustwx_core::ModelId) -> bool {
     rw_ingest::ingest_supported(model)
 }
 
-fn model_download_cadence_hint(model: rustwx_core::ModelId, _cycle: u8) -> &'static str {
+fn model_download_cadence_hint(model: rustwx_core::ModelId, cycle: u8) -> &'static str {
     use rustwx_core::ModelId;
     match model {
         ModelId::Gfs => "hourly <=120, 3-hourly 123-384",
@@ -45832,8 +46703,17 @@ fn model_download_cadence_hint(model: rustwx_core::ModelId, _cycle: u8) -> &'sta
         ModelId::EcmwfOpenData => {
             "00/12z: 3-hourly <=144 then 6-hourly <=360; 06/18z: 3-hourly <=144"
         }
+        ModelId::Aifs => "6-hourly 000-360",
         ModelId::Rap => "f000-f021 most cycles, f000-f051 at 03/09/15/21z",
         ModelId::Nam => "hourly <=36, 3-hourly 39-84",
+        ModelId::Hiresw => "hourly 000-048; CONUS surface/native",
+        ModelId::Href => "hourly 001-048; CONUS ensemble mean",
+        ModelId::Sref => "3-hourly 000-087; ensemble mean",
+        ModelId::Rtma | ModelId::Urma => "analysis hour 000 only",
+        ModelId::Nbm => "hourly 001-036, 3-hourly 039-192, 6-hourly 198-264",
+        ModelId::RrfsPublic if cycle % 6 == 0 => "hourly 000-084; preliminary CONUS",
+        ModelId::RrfsPublic => "hourly 000-018; preliminary CONUS",
+        ModelId::Refs => "hourly 001-060; preliminary CONUS ensemble mean",
         _ => "",
     }
 }
@@ -45842,10 +46722,56 @@ fn normalize_model_download_spec(mut spec: rw_ui::DownloadSpec) -> rw_ui::Downlo
     let Ok(model) = spec.model.parse::<rustwx_core::ModelId>() else {
         return spec;
     };
+    let source_supported = spec.source.eq_ignore_ascii_case("auto")
+        || rustwx_models::model_summary(model)
+            .sources
+            .iter()
+            .any(|source| {
+                source.id.to_string().eq_ignore_ascii_case(&spec.source)
+                    && rw_ingest::model_source_ingest_supported(model, source.id)
+            });
+    if !source_supported {
+        spec.source = "auto".to_owned();
+    }
+    apply_model_download_capability_constraints(model, &mut spec);
     if let Some(hours) = normalize_model_download_hours(model, spec.cycle, &spec.hours) {
         spec.hours = hours;
     }
     spec
+}
+
+fn apply_model_download_capability_constraints(
+    model: rustwx_core::ModelId,
+    spec: &mut rw_ui::DownloadSpec,
+) {
+    use rw_ingest::IngestCapabilityLimitation as L;
+    let capability = rw_ingest::model_ingest_capability(model);
+    if capability.limitations.contains(&L::AnalysisOnly) {
+        spec.profile = "analysis".to_owned();
+        spec.derived = false;
+        spec.heavy = false;
+    } else if capability.limitations.contains(&L::SurfaceOnly) {
+        spec.profile = "surface".to_owned();
+        spec.derived = false;
+        spec.heavy = false;
+    } else if capability.limitations.contains(&L::DerivedProductsDisabled) {
+        spec.derived = false;
+        spec.heavy = false;
+    }
+}
+
+fn default_model_download_profile(model: rustwx_core::ModelId) -> (&'static str, bool) {
+    use rw_ingest::IngestCapabilityLimitation as L;
+    let capability = rw_ingest::model_ingest_capability(model);
+    if capability.limitations.contains(&L::AnalysisOnly) {
+        ("analysis", false)
+    } else if capability.limitations.contains(&L::SurfaceOnly) {
+        ("surface", false)
+    } else if capability.limitations.contains(&L::DerivedProductsDisabled) {
+        ("full", false)
+    } else {
+        ("sounding", false)
+    }
 }
 
 fn normalize_model_download_hours(
@@ -46854,9 +47780,11 @@ fn default_download_spec(model_slug: &str) -> rw_ui::DownloadSpec {
         .ok()
         .filter(|&model| bowecho_model_download_supported(model))
         .unwrap_or(rustwx_core::ModelId::Hrrr);
+    let (profile, derived) = default_model_download_profile(model);
     normalize_model_download_spec(rw_ui::DownloadSpec {
         model: model.as_str().to_owned(),
-        profile: "sounding".to_owned(),
+        profile: profile.to_owned(),
+        derived,
         heavy: false,
         hours: "0-3".to_owned(),
         // ABSOLUTE cache dir: the crate default ("out/cache") is relative,
@@ -51763,6 +52691,96 @@ mod tests {
     }
 
     #[test]
+    fn rift_engine_routes_readout_through_the_opt_in_refinement() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let volume = Arc::new(test_aliased_velocity_volume());
+        app.volume = Some(Arc::clone(&volume));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::DealiasedVelocity;
+        app.dealias_engine = DealiasEngine::Rift;
+
+        let grid = app
+            .dealiased_velocity_readout_grid(&volume, 0)
+            .expect("RIFT readout grid");
+        let cut = &volume.cuts[0];
+        let source = cut.moments.get(&MomentType::Velocity).expect("velocity");
+        assert_eq!(
+            grid.as_ref(),
+            &dealias_velocity_grid_region_global_rift(cut, source),
+            "Rift must serve the explicit RIFT adapter, not replace RegionGlobal"
+        );
+        let cache = app.dealiased_readout_cache.as_ref().expect("cache");
+        assert_eq!(cache.dealias_engine, DealiasEngine::Rift);
+        assert_eq!(cache.reference_volume_ptr, 0, "no previous-volume prior");
+        assert_eq!(cache.dealias_env_ptr, 0, "no model profile");
+    }
+
+    #[test]
+    fn velocity_cross_section_honors_engine_and_reuses_shared_dealias_grids() {
+        let mut volume = test_aliased_velocity_volume();
+        let mut upper = volume.cuts[0].clone();
+        upper.elevation_deg = 4.0;
+        upper.elevation_number = Some(2);
+        for radial in &mut upper.radials {
+            radial.elevation_deg = 4.0;
+        }
+        volume.cuts.push(upper);
+        let volume = Arc::new(volume);
+
+        // Simulate the map having already rendered the selected low tilt.
+        let map_grid = resolve_dealiased_grid(&volume, None, None, 0, DealiasEngine::RegionGlobal)
+            .expect("map region-global grid");
+
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::clone(&volume));
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.dealias_engine = DealiasEngine::RegionGlobal;
+        app.cross_section_view_open = true;
+        app.cross_section_a_lonlat = Some((-97.0, 35.09));
+        app.cross_section_b_lonlat = Some((-97.0, 35.18));
+        app.update_cross_section_texture(&egui::Context::default());
+        assert!(app.cross_section_readout.is_some(), "region-global section");
+
+        let region_context = DealiasContextKey::new(DealiasEngine::RegionGlobal, None, None);
+        let low_key =
+            DealiasGridKey::from_context(Arc::as_ptr(&volume) as usize, 0, region_context);
+        let upper_key =
+            DealiasGridKey::from_context(Arc::as_ptr(&volume) as usize, 1, region_context);
+        {
+            let mut cache = dealias_grid_cache()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let section_low = cache.get(&low_key).expect("shared low-tilt grid");
+            assert!(
+                Arc::ptr_eq(&map_grid, &section_low),
+                "the section must reuse the map's exact Region Global grid"
+            );
+            assert!(
+                cache.get(&upper_key).is_some(),
+                "the section must resolve its remaining tilts through the shared cache"
+            );
+        }
+
+        // Changing the engine invalidates the section signature and routes the
+        // same section through the one-entry whole-volume Analyst v4 cache.
+        app.set_dealias_engine(DealiasEngine::Analyst3d);
+        app.update_cross_section_texture(&egui::Context::default());
+        let analyst_context = DealiasContextKey::new(DealiasEngine::Analyst3d, None, None);
+        let analyst_key =
+            DealiasGridKey::from_context(Arc::as_ptr(&volume) as usize, 0, analyst_context);
+        let cache = dealias_grid_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(
+            cache
+                .entries
+                .iter()
+                .any(|entry| entry.is_v4_volume(analyst_key.volume_key())),
+            "Analyst v4 cross-sections must use the shared whole-volume solve"
+        );
+    }
+
+    #[test]
     fn cursor_readout_format_reports_source_gate_provenance() {
         let readout = CursorReadout {
             site_id: "KTLX".to_owned(),
@@ -51991,6 +53009,17 @@ mod tests {
         let region = DealiasContextKey::new(DealiasEngine::Region, Some(&previous), Some(&env));
         assert_eq!(region.reference_volume_ptr, 0);
         assert_eq!(region.dealias_env_ptr, 0);
+
+        let region_global =
+            DealiasContextKey::new(DealiasEngine::RegionGlobal, Some(&previous), Some(&env));
+        let rift = DealiasContextKey::new(DealiasEngine::Rift, Some(&previous), Some(&env));
+        assert_eq!(rift.reference_volume_ptr, 0);
+        assert_eq!(rift.dealias_env_ptr, 0);
+        assert_ne!(rift, region, "RIFT must not reuse Region Fast grids");
+        assert_ne!(
+            rift, region_global,
+            "RIFT must not reuse unrefined Region Global grids"
+        );
 
         let analyst = DealiasContextKey::new(DealiasEngine::Analyst3d, Some(&previous), Some(&env));
         assert_eq!(
@@ -55149,6 +56178,29 @@ mod tests {
     }
 
     #[test]
+    fn live_low_cut_follow_advances_across_distinct_velocity_tilts_through_one_point_one() {
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        let first = test_velocity_sails_volume_with_radials(&[(0.44, 0)], 720);
+        let second = test_velocity_sails_volume_with_radials(&[(0.44, 0), (0.89, 90_000)], 720);
+
+        assert_eq!(
+            selection_for_installed_volume(Some(&first), 0, &product, &second, true, false, false,),
+            (1, product.clone()),
+            "0.44-degree velocity must advance to the newer complete 0.89-degree cut"
+        );
+
+        let third = test_velocity_sails_volume_with_radials(
+            &[(0.44, 0), (0.89, 90_000), (1.02, 180_000), (1.30, 270_000)],
+            720,
+        );
+        assert_eq!(
+            selection_for_installed_volume(Some(&second), 1, &product, &third, true, false, false,),
+            (2, product),
+            "live following must take the next complete 1.02-degree velocity cut but not the 1.30-degree companion"
+        );
+    }
+
+    #[test]
     fn low_level_auto_advance_accepts_sails_revisit_but_ignores_short_lag_and_high_tilts() {
         let product = DisplayProduct::Moment(MomentType::Reflectivity);
         let previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
@@ -55196,7 +56248,7 @@ mod tests {
                 false,
             ),
             (0, product.clone()),
-            "live auto-advance should stay in the selected low-elevation family, not jump to a later 1.3 deg companion cut"
+            "live auto-advance should stop above the 1.10-degree low-cut ceiling"
         );
         assert_eq!(
             selection_for_installed_volume(
@@ -56951,7 +58003,7 @@ mod tests {
     }
 
     #[test]
-    fn default_and_unknown_dealias_engine_use_region_while_known_choices_survive() {
+    fn default_unknown_and_legacy_dealias_engine_use_region_global() {
         let settings = settings::AppSettings {
             dealias_engine: "future-engine".to_owned(),
             ..Default::default()
@@ -56959,23 +58011,30 @@ mod tests {
 
         assert_eq!(
             RadarAlgorithmPreferences::from_settings(&settings).dealias_engine,
-            DealiasEngine::Region
+            DealiasEngine::RegionGlobal
         );
         assert_eq!(
             DealiasEngine::from_settings(&settings::AppSettings::default()),
-            DealiasEngine::Region
+            DealiasEngine::RegionGlobal
         );
-        for (slug, expected) in [
-            ("region", DealiasEngine::Region),
-            ("region-global", DealiasEngine::RegionGlobal),
-            ("analyst-3d", DealiasEngine::Analyst3d),
+        for (slug, expected, canonical) in [
+            ("region", DealiasEngine::RegionGlobal, "region-global"),
+            ("region-fast", DealiasEngine::Region, "region-fast"),
+            (
+                "region-global",
+                DealiasEngine::RegionGlobal,
+                "region-global",
+            ),
+            ("rift", DealiasEngine::Rift, "rift"),
+            ("region-global-rift", DealiasEngine::Rift, "rift"),
+            ("analyst-3d", DealiasEngine::Analyst3d, "analyst-3d"),
         ] {
             let settings = settings::AppSettings {
                 dealias_engine: slug.to_owned(),
                 ..Default::default()
             };
             assert_eq!(DealiasEngine::from_settings(&settings), expected);
-            assert_eq!(expected.settings_slug(), slug);
+            assert_eq!(expected.settings_slug(), canonical);
         }
     }
 
@@ -59815,9 +60874,47 @@ mod tests {
     }
 
     #[test]
-    fn different_site_install_starts_from_default_reflectivity() {
+    fn different_site_install_preserves_supported_velocity_selection() {
         let previous = test_ref_then_velocity_volume();
         let mut next = previous.clone();
+        next.site.id = "OTHER".to_owned();
+
+        assert_eq!(
+            selection_for_installed_volume(
+                Some(&previous),
+                1,
+                &DisplayProduct::Moment(MomentType::Velocity),
+                &next,
+                true,
+                false,
+                false,
+            ),
+            (1, DisplayProduct::Moment(MomentType::Velocity))
+        );
+    }
+
+    #[test]
+    fn cleared_cross_site_install_preserves_supported_velocity_selection() {
+        let next = test_ref_then_velocity_volume();
+
+        assert_eq!(
+            selection_for_installed_volume(
+                None,
+                0,
+                &DisplayProduct::Moment(MomentType::Velocity),
+                &next,
+                true,
+                false,
+                false,
+            ),
+            (1, DisplayProduct::Moment(MomentType::Velocity))
+        );
+    }
+
+    #[test]
+    fn different_site_install_falls_back_only_when_product_is_unavailable() {
+        let previous = test_ref_then_velocity_volume();
+        let mut next = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
         next.site.id = "OTHER".to_owned();
 
         assert_eq!(
@@ -60725,47 +61822,64 @@ mod tests {
     }
 
     #[test]
-    fn satellite_run_scan_keeps_current_goes_spec_and_other_sources() {
-        let app = test_viewer_app_with_hazards(Vec::new());
+    fn satellite_run_scan_keeps_only_the_active_source_and_product() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
         let runs = vec![
             test_sat_run("g19", "conus_c13_20260615", &[1750]),
             test_sat_run("g19", "conus_c02_20260615", &[1750]),
             test_sat_run("h9", "fulldisk_c13_20260615", &[1750]),
         ];
 
-        let filtered = app.satellite_runs_for_current_spec(runs);
+        let filtered = app.satellite_runs_for_current_spec(runs.clone());
 
-        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].key.model, "g19");
         assert_eq!(filtered[0].key.run, "conus_c13_20260615");
-        assert_eq!(filtered[1].key.model, "h9");
-        assert_eq!(filtered[1].key.run, "fulldisk_c13_20260615");
+
+        app.satellite_source = sat_paint::SatelliteSource::Himawari;
+        app.himawari_band = 13;
+        let filtered = app.satellite_runs_for_current_spec(runs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].key.model, "h9");
+        assert_eq!(filtered[0].key.run, "fulldisk_c13_20260615");
     }
 
     #[test]
-    fn other_satellite_source_frame_matches_without_goes_spec_filter() {
-        let app = test_viewer_app_with_hazards(Vec::new());
+    fn active_himawari_frame_matches_its_band_without_goes_spec_filter() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.satellite_source = sat_paint::SatelliteSource::Himawari;
+        app.himawari_band = 13;
         let key = rw_ui::SatRunKey {
             model: "h9".to_owned(),
             run: "fulldisk_c13_20260615".to_owned(),
         };
 
         assert!(app.satellite_run_key_matches_current_spec(&key));
+        assert!(
+            !app.satellite_run_key_matches_current_spec(&rw_ui::SatRunKey {
+                model: "h9".to_owned(),
+                run: "fulldisk_c08_20260615".to_owned(),
+            })
+        );
     }
 
-    /// The whole-disk true-color run family (`fulldisk_rgb_true_color_*`)
-    /// passes every downstream run filter: it is a composite (band-filter
-    /// exempt), it survives the current-spec scan, and it groups into its
-    /// own timeline family, distinct from windowed composites.
+    /// A selected whole-disk true-color run (`fulldisk_rgb_true_color_*`)
+    /// remains available by exact identity and groups into its own timeline
+    /// family. Unselected one-shot composites must not leak across provider or
+    /// product filters merely because they exist in the shared store.
     #[test]
-    fn fulldisk_composite_run_keys_pass_the_spec_filters() {
-        let app = test_viewer_app_with_hazards(Vec::new());
+    fn explicitly_selected_fulldisk_composite_passes_the_spec_filters() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.satellite_source = sat_paint::SatelliteSource::Himawari;
+        app.himawari_band = 13;
         let key = rw_ui::SatRunKey {
             model: "h9".to_owned(),
             run: "fulldisk_rgb_true_color_20260706".to_owned(),
         };
 
         assert!(satellite_run_key_is_composite(&key));
+        assert!(!app.satellite_run_key_matches_current_spec(&key));
+        app.sat_last_frame = Some((key.clone(), 430));
         assert!(app.satellite_run_key_matches_current_spec(&key));
         let filtered = app.satellite_runs_for_current_spec(vec![test_sat_run(
             "h9",
@@ -60811,7 +61925,10 @@ mod tests {
     #[test]
     fn sat_map_frame_landing_after_layer_removal_does_not_resurrect_the_layer() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        // "h9" bypasses the GOES spec filter, isolating the inflight latch.
+        // Match the active provider/band so this test isolates the in-flight
+        // owner latch rather than relying on the retired cross-source bypass.
+        app.satellite_source = sat_paint::SatelliteSource::Himawari;
+        app.himawari_band = 13;
         let key = rw_ui::SatRunKey {
             model: "h9".to_owned(),
             run: "fulldisk_c13_20260615".to_owned(),
@@ -60897,7 +62014,8 @@ mod tests {
     #[test]
     fn sat_map_frame_with_a_cached_grid_lut_installs_synchronously() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        // "h9" bypasses the GOES spec filter (see the resurrect-latch test).
+        app.satellite_source = sat_paint::SatelliteSource::Himawari;
+        app.himawari_band = 13;
         let run_a = rw_ui::SatRunKey {
             model: "h9".to_owned(),
             run: "fulldisk_rgb_true_color_20260705".to_owned(),
@@ -60931,6 +62049,9 @@ mod tests {
 
         // First frame of run A: no thread build — the layer is live at once.
         let generation_before = app.sat_layer_generation;
+        // One-shot composites are admitted only after their exact ingest
+        // response selects them; model that production lifecycle explicitly.
+        app.sat_last_frame = Some((run_a.clone(), 2350));
         app.sat_map_inflight = Some((run_a.clone(), 2350));
         app.apply_sat_map_frame_response(frame(&run_a, 2350), &egui::Context::default());
         assert!(
@@ -60951,6 +62072,7 @@ mod tests {
             layer.opacity = 0.42;
             layer.visible = false;
         }
+        app.sat_last_frame = Some((run_b.clone(), 0));
         app.sat_map_inflight = Some((run_b.clone(), 0));
         app.apply_sat_map_frame_response(frame(&run_b, 0), &egui::Context::default());
         assert!(app.sat_layer_build_rx.is_none());
@@ -60967,6 +62089,7 @@ mod tests {
         // the content-addressed cache survives, so re-adding is instant too.
         app.clear_satellite_display_for_spec_change();
         assert!(app.sat_layer.is_none());
+        app.sat_last_frame = Some((run_a.clone(), 2350));
         app.sat_map_inflight = Some((run_a.clone(), 2350));
         app.apply_sat_map_frame_response(frame(&run_a, 2350), &egui::Context::default());
         assert!(app.sat_layer_build_rx.is_none());
@@ -63019,6 +64142,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(FeedSource::intl_from_settings(&blank), None);
+    }
+
+    #[test]
+    fn primary_quick_site_uses_pending_us_target_but_preserves_active_intl() {
+        let loaded_us = FeedSource::Live(SiteRef::Us {
+            level2_id: "KOUN".to_owned(),
+        });
+        assert_eq!(
+            primary_quick_site_ref(&loaded_us, Some("KTLX")),
+            Some(SiteRef::Us {
+                level2_id: "KTLX".to_owned(),
+            }),
+            "the selector must not snap back to the still-loaded U.S. feed"
+        );
+
+        let active_intl = FeedSource::Live(SiteRef::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        });
+        assert_eq!(
+            primary_quick_site_ref(&active_intl, Some("KTLX")),
+            Some(SiteRef::Intl {
+                provider_id: "smhi".to_owned(),
+                site_id: "angelholm".to_owned(),
+            }),
+            "an active international source remains the displayed selector value"
+        );
     }
 
     /// Contract harness (v0.29 Phase 1, spec §11 Milestone A item 4): a
@@ -71482,12 +72632,15 @@ mod tests {
             context_menu_gate: None,
             radar_operational_status_cache: BTreeMap::new(),
             radar_operational_status_rx: WorkerSlot::idle("radar-operational-status"),
-            spc_reports: None,
-            spc_receiver: WorkerSlot::idle("spc-tornado-reports"),
             pending_debug_archive_case: None,
             pending_data_pack_scene: None,
             data_pack_expanded: BTreeSet::new(),
             loaded_data_pack: None,
+            archive_browse_mode: ArchiveBrowseMode::default(),
+            community_case_browser: community_cache::CommunityCaseBrowser::default(),
+            community_case_workspace: community_cases::CommunityCaseWorkspace::default(),
+            community_relay_runtime: None,
+            community_relay_network_unmetered_confirmed: false,
             ingest: None,
             download_panel: rw_ui::DownloadPanel::new(default_download_spec("hrrr")),
             sat: None,
@@ -71540,6 +72693,7 @@ mod tests {
             model_layers: Vec::new(),
             model_layer_build_rx: None,
             model_layer_generation: 0,
+            live_ptype: live_ptype::LivePtypeState::default(),
             upper_air_layer: None,
             upper_air_rx: WorkerSlot::idle("upper-air-quicklook"),
             tropical: tropical::TropicalState::default(),
@@ -71711,7 +72865,6 @@ mod tests {
             cross_section_user_signature: None,
             cross_section_volume_cuts: 0,
             cross_section_volume_top_deg: 0.0,
-            cross_section_dealias_cache: VolumeDealiasCache::new(),
             rhi_panel: rhi::RhiPanel::new(),
             hazard_overlay: Some(test_hazard_overlay(records)),
             completed_live_hazard_overlay,
@@ -73678,20 +74831,98 @@ mod tests {
     }
 
     #[test]
-    fn archive_tornado_fetch_pins_event_day_tracks() {
+    fn data_pack_supersedes_stale_archive_catalog_workers() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        let day = NaiveDate::from_ymd_opt(2024, 5, 6).unwrap();
+        let (_sender, receiver) = mpsc::channel();
+        app.archive_list_receiver = Some(receiver);
+        app.archive_load_after_listing = true;
+        app.archive_volumes = Some(Vec::new());
+        app.intl_archive_rows = Some(test_intl_archive_listing("ord", "plbrz", 0));
+        app.intl_archive_load_after_listing = true;
+        app.intl_archive_full_day_after_listing = true;
+        app.archive_load_progress = Some(ArchiveLoadProgress {
+            label: "Archive listing".to_owned(),
+            detail: "Waiting".to_owned(),
+            done: 0,
+            total: 1,
+        });
+
+        app.supersede_live_load_for_data_pack();
+
+        assert!(app.archive_list_receiver.is_none());
+        assert!(!app.archive_load_after_listing);
+        assert!(app.archive_volumes.is_none());
+        assert!(app.intl_archive_rows.is_none());
+        assert!(!app.intl_archive_load_after_listing);
+        assert!(!app.intl_archive_full_day_after_listing);
+        assert!(app.archive_load_progress.is_none());
+    }
+
+    #[test]
+    fn completed_data_pack_preserves_operator_workspace() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let pack = data_packs::BUILT_IN_DATA_PACKS[0];
+        let scan_time = DateTime::parse_from_rfc3339(pack.anchor_utc)
+            .unwrap()
+            .with_timezone(&Utc);
+        app.volume = Some(Arc::new(test_volume_with_site_time(
+            pack.site_id,
+            scan_time,
+        )));
+        app.grid_layout = PanelLayout::FourGrid;
+        app.sync_extra_panes();
+        app.active_pane = 2;
+        app.sidebar_tab = SidebarTab::Settings;
+        app.hazards_visible = false;
+        app.hazards_active_only = true;
+        app.spc_outlooks_enabled = vec!["torn".to_owned(), "hail".to_owned()];
         app.spc_reports_enabled = false;
-        app.event_explorer.set_failed_for_test(day);
-        app.spc_data.fetched_at = Some(Instant::now());
+        app.show_inspector_card = false;
+        app.show_storm_tracks = true;
+        app.vrot_tool_armed = true;
+        app.pending_data_pack_scene = Some(pack.scene(data_packs::DataPackLoadOptions::default()));
 
-        app.pin_event_day_for_archive_date(day);
+        app.apply_data_pack_scene_if_pending(&ctx);
 
-        assert_eq!(app.event_explorer.pinned_day, Some(day));
-        assert_eq!(app.event_explorer.date_input, "2024-05-06");
-        assert!(app.spc_reports_enabled);
-        assert!(app.event_explorer.failed_day_for_test().is_none());
-        assert!(app.spc_data.fetched_at.is_none());
+        assert_eq!(app.grid_layout, PanelLayout::FourGrid);
+        assert_eq!(app.active_pane, 2);
+        assert_eq!(app.sidebar_tab, SidebarTab::Settings);
+        assert!(!app.hazards_visible);
+        assert!(app.hazards_active_only);
+        assert_eq!(app.spc_outlooks_enabled, vec!["torn", "hail"]);
+        assert!(!app.spc_reports_enabled);
+        assert!(!app.show_inspector_card);
+        assert!(app.show_storm_tracks);
+        assert!(app.vrot_tool_armed);
+        assert_eq!(app.map_center_lat, pack.focus_lat);
+        assert_eq!(app.map_center_lon, pack.focus_lon);
+        assert_eq!(app.map_scale, pack.map_scale);
+        assert_eq!(app.loaded_data_pack.map(|loaded| loaded.id), Some(pack.id));
+        assert!(app.pending_data_pack_scene.is_none());
+    }
+
+    #[test]
+    fn event_day_report_filters_apply_even_when_today_is_explicitly_pinned() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let today = spc_layers::spc_convective_date(Utc::now());
+        app.event_explorer.pin_day(today);
+        app.event_explorer.show_tornado_reports = false;
+        app.event_explorer.show_wind_reports = true;
+        app.event_explorer.show_hail_reports = false;
+
+        assert!(!app.event_report_kind_visible(spc_layers::ReportKind::Tornado));
+        assert!(app.event_report_kind_visible(spc_layers::ReportKind::Wind));
+        assert!(!app.event_report_kind_visible(spc_layers::ReportKind::Hail));
+
+        app.event_explorer.pinned_day = None;
+        assert!(app.event_report_kind_visible(spc_layers::ReportKind::Tornado));
+        assert!(app.event_report_kind_visible(spc_layers::ReportKind::Hail));
+    }
+
+    #[test]
+    fn archive_browser_defaults_to_simple_site_and_scan_mode() {
+        assert_eq!(ArchiveBrowseMode::default(), ArchiveBrowseMode::SiteAndScan);
     }
 
     #[test]
@@ -75154,10 +76385,10 @@ mod tests {
         assert_eq!(app.primary.limits.frame_limit, DEFAULT_ARCHIVE_FRAME_COUNT);
         assert!(!app.primary.live.enabled);
         assert!(!app.poll_active);
-        assert!(app.hazards_visible);
-        assert!(!app.hazards_active_only);
-        assert_eq!(app.spc_outlooks_enabled, vec!["cat".to_owned()]);
-        assert!(app.spc_reports_enabled);
+        assert!(!app.hazards_visible);
+        assert!(app.hazards_active_only);
+        assert_eq!(app.spc_outlooks_enabled, vec!["torn", "hail"]);
+        assert!(!app.spc_reports_enabled);
 
         app.restore_previous_workflow(&ctx);
 
@@ -75322,11 +76553,9 @@ mod tests {
     #[test]
     fn model_download_options_expose_ingest_supported_models() {
         let options = ingest_worker_model_options();
-
-        for slug in [
+        let expected = [
             "hrrr",
             "hrrr-ak",
-            "rap",
             "gfs",
             "gdas",
             "gefs",
@@ -75334,9 +76563,21 @@ mod tests {
             "aigefs",
             "hgefs",
             "ecmwf-open-data",
+            "aifs",
+            "rap",
             "nam",
+            "hiresw",
+            "href",
+            "sref",
+            "rtma",
+            "urma",
+            "nbm",
             "rrfs-a",
-        ] {
+            "rrfs-public",
+            "refs",
+        ];
+        assert_eq!(options.len(), expected.len());
+        for slug in expected {
             assert!(
                 options
                     .iter()
@@ -75344,6 +76585,60 @@ mod tests {
                 "{slug} must be active in BowEcho's model download picker"
             );
         }
+        assert!(!options.iter().any(|option| option.slug == "rrfs-firewx"));
+        assert!(!options.iter().any(|option| option.slug == "wrf"));
+    }
+
+    #[test]
+    fn model_download_defaults_follow_typed_capability_limits() {
+        let rtma = default_download_spec("rtma");
+        assert_eq!(
+            (rtma.profile.as_str(), rtma.hours.as_str()),
+            ("analysis", "0")
+        );
+        assert!(!rtma.derived && !rtma.heavy);
+
+        let nbm = default_download_spec("nbm");
+        assert_eq!(
+            (nbm.profile.as_str(), nbm.hours.as_str()),
+            ("surface", "1,2,3")
+        );
+        assert!(!nbm.derived && !nbm.heavy);
+
+        let aifs = default_download_spec("aifs");
+        assert_eq!((aifs.profile.as_str(), aifs.hours.as_str()), ("full", "0"));
+        assert!(!aifs.derived && !aifs.heavy);
+
+        let unrestricted = default_download_spec("gfs");
+        assert_eq!(unrestricted.profile, "sounding");
+    }
+
+    #[test]
+    fn model_download_normalization_drops_an_incompatible_provider_override() {
+        let spec = normalize_model_download_spec(rw_ui::DownloadSpec {
+            model: "aifs".to_owned(),
+            source: "aws".to_owned(),
+            ..rw_ui::DownloadSpec::default()
+        });
+
+        assert_eq!(spec.source, "auto");
+        assert!(!spec.derived && !spec.heavy);
+    }
+
+    #[test]
+    fn model_picker_surfaces_verification_and_limitations() {
+        let options = ingest_worker_model_options();
+        let hrrr = options.iter().find(|option| option.slug == "hrrr").unwrap();
+        assert!(hrrr.label.contains("live"));
+
+        let refs = options.iter().find(|option| option.slug == "refs").unwrap();
+        assert!(refs.label.contains("pre-op"));
+        assert!(refs.note.contains("ensemble mean only"));
+        assert!(refs.note.contains("derived products disabled"));
+
+        let nbm = options.iter().find(|option| option.slug == "nbm").unwrap();
+        assert!(nbm.label.contains("surface"));
+        assert!(nbm.note.contains("conus only"));
     }
 
     #[test]

@@ -1,0 +1,32 @@
+[package]
+name = "arwen-studio"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "ArWen Studio: design a forecast on a map, watch it run, investigate the output."
+
+[lib]
+name = "arwen_studio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arwen-studio"
+path = "src/main.rs"
+
+[build-dependencies]
+chrono.workspace = true
+
+[dependencies]
+arwen-plan.workspace = true
+arwen-proc.workspace = true
+arwen-map.workspace = true
+chrono.workspace = true
+color_tables.workspace = true
+eframe.workspace = true
+egui_tiles.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ui_core.workspace = true
+wrf-core.workspace = true

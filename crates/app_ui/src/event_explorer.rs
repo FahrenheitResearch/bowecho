@@ -43,7 +43,6 @@ const TRACK_CAMERA_POST_SCAN_MINUTES: i64 = 5;
 /// automatic retry — "never an error spam loop".
 const EVENT_FETCH_RETRY_SECONDS: u64 = 60;
 
-#[derive(Default)]
 pub(crate) struct EventExplorerState {
     /// DATA-tab date field (YYYY-MM-DD), archive-input conventions.
     pub date_input: String,
@@ -62,6 +61,28 @@ pub(crate) struct EventExplorerState {
     /// Optional camera target for a clicked tornado track. Playback uses
     /// the displayed frame time to interpolate from touchdown to lift.
     pub camera_follow: Option<EventTrackCameraFollow>,
+    pub show_tornado_tracks: bool,
+    pub show_tornado_reports: bool,
+    pub show_wind_reports: bool,
+    pub show_hail_reports: bool,
+}
+
+impl Default for EventExplorerState {
+    fn default() -> Self {
+        Self {
+            date_input: String::new(),
+            pinned_day: None,
+            cache: HashMap::new(),
+            fetch: None,
+            failed: None,
+            pending_autoplay: false,
+            camera_follow: None,
+            show_tornado_tracks: true,
+            show_tornado_reports: true,
+            show_wind_reports: true,
+            show_hail_reports: true,
+        }
+    }
 }
 
 impl EventExplorerState {
@@ -73,16 +94,6 @@ impl EventExplorerState {
 
     pub(crate) fn fetching_day(&self) -> Option<NaiveDate> {
         self.fetch.as_ref().map(|(day, _)| *day)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_failed_for_test(&mut self, day: NaiveDate) {
-        self.failed = Some((day, Instant::now()));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn failed_day_for_test(&self) -> Option<NaiveDate> {
-        self.failed.map(|(day, _)| day)
     }
 
     #[cfg(test)]
@@ -344,6 +355,17 @@ impl crate::ViewerApp {
         }
     }
 
+    pub(crate) fn event_report_kind_visible(&self, kind: spc_layers::ReportKind) -> bool {
+        if self.event_explorer.pinned_day.is_none() && self.event_followed_day().is_none() {
+            return true;
+        }
+        match kind {
+            spc_layers::ReportKind::Tornado => self.event_explorer.show_tornado_reports,
+            spc_layers::ReportKind::Wind => self.event_explorer.show_wind_reports,
+            spc_layers::ReportKind::Hail => self.event_explorer.show_hail_reports,
+        }
+    }
+
     /// Per-update pump: install a finished day fetch, kick the next one
     /// when the followed day is not cached. Reports off = fully idle.
     pub(crate) fn poll_event_day(&mut self, ctx: &egui::Context) {
@@ -421,7 +443,7 @@ impl crate::ViewerApp {
             if ui
                 .button("Load")
                 .on_hover_text(
-                    "Show this day's storm reports, tornado tracks, and outlook. The map stays put — click a track to load its radar loop.",
+                    "Show this day's selected storm-report categories and tornado tracks. The map stays put and SPC outlook shading is not enabled.",
                 )
                 .clicked()
             {
@@ -447,6 +469,20 @@ impl crate::ViewerApp {
                 ui.spinner();
             }
         });
+        ui.label("Show on event map:");
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut self.event_explorer.show_tornado_tracks,
+                "Tornado tracks",
+            );
+            ui.checkbox(
+                &mut self.event_explorer.show_tornado_reports,
+                "Tornado reports",
+            );
+            ui.checkbox(&mut self.event_explorer.show_wind_reports, "Wind / damage");
+            ui.checkbox(&mut self.event_explorer.show_hail_reports, "Hail");
+        });
+        ui.weak("Event day does not enable SPC outlook shading.");
         // Track/report loop context: every event click uses one explicit
         // archive-loop model; these controls do not inherit the Archive
         // browser's manual N.
@@ -618,7 +654,7 @@ impl crate::ViewerApp {
     /// Zero-length segments are the report dot itself — they only draw
     /// here when the day has no report file (pre-2004 WCM-only days).
     pub(crate) fn draw_event_tracks(&self, painter: &egui::Painter, rect: egui::Rect) {
-        if !self.spc_reports_enabled {
+        if !self.spc_reports_enabled || !self.event_explorer.show_tornado_tracks {
             return;
         }
         let Some(data) = self.active_event_day_data() else {
@@ -637,7 +673,11 @@ impl crate::ViewerApp {
             .pointer_hover_pos()
             .filter(|pos| rect.contains(*pos));
         let cull = rect.expand(400.0);
-        for segment in &data.segments {
+        for segment in data
+            .segments
+            .iter()
+            .filter(|_| self.event_explorer.show_tornado_tracks)
+        {
             let track_color = event_track_color(&segment.ef_label);
             let a = self.lon_lat_to_screen(rect, segment.begin_lon, segment.begin_lat);
             match segment.end {
@@ -708,6 +748,7 @@ impl crate::ViewerApp {
             let dot_nearby = self
                 .reports_for_display()
                 .iter()
+                .filter(|report| self.event_report_kind_visible(report.kind))
                 .filter(|report| self.spc_report_visible_for_timeline(report))
                 .any(|report| {
                     self.lon_lat_to_screen(rect, report.lon, report.lat)
@@ -750,7 +791,11 @@ impl crate::ViewerApp {
                 best = Some((distance, hit));
             }
         };
-        for segment in &data.segments {
+        for segment in data
+            .segments
+            .iter()
+            .filter(|_| self.event_explorer.show_tornado_tracks)
+        {
             let a = self.lon_lat_to_screen(rect, segment.begin_lon, segment.begin_lat);
             let distance = match segment.end {
                 Some((end_lat, end_lon)) => {
@@ -779,6 +824,7 @@ impl crate::ViewerApp {
         for report in self
             .reports_for_display()
             .iter()
+            .filter(|report| self.event_report_kind_visible(report.kind))
             .filter(|report| self.spc_report_visible_for_timeline(report))
         {
             if report.kind != spc_layers::ReportKind::Tornado {

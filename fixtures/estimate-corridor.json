@@ -1,0 +1,193 @@
+{
+  "automatic_resolutions": [
+    {
+      "basis": "schema_default",
+      "key": "data_dir",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "device",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "dry_run",
+      "scope": "run_options",
+      "value": false
+    },
+    {
+      "basis": "schema_default",
+      "key": "geog_root",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "health_debug",
+      "scope": "run_options",
+      "value": false
+    },
+    {
+      "basis": "schema_default",
+      "key": "physics_profile",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "render_products",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "restart",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "column_chunk",
+      "scope": "experiment",
+      "value": 3125
+    },
+    {
+      "basis": "schema_default",
+      "key": "acknowledgements",
+      "scope": "experiment",
+      "value": "()"
+    },
+    {
+      "basis": "schema_default",
+      "key": "physics_mode",
+      "scope": "experiment",
+      "value": {
+        "governed": false,
+        "mode": "wrf-faithful",
+        "patchset": null,
+        "requested_patches": [],
+        "resolved": []
+      }
+    },
+    {
+      "basis": "schema_default",
+      "key": "perturbation",
+      "scope": "experiment",
+      "value": null
+    },
+    {
+      "basis": "declared_time_step",
+      "exact": "60",
+      "grid_id": 1,
+      "key": "dt",
+      "note": "time_step=60 +0/1",
+      "scope": "domain",
+      "value": 60.0
+    },
+    {
+      "basis": "derived_from_parent_time_step_ratio",
+      "exact": "15",
+      "grid_id": 2,
+      "key": "dt",
+      "note": "parent d01 step divided by parent_time_step_ratio=4",
+      "scope": "domain",
+      "value": 15.0
+    },
+    {
+      "basis": "front_door_contract",
+      "key": "execution_mode",
+      "note": "run-plan integrates in THIS process rather than re-executing under gpuwm's own supervisor, so the pid in run-manifest.json is the pid doing the model work and the caller owns restart policy",
+      "scope": "execution",
+      "value": "in_process"
+    },
+    {
+      "basis": "relocation_follow",
+      "key": "statics_corridor",
+      "note": "the config declares a [relocation] follow source on d02, so the rw-wps prepare stage (gpuwm.source_cli) is composed with --statics-corridor and the bundle will carry sealed child-resolution statics over each child's whole parent extent; without it gpuwm-prepared-tree-forecast refuses this config at its preflight.  Derived from the config, not from a run option: there is no way to ask for a moving nest and separately forget the statics it moves onto.  See --estimate for the size.",
+      "scope": "preparation",
+      "value": true
+    }
+  ],
+  "corridor": {
+    "basis": "each child's corridor is its parent's full extent at the child's resolution (parent_nx*ratio x parent_ny*ratio cells) carrying the native static contract's 97 float64 planes, so 776 bytes per corridor cell; counted from the same field inventory the build is shape-checked against.  DISK and HOST are the same figure to within container headers: the cache is an uncompressed NPZ of exactly these arrays.  No GPU residency -- a corridor is cropped on the host, so the VRAM estimate above is unchanged by it.",
+    "domains": [
+      {
+        "bytes_per_cell": 776,
+        "cells": 528768,
+        "corridor_nx": 816,
+        "corridor_ny": 648,
+        "domain": "d02",
+        "grid_id": 2,
+        "host_bytes": 410323968,
+        "parent_id": 1,
+        "planes_per_cell": 97
+      }
+    ],
+    "host_bytes": 410323968,
+    "host_gib": 0.3821
+  },
+  "disk": {
+    "basis": "frame counts are exact from run_seconds and each domain's history_interval_s; bytes-per-frame is not measured by this package, so no byte figure is reported rather than an invented one",
+    "bytes": null,
+    "frames": [
+      {
+        "domain": 1,
+        "frames": 7,
+        "history_interval_s": 3600.0,
+        "nx": 204,
+        "ny": 162,
+        "nz": 49
+      },
+      {
+        "domain": 2,
+        "frames": 25,
+        "history_interval_s": 900.0,
+        "nx": 408,
+        "ny": 320,
+        "nz": 49
+      }
+    ],
+    "total_frames": 32
+  },
+  "download": {
+    "basis": "no [fetch] in this plan",
+    "bytes": null
+  },
+  "plan": {
+    "config_kind": "path",
+    "config_sha256": "40e21a26b3c9090d19de28256671e38c88c053cf82384be54bb4e183bea01197",
+    "config_source": "C:\\ArWenFixture\\mn120\\n-follow.toml",
+    "fetch_args": null,
+    "name": "corridor-n-follow",
+    "route": "prepared",
+    "run_dir": "C:\\ArWenFixture\\mn120\\out\\n-follow",
+    "run_options": {
+      "data_dir": null,
+      "device": null,
+      "dry_run": false,
+      "geog_root": null,
+      "health_debug": false,
+      "physics_profile": null,
+      "render_products": null,
+      "restart": null
+    },
+    "sha256": "f20d1ec0015e4e7f729c0041380d4c72e96c7966ad4ee6bd3a0d7434c8db5010",
+    "source": "C:\\ArWenFixture\\mn120\\plan-n-follow.json"
+  },
+  "schema": "gpuwm.run-plan.estimate.v1",
+  "vram": {
+    "basis": "gpuwm.core.preflight.estimate_experiment, which sums every domain and shares the scratch arena across a tree; the envelope is its peak_envelope_bytes (the estimator `gpuwm check` reports; no device context is created)",
+    "domains": 2,
+    "estimate_bytes": 6858962954,
+    "estimate_gib": 6.3879,
+    "peak_envelope_bytes": 19742190937,
+    "peak_envelope_gib": 18.3863
+  },
+  "wall_time": {
+    "basis": "this package publishes no measured rate for an arbitrary configuration; the model_progress events carry the real one from the first step",
+    "seconds": null
+  }
+}

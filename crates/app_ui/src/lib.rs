@@ -1,6 +1,7 @@
 //! Native app-shell state shared by future winit/wgpu UI code.
 
 pub mod cm1;
+pub mod federated_origins;
 pub mod vcp_catalog;
 pub mod wrf_p3_assets;
 pub mod wrf_property_reader;

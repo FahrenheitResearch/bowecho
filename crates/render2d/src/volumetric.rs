@@ -1153,10 +1153,66 @@ pub fn velocity_cross_section_cached_with_smoothing(
     smoothing: CrossSectionSmoothing,
 ) -> Option<CrossSection> {
     cache.ensure(volume);
-    let mut cols: Vec<CutColumn<'_>> = cache
-        .grids
-        .iter()
-        .filter_map(|(i, g)| CutColumn::new(volume, *i, g))
+    velocity_cross_section_from_indexed_grids(
+        volume,
+        cache
+            .grids
+            .iter()
+            .map(|(cut_index, grid)| (*cut_index, grid)),
+        start_km,
+        end_km,
+        width,
+        height,
+        top_m,
+        smoothing,
+    )
+}
+
+/// Build a velocity cross-section from already-dealiased, volume-aligned
+/// tilt grids. Callers that own an engine-aware dealias memo can pass its
+/// outputs here and avoid both a second solve and the legacy-only
+/// [`VolumeDealiasCache`] path. A `None` entry means that source cut has no
+/// usable dealiased velocity grid.
+#[allow(clippy::too_many_arguments)]
+pub fn velocity_cross_section_from_dealiased_with_smoothing(
+    volume: &RadarVolume,
+    dealiased_velocity: &[Option<&MomentGrid>],
+    start_km: (f32, f32),
+    end_km: (f32, f32),
+    width: usize,
+    height: usize,
+    top_m: f32,
+    smoothing: CrossSectionSmoothing,
+) -> Option<CrossSection> {
+    velocity_cross_section_from_indexed_grids(
+        volume,
+        dealiased_velocity
+            .iter()
+            .enumerate()
+            .filter_map(|(cut_index, grid)| grid.map(|grid| (cut_index, grid))),
+        start_km,
+        end_km,
+        width,
+        height,
+        top_m,
+        smoothing,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn velocity_cross_section_from_indexed_grids<'a>(
+    volume: &'a RadarVolume,
+    grids: impl IntoIterator<Item = (usize, &'a MomentGrid)>,
+    start_km: (f32, f32),
+    end_km: (f32, f32),
+    width: usize,
+    height: usize,
+    top_m: f32,
+    smoothing: CrossSectionSmoothing,
+) -> Option<CrossSection> {
+    let mut cols: Vec<CutColumn<'_>> = grids
+        .into_iter()
+        .filter_map(|(cut_index, grid)| CutColumn::new(volume, cut_index, grid))
         .collect();
     cols.sort_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg));
     cross_section_from_columns(
@@ -1899,6 +1955,54 @@ mod tests {
                 .iter()
                 .any(|v| v.is_finite() && (*v - 15.0).abs() < 1.0),
             "no reconstructed velocity near 15 m/s"
+        );
+    }
+
+    #[test]
+    fn velocity_cross_section_uses_supplied_dealiased_grids_without_resolving_again() {
+        let v = volume_with(vec![
+            cut_with_vel(0.5, 360, 200, 15.0),
+            cut_with_vel(4.0, 360, 200, 15.0),
+        ]);
+        let supplied: Vec<MomentGrid> = v
+            .cuts
+            .iter()
+            .map(|cut| {
+                let mut grid = cut
+                    .moments
+                    .get(&MomentType::Velocity)
+                    .expect("source velocity")
+                    .clone();
+                grid.storage = MomentStorage::F32(vec![-23.0; 360 * 200]);
+                grid
+            })
+            .collect();
+        let borrowed: Vec<Option<&MomentGrid>> = supplied.iter().map(Some).collect();
+
+        let xs = velocity_cross_section_from_dealiased_with_smoothing(
+            &v,
+            &borrowed,
+            (10.0, 0.0),
+            (60.0, 0.0),
+            120,
+            80,
+            18_000.0,
+            CrossSectionSmoothing::Smoothed,
+        )
+        .expect("velocity cross section from supplied grids");
+
+        assert!(
+            xs.values
+                .iter()
+                .any(|value| value.is_finite() && (*value + 23.0).abs() < 1.0),
+            "the section must sample the caller's dealiased grids"
+        );
+        assert!(
+            xs.values
+                .iter()
+                .filter(|value| value.is_finite())
+                .all(|value| (*value - 15.0).abs() >= 1.0),
+            "the constructor must not silently fall back to the raw/legacy-dealiased volume"
         );
     }
 

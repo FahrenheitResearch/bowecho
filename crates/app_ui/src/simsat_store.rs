@@ -168,6 +168,7 @@ pub(crate) fn write_derived_frame(
                 .unwrap_or(0),
             encode_ms: started.elapsed().as_millis() as u64,
             variables: vec![variable],
+            source_provenance: Vec::new(),
         },
     );
     manifest

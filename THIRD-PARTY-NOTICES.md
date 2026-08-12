@@ -64,7 +64,61 @@ ships alongside the fonts at `sharppyrs/assets/fonts/OFL.txt`.
 
 The sounding window's locator basemap lines (CONUS state boundaries and
 coastline) are simplified from Natural Earth 1:50m vector data, as bundled by
-SHARPpy-Reimagined.
+SHARPpy-Reimagined. BowEcho's offline application basemap and the embedded
+ArWen Studio map also contain generated geometry and labels from Natural Earth
+1:50m country boundaries, 1:10m regional administrative boundaries, and 1:10m
+populated places.
+
+## U.S. Census Bureau cartographic boundary data
+
+- **Source:** U.S. Census Bureau cartographic boundary files
+- **Embedded inputs:** `cb_2024_us_state_500k`, `cb_2024_us_county_500k`, and
+  `cb_2023_us_place_500k`
+
+BowEcho's offline application basemap and the embedded ArWen Studio map contain
+generated U.S. state/county geometry and town/place labels derived from these
+files. The year and dataset identifiers above are retained from the checked-in
+generators and generated-source provenance comments.
+
+## Py-ART region-based velocity dealiasing
+
+- **License:** BSD-3-Clause, with the U.S. DOE / Argonne government-rights
+  notice
+- **Copyright:** Copyright (c) 2013, UChicago Argonne, LLC. All rights reserved.
+- **Sources:** <https://github.com/ARM-DOE/pyart>,
+  <https://github.com/FahrenheitResearch/region-global-dealias>
+
+BowEcho's Region Global velocity solver uses the pinned
+`region-global-dealias` Rust port of Py-ART's `dealias_region_based` per-sweep
+core. It is modified software, not the Py-ART distribution from Argonne: the
+standalone solver works on flat `f32` arrays and replaces the original region
+labeling and network-reduction data structures with fold-identical optimized
+implementations. The complete upstream notice is reproduced in
+[`PYART-LICENSE.txt`](PYART-LICENSE.txt).
+
+The separately selectable RIFT engine uses the same pinned crate's v0.2.0
+opt-in gate-resolution refinement. It starts from the unchanged Region Global
+result and only accepts bounded local corrections when its independent trigger
+and wrapped-vortex fit agree; selecting Region Global does not enable RIFT.
+
+Please cite Helmus, J. J., and S. M. Collis, 2016: The Python ARM Radar Toolkit
+(Py-ART), a Library for Working with Radar Data in the Python Programming
+Language. *J. Open Res. Softw.*, **4**(1), e25,
+<https://doi.org/10.5334/jors.119>.
+
+## ArWen Studio control plane
+
+- **License:** Apache-2.0
+- **Snapshot:** `fdee27fe5bd1eae6601e1d3342bde1544c15db36` (2026-08-08)
+
+BowEcho vendors the ArWen Studio Rust planner, `gpuwm run-plan` contract,
+process supervisor, Lambert-domain geometry, and contract fixtures. The
+ArWen-authored Rust sources retain their Apache-2.0 SPDX headers and are not
+relicensed under the MIT alternative offered for BowEcho-owned code. The two
+generated basemap tables instead retain their Census/Natural Earth provenance
+comments and are covered by the data notices above. See
+[`docs/arwen-studio/VENDOR.md`](docs/arwen-studio/VENDOR.md) for scope and
+integration invariants.
 
 ## PyTMatrix-derived property T-matrix research pack
 

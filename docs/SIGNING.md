@@ -7,16 +7,26 @@ them.
 
 ## Current release posture
 
-- Release assets are built by GitHub Actions from the exact Git tag and are
-  uploaded with matching `.sha256` files.
-- Windows packages are unsigned unless the Azure Trusted Signing secrets are
-  configured. Unsigned builds can trigger SmartScreen or antivirus
-  machine-learning warnings on first download.
+- Release assets are built by GitHub Actions from the exact Git tag. Checksums
+  are generated before the workflow artifact is uploaded, so both manually
+  dispatched RC artifacts and tagged release assets carry matching `.sha256`
+  files.
+- Every canonical platform package carries `README.md`, `LICENSE-MIT`,
+  `LICENSE-APACHE`, `THIRD-PARTY-NOTICES.md`, and `PYART-LICENSE.txt`. The
+  workflow verifies the exact required members and compares their bytes with
+  the repository copies before upload.
+- Windows packages are Authenticode-signed only when the Azure Trusted Signing
+  secrets are configured. Unsigned builds can trigger SmartScreen or antivirus
+  machine-learning warnings on first download. Each architecture publishes a
+  notice-bearing ZIP for manual installation plus a byte-identical raw `.exe`
+  whose filename remains the in-app updater contract.
 - Tagged macOS packages are signed with the BowEcho Developer ID, notarized,
   stapled, and validated by `codesign`, `stapler`, and Gatekeeper before they
   are zipped. Missing credentials or a failed validation fails the release
   build rather than publishing an unsigned Mac asset.
-- Linux archives are not code-signed; use the `.sha256` file.
+- Linux `tar.gz` packages are not code-signed; use the archive's `.sha256`
+  file. Their member list is fixed and the archive is created with normalized
+  ordering, timestamps, owner, and group.
 
 The source of truth for a release is the GitHub Actions run attached to that
 tag. It shows whether each signing and validation step passed or failed.
@@ -51,18 +61,19 @@ page.
 Windows PowerShell:
 
 ```powershell
-Get-FileHash .\bowecho-windows-x64.exe -Algorithm SHA256
-Get-Content .\bowecho-windows-x64.exe.sha256
+Get-FileHash .\bowecho-windows-x64.zip -Algorithm SHA256
+Get-Content .\bowecho-windows-x64.zip.sha256
 ```
 
 macOS or Linux:
 
 ```sh
 shasum -a 256 bowecho-macos-apple-silicon.zip
-sha256sum bowecho-linux-x64
+sha256sum bowecho-linux-x64.tar.gz
 ```
 
-If a Windows executable is signed, Authenticode should report `Valid`:
+After extracting the Windows ZIP, Authenticode should report `Valid` when that
+release was signed:
 
 ```powershell
 Get-AuthenticodeSignature .\bowecho.exe | Format-List Status, SignerCertificate
@@ -94,7 +105,10 @@ link of this chain:
 1. **Variant self-identification (build time).** The release workflow bakes
    the exact asset name each Windows binary ships as into that binary
    (`BOWECHO_UPDATE_ASSET`, e.g. `bowecho-windows-x64-v3.exe`). The updater
-   can therefore only download the variant it is already running.
+   can therefore only download the variant it is already running. CI compares
+   that raw updater asset byte-for-byte with `bowecho.exe` inside the matching
+   notice-bearing ZIP; the raw filename is preserved for compatibility rather
+   than changing the updater protocol.
 2. **Download over HTTPS (rustls).** The asset and its `.sha256` are fetched
    from the GitHub release for the new tag, streamed to a temp file in the
    same directory as the executable (same volume, so the final rename never

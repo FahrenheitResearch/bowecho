@@ -2492,6 +2492,7 @@ fn write_himawari_grid_frame(
             written_unix,
             encode_ms,
             variables: vec![variable.clone()],
+            source_provenance: Vec::new(),
         },
     );
     manifest
@@ -4219,6 +4220,7 @@ fn write_himawari_composite_frame(
                 COMPOSITE_G_VAR.to_string(),
                 COMPOSITE_B_VAR.to_string(),
             ],
+            source_provenance: Vec::new(),
         },
     );
     manifest
@@ -5450,6 +5452,7 @@ fn write_goes_rgb_frame(
                 COMPOSITE_G_VAR.to_string(),
                 COMPOSITE_B_VAR.to_string(),
             ],
+            source_provenance: Vec::new(),
         },
     );
     manifest

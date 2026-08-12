@@ -10,6 +10,7 @@ color_tables = { path = "../color_tables" }
 image.workspace = true
 radar_core = { path = "../radar_core" }
 rayon.workspace = true
+region-global-dealias.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

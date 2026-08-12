@@ -26,7 +26,9 @@ mod volumetric;
 mod vwp;
 pub mod wind;
 pub use cells::{StormCell, identify_storm_cells};
-pub use dealias_pyart::dealias_velocity_grid_pyart_region;
+pub use dealias_pyart::{
+    dealias_velocity_grid_pyart_region, dealias_velocity_grid_region_global_rift,
+};
 pub use dealias_v4::{
     ConfidenceGrid, EnvWindLevel, EnvironmentalWindProfile, TemporalPrior, V4Diagnostics,
     V4VolumeSolution, dealias_velocity_grid_v4, dealias_volume_v4, project_environmental_winds,
@@ -67,8 +69,9 @@ pub use volumetric::{
     MeshCalibration, VolumeDealiasCache, composite_reflectivity_grid, echo_top_grid, hail_grids,
     mehs_grid, moment_cross_section, moment_cross_section_with_smoothing, poh_grid,
     reflectivity_cross_section, reflectivity_cross_section_with_smoothing, velocity_cross_section,
-    velocity_cross_section_cached, velocity_cross_section_cached_with_smoothing, vil_density_grid,
-    vil_grid, volume_box_resample, volume_box_resample_moment,
+    velocity_cross_section_cached, velocity_cross_section_cached_with_smoothing,
+    velocity_cross_section_from_dealiased_with_smoothing, vil_density_grid, vil_grid,
+    volume_box_resample, volume_box_resample_moment,
 };
 pub use vwp::{
     VwpCandidateDiagnostics, VwpConfig, VwpError, VwpLevel, VwpLevelOutcome, VwpProfile,

@@ -272,6 +272,7 @@ fn resolve_spec(
     profile.derived = spec.derived;
     profile.heavy = spec.heavy;
     profile.validate()?;
+    rw_ingest::validate_ingest_profile_for_model(model, &profile).map_err(|err| err.to_string())?;
     let hours = parse_hours(&spec.hours).map_err(|err| err.to_string())?;
     let cycle = CycleSpec::new(spec.date.clone(), spec.cycle).map_err(|err| err.to_string())?;
     let supported = supported_forecast_hours(model, spec.cycle);
@@ -1101,8 +1102,13 @@ mod tests {
             probe_products(ModelId::Rap, &sounding).unwrap(),
             vec!["awp130pgrb"]
         );
-        // Models without a fetch plan surface an error, not a panic.
-        assert!(probe_products(ModelId::Nbm, &sounding).is_err());
+        // A surface-only model rejects a sounding profile before probing.
+        assert!(rw_ingest::validate_ingest_profile_for_model(ModelId::Nbm, &sounding).is_err());
+        let surface = IngestProfile::surface();
+        assert_eq!(
+            probe_products(ModelId::Nbm, &surface).unwrap(),
+            vec!["core/co"]
+        );
     }
 
     #[test]

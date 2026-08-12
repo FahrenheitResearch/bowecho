@@ -575,13 +575,37 @@ impl ViewerApp {
         self.remembered_section(ui, "data_packs", "Data packs", true, |app, ui| {
             app.data_packs_section(ui, ctx);
         });
+        self.remembered_section(
+            ui,
+            "data_community_cases",
+            "Community cases",
+            false,
+            |app, ui| {
+                app.community_case_directory_section(ui, ctx);
+            },
+        );
         self.remembered_section(ui, "data_archive", "Archive", true, |app, ui| {
-            app.archive_panel(ui, ctx);
-        });
-        // Event Explorer: pick a convective day (12Z-12Z), get every
-        // storm report + clickable tornado tracks + that day's outlook.
-        self.remembered_section(ui, "data_event_day", "Event day", true, |app, ui| {
-            app.event_day_section(ui, ctx);
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(
+                    &mut app.archive_browse_mode,
+                    ArchiveBrowseMode::SiteAndScan,
+                    "Site + scan",
+                )
+                .on_hover_text("Choose a radar site and load one scan or a simple loop by time");
+                ui.selectable_value(
+                    &mut app.archive_browse_mode,
+                    ArchiveBrowseMode::EventDay,
+                    "Event day",
+                )
+                .on_hover_text(
+                    "Choose a convective day, filter report categories, then click an event to load its radar frames",
+                );
+            });
+            ui.separator();
+            match app.archive_browse_mode {
+                ArchiveBrowseMode::SiteAndScan => app.archive_panel(ui, ctx),
+                ArchiveBrowseMode::EventDay => app.event_day_section(ui, ctx),
+            }
         });
         self.remembered_section(
             ui,
@@ -704,6 +728,262 @@ impl ViewerApp {
             #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
             ui.weak("Native file dialogs are unavailable on this platform.");
         });
+    }
+
+    /// Read-only discovery of deliberate signed case-room publications.
+    fn community_case_directory_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self
+            .community_case_workspace
+            .poll(&mut self.community_case_browser)
+        {
+            ctx.request_repaint();
+        }
+        if self.community_case_browser.poll() {
+            ctx.request_repaint();
+        }
+        if self.community_case_browser.is_loading()
+            || self.community_case_workspace.has_background_work()
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        let community_settings = &self.app_settings.community_cache;
+        let enabled = community_settings.phase1_active() && community_settings.explicit_case_rooms;
+        ui.weak(
+            "Browse deliberate, origin-signed case publications. Opening this section does not search, publish, upload, or expose local files.",
+        );
+        if let Some(runtime) = &self.community_relay_runtime {
+            let relay = runtime.status();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Private Community Sharing").strong());
+                ui.weak(relay.summary());
+            });
+            ui.weak(format!(
+                "{} eligible retained object{} · {} advertised · {} recovered",
+                relay.verified_seed_objects,
+                if relay.verified_seed_objects == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                relay.advertised_objects,
+                relay.recovered_objects,
+            ));
+        }
+        if !enabled {
+            ui.weak(
+                "Enable Community Cache and “Published case rooms and artifacts” in Settings to browse.",
+            );
+        }
+
+        let mut refresh_clicked = false;
+        let mut more_clicked = false;
+        ui.horizontal_wrapped(|ui| {
+            let label = if self.community_case_browser.cases().is_empty() {
+                "Browse"
+            } else {
+                "Refresh"
+            };
+            refresh_clicked = ui
+                .add_enabled(
+                    enabled && !self.community_case_browser.is_loading(),
+                    egui::Button::new(label),
+                )
+                .on_disabled_hover_text(
+                    "Case-room browsing must be enabled and no directory request may be active",
+                )
+                .clicked();
+            if self.community_case_browser.is_loading() {
+                ui.spinner();
+            }
+            if self.community_case_browser.next_after().is_some() {
+                more_clicked = ui
+                    .add_enabled(
+                        enabled && !self.community_case_browser.is_loading(),
+                        egui::Button::new("More"),
+                    )
+                    .clicked();
+            }
+        });
+
+        if refresh_clicked {
+            let result = crate::community_cache::CommunityCacheClient::from_settings(
+                &self.app_settings.community_cache,
+                settings::community_cache_dir(),
+            )
+            .and_then(|client| self.community_case_browser.refresh(client));
+            if let Err(error) = result {
+                self.community_case_browser.report_error(&error);
+            }
+        } else if more_clicked {
+            let result = crate::community_cache::CommunityCacheClient::from_settings(
+                &self.app_settings.community_cache,
+                settings::community_cache_dir(),
+            )
+            .and_then(|client| self.community_case_browser.load_more(client));
+            if let Err(error) = result {
+                self.community_case_browser.report_error(&error);
+            }
+        }
+
+        if let Some(status) = self.community_case_browser.status() {
+            let color = if status.contains("failed") || status.contains("stopped") {
+                egui::Color32::from_rgb(244, 194, 92)
+            } else {
+                ui.visuals().weak_text_color()
+            };
+            ui.colored_label(color, status);
+        }
+
+        let open_case_id = self
+            .community_case_browser
+            .open_case_id()
+            .map(str::to_owned);
+        let viewed_artifact = self
+            .community_case_browser
+            .viewed_artifact()
+            .map(|(case_id, artifact_id)| (case_id.to_owned(), artifact_id.to_owned()));
+        let mut toggle_case = None;
+        let mut toggle_artifact = None;
+        let visible_cases = self.community_case_browser.cases().to_vec();
+        for signed in &visible_cases {
+            let case = &signed.manifest;
+            let is_open = open_case_id.as_deref() == Some(case.case_id.as_str());
+            ui.group(|ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(&case.title).strong());
+                    ui.weak(format!(
+                        "{} artifact{}",
+                        case.artifacts.len(),
+                        if case.artifacts.len() == 1 { "" } else { "s" }
+                    ));
+                    if ui.button(if is_open { "Close" } else { "Open" }).clicked() {
+                        toggle_case = Some(case.case_id.clone());
+                    }
+                });
+                ui.weak(format!(
+                    "{} — {}",
+                    Self::community_case_time_label(case.event_start_unix),
+                    Self::community_case_time_label(case.event_end_unix)
+                ));
+                let source_summary = case
+                    .sources
+                    .iter()
+                    .map(|source| format!("{} {}", source.model, source.run))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                ui.weak(source_summary);
+
+                if is_open {
+                    ui.separator();
+                    ui.weak(format!(
+                        "Published {} · retained through {} · signed by {}",
+                        Self::community_case_time_label(case.published_unix),
+                        Self::community_case_time_label(case.retain_until_unix),
+                        signed.signature.signing_key_id
+                    ));
+
+                    ui.label(egui::RichText::new("Sources").strong());
+                    for source in &case.sources {
+                        ui.label(format!("{} · run {}", source.model, source.run));
+                        let snapshot = source.snapshot_id.get(..12).unwrap_or(&source.snapshot_id);
+                        let grid = source.grid_hash.get(..12).unwrap_or(&source.grid_hash);
+                        ui.weak(format!("snapshot {snapshot}… · grid {grid}…"));
+                        for provenance in &source.source_provenance {
+                            ui.weak(format!(
+                                "{} · roles: {} · products: {}",
+                                provenance.provider,
+                                provenance.roles.join(", "),
+                                provenance.products.join(", ")
+                            ));
+                        }
+                    }
+
+                    if !case.attributions.is_empty() {
+                        ui.label(egui::RichText::new("Attribution").strong());
+                    }
+                    for attribution in &case.attributions {
+                        ui.label(egui::RichText::new(&attribution.provider).strong());
+                        ui.weak(&attribution.notice);
+                        ui.weak(format!("License: {}", attribution.license));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.hyperlink_to("Source", &attribution.source_url);
+                            ui.hyperlink_to("License", &attribution.license_url);
+                            ui.hyperlink_to("Terms", &attribution.terms_url);
+                        });
+                        if !attribution.disclaimer.is_empty() {
+                            ui.weak(&attribution.disclaimer);
+                        }
+                    }
+                    for notice in &case.modification_notices {
+                        ui.weak(format!("Modification notice: {notice}"));
+                    }
+
+                    ui.label(egui::RichText::new("Artifacts").strong());
+                    for artifact in &case.artifacts {
+                        let viewed = viewed_artifact.as_ref().is_some_and(
+                            |(view_case_id, view_artifact_id)| {
+                                view_case_id == &case.case_id
+                                    && view_artifact_id == &artifact.artifact_id
+                            },
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!(
+                                "{} · {}",
+                                artifact.artifact_id,
+                                Self::community_case_artifact_label(artifact.artifact_type)
+                            ));
+                            if ui.button(if viewed { "Hide" } else { "View" }).clicked() {
+                                toggle_artifact =
+                                    Some((case.case_id.clone(), artifact.artifact_id.clone()));
+                            }
+                        });
+                        if viewed {
+                            ui.indent(
+                                ("case-artifact", &case.case_id, &artifact.artifact_id),
+                                |ui| {
+                                    self.community_case_workspace.artifact_ui(
+                                        ui,
+                                        ctx,
+                                        &self.app_settings.community_cache,
+                                        signed,
+                                        artifact,
+                                    );
+                                },
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(case_id) = toggle_case {
+            self.community_case_browser.toggle_case(&case_id);
+        }
+        if let Some((case_id, artifact_id)) = toggle_artifact {
+            self.community_case_browser
+                .toggle_artifact(&case_id, &artifact_id);
+        }
+        self.community_case_workspace
+            .publication_ui(ui, &self.app_settings.community_cache);
+    }
+
+    fn community_case_time_label(unix: i64) -> String {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0).map_or_else(
+            || "invalid signed time".to_owned(),
+            |time| time.format("%Y-%m-%d %H:%M UTC").to_string(),
+        )
+    }
+
+    fn community_case_artifact_label(
+        artifact: rw_community_protocol::CaseArtifactType,
+    ) -> &'static str {
+        match artifact {
+            rw_community_protocol::CaseArtifactType::Annotation => "annotation",
+            rw_community_protocol::CaseArtifactType::DerivedTable => "derived table",
+            rw_community_protocol::CaseArtifactType::Overlay => "overlay",
+            rw_community_protocol::CaseArtifactType::RenderedImage => "rendered image",
+        }
     }
 
     /// Display preferences (Settings ▸ Display).
@@ -2046,6 +2326,33 @@ impl ViewerApp {
         );
         self.remembered_section(
             ui,
+            "settings_community_cache",
+            "Community Cache",
+            false,
+            |app, ui| {
+                app.community_cache_settings_section(ui);
+            },
+        );
+        self.remembered_section(
+            ui,
+            "settings_public_origin_federation",
+            "Public origin federation",
+            false,
+            |app, ui| {
+                app.federation_settings_section(ui);
+            },
+        );
+        self.remembered_section(
+            ui,
+            "settings_generation_publication",
+            "Owner generation publication",
+            false,
+            |app, ui| {
+                app.generation_publication_settings_section(ui);
+            },
+        );
+        self.remembered_section(
+            ui,
             "settings_performance",
             "Performance",
             false,
@@ -2146,6 +2453,887 @@ impl ViewerApp {
         }
         if let Some(path) = styles::styles_path() {
             ui.weak(format!("Appearance: {}", path.display()));
+        }
+    }
+
+    fn generation_publication_settings_section(&mut self, ui: &mut egui::Ui) {
+        let original = self.app_settings.generation_publication.clone();
+        let mut edited = original.clone();
+        let warning = egui::Color32::from_rgb(244, 194, 92);
+
+        ui.weak(
+            "Advanced owner workflow for publishing a complete processed private WRF/ArWen rw-store generation to one trusted Rusty Weather origin over conventional authenticated HTTPS.",
+        );
+        ui.weak(
+            "This setting is independent of Community Cache. It never uploads through TURN, never contacts another user, and never starts or resumes publication when BowEcho opens.",
+        );
+        ui.checkbox(
+            &mut edited.enabled,
+            "Enable explicit owner generation publication",
+        );
+        ui.separator();
+
+        ui.label("Trusted origin ID");
+        ui.add_enabled(
+            false,
+            egui::TextEdit::singleline(&mut edited.trusted_origin_id)
+                .desired_width(ui.available_width()),
+        )
+        .on_hover_text(
+            "The initial release deliberately admits only the compiled hetzner-primary trust slot.",
+        );
+        ui.label("Trusted Rusty Weather HTTPS origin");
+        ui.add(
+            egui::TextEdit::singleline(&mut edited.trusted_origin_url)
+                .hint_text("https://models.example.org")
+                .desired_width(ui.available_width()),
+        );
+        ui.label("Opaque owner principal SHA-256");
+        ui.add(
+            egui::TextEdit::singleline(&mut edited.owner_principal_sha256)
+                .hint_text("64 lowercase hex characters issued by the origin")
+                .desired_width(ui.available_width())
+                .font(egui::TextStyle::Monospace),
+        )
+        .on_hover_text(
+            "This is an opaque owner binding, not an account name, email, path, token, or secret. It is persisted so Prepare can bind identity while offline.",
+        );
+
+        let token_id = egui::Id::new("generation_publication_origin_token_draft");
+        let status_id = egui::Id::new("generation_publication_origin_token_status");
+        let mut token = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<String>(token_id).unwrap_or_default());
+        let mut credential_status = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<String>(status_id).unwrap_or_default());
+        ui.label("Origin owner bearer (OS credential vault only)");
+        ui.add(
+            egui::TextEdit::singleline(&mut token)
+                .password(true)
+                .hint_text("Paste short-lived or revocable owner credential")
+                .desired_width(ui.available_width()),
+        );
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(token_id, token.clone()));
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !token.trim().is_empty(),
+                    egui::Button::new("Save in OS vault"),
+                )
+                .clicked()
+            {
+                credential_status =
+                    match crate::generation_publication::save_origin_credentials_from_app(
+                        &edited, &token,
+                    ) {
+                        Ok(()) => {
+                            token.clear();
+                            "Saved an origin-bound owner credential in the OS vault.".to_owned()
+                        }
+                        Err(error) => format!("Credential was not saved: {error}"),
+                    };
+            }
+            if ui.button("Delete vault credential").clicked() {
+                credential_status =
+                    match crate::generation_publication::delete_origin_credentials_from_app(&edited)
+                    {
+                        Ok(true) => {
+                            "Deleted the credential for this exact origin binding.".to_owned()
+                        }
+                        Ok(false) => {
+                            "No credential existed for this exact origin binding.".to_owned()
+                        }
+                        Err(error) => format!("Credential was not deleted: {error}"),
+                    };
+            }
+        });
+        ui.ctx().data_mut(|data| data.insert_temp(token_id, token));
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(status_id, credential_status.clone()));
+        if !credential_status.is_empty() {
+            ui.weak(&credential_status);
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("Publication bounds").strong());
+        egui::Grid::new("generation_publication_bounds")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Maximum generation");
+                ui.add(
+                    egui::DragValue::new(&mut edited.max_generation_gib)
+                        .range(1..=4096)
+                        .suffix(" GiB"),
+                );
+                ui.end_row();
+                ui.label("Maximum local spool");
+                ui.add(
+                    egui::DragValue::new(&mut edited.max_spool_gib)
+                        .range(2..=8192)
+                        .suffix(" GiB"),
+                );
+                ui.end_row();
+                ui.label("Maximum files");
+                ui.add(egui::DragValue::new(&mut edited.max_files).range(3..=65_538));
+                ui.end_row();
+                ui.label("Maximum chunks");
+                ui.add(egui::DragValue::new(&mut edited.max_chunks).range(1..=1_000_000));
+                ui.end_row();
+                ui.label("Chunk size");
+                ui.add(
+                    egui::DragValue::new(&mut edited.chunk_mib)
+                        .range(1..=64)
+                        .suffix(" MiB"),
+                );
+                ui.end_row();
+                ui.label("Maximum manifest");
+                ui.add(
+                    egui::DragValue::new(&mut edited.max_manifest_mib)
+                        .range(1..=32)
+                        .suffix(" MiB"),
+                );
+                ui.end_row();
+                ui.label("Maximum retention");
+                ui.add(
+                    egui::DragValue::new(&mut edited.max_retention_days)
+                        .range(1..=366)
+                        .suffix(" days"),
+                );
+                ui.end_row();
+                ui.label("Default retention");
+                ui.add(
+                    egui::DragValue::new(&mut edited.default_retention_days)
+                        .range(1..=edited.max_retention_days.max(1))
+                        .suffix(" days"),
+                );
+                ui.end_row();
+            });
+        ui.weak(
+            "Prepare remains available offline but admits conservatively against current total spool usage. Publish fetches and enforces the origin's current advertised limits and owner quota before begin.",
+        );
+
+        ui.separator();
+        ui.label(egui::RichText::new("Mandatory attribution").strong());
+        ui.weak(
+            "Review these values for every publication. ECMWF attribution and processing notice are locked and appended automatically whenever ECMWF lineage is present.",
+        );
+        let text_row = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
+            ui.label(label);
+            ui.add(
+                egui::TextEdit::singleline(value)
+                    .hint_text(hint)
+                    .desired_width(ui.available_width()),
+            );
+        };
+        text_row(
+            ui,
+            "Provider ID",
+            &mut edited.attribution_provider,
+            "owner-lab",
+        );
+        text_row(
+            ui,
+            "Notice",
+            &mut edited.attribution_notice,
+            "Required attribution notice",
+        );
+        text_row(
+            ui,
+            "Source URL",
+            &mut edited.attribution_source_url,
+            "https://...",
+        );
+        text_row(
+            ui,
+            "License",
+            &mut edited.attribution_license,
+            "License / owner authorization",
+        );
+        text_row(
+            ui,
+            "License URL",
+            &mut edited.attribution_license_url,
+            "https://...",
+        );
+        text_row(
+            ui,
+            "Terms URL",
+            &mut edited.attribution_terms_url,
+            "https://...",
+        );
+        text_row(
+            ui,
+            "Disclaimer",
+            &mut edited.attribution_disclaimer,
+            "Research use disclaimer",
+        );
+        text_row(
+            ui,
+            "Modification notice",
+            &mut edited.modification_notice,
+            "Processing/subsetting performed",
+        );
+
+        ui.separator();
+        ui.colored_label(
+            warning,
+            "Only deep-valid closed rw-store generations are accepted. Raw wrfout, arbitrary files/directories, symlinks/reparse points, unsigned private directories, and PublicProvider grants cannot enter this workflow.",
+        );
+        ui.weak(
+            "Published model/run identity remains byte-exact with run.json and every .rws hour. If another owner already occupies that identity, the origin returns a conflict; re-import under a unique run identity. A future import-time opaque namespace may improve this, but publication never fabricates one or rewrites science bytes.",
+        );
+        ui.weak(
+            "The trusted HTTPS operator sees your connection IP and necessary request metadata. Other BowEcho users do not see your address and Community Cache is not involved.",
+        );
+
+        if edited != original {
+            self.app_settings.generation_publication = edited;
+            if let Some(dock) = self.model_dock.as_mut() {
+                dock.set_generation_publication_settings(&self.app_settings.generation_publication);
+            }
+            self.mark_app_settings_dirty();
+        }
+    }
+
+    fn community_cache_settings_section(&mut self, ui: &mut egui::Ui) {
+        let original = self.app_settings.community_cache.clone();
+        let mut edited = original.clone();
+
+        ui.weak(
+            "Operational data always uses the verified local cache, R2, then the Rusty Weather / Hetzner HTTPS origin. It never invokes the community relay.",
+        );
+        ui.weak(
+            "Explicit cold-historical recovery can separately use a TURN-only encrypted Community Cache copy after local and R2 miss, then falls back to archival HTTPS or unavailable.",
+        );
+        ui.separator();
+
+        ui.label("Rusty Weather / Hetzner origin (HTTPS)");
+        ui.add(
+            egui::TextEdit::singleline(&mut edited.origin_url)
+                .hint_text("https://...")
+                .desired_width(ui.available_width()),
+        )
+        .on_hover_text(
+            "Public HTTPS base URL only. User-info, query strings, fragments, and embedded tokens are rejected.",
+        );
+
+        ui.label("R2 hot-object URL (optional, HTTPS)");
+        ui.add(
+            egui::TextEdit::singleline(&mut edited.r2_hot_object_url)
+                .hint_text("https://...")
+                .desired_width(ui.available_width()),
+        )
+        .on_hover_text("Optional public HTTPS base URL for frequently requested cache objects");
+
+        ui.label("Legacy origin key · rw-origin-v1 (Ed25519, base64)");
+        ui.add(
+            egui::TextEdit::singleline(&mut edited.manifest_public_key_base64)
+                .hint_text("32-byte public key; base64")
+                .desired_width(ui.available_width())
+                .font(egui::TextStyle::Monospace),
+        )
+        .on_hover_text(
+            "Existing single-key installs keep this mapping during rotation. Non-secret verification keys only; never put bearer tokens or private keys here.",
+        );
+
+        ui.label("Trusted origin rotation keys (key_id:base64)");
+        let mut remove_rotation_key = None;
+        for (index, entry) in edited.trusted_origin_signing_keys.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(entry)
+                        .hint_text("rw-origin-v2:base64-public-key")
+                        .desired_width((ui.available_width() - 70.0).max(120.0))
+                        .font(egui::TextStyle::Monospace),
+                );
+                if ui.small_button("Remove").clicked() {
+                    remove_rotation_key = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove_rotation_key {
+            edited.trusted_origin_signing_keys.remove(index);
+        }
+        let legacy_key_count = usize::from(!edited.manifest_public_key_base64.trim().is_empty());
+        if ui
+            .add_enabled(
+                edited.trusted_origin_signing_keys.len() + legacy_key_count
+                    < settings::MAX_COMMUNITY_ORIGIN_SIGNING_KEYS,
+                egui::Button::new("Add rotation key"),
+            )
+            .clicked()
+        {
+            edited.trusted_origin_signing_keys.push(String::new());
+        }
+        ui.weak(
+            "Up to 8 explicitly pinned keys may overlap during rotation. Duplicate IDs or public keys, malformed entries, and unknown signing IDs fail closed; BowEcho never trusts a key advertised by a server.",
+        );
+
+        let origin_valid = settings::public_https_base_url_is_valid(&edited.origin_url);
+        let r2_valid = settings::optional_public_https_base_url_is_valid(&edited.r2_hot_object_url);
+        let key_valid = settings::community_origin_keyring_is_valid(
+            &edited.manifest_public_key_base64,
+            &edited.trusted_origin_signing_keys,
+        );
+        let ready = origin_valid && r2_valid && key_valid;
+        if edited.enabled && !ready {
+            edited.enabled = false;
+        }
+        let ok = egui::Color32::from_rgb(108, 218, 142);
+        let warning = egui::Color32::from_rgb(244, 194, 92);
+        if origin_valid {
+            ui.colored_label(ok, "Origin URL is valid HTTPS.");
+        } else {
+            ui.colored_label(warning, "A public HTTPS origin URL is required.");
+        }
+        if !r2_valid {
+            ui.colored_label(warning, "R2 URL must be blank or a public HTTPS base URL.");
+        }
+        if key_valid {
+            ui.colored_label(ok, "Origin signing keyring is valid and explicitly pinned.");
+        } else {
+            ui.colored_label(
+                warning,
+                "Configure 1–8 unique key_id:Ed25519 public-key mappings (the legacy field maps to rw-origin-v1).",
+            );
+        }
+        egui::CollapsingHeader::new("Origin account · optional")
+            .id_salt("community_cache_origin_account")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.weak(
+                    "If the origin requires a bearer token, BowEcho stores it only in this device's operating-system credential vault.",
+                );
+                let token_id = egui::Id::new("community_cache_origin_token_draft");
+                let status_id = egui::Id::new("community_cache_origin_token_status");
+                let mut token: String = ui
+                    .ctx()
+                    .data(|data| data.get_temp(token_id))
+                    .unwrap_or_default();
+                let mut token_status: Option<(bool, String)> =
+                    ui.ctx().data(|data| data.get_temp(status_id));
+                ui.add(
+                    egui::TextEdit::singleline(&mut token)
+                        .hint_text("bearer token")
+                        .password(true)
+                        .desired_width(ui.available_width()),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    let can_save = !token.trim().is_empty();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("Save securely"))
+                        .clicked()
+                    {
+                        let result = crate::community_credentials::CommunityOriginCredentials::new(
+                            &token,
+                        )
+                        .and_then(|credentials| {
+                            crate::community_credentials::save_credentials(&credentials)
+                        });
+                        match result {
+                            Ok(()) => {
+                                token.clear();
+                                token_status = Some((true, "Origin token saved securely.".to_owned()));
+                            }
+                            Err(error) => token_status = Some((false, error.to_string())),
+                        }
+                    }
+                    if ui.button("Check vault").clicked() {
+                        match crate::community_credentials::load_credentials() {
+                            Ok(Some(_)) => {
+                                token_status =
+                                    Some((true, "An origin token is stored securely.".to_owned()));
+                            }
+                            Ok(None) => {
+                                token_status = Some((true, "No origin token is stored.".to_owned()));
+                            }
+                            Err(error) => token_status = Some((false, error.to_string())),
+                        }
+                    }
+                    if ui.button("Forget").clicked() {
+                        match crate::community_credentials::delete_credentials() {
+                            Ok(true) => {
+                                token.clear();
+                                token_status =
+                                    Some((true, "Stored origin token removed.".to_owned()));
+                            }
+                            Ok(false) => {
+                                token_status = Some((true, "No origin token was stored.".to_owned()));
+                            }
+                            Err(error) => token_status = Some((false, error.to_string())),
+                        }
+                    }
+                });
+                if let Some((success, message)) = &token_status {
+                    ui.colored_label(if *success { ok } else { warning }, message);
+                }
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(token_id, token);
+                    data.insert_temp(status_id, token_status);
+                });
+            });
+        if ui
+            .add_enabled(
+                ready,
+                egui::Checkbox::new(&mut edited.enabled, "Enable Community Cache"),
+            )
+            .on_disabled_hover_text("Configure a valid HTTPS origin and pinned public key first")
+            .changed()
+        {
+            ui.ctx().request_repaint();
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("Download/cache allowlist").strong());
+        ui.checkbox(&mut edited.soundings_profiles, "Soundings / profiles");
+        ui.checkbox(&mut edited.point_series, "Point series");
+        ui.checkbox(&mut edited.native_windows_tiles, "Native windows / tiles");
+        ui.checkbox(&mut edited.temporal_diurnal, "Temporal / diurnal products");
+        ui.checkbox(
+            &mut edited.explicit_case_rooms,
+            "Published case rooms and artifacts",
+        );
+        ui.weak(
+            "These are the HTTPS cache categories. Arbitrary files and private directories are never eligible. Private WRF/ArWen publication requires a separate deliberate owner action and confirmed redistribution rights.",
+        );
+
+        ui.separator();
+        ui.label(egui::RichText::new("Resource limits").strong());
+        panel_kit::row(ui, "Disk allowance", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut edited.disk_allowance_gib)
+                    .range(1..=2_048)
+                    .suffix(" GiB"),
+            );
+        });
+        panel_kit::row(ui, "Download cap", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut edited.download_cap_mib_per_hour)
+                    .range(1..=1_048_576)
+                    .suffix(" MiB/hour"),
+            );
+        });
+        panel_kit::row(ui, "Relay upload cap", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut edited.upload_cap_mib_per_hour)
+                    .range(1..=1_048_576)
+                    .suffix(" MiB/hour"),
+            )
+            .on_hover_text(
+                "Applies only to explicit cold-object seeding; operational HTTPS never uploads",
+            );
+        });
+        panel_kit::row(ui, "Monthly transfer", |ui| {
+            ui.add(
+                egui::DragValue::new(&mut edited.monthly_transfer_cap_gib)
+                    .range(1..=10_000)
+                    .suffix(" GiB"),
+            );
+        });
+        panel_kit::row(ui, "Concurrent downloads", |ui| {
+            ui.add(egui::DragValue::new(&mut edited.max_concurrent_downloads).range(1..=16));
+        });
+        ui.weak(
+            "Disk, hourly, monthly, and concurrency limits apply fail-closed. Relay service quotas, cost thresholds, and its global kill switch can impose stricter limits.",
+        );
+        ui.checkbox(
+            &mut edited.pause_sharing_on_metered_networks,
+            "Pause relay seeding on metered networks",
+        )
+        .on_hover_text(
+            "On by default. This blocks relay uploads/seeding only; it never pauses operational HTTPS downloads.",
+        );
+
+        ui.separator();
+        ui.label(egui::RichText::new("Cold historical relay · advanced").strong());
+        ui.weak(
+            "Initial transport is intentionally limited to origin-signed profiles and point series no larger than 64 KiB. Native/geographic windows, temporal products, and case artifacts use archival HTTPS fallback until a bounded sliding-window transport passes release gates.",
+        );
+        ui.label("Pinned relay credential key (Ed25519, base64)");
+        ui.add(
+            egui::TextEdit::singleline(&mut edited.relay_public_key_base64)
+                .hint_text("relay public key; never a private key")
+                .desired_width(ui.available_width())
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.label("Trusted relay rotation keys (key_id:base64)");
+        let mut remove_relay_key = None;
+        for (index, entry) in edited.trusted_relay_signing_keys.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(entry)
+                        .hint_text("rw-relay-v2:base64-public-key")
+                        .desired_width((ui.available_width() - 70.0).max(120.0))
+                        .font(egui::TextStyle::Monospace),
+                );
+                if ui.small_button("Remove").clicked() {
+                    remove_relay_key = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove_relay_key {
+            edited.trusted_relay_signing_keys.remove(index);
+        }
+        let legacy_relay_key_count = usize::from(!edited.relay_public_key_base64.trim().is_empty());
+        if ui
+            .add_enabled(
+                edited.trusted_relay_signing_keys.len() + legacy_relay_key_count
+                    < settings::MAX_COMMUNITY_RELAY_SIGNING_KEYS,
+                egui::Button::new("Add relay rotation key"),
+            )
+            .clicked()
+        {
+            edited.trusted_relay_signing_keys.push(String::new());
+        }
+        ui.weak(
+            "Relay verification keys are local trust pins. Rotation may overlap up to 8 keys; removing a pin immediately removes objects and credentials signed only by that key from eligibility.",
+        );
+        egui::CollapsingHeader::new("Audited TURN provider allocation ranges")
+            .id_salt("community_cache_turn_ranges")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.weak(
+                    "Deployment-managed CIDRs only. Empty or malformed ranges reject all routes; host, server-reflexive, LAN, and direct candidates are never accepted.",
+                );
+                let mut remove_range = None;
+                for (index, range) in edited
+                    .relay_provider_allocation_cidrs
+                    .iter_mut()
+                    .enumerate()
+                {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(range)
+                                .hint_text("provider allocation CIDR")
+                                .desired_width((ui.available_width() - 70.0).max(120.0))
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if ui.small_button("Remove").clicked() {
+                            remove_range = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove_range {
+                    edited.relay_provider_allocation_cidrs.remove(index);
+                }
+                if edited.relay_provider_allocation_cidrs.len() < 128
+                    && ui.button("Add provider range").clicked()
+                {
+                    edited.relay_provider_allocation_cidrs.push(String::new());
+                }
+            });
+        let mut relay_candidate = edited.clone();
+        relay_candidate.historical_relay_enabled = true;
+        let relay_prerequisites = relay_candidate.historical_relay_ready();
+        if edited.historical_relay_enabled && !relay_prerequisites {
+            edited.historical_relay_enabled = false;
+            edited.historical_relay_seeding_enabled = false;
+        }
+        ui.add_enabled(
+            relay_prerequisites,
+            egui::Checkbox::new(
+                &mut edited.historical_relay_enabled,
+                "Enable explicit cold-historical relay retrieval",
+            ),
+        )
+        .on_disabled_hover_text(
+            "Enable Community Cache and configure a pinned relay key plus audited provider ranges first",
+        );
+        if !edited.historical_relay_enabled {
+            edited.historical_relay_seeding_enabled = false;
+        }
+        ui.add_enabled(
+            edited.historical_relay_enabled,
+            egui::Checkbox::new(
+                &mut edited.historical_relay_seeding_enabled,
+                "Seed already verified eligible cold objects",
+            ),
+        );
+        let unmetered_changed = ui
+            .add_enabled(
+                edited.historical_relay_seeding_enabled,
+                egui::Checkbox::new(
+                    &mut self.community_relay_network_unmetered_confirmed,
+                    "I confirm this session's network is unmetered",
+                ),
+            )
+            .on_hover_text(
+                "Session-only and off again after restart. Unknown networks are conservatively treated as metered, so seeding remains paused.",
+            )
+            .changed();
+        if edited.historical_relay_enabled && ui.small_button("Stop relay now").clicked() {
+            edited.historical_relay_enabled = false;
+            edited.historical_relay_seeding_enabled = false;
+            self.community_relay_network_unmetered_confirmed = false;
+            if let Some(runtime) = &self.community_relay_runtime {
+                runtime.reconfigure(&edited, settings::community_cache_dir(), false);
+            }
+        }
+        if let Some(runtime) = &self.community_relay_runtime {
+            let status = runtime.status();
+            ui.separator();
+            ui.label(egui::RichText::new("Runtime").strong());
+            ui.label(status.summary());
+            ui.weak(format!(
+                "Verified eligible: {}  ·  advertised: {}  ·  recovered: {}  ·  archival fallbacks: {}",
+                status.verified_seed_objects,
+                status.advertised_objects,
+                status.recovered_objects,
+                status.archival_fallbacks,
+            ));
+            if let Some(code) = status.last_failure_code {
+                ui.colored_label(warning, format!("Last closed failure: {code}"));
+            }
+        }
+        ui.weak(
+            "The operator must separately verify current provider pricing and enable capacity/security gates. Cloudflare's published Realtime terms currently describe a shared 1,000 GB/month SFU+TURN allowance, then $0.05/GB edge-to-client including TURN overhead; terms and account treatment can change, so this is not a permanent guarantee.",
+        );
+
+        ui.separator();
+        ui.label(egui::RichText::new("Privacy").strong());
+        ui.weak(
+            "Other users never see your IP address. The service operator sees the IP and request/transfer metadata necessary to operate, secure, and limit the service.",
+        );
+        ui.weak(
+            "Cold community transfers are TURN-only and end-to-end encrypted. Other users never receive your address, provider allocation, or credentials; there is no STUN, ICE, LAN discovery, or direct fallback.",
+        );
+
+        let settings_changed = edited != original;
+        if settings_changed {
+            self.app_settings.community_cache = edited;
+            let client = crate::community_cache::CommunityCacheClient::from_settings(
+                &self.app_settings.community_cache,
+                settings::community_cache_dir(),
+            )
+            .ok();
+            if let Some(dock) = self.model_dock.as_mut() {
+                dock.set_community_cache_client(client);
+                dock.set_federation_settings(
+                    &self.app_settings.community_cache,
+                    &self.app_settings.federation,
+                );
+            }
+            self.mark_app_settings_dirty();
+        }
+        if (settings_changed || unmetered_changed)
+            && let Some(runtime) = &self.community_relay_runtime
+        {
+            runtime.reconfigure(
+                &self.app_settings.community_cache,
+                settings::community_cache_dir(),
+                self.community_relay_network_unmetered_confirmed,
+            );
+        }
+    }
+
+    fn federation_settings_section(&mut self, ui: &mut egui::Ui) {
+        let original = self.app_settings.federation.clone();
+        let mut edited = original.clone();
+        let ok = egui::Color32::from_rgb(108, 218, 142);
+        let warning = egui::Color32::from_rgb(244, 194, 92);
+
+        ui.weak(
+            "BowEcho talks only to the configured authoritative Rusty Weather / Hetzner HTTPS origin. After a normal local/R2/origin miss, that authority may fetch from an independently pinned university or lab and re-sign the exact object.",
+        );
+        ui.weak(
+            "Institutional addresses are deliberately public. BowEcho never contacts them, never forwards the authority bearer, and never puts ordinary Community Cache participants in this catalog.",
+        );
+        ui.checkbox(
+            &mut edited.enabled,
+            "Enable authority-mediated public-origin failover",
+        );
+        ui.separator();
+
+        ui.label(egui::RichText::new("Authority catalog signing pins").strong());
+        let mut remove_catalog_key = None;
+        for (index, key) in edited.catalog_signing_keys.iter_mut().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut key.key_id)
+                        .hint_text("catalog-key-id")
+                        .desired_width(150.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut key.public_key_base64)
+                        .hint_text("Ed25519 public key; base64")
+                        .desired_width((ui.available_width() - 70.0).max(180.0))
+                        .font(egui::TextStyle::Monospace),
+                );
+                if ui.small_button("Remove").clicked() {
+                    remove_catalog_key = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove_catalog_key {
+            edited.catalog_signing_keys.remove(index);
+        }
+        if edited.catalog_signing_keys.len() < settings::MAX_FEDERATION_CATALOG_SIGNING_KEYS
+            && ui.button("Add catalog key pin").clicked()
+        {
+            edited
+                .catalog_signing_keys
+                .push(settings::FederationPinnedKeySettings::default());
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("Approved public origins").strong());
+        ui.weak(
+            "Each origin ID and its descriptor keys are pinned independently from the authority catalog. A catalog cannot bootstrap a new institution by itself.",
+        );
+        let mut remove_origin = None;
+        for (origin_index, origin) in edited.approved_origins.iter_mut().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Origin ID");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut origin.origin_id)
+                            .hint_text("university-or-lab-id")
+                            .desired_width(220.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if ui.small_button("Remove origin").clicked() {
+                        remove_origin = Some(origin_index);
+                    }
+                });
+                let mut remove_key = None;
+                for (key_index, key) in origin.descriptor_signing_keys.iter_mut().enumerate() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak("Descriptor key");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut key.key_id)
+                                .hint_text("descriptor-key-id")
+                                .desired_width(150.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut key.public_key_base64)
+                                .hint_text("Ed25519 public key; base64")
+                                .desired_width((ui.available_width() - 70.0).max(180.0))
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if ui.small_button("Remove").clicked() {
+                            remove_key = Some(key_index);
+                        }
+                    });
+                }
+                if let Some(index) = remove_key {
+                    origin.descriptor_signing_keys.remove(index);
+                }
+                if origin.descriptor_signing_keys.len()
+                    < settings::MAX_FEDERATION_DESCRIPTOR_KEYS_PER_ORIGIN
+                    && ui.small_button("Add descriptor key pin").clicked()
+                {
+                    origin
+                        .descriptor_signing_keys
+                        .push(settings::FederationPinnedKeySettings::default());
+                }
+            });
+        }
+        if let Some(index) = remove_origin {
+            edited.approved_origins.remove(index);
+        }
+        if edited.approved_origins.len() < settings::MAX_FEDERATION_APPROVED_ORIGINS
+            && ui.button("Add approved public origin").clicked()
+        {
+            edited
+                .approved_origins
+                .push(settings::FederationApprovedOriginSettings {
+                    origin_id: String::new(),
+                    descriptor_signing_keys: vec![settings::FederationPinnedKeySettings::default()],
+                });
+        }
+
+        ui.separator();
+        egui::CollapsingHeader::new("Revocations")
+            .id_salt("federation_revocations")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.weak(
+                    "Revoked IDs remain explicit and fail closed. Remove a revocation only as a deliberate trust-policy change.",
+                );
+                ui.label("Revoked origin IDs");
+                let mut remove = None;
+                for (index, value) in edited.revoked_origin_ids.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(value)
+                                .hint_text("revoked-origin-id")
+                                .desired_width((ui.available_width() - 70.0).max(180.0))
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove {
+                    edited.revoked_origin_ids.remove(index);
+                }
+                if edited.revoked_origin_ids.len() < settings::MAX_FEDERATION_REVOCATIONS
+                    && ui.small_button("Add revoked origin").clicked()
+                {
+                    edited.revoked_origin_ids.push(String::new());
+                }
+
+                ui.label("Revoked signing key IDs");
+                let mut remove = None;
+                for (index, value) in edited.revoked_key_ids.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(value)
+                                .hint_text("revoked-key-id")
+                                .desired_width((ui.available_width() - 70.0).max(180.0))
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove {
+                    edited.revoked_key_ids.remove(index);
+                }
+                if edited.revoked_key_ids.len() < settings::MAX_FEDERATION_REVOCATIONS
+                    && ui.small_button("Add revoked key").clicked()
+                {
+                    edited.revoked_key_ids.push(String::new());
+                }
+            });
+
+        if edited.trust_ready() {
+            ui.colored_label(ok, "Federation trust policy is bounded and fully pinned.");
+        } else {
+            ui.colored_label(
+                warning,
+                "Trust policy is incomplete, duplicated, revoked, malformed, or over its bound; federation remains off.",
+            );
+        }
+        if !self.app_settings.community_cache.phase1_active() {
+            ui.colored_label(
+                warning,
+                "Configure and enable the authoritative Community Cache HTTPS path first.",
+            );
+        }
+
+        if edited != original {
+            self.app_settings.federation = edited;
+            if let Some(dock) = self.model_dock.as_mut() {
+                dock.set_federation_settings(
+                    &self.app_settings.community_cache,
+                    &self.app_settings.federation,
+                );
+            }
+            self.mark_app_settings_dirty();
+        }
+
+        ui.separator();
+        if let Some(dock) = self.model_dock.as_mut() {
+            dock.federation_discovery_ui(ui);
+        } else {
+            ui.weak("Open the Model workspace to start signed public-origin discovery.");
         }
     }
 

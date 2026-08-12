@@ -12,12 +12,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use rustwx_core::{
-    CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
-};
+use rustwx_core::{CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid};
 use rw_store::{
-    DerivedFieldInput, RwsExactTime, WrittenHour, write_hour_from_fields_with_derived,
-    write_hour_from_fields_with_derived_exact,
+    DerivedFieldInput, HourIngestWriter, RwResult, RwStoreError, RwsExactTime, RwsSourceProvenance,
+    WrittenHour, write_hour_from_fields_with_derived,
 };
 use serde::{Deserialize, Serialize};
 
@@ -287,16 +285,114 @@ pub struct WrfExactProcessSummary {
 }
 
 struct WrfHourFields {
-    canonical: Vec<(String, SelectedField2D)>,
+    grid: LatLonGrid,
+    projection: Option<GridProjection>,
+    canonical: Vec<OwnedCanonicalField>,
     derived: Vec<OwnedDerivedField>,
     volumes: Vec<IsoVolume>,
     notes: Vec<String>,
+}
+
+impl WrfHourFields {
+    fn is_empty(&self) -> bool {
+        self.canonical.is_empty() && self.derived.is_empty() && self.volumes.is_empty()
+    }
+}
+
+struct OwnedCanonicalField {
+    name: String,
+    selector: FieldSelector,
+    units: String,
+    values: Vec<f32>,
 }
 
 struct OwnedDerivedField {
     name: String,
     units: String,
     values: Vec<f32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_wrf_hour_fields(
+    store_root: &Path,
+    model: &str,
+    run: &str,
+    storage_slot: u16,
+    exact_time: Option<RwsExactTime>,
+    fields: &WrfHourFields,
+    source_provenance: &RwsSourceProvenance,
+    writer_build: &str,
+    written_unix: u64,
+) -> RwResult<WrittenHour> {
+    if fields.is_empty() {
+        return Err(RwStoreError::Format(
+            "write_hour requires at least one 2-D field, derived plane, or pressure volume"
+                .to_owned(),
+        ));
+    }
+
+    let cells = fields.grid.shape.len();
+    let (nx, ny) = (fields.grid.shape.nx, fields.grid.shape.ny);
+    for field in &fields.canonical {
+        if field.values.len() != cells {
+            return Err(RwStoreError::Format(format!(
+                "2D field '{}': plane holds {} values, expected {cells} ({ny} x {nx})",
+                field.name,
+                field.values.len()
+            )));
+        }
+    }
+    for field in &fields.derived {
+        if field.values.len() != cells {
+            return Err(RwStoreError::Format(format!(
+                "derived 2D field '{}': plane holds {} values, expected {cells} ({ny} x {nx})",
+                field.name,
+                field.values.len()
+            )));
+        }
+    }
+
+    let mut writer = match exact_time {
+        Some(exact_time) => HourIngestWriter::begin_exact(
+            store_root,
+            model,
+            run,
+            storage_slot,
+            exact_time,
+            &fields.grid,
+            fields.projection.as_ref(),
+            writer_build,
+        )?,
+        None => HourIngestWriter::begin(
+            store_root,
+            model,
+            run,
+            storage_slot,
+            &fields.grid,
+            fields.projection.as_ref(),
+            writer_build,
+        )?,
+    };
+    writer.set_source_provenance(vec![source_provenance.clone()])?;
+    for field in &fields.canonical {
+        let selector = serde_json::to_value(&field.selector).map_err(|error| {
+            RwStoreError::Meta(format!("2D field '{}': selector JSON: {error}", field.name))
+        })?;
+        writer.add_field_2d(&field.name, &field.units, selector, &field.values)?;
+    }
+    for field in &fields.derived {
+        writer.add_derived_2d(&field.name, &field.units, &field.values)?;
+    }
+    for volume in &fields.volumes {
+        let input = volume.as_input();
+        writer.add_volume(
+            input.name,
+            input.units,
+            input.selector_template,
+            &input.levels,
+        )?;
+    }
+    writer.finish(written_unix)
 }
 
 pub fn spawn_process_paths(
@@ -332,6 +428,35 @@ pub fn spawn_process_paths(
     WrfProcessTask { label, rx }
 }
 
+/// Decide whether the desktop may use its legacy/post-processed reader or
+/// must preserve native WRF scene-inventory validation. Native inputs may not
+/// silently downgrade to ordinal slots when inventory reports duplicate,
+/// nonmonotonic, mixed-grid/run, or otherwise invalid exact-time scenes.
+fn checked_native_inventory<T>(
+    native_raw: &[bool],
+    inventory: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let native_count = native_raw.iter().filter(|native| **native).count();
+    if native_count == 0 {
+        return Ok(None);
+    }
+    if native_count != native_raw.len() {
+        return Err(
+            "Selection mixes native raw WRF and legacy/post-processed NetCDF inputs; process them separately so exact-time scenes cannot fall back to ordinal slots"
+                .to_owned(),
+        );
+    }
+    inventory().map(Some)
+}
+
+fn is_native_raw_wrf(path: &Path) -> bool {
+    let Ok(file) = WrfFile::open(path) else {
+        return false;
+    };
+    file.clear_cache();
+    true
+}
+
 /// Desktop full/bulk import prefers the exact-time scene pipeline for native
 /// raw WRF. The established processor remains the compatibility fallback for
 /// postprocessed archives (which `WrfFile` cannot inventory) and for legacy
@@ -352,39 +477,46 @@ fn process_desktop_paths(
         return Err("No supported WRF files selected".to_owned());
     }
 
-    if let Ok(selected) = inventory_selected_wrf_paths(&files)
-        && selected
+    let native_raw = files
+        .iter()
+        .map(|path| is_native_raw_wrf(path))
+        .collect::<Vec<_>>();
+    if let Some(selected) =
+        checked_native_inventory(&native_raw, || inventory_selected_wrf_paths(&files))?
+    {
+        if selected
             .group
             .scenes
             .iter()
             .all(|scene| scene.time.is_authoritative())
-        && parse_wrf_internal_time(&selected.group.key.run_domain.run.0).is_some()
-    {
-        let run = process_run_name(&files);
-        let mut progress = |message: String| {
-            let _ = tx.send(WrfProcessMessage::Progress(message));
-        };
-        let mut committed = |commit: WrfProcessCommit| {
-            let _ = tx.send(WrfProcessMessage::Committed(commit));
-        };
-        let mut summary = process_scene_group_exact_with_commit(
-            &selected.group,
-            store_root,
-            &run,
-            options,
-            &mut progress,
-            &mut committed,
-        )?
-        .process;
-        summary.notes.extend(
-            selected
-                .notes
-                .into_iter()
-                .map(|note| format!("{}: {}", note.source_name, note.message)),
-        );
-        summary.notes.sort();
-        summary.notes.dedup();
-        return Ok(summary);
+            && parse_wrf_internal_time(&selected.group.key.run_domain.run.0).is_some()
+        {
+            let run = process_run_name(&files);
+            let mut progress = |message: String| {
+                let _ = tx.send(WrfProcessMessage::Progress(message));
+            };
+            let mut committed = |commit: WrfProcessCommit| {
+                let _ = tx.send(WrfProcessMessage::Committed(commit));
+            };
+            let mut summary = process_scene_group_exact_with_commit(
+                &selected.group,
+                store_root,
+                &run,
+                options,
+                &mut progress,
+                &mut committed,
+            )?
+            .process;
+            summary.notes.extend(
+                selected
+                    .notes
+                    .into_iter()
+                    .map(|note| format!("{}: {}", note.source_name, note.message)),
+            );
+            summary.notes.sort();
+            summary.notes.dedup();
+            return Ok(summary);
+        }
     }
 
     process_paths(&files, store_root, options, tx)
@@ -480,12 +612,11 @@ fn process_paths(
     let mut written = Vec::<WrittenHour>::new();
     let mut all_vars = Vec::<String>::new();
     let mut all_notes = Vec::<String>::new();
-    if let Ok(metadata) = crate::wrf_source::WrfRunSourceMetadata::inspect(&files[0])
-        && let Err(error) =
-            crate::wrf_source::write_run_metadata(store_root, &model, &run, metadata)
-    {
-        all_notes.push(format!("WRF source metadata was not saved: {error}"));
-    }
+    let source_metadata = crate::wrf_source::WrfRunSourceMetadata::inspect(&files[0])
+        .unwrap_or_else(|_| crate::wrf_source::WrfRunSourceMetadata::generic_wrf());
+    crate::wrf_source::write_run_metadata(store_root, &model, &run, source_metadata.clone())
+        .map_err(|error| format!("WRF source metadata is required: {error}"))?;
+    let source_provenance = source_metadata.store_provenance()?;
 
     for path in &files {
         if written.len() > u16::MAX as usize {
@@ -555,6 +686,13 @@ fn process_paths(
                         now_unix(),
                     )
                     .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
+                    crate::wrf_source::stamp_hour_source_provenance(
+                        store_root,
+                        &model,
+                        &run,
+                        hour,
+                        &source_metadata,
+                    )?;
                     all_vars.extend(result.vars.iter().cloned());
                     written.push(result);
                     let _ = tx.send(WrfProcessMessage::Committed(WrfProcessCommit {
@@ -590,41 +728,22 @@ fn process_paths(
                 let _ = tx.send(WrfProcessMessage::Progress(message));
             };
             let fields = read_wrf_products(&file, path, timeidx, options, &mut progress)?;
-            if fields.canonical.is_empty() {
+            if fields.is_empty() {
                 return Err(format!(
-                    "WRF {} time {} produced no canonical 2D grid fields",
+                    "WRF {} time {} produced no storable grid fields",
                     path.display(),
                     timeidx
                 ));
             }
 
-            let refs = fields
-                .canonical
-                .iter()
-                .map(|(name, field)| (name.as_str(), field))
-                .collect::<Vec<_>>();
-            let derived_refs = fields
-                .derived
-                .iter()
-                .map(|field| DerivedFieldInput {
-                    name: field.name.as_str(),
-                    units: field.units.as_str(),
-                    values: field.values.as_slice(),
-                })
-                .collect::<Vec<_>>();
-            let volume_inputs = fields
-                .volumes
-                .iter()
-                .map(IsoVolume::as_input)
-                .collect::<Vec<_>>();
-            let result = write_hour_from_fields_with_derived(
+            let result = write_wrf_hour_fields(
                 store_root,
                 &model,
                 &run,
                 hour,
-                &refs,
-                &derived_refs,
-                &volume_inputs,
+                None,
+                &fields,
+                &source_provenance,
                 writer_build(),
                 now_unix(),
             )
@@ -726,11 +845,9 @@ fn process_scene_group_exact_with_commit(
     let mut files_seen = BTreeSet::<PathBuf>::new();
     let mut previous_precipitation = None::<(i64, Vec<f32>)>;
     let source_metadata = crate::wrf_source::WrfRunSourceMetadata::from_scene_group(group);
-    if let Err(error) =
-        crate::wrf_source::write_run_metadata(store_root, &model, run, source_metadata)
-    {
-        all_notes.push(format!("WRF source metadata was not saved: {error}"));
-    }
+    crate::wrf_source::write_run_metadata(store_root, &model, run, source_metadata.clone())
+        .map_err(|error| format!("WRF source metadata is required: {error}"))?;
+    let source_provenance = source_metadata.store_provenance()?;
 
     for (index, scene) in group.scenes.iter().enumerate() {
         if !group.key.is_compatible(scene) {
@@ -784,9 +901,9 @@ fn process_scene_group_exact_with_commit(
 
         let mut fields =
             read_wrf_products(&file, &scene.path, scene.time_index, &options, progress)?;
-        if fields.canonical.is_empty() {
+        if fields.is_empty() {
             return Err(format!(
-                "WRF {} time {} produced no canonical 2D grid fields",
+                "WRF {} time {} produced no storable grid fields",
                 scene.path.display(),
                 scene.time_index
             ));
@@ -796,35 +913,15 @@ fn process_scene_group_exact_with_commit(
             &mut previous_precipitation,
             valid_time.timestamp(),
         );
-        let refs = fields
-            .canonical
-            .iter()
-            .map(|(name, field)| (name.as_str(), field))
-            .collect::<Vec<_>>();
-        let derived_refs = fields
-            .derived
-            .iter()
-            .map(|field| DerivedFieldInput {
-                name: field.name.as_str(),
-                units: field.units.as_str(),
-                values: field.values.as_slice(),
-            })
-            .collect::<Vec<_>>();
-        let volume_inputs = fields
-            .volumes
-            .iter()
-            .map(IsoVolume::as_input)
-            .collect::<Vec<_>>();
         let hour_exact_time = exact_time.clone();
-        let result = write_hour_from_fields_with_derived_exact(
+        let result = write_wrf_hour_fields(
             store_root,
             &model,
             run,
             storage_slot,
-            exact_time,
-            &refs,
-            &derived_refs,
-            &volume_inputs,
+            Some(exact_time),
+            &fields,
+            &source_provenance,
             writer_build(),
             now_unix(),
         )
@@ -945,6 +1042,8 @@ fn read_wrf_products(
     let projection = wrf_projection(file);
 
     let mut fields = WrfHourFields {
+        grid,
+        projection,
         canonical: Vec::new(),
         derived: Vec::new(),
         volumes: Vec::new(),
@@ -954,17 +1053,7 @@ fn read_wrf_products(
     macro_rules! push_core {
         ($wrf:expr, $store:expr, $selector:expr, $units:expr) => {
             if options.should_process($wrf, Some($store), WrfProductGroup::Core) {
-                push_canonical(
-                    &mut fields,
-                    file,
-                    timeidx,
-                    &grid,
-                    projection.clone(),
-                    $wrf,
-                    $store,
-                    $selector,
-                    $units,
-                );
+                push_canonical(&mut fields, file, timeidx, $wrf, $store, $selector, $units);
             }
         };
     }
@@ -1016,8 +1105,6 @@ fn read_wrf_products(
             &mut fields,
             file,
             timeidx,
-            &grid,
-            projection.clone(),
             "WSPD10MAX",
             "wind_gust_10m",
             FieldSelector::height_agl(CanonicalField::WindGust, 10),
@@ -1038,8 +1125,6 @@ fn read_wrf_products(
             Ok(output) => match single_plane(output, shape.len()) {
                 Ok((values, _units)) => push_canonical_values(
                     &mut fields,
-                    &grid,
-                    projection.clone(),
                     "surface_pressure",
                     FieldSelector::surface(CanonicalField::Pressure),
                     "Pa",
@@ -1074,8 +1159,6 @@ fn read_wrf_products(
     {
         push_canonical_values(
             &mut fields,
-            &grid,
-            projection.clone(),
             "apcp",
             FieldSelector::surface(CanonicalField::TotalPrecipitation),
             "kg/m^2",
@@ -1148,7 +1231,10 @@ fn read_wrf_products(
 
     for requested in &options.extra_variables {
         let store_name = requested_store_variable_name(requested);
-        let already_present = fields.canonical.iter().any(|(name, _)| name == &store_name)
+        let already_present = fields
+            .canonical
+            .iter()
+            .any(|field| field.name == store_name)
             || fields.derived.iter().any(|field| field.name == store_name);
         if already_present {
             continue;
@@ -1189,7 +1275,7 @@ fn read_wrf_products(
                 // Split wrf3d files (CONUS404 / GDEX CONUS-II) omit PSFC (and
                 // sometimes T2/Td2/winds); synthesize any missing surface field
                 // from the lowest model level so the sounding still builds.
-                fill_missing_surface(&mut fields, &grid, projection.clone(), surface);
+                fill_missing_surface(&mut fields, surface);
             }
             Err(err) => fields
                 .notes
@@ -1222,12 +1308,7 @@ fn read_wrf_products(
 /// lowest-model-level [`SurfaceFallback`]. Real 2D fields (T2, U10, V10, …)
 /// already pushed win; only the genuinely-missing ones (chiefly
 /// `surface_pressure`) are synthesized.
-fn fill_missing_surface(
-    fields: &mut WrfHourFields,
-    grid: &LatLonGrid,
-    projection: Option<GridProjection>,
-    surface: SurfaceFallback,
-) {
+fn fill_missing_surface(fields: &mut WrfHourFields, surface: SurfaceFallback) {
     let entries: [(&str, FieldSelector, &str, Vec<f32>); 5] = [
         (
             "surface_pressure",
@@ -1261,20 +1342,8 @@ fn fill_missing_surface(
         ),
     ];
     for (name, selector, units, values) in entries {
-        if !fields
-            .canonical
-            .iter()
-            .any(|(existing, _)| existing == name)
-        {
-            push_canonical_values(
-                fields,
-                grid,
-                projection.clone(),
-                name,
-                selector,
-                units,
-                values,
-            );
+        if !fields.canonical.iter().any(|field| field.name == name) {
+            push_canonical_values(fields, name, selector, units, values);
         }
     }
 }
@@ -1284,24 +1353,16 @@ fn push_canonical(
     fields: &mut WrfHourFields,
     file: &WrfFile,
     timeidx: usize,
-    grid: &LatLonGrid,
-    projection: Option<GridProjection>,
     wrf_name: &str,
     store_name: &str,
     selector: FieldSelector,
     units: Option<&str>,
 ) {
     match compute_var(file, wrf_name, timeidx, units) {
-        Ok(output) => match single_plane(output, grid.shape.len()) {
-            Ok((values, actual_units)) => push_canonical_values(
-                fields,
-                grid,
-                projection,
-                store_name,
-                selector,
-                &actual_units,
-                values,
-            ),
+        Ok(output) => match single_plane(output, fields.grid.shape.len()) {
+            Ok((values, actual_units)) => {
+                push_canonical_values(fields, store_name, selector, &actual_units, values)
+            }
             Err(err) => fields.notes.push(format!("{wrf_name} skipped: {err}")),
         },
         Err(err) => fields.notes.push(format!("{wrf_name} unavailable: {err}")),
@@ -1310,26 +1371,28 @@ fn push_canonical(
 
 fn push_canonical_values(
     fields: &mut WrfHourFields,
-    grid: &LatLonGrid,
-    projection: Option<GridProjection>,
     store_name: &str,
     selector: FieldSelector,
     units: &str,
     values: Vec<f32>,
 ) {
-    match SelectedField2D::new(selector, units, grid.clone(), values) {
-        Ok(field) => {
-            let field = if let Some(projection) = projection {
-                field.with_projection(projection)
-            } else {
-                field
-            };
-            fields.canonical.push((store_name.to_string(), field));
-        }
-        Err(err) => fields
+    let expected = fields.grid.shape.len();
+    if values.len() != expected {
+        let error = rustwx_core::RustwxError::InvalidFieldDataLength {
+            expected,
+            actual: values.len(),
+        };
+        fields
             .notes
-            .push(format!("{store_name} skipped: invalid field: {err}")),
+            .push(format!("{store_name} skipped: invalid field: {error}"));
+        return;
     }
+    fields.canonical.push(OwnedCanonicalField {
+        name: store_name.to_owned(),
+        selector,
+        units: units.to_owned(),
+        values,
+    });
 }
 
 fn push_derived_output(
@@ -1498,8 +1561,8 @@ fn add_interval_precipitation(
     let Some(current) = fields
         .canonical
         .iter()
-        .find(|(name, _)| name == "apcp")
-        .map(|(_, field)| field.values.clone())
+        .find(|field| field.name == "apcp")
+        .map(|field| field.values.clone())
     else {
         fields
             .notes
@@ -2009,6 +2072,35 @@ mod tests {
     }
 
     #[test]
+    fn desktop_native_inventory_errors_and_mixed_inputs_do_not_fall_back() {
+        let invalid: Result<Option<()>, String> = checked_native_inventory(&[true, true], || {
+            Err("WRF selection contains duplicate valid times".to_owned())
+        });
+        assert_eq!(
+            invalid.unwrap_err(),
+            "WRF selection contains duplicate valid times",
+            "a malformed native exact-time inventory must reach the user"
+        );
+
+        let mixed: Result<Option<()>, String> = checked_native_inventory(&[true, false], || {
+            panic!("mixed inputs stop before inventory")
+        });
+        assert!(
+            mixed.unwrap_err().contains("mixes native raw WRF"),
+            "native and legacy inputs must not share an ordinal fallback run"
+        );
+
+        let legacy: Result<Option<()>, String> = checked_native_inventory(&[false, false], || {
+            panic!("legacy post-processed inputs bypass native scene inventory")
+        });
+        assert_eq!(
+            legacy.unwrap(),
+            None,
+            "uniform legacy inputs retain the supported compatibility path"
+        );
+    }
+
+    #[test]
     fn derived_split_names_are_stable() {
         assert_eq!(derived_name("uvmet10", Some(0)), "wrf_uvmet10_u");
         assert_eq!(derived_name("cloudfrac", Some(2)), "wrf_cloudfrac_high");
@@ -2021,15 +2113,16 @@ mod tests {
         let shape = GridShape::new(values.len(), 1).unwrap();
         let grid =
             LatLonGrid::new(shape, vec![35.0; values.len()], vec![-97.0; values.len()]).unwrap();
-        let field = SelectedField2D::new(
-            FieldSelector::surface(CanonicalField::TotalPrecipitation),
-            "kg/m^2",
-            grid,
+        let field = OwnedCanonicalField {
+            name: "apcp".to_owned(),
+            selector: FieldSelector::surface(CanonicalField::TotalPrecipitation),
+            units: "kg/m^2".to_owned(),
             values,
-        )
-        .unwrap();
+        };
         WrfHourFields {
-            canonical: vec![("apcp".to_owned(), field)],
+            grid,
+            projection: None,
+            canonical: vec![field],
             derived: Vec::new(),
             volumes: Vec::new(),
             notes: Vec::new(),
@@ -2037,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_interval_precipitation_is_timed_and_never_invents_a_reset() {
+    fn wrf_processing_shared_grid_precipitation_is_timed_and_never_invents_a_reset() {
         let mut previous = None;
         let mut first = precipitation_fields(vec![1.0, 2.0]);
         assert_eq!(
@@ -2074,6 +2167,183 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("accumulator decreased"))
         );
+    }
+
+    #[test]
+    fn wrf_processing_shared_grid_writer_accepts_a_derived_only_hour() {
+        let mut fields = precipitation_fields(vec![1.5, 3.25]);
+        fields.canonical.clear();
+        fields.derived.push(OwnedDerivedField {
+            name: "sbcape".to_owned(),
+            units: "J/kg".to_owned(),
+            values: vec![500.0, 750.0],
+        });
+        assert!(
+            !fields.is_empty(),
+            "derived products make an hour storable without canonical fields"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let written = write_wrf_hour_fields(
+            root.path(),
+            "wrf",
+            "derived-only",
+            0,
+            Some(RwsExactTime::new(300, 1_700_000_300)),
+            &fields,
+            &crate::wrf_source::WrfRunSourceMetadata::generic_wrf()
+                .store_provenance()
+                .unwrap(),
+            "derived-only-test",
+            1_700_000_400,
+        )
+        .expect("derived-only hour writes through the shared-grid path");
+        assert_eq!(written.vars, vec!["sbcape"]);
+        let reader = rw_store::reader::HourReader::open(&written.path).unwrap();
+        assert_eq!(reader.meta().variables[0].name, "sbcape");
+    }
+
+    #[test]
+    fn wrf_processing_shared_grid_writer_matches_selected_field_wrapper_bytes() {
+        fn normalized_manifest(path: &Path) -> serde_json::Value {
+            fn remove_encode_timings(value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::Object(fields) => {
+                        fields.remove("encode_ms");
+                        for value in fields.values_mut() {
+                            remove_encode_timings(value);
+                        }
+                    }
+                    serde_json::Value::Array(values) => {
+                        for value in values {
+                            remove_encode_timings(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut manifest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            remove_encode_timings(&mut manifest);
+            manifest
+        }
+
+        let mut fields = precipitation_fields(vec![1.5, 3.25]);
+        let projection = GridProjection::LambertConformal {
+            standard_parallel_1_deg: 30.0,
+            standard_parallel_2_deg: 60.0,
+            central_meridian_deg: -97.0,
+        };
+        fields.projection = Some(projection.clone());
+        fields.derived.push(OwnedDerivedField {
+            name: "precip_interval".to_owned(),
+            units: "kg/m^2".to_owned(),
+            values: vec![0.5, 1.25],
+        });
+        fields.volumes.push(IsoVolume {
+            name: "temperature_iso".to_owned(),
+            units: "K".to_owned(),
+            // Deliberately unsorted: both paths must retain add_volume's
+            // descending-level validation/sort and deferred variable order.
+            levels: vec![(850, vec![280.0, 281.0]), (1000, vec![295.0, 296.0])],
+        });
+
+        let canonical = &fields.canonical[0];
+        let old_field = rustwx_core::SelectedField2D::new(
+            canonical.selector.clone(),
+            canonical.units.clone(),
+            fields.grid.clone(),
+            canonical.values.clone(),
+        )
+        .unwrap()
+        .with_projection(projection);
+        let old_fields = [(canonical.name.as_str(), &old_field)];
+        let old_derived = fields
+            .derived
+            .iter()
+            .map(|field| DerivedFieldInput {
+                name: field.name.as_str(),
+                units: field.units.as_str(),
+                values: field.values.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let old_volumes = fields
+            .volumes
+            .iter()
+            .map(IsoVolume::as_input)
+            .collect::<Vec<_>>();
+
+        for (case, storage_slot, exact_time) in [
+            ("legacy", 3, None),
+            ("exact", 7, Some(RwsExactTime::new(5_400, 1_700_005_400))),
+        ] {
+            let shared_root = tempfile::tempdir().unwrap();
+            let wrapper_root = tempfile::tempdir().unwrap();
+            let shared = write_wrf_hour_fields(
+                shared_root.path(),
+                "wrf",
+                "shared-grid",
+                storage_slot,
+                exact_time,
+                &fields,
+                &crate::wrf_source::WrfRunSourceMetadata::generic_wrf()
+                    .store_provenance()
+                    .unwrap(),
+                "byte-identity-test",
+                1_700_006_000,
+            )
+            .unwrap();
+            let wrapper = match exact_time {
+                Some(exact_time) => rw_store::write_hour_from_fields_with_derived_exact(
+                    wrapper_root.path(),
+                    "wrf",
+                    "shared-grid",
+                    storage_slot,
+                    exact_time,
+                    &old_fields,
+                    &old_derived,
+                    &old_volumes,
+                    "byte-identity-test",
+                    1_700_006_000,
+                ),
+                None => write_hour_from_fields_with_derived(
+                    wrapper_root.path(),
+                    "wrf",
+                    "shared-grid",
+                    storage_slot,
+                    &old_fields,
+                    &old_derived,
+                    &old_volumes,
+                    "byte-identity-test",
+                    1_700_006_000,
+                ),
+            }
+            .unwrap();
+            crate::wrf_source::stamp_hour_source_provenance(
+                wrapper_root.path(),
+                "wrf",
+                "shared-grid",
+                storage_slot,
+                &crate::wrf_source::WrfRunSourceMetadata::generic_wrf(),
+            )
+            .unwrap();
+
+            assert_eq!(shared.bytes, wrapper.bytes, "{case} byte count");
+            assert_eq!(shared.vars, wrapper.vars, "{case} variable order");
+            let run = Path::new("wrf").join("shared-grid");
+            for file in ["grid.rwg".to_owned(), format!("f{storage_slot:03}.rws")] {
+                assert_eq!(
+                    std::fs::read(shared_root.path().join(&run).join(&file)).unwrap(),
+                    std::fs::read(wrapper_root.path().join(&run).join(&file)).unwrap(),
+                    "{case} {file}"
+                );
+            }
+            assert_eq!(
+                normalized_manifest(&shared_root.path().join(&run).join("run.json")),
+                normalized_manifest(&wrapper_root.path().join(&run).join("run.json")),
+                "{case} run.json excluding nondeterministic encode_ms"
+            );
+        }
     }
 
     #[test]

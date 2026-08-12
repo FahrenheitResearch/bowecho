@@ -9,7 +9,6 @@
 use eframe::egui;
 use rustwx_products::viewer::UnitConvert;
 use rw_ui::{FieldData, HourKey, StoreView};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -35,7 +34,7 @@ pub(super) struct PointProbeRequest {
 
 #[derive(Clone)]
 pub(super) struct ProbeHistoryRequest {
-    pub store_root: PathBuf,
+    pub store_view: StoreView,
     pub field: Arc<FieldData>,
     /// Optional fixed geographic sample. Domain extrema deliberately do not
     /// require one: their values come from the whole stored grid at each
@@ -351,7 +350,7 @@ fn load_history(
     tx: &mpsc::Sender<TaskMessage>,
     repaint: &egui::Context,
 ) -> Result<HistorySeries, String> {
-    let view = StoreView::new(&request.store_root);
+    let view = &request.store_view;
     let tree = view.enumerate();
     let source_hour = request.field.key.hour.clone();
     let run = tree
@@ -368,7 +367,7 @@ fn load_history(
 
     let variable = request.field.key.var.clone();
     let source_reader = view
-        .open_hour(&source_hour.model, &source_hour.run, source_hour.hour)
+        .open_hour_shared(&source_hour.model, &source_hour.run, source_hour.hour)
         .map_err(|error| format!("Could not open the selected model time: {error}"))?;
     if source_reader.meta().exact_time() != source_hour.exact_time {
         return Err("The selected model time no longer matches its store manifest".to_owned());
@@ -433,7 +432,7 @@ fn load_history(
             exact_time: entry.exact_time,
         };
         let loaded = view
-            .open_hour(&hour.model, &hour.run, hour.hour)
+            .open_hour_shared(&hour.model, &hour.run, hour.hour)
             .ok()
             .filter(|reader| reader.meta().exact_time() == hour.exact_time)
             .and_then(|reader| {
@@ -522,11 +521,8 @@ fn read_point_value(
     let x = nearest % nx;
     let y = nearest / nx;
     reader
-        .read_window_2d(variable, x, y, x + 1, y + 1)
-        .ok()?
-        .values
-        .first()
-        .copied()
+        .read_point_2d(variable, x, y)
+        .ok()
         .filter(|value| value.is_finite())
 }
 
@@ -888,7 +884,7 @@ mod tests {
     #[test]
     fn feedback_v03412_domain_extrema_requires_neither_grid_nor_map_pin() {
         let request = ProbeHistoryRequest {
-            store_root: PathBuf::from("unused"),
+            store_view: StoreView::new("unused"),
             field: Arc::new(FieldData {
                 key: rw_ui::FieldKey {
                     hour: sample().hour,

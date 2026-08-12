@@ -23,18 +23,22 @@ Grab the latest build from the **[Releases](../../releases)** page:
 
 | Platform | File |
 |---|---|
-| Windows x64 | `bowecho-windows-x64.exe` (or `.zip` with licenses bundled) |
-| Windows x64, CPU from ~2015+ | `bowecho-windows-x64-v3.exe` (AVX2: ~20-30% faster radar rendering) |
-| Windows ARM64 | `bowecho-windows-arm64.exe` |
+| Windows x64 | `bowecho-windows-x64.zip` |
+| Windows x64, CPU from ~2015+ | `bowecho-windows-x64-v3.zip` (AVX2: ~20-30% faster radar rendering) |
+| Windows ARM64 | `bowecho-windows-arm64.zip` |
 | macOS Apple Silicon | `bowecho-macos-apple-silicon.zip` |
 | macOS Intel | `bowecho-macos-intel.zip` |
-| Linux x64 | `bowecho-linux-x64` |
-| Linux ARM64 | `bowecho-linux-arm64` |
+| Linux x64 | `bowecho-linux-x64.tar.gz` |
+| Linux ARM64 | `bowecho-linux-arm64.tar.gz` |
 
-**Windows:** download the `.exe` and run it - that's it. The exe is fully
-self-contained (no installer, no runtime dependencies). Windows builds are not
-yet code-signed, so SmartScreen may show "Windows protected your PC" the first
-time: click **More info -> Run anyway**.
+**Windows:** download the ZIP, extract it, and run `bowecho.exe`. The executable
+is fully self-contained (no installer or runtime dependencies); the archive
+keeps the README and license/attribution notices beside it. The release also
+publishes a byte-identical architecture-specific `.exe` because that exact name
+is part of the in-app updater contract. Windows builds are Authenticode-signed
+when the release job has the Azure Trusted Signing credentials; otherwise they
+are explicitly unsigned and SmartScreen may show "Windows protected your PC"
+the first time. Check the signature and matching checksum as described below.
 
 > **Antivirus false positives.** Windows Defender's machine-learning
 > heuristics sometimes flag new, unsigned Rust executables with names like
@@ -45,22 +49,24 @@ time: click **More info -> Run anyway**.
 > repository (the full build log is public under the Actions tab), and each
 > asset ships with a `.sha256` checksum so you can verify your download is
 > byte-identical to what CI produced:
-> `Get-FileHash bowecho-windows-x64.exe` (PowerShell) and compare. If
+> `Get-FileHash bowecho-windows-x64.zip` (PowerShell) and compare. If
 > Defender quarantines it, restore + add an exclusion, or report the false
 > positive to Microsoft at
 > <https://www.microsoft.com/en-us/wdsi/filesubmission> — developer
 > submissions of `!ml` detections are typically cleared within days. You
 > can always audit and build from source instead (see below).
 
-**macOS:** unzip and open `BowEcho.app`. Release apps are signed and notarized
-when the repository's Apple Developer ID secrets are available. If Gatekeeper
-still shows a first-run warning after a manual download, right-click the app
-and choose **Open** once (or run
+**macOS:** unzip and open `BowEcho.app`. Tagged release apps are required to be
+signed, notarized, stapled, and validated; a tagged build fails instead of
+publishing an unsigned Mac archive. Manually dispatched test artifacts are not
+that release guarantee. If Gatekeeper still shows a first-run warning after a
+manual download, right-click the app and choose **Open** once (or run
 `xattr -d com.apple.quarantine BowEcho.app` in Terminal).
 
-**Linux:** the download is the binary itself - `chmod +x bowecho-linux-x64 &&
-./bowecho-linux-x64` (needs X11/Wayland, OpenGL, and GTK 3.24; these are
-standard on most desktop distributions).
+**Linux:** extract the tarball and run its `bowecho` executable, for example
+`tar -xzf bowecho-linux-x64.tar.gz && ./bowecho-linux-x64/bowecho` (needs
+X11/Wayland, OpenGL, and GTK 3.24; these are standard on most desktop
+distributions). The README and complete release notices stay in that directory.
 
 ## Trust and verification
 
@@ -69,7 +75,7 @@ this repository. Each downloadable asset is published with a `.sha256` file so
 users can verify that a local download matches the CI-built artifact.
 
 ```powershell
-Get-FileHash .\bowecho-windows-x64.exe -Algorithm SHA256
+Get-FileHash .\bowecho-windows-x64.zip -Algorithm SHA256
 ```
 
 Compare the hash with the matching `.sha256` file on the release page. For
@@ -117,6 +123,15 @@ tables, and a colorblind-safe velocity option).
 Shear (LLSD rotation), Radial Divergence — computed volume-locally in tens of
 milliseconds and selectable like any product.
 
+**Models workspace:** a plot-first local/remote workflow turns supported Rusty
+Weather and imported stores into arbitrary geographic-domain maps, soundings
+and profiles, point time series, exact native-index windows, selected
+pressure-level windows, and capability-declared temporal/diurnal products.
+Typed ensemble statistics are shown only when the exact run/hour publishes
+them; BowEcho does not infer members or missing products. Every remote result
+keeps its signed model, run, valid-time, grid, query, recipe, provenance, and
+attribution identity through the map, native plot, and local cache paths.
+
 **Model analysis:** **Windows > Formula Lab** opens a first-class dockable
 workspace for safe custom diagnostics. Its stored-model source follows the
 same model/run/time selection as Models; compatible quick starts and the field
@@ -127,6 +142,27 @@ unlocks grid-aware horizontal and vertical calculus. Normal extensionless
 Models viewer, radar-map layer, and native plot workflow with an automatic
 color scale spanning the finite output range; an exact saved color binding
 takes precedence when one exists.
+
+**Community Cache (opt-in):** BowEcho can use signed, content-addressed Rusty
+Weather query objects from a bounded local cache, an optional R2 hot-object
+endpoint, and a configured HTTPS origin. Operational requests always stay on
+local → R2 → Hetzner/Rusty Weather HTTPS. Separately opted-in cold historical
+profile and point objects (initially at most 64 KiB) may be recovered or seeded
+through an encrypted TURN-only Community Cache after local/R2 miss; larger
+products use archival HTTPS fallback. Direct peer connectivity is permanently
+excluded. Origin key rotation, expiry eviction, metered pause, quotas, cost
+stops, and the server kill switch all fail closed. See the
+[Community Cache guide](docs/community-cache.md) for the trust boundary,
+privacy model, eligible products, and configuration.
+
+**Private WRF and ArWen publication:** owners can explicitly freeze and publish
+a rights-confirmed processed generation to a trusted Rusty Weather HTTPS origin.
+This is a separate, authenticated owner workflow, never an automatic share or
+peer transfer. See [Owner generation publication](docs/owner-generation-publication.md)
+for the confirmation, provenance, recovery, and revocation contract. BowEcho
+also embeds the Apache-2.0 ArWen Studio control plane in the WRF workspace; its
+vendored scope and external-engine boundary are recorded in the
+[ArWen Studio vendor record](docs/arwen-studio/VENDOR.md).
 
 **Scientific guides:** the [Formula Lab reference](docs/formula-lab.md)
 documents syntax, units, source capabilities, numerical operators, examples,
@@ -151,13 +187,13 @@ placefiles (icon sheets, Object blocks, auto-refresh). An experimental
 **Vertical Wind Profile (VWP)** retrieves winds from dealiased radial velocity
 in the loaded PPI volume and exposes its sampling and fit-quality diagnostics.
 
-**Velocity dealiasing** offers two engines: region-based unfolding
-(Jing & Wiener 1993; Feldmann et al. 2020) — validated on real derecho data
-at 99% residual-fold reduction — and an experimental tilt-cascade engine that
-branch-checks each tilt against the wind fit from the tilt above
-(Browning & Wexler 1968; Louf et al. 2020). Raw-velocity mode always carries
-a "folds possible" tag plus near-Nyquist warnings in the inspector. The
-algorithms and their references are documented in
+**Velocity dealiasing** offers four engines: optimized Region Global
+(the default Py-ART-style same-sweep network solve), opt-in RIFT (Region
+Global plus conservative gate-resolution refinement), Region Fast (the
+legacy/local same-tilt solver), and Analyst v4 (a higher-cost whole-volume
+solver with temporal and environmental anchors). Raw-velocity mode always
+carries a "folds possible" tag plus near-Nyquist warnings in the inspector.
+The algorithms and their references are documented in
 [docs/products-guide.md](docs/products-guide.md).
 
 **Display:** 1/2/4-pane synced grids with per-pane products and honest
@@ -246,6 +282,11 @@ During severe weather, follow your local NWS office and emergency management.
 - Crowd-sourced weather reports from **mPING** (NOAA National Severe Storms
   Laboratory / University of Oklahoma). Convective outlooks from
   **ESTOFEX**.
+- **U.S. Census Bureau** cartographic boundary data: 2024 state/county
+  boundaries and the 2023 1:500,000 place-boundary set used for embedded U.S.
+  map geometry and town labels.
+- **Natural Earth** public-domain country, regional administrative, and
+  populated-place data used by the embedded global basemap.
 
 ### Contributed work
 
@@ -262,7 +303,8 @@ During severe weather, follow your local NWS office and emergency management.
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option. License and
-attribution notices for derived and embedded third-party work (SHARPpy and
-the sounding-window port, fonts, basemap data) are collected in
+Dual-licensed under MIT or Apache-2.0, at your option. License and attribution
+notices for derived and embedded third-party work (including SHARPpy, the
+sounding-window port, Py-ART-derived dealiasing, ArWen Studio, fonts, and
+basemap data) are collected in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

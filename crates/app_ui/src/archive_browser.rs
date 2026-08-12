@@ -35,10 +35,10 @@ use ui_core::worker_slot::{SlotMessage, StreamState};
 use crate::{
     ACTIVE_LOAD_POLL_MS, ArchiveLoadProgress, AsyncLoadResult, AsyncLoadUpdate, DecodedLoad,
     DecodedLoadBatch, DisplayTimeZone, FeedSource, FrameStatus, LoadTimings,
-    MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, SpcReport, ViewerApp,
-    archive_load_progress_row, archive_object_scan_time_utc, cache_dir, compact_intl_identity,
-    decode_archive_history_object, fetch_assemble_intl_plan, fetch_intl_frame_plan_batch,
-    intl_provider_label, panel_kit, send_archive_progress,
+    MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, ViewerApp, archive_load_progress_row,
+    archive_object_scan_time_utc, cache_dir, compact_intl_identity, decode_archive_history_object,
+    fetch_assemble_intl_plan, fetch_intl_frame_plan_batch, format_site_label, intl_provider_label,
+    panel_kit, send_archive_progress, us_site_kind,
 };
 
 /// Capability answers are values, not missing branches (spec §1.3): the
@@ -501,8 +501,6 @@ impl ViewerApp {
                 }
             },
         }
-        ui.separator();
-        self.spc_reports_browser_section(ui, ctx);
     }
 
     /// The US archive listing body — moved VERBATIM from the old
@@ -512,6 +510,36 @@ impl ViewerApp {
         // (The loop transport renders above this section in the DATA tab —
         // archive browsing shouldn't need a tab switch to play what it just
         // loaded.)
+        let mut selected_site_index = self.selected_site_index;
+        let original_site_index = selected_site_index;
+        panel_kit::row(ui, "Radar site", |ui| {
+            let selected = self
+                .sites
+                .get(selected_site_index)
+                .map(format_site_label)
+                .unwrap_or_else(|| "Choose site".to_owned());
+            egui::ComboBox::from_id_salt("archive_site_combo")
+                .selected_text(selected)
+                .width(176.0)
+                .show_ui(ui, |ui| {
+                    for (index, site) in self.sites.iter().enumerate() {
+                        if matches!(
+                            us_site_kind(site),
+                            data_source::sites::SiteKind::Wsr88d
+                                | data_source::sites::SiteKind::Tdwr
+                        ) {
+                            ui.selectable_value(
+                                &mut selected_site_index,
+                                index,
+                                format_site_label(site),
+                            );
+                        }
+                    }
+                });
+        });
+        if selected_site_index != original_site_index {
+            self.select_us_archive_site(selected_site_index);
+        }
         panel_kit::row(ui, "Manual picker frames", |ui| {
             // Right-to-left: the frame count at the row edge, +5 older to
             // its left when a loaded range can grow.
@@ -668,70 +696,20 @@ impl ViewerApp {
         }
     }
 
-    /// The SPC tornado report fetch/jump rows — the tail of the old
-    /// `archive_panel`, moved verbatim; date-based (US storm-report
-    /// data), so it renders under every browser arm.
-    fn spc_reports_browser_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        panel_kit::row(ui, "Tornado reports + tracks", |ui| {
-            let fetching = self.spc_receiver.in_flight();
-            if ui
-                .add_enabled(!fetching, egui::Button::new("Fetch"))
-                .on_hover_text(
-                    "Fetch SPC tornado reports and pin the Event day track layer for this date. Click a report to load a centered archive loop.",
-                )
-                .clicked()
-            {
-                self.start_spc_fetch(ctx);
-            }
-            if fetching {
-                ui.spinner();
-            }
-        });
-        let mut jump: Option<SpcReport> = None;
-        if let Some(reports) = &self.spc_reports {
-            if reports.is_empty() {
-                ui.weak("No tornado reports for that date");
-            } else {
-                ui.weak(format!("{} tornado reports", reports.len()));
-                egui::ScrollArea::vertical()
-                    .id_salt("spc_report_list")
-                    .max_height(170.0)
-                    .show(ui, |ui| {
-                        // Kit select_row: left-aligned truncating monospace
-                        // rows — never centered button text.
-                        for report in reports {
-                            let scale = if report.f_scale.is_empty() || report.f_scale == "UNK" {
-                                String::new()
-                            } else {
-                                format!("EF{} ", report.f_scale)
-                            };
-                            let label = format!(
-                                "{} {}{}, {}",
-                                self.time_zone().format_hm(report.time_utc),
-                                scale,
-                                report.location,
-                                report.state
-                            );
-                            if panel_kit::select_row(
-                                ui,
-                                false,
-                                true,
-                                &label,
-                                Some(
-                                    "Jump: lowest-beam radar + event archive loop before/after this time",
-                                ),
-                            )
-                            .clicked()
-                            {
-                                jump = Some(report.clone());
-                            }
-                        }
-                    });
-            }
-        }
-        if let Some(report) = jump {
-            self.jump_to_spc_report(&report, ctx);
-        }
+    fn select_us_archive_site(&mut self, selected_site_index: usize) {
+        self.selected_site_index = selected_site_index;
+        // A US listing response carries no site identity. Dropping the old
+        // receiver prevents late rows for the previous site from being
+        // installed under the newly selected radar.
+        self.archive_list_receiver = None;
+        self.archive_load_progress = None;
+        self.archive_load_after_listing = false;
+        self.archive_volumes = None;
+        self.archive_loaded_range = None;
+        self.status = self
+            .selected_site()
+            .map(|site| format!("Archive site: {}", site.level2_id))
+            .unwrap_or_else(|| "Choose an archive radar site".to_owned());
     }
 
     /// The international arm of the browser: the same date-nav +
@@ -1410,6 +1388,9 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) {
         self.set_intl_archive_primary_source(&provider_id, &site_id);
+        self.sidebar_tab = crate::SidebarTab::Data;
+        self.archive_browse_mode = crate::ArchiveBrowseMode::SiteAndScan;
+        self.set_section_open("data_archive", true);
         if self.archive_date_input.trim().is_empty() {
             self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
         }
@@ -2255,8 +2236,10 @@ fn intl_row_hover_text(row: &ArchiveScanRow) -> String {
 mod tests {
     use std::cell::Cell;
     use std::collections::BTreeMap;
+    use std::sync::mpsc;
 
     use super::*;
+    use crate::tests::test_viewer_app_with_hazards;
 
     fn s3(key: &str) -> data_source::S3Object {
         data_source::S3Object {
@@ -2274,6 +2257,46 @@ mod tests {
             }],
             merge: false,
         }
+    }
+
+    #[test]
+    fn changing_archive_site_cancels_an_unidentified_stale_listing() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![
+            data_source::RadarSite {
+                level2_id: "KTLX".to_owned(),
+                name: Some("Oklahoma City".to_owned()),
+                latitude_deg: Some(35.33),
+                longitude_deg: Some(-97.28),
+            },
+            data_source::RadarSite {
+                level2_id: "KOHX".to_owned(),
+                name: Some("Nashville".to_owned()),
+                latitude_deg: Some(36.25),
+                longitude_deg: Some(-86.56),
+            },
+        ];
+        let (_sender, receiver) = mpsc::channel();
+        app.archive_list_receiver = Some(receiver);
+        app.archive_load_after_listing = true;
+        app.archive_load_progress = Some(ArchiveLoadProgress {
+            label: "KTLX archive".to_owned(),
+            detail: "Listing".to_owned(),
+            done: 0,
+            total: 1,
+        });
+        app.archive_volumes = Some(Vec::new());
+
+        app.select_us_archive_site(1);
+
+        assert_eq!(
+            app.selected_site().map(|site| site.level2_id.as_str()),
+            Some("KOHX")
+        );
+        assert!(app.archive_list_receiver.is_none());
+        assert!(!app.archive_load_after_listing);
+        assert!(app.archive_load_progress.is_none());
+        assert!(app.archive_volumes.is_none());
     }
 
     #[test]

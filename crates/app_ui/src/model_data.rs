@@ -22,6 +22,254 @@ use crate::sat_plot::{SatellitePlotPanel, SatellitePlotSource};
 
 mod probe_history;
 
+/// Remote output work is deliberately separate from catalog discovery.  One
+/// exact canonical request owns each task; changing any material control
+/// cancels that task and advances the epoch so a late HTTPS response cannot
+/// replace a newer selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteOutputIdentity {
+    epoch: u64,
+    request_sha256: String,
+    mode: ModelWorkspaceMode,
+    model: String,
+    run: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteFetchKind {
+    PointSeries,
+    NativeWindow2D,
+    NativeWindow3D,
+    GeographicWindow,
+    TemporalGrid,
+}
+
+#[derive(Clone)]
+struct RemoteOutputExpected {
+    identity: RemoteOutputIdentity,
+    request: rw_community_protocol::ShareRequest,
+    kind: RemoteFetchKind,
+    run_nx: usize,
+    run_ny: usize,
+    /// Snapshot-bound selectors advertised for the exact requested fields.
+    /// Geographic results echo them so stale or substituted product metadata
+    /// can be rejected before it reaches a plot.
+    variable_selectors: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+enum RemoteOutputLoad {
+    PointSeries {
+        result: rw_query::PointSeriesResult,
+        tier: crate::community_cache::DeliveryTier,
+    },
+    NativeWindow2D {
+        result: Vec<rw_query::IndexWindow2DResult>,
+        tier: crate::community_cache::DeliveryTier,
+    },
+    NativeWindow3D {
+        result: Vec<rw_query::IndexWindow3DResult>,
+        tier: crate::community_cache::DeliveryTier,
+    },
+    GeographicWindow {
+        result: rw_query::GeographicWindowResult,
+        tier: crate::community_cache::DeliveryTier,
+    },
+    TemporalGrid {
+        result: rw_query::TemporalGridResult,
+        tier: crate::community_cache::DeliveryTier,
+    },
+}
+
+struct RemoteOutputTask {
+    expected: RemoteOutputExpected,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    rx: std::sync::mpsc::Receiver<Result<RemoteOutputLoad, String>>,
+}
+
+impl RemoteOutputTask {
+    fn cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for RemoteOutputTask {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+enum RemoteOutputResult {
+    PointSeries {
+        result: rw_query::PointSeriesResult,
+        tier: crate::community_cache::DeliveryTier,
+        request_sha256: String,
+    },
+    Field {
+        field: rw_ui::FieldData,
+        tier: crate::community_cache::DeliveryTier,
+        request_sha256: String,
+        coverage_note: String,
+    },
+    Temporal {
+        result: rw_query::TemporalGridResult,
+        tier: crate::community_cache::DeliveryTier,
+        request_sha256: String,
+        selected_metric: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteTemporalContract {
+    variables: Vec<String>,
+    reducer: String,
+    semantics: String,
+    parameters: std::collections::BTreeMap<String, String>,
+}
+
+/// Local ensemble discovery reads the same immutable run manifest used by
+/// `rw-query`, but does so away from egui's render thread.  The exact selected
+/// [`HourKey`] is the task identity: a late catalog from a replaced run/time
+/// is discarded rather than being offered for the new selection.
+struct LocalEnsembleCatalogTask {
+    hour: HourKey,
+    rx: std::sync::mpsc::Receiver<Result<Vec<rw_query::VariableCapability>, String>>,
+}
+
+enum LocalEnsembleCatalogState {
+    Idle,
+    Loading(HourKey),
+    Ready {
+        hour: HourKey,
+        variables: Vec<rw_query::VariableCapability>,
+    },
+    Error {
+        hour: HourKey,
+        message: String,
+    },
+}
+
+impl Default for LocalEnsembleCatalogState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EnsembleProductGroupKey {
+    field: rustwx_core::CanonicalField,
+    vertical: rustwx_core::VerticalSelector,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EnsembleStoredProduct {
+    variable: String,
+    units: String,
+    kind: String,
+    levels_hpa: Vec<u16>,
+    selector: rustwx_core::FieldSelector,
+    available_samples: usize,
+    expected_samples: usize,
+    coverage: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EnsembleProductGroup {
+    key: EnsembleProductGroupKey,
+    products: Vec<EnsembleStoredProduct>,
+}
+
+/// Small adapter over the local and remote typed catalogs.  Classification
+/// below never inspects a variable name: only a successfully decoded
+/// `FieldSelector.product` can make a field appear in Ensemble mode.
+trait EnsembleCatalogCapability {
+    fn ensemble_name(&self) -> &str;
+    fn ensemble_units(&self) -> &str;
+    fn ensemble_kind(&self) -> &str;
+    fn ensemble_levels_hpa(&self) -> &[u16];
+    fn ensemble_selector(&self) -> &serde_json::Value;
+    fn ensemble_available_slots(&self) -> &[u16];
+    fn ensemble_available_samples(&self) -> usize;
+    fn ensemble_expected_samples(&self) -> usize;
+    fn ensemble_coverage(&self) -> f64;
+}
+
+impl EnsembleCatalogCapability for crate::community_cache::RemoteVariableCapability {
+    fn ensemble_name(&self) -> &str {
+        &self.name
+    }
+
+    fn ensemble_units(&self) -> &str {
+        &self.units
+    }
+
+    fn ensemble_kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn ensemble_levels_hpa(&self) -> &[u16] {
+        &self.levels_hpa
+    }
+
+    fn ensemble_selector(&self) -> &serde_json::Value {
+        &self.selector
+    }
+
+    fn ensemble_available_slots(&self) -> &[u16] {
+        &self.available_slots
+    }
+
+    fn ensemble_available_samples(&self) -> usize {
+        self.available_samples
+    }
+
+    fn ensemble_expected_samples(&self) -> usize {
+        self.expected_samples
+    }
+
+    fn ensemble_coverage(&self) -> f64 {
+        self.coverage
+    }
+}
+
+impl EnsembleCatalogCapability for rw_query::VariableCapability {
+    fn ensemble_name(&self) -> &str {
+        &self.name
+    }
+
+    fn ensemble_units(&self) -> &str {
+        &self.units
+    }
+
+    fn ensemble_kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn ensemble_levels_hpa(&self) -> &[u16] {
+        &self.levels_hpa
+    }
+
+    fn ensemble_selector(&self) -> &serde_json::Value {
+        &self.selector
+    }
+
+    fn ensemble_available_slots(&self) -> &[u16] {
+        &self.available_slots
+    }
+
+    fn ensemble_available_samples(&self) -> usize {
+        self.available_samples
+    }
+
+    fn ensemble_expected_samples(&self) -> usize {
+        self.expected_samples
+    }
+
+    fn ensemble_coverage(&self) -> f64 {
+        self.coverage
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum NativePlotContent {
     #[default]
@@ -41,6 +289,444 @@ enum SoundingRequestMode {
     /// Late store-worker point replies are ignored until a new model request
     /// moves ownership back to `Point` or `BoxPending`.
     External,
+}
+
+/// Data source shown by the plot-first Models workspace. Remote currently
+/// means the configured, authenticated HTTPS catalog; it never implies a
+/// direct peer connection and it never scans local private directories.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModelWorkspaceSource {
+    #[default]
+    LocalStore,
+    RemoteCatalog,
+}
+
+impl ModelWorkspaceSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LocalStore => "Local / downloaded",
+            Self::RemoteCatalog => "Remote (authority)",
+        }
+    }
+}
+
+/// Primary output modes stay visible even when their backing server endpoint
+/// is not yet present. This makes capability gaps explicit without burying
+/// the workflows among import and research tools.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModelWorkspaceMode {
+    #[default]
+    MapPlot,
+    Sounding,
+    PointSeries,
+    WindowTile,
+    TemporalDiurnal,
+    Ensemble,
+}
+
+impl ModelWorkspaceMode {
+    const ALL: [Self; 6] = [
+        Self::MapPlot,
+        Self::Sounding,
+        Self::PointSeries,
+        Self::WindowTile,
+        Self::TemporalDiurnal,
+        Self::Ensemble,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::MapPlot => "Map plot",
+            Self::Sounding => "Sounding",
+            Self::PointSeries => "Point series",
+            Self::WindowTile => "Window / tile",
+            Self::TemporalDiurnal => "Temporal / diurnal",
+            Self::Ensemble => "Ensemble",
+        }
+    }
+}
+
+fn explicit_historical_relay_allowed(mode: ModelWorkspaceMode, opted_in: bool) -> bool {
+    opted_in
+        && matches!(
+            mode,
+            ModelWorkspaceMode::Sounding | ModelWorkspaceMode::PointSeries
+        )
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModelDomainChoice {
+    #[default]
+    FullGrid,
+    ActiveOrSaved,
+    DrawOnMap,
+}
+
+impl ModelDomainChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FullGrid => "Full native grid",
+            Self::ActiveOrSaved => "Active / saved domain",
+            Self::DrawOnMap => "Draw on radar map",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RemoteCatalogState {
+    Idle,
+    Loading,
+    Ready(Vec<crate::community_cache::RemoteModelCatalogEntry>),
+    Error(String),
+}
+
+impl Default for RemoteCatalogState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+struct RemoteCatalogTask {
+    rx: std::sync::mpsc::Receiver<Result<RemoteCatalogLoad, String>>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for RemoteCatalogTask {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+struct FederationRefreshTask {
+    rx: std::sync::mpsc::Receiver<
+        Result<
+            (
+                app_ui::federated_origins::FederatedOriginClient,
+                app_ui::federated_origins::FederationRefreshSummary,
+            ),
+            String,
+        >,
+    >,
+}
+
+enum RemoteCatalogLoad {
+    Models(Vec<crate::community_cache::RemoteModelCatalogEntry>),
+    Runs {
+        model: String,
+        runs: Vec<crate::community_cache::RemoteRunCatalogEntry>,
+    },
+    ProfileCatalog {
+        model: String,
+        run: String,
+        catalog: crate::community_cache::RemoteProfileCatalog,
+    },
+    Sounding(rw_ui::SoundingData),
+}
+
+/// One local-store sounding miss being resolved through the opt-in,
+/// signature-verified Community Cache.  The network work never runs on the
+/// egui thread, and replacing this slot makes the newest point request win.
+struct CommunitySoundingTask {
+    hour: HourKey,
+    fx: f64,
+    fy: f64,
+    rx: std::sync::mpsc::Receiver<Result<rw_ui::SoundingData, String>>,
+}
+
+impl CommunitySoundingTask {
+    fn spawn(
+        client: crate::community_cache::CommunityCacheClient,
+        store_root: PathBuf,
+        hour: HourKey,
+        fx: f64,
+        fy: f64,
+        repaint: egui::Context,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task_hour = hour.clone();
+        std::thread::Builder::new()
+            .name("bowecho-community-sounding".into())
+            .spawn(move || {
+                let result = fetch_community_sounding(&client, &store_root, task_hour, fx, fy);
+                let _ = tx.send(result);
+                repaint.request_repaint();
+            })
+            .expect("spawn Community Cache sounding worker");
+        Self { hour, fx, fy, rx }
+    }
+}
+
+fn fetch_community_sounding(
+    client: &crate::community_cache::CommunityCacheClient,
+    store_root: &Path,
+    hour: HourKey,
+    fx: f64,
+    fy: f64,
+) -> Result<rw_ui::SoundingData, String> {
+    use rw_community_protocol::{
+        DataOrigin, PublicationGrant, REQUEST_SCHEMA, RecipeIdentity, ShareQuery, ShareRequest,
+        SourceProvenance,
+    };
+
+    let started = std::time::Instant::now();
+    let catalog = rw_query::StoreCatalog::new(store_root);
+    let snapshot = catalog
+        .snapshot(&hour.model, &hour.run)
+        .map_err(|_| "Community Cache could not validate the selected model run".to_string())?;
+    let time = snapshot
+        .timepoint(hour.hour)
+        .map_err(|_| "Community Cache could not validate the selected model time".to_string())?;
+    let grid = snapshot.grid();
+    let x = fx.round().clamp(0.0, grid.nx.saturating_sub(1) as f64) as usize;
+    let y = fy.round().clamp(0.0, grid.ny.saturating_sub(1) as f64) as usize;
+    let index = y
+        .checked_mul(grid.nx)
+        .and_then(|base| base.checked_add(x))
+        .ok_or_else(|| "Community Cache grid coordinate overflow".to_string())?;
+    let latitude = *grid
+        .lat
+        .get(index)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| "Community Cache grid latitude is unavailable".to_string())?;
+    let longitude = *grid
+        .lon
+        .get(index)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| "Community Cache grid longitude is unavailable".to_string())?;
+
+    let capabilities = snapshot
+        .variable_capabilities()
+        .map_err(|_| "Community Cache could not inventory the selected model run".to_string())?;
+    let mut pressure_variables = capabilities
+        .iter()
+        .filter(|capability| {
+            capability.kind == "pressure3d" && capability.available_slots.contains(&hour.hour)
+        })
+        .map(|capability| capability.name.clone())
+        .collect::<Vec<_>>();
+    const SURFACE_VARIABLES: &[&str] = &[
+        "temperature_2m",
+        "dewpoint_2m",
+        "u_10m",
+        "v_10m",
+        "surface_pressure",
+        "approx_temperature_2m",
+        "approx_dewpoint_2m",
+        "approx_u_10m",
+        "approx_v_10m",
+        "approx_surface_pressure",
+        "orography",
+        "mslp",
+    ];
+    let mut surface_variables = SURFACE_VARIABLES
+        .iter()
+        .filter(|name| {
+            capabilities.iter().any(|capability| {
+                capability.name == **name
+                    && capability.kind == "surface2d"
+                    && capability.available_slots.contains(&hour.hour)
+            })
+        })
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    pressure_variables.sort();
+    pressure_variables.dedup();
+    surface_variables.sort();
+    surface_variables.dedup();
+    if pressure_variables.is_empty() {
+        return Err("The selected model time has no shareable pressure profile".into());
+    }
+
+    let descriptor = snapshot.descriptor();
+    if !crate::community_cache::automatic_public_provider_run_allowed(
+        &descriptor.model,
+        descriptor
+            .source_provenance
+            .iter()
+            .map(|source| source.provider.as_str()),
+    ) {
+        return Err(
+            "This run has no approved public-source provenance and stays local until its owner explicitly publishes it with confirmed redistribution rights".into(),
+        );
+    }
+    let source_provenance = descriptor
+        .source_provenance
+        .iter()
+        .map(|source| SourceProvenance {
+            provider: source.provider.clone(),
+            roles: source.roles.clone(),
+            products: source.products.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut variables = pressure_variables.clone();
+    variables.extend(surface_variables.iter().cloned());
+    variables.sort();
+    variables.dedup();
+
+    let request = ShareRequest {
+        schema: REQUEST_SCHEMA.into(),
+        model: descriptor.model.clone(),
+        run: descriptor.run.clone(),
+        snapshot_id: descriptor.snapshot_id.clone(),
+        grid_hash: descriptor.grid_hash.clone(),
+        variables,
+        query: ShareQuery::Profile {
+            latitude_e7: (f64::from(latitude) * 10_000_000.0).round() as i32,
+            longitude_e7: (f64::from(longitude) * 10_000_000.0).round() as i32,
+            storage_slot: hour.hour,
+            valid_unix: time.valid_unix,
+            pressure_variables,
+            surface_variables,
+            pressure_levels_hpa: Vec::new(),
+        },
+        recipe: RecipeIdentity {
+            recipe_id: "native-profile".into(),
+            recipe_version: "1".into(),
+            parameters: std::collections::BTreeMap::new(),
+        },
+        source_provenance,
+        publication: PublicationGrant {
+            data_origin: DataOrigin::PublicProvider,
+            explicit_owner_publication: false,
+            redistribution_rights_confirmed: true,
+        },
+    }
+    .normalized();
+
+    let (payload, _) = client
+        .fetch_profile::<rw_query::ProfileResult>(request)
+        .map_err(|_| "Community Cache could not retrieve a verified profile".to_string())?;
+    let profile = payload.profile;
+    let vars = profile
+        .variables
+        .into_iter()
+        .map(|variable| rw_ui::ProfileVar {
+            name: variable.name,
+            units: variable.units,
+            levels_hpa: variable.levels_hpa,
+            values: variable
+                .values
+                .into_iter()
+                .map(|value| value.unwrap_or(f32::NAN))
+                .collect(),
+        })
+        .collect();
+    let surface = payload
+        .surface_samples
+        .into_iter()
+        .filter_map(|sample| {
+            sample.value.map(|value| rw_ui::SurfaceSample {
+                name: sample.variable,
+                units: sample.units,
+                value,
+            })
+        })
+        .collect();
+    Ok(rw_ui::SoundingData {
+        hour,
+        fx,
+        fy,
+        lat: Some(profile.point.grid_latitude),
+        lon: Some(profile.point.grid_longitude),
+        vars,
+        surface,
+        read_ms: started.elapsed().as_secs_f32() * 1_000.0,
+    })
+}
+
+/// Explicit cold path used only by the remote profile/point controls. The
+/// local cache and R2 hot tier get a complete attempt first. A miss can then
+/// load one retained local/R2 signed manifest and enqueue it on the historical-only
+/// relay worker; relay failure falls through to archival HTTPS. Success
+/// returns through the ordinary local cache so every existing payload/schema
+/// check still runs.
+fn prepare_explicit_historical_recovery(
+    client: &crate::community_cache::CommunityCacheClient,
+    dispatcher: &crate::community_relay::CommunityRelayDispatcher,
+    request: &rw_community_protocol::ShareRequest,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    match client.has_verified_local_object(request) {
+        Ok(true) => return Ok(()),
+        Err(crate::community_cache::CommunityCacheError::Quota) => {
+            return Err("Community Cache transfer quota is exhausted".into());
+        }
+        Ok(false) | Err(_) => {}
+    }
+    match client.recover_r2_hot_object(request) {
+        Ok(true) => return Ok(()),
+        Err(crate::community_cache::CommunityCacheError::Quota) => {
+            return Err("Community Cache transfer quota is exhausted".into());
+        }
+        Ok(false) | Err(_) => {}
+    }
+    let manifest = match client.historical_manifest(request) {
+        Ok(manifest) => manifest,
+        // A retained local/R2 identity is required before consulting the
+        // community broker. Its absence is not a terminal data miss: skip
+        // TURN entirely and let the caller's immediately following ordinary
+        // fetch perform the final local -> R2 -> authoritative HTTPS path.
+        Err(error) if historical_identity_transient_miss(&error) => return Ok(()),
+        Err(crate::community_cache::CommunityCacheError::Quota) => {
+            return Err("Community Cache transfer quota is exhausted".into());
+        }
+        // Invalid, expired, malformed, or policy-rejected identity metadata
+        // remains fail closed and must not be hidden as an ordinary miss.
+        Err(_) => {
+            return Err("No valid origin-signed historical identity is available".to_owned());
+        }
+    };
+    let handle = dispatcher
+        .recover_exact_historical(request.clone(), manifest)
+        .map_err(|_| "The historical recovery queue is unavailable".to_owned())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3 * 60);
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            handle.cancel();
+            return Err("Historical recovery was cancelled".into());
+        }
+        match handle.wait_timeout(std::time::Duration::from_millis(100)) {
+            Ok(
+                crate::community_relay::HistoricalRecoveryResult::AlreadyLocal
+                | crate::community_relay::HistoricalRecoveryResult::RecoveredFromR2
+                | crate::community_relay::HistoricalRecoveryResult::RecoveredFromCommunity
+                | crate::community_relay::HistoricalRecoveryResult::RecoveredFromArchivalHttps,
+            ) => return Ok(()),
+            Ok(crate::community_relay::HistoricalRecoveryResult::Unavailable) => {
+                return Err("No verified community or archival copy is available".into());
+            }
+            Ok(crate::community_relay::HistoricalRecoveryResult::Cancelled) => {
+                return Err("Historical recovery was cancelled".into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                if std::time::Instant::now() < deadline => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                handle.cancel();
+                return Err("Historical recovery timed out".into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Historical recovery worker stopped".into());
+            }
+        }
+    }
+}
+
+/// Metadata-tier outages are not object-integrity failures. Without a usable
+/// retained/R2 identity BowEcho cannot safely ask the relay, but it must still
+/// let the caller continue to the ordinary authoritative HTTPS path. Hostile
+/// or malformed identity data intentionally does not enter this list.
+fn historical_identity_transient_miss(error: &crate::community_cache::CommunityCacheError) -> bool {
+    matches!(
+        error,
+        crate::community_cache::CommunityCacheError::Network
+            | crate::community_cache::CommunityCacheError::Unavailable
+            | crate::community_cache::CommunityCacheError::Http(404 | 408)
+    ) || matches!(
+        error,
+        crate::community_cache::CommunityCacheError::Http(status) if (500..=599).contains(status)
+    )
 }
 
 /// Background loader for the synthesized per-level isobaric map fields
@@ -85,6 +771,65 @@ enum ImportJob {
     SyntheticRadarReplay(crate::wrf_radar::SyntheticRadarReplayTask),
 }
 
+/// Keep progressive imports visible without re-enumerating and reopening the
+/// model store after every atomic hour commit. The first commit of a job is
+/// surfaced immediately; later commits share one bounded refresh window, and
+/// terminal completion always performs a final full reconciliation of the
+/// newest exact hour.
+const INCREMENTAL_IMPORT_RESCAN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+#[derive(Debug, Default)]
+struct ImportRescanCoalescer {
+    last_rescan_at: Option<std::time::Instant>,
+    pending: bool,
+    latest_hour: Option<HourKey>,
+}
+
+impl ImportRescanCoalescer {
+    fn on_commit(&mut self, now: std::time::Instant, hour: &HourKey) -> bool {
+        self.latest_hour = Some(hour.clone());
+        let due = self.last_rescan_at.is_none_or(|last| {
+            now.saturating_duration_since(last) >= INCREMENTAL_IMPORT_RESCAN_INTERVAL
+        });
+        if due {
+            self.last_rescan_at = Some(now);
+            self.pending = false;
+            true
+        } else {
+            self.pending = true;
+            false
+        }
+    }
+
+    fn take_due(&mut self, now: std::time::Instant) -> Option<HourKey> {
+        if !self.pending
+            || self.last_rescan_at.is_none_or(|last| {
+                now.saturating_duration_since(last) < INCREMENTAL_IMPORT_RESCAN_INTERVAL
+            })
+        {
+            return None;
+        }
+        self.last_rescan_at = Some(now);
+        self.pending = false;
+        self.latest_hour.clone()
+    }
+
+    /// Complete the current import window, preferring a commit drained in the
+    /// same poll as `Done` over the newest commit observed on an earlier poll.
+    fn finish(&mut self, terminal_hour: Option<HourKey>) -> Option<HourKey> {
+        let final_hour = terminal_hour.or_else(|| self.latest_hour.take());
+        self.reset();
+        final_hour
+    }
+
+    fn reset(&mut self) {
+        self.last_rescan_at = None;
+        self.pending = false;
+        self.latest_hour = None;
+    }
+}
+
 /// Editable + persisted state for the WRF "full diagnostics" processing-
 /// options popover. The four booleans mirror [`crate::wrf_process::
 /// WrfProcessOptions`] product groups; `only_text`/`skip_text` are the raw,
@@ -112,8 +857,8 @@ struct WrfProcessUiState {
     /// by default — the whole point of a bulk import is bulk output.
     #[serde(default = "wrf_default_true")]
     auto_plot: bool,
-    /// Re-enumerate the model store after every atomic WRF hour commit and
-    /// select the newest completed timestep while a folder job continues.
+    /// Select the newest completed timestep while a folder job continues.
+    /// Full store re-enumerations remain progressive but are coalesced.
     #[serde(default = "wrf_default_true")]
     follow_processing: bool,
 }
@@ -1196,12 +1941,24 @@ fn retained_namelist_source(path: Option<&Path>) -> Option<PathBuf> {
 
 pub struct ModelDataDock {
     worker: StoreWorker,
+    /// Clone-shared rw-store view used by the main worker and auxiliary
+    /// history workers so they reuse one bounded retained-reader pool.
+    store_view: StoreView,
     /// egui context, kept so a background import can request repaints while it
     /// runs (its worker threads have no repaint hook of their own).
     repaint: egui::Context,
     store_root: PathBuf,
+    /// WRF workspace surface. ArWen is created lazily so ordinary radar/model
+    /// users pay no tile, probe, or registry cost until they explicitly open it.
+    wrf_arwen_selected: bool,
+    arwen: Option<Box<arwen_studio::StudioApp>>,
     /// Running local WRF/NetCDF import, if any (drained in `poll_import`).
     import_job: Option<ImportJob>,
+    /// Progressive Local/Process refresh policy. Full scans and follow-hour
+    /// loads share the same bounded window while retaining the exact newest key.
+    incremental_rescan: ImportRescanCoalescer,
+    #[cfg(test)]
+    rescan_requests_for_test: usize,
     /// First-class native CM1 inspection/placement window. The panel owns
     /// only UI and metadata inspection state; store work joins `import_job`
     /// so the existing busy guard, pump, rescan, and plot handoff apply.
@@ -1254,6 +2011,60 @@ pub struct ModelDataDock {
     operational_cached_selected: usize,
     /// Last import status line shown under the import controls.
     import_message: Option<String>,
+    /// Plot-first workspace state. Session-only by design: it reorganizes the
+    /// surface without migrating or replacing any persisted specialist tool.
+    workspace_source: ModelWorkspaceSource,
+    workspace_mode: ModelWorkspaceMode,
+    workspace_domain: ModelDomainChoice,
+    local_ensemble_catalog: LocalEnsembleCatalogState,
+    local_ensemble_catalog_task: Option<LocalEnsembleCatalogTask>,
+    local_selected_ensemble_variable: Option<String>,
+    remote_catalog: RemoteCatalogState,
+    remote_catalog_task: Option<RemoteCatalogTask>,
+    /// Signed, independently pinned university/lab discovery. Refreshing is
+    /// always performed on a worker; model bytes remain authority-mediated.
+    federation_settings: settings::FederationSettings,
+    federation_authority_origin: String,
+    federation_proxy_enabled: bool,
+    federation_client: Option<app_ui::federated_origins::FederatedOriginClient>,
+    federation_refresh_task: Option<FederationRefreshTask>,
+    federation_refresh_after: Option<std::time::Instant>,
+    federation_status: Option<String>,
+    federation_preferred_origin_id: Option<String>,
+    remote_selected_model: Option<String>,
+    remote_runs: Vec<crate::community_cache::RemoteRunCatalogEntry>,
+    remote_selected_run: Option<String>,
+    remote_profile_catalog: Option<crate::community_cache::RemoteProfileCatalog>,
+    remote_selected_time: usize,
+    remote_selected_variable: Option<String>,
+    /// Inclusive start/end indices into the advertised exact-time axis for
+    /// point-series and temporal products.
+    remote_range_start: usize,
+    remote_range_end: usize,
+    /// Explicit half-open native-index crop for the separate Window / tile
+    /// workflow. Map plot uses the signed geographic query below and never
+    /// guesses a conversion from dimensions alone.
+    remote_x0: u32,
+    remote_y0: u32,
+    remote_x1: u32,
+    remote_y1: u32,
+    /// Exact geographic request bounds in degrees. Longitude is an eastward
+    /// arc, so west > east intentionally crosses the antimeridian.
+    remote_west_longitude: f64,
+    remote_south_latitude: f64,
+    remote_east_longitude: f64,
+    remote_north_latitude: f64,
+    /// Exactly one pressure level is rendered as one honest 2-D field.  A
+    /// pressure volume is never flattened across levels.
+    remote_selected_level_hpa: Option<u16>,
+    remote_latitude: f64,
+    remote_longitude: f64,
+    remote_detail_status: Option<String>,
+    remote_output_epoch: u64,
+    remote_output_expected: Option<RemoteOutputIdentity>,
+    remote_output_task: Option<RemoteOutputTask>,
+    remote_output_result: Option<RemoteOutputResult>,
+    remote_viewer: FieldViewerPanel,
     tree: Option<StoreTree>,
     browser: RunBrowserPanel,
     viewer: FieldViewerPanel,
@@ -1265,6 +2076,20 @@ pub struct ModelDataDock {
     probe_history: probe_history::ModelProbeHistoryPanel,
     /// Most recent sounding data (kept for the native skew-T window).
     latest_sounding: Option<std::sync::Arc<rw_ui::SoundingData>>,
+    /// Optional Phase 1 signed-HTTPS cache client. Local rw-store reads always
+    /// run first; this is used only after a point-sounding read fails.
+    community_cache_client: Option<crate::community_cache::CommunityCacheClient>,
+    /// Explicit owner publication of complete processed private WRF/ArWen
+    /// generations over conventional authenticated HTTPS. This controller is
+    /// separate from Community Cache and never starts network work on load.
+    generation_publication: crate::generation_publication::GenerationPublicationPanel,
+    /// Historical-only relay command capability. It has no operational fetch
+    /// method and is consulted only after the user checks the explicit cold
+    /// recovery control for a supported profile/point request.
+    community_relay_dispatcher: Option<crate::community_relay::CommunityRelayDispatcher>,
+    remote_historical_recovery: bool,
+    community_sounding_task: Option<CommunitySoundingTask>,
+    pending_point_sounding: Option<(HourKey, f64, f64)>,
     /// Which request owns the reusable sounding surface. This prevents a
     /// late point response from replacing a box mean (and vice versa).
     sounding_request_mode: SoundingRequestMode,
@@ -1409,15 +2234,22 @@ pub struct ModelDataDock {
 impl ModelDataDock {
     pub fn new(ctx: &egui::Context, store_root: PathBuf) -> Self {
         let repaint = ctx.clone();
-        let worker = StoreWorker::spawn(StoreView::new(&store_root), move || {
+        let store_view = StoreView::new(&store_root);
+        let worker = StoreWorker::spawn(store_view.clone(), move || {
             repaint.request_repaint();
         });
         worker.send(StoreRequest::Enumerate);
         Self {
             worker,
+            store_view,
             repaint: ctx.clone(),
             store_root,
+            wrf_arwen_selected: false,
+            arwen: None,
             import_job: None,
+            incremental_rescan: ImportRescanCoalescer::default(),
+            #[cfg(test)]
+            rescan_requests_for_test: 0,
             cm1: crate::cm1_ui::Cm1ImportPanel::default(),
             cm1_open_models_requested: false,
             synthetic_radar_result: None,
@@ -1431,6 +2263,47 @@ impl ModelDataDock {
             operational_cached_inputs: Vec::new(),
             operational_cached_selected: 0,
             import_message: None,
+            workspace_source: ModelWorkspaceSource::LocalStore,
+            workspace_mode: ModelWorkspaceMode::MapPlot,
+            workspace_domain: ModelDomainChoice::FullGrid,
+            local_ensemble_catalog: LocalEnsembleCatalogState::Idle,
+            local_ensemble_catalog_task: None,
+            local_selected_ensemble_variable: None,
+            remote_catalog: RemoteCatalogState::Idle,
+            remote_catalog_task: None,
+            federation_settings: settings::FederationSettings::default(),
+            federation_authority_origin: String::new(),
+            federation_proxy_enabled: false,
+            federation_client: None,
+            federation_refresh_task: None,
+            federation_refresh_after: None,
+            federation_status: None,
+            federation_preferred_origin_id: None,
+            remote_selected_model: None,
+            remote_runs: Vec::new(),
+            remote_selected_run: None,
+            remote_profile_catalog: None,
+            remote_selected_time: 0,
+            remote_selected_variable: None,
+            remote_range_start: 0,
+            remote_range_end: 0,
+            remote_x0: 0,
+            remote_y0: 0,
+            remote_x1: 0,
+            remote_y1: 0,
+            remote_west_longitude: -101.0,
+            remote_south_latitude: 32.0,
+            remote_east_longitude: -93.0,
+            remote_north_latitude: 38.0,
+            remote_selected_level_hpa: None,
+            remote_latitude: 35.0,
+            remote_longitude: -97.0,
+            remote_detail_status: None,
+            remote_output_epoch: 0,
+            remote_output_expected: None,
+            remote_output_task: None,
+            remote_output_result: None,
+            remote_viewer: FieldViewerPanel::new(),
             tree: None,
             browser: RunBrowserPanel::new(),
             viewer: FieldViewerPanel::new(),
@@ -1438,6 +2311,13 @@ impl ModelDataDock {
             latest_field: None,
             probe_history: probe_history::ModelProbeHistoryPanel::default(),
             latest_sounding: None,
+            community_cache_client: None,
+            generation_publication:
+                crate::generation_publication::GenerationPublicationPanel::default(),
+            community_relay_dispatcher: None,
+            remote_historical_recovery: false,
+            community_sounding_task: None,
+            pending_point_sounding: None,
             sounding_request_mode: SoundingRequestMode::None,
             box_sounding_armed: false,
             box_sounding_task: None,
@@ -1824,6 +2704,872 @@ impl ModelDataDock {
         }
     }
 
+    fn poll_community_sounding(&mut self) {
+        let result =
+            self.community_sounding_task
+                .as_ref()
+                .and_then(|task| match task.rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                        "Community Cache sounding worker stopped unexpectedly".into(),
+                    )),
+                });
+        let Some(result) = result else {
+            return;
+        };
+        let task = self
+            .community_sounding_task
+            .take()
+            .expect("Community Cache result has an owning task");
+        if self.sounding_request_mode != SoundingRequestMode::Point
+            || self
+                .pending_point_sounding
+                .as_ref()
+                .is_none_or(|(hour, fx, fy)| hour != &task.hour || *fx != task.fx || *fy != task.fy)
+        {
+            return;
+        }
+        self.pending_point_sounding = None;
+        match result {
+            Ok(data) => {
+                self.box_sounding_summary = None;
+                self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
+                self.sounding.set_data(data);
+            }
+            Err(message) => self.sounding.set_error(message),
+        }
+    }
+
+    fn start_remote_catalog_load(&mut self) {
+        let Some(client) = self.community_cache_client.clone() else {
+            self.remote_catalog = RemoteCatalogState::Error(
+                "Configure and enable Community Cache in Settings to browse the HTTPS origin."
+                    .to_owned(),
+            );
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint = self.repaint.clone();
+        std::thread::Builder::new()
+            .name("bowecho-model-remote-catalog".into())
+            .spawn(move || {
+                let result = client
+                    .remote_models()
+                    .map(RemoteCatalogLoad::Models)
+                    .map_err(|error| format!("Remote model catalog unavailable: {error}"));
+                let _ = tx.send(result);
+                repaint.request_repaint();
+            })
+            .expect("spawn remote model catalog worker");
+        self.remote_catalog_task = Some(RemoteCatalogTask { rx, cancel: None });
+        self.remote_catalog = RemoteCatalogState::Loading;
+    }
+
+    fn start_remote_runs_load(&mut self, model: String) {
+        let Some(client) = self.community_cache_client.clone() else {
+            self.remote_detail_status = Some("Remote origin is not configured.".to_owned());
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint = self.repaint.clone();
+        let task_model = model.clone();
+        std::thread::Builder::new()
+            .name("bowecho-model-remote-runs".into())
+            .spawn(move || {
+                let result = client
+                    .remote_runs(&task_model)
+                    .map(|runs| RemoteCatalogLoad::Runs {
+                        model: task_model,
+                        runs,
+                    })
+                    .map_err(|error| format!("Remote runs unavailable: {error}"));
+                let _ = tx.send(result);
+                repaint.request_repaint();
+            })
+            .expect("spawn remote run catalog worker");
+        self.remote_catalog_task = Some(RemoteCatalogTask { rx, cancel: None });
+        self.remote_detail_status = Some(format!("Loading {model} runs…"));
+    }
+
+    fn start_remote_profile_catalog_load(&mut self, model: String, run: String) {
+        let Some(client) = self.community_cache_client.clone() else {
+            self.remote_detail_status = Some("Remote origin is not configured.".to_owned());
+            return;
+        };
+        let latitude = self.remote_latitude;
+        let longitude = self.remote_longitude;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint = self.repaint.clone();
+        let task_model = model.clone();
+        let task_run = run.clone();
+        std::thread::Builder::new()
+            .name("bowecho-model-remote-profile-catalog".into())
+            .spawn(move || {
+                let result = client
+                    .remote_profile_catalog(&task_model, &task_run, latitude, longitude)
+                    .map(|catalog| RemoteCatalogLoad::ProfileCatalog {
+                        model: task_model,
+                        run: task_run,
+                        catalog,
+                    })
+                    .map_err(|error| format!("Remote profile catalog unavailable: {error}"));
+                let _ = tx.send(result);
+                repaint.request_repaint();
+            })
+            .expect("spawn remote profile catalog worker");
+        self.remote_catalog_task = Some(RemoteCatalogTask { rx, cancel: None });
+        self.remote_detail_status = Some(format!("Loading {model}/{run} times and variables…"));
+    }
+
+    fn start_remote_sounding_load(&mut self) {
+        let (Some(client), Some(catalog)) = (
+            self.community_cache_client.clone(),
+            self.remote_profile_catalog.clone(),
+        ) else {
+            self.remote_detail_status = Some("Load a remote run first.".to_owned());
+            return;
+        };
+        let Some(time) = catalog.axis.get(self.remote_selected_time).cloned() else {
+            self.remote_detail_status = Some("Choose an advertised remote time.".to_owned());
+            return;
+        };
+        let selection = remote_profile_selection(&catalog.variables);
+        if selection.pressure_variables.is_empty() {
+            self.remote_detail_status =
+                Some("This run advertises no pressure-profile variables.".to_owned());
+            return;
+        }
+        let request = match client.build_remote_profile_request(&catalog, &time, selection) {
+            Ok(request) => request,
+            Err(error) => {
+                self.remote_detail_status =
+                    Some(format!("Remote profile request is invalid: {error}"));
+                return;
+            }
+        };
+        let recover_historical = explicit_historical_relay_allowed(
+            ModelWorkspaceMode::Sounding,
+            self.remote_historical_recovery,
+        );
+        let relay_dispatcher = self.community_relay_dispatcher.clone();
+        if recover_historical && relay_dispatcher.is_none() {
+            self.remote_detail_status =
+                Some("Historical Community Cache is not available in this session.".to_owned());
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint = self.repaint.clone();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("bowecho-model-remote-sounding".into())
+            .spawn(move || {
+                let result = (|| {
+                    if recover_historical {
+                        prepare_explicit_historical_recovery(
+                            &client,
+                            relay_dispatcher.as_ref().expect("checked before spawn"),
+                            &request,
+                            &worker_cancel,
+                        )?;
+                    }
+                    client
+                        .fetch_profile::<rw_query::ProfileResult>(request)
+                        .map_err(|error| format!("Remote sounding unavailable: {error}"))
+                        .and_then(|(payload, _)| {
+                            remote_profile_payload_to_sounding(payload, time)
+                                .map_err(|error| format!("Remote sounding unavailable: {error}"))
+                        })
+                        .map(RemoteCatalogLoad::Sounding)
+                })();
+                if !worker_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send(result);
+                    repaint.request_repaint();
+                }
+            })
+            .expect("spawn remote sounding worker");
+        self.remote_catalog_task = Some(RemoteCatalogTask {
+            rx,
+            cancel: Some(cancel),
+        });
+        self.remote_detail_status = Some("Loading verified remote sounding…".to_owned());
+    }
+
+    fn start_local_ensemble_catalog_load(&mut self) {
+        let Some(hour) = self.browser.selected().cloned() else {
+            self.local_ensemble_catalog = LocalEnsembleCatalogState::Idle;
+            self.local_ensemble_catalog_task = None;
+            self.local_selected_ensemble_variable = None;
+            return;
+        };
+        if matches!(
+            &self.local_ensemble_catalog,
+            LocalEnsembleCatalogState::Loading(current)
+                | LocalEnsembleCatalogState::Ready { hour: current, .. }
+                if current == &hour
+        ) {
+            return;
+        }
+
+        let store_root = self.store_root.clone();
+        let identity = hour.clone();
+        let worker_hour = hour.clone();
+        let repaint = self.repaint.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("bowecho-model-local-ensemble-catalog".into())
+            .spawn(move || {
+                let result = (|| {
+                    let snapshot = rw_query::StoreCatalog::new(&store_root)
+                        .snapshot(&worker_hour.model, &worker_hour.run)
+                        .map_err(|error| format!("Local run catalog is unavailable: {error}"))?;
+                    let mut variables = snapshot.variable_capabilities().map_err(|error| {
+                        format!("Local variable capabilities are unavailable: {error}")
+                    })?;
+                    variables
+                        .retain(|variable| variable.available_slots.contains(&worker_hour.hour));
+                    Ok(variables)
+                })();
+                let _ = tx.send(result);
+                repaint.request_repaint();
+            });
+        if let Err(error) = spawn {
+            self.local_ensemble_catalog = LocalEnsembleCatalogState::Error {
+                hour,
+                message: format!("Could not start local ensemble discovery: {error}"),
+            };
+            self.local_ensemble_catalog_task = None;
+            return;
+        }
+        self.local_ensemble_catalog = LocalEnsembleCatalogState::Loading(hour);
+        self.local_ensemble_catalog_task = Some(LocalEnsembleCatalogTask { hour: identity, rx });
+    }
+
+    fn poll_local_ensemble_catalog(&mut self) {
+        let Some(task) = self.local_ensemble_catalog_task.as_ref() else {
+            return;
+        };
+        let received = match task.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                "Local ensemble discovery worker stopped unexpectedly".to_owned(),
+            )),
+        };
+        let Some(received) = received else {
+            return;
+        };
+        let task = self
+            .local_ensemble_catalog_task
+            .take()
+            .expect("received local ensemble catalog has an owning task");
+        if self.browser.selected() != Some(&task.hour) {
+            return;
+        }
+        match received {
+            Ok(variables) => {
+                let groups = ensemble_product_groups(&variables, Some(task.hour.hour));
+                self.local_selected_ensemble_variable = retain_or_first_ensemble_variable(
+                    self.local_selected_ensemble_variable.take(),
+                    &groups,
+                );
+                self.local_ensemble_catalog = LocalEnsembleCatalogState::Ready {
+                    hour: task.hour,
+                    variables,
+                };
+            }
+            Err(message) => {
+                self.local_selected_ensemble_variable = None;
+                self.local_ensemble_catalog = LocalEnsembleCatalogState::Error {
+                    hour: task.hour,
+                    message,
+                };
+            }
+        }
+    }
+
+    fn local_ensemble_groups(&self) -> Vec<EnsembleProductGroup> {
+        let Some(selected) = self.browser.selected() else {
+            return Vec::new();
+        };
+        match &self.local_ensemble_catalog {
+            LocalEnsembleCatalogState::Ready { hour, variables } if hour == selected => {
+                ensemble_product_groups(variables, Some(selected.hour))
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn local_ensemble_mode_ready(&self) -> bool {
+        let groups = self.local_ensemble_groups();
+        selected_ensemble_product(&groups, self.local_selected_ensemble_variable.as_deref())
+            // The existing local field worker renders stored 2-D products exactly.
+            // It cannot select one plane from an arbitrary statistical pressure
+            // volume, so those remain visible but honestly non-actionable here.
+            .is_some_and(|product| {
+                product.kind == "surface2d"
+                    && self
+                        .hour_store_vars
+                        .iter()
+                        .any(|name| name == &product.variable)
+            })
+    }
+
+    fn load_local_ensemble_product(&mut self) {
+        let Some(hour) = self.browser.selected().cloned() else {
+            self.import_message = Some("Choose a local model run and time first.".to_owned());
+            return;
+        };
+        let groups = self.local_ensemble_groups();
+        let Some(product) =
+            selected_ensemble_product(&groups, self.local_selected_ensemble_variable.as_deref())
+                .cloned()
+        else {
+            self.import_message =
+                Some("This local hour advertises no typed stored ensemble statistics.".to_owned());
+            return;
+        };
+        if product.kind != "surface2d" {
+            self.import_message = Some(
+                "This is a stored statistical pressure volume. The local viewer cannot select an arbitrary pressure plane without a typed plane loader; no levels were flattened. Use a remote selected-level window when that run is served."
+                    .to_owned(),
+            );
+            return;
+        }
+        if !self
+            .hour_store_vars
+            .iter()
+            .any(|name| name == &product.variable)
+        {
+            self.import_message = Some(
+                "The selected statistic is no longer present in this exact local hour.".to_owned(),
+            );
+            return;
+        }
+        let display = display_var_name(&product.variable, &self.hour_store_vars)
+            .unwrap_or_else(|| product.variable.clone());
+        self.viewer.set_loading(&display);
+        let wanted = rw_ui::FieldKey { hour, var: display };
+        self.request_field_load(wanted);
+        self.import_message = Some(format!(
+            "Loading stored {}. No ensemble members were inferred.",
+            ensemble_product_label(&product)
+        ));
+    }
+
+    fn invalidate_remote_output(&mut self, clear_result: bool) {
+        self.remote_output_epoch = self.remote_output_epoch.wrapping_add(1);
+        self.remote_output_expected = None;
+        if let Some(task) = self.remote_output_task.take() {
+            task.cancel();
+        }
+        if clear_result {
+            self.remote_output_result = None;
+            self.remote_viewer = FieldViewerPanel::new();
+        }
+    }
+
+    fn start_remote_output_load(&mut self) {
+        let Some(client) = self.community_cache_client.clone() else {
+            self.remote_detail_status = Some("Remote origin is not configured.".to_owned());
+            return;
+        };
+        let Some(catalog) = self.remote_profile_catalog.clone() else {
+            self.remote_detail_status = Some("Load a remote run first.".to_owned());
+            return;
+        };
+        let Some(variable_name) = self.remote_selected_variable.clone() else {
+            self.remote_detail_status = Some("Choose an advertised remote product.".to_owned());
+            return;
+        };
+        let Some(variable) = catalog
+            .variables
+            .iter()
+            .find(|candidate| candidate.name == variable_name)
+        else {
+            self.remote_detail_status =
+                Some("The selected product is no longer advertised by this run.".to_owned());
+            return;
+        };
+
+        let request_and_kind = (|| match self.workspace_mode {
+            ModelWorkspaceMode::PointSeries => {
+                if !variable.point_series || variable.kind != "surface2d" {
+                    return Err(
+                        "This product is not advertised for exact point-series queries.".to_owned(),
+                    );
+                }
+                let window = remote_time_window(
+                    &catalog.axis,
+                    self.remote_range_start,
+                    self.remote_range_end,
+                )?;
+                client
+                    .build_remote_point_series_request(
+                        &catalog,
+                        crate::community_cache::RemotePointSeriesSelection {
+                            variables: vec![variable_name.clone()],
+                            window,
+                            missing_policy: rw_community_protocol::MissingPolicy::Partial,
+                        },
+                    )
+                    .map(|request| (request, RemoteFetchKind::PointSeries))
+                    .map_err(|error| format!("Remote point-series request is invalid: {error}"))
+            }
+            ModelWorkspaceMode::WindowTile | ModelWorkspaceMode::Ensemble => {
+                if self.workspace_mode == ModelWorkspaceMode::Ensemble
+                    && ensemble_selector(variable).is_none()
+                {
+                    return Err(
+                        "This variable is not a typed stored ensemble statistic.".to_owned()
+                    );
+                }
+                let time = catalog
+                    .axis
+                    .get(self.remote_selected_time)
+                    .cloned()
+                    .ok_or_else(|| "Choose an advertised remote time.".to_owned())?;
+                let (x0, y0, x1, y1) = remote_native_bounds(
+                    catalog.run.nx,
+                    catalog.run.ny,
+                    self.remote_x0,
+                    self.remote_y0,
+                    self.remote_x1,
+                    self.remote_y1,
+                )?;
+                let (levels, kind) = if variable.kind == "pressure3d" {
+                    let level = self.remote_selected_level_hpa.ok_or_else(|| {
+                        "Choose one advertised pressure level for this window.".to_owned()
+                    })?;
+                    if !variable.levels_hpa.contains(&level) {
+                        return Err(
+                            "The selected pressure level is not advertised for this product."
+                                .to_owned(),
+                        );
+                    }
+                    (vec![level], RemoteFetchKind::NativeWindow3D)
+                } else if variable.kind == "surface2d" {
+                    (Vec::new(), RemoteFetchKind::NativeWindow2D)
+                } else {
+                    return Err("This product has no native-window contract.".to_owned());
+                };
+                client
+                    .build_remote_native_window_request(
+                        &catalog,
+                        crate::community_cache::RemoteNativeWindowSelection {
+                            variables: vec![variable_name.clone()],
+                            time,
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            pressure_levels_hpa: levels,
+                        },
+                    )
+                    .map(|request| (request, kind))
+                    .map_err(|error| format!("Remote native-window request is invalid: {error}"))
+            }
+            ModelWorkspaceMode::TemporalDiurnal => {
+                let contract = remote_temporal_contract(variable)?;
+                let window = remote_time_window(
+                    &catalog.axis,
+                    self.remote_range_start,
+                    self.remote_range_end,
+                )?;
+                let levels = if variable.kind == "pressure3d" {
+                    let level = self.remote_selected_level_hpa.ok_or_else(|| {
+                        "Choose one advertised pressure level for this temporal product.".to_owned()
+                    })?;
+                    if !variable.levels_hpa.contains(&level) {
+                        return Err(
+                            "The selected pressure level is not advertised for this product."
+                                .to_owned(),
+                        );
+                    }
+                    vec![level]
+                } else {
+                    Vec::new()
+                };
+                client
+                    .build_remote_temporal_grid_request(
+                        &catalog,
+                        crate::community_cache::RemoteTemporalGridSelection {
+                            variables: contract.variables,
+                            window,
+                            reducer: contract.reducer,
+                            semantics: contract.semantics,
+                            missing_policy: rw_community_protocol::MissingPolicy::Partial,
+                            pressure_levels_hpa: levels,
+                            parameters: contract.parameters,
+                        },
+                    )
+                    .map(|request| (request, RemoteFetchKind::TemporalGrid))
+                    .map_err(|error| format!("Remote temporal request is invalid: {error}"))
+            }
+            ModelWorkspaceMode::MapPlot => {
+                let time = catalog
+                    .axis
+                    .get(self.remote_selected_time)
+                    .cloned()
+                    .ok_or_else(|| "Choose an advertised remote time.".to_owned())?;
+                let levels = if variable.kind == "pressure3d" {
+                    let level = self.remote_selected_level_hpa.ok_or_else(|| {
+                        "Choose one advertised pressure level for this map.".to_owned()
+                    })?;
+                    if !variable.levels_hpa.contains(&level) {
+                        return Err(
+                            "The selected pressure level is not advertised for this product."
+                                .to_owned(),
+                        );
+                    }
+                    vec![level]
+                } else if variable.kind == "surface2d" {
+                    Vec::new()
+                } else {
+                    return Err("This product has no geographic-window contract.".to_owned());
+                };
+                let bounds = remote_geographic_bounds(
+                    self.remote_west_longitude,
+                    self.remote_south_latitude,
+                    self.remote_east_longitude,
+                    self.remote_north_latitude,
+                )?;
+                client
+                    .build_remote_geographic_window_request(
+                        &catalog,
+                        crate::community_cache::RemoteGeographicWindowSelection {
+                            variables: vec![variable_name.clone()],
+                            time,
+                            west_longitude: bounds.0,
+                            south_latitude: bounds.1,
+                            east_longitude: bounds.2,
+                            north_latitude: bounds.3,
+                            pressure_levels_hpa: levels,
+                        },
+                    )
+                    .map(|request| (request, RemoteFetchKind::GeographicWindow))
+                    .map_err(|error| format!("Remote geographic request is invalid: {error}"))
+            }
+            ModelWorkspaceMode::Sounding => {
+                Err("Use Load sounding for the remote profile path.".to_owned())
+            }
+        })();
+        let (request, kind) = match request_and_kind {
+            Ok(plan) => plan,
+            Err(message) => {
+                self.remote_detail_status = Some(message);
+                return;
+            }
+        };
+        let request_sha256 = match rw_community_protocol::request_sha256(&request) {
+            Ok(hash) => hash,
+            Err(error) => {
+                self.remote_detail_status = Some(format!(
+                    "Could not identify the exact remote request: {error}"
+                ));
+                return;
+            }
+        };
+
+        self.invalidate_remote_output(false);
+        let identity = RemoteOutputIdentity {
+            epoch: self.remote_output_epoch,
+            request_sha256,
+            mode: self.workspace_mode,
+            model: request.model.clone(),
+            run: request.run.clone(),
+        };
+        let expected = RemoteOutputExpected {
+            identity: identity.clone(),
+            request: request.clone(),
+            kind,
+            run_nx: catalog.run.nx,
+            run_ny: catalog.run.ny,
+            variable_selectors: request
+                .variables
+                .iter()
+                .filter_map(|name| {
+                    catalog
+                        .variables
+                        .iter()
+                        .find(|variable| &variable.name == name)
+                        .map(|variable| (name.clone(), variable.selector.clone()))
+                })
+                .collect(),
+        };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint = self.repaint.clone();
+        let relay_dispatcher = self.community_relay_dispatcher.clone();
+        let recover_historical = kind == RemoteFetchKind::PointSeries
+            && explicit_historical_relay_allowed(
+                ModelWorkspaceMode::PointSeries,
+                self.remote_historical_recovery,
+            );
+        let spawn = std::thread::Builder::new()
+            .name("bowecho-model-remote-output".into())
+            .spawn(move || {
+                if worker_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let result = (|| {
+                    if recover_historical {
+                        let dispatcher = relay_dispatcher.as_ref().ok_or_else(|| {
+                            "Historical Community Cache is not available in this session".to_owned()
+                        })?;
+                        prepare_explicit_historical_recovery(
+                            &client,
+                            dispatcher,
+                            &request,
+                            &worker_cancel,
+                        )?;
+                    }
+                    match kind {
+                        RemoteFetchKind::PointSeries => client
+                            .fetch_point_series::<rw_query::PointSeriesResult>(request)
+                            .map(|(payload, tier)| RemoteOutputLoad::PointSeries {
+                                result: payload.data,
+                                tier,
+                            }),
+                        RemoteFetchKind::NativeWindow2D => client
+                            .fetch_native_window::<Vec<rw_query::IndexWindow2DResult>>(request)
+                            .map(|(payload, tier)| RemoteOutputLoad::NativeWindow2D {
+                                result: payload.data,
+                                tier,
+                            }),
+                        RemoteFetchKind::NativeWindow3D => client
+                            .fetch_native_window::<Vec<rw_query::IndexWindow3DResult>>(request)
+                            .map(|(payload, tier)| RemoteOutputLoad::NativeWindow3D {
+                                result: payload.data,
+                                tier,
+                            }),
+                        RemoteFetchKind::GeographicWindow => client
+                            .fetch_geographic_window::<rw_query::GeographicWindowResult>(request)
+                            .map(|(payload, tier)| RemoteOutputLoad::GeographicWindow {
+                                result: payload.data,
+                                tier,
+                            }),
+                        RemoteFetchKind::TemporalGrid => client
+                            .fetch_temporal_grid::<rw_query::TemporalGridResult>(request)
+                            .map(|(payload, tier)| RemoteOutputLoad::TemporalGrid {
+                                result: payload.data,
+                                tier,
+                            }),
+                    }
+                    .map_err(|error| format!("Remote output unavailable: {error}"))
+                })();
+                if !worker_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send(result);
+                    repaint.request_repaint();
+                }
+            });
+        if let Err(error) = spawn {
+            self.remote_detail_status = Some(format!("Could not start remote output: {error}"));
+            self.remote_output_expected = None;
+            return;
+        }
+        self.remote_output_expected = Some(identity);
+        self.remote_output_task = Some(RemoteOutputTask {
+            expected,
+            cancel,
+            rx,
+        });
+        self.remote_detail_status = Some(format!(
+            "Loading verified {} through local cache / R2 / HTTPS origin...",
+            remote_fetch_kind_label(kind)
+        ));
+    }
+
+    fn poll_remote_output(&mut self) {
+        let Some(task) = self.remote_output_task.as_ref() else {
+            return;
+        };
+        let received = match task.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(Err("Remote output worker stopped unexpectedly".to_owned()))
+            }
+        };
+        let Some(received) = received else {
+            return;
+        };
+        let task = self
+            .remote_output_task
+            .take()
+            .expect("received remote output has an owning task");
+        if !remote_output_is_current(
+            self.remote_output_expected.as_ref(),
+            &task.expected.identity,
+        ) {
+            return;
+        }
+
+        match received {
+            Ok(load) => match adapt_remote_output(&task.expected, load) {
+                Ok(result) => {
+                    let tier = remote_output_tier(&result);
+                    let label = remote_fetch_kind_label(task.expected.kind);
+                    self.remote_detail_status = Some(format!(
+                        "Verified {label} loaded from {}.",
+                        remote_delivery_tier_label(tier)
+                    ));
+                    self.remote_output_result = Some(result);
+                    self.install_remote_output_field();
+                    if task.expected.kind == RemoteFetchKind::GeographicWindow {
+                        self.native_plot_content = NativePlotContent::Model;
+                        self.show_plot_viewer = true;
+                    }
+                }
+                Err(message) => {
+                    self.note_remote_output_failure(format!(
+                        "Rejected malformed signed remote result: {message}"
+                    ));
+                }
+            },
+            Err(message) => {
+                self.note_remote_output_failure(message);
+            }
+        }
+    }
+
+    fn note_remote_output_failure(&mut self, message: String) {
+        // Deliberately do not clear `remote_output_result`: the verified last
+        // good object remains visible while the status reports that local,
+        // R2, and origin delivery could not satisfy the new attempt.
+        self.remote_detail_status = Some(format!(
+            "{message}. Every configured HTTPS tier was tried; previous verified result retained."
+        ));
+    }
+
+    fn install_remote_output_field(&mut self) {
+        let field = match self.remote_output_result.as_ref() {
+            Some(RemoteOutputResult::Field { field, .. }) => Some(field.clone()),
+            Some(RemoteOutputResult::Temporal {
+                result,
+                selected_metric,
+                ..
+            }) => remote_temporal_field(result, *selected_metric).ok(),
+            _ => None,
+        };
+        let Some(field) = field else {
+            return;
+        };
+        let variable = field.key.var.clone();
+        let hour = field.key.hour.clone();
+        self.remote_viewer.set_hour(
+            hour,
+            vec![rw_ui::VarInfo {
+                name: variable.clone(),
+                units: field.units.clone(),
+                kind: rw_ui::VarKind::Surface2D,
+                levels_hpa: Vec::new(),
+            }],
+        );
+        self.remote_viewer.set_loading(&variable);
+        self.remote_viewer
+            .install_generated_field(field, self.color_tables.settings());
+    }
+
+    fn poll_remote_catalog(&mut self) {
+        let Some(task) = self.remote_catalog_task.as_ref() else {
+            return;
+        };
+        let result = match task.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                "Remote model catalog worker stopped unexpectedly".to_owned(),
+            )),
+        };
+        let Some(result) = result else {
+            return;
+        };
+        self.remote_catalog_task = None;
+        match result {
+            Ok(RemoteCatalogLoad::Models(models)) => {
+                self.invalidate_remote_output(true);
+                self.remote_selected_model =
+                    retain_or_first_remote_model(self.remote_selected_model.take(), &models);
+                self.remote_catalog = RemoteCatalogState::Ready(models);
+                if let Some(model) = self.remote_selected_model.clone() {
+                    self.start_remote_runs_load(model);
+                }
+            }
+            Ok(RemoteCatalogLoad::Runs { model, runs }) => {
+                if self.remote_selected_model.as_deref() != Some(model.as_str()) {
+                    return;
+                }
+                self.invalidate_remote_output(true);
+                self.remote_selected_run =
+                    retain_or_first_remote_run(self.remote_selected_run.take(), &runs);
+                self.remote_runs = runs;
+                self.remote_profile_catalog = None;
+                self.remote_detail_status = Some(format!(
+                    "{} remote run(s) available for {}.",
+                    self.remote_runs.len(),
+                    model
+                ));
+                if let Some(run) = self.remote_selected_run.clone() {
+                    self.start_remote_profile_catalog_load(model, run);
+                }
+            }
+            Ok(RemoteCatalogLoad::ProfileCatalog {
+                model,
+                run,
+                catalog,
+            }) => {
+                if self.remote_selected_model.as_deref() != Some(model.as_str())
+                    || self.remote_selected_run.as_deref() != Some(run.as_str())
+                {
+                    return;
+                }
+                self.invalidate_remote_output(true);
+                self.remote_selected_time = self
+                    .remote_selected_time
+                    .min(catalog.axis.len().saturating_sub(1));
+                self.remote_range_start = 0;
+                self.remote_range_end = catalog.axis.len().saturating_sub(1);
+                self.remote_x0 = 0;
+                self.remote_y0 = 0;
+                self.remote_x1 = u32::try_from(catalog.run.nx).unwrap_or(u32::MAX);
+                self.remote_y1 = u32::try_from(catalog.run.ny).unwrap_or(u32::MAX);
+                self.remote_selected_variable = retain_or_first_remote_variable(
+                    self.remote_selected_variable.take(),
+                    &catalog.variables,
+                    self.workspace_mode,
+                    catalog
+                        .axis
+                        .get(self.remote_selected_time)
+                        .map(|time| time.storage_slot),
+                );
+                self.remote_selected_level_hpa = remote_selected_level(
+                    self.remote_selected_level_hpa,
+                    self.remote_selected_variable.as_deref(),
+                    &catalog.variables,
+                );
+                self.remote_detail_status = Some(format!(
+                    "{} times · {} variables · profile-ready at {:.3}, {:.3}",
+                    catalog.axis.len(),
+                    catalog.variables.len(),
+                    self.remote_latitude,
+                    self.remote_longitude
+                ));
+                self.remote_profile_catalog = Some(catalog);
+            }
+            Ok(RemoteCatalogLoad::Sounding(data)) => {
+                self.box_sounding_summary = None;
+                self.sounding_request_mode = SoundingRequestMode::Point;
+                self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
+                self.sounding.set_data(data);
+                self.remote_detail_status = Some("Verified remote sounding loaded.".to_owned());
+            }
+            Err(message) => self.remote_catalog = RemoteCatalogState::Error(message),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(ctx: &egui::Context, tree: StoreTree) -> Self {
         let mut dock = Self::new(ctx, std::env::temp_dir().join("bowecho-model-dock-test"));
@@ -1834,6 +3580,9 @@ impl ModelDataDock {
     fn select_hour(&mut self, key: HourKey) {
         self.hour_store_vars.clear();
         self.hour_store_var_info.clear();
+        self.local_ensemble_catalog = LocalEnsembleCatalogState::Idle;
+        self.local_ensemble_catalog_task = None;
+        self.local_selected_ensemble_variable = None;
         // Keep map consumers on their last complete field while the new
         // frame loads, but never leave the native plot's old texture visible.
         // `current_native_plot_field` also suppresses that field until the
@@ -1894,6 +3643,11 @@ impl ModelDataDock {
         self.poll_iso_load();
         self.poll_gdex();
         self.poll_box_sounding();
+        self.poll_community_sounding();
+        self.poll_local_ensemble_catalog();
+        self.poll_federation_refresh();
+        self.poll_remote_catalog();
+        self.poll_remote_output();
         while let Some(response) = self.worker.try_recv() {
             match response {
                 StoreResponse::Tree(tree) => {
@@ -1914,6 +3668,11 @@ impl ModelDataDock {
                         self.hour_store_vars = vars.iter().map(|var| var.name.clone()).collect();
                         self.hour_store_var_info = vars.clone();
                         self.viewer.set_hour(key, viewer_display_vars(vars));
+                        if self.workspace_mode == ModelWorkspaceMode::Ensemble
+                            && self.workspace_source == ModelWorkspaceSource::LocalStore
+                        {
+                            self.start_local_ensemble_catalog_load();
+                        }
                         if let Some(field) = self.viewer.wanted_field() {
                             if self.viewer.restore_generated_field(&field.var) {
                                 self.latest_field = self
@@ -1938,7 +3697,9 @@ impl ModelDataDock {
                 StoreResponse::Field(key, boxed) => {
                     self.apply_store_field_response(key, *boxed);
                 }
-                StoreResponse::Sounding(_, result) => self.apply_point_sounding_response(result),
+                StoreResponse::Sounding(hour, result) => {
+                    self.apply_point_sounding_response(hour, result)
+                }
                 // v0.2.3: worker ack that the style overrides were applied.
                 // No-op by design — `apply_color_table_changes` already
                 // reloads the field, and that reload is what repaints.
@@ -2334,6 +4095,13 @@ impl ModelDataDock {
         self.plot_domain_armed = armed;
         if armed {
             self.box_sounding_armed = false;
+            self.workspace_domain = ModelDomainChoice::DrawOnMap;
+        } else if self.workspace_domain == ModelDomainChoice::DrawOnMap {
+            self.workspace_domain = if self.plot_viewer.active_domain().is_some() {
+                ModelDomainChoice::ActiveOrSaved
+            } else {
+                ModelDomainChoice::FullGrid
+            };
         }
     }
 
@@ -2348,7 +4116,7 @@ impl ModelDataDock {
     pub fn set_box_sounding_armed(&mut self, armed: bool) {
         self.box_sounding_armed = armed;
         if armed {
-            self.plot_domain_armed = false;
+            self.set_plot_domain_armed(false);
         }
     }
 
@@ -2376,6 +4144,8 @@ impl ModelDataDock {
         box_sounding_readiness(&self.hour_store_var_info)?;
 
         self.box_sounding_armed = false;
+        self.community_sounding_task = None;
+        self.pending_point_sounding = None;
         self.sounding_request_mode = SoundingRequestMode::BoxPending;
         self.box_sounding_summary = None;
         self.sounding.set_loading();
@@ -2399,10 +4169,36 @@ impl ModelDataDock {
     /// `DomainSelected` path in [`Self::ui`].
     pub fn apply_map_plot_domain(&mut self, domain: CustomDomain) {
         self.plot_domain_armed = false;
+        self.workspace_domain = ModelDomainChoice::ActiveOrSaved;
         self.native_plot_content = NativePlotContent::Model;
-        self.show_plot_viewer = true;
         self.native_plot_auto_domain = None;
-        self.plot_viewer.set_active_domain(domain);
+        if self.workspace_source == ModelWorkspaceSource::RemoteCatalog
+            && self.workspace_mode == ModelWorkspaceMode::MapPlot
+        {
+            // A screen box that straddles +/-180 arrives as the numerically
+            // wide interval (-179, 179). The signed API uses the shorter
+            // eastward antimeridian arc (179 -> -179), which is what the user
+            // actually drew on a wrapped map.
+            let (west, south, east, north) = remote_domain_bounds(domain.bounds);
+            self.remote_west_longitude = west;
+            self.remote_south_latitude = south;
+            self.remote_east_longitude = east;
+            self.remote_north_latitude = north;
+            self.plot_viewer
+                .set_active_domain(CustomDomain::generated((west, east, south, north)));
+            self.invalidate_remote_output(false);
+            if self.remote_mode_ready() {
+                self.start_remote_output_load();
+            } else {
+                self.remote_detail_status = Some(
+                    "Geographic domain selected. Choose a served product/time, then Fetch map."
+                        .to_owned(),
+                );
+            }
+        } else {
+            self.show_plot_viewer = true;
+            self.plot_viewer.set_active_domain(domain);
+        }
     }
 
     /// Open a raw real-satellite or SimSat product in the shared native plot
@@ -2482,6 +4278,14 @@ impl ModelDataDock {
     /// d03 -> d02 switch, the viewer can still hold d03 until d02's variable
     /// inventory arrives; do not render that stale field under the new run.
     fn current_native_plot_field(&self) -> Option<std::sync::Arc<rw_ui::FieldData>> {
+        if self.workspace_source == ModelWorkspaceSource::RemoteCatalog {
+            return match self.remote_output_result.as_ref() {
+                Some(RemoteOutputResult::Field { field, .. }) if field.grid.is_some() => {
+                    Some(std::sync::Arc::new(field.clone()))
+                }
+                _ => None,
+            };
+        }
         let selected = self.browser.selected()?;
         let field = store_named_current_field(
             &self.viewer,
@@ -2539,7 +4343,7 @@ impl ModelDataDock {
         );
         self.probe_history.open(
             probe_history::ProbeHistoryRequest {
-                store_root: self.store_root.clone(),
+                store_view: self.store_view.clone(),
                 field,
                 point: Some(probe_history::PointProbeRequest { lut, lat, lon }),
             },
@@ -2563,7 +4367,7 @@ impl ModelDataDock {
         );
         self.probe_history.open(
             probe_history::ProbeHistoryRequest {
-                store_root: self.store_root.clone(),
+                store_view: self.store_view.clone(),
                 field,
                 point: None,
             },
@@ -2632,21 +4436,54 @@ impl ModelDataDock {
     /// mode to [`SoundingRequestMode::External`] while the worker is reading;
     /// that late reply must not become `latest_sounding` and reclaim the
     /// shared viewer on the next app frame.
-    fn apply_point_sounding_response(&mut self, result: Result<rw_ui::SoundingData, String>) {
+    fn apply_point_sounding_response(
+        &mut self,
+        hour: HourKey,
+        result: Result<rw_ui::SoundingData, String>,
+    ) {
         if !matches!(
             self.sounding_request_mode,
             SoundingRequestMode::None | SoundingRequestMode::Point
         ) {
             return;
         }
+        if self
+            .pending_point_sounding
+            .as_ref()
+            .is_some_and(|(pending_hour, _, _)| pending_hour != &hour)
+        {
+            return;
+        }
         match result {
             Ok(data) => {
+                self.pending_point_sounding = None;
+                self.community_sounding_task = None;
                 self.sounding_request_mode = SoundingRequestMode::Point;
                 self.box_sounding_summary = None;
                 self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
                 self.sounding.set_data(data);
             }
-            Err(message) => self.sounding.set_error(message),
+            Err(message) => {
+                let pending = self.pending_point_sounding.clone();
+                if pending
+                    .as_ref()
+                    .is_some_and(|(pending_hour, _, _)| pending_hour == &hour)
+                    && let (Some(client), Some((pending_hour, fx, fy))) =
+                        (self.community_cache_client.clone(), pending)
+                {
+                    self.community_sounding_task = Some(CommunitySoundingTask::spawn(
+                        client,
+                        self.store_root.clone(),
+                        pending_hour,
+                        fx,
+                        fy,
+                        self.repaint.clone(),
+                    ));
+                    return;
+                }
+                self.pending_point_sounding = None;
+                self.sounding.set_error(message);
+            }
         }
     }
 
@@ -2888,6 +4725,10 @@ impl ModelDataDock {
 
     /// Re-scan the store (after an ingest finishes).
     pub fn rescan(&mut self) {
+        #[cfg(test)]
+        {
+            self.rescan_requests_for_test += 1;
+        }
         self.worker.send(StoreRequest::Enumerate);
         self.native_plot_source_run = None;
         self.native_plot_source_metadata = None;
@@ -2902,11 +4743,27 @@ impl ModelDataDock {
         }
     }
 
+    /// Reconcile the store tree and, when requested, load the newest fully
+    /// committed hour. Keeping both operations behind one call prevents a
+    /// burst from replacing saved enumeration work with equally costly loads.
+    fn reconcile_import_store(&mut self, newest_hour: Option<HourKey>) {
+        self.rescan();
+        if self.wrf_options.follow_processing
+            && let Some(hour) = newest_hour
+        {
+            self.select_hour_key(hour);
+        }
+    }
+
     /// Drain a running local WRF/NetCDF import. On completion the store is
     /// re-scanned so the new run appears in the browser (and thus sounds).
     /// Called every frame from `handle_responses` — including via `pump`, so
     /// an import finishes and refreshes even while the dock window is closed.
     fn poll_import(&mut self) {
+        self.poll_import_at(std::time::Instant::now());
+    }
+
+    fn poll_import_at(&mut self, now: std::time::Instant) {
         // What to do once the borrow of `import_job` is released. `rescan` is
         // set on any completion so a partially-written run still shows. This
         // value lives for one poll; the completion payloads are moved out
@@ -2915,6 +4772,9 @@ impl ModelDataDock {
         enum PollResult {
             Idle,
             Progress(String),
+            /// The task is still live but produced no message this poll. This
+            /// remains a refresh opportunity for a previously coalesced commit.
+            Pending,
             /// A WRF hour is fully committed and safe to enumerate even while
             /// the remaining folder continues processing.
             Committed {
@@ -2927,6 +4787,9 @@ impl ModelDataDock {
                 /// the store — the auto-plot trigger. `None` for failures
                 /// and for jobs with no store output.
                 plot: Option<(PathBuf, String, String)>,
+                /// Newest commit drained before terminal completion. This is
+                /// populated even when `Committed` and `Done` arrive together.
+                final_hour: Option<HourKey>,
             },
             /// A CM1 plane landed with an exact hour key. Select it before
             /// opening Models so the user sees the requested field/run.
@@ -2985,10 +4848,11 @@ impl ModelDataDock {
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("CM1 import failed: {error}"),
                         plot: None,
+                        final_hour: None,
                     },
                     None => match latest {
                         Some(message) => PollResult::Progress(message),
-                        None => PollResult::Progress(String::new()),
+                        None => PollResult::Pending,
                     },
                 }
             }
@@ -3032,10 +4896,22 @@ impl ModelDataDock {
                             }
                         ),
                         plot: Some((summary.store_root, summary.model, summary.run)),
+                        final_hour: latest_commit.map(|commit| HourKey {
+                            model: commit.model,
+                            run: commit.run,
+                            hour: commit.storage_slot,
+                            exact_time: None,
+                        }),
                     },
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("Import failed: {error}"),
                         plot: None,
+                        final_hour: latest_commit.map(|commit| HourKey {
+                            model: commit.model,
+                            run: commit.run,
+                            hour: commit.storage_slot,
+                            exact_time: None,
+                        }),
                     },
                     None => match latest_commit {
                         Some(commit) => PollResult::Committed {
@@ -3052,7 +4928,7 @@ impl ModelDataDock {
                         },
                         None => match latest {
                             Some(message) => PollResult::Progress(message),
-                            None => PollResult::Progress(String::new()),
+                            None => PollResult::Pending,
                         },
                     },
                 }
@@ -3090,10 +4966,22 @@ impl ModelDataDock {
                             summary.variables.len()
                         ),
                         plot: Some((summary.store_root, summary.model, summary.run)),
+                        final_hour: latest_commit.map(|commit| HourKey {
+                            model: commit.model,
+                            run: commit.run,
+                            hour: commit.storage_slot,
+                            exact_time: commit.exact_time,
+                        }),
                     },
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("WRF processing failed: {error}"),
                         plot: None,
+                        final_hour: latest_commit.map(|commit| HourKey {
+                            model: commit.model,
+                            run: commit.run,
+                            hour: commit.storage_slot,
+                            exact_time: commit.exact_time,
+                        }),
                     },
                     None => match latest_commit {
                         Some(commit) => {
@@ -3115,7 +5003,7 @@ impl ModelDataDock {
                         }
                         None => match latest {
                             Some(message) => PollResult::Progress(message),
-                            None => PollResult::Progress(String::new()),
+                            None => PollResult::Pending,
                         },
                     },
                 }
@@ -3169,6 +5057,7 @@ impl ModelDataDock {
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("Synthetic radar failed: {error}"),
                         plot: None,
+                        final_hour: None,
                     },
                     None => match preview {
                         Some(preview) => PollResult::SyntheticPreview {
@@ -3180,7 +5069,7 @@ impl ModelDataDock {
                         },
                         None => match latest {
                             Some(message) => PollResult::Progress(message),
-                            None => PollResult::Progress(String::new()),
+                            None => PollResult::Pending,
                         },
                     },
                 }
@@ -3221,10 +5110,11 @@ impl ModelDataDock {
                     Some(Err(error)) => PollResult::Finished {
                         message: format!("Exact radar replay failed: {error}"),
                         plot: None,
+                        final_hour: None,
                     },
                     None => match latest {
                         Some(message) => PollResult::Progress(message),
-                        None => PollResult::Progress(String::new()),
+                        None => PollResult::Pending,
                     },
                 }
             }
@@ -3236,24 +5126,43 @@ impl ModelDataDock {
                 if !message.is_empty() {
                     self.import_message = Some(message);
                 }
+                if let Some(hour) = self.incremental_rescan.take_due(now) {
+                    self.reconcile_import_store(Some(hour));
+                }
                 // No repaint hook on the import worker thread — keep the UI
                 // ticking so progress and completion show promptly.
+                self.repaint.request_repaint();
+            }
+            PollResult::Pending => {
+                // A quiet, long-running compute still observes the 500 ms
+                // bound for the latest commit; it need not emit progress.
+                if let Some(hour) = self.incremental_rescan.take_due(now) {
+                    self.reconcile_import_store(Some(hour));
+                }
                 self.repaint.request_repaint();
             }
             PollResult::Committed { message, hour } => {
                 self.import_message = Some(message);
                 // Store writers publish the hour first and the run manifest
                 // last, so enumeration can never observe a half-written hour.
-                self.rescan();
-                if self.wrf_options.follow_processing {
-                    self.select_hour_key(hour);
+                // Surface the first commit immediately, then coalesce both
+                // full-tree scans and follow-hour loads to the newest exact key.
+                if self.incremental_rescan.on_commit(now, &hour) {
+                    self.reconcile_import_store(Some(hour));
                 }
                 self.repaint.request_repaint();
             }
-            PollResult::Finished { message, plot } => {
+            PollResult::Finished {
+                message,
+                plot,
+                final_hour,
+            } => {
                 self.import_message = Some(message);
                 self.import_job = None;
-                self.rescan();
+                let final_hour = self.incremental_rescan.finish(final_hour);
+                // Completion is a mandatory full reconciliation and restores
+                // the exact newest committed key even for Commit+Done bursts.
+                self.reconcile_import_store(final_hour);
                 // Auto-plot: bulk imports produce bulk output when the
                 // toggle is on. All store-writing completions (wrench
                 // heavy, light 📄, GDEX via the local pump) land here.
@@ -3266,6 +5175,7 @@ impl ModelDataDock {
             PollResult::FinishedCm1 { message, summary } => {
                 self.import_message = Some(message);
                 self.import_job = None;
+                self.incremental_rescan.reset();
                 self.select_hour_key(summary.hour.clone());
                 self.rescan();
                 // The button promises an open-in-Models handoff. Leaving the
@@ -3281,6 +5191,7 @@ impl ModelDataDock {
             PollResult::FinishedSynthetic { message, output } => {
                 self.import_message = Some(message);
                 self.import_job = None;
+                self.incremental_rescan.reset();
                 self.synthetic_radar_preview = None;
                 // Retain Arc handles for the CfRadial export control — the
                 // one-shot result below is drained away by the app.
@@ -3300,6 +5211,7 @@ impl ModelDataDock {
             PollResult::FinishedReplay { message, output } => {
                 self.import_message = Some(message);
                 self.import_job = None;
+                self.incremental_rescan.reset();
                 self.synthetic_export_frames = output
                     .frames
                     .iter()
@@ -3311,6 +5223,7 @@ impl ModelDataDock {
             PollResult::Cancelled => {
                 self.import_message = Some("Synthetic radar cancelled".to_owned());
                 self.import_job = None;
+                self.incremental_rescan.reset();
                 self.synthetic_radar_preview = None;
                 self.repaint.request_repaint();
             }
@@ -3586,6 +5499,18 @@ impl ModelDataDock {
         ui.add_space(8.0);
         model_subheading(ui, "Batch plots");
         self.plot_controls(ui);
+
+        ui.add_space(8.0);
+        let selected = self.browser.selected().cloned();
+        egui::CollapsingHeader::new(model_section_heading(
+            "Publish processed WRF / ArWen generation",
+        ))
+        .id_salt("model_owner_generation_publication")
+        .default_open(false)
+        .show(ui, |ui| {
+            self.generation_publication
+                .ui(ui, &self.store_root, selected.as_ref());
+        });
     }
 
     /// Dedicated first-class WRF workspace. It deliberately shares this
@@ -3593,6 +5518,20 @@ impl ModelDataDock {
     /// Formula Lab, and one synthetic-radar result queue.
     pub fn wrf_ui(&mut self, ui: &mut egui::Ui) {
         self.handle_responses();
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.wrf_arwen_selected, false, "Open and process WRF");
+            ui.selectable_value(&mut self.wrf_arwen_selected, true, "Design ArWen run");
+        });
+        ui.separator();
+
+        if self.wrf_arwen_selected {
+            let arwen = self
+                .arwen
+                .get_or_insert_with(|| Box::new(arwen_studio::StudioApp::embedded(&self.repaint)));
+            arwen.ui_impl(ui);
+            return;
+        }
+
         // Keep long-running job state and Cancel fixed above the scrolling
         // workspace so it cannot disappear below a tall recipe/control panel.
         self.import_status_ui(ui);
@@ -6304,6 +8243,8 @@ impl ModelDataDock {
     pub fn supersede_with_external_sounding(&mut self) {
         self.box_sounding_task = None;
         self.box_sounding_pending = None;
+        self.community_sounding_task = None;
+        self.pending_point_sounding = None;
         self.sounding_request_mode = SoundingRequestMode::External;
     }
 
@@ -6315,9 +8256,248 @@ impl ModelDataDock {
         self.box_sounding_summary = None;
         self.box_sounding_armed = false;
         self.sounding_request_mode = SoundingRequestMode::Point;
+        self.community_sounding_task = None;
+        self.pending_point_sounding = Some((hour.clone(), fx, fy));
         self.sounding.set_loading();
         self.worker
             .send(StoreRequest::LoadSounding { hour, fx, fy });
+    }
+
+    /// Install or remove the opt-in signed HTTPS fallback. Local store reads
+    /// remain first and private/local simulations are rejected again at the
+    /// request builder, even if a caller accidentally enables this client.
+    pub(crate) fn set_community_cache_client(
+        &mut self,
+        client: Option<crate::community_cache::CommunityCacheClient>,
+    ) {
+        self.community_cache_client = client;
+        self.sync_authority_federation_policy();
+        if self.community_cache_client.is_none() {
+            self.community_sounding_task = None;
+        }
+    }
+
+    pub(crate) fn set_generation_publication_settings(
+        &mut self,
+        settings: &settings::GenerationPublicationSettings,
+    ) {
+        self.generation_publication.set_settings(settings);
+    }
+
+    pub(crate) fn set_community_relay_dispatcher(
+        &mut self,
+        dispatcher: Option<crate::community_relay::CommunityRelayDispatcher>,
+    ) {
+        self.community_relay_dispatcher = dispatcher;
+        if self.community_relay_dispatcher.is_none() {
+            self.remote_historical_recovery = false;
+        }
+    }
+
+    /// Install the non-secret public-origin trust policy and begin its first
+    /// signed catalog refresh on a worker. The authoritative bearer is read
+    /// from the existing OS vault inside that worker and never enters settings
+    /// or UI state.
+    pub(crate) fn set_federation_settings(
+        &mut self,
+        community: &settings::CommunityCacheSettings,
+        federation: &settings::FederationSettings,
+    ) {
+        let enabled = federation.active_with(community);
+        let origin = community.origin_url.trim_end_matches('/').to_owned();
+        let changed = self.federation_settings != *federation
+            || self.federation_authority_origin != origin
+            || self.federation_proxy_enabled != enabled;
+        self.federation_settings = federation.clone();
+        self.federation_authority_origin = origin;
+        self.federation_proxy_enabled = enabled;
+        if !enabled {
+            self.federation_client = None;
+            self.federation_refresh_task = None;
+            self.federation_refresh_after = None;
+            self.federation_preferred_origin_id = None;
+            self.federation_status = if federation.enabled {
+                Some(
+                    "Federation is disabled until Community Cache and every public trust pin are valid."
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+        } else if changed {
+            // Trust editors persist on each keystroke. Invalidate the old
+            // trust snapshot immediately, then debounce network refreshes so
+            // typing a key or origin ID cannot fan out concurrent requests.
+            self.federation_client = None;
+            self.federation_refresh_task = None;
+            self.federation_preferred_origin_id = None;
+            self.federation_refresh_after =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(750));
+            self.federation_status = Some("Trust policy changed; signed refresh pending.".into());
+            self.repaint
+                .request_repaint_after(std::time::Duration::from_millis(750));
+        }
+        self.sync_authority_federation_policy();
+    }
+
+    fn sync_authority_federation_policy(&mut self) {
+        if let Some(client) = self.community_cache_client.as_mut()
+            && client
+                .set_authority_federation(
+                    self.federation_proxy_enabled,
+                    self.federation_preferred_origin_id.clone(),
+                )
+                .is_err()
+        {
+            self.federation_preferred_origin_id = None;
+            let _ = client.set_authority_federation(self.federation_proxy_enabled, None);
+        }
+    }
+
+    fn start_federation_refresh(&mut self) {
+        if !self.federation_proxy_enabled {
+            return;
+        }
+        let settings = self.federation_settings.clone();
+        let authority_origin = self.federation_authority_origin.clone();
+        let repaint = self.repaint.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("bowecho-federation-discovery".into())
+            .spawn(move || {
+                let result = (|| {
+                    let credentials = crate::community_credentials::load_credentials()
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            "No authoritative Rusty Weather token is stored in the OS vault."
+                                .to_owned()
+                        })?;
+                    let trust =
+                        app_ui::federated_origins::FederationTrustConfig::from_settings(&settings)
+                            .build()
+                            .map_err(|error| error.to_string())?;
+                    let mut client = app_ui::federated_origins::FederatedOriginClient::new(
+                        app_ui::federated_origins::FederatedOriginClientConfig::new(
+                            authority_origin,
+                            credentials.bearer_token(),
+                            trust,
+                        ),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let summary = client.refresh().map_err(|error| error.to_string())?;
+                    Ok((client, summary))
+                })();
+                let _ = tx.send(result);
+                repaint.request_repaint();
+            });
+        match spawn {
+            Ok(_) => {
+                self.federation_refresh_task = Some(FederationRefreshTask { rx });
+                self.federation_refresh_after = None;
+                self.federation_status = Some("Refreshing signed public-origin catalog...".into());
+            }
+            Err(_) => {
+                self.federation_refresh_task = None;
+                self.federation_refresh_after =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+                self.federation_status =
+                    Some("Public-origin catalog worker could not start.".to_owned());
+            }
+        }
+    }
+
+    fn poll_federation_refresh(&mut self) {
+        let result =
+            self.federation_refresh_task
+                .as_ref()
+                .and_then(|task| match task.rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                        "Public-origin catalog worker stopped unexpectedly.".to_owned(),
+                    )),
+                });
+        if let Some(result) = result {
+            self.federation_refresh_task = None;
+            match result {
+                Ok((client, summary)) => {
+                    let admitted = client
+                        .directory_overview()
+                        .ok()
+                        .map(|overview| {
+                            overview
+                                .origins
+                                .into_iter()
+                                .map(|origin| origin.origin_id)
+                                .collect::<std::collections::BTreeSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    if self
+                        .federation_preferred_origin_id
+                        .as_ref()
+                        .is_some_and(|origin_id| !admitted.contains(origin_id))
+                    {
+                        self.federation_preferred_origin_id = None;
+                    }
+                    self.federation_client = Some(client);
+                    self.federation_status = Some(format!(
+                        "Verified {} public origin(s) in catalog {}.",
+                        summary.public_origin_count, summary.catalog_id
+                    ));
+                    let now_unix = chrono::Utc::now().timestamp();
+                    let refresh_seconds = summary
+                        .catalog_expires_unix
+                        .saturating_sub(now_unix)
+                        .saturating_sub(300)
+                        .clamp(60, 15 * 60) as u64;
+                    self.federation_refresh_after = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(refresh_seconds),
+                    );
+                    self.sync_authority_federation_policy();
+                }
+                Err(message) => {
+                    // Retain a still-valid previous signed snapshot. Selection
+                    // methods recheck its expiry before presenting candidates.
+                    self.federation_status =
+                        Some(format!("Public-origin catalog refresh failed: {message}"));
+                    self.federation_refresh_after =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+                }
+            }
+        }
+        if self.federation_proxy_enabled
+            && self.federation_refresh_task.is_none()
+            && self
+                .federation_refresh_after
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.start_federation_refresh();
+        }
+    }
+
+    pub(crate) fn federation_discovery_ui(&mut self, ui: &mut egui::Ui) {
+        self.poll_federation_refresh();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.federation_proxy_enabled && self.federation_refresh_task.is_none(),
+                    egui::Button::new("Refresh signed catalog"),
+                )
+                .clicked()
+            {
+                self.start_federation_refresh();
+            }
+            if self.federation_refresh_task.is_some() {
+                ui.spinner();
+            }
+        });
+        if let Some(status) = self.federation_status.as_deref() {
+            ui.weak(status);
+        }
+        app_ui::federated_origins::show_federation_discovery_ui(
+            ui,
+            self.federation_client.as_ref(),
+        );
     }
 
     /// The hour key in the NEWEST run COVERING `target` whose valid time
@@ -6533,8 +8713,8 @@ impl ModelDataDock {
                              Shortcut: Ctrl+Shift+drag the map.",
                         )
                         .changed();
-                    if plot_changed && self.plot_domain_armed {
-                        self.box_sounding_armed = false;
+                    if plot_changed {
+                        self.set_plot_domain_armed(self.plot_domain_armed);
                     }
                     ui.toggle_value(&mut self.show_color_tables, "Color tables")
                         .on_hover_text(
@@ -6555,10 +8735,1138 @@ impl ModelDataDock {
         ui.add_space(4.0);
     }
 
+    /// The stable, plot-first header for the Models workspace. Frequent
+    /// choices stay visible; imports, batch export, formulas, satellite and
+    /// WRF/ArWen remain intact behind the existing specialist windows or the
+    /// Advanced group in the left rail.
+    fn workspace_primary_controls(&mut self, ui: &mut egui::Ui) {
+        let theme = crate::ui_theme::theme();
+        egui::Frame::new()
+            .fill(theme.bg)
+            .stroke(egui::Stroke::new(1.0, theme.hairline))
+            .corner_radius(5)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(model_section_heading("Build a model plot"));
+                    ui.weak("Source → model/run/time → product/level → domain → output");
+                });
+                ui.add_space(4.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Source");
+                    let previous = self.workspace_source;
+                    egui::ComboBox::from_id_salt("model_workspace_source")
+                        .selected_text(self.workspace_source.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.workspace_source,
+                                ModelWorkspaceSource::LocalStore,
+                                ModelWorkspaceSource::LocalStore.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.workspace_source,
+                                ModelWorkspaceSource::RemoteCatalog,
+                                ModelWorkspaceSource::RemoteCatalog.label(),
+                            );
+                        });
+                    if self.workspace_source != previous {
+                        self.invalidate_remote_output(true);
+                        if self.workspace_source == ModelWorkspaceSource::RemoteCatalog
+                            && matches!(self.remote_catalog, RemoteCatalogState::Idle)
+                        {
+                            self.start_remote_catalog_load();
+                        } else if self.workspace_source == ModelWorkspaceSource::LocalStore
+                            && self.workspace_mode == ModelWorkspaceMode::Ensemble
+                        {
+                            self.start_local_ensemble_catalog_load();
+                        }
+                    }
+
+                    ui.separator();
+                    ui.strong("Model / run / time");
+                    match self.workspace_source {
+                        ModelWorkspaceSource::LocalStore => {
+                            ui.label(
+                                self.browser
+                                    .selected()
+                                    .map(selected_hour_label)
+                                    .unwrap_or_else(|| "Choose from the library".to_owned()),
+                            );
+                        }
+                        ModelWorkspaceSource::RemoteCatalog => self.remote_source_picker(ui),
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Product / level");
+                    match self.workspace_source {
+                        ModelWorkspaceSource::LocalStore => {
+                            if self.workspace_mode == ModelWorkspaceMode::Ensemble {
+                                self.local_ensemble_product_controls(ui);
+                            } else {
+                                ui.label(
+                                    self.viewer
+                                        .selected_var()
+                                        .map(display_product_level_label)
+                                        .unwrap_or_else(|| {
+                                            "Choose a model time first".to_owned()
+                                        }),
+                                );
+                                ui.weak("Use the searchable picker directly above the plot.");
+                            }
+                        }
+                        ModelWorkspaceSource::RemoteCatalog => {
+                            let previous_variable = self.remote_selected_variable.clone();
+                            if self.workspace_mode == ModelWorkspaceMode::Ensemble {
+                                self.remote_ensemble_product_controls(ui);
+                            } else {
+                                let advertised = self
+                                    .remote_profile_catalog
+                                    .as_ref()
+                                    .map(|catalog| {
+                                        catalog
+                                            .variables
+                                            .iter()
+                                            .filter(|variable| {
+                                                remote_variable_usable_for_mode(
+                                                    variable,
+                                                    self.workspace_mode,
+                                                    catalog
+                                                        .axis
+                                                        .get(self.remote_selected_time)
+                                                        .map(|time| time.storage_slot),
+                                                )
+                                            })
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                egui::ComboBox::from_id_salt("model_workspace_remote_variable")
+                                    .selected_text(
+                                        self.remote_selected_variable
+                                            .as_deref()
+                                            .map(display_product_level_label)
+                                            .unwrap_or_else(|| {
+                                                "Load remote capabilities".to_owned()
+                                            }),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for variable in &advertised {
+                                            ui.selectable_value(
+                                                &mut self.remote_selected_variable,
+                                                Some(variable.name.clone()),
+                                                remote_variable_label(variable),
+                                            )
+                                            .on_hover_text(remote_variable_hover(variable));
+                                        }
+                                    });
+                            }
+                            if self.remote_selected_variable != previous_variable {
+                                self.invalidate_remote_output(true);
+                                let variables = self
+                                    .remote_profile_catalog
+                                    .as_ref()
+                                    .map(|catalog| catalog.variables.as_slice())
+                                    .unwrap_or(&[]);
+                                self.remote_selected_level_hpa = remote_selected_level(
+                                    None,
+                                    self.remote_selected_variable.as_deref(),
+                                    variables,
+                                );
+                            }
+                            let levels = self
+                                .remote_profile_catalog
+                                .as_ref()
+                                .and_then(|catalog| {
+                                    catalog.variables.iter().find(|variable| {
+                                        self.remote_selected_variable.as_deref()
+                                            == Some(variable.name.as_str())
+                                    })
+                                })
+                                .filter(|variable| variable.kind == "pressure3d")
+                                .map(|variable| variable.levels_hpa.clone())
+                                .unwrap_or_default();
+                            if !levels.is_empty()
+                                && self.workspace_mode != ModelWorkspaceMode::Sounding
+                            {
+                                let previous_level = self.remote_selected_level_hpa;
+                                egui::ComboBox::from_id_salt("model_workspace_remote_level")
+                                    .selected_text(
+                                        self.remote_selected_level_hpa
+                                            .map(|level| format!("{level} hPa"))
+                                            .unwrap_or_else(|| "Choose level".to_owned()),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for level in levels {
+                                            ui.selectable_value(
+                                                &mut self.remote_selected_level_hpa,
+                                                Some(level),
+                                                format!("{level} hPa"),
+                                            );
+                                        }
+                                    });
+                                if self.remote_selected_level_hpa != previous_level {
+                                    self.invalidate_remote_output(true);
+                                }
+                            } else if self.workspace_mode == ModelWorkspaceMode::Sounding {
+                                ui.weak("Profile uses every advertised native pressure level.");
+                            }
+                        }
+                    }
+
+                    ui.separator();
+                    ui.strong("Domain");
+                    match self.workspace_source {
+                        ModelWorkspaceSource::LocalStore => {
+                            let previous_domain = self.workspace_domain;
+                            egui::ComboBox::from_id_salt("model_workspace_domain")
+                                .selected_text(self.workspace_domain.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.workspace_domain,
+                                        ModelDomainChoice::FullGrid,
+                                        ModelDomainChoice::FullGrid.label(),
+                                    );
+                                    ui.add_enabled_ui(
+                                        self.plot_viewer.active_domain().is_some()
+                                            || !self.plot_viewer.saved_domains().is_empty(),
+                                        |ui| {
+                                            ui.selectable_value(
+                                                &mut self.workspace_domain,
+                                                ModelDomainChoice::ActiveOrSaved,
+                                                ModelDomainChoice::ActiveOrSaved.label(),
+                                            );
+                                        },
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.workspace_domain,
+                                        ModelDomainChoice::DrawOnMap,
+                                        ModelDomainChoice::DrawOnMap.label(),
+                                    );
+                                });
+                            if self.workspace_domain != previous_domain {
+                                self.set_plot_domain_armed(
+                                    self.workspace_domain == ModelDomainChoice::DrawOnMap,
+                                );
+                            }
+                            if self.plot_domain_armed {
+                                ui.weak("Drag the next box on the radar map; Esc cancels.");
+                            }
+                        }
+                        ModelWorkspaceSource::RemoteCatalog => {
+                            match self.workspace_mode {
+                                ModelWorkspaceMode::WindowTile | ModelWorkspaceMode::Ensemble => {
+                                    self.remote_native_bounds_controls(ui);
+                                }
+                                ModelWorkspaceMode::PointSeries | ModelWorkspaceMode::Sounding => {
+                                    if let Some(catalog) = self.remote_profile_catalog.as_ref() {
+                                        ui.label(format!(
+                                            "resolved point ({}, {}) / {:.4}, {:.4}",
+                                            catalog.point.x,
+                                            catalog.point.y,
+                                            catalog.point.grid_latitude,
+                                            catalog.point.grid_longitude
+                                        ));
+                                    } else {
+                                        ui.weak("Load a resolved remote point first.");
+                                    }
+                                }
+                                ModelWorkspaceMode::TemporalDiurnal => {
+                                    if let Some(catalog) = self.remote_profile_catalog.as_ref() {
+                                        ui.label(format!(
+                                            "full native grid {} x {}",
+                                            catalog.run.nx, catalog.run.ny
+                                        ));
+                                        ui.weak("Temporal reductions are full-grid in the signed v1 contract.");
+                                    } else {
+                                        ui.weak("Load remote grid dimensions first.");
+                                    }
+                                }
+                                ModelWorkspaceMode::MapPlot => {
+                                    self.remote_geographic_bounds_controls(ui);
+                                }
+                            }
+                        }
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Output");
+                    let previous_mode = self.workspace_mode;
+                    for mode in ModelWorkspaceMode::ALL {
+                        ui.selectable_value(&mut self.workspace_mode, mode, mode.label());
+                    }
+                    if self.workspace_mode != previous_mode {
+                        self.invalidate_remote_output(true);
+                        if let Some(catalog) = self.remote_profile_catalog.as_ref() {
+                            self.remote_selected_variable = retain_or_first_remote_variable(
+                                self.remote_selected_variable.take(),
+                                &catalog.variables,
+                                self.workspace_mode,
+                                catalog
+                                    .axis
+                                    .get(self.remote_selected_time)
+                                    .map(|time| time.storage_slot),
+                            );
+                            self.remote_selected_level_hpa = remote_selected_level(
+                                self.remote_selected_level_hpa,
+                                self.remote_selected_variable.as_deref(),
+                                &catalog.variables,
+                            );
+                        }
+                        if self.workspace_source == ModelWorkspaceSource::LocalStore
+                            && self.workspace_mode == ModelWorkspaceMode::Ensemble
+                        {
+                            self.start_local_ensemble_catalog_load();
+                        }
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    let availability = workspace_mode_availability(
+                        self.workspace_mode,
+                        self.workspace_source,
+                        self.current_native_plot_field().is_some(),
+                        match self.workspace_source {
+                            ModelWorkspaceSource::LocalStore => {
+                                if self.workspace_mode == ModelWorkspaceMode::Ensemble {
+                                    self.local_ensemble_mode_ready()
+                                } else {
+                                    self.browser.selected().is_some()
+                                }
+                            }
+                            ModelWorkspaceSource::RemoteCatalog => self.remote_mode_ready(),
+                        },
+                    );
+                    if ui
+                        .add_enabled(
+                            availability.ready,
+                            egui::Button::new(primary_action_label(
+                                self.workspace_mode,
+                                self.workspace_source,
+                            )),
+                        )
+                        .on_hover_text(availability.reason)
+                        .clicked()
+                    {
+                        self.run_workspace_primary_action();
+                    }
+                    ui.weak(workspace_mode_description(self.workspace_mode));
+                });
+            });
+        ui.add_space(6.0);
+    }
+
+    fn local_ensemble_product_controls(&mut self, ui: &mut egui::Ui) {
+        if matches!(self.local_ensemble_catalog, LocalEnsembleCatalogState::Idle)
+            && self.browser.selected().is_some()
+        {
+            self.start_local_ensemble_catalog_load();
+        }
+        match &self.local_ensemble_catalog {
+            LocalEnsembleCatalogState::Idle => {
+                ui.weak("Choose a local run/time to discover stored statistics.");
+                return;
+            }
+            LocalEnsembleCatalogState::Loading(_) => {
+                ui.spinner();
+                ui.weak("Reading typed local capabilities...");
+                return;
+            }
+            LocalEnsembleCatalogState::Error { hour, message }
+                if self.browser.selected() == Some(hour) =>
+            {
+                ui.colored_label(ui.visuals().warn_fg_color, message);
+                if ui.small_button("Retry").clicked() {
+                    self.local_ensemble_catalog = LocalEnsembleCatalogState::Idle;
+                    self.start_local_ensemble_catalog_load();
+                }
+                return;
+            }
+            LocalEnsembleCatalogState::Error { .. } | LocalEnsembleCatalogState::Ready { .. } => {}
+        }
+        let groups = self.local_ensemble_groups();
+        if groups.is_empty() {
+            self.local_selected_ensemble_variable = None;
+            ui.weak("No typed stored ensemble statistics exist in this exact local hour.");
+            return;
+        }
+        ensemble_product_picker_ui(
+            ui,
+            "model_workspace_local_ensemble",
+            &groups,
+            &mut self.local_selected_ensemble_variable,
+        );
+        if let Some(product) =
+            selected_ensemble_product(&groups, self.local_selected_ensemble_variable.as_deref())
+            && product.kind == "pressure3d"
+        {
+            ui.weak(format!(
+                "Stored pressure volume / {} advertised levels. Local Ensemble does not flatten them; use a served selected-level window.",
+                product.levels_hpa.len()
+            ));
+        }
+    }
+
+    fn remote_ensemble_product_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(catalog) = self.remote_profile_catalog.as_ref() else {
+            self.remote_selected_variable = None;
+            ui.weak("Load remote capabilities to discover stored statistics.");
+            return;
+        };
+        let slot = catalog
+            .axis
+            .get(self.remote_selected_time)
+            .map(|time| time.storage_slot);
+        let groups = ensemble_product_groups(&catalog.variables, slot);
+        if groups.is_empty() {
+            self.remote_selected_variable = None;
+            ui.weak("This exact time advertises no typed stored ensemble statistics.");
+            return;
+        }
+        ensemble_product_picker_ui(
+            ui,
+            "model_workspace_remote_ensemble",
+            &groups,
+            &mut self.remote_selected_variable,
+        );
+    }
+
+    fn remote_mode_ready(&self) -> bool {
+        let Some(catalog) = self.remote_profile_catalog.as_ref() else {
+            return false;
+        };
+        let Some(variable) = self
+            .remote_selected_variable
+            .as_deref()
+            .and_then(|selected| {
+                catalog
+                    .variables
+                    .iter()
+                    .find(|variable| variable.name == selected)
+            })
+        else {
+            return false;
+        };
+        let slot = catalog
+            .axis
+            .get(self.remote_selected_time)
+            .map(|time| time.storage_slot);
+        if !remote_variable_usable_for_mode(variable, self.workspace_mode, slot) {
+            return false;
+        }
+        match self.workspace_mode {
+            ModelWorkspaceMode::MapPlot => {
+                slot.is_some()
+                    && remote_geographic_bounds(
+                        self.remote_west_longitude,
+                        self.remote_south_latitude,
+                        self.remote_east_longitude,
+                        self.remote_north_latitude,
+                    )
+                    .is_ok()
+                    && (variable.kind != "pressure3d"
+                        || self
+                            .remote_selected_level_hpa
+                            .is_some_and(|level| variable.levels_hpa.contains(&level)))
+            }
+            ModelWorkspaceMode::Sounding => !catalog.axis.is_empty(),
+            ModelWorkspaceMode::PointSeries => remote_time_window(
+                &catalog.axis,
+                self.remote_range_start,
+                self.remote_range_end,
+            )
+            .is_ok(),
+            ModelWorkspaceMode::WindowTile | ModelWorkspaceMode::Ensemble => {
+                remote_native_bounds(
+                    catalog.run.nx,
+                    catalog.run.ny,
+                    self.remote_x0,
+                    self.remote_y0,
+                    self.remote_x1,
+                    self.remote_y1,
+                )
+                .is_ok()
+                    && slot.is_some()
+                    && (self.workspace_mode != ModelWorkspaceMode::Ensemble
+                        || ensemble_selector(variable).is_some())
+                    && (variable.kind != "pressure3d"
+                        || self
+                            .remote_selected_level_hpa
+                            .is_some_and(|level| variable.levels_hpa.contains(&level)))
+            }
+            ModelWorkspaceMode::TemporalDiurnal => {
+                remote_time_window(
+                    &catalog.axis,
+                    self.remote_range_start,
+                    self.remote_range_end,
+                )
+                .is_ok()
+                    && remote_temporal_contract(variable).is_ok()
+                    && (variable.kind != "pressure3d"
+                        || self
+                            .remote_selected_level_hpa
+                            .is_some_and(|level| variable.levels_hpa.contains(&level)))
+            }
+        }
+    }
+
+    fn remote_native_bounds_controls(&mut self, ui: &mut egui::Ui) {
+        let dimensions = self.remote_profile_catalog.as_ref().map(|catalog| {
+            (
+                catalog.run.nx,
+                catalog.run.ny,
+                catalog.point.x,
+                catalog.point.y,
+            )
+        });
+        let previous = (
+            self.remote_x0,
+            self.remote_y0,
+            self.remote_x1,
+            self.remote_y1,
+        );
+        if let Some((nx, ny, point_x, point_y)) = dimensions {
+            if ui.small_button("Full grid").clicked() {
+                self.remote_x0 = 0;
+                self.remote_y0 = 0;
+                self.remote_x1 = u32::try_from(nx).unwrap_or(u32::MAX);
+                self.remote_y1 = u32::try_from(ny).unwrap_or(u32::MAX);
+            }
+            if ui
+                .small_button("Around point")
+                .on_hover_text(
+                    "Use an exact native-index box up to 256 x 256 cells around the resolved point",
+                )
+                .clicked()
+            {
+                let half = 128_usize;
+                let x0 = point_x.saturating_sub(half);
+                let y0 = point_y.saturating_sub(half);
+                let x1 = point_x.saturating_add(half).saturating_add(1).min(nx);
+                let y1 = point_y.saturating_add(half).saturating_add(1).min(ny);
+                self.remote_x0 = u32::try_from(x0).unwrap_or(0);
+                self.remote_y0 = u32::try_from(y0).unwrap_or(0);
+                self.remote_x1 = u32::try_from(x1).unwrap_or(u32::MAX);
+                self.remote_y1 = u32::try_from(y1).unwrap_or(u32::MAX);
+            }
+            ui.add(
+                egui::DragValue::new(&mut self.remote_x0)
+                    .range(0..=u32::try_from(nx).unwrap_or(u32::MAX))
+                    .prefix("x ["),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.remote_x1)
+                    .range(0..=u32::try_from(nx).unwrap_or(u32::MAX))
+                    .suffix(")"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.remote_y0)
+                    .range(0..=u32::try_from(ny).unwrap_or(u32::MAX))
+                    .prefix("y ["),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.remote_y1)
+                    .range(0..=u32::try_from(ny).unwrap_or(u32::MAX))
+                    .suffix(")"),
+            );
+            ui.weak(format!("native grid {nx} x {ny}"));
+        } else {
+            ui.weak("Load remote run dimensions first.");
+        }
+        if previous
+            != (
+                self.remote_x0,
+                self.remote_y0,
+                self.remote_x1,
+                self.remote_y1,
+            )
+        {
+            self.invalidate_remote_output(true);
+        }
+    }
+
+    fn remote_geographic_bounds_controls(&mut self, ui: &mut egui::Ui) {
+        let previous = (
+            self.remote_west_longitude,
+            self.remote_south_latitude,
+            self.remote_east_longitude,
+            self.remote_north_latitude,
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .small_button("Around point")
+                .on_hover_text("Seed a compact 8 x 6 degree domain around the resolved point")
+                .clicked()
+            {
+                self.remote_west_longitude =
+                    remote_normalize_longitude(self.remote_longitude - 4.0);
+                self.remote_east_longitude =
+                    remote_normalize_longitude(self.remote_longitude + 4.0);
+                self.remote_south_latitude = (self.remote_latitude - 3.0).max(-90.0);
+                self.remote_north_latitude = (self.remote_latitude + 3.0).min(90.0);
+            }
+            if ui
+                .toggle_value(&mut self.plot_domain_armed, "Draw on radar map")
+                .on_hover_text("The next radar-map drag becomes this exact signed bbox")
+                .changed()
+            {
+                self.set_plot_domain_armed(self.plot_domain_armed);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut self.remote_west_longitude)
+                    .range(-180.0..=180.0)
+                    .speed(0.1)
+                    .prefix("W ")
+                    .suffix("°"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.remote_east_longitude)
+                    .range(-180.0..=180.0)
+                    .speed(0.1)
+                    .prefix("E ")
+                    .suffix("°"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.remote_south_latitude)
+                    .range(-90.0..=90.0)
+                    .speed(0.1)
+                    .prefix("S ")
+                    .suffix("°"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.remote_north_latitude)
+                    .range(-90.0..=90.0)
+                    .speed(0.1)
+                    .prefix("N ")
+                    .suffix("°"),
+            );
+        });
+        match remote_geographic_bounds(
+            self.remote_west_longitude,
+            self.remote_south_latitude,
+            self.remote_east_longitude,
+            self.remote_north_latitude,
+        ) {
+            Ok((west, south, east, north)) => {
+                let arc = remote_longitude_arc_label(west, east);
+                ui.weak(format!(
+                    "{arc}; closed latitude interval {south:.3}° to {north:.3}°"
+                ));
+                if previous
+                    != (
+                        self.remote_west_longitude,
+                        self.remote_south_latitude,
+                        self.remote_east_longitude,
+                        self.remote_north_latitude,
+                    )
+                {
+                    self.plot_viewer
+                        .set_active_domain(CustomDomain::generated((west, east, south, north)));
+                }
+            }
+            Err(message) => {
+                ui.colored_label(ui.visuals().warn_fg_color, message);
+            }
+        }
+        if self.plot_domain_armed {
+            ui.weak("Drag the next box on the radar map; Esc cancels.");
+        }
+        if previous
+            != (
+                self.remote_west_longitude,
+                self.remote_south_latitude,
+                self.remote_east_longitude,
+                self.remote_north_latitude,
+            )
+        {
+            self.invalidate_remote_output(true);
+        }
+    }
+
+    fn remote_source_picker(&mut self, ui: &mut egui::Ui) {
+        if self.federation_proxy_enabled {
+            let verified_origins = self
+                .federation_client
+                .as_ref()
+                .and_then(|client| client.directory_overview().ok())
+                .map(|overview| {
+                    overview
+                        .origins
+                        .into_iter()
+                        .map(|origin| (origin.origin_id, origin.display_name))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if self
+                .federation_preferred_origin_id
+                .as_ref()
+                .is_some_and(|selected| {
+                    !verified_origins
+                        .iter()
+                        .any(|(origin_id, _)| origin_id == selected)
+                })
+            {
+                self.federation_preferred_origin_id = None;
+                self.sync_authority_federation_policy();
+            }
+            let previous = self.federation_preferred_origin_id.clone();
+            let selected_text = self
+                .federation_preferred_origin_id
+                .as_ref()
+                .and_then(|selected| {
+                    verified_origins
+                        .iter()
+                        .find(|(origin_id, _)| origin_id == selected)
+                        .map(|(_, display_name)| display_name.as_str())
+                })
+                .unwrap_or("Automatic public-origin failover")
+                .to_owned();
+            egui::ComboBox::from_id_salt("model_workspace_federated_origin")
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.federation_preferred_origin_id,
+                        None,
+                        "Automatic public-origin failover",
+                    );
+                    for (origin_id, display_name) in &verified_origins {
+                        ui.selectable_value(
+                            &mut self.federation_preferred_origin_id,
+                            Some(origin_id.clone()),
+                            display_name,
+                        )
+                        .on_hover_text(format!(
+                            "Prefer {origin_id} only after Hetzner's normal local/R2/origin resolve misses"
+                        ));
+                    }
+                });
+            if self.federation_preferred_origin_id != previous {
+                self.sync_authority_federation_policy();
+                self.invalidate_remote_output(true);
+            }
+            egui::CollapsingHeader::new("Verified public origins")
+                .id_salt("model_workspace_federation_directory")
+                .default_open(false)
+                .show(ui, |ui| self.federation_discovery_ui(ui));
+        }
+
+        let mut load_runs = None;
+        let mut load_profile = None;
+        match &mut self.remote_catalog {
+            RemoteCatalogState::Idle => {
+                if ui.button("Load catalog").clicked() {
+                    self.start_remote_catalog_load();
+                }
+            }
+            RemoteCatalogState::Loading => {
+                ui.spinner();
+                ui.weak("Loading signed-origin capabilities…");
+            }
+            RemoteCatalogState::Ready(models) => {
+                let previous_model = self.remote_selected_model.clone();
+                egui::ComboBox::from_id_salt("model_workspace_remote_model")
+                    .selected_text(
+                        self.remote_selected_model
+                            .as_deref()
+                            .unwrap_or("No remote models"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for model in models.iter() {
+                            ui.selectable_value(
+                                &mut self.remote_selected_model,
+                                Some(model.id.clone()),
+                                format!("{} · {} runs", model.id, model.stored_run_count),
+                            )
+                            .on_hover_text(&model.description);
+                        }
+                    });
+                if self.remote_selected_model != previous_model {
+                    self.invalidate_remote_output(true);
+                    self.remote_runs.clear();
+                    self.remote_selected_run = None;
+                    self.remote_profile_catalog = None;
+                    load_runs = self.remote_selected_model.clone();
+                }
+                if ui.small_button("Refresh").clicked() {
+                    self.start_remote_catalog_load();
+                }
+            }
+            RemoteCatalogState::Error(message) => {
+                ui.colored_label(ui.visuals().warn_fg_color, message.as_str());
+                if ui.small_button("Retry").clicked() {
+                    self.start_remote_catalog_load();
+                }
+            }
+        }
+        if let Some(model) = load_runs {
+            self.start_remote_runs_load(model);
+        }
+
+        if !self.remote_runs.is_empty() {
+            let previous_run = self.remote_selected_run.clone();
+            egui::ComboBox::from_id_salt("model_workspace_remote_run")
+                .selected_text(
+                    self.remote_selected_run
+                        .as_deref()
+                        .unwrap_or("Choose remote run"),
+                )
+                .show_ui(ui, |ui| {
+                    for entry in &self.remote_runs {
+                        ui.selectable_value(
+                            &mut self.remote_selected_run,
+                            Some(entry.run.run.clone()),
+                            format!("{} · {} vars", entry.run.run, entry.variable_count),
+                        );
+                    }
+                });
+            if self.remote_selected_run != previous_run {
+                self.invalidate_remote_output(true);
+                self.remote_profile_catalog = None;
+                if let (Some(model), Some(run)) = (
+                    self.remote_selected_model.clone(),
+                    self.remote_selected_run.clone(),
+                ) {
+                    load_profile = Some((model, run));
+                }
+            }
+        }
+
+        ui.add(
+            egui::DragValue::new(&mut self.remote_latitude)
+                .range(-90.0..=90.0)
+                .speed(0.05)
+                .prefix("Lat ")
+                .suffix("°"),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.remote_longitude)
+                .range(-180.0..=180.0)
+                .speed(0.05)
+                .prefix("Lon ")
+                .suffix("°"),
+        );
+        if ui
+            .small_button("Apply point")
+            .on_hover_text("Reload exact times and profile capabilities at this point")
+            .clicked()
+            && let (Some(model), Some(run)) = (
+                self.remote_selected_model.clone(),
+                self.remote_selected_run.clone(),
+            )
+        {
+            self.invalidate_remote_output(true);
+            load_profile = Some((model, run));
+        }
+
+        if let Some((model, run)) = load_profile {
+            self.start_remote_profile_catalog_load(model, run);
+        }
+        let mut time_controls_changed = false;
+        if let Some(catalog) = &self.remote_profile_catalog {
+            let previous_time = self.remote_selected_time;
+            egui::ComboBox::from_id_salt("model_workspace_remote_time")
+                .selected_text(
+                    catalog
+                        .axis
+                        .get(self.remote_selected_time)
+                        .map(remote_time_label)
+                        .unwrap_or_else(|| "No remote times".to_owned()),
+                )
+                .show_ui(ui, |ui| {
+                    for (index, time) in catalog.axis.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.remote_selected_time,
+                            index,
+                            remote_time_label(time),
+                        );
+                    }
+                });
+            time_controls_changed |= self.remote_selected_time != previous_time;
+
+            if matches!(
+                self.workspace_mode,
+                ModelWorkspaceMode::PointSeries | ModelWorkspaceMode::TemporalDiurnal
+            ) && !catalog.axis.is_empty()
+            {
+                let previous_range = (self.remote_range_start, self.remote_range_end);
+                egui::ComboBox::from_id_salt("model_workspace_remote_range_start")
+                    .selected_text(
+                        catalog
+                            .axis
+                            .get(self.remote_range_start)
+                            .map(remote_time_label)
+                            .unwrap_or_else(|| "No start time".to_owned()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (index, time) in catalog.axis.iter().enumerate() {
+                            if index <= self.remote_range_end {
+                                ui.selectable_value(
+                                    &mut self.remote_range_start,
+                                    index,
+                                    format!("From {}", remote_time_label(time)),
+                                );
+                            }
+                        }
+                    });
+                egui::ComboBox::from_id_salt("model_workspace_remote_range_end")
+                    .selected_text(
+                        catalog
+                            .axis
+                            .get(self.remote_range_end)
+                            .map(remote_time_label)
+                            .unwrap_or_else(|| "No end time".to_owned()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (index, time) in catalog.axis.iter().enumerate() {
+                            if index >= self.remote_range_start {
+                                ui.selectable_value(
+                                    &mut self.remote_range_end,
+                                    index,
+                                    format!("Through {}", remote_time_label(time)),
+                                );
+                            }
+                        }
+                    });
+                time_controls_changed |=
+                    previous_range != (self.remote_range_start, self.remote_range_end);
+            }
+        }
+        if time_controls_changed {
+            self.invalidate_remote_output(true);
+            if let Some(catalog) = self.remote_profile_catalog.as_ref() {
+                self.remote_selected_variable = retain_or_first_remote_variable(
+                    self.remote_selected_variable.take(),
+                    &catalog.variables,
+                    self.workspace_mode,
+                    catalog
+                        .axis
+                        .get(self.remote_selected_time)
+                        .map(|time| time.storage_slot),
+                );
+                self.remote_selected_level_hpa = remote_selected_level(
+                    self.remote_selected_level_hpa,
+                    self.remote_selected_variable.as_deref(),
+                    &catalog.variables,
+                );
+            }
+        }
+        if explicit_historical_relay_allowed(self.workspace_mode, true) {
+            ui.add_enabled(
+                self.community_relay_dispatcher.is_some(),
+                egui::Checkbox::new(
+                    &mut self.remote_historical_recovery,
+                    "Recover retired data from Private Community Sharing",
+                ),
+            )
+            .on_hover_text(
+                "Off by default. When enabled, an exact origin-signed profile or point series follows the cold path: verified local cache, R2, encrypted TURN-only Community Cache, then archival HTTPS or an honest unavailable result.",
+            );
+            if self.remote_historical_recovery {
+                ui.weak(
+                    "Explicit cold mode is active for this load only; it never changes current operational delivery or exposes another user's address.",
+                );
+            }
+        }
+        if let Some(status) = &self.remote_detail_status {
+            ui.weak(status);
+        }
+    }
+
+    fn run_workspace_primary_action(&mut self) {
+        if self.workspace_source == ModelWorkspaceSource::RemoteCatalog {
+            match self.workspace_mode {
+                ModelWorkspaceMode::Sounding => self.start_remote_sounding_load(),
+                ModelWorkspaceMode::PointSeries
+                | ModelWorkspaceMode::WindowTile
+                | ModelWorkspaceMode::TemporalDiurnal
+                | ModelWorkspaceMode::Ensemble => self.start_remote_output_load(),
+                ModelWorkspaceMode::MapPlot => {
+                    if let Ok((west, south, east, north)) = remote_geographic_bounds(
+                        self.remote_west_longitude,
+                        self.remote_south_latitude,
+                        self.remote_east_longitude,
+                        self.remote_north_latitude,
+                    ) {
+                        self.plot_viewer
+                            .set_active_domain(CustomDomain::generated((west, east, south, north)));
+                    }
+                    self.start_remote_output_load();
+                }
+            }
+            return;
+        }
+        match self.workspace_mode {
+            ModelWorkspaceMode::MapPlot | ModelWorkspaceMode::WindowTile => {
+                if self.workspace_domain == ModelDomainChoice::FullGrid {
+                    self.native_plot_seeded_run = self
+                        .current_native_plot_field()
+                        .map(|field| (field.key.hour.model.clone(), field.key.hour.run.clone()));
+                    self.plot_viewer.show_full_grid();
+                    self.native_plot_auto_domain = None;
+                }
+                self.native_plot_content = NativePlotContent::Model;
+                self.show_plot_viewer = true;
+            }
+            ModelWorkspaceMode::Sounding => {
+                self.import_message = Some(
+                    "Click the model plot for a point sounding, or use Box sounding for an area mean."
+                        .to_owned(),
+                );
+            }
+            ModelWorkspaceMode::PointSeries | ModelWorkspaceMode::TemporalDiurnal => {
+                self.import_message = Some(match self.open_domain_extrema_history() {
+                    Ok(label) => format!("Opened {label}"),
+                    Err(error) => format!("Time series: {error}"),
+                });
+            }
+            ModelWorkspaceMode::Ensemble => {
+                self.load_local_ensemble_product();
+            }
+        }
+    }
+
     /// The dock body — call inside an egui Window/panel. Returns false when
     /// the user asked to close.
+    fn remote_output_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(model_section_heading("Verified remote result"));
+            if self.remote_output_task.is_some() {
+                ui.spinner();
+                ui.weak("The UI remains interactive while HTTPS/cache work runs.");
+            }
+        });
+        if let Some(status) = self.remote_detail_status.as_deref() {
+            crate::panel_kit::status_block(ui, status, None);
+        }
+
+        if let Some(catalog) = self.remote_profile_catalog.as_ref() {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Canonical run");
+                ui.monospace(format!(
+                    "{} / {} / {}",
+                    catalog.run.model,
+                    catalog.run.run,
+                    short_hash(&catalog.run.snapshot_id)
+                ));
+                ui.weak(format!(
+                    "grid {} x {} / {}",
+                    catalog.run.nx,
+                    catalog.run.ny,
+                    short_hash(&catalog.run.grid_hash)
+                ));
+            });
+            for source in &catalog.run.source_provenance {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Provenance");
+                    ui.monospace(&source.provider);
+                    if !source.roles.is_empty() {
+                        ui.weak(source.roles.join(", "));
+                    }
+                });
+            }
+            for attribution in &catalog.run.provider_attributions {
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to(&attribution.provider, &attribution.source_url);
+                    ui.weak(&attribution.notice);
+                });
+                if !attribution.modification_notice.is_empty() {
+                    ui.weak(&attribution.modification_notice);
+                }
+            }
+        }
+        ui.separator();
+
+        let mut temporal_metric_changed = false;
+        let mut remote_map_request = None;
+        let mut open_remote_native_plot = false;
+        match self.remote_output_result.as_mut() {
+            None => {
+                ui.heading("Choose an output and fetch it");
+                ui.label(
+                    "Arbitrary-domain maps, point series, exact native-index windows, selected pressure-level windows, capability-declared temporal/diurnal products, and typed stored ensemble statistics are fetched as origin-signed immutable objects.",
+                );
+                ui.weak(
+                    "Geographic maps carry their cropped latitude/longitude grid, projection and cell mask inside the verified object; Window / tile remains the exact half-open native-index workflow.",
+                );
+            }
+            Some(RemoteOutputResult::PointSeries {
+                result,
+                tier,
+                request_sha256,
+            }) => {
+                remote_verified_object_header(ui, *tier, request_sha256);
+                remote_point_series_ui(ui, result);
+            }
+            Some(RemoteOutputResult::Field {
+                field,
+                tier,
+                request_sha256,
+                coverage_note,
+            }) => {
+                remote_verified_object_header(ui, *tier, request_sha256);
+                ui.weak(coverage_note.as_str());
+                if field.grid.is_some() {
+                    ui.weak(
+                        "The signed crop supplies its exact coordinates, projection and bbox mask; no grid geometry was inferred.",
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Add to radar map").clicked() {
+                            remote_map_request = Some(std::sync::Arc::new(field.clone()));
+                        }
+                        if ui.button("Native plot").clicked() {
+                            open_remote_native_plot = true;
+                        }
+                    });
+                } else {
+                    ui.weak(
+                        "This is an exact native-index crop. No latitude/longitude grid was invented for it.",
+                    );
+                }
+                let _ = self.remote_viewer.ui(ui);
+            }
+            Some(RemoteOutputResult::Temporal {
+                result,
+                tier,
+                request_sha256,
+                selected_metric,
+            }) => {
+                remote_verified_object_header(ui, *tier, request_sha256);
+                remote_temporal_summary_ui(ui, result);
+                let labels = remote_temporal_metric_labels(result);
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Rendered field");
+                    for (index, label) in labels.iter().enumerate() {
+                        temporal_metric_changed |= ui
+                            .selectable_value(selected_metric, index, *label)
+                            .changed();
+                    }
+                });
+                ui.weak(
+                    "Each pressure result is one explicitly selected level; values are never flattened across levels.",
+                );
+                let _ = self.remote_viewer.ui(ui);
+            }
+        }
+        if temporal_metric_changed {
+            self.install_remote_output_field();
+        }
+        if let Some(field) = remote_map_request {
+            self.map_request = Some(field);
+        }
+        if open_remote_native_plot {
+            self.native_plot_content = NativePlotContent::Model;
+            self.show_plot_viewer = true;
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.handle_responses();
+
+        self.workspace_primary_controls(ui);
 
         egui::Panel::left("model_runs")
             .resizable(true)
@@ -6636,12 +9944,20 @@ impl ModelDataDock {
                     self.select_hour(key);
                 }
                 ui.add_space(6.0);
-                let actions_height = ui.available_height().max(120.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("model_library_actions")
-                    .max_height(actions_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| self.model_library_controls(ui));
+                egui::CollapsingHeader::new(model_section_heading("Advanced"))
+                    .id_salt("model_workspace_advanced")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Imports, Formula Lab, satellite/SimSat plotting, WRF/ArWen, CM1 and batch export remain available without crowding the everyday plot path.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(4.0);
+                        self.model_library_controls(ui);
+                    });
             });
 
         // The sounding is NOT rendered here. A model-sounding load feeds BOTH
@@ -6656,6 +9972,10 @@ impl ModelDataDock {
         // `dock_model_sounding_beside_plot`.
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            if self.workspace_source == ModelWorkspaceSource::RemoteCatalog {
+                self.remote_output_ui(ui);
+                return;
+            }
             self.viewer_toolbar(ui);
             match self.viewer.ui(ui) {
                 Some(FieldViewerEvent::VarSelected(var)) => {
@@ -6686,12 +10006,14 @@ impl ModelDataDock {
                 Some(FieldViewerEvent::DomainSelected(domain)) => {
                     self.native_plot_content = NativePlotContent::Model;
                     self.show_plot_viewer = true;
+                    self.workspace_domain = ModelDomainChoice::ActiveOrSaved;
                     self.native_plot_auto_domain = None;
                     self.plot_viewer.set_active_domain(domain);
                 }
                 Some(FieldViewerEvent::DomainRotationChanged { rotation_deg }) => {
                     self.native_plot_content = NativePlotContent::Model;
                     self.show_plot_viewer = true;
+                    self.workspace_domain = ModelDomainChoice::ActiveOrSaved;
                     self.native_plot_auto_domain = None;
                     self.plot_viewer.set_active_domain_rotation(rotation_deg);
                 }
@@ -6706,6 +10028,2330 @@ fn model_section_heading(title: &str) -> egui::RichText {
         .size(12.5)
         .strong()
         .color(crate::ui_theme::subhead_color())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkspaceModeAvailability {
+    ready: bool,
+    reason: &'static str,
+}
+
+fn workspace_mode_availability(
+    mode: ModelWorkspaceMode,
+    source: ModelWorkspaceSource,
+    field_ready: bool,
+    local_hour_selected: bool,
+) -> WorkspaceModeAvailability {
+    if source == ModelWorkspaceSource::RemoteCatalog {
+        return match mode {
+            ModelWorkspaceMode::Sounding => WorkspaceModeAvailability {
+                ready: local_hour_selected,
+                reason: if local_hour_selected {
+                    "Fetch the selected origin-signed profile through local cache, R2, then origin delivery."
+                } else {
+                    "Choose a remote model, run, time and point first."
+                },
+            },
+            ModelWorkspaceMode::PointSeries => WorkspaceModeAvailability {
+                ready: local_hour_selected,
+                reason: if local_hour_selected {
+                    "Fetch an exact signed series for the resolved grid point and selected time window."
+                } else {
+                    "Choose an advertised point-series product and valid time window."
+                },
+            },
+            ModelWorkspaceMode::WindowTile => WorkspaceModeAvailability {
+                ready: local_hour_selected,
+                reason: if local_hour_selected {
+                    "Fetch an exact half-open native-index crop; pressure products use one selected level."
+                } else {
+                    "Choose an advertised product/time and valid native x/y bounds."
+                },
+            },
+            ModelWorkspaceMode::TemporalDiurnal => WorkspaceModeAvailability {
+                ready: local_hour_selected,
+                reason: if local_hour_selected {
+                    "Fetch the scientifically declared temporal reducer over the selected exact-time window."
+                } else {
+                    "This product must advertise reducible temporal semantics, a compatible reducer, and valid coverage."
+                },
+            },
+            ModelWorkspaceMode::MapPlot => WorkspaceModeAvailability {
+                ready: local_hour_selected,
+                reason: if local_hour_selected {
+                    "Fetch an origin-signed geographic envelope with exact cropped coordinates, projection and bbox mask."
+                } else {
+                    "Choose an advertised product/time and a finite non-empty geographic domain."
+                },
+            },
+            ModelWorkspaceMode::Ensemble => WorkspaceModeAvailability {
+                ready: local_hour_selected,
+                reason: if local_hour_selected {
+                    "Fetch the selected origin-advertised statistical field as an exact signed native window."
+                } else {
+                    "This run/time must advertise a typed stored mean, spread/extreme, percentile, or probability product."
+                },
+            },
+        };
+    }
+    match mode {
+        ModelWorkspaceMode::MapPlot | ModelWorkspaceMode::WindowTile => WorkspaceModeAvailability {
+            ready: field_ready,
+            reason: if field_ready {
+                "Open the selected field in the native arbitrary-domain plotter."
+            } else {
+                "Load a 2-D product first."
+            },
+        },
+        ModelWorkspaceMode::Sounding => WorkspaceModeAvailability {
+            ready: local_hour_selected,
+            reason: if local_hour_selected {
+                "Click the plot for a point sounding or arm an area-mean box."
+            } else {
+                "Choose a local model run and time first."
+            },
+        },
+        ModelWorkspaceMode::PointSeries | ModelWorkspaceMode::TemporalDiurnal => {
+            WorkspaceModeAvailability {
+                ready: field_ready,
+                reason: if field_ready {
+                    "Open the selected field's forecast-time analysis."
+                } else {
+                    "Load a stored 2-D field first."
+                },
+            }
+        }
+        ModelWorkspaceMode::Ensemble => WorkspaceModeAvailability {
+            ready: local_hour_selected,
+            reason: if local_hour_selected {
+                "Load the selected typed stored 2-D statistical field; no members are inferred."
+            } else {
+                "This exact local hour must contain a typed stored 2-D ensemble statistic."
+            },
+        },
+    }
+}
+
+fn primary_action_label(mode: ModelWorkspaceMode, source: ModelWorkspaceSource) -> &'static str {
+    match mode {
+        ModelWorkspaceMode::PointSeries if source == ModelWorkspaceSource::RemoteCatalog => {
+            "Fetch series"
+        }
+        ModelWorkspaceMode::WindowTile if source == ModelWorkspaceSource::RemoteCatalog => {
+            "Fetch window"
+        }
+        ModelWorkspaceMode::TemporalDiurnal if source == ModelWorkspaceSource::RemoteCatalog => {
+            "Fetch temporal grid"
+        }
+        ModelWorkspaceMode::Ensemble if source == ModelWorkspaceSource::RemoteCatalog => {
+            "Fetch statistic"
+        }
+        ModelWorkspaceMode::MapPlot if source == ModelWorkspaceSource::RemoteCatalog => "Fetch map",
+        ModelWorkspaceMode::MapPlot => "Open plot",
+        ModelWorkspaceMode::Sounding if source == ModelWorkspaceSource::RemoteCatalog => {
+            "Load sounding"
+        }
+        ModelWorkspaceMode::Sounding => "Sampling help",
+        ModelWorkspaceMode::PointSeries => "Open series",
+        ModelWorkspaceMode::WindowTile => "Open window",
+        ModelWorkspaceMode::TemporalDiurnal => "Open temporal view",
+        ModelWorkspaceMode::Ensemble => "Load statistic",
+    }
+}
+
+fn workspace_mode_description(mode: ModelWorkspaceMode) -> &'static str {
+    match mode {
+        ModelWorkspaceMode::MapPlot => {
+            "Native map rendering over the full grid or any typed, drawn, or saved domain."
+        }
+        ModelWorkspaceMode::Sounding => {
+            "Point profile or finite-cell box mean from the selected time."
+        }
+        ModelWorkspaceMode::PointSeries => {
+            "Forecast-time values and whole-domain extrema for the selected product."
+        }
+        ModelWorkspaceMode::WindowTile => {
+            "A cropped native-resolution plot using the same domain controls."
+        }
+        ModelWorkspaceMode::TemporalDiurnal => {
+            "Time-window analysis; native diurnal server products plug into this mode."
+        }
+        ModelWorkspaceMode::Ensemble => {
+            "Stored mean, spread/extrema, percentile and probability fields, exactly as advertised."
+        }
+    }
+}
+
+fn selected_hour_label(hour: &HourKey) -> String {
+    format!(
+        "{} / {} / {}",
+        hour.model.to_uppercase(),
+        hour.run,
+        hour.time_label()
+    )
+}
+
+fn display_product_level_label(variable: &str) -> String {
+    variable.replace('_', " ")
+}
+
+fn retain_or_first_remote_model(
+    selected: Option<String>,
+    models: &[crate::community_cache::RemoteModelCatalogEntry],
+) -> Option<String> {
+    selected
+        .filter(|selected| models.iter().any(|model| &model.id == selected))
+        .or_else(|| models.first().map(|model| model.id.clone()))
+}
+
+fn retain_or_first_remote_run(
+    selected: Option<String>,
+    runs: &[crate::community_cache::RemoteRunCatalogEntry],
+) -> Option<String> {
+    selected
+        .filter(|selected| runs.iter().any(|entry| &entry.run.run == selected))
+        .or_else(|| runs.first().map(|entry| entry.run.run.clone()))
+}
+
+fn retain_or_first_remote_variable(
+    selected: Option<String>,
+    variables: &[crate::community_cache::RemoteVariableCapability],
+    mode: ModelWorkspaceMode,
+    selected_slot: Option<u16>,
+) -> Option<String> {
+    selected
+        .filter(|selected| {
+            variables.iter().any(|variable| {
+                variable.name == *selected
+                    && remote_variable_usable_for_mode(variable, mode, selected_slot)
+            })
+        })
+        .or_else(|| {
+            variables
+                .iter()
+                .find(|variable| remote_variable_usable_for_mode(variable, mode, selected_slot))
+                .map(|variable| variable.name.clone())
+        })
+}
+
+fn ensemble_selector<T: EnsembleCatalogCapability>(
+    variable: &T,
+) -> Option<rustwx_core::FieldSelector> {
+    let selector =
+        serde_json::from_value::<rustwx_core::FieldSelector>(variable.ensemble_selector().clone())
+            .ok()?;
+    matches!(
+        selector.product,
+        rustwx_core::FieldProduct::EnsembleMean
+            | rustwx_core::FieldProduct::EnsembleStandardDeviation
+            | rustwx_core::FieldProduct::EnsembleSpread
+            | rustwx_core::FieldProduct::EnsembleMinimum
+            | rustwx_core::FieldProduct::EnsembleMaximum
+            | rustwx_core::FieldProduct::Percentile(_)
+            | rustwx_core::FieldProduct::Probability(_)
+    )
+    .then_some(selector)
+}
+
+fn ensemble_product_groups<T: EnsembleCatalogCapability>(
+    variables: &[T],
+    selected_slot: Option<u16>,
+) -> Vec<EnsembleProductGroup> {
+    let mut groups = Vec::<EnsembleProductGroup>::new();
+    for variable in variables {
+        let Some(selector) = ensemble_selector(variable) else {
+            continue;
+        };
+        let kind = variable.ensemble_kind();
+        if !matches!(kind, "surface2d" | "pressure3d")
+            || (kind == "pressure3d" && variable.ensemble_levels_hpa().is_empty())
+            || selected_slot
+                .is_some_and(|slot| !variable.ensemble_available_slots().contains(&slot))
+        {
+            continue;
+        }
+        let key = EnsembleProductGroupKey {
+            field: selector.field,
+            vertical: selector.vertical,
+        };
+        let product = EnsembleStoredProduct {
+            variable: variable.ensemble_name().to_owned(),
+            units: variable.ensemble_units().to_owned(),
+            kind: kind.to_owned(),
+            levels_hpa: variable.ensemble_levels_hpa().to_vec(),
+            selector,
+            available_samples: variable.ensemble_available_samples(),
+            expected_samples: variable.ensemble_expected_samples(),
+            coverage: variable.ensemble_coverage(),
+        };
+        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+            group.products.push(product);
+        } else {
+            groups.push(EnsembleProductGroup {
+                key,
+                products: vec![product],
+            });
+        }
+    }
+    for group in &mut groups {
+        group.products.sort_by(|left, right| {
+            ensemble_product_sort_key(left)
+                .cmp(&ensemble_product_sort_key(right))
+                .then_with(|| left.variable.cmp(&right.variable))
+        });
+    }
+    groups.sort_by_key(ensemble_group_label);
+    groups
+}
+
+fn ensemble_product_sort_key(product: &EnsembleStoredProduct) -> (u8, String) {
+    let rank = match product.selector.product {
+        rustwx_core::FieldProduct::EnsembleMean => 0,
+        rustwx_core::FieldProduct::EnsembleStandardDeviation => 1,
+        rustwx_core::FieldProduct::EnsembleSpread => 2,
+        rustwx_core::FieldProduct::EnsembleMinimum => 3,
+        rustwx_core::FieldProduct::EnsembleMaximum => 4,
+        rustwx_core::FieldProduct::Percentile(_) => 5,
+        rustwx_core::FieldProduct::Probability(_) => 6,
+        rustwx_core::FieldProduct::Default => 7,
+    };
+    (rank, ensemble_product_label(product))
+}
+
+fn ensemble_group_label(group: &EnsembleProductGroup) -> String {
+    format!(
+        "{} / {}",
+        group.key.field.display_name(),
+        display_product_level_label(&group.key.vertical.to_string())
+    )
+}
+
+fn format_probability_limit_milli(value: i64) -> String {
+    let value = value as f64 / 1_000.0;
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.3}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    }
+}
+
+fn ensemble_product_label(product: &EnsembleStoredProduct) -> String {
+    match product.selector.product {
+        rustwx_core::FieldProduct::Default => "Not an ensemble statistic".to_owned(),
+        rustwx_core::FieldProduct::EnsembleMean => "Published mean".to_owned(),
+        rustwx_core::FieldProduct::EnsembleStandardDeviation => {
+            "Published standard deviation".to_owned()
+        }
+        rustwx_core::FieldProduct::EnsembleSpread => "Published spread".to_owned(),
+        rustwx_core::FieldProduct::EnsembleMinimum => "Published minimum".to_owned(),
+        rustwx_core::FieldProduct::EnsembleMaximum => "Published maximum".to_owned(),
+        rustwx_core::FieldProduct::Percentile(value) => format!("Published P{value}"),
+        rustwx_core::FieldProduct::Probability(selection) => {
+            let threshold_units = product.selector.field.native_units();
+            let bounds = match (selection.lower_limit_milli, selection.upper_limit_milli) {
+                (Some(lower), Some(upper)) => format!(
+                    "{} to {} {threshold_units}",
+                    format_probability_limit_milli(lower),
+                    format_probability_limit_milli(upper)
+                ),
+                (Some(lower), None) => format!(
+                    "> {} {threshold_units}",
+                    format_probability_limit_milli(lower)
+                ),
+                (None, Some(upper)) => format!(
+                    "< {} {threshold_units}",
+                    format_probability_limit_milli(upper)
+                ),
+                (None, None) => "at the published threshold".to_owned(),
+            };
+            let type_label = selection
+                .probability_type
+                .map(|value| format!(" type {value}"))
+                .unwrap_or_default();
+            format!("Published probability{type_label} {bounds}")
+        }
+    }
+}
+
+fn ensemble_product_hover(product: &EnsembleStoredProduct) -> String {
+    format!(
+        "Stored variable {}; output units {}; {} of {} samples ({:.1}% coverage). The typed selector is authoritative.",
+        product.variable,
+        product.units,
+        product.available_samples,
+        product.expected_samples,
+        product.coverage * 100.0
+    )
+}
+
+fn retain_or_first_ensemble_variable(
+    selected: Option<String>,
+    groups: &[EnsembleProductGroup],
+) -> Option<String> {
+    selected
+        .filter(|selected| {
+            groups.iter().any(|group| {
+                group
+                    .products
+                    .iter()
+                    .any(|product| product.variable == *selected)
+            })
+        })
+        .or_else(|| {
+            groups
+                .first()
+                .and_then(|group| group.products.first())
+                .map(|product| product.variable.clone())
+        })
+}
+
+fn selected_ensemble_product<'a>(
+    groups: &'a [EnsembleProductGroup],
+    selected: Option<&str>,
+) -> Option<&'a EnsembleStoredProduct> {
+    groups
+        .iter()
+        .flat_map(|group| &group.products)
+        .find(|product| Some(product.variable.as_str()) == selected)
+}
+
+fn ensemble_group_is_published_mean_only(group: &EnsembleProductGroup) -> bool {
+    group.products.len() == 1
+        && group.products[0].selector.product == rustwx_core::FieldProduct::EnsembleMean
+}
+
+fn ensemble_product_picker_ui(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    groups: &[EnsembleProductGroup],
+    selected: &mut Option<String>,
+) {
+    *selected = retain_or_first_ensemble_variable(selected.take(), groups);
+    let mut selected_group = groups
+        .iter()
+        .find(|group| {
+            group
+                .products
+                .iter()
+                .any(|product| selected.as_deref() == Some(product.variable.as_str()))
+        })
+        .map(|group| group.key.clone());
+    let previous_group = selected_group.clone();
+    egui::ComboBox::from_id_salt((id, "field_vertical"))
+        .selected_text(
+            selected_group
+                .as_ref()
+                .and_then(|key| groups.iter().find(|group| &group.key == key))
+                .map(ensemble_group_label)
+                .unwrap_or_else(|| "Choose field / vertical".to_owned()),
+        )
+        .show_ui(ui, |ui| {
+            for group in groups {
+                ui.selectable_value(
+                    &mut selected_group,
+                    Some(group.key.clone()),
+                    ensemble_group_label(group),
+                );
+            }
+        });
+    if selected_group != previous_group {
+        *selected = selected_group.as_ref().and_then(|key| {
+            groups
+                .iter()
+                .find(|group| &group.key == key)
+                .and_then(|group| group.products.first())
+                .map(|product| product.variable.clone())
+        });
+    }
+    let Some(group) = selected_group
+        .as_ref()
+        .and_then(|key| groups.iter().find(|group| &group.key == key))
+    else {
+        return;
+    };
+    egui::ComboBox::from_id_salt((id, "statistic"))
+        .selected_text(
+            selected_ensemble_product(std::slice::from_ref(group), selected.as_deref())
+                .map(ensemble_product_label)
+                .unwrap_or_else(|| "Choose statistic / threshold".to_owned()),
+        )
+        .show_ui(ui, |ui| {
+            for product in &group.products {
+                ui.selectable_value(
+                    selected,
+                    Some(product.variable.clone()),
+                    ensemble_product_label(product),
+                )
+                .on_hover_text(ensemble_product_hover(product));
+            }
+        });
+    if ensemble_group_is_published_mean_only(group) {
+        ui.weak(
+            "Published mean only; no members, spread, percentiles, or probabilities are advertised.",
+        );
+    } else {
+        ui.weak(
+            "Only origin/store-advertised statistics are listed; member fields are not implied.",
+        );
+    }
+}
+
+fn remote_variable_usable_for_mode(
+    variable: &crate::community_cache::RemoteVariableCapability,
+    mode: ModelWorkspaceMode,
+    selected_slot: Option<u16>,
+) -> bool {
+    match mode {
+        ModelWorkspaceMode::MapPlot => {
+            variable.geographic_window
+                && matches!(variable.kind.as_str(), "surface2d" | "pressure3d")
+                && selected_slot.is_none_or(|slot| variable.available_slots.contains(&slot))
+                && (variable.kind != "pressure3d" || !variable.levels_hpa.is_empty())
+        }
+        ModelWorkspaceMode::Sounding => variable.pressure_profile,
+        ModelWorkspaceMode::PointSeries => variable.kind == "surface2d" && variable.point_series,
+        ModelWorkspaceMode::WindowTile => {
+            matches!(variable.kind.as_str(), "surface2d" | "pressure3d")
+                && selected_slot.is_none_or(|slot| variable.available_slots.contains(&slot))
+                && (variable.kind != "pressure3d" || !variable.levels_hpa.is_empty())
+        }
+        ModelWorkspaceMode::TemporalDiurnal => {
+            matches!(variable.kind.as_str(), "surface2d" | "pressure3d")
+                && variable.available_samples > 0
+                && remote_temporal_contract(variable).is_ok()
+                && (variable.kind != "pressure3d" || !variable.levels_hpa.is_empty())
+        }
+        ModelWorkspaceMode::Ensemble => {
+            ensemble_selector(variable).is_some()
+                && matches!(variable.kind.as_str(), "surface2d" | "pressure3d")
+                && selected_slot.is_none_or(|slot| variable.available_slots.contains(&slot))
+                && (variable.kind != "pressure3d" || !variable.levels_hpa.is_empty())
+        }
+    }
+}
+
+fn remote_selected_level(
+    selected: Option<u16>,
+    variable_name: Option<&str>,
+    variables: &[crate::community_cache::RemoteVariableCapability],
+) -> Option<u16> {
+    let levels = variables
+        .iter()
+        .find(|variable| Some(variable.name.as_str()) == variable_name)
+        .filter(|variable| variable.kind == "pressure3d")
+        .map(|variable| variable.levels_hpa.as_slice())?;
+    selected
+        .filter(|level| levels.contains(level))
+        .or_else(|| levels.first().copied())
+}
+
+fn remote_variable_label(variable: &crate::community_cache::RemoteVariableCapability) -> String {
+    let level = if variable.kind == "pressure3d" {
+        format!(" / {} levels", variable.levels_hpa.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "{} / {}{}",
+        display_product_level_label(&variable.name),
+        variable.units,
+        level
+    )
+}
+
+fn remote_variable_hover(variable: &crate::community_cache::RemoteVariableCapability) -> String {
+    format!(
+        "{}; {} of {} samples ({:.1}% coverage)",
+        variable.kind,
+        variable.available_samples,
+        variable.expected_samples,
+        variable.coverage * 100.0
+    )
+}
+
+fn remote_native_bounds(
+    nx: usize,
+    ny: usize,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) -> Result<(u32, u32, u32, u32), String> {
+    let nx_u32 = u32::try_from(nx).map_err(|_| "Remote grid width exceeds u32.".to_owned())?;
+    let ny_u32 = u32::try_from(ny).map_err(|_| "Remote grid height exceeds u32.".to_owned())?;
+    if x0 >= x1 || y0 >= y1 || x1 > nx_u32 || y1 > ny_u32 {
+        return Err(format!(
+            "Native bounds must be non-empty and inside x [0,{nx_u32}), y [0,{ny_u32})."
+        ));
+    }
+    Ok((x0, y0, x1, y1))
+}
+
+fn remote_geographic_bounds(
+    west_longitude: f64,
+    south_latitude: f64,
+    east_longitude: f64,
+    north_latitude: f64,
+) -> Result<(f64, f64, f64, f64), String> {
+    let finite = [
+        west_longitude,
+        south_latitude,
+        east_longitude,
+        north_latitude,
+    ]
+    .into_iter()
+    .all(f64::is_finite);
+    if !finite
+        || !(-180.0..=180.0).contains(&west_longitude)
+        || !(-180.0..=180.0).contains(&east_longitude)
+        || !(-90.0..=90.0).contains(&south_latitude)
+        || !(-90.0..=90.0).contains(&north_latitude)
+    {
+        return Err("Geographic bounds must be finite Earth coordinates.".to_owned());
+    }
+    let quantize = |value: f64| (value * 10_000_000.0).round() / 10_000_000.0;
+    let west = quantize(west_longitude);
+    let south = quantize(south_latitude);
+    let east = quantize(east_longitude);
+    let north = quantize(north_latitude);
+    if south >= north {
+        return Err("South latitude must be below north latitude.".to_owned());
+    }
+    if west == east {
+        return Err("West and east must select a non-empty eastward longitude arc.".to_owned());
+    }
+    Ok((west, south, east, north))
+}
+
+fn remote_normalize_longitude(longitude: f64) -> f64 {
+    ((longitude + 180.0).rem_euclid(360.0)) - 180.0
+}
+
+/// Convert a map-drawn `CustomDomain` tuple `(west, east, south, north)` to
+/// the signed API tuple `(west, south, east, north)`. A wrapped screen box
+/// around the dateline arrives numerically wider than 180 degrees; exchanging
+/// its endpoints recovers the intended short eastward antimeridian arc.
+fn remote_domain_bounds(bounds: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let (mut west, mut east, south, north) = bounds;
+    if east - west > 180.0 {
+        std::mem::swap(&mut west, &mut east);
+    }
+    (west, south, east, north)
+}
+
+fn remote_longitude_arc_label(west: f64, east: f64) -> &'static str {
+    if (east - west).abs() == 360.0 {
+        "full-globe eastward arc"
+    } else if west > east {
+        "eastward arc crossing the antimeridian"
+    } else {
+        "ordinary eastward longitude arc"
+    }
+}
+
+fn remote_time_window(
+    axis: &[crate::community_cache::RemoteTimePoint],
+    start_index: usize,
+    end_index: usize,
+) -> Result<rw_community_protocol::TimeWindow, String> {
+    if start_index > end_index {
+        return Err("Remote time-window start must not follow its end.".to_owned());
+    }
+    let start = axis
+        .get(start_index)
+        .ok_or_else(|| "Remote time-window start is not advertised.".to_owned())?;
+    let end = axis
+        .get(end_index)
+        .ok_or_else(|| "Remote time-window end is not advertised.".to_owned())?;
+    let end_unix = axis
+        .get(end_index.saturating_add(1))
+        .map(|time| time.valid_unix)
+        .or_else(|| {
+            end_index
+                .checked_sub(1)
+                .and_then(|index| axis.get(index))
+                .and_then(|previous| end.valid_unix.checked_sub(previous.valid_unix))
+                .filter(|step| *step > 0)
+                .and_then(|step| end.valid_unix.checked_add(step))
+        })
+        .or_else(|| end.valid_unix.checked_add(1))
+        .ok_or_else(|| "Remote time-window end overflows UTC time.".to_owned())?;
+    if end_unix <= start.valid_unix {
+        return Err("Remote time window is empty or not chronological.".to_owned());
+    }
+    Ok(rw_community_protocol::TimeWindow::Utc {
+        start_unix: start.valid_unix,
+        end_unix,
+    })
+}
+
+fn remote_temporal_contract(
+    variable: &crate::community_cache::RemoteVariableCapability,
+) -> Result<RemoteTemporalContract, String> {
+    let capability: rw_query::VariableTemporalCapability =
+        serde_json::from_value(variable.temporal.clone()).map_err(|_| {
+            "Origin temporal capability does not match the typed Rusty Weather contract.".to_owned()
+        })?;
+    if capability.requires_manual_semantics {
+        return Err("Temporal semantics require manual metadata and were not guessed.".to_owned());
+    }
+    let semantics = capability
+        .recommended_semantics
+        .ok_or_else(|| "No trusted temporal semantics are advertised.".to_owned())?;
+    let reducer = capability
+        .supported_reducers
+        .first()
+        .copied()
+        .ok_or_else(|| "No compatible temporal reducer is advertised.".to_owned())?;
+    let mut parameters = std::collections::BTreeMap::new();
+    parameters.insert("expectation".to_owned(), "manifest_axis".to_owned());
+    let semantics = match semantics {
+        rw_query::TemporalSemantics::InstantaneousScalar => "instantaneous_scalar".to_owned(),
+        rw_query::TemporalSemantics::IntervalAccumulation { support } => {
+            remote_interval_support_parameters(support, &mut parameters);
+            "interval_accumulation".to_owned()
+        }
+        rw_query::TemporalSemantics::IntervalMaximum { support } => {
+            remote_interval_support_parameters(support, &mut parameters);
+            "interval_maximum".to_owned()
+        }
+        rw_query::TemporalSemantics::CumulativeFromOrigin {
+            include_first_value,
+            reset_tolerance,
+        } => {
+            parameters.insert(
+                "include_first_value".to_owned(),
+                include_first_value.to_string(),
+            );
+            parameters.insert("reset_tolerance".to_owned(), reset_tolerance.to_string());
+            "cumulative_from_origin".to_owned()
+        }
+        rw_query::TemporalSemantics::IntervalRate {
+            support,
+            seconds_per_rate_unit,
+            integral_units,
+        } => {
+            remote_interval_support_parameters(support, &mut parameters);
+            parameters.insert(
+                "seconds_per_rate_unit".to_owned(),
+                seconds_per_rate_unit.to_string(),
+            );
+            parameters.insert("integral_units".to_owned(), integral_units);
+            "interval_rate".to_owned()
+        }
+        rw_query::TemporalSemantics::VectorComponents => "vector_components".to_owned(),
+        rw_query::TemporalSemantics::CircularDegrees => "circular_degrees".to_owned(),
+        rw_query::TemporalSemantics::Categorical => "categorical".to_owned(),
+        rw_query::TemporalSemantics::Unknown => {
+            return Err("Unknown temporal semantics are not reducible.".to_owned());
+        }
+    };
+    let reducer = match reducer {
+        rw_query::TemporalReducer::ScalarSummary => "scalar_summary",
+        rw_query::TemporalReducer::IntervalSummary => "interval_summary",
+        rw_query::TemporalReducer::IntervalMaximumSummary => "interval_maximum_summary",
+        rw_query::TemporalReducer::CumulativeSummary => "cumulative_summary",
+        rw_query::TemporalReducer::RateSummary => "rate_summary",
+        rw_query::TemporalReducer::VectorSummary => "vector_summary",
+        rw_query::TemporalReducer::CircularMean => "circular_mean",
+        rw_query::TemporalReducer::CategoricalSummary => "categorical_summary",
+    }
+    .to_owned();
+    let variables = if capability.required_variables.is_empty() {
+        vec![variable.name.clone()]
+    } else {
+        capability.required_variables
+    };
+    if variables.is_empty() || variables.iter().any(|name| name.trim().is_empty()) {
+        return Err("Temporal capability advertises an invalid variable set.".to_owned());
+    }
+    let mut normalized_variables = variables.clone();
+    normalized_variables.sort();
+    normalized_variables.dedup();
+    if semantics == "vector_components" && normalized_variables != variables {
+        return Err(
+            "Vector-component order cannot survive canonical request normalization; this capability is not safe to execute."
+                .to_owned(),
+        );
+    }
+    Ok(RemoteTemporalContract {
+        variables: normalized_variables,
+        reducer,
+        semantics,
+        parameters,
+    })
+}
+
+fn remote_interval_support_parameters(
+    support: rw_query::IntervalSupport,
+    parameters: &mut std::collections::BTreeMap<String, String>,
+) {
+    let (label, seconds) = match support {
+        rw_query::IntervalSupport::StartsAtValidTime { seconds } => {
+            ("starts_at_valid_time", Some(seconds))
+        }
+        rw_query::IntervalSupport::EndsAtValidTime { seconds } => {
+            ("ends_at_valid_time", Some(seconds))
+        }
+        rw_query::IntervalSupport::UntilNextExpectedTime => ("until_next_expected_time", None),
+        rw_query::IntervalSupport::SincePreviousExpectedTime => {
+            ("since_previous_expected_time", None)
+        }
+    };
+    parameters.insert("support".to_owned(), label.to_owned());
+    if let Some(seconds) = seconds {
+        parameters.insert("support_seconds".to_owned(), seconds.to_string());
+    }
+}
+
+fn remote_output_is_current(
+    expected: Option<&RemoteOutputIdentity>,
+    completed: &RemoteOutputIdentity,
+) -> bool {
+    expected == Some(completed)
+}
+
+fn remote_fetch_kind_label(kind: RemoteFetchKind) -> &'static str {
+    match kind {
+        RemoteFetchKind::PointSeries => "point series",
+        RemoteFetchKind::NativeWindow2D => "native 2-D window",
+        RemoteFetchKind::NativeWindow3D => "selected-level native window",
+        RemoteFetchKind::GeographicWindow => "geographic-domain map",
+        RemoteFetchKind::TemporalGrid => "temporal/diurnal grid",
+    }
+}
+
+fn remote_delivery_tier_label(tier: crate::community_cache::DeliveryTier) -> &'static str {
+    match tier {
+        crate::community_cache::DeliveryTier::LocalCache => "BowEcho's verified local cache",
+        crate::community_cache::DeliveryTier::R2 => "R2 hot-object storage",
+        crate::community_cache::DeliveryTier::Origin => "the Rusty Weather HTTPS origin",
+    }
+}
+
+fn remote_output_tier(result: &RemoteOutputResult) -> crate::community_cache::DeliveryTier {
+    match result {
+        RemoteOutputResult::PointSeries { tier, .. }
+        | RemoteOutputResult::Field { tier, .. }
+        | RemoteOutputResult::Temporal { tier, .. } => *tier,
+    }
+}
+
+fn adapt_remote_output(
+    expected: &RemoteOutputExpected,
+    load: RemoteOutputLoad,
+) -> Result<RemoteOutputResult, String> {
+    let request_sha256 = expected.identity.request_sha256.clone();
+    match (expected.kind, load) {
+        (RemoteFetchKind::PointSeries, RemoteOutputLoad::PointSeries { result, tier }) => {
+            validate_remote_point_result(
+                &result,
+                &expected.request,
+                expected.run_nx,
+                expected.run_ny,
+            )?;
+            Ok(RemoteOutputResult::PointSeries {
+                result,
+                tier,
+                request_sha256,
+            })
+        }
+        (RemoteFetchKind::NativeWindow2D, RemoteOutputLoad::NativeWindow2D { result, tier }) => {
+            let (field, coverage_note) = remote_window_2d_field(
+                result,
+                &expected.request,
+                expected.run_nx,
+                expected.run_ny,
+            )?;
+            Ok(RemoteOutputResult::Field {
+                field,
+                tier,
+                request_sha256,
+                coverage_note,
+            })
+        }
+        (RemoteFetchKind::NativeWindow3D, RemoteOutputLoad::NativeWindow3D { result, tier }) => {
+            let (field, coverage_note) = remote_window_3d_field(
+                result,
+                &expected.request,
+                expected.run_nx,
+                expected.run_ny,
+            )?;
+            Ok(RemoteOutputResult::Field {
+                field,
+                tier,
+                request_sha256,
+                coverage_note,
+            })
+        }
+        (
+            RemoteFetchKind::GeographicWindow,
+            RemoteOutputLoad::GeographicWindow { result, tier },
+        ) => {
+            let (field, coverage_note) = remote_geographic_field(
+                result,
+                &expected.request,
+                expected.run_nx,
+                expected.run_ny,
+                &expected.variable_selectors,
+            )?;
+            Ok(RemoteOutputResult::Field {
+                field,
+                tier,
+                request_sha256,
+                coverage_note,
+            })
+        }
+        (RemoteFetchKind::TemporalGrid, RemoteOutputLoad::TemporalGrid { result, tier }) => {
+            validate_remote_temporal_result(
+                &result,
+                &expected.request,
+                expected.run_nx,
+                expected.run_ny,
+            )?;
+            let labels = remote_temporal_metric_labels(&result);
+            let selected_metric = labels
+                .iter()
+                .position(|label| label.to_ascii_lowercase().contains("range"))
+                .unwrap_or(0);
+            // Build once here as part of admission so a response with a valid
+            // wrapper but malformed per-cell arrays fails closed before UI.
+            let _ = remote_temporal_field(&result, selected_metric)?;
+            Ok(RemoteOutputResult::Temporal {
+                result,
+                tier,
+                request_sha256,
+                selected_metric,
+            })
+        }
+        _ => Err("response family does not match the exact request".to_owned()),
+    }
+}
+
+fn validate_remote_run_result(
+    run: &rw_query::RunDescriptor,
+    request: &rw_community_protocol::ShareRequest,
+    run_nx: usize,
+    run_ny: usize,
+) -> Result<(), String> {
+    if run.model != request.model
+        || run.run != request.run
+        || run.snapshot_id != request.snapshot_id
+        || run.grid_hash != request.grid_hash
+        || run.nx != run_nx
+        || run.ny != run_ny
+        || run.nx == 0
+        || run.ny == 0
+    {
+        return Err("result run/grid identity differs from the signed request".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_remote_point_result(
+    result: &rw_query::PointSeriesResult,
+    request: &rw_community_protocol::ShareRequest,
+    run_nx: usize,
+    run_ny: usize,
+) -> Result<(), String> {
+    validate_remote_run_result(&result.run, request, run_nx, run_ny)?;
+    let rw_community_protocol::ShareQuery::PointSeries {
+        latitude_e7,
+        longitude_e7,
+        window,
+        ..
+    } = &request.query
+    else {
+        return Err("point result arrived for a non-point request".to_owned());
+    };
+    if result.point.x >= run_nx || result.point.y >= run_ny {
+        return Err("resolved point lies outside the signed run grid".to_owned());
+    }
+    let result_latitude_e7 = (f64::from(result.point.grid_latitude) * 10_000_000.0).round();
+    let result_longitude_e7 = (f64::from(result.point.grid_longitude) * 10_000_000.0).round();
+    if result_latitude_e7 != f64::from(*latitude_e7)
+        || result_longitude_e7 != f64::from(*longitude_e7)
+    {
+        return Err("resolved point coordinates differ from the signed request".to_owned());
+    }
+    let (start_unix, end_unix) = protocol_window_bounds(window);
+    if result.axis.is_empty()
+        || result.axis.windows(2).any(|pair| {
+            pair[0].valid_unix >= pair[1].valid_unix || pair[0].storage_slot == pair[1].storage_slot
+        })
+        || result
+            .axis
+            .iter()
+            .any(|time| time.valid_unix < start_unix || time.valid_unix >= end_unix)
+    {
+        return Err(
+            "point-series time axis is empty, unordered, or outside its signed window".to_owned(),
+        );
+    }
+    let names = result
+        .variables
+        .iter()
+        .map(|variable| variable.name.clone())
+        .collect::<Vec<_>>();
+    if names != request.variables {
+        return Err("point-series variables differ from the signed request".to_owned());
+    }
+    for variable in &result.variables {
+        if variable.values.len() != result.axis.len()
+            || variable.available_samples > variable.expected_samples
+            || !variable.coverage.is_finite()
+            || !(0.0..=1.0).contains(&variable.coverage)
+        {
+            return Err(format!(
+                "point-series '{}' has invalid coverage or shape",
+                variable.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remote_window_2d_field(
+    mut result: Vec<rw_query::IndexWindow2DResult>,
+    request: &rw_community_protocol::ShareRequest,
+    run_nx: usize,
+    run_ny: usize,
+) -> Result<(rw_ui::FieldData, String), String> {
+    let rw_community_protocol::ShareQuery::NativeWindow {
+        storage_slot,
+        valid_unix,
+        x0,
+        y0,
+        x1,
+        y1,
+        pressure_levels_hpa,
+    } = &request.query
+    else {
+        return Err("2-D window arrived for a non-window request".to_owned());
+    };
+    if !pressure_levels_hpa.is_empty() || result.len() != 1 || request.variables.len() != 1 {
+        return Err("2-D field viewer requires exactly one surface window".to_owned());
+    }
+    let window = result.pop().expect("length checked");
+    validate_remote_run_result(&window.run, request, run_nx, run_ny)?;
+    let nx = usize::try_from(x1 - x0).map_err(|_| "window width overflow".to_owned())?;
+    let ny = usize::try_from(y1 - y0).map_err(|_| "window height overflow".to_owned())?;
+    if window.variable != request.variables[0]
+        || window.time.storage_slot != *storage_slot
+        || window.time.valid_unix != *valid_unix
+        || window.x0 != *x0 as usize
+        || window.y0 != *y0 as usize
+        || window.nx != nx
+        || window.ny != ny
+        || window.values.len() != nx.checked_mul(ny).ok_or("window cell overflow")?
+    {
+        return Err("2-D window metadata/shape differs from the signed request".to_owned());
+    }
+    let (values, missing) = optional_f32_values(window.values);
+    let coverage_note = format!(
+        "Native x [{x0},{x1}), y [{y0},{y1}); {} finite cells, {missing} missing.",
+        values.len().saturating_sub(missing)
+    );
+    Ok((
+        remote_field_data(
+            &window.run,
+            &window.time,
+            window.variable,
+            window.units,
+            nx,
+            ny,
+            values,
+        ),
+        coverage_note,
+    ))
+}
+
+fn remote_window_3d_field(
+    mut result: Vec<rw_query::IndexWindow3DResult>,
+    request: &rw_community_protocol::ShareRequest,
+    run_nx: usize,
+    run_ny: usize,
+) -> Result<(rw_ui::FieldData, String), String> {
+    let rw_community_protocol::ShareQuery::NativeWindow {
+        storage_slot,
+        valid_unix,
+        x0,
+        y0,
+        x1,
+        y1,
+        pressure_levels_hpa,
+    } = &request.query
+    else {
+        return Err("pressure window arrived for a non-window request".to_owned());
+    };
+    if pressure_levels_hpa.len() != 1 || result.len() != 1 || request.variables.len() != 1 {
+        return Err(
+            "pressure field viewer requires exactly one explicitly selected level".to_owned(),
+        );
+    }
+    let window = result.pop().expect("length checked");
+    validate_remote_run_result(&window.run, request, run_nx, run_ny)?;
+    let nx = usize::try_from(x1 - x0).map_err(|_| "window width overflow".to_owned())?;
+    let ny = usize::try_from(y1 - y0).map_err(|_| "window height overflow".to_owned())?;
+    let cells = nx.checked_mul(ny).ok_or("window cell overflow")?;
+    if window.variable != request.variables[0]
+        || window.time.storage_slot != *storage_slot
+        || window.time.valid_unix != *valid_unix
+        || window.levels_hpa != *pressure_levels_hpa
+        || window.x0 != *x0 as usize
+        || window.y0 != *y0 as usize
+        || window.nx != nx
+        || window.ny != ny
+        || window.values.len() != cells
+    {
+        return Err("pressure-window metadata/shape differs from the signed request".to_owned());
+    }
+    let level = pressure_levels_hpa[0];
+    let (values, missing) = optional_f32_values(window.values);
+    let coverage_note = format!(
+        "{level} hPa only; native x [{x0},{x1}), y [{y0},{y1}); {} finite cells, {missing} missing.",
+        values.len().saturating_sub(missing)
+    );
+    Ok((
+        remote_field_data(
+            &window.run,
+            &window.time,
+            format!("{}_{}hpa", window.variable, level),
+            window.units,
+            nx,
+            ny,
+            values,
+        ),
+        coverage_note,
+    ))
+}
+
+fn remote_geographic_field(
+    mut result: rw_query::GeographicWindowResult,
+    request: &rw_community_protocol::ShareRequest,
+    run_nx: usize,
+    run_ny: usize,
+    expected_selectors: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(rw_ui::FieldData, String), String> {
+    validate_remote_geographic_result(&result, request, run_nx, run_ny, expected_selectors)?;
+    if result.fields.len() != 1 || request.variables.len() != 1 {
+        return Err("map viewer requires exactly one explicitly selected product".to_owned());
+    }
+    let field = result.fields.pop().expect("length checked");
+    let cells = result
+        .envelope
+        .nx
+        .checked_mul(result.envelope.ny)
+        .ok_or_else(|| "geographic envelope shape overflows".to_owned())?;
+    let (variable, values) = match field.data {
+        rw_query::GeographicFieldValues::Surface2d { values } => (field.variable, values),
+        rw_query::GeographicFieldValues::PressureLevels { levels_hpa, values } => {
+            if levels_hpa.len() != 1 {
+                return Err(
+                    "map viewer requires one explicit pressure level; multiple levels were preserved and not flattened"
+                        .to_owned(),
+                );
+            }
+            let level = levels_hpa[0];
+            (format!("{}_{}hpa", field.variable, level), values)
+        }
+    };
+    if values.len() != cells {
+        return Err("rendered geographic plane does not match its envelope".to_owned());
+    }
+    let (values, missing) = optional_f32_values(values);
+    let latitudes = result
+        .latitudes
+        .iter()
+        .map(|value| value.unwrap_or(f32::NAN))
+        .collect::<Vec<_>>();
+    let longitudes = result
+        .longitudes
+        .iter()
+        .map(|value| value.unwrap_or(f32::NAN))
+        .collect::<Vec<_>>();
+    let grid_hash = geographic_grid_hash(
+        &request.grid_hash,
+        result.envelope.nx,
+        result.envelope.ny,
+        &latitudes,
+        &longitudes,
+        result.projection.as_ref(),
+    )?;
+    let grid = rw_store::grid::GridFile {
+        nx: result.envelope.nx,
+        ny: result.envelope.ny,
+        lat: latitudes,
+        lon: longitudes,
+        projection: result.projection,
+        hash: grid_hash,
+    };
+    let lat_descending = grid.lat_descending().unwrap_or(false);
+    let selected = result
+        .cell_mask
+        .iter()
+        .filter(|included| **included)
+        .count();
+    let bbox = result.requested_bbox;
+    let coverage_note = format!(
+        "Signed bbox W {:.3}°, S {:.3}°, E {:.3}°, N {:.3}°; native envelope x [{},{}), y [{},{}); {selected} selected centres, {missing} missing values.",
+        bbox.west_longitude,
+        bbox.south_latitude,
+        bbox.east_longitude,
+        bbox.north_latitude,
+        result.envelope.x0,
+        result.envelope.x0 + result.envelope.nx,
+        result.envelope.y0,
+        result.envelope.y0 + result.envelope.ny,
+    );
+    let mut rendered = remote_field_data(
+        &result.run,
+        &result.time,
+        variable,
+        field.units,
+        result.envelope.nx,
+        result.envelope.ny,
+        values,
+    );
+    rendered.grid = Some(std::sync::Arc::new(grid));
+    rendered.lat_descending = lat_descending;
+    Ok((rendered, coverage_note))
+}
+
+fn validate_remote_geographic_result(
+    result: &rw_query::GeographicWindowResult,
+    request: &rw_community_protocol::ShareRequest,
+    run_nx: usize,
+    run_ny: usize,
+    expected_selectors: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    validate_remote_run_result(&result.run, request, run_nx, run_ny)?;
+    let rw_community_protocol::ShareQuery::GeographicWindow {
+        storage_slot,
+        valid_unix,
+        west_longitude_e7,
+        south_latitude_e7,
+        east_longitude_e7,
+        north_latitude_e7,
+        pressure_levels_hpa,
+    } = &request.query
+    else {
+        return Err("geographic result arrived for a non-geographic request".to_owned());
+    };
+    if result.schema != rw_query::GEOGRAPHIC_WINDOW_RESULT_SCHEMA
+        || result.time.storage_slot != *storage_slot
+        || result.time.valid_unix != *valid_unix
+        || result.envelope_semantics != "minimal_native_rectangular_envelope"
+        || result.cell_inclusion_semantics != "grid_point_center_within_closed_bbox"
+    {
+        return Err(
+            "geographic schema, time, or inclusion semantics differ from request".to_owned(),
+        );
+    }
+    let bbox_e7 = [
+        result.requested_bbox.west_longitude,
+        result.requested_bbox.south_latitude,
+        result.requested_bbox.east_longitude,
+        result.requested_bbox.north_latitude,
+    ]
+    .map(geographic_coordinate_e7)
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    if bbox_e7
+        != [
+            *west_longitude_e7,
+            *south_latitude_e7,
+            *east_longitude_e7,
+            *north_latitude_e7,
+        ]
+    {
+        return Err("geographic bbox differs from the signed fixed-point request".to_owned());
+    }
+    let expected_arc =
+        if (i64::from(*east_longitude_e7) - i64::from(*west_longitude_e7)).abs() == 3_600_000_000 {
+            rw_query::LongitudeArcSemantics::FullGlobe
+        } else if west_longitude_e7 > east_longitude_e7 {
+            rw_query::LongitudeArcSemantics::CrossesAntimeridian
+        } else {
+            rw_query::LongitudeArcSemantics::Ordinary
+        };
+    if result.longitude_arc != expected_arc {
+        return Err("geographic longitude-arc semantics differ from request".to_owned());
+    }
+    let envelope = result.envelope;
+    let x1 = envelope
+        .x0
+        .checked_add(envelope.nx)
+        .ok_or_else(|| "geographic envelope x bound overflows".to_owned())?;
+    let y1 = envelope
+        .y0
+        .checked_add(envelope.ny)
+        .ok_or_else(|| "geographic envelope y bound overflows".to_owned())?;
+    let cells = envelope
+        .nx
+        .checked_mul(envelope.ny)
+        .ok_or_else(|| "geographic envelope cell count overflows".to_owned())?;
+    if envelope.nx == 0
+        || envelope.ny == 0
+        || x1 > run_nx
+        || y1 > run_ny
+        || result.latitudes.len() != cells
+        || result.longitudes.len() != cells
+        || result.cell_mask.len() != cells
+        || result.mask_required != result.cell_mask.iter().any(|included| !included)
+    {
+        return Err("geographic envelope, coordinates, or mask has an invalid shape".to_owned());
+    }
+    for index in 0..cells {
+        let latitude = result.latitudes[index];
+        let longitude = result.longitudes[index];
+        if latitude
+            .is_some_and(|latitude| !latitude.is_finite() || !(-90.0..=90.0).contains(&latitude))
+            || longitude.is_some_and(|longitude| {
+                // Global model stores commonly use 0..360 degrees east. Preserve
+                // the signed coordinate exactly; every containment calculation
+                // below is modulo 360.
+                !longitude.is_finite() || !(-360.0..=360.0).contains(&longitude)
+            })
+        {
+            return Err(
+                "geographic coordinate arrays contain invalid Earth coordinates".to_owned(),
+            );
+        }
+        let expected_included = match (latitude, longitude) {
+            (Some(latitude), Some(longitude)) => geographic_bbox_contains(
+                result.requested_bbox,
+                result.longitude_arc,
+                latitude,
+                longitude,
+            ),
+            _ => false,
+        };
+        if result.cell_mask[index] != expected_included {
+            return Err("geographic cell mask disagrees with the signed bbox".to_owned());
+        }
+    }
+    if result.fields.len() != request.variables.len()
+        || result
+            .fields
+            .iter()
+            .map(|field| field.variable.as_str())
+            .ne(request.variables.iter().map(String::as_str))
+    {
+        return Err("geographic fields differ from signed request variables".to_owned());
+    }
+    for field in &result.fields {
+        if field.units.trim().is_empty()
+            || field.units.len() > 96
+            || expected_selectors.get(&field.variable) != Some(&field.selector)
+        {
+            return Err(
+                "geographic field units or selector differ from the exact catalog".to_owned(),
+            );
+        }
+        let (levels, values) = match (&field.data, pressure_levels_hpa.is_empty()) {
+            (rw_query::GeographicFieldValues::Surface2d { values }, true) => {
+                (&[][..], values.as_slice())
+            }
+            (rw_query::GeographicFieldValues::PressureLevels { levels_hpa, values }, false) => {
+                (levels_hpa.as_slice(), values.as_slice())
+            }
+            _ => {
+                return Err(
+                    "geographic surface/pressure payload kind differs from request".to_owned(),
+                );
+            }
+        };
+        let expected_values = cells
+            .checked_mul(levels.len().max(1))
+            .ok_or_else(|| "geographic field shape overflows".to_owned())?;
+        if levels != pressure_levels_hpa.as_slice() || values.len() != expected_values {
+            return Err("geographic pressure levels or field shape differ from request".to_owned());
+        }
+        for plane in values.chunks_exact(cells) {
+            for (value, included) in plane.iter().zip(&result.cell_mask) {
+                if value.is_some_and(|value| !value.is_finite()) || (!included && value.is_some()) {
+                    return Err(
+                        "geographic values must be finite and masked outside the requested bbox"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn geographic_coordinate_e7(value: f64) -> Result<i32, String> {
+    if !value.is_finite() {
+        return Err("geographic coordinate is not finite".to_owned());
+    }
+    let scaled = (value * 10_000_000.0).round();
+    if scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
+        return Err("geographic coordinate exceeds fixed-point range".to_owned());
+    }
+    Ok(scaled as i32)
+}
+
+fn geographic_bbox_contains(
+    bbox: rw_query::GeographicBoundingBox,
+    arc: rw_query::LongitudeArcSemantics,
+    latitude: f32,
+    longitude: f32,
+) -> bool {
+    let latitude = f64::from(latitude);
+    if latitude < bbox.south_latitude || latitude > bbox.north_latitude {
+        return false;
+    }
+    if arc == rw_query::LongitudeArcSemantics::FullGlobe {
+        return true;
+    }
+    let longitude_span = (bbox.east_longitude - bbox.west_longitude).rem_euclid(360.0);
+    let offset = (f64::from(longitude) - bbox.west_longitude).rem_euclid(360.0);
+    offset <= longitude_span
+}
+
+fn geographic_grid_hash(
+    source_grid_hash: &str,
+    nx: usize,
+    ny: usize,
+    latitudes: &[f32],
+    longitudes: &[f32],
+    projection: Option<&rustwx_core::GridProjection>,
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    hash.update(b"bowecho.remote-geographic-grid.v1\0");
+    hash.update(source_grid_hash.as_bytes());
+    hash.update((nx as u64).to_le_bytes());
+    hash.update((ny as u64).to_le_bytes());
+    for value in latitudes.iter().chain(longitudes) {
+        hash.update(value.to_bits().to_le_bytes());
+    }
+    hash.update(
+        serde_json::to_vec(&projection)
+            .map_err(|_| "geographic projection metadata could not be identified".to_owned())?,
+    );
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn remote_field_data(
+    run: &rw_query::RunDescriptor,
+    time: &rw_query::TimePoint,
+    variable: String,
+    units: String,
+    nx: usize,
+    ny: usize,
+    values: Vec<f32>,
+) -> rw_ui::FieldData {
+    let range = finite_f32_range(&values);
+    rw_ui::FieldData {
+        key: rw_ui::FieldKey {
+            hour: HourKey {
+                model: run.model.clone(),
+                run: run.run.clone(),
+                hour: time.storage_slot,
+                exact_time: Some(rw_store::RwsExactTime::new(
+                    time.lead_seconds,
+                    time.valid_unix,
+                )),
+            },
+            var: variable,
+        },
+        units,
+        nx,
+        ny,
+        values,
+        range,
+        grid: None,
+        lat_descending: false,
+        style: None,
+    }
+}
+
+fn optional_f32_values(values: Vec<Option<f32>>) -> (Vec<f32>, usize) {
+    let mut missing = 0_usize;
+    let values = values
+        .into_iter()
+        .map(|value| match value.filter(|value| value.is_finite()) {
+            Some(value) => value,
+            None => {
+                missing += 1;
+                f32::NAN
+            }
+        })
+        .collect();
+    (values, missing)
+}
+
+fn optional_f64_values(values: &[Option<f64>]) -> (Vec<f32>, usize) {
+    let mut missing = 0_usize;
+    let values = values
+        .iter()
+        .map(|value| match value.filter(|value| value.is_finite()) {
+            Some(value) if value >= f64::from(f32::MIN) && value <= f64::from(f32::MAX) => {
+                value as f32
+            }
+            _ => {
+                missing += 1;
+                f32::NAN
+            }
+        })
+        .collect();
+    (values, missing)
+}
+
+fn finite_f32_range(values: &[f32]) -> Option<(f32, f32)> {
+    values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(None, |range, value| match range {
+            None => Some((value, value)),
+            Some((minimum, maximum)) => Some((minimum.min(value), maximum.max(value))),
+        })
+}
+
+fn protocol_window_bounds(window: &rw_community_protocol::TimeWindow) -> (i64, i64) {
+    match window {
+        rw_community_protocol::TimeWindow::Utc {
+            start_unix,
+            end_unix,
+        } => (*start_unix, *end_unix),
+        rw_community_protocol::TimeWindow::LocalDay {
+            resolved_start_unix,
+            resolved_end_unix,
+            ..
+        } => (*resolved_start_unix, *resolved_end_unix),
+    }
+}
+
+fn remote_temporal_metadata(
+    result: &rw_query::TemporalGridResult,
+) -> &rw_query::TemporalGridMetadata {
+    match result {
+        rw_query::TemporalGridResult::Scalar(grid) => &grid.metadata,
+        rw_query::TemporalGridResult::Interval(grid) => &grid.metadata,
+        rw_query::TemporalGridResult::IntervalMaximum(grid) => &grid.metadata,
+        rw_query::TemporalGridResult::Cumulative(grid) => &grid.metadata,
+        rw_query::TemporalGridResult::Rate(grid) => &grid.metadata,
+        rw_query::TemporalGridResult::Vector(grid) => &grid.metadata,
+        rw_query::TemporalGridResult::Circular(grid) => &grid.metadata,
+        rw_query::TemporalGridResult::Categorical(grid) => &grid.metadata,
+    }
+}
+
+fn validate_remote_temporal_result(
+    result: &rw_query::TemporalGridResult,
+    request: &rw_community_protocol::ShareRequest,
+    run_nx: usize,
+    run_ny: usize,
+) -> Result<(), String> {
+    let rw_community_protocol::ShareQuery::TemporalGrid {
+        window,
+        reducer,
+        semantics,
+        pressure_levels_hpa,
+        ..
+    } = &request.query
+    else {
+        return Err("temporal result arrived for a non-temporal request".to_owned());
+    };
+    let metadata = remote_temporal_metadata(result);
+    validate_remote_run_result(&metadata.run, request, run_nx, run_ny)?;
+    if metadata.variables != request.variables
+        || remote_temporal_reducer_name(metadata.reducer) != reducer
+        || remote_temporal_semantics_name(&metadata.semantics) != semantics
+        || metadata.nx != run_nx
+        || metadata.ny != run_ny
+        || metadata.levels_hpa != *pressure_levels_hpa
+    {
+        return Err("temporal metadata differs from the signed request".to_owned());
+    }
+    validate_temporal_semantics_parameters(&metadata.semantics, &request.recipe.parameters)?;
+    validate_temporal_expectation(
+        &metadata.completeness.expectation,
+        &request.recipe.parameters,
+    )?;
+    let planes = metadata.levels_hpa.len().max(1);
+    let cells = run_nx
+        .checked_mul(run_ny)
+        .and_then(|cells| cells.checked_mul(planes))
+        .ok_or_else(|| "temporal result shape overflows".to_owned())?;
+    if cells == 0 {
+        return Err("temporal result has an empty shape".to_owned());
+    }
+    if metadata.levels_hpa.is_empty() {
+        if metadata.layout.is_some() || metadata.shape.is_some() {
+            return Err(
+                "surface temporal result unexpectedly declares a vertical layout".to_owned(),
+            );
+        }
+    } else if metadata.layout != Some(rw_query::TemporalGridLayout::LevelYX)
+        || metadata.shape != Some([planes, run_ny, run_nx])
+    {
+        return Err("pressure temporal result does not preserve [level][y][x] shape".to_owned());
+    }
+    let (start_unix, end_unix) = protocol_window_bounds(window);
+    if metadata.axis.is_empty()
+        || metadata.window.start_unix != start_unix
+        || metadata.window.end_unix != end_unix
+        || metadata
+            .axis
+            .iter()
+            .any(|time| time.valid_unix < start_unix || time.valid_unix >= end_unix)
+        || metadata
+            .axis
+            .windows(2)
+            .any(|pair| pair[0].valid_unix >= pair[1].valid_unix)
+        || !metadata.completeness.duration_coverage.is_finite()
+        || !(0.0..=1.0).contains(&metadata.completeness.duration_coverage)
+        || metadata.completeness.available_samples > metadata.completeness.expected_samples
+    {
+        return Err("temporal time window or completeness metadata is invalid".to_owned());
+    }
+
+    let all_lengths = |lengths: &[usize]| lengths.iter().all(|length| *length == cells);
+    let valid = match result {
+        rw_query::TemporalGridResult::Scalar(grid) => all_lengths(&[
+            grid.minimum.len(),
+            grid.maximum.len(),
+            grid.range.len(),
+            grid.time_weighted_mean.len(),
+            grid.argmin_time_index.len(),
+            grid.argmax_time_index.len(),
+            grid.finite_count.len(),
+            grid.covered_duration_seconds.len(),
+            grid.duration_coverage.len(),
+        ]),
+        rw_query::TemporalGridResult::Interval(grid) => all_lengths(&[
+            grid.total.len(),
+            grid.minimum_interval.len(),
+            grid.maximum_interval.len(),
+            grid.range_interval.len(),
+            grid.argmin_time_index.len(),
+            grid.argmax_time_index.len(),
+            grid.finite_count.len(),
+            grid.covered_duration_seconds.len(),
+            grid.duration_coverage.len(),
+        ]),
+        rw_query::TemporalGridResult::IntervalMaximum(grid) => all_lengths(&[
+            grid.minimum_of_interval_maxima.len(),
+            grid.maximum_of_interval_maxima.len(),
+            grid.range_of_interval_maxima.len(),
+            grid.argmin_interval_maximum_time_index.len(),
+            grid.argmax_interval_maximum_time_index.len(),
+            grid.finite_interval_maximum_count.len(),
+            grid.covered_duration_seconds.len(),
+            grid.duration_coverage.len(),
+        ]),
+        rw_query::TemporalGridResult::Cumulative(grid) => all_lengths(&[
+            grid.total_increment.len(),
+            grid.minimum_increment.len(),
+            grid.maximum_increment.len(),
+            grid.range_increment.len(),
+            grid.argmin_time_index.len(),
+            grid.argmax_time_index.len(),
+            grid.finite_increment_count.len(),
+            grid.reset_count.len(),
+            grid.covered_duration_seconds.len(),
+            grid.duration_coverage.len(),
+        ]),
+        rw_query::TemporalGridResult::Rate(grid) => all_lengths(&[
+            grid.minimum_rate.len(),
+            grid.maximum_rate.len(),
+            grid.range_rate.len(),
+            grid.duration_weighted_mean.len(),
+            grid.integral.len(),
+            grid.argmin_time_index.len(),
+            grid.argmax_time_index.len(),
+            grid.finite_count.len(),
+            grid.covered_duration_seconds.len(),
+            grid.duration_coverage.len(),
+        ]),
+        rw_query::TemporalGridResult::Vector(grid) => all_lengths(&[
+            grid.minimum_speed.len(),
+            grid.maximum_speed.len(),
+            grid.range_speed.len(),
+            grid.time_weighted_mean_speed.len(),
+            grid.vector_mean_u.len(),
+            grid.vector_mean_v.len(),
+            grid.vector_mean_speed.len(),
+            grid.vector_mean_direction_toward_degrees.len(),
+            grid.argmin_time_index.len(),
+            grid.argmax_time_index.len(),
+            grid.finite_count.len(),
+            grid.covered_duration_seconds.len(),
+            grid.duration_coverage.len(),
+        ]),
+        rw_query::TemporalGridResult::Circular(grid) => all_lengths(&[
+            grid.mean_degrees.len(),
+            grid.resultant_length.len(),
+            grid.finite_count.len(),
+            grid.covered_duration_seconds.len(),
+            grid.duration_coverage.len(),
+        ]),
+        rw_query::TemporalGridResult::Categorical(grid) => all_lengths(&[
+            grid.mode.len(),
+            grid.mode_duration_seconds.len(),
+            grid.category_durations.len(),
+            grid.transitions.len(),
+            grid.finite_count.len(),
+            grid.covered_duration_seconds.len(),
+            grid.duration_coverage.len(),
+        ]),
+    };
+    if !valid {
+        return Err("temporal per-cell arrays do not match the declared shape".to_owned());
+    }
+    Ok(())
+}
+
+fn remote_temporal_reducer_name(reducer: rw_query::TemporalReducer) -> &'static str {
+    match reducer {
+        rw_query::TemporalReducer::ScalarSummary => "scalar_summary",
+        rw_query::TemporalReducer::IntervalSummary => "interval_summary",
+        rw_query::TemporalReducer::IntervalMaximumSummary => "interval_maximum_summary",
+        rw_query::TemporalReducer::CumulativeSummary => "cumulative_summary",
+        rw_query::TemporalReducer::RateSummary => "rate_summary",
+        rw_query::TemporalReducer::VectorSummary => "vector_summary",
+        rw_query::TemporalReducer::CircularMean => "circular_mean",
+        rw_query::TemporalReducer::CategoricalSummary => "categorical_summary",
+    }
+}
+
+fn remote_temporal_semantics_name(semantics: &rw_query::TemporalSemantics) -> &'static str {
+    match semantics {
+        rw_query::TemporalSemantics::InstantaneousScalar => "instantaneous_scalar",
+        rw_query::TemporalSemantics::IntervalAccumulation { .. } => "interval_accumulation",
+        rw_query::TemporalSemantics::IntervalMaximum { .. } => "interval_maximum",
+        rw_query::TemporalSemantics::CumulativeFromOrigin { .. } => "cumulative_from_origin",
+        rw_query::TemporalSemantics::IntervalRate { .. } => "interval_rate",
+        rw_query::TemporalSemantics::VectorComponents => "vector_components",
+        rw_query::TemporalSemantics::CircularDegrees => "circular_degrees",
+        rw_query::TemporalSemantics::Categorical => "categorical",
+        rw_query::TemporalSemantics::Unknown => "unknown",
+    }
+}
+
+fn validate_temporal_semantics_parameters(
+    semantics: &rw_query::TemporalSemantics,
+    parameters: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    match semantics {
+        rw_query::TemporalSemantics::IntervalAccumulation { support }
+        | rw_query::TemporalSemantics::IntervalMaximum { support } => {
+            validate_interval_support_parameters(*support, parameters)
+        }
+        rw_query::TemporalSemantics::CumulativeFromOrigin {
+            include_first_value,
+            reset_tolerance,
+        } => {
+            let expected_include = remote_parameter::<bool>(parameters, "include_first_value")?;
+            let expected_tolerance = remote_parameter::<f64>(parameters, "reset_tolerance")?;
+            if *include_first_value != expected_include || *reset_tolerance != expected_tolerance {
+                return Err(
+                    "temporal cumulative semantics differ from signed recipe parameters".to_owned(),
+                );
+            }
+            Ok(())
+        }
+        rw_query::TemporalSemantics::IntervalRate {
+            support,
+            seconds_per_rate_unit,
+            integral_units,
+        } => {
+            validate_interval_support_parameters(*support, parameters)?;
+            let expected_seconds = remote_parameter::<f64>(parameters, "seconds_per_rate_unit")?;
+            let expected_units = parameters
+                .get("integral_units")
+                .ok_or_else(|| "signed recipe lacks integral_units".to_owned())?;
+            if *seconds_per_rate_unit != expected_seconds || integral_units != expected_units {
+                return Err(
+                    "temporal rate semantics differ from signed recipe parameters".to_owned(),
+                );
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_interval_support_parameters(
+    support: rw_query::IntervalSupport,
+    parameters: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let (expected_label, expected_seconds) = match support {
+        rw_query::IntervalSupport::StartsAtValidTime { seconds } => {
+            ("starts_at_valid_time", Some(seconds))
+        }
+        rw_query::IntervalSupport::EndsAtValidTime { seconds } => {
+            ("ends_at_valid_time", Some(seconds))
+        }
+        rw_query::IntervalSupport::UntilNextExpectedTime => ("until_next_expected_time", None),
+        rw_query::IntervalSupport::SincePreviousExpectedTime => {
+            ("since_previous_expected_time", None)
+        }
+    };
+    if parameters.get("support").map(String::as_str) != Some(expected_label)
+        || expected_seconds.is_some_and(|seconds| {
+            remote_parameter::<u64>(parameters, "support_seconds") != Ok(seconds)
+        })
+    {
+        return Err("temporal interval support differs from signed recipe parameters".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_temporal_expectation(
+    expectation: &rw_query::TimeExpectation,
+    parameters: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let expected = match parameters.get("expectation").map(String::as_str) {
+        None | Some("manifest_axis") => rw_query::TimeExpectation::ManifestAxis,
+        Some("fixed_cadence") => rw_query::TimeExpectation::FixedCadence {
+            step_seconds: remote_parameter(parameters, "expectation_step_seconds")?,
+            anchor_unix: parameters
+                .get("expectation_anchor_unix")
+                .map(|_| remote_parameter(parameters, "expectation_anchor_unix"))
+                .transpose()?,
+        },
+        Some(_) => return Err("signed recipe has an unknown time expectation".to_owned()),
+    };
+    if expectation != &expected {
+        return Err("temporal expectation differs from signed recipe parameters".to_owned());
+    }
+    Ok(())
+}
+
+fn remote_parameter<T>(
+    parameters: &std::collections::BTreeMap<String, String>,
+    name: &'static str,
+) -> Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    parameters
+        .get(name)
+        .ok_or_else(|| format!("signed recipe lacks {name}"))?
+        .parse()
+        .map_err(|_| format!("signed recipe has invalid {name}"))
+}
+
+fn remote_temporal_metric_labels(result: &rw_query::TemporalGridResult) -> &'static [&'static str] {
+    match result {
+        rw_query::TemporalGridResult::Scalar(_) => {
+            &["Minimum", "Maximum", "Range", "Time-weighted mean"]
+        }
+        rw_query::TemporalGridResult::Interval(_) => &[
+            "Total",
+            "Minimum interval",
+            "Maximum interval",
+            "Range of intervals",
+        ],
+        rw_query::TemporalGridResult::IntervalMaximum(_) => &[
+            "Minimum of interval maxima",
+            "Maximum of interval maxima",
+            "Range of interval maxima",
+        ],
+        rw_query::TemporalGridResult::Cumulative(_) => &[
+            "Total increment",
+            "Minimum increment",
+            "Maximum increment",
+            "Range of increments",
+        ],
+        rw_query::TemporalGridResult::Rate(_) => &[
+            "Minimum rate",
+            "Maximum rate",
+            "Range of rates",
+            "Duration-weighted mean",
+            "Integral",
+        ],
+        rw_query::TemporalGridResult::Vector(_) => &[
+            "Minimum speed",
+            "Maximum speed",
+            "Range of speeds",
+            "Time-weighted mean speed",
+            "Vector-mean U",
+            "Vector-mean V",
+            "Vector-mean speed",
+            "Vector-mean direction",
+        ],
+        rw_query::TemporalGridResult::Circular(_) => &["Circular mean", "Resultant length"],
+        rw_query::TemporalGridResult::Categorical(_) => &["Category mode", "Transitions"],
+    }
+}
+
+fn remote_temporal_metric_values(
+    result: &rw_query::TemporalGridResult,
+    selected_metric: usize,
+) -> Result<(Vec<f32>, String, String), String> {
+    let metadata = remote_temporal_metadata(result);
+    let unit = metadata.units.first().cloned().unwrap_or_default();
+    let label = remote_temporal_metric_labels(result)
+        .get(selected_metric)
+        .copied()
+        .ok_or_else(|| "temporal metric selection is out of range".to_owned())?;
+    let (values, units) = match result {
+        rw_query::TemporalGridResult::Scalar(grid) => {
+            let values = match selected_metric {
+                0 => &grid.minimum,
+                1 => &grid.maximum,
+                2 => &grid.range,
+                3 => &grid.time_weighted_mean,
+                _ => unreachable!("label count checked"),
+            };
+            (optional_f64_values(values).0, unit)
+        }
+        rw_query::TemporalGridResult::Interval(grid) => {
+            let values = match selected_metric {
+                0 => &grid.total,
+                1 => &grid.minimum_interval,
+                2 => &grid.maximum_interval,
+                3 => &grid.range_interval,
+                _ => unreachable!("label count checked"),
+            };
+            (optional_f64_values(values).0, unit)
+        }
+        rw_query::TemporalGridResult::IntervalMaximum(grid) => {
+            let values = match selected_metric {
+                0 => &grid.minimum_of_interval_maxima,
+                1 => &grid.maximum_of_interval_maxima,
+                2 => &grid.range_of_interval_maxima,
+                _ => unreachable!("label count checked"),
+            };
+            (optional_f64_values(values).0, unit)
+        }
+        rw_query::TemporalGridResult::Cumulative(grid) => {
+            let values = match selected_metric {
+                0 => &grid.total_increment,
+                1 => &grid.minimum_increment,
+                2 => &grid.maximum_increment,
+                3 => &grid.range_increment,
+                _ => unreachable!("label count checked"),
+            };
+            (optional_f64_values(values).0, unit)
+        }
+        rw_query::TemporalGridResult::Rate(grid) => {
+            let (values, units) = match selected_metric {
+                0 => (&grid.minimum_rate, unit.clone()),
+                1 => (&grid.maximum_rate, unit.clone()),
+                2 => (&grid.range_rate, unit.clone()),
+                3 => (&grid.duration_weighted_mean, unit.clone()),
+                4 => (&grid.integral, grid.integral_units.clone()),
+                _ => unreachable!("label count checked"),
+            };
+            (optional_f64_values(values).0, units)
+        }
+        rw_query::TemporalGridResult::Vector(grid) => {
+            let (values, units) = match selected_metric {
+                0 => (&grid.minimum_speed, unit.clone()),
+                1 => (&grid.maximum_speed, unit.clone()),
+                2 => (&grid.range_speed, unit.clone()),
+                3 => (&grid.time_weighted_mean_speed, unit.clone()),
+                4 => (&grid.vector_mean_u, unit.clone()),
+                5 => (&grid.vector_mean_v, unit.clone()),
+                6 => (&grid.vector_mean_speed, unit.clone()),
+                7 => (
+                    &grid.vector_mean_direction_toward_degrees,
+                    "degrees".to_owned(),
+                ),
+                _ => unreachable!("label count checked"),
+            };
+            (optional_f64_values(values).0, units)
+        }
+        rw_query::TemporalGridResult::Circular(grid) => {
+            let (values, units) = match selected_metric {
+                0 => (&grid.mean_degrees, "degrees".to_owned()),
+                1 => (&grid.resultant_length, "ratio".to_owned()),
+                _ => unreachable!("label count checked"),
+            };
+            (optional_f64_values(values).0, units)
+        }
+        rw_query::TemporalGridResult::Categorical(grid) => match selected_metric {
+            0 => (
+                grid.mode
+                    .iter()
+                    .map(|value| value.map_or(f32::NAN, |value| value as f32))
+                    .collect(),
+                "category".to_owned(),
+            ),
+            1 => (
+                grid.transitions.iter().map(|value| *value as f32).collect(),
+                "count".to_owned(),
+            ),
+            _ => unreachable!("label count checked"),
+        },
+    };
+    Ok((values, units, label.to_owned()))
+}
+
+fn remote_temporal_field(
+    result: &rw_query::TemporalGridResult,
+    selected_metric: usize,
+) -> Result<rw_ui::FieldData, String> {
+    let metadata = remote_temporal_metadata(result);
+    if metadata.levels_hpa.len() > 1 {
+        return Err(
+            "The field viewer cannot represent multiple pressure planes; select exactly one level."
+                .to_owned(),
+        );
+    }
+    let (values, units, metric_label) = remote_temporal_metric_values(result, selected_metric)?;
+    let expected = metadata
+        .nx
+        .checked_mul(metadata.ny)
+        .ok_or_else(|| "temporal field shape overflows".to_owned())?;
+    if values.len() != expected {
+        return Err("temporal field is not one honest 2-D plane".to_owned());
+    }
+    let time = metadata
+        .axis
+        .last()
+        .ok_or_else(|| "temporal result has no available time axis".to_owned())?;
+    let base_variable = metadata
+        .variables
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "temporal".to_owned());
+    let level_suffix = metadata
+        .levels_hpa
+        .first()
+        .map(|level| format!("_{level}hpa"))
+        .unwrap_or_default();
+    Ok(remote_field_data(
+        &metadata.run,
+        time,
+        format!(
+            "{}_{}{}",
+            base_variable,
+            metric_label.to_ascii_lowercase().replace([' ', '-'], "_"),
+            level_suffix
+        ),
+        units,
+        metadata.nx,
+        metadata.ny,
+        values,
+    ))
+}
+
+fn short_hash(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
+}
+
+fn remote_verified_object_header(
+    ui: &mut egui::Ui,
+    tier: crate::community_cache::DeliveryTier,
+    request_sha256: &str,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("SIGNATURE VERIFIED").strong());
+        ui.weak(remote_delivery_tier_label(tier));
+        ui.separator();
+        ui.weak("request");
+        ui.monospace(short_hash(request_sha256));
+    });
+}
+
+fn remote_point_series_ui(ui: &mut egui::Ui, result: &rw_query::PointSeriesResult) {
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(format!(
+            "Nearest grid point ({}, {})",
+            result.point.x, result.point.y
+        ));
+        ui.label(format!(
+            "{:.4}, {:.4}",
+            result.point.grid_latitude, result.point.grid_longitude
+        ));
+        ui.weak(format!("{} exact times", result.axis.len()));
+    });
+    for variable in &result.variables {
+        let finite = variable
+            .values
+            .iter()
+            .filter(|value| value.is_some_and(f32::is_finite))
+            .count();
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(display_product_level_label(&variable.name));
+            ui.label(&variable.units);
+            ui.weak(format!(
+                "{finite}/{} finite ({:.1}% advertised coverage)",
+                variable.expected_samples,
+                variable.coverage * 100.0
+            ));
+            if finite < result.axis.len() {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{} missing", result.axis.len() - finite),
+                );
+            }
+        });
+    }
+
+    let series = result
+        .variables
+        .iter()
+        .map(|variable| {
+            result
+                .axis
+                .iter()
+                .zip(variable.values.iter())
+                .map(|(time, value)| {
+                    value
+                        .filter(|value| value.is_finite())
+                        .map(|value| (time.valid_unix as f64, value))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let finite_values = series
+        .iter()
+        .flat_map(|points| {
+            points
+                .iter()
+                .filter_map(|point| point.map(|(_, value)| value))
+        })
+        .collect::<Vec<_>>();
+    if finite_values.is_empty() {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "No finite point samples are available in this window.",
+        );
+        return;
+    }
+    let x_min = result
+        .axis
+        .first()
+        .map_or(0.0, |time| time.valid_unix as f64);
+    let x_max = result
+        .axis
+        .last()
+        .map_or(x_min + 1.0, |time| time.valid_unix as f64);
+    let y_min = finite_values.iter().copied().fold(f32::INFINITY, f32::min);
+    let y_max = finite_values
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let desired = egui::vec2(ui.available_width().max(240.0), 280.0);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let theme = crate::ui_theme::theme();
+    painter.rect_filled(rect, 4.0, theme.faint);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, theme.hairline),
+        egui::StrokeKind::Inside,
+    );
+    let plot = rect.shrink2(egui::vec2(42.0, 24.0));
+    painter.line_segment(
+        [plot.left_bottom(), plot.right_bottom()],
+        egui::Stroke::new(1.0, theme.hairline),
+    );
+    painter.line_segment(
+        [plot.left_bottom(), plot.left_top()],
+        egui::Stroke::new(1.0, theme.hairline),
+    );
+    let x_span = (x_max - x_min).max(1.0);
+    let y_span = (y_max - y_min).max(f32::EPSILON);
+    let colors = [
+        egui::Color32::from_rgb(75, 184, 255),
+        egui::Color32::from_rgb(255, 173, 66),
+        egui::Color32::from_rgb(126, 222, 129),
+        egui::Color32::from_rgb(218, 126, 255),
+    ];
+    for (series_index, points) in series.iter().enumerate() {
+        for pair in points.windows(2) {
+            let (Some(left), Some(right)) = (pair[0], pair[1]) else {
+                continue;
+            };
+            let map = |(time, value): (f64, f32)| {
+                egui::pos2(
+                    plot.left() + (((time - x_min) / x_span) as f32) * plot.width(),
+                    plot.bottom() - ((value - y_min) / y_span) * plot.height(),
+                )
+            };
+            painter.line_segment(
+                [map(left), map(right)],
+                egui::Stroke::new(2.0, colors[series_index % colors.len()]),
+            );
+        }
+    }
+    painter.text(
+        egui::pos2(rect.left() + 4.0, plot.top()),
+        egui::Align2::LEFT_TOP,
+        format!("{y_max:.2}"),
+        egui::FontId::monospace(10.0),
+        theme.text,
+    );
+    painter.text(
+        egui::pos2(rect.left() + 4.0, plot.bottom()),
+        egui::Align2::LEFT_BOTTOM,
+        format!("{y_min:.2}"),
+        egui::FontId::monospace(10.0),
+        theme.text,
+    );
+    let start_label = chrono::DateTime::<chrono::Utc>::from_timestamp(x_min as i64, 0)
+        .map(|time| time.format("%m-%d %HZ").to_string())
+        .unwrap_or_else(|| format!("{x_min:.0}"));
+    let end_label = chrono::DateTime::<chrono::Utc>::from_timestamp(x_max as i64, 0)
+        .map(|time| time.format("%m-%d %HZ").to_string())
+        .unwrap_or_else(|| format!("{x_max:.0}"));
+    painter.text(
+        plot.left_bottom() + egui::vec2(0.0, 4.0),
+        egui::Align2::LEFT_TOP,
+        start_label,
+        egui::FontId::monospace(10.0),
+        theme.text_weak,
+    );
+    painter.text(
+        plot.right_bottom() + egui::vec2(0.0, 4.0),
+        egui::Align2::RIGHT_TOP,
+        end_label,
+        egui::FontId::monospace(10.0),
+        theme.text_weak,
+    );
+    response
+        .on_hover_text("Only finite signed samples are joined; null/non-finite gaps are omitted.");
+}
+
+fn remote_temporal_summary_ui(ui: &mut egui::Ui, result: &rw_query::TemporalGridResult) {
+    let metadata = remote_temporal_metadata(result);
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(format!(
+            "{} x {}{}",
+            metadata.nx,
+            metadata.ny,
+            metadata
+                .levels_hpa
+                .first()
+                .map(|level| format!(" at {level} hPa"))
+                .unwrap_or_default()
+        ));
+        ui.label(format!(
+            "{} of {} expected samples",
+            metadata.completeness.available_samples, metadata.completeness.expected_samples
+        ));
+        ui.weak(format!(
+            "{:.1}% duration coverage; largest gap {} s",
+            metadata.completeness.duration_coverage * 100.0,
+            metadata.completeness.largest_gap_seconds
+        ));
+    });
+    if metadata.completeness.missing_samples > 0 {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "Partial coverage: {} expected time(s) missing; partial policy is explicit in the signed request.",
+                metadata.completeness.missing_samples
+            ),
+        );
+    }
+}
+
+fn remote_time_label(time: &crate::community_cache::RemoteTimePoint) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(time.valid_unix, 0).map_or_else(
+        || format!("slot {} · valid {}", time.storage_slot, time.valid_unix),
+        |valid| {
+            format!(
+                "slot {} · {} UTC",
+                time.storage_slot,
+                valid.format("%Y-%m-%d %H:%M")
+            )
+        },
+    )
+}
+
+fn remote_profile_selection(
+    variables: &[crate::community_cache::RemoteVariableCapability],
+) -> crate::community_cache::RemoteProfileVariableSelection {
+    let mut pressure_variables = variables
+        .iter()
+        .filter(|variable| variable.pressure_profile)
+        .map(|variable| variable.name.clone())
+        .collect::<Vec<_>>();
+    let mut surface_variables = variables
+        .iter()
+        .filter(|variable| variable.point_series && !variable.pressure_profile)
+        .filter(|variable| {
+            matches!(
+                variable.name.as_str(),
+                "temperature_2m"
+                    | "dewpoint_2m"
+                    | "u_10m"
+                    | "v_10m"
+                    | "surface_pressure"
+                    | "approx_temperature_2m"
+                    | "approx_dewpoint_2m"
+                    | "approx_u_10m"
+                    | "approx_v_10m"
+                    | "approx_surface_pressure"
+                    | "orography"
+                    | "mslp"
+            )
+        })
+        .map(|variable| variable.name.clone())
+        .collect::<Vec<_>>();
+    pressure_variables.sort();
+    pressure_variables.dedup();
+    surface_variables.sort();
+    surface_variables.dedup();
+    crate::community_cache::RemoteProfileVariableSelection {
+        pressure_variables,
+        surface_variables,
+        pressure_levels_hpa: Vec::new(),
+    }
+}
+
+fn remote_profile_payload_to_sounding(
+    payload: rw_community_protocol::ProfileObjectPayload<rw_query::ProfileResult>,
+    time: crate::community_cache::RemoteTimePoint,
+) -> Result<rw_ui::SoundingData, crate::community_cache::CommunityCacheError> {
+    let profile = payload.profile;
+    let vars = profile
+        .variables
+        .into_iter()
+        .map(|variable| rw_ui::ProfileVar {
+            name: variable.name,
+            units: variable.units,
+            levels_hpa: variable.levels_hpa,
+            values: variable
+                .values
+                .into_iter()
+                .map(|value| value.unwrap_or(f32::NAN))
+                .collect(),
+        })
+        .collect();
+    let surface = payload
+        .surface_samples
+        .into_iter()
+        .filter_map(|sample| {
+            sample.value.map(|value| rw_ui::SurfaceSample {
+                name: sample.variable,
+                units: sample.units,
+                value,
+            })
+        })
+        .collect();
+    Ok(rw_ui::SoundingData {
+        hour: HourKey {
+            model: profile.run.model,
+            run: profile.run.run,
+            hour: time.storage_slot,
+            exact_time: None,
+        },
+        fx: profile.point.x as f64,
+        fy: profile.point.y as f64,
+        lat: Some(profile.point.grid_latitude),
+        lon: Some(profile.point.grid_longitude),
+        vars,
+        surface,
+        read_ms: 0.0,
+    })
 }
 
 fn box_sounding_readiness(vars: &[rw_ui::VarInfo]) -> Result<(), String> {
@@ -7283,6 +12929,256 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    fn historical_test_request() -> rw_community_protocol::ShareRequest {
+        rw_community_protocol::ShareRequest {
+            schema: rw_community_protocol::REQUEST_SCHEMA.into(),
+            model: "hrrr".into(),
+            run: "20260812_00z".into(),
+            snapshot_id: "1".repeat(64),
+            grid_hash: "2".repeat(64),
+            variables: vec!["temperature_iso".into(), "temperature_2m".into()],
+            query: rw_community_protocol::ShareQuery::Profile {
+                latitude_e7: 350_000_000,
+                longitude_e7: -970_000_000,
+                storage_slot: 1,
+                valid_unix: 1_800_000_000,
+                pressure_variables: vec!["temperature_iso".into()],
+                surface_variables: vec!["temperature_2m".into()],
+                pressure_levels_hpa: vec![],
+            },
+            recipe: rw_community_protocol::RecipeIdentity {
+                recipe_id: "native-profile".into(),
+                recipe_version: "1".into(),
+                parameters: std::collections::BTreeMap::new(),
+            },
+            source_provenance: vec![rw_community_protocol::SourceProvenance {
+                provider: "noaa-aws-public-data".into(),
+                roles: vec!["pressure".into()],
+                products: vec!["wrfprs".into()],
+            }],
+            publication: rw_community_protocol::PublicationGrant {
+                data_origin: rw_community_protocol::DataOrigin::PublicProvider,
+                explicit_owner_publication: false,
+                redistribution_rights_confirmed: true,
+            },
+        }
+        .normalized()
+    }
+
+    #[test]
+    fn missing_historical_identity_skips_relay_and_preserves_https_origin_fallback() {
+        const ORIGIN_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let temp = tempfile::tempdir().unwrap();
+        let settings = settings::CommunityCacheSettings {
+            enabled: true,
+            // Port 9 is intentionally closed. A Network result below proves
+            // the ordinary fetch advanced past local/R2 and attempted HTTPS.
+            origin_url: "https://127.0.0.1:9".to_owned(),
+            manifest_public_key_base64: ORIGIN_KEY.to_owned(),
+            ..Default::default()
+        };
+        let client = crate::community_cache::CommunityCacheClient::from_settings(
+            &settings,
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        let runtime = crate::community_relay::CommunityRelayRuntime::start(
+            &settings,
+            temp.path().to_path_buf(),
+            false,
+        );
+        let request = historical_test_request();
+        let dispatcher = runtime.dispatcher();
+
+        // There is no retained/R2 manifest. Preparation must succeed without
+        // enqueueing a relay command so the caller can continue normally.
+        assert_eq!(
+            prepare_explicit_historical_recovery(
+                &client,
+                &dispatcher,
+                &request,
+                &std::sync::atomic::AtomicBool::new(false),
+            ),
+            Ok(())
+        );
+        assert_eq!(dispatcher.recovery_enqueue_count_for_test(), 0);
+        let ordinary_result = client.fetch_profile::<serde_json::Value>(request);
+        assert!(
+            matches!(
+                ordinary_result,
+                Err(crate::community_cache::CommunityCacheError::Network)
+            ),
+            "ordinary fetch result: {ordinary_result:?}"
+        );
+    }
+
+    #[test]
+    fn unreachable_r2_identity_skips_relay_and_reaches_authoritative_https_origin() {
+        const ORIGIN_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let temp = tempfile::tempdir().unwrap();
+
+        // Reserve distinct ephemeral ports, then close both so R2 and origin
+        // requests fail immediately and deterministically with Network.
+        let unavailable_origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_port = unavailable_origin.local_addr().unwrap().port();
+        let unavailable_r2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let r2_port = unavailable_r2.local_addr().unwrap().port();
+        drop(unavailable_origin);
+        drop(unavailable_r2);
+        let settings = settings::CommunityCacheSettings {
+            enabled: true,
+            origin_url: format!("https://127.0.0.1:{origin_port}"),
+            r2_hot_object_url: format!("https://127.0.0.1:{r2_port}"),
+            manifest_public_key_base64: ORIGIN_KEY.to_owned(),
+            // Each explicit historical preparation makes two failed R2
+            // attempts (object, then metadata); the following normal fetch
+            // needs a third concurrency admission before reaching origin.
+            max_concurrent_downloads: 4,
+            ..Default::default()
+        };
+        let client = crate::community_cache::CommunityCacheClient::from_settings(
+            &settings,
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        let runtime = crate::community_relay::CommunityRelayRuntime::start(
+            &settings,
+            temp.path().to_path_buf(),
+            false,
+        );
+        let dispatcher = runtime.dispatcher();
+        let request = historical_test_request();
+
+        assert_eq!(
+            prepare_explicit_historical_recovery(
+                &client,
+                &dispatcher,
+                &request,
+                &std::sync::atomic::AtomicBool::new(false),
+            ),
+            Ok(()),
+            "transient R2 identity failure must skip TURN, not block HTTPS fallback"
+        );
+        assert_eq!(
+            dispatcher.recovery_enqueue_count_for_test(),
+            0,
+            "no exact signed identity means no broker/relay command"
+        );
+        assert_eq!(client.origin_attempts_for_test(), 0);
+        let ordinary_result = client.fetch_profile::<serde_json::Value>(request);
+        assert!(
+            matches!(
+                ordinary_result,
+                Err(crate::community_cache::CommunityCacheError::Network)
+            ),
+            "ordinary fetch result: {ordinary_result:?}"
+        );
+        assert_eq!(
+            client.origin_attempts_for_test(),
+            1,
+            "ordinary fetch must enter authoritative HTTPS resolution after R2 fails"
+        );
+
+        for transient in [
+            crate::community_cache::CommunityCacheError::Network,
+            crate::community_cache::CommunityCacheError::Unavailable,
+            crate::community_cache::CommunityCacheError::Http(404),
+            crate::community_cache::CommunityCacheError::Http(408),
+            crate::community_cache::CommunityCacheError::Http(500),
+            crate::community_cache::CommunityCacheError::Http(599),
+        ] {
+            assert!(historical_identity_transient_miss(&transient));
+        }
+        for fail_closed in [
+            crate::community_cache::CommunityCacheError::Response,
+            crate::community_cache::CommunityCacheError::Quota,
+            crate::community_cache::CommunityCacheError::Http(400),
+            crate::community_cache::CommunityCacheError::Http(401),
+            crate::community_cache::CommunityCacheError::Http(429),
+        ] {
+            assert!(!historical_identity_transient_miss(&fail_closed));
+        }
+    }
+
+    #[test]
+    fn operational_model_modes_never_dispatch_the_relay_without_explicit_cold_opt_in() {
+        for mode in ModelWorkspaceMode::ALL {
+            assert!(!explicit_historical_relay_allowed(mode, false));
+        }
+        assert!(explicit_historical_relay_allowed(
+            ModelWorkspaceMode::Sounding,
+            true
+        ));
+        assert!(explicit_historical_relay_allowed(
+            ModelWorkspaceMode::PointSeries,
+            true
+        ));
+        for mode in [
+            ModelWorkspaceMode::MapPlot,
+            ModelWorkspaceMode::WindowTile,
+            ModelWorkspaceMode::TemporalDiurnal,
+            ModelWorkspaceMode::Ensemble,
+        ] {
+            assert!(!explicit_historical_relay_allowed(mode, true));
+        }
+    }
+
+    #[test]
+    fn automatic_community_lookup_requires_strict_public_provenance_not_just_a_model_name() {
+        use crate::community_cache::automatic_public_provider_run_allowed as allowed;
+
+        assert!(allowed("hrrr", ["noaa-aws-public-data"]));
+        assert!(allowed("aifs", ["ecmwf-open-data"]));
+        assert!(!allowed("wrf", ["noaa-aws-public-data"]));
+        assert!(!allowed("private-arwen-d03", ["noaa-aws-public-data"]));
+        assert!(!allowed("my-sim", ["local-lab"]));
+        assert!(!allowed("my-sim", std::iter::empty::<&str>()));
+        assert!(!allowed("hrrr", ["noaa-aws-public-data", "private-mirror"]));
+    }
+
+    #[test]
+    fn federation_install_is_debounced_and_persists_no_authority_secret() {
+        const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        const KEY_B: &str = "//////////////////////////////////////////8=";
+        let community = settings::CommunityCacheSettings {
+            enabled: true,
+            origin_url: "https://authority.weather.net".to_owned(),
+            manifest_public_key_base64: KEY_A.to_owned(),
+            ..Default::default()
+        };
+        let federation = settings::FederationSettings {
+            enabled: true,
+            catalog_signing_keys: vec![settings::FederationPinnedKeySettings {
+                key_id: "catalog-v1".to_owned(),
+                public_key_base64: KEY_A.to_owned(),
+            }],
+            approved_origins: vec![settings::FederationApprovedOriginSettings {
+                origin_id: "university-lab".to_owned(),
+                descriptor_signing_keys: vec![settings::FederationPinnedKeySettings {
+                    key_id: "university-descriptor-v1".to_owned(),
+                    public_key_base64: KEY_B.to_owned(),
+                }],
+            }],
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+        dock.set_federation_settings(&community, &federation);
+        assert!(dock.federation_proxy_enabled);
+        assert!(dock.federation_client.is_none());
+        assert!(dock.federation_refresh_task.is_none());
+        assert!(dock.federation_refresh_after.is_some());
+        let persisted = serde_json::to_string(&federation).unwrap();
+        assert!(!persisted.contains("bearer"));
+        assert!(!persisted.contains("token"));
+
+        let mut disabled = federation;
+        disabled.enabled = false;
+        dock.set_federation_settings(&community, &disabled);
+        assert!(!dock.federation_proxy_enabled);
+        assert!(dock.federation_refresh_after.is_none());
+    }
+
     #[test]
     fn external_sounding_rejects_late_point_reply_until_new_model_request() {
         let ctx = egui::Context::default();
@@ -7305,7 +13201,8 @@ mod tests {
 
         dock.sounding_request_mode = SoundingRequestMode::Point;
         dock.supersede_with_external_sounding();
-        dock.apply_point_sounding_response(Ok(data("stale-hrrr")));
+        let stale = data("stale-hrrr");
+        dock.apply_point_sounding_response(stale.hour.clone(), Ok(stale));
         assert!(
             dock.latest_sounding().is_none(),
             "the pre-RAOB worker reply must be discarded"
@@ -7313,7 +13210,8 @@ mod tests {
 
         // A later explicit model request restores ownership before its reply.
         dock.sounding_request_mode = SoundingRequestMode::Point;
-        dock.apply_point_sounding_response(Ok(data("new-hrrr")));
+        let fresh = data("new-hrrr");
+        dock.apply_point_sounding_response(fresh.hour.clone(), Ok(fresh));
         assert_eq!(
             dock.latest_sounding().map(|data| data.hour.model.as_str()),
             Some("new-hrrr")
@@ -7332,6 +13230,863 @@ mod tests {
         dock.set_plot_domain_armed(true);
         assert!(dock.plot_domain_armed());
         assert!(!dock.box_sounding_armed());
+    }
+
+    #[test]
+    fn plot_first_workspace_defaults_to_local_map_and_full_native_grid() {
+        assert_eq!(
+            ModelWorkspaceSource::default(),
+            ModelWorkspaceSource::LocalStore
+        );
+        assert_eq!(ModelWorkspaceMode::default(), ModelWorkspaceMode::MapPlot);
+        assert_eq!(ModelDomainChoice::default(), ModelDomainChoice::FullGrid);
+        assert_eq!(ModelWorkspaceMode::ALL.len(), 6);
+        assert_eq!(
+            primary_action_label(
+                ModelWorkspaceMode::MapPlot,
+                ModelWorkspaceSource::LocalStore,
+            ),
+            "Open plot"
+        );
+        assert_eq!(
+            primary_action_label(
+                ModelWorkspaceMode::Sounding,
+                ModelWorkspaceSource::RemoteCatalog,
+            ),
+            "Load sounding"
+        );
+    }
+
+    #[test]
+    fn workspace_availability_claims_only_implemented_remote_outputs() {
+        for mode in ModelWorkspaceMode::ALL {
+            let remote =
+                workspace_mode_availability(mode, ModelWorkspaceSource::RemoteCatalog, true, true);
+            assert_eq!(
+                remote.ready,
+                matches!(
+                    mode,
+                    ModelWorkspaceMode::MapPlot
+                        | ModelWorkspaceMode::Sounding
+                        | ModelWorkspaceMode::PointSeries
+                        | ModelWorkspaceMode::WindowTile
+                        | ModelWorkspaceMode::TemporalDiurnal
+                        | ModelWorkspaceMode::Ensemble
+                ),
+                "remote readiness must match an end-to-end typed seam: {mode:?}"
+            );
+        }
+        assert!(
+            workspace_mode_availability(
+                ModelWorkspaceMode::MapPlot,
+                ModelWorkspaceSource::LocalStore,
+                true,
+                true,
+            )
+            .ready
+        );
+        assert!(
+            workspace_mode_availability(
+                ModelWorkspaceMode::Sounding,
+                ModelWorkspaceSource::LocalStore,
+                false,
+                true,
+            )
+            .ready
+        );
+        assert!(
+            workspace_mode_availability(
+                ModelWorkspaceMode::Ensemble,
+                ModelWorkspaceSource::LocalStore,
+                true,
+                true,
+            )
+            .ready
+        );
+    }
+
+    #[test]
+    fn remote_catalog_selection_is_retained_only_when_still_advertised() {
+        let model = |id: &str| crate::community_cache::RemoteModelCatalogEntry {
+            id: id.to_owned(),
+            description: String::new(),
+            cycle_hours_utc: Vec::new(),
+            max_forecast_hour: 0,
+            registry_source_count: 0,
+            ingest_status: String::new(),
+            verification: String::new(),
+            limitations: Vec::new(),
+            products: Vec::new(),
+            provider_attributions: Vec::new(),
+            stored_run_count: 0,
+        };
+        let models = vec![model("gfs"), model("hrrr")];
+        assert_eq!(
+            retain_or_first_remote_model(Some("hrrr".to_owned()), &models).as_deref(),
+            Some("hrrr")
+        );
+        assert_eq!(
+            retain_or_first_remote_model(Some("removed".to_owned()), &models).as_deref(),
+            Some("gfs")
+        );
+        assert_eq!(retain_or_first_remote_model(None, &[]), None);
+    }
+
+    #[test]
+    fn remote_profile_selection_uses_only_profile_and_allowlisted_surface_variables() {
+        let variable = |name: &str, profile: bool, series: bool| {
+            crate::community_cache::RemoteVariableCapability {
+                name: name.to_owned(),
+                units: String::new(),
+                kind: if profile { "pressure3d" } else { "surface2d" }.to_owned(),
+                codec: String::new(),
+                levels_hpa: Vec::new(),
+                selector: serde_json::Value::Null,
+                available_slots: Vec::new(),
+                available_samples: 0,
+                expected_samples: 0,
+                coverage: 0.0,
+                point_series: series,
+                pressure_profile: profile,
+                geographic_window: true,
+                scalar_temporal_reduction: false,
+                temporal: serde_json::Value::Null,
+            }
+        };
+        let selection = remote_profile_selection(&[
+            variable("temperature_iso", true, false),
+            variable("u_iso", true, false),
+            variable("temperature_2m", false, true),
+            variable("unrelated_surface", false, true),
+        ]);
+        assert_eq!(selection.pressure_variables, ["temperature_iso", "u_iso"]);
+        assert_eq!(selection.surface_variables, ["temperature_2m"]);
+        assert!(selection.pressure_levels_hpa.is_empty());
+    }
+
+    fn remote_output_test_variable(
+        name: &str,
+        kind: &str,
+        levels_hpa: Vec<u16>,
+    ) -> crate::community_cache::RemoteVariableCapability {
+        crate::community_cache::RemoteVariableCapability {
+            name: name.to_owned(),
+            units: "K".to_owned(),
+            kind: kind.to_owned(),
+            codec: "zstd-f32".to_owned(),
+            levels_hpa,
+            selector: serde_json::json!({"discipline": 0}),
+            available_slots: vec![0, 1, 2],
+            available_samples: 3,
+            expected_samples: 3,
+            coverage: 1.0,
+            point_series: kind == "surface2d",
+            pressure_profile: kind == "pressure3d",
+            geographic_window: matches!(kind, "surface2d" | "pressure3d"),
+            scalar_temporal_reduction: true,
+            temporal: serde_json::json!({
+                "value_class": "instantaneous_scalar",
+                "basis": "canonical_selector",
+                "recommended_semantics": {"kind": "instantaneous_scalar"},
+                "supported_reducers": ["scalar_summary"],
+                "operations": [
+                    "scalar_minimum",
+                    "scalar_maximum",
+                    "scalar_range",
+                    "time_weighted_mean"
+                ],
+                "required_variables": [name],
+                "requires_manual_semantics": false,
+                "note": "typed test capability"
+            }),
+        }
+    }
+
+    fn remote_ensemble_test_variable(
+        name: &str,
+        field: rustwx_core::CanonicalField,
+        vertical: rustwx_core::VerticalSelector,
+        product: rustwx_core::FieldProduct,
+        kind: &str,
+        levels_hpa: Vec<u16>,
+    ) -> crate::community_cache::RemoteVariableCapability {
+        let mut variable = remote_output_test_variable(name, kind, levels_hpa);
+        variable.selector = serde_json::to_value(
+            rustwx_core::FieldSelector::new(field, vertical).with_product(product),
+        )
+        .expect("typed test selector");
+        variable
+    }
+
+    fn local_ensemble_test_variable(
+        name: &str,
+        field: rustwx_core::CanonicalField,
+        vertical: rustwx_core::VerticalSelector,
+        product: rustwx_core::FieldProduct,
+    ) -> rw_query::VariableCapability {
+        let remote =
+            remote_ensemble_test_variable(name, field, vertical, product, "surface2d", Vec::new());
+        rw_query::VariableCapability {
+            name: remote.name,
+            units: remote.units,
+            kind: remote.kind,
+            codec: remote.codec,
+            levels_hpa: remote.levels_hpa,
+            selector: remote.selector,
+            available_slots: remote.available_slots,
+            available_samples: remote.available_samples,
+            expected_samples: remote.expected_samples,
+            coverage: remote.coverage,
+            point_series: remote.point_series,
+            pressure_profile: remote.pressure_profile,
+            geographic_window: remote.geographic_window,
+            scalar_temporal_reduction: remote.scalar_temporal_reduction,
+            temporal: serde_json::from_value(remote.temporal).expect("typed temporal capability"),
+        }
+    }
+
+    fn remote_output_test_catalog() -> crate::community_cache::RemoteProfileCatalog {
+        crate::community_cache::RemoteProfileCatalog {
+            run: crate::community_cache::RemoteRunDescriptor {
+                model: "hrrr".to_owned(),
+                run: "20260812_00z".to_owned(),
+                schema: "rw-store.run.v1".to_owned(),
+                snapshot_id: "a".repeat(64),
+                grid_hash: "b".repeat(64),
+                nx: 100,
+                ny: 80,
+                exact_time_axis: true,
+                origin_unix: Some(1_786_492_800),
+                sample_count: 3,
+                first_valid_unix: Some(1_786_492_800),
+                last_valid_unix: Some(1_786_500_000),
+                source_provenance: vec![crate::community_cache::RemoteSourceProvenance {
+                    provider: "noaa-aws-public-data".to_owned(),
+                    roles: vec!["surface".to_owned(), "pressure".to_owned()],
+                    products: vec!["hrrr".to_owned()],
+                }],
+                provider_attributions: Vec::new(),
+            },
+            point: crate::community_cache::RemoteGridPoint {
+                requested_latitude: 35.0,
+                requested_longitude: -97.0,
+                x: 50,
+                y: 40,
+                grid_latitude: 35.0,
+                grid_longitude: -97.0,
+            },
+            axis: vec![
+                crate::community_cache::RemoteTimePoint {
+                    storage_slot: 0,
+                    lead_seconds: 0,
+                    valid_unix: 1_786_492_800,
+                },
+                crate::community_cache::RemoteTimePoint {
+                    storage_slot: 1,
+                    lead_seconds: 3_600,
+                    valid_unix: 1_786_496_400,
+                },
+                crate::community_cache::RemoteTimePoint {
+                    storage_slot: 2,
+                    lead_seconds: 7_200,
+                    valid_unix: 1_786_500_000,
+                },
+            ],
+            variables: vec![
+                remote_output_test_variable("temperature_2m", "surface2d", Vec::new()),
+                remote_output_test_variable("temperature_iso", "pressure3d", vec![500, 850, 1000]),
+            ],
+        }
+    }
+
+    fn remote_request_test_client() -> (
+        crate::community_cache::CommunityCacheClient,
+        tempfile::TempDir,
+    ) {
+        let mut settings = settings::CommunityCacheSettings::default();
+        settings.enabled = true;
+        settings.origin_url = "https://weather.example.test".to_owned();
+        settings.manifest_public_key_base64 =
+            "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=".to_owned();
+        let root = tempfile::tempdir().expect("cache root");
+        let client = crate::community_cache::CommunityCacheClient::from_settings(
+            &settings,
+            root.path().to_path_buf(),
+        )
+        .expect("valid offline client settings");
+        (client, root)
+    }
+
+    #[test]
+    fn remote_workspace_wires_every_material_choice_into_exact_requests() {
+        let catalog = remote_output_test_catalog();
+        let (client, _root) = remote_request_test_client();
+        let window = remote_time_window(&catalog.axis, 0, 1).expect("exact window");
+        let point = client
+            .build_remote_point_series_request(
+                &catalog,
+                crate::community_cache::RemotePointSeriesSelection {
+                    variables: vec!["temperature_2m".to_owned()],
+                    window: window.clone(),
+                    missing_policy: rw_community_protocol::MissingPolicy::Partial,
+                },
+            )
+            .expect("point request");
+        assert_eq!(point.model, "hrrr");
+        assert_eq!(point.run, "20260812_00z");
+        assert_eq!(point.snapshot_id, "a".repeat(64));
+        assert_eq!(point.grid_hash, "b".repeat(64));
+        assert_eq!(point.variables, ["temperature_2m"]);
+        assert!(matches!(
+            point.query,
+            rw_community_protocol::ShareQuery::PointSeries {
+                latitude_e7: 350_000_000,
+                longitude_e7: -970_000_000,
+                window: rw_community_protocol::TimeWindow::Utc {
+                    start_unix: 1_786_492_800,
+                    end_unix: 1_786_500_000,
+                },
+                missing_policy: rw_community_protocol::MissingPolicy::Partial,
+            }
+        ));
+
+        let native = client
+            .build_remote_native_window_request(
+                &catalog,
+                crate::community_cache::RemoteNativeWindowSelection {
+                    variables: vec!["temperature_iso".to_owned()],
+                    time: catalog.axis[1].clone(),
+                    x0: 10,
+                    y0: 20,
+                    x1: 30,
+                    y1: 40,
+                    pressure_levels_hpa: vec![850],
+                },
+            )
+            .expect("pressure window request");
+        assert!(matches!(
+            native.query,
+            rw_community_protocol::ShareQuery::NativeWindow {
+                storage_slot: 1,
+                valid_unix: 1_786_496_400,
+                x0: 10,
+                y0: 20,
+                x1: 30,
+                y1: 40,
+                pressure_levels_hpa,
+            } if pressure_levels_hpa == [850]
+        ));
+
+        let contract = remote_temporal_contract(&catalog.variables[0]).expect("typed temporal");
+        let temporal = client
+            .build_remote_temporal_grid_request(
+                &catalog,
+                crate::community_cache::RemoteTemporalGridSelection {
+                    variables: contract.variables,
+                    window,
+                    reducer: contract.reducer,
+                    semantics: contract.semantics,
+                    missing_policy: rw_community_protocol::MissingPolicy::Partial,
+                    pressure_levels_hpa: Vec::new(),
+                    parameters: contract.parameters,
+                },
+            )
+            .expect("temporal request");
+        assert!(matches!(
+            temporal.query,
+            rw_community_protocol::ShareQuery::TemporalGrid {
+                reducer,
+                semantics,
+                missing_policy: rw_community_protocol::MissingPolicy::Partial,
+                ..
+            } if reducer == "scalar_summary" && semantics == "instantaneous_scalar"
+        ));
+        assert_eq!(
+            temporal
+                .recipe
+                .parameters
+                .get("expectation")
+                .map(String::as_str),
+            Some("manifest_axis")
+        );
+
+        let geographic = client
+            .build_remote_geographic_window_request(
+                &catalog,
+                crate::community_cache::RemoteGeographicWindowSelection {
+                    variables: vec!["temperature_iso".to_owned()],
+                    time: catalog.axis[1].clone(),
+                    west_longitude: 170.0,
+                    south_latitude: 20.0,
+                    east_longitude: -170.0,
+                    north_latitude: 50.0,
+                    pressure_levels_hpa: vec![850],
+                },
+            )
+            .expect("signed geographic request");
+        assert!(matches!(
+            geographic.query,
+            rw_community_protocol::ShareQuery::GeographicWindow {
+                storage_slot: 1,
+                valid_unix: 1_786_496_400,
+                west_longitude_e7: 1_700_000_000,
+                south_latitude_e7: 200_000_000,
+                east_longitude_e7: -1_700_000_000,
+                north_latitude_e7: 500_000_000,
+                pressure_levels_hpa,
+            } if pressure_levels_hpa == [850]
+        ));
+    }
+
+    fn geographic_result_for_request(
+        request: &rw_community_protocol::ShareRequest,
+        pressure_levels_hpa: &[u16],
+    ) -> rw_query::GeographicWindowResult {
+        let data = if pressure_levels_hpa.is_empty() {
+            serde_json::json!({
+                "kind": "surface2d",
+                "values": [290.0, null, 292.0, 293.0]
+            })
+        } else {
+            let mut values = Vec::new();
+            for (level_index, _) in pressure_levels_hpa.iter().enumerate() {
+                values.extend([
+                    Some(280.0 + level_index as f32),
+                    None,
+                    Some(282.0 + level_index as f32),
+                    Some(283.0 + level_index as f32),
+                ]);
+            }
+            serde_json::json!({
+                "kind": "pressure_levels",
+                "levels_hpa": pressure_levels_hpa,
+                "values": values
+            })
+        };
+        serde_json::from_value(serde_json::json!({
+            "schema": rw_query::GEOGRAPHIC_WINDOW_RESULT_SCHEMA,
+            "run": {
+                "model": request.model,
+                "run": request.run,
+                "schema": "rw-store.run.v1",
+                "snapshot_id": request.snapshot_id,
+                "grid_hash": request.grid_hash,
+                "nx": 100,
+                "ny": 80,
+                "exact_time_axis": true,
+                "origin_unix": 1_786_492_800_i64,
+                "sample_count": 3,
+                "first_valid_unix": 1_786_492_800_i64,
+                "last_valid_unix": 1_786_500_000_i64,
+                "source_provenance": [{
+                    "provider": "noaa-aws-public-data",
+                    "roles": ["surface", "pressure"],
+                    "products": ["hrrr"]
+                }],
+                "provider_attributions": []
+            },
+            "time": {
+                "storage_slot": 1,
+                "lead_seconds": 3_600,
+                "valid_unix": 1_786_496_400_i64
+            },
+            "requested_bbox": {
+                "west_longitude": -100.0,
+                "south_latitude": 34.0,
+                "east_longitude": -96.0,
+                "north_latitude": 37.0
+            },
+            "longitude_arc": "ordinary",
+            "envelope_semantics": "minimal_native_rectangular_envelope",
+            "cell_inclusion_semantics": "grid_point_center_within_closed_bbox",
+            "envelope": { "x0": 10, "y0": 20, "nx": 2, "ny": 2 },
+            "latitudes": [35.0, 35.0, 36.0, 36.0],
+            "longitudes": [-99.0, -95.0, -99.0, -98.0],
+            "cell_mask": [true, false, true, true],
+            "mask_required": true,
+            "projection": null,
+            "fields": [{
+                "variable": request.variables[0],
+                "units": "K",
+                "selector": {"discipline": 0},
+                "data": data
+            }]
+        }))
+        .expect("typed geographic result")
+    }
+
+    #[test]
+    fn signed_geographic_adapter_preserves_grid_mask_and_never_flattens_levels() {
+        let catalog = remote_output_test_catalog();
+        let (client, _root) = remote_request_test_client();
+        let surface_request = client
+            .build_remote_geographic_window_request(
+                &catalog,
+                crate::community_cache::RemoteGeographicWindowSelection {
+                    variables: vec!["temperature_2m".to_owned()],
+                    time: catalog.axis[1].clone(),
+                    west_longitude: -100.0,
+                    south_latitude: 34.0,
+                    east_longitude: -96.0,
+                    north_latitude: 37.0,
+                    pressure_levels_hpa: vec![],
+                },
+            )
+            .unwrap();
+        let selectors = std::collections::BTreeMap::from([(
+            "temperature_2m".to_owned(),
+            serde_json::json!({"discipline": 0}),
+        )]);
+        let surface = geographic_result_for_request(&surface_request, &[]);
+        let (field, coverage) =
+            remote_geographic_field(surface, &surface_request, 100, 80, &selectors).unwrap();
+        assert_eq!((field.nx, field.ny), (2, 2));
+        assert!(field.values[1].is_nan());
+        let grid = field.grid.expect("signed cropped grid installed");
+        assert_eq!(grid.lat, [35.0, 35.0, 36.0, 36.0]);
+        assert_eq!(grid.lon, [-99.0, -95.0, -99.0, -98.0]);
+        assert_eq!(grid.hash.len(), 64);
+        assert!(coverage.contains("3 selected centres"));
+
+        let pressure_request = client
+            .build_remote_geographic_window_request(
+                &catalog,
+                crate::community_cache::RemoteGeographicWindowSelection {
+                    variables: vec!["temperature_iso".to_owned()],
+                    time: catalog.axis[1].clone(),
+                    west_longitude: -100.0,
+                    south_latitude: 34.0,
+                    east_longitude: -96.0,
+                    north_latitude: 37.0,
+                    pressure_levels_hpa: vec![500, 850],
+                },
+            )
+            .unwrap();
+        let pressure_selectors = std::collections::BTreeMap::from([(
+            "temperature_iso".to_owned(),
+            serde_json::json!({"discipline": 0}),
+        )]);
+        let pressure = geographic_result_for_request(&pressure_request, &[500, 850]);
+        validate_remote_geographic_result(
+            &pressure,
+            &pressure_request,
+            100,
+            80,
+            &pressure_selectors,
+        )
+        .expect("the typed adapter preserves every explicit level");
+        assert!(
+            remote_geographic_field(pressure, &pressure_request, 100, 80, &pressure_selectors)
+                .unwrap_err()
+                .contains("not flattened")
+        );
+    }
+
+    #[test]
+    fn geographic_adapter_rejects_tampered_mask_bbox_selector_and_shape() {
+        let catalog = remote_output_test_catalog();
+        let (client, _root) = remote_request_test_client();
+        let request = client
+            .build_remote_geographic_window_request(
+                &catalog,
+                crate::community_cache::RemoteGeographicWindowSelection {
+                    variables: vec!["temperature_2m".to_owned()],
+                    time: catalog.axis[1].clone(),
+                    west_longitude: -100.0,
+                    south_latitude: 34.0,
+                    east_longitude: -96.0,
+                    north_latitude: 37.0,
+                    pressure_levels_hpa: vec![],
+                },
+            )
+            .unwrap();
+        let selectors = std::collections::BTreeMap::from([(
+            "temperature_2m".to_owned(),
+            serde_json::json!({"discipline": 0}),
+        )]);
+        let valid = geographic_result_for_request(&request, &[]);
+
+        let mut tampered = valid.clone();
+        tampered.cell_mask[1] = true;
+        assert!(
+            validate_remote_geographic_result(&tampered, &request, 100, 80, &selectors).is_err()
+        );
+        let mut tampered = valid.clone();
+        tampered.requested_bbox.east_longitude = -95.0;
+        assert!(
+            validate_remote_geographic_result(&tampered, &request, 100, 80, &selectors).is_err()
+        );
+        let mut tampered = valid.clone();
+        tampered.fields[0].selector = serde_json::json!({"discipline": 1});
+        assert!(
+            validate_remote_geographic_result(&tampered, &request, 100, 80, &selectors).is_err()
+        );
+        let mut tampered = valid;
+        tampered.fields[0].data = rw_query::GeographicFieldValues::Surface2d {
+            values: vec![Some(1.0)],
+        };
+        assert!(
+            validate_remote_geographic_result(&tampered, &request, 100, 80, &selectors).is_err()
+        );
+    }
+
+    #[test]
+    fn ensemble_groups_only_typed_stored_products_by_field_and_vertical() {
+        use rustwx_core::{CanonicalField, FieldProduct, ProbabilitySelection, VerticalSelector};
+
+        let variables = vec![
+            remote_ensemble_test_variable(
+                "temperature_mean_2m",
+                CanonicalField::Temperature,
+                VerticalSelector::HeightAboveGroundMeters(2),
+                FieldProduct::EnsembleMean,
+                "surface2d",
+                Vec::new(),
+            ),
+            remote_ensemble_test_variable(
+                "temperature_spread_2m",
+                CanonicalField::Temperature,
+                VerticalSelector::HeightAboveGroundMeters(2),
+                FieldProduct::EnsembleSpread,
+                "surface2d",
+                Vec::new(),
+            ),
+            remote_ensemble_test_variable(
+                "temperature_p90_2m",
+                CanonicalField::Temperature,
+                VerticalSelector::HeightAboveGroundMeters(2),
+                FieldProduct::Percentile(90),
+                "surface2d",
+                Vec::new(),
+            ),
+            remote_ensemble_test_variable(
+                "precip_probability_gt_25mm",
+                CanonicalField::TotalPrecipitation,
+                VerticalSelector::Surface,
+                FieldProduct::Probability(ProbabilitySelection::above_milli(25_000)),
+                "surface2d",
+                Vec::new(),
+            ),
+            remote_ensemble_test_variable(
+                "temperature_mean_pressure",
+                CanonicalField::Temperature,
+                VerticalSelector::EntireAtmosphere,
+                FieldProduct::EnsembleMean,
+                "pressure3d",
+                vec![500, 850],
+            ),
+            // A deterministic selector and a name that merely looks like an
+            // ensemble product must never enter the workspace.
+            remote_ensemble_test_variable(
+                "temperature_deterministic",
+                CanonicalField::Temperature,
+                VerticalSelector::HeightAboveGroundMeters(2),
+                FieldProduct::Default,
+                "surface2d",
+                Vec::new(),
+            ),
+            remote_output_test_variable("fake_ensemble_mean", "surface2d", Vec::new()),
+        ];
+        let groups = ensemble_product_groups(&variables, Some(1));
+        assert_eq!(groups.len(), 3);
+        let temperature_2m = groups
+            .iter()
+            .find(|group| {
+                group.key.field == CanonicalField::Temperature
+                    && group.key.vertical == VerticalSelector::HeightAboveGroundMeters(2)
+            })
+            .expect("2 m temperature group");
+        assert_eq!(
+            temperature_2m
+                .products
+                .iter()
+                .map(|product| product.variable.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "temperature_mean_2m",
+                "temperature_spread_2m",
+                "temperature_p90_2m"
+            ]
+        );
+        let probability = groups
+            .iter()
+            .flat_map(|group| &group.products)
+            .find(|product| product.variable == "precip_probability_gt_25mm")
+            .expect("stored probability");
+        assert_eq!(
+            ensemble_product_label(probability),
+            "Published probability > 25 kg/m^2"
+        );
+        assert!(
+            groups
+                .iter()
+                .flat_map(|group| &group.products)
+                .all(|product| product.variable != "fake_ensemble_mean")
+        );
+    }
+
+    #[test]
+    fn ensemble_selection_is_catalog_truthful_for_remote_and_local_mean_only() {
+        use rustwx_core::{CanonicalField, FieldProduct, VerticalSelector};
+
+        let remote = vec![remote_ensemble_test_variable(
+            "href_temperature_mean",
+            CanonicalField::Temperature,
+            VerticalSelector::HeightAboveGroundMeters(2),
+            FieldProduct::EnsembleMean,
+            "surface2d",
+            Vec::new(),
+        )];
+        let remote_groups = ensemble_product_groups(&remote, Some(1));
+        assert_eq!(
+            retain_or_first_ensemble_variable(Some("invented_spread".to_owned()), &remote_groups)
+                .as_deref(),
+            Some("href_temperature_mean")
+        );
+        assert!(ensemble_group_is_published_mean_only(&remote_groups[0]));
+        assert_eq!(
+            ensemble_product_label(&remote_groups[0].products[0]),
+            "Published mean"
+        );
+
+        let local = vec![local_ensemble_test_variable(
+            "sref_temperature_mean",
+            CanonicalField::Temperature,
+            VerticalSelector::HeightAboveGroundMeters(2),
+            FieldProduct::EnsembleMean,
+        )];
+        let local_groups = ensemble_product_groups(&local, Some(1));
+        assert_eq!(local_groups.len(), 1);
+        assert!(ensemble_group_is_published_mean_only(&local_groups[0]));
+    }
+
+    #[test]
+    fn ensemble_exact_window_request_identity_binds_the_stored_statistic() {
+        use rustwx_core::{CanonicalField, FieldProduct, VerticalSelector};
+
+        let mut catalog = remote_output_test_catalog();
+        catalog.variables = vec![
+            remote_ensemble_test_variable(
+                "temperature_mean_2m",
+                CanonicalField::Temperature,
+                VerticalSelector::HeightAboveGroundMeters(2),
+                FieldProduct::EnsembleMean,
+                "surface2d",
+                Vec::new(),
+            ),
+            remote_ensemble_test_variable(
+                "temperature_spread_2m",
+                CanonicalField::Temperature,
+                VerticalSelector::HeightAboveGroundMeters(2),
+                FieldProduct::EnsembleSpread,
+                "surface2d",
+                Vec::new(),
+            ),
+        ];
+        let groups = ensemble_product_groups(&catalog.variables, Some(1));
+        assert_eq!(groups.len(), 1);
+        let (client, _root) = remote_request_test_client();
+        let request_for = |variable: &str| {
+            client
+                .build_remote_native_window_request(
+                    &catalog,
+                    crate::community_cache::RemoteNativeWindowSelection {
+                        variables: vec![variable.to_owned()],
+                        time: catalog.axis[1].clone(),
+                        x0: 10,
+                        y0: 20,
+                        x1: 30,
+                        y1: 40,
+                        pressure_levels_hpa: Vec::new(),
+                    },
+                )
+                .expect("ensemble window request")
+        };
+        let mean = request_for("temperature_mean_2m");
+        let spread = request_for("temperature_spread_2m");
+        assert_eq!(mean.variables, ["temperature_mean_2m"]);
+        assert_eq!(spread.variables, ["temperature_spread_2m"]);
+        assert_ne!(
+            rw_community_protocol::request_sha256(&mean).unwrap(),
+            rw_community_protocol::request_sha256(&spread).unwrap(),
+            "a changed stored statistic must replace the canonical task identity"
+        );
+    }
+
+    #[test]
+    fn remote_output_identity_suppresses_late_replaced_tasks() {
+        let old = RemoteOutputIdentity {
+            epoch: 7,
+            request_sha256: "old".to_owned(),
+            mode: ModelWorkspaceMode::PointSeries,
+            model: "hrrr".to_owned(),
+            run: "old-run".to_owned(),
+        };
+        let current = RemoteOutputIdentity {
+            epoch: 8,
+            request_sha256: "new".to_owned(),
+            mode: ModelWorkspaceMode::WindowTile,
+            model: "hrrr".to_owned(),
+            run: "new-run".to_owned(),
+        };
+        assert!(!remote_output_is_current(Some(&current), &old));
+        assert!(remote_output_is_current(Some(&current), &current));
+        assert!(!remote_output_is_current(None, &current));
+    }
+
+    #[test]
+    fn remote_native_bounds_and_time_windows_are_half_open_and_bounded() {
+        assert_eq!(
+            remote_native_bounds(100, 80, 10, 20, 30, 40).unwrap(),
+            (10, 20, 30, 40)
+        );
+        assert!(remote_native_bounds(100, 80, 30, 20, 30, 40).is_err());
+        assert!(remote_native_bounds(100, 80, 0, 0, 101, 80).is_err());
+        let catalog = remote_output_test_catalog();
+        assert_eq!(
+            remote_time_window(&catalog.axis, 1, 2).unwrap(),
+            rw_community_protocol::TimeWindow::Utc {
+                start_unix: 1_786_496_400,
+                end_unix: 1_786_503_600,
+            }
+        );
+        assert!(remote_time_window(&catalog.axis, 2, 1).is_err());
+    }
+
+    #[test]
+    fn remote_payload_adapters_turn_null_and_nonfinite_values_into_gaps() {
+        let (values, missing) = optional_f32_values(vec![
+            Some(1.0),
+            None,
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+            Some(-2.0),
+        ]);
+        assert_eq!(missing, 3);
+        assert_eq!(finite_f32_range(&values), Some((-2.0, 1.0)));
+        assert!(values[1].is_nan() && values[2].is_nan() && values[3].is_nan());
+        let (values, missing) =
+            optional_f64_values(&[Some(2.0), None, Some(f64::NAN), Some(f64::MAX)]);
+        assert_eq!(missing, 3);
+        assert_eq!(values[0], 2.0);
+        assert!(values[1..].iter().all(|value| value.is_nan()));
+    }
+
+    #[test]
+    fn remote_failure_status_retains_the_previous_verified_result() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(&ctx, StoreTree::default());
+        dock.remote_output_result = Some(RemoteOutputResult::Field {
+            field: override_test_field("remote_temperature"),
+            tier: crate::community_cache::DeliveryTier::R2,
+            request_sha256: "verified".to_owned(),
+            coverage_note: "complete".to_owned(),
+        });
+        dock.note_remote_output_failure("origin unavailable".to_owned());
+        assert!(dock.remote_output_result.is_some());
+        let status = dock.remote_detail_status.expect("failure status");
+        assert!(status.contains("Every configured HTTPS tier was tried"));
+        assert!(status.contains("previous verified result retained"));
     }
 
     #[test]
@@ -8412,6 +15167,167 @@ mod tests {
             dock.import_message.as_deref(),
             Some("Imported WRF timestep 2/3; available in Models now")
         );
+    }
+
+    #[test]
+    fn incremental_import_rescan_policy_keeps_first_commit_and_coalesces_bursts() {
+        let start = std::time::Instant::now();
+        let mut policy = ImportRescanCoalescer::default();
+        let hour = |slot| HourKey {
+            model: "wrf".to_owned(),
+            run: "20260707_00z".to_owned(),
+            hour: slot,
+            exact_time: Some(rw_store::RwsExactTime::new(
+                slot as u64 * 300,
+                1_783_387_200,
+            )),
+        };
+        let first = hour(1);
+        let second = hour(2);
+        let third = hour(3);
+
+        assert!(
+            policy.on_commit(start, &first),
+            "the first commit is immediately visible"
+        );
+        assert!(!policy.on_commit(start + std::time::Duration::from_millis(1), &second));
+        assert!(!policy.on_commit(start + std::time::Duration::from_millis(499), &third));
+        assert_eq!(
+            policy.take_due(
+                start + INCREMENTAL_IMPORT_RESCAN_INTERVAL - std::time::Duration::from_nanos(1)
+            ),
+            None
+        );
+        assert_eq!(
+            policy.take_due(start + INCREMENTAL_IMPORT_RESCAN_INTERVAL),
+            Some(third.clone()),
+            "the due refresh follows only the newest exact hour"
+        );
+        assert_eq!(
+            policy.take_due(start + INCREMENTAL_IMPORT_RESCAN_INTERVAL),
+            None
+        );
+
+        policy.reset();
+        assert!(
+            policy.on_commit(start + std::time::Duration::from_secs(1), &first),
+            "a new job again surfaces its first commit immediately"
+        );
+        assert_eq!(policy.finish(None), Some(first));
+        assert!(policy.latest_hour.is_none());
+    }
+
+    #[test]
+    fn burst_commits_coalesce_rescan_and_follow_load_then_done_selects_exact_latest() {
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new_for_test(
+            &ctx,
+            tree_with_runs("wrf", &[("20260707_00z", &[0, 1, 2, 3, 4, 5])]),
+        );
+        dock.wrf_options.follow_processing = true;
+        dock.wrf_options.auto_plot = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        dock.import_job = Some(ImportJob::Process(crate::wrf_process::WrfProcessTask {
+            label: "coalesced WRF".to_owned(),
+            rx,
+        }));
+        let start = std::time::Instant::now();
+
+        let send_commit = |slot: u16, completed: usize, exact_time| {
+            tx.send(crate::wrf_process::WrfProcessMessage::Committed(
+                crate::wrf_process::WrfProcessCommit {
+                    model: "wrf".to_owned(),
+                    run: "20260707_00z".to_owned(),
+                    storage_slot: slot,
+                    exact_time: Some(exact_time),
+                    completed,
+                    total: Some(5),
+                },
+            ))
+            .unwrap();
+        };
+
+        let first_exact = rw_store::RwsExactTime::new(300, 1_783_387_500);
+        send_commit(1, 1, first_exact);
+        dock.poll_import_at(start);
+        assert_eq!(
+            dock.rescan_requests_for_test, 1,
+            "the first committed hour is enumerated immediately"
+        );
+        assert_eq!(
+            dock.selected_hour().and_then(|hour| hour.exact_time),
+            Some(first_exact)
+        );
+
+        send_commit(2, 2, rw_store::RwsExactTime::new(600, 1_783_387_800));
+        dock.poll_import_at(start + std::time::Duration::from_millis(10));
+        let third_exact = rw_store::RwsExactTime::new(900, 1_783_388_100);
+        send_commit(3, 3, third_exact);
+        dock.poll_import_at(start + std::time::Duration::from_millis(20));
+        assert_eq!(
+            dock.rescan_requests_for_test, 1,
+            "a burst does not enumerate once per committed hour"
+        );
+        assert_eq!(
+            dock.selected_hour().and_then(|hour| hour.exact_time),
+            Some(first_exact)
+        );
+
+        // No queued message: this exercises the ordinary Pending poll path.
+        dock.poll_import_at(start + INCREMENTAL_IMPORT_RESCAN_INTERVAL);
+        assert_eq!(
+            dock.rescan_requests_for_test, 2,
+            "a quiet poll flushes the bounded progressive refresh"
+        );
+        assert_eq!(
+            dock.selected_hour().and_then(|hour| hour.exact_time),
+            Some(third_exact),
+            "the quiet flush loads only the newest exact hour in the burst"
+        );
+
+        send_commit(4, 4, rw_store::RwsExactTime::new(1_200, 1_783_388_400));
+        dock.poll_import_at(
+            start + INCREMENTAL_IMPORT_RESCAN_INTERVAL + std::time::Duration::from_millis(10),
+        );
+        assert_eq!(dock.rescan_requests_for_test, 2);
+        assert_eq!(
+            dock.selected_hour().and_then(|hour| hour.exact_time),
+            Some(third_exact)
+        );
+
+        // Commit and Done may be drained together. Completion must still use
+        // this exact final key rather than the prior coalescing-window key.
+        let final_exact = rw_store::RwsExactTime::new(1_500, 1_783_388_700);
+        send_commit(5, 5, final_exact);
+        tx.send(crate::wrf_process::WrfProcessMessage::Done(Ok(
+            crate::wrf_process::WrfProcessSummary {
+                store_root: dock.store_root.clone(),
+                model: "wrf".to_owned(),
+                run: "20260707_00z".to_owned(),
+                files_seen: 5,
+                hours_written: 5,
+                variables: vec!["temperature_2m".to_owned()],
+                notes: Vec::new(),
+            },
+        )))
+        .unwrap();
+        dock.poll_import_at(
+            start + INCREMENTAL_IMPORT_RESCAN_INTERVAL + std::time::Duration::from_millis(20),
+        );
+        assert_eq!(
+            dock.rescan_requests_for_test, 3,
+            "terminal completion always performs a final full reconciliation"
+        );
+        assert_eq!(dock.selected_hour().map(|hour| hour.hour), Some(5));
+        assert_eq!(
+            dock.selected_hour().and_then(|hour| hour.exact_time),
+            Some(final_exact),
+            "terminal reconciliation preserves the newest exact valid time"
+        );
+        assert!(dock.import_job.is_none());
+        assert!(!dock.incremental_rescan.pending);
+        assert!(dock.incremental_rescan.last_rescan_at.is_none());
+        assert!(dock.incremental_rescan.latest_hour.is_none());
     }
 
     #[test]

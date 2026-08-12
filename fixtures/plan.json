@@ -1,0 +1,15 @@
+{
+  "schema": "gpuwm.run-plan.v1",
+  "name": "afternoon-run",
+  "route": "experiment",
+  "config": {
+    "inline": "[experiment]\nname = \"afternoon-run\"\nrun_seconds = 21600.0\n\n[projection]\nmap_proj = \"lambert\"\nref_lat = 35.5\nref_lon = -97.5\ntruelat1 = 30.0\ntruelat2 = 60.0\nstand_lon = -97.5\n\n[[domain]]\ngrid_id = 1\nparent_id = 0\nparent_grid_ratio = 1\nnx = 300\nny = 240\ndx = 3000.0\ntime_step = 15\nhistory_interval_s = 900.0\n"
+  },
+  "fetch": {
+    "args": ["--source", "gfs", "--cycle", "2026080706", "--hours", "12", "--out", "data"]
+  },
+  "output_root": "C:/Forecasts/afternoon-run",
+  "run_options": {
+    "device": 0
+  }
+}

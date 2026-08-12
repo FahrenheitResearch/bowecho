@@ -178,6 +178,7 @@ pub(crate) fn write_regular_lonlat_rgb_frame(
                 RGB_G_VAR.to_string(),
                 RGB_B_VAR.to_string(),
             ],
+            source_provenance: Vec::new(),
         },
     );
     manifest

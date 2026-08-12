@@ -3,28 +3,39 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.34.12"
+version = "0.34.13"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/bowecho"
 
 [workspace.dependencies]
+arwen-map = { path = "crates/arwen-map" }
+arwen-plan = { path = "crates/arwen-plan" }
+arwen-proc = { path = "crates/arwen-proc" }
 byteorder = "1.5"
 bzip2 = { version = "0.6", default-features = false, features = ["bzip2-sys"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+color_tables = { path = "crates/color_tables" }
 eframe = { version = "0.34.3", features = ["glow"] }
+egui_tiles = "0.15"
 earcutr = "0.5"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6", "gtk3"] }
 libdeflate-sys = "1.25.2"
 quick-xml = { version = "0.39", features = ["serialize"] }
 rayon = "1.11"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+region-global-dealias = { git = "https://github.com/FahrenheitResearch/region-global-dealias", rev = "a7d4baf6b8a11ca5602fe44a533efd8200ef6cea" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
 tiff = "0.11.3"
+toml = "0.9"
+ui_core = { path = "crates/ui_core" }
+wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "9874474d9566a7536a90f457a48be30caa5f973a", package = "wrf-core", default-features = false, features = ["pure-rust-reader"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [profile.release]
@@ -49,10 +60,10 @@ incremental = true
 strip = false
 
 [patch.crates-io]
-hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17" }
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "de0478a6146792e2b10cec11ee0d2503dddeb310" }
 
 # sharppyrs pulls sharprs from its standalone repo; unify it with the
 # rusty-weather-vendored sharprs every other crate here uses so the two
 # resolve to ONE crate (identical types).
 [patch."https://github.com/FahrenheitResearch/sharprs"]
-sharprs = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17" }
+sharprs = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "de0478a6146792e2b10cec11ee0d2503dddeb310" }

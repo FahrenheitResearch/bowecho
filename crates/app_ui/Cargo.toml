@@ -6,12 +6,15 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+arwen-studio = { path = "../arwen-studio" }
+async-trait = "0.1"
 chrono.workspace = true
 rayon.workspace = true
 bowecho_cli = { path = "../bowecho_cli" }
 color_tables = { path = "../color_tables" }
 data_source = { path = "../data_source" }
 flate2.workspace = true
+getrandom = "0.3"
 eframe.workspace = true
 # Dockable workspace tile tree (docs/docking-spike.md: egui_tiles 0.15.0
 # verified compatible with egui 0.34; rerun-io maintained, serde layouts).
@@ -42,10 +45,30 @@ sha2 = "0.10"
 tempfile = "3.20"
 tiff.workspace = true
 zip.workspace = true
+zstd = "0.13"
+
+[dependencies.rw-community-protocol]
+git = "https://github.com/FahrenheitResearch/rusty-weather"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
+
+[dependencies.rw-community-relay]
+git = "https://github.com/FahrenheitResearch/rusty-weather"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "sync", "time"]
+
+[dependencies.ed25519-dalek]
+version = "2.2"
+
+[dependencies.rw-query]
+git = "https://github.com/FahrenheitResearch/rusty-weather"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rusty-weather]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dev-dependencies]
 # B3 (docs/miniderecho-spec.md §1): the shared slots' `inject_for_test`
@@ -91,15 +114,15 @@ windows-sys = { version = "0.61", features = [
 # Model-data dock and satellite/model stack (rusty-weather).
 [dependencies.rw-ui]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rustwx-render]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rustwx-sounding]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 # BowEcho-compatible SHARPpy v0.3.2 parity line: retains the configurable
 # native table/layout APIs after the verified parity + ECAPE-EL corrections,
@@ -111,43 +134,43 @@ rev = "b97d29c937d4f4146796249c9663e924d98ed34a"
 
 [dependencies.sharprs]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rw-ingest]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rw-glm]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rustwx-products]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rustwx-core]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rustwx-io]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rustwx-models]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rw-sat]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rw-store]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 [dependencies.rw-formula]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 # WRF/NetCDF local ingest (rusty-weather v0.2.3 Feature 2 — WRF/GUI soundings).
 # `netcrust` is the pure-Rust NetCDF/HDF5 reader; it is already pulled
@@ -158,7 +181,7 @@ rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
 # through the existing ModelDataDock skew-T path.
 [dependencies.netcrust]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 
 # GRIB Edition 1 decode (ERA-20C / GDEX "past" reanalysis local import —
 # see `grib_import.rs`). Same pinned rusty-weather rev as everything above;
@@ -166,7 +189,7 @@ rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
 # importer never touches.
 [dependencies.grib-core]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "401b86482a33b47e14bfd3d01f3ceb9e39701a17"
+rev = "de0478a6146792e2b10cec11ee0d2503dddeb310"
 default-features = false
 
 [dependencies.wrf-core]

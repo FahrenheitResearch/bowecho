@@ -7,16 +7,23 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use app_ui::wrf_scene_inventory::{
     WrfDomainId, WrfProducerIdentity, WrfSceneGroup, parse_wrf_domain_id,
 };
 use rw_store::atomic::atomic_write_bytes;
+use rw_store::run::{RwsRunManifest, validate_store_component};
+use rw_store::{RunLock, RwsSourceProvenance};
 use serde::{Deserialize, Serialize};
 use wrf_core::WrfFile;
 
 const REGISTRY_SCHEMA: &str = "bowecho-wrf-sources/1";
 const REGISTRY_FILE: &str = ".bowecho-wrf-sources.json";
+const PROVENANCE_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(crate) const PRIVATE_WRF_PROVIDER: &str = "private-wrf";
+pub(crate) const PRIVATE_ARWEN_PROVIDER: &str = "private-arwen";
 
 fn registry_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -39,6 +46,22 @@ pub(crate) struct WrfRunSourceMetadata {
 }
 
 impl WrfRunSourceMetadata {
+    /// Conservative identity for a post-processed WRF file that no longer
+    /// exposes the raw producer attributes needed by `wrf-core`. ArWen is
+    /// never inferred through this fallback; only an observed GPUWM marker
+    /// may select the ArWen identity.
+    pub(crate) fn generic_wrf() -> Self {
+        Self {
+            producer: "wrf".to_owned(),
+            producer_version: None,
+            domain: None,
+            nx: 0,
+            ny: 0,
+            dx_m: None,
+            dy_m: None,
+        }
+    }
+
     pub(crate) fn from_scene_group(group: &WrfSceneGroup) -> Self {
         let (producer, producer_version) = producer_fields(&group.key.producer);
         Self {
@@ -115,6 +138,103 @@ impl WrfRunSourceMetadata {
             _ => "WRF".to_owned(),
         }
     }
+
+    /// Sanitized rw-store provenance for an owner-processed local run.
+    ///
+    /// This labels producer identity only. It is deliberately not a claim
+    /// that the owner may redistribute the bytes; the publication workflow
+    /// asks for and persists that confirmation separately.
+    pub(crate) fn store_provenance(&self) -> Result<RwsSourceProvenance, String> {
+        let provider = match self.producer.as_str() {
+            "wrf" => PRIVATE_WRF_PROVIDER,
+            "arwen" => PRIVATE_ARWEN_PROVIDER,
+            other => {
+                return Err(format!(
+                    "unsupported WRF producer identity '{other}'; expected 'wrf' or 'arwen'"
+                ));
+            }
+        };
+        RwsSourceProvenance::new(
+            provider,
+            vec!["owner-processed".to_owned()],
+            vec!["rw-store".to_owned()],
+        )
+        .map_err(|error| format!("build WRF source provenance: {error}"))
+    }
+}
+
+/// Attach the producer marker to one just-written WRF/ArWen hour while
+/// holding the same advisory run lock used by rw-store writers.
+///
+/// Convenience rw-store writers predate per-hour provenance, so their WRF
+/// call sites use this immediately after `finish`. Publication still rejects
+/// an interrupted legacy hour whose marker was never committed.
+pub(crate) fn stamp_hour_source_provenance(
+    store_root: &Path,
+    model: &str,
+    run: &str,
+    storage_slot: u16,
+    metadata: &WrfRunSourceMetadata,
+) -> Result<(), String> {
+    validate_store_component("WRF model", model).map_err(|error| error.to_string())?;
+    validate_store_component("WRF run", run).map_err(|error| error.to_string())?;
+    let run_dir = store_root.join(model).join(run);
+    let _lock = RunLock::acquire(&run_dir, PROVENANCE_LOCK_TIMEOUT)
+        .map_err(|error| format!("lock WRF run for provenance: {error}"))?;
+    let manifest_path = run_dir.join("run.json");
+    let mut manifest = RwsRunManifest::load_for_run(&manifest_path, model, run)
+        .map_err(|error| format!("open WRF run for provenance: {error}"))?;
+    let entry = manifest.hours.get_mut(&storage_slot).ok_or_else(|| {
+        format!("WRF run manifest has no just-written storage slot {storage_slot}")
+    })?;
+    entry.source_provenance = vec![metadata.store_provenance()?];
+    manifest
+        .save(&manifest_path)
+        .map_err(|error| format!("save WRF source provenance: {error}"))
+}
+
+/// Explicit repair for a legacy processed run whose hour entries predate
+/// provenance. This operation never infers or grants redistribution rights;
+/// it records only the producer identity already present in BowEcho's
+/// external registry. The exact confirmation phrase keeps migration from
+/// becoming an accidental side effect of browsing or publishing.
+#[allow(dead_code)] // wired only from the explicit generation-publication migration UI
+pub(crate) fn migrate_legacy_run_provenance(
+    store_root: &Path,
+    model: &str,
+    run: &str,
+    confirmation: &str,
+) -> Result<usize, String> {
+    const CONFIRMATION: &str = "MIGRATE LEGACY WRF PROVENANCE";
+    if confirmation != CONFIRMATION {
+        return Err(format!(
+            "legacy provenance migration requires the exact confirmation '{CONFIRMATION}'"
+        ));
+    }
+    validate_store_component("WRF model", model).map_err(|error| error.to_string())?;
+    validate_store_component("WRF run", run).map_err(|error| error.to_string())?;
+    let metadata = read_run_metadata(store_root, model, run)?
+        .ok_or_else(|| "legacy WRF run has no reviewed producer registry entry".to_owned())?;
+    let provenance = metadata.store_provenance()?;
+    let run_dir = store_root.join(model).join(run);
+    let _lock = RunLock::acquire(&run_dir, PROVENANCE_LOCK_TIMEOUT)
+        .map_err(|error| format!("lock legacy WRF run for provenance migration: {error}"))?;
+    let manifest_path = run_dir.join("run.json");
+    let mut manifest = RwsRunManifest::load_for_run(&manifest_path, model, run)
+        .map_err(|error| format!("open legacy WRF run: {error}"))?;
+    let mut migrated = 0usize;
+    for entry in manifest.hours.values_mut() {
+        if entry.source_provenance.is_empty() {
+            entry.source_provenance = vec![provenance.clone()];
+            migrated += 1;
+        }
+    }
+    if migrated > 0 {
+        manifest
+            .save(&manifest_path)
+            .map_err(|error| format!("save migrated WRF provenance: {error}"))?;
+    }
+    Ok(migrated)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

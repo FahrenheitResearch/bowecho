@@ -663,7 +663,7 @@ fn live_tilt_azimuth_coverage_deg(cut: &ElevationCut) -> f32 {
 }
 
 fn is_live_low_level_tilt(cut: &ElevationCut) -> bool {
-    cut.elevation_deg <= LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG
+    cut.elevation_deg <= LIVE_LOW_LEVEL_MAX_ELEVATION_DEG
 }
 
 fn is_allowed_live_low_level_tilt_for_site(
@@ -949,24 +949,24 @@ pub(crate) fn selection_for_installed_volume_with_low_sweep_min_seconds(
     {
         return (next_cut, previous_product.clone());
     }
-    if same_site
-        && can_materialize_product_on_live_candidate_cut(
-            volume,
-            previous_cut,
-            previous_product,
-            policy.require_complete_live_cut,
-        )
-    {
+    // Product choice is user intent, not site-local state. Keep it across a
+    // radar switch (and across the brief volume=None state used while a new
+    // site loads) whenever the destination can render it. Only the automatic
+    // low-sweep advance above is inherently a same-site operation.
+    if can_materialize_product_on_live_candidate_cut(
+        volume,
+        previous_cut,
+        previous_product,
+        policy.require_complete_live_cut,
+    ) {
         return (previous_cut, previous_product.clone());
     }
-    if same_site
-        && let Some(cut) = best_cut_for_product_with_live_filter(
-            volume,
-            previous_cut,
-            previous_product,
-            policy.require_complete_live_cut,
-        )
-    {
+    if let Some(cut) = best_cut_for_product_with_live_filter(
+        volume,
+        previous_cut,
+        previous_product,
+        policy.require_complete_live_cut,
+    ) {
         return (cut, previous_product.clone());
     }
 
@@ -994,7 +994,6 @@ fn latest_newer_low_level_cut(
         return None;
     }
     let previous_time = cut_start_time_utc(previous_volume, previous_cut)?;
-    let previous_elevation_deg = previous_cut_data.elevation_deg;
 
     (0..volume.cuts.len())
         .filter(|cut_index| {
@@ -1003,8 +1002,7 @@ fn latest_newer_low_level_cut(
                     cut,
                     &volume.site.id,
                     allow_incomplete_live_chunk_advance,
-                ) && (cut.elevation_deg - previous_elevation_deg).abs()
-                    <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
+                ) && cut.elevation_deg <= LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG
             }) && can_materialize_product_on_cut(volume, *cut_index, previous_product)
         })
         .filter_map(|cut_index| {

@@ -1,0 +1,189 @@
+{
+  "automatic_resolutions": [
+    {
+      "basis": "schema_default",
+      "key": "data_dir",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "device",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "dry_run",
+      "scope": "run_options",
+      "value": false
+    },
+    {
+      "basis": "schema_default",
+      "key": "geog_root",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "health_debug",
+      "scope": "run_options",
+      "value": false
+    },
+    {
+      "basis": "schema_default",
+      "key": "physics_profile",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "render_products",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "restart",
+      "scope": "run_options",
+      "value": null
+    },
+    {
+      "basis": "schema_default",
+      "key": "column_chunk",
+      "scope": "experiment",
+      "value": 3125
+    },
+    {
+      "basis": "schema_default",
+      "key": "acknowledgements",
+      "scope": "experiment",
+      "value": "()"
+    },
+    {
+      "basis": "schema_default",
+      "key": "relocation",
+      "scope": "experiment",
+      "value": {
+        "cadence_seconds": null,
+        "enabled": false,
+        "follow": null,
+        "grid_id": null,
+        "max_move_parent_cells": null,
+        "min_overlap_fraction": null,
+        "mode": "discrete-cycle-boundary",
+        "moves": []
+      }
+    },
+    {
+      "basis": "schema_default",
+      "key": "physics_mode",
+      "scope": "experiment",
+      "value": {
+        "governed": false,
+        "mode": "wrf-faithful",
+        "patchset": null,
+        "requested_patches": [],
+        "resolved": []
+      }
+    },
+    {
+      "basis": "schema_default",
+      "key": "perturbation",
+      "scope": "experiment",
+      "value": null
+    },
+    {
+      "basis": "declared_time_step",
+      "exact": "60",
+      "grid_id": 1,
+      "key": "dt",
+      "note": "time_step=60 +0/1",
+      "scope": "domain",
+      "value": 60.0
+    },
+    {
+      "basis": "derived_from_parent_time_step_ratio",
+      "exact": "15",
+      "grid_id": 2,
+      "key": "dt",
+      "note": "parent d01 step divided by parent_time_step_ratio=4",
+      "scope": "domain",
+      "value": 15.0
+    },
+    {
+      "basis": "front_door_contract",
+      "key": "execution_mode",
+      "note": "run-plan integrates in THIS process rather than re-executing under gpuwm's own supervisor, so the pid in run-manifest.json is the pid doing the model work and the caller owns restart policy",
+      "scope": "execution",
+      "value": "in_process"
+    }
+  ],
+  "corridor": {
+    "basis": "this config declares no [relocation] follow source, so no statics corridor is prepared",
+    "domains": [],
+    "host_bytes": 0,
+    "host_gib": 0.0
+  },
+  "disk": {
+    "basis": "frame counts are exact from run_seconds and each domain's history_interval_s; bytes-per-frame is not measured by this package, so no byte figure is reported rather than an invented one",
+    "bytes": null,
+    "frames": [
+      {
+        "domain": 1,
+        "frames": 7,
+        "history_interval_s": 3600.0,
+        "nx": 204,
+        "ny": 162,
+        "nz": 49
+      },
+      {
+        "domain": 2,
+        "frames": 25,
+        "history_interval_s": 900.0,
+        "nx": 408,
+        "ny": 320,
+        "nz": 49
+      }
+    ],
+    "total_frames": 32
+  },
+  "download": {
+    "basis": "no [fetch] in this plan",
+    "bytes": null
+  },
+  "plan": {
+    "config_kind": "path",
+    "config_sha256": "c26398414f0b66e9b831f74b12f2387185a2d13dcb9231ff25b0efe5f70319b2",
+    "config_source": "C:\\ArWenFixture\\mn120\\n-still.toml",
+    "fetch_args": null,
+    "name": "corridor-n-still",
+    "route": "prepared",
+    "run_dir": "C:\\ArWenFixture\\mn120\\out\\n-still",
+    "run_options": {
+      "data_dir": null,
+      "device": null,
+      "dry_run": false,
+      "geog_root": null,
+      "health_debug": false,
+      "physics_profile": null,
+      "render_products": null,
+      "restart": null
+    },
+    "sha256": "631940b899127cf43519bc608e9c4642a1d8e04f83319df96e2d04e79bf283a3",
+    "source": "C:\\ArWenFixture\\mn120\\plan-n-still.json"
+  },
+  "schema": "gpuwm.run-plan.estimate.v1",
+  "vram": {
+    "basis": "gpuwm.core.preflight.estimate_experiment, which sums every domain and shares the scratch arena across a tree; the envelope is its peak_envelope_bytes (the estimator `gpuwm check` reports; no device context is created)",
+    "domains": 2,
+    "estimate_bytes": 6858962954,
+    "estimate_gib": 6.3879,
+    "peak_envelope_bytes": 19742190937,
+    "peak_envelope_gib": 18.3863
+  },
+  "wall_time": {
+    "basis": "this package publishes no measured rate for an arbitrary configuration; the model_progress events carry the real one from the first step",
+    "seconds": null
+  }
+}

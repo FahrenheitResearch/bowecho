@@ -17,8 +17,13 @@
 // them into a struct would only obscure the call sites.
 #![allow(clippy::too_many_arguments)]
 
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use rw_store::PressureVolumeInput;
+use std::sync::OnceLock;
 use wrf_core::{ComputeOpts, VarOutput, WrfFile, getvar};
+
+const MAX_WRF_ISO_THREADS: usize = 8;
+const MIN_PARALLEL_ISO_CELLS: usize = 4_096;
 
 /// Canonical isobaric levels (hPa), matching the model-ingest convention
 /// (`100..=1000` step 25 -> 37 levels). Levels outside a column's model range
@@ -65,6 +70,226 @@ pub struct SurfaceFallback {
     pub dewpoint_2m_k: Vec<f32>,
     pub u_10m: Vec<f32>,
     pub v_10m: Vec<f32>,
+}
+
+struct IsoPlanes {
+    temperature: Vec<Vec<f32>>,
+    dewpoint: Vec<Vec<f32>>,
+    u_wind: Vec<Vec<f32>>,
+    v_wind: Vec<Vec<f32>>,
+    height: Vec<Vec<f32>>,
+}
+
+impl IsoPlanes {
+    fn new(levels: usize, cells: usize) -> Self {
+        Self {
+            temperature: init_planes(levels, cells),
+            dewpoint: init_planes(levels, cells),
+            u_wind: init_planes(levels, cells),
+            v_wind: init_planes(levels, cells),
+            height: init_planes(levels, cells),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IsoInterpolationInputs<'a> {
+    pressure_hpa: &'a [f64],
+    temp_k: &'a [f64],
+    dewpoint_k: &'a [f64],
+    height_m: &'a [f64],
+    u_ms: &'a [f64],
+    v_ms: &'a [f64],
+    nz: usize,
+    cells: usize,
+    levels: &'a [u16],
+}
+
+/// Matching cell slices from every level plane. Splitting this value splits
+/// every output at the same cell boundary, so parallel workers never alias.
+struct IsoPlaneSlices<'a> {
+    temperature: Vec<&'a mut [f32]>,
+    dewpoint: Vec<&'a mut [f32]>,
+    u_wind: Vec<&'a mut [f32]>,
+    v_wind: Vec<&'a mut [f32]>,
+    height: Vec<&'a mut [f32]>,
+}
+
+impl<'a> IsoPlaneSlices<'a> {
+    fn for_range(planes: &'a mut IsoPlanes, start: usize, end: usize) -> Self {
+        fn field_slices<'a>(
+            planes: &'a mut [Vec<f32>],
+            start: usize,
+            end: usize,
+        ) -> Vec<&'a mut [f32]> {
+            planes
+                .iter_mut()
+                .map(|plane| &mut plane[start..end])
+                .collect()
+        }
+
+        Self {
+            temperature: field_slices(&mut planes.temperature, start, end),
+            dewpoint: field_slices(&mut planes.dewpoint, start, end),
+            u_wind: field_slices(&mut planes.u_wind, start, end),
+            v_wind: field_slices(&mut planes.v_wind, start, end),
+            height: field_slices(&mut planes.height, start, end),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.temperature.first().map_or(0, |plane| plane.len())
+    }
+
+    fn split_at(self, mid: usize) -> (Self, Self) {
+        fn split_field<'a>(
+            planes: Vec<&'a mut [f32]>,
+            mid: usize,
+        ) -> (Vec<&'a mut [f32]>, Vec<&'a mut [f32]>) {
+            let mut left = Vec::with_capacity(planes.len());
+            let mut right = Vec::with_capacity(planes.len());
+            for plane in planes {
+                let (left_plane, right_plane) = plane.split_at_mut(mid);
+                left.push(left_plane);
+                right.push(right_plane);
+            }
+            (left, right)
+        }
+
+        let (temperature_left, temperature_right) = split_field(self.temperature, mid);
+        let (dewpoint_left, dewpoint_right) = split_field(self.dewpoint, mid);
+        let (u_wind_left, u_wind_right) = split_field(self.u_wind, mid);
+        let (v_wind_left, v_wind_right) = split_field(self.v_wind, mid);
+        let (height_left, height_right) = split_field(self.height, mid);
+        (
+            Self {
+                temperature: temperature_left,
+                dewpoint: dewpoint_left,
+                u_wind: u_wind_left,
+                v_wind: v_wind_left,
+                height: height_left,
+            },
+            Self {
+                temperature: temperature_right,
+                dewpoint: dewpoint_right,
+                u_wind: u_wind_right,
+                v_wind: v_wind_right,
+                height: height_right,
+            },
+        )
+    }
+}
+
+fn wrf_iso_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_sub(1).clamp(1, MAX_WRF_ISO_THREADS))
+        .unwrap_or(1)
+}
+
+/// A bounded pool prevents a large WRF import from occupying every process
+/// worker. Calls already running on a Rayon worker use the serial path below,
+/// avoiding nested pools and oversubscription.
+fn wrf_iso_pool() -> Option<&'static ThreadPool> {
+    static POOL: OnceLock<Option<ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let workers = wrf_iso_worker_count();
+        if workers < 2 {
+            return None;
+        }
+        ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("wrf-iso-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+fn try_pressure_columns(count: usize, nz: usize) -> Option<Vec<Vec<f64>>> {
+    let mut columns = Vec::new();
+    columns.try_reserve_exact(count).ok()?;
+    for _ in 0..count {
+        let mut column = Vec::new();
+        column.try_reserve_exact(nz).ok()?;
+        column.resize(nz, 0.0);
+        columns.push(column);
+    }
+    Some(columns)
+}
+
+fn interpolate_iso_cells(
+    inputs: &IsoInterpolationInputs<'_>,
+    mut planes: IsoPlaneSlices<'_>,
+    cell_start: usize,
+    col_p: &mut [f64],
+) {
+    for local_cell in 0..planes.len() {
+        let cell = cell_start + local_cell;
+        for k in 0..inputs.nz {
+            col_p[k] = inputs.pressure_hpa[k * inputs.cells + cell];
+        }
+        for (level_index, &level) in inputs.levels.iter().enumerate() {
+            let Some((k, t)) = bracket(col_p, f64::from(level)) else {
+                continue;
+            };
+            let (i0, i1) = (k * inputs.cells + cell, (k + 1) * inputs.cells + cell);
+            if let Some(value) = lerp(inputs.temp_k[i0], inputs.temp_k[i1], t) {
+                planes.temperature[level_index][local_cell] = value as f32;
+            }
+            if let Some(value) = lerp(inputs.dewpoint_k[i0], inputs.dewpoint_k[i1], t) {
+                planes.dewpoint[level_index][local_cell] = value as f32;
+            }
+            if let Some(value) = lerp(inputs.u_ms[i0], inputs.u_ms[i1], t) {
+                planes.u_wind[level_index][local_cell] = value as f32;
+            }
+            if let Some(value) = lerp(inputs.v_ms[i0], inputs.v_ms[i1], t) {
+                planes.v_wind[level_index][local_cell] = value as f32;
+            }
+            if let Some(value) = lerp(inputs.height_m[i0], inputs.height_m[i1], t) {
+                planes.height[level_index][local_cell] = value as f32;
+            }
+        }
+    }
+}
+
+fn interpolate_iso_cells_parallel(
+    inputs: &IsoInterpolationInputs<'_>,
+    planes: IsoPlaneSlices<'_>,
+    cell_start: usize,
+    pressure_columns: &mut [Vec<f64>],
+) {
+    if pressure_columns.len() <= 1 || planes.len() <= 1 {
+        interpolate_iso_cells(inputs, planes, cell_start, &mut pressure_columns[0]);
+        return;
+    }
+
+    let left_workers = pressure_columns.len() / 2;
+    let split_cell = planes.len() * left_workers / pressure_columns.len();
+    let (left_planes, right_planes) = planes.split_at(split_cell);
+    let (left_columns, right_columns) = pressure_columns.split_at_mut(left_workers);
+    rayon::join(
+        || interpolate_iso_cells_parallel(inputs, left_planes, cell_start, left_columns),
+        || {
+            interpolate_iso_cells_parallel(
+                inputs,
+                right_planes,
+                cell_start + split_cell,
+                right_columns,
+            )
+        },
+    );
+}
+
+fn report_iso_progress(
+    progress: &mut dyn FnMut(String),
+    level_count: usize,
+    cell: usize,
+    cells: usize,
+) {
+    progress(format!(
+        "interpolating 5 sounding fields to {level_count} isobaric levels — {}%",
+        cell * 100 / cells
+    ));
 }
 
 /// Read WRF 3D fields for `timeidx` and interpolate them to the canonical
@@ -188,45 +413,39 @@ pub fn interpolate_iso_volumes(
     progress: &mut dyn FnMut(String),
 ) -> (Vec<IsoVolume>, SurfaceFallback) {
     let levels = standard_levels();
-    let mut temp_iso = init_planes(levels.len(), cells);
-    let mut dewp_iso = init_planes(levels.len(), cells);
-    let mut u_iso = init_planes(levels.len(), cells);
-    let mut v_iso = init_planes(levels.len(), cells);
-    let mut hgt_iso = init_planes(levels.len(), cells);
-
+    let mut planes = IsoPlanes::new(levels.len(), cells);
+    let inputs = IsoInterpolationInputs {
+        pressure_hpa,
+        temp_k,
+        dewpoint_k,
+        height_m,
+        u_ms,
+        v_ms,
+        nz,
+        cells,
+        levels: &levels,
+    };
     let progress_step = (cells / 10).max(1);
     let mut col_p = vec![0f64; nz];
-    for c in 0..cells {
-        if c % progress_step == 0 {
-            progress(format!(
-                "interpolating 5 sounding fields to {} isobaric levels — {}%",
-                levels.len(),
-                c * 100 / cells
-            ));
-        }
-        for k in 0..nz {
-            col_p[k] = pressure_hpa[k * cells + c];
-        }
-        for (li, &lev) in levels.iter().enumerate() {
-            let Some((k, t)) = bracket(&col_p, f64::from(lev)) else {
-                continue;
-            };
-            let (i0, i1) = (k * cells + c, (k + 1) * cells + c);
-            if let Some(value) = lerp(temp_k[i0], temp_k[i1], t) {
-                temp_iso[li][c] = value as f32;
-            }
-            if let Some(value) = lerp(dewpoint_k[i0], dewpoint_k[i1], t) {
-                dewp_iso[li][c] = value as f32;
-            }
-            if let Some(value) = lerp(u_ms[i0], u_ms[i1], t) {
-                u_iso[li][c] = value as f32;
-            }
-            if let Some(value) = lerp(v_ms[i0], v_ms[i1], t) {
-                v_iso[li][c] = value as f32;
-            }
-            if let Some(value) = lerp(height_m[i0], height_m[i1], t) {
-                hgt_iso[li][c] = value as f32;
-            }
+    let pool = match (
+        cells >= MIN_PARALLEL_ISO_CELLS,
+        rayon::current_thread_index(),
+    ) {
+        (true, None) => wrf_iso_pool(),
+        _ => None,
+    };
+    let mut pressure_columns =
+        pool.and_then(|pool| try_pressure_columns(pool.current_num_threads(), nz));
+    for start in (0..cells).step_by(progress_step) {
+        report_iso_progress(progress, levels.len(), start, cells);
+        let end = start.saturating_add(progress_step).min(cells);
+        let plane_slices = IsoPlaneSlices::for_range(&mut planes, start, end);
+        if let (Some(pool), Some(columns)) = (pool, pressure_columns.as_mut()) {
+            pool.install(|| {
+                interpolate_iso_cells_parallel(&inputs, plane_slices, start, columns.as_mut_slice())
+            });
+        } else {
+            interpolate_iso_cells(&inputs, plane_slices, start, &mut col_p);
         }
     }
 
@@ -248,27 +467,27 @@ pub fn interpolate_iso_volumes(
         IsoVolume {
             name: "temperature_iso".to_string(),
             units: "K".to_string(),
-            levels: pack(&levels, temp_iso),
+            levels: pack(&levels, planes.temperature),
         },
         IsoVolume {
             name: "dewpoint_iso".to_string(),
             units: "K".to_string(),
-            levels: pack(&levels, dewp_iso),
+            levels: pack(&levels, planes.dewpoint),
         },
         IsoVolume {
             name: "u_iso".to_string(),
             units: "m/s".to_string(),
-            levels: pack(&levels, u_iso),
+            levels: pack(&levels, planes.u_wind),
         },
         IsoVolume {
             name: "v_iso".to_string(),
             units: "m/s".to_string(),
-            levels: pack(&levels, v_iso),
+            levels: pack(&levels, planes.v_wind),
         },
         IsoVolume {
             name: "height_iso".to_string(),
             units: "gpm".to_string(),
-            levels: pack(&levels, hgt_iso),
+            levels: pack(&levels, planes.height),
         },
     ];
     (volumes, surface)
@@ -347,6 +566,103 @@ mod tests {
         assert_eq!(lerp(0.0, 10.0, 0.5), Some(5.0));
         assert_eq!(lerp(f64::NAN, 10.0, 0.5), None);
         assert_eq!(lerp(0.0, f64::NAN, 0.5), None);
+    }
+
+    #[test]
+    fn wrf_processing_multicore_interpolation_is_bit_exact_with_serial_cell_order() {
+        const CELLS: usize = 4_123;
+        const NZ: usize = 9;
+        const WORKERS: usize = 4;
+
+        let levels = standard_levels();
+        let native_len = NZ * CELLS;
+        let mut pressure = Vec::with_capacity(native_len);
+        let mut temp = Vec::with_capacity(native_len);
+        let mut dewp = Vec::with_capacity(native_len);
+        let mut height = Vec::with_capacity(native_len);
+        let mut u = Vec::with_capacity(native_len);
+        let mut v = Vec::with_capacity(native_len);
+        for k in 0..NZ {
+            for cell in 0..CELLS {
+                let cell_term = cell as f64 * 0.003;
+                let level_term = k as f64;
+                pressure.push(1_012.75 - f64::from((cell % 17) as u8) * 0.25 - level_term * 112.5);
+                temp.push(302.0 - level_term * 5.125 + cell_term);
+                dewp.push(296.0 - level_term * 5.375 + cell_term * 0.75);
+                height.push(125.0 + level_term * 950.75 + cell_term * 2.0);
+                u.push(-12.0 + level_term * 1.75 - cell_term);
+                v.push(8.0 - level_term * 0.875 + cell_term * 0.5);
+            }
+        }
+
+        // Exercise skipped pressure pairs, equal-pressure pairs, and
+        // non-finite field endpoints in addition to ordinary columns.
+        for cell in (0..CELLS).step_by(257) {
+            pressure[3 * CELLS + cell] = f64::NAN;
+            temp[5 * CELLS + cell] = f64::NAN;
+            dewp[6 * CELLS + cell] = f64::INFINITY;
+        }
+        for cell in (11..CELLS).step_by(389) {
+            pressure[5 * CELLS + cell] = pressure[4 * CELLS + cell];
+        }
+
+        let inputs = IsoInterpolationInputs {
+            pressure_hpa: &pressure,
+            temp_k: &temp,
+            dewpoint_k: &dewp,
+            height_m: &height,
+            u_ms: &u,
+            v_ms: &v,
+            nz: NZ,
+            cells: CELLS,
+            levels: &levels,
+        };
+        let mut serial = IsoPlanes::new(levels.len(), CELLS);
+        let mut parallel = IsoPlanes::new(levels.len(), CELLS);
+        let mut serial_pressure = vec![0.0; NZ];
+        interpolate_iso_cells(
+            &inputs,
+            IsoPlaneSlices::for_range(&mut serial, 0, CELLS),
+            0,
+            &mut serial_pressure,
+        );
+
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(WORKERS)
+            .build()
+            .expect("test pool");
+        let mut parallel_pressure =
+            try_pressure_columns(WORKERS, NZ).expect("parallel pressure scratch");
+        pool.install(|| {
+            interpolate_iso_cells_parallel(
+                &inputs,
+                IsoPlaneSlices::for_range(&mut parallel, 0, CELLS),
+                0,
+                &mut parallel_pressure,
+            )
+        });
+
+        fn assert_field_bits(field: &str, serial: &[Vec<f32>], parallel: &[Vec<f32>]) {
+            assert_eq!(serial.len(), parallel.len());
+            for (level, (serial_plane, parallel_plane)) in serial.iter().zip(parallel).enumerate() {
+                assert_eq!(serial_plane.len(), parallel_plane.len());
+                for (cell, (serial_value, parallel_value)) in
+                    serial_plane.iter().zip(parallel_plane).enumerate()
+                {
+                    assert_eq!(
+                        serial_value.to_bits(),
+                        parallel_value.to_bits(),
+                        "{field} differs at level {level}, cell {cell}"
+                    );
+                }
+            }
+        }
+
+        assert_field_bits("temperature", &serial.temperature, &parallel.temperature);
+        assert_field_bits("dewpoint", &serial.dewpoint, &parallel.dewpoint);
+        assert_field_bits("u wind", &serial.u_wind, &parallel.u_wind);
+        assert_field_bits("v wind", &serial.v_wind, &parallel.v_wind);
+        assert_field_bits("height", &serial.height, &parallel.height);
     }
 
     /// The shared interpolator must stream progress (both import paths surface

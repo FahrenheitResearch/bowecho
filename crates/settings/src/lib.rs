@@ -214,6 +214,535 @@ fn default_raster_quality() -> String {
     RasterQuality::Standard.as_slug().to_owned()
 }
 
+/// Persisted policy for the opt-in Community Cache. Operational requests stay
+/// on signed HTTPS; cold historical relay retrieval and seeding have separate
+/// opt-ins. This document contains no bearer tokens, private keys, provider
+/// allocations, TURN credentials, or participant addresses.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommunityCacheSettings {
+    /// User opt-in. Consumers must also check [`Self::phase1_ready`] before
+    /// starting work, so an incomplete or malformed configuration stays off.
+    pub enabled: bool,
+    /// Public Rusty Weather / Hetzner HTTPS origin base URL.
+    pub origin_url: String,
+    /// Optional public R2 base URL for hot objects.
+    pub r2_hot_object_url: String,
+    /// Non-secret raw 32-byte Ed25519 manifest-verification key, base64.
+    pub manifest_public_key_base64: String,
+    /// Bounded rotation keyring encoded as `key_id:base64`. The legacy single
+    /// key above remains mapped to `rw-origin-v1` during migration/overlap.
+    pub trusted_origin_signing_keys: Vec<String>,
+    /// Allowlisted cache object categories. There is intentionally no path,
+    /// arbitrary-file, or complete-model-run category.
+    pub soundings_profiles: bool,
+    pub point_series: bool,
+    pub native_windows_tiles: bool,
+    pub temporal_diurnal: bool,
+    pub explicit_case_rooms: bool,
+    /// Separate Community Cache disk allowance in GiB.
+    pub disk_allowance_gib: u16,
+    /// Phase 1 origin/R2 download cap in MiB per hour.
+    pub download_cap_mib_per_hour: u32,
+    /// Upload allowance for the separately gated cold historical seed lane.
+    /// Operational HTTPS requests never upload, regardless of this value.
+    pub upload_cap_mib_per_hour: u32,
+    /// Aggregate transfer allowance in GiB per calendar month.
+    pub monthly_transfer_cap_gib: u32,
+    /// Maximum simultaneous Phase 1 cache downloads.
+    pub max_concurrent_downloads: u8,
+    /// Conservative policy for cold relay-only seeding. This does not pause
+    /// operational HTTPS downloads, which never upload or seed data.
+    pub pause_sharing_on_metered_networks: bool,
+    /// Separate opt-in for explicit cold/historical recovery. Operational
+    /// model requests never consult this gate or the relay broker.
+    pub historical_relay_enabled: bool,
+    /// Separate seed-side opt-in. Only already origin-verified local CAS
+    /// objects in the initial small profile/point category set may advertise.
+    pub historical_relay_seeding_enabled: bool,
+    /// Non-secret Ed25519 key for short-lived relay credentials/transcripts.
+    pub relay_public_key_base64: String,
+    /// Bounded relay-credential verification keyring encoded as
+    /// `key_id:base64`. The legacy key above remains pinned as
+    /// `rw-relay-v1` during a deliberate rotation overlap.
+    pub trusted_relay_signing_keys: Vec<String>,
+    /// Operator-audited provider allocation CIDRs. This is intentionally an
+    /// advanced deployment value with an empty fail-closed default.
+    pub relay_provider_allocation_cidrs: Vec<String>,
+}
+
+/// Provenance boundary used by the relay-only seed admission policy. It is
+/// deliberately narrower than a filesystem path or arbitrary source label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommunityShareSource {
+    /// Data obtained from a public provider under confirmed redistribution
+    /// terms. A signed manifest is still required by the transfer layer.
+    PublicProvider,
+    /// A private/local Weather Research and Forecasting Model run.
+    PrivateWrf,
+    /// A private/local ArWen run.
+    PrivateArwen,
+}
+
+/// Runtime facts required before a relay-only upload or seed may be admitted.
+/// This policy object contains no file path or network endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommunitySharingContext {
+    pub network_is_metered: bool,
+    pub source: CommunityShareSource,
+    /// The owner deliberately published this specific private/local result.
+    pub explicit_owner_publication: bool,
+    /// Redistribution terms for the source have been checked and accepted.
+    pub redistribution_rights_confirmed: bool,
+}
+
+impl Default for CommunityCacheSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            origin_url: String::new(),
+            r2_hot_object_url: String::new(),
+            manifest_public_key_base64: String::new(),
+            trusted_origin_signing_keys: Vec::new(),
+            soundings_profiles: true,
+            point_series: true,
+            native_windows_tiles: true,
+            temporal_diurnal: true,
+            explicit_case_rooms: false,
+            disk_allowance_gib: 20,
+            download_cap_mib_per_hour: 2_048,
+            upload_cap_mib_per_hour: 512,
+            monthly_transfer_cap_gib: 100,
+            max_concurrent_downloads: 2,
+            pause_sharing_on_metered_networks: true,
+            historical_relay_enabled: false,
+            historical_relay_seeding_enabled: false,
+            relay_public_key_base64: String::new(),
+            trusted_relay_signing_keys: Vec::new(),
+            relay_provider_allocation_cidrs: Vec::new(),
+        }
+    }
+}
+
+impl CommunityCacheSettings {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Whether the required public endpoints and pinned signing key are safe
+    /// to persist and syntactically usable. This performs no network access.
+    pub fn phase1_ready(&self) -> bool {
+        public_https_base_url_is_valid(&self.origin_url)
+            && optional_public_https_base_url_is_valid(&self.r2_hot_object_url)
+            && community_origin_keyring_is_valid(
+                &self.manifest_public_key_base64,
+                &self.trusted_origin_signing_keys,
+            )
+    }
+
+    /// Effective master gate for operational HTTPS Community Cache consumers.
+    pub fn phase1_active(&self) -> bool {
+        self.enabled && self.phase1_ready()
+    }
+
+    /// Phase 1 performs bounded HTTPS downloads only. A metered connection
+    /// does not silently change the download gate; download/monthly quotas are
+    /// the applicable controls in this phase.
+    pub fn phase1_download_allowed(&self, _network_is_metered: bool) -> bool {
+        self.phase1_active()
+    }
+
+    /// Effective client gate for explicit cold/historical lookup. Provider
+    /// pricing verification remains a server/operator gate; the client also
+    /// requires its pinned relay key and audited allocation ranges.
+    pub fn historical_relay_ready(&self) -> bool {
+        self.phase1_active()
+            && self.historical_relay_enabled
+            && community_relay_keyring_is_valid(
+                &self.relay_public_key_base64,
+                &self.trusted_relay_signing_keys,
+            )
+            && !self.relay_provider_allocation_cidrs.is_empty()
+            && self
+                .relay_provider_allocation_cidrs
+                .iter()
+                .all(|value| audited_relay_cidr_shape_is_valid(value))
+    }
+
+    /// Admission policy for a relay-only upload/seed operation.
+    ///
+    /// This method does not enable or initiate sharing. It exists now so a
+    /// transport cannot accidentally interpret the operational download gate
+    /// as upload authorization.
+    pub fn future_relay_sharing_allowed(&self, context: CommunitySharingContext) -> bool {
+        if !self.historical_relay_ready()
+            || !self.historical_relay_seeding_enabled
+            || !context.redistribution_rights_confirmed
+            || (context.network_is_metered && self.pause_sharing_on_metered_networks)
+        {
+            return false;
+        }
+
+        match context.source {
+            CommunityShareSource::PublicProvider => true,
+            CommunityShareSource::PrivateWrf | CommunityShareSource::PrivateArwen => {
+                context.explicit_owner_publication
+            }
+        }
+    }
+}
+
+/// Separate, default-off policy for an owner explicitly publishing one
+/// processed private WRF/ArWen rw-store generation to a trusted conventional
+/// Rusty Weather HTTPS origin. This is intentionally not a Community Cache
+/// sharing switch. Bearer credentials remain in the operating-system vault.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GenerationPublicationSettings {
+    pub enabled: bool,
+    pub trusted_origin_id: String,
+    pub trusted_origin_url: String,
+    /// Opaque SHA-256 principal issued by the configured origin. It is not a
+    /// login name or bearer and is needed to prepare a signed identity while
+    /// offline.
+    pub owner_principal_sha256: String,
+    pub max_generation_gib: u32,
+    pub max_spool_gib: u32,
+    pub max_files: u32,
+    pub max_chunks: u32,
+    pub chunk_mib: u16,
+    pub max_manifest_mib: u16,
+    pub max_retention_days: u16,
+    pub default_retention_days: u16,
+    pub attribution_provider: String,
+    pub attribution_notice: String,
+    pub attribution_source_url: String,
+    pub attribution_license: String,
+    pub attribution_license_url: String,
+    pub attribution_terms_url: String,
+    pub attribution_disclaimer: String,
+    pub modification_notice: String,
+}
+
+impl Default for GenerationPublicationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trusted_origin_id: "hetzner-primary".to_owned(),
+            trusted_origin_url: String::new(),
+            owner_principal_sha256: String::new(),
+            max_generation_gib: 64,
+            max_spool_gib: 144,
+            max_files: 8_192,
+            max_chunks: 1_000_000,
+            chunk_mib: 8,
+            max_manifest_mib: 16,
+            max_retention_days: 90,
+            default_retention_days: 30,
+            attribution_provider: "owner".to_owned(),
+            attribution_notice: "Owner-published processed WRF/ArWen simulation.".to_owned(),
+            attribution_source_url: String::new(),
+            attribution_license: "Owner-confirmed redistribution rights".to_owned(),
+            attribution_license_url: String::new(),
+            attribution_terms_url: String::new(),
+            attribution_disclaimer: "Research output; no operational warranty.".to_owned(),
+            modification_notice: String::new(),
+        }
+    }
+}
+
+impl GenerationPublicationSettings {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Pure local readiness check. It never resolves DNS, opens the vault, or
+    /// contacts the origin, so loading settings cannot resume publication.
+    pub fn locally_ready(&self) -> bool {
+        self.enabled
+            && federation_identifier_is_valid(&self.trusted_origin_id)
+            && public_https_base_url_is_valid(&self.trusted_origin_url)
+            && self.owner_principal_sha256.len() == 64
+            && self
+                .owner_principal_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            && self.max_generation_gib > 0
+            && self.max_spool_gib >= self.max_generation_gib.saturating_mul(2)
+            && self.max_files >= 3
+            && self.max_chunks > 0
+            && self.chunk_mib > 0
+            && self.max_manifest_mib > 0
+            && self.max_retention_days > 0
+            && self.default_retention_days > 0
+            && self.default_retention_days <= self.max_retention_days
+    }
+}
+
+/// One non-secret Ed25519 verification-key pin used by public-origin
+/// federation. Private keys and bearer credentials never belong here.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FederationPinnedKeySettings {
+    pub key_id: String,
+    pub public_key_base64: String,
+}
+
+/// An institution/public origin deliberately approved by the BowEcho
+/// operator. Network roots still come only from the authority-signed catalog;
+/// this record pins the independent descriptor signing keys for that origin.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FederationApprovedOriginSettings {
+    pub origin_id: String,
+    pub descriptor_signing_keys: Vec<FederationPinnedKeySettings>,
+}
+
+/// Persisted, non-secret trust policy for authority-mediated public-origin
+/// federation. The authoritative Rusty Weather bearer remains solely in the
+/// operating-system credential vault used by Community Cache.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FederationSettings {
+    pub enabled: bool,
+    pub catalog_signing_keys: Vec<FederationPinnedKeySettings>,
+    pub approved_origins: Vec<FederationApprovedOriginSettings>,
+    pub revoked_origin_ids: Vec<String>,
+    pub revoked_key_ids: Vec<String>,
+}
+
+pub const MAX_FEDERATION_CATALOG_SIGNING_KEYS: usize = 8;
+pub const MAX_FEDERATION_APPROVED_ORIGINS: usize = 128;
+pub const MAX_FEDERATION_DESCRIPTOR_KEYS_PER_ORIGIN: usize = 8;
+pub const MAX_FEDERATION_REVOCATIONS: usize = 256;
+
+impl FederationSettings {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Validate the bounded, independently pinned trust roots without doing
+    /// DNS or network I/O. The shared authoritative HTTPS URL and vault token
+    /// are checked by the runtime separately.
+    pub fn trust_ready(&self) -> bool {
+        if self.catalog_signing_keys.is_empty()
+            || self.catalog_signing_keys.len() > MAX_FEDERATION_CATALOG_SIGNING_KEYS
+            || self.approved_origins.len() > MAX_FEDERATION_APPROVED_ORIGINS
+            || self.revoked_origin_ids.len() > MAX_FEDERATION_REVOCATIONS
+            || self.revoked_key_ids.len() > MAX_FEDERATION_REVOCATIONS
+            || !unique_federation_keys(&self.catalog_signing_keys)
+        {
+            return false;
+        }
+
+        let mut origin_ids = std::collections::BTreeSet::new();
+        for origin in &self.approved_origins {
+            if !federation_identifier_is_valid(&origin.origin_id)
+                || !origin_ids.insert(origin.origin_id.as_str())
+                || origin.descriptor_signing_keys.is_empty()
+                || origin.descriptor_signing_keys.len() > MAX_FEDERATION_DESCRIPTOR_KEYS_PER_ORIGIN
+                || !unique_federation_keys(&origin.descriptor_signing_keys)
+            {
+                return false;
+            }
+        }
+
+        let Some(revoked_origins) = unique_federation_ids(&self.revoked_origin_ids) else {
+            return false;
+        };
+        let Some(revoked_keys) = unique_federation_ids(&self.revoked_key_ids) else {
+            return false;
+        };
+        !origin_ids.iter().any(|id| revoked_origins.contains(*id))
+            && !self
+                .catalog_signing_keys
+                .iter()
+                .any(|key| revoked_keys.contains(key.key_id.as_str()))
+            && !self.approved_origins.iter().any(|origin| {
+                origin
+                    .descriptor_signing_keys
+                    .iter()
+                    .any(|key| revoked_keys.contains(key.key_id.as_str()))
+            })
+    }
+
+    pub fn active_with(&self, community: &CommunityCacheSettings) -> bool {
+        self.enabled && self.trust_ready() && community.phase1_active()
+    }
+}
+
+fn unique_federation_keys(keys: &[FederationPinnedKeySettings]) -> bool {
+    let mut key_ids = std::collections::BTreeSet::new();
+    let mut public_keys = std::collections::BTreeSet::new();
+    keys.iter().all(|key| {
+        federation_identifier_is_valid(&key.key_id)
+            && ed25519_public_key_base64_is_valid(&key.public_key_base64)
+            && key_ids.insert(key.key_id.as_str())
+            && canonical_ed25519_public_key_base64(&key.public_key_base64)
+                .is_some_and(|value| public_keys.insert(value))
+    })
+}
+
+fn unique_federation_ids(values: &[String]) -> Option<std::collections::BTreeSet<&str>> {
+    let mut result = std::collections::BTreeSet::new();
+    values
+        .iter()
+        .all(|value| federation_identifier_is_valid(value) && result.insert(value.as_str()))
+        .then_some(result)
+}
+
+pub fn federation_identifier_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with(['-', '_', '.'])
+        && !value.ends_with(['-', '_', '.'])
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+pub const MAX_COMMUNITY_ORIGIN_SIGNING_KEYS: usize = 8;
+pub const MAX_COMMUNITY_RELAY_SIGNING_KEYS: usize = 8;
+
+pub fn community_origin_keyring_is_valid(legacy: &str, entries: &[String]) -> bool {
+    community_keyring_is_valid(
+        legacy,
+        "rw-origin-v1",
+        entries,
+        MAX_COMMUNITY_ORIGIN_SIGNING_KEYS,
+    )
+}
+
+pub fn community_relay_keyring_is_valid(legacy: &str, entries: &[String]) -> bool {
+    community_keyring_is_valid(
+        legacy,
+        "rw-relay-v1",
+        entries,
+        MAX_COMMUNITY_RELAY_SIGNING_KEYS,
+    )
+}
+
+fn community_keyring_is_valid(
+    legacy: &str,
+    legacy_key_id: &'static str,
+    entries: &[String],
+    maximum: usize,
+) -> bool {
+    if entries.len() > maximum {
+        return false;
+    }
+    let mut key_ids = std::collections::BTreeSet::new();
+    let mut public_keys = std::collections::BTreeSet::new();
+    let mut count = 0_usize;
+    if !legacy.trim().is_empty() {
+        let Some(canonical_key) = canonical_ed25519_public_key_base64(legacy) else {
+            return false;
+        };
+        key_ids.insert(legacy_key_id);
+        public_keys.insert(canonical_key);
+        count += 1;
+    }
+    for entry in entries {
+        let Some((key_id, encoded)) = entry.split_once(':') else {
+            return false;
+        };
+        let Some(canonical_key) = canonical_ed25519_public_key_base64(encoded) else {
+            return false;
+        };
+        if !community_signing_key_id_is_valid(key_id)
+            || !key_ids.insert(key_id)
+            || !public_keys.insert(canonical_key)
+        {
+            return false;
+        }
+        count += 1;
+    }
+    count > 0 && count <= maximum
+}
+
+fn canonical_ed25519_public_key_base64(value: &str) -> Option<String> {
+    if !ed25519_public_key_base64_is_valid(value) {
+        return None;
+    }
+    let canonical = value
+        .trim()
+        .trim_end_matches('=')
+        .bytes()
+        .map(|byte| match byte {
+            b'-' => '+',
+            b'_' => '/',
+            other => char::from(other),
+        })
+        .collect();
+    Some(canonical)
+}
+
+pub fn community_signing_key_id_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn audited_relay_cidr_shape_is_valid(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 96
+        && !value.chars().any(char::is_whitespace)
+        && value.contains('/')
+        && !matches!(value, "0.0.0.0/0" | "::/0")
+}
+
+/// Validate a public HTTPS base URL without resolving it or making a request.
+/// Query strings, fragments, and user-info are rejected so credentials cannot
+/// accidentally be embedded in persisted Community Cache URLs.
+pub fn public_https_base_url_is_valid(value: &str) -> bool {
+    let value = value.trim();
+    let Some((scheme, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("https")
+        || remainder.is_empty()
+        || remainder.chars().any(char::is_whitespace)
+        || remainder.contains(['?', '#', '\\'])
+    {
+        return false;
+    }
+    let authority = remainder.split('/').next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@')
+}
+
+pub fn optional_public_https_base_url_is_valid(value: &str) -> bool {
+    value.trim().is_empty() || public_https_base_url_is_valid(value)
+}
+
+/// Accept standard or URL-safe base64, padded or unpadded, for exactly one raw
+/// 32-byte Ed25519 public key. No key material is decoded or used here.
+pub fn ed25519_public_key_base64_is_valid(value: &str) -> bool {
+    let value = value.trim().as_bytes();
+    let encoded = match value {
+        bytes if bytes.len() == 43 => bytes,
+        bytes if bytes.len() == 44 && bytes.last() == Some(&b'=') => &bytes[..43],
+        _ => return false,
+    };
+    let Some(last) = encoded.last().and_then(|byte| base64_value(*byte)) else {
+        return false;
+    };
+    encoded.iter().all(|byte| base64_value(*byte).is_some()) && last & 0b11 == 0
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -510,6 +1039,21 @@ pub struct AppSettings {
     /// caches, in GiB. Oldest files recycle first; 0 disables the cap.
     #[serde(default = "default_rebuildable_cache_limit_gib")]
     pub rebuildable_cache_limit_gib: u16,
+    /// Opt-in, bounded Community Cache policy. Runtime transfer code is kept
+    /// outside the settings crate and must honor `phase1_active()`.
+    #[serde(default, skip_serializing_if = "CommunityCacheSettings::is_default")]
+    pub community_cache: CommunityCacheSettings,
+    /// Explicit owner publication is separate from operational downloads and
+    /// relay sharing. The origin bearer is never serialized here.
+    #[serde(
+        default,
+        skip_serializing_if = "GenerationPublicationSettings::is_default"
+    )]
+    pub generation_publication: GenerationPublicationSettings,
+    /// Non-secret trust pins and revocations for authority-mediated public
+    /// origin discovery. The authority bearer is never serialized here.
+    #[serde(default, skip_serializing_if = "FederationSettings::is_default")]
+    pub federation: FederationSettings,
     /// Perf HUD: floating per-frame timing overlay on the map (decode /
     /// render / layer raster / FPS / time-to-first-pixels). Debug aid,
     /// default off.
@@ -821,6 +1365,11 @@ pub struct AppSettings {
     /// evolve without coupling this crate to its UI types.
     #[serde(default)]
     pub model_native_plot_state: Option<serde_json::Value>,
+    /// Durable controls for the live precipitation-type analysis layer.
+    /// The app-ui crate owns this versioned document; fetched model/radar
+    /// data, worker state, errors, and rendered textures are never persisted.
+    #[serde(default)]
+    pub live_ptype_state: Option<serde_json::Value>,
     /// Last-used WRF "full diagnostics" processing selection (which product
     /// groups + optional only/skip field filters). Opaque JSON built by
     /// app_ui's model dock, kept UI-crate-free here like the two states above.
@@ -941,7 +1490,7 @@ fn default_rotation_markers_enabled() -> bool {
 }
 
 fn default_dealias_engine() -> String {
-    "region".to_owned()
+    "region-global".to_owned()
 }
 
 fn default_sat_ir_enhancement() -> String {
@@ -1269,6 +1818,9 @@ impl Default for AppSettings {
             gate_filter_decidbz: None,
             model_keep_runs: default_model_keep_runs(),
             rebuildable_cache_limit_gib: default_rebuildable_cache_limit_gib(),
+            community_cache: CommunityCacheSettings::default(),
+            generation_publication: GenerationPublicationSettings::default(),
+            federation: FederationSettings::default(),
             perf_hud: false,
             alert_flash_enabled: true,
             alert_flash_families: Vec::new(),
@@ -1334,6 +1886,7 @@ impl Default for AppSettings {
             sounding_view_state: None,
             model_style_overrides: None,
             model_native_plot_state: None,
+            live_ptype_state: None,
             wrf_process_options: None,
             wrf_synth_radar: None,
             formula_lab_state: None,
@@ -1769,6 +2322,19 @@ pub fn model_cache_dir() -> PathBuf {
         }
     }
     bowecho_dir("model-cache")
+}
+
+/// Verified immutable objects downloaded through the opt-in Community Cache.
+/// This is a rebuildable, independently bounded cache and never contains raw
+/// private WRF/ArWen directories or arbitrary user files.
+pub fn community_cache_dir() -> PathBuf {
+    bowecho_dir("community-cache")
+}
+
+/// Private owner-publication spool and redacted resumable job state. This is
+/// separate from the rebuildable Community Cache CAS.
+pub fn generation_publication_dir() -> PathBuf {
+    bowecho_dir("generation-publication")
 }
 
 /// GDEX (NSF NCAR CONUS II) download cache for the in-app catalog browser.
@@ -2226,6 +2792,340 @@ mod tests {
     }
 
     #[test]
+    fn community_cache_defaults_are_off_bounded_and_private() {
+        let cache = AppSettings::from_json("{}").community_cache;
+
+        assert!(!cache.enabled);
+        assert!(!cache.phase1_ready());
+        assert!(!cache.phase1_active());
+        assert!(cache.origin_url.is_empty());
+        assert!(cache.r2_hot_object_url.is_empty());
+        assert!(cache.manifest_public_key_base64.is_empty());
+        assert!(cache.trusted_origin_signing_keys.is_empty());
+        assert!(cache.soundings_profiles);
+        assert!(cache.point_series);
+        assert!(cache.native_windows_tiles);
+        assert!(cache.temporal_diurnal);
+        assert!(!cache.explicit_case_rooms);
+        assert_eq!(cache.disk_allowance_gib, 20);
+        assert_eq!(cache.download_cap_mib_per_hour, 2_048);
+        assert_eq!(cache.upload_cap_mib_per_hour, 512);
+        assert_eq!(cache.monthly_transfer_cap_gib, 100);
+        assert_eq!(cache.max_concurrent_downloads, 2);
+        assert!(cache.pause_sharing_on_metered_networks);
+        assert!(!cache.historical_relay_enabled);
+        assert!(!cache.historical_relay_seeding_enabled);
+        assert!(!cache.historical_relay_ready());
+        assert!(!AppSettings::default().to_json().contains("community_cache"));
+
+        let partial =
+            AppSettings::from_json(r#"{"community_cache":{"enabled":true}}"#).community_cache;
+        assert!(partial.enabled);
+        assert!(!partial.phase1_active());
+        assert_eq!(partial.disk_allowance_gib, 20);
+        assert!(partial.pause_sharing_on_metered_networks);
+    }
+
+    #[test]
+    fn generation_publication_defaults_off_and_never_serializes_a_bearer() {
+        let defaults = AppSettings::from_json("{}").generation_publication;
+        assert!(!defaults.enabled);
+        assert!(!defaults.locally_ready());
+        assert_eq!(defaults.trusted_origin_id, "hetzner-primary");
+        assert!(defaults.max_spool_gib >= defaults.max_generation_gib * 2);
+        assert!(
+            !AppSettings::default()
+                .to_json()
+                .contains("generation_publication")
+        );
+
+        let mut app = AppSettings::default();
+        app.generation_publication.enabled = true;
+        app.generation_publication.trusted_origin_url = "https://models.example.test".into();
+        app.generation_publication.owner_principal_sha256 = "a".repeat(64);
+        let serialized = app.to_json();
+        assert!(serialized.contains("generation_publication"));
+        assert!(!serialized.contains("bearer"));
+        let restored = AppSettings::from_json(&serialized);
+        assert!(restored.generation_publication.locally_ready());
+    }
+
+    #[test]
+    fn community_cache_configuration_round_trips_and_requires_public_pins() {
+        const PUBLIC_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        const HIGH_BITS_PUBLIC_KEY: &str = "//////////////////////////////////////////8=";
+        assert!(ed25519_public_key_base64_is_valid(HIGH_BITS_PUBLIC_KEY));
+        let settings = AppSettings {
+            community_cache: CommunityCacheSettings {
+                enabled: true,
+                origin_url: "https://cache.rusty-weather.example/v1".to_owned(),
+                r2_hot_object_url: "https://hot.r2.example/objects".to_owned(),
+                manifest_public_key_base64: PUBLIC_KEY.to_owned(),
+                trusted_origin_signing_keys: vec![format!("rw-origin-v2:{HIGH_BITS_PUBLIC_KEY}")],
+                soundings_profiles: false,
+                point_series: true,
+                native_windows_tiles: false,
+                temporal_diurnal: true,
+                explicit_case_rooms: true,
+                disk_allowance_gib: 48,
+                download_cap_mib_per_hour: 4_096,
+                upload_cap_mib_per_hour: 256,
+                monthly_transfer_cap_gib: 240,
+                max_concurrent_downloads: 4,
+                pause_sharing_on_metered_networks: false,
+                historical_relay_enabled: true,
+                historical_relay_seeding_enabled: true,
+                relay_public_key_base64: HIGH_BITS_PUBLIC_KEY.to_owned(),
+                trusted_relay_signing_keys: Vec::new(),
+                relay_provider_allocation_cidrs: vec!["104.16.0.0/24".into()],
+            },
+            ..Default::default()
+        };
+
+        let restored = AppSettings::from_json(&settings.to_json());
+        assert_eq!(restored, settings);
+        assert!(restored.community_cache.phase1_ready());
+        assert!(restored.community_cache.phase1_active());
+        assert!(restored.community_cache.historical_relay_ready());
+
+        let mut invalid = restored.community_cache;
+        invalid.origin_url = "http://cache.example".to_owned();
+        assert!(!invalid.phase1_ready());
+        assert!(!invalid.phase1_active());
+        invalid.origin_url = "https://token@example.test/cache".to_owned();
+        assert!(!invalid.phase1_ready());
+        invalid.origin_url = "https://cache.example".to_owned();
+        invalid.manifest_public_key_base64 = "not-a-key".to_owned();
+        assert!(!invalid.phase1_ready());
+    }
+
+    #[test]
+    fn community_origin_keyring_migrates_legacy_and_rejects_duplicates() {
+        const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        const KEY_B: &str = "//////////////////////////////////////////8=";
+        let legacy = AppSettings::from_json(&format!(
+            r#"{{"community_cache":{{"enabled":true,"origin_url":"https://cache.example","manifest_public_key_base64":"{KEY_A}"}}}}"#
+        ));
+        assert!(legacy.community_cache.phase1_ready());
+        assert!(
+            legacy
+                .community_cache
+                .trusted_origin_signing_keys
+                .is_empty()
+        );
+        let stable = AppSettings::from_json(&legacy.to_json());
+        assert_eq!(stable.community_cache, legacy.community_cache);
+
+        assert!(community_origin_keyring_is_valid(
+            KEY_A,
+            &[format!("rw-origin-v2:{KEY_B}")]
+        ));
+        assert!(!community_origin_keyring_is_valid(
+            KEY_A,
+            &[format!("rw-origin-v1:{KEY_B}")]
+        ));
+        assert!(!community_origin_keyring_is_valid(
+            KEY_A,
+            &[format!("rw-origin-v2:{KEY_A}")]
+        ));
+        assert!(!community_origin_keyring_is_valid(
+            KEY_A,
+            &[format!(
+                "rw-origin-v2:{}",
+                KEY_A
+                    .replace('+', "-")
+                    .replace('/', "_")
+                    .trim_end_matches('=')
+            )]
+        ));
+        assert!(!community_origin_keyring_is_valid(
+            "",
+            &[format!("bad.id:{KEY_B}")]
+        ));
+        assert!(!community_origin_keyring_is_valid(
+            "",
+            &vec![format!("key:{KEY_B}"); MAX_COMMUNITY_ORIGIN_SIGNING_KEYS + 1]
+        ));
+    }
+
+    #[test]
+    fn community_relay_keyring_supports_rotation_and_fails_closed() {
+        const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        const KEY_B: &str = "//////////////////////////////////////////8=";
+        assert!(community_relay_keyring_is_valid(
+            KEY_A,
+            &[format!("rw-relay-v2:{KEY_B}")]
+        ));
+        assert!(!community_relay_keyring_is_valid(
+            KEY_A,
+            &[format!("rw-relay-v1:{KEY_B}")]
+        ));
+        assert!(!community_relay_keyring_is_valid(
+            KEY_A,
+            &[format!("rw-relay-v2:{KEY_A}")]
+        ));
+        assert!(!community_relay_keyring_is_valid(
+            "",
+            &[format!("bad.id:{KEY_B}")]
+        ));
+    }
+
+    #[test]
+    fn federation_trust_persists_only_bounded_public_pins_and_revocations() {
+        const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        const KEY_B: &str = "//////////////////////////////////////////8=";
+        let community_cache = CommunityCacheSettings {
+            enabled: true,
+            origin_url: "https://authority.example".to_owned(),
+            manifest_public_key_base64: KEY_A.to_owned(),
+            ..Default::default()
+        };
+        let federation = FederationSettings {
+            enabled: true,
+            catalog_signing_keys: vec![FederationPinnedKeySettings {
+                key_id: "catalog-v1".to_owned(),
+                public_key_base64: KEY_A.to_owned(),
+            }],
+            approved_origins: vec![FederationApprovedOriginSettings {
+                origin_id: "university-lab".to_owned(),
+                descriptor_signing_keys: vec![FederationPinnedKeySettings {
+                    key_id: "university-descriptor-v1".to_owned(),
+                    public_key_base64: KEY_B.to_owned(),
+                }],
+            }],
+            revoked_origin_ids: vec!["retired-lab".to_owned()],
+            revoked_key_ids: vec!["retired-key".to_owned()],
+        };
+        assert!(federation.trust_ready());
+        assert!(federation.active_with(&community_cache));
+
+        let settings = AppSettings {
+            community_cache,
+            federation,
+            ..Default::default()
+        };
+        let json = settings.to_json();
+        assert!(!json.contains("bearer"));
+        let restored = AppSettings::from_json(&json);
+        assert_eq!(restored, settings);
+
+        let mut duplicate = restored.federation.clone();
+        duplicate
+            .catalog_signing_keys
+            .push(FederationPinnedKeySettings {
+                key_id: "catalog-v1".to_owned(),
+                public_key_base64: KEY_B.to_owned(),
+            });
+        assert!(!duplicate.trust_ready());
+
+        let mut revoked = restored.federation.clone();
+        revoked.revoked_origin_ids.push("university-lab".to_owned());
+        assert!(!revoked.trust_ready());
+
+        let mut oversized = restored.federation;
+        oversized.catalog_signing_keys = vec![
+            FederationPinnedKeySettings {
+                key_id: "catalog-v1".to_owned(),
+                public_key_base64: KEY_A.to_owned(),
+            };
+            MAX_FEDERATION_CATALOG_SIGNING_KEYS + 1
+        ];
+        assert!(!oversized.trust_ready());
+    }
+
+    #[test]
+    fn community_cache_separates_phase1_downloads_from_future_sharing_policy() {
+        const RELAY_KEY: &str = "//////////////////////////////////////////8=";
+        let mut cache = CommunityCacheSettings {
+            enabled: true,
+            origin_url: "https://cache.example/v1".to_owned(),
+            manifest_public_key_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            ..Default::default()
+        };
+        let public = CommunitySharingContext {
+            network_is_metered: false,
+            source: CommunityShareSource::PublicProvider,
+            explicit_owner_publication: false,
+            redistribution_rights_confirmed: true,
+        };
+
+        assert!(cache.phase1_download_allowed(false));
+        assert!(cache.phase1_download_allowed(true));
+        assert!(!cache.future_relay_sharing_allowed(public));
+
+        cache.historical_relay_enabled = true;
+        cache.relay_public_key_base64 = RELAY_KEY.to_owned();
+        cache.relay_provider_allocation_cidrs = vec!["104.16.0.0/24".to_owned()];
+        assert!(cache.historical_relay_ready());
+        assert!(!cache.future_relay_sharing_allowed(public));
+        cache.historical_relay_seeding_enabled = true;
+        assert!(cache.future_relay_sharing_allowed(public));
+
+        cache.enabled = false;
+        assert!(!cache.phase1_download_allowed(false));
+        assert!(!cache.future_relay_sharing_allowed(public));
+        cache.enabled = true;
+
+        assert!(
+            !cache.future_relay_sharing_allowed(CommunitySharingContext {
+                network_is_metered: true,
+                ..public
+            })
+        );
+        cache.pause_sharing_on_metered_networks = false;
+        assert!(cache.phase1_download_allowed(true));
+        assert!(cache.future_relay_sharing_allowed(CommunitySharingContext {
+            network_is_metered: true,
+            ..public
+        }));
+
+        assert!(
+            !cache.future_relay_sharing_allowed(CommunitySharingContext {
+                redistribution_rights_confirmed: false,
+                ..public
+            })
+        );
+    }
+
+    #[test]
+    fn private_wrf_and_arwen_require_deliberate_publication_and_rights() {
+        let cache = CommunityCacheSettings {
+            enabled: true,
+            origin_url: "https://cache.example/v1".to_owned(),
+            manifest_public_key_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            historical_relay_enabled: true,
+            historical_relay_seeding_enabled: true,
+            relay_public_key_base64: "//////////////////////////////////////////8=".to_owned(),
+            relay_provider_allocation_cidrs: vec!["104.16.0.0/24".to_owned()],
+            ..Default::default()
+        };
+
+        for source in [
+            CommunityShareSource::PrivateWrf,
+            CommunityShareSource::PrivateArwen,
+        ] {
+            let unpublished = CommunitySharingContext {
+                network_is_metered: false,
+                source,
+                explicit_owner_publication: false,
+                redistribution_rights_confirmed: true,
+            };
+            assert!(!cache.future_relay_sharing_allowed(unpublished));
+            assert!(
+                !cache.future_relay_sharing_allowed(CommunitySharingContext {
+                    explicit_owner_publication: true,
+                    redistribution_rights_confirmed: false,
+                    ..unpublished
+                })
+            );
+            assert!(cache.future_relay_sharing_allowed(CommunitySharingContext {
+                explicit_owner_publication: true,
+                ..unpublished
+            }));
+        }
+    }
+
+    #[test]
     fn sat_native_window_defaults_and_round_trips() {
         // Old configs (no keys) get the disabled Guam/800 km default.
         let defaults = AppSettings::from_json("{}");
@@ -2630,7 +3530,7 @@ mod tests {
         assert!(!old.tds_tracks_enabled);
         assert!(old.rotation_markers_enabled);
         assert!(!old.unfold_velocity_display);
-        assert_eq!(old.dealias_engine, "region");
+        assert_eq!(old.dealias_engine, "region-global");
         assert_eq!(old.storm_track_max_tracks, 16);
         assert_eq!(old.storm_track_min_dbz_tenths, 350);
 
@@ -2954,6 +3854,26 @@ mod tests {
         assert_eq!(back, s);
         // Older configs restore the native plotter's reviewed defaults.
         assert_eq!(AppSettings::from_json("{}").model_native_plot_state, None);
+    }
+
+    #[test]
+    fn live_ptype_state_round_trips_as_opaque_json() {
+        let s = AppSettings {
+            live_ptype_state: Some(serde_json::json!({
+                "version": 1,
+                "enabled": true,
+                "model": "hrrr",
+                "surface_correction": "rtma",
+                "mode": "dominant",
+                "mixed_threshold_percent": 60,
+                "opacity_percent": 85,
+                "show_qc": false
+            })),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back, s);
+        assert_eq!(AppSettings::from_json("{}").live_ptype_state, None);
     }
 
     #[test]

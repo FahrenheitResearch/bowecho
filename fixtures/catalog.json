@@ -1,0 +1,467 @@
+{
+  "engine": "rust",
+  "engine_notice": null,
+  "group_keywords": [
+    "all",
+    "direct",
+    "derived",
+    "heavy",
+    "windowed"
+  ],
+  "products": [
+    {
+      "name": "10m_wind_0_24h_max"
+    },
+    {
+      "name": "10m_wind_0_48h_max"
+    },
+    {
+      "name": "10m_wind_1h_max"
+    },
+    {
+      "name": "10m_wind_24_48h_max"
+    },
+    {
+      "name": "10m_wind_gusts"
+    },
+    {
+      "name": "10m_wind_run_max"
+    },
+    {
+      "name": "10m_wind_speed_and_direction"
+    },
+    {
+      "name": "1km_reflectivity"
+    },
+    {
+      "name": "200mb_absolute_vorticity_height_winds"
+    },
+    {
+      "name": "200mb_height_winds"
+    },
+    {
+      "name": "200mb_rh_height_winds"
+    },
+    {
+      "name": "200mb_temperature_height_winds"
+    },
+    {
+      "name": "250mb_height_winds"
+    },
+    {
+      "name": "250mb_temperature_height_winds"
+    },
+    {
+      "name": "2m_dewpoint"
+    },
+    {
+      "name": "2m_dewpoint_0_24h_max"
+    },
+    {
+      "name": "2m_dewpoint_0_24h_min"
+    },
+    {
+      "name": "2m_dewpoint_0_24h_range"
+    },
+    {
+      "name": "2m_dewpoint_0_48h_max"
+    },
+    {
+      "name": "2m_dewpoint_0_48h_min"
+    },
+    {
+      "name": "2m_dewpoint_0_48h_range"
+    },
+    {
+      "name": "2m_dewpoint_10m_winds"
+    },
+    {
+      "name": "2m_dewpoint_24_48h_max"
+    },
+    {
+      "name": "2m_dewpoint_24_48h_min"
+    },
+    {
+      "name": "2m_dewpoint_24_48h_range"
+    },
+    {
+      "name": "2m_relative_humidity"
+    },
+    {
+      "name": "2m_relative_humidity_10m_winds"
+    },
+    {
+      "name": "2m_rh_0_24h_max"
+    },
+    {
+      "name": "2m_rh_0_24h_min"
+    },
+    {
+      "name": "2m_rh_0_24h_range"
+    },
+    {
+      "name": "2m_rh_0_48h_max"
+    },
+    {
+      "name": "2m_rh_0_48h_min"
+    },
+    {
+      "name": "2m_rh_0_48h_range"
+    },
+    {
+      "name": "2m_rh_24_48h_max"
+    },
+    {
+      "name": "2m_rh_24_48h_min"
+    },
+    {
+      "name": "2m_rh_24_48h_range"
+    },
+    {
+      "name": "2m_temp_0_24h_max"
+    },
+    {
+      "name": "2m_temp_0_24h_min"
+    },
+    {
+      "name": "2m_temp_0_24h_range"
+    },
+    {
+      "name": "2m_temp_0_48h_max"
+    },
+    {
+      "name": "2m_temp_0_48h_min"
+    },
+    {
+      "name": "2m_temp_0_48h_range"
+    },
+    {
+      "name": "2m_temp_24_48h_max"
+    },
+    {
+      "name": "2m_temp_24_48h_min"
+    },
+    {
+      "name": "2m_temp_24_48h_range"
+    },
+    {
+      "name": "2m_temperature"
+    },
+    {
+      "name": "2m_temperature_10m_winds"
+    },
+    {
+      "name": "2m_vpd_0_24h_max"
+    },
+    {
+      "name": "2m_vpd_0_24h_min"
+    },
+    {
+      "name": "2m_vpd_0_24h_range"
+    },
+    {
+      "name": "2m_vpd_0_48h_max"
+    },
+    {
+      "name": "2m_vpd_0_48h_min"
+    },
+    {
+      "name": "2m_vpd_0_48h_range"
+    },
+    {
+      "name": "2m_vpd_24_48h_max"
+    },
+    {
+      "name": "2m_vpd_24_48h_min"
+    },
+    {
+      "name": "2m_vpd_24_48h_range"
+    },
+    {
+      "name": "300mb_absolute_vorticity_height_winds"
+    },
+    {
+      "name": "300mb_height_winds"
+    },
+    {
+      "name": "300mb_rh_height_winds"
+    },
+    {
+      "name": "300mb_temperature_height_winds"
+    },
+    {
+      "name": "500mb_absolute_vorticity_height_winds"
+    },
+    {
+      "name": "500mb_height_winds"
+    },
+    {
+      "name": "500mb_rh_height_winds"
+    },
+    {
+      "name": "500mb_temperature_height_winds"
+    },
+    {
+      "name": "700mb_absolute_vorticity_height_winds"
+    },
+    {
+      "name": "700mb_dewpoint_height_winds"
+    },
+    {
+      "name": "700mb_height_winds"
+    },
+    {
+      "name": "700mb_rh_height_winds"
+    },
+    {
+      "name": "700mb_temperature_height_winds"
+    },
+    {
+      "name": "850mb_absolute_vorticity_height_winds"
+    },
+    {
+      "name": "850mb_dewpoint_height_winds"
+    },
+    {
+      "name": "850mb_height_winds"
+    },
+    {
+      "name": "850mb_rh_height_winds"
+    },
+    {
+      "name": "850mb_temperature_height_winds"
+    },
+    {
+      "name": "apparent_temperature_2m"
+    },
+    {
+      "name": "bulk_shear_0_1km"
+    },
+    {
+      "name": "bulk_shear_0_6km"
+    },
+    {
+      "name": "categorical_freezing_rain"
+    },
+    {
+      "name": "categorical_ice_pellets"
+    },
+    {
+      "name": "categorical_rain"
+    },
+    {
+      "name": "categorical_snow"
+    },
+    {
+      "name": "cloud_cover"
+    },
+    {
+      "name": "cloud_cover_levels"
+    },
+    {
+      "name": "composite_reflectivity"
+    },
+    {
+      "name": "composite_reflectivity_uh"
+    },
+    {
+      "name": "dcape"
+    },
+    {
+      "name": "dewpoint_depression_2m"
+    },
+    {
+      "name": "ecape_ehi_0_1km"
+    },
+    {
+      "name": "ecape_ehi_0_3km"
+    },
+    {
+      "name": "ecape_scp"
+    },
+    {
+      "name": "ecape_stp"
+    },
+    {
+      "name": "ehi_0_1km"
+    },
+    {
+      "name": "ehi_0_3km"
+    },
+    {
+      "name": "fire_weather_composite"
+    },
+    {
+      "name": "heat_index_2m"
+    },
+    {
+      "name": "high_cloud_cover"
+    },
+    {
+      "name": "lapse_rate_0_3km"
+    },
+    {
+      "name": "lapse_rate_700_500"
+    },
+    {
+      "name": "lifted_index"
+    },
+    {
+      "name": "lightning_flash_density"
+    },
+    {
+      "name": "low_cloud_cover"
+    },
+    {
+      "name": "middle_cloud_cover"
+    },
+    {
+      "name": "ml_ecape_derived_cape_ratio"
+    },
+    {
+      "name": "ml_ecape_native_cape_ratio"
+    },
+    {
+      "name": "mlcape"
+    },
+    {
+      "name": "mlcin"
+    },
+    {
+      "name": "mlecape"
+    },
+    {
+      "name": "mlecin"
+    },
+    {
+      "name": "mslp_10m_winds"
+    },
+    {
+      "name": "mu_ecape_derived_cape_ratio"
+    },
+    {
+      "name": "mu_ecape_native_cape_ratio"
+    },
+    {
+      "name": "mucape"
+    },
+    {
+      "name": "mucin"
+    },
+    {
+      "name": "muecape"
+    },
+    {
+      "name": "precipitable_water"
+    },
+    {
+      "name": "precipitation_type"
+    },
+    {
+      "name": "probability_of_precipitation"
+    },
+    {
+      "name": "qpf_12h"
+    },
+    {
+      "name": "qpf_1h"
+    },
+    {
+      "name": "qpf_24h"
+    },
+    {
+      "name": "qpf_6h"
+    },
+    {
+      "name": "qpf_total"
+    },
+    {
+      "name": "sb_ecape_derived_cape_ratio"
+    },
+    {
+      "name": "sb_ecape_native_cape_ratio"
+    },
+    {
+      "name": "sbcape"
+    },
+    {
+      "name": "sbcin"
+    },
+    {
+      "name": "sbecape"
+    },
+    {
+      "name": "sbecin"
+    },
+    {
+      "name": "sblcl"
+    },
+    {
+      "name": "sbncape"
+    },
+    {
+      "name": "scp_mu_0_3km_0_6km_proxy"
+    },
+    {
+      "name": "simulated_ir_satellite"
+    },
+    {
+      "name": "smoke_column"
+    },
+    {
+      "name": "smoke_pm25_native"
+    },
+    {
+      "name": "srh_0_1km"
+    },
+    {
+      "name": "srh_0_3km"
+    },
+    {
+      "name": "stp_fixed"
+    },
+    {
+      "name": "temperature_advection_700mb"
+    },
+    {
+      "name": "temperature_advection_850mb"
+    },
+    {
+      "name": "terrain_height"
+    },
+    {
+      "name": "theta_e_2m_10m_winds"
+    },
+    {
+      "name": "total_qpf"
+    },
+    {
+      "name": "uh_2to5km"
+    },
+    {
+      "name": "uh_2to5km_1h_max"
+    },
+    {
+      "name": "uh_2to5km_3h_max"
+    },
+    {
+      "name": "uh_2to5km_run_max"
+    },
+    {
+      "name": "visibility"
+    },
+    {
+      "name": "vpd_2m"
+    },
+    {
+      "name": "wetbulb_2m"
+    },
+    {
+      "name": "wind_chill_2m"
+    }
+  ],
+  "schema": "gpuwm.run-plan.catalog.v1",
+  "skip_token": "none",
+  "source": "the rust renderer's own --list-products",
+  "spec": "a comma-separated list of the names below, or 'all'; 'none' skips rendering entirely"
+}

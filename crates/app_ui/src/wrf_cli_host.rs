@@ -33,7 +33,7 @@ use crate::wrf_process::{
 use app_ui::wrf_scene_adapter::inventory_wrf_paths;
 use app_ui::wrf_scene_inventory::{WrfSceneInventory, parse_wrf_internal_time};
 
-const RUSTY_WEATHER_COMMIT: &str = "791806f5f4798fe05c1204c165c92f174f9d222e";
+const RUSTY_WEATHER_COMMIT: &str = "de0478a6146792e2b10cec11ee0d2503dddeb310";
 const OUTPUT_WIDTH: u32 = 1_200;
 const OUTPUT_HEIGHT: u32 = 900;
 
