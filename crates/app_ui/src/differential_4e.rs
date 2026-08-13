@@ -747,10 +747,17 @@ impl EngineMirror {
 
     /// The stage-(ii) shim body for the polled route: the legacy
     /// `install_polled_volume` frame shape (path `poll://{name}`, status
-    /// Complete, label `polled {name}`) through `install_frame` +
-    /// `FollowNewestUnlessPlaying` (census D5a); single-frame routes never
-    /// defer (census D7 row P3).
+    /// Complete, label `polled {name}`) through the matching engine policy.
+    /// Normal live ownership uses `FollowNewestUnlessPlaying`; same-site
+    /// history browsing uses `BackfillPreservingActive` so the selected frame
+    /// stays on screen while the live edge continues filling history.
     fn install_polled(&mut self, name: &str, volume: Arc<RadarVolume>) -> InstallOutcome {
+        let identity = frame_identity_for_volume(volume.as_ref());
+        let browse_holds_display = self.engine.cursor.browsing
+            && self.display.as_deref().is_some_and(|displayed| {
+                let displayed = frame_identity_for_volume(displayed);
+                displayed.site_id == identity.site_id && displayed != identity
+            });
         let decoded = DecodedLoad {
             path: PathBuf::from(format!("poll://{name}")),
             volume,
@@ -758,11 +765,12 @@ impl EngineMirror {
             status: FrameStatus::Complete,
             source_label: format!("polled {name}"),
         };
-        self.install_batch(
-            DecodedLoadBatch::single(decoded),
-            &SelectionPolicy::FollowNewestUnlessPlaying,
-            |_| false,
-        )
+        let policy = if browse_holds_display {
+            &SelectionPolicy::BackfillPreservingActive
+        } else {
+            &SelectionPolicy::FollowNewestUnlessPlaying
+        };
+        self.install_batch(DecodedLoadBatch::single(decoded), policy, |_| false)
     }
 }
 
@@ -1283,11 +1291,11 @@ fn install_diff_fixture_batches_order_identically() {
 
 /// Census D2/D3/D5a/D9/D10: the polled route, tick by tick — follow, rule-c
 /// replace under a new `poll://` path, cursor hold while playing WITH the
-/// LIVE-WINS display install, browsing deliberately not blocking the
-/// follow, cross-site clear (silent in legacy P3; the engine GAINS the P1
+/// LIVE-WINS display install, same-site browsing holding the selected frame,
+/// cross-site clear (silent in legacy P3; the engine GAINS the P1
 /// diagnostic per the D3 decision — a class-(b) normalize), and trim.
 #[test]
-fn install_diff_p3_polled_tick_sequence_matches_engine_follow_newest() {
+fn install_diff_p3_polled_tick_sequence_matches_engine_policy() {
     let ctx = egui::Context::default();
     let mut app = test_viewer_app_with_hazards(Vec::new());
     let mut mirror = EngineMirror::primary("FWLX");
@@ -1376,7 +1384,8 @@ fn install_diff_p3_polled_tick_sequence_matches_engine_follow_newest() {
         "legacy display shows the newest volume while the cursor holds"
     );
 
-    // Browsing does NOT block the follow (census D5a, deliberate).
+    // Browsing is explicit display ownership: the newest poll enters history
+    // but neither the cursor nor the displayed frame gets yanked to it.
     app.primary.cursor.playing = false;
     app.primary.cursor.browsing = true;
     mirror.engine.cursor.playing = false;
@@ -1386,11 +1395,11 @@ fn install_diff_p3_polled_tick_sequence_matches_engine_follow_newest() {
         &mut mirror,
         "FWLX_0540",
         volume("FWLX", 40),
-        "browsing follow",
+        "browsing hold",
     );
     assert_eq!(
-        app.primary.cursor.index, 3,
-        "browsing is deliberately ignored"
+        app.primary.cursor.index, 2,
+        "browsing keeps the selected historical frame"
     );
     assert!(app.primary.cursor.browsing, "the flag itself survives");
 
