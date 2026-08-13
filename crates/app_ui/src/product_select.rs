@@ -391,10 +391,17 @@ pub(crate) fn radar_quick_product_entries(
             RadarQuickProductEntry { caption, product }
         })
         .collect::<Vec<_>>();
+    let base_captions = entries
+        .iter()
+        .map(|entry| entry.caption.clone())
+        .collect::<Vec<_>>();
     for index in 0..entries.len() {
-        let duplicate = entries.iter().enumerate().any(|(candidate, entry)| {
-            candidate != index && entry.caption.eq_ignore_ascii_case(&entries[index].caption)
-        });
+        let duplicate = base_captions
+            .iter()
+            .enumerate()
+            .any(|(candidate, caption)| {
+                candidate != index && caption.eq_ignore_ascii_case(&base_captions[index])
+            });
         if duplicate {
             entries[index].caption = format!(
                 "{} ({})",
