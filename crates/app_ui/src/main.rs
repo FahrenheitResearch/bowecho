@@ -289,6 +289,7 @@ use product_select::global_displayable_products;
 use product_select::global_displayable_products_for_picker;
 #[cfg(test)]
 use product_select::global_displayable_products_with_advanced;
+use product_select::is_complete_live_candidate_tilt_for_site;
 use product_select::is_displayable_on_cut;
 use product_select::is_product_visible_in_picker;
 use product_select::latest_load_pauses_poll;
@@ -3236,6 +3237,14 @@ struct ViewerApp {
     /// busy predicate ignores auto-refresh loads — they fire every
     /// second on a live site and made every busy-greyed button flash.
     primary_load_is_auto_refresh: bool,
+    /// One-shot live/latest intent carried across the deliberate blank state
+    /// while a different site or scan loads. Archive and local paths never
+    /// set this flag.
+    pending_primary_live_low_follow_reanchor: bool,
+    /// Scoped to the single live install allowed to consume the pending
+    /// intent. Frame status alone cannot identify live data because polled
+    /// and archived complete frames share the same status.
+    installing_primary_live_low_follow_reanchor: bool,
     hazard_receiver: Option<mpsc::Receiver<AsyncHazardResult>>,
     pending_site_id: Option<String>,
     cursor_readout: Option<CursorReadout>,
@@ -4647,6 +4656,10 @@ struct StormTrackHit {
 #[derive(Clone, Copy, Debug)]
 struct VolumeSelectionPolicy {
     allow_low_level_auto_advance: bool,
+    /// Re-anchor a live feed on the newest compatible low sweep when its
+    /// scan/site identity changes. Callers must set this only for incoming
+    /// live data, never for archive/history/local installs.
+    reanchor_low_follow: bool,
     allow_incomplete_live_chunk_advance: bool,
     require_complete_live_cut: bool,
     low_level_min_seconds: i64,
@@ -5364,10 +5377,68 @@ struct AsyncRenderResult {
 /// Background cell-identification result: (frame key, cells).
 type StormCellsResult = (FrameWorkKey, Vec<StormCell>);
 type RotationMarkersResult = (DealiasFrameWorkKey, Vec<RotationMarker>);
-/// One TILT list row: (index, elevation_deg, radial_count, start_time,
-/// is_selected, has_selected_product) — built in radar_controls_panel,
-/// rendered by radar_tilt_section_body.
-type TiltCutRow = (usize, f32, usize, Option<DateTime<Utc>>, bool, bool);
+/// One named TILT row used by both quick and detailed controls. Ordinal,
+/// sweep time, compatibility, and build state keep repeated SAILS cuts
+/// unambiguous.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TiltCutRow {
+    index: usize,
+    total: usize,
+    elevation_deg: f32,
+    radial_count: usize,
+    start_time_utc: Option<DateTime<Utc>>,
+    selected: bool,
+    product_compatible: bool,
+    state: TiltCompletionState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TiltCompletionState {
+    Complete,
+    Building,
+}
+
+fn selected_sweep_readout(
+    row: &TiltCutRow,
+    time_zone: DisplayTimeZone,
+    now_utc: DateTime<Utc>,
+    follow_low: bool,
+    manual_hold: bool,
+) -> String {
+    let sweep_time = row
+        .start_time_utc
+        .map(|time| {
+            format!(
+                "{} · age {}",
+                time_zone.format_hms(time),
+                frame_age_label(time, now_utc)
+            )
+        })
+        .unwrap_or_else(|| "sweep time unavailable".to_owned());
+    let follow = if manual_hold {
+        " · MANUAL HOLD"
+    } else if follow_low {
+        " · FOLLOW LOW"
+    } else {
+        ""
+    };
+    format!(
+        "{:.2}° · cut {}/{} · {sweep_time} · {}{follow}",
+        row.elevation_deg,
+        row.index + 1,
+        row.total,
+        row.state.label(),
+    )
+}
+
+impl TiltCompletionState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "COMPLETE",
+            Self::Building => "BUILDING",
+        }
+    }
+}
 /// (grid hash, inverse LUT) for the decoupled model geolocation.
 type ModelLutEntry = (String, Arc<model_layer::InverseLut>);
 type NativeSoundingResult = (
@@ -9736,6 +9807,8 @@ impl ViewerApp {
             site_catalog_receiver: None,
             load_receiver: None,
             primary_load_is_auto_refresh: false,
+            pending_primary_live_low_follow_reanchor: false,
+            installing_primary_live_low_follow_reanchor: false,
             hazard_receiver: None,
             pending_site_id: None,
             cursor_readout: None,
@@ -12012,6 +12085,8 @@ impl ViewerApp {
                 VolumeSelectionPolicy {
                     allow_low_level_auto_advance: self.app_settings.live_low_sweep_auto_advance
                         && !self.primary.cursor.playing,
+                    reanchor_low_follow: self.installing_primary_live_low_follow_reanchor
+                        && !self.primary.cursor.browsing,
                     allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
                     require_complete_live_cut,
                     low_level_min_seconds: self.live_low_sweep_auto_advance_min_seconds(),
@@ -12265,6 +12340,7 @@ impl ViewerApp {
                     VolumeSelectionPolicy {
                         allow_low_level_auto_advance: live_low_sweep_auto_advance
                             && !self.primary.cursor.playing,
+                        reanchor_low_follow: false,
                         allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
                         require_complete_live_cut,
                         low_level_min_seconds,
@@ -14901,8 +14977,16 @@ impl ViewerApp {
                             self.status = format!("Preview {}", message.label);
                         }
                         AsyncLoadUpdate::History(batch, select_frame) => {
+                            self.installing_primary_live_low_follow_reanchor = select_frame
+                                && self.pending_primary_live_low_follow_reanchor
+                                && !self.primary.cursor.playing
+                                && !self.primary.cursor.browsing;
                             let selected_loaded =
                                 self.install_decoded_load_batch(batch, false, select_frame, ctx);
+                            if selected_loaded {
+                                self.pending_primary_live_low_follow_reanchor = false;
+                            }
+                            self.installing_primary_live_low_follow_reanchor = false;
                             self.live_refresh_skip_reason = None;
                             if select_frame && selected_loaded {
                                 self.status = format!("Loaded {}", message.label);
@@ -14914,6 +14998,8 @@ impl ViewerApp {
                                 self.load_timing = Some(timings);
                             }
                             self.load_receiver = None;
+                            self.pending_primary_live_low_follow_reanchor = false;
+                            self.installing_primary_live_low_follow_reanchor = false;
                             self.archive_load_progress = None;
                             self.pending_site_id = None;
                             self.event_explorer.pending_autoplay = false;
@@ -14931,8 +15017,16 @@ impl ViewerApp {
                             self.pending_site_id = None;
                             match result {
                                 Ok(batch) => {
+                                    self.installing_primary_live_low_follow_reanchor = self
+                                        .pending_primary_live_low_follow_reanchor
+                                        && !self.primary.cursor.playing
+                                        && !self.primary.cursor.browsing;
                                     let selected_loaded =
                                         self.install_decoded_load_batch(batch, true, true, ctx);
+                                    if selected_loaded {
+                                        self.pending_primary_live_low_follow_reanchor = false;
+                                    }
+                                    self.installing_primary_live_low_follow_reanchor = false;
                                     self.live_refresh_skip_reason = None;
                                     if selected_loaded {
                                         self.status = format!("Loaded {}", message.label);
@@ -14956,6 +15050,8 @@ impl ViewerApp {
                                     self.request_rebuildable_cache_maintenance(ctx, false);
                                 }
                                 Err(err) => {
+                                    self.pending_primary_live_low_follow_reanchor = false;
+                                    self.installing_primary_live_low_follow_reanchor = false;
                                     self.event_explorer.pending_autoplay = false;
                                     self.pending_debug_archive_case = None;
                                     self.pending_data_pack_scene = None;
@@ -14979,6 +15075,8 @@ impl ViewerApp {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.load_receiver = None;
+                    self.pending_primary_live_low_follow_reanchor = false;
+                    self.installing_primary_live_low_follow_reanchor = false;
                     self.archive_load_progress = None;
                     self.pending_site_id = None;
                     self.event_explorer.pending_autoplay = false;
@@ -18317,6 +18415,7 @@ impl ViewerApp {
                 VolumeSelectionPolicy {
                     allow_low_level_auto_advance: live_low_sweep_auto_advance
                         && !pane.engine.cursor.playing,
+                    reanchor_low_follow: false,
                     allow_incomplete_live_chunk_advance: display_live_chunk_updates,
                     require_complete_live_cut,
                     low_level_min_seconds,
@@ -19314,6 +19413,8 @@ impl ViewerApp {
     }
 
     fn prepare_local_volume_load(&mut self, label: &str) {
+        self.pending_primary_live_low_follow_reanchor = false;
+        self.installing_primary_live_low_follow_reanchor = false;
         // Deployments are opened to be WATCHED: when this load lands as a
         // multi-frame batch, grow history to fit it and start the loop.
         self.pending_local_autoplay = true;
@@ -21252,6 +21353,7 @@ impl ViewerApp {
             self.primary.cursor.browsing = false;
             self.primary.cursor.last_step = None;
         }
+        self.pending_primary_live_low_follow_reanchor = mode != LatestLoadMode::Loop;
         if history_contains_other_site(&self.primary.history, &site_id) {
             self.clear_frame_history();
         }
@@ -23371,6 +23473,8 @@ impl ViewerApp {
         let cancelled_intl_loop = self.intl_loop_rx.take().is_some();
         let cancelled = cancelled_primary || cancelled_intl_loop;
         if cancelled {
+            self.pending_primary_live_low_follow_reanchor = false;
+            self.installing_primary_live_low_follow_reanchor = false;
             self.archive_load_progress = None;
             self.intl_loop_frames = 0;
             self.intl_loop_requested = 0;
@@ -25809,6 +25913,152 @@ impl ViewerApp {
             .response
             .on_hover_text("Choose or edit the color table used by the active radar product");
         });
+
+        self.radar_quick_favorites_controls(
+            ui,
+            ctx,
+            editing_pane,
+            editing_product,
+            product_buttons,
+        );
+    }
+
+    fn radar_quick_favorites_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        editing_pane: Option<usize>,
+        editing_product: &DisplayProduct,
+        product_buttons: &[(DisplayProduct, Option<usize>)],
+    ) {
+        let canonical_available = |label: &str| {
+            product_buttons
+                .iter()
+                .find(|(product, _)| product.label().eq_ignore_ascii_case(label))
+                .map(|(product, _)| product.clone())
+        };
+        let favorites = self.app_settings.radar_product_favorites.clone();
+        let available_favorites = favorites
+            .iter()
+            .filter_map(|label| canonical_available(label))
+            .collect::<Vec<_>>();
+        let editing_label = editing_product.label();
+        let editing_is_favorite = favorites
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case(editing_label));
+        let mut picked_product = None;
+        let mut add_or_remove_current = None;
+        let mut edit_action = None;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Quick products");
+            if available_favorites.is_empty() {
+                if ui.small_button("Add current").clicked() {
+                    add_or_remove_current = Some(true);
+                }
+            } else {
+                for product in &available_favorites {
+                    if ui
+                        .selectable_label(editing_product == product, product.label())
+                        .on_hover_text(product_picker_long_label(product))
+                        .clicked()
+                    {
+                        picked_product = Some(product.clone());
+                    }
+                }
+                if ui
+                    .small_button(if editing_is_favorite {
+                        "Remove current"
+                    } else {
+                        "+ Current"
+                    })
+                    .clicked()
+                {
+                    add_or_remove_current = Some(!editing_is_favorite);
+                }
+            }
+            ui.menu_button("Edit", |ui| {
+                if favorites.is_empty() {
+                    ui.weak("No saved quick products");
+                }
+                for (index, label) in favorites.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let display = canonical_available(label)
+                            .map(|product| product.label().to_owned())
+                            .unwrap_or_else(|| format!("{label} (unavailable)"));
+                        ui.label(display);
+                        if ui.add_enabled(index > 0, egui::Button::new("Up")).clicked() {
+                            edit_action = Some((index, -1_i8));
+                        }
+                        if ui
+                            .add_enabled(index + 1 < favorites.len(), egui::Button::new("Down"))
+                            .clicked()
+                        {
+                            edit_action = Some((index, 1_i8));
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            edit_action = Some((index, 0_i8));
+                        }
+                    });
+                }
+            });
+        });
+
+        if let Some(add) = add_or_remove_current {
+            if add {
+                if !self
+                    .app_settings
+                    .radar_product_favorites
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case(editing_label))
+                {
+                    self.app_settings
+                        .radar_product_favorites
+                        .push(editing_label.to_owned());
+                }
+                self.app_settings.normalize_radar_product_favorites();
+            } else {
+                self.app_settings
+                    .radar_product_favorites
+                    .retain(|label| !label.eq_ignore_ascii_case(editing_label));
+                self.sanitize_selection();
+                self.clear_texture();
+            }
+            self.mark_app_settings_dirty();
+            ctx.request_repaint();
+        }
+        if let Some((index, direction)) = edit_action {
+            if direction == 0 {
+                if index < self.app_settings.radar_product_favorites.len() {
+                    self.app_settings.radar_product_favorites.remove(index);
+                    self.sanitize_selection();
+                    self.clear_texture();
+                }
+            } else {
+                let other = if direction < 0 {
+                    index.saturating_sub(1)
+                } else {
+                    index.saturating_add(1)
+                };
+                if index < self.app_settings.radar_product_favorites.len()
+                    && other < self.app_settings.radar_product_favorites.len()
+                {
+                    self.app_settings.radar_product_favorites.swap(index, other);
+                }
+            }
+            self.mark_app_settings_dirty();
+            ctx.request_repaint();
+        }
+        if let Some(product) = picked_product {
+            let changed = if let Some(slot) = editing_pane {
+                self.switch_pane_product(slot, product)
+            } else {
+                self.switch_primary_product(product)
+            };
+            if changed {
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn radar_quick_source_controls(
@@ -25997,20 +26247,20 @@ impl ViewerApp {
         editing_pane: Option<usize>,
         cut_rows: &[TiltCutRow],
     ) {
-        let selected_position = cut_rows.iter().position(|row| row.4).unwrap_or(0);
+        let selected_position = cut_rows.iter().position(|row| row.selected).unwrap_or(0);
         let selected_index = cut_rows
             .get(selected_position)
-            .map(|row| row.0)
+            .map(|row| row.index)
             .unwrap_or(0);
         let lower = cut_rows[..selected_position]
             .iter()
             .rev()
-            .find(|row| row.5)
-            .map(|row| row.0);
+            .find(|row| row.product_compatible)
+            .map(|row| row.index);
         let higher = cut_rows
             .get(selected_position.saturating_add(1)..)
-            .and_then(|rows| rows.iter().find(|row| row.5))
-            .map(|row| row.0);
+            .and_then(|rows| rows.iter().find(|row| row.product_compatible))
+            .map(|row| row.index);
         let mut picked_cut = None;
         panel_kit::row(ui, "Tilt", |ui| {
             if ui
@@ -26022,7 +26272,14 @@ impl ViewerApp {
             }
             let selected_text = cut_rows
                 .get(selected_position)
-                .map(|row| format!("{:.2} deg  (#{})", row.1, row.0))
+                .map(|row| {
+                    format!(
+                        "{:.2} deg  ({}/{})",
+                        row.elevation_deg,
+                        row.index + 1,
+                        row.total
+                    )
+                })
                 .unwrap_or_else(|| "No compatible tilt".to_owned());
             egui::ComboBox::from_id_salt(("radar_quick_tilt", editing_pane))
                 .selected_text(selected_text)
@@ -26030,14 +26287,23 @@ impl ViewerApp {
                 .show_ui(ui, |ui| {
                     for row in cut_rows {
                         let response = ui.add_enabled(
-                            row.5,
+                            row.product_compatible,
                             egui::Button::selectable(
-                                row.0 == selected_index,
-                                format!("{:.2} deg - cut #{} - {} radials", row.1, row.0, row.2),
+                                row.index == selected_index,
+                                format!(
+                                    "{:.2} deg - cut {}/{} - {} radials - {}",
+                                    row.elevation_deg,
+                                    row.index + 1,
+                                    row.total,
+                                    row.radial_count,
+                                    row.start_time_utc
+                                        .map(|time| self.time_zone().format_hms(time))
+                                        .unwrap_or_else(|| "sweep time unavailable".to_owned()),
+                                ),
                             ),
                         );
                         if response.clicked() {
-                            picked_cut = Some(row.0);
+                            picked_cut = Some(row.index);
                         }
                     }
                 });
@@ -26052,15 +26318,27 @@ impl ViewerApp {
         if editing_pane.is_none() {
             let mut follow_low = self.app_settings.live_low_sweep_auto_advance;
             if ui
-                .checkbox(&mut follow_low, "Auto-follow new complete low tilts")
+                .checkbox(&mut follow_low, "Follow incoming low tilts")
                 .on_hover_text(
-                    "Advance through every newer complete, product-compatible low tilt as it arrives; manual tilt controls remain available",
+                    "Keep live/newest radar views on the newest product-compatible sweep through 1.10 deg, including after changing sites or scan strategies. Manual tilt choices hold for the current scan; history browsing never moves.",
                 )
                 .changed()
             {
                 self.app_settings.live_low_sweep_auto_advance = follow_low;
                 self.mark_app_settings_dirty();
             }
+        }
+        if let Some(row) = cut_rows.get(selected_position) {
+            ui.label(
+                egui::RichText::new(selected_sweep_readout(
+                    row,
+                    self.time_zone(),
+                    Utc::now(),
+                    editing_pane.is_none() && self.app_settings.live_low_sweep_auto_advance,
+                    editing_pane.is_none() && self.manual_primary_cut_hold.is_some(),
+                ))
+                .monospace(),
+            );
         }
         if let Some(index) = picked_cut {
             if let Some(slot) = editing_pane {
@@ -26190,19 +26468,36 @@ impl ViewerApp {
                     (product, target_cut)
                 })
                 .collect::<Vec<_>>();
+            let selected_frame_status = if editing_pane.is_none() {
+                self.selected_frame().map(|frame| frame.status)
+            } else {
+                editing_pane
+                    .and_then(|slot| self.extra_panes.get(slot))
+                    .and_then(|pane| pane.engine.history.get(pane.engine.cursor.index))
+                    .map(|frame| frame.status)
+            };
+            let total_cuts = volume.cuts.len();
             let cuts = volume
                 .cuts
                 .iter()
                 .enumerate()
                 .map(|(index, cut)| {
-                    (
+                    let building = selected_frame_status == Some(FrameStatus::LivePartial)
+                        && !is_complete_live_candidate_tilt_for_site(cut, &volume.site.id);
+                    TiltCutRow {
                         index,
-                        cut.elevation_deg,
-                        cut.radials.len(),
-                        cut_start_time_utc(volume, index),
-                        index == effective_cut,
-                        is_displayable_on_cut(volume, index, &editing_product),
-                    )
+                        total: total_cuts,
+                        elevation_deg: cut.elevation_deg,
+                        radial_count: cut.radials.len(),
+                        start_time_utc: cut_start_time_utc(volume, index),
+                        selected: index == effective_cut,
+                        product_compatible: is_displayable_on_cut(volume, index, &editing_product),
+                        state: if building {
+                            TiltCompletionState::Building
+                        } else {
+                            TiltCompletionState::Complete
+                        },
+                    }
                 })
                 .collect::<Vec<_>>();
             (products, cuts)
@@ -26468,19 +26763,36 @@ impl ViewerApp {
                 (product, target_cut)
             })
             .collect::<Vec<_>>();
+        let selected_frame_status = if editing_pane.is_none() {
+            self.selected_frame().map(|frame| frame.status)
+        } else {
+            editing_pane
+                .and_then(|slot| self.extra_panes.get(slot))
+                .and_then(|pane| pane.engine.history.get(pane.engine.cursor.index))
+                .map(|frame| frame.status)
+        };
+        let total_cuts = volume.cuts.len();
         let cut_rows = volume
             .cuts
             .iter()
             .enumerate()
             .map(|(index, cut)| {
-                (
+                let building = selected_frame_status == Some(FrameStatus::LivePartial)
+                    && !is_complete_live_candidate_tilt_for_site(cut, &volume.site.id);
+                TiltCutRow {
                     index,
-                    cut.elevation_deg,
-                    cut.radials.len(),
-                    cut_start_time_utc(volume, index),
-                    index == editing_effective_cut,
-                    is_displayable_on_cut(volume, index, &editing_product),
-                )
+                    total: total_cuts,
+                    elevation_deg: cut.elevation_deg,
+                    radial_count: cut.radials.len(),
+                    start_time_utc: cut_start_time_utc(volume, index),
+                    selected: index == editing_effective_cut,
+                    product_compatible: is_displayable_on_cut(volume, index, &editing_product),
+                    state: if building {
+                        TiltCompletionState::Building
+                    } else {
+                        TiltCompletionState::Complete
+                    },
+                }
             })
             .collect::<Vec<_>>();
 
@@ -27122,40 +27434,41 @@ impl ViewerApp {
             .max_height(TILT_LIST_SCROLL_HEIGHT)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                for (
-                    index,
-                    elevation_deg,
-                    radial_count,
-                    start_time,
-                    is_selected,
-                    has_selected_product,
-                ) in cut_rows
-                {
+                for row in cut_rows {
                     let label = format!(
-                        "#{:02}  {:>4.2} deg  {:>4} radials  {}",
-                        index,
-                        elevation_deg,
-                        radial_count,
-                        start_time
-                            .map(|time| time.format("%H:%M:%S").to_string())
-                            .unwrap_or_else(|| "--:--:--".to_owned())
+                        "{:>2}/{:<2}  {:>4.2} deg  {:>4} radials  {}  {}",
+                        row.index + 1,
+                        row.total,
+                        row.elevation_deg,
+                        row.radial_count,
+                        row.start_time_utc
+                            .map(|time| self.time_zone().format_hms(time))
+                            .unwrap_or_else(|| "sweep time unavailable".to_owned()),
+                        row.state.label(),
                     );
                     // Kit select_row: left-aligned truncating monospace —
                     // the columns line up and the row fits at 320 pt.
                     let response = panel_kit::select_row(
                         ui,
-                        *is_selected,
-                        *has_selected_product,
+                        row.selected,
+                        row.product_compatible,
                         &label,
                         None,
-                    );
+                    )
+                    .on_hover_text(selected_sweep_readout(
+                        row,
+                        self.time_zone(),
+                        Utc::now(),
+                        editing_pane.is_none() && self.app_settings.live_low_sweep_auto_advance,
+                        editing_pane.is_none() && self.manual_primary_cut_hold.is_some(),
+                    ));
                     if response.clicked() {
                         if let Some(slot) = editing_pane {
                             // Pin this pane to an independent tilt.
-                            self.extra_panes[slot].cut = Some(*index);
+                            self.extra_panes[slot].cut = Some(row.index);
                             ctx.request_repaint();
                         } else {
-                            self.select_primary_cut_manually(*index, ctx);
+                            self.select_primary_cut_manually(row.index, ctx);
                         }
                     }
                 }
@@ -32259,18 +32572,26 @@ impl ViewerApp {
         product: &DisplayProduct,
         cut: usize,
     ) {
-        let Some(volume) = self.volume.as_ref() else {
+        let volume = pane_index
+            .checked_sub(1)
+            .and_then(|slot| self.extra_panes.get(slot))
+            .and_then(|pane| pane.volume.as_ref())
+            .or(self.volume.as_ref());
+        let Some(volume) = volume else {
             return;
         };
         let site_id = volume.site.id.clone();
-        let scan_time = self
-            .time_zone()
-            .format_hm(volume.volume_time.with_timezone(&Utc));
-        let tilt = volume
-            .cuts
-            .get(cut)
-            .map(|c| format!(" {:.1}°", c.elevation_deg))
-            .unwrap_or_default();
+        let sweep_time = cut_start_time_utc(volume, cut)
+            .map(|time| self.time_zone().format_hms(time))
+            .unwrap_or_else(|| "sweep time unavailable".to_owned());
+        let tilt = volume.cuts.get(cut).map_or_else(String::new, |sweep| {
+            format!(
+                " {:.1}° {}/{}",
+                sweep.elevation_deg,
+                cut + 1,
+                volume.cuts.len()
+            )
+        });
         let (_, mode_accent, mode) = self.pane_mode_chip_state(pane_index).unwrap_or((
             "ARCHIVE".to_owned(),
             egui::Color32::from_rgb(132, 96, 24),
@@ -32287,15 +32608,15 @@ impl ViewerApp {
         let candidates = if let Some(role) = comparison_role {
             let role = role.label();
             [
-                format!("{role} {site_id} {product_label}{tilt} · {scan_time}"),
-                format!("{role} {product_label}{tilt} · {scan_time}"),
+                format!("{role} {site_id} {product_label}{tilt} · {sweep_time}"),
+                format!("{role} {product_label}{tilt} · {sweep_time}"),
                 format!("{role} {product_label}{tilt}"),
                 role.to_owned(),
             ]
         } else {
             [
-                format!("{mode} {site_id} {product_label}{tilt} · {scan_time}"),
-                format!("{site_id} {product_label}{tilt} · {scan_time}"),
+                format!("{mode} {site_id} {product_label}{tilt} · {sweep_time}"),
+                format!("{site_id} {product_label}{tilt} · {sweep_time}"),
                 format!("{site_id} {product_label}{tilt}"),
                 format!("{product_label}{tilt}"),
             ]
@@ -35798,6 +36119,9 @@ impl ViewerApp {
     fn install_polled_volume(&mut self, name: &str, volume: Arc<RadarVolume>, ctx: &egui::Context) {
         let identity = frame_identity_for_volume(&volume);
         let displayed_identity = self.volume.as_deref().map(frame_identity_for_volume);
+        let reanchor_low_follow = !self.primary.cursor.playing
+            && !self.primary.cursor.browsing
+            && displayed_identity.as_ref() != Some(&identity);
         // Drawing a section is an explicit request to interrogate the volume
         // currently on screen. Keep accepting newer polled/international
         // scans into history, but do not let the repaint caused by an endpoint
@@ -35870,7 +36194,9 @@ impl ViewerApp {
                 .position(|frame| frame.identity == identity)
                 .unwrap_or_else(|| self.primary.history.len().saturating_sub(1));
         }
+        self.installing_primary_live_low_follow_reanchor = reanchor_low_follow;
         self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
+        self.installing_primary_live_low_follow_reanchor = false;
         self.request_rebuildable_cache_maintenance(ctx, false);
     }
 
@@ -56279,6 +56605,7 @@ mod tests {
                 &short_lag,
                 VolumeSelectionPolicy {
                     allow_low_level_auto_advance: true,
+                    reanchor_low_follow: false,
                     allow_incomplete_live_chunk_advance: false,
                     require_complete_live_cut: false,
                     low_level_min_seconds: i64::from(MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS),
@@ -72563,6 +72890,8 @@ mod tests {
             site_catalog_receiver: None,
             load_receiver: None,
             primary_load_is_auto_refresh: false,
+            pending_primary_live_low_follow_reanchor: false,
+            installing_primary_live_low_follow_reanchor: false,
             hazard_receiver: None,
             pending_site_id: None,
             cursor_readout: None,
@@ -76666,6 +76995,45 @@ mod tests {
         );
         assert_eq!(DisplayTimeZone::Central.format_hm(summer), "20:30 CDT");
         assert_eq!(DisplayTimeZone::Pacific.format_hms(winter), "17:30:00 PST");
+    }
+
+    #[test]
+    fn selected_sweep_readout_distinguishes_duplicate_tilts_and_build_state() {
+        let sweep_time = Utc.with_ymd_and_hms(2026, 6, 13, 1, 30, 0).unwrap();
+        let row = TiltCutRow {
+            index: 3,
+            total: 14,
+            elevation_deg: 0.5,
+            radial_count: 180,
+            start_time_utc: Some(sweep_time),
+            selected: true,
+            product_compatible: true,
+            state: TiltCompletionState::Building,
+        };
+
+        assert_eq!(
+            selected_sweep_readout(
+                &row,
+                DisplayTimeZone::Utc,
+                sweep_time + chrono::Duration::seconds(18),
+                true,
+                false,
+            ),
+            "0.50° · cut 4/14 · 01:30:00Z · age 18s · BUILDING · FOLLOW LOW"
+        );
+        assert!(
+            selected_sweep_readout(
+                &TiltCutRow {
+                    start_time_utc: None,
+                    ..row
+                },
+                DisplayTimeZone::Eastern,
+                sweep_time,
+                true,
+                true,
+            )
+            .contains("sweep time unavailable · BUILDING · MANUAL HOLD")
+        );
     }
 
     #[test]

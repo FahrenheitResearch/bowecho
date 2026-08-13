@@ -1915,6 +1915,27 @@ pub struct LoadedAppSettings {
 }
 
 impl AppSettings {
+    /// Normalize the persisted quick-product strip without discarding labels
+    /// that are temporarily unavailable at the current radar. The first
+    /// spelling wins and matching is case-insensitive.
+    pub fn normalize_radar_product_favorites(&mut self) {
+        let mut seen = std::collections::BTreeSet::new();
+        self.radar_product_favorites.retain_mut(|label| {
+            let trimmed = label.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            let key = trimmed.to_ascii_lowercase();
+            if !seen.insert(key) {
+                return false;
+            }
+            if trimmed.len() != label.len() {
+                *label = trimmed.to_owned();
+            }
+            true
+        });
+    }
+
     /// Platform config file path: `%APPDATA%\bowecho\config.json` on
     /// Windows, `$XDG_CONFIG_HOME`/`~/.config/...` on Linux,
     /// `~/Library/Application Support/...` on macOS.
@@ -2014,6 +2035,7 @@ impl AppSettings {
         let mut settings: Self =
             serde_json::from_str(&text).map_err(|error| PersistenceError::parse(path, error))?;
         settings.brand = settings.brand.normalized_for_load();
+        settings.normalize_radar_product_favorites();
         Ok(settings)
     }
 
@@ -2033,6 +2055,7 @@ impl AppSettings {
     pub fn from_json(text: &str) -> Self {
         let mut settings: Self = serde_json::from_str(text).unwrap_or_default();
         settings.brand = settings.brand.normalized_for_load();
+        settings.normalize_radar_product_favorites();
         settings
     }
 
@@ -4013,6 +4036,18 @@ mod tests {
                 .get("uh_2to5__prob_60")
                 .map(String::as_str),
             Some("My UH probability")
+        );
+    }
+
+    #[test]
+    fn radar_product_favorites_normalize_case_insensitive_duplicates_only() {
+        let restored = AppSettings::from_json(
+            r#"{"radar_product_favorites":[" REF ","ref","PHIF","temporarily-away","PHIF",""]}"#,
+        );
+
+        assert_eq!(
+            restored.radar_product_favorites,
+            ["REF", "PHIF", "temporarily-away"]
         );
     }
 

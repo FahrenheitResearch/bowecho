@@ -923,6 +923,7 @@ pub(crate) fn selection_for_installed_volume(
             allow_low_level_auto_advance,
             allow_incomplete_live_chunk_advance,
             require_complete_live_cut,
+            reanchor_low_follow: false,
             low_level_min_seconds: 60,
         },
     )
@@ -945,6 +946,20 @@ pub(crate) fn selection_for_installed_volume_with_low_sweep_min_seconds(
             volume,
             policy.allow_incomplete_live_chunk_advance,
             policy.low_level_min_seconds,
+        )
+    {
+        return (next_cut, previous_product.clone());
+    }
+    let reanchor_on_new_frame = previous_volume.is_none_or(|previous| {
+        frame_identity_for_volume(previous) != frame_identity_for_volume(volume)
+    });
+    if reanchor_on_new_frame
+        && policy.allow_low_level_auto_advance
+        && policy.reanchor_low_follow
+        && let Some(next_cut) = newest_timed_low_level_cut(
+            previous_product,
+            volume,
+            policy.allow_incomplete_live_chunk_advance,
         )
     {
         return (next_cut, previous_product.clone());
@@ -1011,6 +1026,32 @@ fn latest_newer_low_level_cut(
                 .then_some((cut_index, cut_time))
         })
         .max_by_key(|(_, cut_time)| *cut_time)
+        .map(|(cut_index, _)| cut_index)
+}
+
+fn newest_timed_low_level_cut(
+    product: &DisplayProduct,
+    volume: &RadarVolume,
+    allow_incomplete_live_chunk_advance: bool,
+) -> Option<usize> {
+    (0..volume.cuts.len())
+        .filter(|cut_index| {
+            volume.cuts.get(*cut_index).is_some_and(|cut| {
+                is_allowed_live_low_level_tilt_for_site(
+                    cut,
+                    &volume.site.id,
+                    allow_incomplete_live_chunk_advance,
+                ) && cut.elevation_deg <= LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG
+            }) && can_materialize_product_on_cut(volume, *cut_index, product)
+        })
+        .filter_map(|cut_index| {
+            cut_start_time_utc(volume, cut_index).map(|cut_time| (cut_index, cut_time))
+        })
+        .max_by(|(left_index, left_time), (right_index, right_time)| {
+            left_time
+                .cmp(right_time)
+                .then_with(|| left_index.cmp(right_index))
+        })
         .map(|(cut_index, _)| cut_index)
 }
 
@@ -1190,7 +1231,7 @@ pub(crate) fn can_materialize_product_on_live_candidate_cut(
                 .is_some_and(|cut| is_complete_live_candidate_tilt_for_site(cut, &volume.site.id)))
 }
 
-fn is_complete_live_candidate_tilt_for_site(cut: &ElevationCut, site_id: &str) -> bool {
+pub(crate) fn is_complete_live_candidate_tilt_for_site(cut: &ElevationCut, site_id: &str) -> bool {
     if is_live_low_level_tilt(cut) {
         is_complete_live_low_level_tilt_for_site(cut, site_id)
     } else {
@@ -1266,6 +1307,116 @@ pub(crate) fn archive_fetch_count_for_latest_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn low_follow_policy(
+        allow_incomplete_live_chunk_advance: bool,
+        reanchor_low_follow: bool,
+    ) -> VolumeSelectionPolicy {
+        VolumeSelectionPolicy {
+            allow_low_level_auto_advance: true,
+            allow_incomplete_live_chunk_advance,
+            require_complete_live_cut: false,
+            reanchor_low_follow,
+            low_level_min_seconds: 60,
+        }
+    }
+
+    #[test]
+    fn low_follow_reanchor_chooses_newest_compatible_timed_cut_not_highest_index() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let mut previous =
+            crate::tests::test_reflectivity_sails_volume_with_radials(&[(0.50, 60_000)], 720);
+        previous.site.id = "KTLX".to_owned();
+        let mut volume = crate::tests::test_reflectivity_sails_volume_with_radials(
+            &[
+                (0.50, 120_000),
+                (0.70, 300_000),
+                (0.60, 180_000),
+                (1.20, 420_000),
+            ],
+            720,
+        );
+        volume.site.id = "KOUN".to_owned();
+
+        assert_eq!(
+            selection_for_installed_volume_with_low_sweep_min_seconds(
+                Some(&previous),
+                0,
+                &product,
+                &volume,
+                low_follow_policy(false, true),
+            ),
+            (1, product),
+            "the newest timed cut at or below 1.10 degrees should win"
+        );
+    }
+
+    #[test]
+    fn low_follow_reanchor_respects_complete_cut_policy() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let volume = crate::tests::test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 120_000), (0.70, 300_000)],
+            240,
+        );
+
+        assert_eq!(
+            newest_timed_low_level_cut(&product, &volume, false),
+            None,
+            "chunk-only cuts must not be followed while incomplete updates are hidden"
+        );
+        assert_eq!(
+            newest_timed_low_level_cut(&product, &volume, true),
+            Some(1),
+            "the newest chunk may be followed when incomplete updates are visible"
+        );
+    }
+
+    #[test]
+    fn low_follow_reanchor_does_not_bypass_same_frame_minimum_gap() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let previous =
+            crate::tests::test_reflectivity_sails_volume_with_radials(&[(0.50, 120_000)], 720);
+        let volume = crate::tests::test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 120_000), (0.70, 150_000)],
+            720,
+        );
+
+        assert_eq!(
+            selection_for_installed_volume_with_low_sweep_min_seconds(
+                Some(&previous),
+                0,
+                &product,
+                &volume,
+                low_follow_policy(false, true),
+            ),
+            (0, product),
+            "a stale one-shot flag must not bypass the 60-second same-scan threshold"
+        );
+    }
+
+    #[test]
+    fn low_follow_reanchor_without_timed_candidate_falls_through() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let mut volume = crate::tests::test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 120_000), (0.70, 300_000)],
+            720,
+        );
+        for cut in &mut volume.cuts {
+            cut.radials.clear();
+        }
+
+        assert_eq!(
+            selection_for_installed_volume_with_low_sweep_min_seconds(
+                None,
+                1,
+                &product,
+                &volume,
+                low_follow_policy(true, true),
+            ),
+            (1, product),
+            "missing sweep times should retain the ordinary product/cut selection path"
+        );
+    }
 
     #[test]
     fn product_keyboard_step_wraps_display_products() {
