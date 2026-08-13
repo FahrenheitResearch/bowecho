@@ -10501,12 +10501,11 @@ fn retain_or_latest_remote_run(
     runs: &[crate::community_cache::RemoteRunCatalogEntry],
     latest_run: &str,
 ) -> (Option<String>, bool) {
-    if selection_explicit {
-        if let Some(selected) =
+    if selection_explicit
+        && let Some(selected) =
             selected.filter(|selected| runs.iter().any(|entry| &entry.run.run == selected))
-        {
-            return (Some(selected), true);
-        }
+    {
+        return (Some(selected), true);
     }
     (
         runs.iter()
