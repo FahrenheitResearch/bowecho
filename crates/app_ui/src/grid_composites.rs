@@ -611,16 +611,19 @@ fn selected_field_to_field_data(
 }
 
 fn sanitize_grid_composite_values(source: GridCompositeSource, values: &mut [f32]) {
-    if !matches!(
-        source,
+    let minimum = match source {
         GridCompositeSource::MrmsLowestAltitudeReflectivity
-            | GridCompositeSource::MrmsCompositeReflectivity
-            | GridCompositeSource::EumetnetOperaDbzh
-    ) {
-        return;
-    }
+        | GridCompositeSource::MrmsCompositeReflectivity => -25.0,
+        // rustwx-io deliberately maps ODIM `undetect` to this finite value:
+        // the network covered the cell and observed no echo. Applying MRMS's
+        // -25 dBZ plausibility floor here would collapse it back into NaN and
+        // undo the upstream no-coverage/no-echo distinction at BowEcho's
+        // production adapter boundary.
+        GridCompositeSource::EumetnetOperaDbzh => rustwx_io::OPERA_NO_ECHO_DBZ,
+        GridCompositeSource::ImgwPolradCmax { .. } => return,
+    };
     for value in values {
-        if !value.is_finite() || *value < -25.0 || *value > 95.0 {
+        if !value.is_finite() || *value < minimum || *value > 95.0 {
             *value = f32::NAN;
         }
     }
@@ -647,6 +650,30 @@ fn format_opera_time(time: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use rustwx_core::{CanonicalField, FieldSelector, GridShape, LatLonGrid, SelectedField2D};
+
+    #[test]
+    fn opera_no_echo_survives_without_weakening_the_mrms_floor() {
+        let no_echo = rustwx_io::OPERA_NO_ECHO_DBZ;
+        let mut opera = [no_echo - 0.5, no_echo, -32.0, 95.0, 95.5, f32::NAN];
+        sanitize_grid_composite_values(GridCompositeSource::EumetnetOperaDbzh, &mut opera);
+        assert!(
+            opera[0].is_nan(),
+            "values below the OPERA floor stay invalid"
+        );
+        assert_eq!(
+            opera[1], no_echo,
+            "ODIM undetect is observed clear air and must not collapse to no coverage"
+        );
+        assert_eq!(opera[2], -32.0);
+        assert_eq!(opera[3], 95.0);
+        assert!(opera[4].is_nan());
+        assert!(opera[5].is_nan());
+
+        let mut mrms = [no_echo, -25.0];
+        sanitize_grid_composite_values(GridCompositeSource::MrmsCompositeReflectivity, &mut mrms);
+        assert!(mrms[0].is_nan(), "the MRMS plausibility floor is unchanged");
+        assert_eq!(mrms[1], -25.0);
+    }
 
     #[test]
     fn imgw_source_slug_round_trips_site_and_quantity() {

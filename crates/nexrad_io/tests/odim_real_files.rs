@@ -65,6 +65,10 @@ fn real_bejab_pvol_decodes_site_geometry_and_gates() {
     assert_close(cut.elevation_deg, 0.3, 1e-5, "elangle");
     assert_eq!(cut.radials.len(), 360);
     assert_close(cut.radials[0].azimuth_deg, 0.5, 1e-5, "az0");
+    assert_eq!(
+        cut.radials[0].time_offset_ms, 237_000,
+        "dataset1 starts at 00:04:19, 237 seconds after the volume stamp"
+    );
     let gates = &cut.radials[0].gate_range;
     assert_eq!(
         (gates.first_gate_m, gates.gate_spacing_m, gates.gate_count),
@@ -87,6 +91,10 @@ fn real_bejab_pvol_decodes_site_geometry_and_gates() {
     // Top sweep changes geometry (25 deg, 300 gates) — chunk clipping etc.
     let top = &volume.cuts[10];
     assert_close(top.elevation_deg, 25.0, 1e-5, "top elangle");
+    assert_eq!(
+        top.radials[0].time_offset_ms, 0,
+        "dataset11 starts at the 00:00:22 volume stamp"
+    );
     assert_eq!(top.radials[0].gate_range.gate_count, 300);
     let top_dbzh = top.moments.get(&MomentType::Reflectivity).expect("DBZH");
     assert_close(
@@ -179,6 +187,10 @@ fn real_norst_pvol_reads_superblock_v1_and_half_degree_sweep() {
     let cut = &volume.cuts[0];
     assert_close(cut.elevation_deg, 0.5, 1e-5, "elangle");
     assert_eq!(cut.radials.len(), 720);
+    assert_eq!(
+        cut.radials[0].time_offset_ms, -60_000,
+        "a sweep declared before the nominal volume stamp retains its truthful negative offset"
+    );
     assert_close(cut.radials[0].azimuth_deg, 0.25, 1e-5, "az0");
     assert_close(cut.radials[1].azimuth_deg, 0.75, 1e-5, "az1");
     let gates = &cut.radials[0].gate_range;
@@ -201,6 +213,7 @@ fn real_norst_pvol_reads_superblock_v1_and_half_degree_sweep() {
     // Upper sweeps drop back to 360 rays and shorter ranges.
     let top = &volume.cuts[5];
     assert_close(top.elevation_deg, 9.4, 1e-5, "top elangle");
+    assert_eq!(top.radials[0].time_offset_ms, 142_000);
     assert_eq!(top.radials.len(), 360);
     assert_eq!(top.radials[0].gate_range.gate_count, 300);
     let top_dbzh = top.moments.get(&MomentType::Reflectivity).expect("DBZH");
@@ -250,6 +263,11 @@ fn real_espdg_pvol_decodes_v2_object_headers_end_to_end() {
     assert_eq!(volume.metadata.decoded_radial_count, 720);
     assert_close(volume.cuts[0].elevation_deg, 0.4998779, 1e-5, "el0");
     assert_close(volume.cuts[1].elevation_deg, 1.4996338, 1e-5, "el1");
+    assert_eq!(
+        volume.cuts[0].radials[0].time_offset_ms, 24_000,
+        "the elevation sort must not discard dataset2's later sweep timestamp"
+    );
+    assert_eq!(volume.cuts[1].radials[0].time_offset_ms, 0);
 
     for (label, cut) in [("0.5deg", &volume.cuts[0]), ("1.5deg", &volume.cuts[1])] {
         assert_eq!(cut.radials.len(), 360, "{label} rays");

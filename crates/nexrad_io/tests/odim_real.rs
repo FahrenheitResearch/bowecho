@@ -46,6 +46,18 @@ fn decodes_synthetic_odim_pvol() {
     assert_eq!(cut.radials[0].gate_range.gate_spacing_m, 150);
     assert_eq!(cut.radials[0].gate_range.gate_count, 25);
     assert_eq!(cut.radials[0].nyquist_velocity_mps, Some(48.0));
+    assert_eq!(cut.radials[0].time_offset_ms, 0);
+    assert_eq!(
+        volume.cuts[1].radials[0].time_offset_ms, 30_000,
+        "dataset2's declared sweep start must survive independently of the volume time"
+    );
+    assert!(
+        volume.cuts[1]
+            .radials
+            .iter()
+            .all(|radial| radial.time_offset_ms == 30_000),
+        "ODIM declares only the sweep start, so no per-ray timing should be invented"
+    );
 
     // DBZH (gzip-chunked u8): physical = 0.5·raw − 32.
     let dbzh = cut.moments.get(&MomentType::Reflectivity).expect("DBZH");

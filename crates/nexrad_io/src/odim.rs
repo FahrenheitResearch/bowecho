@@ -125,6 +125,9 @@ fn decode_sweep(
         .or(root_nyquist)
         .map(|value| value as f32)
         .filter(|value| *value > 0.0);
+    let sweep_what_path = format!("/{dataset}/what");
+    let sweep_start = parse_datetime_attrs(file, &sweep_what_path, "startdate", "starttime");
+    let sweep_start_offset_ms = sweep_start_offset_ms(&volume.volume_time, sweep_start);
 
     let mut data_names: Vec<String> = file
         .child_names(&format!("/{dataset}"))
@@ -165,7 +168,11 @@ fn decode_sweep(
         cut.radials.push(Radial {
             azimuth_deg: ((ray as f32 + 0.5) * 360.0 / nrays as f32).rem_euclid(360.0),
             elevation_deg: elangle,
-            time_offset_ms: 0,
+            // ODIM gives the sweep start, not a trustworthy timestamp for
+            // every stored ray. Carry that declared instant on every radial
+            // so the shared cut-start helper can distinguish repeated low
+            // tilts without inventing a within-sweep time distribution.
+            time_offset_ms: sweep_start_offset_ms,
             gate_range: gate_range.clone(),
             nyquist_velocity_mps: nyquist,
             radial_status: None,
@@ -561,11 +568,52 @@ fn site_identity_from_source(source: &str) -> (String, Option<String>) {
 }
 
 fn parse_datetime(file: &H5File<'_>, group: &str) -> Option<chrono::DateTime<Utc>> {
-    let date = file.attr(group, "date")?.as_str()?.to_owned();
-    let time = file.attr(group, "time")?.as_str()?.to_owned();
-    let date = NaiveDate::parse_from_str(&date, "%Y%m%d").ok()?;
-    let time = NaiveTime::parse_from_str(&time, "%H%M%S").ok()?;
+    parse_datetime_attrs(file, group, "date", "time")
+}
+
+fn parse_datetime_attrs(
+    file: &H5File<'_>,
+    group: &str,
+    date_attr: &str,
+    time_attr: &str,
+) -> Option<chrono::DateTime<Utc>> {
+    let date = file.attr(group, date_attr)?.as_str()?.to_owned();
+    let time = file.attr(group, time_attr)?.as_str()?.to_owned();
+    parse_odim_datetime(&date, &time)
+}
+
+fn parse_odim_datetime(date: &str, time: &str) -> Option<chrono::DateTime<Utc>> {
+    let date = NaiveDate::parse_from_str(date.trim(), "%Y%m%d").ok()?;
+    // HHMMSS is the ODIM spelling. A few writers omit zero seconds and ship
+    // HHMM, which is still unambiguous and is accepted by the upstream
+    // decoder too.
+    let time = NaiveTime::parse_from_str(time.trim(), "%H%M%S")
+        .or_else(|_| NaiveTime::parse_from_str(time.trim(), "%H%M"))
+        .ok()?;
     Some(Utc.from_utc_datetime(&NaiveDateTime::new(date, time)))
+}
+
+/// Milliseconds from the volume reference time to a declared sweep start.
+///
+/// Negative offsets are valid (some writers stamp the volume at the end or
+/// nominal minute of a scan). A malformed/missing timestamp, or a difference
+/// outside the shared model's signed 32-bit millisecond field, retains the
+/// historical zero-offset fallback instead of wrapping or clamping to a
+/// fabricated instant. `VolumeMetadata::compression = "odim-h5"` makes this
+/// relative convention explicit to BowEcho's cut-time adapter, so it remains
+/// exact even when a sweep crosses UTC midnight.
+fn sweep_start_offset_ms(
+    volume_time: &chrono::DateTime<Utc>,
+    sweep_start: Option<chrono::DateTime<Utc>>,
+) -> i32 {
+    sweep_start
+        .and_then(|start| {
+            start
+                .timestamp_millis()
+                .checked_sub(volume_time.timestamp_millis())
+        })
+        .and_then(|milliseconds| i32::try_from(milliseconds).ok())
+        .unwrap_or(0)
 }
 
 fn attr_f64(file: &H5File<'_>, path: &str, name: &str) -> Option<f64> {
@@ -680,6 +728,64 @@ mod tests {
         assert_eq!(id, "01104");
         let (id, _) = site_identity_from_source("CMT:whatever");
         assert_eq!(id, "ODIM");
+    }
+
+    #[test]
+    fn duplicate_tilts_keep_distinct_declared_sweep_start_offsets() {
+        let volume_time = Utc.with_ymd_and_hms(2026, 8, 12, 23, 35, 0).unwrap();
+        let starts = [
+            volume_time - chrono::Duration::seconds(12),
+            volume_time + chrono::Duration::seconds(41),
+        ];
+        let mut cuts = Vec::new();
+        for start in starts {
+            let mut cut = radar_core::ElevationCut::new(0.5, None);
+            cut.radials.push(Radial {
+                azimuth_deg: 0.5,
+                elevation_deg: 0.5,
+                time_offset_ms: sweep_start_offset_ms(&volume_time, Some(start)),
+                gate_range: GateRange {
+                    first_gate_m: 0,
+                    gate_spacing_m: 250,
+                    gate_count: 1,
+                },
+                nyquist_velocity_mps: None,
+                radial_status: None,
+            });
+            cuts.push(cut);
+        }
+
+        assert_eq!(cuts[0].elevation_deg, cuts[1].elevation_deg);
+        assert_eq!(cuts[0].radials[0].time_offset_ms, -12_000);
+        assert_eq!(cuts[1].radials[0].time_offset_ms, 41_000);
+    }
+
+    #[test]
+    fn sweep_start_timestamp_failures_fall_back_without_wrapping() {
+        let volume_time = Utc.with_ymd_and_hms(2026, 8, 12, 23, 35, 0).unwrap();
+
+        assert_eq!(sweep_start_offset_ms(&volume_time, None), 0);
+        assert_eq!(
+            sweep_start_offset_ms(
+                &volume_time,
+                Some(volume_time - chrono::Duration::milliseconds(1)),
+            ),
+            -1,
+            "a real negative offset is data, not an error"
+        );
+        assert_eq!(
+            sweep_start_offset_ms(&volume_time, Some(volume_time + chrono::Duration::days(25)),),
+            0,
+            "an i32 millisecond overflow must not wrap or clamp"
+        );
+
+        assert!(parse_odim_datetime("not-a-date", "233500").is_none());
+        assert!(parse_odim_datetime("20260812", "not-a-time").is_none());
+        assert_eq!(
+            parse_odim_datetime("20260812", "2335"),
+            Some(volume_time),
+            "the unambiguous HHMM writer variant remains usable"
+        );
     }
 
     #[test]

@@ -10,6 +10,8 @@ headers, old-style groups, fixed-length ASCII string attributes, gzip'd
 chunked 8-bit data planes.
 
 Volume: 2 elevations (0.5deg, 1.5deg), 36 rays x 25 bins, DBZH + VRADH.
+The sweeps begin at 05:51:00 and 05:51:30 UTC so the Rust test also pins
+per-sweep timestamps independently of the volume reference time.
 Values are deterministic ramps so the Rust test can assert exact samples:
   DBZH raw = (ray + bin) % 254 + 1, gain 0.5, offset -32 -> dBZ
   VRADH raw = (ray * 2 + bin) % 254 + 1, gain 0.1875, offset -24 -> m/s
@@ -57,7 +59,7 @@ def main() -> None:
             dwhat = ds.create_group("what")
             dwhat.attrs.create("product", s("SCAN"))
             dwhat.attrs.create("startdate", s("20260609"))
-            dwhat.attrs.create("starttime", s("055100"))
+            dwhat.attrs.create("starttime", s(("055100", "055130")[idx - 1]))
             dwhere = ds.create_group("where")
             dwhere.attrs.create("elangle", np.float64(elangle))
             dwhere.attrs.create("nbins", np.int64(nbins))
