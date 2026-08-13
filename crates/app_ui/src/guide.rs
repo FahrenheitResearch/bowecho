@@ -488,8 +488,9 @@ fn getting_started(ui: &mut egui::Ui) {
         "LOOP",
         "— under Site, set Frames to load before pressing Load Loop; this persisted count controls \
          how many recent radar scans BowEcho fetches and keeps for playback. Raise it and press \
-         Load Loop again to refill with more scans. After loading, use play/pause, step buttons, \
-         and the scrub slider. Video & GIF export settings only record already-loaded frames; they \
+         Load Loop again to refill with more scans. After loading, the always-visible frame strip \
+         shows each scan time and BUILDING/COMPLETE state; click a frame directly or use play/pause \
+         and the step buttons. Video & GIF export settings only record already-loaded frames; they \
          do not change the load count. Unified Player still supports the same limit up to 2000 frames.",
     );
 

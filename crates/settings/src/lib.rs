@@ -898,15 +898,15 @@ pub struct AppSettings {
     pub overlay_aircraft_soundings: bool,
     /// Draw the tropical-cyclone layer: active storm positions, forecast
     /// track, quadrant wind radii / 34-kt danger area (NHC + JTWC), and cone
-    /// of uncertainty (GDACS basins). Default ON — the map layer draws
-    /// nothing when no storms are active, so a quiet globe costs nothing.
-    #[serde(default = "default_true")]
+    /// of uncertainty (GDACS basins). Default off because enabling the layer
+    /// starts live NHC/GDACS/JTWC network work.
+    #[serde(default)]
     pub show_tropical: bool,
     /// Show the floating tropical storm-cards window while the tropical layer
     /// is on. Separate from `show_tropical` so the window's title-bar [✕]
     /// (mirrored here, like `show_radar_status`) closes just the cards without
     /// killing the map overlay.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub show_tropical_panel: bool,
     /// Live USAF/NOAA Hurricane Hunters aircraft tracks and flight-level wind
     /// barbs from the four official NHC HDOB bulletins. Default off so BowEcho
@@ -1784,8 +1784,8 @@ impl Default for AppSettings {
             eumetsat_loop_frames: default_eumetsat_loop_frames(),
             overlay_raob: false,
             overlay_aircraft_soundings: false,
-            show_tropical: true,
-            show_tropical_panel: true,
+            show_tropical: false,
+            show_tropical_panel: false,
             show_hurricane_hunters: false,
             show_radar_status: false,
             overlay_spc_outlooks: Vec::new(),
@@ -3304,16 +3304,15 @@ mod tests {
     }
 
     #[test]
-    fn tropical_layer_defaults_on_and_panel_flag_round_trips() {
-        // Audit #4: the marquee tropical layer used to be default-off and its
-        // cards window had no close button. The layer (and its cards window)
-        // now default ON — including for a pre-existing settings file that
-        // predates the keys — and the window's [✕] persists into
-        // `show_tropical_panel` without touching the map overlay toggle.
-        assert!(AppSettings::default().show_tropical);
-        assert!(AppSettings::default().show_tropical_panel);
-        assert!(AppSettings::from_json("{}").show_tropical);
-        assert!(AppSettings::from_json("{}").show_tropical_panel);
+    fn tropical_layer_defaults_off_and_panel_flag_round_trips() {
+        // A fresh or legacy config must not opt into live tropical-network
+        // work or open a floating window. The two controls still round-trip
+        // independently for settings/export compatibility; the desktop
+        // startup policy requires a fresh explicit opt-in each run.
+        assert!(!AppSettings::default().show_tropical);
+        assert!(!AppSettings::default().show_tropical_panel);
+        assert!(!AppSettings::from_json("{}").show_tropical);
+        assert!(!AppSettings::from_json("{}").show_tropical_panel);
         assert!(!AppSettings::from_json("{}").show_hurricane_hunters);
 
         let settings = AppSettings {

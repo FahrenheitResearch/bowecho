@@ -1283,7 +1283,7 @@ impl ViewerApp {
         if ui
             .checkbox(&mut self.app_settings.show_tropical, "Tropical cyclones")
             .on_hover_text(
-                "Show active hurricanes/typhoons worldwide (NHC + GDACS + JTWC): a storm-card panel with wind, pressure, and motion, plus each storm's position, forecast track with per-point intensity, and official 34/50/64-kt wind radii with the gale danger area (NHC and JTWC storms) or the cone of uncertainty (other basins) on the map. Draws nothing when no storms are active.",
+                "Off and network-idle on every launch. Enable for this session to fetch and show active hurricanes/typhoons worldwide (NHC + GDACS + JTWC): storm cards, positions, forecast tracks, intensity, wind radii, and uncertainty areas.",
             )
             .changed()
         {

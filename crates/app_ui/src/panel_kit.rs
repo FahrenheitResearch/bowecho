@@ -33,8 +33,8 @@ pub(crate) const CHIP_MIN_W: f32 = 52.0;
 /// Always-visible compact strips should remain compact on unusually wide
 /// sidebars instead of stretching a handful of chips into giant buttons.
 pub(crate) const BALANCED_CHIP_MAX_W: f32 = 96.0;
-/// Windows opened by `gear_window` lay their kit rows out at least this
-/// wide (kit row math yields a usable label column at this width).
+/// Windows opened by `gear_window` / `button_window` lay their kit rows out
+/// at least this wide (kit row math yields a usable label column here).
 pub(crate) const POPOVER_MIN_W: f32 = 260.0;
 
 // Layer-rail row columns (wave 2): the rail aligns by construction — the
@@ -435,10 +435,32 @@ fn gear_window_impl<R>(
     title: &str,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> (egui::Response, Option<R>) {
-    let button = ui.button("⚙").on_hover_text(title.to_owned());
+    let (button, result) = button_window_impl(ui, "⚙", title, body);
+    (button.on_hover_text(title.to_owned()), result)
+}
+
+/// Text-button counterpart to [`gear_window`]. Use this whenever a compact
+/// panel action needs to contain a ComboBox or any other popup: the body lives
+/// in a real window, so opening the nested popup cannot dismiss its parent.
+pub(crate) fn button_window<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> (egui::Response, Option<R>) {
+    button_window_impl(ui, label, title, body)
+}
+
+fn button_window_impl<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> (egui::Response, Option<R>) {
+    let button = ui.button(label);
     let ctx = ui.ctx().clone();
-    let open_id = button.id.with("gear_window_open");
-    let window_id = button.id.with("gear_window");
+    let open_id = button.id.with("button_window_open");
+    let window_id = button.id.with("button_window");
     let mut open = ctx.data(|data| data.get_temp::<bool>(open_id).unwrap_or(false));
     if button.clicked() {
         open = !open;
@@ -598,10 +620,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gear_window_stays_open_while_using_a_combo_box() {
+    fn button_window_stays_open_while_using_a_combo_box() {
         #[derive(Default)]
         struct FrameState {
-            gear_rect: Option<egui::Rect>,
+            button_rect: Option<egui::Rect>,
             combo_rect: Option<egui::Rect>,
             second_option_rect: Option<egui::Rect>,
             body_rendered: bool,
@@ -633,17 +655,18 @@ mod tests {
         fn frame(ctx: &egui::Context, input: egui::RawInput, selection: &mut usize) -> FrameState {
             let mut state = FrameState::default();
             let _ = ctx.run_ui(input, |ui| {
-                let (gear, body) = gear_window_impl(ui, "Loop settings", |ui| {
-                    let combo = egui::ComboBox::from_id_salt("gear_window_test_combo")
-                        .selected_text(format!("{} frames", *selection))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(selection, 24, "24 frames");
-                            let second = ui.selectable_value(selection, 48, "48 frames");
-                            state.second_option_rect = Some(second.rect);
-                        });
-                    state.combo_rect = Some(combo.response.rect);
-                });
-                state.gear_rect = Some(gear.rect);
+                let (button, body) =
+                    button_window_impl(ui, "Colors...", "Radar color table", |ui| {
+                        let combo = egui::ComboBox::from_id_salt("button_window_test_combo")
+                            .selected_text(format!("{} frames", *selection))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(selection, 24, "24 frames");
+                                let second = ui.selectable_value(selection, 48, "48 frames");
+                                state.second_option_rect = Some(second.rect);
+                            });
+                        state.combo_rect = Some(combo.response.rect);
+                    });
+                state.button_rect = Some(button.rect);
                 state.body_rendered = body.is_some();
             });
             state
@@ -659,15 +682,15 @@ mod tests {
 
         let initial = frame(&ctx, raw_input(Vec::new()), &mut selection);
         assert!(!initial.body_rendered);
-        let gear_center = initial
-            .gear_rect
-            .expect("gear button must be laid out")
+        let button_center = initial
+            .button_rect
+            .expect("chooser button must be laid out")
             .center();
 
-        let clicked_open = click(&ctx, gear_center, &mut selection);
+        let clicked_open = click(&ctx, button_center, &mut selection);
         assert!(
             clicked_open.body_rendered,
-            "gear click must open the settings window"
+            "button click must open the chooser window"
         );
         let opened = frame(&ctx, raw_input(Vec::new()), &mut selection);
         assert!(

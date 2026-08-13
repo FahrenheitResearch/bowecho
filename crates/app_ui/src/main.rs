@@ -1469,6 +1469,22 @@ fn load_startup_settings_report() -> settings::LoadedAppSettings {
     )
 }
 
+/// Live tropical sources are a per-session opt-in. Older builds wrote `true`
+/// for both fields even when the user had never touched the controls, so a
+/// saved `true` cannot be treated as informed permission to start background
+/// NHC/GDACS/JTWC requests on the next launch.
+fn apply_tropical_startup_policy(settings: &mut settings::AppSettings) {
+    settings.show_tropical = false;
+    settings.show_tropical_panel = false;
+}
+
+/// The one gate used by the frame loop before it schedules tropical-network
+/// work. Keeping this separate makes the startup/no-network contract directly
+/// testable without launching a real HTTP worker.
+fn tropical_data_visible(settings: &settings::AppSettings, map_pane_active: bool) -> bool {
+    settings.show_tropical && (map_pane_active || settings.show_tropical_panel)
+}
+
 /// BowEcho's tile-layer knobs: exactly the values tiles.rs hardcoded before
 /// the ui_core extraction (miniderecho-spec §13 Task 1.3) — zero behavior
 /// change; `BOWECHO_TILE_DEBUG` keeps working.
@@ -9555,6 +9571,7 @@ impl ViewerApp {
             settings: mut app_settings,
             status: app_settings_load_status,
         } = loaded_app_settings;
+        apply_tropical_startup_policy(&mut app_settings);
         // Dedicated CIG layers duplicate the CIG regions already included in
         // SPC's ordinary categorical/probabilistic products. Drop stale saved
         // selections now that those duplicate controls are no longer exposed.
@@ -21685,8 +21702,7 @@ impl eframe::App for ViewerApp {
         self.poll_archive_listing(&ctx);
         self.poll_intl_archive_listing(&ctx);
         let map_pane_active = self.workspace.is_pane_active(dock::WorkspacePane::Map);
-        let tropical_visible = self.app_settings.show_tropical
-            && (map_pane_active || self.app_settings.show_tropical_panel);
+        let tropical_visible = tropical_data_visible(&self.app_settings, map_pane_active);
         self.tropical.maybe_refresh(&ctx, tropical_visible);
         self.tropical.poll();
         self.tropical.hurricane_hunters.maybe_refresh(
@@ -26198,11 +26214,11 @@ impl ViewerApp {
             .to_owned();
         let current_label = product_picker_long_label(editing_product);
         panel_kit::row(ui, "Current", |ui| {
-            ui.menu_button("Colors...", |ui| {
-                self.active_product_color_picker(ui, ctx, editing_product);
-            })
-            .response
-            .on_hover_text(format!(
+            let (colors_button, _) =
+                panel_kit::button_window(ui, "Colors...", "Radar color table", |ui| {
+                    self.active_product_color_picker(ui, ctx, editing_product)
+                });
+            colors_button.on_hover_text(format!(
                 "Choose or edit the {table_name} color table used by the current product"
             ));
             ui.add(egui::Label::new(current_label.clone()).truncate())
@@ -26612,20 +26628,41 @@ impl ViewerApp {
     }
 
     fn radar_quick_playback_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if let Some(slot) = self.focused_extra_pane_loop_slot() {
-            // Independent panes retain their dedicated transport. Their loop
-            // state is separate, so routing through the established panel is
-            // safer and clearer than presenting the primary controls.
-            self.extra_pane_frame_history_panel(ui, ctx, slot);
-            return;
-        }
-        if self.primary.history.is_empty() {
+        // Keep the quick surface compact for both the primary view and a
+        // focused independent pane. The detailed status/record/sweep controls
+        // remain in Advanced; this surface owns transport plus one directly
+        // clickable, horizontally bounded frame strip.
+        let target = self
+            .focused_extra_pane_loop_slot()
+            .map(LoopTimelineTarget::ExtraPane)
+            .unwrap_or(LoopTimelineTarget::Primary);
+        let (frame_count, selected_frame_index, history_playing) = match target {
+            LoopTimelineTarget::Primary => (
+                self.primary.history.len(),
+                self.primary.cursor.index,
+                self.primary.cursor.playing,
+            ),
+            LoopTimelineTarget::ExtraPane(slot) => {
+                let Some(pane) = self.extra_panes.get(slot) else {
+                    return;
+                };
+                (
+                    pane.engine.history.len(),
+                    pane.engine.cursor.index,
+                    pane.engine.cursor.playing,
+                )
+            }
+        };
+        if frame_count == 0 {
             ui.weak("No history loaded - choose Loop / History above");
             return;
         }
 
-        let frame_count = self.primary.history.len();
-        let can_play = self.primary_history_loop_can_step();
+        let selected_frame_index = selected_frame_index.min(frame_count - 1);
+        let can_play = match target {
+            LoopTimelineTarget::Primary => self.primary_history_loop_can_step(),
+            LoopTimelineTarget::ExtraPane(slot) => self.extra_pane_history_loop_can_step(slot),
+        };
         let mut timeline_step_delta = None;
         let mut next_frame_index = None;
         ui.horizontal(|ui| {
@@ -26637,18 +26674,21 @@ impl ViewerApp {
             {
                 timeline_step_delta = Some(-1);
             }
-            let play_label = if self.primary.cursor.playing {
-                "Pause"
-            } else {
-                "Play"
-            };
+            let play_label = if history_playing { "Pause" } else { "Play" };
             if ui
                 .add_enabled_ui(can_play, |ui| fixed_action_button(ui, play_label, 54.0))
                 .inner
                 .on_hover_text("Play or pause loaded history (Space)")
                 .clicked()
             {
-                self.toggle_history_playback(ctx);
+                match target {
+                    LoopTimelineTarget::Primary => {
+                        self.toggle_history_playback(ctx);
+                    }
+                    LoopTimelineTarget::ExtraPane(slot) => {
+                        self.toggle_extra_pane_history_playback(slot, ctx);
+                    }
+                }
             }
             if ui
                 .add_enabled_ui(frame_count > 1, |ui| fixed_action_button(ui, ">", 28.0))
@@ -26658,34 +26698,63 @@ impl ViewerApp {
             {
                 timeline_step_delta = Some(1);
             }
-            ui.weak(self.loop_timeline_position_label(LoopTimelineTarget::Primary));
-            self.loop_speed_combo_ui(ui, ctx, "radar_quick_loop_speed");
+            ui.weak(self.loop_timeline_position_label(target));
+            let speed_id = match target {
+                LoopTimelineTarget::Primary => egui::Id::new("radar_quick_loop_speed"),
+                LoopTimelineTarget::ExtraPane(slot) => {
+                    egui::Id::new(("radar_quick_loop_speed", slot))
+                }
+            };
+            self.loop_speed_combo_ui(ui, ctx, speed_id);
         });
 
-        let mut slider_index = self.primary.cursor.index.min(frame_count - 1);
-        if ui
-            .add_enabled_ui(frame_count > 1, |ui| {
-                ui.spacing_mut().slider_width =
-                    (ui.available_width() - PANEL_BUTTON_HEIGHT).max(panel_kit::SLIDER_TRACK_MIN_W);
-                ui.add(egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false))
-            })
-            .inner
-            .on_hover_text("Scrub loaded radar history")
-            .changed()
-        {
-            next_frame_index = Some(slider_index);
+        let strip_id = match target {
+            LoopTimelineTarget::Primary => egui::Id::new("radar_quick_frame_strip"),
+            LoopTimelineTarget::ExtraPane(slot) => egui::Id::new(("radar_quick_frame_strip", slot)),
+        };
+        let time_zone = self.time_zone();
+        let now_utc = Utc::now();
+        let clicked_frame = match target {
+            LoopTimelineTarget::Primary => compact_loaded_frame_strip(
+                ui,
+                &self.primary.history,
+                selected_frame_index,
+                time_zone,
+                now_utc,
+                strip_id,
+            ),
+            LoopTimelineTarget::ExtraPane(slot) => self.extra_panes.get(slot).and_then(|pane| {
+                compact_loaded_frame_strip(
+                    ui,
+                    &pane.engine.history,
+                    selected_frame_index,
+                    time_zone,
+                    now_utc,
+                    strip_id,
+                )
+            }),
+        };
+        if let Some(index) = clicked_frame {
+            next_frame_index = Some(index);
         }
 
         if let Some(delta) = timeline_step_delta {
-            let _ = self.select_relative_timeline_step_for_target(
-                LoopTimelineTarget::Primary,
-                delta,
-                ctx,
-            );
+            let _ = self.select_relative_timeline_step_for_target(target, delta, ctx);
         } else if let Some(index) = next_frame_index {
-            self.primary.cursor.playing = false;
-            self.select_history_frame(index, false, ctx);
-            self.primary.cursor.browsing = index + 1 < self.primary.history.len();
+            match target {
+                LoopTimelineTarget::Primary => {
+                    self.primary.cursor.playing = false;
+                    self.select_history_frame(index, false, ctx);
+                    self.primary.cursor.browsing = index + 1 < self.primary.history.len();
+                }
+                LoopTimelineTarget::ExtraPane(slot) => {
+                    if let Some(pane) = self.extra_panes.get_mut(slot) {
+                        pane.engine.cursor.playing = false;
+                        pane.engine.cursor.browsing = index + 1 < pane.engine.history.len();
+                    }
+                    self.select_extra_pane_history_frame(slot, index, ctx);
+                }
+            }
         }
     }
 
@@ -50379,6 +50448,107 @@ fn live_chunk_readout_row(ui: &mut egui::Ui, readout: Option<String>) -> egui::R
     ui.add(egui::Label::new(egui::RichText::new(text).weak()).truncate())
 }
 
+const COMPACT_PLAYBACK_FRAME_WIDTH: f32 = 88.0;
+const COMPACT_PLAYBACK_FRAME_HEIGHT: f32 = 40.0;
+
+fn compact_loaded_frame_strip(
+    ui: &mut egui::Ui,
+    frames: &[FrameHistoryEntry],
+    selected_index: usize,
+    time_zone: DisplayTimeZone,
+    now_utc: DateTime<Utc>,
+    strip_id: egui::Id,
+) -> Option<usize> {
+    if frames.is_empty() {
+        return None;
+    }
+
+    let selected_index = selected_index.min(frames.len() - 1);
+    let selected_signature = (
+        selected_index,
+        frames[selected_index]
+            .identity
+            .scan_time_utc
+            .timestamp_millis(),
+    );
+    let selection_memory_id = strip_id.with("selected_frame");
+    let selection_changed = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<(usize, i64)>(selection_memory_id);
+        data.insert_temp(selection_memory_id, selected_signature);
+        previous != Some(selected_signature)
+    });
+
+    let mut clicked_index = None;
+    egui::ScrollArea::horizontal()
+        .id_salt(strip_id)
+        .auto_shrink([false, true])
+        .max_height(COMPACT_PLAYBACK_FRAME_HEIGHT + 12.0)
+        .stick_to_right(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (index, frame) in frames.iter().enumerate() {
+                    let selected = index == selected_index;
+                    let label = compact_playback_frame_label(
+                        frame.identity.scan_time_utc,
+                        frame.status,
+                        selected,
+                        time_zone,
+                    );
+                    let mut text = egui::RichText::new(label).monospace();
+                    if selected {
+                        text = text.strong();
+                    }
+                    let response = ui.add_sized(
+                        egui::vec2(
+                            COMPACT_PLAYBACK_FRAME_WIDTH,
+                            COMPACT_PLAYBACK_FRAME_HEIGHT,
+                        ),
+                        egui::Button::selectable(selected, text),
+                    );
+                    if selected && selection_changed {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    let selected_label = if selected { "Selected " } else { "" };
+                    if response
+                        .on_hover_text(format!(
+                            "{selected_label}frame {} of {}\n{}\nClick, or focus with Tab and press Enter/Space. Shift+wheel or drag the bar to scan loaded frames.",
+                            index + 1,
+                            frames.len(),
+                            frame_status_text(frame, now_utc, time_zone)
+                        ))
+                        .clicked()
+                    {
+                        clicked_index = Some(index);
+                    }
+                }
+            });
+        });
+    clicked_index
+}
+
+fn playback_frame_completion_label(status: FrameStatus) -> &'static str {
+    match status {
+        FrameStatus::Local => "LOCAL",
+        FrameStatus::Preview | FrameStatus::LivePartial => "BUILDING",
+        FrameStatus::LiveComplete | FrameStatus::Complete => "COMPLETE",
+        FrameStatus::Stale => "STALE",
+    }
+}
+
+fn compact_playback_frame_label(
+    scan_time_utc: DateTime<Utc>,
+    status: FrameStatus,
+    selected: bool,
+    time_zone: DisplayTimeZone,
+) -> String {
+    let selected_marker = if selected { "\u{25b6}" } else { "" };
+    format!(
+        "{selected_marker}{}\n{}",
+        time_zone.format_hm(scan_time_utc),
+        playback_frame_completion_label(status)
+    )
+}
+
 fn compact_frame_label(
     frame: &FrameHistoryEntry,
     now_utc: DateTime<Utc>,
@@ -50778,6 +50948,41 @@ fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_frame_completion_labels_partial_data_as_building_only() {
+        for status in [FrameStatus::Preview, FrameStatus::LivePartial] {
+            assert_eq!(playback_frame_completion_label(status), "BUILDING");
+        }
+        for status in [FrameStatus::LiveComplete, FrameStatus::Complete] {
+            assert_eq!(playback_frame_completion_label(status), "COMPLETE");
+        }
+        assert_eq!(playback_frame_completion_label(FrameStatus::Local), "LOCAL");
+        assert_eq!(playback_frame_completion_label(FrameStatus::Stale), "STALE");
+    }
+
+    #[test]
+    fn compact_playback_frame_label_exposes_time_status_and_textual_selection() {
+        let scan_time = Utc.with_ymd_and_hms(2026, 8, 13, 17, 58, 45).unwrap();
+        assert_eq!(
+            compact_playback_frame_label(
+                scan_time,
+                FrameStatus::LivePartial,
+                true,
+                DisplayTimeZone::Utc,
+            ),
+            "\u{25b6}17:58Z\nBUILDING"
+        );
+        assert_eq!(
+            compact_playback_frame_label(
+                scan_time,
+                FrameStatus::Complete,
+                false,
+                DisplayTimeZone::Utc,
+            ),
+            "17:58Z\nCOMPLETE"
+        );
+    }
 
     #[test]
     fn floating_window_accent_tints_surface_and_owns_title_and_outline() {
@@ -77224,6 +77429,33 @@ mod tests {
     }
 
     #[test]
+    fn tropical_startup_keeps_window_closed_and_network_idle() {
+        let fresh = settings::AppSettings::default();
+        assert!(!fresh.show_tropical);
+        assert!(!fresh.show_tropical_panel);
+        assert!(!tropical_data_visible(&fresh, true));
+
+        // Previous releases persisted these true by default, so even an old
+        // settings document that says "on" must begin the new session quiet.
+        let mut restored = settings::AppSettings {
+            show_tropical: true,
+            show_tropical_panel: true,
+            ..Default::default()
+        };
+        apply_tropical_startup_policy(&mut restored);
+        assert!(!restored.show_tropical);
+        assert!(!restored.show_tropical_panel);
+
+        let ctx = egui::Context::default();
+        let mut tropical = tropical::TropicalState::default();
+        tropical.maybe_refresh(&ctx, tropical_data_visible(&restored, true));
+        assert!(
+            !tropical.is_fetching(),
+            "normal startup must not spawn a tropical data worker"
+        );
+    }
+
+    #[test]
     fn workflow_preset_records_current_marker() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
@@ -77440,6 +77672,13 @@ mod tests {
         assert!(app.show_inspector_card);
         assert!(app.app_settings.show_tropical);
         assert!(app.app_settings.show_tropical_panel);
+        assert!(
+            tropical_data_visible(
+                &app.app_settings,
+                app.workspace.is_pane_active(dock::WorkspacePane::Map),
+            ),
+            "the explicit tropical workflow must arm the frame-loop fetch gate"
+        );
 
         app.restore_previous_workflow(&ctx);
 
