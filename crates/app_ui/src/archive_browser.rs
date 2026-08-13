@@ -678,6 +678,7 @@ impl ViewerApp {
                                     label: &display.chip,
                                     hotkey: None,
                                     selected: false,
+                                    enabled: true,
                                     hover: Some(display.hover.clone()),
                                 })
                                 .collect::<Vec<_>>();
@@ -884,6 +885,7 @@ impl ViewerApp {
                                         label: &display.chip,
                                         hotkey: None,
                                         selected: false,
+                                        enabled: true,
                                         hover: Some(format!(
                                             "{} · {}",
                                             display.hover,

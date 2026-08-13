@@ -30,6 +30,9 @@ pub(crate) const VALUE_SLOT_MAX_CHARS: usize = 7;
 pub(crate) const SLIDER_TRACK_MIN_W: f32 = 70.0;
 /// Minimum selectable-chip width; chips grow from here to fill the row.
 pub(crate) const CHIP_MIN_W: f32 = 52.0;
+/// Always-visible compact strips should remain compact on unusually wide
+/// sidebars instead of stretching a handful of chips into giant buttons.
+pub(crate) const BALANCED_CHIP_MAX_W: f32 = 96.0;
 /// Windows opened by `gear_window` lay their kit rows out at least this
 /// wide (kit row math yields a usable label column at this width).
 pub(crate) const POPOVER_MIN_W: f32 = 260.0;
@@ -72,6 +75,31 @@ pub(crate) fn chip_width(available: f32, spacing: f32, columns: usize) -> f32 {
     ((available - spacing * (columns as f32 - 1.0)) / columns as f32)
         .floor()
         .max(1.0)
+}
+
+/// Row lengths for a compact chip grid whose rows stay visually balanced.
+///
+/// The ordinary [`chip_grid_columns`] deliberately packs as many fixed-width
+/// slots as possible. This variant first chooses the minimum number of rows
+/// needed at that capacity, then spreads the chips evenly across those rows.
+/// Consequently adjacent row lengths differ by at most one and a final
+/// one-chip orphan is avoided whenever the balanced rows can hold at least
+/// two chips (including every 300..900 pt panel-width budget).
+pub(crate) fn balanced_chip_grid_row_lengths(
+    available: f32,
+    spacing: f32,
+    chip_count: usize,
+) -> Vec<usize> {
+    if chip_count == 0 {
+        return Vec::new();
+    }
+    let max_columns = chip_grid_columns(available, spacing).min(chip_count);
+    let rows = chip_count.div_ceil(max_columns);
+    let short_row = chip_count / rows;
+    let long_rows = chip_count % rows;
+    (0..rows)
+        .map(|row| short_row + usize::from(row < long_rows))
+        .collect()
 }
 
 /// Slider track width inside a kit slider row: whatever the control column
@@ -232,6 +260,7 @@ pub(crate) struct Chip<'a> {
     /// Optional weak hotkey prefix (e.g. the product hotkey digit).
     pub hotkey: Option<&'a str>,
     pub selected: bool,
+    pub enabled: bool,
     pub hover: Option<String>,
 }
 
@@ -245,43 +274,114 @@ pub(crate) fn chip_grid(ui: &mut egui::Ui, chips: &[Chip<'_>]) -> Option<usize> 
     let spacing = ui.spacing().item_spacing.x;
     let available = ui.available_width();
     let columns = chip_grid_columns(available, spacing);
+    chip_grid_with_columns(ui, chips, columns, available, spacing)
+}
+
+/// A compact chip grid that preserves the same width budget as [`chip_grid`]
+/// while spreading chips across the minimum number of balanced rows. Use this
+/// for short, always-visible tool strips where a one-chip final row would look
+/// accidental; the established [`chip_grid`] packing remains unchanged.
+pub(crate) fn balanced_chip_grid(ui: &mut egui::Ui, chips: &[Chip<'_>]) -> Option<usize> {
+    if chips.is_empty() {
+        return None;
+    }
+    let spacing = ui.spacing().item_spacing.x;
+    let available = ui.available_width();
+    let row_lengths = balanced_chip_grid_row_lengths(available, spacing, chips.len());
+    let label_font = egui::TextStyle::Button.resolve(ui.style());
+    let hotkey_font = egui::FontId::proportional((label_font.size - 2.0).max(9.0));
+    let mut clicked = None;
+    let mut start = 0;
+    for row_len in row_lengths {
+        let end = start + row_len;
+        let width = chip_width(available, spacing, row_len).min(BALANCED_CHIP_MAX_W);
+        chip_row(
+            ui,
+            &chips[start..end],
+            width,
+            start,
+            &label_font,
+            &hotkey_font,
+            &mut clicked,
+        );
+        start = end;
+    }
+    clicked
+}
+
+fn chip_grid_with_columns(
+    ui: &mut egui::Ui,
+    chips: &[Chip<'_>],
+    columns: usize,
+    available: f32,
+    spacing: f32,
+) -> Option<usize> {
     let width = chip_width(available, spacing, columns);
     let label_font = egui::TextStyle::Button.resolve(ui.style());
     let hotkey_font = egui::FontId::proportional((label_font.size - 2.0).max(9.0));
-    let label_color = ui.visuals().text_color();
-    let hotkey_color = ui.visuals().weak_text_color();
     let mut clicked = None;
     for (chunk_index, chunk) in chips.chunks(columns).enumerate() {
-        ui.horizontal(|ui| {
-            for (offset, chip) in chunk.iter().enumerate() {
-                let mut text = egui::text::LayoutJob::default();
-                if let Some(hotkey) = chip.hotkey {
-                    text.append(
-                        hotkey,
-                        0.0,
-                        egui::TextFormat::simple(hotkey_font.clone(), hotkey_color),
-                    );
-                }
-                text.append(
-                    chip.label,
-                    if chip.hotkey.is_some() { 3.0 } else { 0.0 },
-                    egui::TextFormat::simple(label_font.clone(), label_color),
-                );
-                let mut response = ui.add_sized(
-                    egui::vec2(width, ROW_H),
-                    egui::Button::selectable(chip.selected, egui::WidgetText::from(text))
-                        .wrap_mode(egui::TextWrapMode::Truncate),
-                );
-                if let Some(hover) = &chip.hover {
-                    response = response.on_hover_text(hover);
-                }
-                if response.clicked() {
-                    clicked = Some(chunk_index * columns + offset);
-                }
-            }
-        });
+        chip_row(
+            ui,
+            chunk,
+            width,
+            chunk_index * columns,
+            &label_font,
+            &hotkey_font,
+            &mut clicked,
+        );
     }
     clicked
+}
+
+fn chip_row(
+    ui: &mut egui::Ui,
+    chips: &[Chip<'_>],
+    width: f32,
+    index_offset: usize,
+    label_font: &egui::FontId,
+    hotkey_font: &egui::FontId,
+    clicked: &mut Option<usize>,
+) {
+    ui.horizontal(|ui| {
+        for (offset, chip) in chips.iter().enumerate() {
+            let label_color = if chip.enabled {
+                ui.visuals().text_color()
+            } else {
+                ui.visuals().weak_text_color()
+            };
+            let hotkey_color = ui.visuals().weak_text_color();
+            let mut text = egui::text::LayoutJob::default();
+            if let Some(hotkey) = chip.hotkey {
+                text.append(
+                    hotkey,
+                    0.0,
+                    egui::TextFormat::simple(hotkey_font.clone(), hotkey_color),
+                );
+            }
+            text.append(
+                chip.label,
+                if chip.hotkey.is_some() { 3.0 } else { 0.0 },
+                egui::TextFormat::simple(label_font.clone(), label_color),
+            );
+            let button = egui::Button::selectable(chip.selected, egui::WidgetText::from(text))
+                .wrap_mode(egui::TextWrapMode::Truncate);
+            let mut response = if chip.enabled {
+                // Preserve chip_grid's established layout path exactly for
+                // enabled chips; only disabled chips need a scoped Ui.
+                ui.add_sized(egui::vec2(width, ROW_H), button)
+            } else {
+                ui.add_enabled_ui(false, |ui| ui.add_sized(egui::vec2(width, ROW_H), button))
+                    .inner
+            };
+            if let Some(hover) = &chip.hover {
+                response = response.on_hover_text(hover);
+            }
+            if response.clicked() {
+                *clicked = Some(index_offset + offset);
+            }
+        }
+    });
 }
 
 /// Kit 5 — Up-to-two-line small monospace weak status text; each line truncates
@@ -432,6 +532,30 @@ pub(crate) fn subgroup<R>(
     right: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(section_title(title))
+                .size(11.0)
+                .strong()
+                .color(subhead_color()),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right)
+            .inner
+    })
+    .inner
+}
+
+/// Ruled, non-collapsible subgroup header for dense always-visible controls.
+/// The subtle hairline provides a stronger boundary than [`subgroup`] while
+/// the uppercase title and optional right-aligned action retain the same
+/// visual language as the rest of the panel kit.
+pub(crate) fn ruled_subgroup<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    right: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.add_space(6.0);
+    section_rule(ui);
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(section_title(title))
@@ -621,6 +745,119 @@ mod tests {
         // Degenerate width still yields a single (clamped) column.
         assert_eq!(chip_grid_columns(10.0, 4.0), 1);
         assert!(chip_width(10.0, 4.0, 1) >= 1.0);
+    }
+
+    #[test]
+    fn balanced_chip_grid_avoids_orphan_rows_across_panel_widths() {
+        let spacing = 4.0;
+        let cases = [
+            (300.0, 6, vec![3, 3]),
+            (300.0, 11, vec![4, 4, 3]),
+            (380.0, 7, vec![4, 3]),
+            (380.0, 13, vec![5, 4, 4]),
+            (900.0, 17, vec![9, 8]),
+            (900.0, 33, vec![11, 11, 11]),
+        ];
+
+        for (available, chip_count, expected) in cases {
+            let rows = balanced_chip_grid_row_lengths(available, spacing, chip_count);
+            assert_eq!(rows, expected, "unexpected rows at {available}pt");
+            assert_eq!(rows.iter().sum::<usize>(), chip_count);
+            assert_ne!(rows.last(), Some(&1), "orphan row at {available}pt");
+            let shortest = *rows.iter().min().expect("non-empty row plan");
+            let longest = *rows.iter().max().expect("non-empty row plan");
+            assert!(longest - shortest <= 1, "unbalanced rows at {available}pt");
+
+            for columns in rows {
+                assert!(columns <= chip_grid_columns(available, spacing));
+                let width = chip_width(available, spacing, columns);
+                assert!(width >= CHIP_MIN_W);
+                let row_width = width * columns as f32 + spacing * (columns as f32 - 1.0);
+                assert!(row_width <= available, "row overflows at {available}pt");
+            }
+        }
+
+        assert!(balanced_chip_grid_row_lengths(300.0, spacing, 0).is_empty());
+        assert_eq!(balanced_chip_grid_row_lengths(300.0, spacing, 1), vec![1]);
+        assert_eq!(
+            chip_width(900.0, spacing, 6).min(BALANCED_CHIP_MAX_W),
+            BALANCED_CHIP_MAX_W,
+            "a six-chip mini strip must stay compact on a wide sidebar"
+        );
+    }
+
+    #[test]
+    fn disabled_chip_does_not_report_a_click() {
+        #[derive(Default)]
+        struct FrameState {
+            chip_rect: Option<egui::Rect>,
+            clicked: Option<usize>,
+        }
+
+        fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(240.0, 120.0),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn pointer_input(position: egui::Pos2, pressed: bool) -> egui::RawInput {
+            raw_input(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ])
+        }
+
+        fn frame(ctx: &egui::Context, input: egui::RawInput, enabled: bool) -> FrameState {
+            let mut state = FrameState::default();
+            let _ = ctx.run_ui(input, |ui| {
+                ui.set_min_width(100.0);
+                ui.set_max_width(100.0);
+                let chips = [Chip {
+                    label: "REF",
+                    hotkey: Some("1"),
+                    selected: false,
+                    enabled,
+                    hover: Some("Base reflectivity".to_owned()),
+                }];
+                let response = ui.scope(|ui| balanced_chip_grid(ui, &chips));
+                state.chip_rect = Some(response.response.rect);
+                state.clicked = response.inner;
+            });
+            state
+        }
+
+        fn click(ctx: &egui::Context, position: egui::Pos2, enabled: bool) -> FrameState {
+            let _ = frame(ctx, pointer_input(position, true), enabled);
+            frame(ctx, pointer_input(position, false), enabled)
+        }
+
+        let disabled_ctx = egui::Context::default();
+        let disabled = frame(&disabled_ctx, raw_input(Vec::new()), false);
+        let disabled_click = click(
+            &disabled_ctx,
+            disabled.chip_rect.expect("chip must be laid out").center(),
+            false,
+        );
+        assert_eq!(disabled_click.clicked, None);
+
+        let enabled_ctx = egui::Context::default();
+        let enabled = frame(&enabled_ctx, raw_input(Vec::new()), true);
+        let enabled_click = click(
+            &enabled_ctx,
+            enabled.chip_rect.expect("chip must be laid out").center(),
+            true,
+        );
+        assert_eq!(enabled_click.clicked, Some(0));
     }
 
     #[test]

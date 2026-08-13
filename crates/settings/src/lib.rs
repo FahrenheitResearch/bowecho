@@ -763,8 +763,9 @@ pub struct AppSettings {
     pub favorites: Vec<String>,
     /// Favorite radar products, stored by variant-qualified stable keys (for
     /// example `moment:REF`, `display:DSRV`, and `derived:ET`). Legacy bare
-    /// short labels remain readable by the app.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// short labels remain readable by the app. Missing legacy/fresh settings
+    /// receive the default mini strip; an explicit empty list remains empty.
+    #[serde(default = "default_radar_product_favorites")]
     pub radar_product_favorites: Vec<String>,
     /// Favorite WoFS base products, stored by the official API slug so a
     /// temporarily unavailable product remains favorited for later runs.
@@ -1237,10 +1238,12 @@ pub struct AppSettings {
     /// and computed advanced products when they want a raw-moment-only row.
     #[serde(default = "default_true")]
     pub show_derived_products: bool,
-    /// Use the compact pre-v0.34.2 product chip grid instead of the
-    /// categorized full-name browser. This changes presentation only; both
-    /// layouts expose the same products and selection behavior.
-    #[serde(default)]
+    /// Use the Classic full product browser: the compact pre-v0.34.2 chip
+    /// grid instead of the categorized full-name browser. Classic is the
+    /// fresh/missing-settings default; an explicitly persisted false keeps
+    /// the Modern categorized browser. Both layouts expose the same products
+    /// and selection behavior.
+    #[serde(default = "default_true")]
     pub classic_product_picker: bool,
     /// During live updates, advance to each newly completed low-level sweep
     /// instead of waiting for a scan-separated low-level revisit.
@@ -1695,6 +1698,21 @@ pub fn default_product_hotkeys() -> BTreeMap<String, String> {
     .collect()
 }
 
+/// Default typed product keys for the always-visible mini Quick Products strip.
+pub fn default_radar_product_favorites() -> Vec<String> {
+    [
+        "moment:REF",
+        "moment:VEL",
+        "display:SRV",
+        "moment:RHO",
+        "moment:ZDR",
+        "moment:SW",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 fn default_model_keep_runs() -> u8 {
     2
 }
@@ -1781,7 +1799,7 @@ impl Default for AppSettings {
             startup_site: None,
             display_owner_site: None,
             favorites: Vec::new(),
-            radar_product_favorites: Vec::new(),
+            radar_product_favorites: default_radar_product_favorites(),
             wofs_product_favorites: Vec::new(),
             wofs_product_aliases: BTreeMap::new(),
             polling_interval_seconds: 60,
@@ -1858,7 +1876,7 @@ impl Default for AppSettings {
             loop_sweep_control: None,
             remember_product_tilts: true,
             show_derived_products: true,
-            classic_product_picker: false,
+            classic_product_picker: true,
             live_low_sweep_auto_advance: false,
             live_low_sweep_auto_advance_seconds: default_live_low_sweep_auto_advance_seconds(),
             show_center_crosshair: false,
@@ -3363,7 +3381,7 @@ mod tests {
         assert_eq!(old.loop_sweep_control, None);
         assert!(old.remember_product_tilts);
         assert!(old.show_derived_products);
-        assert!(!old.classic_product_picker);
+        assert!(old.classic_product_picker);
         assert!(!old.live_low_sweep_auto_advance);
         assert_eq!(
             old.live_low_sweep_auto_advance_seconds,
@@ -3379,7 +3397,7 @@ mod tests {
             loop_low_sweep_filter: "base".to_owned(),
             remember_product_tilts: false,
             show_derived_products: false,
-            classic_product_picker: true,
+            classic_product_picker: false,
             live_low_sweep_auto_advance: true,
             live_low_sweep_auto_advance_seconds: 10,
             show_center_crosshair: true,
@@ -3395,10 +3413,20 @@ mod tests {
         assert_eq!(back.loop_sweep_control, None);
         assert!(!back.remember_product_tilts);
         assert!(!back.show_derived_products);
-        assert!(back.classic_product_picker);
+        assert!(!back.classic_product_picker);
         assert!(back.live_low_sweep_auto_advance);
         assert_eq!(back.live_low_sweep_auto_advance_seconds, 10);
         assert!(back.show_center_crosshair);
+    }
+
+    #[test]
+    fn classic_product_picker_defaults_on_but_preserves_explicit_modern() {
+        assert!(AppSettings::default().classic_product_picker);
+        assert!(AppSettings::from_json("{}").classic_product_picker);
+
+        let modern = AppSettings::from_json(r#"{"classic_product_picker":false}"#);
+        assert!(!modern.classic_product_picker);
+        assert!(!AppSettings::from_json(&modern.to_json()).classic_product_picker);
     }
 
     #[test]
@@ -4037,6 +4065,40 @@ mod tests {
                 .get("uh_2to5__prob_60")
                 .map(String::as_str),
             Some("My UH probability")
+        );
+    }
+
+    #[test]
+    fn radar_product_favorites_default_only_when_the_key_is_missing() {
+        assert_eq!(
+            AppSettings::from_json("{}").radar_product_favorites,
+            default_radar_product_favorites()
+        );
+
+        let cleared = AppSettings::from_json(r#"{"radar_product_favorites":[]}"#);
+        assert!(cleared.radar_product_favorites.is_empty());
+        let cleared_json = cleared.to_json();
+        assert!(cleared_json.contains(r#""radar_product_favorites": []"#));
+        assert!(
+            AppSettings::from_json(&cleared_json)
+                .radar_product_favorites
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn radar_product_favorites_preserve_explicit_custom_order() {
+        let restored = AppSettings::from_json(
+            r#"{"radar_product_favorites":["moment:ZDR","display:SRV","moment:REF"]}"#,
+        );
+
+        assert_eq!(
+            restored.radar_product_favorites,
+            ["moment:ZDR", "display:SRV", "moment:REF"]
+        );
+        assert_eq!(
+            AppSettings::from_json(&restored.to_json()).radar_product_favorites,
+            restored.radar_product_favorites
         );
     }
 

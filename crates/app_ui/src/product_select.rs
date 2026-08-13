@@ -310,6 +310,102 @@ pub(crate) fn radar_product_favorite_caption(
     format!("{label} ({qualifier})")
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RadarQuickProductEntry {
+    pub caption: String,
+    pub product: Option<DisplayProduct>,
+}
+
+fn unavailable_radar_product_favorite_caption(favorite: &str) -> String {
+    let favorite = favorite.trim();
+    let Some((prefix, value)) = favorite.split_once(':') else {
+        return favorite.to_ascii_uppercase();
+    };
+    if !["moment", "display", "derived"]
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(prefix))
+    {
+        return favorite.to_ascii_uppercase();
+    }
+    if let Some(encoded) = value.get("unknown=".len()..).filter(|_| {
+        value
+            .get(.."unknown=".len())
+            .is_some_and(|marker| marker.eq_ignore_ascii_case("unknown="))
+    }) {
+        let decoded = (encoded.len().is_multiple_of(2))
+            .then(|| {
+                encoded
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        std::str::from_utf8(pair)
+                            .ok()
+                            .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        decoded
+            .filter(|label| !label.trim().is_empty())
+            .map_or_else(|| "CUSTOM".to_owned(), |label| label.to_ascii_uppercase())
+    } else {
+        value.to_ascii_uppercase()
+    }
+}
+
+fn radar_product_favorite_variant_caption(favorite: &str) -> &'static str {
+    let Some((prefix, value)) = favorite.trim().split_once(':') else {
+        return "legacy";
+    };
+    if prefix.eq_ignore_ascii_case("derived") {
+        "derived"
+    } else if prefix.eq_ignore_ascii_case("display") {
+        "display"
+    } else if prefix.eq_ignore_ascii_case("moment")
+        && value
+            .get(.."unknown=".len())
+            .is_some_and(|marker| marker.eq_ignore_ascii_case("unknown="))
+    {
+        "custom moment"
+    } else {
+        "moment"
+    }
+}
+
+/// Resolve the persisted mini-strip in exact saved order. Missing products
+/// stay in the result with `product = None` so a radar with fewer moments does
+/// not make the strip reflow or silently discard a user's customization.
+pub(crate) fn radar_quick_product_entries(
+    favorites: &[String],
+    products: &[DisplayProduct],
+) -> Vec<RadarQuickProductEntry> {
+    let mut entries = favorites
+        .iter()
+        .map(|favorite| {
+            let product = resolve_radar_product_favorite(favorite, products).cloned();
+            let caption = product.as_ref().map_or_else(
+                || unavailable_radar_product_favorite_caption(favorite),
+                |product| radar_product_favorite_caption(product, products),
+            );
+            RadarQuickProductEntry { caption, product }
+        })
+        .collect::<Vec<_>>();
+    for index in 0..entries.len() {
+        let duplicate = entries.iter().enumerate().any(|(candidate, entry)| {
+            candidate != index && entry.caption.eq_ignore_ascii_case(&entries[index].caption)
+        });
+        if duplicate {
+            entries[index].caption = format!(
+                "{} ({})",
+                entries[index].caption,
+                radar_product_favorite_variant_caption(&favorites[index])
+            );
+        }
+    }
+    entries
+}
+
 fn known_hideable_products() -> Vec<DisplayProduct> {
     let mut products = DerivedProduct::ALL
         .into_iter()
@@ -1817,6 +1913,63 @@ mod tests {
         assert_eq!(
             radar_product_favorite_key(&DisplayProduct::StormRelativeDealiasedVelocity),
             "display:DSRV"
+        );
+    }
+
+    #[test]
+    fn mini_product_entries_keep_saved_order_and_unavailable_slots() {
+        let reflectivity = DisplayProduct::Moment(MomentType::Reflectivity);
+        let composite = DisplayProduct::Derived(DerivedProduct::CompositeReflectivity);
+        let products = vec![reflectivity.clone(), composite.clone()];
+        let favorites = vec![
+            "derived:CREF".to_owned(),
+            "moment:REF".to_owned(),
+            "display:SRV".to_owned(),
+            "moment:unknown=524546".to_owned(),
+        ];
+
+        let entries = radar_quick_product_entries(&favorites, &products);
+        assert_eq!(
+            entries,
+            vec![
+                RadarQuickProductEntry {
+                    caption: "CREF".to_owned(),
+                    product: Some(composite),
+                },
+                RadarQuickProductEntry {
+                    caption: "REF (moment)".to_owned(),
+                    product: Some(reflectivity),
+                },
+                RadarQuickProductEntry {
+                    caption: "SRV".to_owned(),
+                    product: None,
+                },
+                RadarQuickProductEntry {
+                    caption: "REF (custom moment)".to_owned(),
+                    product: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn mini_product_entries_qualify_colliding_available_and_unavailable_products() {
+        let composite = DisplayProduct::Derived(DerivedProduct::CompositeReflectivity);
+        let products = vec![composite.clone()];
+        let favorites = vec!["derived:CREF".to_owned(), "moment:CREF".to_owned()];
+
+        assert_eq!(
+            radar_quick_product_entries(&favorites, &products),
+            vec![
+                RadarQuickProductEntry {
+                    caption: "CREF (derived)".to_owned(),
+                    product: Some(composite),
+                },
+                RadarQuickProductEntry {
+                    caption: "CREF (moment)".to_owned(),
+                    product: None,
+                },
+            ]
         );
     }
 

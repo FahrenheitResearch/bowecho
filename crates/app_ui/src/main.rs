@@ -306,6 +306,7 @@ use product_select::product_hotkey_sort_key;
 use product_select::radar_product_favorite_caption;
 use product_select::radar_product_favorite_key;
 use product_select::radar_product_matches_favorite;
+use product_select::radar_quick_product_entries;
 use product_select::resolve_radar_product_favorite;
 use product_select::selected_cut_render_data_unchanged;
 #[cfg(test)]
@@ -26054,88 +26055,12 @@ impl ViewerApp {
         editing_product: &DisplayProduct,
         product_buttons: &[(DisplayProduct, Option<usize>)],
     ) {
-        let mut picked_product = editing_product.clone();
-        let original_product = picked_product.clone();
-        panel_kit::row(ui, "Product", |ui| {
-            egui::ComboBox::from_id_salt(("radar_quick_product", editing_pane))
-                .selected_text(product_picker_long_label(editing_product))
-                .width((ui.available_width() - 8.0).max(180.0))
-                .show_ui(ui, |ui| {
-                    ui.set_min_width(280.0);
-                    for group in ProductPickerGroup::ALL {
-                        let products = product_buttons
-                            .iter()
-                            .filter(|(product, _)| product_picker_group(product) == group)
-                            .collect::<Vec<_>>();
-                        if products.is_empty() {
-                            continue;
-                        }
-                        ui.strong(group.label());
-                        for (product, _) in products {
-                            ui.selectable_value(
-                                &mut picked_product,
-                                product.clone(),
-                                product_picker_long_label(product),
-                            );
-                        }
-                    }
-                });
-        });
-        if picked_product != original_product {
-            let changed = if let Some(slot) = editing_pane {
-                self.switch_pane_product(slot, picked_product)
-            } else {
-                self.switch_primary_product(picked_product)
-            };
-            if changed {
-                ctx.request_repaint();
-            }
-        }
-
-        let table_name = self
-            .active_table_for_product(editing_product)
-            .name()
-            .to_owned();
-        ui.horizontal_wrapped(|ui| {
-            ui.weak(format!(
-                "Active: {}",
-                product_display_label(editing_product)
-            ));
-            ui.menu_button(format!("Color table: {table_name}"), |ui| {
-                self.active_product_color_picker(ui, ctx, editing_product);
-            })
-            .response
-            .on_hover_text("Choose or edit the color table used by the active radar product");
-        });
-
-        self.radar_quick_favorites_controls(
-            ui,
-            ctx,
-            editing_pane,
-            editing_product,
-            product_buttons,
-        );
-    }
-
-    fn radar_quick_favorites_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        editing_pane: Option<usize>,
-        editing_product: &DisplayProduct,
-        product_buttons: &[(DisplayProduct, Option<usize>)],
-    ) {
         let available_products = product_buttons
             .iter()
             .map(|(product, _)| product.clone())
             .collect::<Vec<_>>();
-        let canonical_available =
-            |key: &str| resolve_radar_product_favorite(key, &available_products).cloned();
         let favorites = self.app_settings.radar_product_favorites.clone();
-        let available_favorites = favorites
-            .iter()
-            .filter_map(|label| canonical_available(label))
-            .collect::<Vec<_>>();
+        let quick_entries = radar_quick_product_entries(&favorites, &available_products);
         let editing_key = radar_product_favorite_key(editing_product);
         let editing_is_favorite = favorites.iter().any(|favorite| {
             radar_product_matches_favorite(favorite, editing_product, &available_products)
@@ -26144,47 +26069,36 @@ impl ViewerApp {
         let mut add_or_remove_current = None;
         let mut edit_action = None;
 
-        ui.horizontal_wrapped(|ui| {
-            ui.weak("Quick products");
-            if available_favorites.is_empty() {
-                if ui.small_button("Add current").clicked() {
-                    add_or_remove_current = Some(true);
-                }
-            } else {
-                for product in &available_favorites {
-                    if ui
-                        .selectable_label(
-                            editing_product == product,
-                            radar_product_favorite_caption(product, &available_products),
-                        )
-                        .on_hover_text(product_picker_long_label(product))
-                        .clicked()
-                    {
-                        picked_product = Some(product.clone());
-                    }
-                }
+        panel_kit::ruled_subgroup(ui, "Products", |ui| {
+            ui.menu_button("Edit...", |ui| {
                 if ui
-                    .small_button(if editing_is_favorite {
+                    .button(if editing_is_favorite {
                         "Remove current"
                     } else {
-                        "+ Current"
+                        "Add current"
+                    })
+                    .on_hover_text(if editing_is_favorite {
+                        "Remove the current product from the mini product strip"
+                    } else {
+                        "Add the current product to the end of the mini product strip"
                     })
                     .clicked()
                 {
                     add_or_remove_current = Some(!editing_is_favorite);
+                    ui.close();
                 }
-            }
-            ui.menu_button("Edit", |ui| {
+                ui.separator();
                 if favorites.is_empty() {
-                    ui.weak("No saved quick products");
+                    ui.weak("No saved mini products");
                 }
-                for (index, key) in favorites.iter().enumerate() {
+                for (index, _key) in favorites.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        let display = canonical_available(key)
-                            .map(|product| {
-                                radar_product_favorite_caption(&product, &available_products)
-                            })
-                            .unwrap_or_else(|| format!("{key} (unavailable)"));
+                        let entry = &quick_entries[index];
+                        let display = if entry.product.is_some() {
+                            entry.caption.clone()
+                        } else {
+                            format!("{} (unavailable)", entry.caption)
+                        };
                         ui.label(display);
                         if ui.add_enabled(index > 0, egui::Button::new("Up")).clicked() {
                             edit_action = Some((index, -1_i8));
@@ -26200,7 +26114,99 @@ impl ViewerApp {
                         }
                     });
                 }
-            });
+            })
+            .response
+            .on_hover_text("Add, remove, or reorder the always-visible mini product strip");
+
+            ui.menu_button("All...", |ui| {
+                ui.set_min_width(280.0);
+                for group in ProductPickerGroup::ALL {
+                    let products = product_buttons
+                        .iter()
+                        .filter(|(product, _)| product_picker_group(product) == group)
+                        .collect::<Vec<_>>();
+                    if products.is_empty() {
+                        continue;
+                    }
+                    ui.strong(group.label());
+                    for (product, _) in products {
+                        if ui
+                            .selectable_label(
+                                editing_product == product,
+                                product_picker_long_label(product),
+                            )
+                            .clicked()
+                        {
+                            picked_product = Some(product.clone());
+                            ui.close();
+                        }
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Choose from every product available on this radar volume");
+        });
+
+        if quick_entries.is_empty() {
+            ui.weak("No mini products saved - use Edit... to add the current product.");
+        } else {
+            let hotkeys = quick_entries
+                .iter()
+                .map(|entry| {
+                    entry.product.as_ref().and_then(|product| {
+                        self.app_settings
+                            .product_hotkeys
+                            .iter()
+                            .find(|(_, label)| label.eq_ignore_ascii_case(product.label()))
+                            .map(|(key, _)| key.clone())
+                    })
+                })
+                .collect::<Vec<_>>();
+            let chips = quick_entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| panel_kit::Chip {
+                    label: &entry.caption,
+                    hotkey: hotkeys[index].as_deref(),
+                    selected: entry.product.as_ref() == Some(editing_product),
+                    enabled: entry.product.is_some(),
+                    hover: Some(entry.product.as_ref().map_or_else(
+                        || {
+                            format!(
+                                "{} is saved but unavailable for this radar; its position is preserved",
+                                entry.caption
+                            )
+                        },
+                        |product| {
+                            let mut hover = product_picker_long_label(product);
+                            if let Some(key) = hotkeys[index].as_deref() {
+                                hover.push_str(&format!("\nHotkey: {key}"));
+                            }
+                            hover
+                        },
+                    )),
+                })
+                .collect::<Vec<_>>();
+            if let Some(index) = panel_kit::balanced_chip_grid(ui, &chips) {
+                picked_product = quick_entries[index].product.clone();
+            }
+        }
+
+        let table_name = self
+            .active_table_for_product(editing_product)
+            .name()
+            .to_owned();
+        let current_label = product_picker_long_label(editing_product);
+        panel_kit::row(ui, "Current", |ui| {
+            ui.menu_button("Colors...", |ui| {
+                self.active_product_color_picker(ui, ctx, editing_product);
+            })
+            .response
+            .on_hover_text(format!(
+                "Choose or edit the {table_name} color table used by the current product"
+            ));
+            ui.add(egui::Label::new(current_label.clone()).truncate())
+                .on_hover_text(current_label);
         });
 
         if let Some(add) = add_or_remove_current {
@@ -26270,6 +26276,33 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         }
+    }
+
+    fn radar_unloaded_quick_product_controls(&self, ui: &mut egui::Ui) {
+        panel_kit::ruled_subgroup(ui, "Products", |_| {});
+        let favorites = &self.app_settings.radar_product_favorites;
+        let entries = radar_quick_product_entries(favorites, &[]);
+        if entries.is_empty() {
+            ui.weak("No mini products saved.");
+        } else {
+            let chips = entries
+                .iter()
+                .map(|entry| panel_kit::Chip {
+                    label: &entry.caption,
+                    hotkey: None,
+                    selected: false,
+                    enabled: false,
+                    hover: Some(format!(
+                        "{} is saved; load a radar to select it",
+                        entry.caption
+                    )),
+                })
+                .collect::<Vec<_>>();
+            let _ = panel_kit::balanced_chip_grid(ui, &chips);
+        }
+        panel_kit::row(ui, "Current", |ui| {
+            ui.add_enabled(false, egui::Button::new("Load a radar to choose a product"));
+        });
     }
 
     fn radar_quick_source_controls(
@@ -26368,36 +26401,37 @@ impl ViewerApp {
         let mut load_newest = false;
         let mut load_loop = false;
         panel_kit::row(ui, "Mode", |ui| {
-            load_newest = ui
-                .selectable_label(!history_mode, "Newest / Live")
-                .on_hover_text("Load the newest scan and optionally keep following live updates")
-                .clicked();
-            load_loop = ui
-                .selectable_label(history_mode, "Loop / History")
-                .on_hover_text(format!(
-                    "Load up to {} recent scans for playback",
-                    self.primary.limits.frame_limit
-                ))
-                .clicked();
-
+            // panel_kit::row is right-to-left: emit Auto, History, Live so
+            // the visible order reads conventionally from left to right.
             if let Some(slot) = independent_pane {
                 if let Some(pane) = self.extra_panes.get_mut(slot) {
-                    ui.checkbox(&mut pane.engine.live.enabled, "Auto-live")
+                    ui.checkbox(&mut pane.engine.live.enabled, "Auto")
                         .on_hover_text("Keep this pane on incoming radar scans");
                 }
             } else if self.intl_source_owns_primary_display() {
                 let mut live = self.poll_active;
                 if ui
-                    .checkbox(&mut live, "Auto-live")
+                    .checkbox(&mut live, "Auto")
                     .on_hover_text("Pause or resume live polling for this international radar")
                     .changed()
                 {
                     self.set_intl_poll_paused(!live);
                 }
             } else {
-                ui.checkbox(&mut self.primary.live.enabled, "Auto-live")
+                ui.checkbox(&mut self.primary.live.enabled, "Auto")
                     .on_hover_text("Keep the primary radar on incoming scans");
             }
+            load_loop = ui
+                .selectable_label(history_mode, "History")
+                .on_hover_text(format!(
+                    "Load up to {} recent scans for playback",
+                    self.primary.limits.frame_limit
+                ))
+                .clicked();
+            load_newest = ui
+                .selectable_label(!history_mode, "Live")
+                .on_hover_text("Load the newest scan and optionally keep following live updates")
+                .clicked();
         });
 
         if load_newest || load_loop {
@@ -26473,25 +26507,27 @@ impl ViewerApp {
             .and_then(|rows| rows.iter().find(|row| row.product_compatible))
             .map(|row| row.index);
         let mut picked_cut = None;
+        let selected_text = cut_rows
+            .get(selected_position)
+            .map(|row| {
+                format!(
+                    "{:.2} deg  ({}/{})",
+                    row.elevation_deg,
+                    row.index + 1,
+                    row.total
+                )
+            })
+            .unwrap_or_else(|| "No compatible tilt".to_owned());
         panel_kit::row(ui, "Tilt", |ui| {
+            // panel_kit::row is right-to-left: emit Higher, picker, Lower so
+            // the visible order is Lower -> selected tilt -> Higher.
             if ui
-                .add_enabled(lower.is_some(), egui::Button::new("Lower"))
-                .on_hover_text("Select the next lower product-compatible tilt")
+                .add_enabled(higher.is_some(), egui::Button::new("Higher"))
+                .on_hover_text("Select the next higher product-compatible tilt")
                 .clicked()
             {
-                picked_cut = lower;
+                picked_cut = higher;
             }
-            let selected_text = cut_rows
-                .get(selected_position)
-                .map(|row| {
-                    format!(
-                        "{:.2} deg  ({}/{})",
-                        row.elevation_deg,
-                        row.index + 1,
-                        row.total
-                    )
-                })
-                .unwrap_or_else(|| "No compatible tilt".to_owned());
             egui::ComboBox::from_id_salt(("radar_quick_tilt", editing_pane))
                 .selected_text(selected_text)
                 .width(118.0)
@@ -26519,11 +26555,11 @@ impl ViewerApp {
                     }
                 });
             if ui
-                .add_enabled(higher.is_some(), egui::Button::new("Higher"))
-                .on_hover_text("Select the next higher product-compatible tilt")
+                .add_enabled(lower.is_some(), egui::Button::new("Lower"))
+                .on_hover_text("Select the next lower product-compatible tilt")
                 .clicked()
             {
-                picked_cut = higher;
+                picked_cut = lower;
             }
         });
         if editing_pane.is_none() {
@@ -26723,16 +26759,15 @@ impl ViewerApp {
         if let Some((products, _)) = &quick_data {
             self.radar_quick_product_controls(ui, ctx, editing_pane, &editing_product, products);
         } else {
-            panel_kit::row(ui, "Product", |ui| {
-                ui.add_enabled(false, egui::Button::new("Load a radar to choose a product"));
-            });
+            self.radar_unloaded_quick_product_controls(ui);
         }
 
+        panel_kit::ruled_subgroup(ui, "Source", |_| {});
         self.radar_quick_source_controls(ui, ctx, independent_pane);
 
         let Some(volume) = active_volume else {
             ui.weak("Choose a site, then load Newest / Live or Loop / History.");
-            panel_kit::subgroup(ui, "Advanced", |_| {});
+            panel_kit::ruled_subgroup(ui, "Advanced", |_| {});
             self.remembered_section(
                 ui,
                 "radar_advanced_site",
@@ -26752,9 +26787,10 @@ impl ViewerApp {
         let volume = volume.as_ref();
         let (product_buttons, cut_rows) = quick_data.expect("volume and quick radar data agree");
 
+        panel_kit::ruled_subgroup(ui, "Tilt", |_| {});
         self.radar_quick_tilt_controls(ui, ctx, editing_pane, &cut_rows);
 
-        panel_kit::subgroup(ui, "Playback", |_| {});
+        panel_kit::ruled_subgroup(ui, "Playback", |_| {});
         self.radar_quick_playback_controls(ui, ctx);
 
         let layer_count = self.rail_layer_count();
@@ -26768,7 +26804,7 @@ impl ViewerApp {
             self.sidebar_tab = SidebarTab::Layers;
         }
 
-        panel_kit::subgroup(ui, "Advanced", |_| {});
+        panel_kit::ruled_subgroup(ui, "Advanced", |_| {});
         self.remembered_section(
             ui,
             "radar_advanced_workspace",
@@ -27210,7 +27246,11 @@ impl ViewerApp {
                         label: product_display_label(product),
                         hotkey,
                         selected: editing_product == product,
-                        hover: hotkey.map(|key| format!("hotkey {key}")),
+                        enabled: true,
+                        hover: Some(hotkey.map_or_else(
+                            || product_picker_long_label(product),
+                            |key| format!("{}\nHotkey: {key}", product_picker_long_label(product)),
+                        )),
                     }
                 })
                 .collect::<Vec<_>>();

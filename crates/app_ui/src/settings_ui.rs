@@ -1474,34 +1474,38 @@ impl ViewerApp {
     fn radar_product_settings_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         panel_kit::row(ui, "Browser layout", |ui| {
             let selected = if self.app_settings.classic_product_picker {
-                "Classic compact"
+                "Classic full browser (default)"
             } else {
-                "Modern categorized"
+                "Modern categorized browser"
             };
             let mut picked = None;
             egui::ComboBox::from_id_salt("radar_product_browser_layout")
                 .selected_text(selected)
-                .width(158.0)
+                .width(208.0)
                 .show_ui(ui, |ui| {
                     if ui
                         .selectable_label(
-                            !self.app_settings.classic_product_picker,
-                            "Modern categorized",
-                        )
-                        .on_hover_text("Full product names grouped into collapsible families")
-                        .clicked()
-                    {
-                        picked = Some(false);
-                    }
-                    if ui
-                        .selectable_label(
                             self.app_settings.classic_product_picker,
-                            "Classic compact",
+                            "Classic full browser (default)",
                         )
-                        .on_hover_text("Pre-v0.34.2 abbreviation chips in a wrapping grid")
+                        .on_hover_text(
+                            "Full product catalog as compact pre-v0.34.2 abbreviation chips in a wrapping grid",
+                        )
                         .clicked()
                     {
                         picked = Some(true);
+                    }
+                    if ui
+                        .selectable_label(
+                            !self.app_settings.classic_product_picker,
+                            "Modern categorized browser",
+                        )
+                        .on_hover_text(
+                            "Explicit alternate with full product names grouped into collapsible families",
+                        )
+                        .clicked()
+                    {
+                        picked = Some(false);
                     }
                 });
             if let Some(classic) = picked
@@ -1513,7 +1517,7 @@ impl ViewerApp {
             }
         });
         ui.weak(
-            "Layout changes presentation only; product availability, hotkeys, lazy computation, and pane selections remain identical.",
+            "This selects the full catalog browser, separate from the always-visible mini Quick Products strip. Product availability, hotkeys, lazy computation, and pane selections remain identical.",
         );
 
         let mut show_more = self.app_settings.show_derived_products;

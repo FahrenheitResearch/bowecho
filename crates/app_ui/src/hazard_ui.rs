@@ -152,6 +152,7 @@ impl ViewerApp {
                     label,
                     hotkey: None,
                     selected: !self.hidden_hazard_families.contains(family),
+                    enabled: true,
                     hover: Some(format!("Show {family} alerts on the map and in the list")),
                 })
                 .collect::<Vec<_>>();
@@ -182,6 +183,7 @@ impl ViewerApp {
                             .hidden_hazard_watch_types
                             .iter()
                             .any(|hidden| hidden.eq_ignore_ascii_case(watch_type)),
+                    enabled: true,
                     hover: Some(if watch_type == "pds" {
                         "Show PDS watches even when the general Watch family is hidden".to_owned()
                     } else {
@@ -701,6 +703,7 @@ impl ViewerApp {
                         label,
                         hotkey: None,
                         selected: on,
+                        enabled: true,
                         hover: Some("Outlook kind — drawn in SPC's own colors".to_owned()),
                     }
                 })
@@ -710,6 +713,7 @@ impl ViewerApp {
                 label: "Reports",
                 hotkey: None,
                 selected: app.spc_reports_enabled,
+                enabled: true,
                 hover: Some(
                     "Today's filtered storm reports (tornado / wind / hail) — same state as the Map-tab row"
                         .to_owned(),
@@ -720,6 +724,7 @@ impl ViewerApp {
                 label: "ESTOFEX Europe",
                 hotkey: None,
                 selected: estofex_on,
+                enabled: true,
                 hover: Some(
                     "ESTOFEX European Storm Forecast Experiment outlooks, with issue selection separate from SPC day"
                         .to_owned(),

@@ -464,11 +464,13 @@ fn getting_started(ui: &mut egui::Ui) {
     action(
         ui,
         "Products browser",
-        "— Quick products on the main Radar surface provides an ordered, customizable strip for \
-         one-click access to the fields you use most. Edit adds, removes, or reorders the strip. \
-         The browser contains every currently available radar product. The default Modern layout groups full names \
-         by category; Classic restores the compact pre-v0.34.2 chip grid. Choose either under \
-         Settings > Radar products. More products reveals volume, dual-pol, precipitation, \
+        "— The always-visible mini Quick Products strip at the top of Radar provides one-click access \
+         to the fields you use most. It starts with REF, VEL, SRV, RHO, ZDR, and SW; Edit adds, \
+         removes, or reorders its saved fields, while All reaches every currently available product. \
+         The separate full browser under Advanced contains the same complete catalog. Classic is its default and \
+         uses the compact pre-v0.34.2 abbreviation-chip grid; Modern categorized is the explicit \
+         full-name alternative. Choose either under Settings > Radar products. More products reveals \
+         volume, dual-pol, precipitation, \
          texture, quality, and simulation diagnostics. Advanced products compute only when \
          selected. Assigned number-key hotkeys appear before their product; \u{2190}/\u{2192} also \
          step through visible products.",
@@ -602,11 +604,12 @@ fn products(ui: &mut egui::Ui) {
     subhead(ui, "ADVANCED ON-DEMAND SWEEP PRODUCTS");
     para(
         ui,
-        "The Modern Products layout uses full names grouped by base moments, velocity, \
-         volume/hail, dual-pol, precipitation, texture/quality, and simulation fields. Choose \
-         Classic under Settings > Radar products for the compact chip grid. Turn on More products \
-         to expose the extended catalog. An advanced per-tilt product computes lazily when you \
-         select it; KDP remains automatic when its source metadata are trustworthy.",
+        "The full Products browser defaults to Classic's compact abbreviation-chip grid. Modern \
+         categorized is an explicit alternative that groups full names by base moments, velocity, \
+         volume/hail, dual-pol, precipitation, texture/quality, and simulation fields. Choose either \
+         under Settings > Radar products. Turn on More products to expose the extended catalog. An \
+         advanced per-tilt product computes lazily when selected; KDP remains automatic when its \
+         source metadata are trustworthy.",
     );
     product_entry(
         ui,
@@ -861,9 +864,9 @@ fn layers(ui: &mut egui::Ui) {
     action(
         ui,
         "Product favorites",
-        "— Add current on Radar's Quick products strip (or the star in Advanced products) \
-         persists a radar favorite; Edit reorders or removes it. Available WoFS favorites \
-         appear first in its picker, while temporarily unavailable slugs remain saved.",
+        "— Add current on Radar's always-visible mini Quick Products strip (or the star in \
+         Advanced products) persists a radar favorite; Edit reorders or removes it. Available \
+         WoFS favorites appear first in its picker, while temporarily unavailable slugs remain saved.",
     );
     action(
         ui,
