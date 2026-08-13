@@ -464,7 +464,9 @@ fn getting_started(ui: &mut egui::Ui) {
     action(
         ui,
         "Products browser",
-        "— every currently available radar product. The default Modern layout groups full names \
+        "— Quick products on the main Radar surface provides an ordered, customizable strip for \
+         one-click access to the fields you use most. Edit adds, removes, or reorders the strip. \
+         The browser contains every currently available radar product. The default Modern layout groups full names \
          by category; Classic restores the compact pre-v0.34.2 chip grid. Choose either under \
          Settings > Radar products. More products reveals volume, dual-pol, precipitation, \
          texture, quality, and simulation diagnostics. Advanced products compute only when \
@@ -474,8 +476,10 @@ fn getting_started(ui: &mut egui::Ui) {
     action(
         ui,
         "TILT list",
-        "— each elevation cut with its angle, radial count, and scan time; \u{2191}/\u{2193} \
-         step it. Tilts that can't show the selected product are greyed.",
+        "— each physical sweep with its cut ordinal, elevation angle, radial count, sweep start \
+         time, and COMPLETE/BUILDING state; \u{2191}/\u{2193} step it. The always-visible selected \
+         sweep readout includes age and low-follow/manual-hold state. Tilts that can't show the \
+         selected product are greyed.",
     );
     action(
         ui,
@@ -857,8 +861,8 @@ fn layers(ui: &mut egui::Ui) {
     action(
         ui,
         "Product favorites",
-        "— the star beside the current radar or WoFS product persists it as a favorite. Radar \
-         favorites appear as quick chips above the product browser; available WoFS favorites \
+        "— Add current on Radar's Quick products strip (or the star in Advanced products) \
+         persists a radar favorite; Edit reorders or removes it. Available WoFS favorites \
          appear first in its picker, while temporarily unavailable slugs remain saved.",
     );
     action(
@@ -2939,8 +2943,11 @@ fn unified_player(ui: &mut egui::Ui) {
          low shows every low sweep, same degree follows matching physical elevation, and base \
          only keeps the base tilt. This is useful for SAILS/MRLE-style rapid low-level cuts \
          without pretending every product updates at the same instant. The separate Live \
-         sweeps control determines whether a newly arriving low cut may move the live display; \
-         leave Follow new low cuts off to keep the selected sweep fixed.",
+         sweeps control determines whether a newly arriving low cut may move the live display. \
+         Follow incoming low tilts persists across site and scan-strategy changes and chooses the \
+         newest compatible sweep through 1.10 degrees by actual sweep time. A manual choice holds \
+         the current scan, and archive/history browsing never moves; turn follow off to keep the \
+         selected sweep fixed across incoming scans.",
     );
 
     subhead(ui, "TIME-SYNCED LAYERS");

@@ -6370,6 +6370,10 @@ struct PaneView {
     archive_load_progress: Option<ArchiveLoadProgress>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
     load_mode: Option<LatestLoadMode>,
+    /// Live/latest intent for this independently owned pane. It is consumed
+    /// by one selected live frame and never set by history/loop playback.
+    pending_live_low_follow_reanchor: bool,
+    installing_live_low_follow_reanchor: bool,
     pending_site_id: Option<String>,
     map_center_lat: f32,
     map_center_lon: f32,
@@ -6416,6 +6420,8 @@ impl PaneView {
             archive_load_progress: None,
             load_receiver: None,
             load_mode: None,
+            pending_live_low_follow_reanchor: false,
+            installing_live_low_follow_reanchor: false,
             pending_site_id: None,
             map_center_lat: 0.0,
             map_center_lon: 0.0,
@@ -17870,6 +17876,7 @@ impl ViewerApp {
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
             pane.load_mode = Some(mode);
+            pane.pending_live_low_follow_reanchor = mode != LatestLoadMode::Loop;
             pane.engine.live.last_refresh = Some(Instant::now());
             pane.archive_load_progress = progress.clone();
             pane.engine.status = match (&progress, mode) {
@@ -18012,6 +18019,7 @@ impl ViewerApp {
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
             pane.load_mode = Some(mode);
+            pane.pending_live_low_follow_reanchor = mode != LatestLoadMode::Loop;
             pane.engine.live.last_refresh = Some(Instant::now());
             pane.archive_load_progress = progress.clone();
             pane.engine.status = progress.as_ref().map_or_else(
@@ -18090,17 +18098,31 @@ impl ViewerApp {
                                     format!("Preview {}", message.label);
                             }
                             AsyncLoadUpdate::History(batch, select_frame) => {
-                                self.install_extra_pane_decoded_load_batch(
+                                self.extra_panes[pane_slot].installing_live_low_follow_reanchor =
+                                    select_frame
+                                        && self.extra_panes[pane_slot]
+                                            .pending_live_low_follow_reanchor
+                                        && !self.extra_panes[pane_slot].engine.cursor.playing
+                                        && !self.extra_panes[pane_slot].engine.cursor.browsing;
+                                let selected = self.install_extra_pane_decoded_load_batch(
                                     pane_slot,
                                     batch,
                                     select_frame,
                                     ctx,
                                 );
+                                if selected {
+                                    self.extra_panes[pane_slot].pending_live_low_follow_reanchor =
+                                        false;
+                                }
+                                self.extra_panes[pane_slot].installing_live_low_follow_reanchor =
+                                    false;
                             }
                             AsyncLoadUpdate::Unchanged { timings, reason } => {
                                 let load_mode = self.extra_panes[pane_slot].load_mode.take();
                                 let pane = &mut self.extra_panes[pane_slot];
                                 pane.load_receiver = None;
+                                pane.pending_live_low_follow_reanchor = false;
+                                pane.installing_live_low_follow_reanchor = false;
                                 pane.pending_site_id = None;
                                 pane.archive_load_progress = None;
                                 if let Some(timings) = timings {
@@ -18122,9 +18144,21 @@ impl ViewerApp {
                                 match result {
                                     Ok(batch) => {
                                         let frame_count = batch.frames.len();
+                                        let reanchor = self.extra_panes[pane_slot]
+                                            .pending_live_low_follow_reanchor
+                                            && !self.extra_panes[pane_slot].engine.cursor.playing
+                                            && !self.extra_panes[pane_slot].engine.cursor.browsing;
+                                        self.extra_panes[pane_slot]
+                                            .installing_live_low_follow_reanchor = reanchor;
                                         let selected = self.install_extra_pane_decoded_load_batch(
                                             pane_slot, batch, true, ctx,
                                         );
+                                        if selected {
+                                            self.extra_panes[pane_slot]
+                                                .pending_live_low_follow_reanchor = false;
+                                        }
+                                        self.extra_panes[pane_slot]
+                                            .installing_live_low_follow_reanchor = false;
                                         if load_mode == Some(LatestLoadMode::Loop)
                                             && frame_count > 1
                                             && self.start_extra_pane_history_loop_if_ready(
@@ -18149,6 +18183,10 @@ impl ViewerApp {
                                         self.request_rebuildable_cache_maintenance(ctx, false);
                                     }
                                     Err(err) => {
+                                        self.extra_panes[pane_slot]
+                                            .pending_live_low_follow_reanchor = false;
+                                        self.extra_panes[pane_slot]
+                                            .installing_live_low_follow_reanchor = false;
                                         self.extra_panes[pane_slot].engine.status =
                                             format!("Load failed for {}: {err}", message.label);
                                     }
@@ -18415,7 +18453,8 @@ impl ViewerApp {
                 VolumeSelectionPolicy {
                     allow_low_level_auto_advance: live_low_sweep_auto_advance
                         && !pane.engine.cursor.playing,
-                    reanchor_low_follow: false,
+                    reanchor_low_follow: pane.installing_live_low_follow_reanchor
+                        && !pane.engine.cursor.browsing,
                     allow_incomplete_live_chunk_advance: display_live_chunk_updates,
                     require_complete_live_cut,
                     low_level_min_seconds,
