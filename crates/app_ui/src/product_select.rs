@@ -198,40 +198,163 @@ fn is_hideable_derived_product(product: &DisplayProduct) -> bool {
         || advanced_derived_product_for_display_product(product).is_some()
 }
 
+/// Stable persisted identity for a radar quick-product favorite.
+///
+/// The variant prefix is intentional: a volume-derived `CREF` and a native
+/// (or source-provided) moment named `CREF` are different products even though
+/// their compact picker labels are identical. Legacy settings without a
+/// prefix are still accepted by [`resolve_radar_product_favorite`].
+pub(crate) fn radar_product_favorite_key(product: &DisplayProduct) -> String {
+    match product {
+        DisplayProduct::Moment(moment) => {
+            let name = moment.short_name();
+            let name_collides_with_known_moment = matches!(moment, MomentType::Unknown(_))
+                && ["REF", "VEL", "SW", "ZDR", "RHO", "PHI", "KDP"]
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(name));
+            let name_uses_reserved_escape = matches!(moment, MomentType::Unknown(_))
+                && name
+                    .get(.."unknown=".len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("unknown="));
+            if name_collides_with_known_moment || name_uses_reserved_escape {
+                let encoded = name
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>();
+                format!("moment:unknown={encoded}")
+            } else {
+                format!("moment:{name}")
+            }
+        }
+        DisplayProduct::DealiasedVelocity => "display:DVEL".to_owned(),
+        DisplayProduct::StormRelativeVelocity => "display:SRV".to_owned(),
+        DisplayProduct::StormRelativeDealiasedVelocity => "display:DSRV".to_owned(),
+        DisplayProduct::Derived(derived) => format!("derived:{}", derived.label()),
+    }
+}
+
+fn is_typed_radar_product_favorite(value: &str) -> bool {
+    let Some((prefix, _)) = value.trim().split_once(':') else {
+        return false;
+    };
+    ["moment", "display", "derived"]
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(prefix))
+}
+
+/// Resolve a persisted favorite against the products available in the
+/// current picker. Typed identities match exactly (case-insensitively for
+/// compatibility with settings normalization). A legacy bare label resolves
+/// to the first product in the established picker ranking, so old `CREF`
+/// settings continue to select volume-derived composite reflectivity.
+pub(crate) fn resolve_radar_product_favorite<'a>(
+    favorite: &str,
+    products: &'a [DisplayProduct],
+) -> Option<&'a DisplayProduct> {
+    let favorite = favorite.trim();
+    if favorite.is_empty() {
+        return None;
+    }
+    if is_typed_radar_product_favorite(favorite) {
+        return products
+            .iter()
+            .find(|product| radar_product_favorite_key(product).eq_ignore_ascii_case(favorite));
+    }
+
+    let mut selected = None;
+    for product in products
+        .iter()
+        .filter(|product| product.label().eq_ignore_ascii_case(favorite))
+    {
+        if selected
+            .is_none_or(|current| picker_product_rank(product) < picker_product_rank(current))
+        {
+            selected = Some(product);
+        }
+    }
+    selected
+}
+
+/// Whether a persisted typed or legacy favorite resolves to `product` within
+/// the supplied picker product list.
+pub(crate) fn radar_product_matches_favorite(
+    favorite: &str,
+    product: &DisplayProduct,
+    products: &[DisplayProduct],
+) -> bool {
+    resolve_radar_product_favorite(favorite, products).is_some_and(|resolved| resolved == product)
+}
+
+/// Compact chip text that only expands when two products share a short label.
+pub(crate) fn radar_product_favorite_caption(
+    product: &DisplayProduct,
+    products: &[DisplayProduct],
+) -> String {
+    let label = product.label();
+    let duplicate_label = products
+        .iter()
+        .any(|candidate| candidate != product && candidate.label().eq_ignore_ascii_case(label));
+    if !duplicate_label {
+        return label.to_owned();
+    }
+    let qualifier = match product {
+        DisplayProduct::Derived(derived) => derived.display_name(),
+        DisplayProduct::Moment(moment) => advanced_derived_product_for_moment(moment)
+            .map(product_engine::DerivedSweepProduct::display_name)
+            .unwrap_or("moment"),
+        DisplayProduct::DealiasedVelocity => "dealiased",
+        DisplayProduct::StormRelativeVelocity => "storm-relative",
+        DisplayProduct::StormRelativeDealiasedVelocity => "storm-relative dealiased",
+    };
+    format!("{label} ({qualifier})")
+}
+
+fn known_hideable_products() -> Vec<DisplayProduct> {
+    let mut products = DerivedProduct::ALL
+        .into_iter()
+        .map(DisplayProduct::Derived)
+        .collect::<Vec<_>>();
+    products.extend(
+        product_engine::DerivedSweepProduct::ALL
+            .iter()
+            .copied()
+            .filter_map(advanced_derived_display_product),
+    );
+    products
+}
+
 pub(crate) fn is_product_visible_in_picker(
     product: &DisplayProduct,
     show_derived_products: bool,
-    favorite_labels: &[String],
+    favorite_keys: &[String],
 ) -> bool {
-    show_derived_products
-        || !is_hideable_derived_product(product)
-        || favorite_labels
+    show_derived_products || !is_hideable_derived_product(product) || {
+        let products = known_hideable_products();
+        favorite_keys
             .iter()
-            .any(|label| label.eq_ignore_ascii_case(product.label()))
+            .any(|favorite| radar_product_matches_favorite(favorite, product, &products))
+    }
 }
 
 fn retain_picker_visible_products(
     products: &mut Vec<DisplayProduct>,
     show_derived_products: bool,
-    favorite_labels: &[String],
+    favorite_keys: &[String],
 ) {
     if !show_derived_products {
         products.retain(|product| {
-            is_product_visible_in_picker(product, show_derived_products, favorite_labels)
+            is_product_visible_in_picker(product, show_derived_products, favorite_keys)
         });
     }
 }
 
-fn favorites_include_advanced_product(favorite_labels: &[String]) -> bool {
-    product_engine::DerivedSweepProduct::ALL
-        .iter()
-        .copied()
-        .filter_map(advanced_derived_display_product)
-        .any(|product| {
-            favorite_labels
-                .iter()
-                .any(|label| label.eq_ignore_ascii_case(product.label()))
-        })
+fn favorites_include_advanced_product(favorite_keys: &[String]) -> bool {
+    let products = known_hideable_products();
+    favorite_keys.iter().any(|favorite| {
+        resolve_radar_product_favorite(favorite, &products)
+            .is_some_and(|product| advanced_derived_product_for_display_product(product).is_some())
+    })
 }
 
 fn append_present_advanced_products(
@@ -307,13 +430,13 @@ pub(crate) fn global_displayable_products_for_picker(
     volume: &RadarVolume,
     include_advanced_placeholders: bool,
     show_derived_products: bool,
-    favorite_labels: &[String],
+    favorite_keys: &[String],
 ) -> Vec<DisplayProduct> {
     let include_advanced_placeholders =
-        include_advanced_placeholders || favorites_include_advanced_product(favorite_labels);
+        include_advanced_placeholders || favorites_include_advanced_product(favorite_keys);
     let mut products =
         global_displayable_products_with_advanced(volume, include_advanced_placeholders);
-    retain_picker_visible_products(&mut products, show_derived_products, favorite_labels);
+    retain_picker_visible_products(&mut products, show_derived_products, favorite_keys);
     products.sort_by(|left, right| picker_product_rank(left).cmp(&picker_product_rank(right)));
     products
 }
@@ -346,7 +469,11 @@ pub(crate) fn cut_start_time_utc(volume: &RadarVolume, cut_index: usize) -> Opti
     cut.radials
         .iter()
         .filter_map(|radial| {
-            radial_collection_time_from_volume_time_utc(volume.volume_time, radial.time_offset_ms)
+            radial_collection_time_from_volume_time_utc(
+                volume.volume_time,
+                radial.time_offset_ms,
+                volume.metadata.compression.as_deref(),
+            )
         })
         .min()
 }
@@ -354,7 +481,16 @@ pub(crate) fn cut_start_time_utc(volume: &RadarVolume, cut_index: usize) -> Opti
 fn radial_collection_time_from_volume_time_utc(
     volume_time: DateTime<Utc>,
     time_offset_ms: i32,
+    source_encoding: Option<&str>,
 ) -> Option<DateTime<Utc>> {
+    // ODIM declares an absolute sweep start. Its decoder stores the checked
+    // difference from the volume anchor because that remains exact across UTC
+    // midnight; do not run those values through the legacy NEXRAD/CfRadial
+    // dual-encoding heuristic below.
+    if source_encoding == Some("odim-h5") {
+        return volume_time
+            .checked_add_signed(chrono::Duration::milliseconds(i64::from(time_offset_ms)));
+    }
     let midnight = volume_time
         .date_naive()
         .and_hms_opt(0, 0, 0)
@@ -1308,6 +1444,29 @@ pub(crate) fn archive_fetch_count_for_latest_load(
 mod tests {
     use super::*;
 
+    #[test]
+    fn odim_relative_sweep_offsets_remain_exact_near_midnight() {
+        let mut volume =
+            crate::tests::test_reflectivity_sails_volume_with_radials(&[(0.5, 237_000)], 360);
+        volume.volume_time = Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 22).unwrap();
+        volume.metadata.compression = Some("odim-h5".to_owned());
+
+        assert_eq!(
+            cut_start_time_utc(&volume, 0),
+            Some(Utc.with_ymd_and_hms(2026, 8, 12, 0, 4, 19).unwrap()),
+            "the real BEJAB-style offset must not be mistaken for milliseconds since midnight"
+        );
+
+        for radial in &mut volume.cuts[0].radials {
+            radial.time_offset_ms = -60_000;
+        }
+        assert_eq!(
+            cut_start_time_utc(&volume, 0),
+            Some(Utc.with_ymd_and_hms(2026, 8, 11, 23, 59, 22).unwrap()),
+            "negative ODIM offsets must cross midnight without changing dates heuristically"
+        );
+    }
+
     fn low_follow_policy(
         allow_incomplete_live_chunk_advance: bool,
         reanchor_low_follow: bool,
@@ -1572,6 +1731,92 @@ mod tests {
             vec![
                 "REF", "VEL", "DVEL", "SRV", "DSRV", "RHO", "ZDR", "SW", "PHI", "KDP"
             ]
+        );
+    }
+
+    #[test]
+    fn typed_favorites_distinguish_derived_and_moment_products_with_the_same_label() {
+        let moment = DisplayProduct::Moment(MomentType::Unknown("CREF".to_owned()));
+        let derived = DisplayProduct::Derived(DerivedProduct::CompositeReflectivity);
+        // Put the moment first to prove typed resolution does not depend on
+        // list order and legacy resolution uses picker rank, not `.find()`.
+        let products = vec![moment.clone(), derived.clone()];
+
+        assert_eq!(radar_product_favorite_key(&derived), "derived:CREF");
+        assert_eq!(radar_product_favorite_key(&moment), "moment:CREF");
+        assert_eq!(
+            resolve_radar_product_favorite("derived:CREF", &products),
+            Some(&derived)
+        );
+        assert_eq!(
+            resolve_radar_product_favorite("moment:CREF", &products),
+            Some(&moment)
+        );
+        assert_eq!(
+            radar_product_favorite_caption(&derived, &products),
+            "CREF (Composite reflectivity)"
+        );
+        assert_eq!(
+            radar_product_favorite_caption(&moment, &products),
+            "CREF (moment)"
+        );
+    }
+
+    #[test]
+    fn legacy_bare_cref_keeps_historical_composite_resolution() {
+        let moment = DisplayProduct::Moment(MomentType::Unknown("CREF".to_owned()));
+        let derived = DisplayProduct::Derived(DerivedProduct::CompositeReflectivity);
+        let products = vec![moment, derived.clone()];
+
+        assert_eq!(
+            resolve_radar_product_favorite("cref", &products),
+            Some(&derived)
+        );
+        assert!(is_product_visible_in_picker(
+            &derived,
+            false,
+            &["CREF".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn typed_moment_keys_round_trip_known_unknown_and_reserved_names() {
+        let products = vec![
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            DisplayProduct::Moment(MomentType::Unknown("CREF".to_owned())),
+            DisplayProduct::Moment(MomentType::Unknown("REF".to_owned())),
+            DisplayProduct::Moment(MomentType::Unknown("unknown=524546".to_owned())),
+        ];
+
+        let keys = products
+            .iter()
+            .map(radar_product_favorite_key)
+            .collect::<Vec<_>>();
+        assert_eq!(keys[0], "moment:REF");
+        assert_eq!(keys[1], "moment:CREF");
+        assert_eq!(keys[2], "moment:unknown=524546");
+        assert_eq!(keys[3], "moment:unknown=756E6B6E6F776E3D353234353436");
+        for (product, key) in products.iter().zip(&keys) {
+            assert_eq!(
+                resolve_radar_product_favorite(key, &products),
+                Some(product)
+            );
+        }
+    }
+
+    #[test]
+    fn display_product_favorite_keys_are_variant_qualified() {
+        assert_eq!(
+            radar_product_favorite_key(&DisplayProduct::DealiasedVelocity),
+            "display:DVEL"
+        );
+        assert_eq!(
+            radar_product_favorite_key(&DisplayProduct::StormRelativeVelocity),
+            "display:SRV"
+        );
+        assert_eq!(
+            radar_product_favorite_key(&DisplayProduct::StormRelativeDealiasedVelocity),
+            "display:DSRV"
         );
     }
 

@@ -303,6 +303,10 @@ use product_select::low_sweep_cuts_for_history_entry;
 use product_select::low_sweep_cuts_for_product;
 use product_select::product_hotkey_egui_key;
 use product_select::product_hotkey_sort_key;
+use product_select::radar_product_favorite_caption;
+use product_select::radar_product_favorite_key;
+use product_select::radar_product_matches_favorite;
+use product_select::resolve_radar_product_favorite;
 use product_select::selected_cut_render_data_unchanged;
 #[cfg(test)]
 use product_select::selection_for_installed_volume;
@@ -3110,6 +3114,10 @@ struct ViewerApp {
     primary: LoopEngine,
     low_sweep_disabled_cuts: BTreeSet<LowSweepCutKey>,
     manual_primary_cut_hold: Option<LowSweepCutKey>,
+    /// Completeness of the primary volume actually installed on screen.
+    /// A progressive preview can precede its history entry, so the selected
+    /// cursor alone cannot truthfully label its tilts.
+    displayed_primary_frame_status: Option<FrameStatus>,
     product_cut_memory: BTreeMap<String, usize>,
     /// Per-target summary memo (primary + each pane), so Unified Player
     /// queries against different targets stop evicting each other.
@@ -5396,6 +5404,23 @@ struct TiltCutRow {
 enum TiltCompletionState {
     Complete,
     Building,
+    Unknown,
+}
+
+fn tilt_completion_state_for_displayed_frame(
+    status: Option<FrameStatus>,
+    cut: &radar_core::ElevationCut,
+    site_id: &str,
+) -> TiltCompletionState {
+    match status {
+        Some(FrameStatus::Preview | FrameStatus::LivePartial)
+            if !is_complete_live_candidate_tilt_for_site(cut, site_id) =>
+        {
+            TiltCompletionState::Building
+        }
+        Some(_) => TiltCompletionState::Complete,
+        None => TiltCompletionState::Unknown,
+    }
 }
 
 fn selected_sweep_readout(
@@ -5417,7 +5442,7 @@ fn selected_sweep_readout(
         .unwrap_or_else(|| "sweep time unavailable".to_owned());
     let follow = if manual_hold {
         " · MANUAL HOLD"
-    } else if follow_low {
+    } else if follow_low && row.elevation_deg <= LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG {
         " · FOLLOW LOW"
     } else {
         ""
@@ -5436,6 +5461,7 @@ impl TiltCompletionState {
         match self {
             Self::Complete => "COMPLETE",
             Self::Building => "BUILDING",
+            Self::Unknown => "UNKNOWN",
         }
     }
 }
@@ -6348,6 +6374,10 @@ struct PaneView {
     /// Independent tilt override; None = follow the main pane's tilt, so
     /// scrubbing the main tilt moves every un-pinned pane in sync.
     cut: Option<usize>,
+    /// An explicit pane tilt choice held for this exact displayed scan.
+    /// It suppresses low-follow updates within the scan, then clears when a
+    /// different frame/site arrives so live following resumes naturally.
+    manual_cut_hold: Option<LowSweepCutKey>,
     /// None = follow the primary radar volume. Some = this pane owns its
     /// own source and map view — ONE identity for both worlds (v0.29
     /// Phase 3): `SiteRef::Us` for Level-II catalog sites, `SiteRef::Intl`
@@ -6367,6 +6397,9 @@ struct PaneView {
     volume: Option<Arc<RadarVolume>>,
     source_path: Option<PathBuf>,
     load_timing: Option<LoadTimings>,
+    /// Completeness of the pane volume actually on screen; previews may not
+    /// yet have a matching cursor/history entry.
+    displayed_frame_status: Option<FrameStatus>,
     archive_load_progress: Option<ArchiveLoadProgress>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
     load_mode: Option<LatestLoadMode>,
@@ -6411,12 +6444,14 @@ impl PaneView {
             product,
             pending_product_restore: None,
             cut: None,
+            manual_cut_hold: None,
             pin: None,
             comparison_role: None,
             followed_primary_volume_ptr: None,
             volume: None,
             source_path: None,
             load_timing: None,
+            displayed_frame_status: None,
             archive_load_progress: None,
             load_receiver: None,
             load_mode: None,
@@ -9733,6 +9768,7 @@ impl ViewerApp {
             primary,
             low_sweep_disabled_cuts: BTreeSet::new(),
             manual_primary_cut_hold: None,
+            displayed_primary_frame_status: None,
             product_cut_memory: BTreeMap::new(),
             loop_timeline_summary_cache: std::cell::RefCell::new(BTreeMap::new()),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(bowecho_tile_layer_config())),
@@ -10954,6 +10990,7 @@ impl ViewerApp {
         self.clear_simradar_comparison_presentation();
         self.remember_current_primary_product_cut();
         self.volume = None;
+        self.displayed_primary_frame_status = None;
         self.load_timing = None;
         self.dealiased_readout_cache = None;
         self.selected_cut = 0;
@@ -10966,6 +11003,8 @@ impl ViewerApp {
             if !pane.owns_radar() {
                 pane.clear_texture();
                 pane.cut = None;
+                pane.manual_cut_hold = None;
+                pane.displayed_frame_status = None;
             }
         }
         ctx.request_repaint();
@@ -11456,6 +11495,7 @@ impl ViewerApp {
         pane.product = product;
         pane.pending_product_restore = None;
         pane.cut = Some(cut);
+        pane.manual_cut_hold = None;
         pane.map_center_lat = map_center_lat;
         pane.map_center_lon = map_center_lon;
         pane.map_scale = map_scale;
@@ -11470,6 +11510,7 @@ impl ViewerApp {
         pane.engine.cursor.last_step = None;
         pane.engine.live.enabled = false;
         pane.engine.live.last_refresh = None;
+        pane.displayed_frame_status = Some(FrameStatus::Local);
         pane.engine.status = format!("{} comparison volume", role.label());
         pane.clear_texture();
     }
@@ -12090,10 +12131,19 @@ impl ViewerApp {
                 volume.as_ref(),
                 VolumeSelectionPolicy {
                     allow_low_level_auto_advance: self.app_settings.live_low_sweep_auto_advance
-                        && !self.primary.cursor.playing,
+                        && !self.primary.cursor.playing
+                        && !self.primary.cursor.browsing,
                     reanchor_low_follow: self.installing_primary_live_low_follow_reanchor
                         && !self.primary.cursor.browsing,
-                    allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
+                    // A terminal Complete/LiveComplete frame is a complete
+                    // source even when its native sweep has 360 radials
+                    // (common ODIM/international geometry). Chunks controls
+                    // only whether Preview/LivePartial cuts may advance.
+                    allow_incomplete_live_chunk_advance: self.display_live_chunk_updates
+                        || !matches!(
+                            frame_status,
+                            FrameStatus::Preview | FrameStatus::LivePartial
+                        ),
                     require_complete_live_cut,
                     low_level_min_seconds: self.live_low_sweep_auto_advance_min_seconds(),
                 },
@@ -12208,6 +12258,7 @@ impl ViewerApp {
             self.source_path = Some(source_path);
         }
         self.load_timing = load_timing;
+        self.displayed_primary_frame_status = Some(frame_status);
         self.volume = Some(volume);
         self.dealiased_readout_cache = None;
         self.selected_cut = selected_cut;
@@ -12272,9 +12323,23 @@ impl ViewerApp {
         let live_partial = frame_status == FrameStatus::LivePartial;
         let live_low_sweep_auto_advance = self.app_settings.live_low_sweep_auto_advance;
         let low_level_min_seconds = self.live_low_sweep_auto_advance_min_seconds();
+        let primary_playing = self.primary.cursor.playing;
+        let primary_browsing = self.primary.cursor.browsing;
+        let reanchor_following_low = self.installing_primary_live_low_follow_reanchor
+            && !primary_playing
+            && !primary_browsing;
         for pane in &mut self.extra_panes {
             if pane.owns_radar() {
                 continue;
+            }
+            pane.displayed_frame_status = Some(frame_status);
+            let next_identity = frame_identity_for_volume(volume);
+            if pane
+                .manual_cut_hold
+                .as_ref()
+                .is_some_and(|hold| hold.identity != next_identity)
+            {
+                pane.manual_cut_hold = None;
             }
             let previous_product = pane.product.clone();
             // Seed the resolution from a pending fallback-restore if one is in
@@ -12296,6 +12361,11 @@ impl ViewerApp {
                     })
                 })
                 .unwrap_or(previous_primary_cut);
+            let manual_hold_cut = pane.manual_cut_hold.as_ref().and_then(|hold| {
+                (hold.identity == next_identity
+                    && is_displayable_on_cut(volume, hold.cut_index, &previous_product))
+                .then_some(hold.cut_index)
+            });
 
             let product_ready = volume_can_materialize_product_with_live_filter(
                 volume,
@@ -12321,6 +12391,7 @@ impl ViewerApp {
             let same_site =
                 previous_volume.is_some_and(|previous| previous.site.id == volume.site.id);
             if !same_site
+                && !reanchor_following_low
                 && let Some(cut) = best_cut_for_product_with_live_filter(
                     volume,
                     previous_cut,
@@ -12337,7 +12408,9 @@ impl ViewerApp {
                 continue;
             }
 
-            let (selected_cut, selected_product) =
+            let (selected_cut, selected_product) = if let Some(cut) = manual_hold_cut {
+                (cut, previous_product.clone())
+            } else {
                 selection_for_installed_volume_with_low_sweep_min_seconds(
                     previous_volume,
                     previous_cut,
@@ -12345,13 +12418,19 @@ impl ViewerApp {
                     volume,
                     VolumeSelectionPolicy {
                         allow_low_level_auto_advance: live_low_sweep_auto_advance
-                            && !self.primary.cursor.playing,
-                        reanchor_low_follow: false,
-                        allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
+                            && !primary_playing
+                            && !primary_browsing,
+                        reanchor_low_follow: reanchor_following_low,
+                        allow_incomplete_live_chunk_advance: self.display_live_chunk_updates
+                            || !matches!(
+                                frame_status,
+                                FrameStatus::Preview | FrameStatus::LivePartial
+                            ),
                         require_complete_live_cut,
                         low_level_min_seconds,
                     },
-                );
+                )
+            };
             pane.cut = Some(selected_cut);
             // Fallback-restore bookkeeping (mirrors the primary): resolving to
             // the seed satisfies any pending restore; resolving to a different
@@ -12378,6 +12457,44 @@ impl ViewerApp {
         self.primary.history.get(self.primary.cursor.index)
     }
 
+    fn primary_low_follow_is_active(&self) -> bool {
+        let displayed_is_live = matches!(
+            self.displayed_primary_frame_status,
+            Some(FrameStatus::LivePartial | FrameStatus::LiveComplete)
+        ) || (self.displayed_primary_frame_status
+            == Some(FrameStatus::Complete)
+            && self.poll_active
+            && self.poll_source_armed());
+        self.app_settings.live_low_sweep_auto_advance
+            && !self.primary.cursor.playing
+            && !self.primary.cursor.browsing
+            && self.primary_chip_live_flag()
+            && displayed_is_live
+    }
+
+    fn pane_low_follow_is_active(&self, slot: usize) -> bool {
+        let Some(pane) = self.extra_panes.get(slot) else {
+            return false;
+        };
+        if !pane.owns_radar() {
+            return self.primary_low_follow_is_active();
+        }
+        let displayed_is_live = matches!(
+            pane.displayed_frame_status,
+            Some(FrameStatus::LivePartial | FrameStatus::LiveComplete)
+        ) || (pane.displayed_frame_status == Some(FrameStatus::Complete)
+            && pane.pinned_intl().is_some()
+            && pane.engine.live.enabled);
+        self.app_settings.live_low_sweep_auto_advance
+            && !pane.engine.cursor.playing
+            && !pane.engine.cursor.browsing
+            && pane.engine.live.enabled
+            && displayed_is_live
+    }
+
+    /// Completeness for the volume actually on screen. Preview installs may
+    /// intentionally precede their history entry, so cursor status alone can
+    /// describe the prior frame and mislabel a partial cut as COMPLETE.
     fn selected_frame_scan_time_utc(&self) -> Option<DateTime<Utc>> {
         self.primary
             .history
@@ -15561,6 +15678,7 @@ impl ViewerApp {
         // An explicit user choice supersedes any in-flight fallback recovery.
         pane.pending_product_restore = None;
         pane.cut = Some(next_cut);
+        pane.manual_cut_hold = None;
         pane.render_ms = None;
         true
     }
@@ -15614,7 +15732,12 @@ impl ViewerApp {
             return false;
         }
         let _ = self.materialize_extra_pane_advanced_product_at_cut(slot, next_cut);
-        self.extra_panes[slot].cut = Some(next_cut);
+        let pane = &mut self.extra_panes[slot];
+        pane.cut = Some(next_cut);
+        pane.manual_cut_hold = Some(LowSweepCutKey::new(
+            &frame_identity_for_volume(volume.as_ref()),
+            next_cut,
+        ));
         true
     }
 
@@ -17542,6 +17665,7 @@ impl ViewerApp {
         let advanced_products_enabled = self.advanced_products_enabled || show_derived_products;
         let favorite_products = self.app_settings.radar_product_favorites.clone();
         let primary_live = self.primary.live.enabled;
+        let displayed_frame_status = self.displayed_primary_frame_status;
 
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
             return;
@@ -17561,6 +17685,7 @@ impl ViewerApp {
         pane.volume = primary_volume.clone();
         pane.source_path = source_path;
         pane.load_timing = load_timing;
+        pane.displayed_frame_status = displayed_frame_status;
         pane.engine.history = frame_history;
         pane.engine.cursor.index = selected_frame_index;
         pane.engine.cursor.playing = false;
@@ -17669,12 +17794,14 @@ impl ViewerApp {
             pane.engine.live.last_refresh = None;
             pane.followed_primary_volume_ptr = None;
             pane.volume = None;
+            pane.displayed_frame_status = None;
             pane.source_path = None;
             pane.load_timing = None;
             pane.load_receiver = None;
             pane.load_mode = None;
             pane.pending_site_id = None;
             pane.cut = None;
+            pane.manual_cut_hold = None;
             pane.engine.status = if pane.engine.live.enabled {
                 format!("Pane radar set to {site_id}; live poll starting")
             } else {
@@ -17711,12 +17838,14 @@ impl ViewerApp {
             pane.engine.live.last_refresh = None;
             pane.followed_primary_volume_ptr = None;
             pane.volume = None;
+            pane.displayed_frame_status = None;
             pane.source_path = None;
             pane.load_timing = None;
             pane.load_receiver = None;
             pane.load_mode = None;
             pane.pending_site_id = None;
             pane.cut = None;
+            pane.manual_cut_hold = None;
             pane.engine.status = if pane.engine.live.enabled {
                 format!("Pane radar set to {}; live poll starting", site.label)
             } else {
@@ -17778,6 +17907,7 @@ impl ViewerApp {
             pane.engine.live.last_refresh = None;
             pane.followed_primary_volume_ptr = None;
             pane.volume = None;
+            pane.displayed_frame_status = None;
             pane.source_path = None;
             pane.load_timing = None;
             pane.load_receiver = None;
@@ -17786,6 +17916,7 @@ impl ViewerApp {
             pane.clear_history();
             pane.engine.status = "Following primary radar".to_owned();
             pane.cut = None;
+            pane.manual_cut_hold = None;
             pane.clear_texture();
         }
     }
@@ -17867,9 +17998,11 @@ impl ViewerApp {
             if pane.pin.as_ref() != Some(&pin) {
                 pane.clear_history();
                 pane.volume = None;
+                pane.displayed_frame_status = None;
                 pane.source_path = None;
                 pane.load_timing = None;
                 pane.cut = None;
+                pane.manual_cut_hold = None;
                 pane.clear_texture();
             }
             pane.pin = Some(pin);
@@ -18422,6 +18555,19 @@ impl ViewerApp {
         };
         let previous_cut = pane.cut.unwrap_or(main_cut);
         let previous_product = pane.product.clone();
+        let next_identity = frame_identity_for_volume(volume.as_ref());
+        if pane
+            .manual_cut_hold
+            .as_ref()
+            .is_some_and(|hold| hold.identity != next_identity)
+        {
+            pane.manual_cut_hold = None;
+        }
+        let manual_hold_cut = pane.manual_cut_hold.as_ref().and_then(|hold| {
+            (hold.identity == next_identity
+                && is_displayable_on_cut(volume.as_ref(), hold.cut_index, &previous_product))
+            .then_some(hold.cut_index)
+        });
         // Seed the resolution from a pending fallback-restore if one is in
         // flight, otherwise the pane's current product. Same intent-
         // preservation as the primary install: a lone velocity-less frame
@@ -18444,7 +18590,9 @@ impl ViewerApp {
                 require_complete_live_cut,
             )],
         );
-        let (selected_cut, selected_product) =
+        let (selected_cut, selected_product) = if let Some(cut) = manual_hold_cut {
+            (cut, previous_product.clone())
+        } else {
             selection_for_installed_volume_with_low_sweep_min_seconds(
                 pane.volume.as_deref(),
                 previous_cut,
@@ -18452,14 +18600,20 @@ impl ViewerApp {
                 volume.as_ref(),
                 VolumeSelectionPolicy {
                     allow_low_level_auto_advance: live_low_sweep_auto_advance
-                        && !pane.engine.cursor.playing,
+                        && !pane.engine.cursor.playing
+                        && !pane.engine.cursor.browsing,
                     reanchor_low_follow: pane.installing_live_low_follow_reanchor
                         && !pane.engine.cursor.browsing,
-                    allow_incomplete_live_chunk_advance: display_live_chunk_updates,
+                    allow_incomplete_live_chunk_advance: display_live_chunk_updates
+                        || !matches!(
+                            frame_status,
+                            FrameStatus::Preview | FrameStatus::LivePartial
+                        ),
                     require_complete_live_cut,
                     low_level_min_seconds,
                 },
-            );
+            )
+        };
         // Fallback-restore bookkeeping (mirrors the primary): resolving to the
         // seed satisfies any pending restore; resolving to a different product
         // means this frame couldn't show the seed, so remember it for a later
@@ -18534,6 +18688,7 @@ impl ViewerApp {
             }),
         };
         pane.volume = Some(Arc::clone(&volume));
+        pane.displayed_frame_status = Some(frame_status);
         pane.pending_site_id = None;
         if site_changed
             && let (Some(latitude_deg), Some(longitude_deg)) =
@@ -25970,21 +26125,21 @@ impl ViewerApp {
         editing_product: &DisplayProduct,
         product_buttons: &[(DisplayProduct, Option<usize>)],
     ) {
-        let canonical_available = |label: &str| {
-            product_buttons
-                .iter()
-                .find(|(product, _)| product.label().eq_ignore_ascii_case(label))
-                .map(|(product, _)| product.clone())
-        };
+        let available_products = product_buttons
+            .iter()
+            .map(|(product, _)| product.clone())
+            .collect::<Vec<_>>();
+        let canonical_available =
+            |key: &str| resolve_radar_product_favorite(key, &available_products).cloned();
         let favorites = self.app_settings.radar_product_favorites.clone();
         let available_favorites = favorites
             .iter()
             .filter_map(|label| canonical_available(label))
             .collect::<Vec<_>>();
-        let editing_label = editing_product.label();
-        let editing_is_favorite = favorites
-            .iter()
-            .any(|label| label.eq_ignore_ascii_case(editing_label));
+        let editing_key = radar_product_favorite_key(editing_product);
+        let editing_is_favorite = favorites.iter().any(|favorite| {
+            radar_product_matches_favorite(favorite, editing_product, &available_products)
+        });
         let mut picked_product = None;
         let mut add_or_remove_current = None;
         let mut edit_action = None;
@@ -25998,7 +26153,10 @@ impl ViewerApp {
             } else {
                 for product in &available_favorites {
                     if ui
-                        .selectable_label(editing_product == product, product.label())
+                        .selectable_label(
+                            editing_product == product,
+                            radar_product_favorite_caption(product, &available_products),
+                        )
                         .on_hover_text(product_picker_long_label(product))
                         .clicked()
                     {
@@ -26020,11 +26178,13 @@ impl ViewerApp {
                 if favorites.is_empty() {
                     ui.weak("No saved quick products");
                 }
-                for (index, label) in favorites.iter().enumerate() {
+                for (index, key) in favorites.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        let display = canonical_available(label)
-                            .map(|product| product.label().to_owned())
-                            .unwrap_or_else(|| format!("{label} (unavailable)"));
+                        let display = canonical_available(key)
+                            .map(|product| {
+                                radar_product_favorite_caption(&product, &available_products)
+                            })
+                            .unwrap_or_else(|| format!("{key} (unavailable)"));
                         ui.label(display);
                         if ui.add_enabled(index > 0, egui::Button::new("Up")).clicked() {
                             edit_action = Some((index, -1_i8));
@@ -26049,17 +26209,29 @@ impl ViewerApp {
                     .app_settings
                     .radar_product_favorites
                     .iter()
-                    .any(|label| label.eq_ignore_ascii_case(editing_label))
+                    .any(|favorite| {
+                        radar_product_matches_favorite(
+                            favorite,
+                            editing_product,
+                            &available_products,
+                        )
+                    })
                 {
                     self.app_settings
                         .radar_product_favorites
-                        .push(editing_label.to_owned());
+                        .push(editing_key.clone());
                 }
                 self.app_settings.normalize_radar_product_favorites();
             } else {
                 self.app_settings
                     .radar_product_favorites
-                    .retain(|label| !label.eq_ignore_ascii_case(editing_label));
+                    .retain(|favorite| {
+                        !radar_product_matches_favorite(
+                            favorite,
+                            editing_product,
+                            &available_products,
+                        )
+                    });
                 self.sanitize_selection();
                 self.clear_texture();
             }
@@ -26373,15 +26545,29 @@ impl ViewerApp {
                     row,
                     self.time_zone(),
                     Utc::now(),
-                    editing_pane.is_none() && self.app_settings.live_low_sweep_auto_advance,
-                    editing_pane.is_none() && self.manual_primary_cut_hold.is_some(),
+                    editing_pane.map_or_else(
+                        || self.primary_low_follow_is_active(),
+                        |slot| self.pane_low_follow_is_active(slot),
+                    ),
+                    editing_pane.map_or_else(
+                        || self.manual_primary_cut_hold.is_some(),
+                        |slot| self.extra_panes[slot].manual_cut_hold.is_some(),
+                    ),
                 ))
                 .monospace(),
             );
         }
         if let Some(index) = picked_cut {
             if let Some(slot) = editing_pane {
-                self.extra_panes[slot].cut = Some(index);
+                let active_volume = self.extra_panes[slot]
+                    .volume
+                    .clone()
+                    .or_else(|| self.volume.clone());
+                let pane = &mut self.extra_panes[slot];
+                pane.cut = Some(index);
+                pane.manual_cut_hold = active_volume.as_ref().map(|volume| {
+                    LowSweepCutKey::new(&frame_identity_for_volume(volume.as_ref()), index)
+                });
                 ctx.request_repaint();
             } else {
                 self.select_primary_cut_manually(index, ctx);
@@ -26507,36 +26693,28 @@ impl ViewerApp {
                     (product, target_cut)
                 })
                 .collect::<Vec<_>>();
-            let selected_frame_status = if editing_pane.is_none() {
-                self.selected_frame().map(|frame| frame.status)
-            } else {
-                editing_pane
-                    .and_then(|slot| self.extra_panes.get(slot))
-                    .and_then(|pane| pane.engine.history.get(pane.engine.cursor.index))
-                    .map(|frame| frame.status)
-            };
+            let selected_frame_status = editing_pane
+                .map_or(self.displayed_primary_frame_status, |slot| {
+                    self.extra_panes[slot].displayed_frame_status
+                });
             let total_cuts = volume.cuts.len();
             let cuts = volume
                 .cuts
                 .iter()
                 .enumerate()
-                .map(|(index, cut)| {
-                    let building = selected_frame_status == Some(FrameStatus::LivePartial)
-                        && !is_complete_live_candidate_tilt_for_site(cut, &volume.site.id);
-                    TiltCutRow {
-                        index,
-                        total: total_cuts,
-                        elevation_deg: cut.elevation_deg,
-                        radial_count: cut.radials.len(),
-                        start_time_utc: cut_start_time_utc(volume, index),
-                        selected: index == effective_cut,
-                        product_compatible: is_displayable_on_cut(volume, index, &editing_product),
-                        state: if building {
-                            TiltCompletionState::Building
-                        } else {
-                            TiltCompletionState::Complete
-                        },
-                    }
+                .map(|(index, cut)| TiltCutRow {
+                    index,
+                    total: total_cuts,
+                    elevation_deg: cut.elevation_deg,
+                    radial_count: cut.radials.len(),
+                    start_time_utc: cut_start_time_utc(volume, index),
+                    selected: index == effective_cut,
+                    product_compatible: is_displayable_on_cut(volume, index, &editing_product),
+                    state: tilt_completion_state_for_displayed_frame(
+                        selected_frame_status,
+                        cut,
+                        &volume.site.id,
+                    ),
                 })
                 .collect::<Vec<_>>();
             (products, cuts)
@@ -26802,36 +26980,28 @@ impl ViewerApp {
                 (product, target_cut)
             })
             .collect::<Vec<_>>();
-        let selected_frame_status = if editing_pane.is_none() {
-            self.selected_frame().map(|frame| frame.status)
-        } else {
-            editing_pane
-                .and_then(|slot| self.extra_panes.get(slot))
-                .and_then(|pane| pane.engine.history.get(pane.engine.cursor.index))
-                .map(|frame| frame.status)
-        };
+        let selected_frame_status = editing_pane
+            .map_or(self.displayed_primary_frame_status, |slot| {
+                self.extra_panes[slot].displayed_frame_status
+            });
         let total_cuts = volume.cuts.len();
         let cut_rows = volume
             .cuts
             .iter()
             .enumerate()
-            .map(|(index, cut)| {
-                let building = selected_frame_status == Some(FrameStatus::LivePartial)
-                    && !is_complete_live_candidate_tilt_for_site(cut, &volume.site.id);
-                TiltCutRow {
-                    index,
-                    total: total_cuts,
-                    elevation_deg: cut.elevation_deg,
-                    radial_count: cut.radials.len(),
-                    start_time_utc: cut_start_time_utc(volume, index),
-                    selected: index == editing_effective_cut,
-                    product_compatible: is_displayable_on_cut(volume, index, &editing_product),
-                    state: if building {
-                        TiltCompletionState::Building
-                    } else {
-                        TiltCompletionState::Complete
-                    },
-                }
+            .map(|(index, cut)| TiltCutRow {
+                index,
+                total: total_cuts,
+                elevation_deg: cut.elevation_deg,
+                radial_count: cut.radials.len(),
+                start_time_utc: cut_start_time_utc(volume, index),
+                selected: index == editing_effective_cut,
+                product_compatible: is_displayable_on_cut(volume, index, &editing_product),
+                state: tilt_completion_state_for_displayed_frame(
+                    selected_frame_status,
+                    cut,
+                    &volume.site.id,
+                ),
             })
             .collect::<Vec<_>>();
 
@@ -26951,22 +27121,25 @@ impl ViewerApp {
             .iter()
             .map(|(key, label)| (label.clone(), key.clone()))
             .collect();
-        let mut clicked_product = None;
-        let editing_label = editing_product.label().to_owned();
-        let editing_is_favorite = self
-            .app_settings
-            .radar_product_favorites
+        let available_products = product_buttons
             .iter()
-            .any(|label| label.eq_ignore_ascii_case(&editing_label));
+            .map(|(product, _)| product.clone())
+            .collect::<Vec<_>>();
+        let mut clicked_product = None;
+        let editing_key = radar_product_favorite_key(editing_product);
+        let editing_is_favorite =
+            self.app_settings
+                .radar_product_favorites
+                .iter()
+                .any(|favorite| {
+                    radar_product_matches_favorite(favorite, editing_product, &available_products)
+                });
         let favorite_products = self
             .app_settings
             .radar_product_favorites
             .iter()
-            .filter_map(|label| {
-                product_buttons
-                    .iter()
-                    .find(|(product, _)| product.label().eq_ignore_ascii_case(label))
-                    .map(|(product, _)| product.clone())
+            .filter_map(|favorite| {
+                resolve_radar_product_favorite(favorite, &available_products).cloned()
             })
             .collect::<Vec<_>>();
         let mut favorite_changed = false;
@@ -26987,11 +27160,17 @@ impl ViewerApp {
                 if editing_is_favorite {
                     self.app_settings
                         .radar_product_favorites
-                        .retain(|label| !label.eq_ignore_ascii_case(&editing_label));
+                        .retain(|favorite| {
+                            !radar_product_matches_favorite(
+                                favorite,
+                                editing_product,
+                                &available_products,
+                            )
+                        });
                 } else {
                     self.app_settings
                         .radar_product_favorites
-                        .push(editing_label.clone());
+                        .push(editing_key.clone());
                 }
                 favorite_changed = true;
                 let _ = self.app_settings.save();
@@ -27002,7 +27181,7 @@ impl ViewerApp {
                     if ui
                         .selectable_label(
                             editing_product == &product,
-                            product_display_label(&product),
+                            radar_product_favorite_caption(&product, &available_products),
                         )
                         .on_hover_text(product_picker_long_label(&product))
                         .clicked()
@@ -27460,6 +27639,7 @@ impl ViewerApp {
                         .clicked()
                     {
                         self.extra_panes[slot].cut = None;
+                        self.extra_panes[slot].manual_cut_hold = None;
                         ctx.request_repaint();
                     }
                 } else {
@@ -27498,13 +27678,30 @@ impl ViewerApp {
                         row,
                         self.time_zone(),
                         Utc::now(),
-                        editing_pane.is_none() && self.app_settings.live_low_sweep_auto_advance,
-                        editing_pane.is_none() && self.manual_primary_cut_hold.is_some(),
+                        editing_pane.map_or_else(
+                            || self.primary_low_follow_is_active(),
+                            |slot| self.pane_low_follow_is_active(slot),
+                        ),
+                        editing_pane.map_or_else(
+                            || self.manual_primary_cut_hold.is_some(),
+                            |slot| self.extra_panes[slot].manual_cut_hold.is_some(),
+                        ),
                     ));
                     if response.clicked() {
                         if let Some(slot) = editing_pane {
                             // Pin this pane to an independent tilt.
-                            self.extra_panes[slot].cut = Some(row.index);
+                            let active_volume = self.extra_panes[slot]
+                                .volume
+                                .clone()
+                                .or_else(|| self.volume.clone());
+                            let pane = &mut self.extra_panes[slot];
+                            pane.cut = Some(row.index);
+                            pane.manual_cut_hold = active_volume.as_ref().map(|volume| {
+                                LowSweepCutKey::new(
+                                    &frame_identity_for_volume(volume.as_ref()),
+                                    row.index,
+                                )
+                            });
                             ctx.request_repaint();
                         } else {
                             self.select_primary_cut_manually(row.index, ctx);
@@ -36161,16 +36358,22 @@ impl ViewerApp {
         let reanchor_low_follow = !self.primary.cursor.playing
             && !self.primary.cursor.browsing
             && displayed_identity.as_ref() != Some(&identity);
-        // Drawing a section is an explicit request to interrogate the volume
-        // currently on screen. Keep accepting newer polled/international
-        // scans into history, but do not let the repaint caused by an endpoint
-        // click swap the displayed volume underneath the tool. A growing
-        // update of the SAME scan is still allowed so a live partial can gain
-        // its later tilts.
+        // Drawing a section or browsing history is an explicit request to
+        // interrogate the volume currently on screen. Keep accepting newer
+        // polled/international scans into history, but do not let the repaint
+        // swap the displayed volume underneath the user. A growing update of
+        // the SAME scan is still allowed so a live partial can gain later
+        // tilts.
         let cross_section_holds_displayed_frame = self.cross_section_armed
             && displayed_identity.as_ref().is_some_and(|displayed| {
                 displayed.site_id == identity.site_id && displayed != &identity
             });
+        let browsing_holds_displayed_frame = self.primary.cursor.browsing
+            && displayed_identity.as_ref().is_some_and(|displayed| {
+                displayed.site_id == identity.site_id && displayed != &identity
+            });
+        let hold_displayed_frame =
+            cross_section_holds_displayed_frame || browsing_holds_displayed_frame;
         if self
             .volume
             .as_ref()
@@ -36200,13 +36403,13 @@ impl ViewerApp {
         self.primary
             .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
-        if cross_section_holds_displayed_frame {
+        if hold_displayed_frame {
             self.primary
                 .trim_history_to_limits_preserving(displayed_identity.as_ref());
         } else {
             self.trim_frame_history();
         }
-        if cross_section_holds_displayed_frame {
+        if hold_displayed_frame {
             if let Some(displayed_identity) = displayed_identity
                 && let Some(index) = self
                     .primary
@@ -36225,6 +36428,8 @@ impl ViewerApp {
         // volume (census D9, "LIVE WINS"); if it is a reflectivity-only live
         // partial the product falls back for that frame only and
         // `pending_product_restore` restores it on the next loop step.
+        // Browsing has already returned through the display-hold branch;
+        // playing likewise keeps its cursor while the live feed backfills.
         if !self.primary.cursor.playing {
             self.primary.cursor.index = self
                 .primary
@@ -56703,6 +56908,305 @@ mod tests {
     }
 
     #[test]
+    fn cross_site_live_load_reanchors_low_follow_after_display_reset() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.live_low_sweep_auto_advance = true;
+        app.pending_primary_live_low_follow_reanchor = true;
+        let ctx = egui::Context::default();
+
+        app.clear_displayed_volume_for_pending_load(&ctx);
+        assert!(
+            app.pending_primary_live_low_follow_reanchor,
+            "clearing the old site's image must not discard the live-load intent"
+        );
+
+        let mut next = test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (1.80, 60_000), (0.70, 180_000), (1.30, 300_000)],
+            720,
+        );
+        next.site.id = "KOUN".to_owned();
+        // This generic fixture carries the legacy dual-encoding field, so keep
+        // it away from midnight; ODIM's explicit relative-time behavior is
+        // covered separately in product_select.
+        next.volume_time = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+            + chrono::Duration::hours(12)
+            + chrono::Duration::minutes(5);
+        app.installing_primary_live_low_follow_reanchor =
+            std::mem::take(&mut app.pending_primary_live_low_follow_reanchor);
+        app.install_volume_arc(
+            Arc::new(next),
+            None,
+            false,
+            None,
+            FrameStatus::LiveComplete,
+            &ctx,
+        );
+        app.installing_primary_live_low_follow_reanchor = false;
+
+        assert_eq!(app.selected_cut, 2);
+        assert_eq!(app.volume.as_ref().unwrap().site.id, "KOUN");
+    }
+
+    #[test]
+    fn history_browsing_blocks_reanchor_but_next_live_identity_resumes_it() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.live_low_sweep_auto_advance = true;
+        app.selected_cut = 3;
+        app.volume = Some(Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[
+                (0.50, 0),
+                (1.80, 60_000),
+                (0.70, 180_000),
+                (1.30, 300_000),
+                (2.40, 420_000),
+            ],
+            720,
+        )));
+        let ctx = egui::Context::default();
+
+        let mut historical = test_reflectivity_sails_volume_with_radials(
+            &[
+                (0.50, 0),
+                (1.80, 60_000),
+                (0.70, 180_000),
+                (1.30, 300_000),
+                (2.40, 420_000),
+            ],
+            720,
+        );
+        historical.volume_time += chrono::Duration::minutes(5);
+        app.primary.cursor.browsing = true;
+        app.installing_primary_live_low_follow_reanchor = true;
+        app.install_volume_arc(
+            Arc::new(historical),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.selected_cut, 3,
+            "history inspection must preserve the explicitly viewed high cut"
+        );
+
+        let mut live = test_reflectivity_sails_volume_with_radials(
+            &[
+                (0.50, 0),
+                (1.80, 60_000),
+                (0.70, 180_000),
+                (1.30, 300_000),
+                (2.40, 420_000),
+            ],
+            720,
+        );
+        live.volume_time += chrono::Duration::minutes(10);
+        app.primary.cursor.browsing = false;
+        app.installing_primary_live_low_follow_reanchor = true;
+        app.install_volume_arc(
+            Arc::new(live),
+            None,
+            false,
+            None,
+            FrameStatus::LiveComplete,
+            &ctx,
+        );
+        app.installing_primary_live_low_follow_reanchor = false;
+        assert_eq!(
+            app.selected_cut, 2,
+            "the next live scan must return to its newest compatible low cut"
+        );
+    }
+
+    #[test]
+    fn following_pane_reanchors_to_newest_low_cut_after_site_change() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.live_low_sweep_auto_advance = true;
+        let mut previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        previous.site.id = "KTLX".to_owned();
+        app.volume = Some(Arc::new(previous));
+        let mut pane = test_pane(DisplayProduct::Moment(MomentType::Reflectivity));
+        pane.cut = Some(0);
+        app.extra_panes.push(pane);
+
+        let mut next = test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (1.80, 60_000), (0.70, 180_000), (1.30, 300_000)],
+            720,
+        );
+        next.site.id = "KOUN".to_owned();
+        next.volume_time += chrono::Duration::hours(12) + chrono::Duration::minutes(5);
+        app.installing_primary_live_low_follow_reanchor = true;
+        app.install_volume_arc(
+            Arc::new(next),
+            None,
+            false,
+            None,
+            FrameStatus::LiveComplete,
+            &egui::Context::default(),
+        );
+
+        assert_eq!(app.selected_cut, 2);
+        assert_eq!(app.extra_panes[0].cut, Some(2));
+        assert_eq!(
+            app.extra_panes[0].displayed_frame_status,
+            Some(FrameStatus::LiveComplete)
+        );
+    }
+
+    #[test]
+    fn following_pane_manual_hold_survives_growth_then_clears_on_next_scan() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.live_low_sweep_auto_advance = true;
+        let current = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (0.70, 60_000), (0.60, 120_000)],
+            720,
+        ));
+        app.volume = Some(Arc::clone(&current));
+        let mut pane = test_pane(DisplayProduct::Moment(MomentType::Reflectivity));
+        pane.cut = Some(1);
+        pane.manual_cut_hold = Some(LowSweepCutKey::new(
+            &frame_identity_for_volume(current.as_ref()),
+            1,
+        ));
+        app.extra_panes.push(pane);
+
+        let mut growing = current.as_ref().clone();
+        growing.cuts.push(
+            test_reflectivity_sails_volume_with_radials(&[(0.55, 180_000)], 720)
+                .cuts
+                .remove(0),
+        );
+        app.install_volume_arc(
+            Arc::new(growing),
+            None,
+            false,
+            None,
+            FrameStatus::LivePartial,
+            &egui::Context::default(),
+        );
+        assert_eq!(app.extra_panes[0].cut, Some(1));
+        assert!(app.extra_panes[0].manual_cut_hold.is_some());
+
+        let mut next = test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (1.80, 60_000), (0.70, 180_000)],
+            720,
+        );
+        next.volume_time = current.volume_time + chrono::Duration::minutes(3);
+        app.installing_primary_live_low_follow_reanchor = true;
+        app.install_volume_arc(
+            Arc::new(next),
+            None,
+            false,
+            None,
+            FrameStatus::LiveComplete,
+            &egui::Context::default(),
+        );
+        assert!(app.extra_panes[0].manual_cut_hold.is_none());
+        assert_eq!(app.extra_panes[0].cut, Some(2));
+    }
+
+    #[test]
+    fn owned_pane_manual_hold_survives_growth_then_clears_on_next_scan() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.live_low_sweep_auto_advance = true;
+        let current = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (0.70, 60_000), (0.60, 120_000)],
+            720,
+        ));
+        let mut pane = test_pane(DisplayProduct::Moment(MomentType::Reflectivity));
+        pane.pin = Some(SiteRef::Us {
+            level2_id: current.site.id.clone(),
+        });
+        pane.volume = Some(Arc::clone(&current));
+        pane.cut = Some(1);
+        pane.manual_cut_hold = Some(LowSweepCutKey::new(
+            &frame_identity_for_volume(current.as_ref()),
+            1,
+        ));
+        app.extra_panes.push(pane);
+        let ctx = egui::Context::default();
+
+        let mut growing = current.as_ref().clone();
+        growing.cuts.push(
+            test_reflectivity_sails_volume_with_radials(&[(0.55, 180_000)], 720)
+                .cuts
+                .remove(0),
+        );
+        app.install_extra_pane_volume_arc(
+            0,
+            Arc::new(growing),
+            None,
+            None,
+            FrameStatus::LivePartial,
+            &ctx,
+        );
+        assert_eq!(app.extra_panes[0].cut, Some(1));
+        assert!(app.extra_panes[0].manual_cut_hold.is_some());
+
+        let mut next = test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (1.80, 60_000), (0.70, 180_000)],
+            720,
+        );
+        next.volume_time = current.volume_time + chrono::Duration::minutes(3);
+        app.extra_panes[0].installing_live_low_follow_reanchor = true;
+        app.install_extra_pane_volume_arc(
+            0,
+            Arc::new(next),
+            None,
+            None,
+            FrameStatus::LiveComplete,
+            &ctx,
+        );
+        assert!(app.extra_panes[0].manual_cut_hold.is_none());
+        assert_eq!(app.extra_panes[0].cut, Some(2));
+    }
+
+    #[test]
+    fn completed_360_ray_frame_reanchors_but_live_partial_does_not() {
+        let mut complete_app = test_viewer_app_with_hazards(Vec::new());
+        complete_app.app_settings.live_low_sweep_auto_advance = true;
+        complete_app.volume = Some(Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0)],
+            720,
+        )));
+        let mut complete =
+            test_reflectivity_sails_volume_with_radials(&[(0.50, 0), (0.70, 180_000)], 360);
+        // Use a non-terminal international site. `TEST` intentionally follows
+        // the terminal-radar 360-ray rule because terminal IDs begin with T.
+        complete.site.id = "ESPDG".to_owned();
+        complete_app.installing_primary_live_low_follow_reanchor = true;
+        complete_app.install_volume_arc(
+            Arc::new(complete),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &egui::Context::default(),
+        );
+        assert_eq!(complete_app.selected_cut, 1);
+
+        let mut partial_app = test_viewer_app_with_hazards(Vec::new());
+        partial_app.app_settings.live_low_sweep_auto_advance = true;
+        partial_app.volume = Some(Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0)],
+            720,
+        )));
+        let mut partial =
+            test_reflectivity_sails_volume_with_radials(&[(0.50, 0), (0.70, 180_000)], 360);
+        partial.site.id = "ESPDG".to_owned();
+        partial_app.installing_primary_live_low_follow_reanchor = true;
+        partial_app.install_volume_arc(
+            Arc::new(partial),
+            None,
+            false,
+            None,
+            FrameStatus::LivePartial,
+            &egui::Context::default(),
+        );
+        assert_eq!(partial_app.selected_cut, 0);
+    }
+
+    #[test]
     fn low_level_auto_advance_ignores_incomplete_chunk_tilt_by_default() {
         let product = DisplayProduct::Moment(MomentType::Reflectivity);
         let previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
@@ -72850,6 +73354,7 @@ mod tests {
             primary,
             low_sweep_disabled_cuts: BTreeSet::new(),
             manual_primary_cut_hold: None,
+            displayed_primary_frame_status: None,
             product_cut_memory: BTreeMap::new(),
             loop_timeline_summary_cache: std::cell::RefCell::new(BTreeMap::new()),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(bowecho_tile_layer_config())),
@@ -77072,6 +77577,19 @@ mod tests {
                 true,
             )
             .contains("sweep time unavailable · BUILDING · MANUAL HOLD")
+        );
+        assert!(
+            !selected_sweep_readout(
+                &TiltCutRow {
+                    elevation_deg: 1.3,
+                    ..row
+                },
+                DisplayTimeZone::Utc,
+                sweep_time,
+                true,
+                false,
+            )
+            .contains("FOLLOW LOW")
         );
     }
 

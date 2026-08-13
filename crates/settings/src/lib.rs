@@ -761,8 +761,9 @@ pub struct AppSettings {
     pub display_owner_site: Option<String>,
     /// Favorite site ids, in user order.
     pub favorites: Vec<String>,
-    /// Favorite radar products, stored by the same stable short labels used
-    /// by product hotkeys (for example `REF`, `VEL`, and `ET`).
+    /// Favorite radar products, stored by variant-qualified stable keys (for
+    /// example `moment:REF`, `display:DSRV`, and `derived:ET`). Legacy bare
+    /// short labels remain readable by the app.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub radar_product_favorites: Vec<String>,
     /// Favorite WoFS base products, stored by the official API slug so a
@@ -1915,7 +1916,7 @@ pub struct LoadedAppSettings {
 }
 
 impl AppSettings {
-    /// Normalize the persisted quick-product strip without discarding labels
+    /// Normalize the persisted quick-product strip without discarding keys
     /// that are temporarily unavailable at the current radar. The first
     /// spelling wins and matching is case-insensitive.
     pub fn normalize_radar_product_favorites(&mut self) {
@@ -4048,6 +4049,28 @@ mod tests {
         assert_eq!(
             restored.radar_product_favorites,
             ["REF", "PHIF", "temporarily-away"]
+        );
+    }
+
+    #[test]
+    fn typed_radar_product_favorites_round_trip_and_retain_unavailable_keys() {
+        let restored = AppSettings::from_json(
+            r#"{"radar_product_favorites":[" derived:CREF ","DERIVED:cref","moment:CREF","display:DSRV","moment:temporarily-away",""]}"#,
+        );
+
+        assert_eq!(
+            restored.radar_product_favorites,
+            [
+                "derived:CREF",
+                "moment:CREF",
+                "display:DSRV",
+                "moment:temporarily-away"
+            ]
+        );
+        let round_tripped = AppSettings::from_json(&restored.to_json());
+        assert_eq!(
+            round_tripped.radar_product_favorites,
+            restored.radar_product_favorites
         );
     }
 
