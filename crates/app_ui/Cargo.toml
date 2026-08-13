@@ -6,7 +6,6 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
-arwen-studio = { path = "../arwen-studio" }
 async-trait = "0.1"
 chrono.workspace = true
 rayon.workspace = true

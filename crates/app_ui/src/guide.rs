@@ -3459,7 +3459,7 @@ fn sources(ui: &mut egui::Ui) {
          comes from U.S. Census Bureau 2024 cartographic boundary files; dense U.S. town/place \
          labels come from the 2023 1:500,000 place-boundary set. Global country, regional \
          administrative, and populated-place data comes from public-domain Natural Earth. \
-         These same generated tables support the embedded ArWen Studio map. Tile styles: imagery \
+         Tile styles: imagery \
          © Esri, Maxar, Earthstar Geographics; Streets/Topo map tiles © Esri and contributors.",
     );
 

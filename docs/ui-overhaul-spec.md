@@ -217,7 +217,7 @@ Extract a `mod ui_theme` (new file `crates/app_ui/src/ui_theme.rs`) holding the 
 
 ## 6. MIGRATION PLAN — eight PR-sized steps
 
-Ordering principle: **scaffold the homes before the five feature branches land**, so they merge into the new structure instead of bolting onto the fold and being migrated twice. Every step compiles and ships alone. Coordination gate (same as both prior specs): confirm no concurrent app_ui session (the `rra-review` clone's UI agent), branch off current mainline, never touch dealias/render-worker code.
+Ordering principle: **scaffold the homes before the five feature branches land**, so they merge into the new structure instead of bolting onto the fold and being migrated twice. Every step compiles and ships alone. Coordination gate: confirm no concurrent `app_ui` work, branch from the current mainline, and never touch dealias/render-worker code.
 
 | PR | Scope | Exact moves | Feature-branch gates |
 |---|---|---|---|

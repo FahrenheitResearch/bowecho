@@ -1,17 +1,32 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/app_ui",
+    "crates/bench",
+    "crates/bowecho_cli",
+    "crates/cache",
+    "crates/color_tables",
+    "crates/data_source",
+    "crates/mini_ui",
+    "crates/nexrad_io",
+    "crates/product_engine",
+    "crates/radar_core",
+    "crates/radar_scattering",
+    "crates/render2d",
+    "crates/settings",
+    "crates/simradar_cuda",
+    "crates/simradar_validation",
+    "crates/styles",
+    "crates/ui_core",
+]
 resolver = "3"
 
 [workspace.package]
-version = "0.34.13"
+version = "0.34.12"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/bowecho"
 
 [workspace.dependencies]
-arwen-map = { path = "crates/arwen-map" }
-arwen-plan = { path = "crates/arwen-plan" }
-arwen-proc = { path = "crates/arwen-proc" }
 byteorder = "1.5"
 bzip2 = { version = "0.6", default-features = false, features = ["bzip2-sys"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
@@ -20,7 +35,6 @@ eframe = { version = "0.34.3", features = ["glow"] }
 egui_tiles = "0.15"
 earcutr = "0.5"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
-fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6", "gtk3"] }
 libdeflate-sys = "1.25.2"

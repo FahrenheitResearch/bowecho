@@ -154,11 +154,13 @@ fn real_cow2_sweep_header_peek_matches_full_decode() {
 /// under the local mobile-radar corpus (DOW7 Goshen 2009, RaXPol Sulphur
 /// 2016, COW2/DOW7low Goodland + COW2 deployment 2026, GR2 msg31 twins).
 #[test]
-#[ignore = "requires BOWECHO_MOBILE_RADAR_DIR or C:\\Users\\drew\\Downloads\\obscure_radar"]
+#[ignore = "requires BOWECHO_MOBILE_RADAR_DIR"]
 fn mobile_radar_corpus_decodes_every_archive() {
-    let corpus = std::env::var_os("BOWECHO_MOBILE_RADAR_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Users\drew\Downloads\obscure_radar"));
+    let Some(corpus) = std::env::var_os("BOWECHO_MOBILE_RADAR_DIR").map(std::path::PathBuf::from)
+    else {
+        eprintln!("skipping corpus test; BOWECHO_MOBILE_RADAR_DIR is not set");
+        return;
+    };
     if !corpus.is_dir() {
         eprintln!("skipping corpus test; {} not found", corpus.display());
         return;

@@ -371,4 +371,4 @@ Implementation: generalize `product_hotkeys` into a `key_bindings: BTreeMap<Stri
 | Hotkey defaults | `default_product_hotkeys` | crates/settings/src/lib.rs:57 |
 | Sidebar width constants | `SIDEBAR_*_WIDTH` | 99–103 |
 
-Coordination note (same as the last spec's gate): a separate UI agent has owned app_ui work on the `rra-review` clone (`perf/engine-fast-path`); confirm no concurrent app_ui session before starting, branch off the then-current mainline (e.g. `ui/refresh-v1`), and do not touch dealias or render-worker logic from this branch.
+Coordination note: confirm no concurrent `app_ui` work before starting, branch from the then-current mainline, and do not touch dealias or render-worker logic from that branch.

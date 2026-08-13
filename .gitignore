@@ -10,6 +10,8 @@
 *.download
 .DS_Store
 Thumbs.db
+__pycache__/
+*.py[cod]
 
 # agent scratch probes at repo root
 /*.html

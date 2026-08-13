@@ -51,8 +51,8 @@ regressing (§4 below).
 - `crates/bench/src/dealias_eval.rs` — the battery harness (below).
 - `docs/dealias-v4-baselines.json` — every measured row. NEVER edit
   existing rows; append new ones with a date.
-- Case volumes live in `C:/Users/drew/radar-work/dealias-cases/`
-  (download commands in `crates/bench/README.md`).
+- Set `BOWECHO_DEALIAS_CASES` to the local case-volume directory
+  (download commands are in `crates/bench/README.md`).
 
 ## 3. The iteration loop (build → run → read → repeat)
 
@@ -65,7 +65,7 @@ cargo build --release -p bowecho-bench
 Run case H (from the repo root; `V` = the case-volume dir):
 
 ```
-V=C:/Users/drew/radar-work/dealias-cases
+V="$BOWECHO_DEALIAS_CASES"
 target/release/bowecho-bench.exe --dealias \
   --target $V/KGWX20230325_033846_V06 \
   --prior  $V/KGWX20230325_033149_V06 \

@@ -53,7 +53,7 @@
 **Ingest rules (hard, from `docs/wrf-import-large-grids.md`):**
 - Never `getvar` 3-D fields: wrf-core's `WrfFile` memoizes every 3-D **f64** intermediate (~400 MB each at 50.5 M cells) until timestep change; that produced the measured 8.87 GB peak. SimSat ingest reads raw variables one at a time via `WrfFile::read_var` (the "fast reads" path that took light import 1241 s → 91 s, `local_import.rs` `PlaneSource`) and does its own cheap arithmetic (T = (θ′+300)(p/p₀)^κ with p = P+PB; z = (PH+PHB)/g₀ with destaggering).
 - One 3-D field resident at a time; each is folded into the (much smaller, quantized) brick accumulation buffers and dropped before the next read. Peak RSS target < 2.5 GB on the Enderlin file (vs ~200–400 MB per raw field).
-- Ingest worker thread calls `wrf_process::lower_import_thread_priority()` (`wrf_process.rs:262`, `THREAD_PRIORITY_BELOW_NORMAL`) — the owner's machine has already hard-crashed under all-core memory-bandwidth load; that lesson is inherited wholesale, including the confirm-first size gate UX from `local_import.rs`.
+- Ingest worker threads call `wrf_process::lower_import_thread_priority()` (`wrf_process.rs:262`, `THREAD_PRIORITY_BELOW_NORMAL`) to avoid all-core memory-bandwidth overload, together with the confirm-first size gate UX from `local_import.rs`.
 
 **Fields read per timestep:** 3-D `QCLOUD, QRAIN, QICE, QSNOW, QGRAUP, QVAPOR, T, P, PB, PH, PHB`; 2-D `HGT, TSK, LANDMASK, SNOWH (if present), U10, V10, XLAT, XLONG` (+ `IVGTYP` best-effort — note the known wrf-core "no layout message" fallback for `IVGTYP/ISLTYP` documented in `wrf-import-large-grids.md`; fall back to netcrust exactly as `local_import.rs` does).
 
@@ -173,26 +173,6 @@ Dependency-ordered; every gate = fmt/clippy/test on nodes + a real-data proof re
 6. **QVAPOR gets a full brick channel now** so a 6.2 µm water-vapor IR band is a shader-only addition later.
 7. **Standalone + BowEcho (updated 2026-07-10):** SimSat still ships as its own app (`simsat_studio`). The original output-only BowEcho bridge shipped in v0.1.2; the owner subsequently approved direct engine integration as a BowEcho SimSat pane, while retaining the same sat-store contract as the playback/map boundary.
 8. **iGPU hardware floor (2026-07-07 addendum):** must run well on Intel Arrow Lake Xe (Core Ultra 270K-class) and AMD RDNA2 iGPU (Ryzen 9950X-class): prerender-then-play is the primary iGPU mode, stored-frame quality is never reduced, preview adapts. Discrete GPUs are the fast path.
-
----
-
-## 12. Implementation handoff — read this first if you are the implementing agent
-
-This section exists so the plan is executable without the context of the session that wrote it.
-
-**Process rules (owner mandates, non-negotiable):**
-- NEVER run cargo/rustc on the owner's Windows machine (a PreToolUse hook blocks it). The one sanctioned local build is a release smoke (`env -u CARGO_BUILD_JOBS cargo build --release -p <bin>`) when producing an exe for the owner to run.
-- All verification runs on the build nodes over ssh: push your branch to the node's bare repo first (`git push node3|node4 HEAD:refs/heads/<branch>` — node3 = drew@192.168.68.56, node4 = drew@192.168.68.57; the verify script fetches from the node's LOCAL repo, pushing to origin alone fails with exit 3), then run each gate FOREGROUND: `ssh -o BatchMode=yes drew@<ip> "flock -w 3600 /tmp/bowecho-verify.lock env BOWECHO_BRANCH='<branch>' bash ~/bowecho-verify.sh <cargo args>"` for `fmt --all --check`, `clippy --workspace --all-targets -- -D warnings`, `test --workspace`. Never leave a gate unverified; on a client timeout, re-run (node caches make retries fast).
-- Work in a git worktree branched from the integration tip; commit early and often (uncommitted worktrees have been lost); checkpoint findings to a notes file under `C:\Users\drew\radar-work\` as you go.
-- Nodes are headless Linux: no GPU, no golden-image tests — the §9 test strategy (CPU reference kernels, naga validation, pure-math round trips) is the CI story; visual proofs happen on the owner's box via a locally built exe the owner runs.
-- Never touch `~/weather` on the nodes (owner data). Prefer cohesive SimSat modules, but the former `main.rs` line-count ratchet is currently discontinued.
-
-**Owner-side facts:**
-- The Enderlin canonical fixture lives on the owner's machine under his `wrf_demo` folder (2.4 GB, 800×800×79); ask the owner to confirm the path before M0 ingest testing, and NEVER import it with the heavy full-diagnostics path.
-- Proof loop per milestone: build `simsat_studio` release exe locally (sanctioned smoke), copy to the owner's Desktop with a clear name, owner runs it and reports; treat owner reports as the acceptance test.
-- Blue Marble source: NASA Visible Earth collection 1484 (public domain), 12 monthly global composites; 2 km JPEGs ≈ 30–50 MB/month; re-host as GitHub release assets with a sha256 manifest (streaming-download pattern precedent: `crates/app_ui/src/self_update.rs`).
-
-**Order of work = §10 milestones, one at a time, each fully gated before the next.** Scaffold M0 by hand-writing the two crates' `Cargo.toml` + adding them to the workspace `members` (you cannot run `cargo new` locally); first gate run on a node will validate the scaffold. Every §1–§7 subsystem names its repo precedent file — read the precedent before writing the subsystem. When a detail here conflicts with what you find in the code, the code wins and this doc gets a correcting commit.
 
 ---
 

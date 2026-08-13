@@ -2339,30 +2339,13 @@ fn bowecho_dir_path(leaf: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("bowecho-data").join(leaf))
 }
 
-/// Model (rw-store) root. Dev convenience: when the local rusty-weather
-/// checkout's store exists (the dev machine), share it; everyone else gets
-/// a per-user app-data store — NEVER a hardcoded path that resolves
-/// read-only on other systems (v0.8.0 macOS "os error 30").
+/// Model (rw-store) root under BowEcho's per-user data directory.
 pub fn model_store_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let dev = PathBuf::from("C:/Users/drew/rusty-weather/store");
-        if dev.is_dir() {
-            return dev;
-        }
-    }
     bowecho_dir("model-store")
 }
 
 /// Raw GRIB download cache for in-app ingest.
 pub fn model_cache_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let dev = PathBuf::from("C:/Users/drew/rusty-weather/out/rw_batch/cache");
-        if dev.is_dir() {
-            return dev;
-        }
-    }
     bowecho_dir("model-cache")
 }
 

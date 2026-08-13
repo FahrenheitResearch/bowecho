@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,9 +17,30 @@ jobs:
   create-release:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag matches workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace_version="$(python3 -c '
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          print(manifest["workspace"]["package"]["version"])
+          ')"
+          expected_tag="v${workspace_version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "::error title=Release tag/version mismatch::Tag ${GITHUB_REF_NAME} does not match Cargo workspace version ${workspace_version} (expected ${expected_tag})."
+            exit 1
+          fi
 
       - name: Create release
         env:
@@ -51,6 +72,8 @@ jobs:
   build:
     needs: create-release
     if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +86,7 @@ jobs:
           - os: windows-latest
             artifact_name: bowecho-windows-x64
             package: windows
+            rustflags: "-C target-feature=+crt-static"
             update_asset: bowecho-windows-x64.exe
           # AVX2 variant for ~2015+ CPUs: benched -21% on the dealiased
           # velocity raster and -30% on reflectivity vs baseline x86-64
@@ -70,11 +94,12 @@ jobs:
           - os: windows-latest
             artifact_name: bowecho-windows-x64-v3
             package: windows
-            rustflags: "-C target-cpu=x86-64-v3"
+            rustflags: "-C target-feature=+crt-static -C target-cpu=x86-64-v3"
             update_asset: bowecho-windows-x64-v3.exe
           - os: windows-11-arm
             artifact_name: bowecho-windows-arm64
             package: windows
+            rustflags: "-C target-feature=+crt-static"
             update_asset: bowecho-windows-arm64.exe
           - os: ubuntu-24.04
             artifact_name: bowecho-linux-x64
@@ -93,7 +118,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux desktop build dependencies
         if: runner.os == 'Linux'
@@ -118,7 +145,7 @@ jobs:
       # spill instead of dying, so shipped binaries keep full optimization.
       - name: Expand Windows pagefile for fat-LTO link
         if: runner.os == 'Windows'
-        uses: al-cheb/configure-pagefile-action@v1.4
+        uses: al-cheb/configure-pagefile-action@a3b6ebd6b634da88790d9c58d4b37a7f4a7b8708 # v1.4
         with:
           minimum-size: 16GB
           maximum-size: 32GB
@@ -154,18 +181,22 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
+            if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+              echo "::error title=Windows signing unavailable::Tagged Windows releases require every Azure Trusted Signing secret (see docs/SIGNING.md)."
+              exit 1
+            fi
           fi
 
-      # Signs bowecho.exe via Azure Trusted Signing when the secrets exist
-      # (docs/SIGNING.md) — silently skipped until then, so adding the
-      # secrets is the ONLY step needed to start shipping signed builds.
+      # Signs bowecho.exe via Azure Trusted Signing when the secrets exist.
+      # Manual RC builds may remain unsigned, but tagged releases fail above
+      # rather than publishing binaries that the in-app updater would reject.
       - name: Sign Windows binary (Azure Trusted Signing)
         if: runner.os == 'Windows' && steps.windows_signing.outputs.enabled == 'true'
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        uses: azure/trusted-signing-action@v0
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -552,23 +583,54 @@ jobs:
           done
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/*
           if-no-files-found: error
 
-      - name: Upload release asset
-        if: startsWith(github.ref, 'refs/tags/')
+  upload-release-assets:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify aggregated release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*)
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "::error::No release assets were downloaded"
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            if [[ ! -f "$asset" ]]; then
+              echo "::error::Unexpected directory in aggregated release assets: $asset"
+              exit 1
+            fi
+          done
+
+      - name: Upload release assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
 
   publish-release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success'
+    needs: upload-release-assets
+    if: startsWith(github.ref, 'refs/tags/') && needs.upload-release-assets.result == 'success'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Publish release after all assets upload
         env:

@@ -3,8 +3,8 @@
 //! The panels (run browser, false-color field viewer, skew-T sounding) were
 //! built to take a `&mut egui::Ui` from any egui host; all store IO runs on
 //! rw-ui's own worker thread, so BowEcho's render loop never blocks. The
-//! data source is an rw-store directory on disk (produced by rusty-weather
-//! ingest, default `C:\Users\drew\rusty-weather\store`).
+//! data source is an rw-store directory on disk produced by rusty-weather
+//! ingest and selected through BowEcho settings.
 
 use eframe::egui;
 use rw_ui::{
@@ -1969,10 +1969,6 @@ pub struct ModelDataDock {
     /// runs (its worker threads have no repaint hook of their own).
     repaint: egui::Context,
     store_root: PathBuf,
-    /// WRF workspace surface. ArWen is created lazily so ordinary radar/model
-    /// users pay no tile, probe, or registry cost until they explicitly open it.
-    wrf_arwen_selected: bool,
-    arwen: Option<Box<arwen_studio::StudioApp>>,
     /// Running local WRF/NetCDF import, if any (drained in `poll_import`).
     import_job: Option<ImportJob>,
     /// Progressive Local/Process refresh policy. Full scans and follow-hour
@@ -2268,8 +2264,6 @@ impl ModelDataDock {
             store_view,
             repaint: ctx.clone(),
             store_root,
-            wrf_arwen_selected: false,
-            arwen: None,
             import_job: None,
             incremental_rescan: ImportRescanCoalescer::default(),
             #[cfg(test)]
@@ -5685,7 +5679,7 @@ impl ModelDataDock {
 
     /// True while a WRF/NetCDF import or synthetic-radar build runs on the dock
     /// worker. The app pauses live radar auto-refresh while this holds: the
-    /// owner's machine has hard-crashed under the combined all-core memory-
+    /// systems can hard-crash under the combined all-core memory-
     /// bandwidth load of a large WRF import plus concurrent live-radar decode
     /// (the import workers already run below-normal priority). Only the network
     /// fetch pauses — the loop keeps playing existing frames.
@@ -5757,20 +5751,6 @@ impl ModelDataDock {
     /// Formula Lab, and one synthetic-radar result queue.
     pub fn wrf_ui(&mut self, ui: &mut egui::Ui) {
         self.handle_responses();
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.wrf_arwen_selected, false, "Open and process WRF");
-            ui.selectable_value(&mut self.wrf_arwen_selected, true, "Design ArWen run");
-        });
-        ui.separator();
-
-        if self.wrf_arwen_selected {
-            let arwen = self
-                .arwen
-                .get_or_insert_with(|| Box::new(arwen_studio::StudioApp::embedded(&self.repaint)));
-            arwen.ui_impl(ui);
-            return;
-        }
-
         // Keep long-running job state and Cancel fixed above the scrolling
         // workspace so it cannot disappear below a tall recipe/control panel.
         self.import_status_ui(ui);
@@ -8994,8 +8974,8 @@ impl ModelDataDock {
 
     /// The stable, plot-first header for the Models workspace. Frequent
     /// choices stay visible; imports, batch export, formulas, satellite and
-    /// WRF/ArWen remain intact behind the existing specialist windows or the
-    /// Advanced group in the left rail.
+    /// WRF processing remain intact behind the existing specialist windows or
+    /// the Advanced group in the left rail.
     fn workspace_primary_controls(&mut self, ui: &mut egui::Ui) {
         let theme = crate::ui_theme::theme();
         egui::Frame::new()
@@ -10241,7 +10221,7 @@ impl ModelDataDock {
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(
-                                "Imports, Formula Lab, satellite/SimSat plotting, WRF/ArWen, CM1 and batch export remain available without crowding the everyday plot path.",
+                                "Imports, Formula Lab, satellite/SimSat plotting, WRF processing, CM1 and batch export remain available without crowding the everyday plot path.",
                             )
                             .small()
                             .weak(),
@@ -13497,6 +13477,38 @@ pub(crate) fn patch_sounding_scene_zoom(view_state: &mut serde_json::Value, zoom
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn bowecho_release_has_no_simulation_controller_launch_surface() {
+        let manifest = include_str!("../Cargo.toml");
+        let model_data_source = include_str!("model_data.rs");
+        let main_source = include_str!("main.rs");
+        let package_name = format!("{}-{}", "arwen", "studio");
+        let studio_type = format!("{}{}", "arwen_", "studio::StudioApp");
+        let launch_label = format!("Design {} run", "ArWen");
+        let studio_label = format!("{} {}", "ArWen", "Studio");
+        let workspace_manifest = include_str!("../../../Cargo.toml");
+
+        assert!(
+            !manifest
+                .lines()
+                .any(|line| { line.trim_start().starts_with(&format!("{package_name} =")) }),
+            "the BowEcho binary must not link the separate simulation controller"
+        );
+        for source in [model_data_source, main_source] {
+            assert!(!source.contains(&studio_type));
+            assert!(!source.contains(&launch_label));
+            assert!(!source.contains(&studio_label));
+        }
+        let controller_prefix = format!("crates/{}-", "arwen");
+        let map_package = format!("{}-map", "arwen");
+        let plan_package = format!("{}-plan", "arwen");
+        let process_package = format!("{}-proc", "arwen");
+        assert!(!workspace_manifest.contains(&controller_prefix));
+        assert!(!workspace_manifest.contains(&format!("{map_package} =")));
+        assert!(!workspace_manifest.contains(&format!("{plan_package} =")));
+        assert!(!workspace_manifest.contains(&format!("{process_package} =")));
+    }
 
     fn historical_test_request() -> rw_community_protocol::ShareRequest {
         rw_community_protocol::ShareRequest {

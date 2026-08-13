@@ -109,7 +109,7 @@ fields + `*_iso` sounding volumes through the same `wrf-core` getvar family)
 never got the fixes above, and its worker sent exactly ONE terminal message —
 the dock showed an anonymous spinner for the whole run.
 
-Measured on node4 (Linux, 24-core, release, `/usr/bin/time -v`), single
+Measured on a 24-core Linux build host (release, `/usr/bin/time -v`), single
 Enderlin `wrfout_d03_2025-06-21_02_15_00` (2.05 GB, 800×800×79):
 
 | | wall | peak RSS |
@@ -177,7 +177,7 @@ ONCE — `netcrust::open` eagerly indexes NetCDF-4 metadata twice over
 this file) and the old code paid it in both `try_postprocessed_wrf` and
 `read_wrf_2d_fields`.
 
-Enderlin `02_15_00` after-breakdown (release, node4, `/usr/bin/time -v`):
+Enderlin `02_15_00` after-breakdown (Linux release benchmark, `/usr/bin/time -v`):
 **91 s wall, 6.74 GB peak RSS** (18 s user / 75 s system, 58 M minor faults),
 120 store variables — identical field set. Stages: 57.8 s `netcrust::open`
 (the remaining churn — upstream), 21.5 s all ~120 2-D planes (≈1 s for the

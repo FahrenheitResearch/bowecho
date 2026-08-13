@@ -264,7 +264,7 @@ pub(crate) struct PlotIndexFrame {
 pub(crate) const PLOT_INDEX_SCHEMA: &str = "bowecho-plot-index/1";
 
 /// Spawn the batch plot worker. Below-normal thread priority like the import
-/// workers (the owner's machine has hard-crashed under all-core load), one
+/// workers (all-core model work can overwhelm memory bandwidth), one
 /// progress message per attempted plot, terminal `Done`.
 pub(crate) fn spawn_batch_plot(
     request: BatchPlotRequest,

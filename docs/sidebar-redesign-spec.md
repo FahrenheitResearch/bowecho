@@ -79,7 +79,7 @@ REMOVED from Radar tab (all relocated): Smooth display (5481–5489), Basemap + 
 
 ## VISIBLE BUDGET (volume loaded, defaults): panes row + 3 site/status rows + 2 fold titles (Layers, Volume details) + product grid + ≤1 contextual row + color row + hide-below row + tilt header/list + transport + slider + status line + Frames fold title + 2 algorithm rows + 2 tool rows. Worst case (300 px, quad + SRV + unfold) fits without inner scrolling beyond tilt_list; the 7 section headers cost less height than the removed Placefiles/Hotkeys/Basemap/Smooth/verbose-labels blocks.ORDERED IMPLEMENTATION CHECKLIST (one focused session; all edits in crates/app_ui/src/main.rs unless noted)
 
-0. COORDINATION GATE: a separate UI agent owns app_ui on the rra-review clone (branch perf/engine-fast-path). Confirm no concurrent app_ui work before starting; implement here on a new branch off fix/region-based-velocity-dealias (e.g. ui/sidebar-redesign). Do NOT touch dealias logic.
+0. COORDINATION GATE: confirm no concurrent `app_ui` work before starting. Implement on a dedicated branch and do not touch dealias logic.
 
 1. Scaffolding (compiles after this step): rename enum SidebarTab variants → Radar/Warnings/Settings (2029–2034); SIDEBAR_TABS → 3 entries (2036–2041); sidebar_tab_tooltip (2043–2050); fix BOTH construction sites 2187 and 15424; side_panel match (5012–5049): Warnings→hazard_panel (keep id "sidebar_hazards_tab"), Settings→stub settings_panel (new id "sidebar_settings_tab"); delete heading (5007); tab width 67.0 (5059) → (available_width − 2·spacing)/3. Grep `SidebarTab::` for stragglers. No serde migration (verified non-persisted).
 

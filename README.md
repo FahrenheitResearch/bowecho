@@ -160,9 +160,8 @@ a rights-confirmed processed generation to a trusted Rusty Weather HTTPS origin.
 This is a separate, authenticated owner workflow, never an automatic share or
 peer transfer. See [Owner generation publication](docs/owner-generation-publication.md)
 for the confirmation, provenance, recovery, and revocation contract. BowEcho
-also embeds the Apache-2.0 ArWen Studio control plane in the WRF workspace; its
-vendored scope and external-engine boundary are recorded in the
-[ArWen Studio vendor record](docs/arwen-studio/VENDOR.md).
+can recognize and process ArWen-generated wrfout data, but the released app
+does not embed or launch the ArWen simulation controller.
 
 **Scientific guides:** the [Formula Lab reference](docs/formula-lab.md)
 documents syntax, units, source capabilities, numerical operators, examples,
@@ -305,6 +304,5 @@ During severe weather, follow your local NWS office and emergency management.
 
 Dual-licensed under MIT or Apache-2.0, at your option. License and attribution
 notices for derived and embedded third-party work (including SHARPpy, the
-sounding-window port, Py-ART-derived dealiasing, ArWen Studio, fonts, and
-basemap data) are collected in
+sounding-window port, Py-ART-derived dealiasing, fonts, and basemap data) are collected in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

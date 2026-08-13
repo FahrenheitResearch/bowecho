@@ -10503,7 +10503,7 @@ impl ViewerApp {
             return;
         }
         // Do not spawn live radar decode while a heavy WRF/model import (or
-        // synthetic build) runs: the owner's machine has hard-crashed under the
+        // synthetic build) runs: systems can hard-crash under the
         // combined all-core memory-bandwidth load of a large WRF import plus
         // concurrent live decode. Only the network fetch pauses — the loop keeps
         // playing existing frames — and it resumes when the import ends.
@@ -35395,7 +35395,7 @@ impl ViewerApp {
         let mut open_models = false;
         ui.horizontal_wrapped(|ui| {
             ui.weak(
-                "Open/process wrfout files here, or design and monitor ArWen forecasts. \
+                "Open/process wrfout files here and build simulated radar. \
                  Processed fields and Formula Lab results are displayed in Models.",
             );
             open_models = ui.button("Open Models").clicked();
@@ -51535,7 +51535,11 @@ mod tests {
     #[test]
     #[ignore = "reads the real on-disk PGUA level2 cache; run with --ignored"]
     fn real_pgua_loop_second_pass_is_all_cache_hits() {
-        let dir = Path::new(r"C:\Users\drew\AppData\Local\BowEcho\cache\level2\PGUA");
+        let Some(dir) = std::env::var_os("BOWECHO_PGUA_DIR").map(PathBuf::from) else {
+            eprintln!("skipping: BOWECHO_PGUA_DIR is not set");
+            return;
+        };
+        let dir = dir.as_path();
         if !dir.is_dir() {
             eprintln!("skipping: {} not present", dir.display());
             return;
@@ -51616,7 +51620,11 @@ mod tests {
     #[test]
     #[ignore = "reads the real on-disk PGUA level2 cache; run with --ignored"]
     fn real_pgua_overwritten_file_under_same_path_re_decodes() {
-        let dir = Path::new(r"C:\Users\drew\AppData\Local\BowEcho\cache\level2\PGUA");
+        let Some(dir) = std::env::var_os("BOWECHO_PGUA_DIR").map(PathBuf::from) else {
+            eprintln!("skipping: BOWECHO_PGUA_DIR is not set");
+            return;
+        };
+        let dir = dir.as_path();
         if !dir.is_dir() {
             eprintln!("skipping: {} not present", dir.display());
             return;
@@ -56644,10 +56652,10 @@ mod tests {
     #[test]
     #[ignore = "requires local real PGUA Level-II cache (BOWECHO_PGUA_DIR)"]
     fn following_velocity_pane_restores_on_real_pgua_volumes() {
-        let dir = std::env::var("BOWECHO_PGUA_DIR").unwrap_or_else(|_| {
-            r"C:\Users\drew\AppData\Local\BowEcho\cache\level2\PGUA".to_owned()
-        });
-        let dir = PathBuf::from(dir);
+        let Some(dir) = std::env::var_os("BOWECHO_PGUA_DIR").map(PathBuf::from) else {
+            eprintln!("skipping: BOWECHO_PGUA_DIR is not set");
+            return;
+        };
         let velocity = |volume: &RadarVolume| {
             volume
                 .cuts
@@ -73276,9 +73284,10 @@ mod tests {
     #[test]
     #[ignore = "renders a REAL model field from the rusty-weather store and writes loupe PNGs"]
     fn loupe_magnifies_real_hrrr_model_field() {
-        let root = std::env::var("BOWECHO_LOUPE_STORE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(r"C:\Users\drew\rusty-weather\store"));
+        let Some(root) = std::env::var_os("BOWECHO_LOUPE_STORE").map(PathBuf::from) else {
+            eprintln!("skip: BOWECHO_LOUPE_STORE is not set");
+            return;
+        };
         if !root.exists() {
             eprintln!("skip: no model store at {}", root.display());
             return;
