@@ -50,6 +50,8 @@ const REMOTE_RUNS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const REMOTE_RUN_MAX_BYTES: u64 = 512 * 1024;
 const REMOTE_VARIABLES_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const REMOTE_AXIS_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const REMOTE_PROFILE_CYCLE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const REMOTE_PROFILE_CYCLE_MAX_VALUES: usize = 1_000_000;
 const REMOTE_MAX_MODELS: usize = 512;
 const REMOTE_MAX_RUNS: usize = 4_096;
 const REMOTE_MAX_VARIABLES: usize = 4_096;
@@ -491,6 +493,11 @@ pub(crate) struct RemoteVariableCapability {
     pub coverage: f64,
     pub point_series: bool,
     pub pressure_profile: bool,
+    /// Added by rw-server alongside the bounded multi-hour sounding API.
+    /// Old authorities omit it, which deliberately keeps the client on the
+    /// already supported single-time signed profile path.
+    #[serde(default)]
+    pub profile_cycle: bool,
     #[serde(default)]
     pub geographic_window: bool,
     pub scalar_temporal_reduction: bool,
@@ -504,6 +511,92 @@ pub(crate) struct RemoteTimePoint {
     pub storage_slot: u16,
     pub lead_seconds: u64,
     pub valid_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteRunCatalog {
+    pub runs: Vec<RemoteRunCatalogEntry>,
+    pub latest_run: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemotePressureProfile {
+    pub name: String,
+    pub units: String,
+    pub levels_hpa: Vec<u16>,
+    pub values: Vec<Option<f32>>,
+    pub available_levels: usize,
+    pub expected_levels: usize,
+    pub coverage: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteProfileSurfaceSample {
+    pub variable: String,
+    pub units: String,
+    pub value: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteProfileCycleSampleStatus {
+    Complete,
+    Partial,
+    Gap,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteProfileCycleSample {
+    pub time: RemoteTimePoint,
+    pub source_provenance: Vec<RemoteSourceProvenance>,
+    pub status: RemoteProfileCycleSampleStatus,
+    pub variables: Vec<RemotePressureProfile>,
+    pub missing_variables: Vec<String>,
+    pub surface_samples: Vec<RemoteProfileSurfaceSample>,
+    pub missing_surface_variables: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteProfileCycleTimeRange {
+    pub start_unix: Option<i64>,
+    pub end_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteProfileCycleMissingPolicy {
+    Strict,
+    Partial,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteProfileCycleResult {
+    pub run: RemoteRunDescriptor,
+    pub point: RemoteGridPoint,
+    pub requested_variables: Vec<String>,
+    pub requested_surface_variables: Vec<String>,
+    pub requested_time: RemoteProfileCycleTimeRange,
+    pub missing_policy: RemoteProfileCycleMissingPolicy,
+    pub samples: Vec<RemoteProfileCycleSample>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteProfileCycleRequest<'a> {
+    model: &'a str,
+    run: &'a str,
+    latitude: f64,
+    longitude: f64,
+    variables: &'a [String],
+    surface_variables: &'a [String],
+    start_unix: Option<i64>,
+    end_unix: Option<i64>,
+    missing_policy: &'static str,
 }
 
 #[allow(dead_code)]
@@ -1147,6 +1240,38 @@ impl CommunityCacheClient {
         Ok(runs)
     }
 
+    /// Resolve the authority's latest physical cycle and bind it back to the
+    /// exact authorized run catalog. The pointer has its own non-colliding
+    /// route because `latest` remains a legal immutable run identifier.
+    #[allow(dead_code)]
+    pub(crate) fn remote_run_catalog(
+        &self,
+        model: &str,
+    ) -> Result<RemoteRunCatalog, CommunityCacheError> {
+        let latest = self.remote_latest_run(model)?;
+        let mut runs = self.remote_runs(model)?;
+        validate_remote_latest_catalog(&runs, &latest)?;
+        sort_remote_runs_by_physical_origin(&mut runs);
+        Ok(RemoteRunCatalog {
+            runs,
+            latest_run: latest.run,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn remote_latest_run(
+        &self,
+        model: &str,
+    ) -> Result<RemoteRunDescriptor, CommunityCacheError> {
+        let path = remote_latest_run_path(model)?;
+        let descriptor: RemoteRunDescriptor = self.get_origin_json(&path, REMOTE_RUN_MAX_BYTES)?;
+        validate_remote_run(&descriptor)?;
+        if descriptor.model != model {
+            return Err(CommunityCacheError::Response);
+        }
+        Ok(descriptor)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn remote_run(
         &self,
@@ -1213,7 +1338,7 @@ impl CommunityCacheClient {
         let response: RemoteAxisProbeResponse =
             self.get_origin_json(&path, REMOTE_AXIS_MAX_BYTES)?;
         validate_remote_run(&response.run)?;
-        validate_remote_point(&response.point)?;
+        validate_remote_grid_point(&response.point, &response.run)?;
         validate_remote_axis(&response.axis, &descriptor, &variables)?;
         if response.run != descriptor
             || response.variables.len() != 1
@@ -1334,6 +1459,71 @@ impl CommunityCacheClient {
         self.fetch_profile(request)
     }
 
+    /// Fetch one complete, bounded sounding cycle from the authenticated
+    /// authority. Unlike Community Cache objects this response is not a
+    /// portable signed artifact, so every identity, axis, variable, surface
+    /// value and gap is checked against the independently loaded authorized
+    /// catalog before it becomes session state.
+    #[allow(dead_code)]
+    pub(crate) fn remote_profile_cycle(
+        &self,
+        catalog: &RemoteProfileCatalog,
+        mut selection: RemoteProfileVariableSelection,
+    ) -> Result<RemoteProfileCycleResult, CommunityCacheError> {
+        if !self.categories.profiles {
+            return Err(CommunityCacheError::Disabled);
+        }
+        validate_remote_catalog_for_request(catalog)?;
+        normalize_selected_variables(&mut selection.pressure_variables)?;
+        if !selection.surface_variables.is_empty() {
+            normalize_selected_variables(&mut selection.surface_variables)?;
+        }
+        if selection.pressure_variables.is_empty()
+            || !selection.pressure_levels_hpa.is_empty()
+            || selection
+                .pressure_variables
+                .iter()
+                .any(|name| selection.surface_variables.contains(name))
+        {
+            return Err(CommunityCacheError::Response);
+        }
+        for name in &selection.pressure_variables {
+            let variable = remote_variable(catalog, name)?;
+            if variable.kind != "pressure3d"
+                || !variable.pressure_profile
+                || !variable.profile_cycle
+            {
+                return Err(CommunityCacheError::Response);
+            }
+        }
+        for name in &selection.surface_variables {
+            let variable = remote_variable(catalog, name)?;
+            if variable.kind != "surface2d" || !variable.point_series {
+                return Err(CommunityCacheError::Response);
+            }
+        }
+        let request = RemoteProfileCycleRequest {
+            model: &catalog.run.model,
+            run: &catalog.run.run,
+            latitude: catalog.point.requested_latitude,
+            longitude: catalog.point.requested_longitude,
+            variables: &selection.pressure_variables,
+            surface_variables: &selection.surface_variables,
+            start_unix: None,
+            end_unix: None,
+            missing_policy: "partial",
+        };
+        let response_limit = REMOTE_PROFILE_CYCLE_MAX_BYTES.min(self.limits.max_decoded_bytes);
+        let result: RemoteProfileCycleResult = self.post_origin_query_json(
+            "/v1/profile-cycle",
+            &request,
+            self.limits.max_manifest_bytes,
+            response_limit,
+        )?;
+        validate_remote_profile_cycle(&result, catalog, &selection, &self.limits)?;
+        Ok(result)
+    }
+
     fn get_origin_json<T: DeserializeOwned>(
         &self,
         path_and_query: &str,
@@ -1383,6 +1573,40 @@ impl CommunityCacheClient {
             .body(body)
             .send()
             .map_err(|_| CommunityCacheError::Network)?;
+        if !response.status().is_success() {
+            return Err(CommunityCacheError::Http(response.status().as_u16()));
+        }
+        read_bounded_json(response, response_limit, &self.transfers)
+    }
+
+    /// Read-only query POST. Rusty Weather permits a tokenless local service
+    /// when the operator configured no tokens, matching the GET catalog
+    /// behavior. Mutation/publication POSTs continue to require a bearer via
+    /// `post_origin_json`.
+    fn post_origin_query_json<TRequest: Serialize, TResponse: DeserializeOwned>(
+        &self,
+        path: &str,
+        request: &TRequest,
+        request_limit: u64,
+        response_limit: u64,
+    ) -> Result<TResponse, CommunityCacheError> {
+        if !path.starts_with('/') || path.starts_with("//") {
+            return Err(CommunityCacheError::Response);
+        }
+        let body = serde_json::to_vec(request).map_err(|_| CommunityCacheError::Response)?;
+        if body.is_empty() || body.len() as u64 > request_limit {
+            return Err(CommunityCacheError::Quota);
+        }
+        let _active = self.transfers.begin()?;
+        let mut builder = self
+            .http
+            .post(format!("{}{path}", self.origin_url))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(token) = &self.bearer_token {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.send().map_err(|_| CommunityCacheError::Network)?;
         if !response.status().is_success() {
             return Err(CommunityCacheError::Http(response.status().as_u16()));
         }
@@ -1853,13 +2077,16 @@ fn validate_remote_model(model: &RemoteModelCatalogEntry) -> Result<(), Communit
 fn validate_remote_run(run: &RemoteRunDescriptor) -> Result<(), CommunityCacheError> {
     validate_remote_component(&run.model)?;
     validate_remote_component(&run.run)?;
-    if run.schema != "rw-store.run.v1"
+    let valid_schema_axis = matches!(
+        (run.schema.as_str(), run.exact_time_axis),
+        ("rw-store.run.v1", false) | ("rw-store.run.v2", true)
+    );
+    if !valid_schema_axis
         || !is_sha256_hex(&run.snapshot_id)
         || !is_sha256_hex(&run.grid_hash)
         || run.nx == 0
         || run.ny == 0
         || run.nx.checked_mul(run.ny).is_none()
-        || !run.exact_time_axis
         || run.sample_count == 0
         || run.sample_count > REMOTE_MAX_TIMES
         || run.first_valid_unix.is_some_and(|time| time < 0)
@@ -1885,6 +2112,41 @@ fn validate_remote_run(run: &RemoteRunDescriptor) -> Result<(), CommunityCacheEr
     Ok(())
 }
 
+fn validate_remote_latest_catalog(
+    runs: &[RemoteRunCatalogEntry],
+    latest: &RemoteRunDescriptor,
+) -> Result<(), CommunityCacheError> {
+    if runs.is_empty()
+        || !runs.iter().any(|entry| entry.run == *latest)
+        || runs.iter().any(|entry| entry.run.origin_unix.is_none())
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    let physically_latest = runs
+        .iter()
+        .max_by(|left, right| {
+            left.run
+                .origin_unix
+                .cmp(&right.run.origin_unix)
+                .then_with(|| left.run.run.cmp(&right.run.run))
+        })
+        .ok_or(CommunityCacheError::Response)?;
+    if physically_latest.run != *latest {
+        return Err(CommunityCacheError::Response);
+    }
+    Ok(())
+}
+
+fn sort_remote_runs_by_physical_origin(runs: &mut [RemoteRunCatalogEntry]) {
+    runs.sort_by(|left, right| {
+        right
+            .run
+            .origin_unix
+            .cmp(&left.run.origin_unix)
+            .then_with(|| right.run.run.cmp(&left.run.run))
+    });
+}
+
 fn validate_remote_variable(
     variable: &RemoteVariableCapability,
 ) -> Result<(), CommunityCacheError> {
@@ -1904,7 +2166,7 @@ fn validate_remote_variable(
         || variable
             .levels_hpa
             .windows(2)
-            .any(|pair| pair[0] >= pair[1])
+            .any(|pair| pair[0] <= pair[1])
         || variable
             .available_slots
             .windows(2)
@@ -1920,11 +2182,19 @@ fn validate_remote_axis(
     run: &RemoteRunDescriptor,
     variables: &[RemoteVariableCapability],
 ) -> Result<(), CommunityCacheError> {
+    let Some(origin_unix) = run.origin_unix else {
+        return Err(CommunityCacheError::Response);
+    };
     if axis.is_empty() || axis.len() != run.sample_count || axis.len() > REMOTE_MAX_TIMES {
         return Err(CommunityCacheError::Response);
     }
     for point in axis {
-        if point.valid_unix < 0 {
+        let physical_origin = i128::from(point.valid_unix) - i128::from(point.lead_seconds);
+        if point.valid_unix < 0
+            || physical_origin != i128::from(origin_unix)
+            || (run.schema == "rw-store.run.v1"
+                && point.lead_seconds != u64::from(point.storage_slot) * 3_600)
+        {
             return Err(CommunityCacheError::Response);
         }
     }
@@ -1942,12 +2212,192 @@ fn validate_remote_axis(
         .map(|time| time.storage_slot)
         .collect::<BTreeSet<_>>();
     if variables.iter().any(|variable| {
-        variable
-            .available_slots
-            .iter()
-            .any(|slot| !available.contains(slot))
+        let expected_coverage = variable.available_slots.len() as f64 / axis.len() as f64;
+        variable.expected_samples != axis.len()
+            || variable.available_samples != variable.available_slots.len()
+            || (variable.coverage - expected_coverage).abs() > 1.0e-6
+            || variable
+                .available_slots
+                .iter()
+                .any(|slot| !available.contains(slot))
     }) {
         return Err(CommunityCacheError::Response);
+    }
+    Ok(())
+}
+
+fn validate_remote_profile_cycle(
+    result: &RemoteProfileCycleResult,
+    catalog: &RemoteProfileCatalog,
+    selection: &RemoteProfileVariableSelection,
+    limits: &ProtocolLimits,
+) -> Result<(), CommunityCacheError> {
+    if result.run != catalog.run
+        || result.point != catalog.point
+        || result.requested_variables != selection.pressure_variables
+        || result.requested_surface_variables != selection.surface_variables
+        || result.requested_time.start_unix.is_some()
+        || result.requested_time.end_unix.is_some()
+        || result.missing_policy != RemoteProfileCycleMissingPolicy::Partial
+        || result.samples.len() != catalog.axis.len()
+        || result.samples.len() > REMOTE_MAX_TIMES
+        || selection
+            .pressure_variables
+            .len()
+            .checked_add(selection.surface_variables.len())
+            .is_none_or(|count| count > limits.max_variables)
+    {
+        return Err(CommunityCacheError::Response);
+    }
+
+    let capabilities = catalog
+        .variables
+        .iter()
+        .map(|variable| (variable.name.as_str(), variable))
+        .collect::<BTreeMap<_, _>>();
+    let mut total_values = 0_usize;
+    for (sample, expected_time) in result.samples.iter().zip(&catalog.axis) {
+        if sample.time != *expected_time
+            || sample.source_provenance.is_empty()
+            || sample.source_provenance.len() > limits.max_provenance_entries
+        {
+            return Err(CommunityCacheError::Response);
+        }
+        for source in &sample.source_provenance {
+            validate_provenance_token(&source.provider)?;
+            if source.roles.len() > 16
+                || source.products.len() > 32
+                || !catalog.run.source_provenance.iter().any(|expected| {
+                    expected.provider == source.provider
+                        && source
+                            .roles
+                            .iter()
+                            .all(|role| expected.roles.contains(role))
+                        && source
+                            .products
+                            .iter()
+                            .all(|product| expected.products.contains(product))
+                })
+            {
+                return Err(CommunityCacheError::Response);
+            }
+            for token in source.roles.iter().chain(&source.products) {
+                validate_provenance_token(token)?;
+            }
+        }
+
+        let profile_names = sample
+            .variables
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect::<Vec<_>>();
+        let expected_present = selection
+            .pressure_variables
+            .iter()
+            .filter(|name| {
+                capabilities.get(name.as_str()).is_some_and(|capability| {
+                    capability
+                        .available_slots
+                        .contains(&sample.time.storage_slot)
+                })
+            })
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let expected_missing = selection
+            .pressure_variables
+            .iter()
+            .filter(|name| {
+                capabilities.get(name.as_str()).is_none_or(|capability| {
+                    !capability
+                        .available_slots
+                        .contains(&sample.time.storage_slot)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if sample.missing_variables != expected_missing || profile_names != expected_present {
+            return Err(CommunityCacheError::Response);
+        }
+        for profile in &sample.variables {
+            let capability = capabilities
+                .get(profile.name.as_str())
+                .ok_or(CommunityCacheError::Response)?;
+            let available_levels = profile.values.iter().flatten().count();
+            let expected_coverage = if profile.expected_levels == 0 {
+                0.0
+            } else {
+                available_levels as f64 / profile.expected_levels as f64
+            };
+            if capability.kind != "pressure3d"
+                || !capability.pressure_profile
+                || !capability.profile_cycle
+                || profile.units != capability.units
+                || profile.levels_hpa != capability.levels_hpa
+                || profile.values.len() != profile.levels_hpa.len()
+                || profile.expected_levels != profile.levels_hpa.len()
+                || profile.available_levels != available_levels
+                || !profile.coverage.is_finite()
+                || (profile.coverage - expected_coverage).abs() > 1.0e-6
+                || profile
+                    .values
+                    .iter()
+                    .flatten()
+                    .any(|value| !value.is_finite())
+            {
+                return Err(CommunityCacheError::Response);
+            }
+            total_values = total_values
+                .checked_add(profile.values.len())
+                .ok_or(CommunityCacheError::Response)?;
+        }
+
+        if sample.surface_samples.len() != selection.surface_variables.len() {
+            return Err(CommunityCacheError::Response);
+        }
+        let mut expected_missing_surface = Vec::new();
+        for (surface, expected_name) in sample
+            .surface_samples
+            .iter()
+            .zip(&selection.surface_variables)
+        {
+            let capability = capabilities
+                .get(expected_name.as_str())
+                .ok_or(CommunityCacheError::Response)?;
+            if surface.variable != *expected_name
+                || surface.units != capability.units
+                || capability.kind != "surface2d"
+                || !capability.point_series
+                || surface.value.is_some_and(|value| !value.is_finite())
+            {
+                return Err(CommunityCacheError::Response);
+            }
+            if surface.value.is_none() {
+                expected_missing_surface.push(expected_name.clone());
+            }
+        }
+        total_values = total_values
+            .checked_add(sample.surface_samples.len())
+            .ok_or(CommunityCacheError::Response)?;
+        if sample.missing_surface_variables != expected_missing_surface {
+            return Err(CommunityCacheError::Response);
+        }
+
+        let expected_status =
+            if sample.missing_variables.is_empty() && sample.missing_surface_variables.is_empty() {
+                RemoteProfileCycleSampleStatus::Complete
+            } else if sample.variables.is_empty()
+                && sample
+                    .surface_samples
+                    .iter()
+                    .all(|sample| sample.value.is_none())
+            {
+                RemoteProfileCycleSampleStatus::Gap
+            } else {
+                RemoteProfileCycleSampleStatus::Partial
+            };
+        if sample.status != expected_status || total_values > REMOTE_PROFILE_CYCLE_MAX_VALUES {
+            return Err(CommunityCacheError::Response);
+        }
     }
     Ok(())
 }
@@ -1958,6 +2408,17 @@ fn validate_remote_point(point: &RemoteGridPoint) -> Result<(), CommunityCacheEr
         f64::from(point.grid_latitude),
         f64::from(point.grid_longitude),
     )
+}
+
+fn validate_remote_grid_point(
+    point: &RemoteGridPoint,
+    run: &RemoteRunDescriptor,
+) -> Result<(), CommunityCacheError> {
+    validate_remote_point(point)?;
+    if point.x >= run.nx || point.y >= run.ny {
+        return Err(CommunityCacheError::Response);
+    }
+    Ok(())
 }
 
 fn validate_coordinates(latitude: f64, longitude: f64) -> Result<(), CommunityCacheError> {
@@ -1995,6 +2456,14 @@ fn encode_path_segment(value: &str) -> String {
 
 fn encode_query_component(value: &str) -> String {
     percent_encode(value)
+}
+
+fn remote_latest_run_path(model: &str) -> Result<String, CommunityCacheError> {
+    validate_remote_component(model)?;
+    Ok(format!(
+        "/v1/models/{}/latest-run",
+        encode_path_segment(model)
+    ))
 }
 
 fn case_directory_path(after: Option<&str>, limit: usize) -> Result<String, CommunityCacheError> {
@@ -2201,7 +2670,7 @@ fn build_remote_profile_request(
                 && selection
                     .pressure_levels_hpa
                     .iter()
-                    .any(|level| variable.levels_hpa.binary_search(level).is_err()))
+                    .any(|level| !variable.levels_hpa.contains(level)))
         {
             return Err(CommunityCacheError::Response);
         }
@@ -2324,7 +2793,7 @@ fn build_remote_native_window_request(
                 && selection
                     .pressure_levels_hpa
                     .iter()
-                    .any(|level| variable.levels_hpa.binary_search(level).is_err()))
+                    .any(|level| !variable.levels_hpa.contains(level)))
         {
             return Err(CommunityCacheError::Response);
         }
@@ -2382,7 +2851,7 @@ fn build_remote_geographic_window_request(
                 && selection
                     .pressure_levels_hpa
                     .iter()
-                    .any(|level| variable.levels_hpa.binary_search(level).is_err()))
+                    .any(|level| !variable.levels_hpa.contains(level)))
         {
             return Err(CommunityCacheError::Response);
         }
@@ -2435,7 +2904,7 @@ fn build_remote_temporal_grid_request(
                 && selection
                     .pressure_levels_hpa
                     .iter()
-                    .all(|level| variable.levels_hpa.binary_search(level).is_ok())
+                    .all(|level| variable.levels_hpa.contains(level))
         } else {
             variable.kind == "surface2d"
         };
@@ -2464,7 +2933,7 @@ fn validate_remote_catalog_for_request(
     catalog: &RemoteProfileCatalog,
 ) -> Result<(), CommunityCacheError> {
     validate_remote_run(&catalog.run)?;
-    validate_remote_point(&catalog.point)?;
+    validate_remote_grid_point(&catalog.point, &catalog.run)?;
     validate_remote_axis(&catalog.axis, &catalog.run, &catalog.variables)?;
     deny_automatic_private_run(&catalog.run)
 }
@@ -3675,7 +4144,13 @@ mod tests {
     ) -> RemoteVariableCapability {
         RemoteVariableCapability {
             name: name.into(),
-            units: if kind == "pressure3d" { "K" } else { "m/s" }.into(),
+            units: match name {
+                "temperature_iso" | "dewpoint_iso" | "temperature_2m" | "dewpoint_2m" => "K",
+                "height_iso" | "orography" => "m",
+                "surface_pressure" => "Pa",
+                _ => "m/s",
+            }
+            .into(),
             kind: kind.into(),
             codec: "q16-zstd".into(),
             levels_hpa,
@@ -3686,6 +4161,7 @@ mod tests {
             coverage: 1.0,
             point_series,
             pressure_profile,
+            profile_cycle: pressure_profile,
             geographic_window: matches!(kind, "surface2d" | "pressure3d"),
             scalar_temporal_reduction: kind == "surface2d",
             temporal: serde_json::json!({}),
@@ -3697,7 +4173,7 @@ mod tests {
             run: RemoteRunDescriptor {
                 model: model.into(),
                 run: "20260812_00z".into(),
-                schema: "rw-store.run.v1".into(),
+                schema: "rw-store.run.v2".into(),
                 snapshot_id: "1".repeat(64),
                 grid_hash: "2".repeat(64),
                 nx: 1_799,
@@ -3740,17 +4216,89 @@ mod tests {
                     "pressure3d",
                     true,
                     false,
-                    vec![500, 700, 850],
+                    vec![850, 700, 500],
                 ),
                 remote_variable(
                     "dewpoint_iso",
                     "pressure3d",
                     true,
                     false,
-                    vec![500, 700, 850],
+                    vec![850, 700, 500],
                 ),
                 remote_variable("temperature_2m", "surface2d", false, true, vec![]),
                 remote_variable("u_10m", "surface2d", false, true, vec![]),
+            ],
+        }
+    }
+
+    fn pressure_profile(name: &str) -> RemotePressureProfile {
+        RemotePressureProfile {
+            name: name.into(),
+            units: "K".into(),
+            levels_hpa: vec![850, 700, 500],
+            values: vec![Some(290.0), Some(270.0), Some(250.0)],
+            available_levels: 3,
+            expected_levels: 3,
+            coverage: 1.0,
+        }
+    }
+
+    fn remote_profile_cycle_result(catalog: &RemoteProfileCatalog) -> RemoteProfileCycleResult {
+        let source_provenance = catalog.run.source_provenance.clone();
+        RemoteProfileCycleResult {
+            run: catalog.run.clone(),
+            point: catalog.point.clone(),
+            requested_variables: vec!["dewpoint_iso".into(), "temperature_iso".into()],
+            requested_surface_variables: vec!["temperature_2m".into(), "u_10m".into()],
+            requested_time: RemoteProfileCycleTimeRange {
+                start_unix: None,
+                end_unix: None,
+            },
+            missing_policy: RemoteProfileCycleMissingPolicy::Partial,
+            samples: vec![
+                RemoteProfileCycleSample {
+                    time: catalog.axis[0].clone(),
+                    source_provenance: source_provenance.clone(),
+                    status: RemoteProfileCycleSampleStatus::Partial,
+                    variables: vec![pressure_profile("temperature_iso")],
+                    missing_variables: vec!["dewpoint_iso".into()],
+                    surface_samples: vec![
+                        RemoteProfileSurfaceSample {
+                            variable: "temperature_2m".into(),
+                            units: "K".into(),
+                            value: Some(300.0),
+                        },
+                        RemoteProfileSurfaceSample {
+                            variable: "u_10m".into(),
+                            units: "m/s".into(),
+                            value: None,
+                        },
+                    ],
+                    missing_surface_variables: vec!["u_10m".into()],
+                },
+                RemoteProfileCycleSample {
+                    time: catalog.axis[1].clone(),
+                    source_provenance,
+                    status: RemoteProfileCycleSampleStatus::Complete,
+                    variables: vec![
+                        pressure_profile("dewpoint_iso"),
+                        pressure_profile("temperature_iso"),
+                    ],
+                    missing_variables: vec![],
+                    surface_samples: vec![
+                        RemoteProfileSurfaceSample {
+                            variable: "temperature_2m".into(),
+                            units: "K".into(),
+                            value: Some(301.0),
+                        },
+                        RemoteProfileSurfaceSample {
+                            variable: "u_10m".into(),
+                            units: "m/s".into(),
+                            value: Some(10.0),
+                        },
+                    ],
+                    missing_surface_variables: vec![],
+                },
             ],
         }
     }
@@ -3902,6 +4450,208 @@ mod tests {
         };
         let keys = BTreeMap::from([(ORIGIN_SIGNING_KEY_ID.into(), signing.verifying_key())]);
         (page, keys)
+    }
+
+    #[test]
+    fn remote_run_schema_and_axis_version_must_be_a_valid_pair() {
+        let catalog = remote_profile_catalog("hrrr", "noaa-aws-public-data");
+        let v2 = catalog.run.clone();
+        assert!(validate_remote_run(&v2).is_ok());
+        assert!(validate_remote_axis(&catalog.axis, &v2, &catalog.variables).is_ok());
+
+        let mut wrong_origin_axis = catalog.axis.clone();
+        wrong_origin_axis[1].lead_seconds += 1;
+        assert!(validate_remote_axis(&wrong_origin_axis, &v2, &catalog.variables).is_err());
+
+        let mut v1 = v2.clone();
+        v1.schema = "rw-store.run.v1".into();
+        v1.exact_time_axis = false;
+        assert!(validate_remote_run(&v1).is_ok());
+        let mut v1_axis = catalog.axis.clone();
+        for point in &mut v1_axis {
+            point.lead_seconds = u64::from(point.storage_slot) * 3_600;
+            point.valid_unix = v1.origin_unix.unwrap() + point.lead_seconds as i64;
+        }
+        v1.first_valid_unix = v1_axis.first().map(|time| time.valid_unix);
+        v1.last_valid_unix = v1_axis.last().map(|time| time.valid_unix);
+        assert!(validate_remote_axis(&v1_axis, &v1, &catalog.variables).is_ok());
+        v1_axis[0].lead_seconds += 1;
+        assert!(validate_remote_axis(&v1_axis, &v1, &catalog.variables).is_err());
+
+        for (schema, exact_time_axis) in [
+            ("rw-store.run.v1", true),
+            ("rw-store.run.v2", false),
+            ("rw-store.run.v3", true),
+        ] {
+            let mut invalid = v2.clone();
+            invalid.schema = schema.into();
+            invalid.exact_time_axis = exact_time_axis;
+            assert!(validate_remote_run(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn profile_cycle_capability_defaults_false_for_older_authorities() {
+        let base = serde_json::json!({
+            "name": "temperature_iso",
+            "units": "K",
+            "kind": "pressure3d",
+            "codec": "q16-zstd",
+            "levels_hpa": [500, 700, 850],
+            "selector": {"field": "temperature_iso"},
+            "available_slots": [1, 2],
+            "available_samples": 2,
+            "expected_samples": 2,
+            "coverage": 1.0,
+            "point_series": false,
+            "pressure_profile": true,
+            "geographic_window": true,
+            "scalar_temporal_reduction": false,
+            "temporal": {}
+        });
+        let old: RemoteVariableCapability = serde_json::from_value(base.clone()).unwrap();
+        assert!(!old.profile_cycle);
+
+        let mut current = base;
+        current["profile_cycle"] = serde_json::Value::Bool(true);
+        let current: RemoteVariableCapability = serde_json::from_value(current).unwrap();
+        assert!(current.profile_cycle);
+    }
+
+    #[test]
+    fn latest_pointer_must_match_the_physically_newest_authorized_run() {
+        assert_eq!(
+            remote_latest_run_path("hrrr").unwrap(),
+            "/v1/models/hrrr/latest-run"
+        );
+        assert_ne!(
+            remote_latest_run_path("hrrr").unwrap(),
+            "/v1/models/hrrr/runs/latest"
+        );
+        let newest = remote_profile_catalog("hrrr", "noaa-aws-public-data").run;
+        let mut older = newest.clone();
+        older.run = "20260811_18z".into();
+        older.snapshot_id = "3".repeat(64);
+        older.origin_unix = newest.origin_unix.map(|origin| origin - 21_600);
+        let mut runs = vec![
+            RemoteRunCatalogEntry {
+                run: older.clone(),
+                variable_count: 4,
+            },
+            RemoteRunCatalogEntry {
+                run: newest.clone(),
+                variable_count: 4,
+            },
+        ];
+        assert!(validate_remote_latest_catalog(&runs, &newest).is_ok());
+        sort_remote_runs_by_physical_origin(&mut runs);
+        assert_eq!(runs[0].run, newest);
+        assert_eq!(runs[1].run, older);
+        assert!(validate_remote_latest_catalog(&runs, &older).is_err());
+
+        let mut unlisted = newest.clone();
+        unlisted.snapshot_id = "4".repeat(64);
+        assert!(validate_remote_latest_catalog(&runs, &unlisted).is_err());
+
+        let mut missing_origin = runs;
+        missing_origin[0].run.origin_unix = None;
+        assert!(validate_remote_latest_catalog(&missing_origin, &newest).is_err());
+    }
+
+    #[test]
+    fn profile_cycle_validation_preserves_exact_axis_surfaces_and_gaps() {
+        let mut catalog = remote_profile_catalog("hrrr", "noaa-aws-public-data");
+        let dewpoint = catalog
+            .variables
+            .iter_mut()
+            .find(|variable| variable.name == "dewpoint_iso")
+            .expect("dewpoint capability");
+        dewpoint.available_slots = vec![2];
+        dewpoint.available_samples = 1;
+        dewpoint.coverage = 0.5;
+        let selection = RemoteProfileVariableSelection {
+            pressure_variables: vec!["dewpoint_iso".into(), "temperature_iso".into()],
+            surface_variables: vec!["temperature_2m".into(), "u_10m".into()],
+            pressure_levels_hpa: vec![],
+        };
+        let result = remote_profile_cycle_result(&catalog);
+        assert!(
+            validate_remote_profile_cycle(
+                &result,
+                &catalog,
+                &selection,
+                &ProtocolLimits::default()
+            )
+            .is_ok()
+        );
+
+        let mut gaps_catalog = catalog.clone();
+        for variable in gaps_catalog
+            .variables
+            .iter_mut()
+            .filter(|variable| variable.kind == "pressure3d")
+        {
+            variable.available_slots.retain(|slot| *slot != 1);
+            variable.available_samples = variable.available_slots.len();
+            variable.coverage =
+                variable.available_samples as f64 / variable.expected_samples as f64;
+        }
+        let mut gaps = result.clone();
+        gaps.samples[0].status = RemoteProfileCycleSampleStatus::Gap;
+        gaps.samples[0].variables.clear();
+        gaps.samples[0].missing_variables = selection.pressure_variables.clone();
+        for surface in &mut gaps.samples[0].surface_samples {
+            surface.value = None;
+        }
+        gaps.samples[0].missing_surface_variables = selection.surface_variables.clone();
+        assert!(
+            validate_remote_profile_cycle(
+                &gaps,
+                &gaps_catalog,
+                &selection,
+                &ProtocolLimits::default()
+            )
+            .is_ok(),
+            "a gap stays on the manifest axis instead of being compacted away"
+        );
+
+        let mut falsely_missing = result.clone();
+        falsely_missing.samples[1]
+            .variables
+            .retain(|profile| profile.name != "temperature_iso");
+        falsely_missing.samples[1].missing_variables = vec!["temperature_iso".into()];
+        falsely_missing.samples[1].status = RemoteProfileCycleSampleStatus::Partial;
+        assert!(
+            validate_remote_profile_cycle(
+                &falsely_missing,
+                &catalog,
+                &selection,
+                &ProtocolLimits::default()
+            )
+            .is_err(),
+            "a capability-advertised pressure profile cannot be relabeled as missing"
+        );
+
+        for mutate in 0..5 {
+            let mut malformed = result.clone();
+            match mutate {
+                0 => malformed.run.snapshot_id = "f".repeat(64),
+                1 => malformed.samples.swap(0, 1),
+                2 => malformed.requested_variables.reverse(),
+                3 => malformed.samples[0].missing_surface_variables.clear(),
+                4 => malformed.samples[0].status = RemoteProfileCycleSampleStatus::Complete,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_remote_profile_cycle(
+                    &malformed,
+                    &catalog,
+                    &selection,
+                    &ProtocolLimits::default()
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

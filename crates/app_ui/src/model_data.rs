@@ -407,13 +407,43 @@ enum RemoteCatalogLoad {
     Runs {
         model: String,
         runs: Vec<crate::community_cache::RemoteRunCatalogEntry>,
+        latest_run: String,
     },
     ProfileCatalog {
         model: String,
         run: String,
         catalog: Box<crate::community_cache::RemoteProfileCatalog>,
     },
-    Sounding(rw_ui::SoundingData),
+    Sounding {
+        identity: RemoteSoundingIdentity,
+        data: rw_ui::SoundingData,
+    },
+    SoundingFallback {
+        identity: RemoteSoundingIdentity,
+        data: rw_ui::SoundingData,
+        cycle_error: String,
+    },
+    SoundingCycle(Box<crate::community_cache::RemoteProfileCycleResult>),
+    SoundingUnavailable {
+        identity: RemoteSoundingIdentity,
+        message: String,
+    },
+}
+
+#[derive(Clone)]
+struct RemoteSoundingIdentity {
+    run: crate::community_cache::RemoteRunDescriptor,
+    point: crate::community_cache::RemoteGridPoint,
+    time: crate::community_cache::RemoteTimePoint,
+}
+
+/// One authority-validated multi-hour sounding response retained only for
+/// this app session. It is deliberately not written into the portable signed
+/// Community Cache: the authority response is authenticated and catalog-
+/// bound, while the existing single-time cache path remains the fallback.
+#[derive(Clone)]
+struct RemoteSoundingCycleCache {
+    result: crate::community_cache::RemoteProfileCycleResult,
 }
 
 /// One local-store sounding miss being resolved through the opt-in,
@@ -2024,8 +2054,11 @@ pub struct ModelDataDock {
     federation_preferred_origin_id: Option<String>,
     remote_selected_model: Option<String>,
     remote_runs: Vec<crate::community_cache::RemoteRunCatalogEntry>,
+    remote_latest_run: Option<String>,
     remote_selected_run: Option<String>,
+    remote_run_selection_explicit: bool,
     remote_profile_catalog: Option<crate::community_cache::RemoteProfileCatalog>,
+    remote_sounding_cycle: Option<RemoteSoundingCycleCache>,
     remote_selected_time: usize,
     remote_selected_variable: Option<String>,
     /// Inclusive start/end indices into the advertised exact-time axis for
@@ -2272,8 +2305,11 @@ impl ModelDataDock {
             federation_preferred_origin_id: None,
             remote_selected_model: None,
             remote_runs: Vec::new(),
+            remote_latest_run: None,
             remote_selected_run: None,
+            remote_run_selection_explicit: false,
             remote_profile_catalog: None,
+            remote_sounding_cycle: None,
             remote_selected_time: 0,
             remote_selected_variable: None,
             remote_range_start: 0,
@@ -2769,10 +2805,11 @@ impl ModelDataDock {
             .name("bowecho-model-remote-runs".into())
             .spawn(move || {
                 let result = client
-                    .remote_runs(&task_model)
-                    .map(|runs| RemoteCatalogLoad::Runs {
+                    .remote_run_catalog(&task_model)
+                    .map(|catalog| RemoteCatalogLoad::Runs {
                         model: task_model,
-                        runs,
+                        runs: catalog.runs,
+                        latest_run: catalog.latest_run,
                     })
                     .map_err(|error| format!("Remote runs unavailable: {error}"));
                 let _ = tx.send(result);
@@ -2825,13 +2862,85 @@ impl ModelDataDock {
             self.remote_detail_status = Some("Choose an advertised remote time.".to_owned());
             return;
         };
+        let sounding_identity = RemoteSoundingIdentity {
+            run: catalog.run.clone(),
+            point: catalog.point.clone(),
+            time: time.clone(),
+        };
         let selection = remote_profile_selection(&catalog.variables);
         if selection.pressure_variables.is_empty() {
             self.remote_detail_status =
                 Some("This run advertises no pressure-profile variables.".to_owned());
             return;
         }
-        let request = match client.build_remote_profile_request(&catalog, &time, selection) {
+        if self.install_cached_remote_sounding() {
+            return;
+        }
+        let recover_historical = explicit_historical_relay_allowed(
+            ModelWorkspaceMode::Sounding,
+            self.remote_historical_recovery,
+        );
+        if !recover_historical && remote_profile_cycle_supported(&catalog, &selection) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let repaint = self.repaint.clone();
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_cancel = std::sync::Arc::clone(&cancel);
+            std::thread::Builder::new()
+                .name("bowecho-model-remote-sounding-cycle".into())
+                .spawn(move || {
+                    let load = match client.remote_profile_cycle(&catalog, selection.clone()) {
+                        Ok(result) => RemoteCatalogLoad::SoundingCycle(Box::new(result)),
+                        Err(cycle_error) => {
+                            let fallback = client
+                                .build_remote_profile_request(
+                                    &catalog,
+                                    &time,
+                                    selection.clone(),
+                                )
+                                .and_then(|request| {
+                                    client
+                                        .fetch_profile::<rw_query::ProfileResult>(request)
+                                        .and_then(|(payload, _)| {
+                                            remote_profile_payload_to_sounding(
+                                                payload,
+                                                &catalog,
+                                                &time,
+                                                &selection,
+                                            )
+                                        })
+                                });
+                            match fallback {
+                                Ok(data) => RemoteCatalogLoad::SoundingFallback {
+                                    identity: sounding_identity,
+                                    data,
+                                    cycle_error: cycle_error.to_string(),
+                                },
+                                Err(fallback_error) => RemoteCatalogLoad::SoundingUnavailable {
+                                    identity: sounding_identity,
+                                    message: format!(
+                                        "Remote sounding cycle unavailable: {cycle_error}; compatible single-time fallback unavailable: {fallback_error}"
+                                    ),
+                                },
+                            }
+                        }
+                    };
+                    if !worker_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = tx.send(Ok(load));
+                        repaint.request_repaint();
+                    }
+                })
+                .expect("spawn remote sounding-cycle worker");
+            self.remote_catalog_task = Some(RemoteCatalogTask {
+                rx,
+                cancel: Some(cancel),
+            });
+            self.remote_detail_status =
+                Some("Loading the authenticated sounding cycle in one bounded request…".to_owned());
+            return;
+        }
+
+        let request = match client.build_remote_profile_request(&catalog, &time, selection.clone())
+        {
             Ok(request) => request,
             Err(error) => {
                 self.remote_detail_status =
@@ -2839,10 +2948,6 @@ impl ModelDataDock {
                 return;
             }
         };
-        let recover_historical = explicit_historical_relay_allowed(
-            ModelWorkspaceMode::Sounding,
-            self.remote_historical_recovery,
-        );
         let relay_dispatcher = self.community_relay_dispatcher.clone();
         if recover_historical && relay_dispatcher.is_none() {
             self.remote_detail_status =
@@ -2869,13 +2974,23 @@ impl ModelDataDock {
                         .fetch_profile::<rw_query::ProfileResult>(request)
                         .map_err(|error| format!("Remote sounding unavailable: {error}"))
                         .and_then(|(payload, _)| {
-                            remote_profile_payload_to_sounding(payload, time)
+                            remote_profile_payload_to_sounding(payload, &catalog, &time, &selection)
                                 .map_err(|error| format!("Remote sounding unavailable: {error}"))
                         })
-                        .map(RemoteCatalogLoad::Sounding)
+                        .map(|data| RemoteCatalogLoad::Sounding {
+                            identity: sounding_identity.clone(),
+                            data,
+                        })
                 })();
                 if !worker_cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = tx.send(result);
+                    let load = match result {
+                        Ok(load) => load,
+                        Err(message) => RemoteCatalogLoad::SoundingUnavailable {
+                            identity: sounding_identity,
+                            message,
+                        },
+                    };
+                    let _ = tx.send(Ok(load));
                     repaint.request_repaint();
                 }
             })
@@ -2884,7 +2999,67 @@ impl ModelDataDock {
             rx,
             cancel: Some(cancel),
         });
-        self.remote_detail_status = Some("Loading verified remote sounding…".to_owned());
+        self.remote_detail_status = Some(
+            "Loading one verified remote sounding through the compatible single-time path…"
+                .to_owned(),
+        );
+    }
+
+    /// Install the selected time from the already authenticated cycle without
+    /// another request. Explicit gaps and unusable surface-only partials keep
+    /// the last usable sounding visible and prevent a redundant point retry.
+    fn install_cached_remote_sounding(&mut self) -> bool {
+        let (Some(catalog), Some(cache)) = (
+            self.remote_profile_catalog.as_ref(),
+            self.remote_sounding_cycle.as_ref(),
+        ) else {
+            return false;
+        };
+        let selection = remote_profile_selection(&catalog.variables);
+        if !remote_profile_cycle_matches(&cache.result, catalog, &selection) {
+            return false;
+        }
+        let Some(sample) = cache.result.samples.get(self.remote_selected_time) else {
+            return false;
+        };
+        let sample_count = cache.result.samples.len();
+        let gap_count = cache
+            .result
+            .samples
+            .iter()
+            .filter(|sample| {
+                sample.status == crate::community_cache::RemoteProfileCycleSampleStatus::Gap
+            })
+            .count();
+        let label = remote_time_label(&sample.time);
+        let sounding = remote_profile_cycle_sample_to_sounding(&cache.result, sample);
+        match sounding {
+            Some(data) => {
+                let partial = sample.status
+                    == crate::community_cache::RemoteProfileCycleSampleStatus::Partial;
+                self.box_sounding_summary = None;
+                self.sounding_request_mode = SoundingRequestMode::Point;
+                self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
+                self.sounding.set_data(data);
+                self.remote_detail_status = Some(format!(
+                    "Loaded {label} from the authenticated session cycle{} ({sample_count} times, {gap_count} explicit gaps).",
+                    if partial { " (partial)" } else { "" }
+                ));
+            }
+            None => {
+                let reason = if sample.status
+                    == crate::community_cache::RemoteProfileCycleSampleStatus::Gap
+                {
+                    "an explicit sounding gap"
+                } else {
+                    "an incomplete sounding sample without every required pressure and surface field"
+                };
+                self.remote_detail_status = Some(format!(
+                    "{label} is {reason}; previous usable sounding retained."
+                ));
+            }
+        }
+        true
     }
 
     fn start_local_ensemble_catalog_load(&mut self) {
@@ -3489,13 +3664,24 @@ impl ModelDataDock {
                     self.start_remote_runs_load(model);
                 }
             }
-            Ok(RemoteCatalogLoad::Runs { model, runs }) => {
+            Ok(RemoteCatalogLoad::Runs {
+                model,
+                runs,
+                latest_run,
+            }) => {
                 if self.remote_selected_model.as_deref() != Some(model.as_str()) {
                     return;
                 }
                 self.invalidate_remote_output(true);
-                self.remote_selected_run =
-                    retain_or_first_remote_run(self.remote_selected_run.take(), &runs);
+                let (selected_run, selection_explicit) = retain_or_latest_remote_run(
+                    self.remote_selected_run.take(),
+                    self.remote_run_selection_explicit,
+                    &runs,
+                    &latest_run,
+                );
+                self.remote_selected_run = selected_run;
+                self.remote_run_selection_explicit = selection_explicit;
+                self.remote_latest_run = Some(latest_run);
                 self.remote_runs = runs;
                 self.remote_profile_catalog = None;
                 self.remote_detail_status = Some(format!(
@@ -3548,14 +3734,74 @@ impl ModelDataDock {
                     self.remote_latitude,
                     self.remote_longitude
                 ));
+                let selection = remote_profile_selection(&catalog.variables);
+                if self.remote_sounding_cycle.as_ref().is_some_and(|cache| {
+                    !remote_profile_cycle_matches(&cache.result, &catalog, &selection)
+                }) {
+                    self.remote_sounding_cycle = None;
+                }
                 self.remote_profile_catalog = Some(*catalog);
             }
-            Ok(RemoteCatalogLoad::Sounding(data)) => {
+            Ok(RemoteCatalogLoad::Sounding { identity, data }) => {
+                if !remote_sounding_identity_matches(
+                    &identity,
+                    self.remote_profile_catalog.as_ref(),
+                    self.remote_selected_time,
+                ) {
+                    self.remote_detail_status = Some(
+                        "Ignored a completed sounding for an older run, point, or time selection; previous usable sounding retained."
+                            .to_owned(),
+                    );
+                    return;
+                }
                 self.box_sounding_summary = None;
                 self.sounding_request_mode = SoundingRequestMode::Point;
                 self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
                 self.sounding.set_data(data);
                 self.remote_detail_status = Some("Verified remote sounding loaded.".to_owned());
+            }
+            Ok(RemoteCatalogLoad::SoundingFallback {
+                identity,
+                data,
+                cycle_error,
+            }) => {
+                if !remote_sounding_identity_matches(
+                    &identity,
+                    self.remote_profile_catalog.as_ref(),
+                    self.remote_selected_time,
+                ) {
+                    self.remote_detail_status = Some(
+                        "Ignored a completed fallback sounding for an older run, point, or time selection; previous usable sounding retained."
+                            .to_owned(),
+                    );
+                    return;
+                }
+                self.box_sounding_summary = None;
+                self.sounding_request_mode = SoundingRequestMode::Point;
+                self.latest_sounding = Some(std::sync::Arc::new(data.clone()));
+                self.sounding.set_data(data);
+                self.remote_detail_status = Some(format!(
+                    "The cycle request was unavailable ({cycle_error}); loaded this time through the compatible verified single-time path."
+                ));
+            }
+            Ok(RemoteCatalogLoad::SoundingCycle(result)) => {
+                self.remote_sounding_cycle = Some(RemoteSoundingCycleCache { result: *result });
+                if !self.install_cached_remote_sounding() {
+                    self.remote_detail_status = Some(
+                        "The sounding cycle no longer matches the selected run or point; previous sounding retained."
+                            .to_owned(),
+                    );
+                }
+            }
+            Ok(RemoteCatalogLoad::SoundingUnavailable { identity, message }) => {
+                if remote_sounding_identity_matches(
+                    &identity,
+                    self.remote_profile_catalog.as_ref(),
+                    self.remote_selected_time,
+                ) {
+                    self.remote_detail_status =
+                        Some(format!("{message}. Previous usable sounding retained."));
+                }
             }
             Err(message) => self.remote_catalog = RemoteCatalogState::Error(message),
         }
@@ -8263,11 +8509,29 @@ impl ModelDataDock {
         &mut self,
         client: Option<crate::community_cache::CommunityCacheClient>,
     ) {
+        // A profile-cycle response is authenticated transport state, not a
+        // portable signed Community Cache object. Replacing the authority
+        // therefore invalidates every catalog/cache identity derived from the
+        // previous client even if two origins advertise coincidentally equal
+        // run descriptors and axes. Keep the last usable rendered sounding,
+        // but never serve the old authority's session cycle under the new one.
+        self.remote_catalog_task = None;
+        self.remote_catalog = RemoteCatalogState::Idle;
+        self.remote_selected_model = None;
+        self.remote_runs.clear();
+        self.remote_latest_run = None;
+        self.remote_selected_run = None;
+        self.remote_run_selection_explicit = false;
+        self.remote_profile_catalog = None;
+        self.remote_sounding_cycle = None;
+        self.remote_selected_time = 0;
+        self.remote_range_start = 0;
+        self.remote_range_end = 0;
+        self.remote_detail_status = None;
+        self.invalidate_remote_output(true);
+        self.community_sounding_task = None;
         self.community_cache_client = client;
         self.sync_authority_federation_policy();
-        if self.community_cache_client.is_none() {
-            self.community_sounding_task = None;
-        }
     }
 
     pub(crate) fn set_generation_publication_settings(
@@ -9480,8 +9744,11 @@ impl ModelDataDock {
                 if self.remote_selected_model != previous_model {
                     self.invalidate_remote_output(true);
                     self.remote_runs.clear();
+                    self.remote_latest_run = None;
                     self.remote_selected_run = None;
+                    self.remote_run_selection_explicit = false;
                     self.remote_profile_catalog = None;
+                    self.remote_sounding_cycle = None;
                     load_runs = self.remote_selected_model.clone();
                 }
                 if ui.small_button("Refresh").clicked() {
@@ -9501,6 +9768,8 @@ impl ModelDataDock {
 
         if !self.remote_runs.is_empty() {
             let previous_run = self.remote_selected_run.clone();
+            let latest_run = self.remote_latest_run.clone();
+            let mut follow_latest_clicked = false;
             egui::ComboBox::from_id_salt("model_workspace_remote_run")
                 .selected_text(
                     self.remote_selected_run
@@ -9512,13 +9781,38 @@ impl ModelDataDock {
                         ui.selectable_value(
                             &mut self.remote_selected_run,
                             Some(entry.run.run.clone()),
-                            format!("{} · {} vars", entry.run.run, entry.variable_count),
+                            format!(
+                                "{}{} · {} vars",
+                                entry.run.run,
+                                if latest_run.as_deref() == Some(entry.run.run.as_str()) {
+                                    " · Latest"
+                                } else {
+                                    ""
+                                },
+                                entry.variable_count
+                            ),
                         );
                     }
                 });
+            if ui
+                .add_enabled(
+                    self.remote_selected_run != latest_run,
+                    egui::Button::new("Latest run"),
+                )
+                .on_hover_text("Select the authority's newest physical model cycle")
+                .clicked()
+            {
+                self.remote_selected_run = latest_run;
+                self.remote_run_selection_explicit = false;
+                follow_latest_clicked = true;
+            }
             if self.remote_selected_run != previous_run {
+                if !follow_latest_clicked {
+                    self.remote_run_selection_explicit = true;
+                }
                 self.invalidate_remote_output(true);
                 self.remote_profile_catalog = None;
+                self.remote_sounding_cycle = None;
                 if let (Some(model), Some(run)) = (
                     self.remote_selected_model.clone(),
                     self.remote_selected_run.clone(),
@@ -9552,6 +9846,7 @@ impl ModelDataDock {
             )
         {
             self.invalidate_remote_output(true);
+            self.remote_sounding_cycle = None;
             load_profile = Some((model, run));
         }
 
@@ -9645,6 +9940,9 @@ impl ModelDataDock {
                     self.remote_selected_variable.as_deref(),
                     &catalog.variables,
                 );
+            }
+            if self.workspace_mode == ModelWorkspaceMode::Sounding {
+                let _ = self.install_cached_remote_sounding();
             }
         }
         if explicit_historical_relay_allowed(self.workspace_mode, true) {
@@ -10197,13 +10495,25 @@ fn retain_or_first_remote_model(
         .or_else(|| models.first().map(|model| model.id.clone()))
 }
 
-fn retain_or_first_remote_run(
+fn retain_or_latest_remote_run(
     selected: Option<String>,
+    selection_explicit: bool,
     runs: &[crate::community_cache::RemoteRunCatalogEntry],
-) -> Option<String> {
-    selected
-        .filter(|selected| runs.iter().any(|entry| &entry.run.run == selected))
-        .or_else(|| runs.first().map(|entry| entry.run.run.clone()))
+    latest_run: &str,
+) -> (Option<String>, bool) {
+    if selection_explicit {
+        if let Some(selected) =
+            selected.filter(|selected| runs.iter().any(|entry| &entry.run.run == selected))
+        {
+            return (Some(selected), true);
+        }
+    }
+    (
+        runs.iter()
+            .find(|entry| entry.run.run == latest_run)
+            .map(|entry| entry.run.run.clone()),
+        false,
+    )
 }
 
 fn retain_or_first_remote_variable(
@@ -10938,6 +11248,7 @@ fn validate_remote_run_result(
         || run.ny != run_ny
         || run.nx == 0
         || run.ny == 0
+        || !remote_run_schema_axis_valid(&run.schema, run.exact_time_axis)
     {
         return Err("result run/grid identity differs from the signed request".to_owned());
     }
@@ -11448,10 +11759,12 @@ fn remote_field_data(
                 model: run.model.clone(),
                 run: run.run.clone(),
                 hour: time.storage_slot,
-                exact_time: Some(rw_store::RwsExactTime::new(
+                exact_time: remote_hour_exact_time(
+                    &run.schema,
+                    run.exact_time_axis,
                     time.lead_seconds,
                     time.valid_unix,
-                )),
+                ),
             },
             var: variable,
         },
@@ -12300,11 +12613,206 @@ fn remote_profile_selection(
     }
 }
 
+fn remote_profile_cycle_supported(
+    catalog: &crate::community_cache::RemoteProfileCatalog,
+    selection: &crate::community_cache::RemoteProfileVariableSelection,
+) -> bool {
+    !selection.pressure_variables.is_empty()
+        && selection.pressure_variables.iter().all(|name| {
+            catalog.variables.iter().any(|variable| {
+                variable.name == *name
+                    && variable.kind == "pressure3d"
+                    && variable.pressure_profile
+                    && variable.profile_cycle
+            })
+        })
+}
+
+fn remote_profile_cycle_matches(
+    result: &crate::community_cache::RemoteProfileCycleResult,
+    catalog: &crate::community_cache::RemoteProfileCatalog,
+    selection: &crate::community_cache::RemoteProfileVariableSelection,
+) -> bool {
+    result.run == catalog.run
+        && result.point == catalog.point
+        && result.requested_variables == selection.pressure_variables
+        && result.requested_surface_variables == selection.surface_variables
+        && result.samples.len() == catalog.axis.len()
+        && result
+            .samples
+            .iter()
+            .zip(&catalog.axis)
+            .all(|(sample, time)| sample.time == *time)
+}
+
+fn remote_sounding_identity_matches(
+    identity: &RemoteSoundingIdentity,
+    catalog: Option<&crate::community_cache::RemoteProfileCatalog>,
+    selected_time: usize,
+) -> bool {
+    catalog.is_some_and(|catalog| {
+        identity.run == catalog.run
+            && identity.point == catalog.point
+            && catalog.axis.get(selected_time) == Some(&identity.time)
+    })
+}
+
+fn remote_run_schema_axis_valid(schema: &str, exact_time_axis: bool) -> bool {
+    matches!(
+        (schema, exact_time_axis),
+        ("rw-store.run.v1", false) | ("rw-store.run.v2", true)
+    )
+}
+
+fn remote_hour_exact_time(
+    schema: &str,
+    exact_time_axis: bool,
+    lead_seconds: u64,
+    valid_unix: i64,
+) -> Option<rw_store::RwsExactTime> {
+    (schema == "rw-store.run.v2" && exact_time_axis)
+        .then(|| rw_store::RwsExactTime::new(lead_seconds, valid_unix))
+}
+
+fn remote_profile_cycle_sample_to_sounding(
+    result: &crate::community_cache::RemoteProfileCycleResult,
+    sample: &crate::community_cache::RemoteProfileCycleSample,
+) -> Option<rw_ui::SoundingData> {
+    if sample.status == crate::community_cache::RemoteProfileCycleSampleStatus::Gap
+        || sample.variables.is_empty()
+    {
+        return None;
+    }
+    let vars = sample
+        .variables
+        .iter()
+        .map(|variable| rw_ui::ProfileVar {
+            name: variable.name.clone(),
+            units: variable.units.clone(),
+            levels_hpa: variable.levels_hpa.clone(),
+            values: variable
+                .values
+                .iter()
+                .map(|value| value.unwrap_or(f32::NAN))
+                .collect(),
+        })
+        .collect();
+    let surface = sample
+        .surface_samples
+        .iter()
+        .filter_map(|sample| {
+            sample.value.map(|value| rw_ui::SurfaceSample {
+                name: sample.variable.clone(),
+                units: sample.units.clone(),
+                value,
+            })
+        })
+        .collect();
+    let data = rw_ui::SoundingData {
+        hour: HourKey {
+            model: result.run.model.clone(),
+            run: result.run.run.clone(),
+            hour: sample.time.storage_slot,
+            exact_time: remote_hour_exact_time(
+                &result.run.schema,
+                result.run.exact_time_axis,
+                sample.time.lead_seconds,
+                sample.time.valid_unix,
+            ),
+        },
+        fx: result.point.x as f64,
+        fy: result.point.y as f64,
+        lat: Some(result.point.grid_latitude),
+        lon: Some(result.point.grid_longitude),
+        vars,
+        surface,
+        read_ms: 0.0,
+    };
+    // A partial cycle sample is usable only when the canonical sounding
+    // bridge can assemble every required primitive (T/u/v/height plus Td or
+    // RH, and finite exact-or-approximate surface T/Td/u/v/pressure). Do not
+    // replace the last usable sounding with a merely non-empty partial.
+    rw_ui::skewt::build_sounding_column(&data).ok()?;
+    Some(data)
+}
+
 fn remote_profile_payload_to_sounding(
     payload: rw_community_protocol::ProfileObjectPayload<rw_query::ProfileResult>,
-    time: crate::community_cache::RemoteTimePoint,
+    catalog: &crate::community_cache::RemoteProfileCatalog,
+    time: &crate::community_cache::RemoteTimePoint,
+    selection: &crate::community_cache::RemoteProfileVariableSelection,
 ) -> Result<rw_ui::SoundingData, crate::community_cache::CommunityCacheError> {
     let profile = payload.profile;
+    if !remote_query_run_matches(&profile.run, &catalog.run)
+        || !remote_query_point_matches(&profile.point, &catalog.point)
+        || profile.time.storage_slot != time.storage_slot
+        || profile.time.lead_seconds != time.lead_seconds
+        || profile.time.valid_unix != time.valid_unix
+        || profile.variables.len() != selection.pressure_variables.len()
+        || payload.surface_samples.len() != selection.surface_variables.len()
+    {
+        return Err(crate::community_cache::CommunityCacheError::Response);
+    }
+    for (variable, expected_name) in profile.variables.iter().zip(&selection.pressure_variables) {
+        let capability = catalog
+            .variables
+            .iter()
+            .find(|capability| capability.name == *expected_name)
+            .ok_or(crate::community_cache::CommunityCacheError::Response)?;
+        let expected_levels = if selection.pressure_levels_hpa.is_empty() {
+            capability.levels_hpa.clone()
+        } else {
+            capability
+                .levels_hpa
+                .iter()
+                .copied()
+                .filter(|level| selection.pressure_levels_hpa.contains(level))
+                .collect()
+        };
+        let available_levels = variable.values.iter().flatten().count();
+        let expected_coverage = if variable.expected_levels == 0 {
+            0.0
+        } else {
+            available_levels as f64 / variable.expected_levels as f64
+        };
+        if variable.name != *expected_name
+            || capability.kind != "pressure3d"
+            || !capability.pressure_profile
+            || variable.units != capability.units
+            || variable.levels_hpa != expected_levels
+            || variable.values.len() != variable.levels_hpa.len()
+            || variable.expected_levels != variable.levels_hpa.len()
+            || variable.available_levels != available_levels
+            || !variable.coverage.is_finite()
+            || (variable.coverage - expected_coverage).abs() > 1.0e-6
+            || variable
+                .values
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite())
+        {
+            return Err(crate::community_cache::CommunityCacheError::Response);
+        }
+    }
+    for (sample, expected_name) in payload
+        .surface_samples
+        .iter()
+        .zip(&selection.surface_variables)
+    {
+        let capability = catalog
+            .variables
+            .iter()
+            .find(|capability| capability.name == *expected_name)
+            .ok_or(crate::community_cache::CommunityCacheError::Response)?;
+        if sample.variable != *expected_name
+            || sample.units != capability.units
+            || capability.kind != "surface2d"
+            || !capability.point_series
+            || sample.value.is_some_and(|value| !value.is_finite())
+        {
+            return Err(crate::community_cache::CommunityCacheError::Response);
+        }
+    }
     let vars = profile
         .variables
         .into_iter()
@@ -12330,12 +12838,18 @@ fn remote_profile_payload_to_sounding(
             })
         })
         .collect();
-    Ok(rw_ui::SoundingData {
+    let exact_time = remote_hour_exact_time(
+        &profile.run.schema,
+        profile.run.exact_time_axis,
+        time.lead_seconds,
+        time.valid_unix,
+    );
+    let data = rw_ui::SoundingData {
         hour: HourKey {
             model: profile.run.model,
             run: profile.run.run,
             hour: time.storage_slot,
-            exact_time: None,
+            exact_time,
         },
         fx: profile.point.x as f64,
         fy: profile.point.y as f64,
@@ -12344,7 +12858,70 @@ fn remote_profile_payload_to_sounding(
         vars,
         surface,
         read_ms: 0.0,
-    })
+    };
+    rw_ui::skewt::build_sounding_column(&data)
+        .map_err(|_| crate::community_cache::CommunityCacheError::Response)?;
+    Ok(data)
+}
+
+fn remote_query_run_matches(
+    actual: &rw_query::RunDescriptor,
+    expected: &crate::community_cache::RemoteRunDescriptor,
+) -> bool {
+    actual.model == expected.model
+        && actual.run == expected.run
+        && actual.schema == expected.schema
+        && actual.snapshot_id == expected.snapshot_id
+        && actual.grid_hash == expected.grid_hash
+        && actual.nx == expected.nx
+        && actual.ny == expected.ny
+        && actual.exact_time_axis == expected.exact_time_axis
+        && actual.origin_unix == expected.origin_unix
+        && actual.sample_count == expected.sample_count
+        && actual.first_valid_unix == expected.first_valid_unix
+        && actual.last_valid_unix == expected.last_valid_unix
+        && actual.source_provenance.len() == expected.source_provenance.len()
+        && actual
+            .source_provenance
+            .iter()
+            .zip(&expected.source_provenance)
+            .all(|(actual, expected)| {
+                actual.provider == expected.provider
+                    && actual.roles == expected.roles
+                    && actual.products == expected.products
+            })
+        && actual.provider_attributions.len() == expected.provider_attributions.len()
+        && actual
+            .provider_attributions
+            .iter()
+            .zip(&expected.provider_attributions)
+            .all(|(actual, expected)| {
+                actual.provider == expected.provider
+                    && actual.copyright_statement == expected.copyright_statement
+                    && actual.notice == expected.notice
+                    && actual.source_url == expected.source_url
+                    && actual.license == expected.license
+                    && actual.license_url == expected.license_url
+                    && actual.terms_url == expected.terms_url
+                    && actual.modification_notice == expected.modification_notice
+                    && actual.disclaimer == expected.disclaimer
+            })
+}
+
+fn remote_query_point_matches(
+    actual: &rw_query::GridPoint,
+    expected: &crate::community_cache::RemoteGridPoint,
+) -> bool {
+    let expected_requested_latitude =
+        (f64::from(expected.grid_latitude) * 10_000_000.0).round() / 10_000_000.0;
+    let expected_requested_longitude =
+        (f64::from(expected.grid_longitude) * 10_000_000.0).round() / 10_000_000.0;
+    actual.requested_latitude == expected_requested_latitude
+        && actual.requested_longitude == expected_requested_longitude
+        && actual.x == expected.x
+        && actual.y == expected.y
+        && actual.grid_latitude == expected.grid_latitude
+        && actual.grid_longitude == expected.grid_longitude
 }
 
 fn box_sounding_readiness(vars: &[rw_ui::VarInfo]) -> Result<(), String> {
@@ -13328,6 +13905,65 @@ mod tests {
     }
 
     #[test]
+    fn remote_run_selection_preserves_explicit_history_then_uses_latest_pointer() {
+        let descriptor = |run: &str, origin_unix| crate::community_cache::RemoteRunCatalogEntry {
+            run: crate::community_cache::RemoteRunDescriptor {
+                model: "hrrr".into(),
+                run: run.into(),
+                schema: "rw-store.run.v2".into(),
+                snapshot_id: "a".repeat(64),
+                grid_hash: "b".repeat(64),
+                nx: 2,
+                ny: 2,
+                exact_time_axis: true,
+                origin_unix: Some(origin_unix),
+                sample_count: 1,
+                first_valid_unix: Some(origin_unix),
+                last_valid_unix: Some(origin_unix),
+                source_provenance: Vec::new(),
+                provider_attributions: Vec::new(),
+            },
+            variable_count: 1,
+        };
+        let runs = vec![
+            descriptor("20260812_06z", 1_786_514_400),
+            descriptor("20260812_00z", 1_786_492_800),
+        ];
+        assert_eq!(
+            retain_or_latest_remote_run(Some("20260812_00z".into()), true, &runs, "20260812_06z"),
+            (Some("20260812_00z".into()), true)
+        );
+        assert_eq!(
+            retain_or_latest_remote_run(None, false, &runs, "20260812_06z"),
+            (Some("20260812_06z".into()), false)
+        );
+        assert_eq!(
+            retain_or_latest_remote_run(Some("retired".into()), true, &runs, "20260812_06z"),
+            (Some("20260812_06z".into()), false)
+        );
+        assert_eq!(
+            retain_or_latest_remote_run(Some("20260812_00z".into()), false, &runs, "20260812_06z"),
+            (Some("20260812_06z".into()), false),
+            "an automatically selected latest run follows a newly published latest pointer"
+        );
+        assert_eq!(
+            retain_or_latest_remote_run(None, false, &runs, "unlisted"),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn remote_exact_time_is_preserved_only_for_valid_v2_runs() {
+        let exact = remote_hour_exact_time("rw-store.run.v2", true, 3_601, 1_786_496_401)
+            .expect("v2 exact time");
+        assert_eq!(exact.lead_seconds, 3_601);
+        assert_eq!(exact.valid_unix, 1_786_496_401);
+        assert!(remote_hour_exact_time("rw-store.run.v1", false, 3_600, 1).is_none());
+        assert!(!remote_run_schema_axis_valid("rw-store.run.v1", true));
+        assert!(!remote_run_schema_axis_valid("rw-store.run.v2", false));
+    }
+
+    #[test]
     fn remote_profile_selection_uses_only_profile_and_allowlisted_surface_variables() {
         let variable = |name: &str, profile: bool, series: bool| {
             crate::community_cache::RemoteVariableCapability {
@@ -13343,6 +13979,7 @@ mod tests {
                 coverage: 0.0,
                 point_series: series,
                 pressure_profile: profile,
+                profile_cycle: profile,
                 geographic_window: true,
                 scalar_temporal_reduction: false,
                 temporal: serde_json::Value::Null,
@@ -13366,7 +14003,13 @@ mod tests {
     ) -> crate::community_cache::RemoteVariableCapability {
         crate::community_cache::RemoteVariableCapability {
             name: name.to_owned(),
-            units: "K".to_owned(),
+            units: match name {
+                "temperature_iso" | "dewpoint_iso" | "temperature_2m" | "dewpoint_2m" => "K",
+                "height_iso" | "orography" => "m",
+                "surface_pressure" => "Pa",
+                _ => "m/s",
+            }
+            .to_owned(),
             kind: kind.to_owned(),
             codec: "zstd-f32".to_owned(),
             levels_hpa,
@@ -13377,6 +14020,7 @@ mod tests {
             coverage: 1.0,
             point_series: kind == "surface2d",
             pressure_profile: kind == "pressure3d",
+            profile_cycle: kind == "pressure3d",
             geographic_window: matches!(kind, "surface2d" | "pressure3d"),
             scalar_temporal_reduction: true,
             temporal: serde_json::json!({
@@ -13434,6 +14078,7 @@ mod tests {
             coverage: remote.coverage,
             point_series: remote.point_series,
             pressure_profile: remote.pressure_profile,
+            profile_cycle: remote.profile_cycle,
             geographic_window: remote.geographic_window,
             scalar_temporal_reduction: remote.scalar_temporal_reduction,
             temporal: serde_json::from_value(remote.temporal).expect("typed temporal capability"),
@@ -13445,7 +14090,7 @@ mod tests {
             run: crate::community_cache::RemoteRunDescriptor {
                 model: "hrrr".to_owned(),
                 run: "20260812_00z".to_owned(),
-                schema: "rw-store.run.v1".to_owned(),
+                schema: "rw-store.run.v2".to_owned(),
                 snapshot_id: "a".repeat(64),
                 grid_hash: "b".repeat(64),
                 nx: 100,
@@ -13489,7 +14134,7 @@ mod tests {
             ],
             variables: vec![
                 remote_output_test_variable("temperature_2m", "surface2d", Vec::new()),
-                remote_output_test_variable("temperature_iso", "pressure3d", vec![500, 850, 1000]),
+                remote_output_test_variable("temperature_iso", "pressure3d", vec![1000, 850, 500]),
             ],
         }
     }
@@ -13512,6 +14157,179 @@ mod tests {
         )
         .expect("valid offline client settings");
         (client, root)
+    }
+
+    #[test]
+    fn remote_cycle_cache_preserves_gaps_and_v2_exact_hour_identity() {
+        let mut catalog = remote_output_test_catalog();
+        for (name, kind, levels) in [
+            ("dewpoint_iso", "pressure3d", vec![1000, 850, 500]),
+            ("u_iso", "pressure3d", vec![1000, 850, 500]),
+            ("v_iso", "pressure3d", vec![1000, 850, 500]),
+            ("height_iso", "pressure3d", vec![1000, 850, 500]),
+            ("dewpoint_2m", "surface2d", Vec::new()),
+            ("u_10m", "surface2d", Vec::new()),
+            ("v_10m", "surface2d", Vec::new()),
+            ("surface_pressure", "surface2d", Vec::new()),
+        ] {
+            catalog
+                .variables
+                .push(remote_output_test_variable(name, kind, levels));
+        }
+        let selection = remote_profile_selection(&catalog.variables);
+        assert!(remote_profile_cycle_supported(&catalog, &selection));
+        let profile = |name: &str| {
+            let capability = catalog
+                .variables
+                .iter()
+                .find(|variable| variable.name == name)
+                .expect("profile capability");
+            let values = match name {
+                "temperature_iso" => vec![Some(299.0), Some(280.0), Some(255.0)],
+                "dewpoint_iso" => vec![Some(295.0), Some(275.0), Some(245.0)],
+                "height_iso" => vec![Some(100.0), Some(1_500.0), Some(5_600.0)],
+                "u_iso" => vec![Some(5.0), Some(10.0), Some(20.0)],
+                "v_iso" => vec![Some(0.0), Some(5.0), Some(10.0)],
+                _ => unreachable!("unexpected profile {name}"),
+            };
+            crate::community_cache::RemotePressureProfile {
+                name: name.into(),
+                units: capability.units.clone(),
+                levels_hpa: capability.levels_hpa.clone(),
+                values,
+                available_levels: 3,
+                expected_levels: 3,
+                coverage: 1.0,
+            }
+        };
+        let surfaces = |present: bool| {
+            selection
+                .surface_variables
+                .iter()
+                .map(|name| {
+                    let capability = catalog
+                        .variables
+                        .iter()
+                        .find(|variable| variable.name == *name)
+                        .expect("surface capability");
+                    let value = present.then(|| match name.as_str() {
+                        "temperature_2m" => 300.0,
+                        "dewpoint_2m" => 295.0,
+                        "u_10m" => 5.0,
+                        "v_10m" => -2.0,
+                        "surface_pressure" => 100_000.0,
+                        _ => unreachable!("unexpected surface {name}"),
+                    });
+                    crate::community_cache::RemoteProfileSurfaceSample {
+                        variable: name.clone(),
+                        units: capability.units.clone(),
+                        value,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let point = catalog.point.clone();
+        let gap = crate::community_cache::RemoteProfileCycleSample {
+            time: catalog.axis[1].clone(),
+            source_provenance: catalog.run.source_provenance.clone(),
+            status: crate::community_cache::RemoteProfileCycleSampleStatus::Gap,
+            variables: Vec::new(),
+            missing_variables: selection.pressure_variables.clone(),
+            surface_samples: surfaces(false),
+            missing_surface_variables: selection.surface_variables.clone(),
+        };
+        let usable = |time: crate::community_cache::RemoteTimePoint| {
+            crate::community_cache::RemoteProfileCycleSample {
+                time,
+                source_provenance: catalog.run.source_provenance.clone(),
+                status: crate::community_cache::RemoteProfileCycleSampleStatus::Complete,
+                variables: selection
+                    .pressure_variables
+                    .iter()
+                    .map(|name| profile(name))
+                    .collect(),
+                missing_variables: Vec::new(),
+                surface_samples: surfaces(true),
+                missing_surface_variables: Vec::new(),
+            }
+        };
+        let result = crate::community_cache::RemoteProfileCycleResult {
+            run: catalog.run.clone(),
+            point,
+            requested_variables: selection.pressure_variables.clone(),
+            requested_surface_variables: selection.surface_variables.clone(),
+            requested_time: crate::community_cache::RemoteProfileCycleTimeRange {
+                start_unix: None,
+                end_unix: None,
+            },
+            missing_policy: crate::community_cache::RemoteProfileCycleMissingPolicy::Partial,
+            samples: vec![
+                usable(catalog.axis[0].clone()),
+                gap.clone(),
+                usable(catalog.axis[2].clone()),
+            ],
+        };
+        assert!(remote_profile_cycle_matches(&result, &catalog, &selection));
+        assert!(remote_profile_cycle_sample_to_sounding(&result, &gap).is_none());
+        let sounding = remote_profile_cycle_sample_to_sounding(&result, &result.samples[2])
+            .expect("usable exact cycle sample");
+        assert_eq!(sounding.hour.hour, catalog.axis[2].storage_slot);
+        assert_eq!(
+            sounding.hour.exact_time,
+            Some(rw_store::RwsExactTime::new(
+                catalog.axis[2].lead_seconds,
+                catalog.axis[2].valid_unix
+            ))
+        );
+
+        let mut unusable_partial = result.samples[2].clone();
+        unusable_partial.status = crate::community_cache::RemoteProfileCycleSampleStatus::Partial;
+        unusable_partial
+            .variables
+            .retain(|variable| variable.name != "height_iso");
+        unusable_partial.missing_variables = vec!["height_iso".into()];
+        assert!(
+            remote_profile_cycle_sample_to_sounding(&result, &unusable_partial).is_none(),
+            "a non-empty partial without every required pressure primitive must retain the last usable sounding"
+        );
+
+        let mut missing_surface = result.samples[2].clone();
+        missing_surface.status = crate::community_cache::RemoteProfileCycleSampleStatus::Partial;
+        missing_surface
+            .surface_samples
+            .iter_mut()
+            .find(|sample| sample.variable == "surface_pressure")
+            .expect("surface pressure")
+            .value = None;
+        missing_surface.missing_surface_variables = vec!["surface_pressure".into()];
+        assert!(
+            remote_profile_cycle_sample_to_sounding(&result, &missing_surface).is_none(),
+            "a non-empty partial without finite exact-or-approx surface state must retain the last usable sounding"
+        );
+
+        let mut stale = result;
+        stale.run.snapshot_id = "f".repeat(64);
+        assert!(!remote_profile_cycle_matches(&stale, &catalog, &selection));
+    }
+
+    #[test]
+    fn cycle_capability_false_keeps_single_time_fallback_available() {
+        let mut catalog = remote_output_test_catalog();
+        let selection = remote_profile_selection(&catalog.variables);
+        assert!(remote_profile_cycle_supported(&catalog, &selection));
+        catalog
+            .variables
+            .iter_mut()
+            .filter(|variable| variable.pressure_profile)
+            .for_each(|variable| variable.profile_cycle = false);
+        assert!(!remote_profile_cycle_supported(&catalog, &selection));
+        let (client, _root) = remote_request_test_client();
+        assert!(
+            client
+                .build_remote_profile_request(&catalog, &catalog.axis[0], selection)
+                .is_ok(),
+            "the established signed single-time profile builder remains the fallback"
+        );
     }
 
     #[test]
@@ -13665,7 +14483,7 @@ mod tests {
             "run": {
                 "model": request.model,
                 "run": request.run,
-                "schema": "rw-store.run.v1",
+                "schema": "rw-store.run.v2",
                 "snapshot_id": request.snapshot_id,
                 "grid_hash": request.grid_hash,
                 "nx": 100,
@@ -13870,7 +14688,7 @@ mod tests {
                 VerticalSelector::EntireAtmosphere,
                 FieldProduct::EnsembleMean,
                 "pressure3d",
-                vec![500, 850],
+                vec![850, 500],
             ),
             // A deterministic selector and a name that merely looks like an
             // ensemble product must never enter the workspace.
