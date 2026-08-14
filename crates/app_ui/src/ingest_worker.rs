@@ -3,7 +3,8 @@
 //! that wires the two together is this shell — rw-ui stays free of ingest
 //! dependencies.
 //!
-//! One control thread owns a request channel (estimate / probe / start);
+//! One control thread owns a request channel (estimate / probe / latest /
+//! start);
 //! responses stream back as plain data and every response fires
 //! the `notify` hook (`ctx.request_repaint`). Cancellation bypasses the
 //! queue: [`IngestWorker::cancel`] flips a shared `AtomicBool` the ingest
@@ -39,6 +40,9 @@ pub enum IngestRequest {
     Estimate(DownloadSpec),
     /// Probe which forecast hours of the spec's run exist upstream.
     Probe(DownloadSpec),
+    /// Find the newest available run for the spec's model. This is emitted
+    /// only by the panel's explicit Latest button.
+    Latest(DownloadSpec),
     /// Run the download/ingest.
     Start(DownloadSpec),
 }
@@ -49,6 +53,21 @@ pub enum IngestResponse {
     /// `Err` carries a spec/validation problem for the panel's error slot.
     Estimate(Box<Result<EstimateView, String>>),
     Availability(AvailabilityView),
+    Latest {
+        /// Exact request identity. The UI must discard this response if the
+        /// user edited any field while the lookup was in flight.
+        request: DownloadSpec,
+        date: String,
+        cycle: u8,
+        /// Provider that actually proved the run exists. This is especially
+        /// important when the requested source was Auto.
+        source: String,
+    },
+    LatestFailed {
+        /// Exact request identity for the same stale-response guard.
+        request: DownloadSpec,
+        message: String,
+    },
     /// A run began over these hours.
     Started {
         hours: Vec<u16>,
@@ -77,7 +96,7 @@ pub enum IngestResponse {
 /// the UI must terminate any active run instead of leaving it spinning.
 #[derive(Debug)]
 pub enum IngestPoll {
-    Response(IngestResponse),
+    Response(Box<IngestResponse>),
     Empty,
     Disconnected,
 }
@@ -135,7 +154,7 @@ impl IngestWorker {
 
 fn poll_response(receiver: &Receiver<IngestResponse>) -> IngestPoll {
     match receiver.try_recv() {
-        Ok(response) => IngestPoll::Response(response),
+        Ok(response) => IngestPoll::Response(Box::new(response)),
         Err(TryRecvError::Empty) => IngestPoll::Empty,
         Err(TryRecvError::Disconnected) => IngestPoll::Disconnected,
     }
@@ -171,6 +190,7 @@ fn worker_loop(
         notify();
         ok
     };
+    let latest_busy = Arc::new(AtomicBool::new(false));
     while let Ok(request) = requests.recv() {
         match request {
             IngestRequest::Estimate(spec) => {
@@ -189,6 +209,26 @@ fn worker_loop(
                     spec,
                     responses.clone(),
                     Arc::clone(&notify),
+                );
+            }
+            IngestRequest::Latest(spec) => {
+                if latest_busy
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    if !send(IngestResponse::LatestFailed {
+                        request: spec,
+                        message: "a latest-run lookup is already in progress".to_owned(),
+                    }) {
+                        return;
+                    }
+                    continue;
+                }
+                spawn_latest_task(
+                    spec,
+                    responses.clone(),
+                    Arc::clone(&notify),
+                    Arc::clone(&latest_busy),
                 );
             }
             IngestRequest::Start(spec) => {
@@ -225,6 +265,99 @@ fn spawn_probe_task(
             note: Some(format!("availability probe could not start: {err}")),
         }));
         notify_on_fail();
+    }
+}
+
+const LATEST_LOOKUP_TIMEOUT: Duration = Duration::from_secs(25);
+
+fn spawn_latest_task(
+    spec: DownloadSpec,
+    responses: Sender<IngestResponse>,
+    notify: Arc<dyn Fn() + Send + Sync + 'static>,
+    latest_busy: Arc<AtomicBool>,
+) {
+    let fallback_request = spec.clone();
+    let worker_responses = responses.clone();
+    let notify_on_fail = Arc::clone(&notify);
+    let latest_busy_for_worker = Arc::clone(&latest_busy);
+    let spawn_result = std::thread::Builder::new()
+        .name("rw-ingest-latest".to_string())
+        .spawn(move || {
+            throttle::set_current_thread_background_priority();
+            let response =
+                latest_response_bounded(spec, LATEST_LOOKUP_TIMEOUT, latest_busy_for_worker);
+            let _ = worker_responses.send(response);
+            notify();
+        });
+    if let Err(err) = spawn_result {
+        latest_busy.store(false, Ordering::Release);
+        let _ = responses.send(IngestResponse::LatestFailed {
+            request: fallback_request,
+            message: format!("latest-run lookup could not start: {err}"),
+        });
+        notify_on_fail();
+    }
+}
+
+/// Put a hard wall-clock bound around provider discovery. Some HTTP stacks
+/// can outlive their own per-request timeout while resolving/failing over;
+/// the detached lookup may finish later, but its receiver is dropped after
+/// this deadline so a late result can never reach the UI.
+fn latest_response_bounded(
+    spec: DownloadSpec,
+    timeout: Duration,
+    latest_busy: Arc<AtomicBool>,
+) -> IngestResponse {
+    latest_response_bounded_with(spec, timeout, find_latest, latest_busy)
+}
+
+fn latest_response_bounded_with<F>(
+    spec: DownloadSpec,
+    timeout: Duration,
+    lookup_fn: F,
+    latest_busy: Arc<AtomicBool>,
+) -> IngestResponse
+where
+    F: FnOnce(&DownloadSpec) -> Result<(String, u8, String), String> + Send + 'static,
+{
+    let request = spec.clone();
+    let (result_tx, result_rx) = sync_channel(1);
+    let latest_busy_for_lookup = Arc::clone(&latest_busy);
+    let lookup = std::thread::Builder::new()
+        .name("rw-ingest-latest-lookup".to_string())
+        .spawn(move || {
+            throttle::set_current_thread_background_priority();
+            let result = lookup_fn(&spec);
+            latest_busy_for_lookup.store(false, Ordering::Release);
+            let _ = result_tx.send(result);
+        });
+    if let Err(err) = lookup {
+        latest_busy.store(false, Ordering::Release);
+        return IngestResponse::LatestFailed {
+            request,
+            message: format!("latest-run lookup could not start: {err}"),
+        };
+    }
+
+    match result_rx.recv_timeout(timeout) {
+        Ok(Ok((date, cycle, source))) => IngestResponse::Latest {
+            request,
+            date,
+            cycle,
+            source,
+        },
+        Ok(Err(message)) => IngestResponse::LatestFailed { request, message },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => IngestResponse::LatestFailed {
+            request,
+            message: format!(
+                "latest-run lookup timed out after {} seconds; choose a run manually or try again",
+                timeout.as_secs()
+            ),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => IngestResponse::LatestFailed {
+            request,
+            message: "latest-run lookup ended without a result".to_owned(),
+        },
     }
 }
 
@@ -497,6 +630,55 @@ fn probe_products(model: ModelId, profile: &IngestProfile) -> Result<Vec<&'stati
         .filter(|fetch| fetch.surface_source || (fetch.pressure_source && profile.needs_prs()))
         .map(|fetch| fetch.product)
         .collect())
+}
+
+#[cfg(test)]
+fn latest_lookup_forecast_hour(spec: &DownloadSpec) -> Result<u16, String> {
+    parse_hours(&spec.hours)
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .max()
+        .ok_or_else(|| "choose at least one forecast hour".to_owned())
+}
+
+/// Find the newest run available from the selected source, or across the
+/// catalog when source is Auto. Latest always means latest *now*, independent
+/// of an archive date left in the picker, and requires the run to be complete
+/// through the greatest forecast hour the user selected.
+fn find_latest(spec: &DownloadSpec) -> Result<(String, u8, String), String> {
+    let (model, profile, hours, _) = resolve_spec(spec)?;
+    let source = source_override(spec)?;
+    // Probe only the products this exact profile will read. A surface-only
+    // request must not wait for an unrelated pressure product, while a
+    // sounding/full request still requires both sides of split feeds such as
+    // HRRR prs+sfc.
+    let products = probe_products(model, &profile)?;
+    let forecast_hour = hours
+        .into_iter()
+        .max()
+        .ok_or_else(|| "choose at least one forecast hour".to_owned())?;
+    let today_utc = chrono::Utc::now().format("%Y%m%d").to_string();
+    let latest = rustwx_models::latest_available_run_for_products_at_forecast_hour(
+        model,
+        source,
+        &today_utc,
+        &products,
+        forecast_hour,
+    )
+    .map_err(|err| {
+        if source == Some(SourceId::Ncei) {
+            format!(
+                "NCEI has no matching run in the latest two UTC days checked ({err}); NCEI is the GFS historical source, while NOMADS is the operational current source"
+            )
+        } else {
+            format!("latest-run lookup failed: {err}")
+        }
+    })?;
+    Ok((
+        latest.cycle.date_yyyymmdd,
+        latest.cycle.hour_utc,
+        latest.source.to_string(),
+    ))
 }
 
 // --- Shared cache/publication-cycle helpers — pure, no network. ---
@@ -808,23 +990,75 @@ mod tests {
         sender
             .send(IngestResponse::Finished)
             .expect("test receiver is connected");
-        assert!(matches!(
-            poll_response(&receiver),
-            IngestPoll::Response(IngestResponse::Finished)
-        ));
+        let IngestPoll::Response(response) = poll_response(&receiver) else {
+            panic!("expected a response");
+        };
+        assert!(matches!(*response, IngestResponse::Finished));
 
         drop(sender);
         assert!(matches!(poll_response(&receiver), IngestPoll::Disconnected));
     }
 
-    /// Field repro: GFS Estimate/availability did nothing with no error. Drives
+    #[test]
+    fn latest_failure_preserves_the_exact_request_identity() {
+        let mut request = spec();
+        request.model = "not-a-model".to_owned();
+        request.source = "nomads".to_owned();
+
+        let busy = Arc::new(AtomicBool::new(true));
+        match latest_response_bounded(request.clone(), Duration::from_secs(1), Arc::clone(&busy)) {
+            IngestResponse::LatestFailed {
+                request: response_request,
+                message,
+            } => {
+                assert_eq!(response_request, request);
+                assert!(message.contains("unknown model"), "got: {message}");
+            }
+            other => panic!("expected LatestFailed, got {other:?}"),
+        }
+        assert!(!busy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn latest_lookup_timeout_returns_failure_and_drops_the_late_result() {
+        let request = spec();
+        let busy = Arc::new(AtomicBool::new(true));
+        let response = latest_response_bounded_with(
+            request.clone(),
+            Duration::from_millis(10),
+            |_| {
+                std::thread::sleep(Duration::from_millis(75));
+                Ok(("20990101".to_owned(), 0, "nomads".to_owned()))
+            },
+            Arc::clone(&busy),
+        );
+
+        match response {
+            IngestResponse::LatestFailed {
+                request: response_request,
+                message,
+            } => {
+                assert_eq!(response_request, request);
+                assert!(message.contains("timed out"), "got: {message}");
+            }
+            other => panic!("expected timeout failure, got {other:?}"),
+        }
+        assert!(
+            busy.load(Ordering::Acquire),
+            "the worker remains occupied until the timed-out inner lookup exits"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!busy.load(Ordering::Acquire));
+    }
+
+    /// Field repro: GFS Latest/Download did nothing with no error. Drives
     /// the REAL worker thread with a gfs spec exactly like the panel does
     /// and requires a response for every request — a worker panic shows up
     /// here as a recv timeout instead of a silent no-op.
     /// `cargo test -p app_ui gfs_panel_live -- --ignored --nocapture`
     #[test]
     #[ignore = "live network probe of the GFS panel path"]
-    fn gfs_panel_live_estimate_and_probe_both_answer() {
+    fn gfs_panel_live_latest_estimate_probe_all_answer() {
         let scratch = std::env::temp_dir().join("bowecho-gfs-panel-live");
         let worker = IngestWorker::spawn(scratch, || {});
         let mut gfs = spec();
@@ -837,7 +1071,7 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
                 match worker.try_recv() {
-                    IngestPoll::Response(response) => return response,
+                    IngestPoll::Response(response) => return *response,
                     IngestPoll::Empty => {}
                     IngestPoll::Disconnected => {
                         panic!("{what}: ingest worker disconnected before responding")
@@ -854,6 +1088,24 @@ mod tests {
         worker.send(IngestRequest::Estimate(gfs.clone()));
         let estimate = recv("estimate");
         println!("estimate -> {estimate:?}");
+
+        worker.send(IngestRequest::Latest(gfs.clone()));
+        let latest = recv("latest");
+        println!("latest -> {latest:?}");
+        match &latest {
+            IngestResponse::Latest {
+                request,
+                date,
+                cycle,
+                source,
+            } => {
+                assert_eq!(request, &gfs);
+                assert!(!source.is_empty());
+                gfs.date = date.clone();
+                gfs.cycle = *cycle;
+            }
+            other => panic!("Latest must answer Latest{{..}}, got {other:?}"),
+        }
 
         worker.send(IngestRequest::Probe(gfs.clone()));
         let probe = recv("probe");
@@ -910,6 +1162,16 @@ mod tests {
                 .min();
             assert_eq!(first, Some(expected), "{model}");
         }
+    }
+
+    #[test]
+    fn latest_requires_completion_through_the_highest_selected_hour() {
+        let mut request = spec();
+        request.hours = "0,3,12,6".to_owned();
+        assert_eq!(latest_lookup_forecast_hour(&request).unwrap(), 12);
+
+        request.hours = "not-hours".to_owned();
+        assert!(latest_lookup_forecast_hour(&request).is_err());
     }
 
     #[test]

@@ -35717,12 +35717,12 @@ impl ViewerApp {
                     }
                     ingest.send(ingest_worker::IngestRequest::Probe(spec));
                 }
-                rw_ui::DownloadEvent::LatestRequested(_) => {
-                    // BowEcho hides this action and never starts a network
-                    // latest-run scan. Keep this fail-closed arm because the
-                    // shared rw-ui event enum also serves other applications.
-                    self.download_panel
-                        .set_probing_failed("Choose the run date and cycle explicitly".to_owned());
+                rw_ui::DownloadEvent::LatestRequested(spec) => {
+                    let spec = normalize_model_download_spec(spec);
+                    if self.download_panel.spec() != &spec {
+                        self.download_panel.set_spec(spec.clone());
+                    }
+                    ingest.send(ingest_worker::IngestRequest::Latest(spec));
                 }
                 rw_ui::DownloadEvent::StartRequested(spec) => {
                     let spec = normalize_model_download_spec(spec);
@@ -35754,11 +35754,12 @@ impl ViewerApp {
     }
 
     fn pump_ingest_responses(&mut self, ctx: &egui::Context) {
-        let mut rescan = false;
+        let mut store_changed = false;
+        let mut select_written_hour = None;
         let mut disconnected = false;
         loop {
             let response = match self.ingest.as_ref().map(|ingest| ingest.try_recv()) {
-                Some(ingest_worker::IngestPoll::Response(response)) => response,
+                Some(ingest_worker::IngestPoll::Response(response)) => *response,
                 Some(ingest_worker::IngestPoll::Empty) | None => break,
                 Some(ingest_worker::IngestPoll::Disconnected) => {
                     disconnected = true;
@@ -35775,6 +35776,37 @@ impl ViewerApp {
                         self.download_panel.set_availability(view);
                     }
                 }
+                ingest_worker::IngestResponse::Latest {
+                    request,
+                    date,
+                    cycle,
+                    source,
+                } => {
+                    if !latest_response_matches_panel(&request, self.download_panel.spec()) {
+                        continue;
+                    }
+                    self.status = format!(
+                        "Latest {} run: {} {:02}z via {}",
+                        request.model.to_ascii_uppercase(),
+                        date,
+                        cycle,
+                        source
+                    );
+                    self.download_panel.set_latest(date, cycle);
+                    let spec = normalize_model_download_spec(self.download_panel.spec().clone());
+                    if self.download_panel.spec() != &spec {
+                        self.download_panel.set_spec(spec.clone());
+                    }
+                    sync_run_pickers(&mut self.download_panel, &spec);
+                    if let Some(ingest) = &self.ingest {
+                        ingest.send(ingest_worker::IngestRequest::Estimate(spec));
+                    }
+                }
+                ingest_worker::IngestResponse::LatestFailed { request, message } => {
+                    if latest_response_matches_panel(&request, self.download_panel.spec()) {
+                        self.download_panel.set_probing_failed(message);
+                    }
+                }
                 ingest_worker::IngestResponse::Started { hours } => {
                     self.download_panel.begin_run(&hours);
                 }
@@ -35788,16 +35820,22 @@ impl ViewerApp {
                     self.download_panel.apply_note(message);
                 }
                 ingest_worker::IngestResponse::HourDone(done) => {
+                    let spec = self.download_panel.spec();
+                    select_written_hour = Some((
+                        spec.model.clone(),
+                        format!("{}_{:02}z", spec.date, spec.cycle),
+                        done.hour,
+                    ));
                     self.download_panel.apply_hour_done(done);
-                    rescan = true;
+                    store_changed = true;
                 }
                 ingest_worker::IngestResponse::Finished => {
                     self.download_panel.finish_run(Ok(()));
-                    rescan = true;
+                    store_changed = true;
                 }
                 ingest_worker::IngestResponse::Cancelled => {
                     self.download_panel.finish_cancelled();
-                    rescan = true;
+                    store_changed = true;
                 }
                 ingest_worker::IngestResponse::Failed(message) => {
                     if self.download_panel.is_running() {
@@ -35813,10 +35851,14 @@ impl ViewerApp {
             self.ingest = None;
             self.ensure_ingest_worker_started(ctx);
         }
-        if rescan {
+        if store_changed {
             // New hours on disk: refresh the model dock + retention pass.
             if let Some(dock) = &mut self.model_dock {
-                dock.rescan();
+                if let Some((model, run, hour)) = select_written_hour {
+                    dock.rescan_and_select(&model, &run, hour);
+                } else {
+                    dock.rescan();
+                }
             }
             if self.model_keep_runs > 0 {
                 prune_model_store(
@@ -48198,14 +48240,22 @@ fn default_download_spec(model_slug: &str) -> rw_ui::DownloadSpec {
     })
 }
 
-/// BowEcho's model downloader is deliberately explicit-run only. Opening the
-/// panel or changing models never searches providers, and the network-backed
-/// Latest action is hidden; users choose date/cycle/hours themselves or use
-/// the bounded Check availability action.
+/// Opening the model downloader or changing models is always local-only. A
+/// provider search runs only when the user explicitly presses Latest.
 fn explicit_model_download_panel(spec: rw_ui::DownloadSpec) -> rw_ui::DownloadPanel {
     let mut panel = rw_ui::DownloadPanel::new(spec);
-    panel.set_latest_action_visible(false);
+    panel.set_latest_action_visible(true);
     panel
+}
+
+/// A Latest lookup captures every field shown in the panel. Do not let a
+/// delayed response overwrite any manual edit, even when the model itself is
+/// unchanged (source/date/cycle edits are especially important here).
+fn latest_response_matches_panel(
+    request: &rw_ui::DownloadSpec,
+    current: &rw_ui::DownloadSpec,
+) -> bool {
+    request == current
 }
 
 pub(crate) fn normalize_event_track_model_slug(model_slug: &str) -> String {
@@ -77422,6 +77472,28 @@ mod tests {
         assert_eq!(valid_model_download_cycle(ModelId::Gfs, 6, 17), 6);
         assert_eq!(valid_model_download_cycle(ModelId::Gfs, 17, 17), 12);
         assert_eq!(valid_model_download_cycle(ModelId::Gfs, 17, 2), 0);
+    }
+
+    #[test]
+    fn latest_response_requires_the_exact_panel_request() {
+        let request = default_download_spec("gfs");
+        assert!(latest_response_matches_panel(&request, &request));
+
+        let mut edited = request.clone();
+        edited.source = "nomads".to_owned();
+        assert!(!latest_response_matches_panel(&request, &edited));
+
+        let mut edited = request.clone();
+        edited.date = "20260813".to_owned();
+        assert!(!latest_response_matches_panel(&request, &edited));
+
+        let mut edited = request.clone();
+        edited.cycle = (request.cycle + 6) % 24;
+        assert!(!latest_response_matches_panel(&request, &edited));
+
+        let mut edited = request.clone();
+        edited.hours = "6-12".to_owned();
+        assert!(!latest_response_matches_panel(&request, &edited));
     }
 
     #[test]

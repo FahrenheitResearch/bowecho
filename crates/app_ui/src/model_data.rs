@@ -1976,6 +1976,31 @@ fn retained_namelist_source(path: Option<&Path>) -> Option<PathBuf> {
     path.filter(|path| path.is_file()).map(Path::to_path_buf)
 }
 
+/// Stable identity requested by a writer-triggered store refresh. Exact-time
+/// metadata belongs to the freshly enumerated manifest, so it is deliberately
+/// resolved only after that tree arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRescanSelection {
+    model: String,
+    run: String,
+    hour: u16,
+}
+
+fn enumerated_hour_key(tree: &StoreTree, wanted: &PendingRescanSelection) -> Option<HourKey> {
+    let model = tree
+        .models
+        .iter()
+        .find(|model| model.model == wanted.model)?;
+    let run = model.runs.iter().find(|run| run.run == wanted.run)?;
+    let hour = run.hours.iter().find(|hour| hour.hour == wanted.hour)?;
+    Some(HourKey {
+        model: model.model.clone(),
+        run: run.run.clone(),
+        hour: hour.hour,
+        exact_time: hour.exact_time,
+    })
+}
+
 pub struct ModelDataDock {
     worker: StoreWorker,
     /// Clone-shared rw-store view used by the main worker and auxiliary
@@ -2102,6 +2127,9 @@ pub struct ModelDataDock {
     remote_output_result: Option<RemoteOutputResult>,
     remote_viewer: FieldViewerPanel,
     tree: Option<StoreTree>,
+    /// A just-written hour that must win over the browser's previous
+    /// selection when the corresponding asynchronous enumeration lands.
+    pending_rescan_selection: Option<PendingRescanSelection>,
     browser: RunBrowserPanel,
     viewer: FieldViewerPanel,
     sounding: crate::sharppy_sounding::SharppySoundingPanel,
@@ -2342,6 +2370,7 @@ impl ModelDataDock {
             remote_output_result: None,
             remote_viewer: FieldViewerPanel::new(),
             tree: None,
+            pending_rescan_selection: None,
             browser: RunBrowserPanel::new(),
             viewer: FieldViewerPanel::new(),
             sounding: crate::sharppy_sounding::SharppySoundingPanel::new(),
@@ -3882,6 +3911,33 @@ impl ModelDataDock {
         }
     }
 
+    fn apply_store_tree(&mut self, tree: StoreTree) {
+        // A completed writer names the stable v1 slot, while the manifest owns
+        // the authoritative exact-time metadata. Resolve that identity against
+        // this enumeration before reconciliation so the browser cannot retain
+        // an unrelated run merely because it was selected previously.
+        let pending_key = self
+            .pending_rescan_selection
+            .as_ref()
+            .and_then(|wanted| enumerated_hour_key(&tree, wanted));
+        if let Some(key) = &pending_key {
+            self.browser.select(key.clone());
+        }
+
+        let selection_changed = self.browser.reconcile(&tree);
+        let selected = self.browser.selected().cloned();
+        self.tree = Some(tree);
+
+        if let Some(key) = pending_key {
+            self.pending_rescan_selection = None;
+            // Load only after installing the tree snapshot that proved this
+            // exact model/run/hour exists.
+            self.select_hour(key);
+        } else if selection_changed && let Some(key) = selected {
+            self.select_hour(key);
+        }
+    }
+
     /// Drain worker responses into panel state (mirrors the rusty-weather
     /// reference host).
     fn handle_responses(&mut self) {
@@ -3897,14 +3953,7 @@ impl ModelDataDock {
         self.poll_remote_output();
         while let Some(response) = self.worker.try_recv() {
             match response {
-                StoreResponse::Tree(tree) => {
-                    let selection_changed = self.browser.reconcile(&tree);
-                    let selected = self.browser.selected().cloned();
-                    self.tree = Some(tree);
-                    if selection_changed && let Some(key) = selected {
-                        self.select_hour(key);
-                    }
-                }
+                StoreResponse::Tree(tree) => self.apply_store_tree(tree),
                 StoreResponse::HourVars(key, Ok(vars)) => {
                     if self.browser.selected() == Some(&key) {
                         // Raw wrf_* vars show their catalog labels in the
@@ -4972,6 +5021,23 @@ impl ModelDataDock {
 
     /// Re-scan the store (after an ingest finishes).
     pub fn rescan(&mut self) {
+        self.queue_rescan(true);
+    }
+
+    /// Re-scan after a writer commits one hour, then select that exact
+    /// model/run/slot from the returned manifest. This keeps an older or newer
+    /// run that happened to be open before the download from hiding the hours
+    /// that just landed.
+    pub fn rescan_and_select(&mut self, model: &str, run: &str, hour: u16) {
+        self.pending_rescan_selection = Some(PendingRescanSelection {
+            model: model.to_owned(),
+            run: run.to_owned(),
+            hour,
+        });
+        self.queue_rescan(false);
+    }
+
+    fn queue_rescan(&mut self, reload_current_selection: bool) {
         #[cfg(test)]
         {
             self.rescan_requests_for_test += 1;
@@ -4985,7 +5051,7 @@ impl ModelDataDock {
         // Formula Lab can never report Ready from the previous revision.
         self.hour_store_vars.clear();
         self.hour_store_var_info.clear();
-        if let Some(selected) = self.browser.selected().cloned() {
+        if reload_current_selection && let Some(selected) = self.browser.selected().cloned() {
             self.worker.send(StoreRequest::LoadHour(selected));
         }
     }
@@ -15981,6 +16047,35 @@ mod tests {
         dock.rescan();
         assert!(dock.hour_store_vars.is_empty());
         assert!(dock.hour_store_var_info.is_empty());
+    }
+
+    #[test]
+    fn ingest_rescan_selects_the_exact_run_and_last_written_hour() {
+        let ctx = egui::Context::default();
+        let old_tree = tree_with_runs("hrrr", &[("20260814_19z", &[0])]);
+        let mut dock = ModelDataDock::new_for_test(&ctx, old_tree.clone());
+        dock.browser.select(HourKey {
+            model: "hrrr".to_owned(),
+            run: "20260814_19z".to_owned(),
+            hour: 0,
+            exact_time: None,
+        });
+
+        dock.rescan_and_select("hrrr", "20260814_00z", 3);
+        // An already-queued stale enumeration must not consume the target.
+        dock.apply_store_tree(old_tree);
+        assert_eq!(dock.browser.selected().unwrap().run, "20260814_19z");
+        assert!(dock.pending_rescan_selection.is_some());
+
+        dock.apply_store_tree(tree_with_runs(
+            "hrrr",
+            &[("20260814_19z", &[0]), ("20260814_00z", &[0, 1, 2, 3])],
+        ));
+        let selected = dock.browser.selected().expect("downloaded hour selected");
+        assert_eq!(selected.model, "hrrr");
+        assert_eq!(selected.run, "20260814_00z");
+        assert_eq!(selected.hour, 3);
+        assert!(dock.pending_rescan_selection.is_none());
     }
 
     #[test]

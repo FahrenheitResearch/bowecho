@@ -339,11 +339,19 @@ impl SharppySoundingPanel {
     }
 
     pub fn set_loading(&mut self) {
-        self.source = None;
-        self.display_column = None;
-        self.correction_recipe = CorrectionRecipe::default();
-        self.correction_result = None;
-        self.correction_editor.reset_source_state();
+        // A fluid Ctrl+Alt sounding requests a replacement on every newly
+        // hovered grid cell. Keep the complete current source, toolbar, plot,
+        // and correction state mounted while that replacement is in flight;
+        // `rw_ui::SoundingPanel::set_loading` already preserves a Ready scene
+        // and merely marks it as refreshing. Clearing `display_column` here
+        // used to remove the toolbar for every request while the old
+        // sharppyrs canvas remained, making the pane jump vertically.
+        if self.display_column.is_none() {
+            self.source = None;
+            self.correction_recipe = CorrectionRecipe::default();
+            self.correction_result = None;
+            self.correction_editor.reset_source_state();
+        }
         self.inner.set_loading();
     }
 
@@ -1371,13 +1379,60 @@ mod tests {
         );
 
         panel.set_loading();
-        assert!(panel.display_column.is_none());
+        assert_eq!(panel.display_column.as_ref(), Some(&original));
         panel.install_source(manual_test_data("wrf"), original.clone(), None);
         panel.set_error("test error".to_owned());
         assert!(panel.display_column.is_none());
         panel.install_source(manual_test_data("wrf"), original, None);
         panel.clear();
         assert!(panel.display_column.is_none());
+    }
+
+    #[test]
+    fn loading_refresh_preserves_ready_sharppyrs_header_scene_and_correction() {
+        use crate::sounding_correction::{ThermalEdit, ThermalTarget};
+
+        let mut panel = SharppySoundingPanel::new();
+        let original = manual_test_column();
+        panel.install_source(manual_test_data("wrf"), original, None);
+
+        let mut level = CorrectionLevel::at_height(0.0);
+        level.thermal = Some(ThermalEdit::new(ThermalTarget::TemperatureC(29.0)));
+        panel.correction_recipe.levels.push(level);
+        panel.rebuild_from_source();
+
+        let displayed = panel.display_column.clone().expect("ready display column");
+        let title = panel
+            .analysis
+            .as_ref()
+            .expect("ready sharppyrs analysis")
+            .title
+            .clone();
+        assert!(panel.source.is_some());
+        assert!(panel.correction_result.is_some());
+        assert!(panel.has_content());
+
+        panel.set_loading();
+
+        assert!(panel.source.is_some());
+        assert_eq!(panel.display_column.as_ref(), Some(&displayed));
+        assert_eq!(
+            panel
+                .analysis
+                .as_ref()
+                .expect("analysis remains mounted while refreshing")
+                .title,
+            title
+        );
+        assert_eq!(panel.correction_recipe.active_level_count(), 1);
+        assert!(panel.correction_result.is_some());
+        assert!(panel.has_content());
+
+        let mut replacement = manual_test_column();
+        replacement.metadata.station_id = "KNEW".to_owned();
+        panel.install_source(manual_test_data("gfs"), replacement.clone(), None);
+        assert_eq!(panel.display_column.as_ref(), Some(&replacement));
+        assert_eq!(panel.correction_recipe.active_level_count(), 0);
     }
 
     #[test]
