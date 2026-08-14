@@ -157,7 +157,7 @@ jobs:
           # In-app updater self-identification (empty for Linux matrix
           # entries, which the code treats as "cannot self-update").
           BOWECHO_UPDATE_ASSET: ${{ matrix.update_asset }}
-        run: cargo build --release -p app_ui --bin bowecho
+        run: cargo build --release -p app_ui --bin bowecho --locked
 
       - name: Detect Windows signing secrets
         id: windows_signing
